@@ -540,6 +540,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM:
                 return toggleSplitZoom(app, target: target)
 
+            case GHOSTTY_ACTION_TOGGLE_HERO_MODE:
+                return toggleHeroMode(app, target: target)
+
             case GHOSTTY_ACTION_INSPECTOR:
                 controlInspector(app, target: target, mode: action.action.inspector)
 
@@ -1387,6 +1390,33 @@ extension Ghostty {
 
                 NotificationCenter.default.post(
                     name: Notification.didToggleSplitZoom,
+                    object: surfaceView
+                )
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func toggleHeroMode(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("toggle hero mode does nothing with an app target")
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return false }
+
+                guard controller.surfaceTree.isSplit else { return false }
+
+                NotificationCenter.default.post(
+                    name: Notification.didToggleHeroMode,
                     object: surfaceView
                 )
                 return true

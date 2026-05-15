@@ -558,6 +558,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Toggle the zoom state of the current split.",
         }},
 
+        .toggle_hero_mode => comptime &.{.{
+            .action = .toggle_hero_mode,
+            .title = "Toggle Hero Mode",
+            .description = "Toggle hero mode, showing the focused pane full-size with a carousel of all panes.",
+        }},
+
         .toggle_readonly => comptime &.{.{
             .action = .toggle_readonly,
             .title = "Toggle Read-Only Mode",

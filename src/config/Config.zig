@@ -6955,6 +6955,13 @@ pub const Keybinds = struct {
             .{ .toggle_split_zoom = {} },
         );
 
+        // Toggle hero mode
+        try self.set.put(
+            alloc,
+            .{ .key = .{ .unicode = 'h' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .toggle_hero_mode = {} },
+        );
+
         // Toggle command palette, matches VSCode
         try self.set.put(
             alloc,
