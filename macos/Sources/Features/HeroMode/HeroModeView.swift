@@ -35,7 +35,7 @@ struct HeroModeView: View {
                 HeroCarouselView(
                     leaves: leaves,
                     state: state,
-                    heroAspectRatio: heroAspectRatio
+                    heroSize: CGSize(width: heroWidth, height: geo.size.height)
                 )
                 .frame(width: carouselWidth, height: geo.size.height)
             }

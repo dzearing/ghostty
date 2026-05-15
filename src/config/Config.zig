@@ -6958,7 +6958,7 @@ pub const Keybinds = struct {
         // Toggle hero mode
         try self.set.put(
             alloc,
-            .{ .key = .{ .unicode = 'h' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .key = .{ .physical = .space }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
             .{ .toggle_hero_mode = {} },
         );
 

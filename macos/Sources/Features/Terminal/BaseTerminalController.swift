@@ -704,12 +704,10 @@ class BaseTerminalController: NSWindowController,
             let leaves = surfaceTree.root?.leaves() ?? []
             guard let directionValue = notification.userInfo?[Ghostty.Notification.SplitDirectionKey] as? Ghostty.SplitFocusDirection else { return }
             switch directionValue {
-            case .previous:
+            case .previous, .up, .left:
                 heroModeState.selectPrevious(leafCount: leaves.count)
-            case .next:
+            case .next, .down, .right:
                 heroModeState.selectNext(leafCount: leaves.count)
-            default:
-                break
             }
             return
         }
