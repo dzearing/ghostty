@@ -81,6 +81,7 @@ class HeroCarouselContainer: NSView {
             repositionStrip(animated: false)
         }
 
+        refreshSnapshots()
         startSnapshotTimer(leaves: leaves)
     }
 
