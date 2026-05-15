@@ -46,6 +46,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     let heroModeState = HeroModeState()
+    private var heroSelectionCancellable: AnyCancellable?
 
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
@@ -230,6 +231,13 @@ class BaseTerminalController: NSWindowController,
             selector: #selector(ghosttyDidToggleHeroMode(_:)),
             name: Ghostty.Notification.didToggleHeroMode,
             object: nil)
+
+        heroSelectionCancellable = heroModeState.$selectedIndex
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newIndex in
+                self?.heroSelectionDidChange(to: newIndex)
+            }
+
         center.addObserver(
             self,
             selector: #selector(ghosttyDidResizeSplit(_:)),
@@ -832,6 +840,13 @@ class BaseTerminalController: NSWindowController,
         let leaves = surfaceTree.root?.leaves() ?? []
         guard heroModeState.selectedIndex < leaves.count else { return nil }
         return leaves[heroModeState.selectedIndex]
+    }
+
+    private func heroSelectionDidChange(to index: Int) {
+        guard heroModeState.isActive else { return }
+        if let surface = heroSurfaceForCurrentSelection() {
+            Ghostty.moveFocus(to: surface)
+        }
     }
 
     @objc private func ghosttyDidResizeSplit(_ notification: Notification) {

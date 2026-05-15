@@ -4,22 +4,27 @@ import GhosttyKit
 struct HeroPaneView: View {
     let leaves: [Ghostty.SurfaceView]
     @ObservedObject var state: HeroModeState
+    let gap: CGFloat = 60
 
     var body: some View {
-        ZStack {
-            if state.selectedIndex < leaves.count {
-                Ghostty.InspectableSurface(
-                    surfaceView: leaves[state.selectedIndex],
-                    isSplit: false
-                )
-                .id(leaves[state.selectedIndex].id)
-                .transition(.asymmetric(
-                    insertion: .move(edge: state.lastDirection == .down ? .bottom : .top),
-                    removal: .move(edge: state.lastDirection == .down ? .top : .bottom)
-                ))
+        GeometryReader { geo in
+            let paneHeight = geo.size.height
+            let stride = paneHeight + gap
+            let offset = -CGFloat(state.selectedIndex) * stride
+
+            VStack(spacing: gap) {
+                ForEach(Array(leaves.enumerated()), id: \.element.id) { index, surface in
+                    Ghostty.InspectableSurface(
+                        surfaceView: surface,
+                        isSplit: false
+                    )
+                    .frame(width: geo.size.width, height: paneHeight)
+                }
             }
+            .frame(width: geo.size.width, alignment: .top)
+            .offset(y: offset)
+            .animation(.easeInOut(duration: 0.35), value: state.selectedIndex)
         }
         .clipped()
-        .animation(.easeInOut(duration: 0.3), value: state.selectedIndex)
     }
 }
