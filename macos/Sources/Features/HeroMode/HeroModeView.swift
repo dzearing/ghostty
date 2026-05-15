@@ -6,8 +6,6 @@ struct HeroModeView: View {
     @ObservedObject var state: HeroModeState
 
     @State private var keyMonitor: Any? = nil
-    @State private var scrollMonitor: Any? = nil
-    @State private var carouselFrame: CGRect = .zero
 
     var body: some View {
         let leaves = tree.root?.leaves() ?? []
@@ -42,96 +40,38 @@ struct HeroModeView: View {
                     heroAspectRatio: heroAspectRatio
                 )
                 .frame(width: carouselWidth, height: geo.size.height)
-                .background(GeometryReader { carouselGeo in
-                    Color.clear.preference(
-                        key: CarouselFrameKey.self,
-                        value: carouselGeo.frame(in: .global)
-                    )
-                })
             }
         }
-        .onPreferenceChange(CarouselFrameKey.self) { carouselFrame = $0 }
-        .onAppear { installMonitors(leafCount: leaves.count) }
-        .onDisappear { removeMonitors() }
-        .onChange(of: state.isActive) { newValue in
-            if newValue {
-                installMonitors(leafCount: leaves.count)
-            } else {
-                removeMonitors()
-            }
-        }
+        .onAppear { installKeyMonitor() }
+        .onDisappear { removeKeyMonitor() }
     }
 
     private let dividerWidth: CGFloat = 6
 
-    private func installMonitors(leafCount: Int) {
-        if keyMonitor == nil {
-            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                guard state.isActive else { return event }
-                let leaves = tree.root?.leaves() ?? []
-                guard leaves.count > 1 else { return event }
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard state.isActive else { return event }
+            let leaves = tree.root?.leaves() ?? []
+            guard leaves.count > 1 else { return event }
 
-                let hasShiftCmd = event.modifierFlags.contains([.shift, .command])
-                if hasShiftCmd && event.keyCode == 126 { // Up arrow
-                    state.selectPrevious(leafCount: leaves.count)
-                    return nil
-                } else if hasShiftCmd && event.keyCode == 125 { // Down arrow
-                    state.selectNext(leafCount: leaves.count)
-                    return nil
-                }
-                return event
+            let hasShiftCmd = event.modifierFlags.contains([.shift, .command])
+            if hasShiftCmd && event.keyCode == 126 {
+                state.selectPrevious(leafCount: leaves.count)
+                return nil
+            } else if hasShiftCmd && event.keyCode == 125 {
+                state.selectNext(leafCount: leaves.count)
+                return nil
             }
-        }
-
-        if scrollMonitor == nil {
-            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-                guard state.isActive else { return event }
-                guard let window = event.window else { return event }
-
-                let windowPoint = event.locationInWindow
-                let screenPoint = window.convertPoint(toScreen: windowPoint)
-
-                if isPointInCarousel(screenPoint) {
-                    let leaves = tree.root?.leaves() ?? []
-                    let heroAR = carouselFrame.width > 0 ? (carouselFrame.width * 0.88) : 1.0
-                    let gap: CGFloat = 8
-                    let totalHeight = CGFloat(leaves.count) * (heroAR + gap)
-                    let maxScroll = max(totalHeight, carouselFrame.height) * 0.8
-
-                    state.scrollOffset += event.scrollingDeltaY
-                    state.scrollOffset = max(-maxScroll, min(maxScroll, state.scrollOffset))
-                    return nil
-                }
-                return event
-            }
+            return event
         }
     }
 
-    private func isPointInCarousel(_ screenPoint: CGPoint) -> Bool {
-        guard carouselFrame.width > 0 else { return false }
-        let mainScreen = NSScreen.main ?? NSScreen.screens.first
-        guard let screenHeight = mainScreen?.frame.height else { return false }
-        let flippedY = screenHeight - screenPoint.y
-        let flippedPoint = CGPoint(x: screenPoint.x, y: flippedY)
-        return carouselFrame.contains(flippedPoint)
-    }
-
-    private func removeMonitors() {
+    private func removeKeyMonitor() {
         if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
             keyMonitor = nil
         }
-        if let monitor = scrollMonitor {
-            NSEvent.removeMonitor(monitor)
-            scrollMonitor = nil
-        }
-    }
-}
-
-private struct CarouselFrameKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
-        value = nextValue()
     }
 }
 
