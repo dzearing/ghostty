@@ -81,8 +81,10 @@ class HeroCarouselContainer: NSView {
             repositionStrip(animated: false)
         }
 
-        refreshSnapshots()
         startSnapshotTimer(leaves: leaves)
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshSnapshots()
+        }
     }
 
     private func rebuildTiles(leaves: [Ghostty.SurfaceView]) {
@@ -250,7 +252,36 @@ private class CarouselTile: NSView {
     }
 
     func refreshSnapshot() {
-        imageView.image = surfaceView.asImage
+        guard let surfaceLayer = surfaceView.layer else { return }
+        let size = surfaceView.bounds.size
+        guard size.width > 0, size.height > 0 else { return }
+
+        let scale = surfaceView.window?.backingScaleFactor ?? 2.0
+        let pixelWidth = Int(size.width * scale)
+        let pixelHeight = Int(size.height * scale)
+
+        guard let bitmapRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return }
+
+        let ctx = NSGraphicsContext(bitmapImageRep: bitmapRep)
+        guard let cgCtx = ctx?.cgContext else { return }
+
+        cgCtx.scaleBy(x: scale, y: scale)
+        surfaceLayer.render(in: cgCtx)
+
+        let image = NSImage(size: size)
+        image.addRepresentation(bitmapRep)
+        imageView.image = image
     }
 
     override func mouseDown(with event: NSEvent) {
