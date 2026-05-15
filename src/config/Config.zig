@@ -6955,6 +6955,18 @@ pub const Keybinds = struct {
             .{ .toggle_split_zoom = {} },
         );
 
+        // Hero mode navigation (previous/next split, intercepted by hero mode)
+        try self.set.put(
+            alloc,
+            .{ .key = .{ .physical = .arrow_up }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .goto_split = .previous },
+        );
+        try self.set.put(
+            alloc,
+            .{ .key = .{ .physical = .arrow_down }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .goto_split = .next },
+        );
+
         // Toggle hero mode
         try self.set.put(
             alloc,

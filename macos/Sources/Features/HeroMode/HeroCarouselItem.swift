@@ -6,39 +6,19 @@ struct HeroCarouselItem: View {
     let isSelected: Bool
     let isHovered: Bool
     let thumbnailSize: CGSize
-    let heroSize: CGSize
 
     var body: some View {
-        ZStack {
-            thumbnailContent
-        }
-        .frame(width: thumbnailSize.width, height: thumbnailSize.height)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(borderColor, lineWidth: borderWidth)
-        )
-        .shadow(color: glowColor, radius: isSelected ? 15 : 0)
-        .shadow(color: glowColor.opacity(0.5), radius: isSelected ? 30 : 0)
-        .opacity(isSelected || isHovered ? 1.0 : 0.35)
-        .contentShape(Rectangle())
-        .animation(.easeInOut(duration: 0.15), value: isHovered)
-    }
-
-    @ViewBuilder
-    private var thumbnailContent: some View {
-        if isSelected {
-            SnapshotView(surfaceView: surfaceView, size: thumbnailSize)
-        } else {
-            let scale = thumbnailSize.width / heroSize.width
-            Ghostty.SurfaceRepresentable(view: surfaceView, size: heroSize)
-                .frame(width: heroSize.width, height: heroSize.height)
-                .scaleEffect(scale, anchor: .topLeading)
-                .frame(width: thumbnailSize.width, height: thumbnailSize.height, alignment: .topLeading)
-                .clipped()
-                .allowsHitTesting(false)
-                .disabled(true)
-        }
+        SnapshotView(surfaceView: surfaceView, size: thumbnailSize)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(borderColor, lineWidth: borderWidth)
+            )
+            .shadow(color: glowColor, radius: isSelected ? 15 : 0)
+            .shadow(color: glowColor.opacity(0.5), radius: isSelected ? 30 : 0)
+            .opacity(isSelected || isHovered ? 1.0 : 0.35)
+            .contentShape(Rectangle())
+            .animation(.easeInOut(duration: 0.15), value: isHovered)
     }
 
     private var borderColor: Color {
@@ -65,7 +45,7 @@ struct SnapshotView: View {
     let size: CGSize
 
     @State private var snapshot: NSImage?
-    private let refreshTimer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
+    private let refreshTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Group {

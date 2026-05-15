@@ -4,13 +4,12 @@ import GhosttyKit
 struct HeroCarouselView: View {
     let leaves: [Ghostty.SurfaceView]
     @ObservedObject var state: HeroModeState
-    let heroSize: CGSize
+    let heroAspectRatio: CGFloat
 
     @State private var hoveredIndex: Int? = nil
 
     var body: some View {
         GeometryReader { geo in
-            let heroAspectRatio = heroSize.width / heroSize.height
             let thumbWidth = geo.size.width * 0.88
             let thumbHeight = thumbWidth / heroAspectRatio
             let gap: CGFloat = 8
@@ -26,8 +25,7 @@ struct HeroCarouselView: View {
                             surfaceView: surface,
                             isSelected: index == state.selectedIndex,
                             isHovered: index == hoveredIndex,
-                            thumbnailSize: CGSize(width: thumbWidth, height: thumbHeight),
-                            heroSize: heroSize
+                            thumbnailSize: CGSize(width: thumbWidth, height: thumbHeight)
                         )
                         .contentShape(Rectangle())
                         .onHover { hovering in
