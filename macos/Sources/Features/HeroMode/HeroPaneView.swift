@@ -13,6 +13,7 @@ struct HeroPaneView: View {
 
             HeroPaneStrip(
                 leaves: leaves,
+                selectedIndex: state.selectedIndex,
                 paneSize: geo.size,
                 gap: gap
             )
@@ -25,17 +26,23 @@ struct HeroPaneView: View {
 
 private struct HeroPaneStrip: View {
     let leaves: [Ghostty.SurfaceView]
+    let selectedIndex: Int
     let paneSize: CGSize
     let gap: CGFloat
 
     var body: some View {
         VStack(spacing: gap) {
-            ForEach(Array(leaves.enumerated()), id: \.element.id) { _, surface in
-                Ghostty.InspectableSurface(
-                    surfaceView: surface,
-                    isSplit: false
-                )
-                .frame(width: paneSize.width, height: paneSize.height)
+            ForEach(Array(leaves.enumerated()), id: \.element.id) { index, surface in
+                if abs(index - selectedIndex) <= 1 {
+                    Ghostty.InspectableSurface(
+                        surfaceView: surface,
+                        isSplit: false
+                    )
+                    .frame(width: paneSize.width, height: paneSize.height)
+                } else {
+                    Color.black
+                        .frame(width: paneSize.width, height: paneSize.height)
+                }
             }
         }
         .frame(width: paneSize.width, alignment: .top)
