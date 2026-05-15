@@ -7,8 +7,6 @@ struct HeroCarouselView: View {
     let heroAspectRatio: CGFloat
 
     @State private var hoveredIndex: Int? = nil
-    @State private var scrollMonitor: Any? = nil
-    @State private var carouselFrame: CGRect = .zero
 
     var body: some View {
         GeometryReader { geo in
@@ -32,10 +30,7 @@ struct HeroCarouselView: View {
                         hoveredIndex = hovering ? index : nil
                     }
                     .onTapGesture {
-                        withAnimation(.easeInOut(duration: state.animationDuration(
-                            from: state.selectedIndex, to: index))) {
-                            state.select(index, leafCount: leaves.count)
-                        }
+                        state.select(index, leafCount: leaves.count)
                     }
                 }
             }
@@ -46,49 +41,5 @@ struct HeroCarouselView: View {
             .clipped()
         }
         .background(Color.black.opacity(0.3))
-        .background(GeometryReader { geo in
-            Color.clear.preference(key: CarouselFrameKey.self, value: geo.frame(in: .global))
-        })
-        .onPreferenceChange(CarouselFrameKey.self) { carouselFrame = $0 }
-        .onAppear { installScrollMonitor() }
-        .onDisappear { removeScrollMonitor() }
-    }
-
-    private func installScrollMonitor() {
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            guard let window = event.window else { return event }
-            let windowPoint = event.locationInWindow
-            let screenPoint = window.convertPoint(toScreen: windowPoint)
-            let flippedPoint = CGPoint(x: screenPoint.x, y: screenPoint.y)
-
-            if carouselFrame.contains(flippedPoint) {
-                let heroAR = heroAspectRatio
-                let thumbWidth = carouselFrame.width * 0.88
-                let thumbHeight = thumbWidth / heroAR
-                let gap: CGFloat = 8
-                let stride = thumbHeight + gap
-                let totalHeight = CGFloat(leaves.count) * stride
-                let maxScroll = totalHeight * 0.8
-
-                state.scrollOffset += event.scrollingDeltaY
-                state.scrollOffset = max(-maxScroll, min(maxScroll, state.scrollOffset))
-                return nil
-            }
-            return event
-        }
-    }
-
-    private func removeScrollMonitor() {
-        if let monitor = scrollMonitor {
-            NSEvent.removeMonitor(monitor)
-            scrollMonitor = nil
-        }
-    }
-}
-
-private struct CarouselFrameKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
-        value = nextValue()
     }
 }

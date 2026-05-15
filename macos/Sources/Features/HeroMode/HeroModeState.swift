@@ -2,10 +2,13 @@ import SwiftUI
 import GhosttyKit
 
 class HeroModeState: ObservableObject {
+    enum Direction { case up, down }
+
     @Published var isActive: Bool = false
     @Published var selectedIndex: Int = 0
     @Published var carouselRatio: CGFloat = 0.25
     @Published var scrollOffset: CGFloat = 0
+    var lastDirection: Direction = .down
 
     private static let minCarouselRatio: CGFloat = 0.1
     private static let maxCarouselRatio: CGFloat = 0.6
@@ -25,6 +28,7 @@ class HeroModeState: ObservableObject {
     func select(_ index: Int, leafCount: Int) {
         let clamped = clampIndex(index, leafCount: leafCount)
         guard clamped != selectedIndex else { return }
+        lastDirection = clamped > selectedIndex ? .down : .up
         selectedIndex = clamped
         scrollOffset = 0
     }
