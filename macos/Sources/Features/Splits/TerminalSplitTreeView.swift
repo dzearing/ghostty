@@ -28,9 +28,13 @@ enum TerminalSplitOperation {
 struct TerminalSplitTreeView: View {
     let tree: SplitTree<Ghostty.SurfaceView>
     let action: (TerminalSplitOperation) -> Void
+    @ObservedObject var heroModeState: HeroModeState
 
     var body: some View {
-        if let node = tree.zoomed ?? tree.root {
+        if heroModeState.isActive {
+            HeroModeView(tree: tree, state: heroModeState)
+                .transition(.opacity)
+        } else if let node = tree.zoomed ?? tree.root {
             TerminalSplitSubtreeView(
                 node: node,
                 isRoot: node == tree.root,

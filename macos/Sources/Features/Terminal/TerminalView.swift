@@ -30,6 +30,9 @@ protocol TerminalViewModel: ObservableObject {
     /// and children. This should be @Published.
     var surfaceTree: SplitTree<Ghostty.SurfaceView> { get set }
 
+    /// The hero mode state for this window.
+    var heroModeState: HeroModeState { get }
+
     /// The command palette state.
     var commandPaletteIsShowing: Bool { get set }
 
@@ -81,7 +84,8 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
 
                     TerminalSplitTreeView(
                         tree: viewModel.surfaceTree,
-                        action: { delegate?.performSplitAction($0) })
+                        action: { delegate?.performSplitAction($0) },
+                        heroModeState: viewModel.heroModeState)
                         .environmentObject(ghostty)
                         .ghosttyLastFocusedSurface(lastFocusedSurface)
                         .focused($focused)
