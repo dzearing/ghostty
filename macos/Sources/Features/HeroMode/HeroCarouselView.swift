@@ -40,10 +40,12 @@ class HeroCarouselContainer: NSView {
     private var tiles: [CarouselTile] = []
     private var currentIndex: Int = -1
     private var scrollOffset: CGFloat = 0
-    private var gap: CGFloat = 8
-    private var thumbSize: CGSize = .zero
+    private let gap: CGFloat = 8
+    private var heroAspectRatio: CGFloat = 1.5
     private weak var state: HeroModeState?
+    private var currentLeaves: [Ghostty.SurfaceView] = []
     private var snapshotTimer: Timer?
+    private var needsInitialSnapshot = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -58,42 +60,53 @@ class HeroCarouselContainer: NSView {
 
     override func layout() {
         super.layout()
+        guard bounds.width > 0, bounds.height > 0 else { return }
         relayout(animated: false)
+        if needsInitialSnapshot {
+            needsInitialSnapshot = false
+            DispatchQueue.main.async { [weak self] in
+                self?.refreshSnapshots()
+            }
+        }
     }
 
     func update(leaves: [Ghostty.SurfaceView], state: HeroModeState, heroAspectRatio: CGFloat) {
         self.state = state
+        self.heroAspectRatio = heroAspectRatio
+        self.currentLeaves = leaves
 
-        let thumbWidth = bounds.width * 0.88
-        let thumbHeight = thumbWidth / max(heroAspectRatio, 0.1)
-        thumbSize = CGSize(width: thumbWidth, height: thumbHeight)
+        let tilesChanged = rebuildTiles(leaves: leaves)
+        if tilesChanged {
+            needsInitialSnapshot = true
+        }
 
-        rebuildTiles(leaves: leaves)
-        relayout(animated: false)
+        if bounds.width > 0 {
+            relayout(animated: false)
+        }
 
         if state.selectedIndex != currentIndex {
             scrollOffset = 0
+            state.scrollOffset = 0
             animateToIndex(state.selectedIndex)
         }
 
-        if state.scrollOffset != scrollOffset {
-            scrollOffset = state.scrollOffset
-            repositionStrip(animated: false)
-        }
-
-        startSnapshotTimer(leaves: leaves)
-        DispatchQueue.main.async { [weak self] in
-            self?.refreshSnapshots()
-        }
+        startSnapshotTimer()
     }
 
-    private func rebuildTiles(leaves: [Ghostty.SurfaceView]) {
+    private var thumbSize: CGSize {
+        let w = bounds.width * 0.88
+        let h = w / max(heroAspectRatio, 0.1)
+        return CGSize(width: w, height: h)
+    }
+
+    @discardableResult
+    private func rebuildTiles(leaves: [Ghostty.SurfaceView]) -> Bool {
         guard tiles.count != leaves.count ||
               !zip(tiles, leaves).allSatisfy({ $0.surfaceView === $1 }) else {
             for (i, tile) in tiles.enumerated() {
                 tile.isSelected = i == (state?.selectedIndex ?? 0)
             }
-            return
+            return false
         }
 
         tiles.forEach { $0.removeFromSuperview() }
@@ -102,39 +115,38 @@ class HeroCarouselContainer: NSView {
         for (i, surface) in leaves.enumerated() {
             let tile = CarouselTile(surfaceView: surface)
             tile.isSelected = i == (state?.selectedIndex ?? 0)
+            let index = i
             tile.onTap = { [weak self] in
-                self?.state?.select(i, leafCount: leaves.count)
+                self?.state?.select(index, leafCount: leaves.count)
             }
             strip.addSubview(tile)
             tiles.append(tile)
         }
+        return true
     }
 
     private func relayout(animated: Bool) {
-        guard bounds.height > 0, thumbSize.width > 0 else { return }
+        let ts = thumbSize
+        guard ts.width > 0, ts.height > 0 else { return }
         let padding = bounds.width * 0.06
 
         for (i, tile) in tiles.enumerated() {
-            let y = CGFloat(i) * (thumbSize.height + gap)
-            tile.frame = NSRect(
-                x: padding,
-                y: y,
-                width: thumbSize.width,
-                height: thumbSize.height
-            )
+            let y = CGFloat(i) * (ts.height + gap)
+            tile.frame = NSRect(x: padding, y: y, width: ts.width, height: ts.height)
         }
 
-        let totalHeight = CGFloat(tiles.count) * (thumbSize.height + gap)
+        let totalHeight = CGFloat(tiles.count) * (ts.height + gap)
         strip.frame = NSRect(x: 0, y: strip.frame.origin.y, width: bounds.width, height: totalHeight)
 
         repositionStrip(animated: animated)
     }
 
     private func repositionStrip(animated: Bool) {
-        let stride = thumbSize.height + gap
-        let centeredY = bounds.height / 2
-            - (CGFloat(currentIndex >= 0 ? currentIndex : 0) * stride + thumbSize.height / 2)
-
+        let ts = thumbSize
+        guard ts.height > 0 else { return }
+        let stride = ts.height + gap
+        let idx = currentIndex >= 0 ? currentIndex : 0
+        let centeredY = bounds.height / 2 - (CGFloat(idx) * stride + ts.height / 2)
         let targetY = centeredY + scrollOffset
 
         if animated {
@@ -150,28 +162,29 @@ class HeroCarouselContainer: NSView {
     }
 
     private func animateToIndex(_ index: Int) {
-        let oldIndex = currentIndex
+        let wasFirst = currentIndex < 0
         currentIndex = index
 
         for (i, tile) in tiles.enumerated() {
             tile.isSelected = i == index
         }
 
-        repositionStrip(animated: oldIndex >= 0)
+        repositionStrip(animated: !wasFirst)
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard let state = state else { return }
+        let ts = thumbSize
+        guard ts.height > 0 else { return }
         scrollOffset += event.scrollingDeltaY
-        let stride = thumbSize.height + gap
+        let stride = ts.height + gap
         let totalHeight = CGFloat(tiles.count) * stride
         let maxScroll = max(totalHeight, bounds.height) * 0.8
         scrollOffset = max(-maxScroll, min(maxScroll, scrollOffset))
-        state.scrollOffset = scrollOffset
+        state?.scrollOffset = scrollOffset
         repositionStrip(animated: false)
     }
 
-    private func startSnapshotTimer(leaves: [Ghostty.SurfaceView]) {
+    private func startSnapshotTimer() {
         guard snapshotTimer == nil else { return }
         snapshotTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             self?.refreshSnapshots()
@@ -198,8 +211,6 @@ private class CarouselTile: NSView {
     var onTap: (() -> Void)?
     private let imageView = NSImageView()
     private let borderLayer = CAShapeLayer()
-    private let glowLayer = CALayer()
-    private var isHovered = false
 
     private let selectedColor = NSColor(red: 0.416, green: 0.416, blue: 1.0, alpha: 1.0)
     private let hoverColor = NSColor(red: 0.545, green: 0.361, blue: 0.965, alpha: 1.0)
@@ -208,6 +219,8 @@ private class CarouselTile: NSView {
     var isSelected: Bool = false {
         didSet { updateAppearance() }
     }
+
+    private var isHovered = false
 
     init(surfaceView: Ghostty.SurfaceView) {
         self.surfaceView = surfaceView
@@ -284,9 +297,7 @@ private class CarouselTile: NSView {
         imageView.image = image
     }
 
-    override func mouseDown(with event: NSEvent) {
-        // intentionally empty — wait for mouseUp
-    }
+    override func mouseDown(with event: NSEvent) {}
 
     override func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
