@@ -4,60 +4,136 @@ import GhosttyKit
 struct HeroPaneView: View {
     let leaves: [Ghostty.SurfaceView]
     @ObservedObject var state: HeroModeState
-    private let gap: CGFloat = 60
 
     var body: some View {
-        GeometryReader { geo in
-            let stride = geo.size.height + gap
-            let targetOffset = -CGFloat(state.selectedIndex) * stride
-
-            HeroPaneStrip(
-                leaves: leaves,
-                selectedIndex: state.selectedIndex,
-                paneSize: geo.size,
-                gap: gap
-            )
-            .modifier(SmoothSlide(offset: targetOffset))
-            .animation(.easeInOut(duration: 0.35), value: state.selectedIndex)
-        }
-        .clipped()
+        HeroPaneRepresentable(
+            leaves: leaves,
+            selectedIndex: state.selectedIndex
+        )
     }
 }
 
-private struct HeroPaneStrip: View {
+struct HeroPaneRepresentable: NSViewRepresentable {
     let leaves: [Ghostty.SurfaceView]
     let selectedIndex: Int
-    let paneSize: CGSize
-    let gap: CGFloat
 
-    var body: some View {
-        VStack(spacing: gap) {
-            ForEach(Array(leaves.enumerated()), id: \.element.id) { index, surface in
-                if abs(index - selectedIndex) <= 1 {
-                    Ghostty.InspectableSurface(
-                        surfaceView: surface,
-                        isSplit: false
-                    )
-                    .frame(width: paneSize.width, height: paneSize.height)
-                } else {
-                    Color.black
-                        .frame(width: paneSize.width, height: paneSize.height)
-                }
-            }
-        }
-        .frame(width: paneSize.width, alignment: .top)
+    func makeNSView(context: Context) -> HeroPaneContainer {
+        HeroPaneContainer()
+    }
+
+    func updateNSView(_ container: HeroPaneContainer, context: Context) {
+        container.update(leaves: leaves, selectedIndex: selectedIndex)
     }
 }
 
-private struct SmoothSlide: GeometryEffect {
-    var offset: CGFloat
+class HeroPaneContainer: NSView {
+    override var isFlipped: Bool { true }
 
-    var animatableData: CGFloat {
-        get { offset }
-        set { offset = newValue }
+    private let strip = HeroPaneStrip()
+    private var currentIndex: Int = -1
+    private let gap: CGFloat = 60
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        strip.wantsLayer = true
+        addSubview(strip)
     }
 
-    func effectValue(size: CGSize) -> ProjectionTransform {
-        ProjectionTransform(CGAffineTransform(translationX: 0, y: offset))
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        relayout()
+    }
+
+    func update(leaves: [Ghostty.SurfaceView], selectedIndex: Int) {
+        let changed = rebuildIfNeeded(leaves: leaves)
+        if changed { relayout() }
+        animateToIndex(selectedIndex)
+    }
+
+    private func rebuildIfNeeded(leaves: [Ghostty.SurfaceView]) -> Bool {
+        let currentSurfaces = strip.subviews.compactMap { ($0 as? HeroPaneSlot)?.surfaceView }
+        guard currentSurfaces != leaves else { return false }
+
+        strip.subviews.forEach { $0.removeFromSuperview() }
+
+        for surface in leaves {
+            let slot = HeroPaneSlot(surfaceView: surface)
+            strip.addSubview(slot)
+        }
+        return true
+    }
+
+    private func relayout() {
+        let h = bounds.height
+        let w = bounds.width
+        guard h > 0, w > 0 else { return }
+
+        let stride = h + gap
+
+        for (i, slot) in strip.subviews.enumerated() {
+            slot.frame = NSRect(x: 0, y: CGFloat(i) * stride, width: w, height: h)
+            if let paneSlot = slot as? HeroPaneSlot {
+                paneSlot.surfaceView.frame = paneSlot.bounds
+            }
+        }
+
+        let totalHeight = CGFloat(strip.subviews.count) * stride
+        strip.frame = NSRect(x: 0, y: strip.frame.origin.y, width: w, height: totalHeight)
+
+        if currentIndex >= 0 {
+            strip.frame.origin.y = -CGFloat(currentIndex) * stride
+        }
+    }
+
+    private func animateToIndex(_ index: Int) {
+        let h = bounds.height
+        guard h > 0 else { return }
+        let stride = h + gap
+        let target = -CGFloat(index) * stride
+
+        if currentIndex < 0 || currentIndex == index {
+            strip.layer?.removeAllAnimations()
+            strip.frame.origin.y = target
+            currentIndex = index
+            return
+        }
+
+        currentIndex = index
+
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.35
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            ctx.allowsImplicitAnimation = true
+            strip.animator().frame.origin.y = target
+        }
+    }
+}
+
+private class HeroPaneStrip: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private class HeroPaneSlot: NSView {
+    let surfaceView: Ghostty.SurfaceView
+
+    init(surfaceView: Ghostty.SurfaceView) {
+        self.surfaceView = surfaceView
+        super.init(frame: .zero)
+        wantsLayer = true
+        surfaceView.removeFromSuperview()
+        addSubview(surfaceView)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        surfaceView.frame = bounds
     }
 }
