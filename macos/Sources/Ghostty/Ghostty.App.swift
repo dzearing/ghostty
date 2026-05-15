@@ -1184,11 +1184,23 @@ extension Ghostty {
                     guard let surfaceView = self.surfaceView(from: surface) else { return false }
                     guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return false }
 
-                    // If the window has no splits, the action is not performable
-                    guard controller.surfaceTree.isSplit else { return false }
-
                     // Convert the C API direction to our Swift type
                     guard let splitDirection = SplitFocusDirection.from(direction: direction) else { return false }
+
+                    // In hero mode, post notification directly — skip split tree checks
+                    if controller.heroModeState.isActive {
+                        NotificationCenter.default.post(
+                            name: Notification.ghosttyFocusSplit,
+                            object: surfaceView,
+                            userInfo: [
+                                Notification.SplitDirectionKey: splitDirection as Any,
+                            ]
+                        )
+                        return true
+                    }
+
+                    // If the window has no splits, the action is not performable
+                    guard controller.surfaceTree.isSplit else { return false }
 
                     // Find the current node in the tree
                     guard let targetNode = controller.surfaceTree.root?.node(view: surfaceView) else { return false }
