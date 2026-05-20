@@ -1781,64 +1781,144 @@ extension Ghostty {
             Self.adjustPaletteForContrast(surface: surface, background: resolved)
         }
 
-        private static let defaultAnsiColors: [(CGFloat, CGFloat, CGFloat)] = [
-            // Standard 8 colors (dark)
-            (0.00, 0.00, 0.00), // 0: black
-            (0.80, 0.00, 0.00), // 1: red
-            (0.00, 0.80, 0.00), // 2: green
-            (0.80, 0.80, 0.00), // 3: yellow
-            (0.00, 0.00, 0.80), // 4: blue
-            (0.80, 0.00, 0.80), // 5: magenta
-            (0.00, 0.80, 0.80), // 6: cyan
-            (0.75, 0.75, 0.75), // 7: white
-            // Bright 8 colors
-            (0.50, 0.50, 0.50), // 8: bright black
-            (1.00, 0.33, 0.33), // 9: bright red
-            (0.33, 1.00, 0.33), // 10: bright green
-            (1.00, 1.00, 0.33), // 11: bright yellow
-            (0.33, 0.33, 1.00), // 12: bright blue
-            (1.00, 0.33, 1.00), // 13: bright magenta
-            (0.33, 1.00, 1.00), // 14: bright cyan
-            (1.00, 1.00, 1.00), // 15: bright white
+        // Actual Ghoztty default palette from src/terminal/color.zig
+        private static let defaultAnsiColors: [(UInt8, UInt8, UInt8)] = [
+            (0x1D, 0x1F, 0x21), // 0: black
+            (0xCC, 0x66, 0x66), // 1: red
+            (0xB5, 0xBD, 0x68), // 2: green
+            (0xF0, 0xC6, 0x74), // 3: yellow
+            (0x81, 0xA2, 0xBE), // 4: blue
+            (0xB2, 0x94, 0xBB), // 5: magenta
+            (0x8A, 0xBE, 0xB7), // 6: cyan
+            (0xC5, 0xC8, 0xC6), // 7: white
+            (0x66, 0x66, 0x66), // 8: bright black
+            (0xD5, 0x4E, 0x53), // 9: bright red
+            (0xB9, 0xCA, 0x4A), // 10: bright green
+            (0xE7, 0xC5, 0x47), // 11: bright yellow
+            (0x7A, 0xA6, 0xDA), // 12: bright blue
+            (0xC3, 0x97, 0xD8), // 13: bright magenta
+            (0x70, 0xC0, 0xB1), // 14: bright cyan
+            (0xEA, 0xEA, 0xEA), // 15: bright white
         ]
 
-        static func adjustPaletteForContrast(surface: ghostty_surface_t, background: NSColor) {
-            let bgLum = background.luminance
+        // MARK: - WCAG contrast helpers
 
-            for (i, base) in defaultAnsiColors.enumerated() {
-                let baseColor = NSColor(red: base.0, green: base.1, blue: base.2, alpha: 1)
-                let adjusted = ensureContrast(baseColor, against: bgLum)
+        private static func wcagLuminance(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> CGFloat {
+            0.2126 * LAB.linearize(r) + 0.7152 * LAB.linearize(g) + 0.0722 * LAB.linearize(b)
+        }
 
-                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-                (adjusted.usingColorSpace(.sRGB) ?? adjusted).getRed(&r, green: &g, blue: &b, alpha: &a)
-                ghostty_surface_set_color(surface, 0, UInt8(i),
-                    UInt8(min(r, 1) * 255), UInt8(min(g, 1) * 255), UInt8(min(b, 1) * 255))
+        private static func wcagContrastRatio(_ lum1: CGFloat, _ lum2: CGFloat) -> CGFloat {
+            let lighter = max(lum1, lum2)
+            let darker = min(lum1, lum2)
+            return (lighter + 0.05) / (darker + 0.05)
+        }
+
+        // MARK: - CIELAB for perceptual lightness adjustment
+
+        private struct LAB {
+            var l: CGFloat
+            var a: CGFloat
+            var b: CGFloat
+
+            static func linearize(_ c: CGFloat) -> CGFloat {
+                c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+            }
+
+            init(r: CGFloat, g: CGFloat, b: CGFloat) {
+                let rl = Self.linearize(r)
+                let gl = Self.linearize(g)
+                let bl = Self.linearize(b)
+
+                let e: CGFloat = 0.008856
+                var x = (rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375) / 0.95047
+                var y = rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750
+                var z = (rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041) / 1.08883
+                x = x > e ? pow(x, 1.0 / 3.0) : 7.787 * x + 16.0 / 116.0
+                y = y > e ? pow(y, 1.0 / 3.0) : 7.787 * y + 16.0 / 116.0
+                z = z > e ? pow(z, 1.0 / 3.0) : 7.787 * z + 16.0 / 116.0
+
+                self.l = 116.0 * y - 16.0
+                self.a = 500.0 * (x - y)
+                self.b = 200.0 * (y - z)
+            }
+
+            func toSRGB() -> (CGFloat, CGFloat, CGFloat) {
+                let fy = (l + 16.0) / 116.0
+                let fx = a / 500.0 + fy
+                let fz = fy - b / 200.0
+
+                let e: CGFloat = 0.008856
+                let fx3 = fx * fx * fx, fy3 = fy * fy * fy, fz3 = fz * fz * fz
+                let xf = (fx3 > e ? fx3 : (fx - 16.0 / 116.0) / 7.787) * 0.95047
+                let yf = fy3 > e ? fy3 : (fy - 16.0 / 116.0) / 7.787
+                let zf = (fz3 > e ? fz3 : (fz - 16.0 / 116.0) / 7.787) * 1.08883
+
+                var r = xf *  3.2404542 - yf * 1.5371385 - zf * 0.4985314
+                var g = -xf * 0.9692660 + yf * 1.8760108 + zf * 0.0415560
+                var b = xf *  0.0556434 - yf * 0.2040259 + zf * 1.0572252
+
+                r = r > 0.0031308 ? 1.055 * pow(r, 1.0 / 2.4) - 0.055 : 12.92 * r
+                g = g > 0.0031308 ? 1.055 * pow(g, 1.0 / 2.4) - 0.055 : 12.92 * g
+                b = b > 0.0031308 ? 1.055 * pow(b, 1.0 / 2.4) - 0.055 : 12.92 * b
+
+                return (min(max(r, 0), 1), min(max(g, 0), 1), min(max(b, 0), 1))
             }
         }
 
-        /// Adjust a color's brightness to ensure minimum contrast against a background luminance.
-        /// Preserves hue and saturation, only shifts brightness.
-        private static func ensureContrast(_ color: NSColor, against bgLum: Double) -> NSColor {
-            let minContrast: CGFloat = 0.35
-            var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-            (color.usingColorSpace(.sRGB) ?? color).getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        // MARK: - Palette adjustment
 
-            let colorLum = color.luminance
-            let contrast = abs(colorLum - bgLum)
+        static func adjustPaletteForContrast(surface: ghostty_surface_t, background: NSColor) {
+            var bgR: CGFloat = 0, bgG: CGFloat = 0, bgB: CGFloat = 0, bgA: CGFloat = 0
+            background.getRed(&bgR, green: &bgG, blue: &bgB, alpha: &bgA)
+            let bgLum = wcagLuminance(bgR, bgG, bgB)
+            let targetRatio: CGFloat = 4.5
 
-            if contrast >= minContrast { return color }
+            for (i, base) in defaultAnsiColors.enumerated() {
+                let r = CGFloat(base.0) / 255.0
+                let g = CGFloat(base.1) / 255.0
+                let b = CGFloat(base.2) / 255.0
 
-            // Push brightness away from the background
-            let targetB: CGFloat
-            if bgLum > 0.5 {
-                // Light background: darken the color
-                targetB = max(b - (minContrast - contrast), 0.05)
-            } else {
-                // Dark background: lighten the color
-                targetB = min(b + (minContrast - contrast), 1.0)
+                let fgLum = wcagLuminance(r, g, b)
+                let ratio = wcagContrastRatio(fgLum, bgLum)
+
+                let finalR: UInt8, finalG: UInt8, finalB: UInt8
+                if ratio >= targetRatio {
+                    finalR = base.0; finalG = base.1; finalB = base.2
+                } else {
+                    var lab = LAB(r: r, g: g, b: b)
+                    let bgIsLight = bgLum > 0.18
+
+                    // Binary search for L* closest to original that meets target contrast
+                    var lo: CGFloat, hi: CGFloat
+                    if bgIsLight {
+                        lo = 0; hi = lab.l
+                    } else {
+                        lo = lab.l; hi = 100
+                    }
+                    var bestL = bgIsLight ? lo : hi
+
+                    for _ in 0..<30 {
+                        let mid = (lo + hi) / 2
+                        lab.l = mid
+                        let (tr, tg, tb) = lab.toSRGB()
+                        let testRatio = wcagContrastRatio(wcagLuminance(tr, tg, tb), bgLum)
+                        if testRatio >= targetRatio {
+                            bestL = mid
+                            if bgIsLight { lo = mid } else { hi = mid }
+                        } else {
+                            if bgIsLight { hi = mid } else { lo = mid }
+                        }
+                    }
+
+                    lab.l = bestL
+                    let (fr, fg, fb) = lab.toSRGB()
+                    finalR = UInt8(fr * 255 + 0.5)
+                    finalG = UInt8(fg * 255 + 0.5)
+                    finalB = UInt8(fb * 255 + 0.5)
+                }
+
+                ghostty_surface_set_color(surface, 0, UInt8(i), finalR, finalG, finalB)
             }
-
-            return NSColor(hue: h, saturation: s, brightness: targetB, alpha: a)
         }
 
         @IBAction func changeTitle(_ sender: Any) {
