@@ -31,13 +31,15 @@ class HeroPaneContainer: NSView {
 
     private let strip = HeroPaneStrip()
     private var currentIndex: Int = -1
-    private let gap: CGFloat = 60
+    private let gap: CGFloat = 40
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor.black.cgColor
         strip.wantsLayer = true
+        strip.layer?.backgroundColor = NSColor.black.cgColor
         addSubview(strip)
     }
 

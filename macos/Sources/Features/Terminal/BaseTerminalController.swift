@@ -363,11 +363,19 @@ class BaseTerminalController: NSWindowController,
         }
 
         if heroModeState.isActive {
-            let leaves = surfaceTree.root?.leaves() ?? []
-            if leaves.count <= 1 {
+            let oldLeaves = from.root?.leaves() ?? []
+            let newLeaves = to.root?.leaves() ?? []
+            if newLeaves.count <= 1 {
                 heroModeState.deactivate()
             } else {
-                heroModeState.clampIndex(leaves.count)
+                let oldSet = Set(oldLeaves.map { ObjectIdentifier($0) })
+                let addedLeaves = newLeaves.filter { !oldSet.contains(ObjectIdentifier($0)) }
+                if let addedLeaf = addedLeaves.first,
+                   let newIndex = newLeaves.firstIndex(of: addedLeaf) {
+                    heroModeState.select(newIndex, leafCount: newLeaves.count)
+                } else {
+                    heroModeState.clampIndex(newLeaves.count)
+                }
             }
         }
     }
@@ -829,7 +837,7 @@ class BaseTerminalController: NSWindowController,
             let leaves = surfaceTree.root?.leaves() ?? []
             guard leaves.count > 1 else { return }
 
-            let focusedIndex = leaves.firstIndex(where: { $0 === focusedSurface }) ?? 0
+            let focusedIndex = leaves.firstIndex(where: { $0 === target }) ?? 0
             heroModeState.activate(focusedIndex: focusedIndex, leafCount: leaves.count)
         }
 

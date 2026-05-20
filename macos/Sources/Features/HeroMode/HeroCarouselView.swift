@@ -46,6 +46,8 @@ class HeroCarouselContainer: NSView {
     private var currentLeaves: [Ghostty.SurfaceView] = []
     private var snapshotTimer: Timer?
     private var needsInitialSnapshot = false
+    private var isScrolling = false
+    private var scrollEndTimer: Timer?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -73,9 +75,9 @@ class HeroCarouselContainer: NSView {
     func update(leaves: [Ghostty.SurfaceView], state: HeroModeState, heroAspectRatio: CGFloat) {
         self.state = state
         self.heroAspectRatio = heroAspectRatio
-        self.currentLeaves = leaves
 
         let tilesChanged = rebuildTiles(leaves: leaves)
+        self.currentLeaves = leaves
         if tilesChanged {
             needsInitialSnapshot = true
         }
@@ -101,27 +103,61 @@ class HeroCarouselContainer: NSView {
 
     @discardableResult
     private func rebuildTiles(leaves: [Ghostty.SurfaceView]) -> Bool {
-        guard tiles.count != leaves.count ||
-              !zip(tiles, leaves).allSatisfy({ $0.surfaceView === $1 }) else {
+        let oldSurfaces = currentLeaves
+        guard oldSurfaces != leaves else {
             for (i, tile) in tiles.enumerated() {
                 tile.isSelected = i == (state?.selectedIndex ?? 0)
             }
             return false
         }
 
-        tiles.forEach { $0.removeFromSuperview() }
-        tiles.removeAll()
+        let oldSet = Set(oldSurfaces.map { ObjectIdentifier($0) })
+        let newSet = Set(leaves.map { ObjectIdentifier($0) })
 
-        for (i, surface) in leaves.enumerated() {
+        let added = leaves.filter { !oldSet.contains(ObjectIdentifier($0)) }
+        let removed = oldSurfaces.filter { !newSet.contains(ObjectIdentifier($0)) }
+
+        if added.isEmpty && removed.isEmpty && oldSurfaces.count == leaves.count {
+            for (i, tile) in tiles.enumerated() {
+                tile.isSelected = i == (state?.selectedIndex ?? 0)
+            }
+            return false
+        }
+
+        // Remove tiles for deleted leaves
+        for surface in removed {
+            if let idx = tiles.firstIndex(where: { $0.surfaceView === surface }) {
+                tiles[idx].removeFromSuperview()
+                tiles.remove(at: idx)
+            }
+        }
+
+        // Add tiles for new leaves at the correct position
+        for surface in added {
+            guard let targetIndex = leaves.firstIndex(of: surface) else { continue }
             let tile = CarouselTile(surfaceView: surface)
+            let leafCount = leaves.count
+            tile.isSelected = targetIndex == (state?.selectedIndex ?? 0)
+            tile.onTap = { [weak self] in
+                guard let self = self,
+                      let idx = self.tiles.firstIndex(where: { $0.surfaceView === surface }) else { return }
+                self.state?.select(idx, leafCount: leafCount)
+            }
+            let insertAt = min(targetIndex, tiles.count)
+            strip.addSubview(tile)
+            tiles.insert(tile, at: insertAt)
+        }
+
+        // Update onTap closures for all tiles since indices shifted
+        let leafCount = leaves.count
+        for (i, tile) in tiles.enumerated() {
             tile.isSelected = i == (state?.selectedIndex ?? 0)
             let index = i
             tile.onTap = { [weak self] in
-                self?.state?.select(index, leafCount: leaves.count)
+                self?.state?.select(index, leafCount: leafCount)
             }
-            strip.addSubview(tile)
-            tiles.append(tile)
         }
+
         return true
     }
 
@@ -157,7 +193,10 @@ class HeroCarouselContainer: NSView {
                 strip.animator().frame.origin.y = targetY
             }
         } else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             strip.frame.origin.y = targetY
+            CATransaction.commit()
         }
     }
 
@@ -175,11 +214,22 @@ class HeroCarouselContainer: NSView {
     override func scrollWheel(with event: NSEvent) {
         let ts = thumbSize
         guard ts.height > 0 else { return }
+
+        isScrolling = true
+        scrollEndTimer?.invalidate()
+        scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { [weak self] _ in
+            self?.isScrolling = false
+            self?.refreshSnapshots()
+        }
+
         scrollOffset += event.scrollingDeltaY
+
         let stride = ts.height + gap
-        let totalHeight = CGFloat(tiles.count) * stride
-        let maxScroll = max(totalHeight, bounds.height) * 0.8
-        scrollOffset = max(-maxScroll, min(maxScroll, scrollOffset))
+        let totalContentHeight = CGFloat(tiles.count) * stride - gap
+        let maxScrollDown = max(0, (totalContentHeight - ts.height) / 2)
+        let maxScrollUp = -maxScrollDown
+        scrollOffset = max(maxScrollUp, min(maxScrollDown, scrollOffset))
+
         state?.scrollOffset = scrollOffset
         repositionStrip(animated: false)
     }
@@ -187,7 +237,8 @@ class HeroCarouselContainer: NSView {
     private func startSnapshotTimer() {
         guard snapshotTimer == nil else { return }
         snapshotTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            self?.refreshSnapshots()
+            guard let self = self, !self.isScrolling else { return }
+            self.refreshVisibleSnapshots()
         }
     }
 
@@ -197,8 +248,19 @@ class HeroCarouselContainer: NSView {
         }
     }
 
+    private func refreshVisibleSnapshots() {
+        let visibleRect = bounds
+        for tile in tiles {
+            let tileFrameInSelf = strip.convert(tile.frame, to: self)
+            if tileFrameInSelf.intersects(visibleRect) {
+                tile.refreshSnapshot()
+            }
+        }
+    }
+
     deinit {
         snapshotTimer?.invalidate()
+        scrollEndTimer?.invalidate()
     }
 }
 
