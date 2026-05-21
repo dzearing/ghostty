@@ -92,19 +92,19 @@ class HeroPaneContainer: NSView {
     }
 
     private func animateToIndex(_ index: Int) {
+        let shouldAnimate = currentIndex >= 0 && currentIndex != index
+        currentIndex = index
+
         let h = bounds.height
         guard h > 0 else { return }
         let stride = h + gap
         let target = -CGFloat(index) * stride
 
-        if currentIndex < 0 || currentIndex == index {
+        if !shouldAnimate {
             strip.layer?.removeAllAnimations()
             strip.frame.origin.y = target
-            currentIndex = index
             return
         }
-
-        currentIndex = index
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.35
