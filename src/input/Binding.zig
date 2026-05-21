@@ -649,6 +649,11 @@ pub const Action = union(enum) {
     /// reflect this by displaying an icon indicating the zoomed state.
     toggle_split_zoom,
 
+    /// Toggle hero mode for the current window. Hero mode shows the focused
+    /// pane full-size on the left with a scrollable carousel of all panes
+    /// on the right.
+    toggle_hero_mode,
+
     /// Toggle read-only mode for the current surface.
     ///
     /// When a surface is in read-only mode:
@@ -1430,6 +1435,7 @@ pub const Action = union(enum) {
             .swap_split,
             .goto_window,
             .toggle_split_zoom,
+            .toggle_hero_mode,
             .toggle_readonly,
             .resize_split,
             .equalize_splits,

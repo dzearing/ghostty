@@ -45,6 +45,9 @@ class BaseTerminalController: NSWindowController,
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
+    let heroModeState = HeroModeState()
+    private var heroSelectionCancellable: AnyCancellable?
+
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
 
@@ -225,6 +228,18 @@ class BaseTerminalController: NSWindowController,
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(ghosttyDidToggleHeroMode(_:)),
+            name: Ghostty.Notification.didToggleHeroMode,
+            object: nil)
+
+        heroSelectionCancellable = heroModeState.$selectedIndex
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newIndex in
+                self?.heroSelectionDidChange(to: newIndex)
+            }
+
+        center.addObserver(
+            self,
             selector: #selector(ghosttyDidResizeSplit(_:)),
             name: Ghostty.Notification.didResizeSplit,
             object: nil)
@@ -345,6 +360,23 @@ class BaseTerminalController: NSWindowController,
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
             focusedSurface = nil
+        }
+
+        if heroModeState.isActive {
+            let oldLeaves = from.root?.leaves() ?? []
+            let newLeaves = to.root?.leaves() ?? []
+            if newLeaves.count <= 1 {
+                heroModeState.deactivate()
+            } else {
+                let oldSet = Set(oldLeaves.map { ObjectIdentifier($0) })
+                let addedLeaves = newLeaves.filter { !oldSet.contains(ObjectIdentifier($0)) }
+                if let addedLeaf = addedLeaves.first,
+                   let newIndex = newLeaves.firstIndex(of: addedLeaf) {
+                    heroModeState.select(newIndex, leafCount: newLeaves.count)
+                } else {
+                    heroModeState.clampIndex(newLeaves.count)
+                }
+            }
         }
     }
 
@@ -683,6 +715,19 @@ class BaseTerminalController: NSWindowController,
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.root?.node(view: target) != nil else { return }
 
+        // Intercept navigation when hero mode is active
+        if heroModeState.isActive {
+            let leaves = surfaceTree.root?.leaves() ?? []
+            guard let directionValue = notification.userInfo?[Ghostty.Notification.SplitDirectionKey] as? Ghostty.SplitFocusDirection else { return }
+            switch directionValue {
+            case .previous, .up, .left:
+                heroModeState.selectPrevious(leafCount: leaves.count)
+            case .next, .down, .right:
+                heroModeState.selectNext(leafCount: leaves.count)
+            }
+            return
+        }
+
         // Get the direction from the notification
         guard let directionAny = notification.userInfo?[Ghostty.Notification.SplitDirectionKey] else { return }
         guard let direction = directionAny as? Ghostty.SplitFocusDirection else { return }
@@ -739,6 +784,11 @@ class BaseTerminalController: NSWindowController,
     }
 
     @objc private func ghosttyDidToggleSplitZoom(_ notification: Notification) {
+        // Exit hero mode if active (mutually exclusive)
+        if heroModeState.isActive {
+            heroModeState.deactivate()
+        }
+
         // The target must be within our tree
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard let targetNode = surfaceTree.root?.node(view: target) else { return }
@@ -763,6 +813,47 @@ class BaseTerminalController: NSWindowController,
         // this so we need to grab it again.
         DispatchQueue.main.async {
             Ghostty.moveFocus(to: target)
+        }
+    }
+
+    @objc private func ghosttyDidToggleHeroMode(_ notification: Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.root?.node(view: target) != nil else { return }
+
+        if heroModeState.isActive {
+            let previousSurface = heroSurfaceForCurrentSelection()
+            heroModeState.deactivate()
+            if let surface = previousSurface {
+                DispatchQueue.main.async {
+                    Ghostty.moveFocus(to: surface)
+                }
+            }
+        } else {
+            // Exit zoom if active
+            if surfaceTree.zoomed != nil {
+                surfaceTree = SplitTree(root: surfaceTree.root, zoomed: nil)
+            }
+
+            let leaves = surfaceTree.root?.leaves() ?? []
+            guard leaves.count > 1 else { return }
+
+            let focusedIndex = leaves.firstIndex(where: { $0 === target }) ?? 0
+            heroModeState.activate(focusedIndex: focusedIndex, leafCount: leaves.count)
+        }
+
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func heroSurfaceForCurrentSelection() -> Ghostty.SurfaceView? {
+        let leaves = surfaceTree.root?.leaves() ?? []
+        guard heroModeState.selectedIndex < leaves.count else { return nil }
+        return leaves[heroModeState.selectedIndex]
+    }
+
+    private func heroSelectionDidChange(to index: Int) {
+        guard heroModeState.isActive else { return }
+        if let surface = heroSurfaceForCurrentSelection() {
+            Ghostty.moveFocus(to: surface)
         }
     }
 

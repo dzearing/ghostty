@@ -155,6 +155,9 @@ pub const Action = union(Key) {
     /// to take up the entire window.
     toggle_split_zoom,
 
+    /// Toggle hero mode view for the window.
+    toggle_hero_mode,
+
     /// Present the target terminal whether its a tab, split, or window.
     present_terminal,
 
@@ -373,6 +376,7 @@ pub const Action = union(Key) {
         resize_split,
         equalize_splits,
         toggle_split_zoom,
+        toggle_hero_mode,
         present_terminal,
         size_limit,
         reset_window_size,
