@@ -56,10 +56,10 @@ struct HeroModeView: View {
             guard leaves.count > 1 else { return event }
 
             let hasShiftCmd = event.modifierFlags.contains([.shift, .command])
-            if hasShiftCmd && event.keyCode == 126 {
+            if hasShiftCmd && event.specialKey == .upArrow {
                 state.selectPrevious(leafCount: leaves.count)
                 return nil
-            } else if hasShiftCmd && event.keyCode == 125 {
+            } else if hasShiftCmd && event.specialKey == .downArrow {
                 state.selectNext(leafCount: leaves.count)
                 return nil
             }

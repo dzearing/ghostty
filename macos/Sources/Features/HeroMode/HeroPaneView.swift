@@ -30,6 +30,7 @@ class HeroPaneContainer: NSView {
     override var isFlipped: Bool { true }
 
     private let strip = HeroPaneStrip()
+    private var slots: [HeroPaneSlot] = []
     private var currentIndex: Int = -1
     private let gap: CGFloat = 40
 
@@ -37,9 +38,7 @@ class HeroPaneContainer: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layer?.masksToBounds = true
-        layer?.backgroundColor = NSColor.black.cgColor
         strip.wantsLayer = true
-        strip.layer?.backgroundColor = NSColor.black.cgColor
         addSubview(strip)
     }
 
@@ -53,20 +52,44 @@ class HeroPaneContainer: NSView {
     func update(leaves: [Ghostty.SurfaceView], selectedIndex: Int) {
         let changed = rebuildIfNeeded(leaves: leaves)
         if changed { relayout() }
+        updateBackgroundColor()
         animateToIndex(selectedIndex)
     }
 
     private func rebuildIfNeeded(leaves: [Ghostty.SurfaceView]) -> Bool {
-        let currentSurfaces = strip.subviews.compactMap { ($0 as? HeroPaneSlot)?.surfaceView }
+        let currentSurfaces = slots.map(\.surfaceView)
         guard currentSurfaces != leaves else { return false }
 
-        strip.subviews.forEach { $0.removeFromSuperview() }
-
-        for surface in leaves {
-            let slot = HeroPaneSlot(surfaceView: surface)
-            strip.addSubview(slot)
+        var slotsBySurface: [ObjectIdentifier: HeroPaneSlot] = [:]
+        for slot in slots {
+            slotsBySurface[ObjectIdentifier(slot.surfaceView)] = slot
         }
+
+        var newSlots: [HeroPaneSlot] = []
+        for surface in leaves {
+            let id = ObjectIdentifier(surface)
+            if let existing = slotsBySurface.removeValue(forKey: id) {
+                newSlots.append(existing)
+            } else {
+                let slot = HeroPaneSlot(surfaceView: surface)
+                strip.addSubview(slot)
+                newSlots.append(slot)
+            }
+        }
+
+        for (_, slot) in slotsBySurface {
+            slot.removeFromSuperview()
+        }
+
+        slots = newSlots
         return true
+    }
+
+    private func updateBackgroundColor() {
+        guard let surface = slots.first?.surfaceView else { return }
+        let bgColor = NSColor(surface.derivedConfig.backgroundColor).cgColor
+        layer?.backgroundColor = bgColor
+        strip.layer?.backgroundColor = bgColor
     }
 
     private func relayout() {
@@ -76,14 +99,12 @@ class HeroPaneContainer: NSView {
 
         let stride = h + gap
 
-        for (i, slot) in strip.subviews.enumerated() {
+        for (i, slot) in slots.enumerated() {
             slot.frame = NSRect(x: 0, y: CGFloat(i) * stride, width: w, height: h)
-            if let paneSlot = slot as? HeroPaneSlot {
-                paneSlot.surfaceView.frame = paneSlot.bounds
-            }
+            slot.surfaceView.frame = slot.bounds
         }
 
-        let totalHeight = CGFloat(strip.subviews.count) * stride
+        let totalHeight = CGFloat(slots.count) * stride
         strip.frame = NSRect(x: 0, y: strip.frame.origin.y, width: w, height: totalHeight)
 
         if currentIndex >= 0 {

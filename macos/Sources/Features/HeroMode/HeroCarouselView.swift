@@ -72,6 +72,13 @@ class HeroCarouselContainer: NSView {
         }
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopTimers()
+        }
+    }
+
     func update(leaves: [Ghostty.SurfaceView], state: HeroModeState, heroAspectRatio: CGFloat) {
         self.state = state
         self.heroAspectRatio = heroAspectRatio
@@ -111,50 +118,35 @@ class HeroCarouselContainer: NSView {
             return false
         }
 
-        let oldSet = Set(oldSurfaces.map { ObjectIdentifier($0) })
-        let newSet = Set(leaves.map { ObjectIdentifier($0) })
-
-        let added = leaves.filter { !oldSet.contains(ObjectIdentifier($0)) }
-        let removed = oldSurfaces.filter { !newSet.contains(ObjectIdentifier($0)) }
-
-        if added.isEmpty && removed.isEmpty && oldSurfaces.count == leaves.count {
-            for (i, tile) in tiles.enumerated() {
-                tile.isSelected = i == (state?.selectedIndex ?? 0)
-            }
-            return false
+        var tilesBySurface: [ObjectIdentifier: CarouselTile] = [:]
+        for tile in tiles {
+            tilesBySurface[ObjectIdentifier(tile.surfaceView)] = tile
         }
 
-        // Remove tiles for deleted leaves
-        for surface in removed {
-            if let idx = tiles.firstIndex(where: { $0.surfaceView === surface }) {
-                tiles[idx].removeFromSuperview()
-                tiles.remove(at: idx)
+        var newTiles: [CarouselTile] = []
+        for surface in leaves {
+            let id = ObjectIdentifier(surface)
+            if let existing = tilesBySurface.removeValue(forKey: id) {
+                newTiles.append(existing)
+            } else {
+                let tile = CarouselTile(surfaceView: surface)
+                strip.addSubview(tile)
+                newTiles.append(tile)
             }
         }
 
-        // Add tiles for new leaves at the correct position
-        for surface in added {
-            guard let targetIndex = leaves.firstIndex(of: surface) else { continue }
-            let tile = CarouselTile(surfaceView: surface)
-            let leafCount = leaves.count
-            tile.isSelected = targetIndex == (state?.selectedIndex ?? 0)
-            tile.onTap = { [weak self] in
-                guard let self = self,
-                      let idx = self.tiles.firstIndex(where: { $0.surfaceView === surface }) else { return }
-                self.state?.select(idx, leafCount: leafCount)
-            }
-            let insertAt = min(targetIndex, tiles.count)
-            strip.addSubview(tile)
-            tiles.insert(tile, at: insertAt)
+        for (_, tile) in tilesBySurface {
+            tile.removeFromSuperview()
         }
 
-        // Update onTap closures for all tiles since indices shifted
-        let leafCount = leaves.count
+        tiles = newTiles
+
         for (i, tile) in tiles.enumerated() {
             tile.isSelected = i == (state?.selectedIndex ?? 0)
-            let index = i
-            tile.onTap = { [weak self] in
-                self?.state?.select(index, leafCount: leafCount)
+            tile.onTap = { [weak self, weak tile] in
+                guard let self = self, let tile = tile else { return }
+                guard let idx = self.tiles.firstIndex(where: { $0 === tile }) else { return }
+                self.state?.select(idx, leafCount: self.currentLeaves.count)
             }
         }
 
@@ -242,6 +234,13 @@ class HeroCarouselContainer: NSView {
         }
     }
 
+    private func stopTimers() {
+        snapshotTimer?.invalidate()
+        snapshotTimer = nil
+        scrollEndTimer?.invalidate()
+        scrollEndTimer = nil
+    }
+
     private func refreshSnapshots() {
         for tile in tiles {
             tile.refreshSnapshot()
@@ -259,8 +258,7 @@ class HeroCarouselContainer: NSView {
     }
 
     deinit {
-        snapshotTimer?.invalidate()
-        scrollEndTimer?.invalidate()
+        stopTimers()
     }
 }
 
