@@ -76,7 +76,22 @@ NOTES
 )"
 ```
 
-### Step 6: Report
+### Step 6: Update Website
+
+Update the version on the gh-pages landing page:
+
+```bash
+git worktree add /tmp/ghoztty-gh-pages gh-pages
+```
+
+In `/tmp/ghoztty-gh-pages/index.html`, replace all occurrences of the old version with `vX.Y.Z` (download button text, DMG download URL including filename, and footer version string).
+
+```bash
+cd /tmp/ghoztty-gh-pages && git add index.html && git commit -m "Update website version to vX.Y.Z" && git push origin gh-pages
+git worktree remove /tmp/ghoztty-gh-pages
+```
+
+### Step 7: Report
 
 Show a summary:
 - Version released
