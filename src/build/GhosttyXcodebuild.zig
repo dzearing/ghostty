@@ -85,6 +85,7 @@ pub fn init(
         }) catch "0.0.0";
         step.addArgs(&.{
             b.fmt("MARKETING_VERSION={s}", .{marketing_version}),
+            b.fmt("CURRENT_PROJECT_VERSION={s}", .{marketing_version}),
         });
 
         // We need the xcframework
