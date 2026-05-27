@@ -249,7 +249,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     static func newWindow(
         _ ghostty: Ghostty.App,
         withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil,
-        withParent explicitParent: NSWindow? = nil
+        withParent explicitParent: NSWindow? = nil,
+        activate: Bool = true
     ) -> TerminalController {
         let c = TerminalController.init(ghostty, withBaseConfig: baseConfig)
 
@@ -284,7 +285,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // take effect. Our best theory is there is some next-event-loop-tick logic
         // that Cocoa is doing that we need to be after.
         c.scheduleInitialPresentation {
-            c.showWindow(self)
+            if activate {
+                c.showWindow(self)
+            } else {
+                c.window?.orderBack(nil)
+            }
 
             // Only cascade if we aren't fullscreen.
             if let window = c.window {
@@ -294,9 +299,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 }
             }
 
-            // All new_window actions force our app to be active, so that the new
-            // window is focused and visible.
-            NSApp.activate(ignoringOtherApps: true)
+            if activate {
+                NSApp.activate(ignoringOtherApps: true)
+            }
         }
 
         // Setup our undo

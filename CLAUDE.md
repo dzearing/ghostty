@@ -11,7 +11,7 @@ IPC commands communicate with a running Ghoztty instance over a Unix domain sock
 Create or focus a terminal window. Auto-launches Ghoztty if no instance is running.
 
 ```
-ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> --shell=<path> --title=<title> --split=right|down|left|up --split-command=<cmd> -e <args...>
+ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> --shell=<path> --title=<title> --split=right|down|left|up --split-command=<cmd> --no-activate -e <args...>
 ```
 
 - `--shell`: Shell to use for `--command`/`--split-command`, invoked with `-lic` so profile is loaded. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`.

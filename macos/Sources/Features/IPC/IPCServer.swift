@@ -274,6 +274,7 @@ class IPCServer {
         var lines: Int?
         var shell: String?
         var state: String?
+        var noActivate: Bool = false
     }
 
     private func handleNewWindow(_ request: IPCRequest) -> IPCResponse {
@@ -296,9 +297,11 @@ class IPCServer {
         if let target = parsed.target {
             pruneStaleTargets()
             if let entry = targetRegistry[target], let controller = entry.controller {
-                DispatchQueue.main.async {
-                    controller.window?.makeKeyAndOrderFront(nil)
-                    NSApp.activate(ignoringOtherApps: true)
+                if !parsed.noActivate {
+                    DispatchQueue.main.async {
+                        controller.window?.makeKeyAndOrderFront(nil)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
                 }
                 return .ok
             }
@@ -335,7 +338,7 @@ class IPCServer {
 
         let windowTint: Color? = config.backgroundTint
         DispatchQueue.main.async { [ghostty = self.ghostty, weak self] in
-            let controller = TerminalController.newWindow(ghostty, withBaseConfig: config)
+            let controller = TerminalController.newWindow(ghostty, withBaseConfig: config, activate: !parsed.noActivate)
 
             if let title = parsed.title {
                 controller.titleOverride = title
@@ -1366,6 +1369,11 @@ class IPCServer {
 
             if let value = arg.dropPrefix("--shell=") {
                 result.shell = String(value)
+                continue
+            }
+
+            if arg == "--no-activate" {
+                result.noActivate = true
                 continue
             }
         }

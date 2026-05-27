@@ -206,6 +206,11 @@ pub const Options = struct {
 ///     on the initial split pane. Only meaningful when `--split` is also
 ///     specified.
 ///
+///   * `--no-activate`: Create the window without activating the app or
+///     stealing focus. The window is created and visible but remains in
+///     the background. Also suppresses focus when an existing `--target`
+///     is found.
+///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
     var iter = try args.argsIterator(alloc);
