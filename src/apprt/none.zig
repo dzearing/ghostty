@@ -19,6 +19,7 @@ pub const App = struct {
             .rename => "rename",
             .rearrange => "rearrange",
             .send_keys => "send-keys",
+            .set_state => "set-state",
         };
 
         return sendIpc(alloc, action_name, value.arguments);
@@ -68,6 +69,14 @@ pub const App = struct {
                     std.fs.cwd().deleteFile(sentinel_path) catch {};
                     break :blk connected_fd;
                 } else |_| {}
+
+                // If the sentinel file still exists after several attempts,
+                // no server is watching for it — bail early.
+                if (attempt >= 2) {
+                    if (std.fs.accessAbsolute(sentinel_path, .{})) |_| {
+                        break;
+                    } else |_| {}
+                }
             }
 
             std.fs.cwd().deleteFile(sentinel_path) catch {};

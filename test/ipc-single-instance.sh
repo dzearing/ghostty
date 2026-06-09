@@ -122,7 +122,7 @@ STALE_PID=$!
 # Give the stale socket time to bind
 sleep 0.1
 
-# Run +new-window in the background (it will retry for ~2.4s)
+# Run +new-window in the background (it will retry, bailing after ~900ms if no server)
 "$GHOZTTY" +new-window 2>/dev/null &
 CMD_PID=$!
 
@@ -176,11 +176,17 @@ printf "Test 6: recovery via mock server during retries\n"
 
 rm -f "$SOCK_PATH" "$SENTINEL_PATH"
 
-# Start the mock IPC server after a short delay
+# Start the mock IPC server after a short delay, simulating
+# a real server that detects the sentinel and rebinds its socket.
 python3 -c "
 import socket, struct, json, time, os
 
-time.sleep(0.5)
+time.sleep(0.1)
+
+# Simulate server detecting sentinel and rebinding: delete sentinel first
+sentinel_path = '$SENTINEL_PATH'
+try: os.unlink(sentinel_path)
+except: pass
 
 sock_path = '$SOCK_PATH'
 try: os.unlink(sock_path)

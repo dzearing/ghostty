@@ -188,8 +188,13 @@ class IPCServer {
         source.resume()
     }
 
+    private var isResetting = false
+
     private func checkSentinel() {
         guard FileManager.default.fileExists(atPath: sentinelPath) else { return }
+        guard !isResetting else { return }
+        isResetting = true
+        defer { isResetting = false }
 
         Self.logger.info("IPC: sentinel file detected, resetting socket")
 
@@ -205,9 +210,13 @@ class IPCServer {
         // Rebind the socket
         bindAndListen()
 
-        // Remove sentinel to signal readiness to the waiting client
-        unlink(sentinelPath)
-        Self.logger.info("IPC: socket reset complete, sentinel removed")
+        // Only remove sentinel if rebind succeeded
+        if listenSocket >= 0 {
+            unlink(sentinelPath)
+            Self.logger.info("IPC: socket reset complete, sentinel removed")
+        } else {
+            Self.logger.error("IPC: socket rebind failed, sentinel retained")
+        }
     }
 
     private func handleClient(fd: Int32) {

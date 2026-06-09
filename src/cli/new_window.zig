@@ -297,29 +297,3 @@ fn runArgs(
     return 1;
 }
 
-fn buildIpcJson(alloc: Allocator, action_name: []const u8, arguments: ?[][:0]const u8) ![:0]const u8 {
-    var json_buf: std.Io.Writer.Allocating = .init(alloc);
-    errdefer json_buf.deinit();
-    var jws: std.json.Stringify = .{ .writer = &json_buf.writer };
-
-    try jws.beginObject();
-    try jws.objectField("action");
-    try jws.write(action_name);
-
-    if (arguments) |args_list| {
-        try jws.objectField("arguments");
-        try jws.beginArray();
-        for (args_list) |arg| {
-            try jws.write(arg);
-        }
-        try jws.endArray();
-    }
-
-    try jws.endObject();
-
-    const written = json_buf.written();
-    const result = try alloc.allocSentinel(u8, written.len, 0);
-    @memcpy(result, written);
-    json_buf.deinit();
-    return result;
-}
