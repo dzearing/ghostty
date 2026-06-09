@@ -46,7 +46,31 @@ pub const App = struct {
         };
         defer alloc.free(sock_path);
 
-        const fd = connectUnixSocket(sock_path) catch {
+        const fd = connectUnixSocket(sock_path) catch blk: {
+            // Connection failed. Drop a sentinel file to signal the main
+            // process to rebind its socket, then retry with backoff.
+            const sentinel_path = std.fmt.allocPrintSentinel(alloc, "{s}.reset", .{sock_path}, 0) catch {
+                stderr.print("Could not connect to running Ghoztty instance.\n", .{}) catch {};
+                stderr.flush() catch {};
+                return error.IPCFailed;
+            };
+            defer alloc.free(sentinel_path);
+
+            if (std.fs.cwd().createFile(sentinel_path, .{})) |f| {
+                f.close();
+            } else |_| {}
+
+            const max_retries = 8;
+            var attempt: usize = 0;
+            while (attempt < max_retries) : (attempt += 1) {
+                std.Thread.sleep(300 * std.time.ns_per_ms);
+                if (connectUnixSocket(sock_path)) |connected_fd| {
+                    std.fs.cwd().deleteFile(sentinel_path) catch {};
+                    break :blk connected_fd;
+                } else |_| {}
+            }
+
+            std.fs.cwd().deleteFile(sentinel_path) catch {};
             return error.NoRunningInstance;
         };
         defer std.posix.close(fd);

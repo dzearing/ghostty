@@ -14,6 +14,8 @@ class IPCServer {
     private let socketPath: String
     private var listenSocket: Int32 = -1
     private var acceptSource: DispatchSourceRead?
+    private var sentinelSource: DispatchSourceFileSystemObject?
+    private var sentinelDirFd: Int32 = -1
     private let queue = DispatchQueue(label: "com.mitchellh.ghostty.ipc", qos: .utility)
     private var targetRegistry: [String: TargetEntry] = [:]
 
@@ -58,9 +60,14 @@ class IPCServer {
             .appendingPathComponent("ghostty\(suffix)-\(uid).sock").path
     }
 
+    private var sentinelPath: String {
+        socketPath + ".reset"
+    }
+
     func start() {
         queue.async { [weak self] in
             self?.bindAndListen()
+            self?.startSentinelMonitor()
         }
     }
 
@@ -68,6 +75,13 @@ class IPCServer {
         queue.sync {
             acceptSource?.cancel()
             acceptSource = nil
+            sentinelSource?.cancel()
+            sentinelSource = nil
+            sentinelDirFd = -1
+            if listenSocket >= 0 {
+                Darwin.close(listenSocket)
+                listenSocket = -1
+            }
         }
         unlink(socketPath)
         Self.logger.info("IPC server stopped")
@@ -133,13 +147,6 @@ class IPCServer {
         source.setEventHandler { [weak self] in
             self?.acceptConnection()
         }
-        source.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.listenSocket >= 0 {
-                Darwin.close(self.listenSocket)
-                self.listenSocket = -1
-            }
-        }
         acceptSource = source
         source.resume()
     }
@@ -152,6 +159,55 @@ class IPCServer {
             self?.handleClient(fd: clientFd)
             Darwin.close(clientFd)
         }
+    }
+
+    // MARK: - Sentinel file monitoring
+
+    private func startSentinelMonitor() {
+        let dirPath = (socketPath as NSString).deletingLastPathComponent
+        sentinelDirFd = Darwin.open(dirPath, O_EVTONLY)
+        guard sentinelDirFd >= 0 else {
+            Self.logger.warning("IPC: failed to open directory for sentinel monitoring")
+            return
+        }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: sentinelDirFd,
+            eventMask: .write,
+            queue: queue
+        )
+        source.setEventHandler { [weak self] in
+            self?.checkSentinel()
+        }
+        source.setCancelHandler { [dirFd = sentinelDirFd] in
+            if dirFd >= 0 {
+                Darwin.close(dirFd)
+            }
+        }
+        sentinelSource = source
+        source.resume()
+    }
+
+    private func checkSentinel() {
+        guard FileManager.default.fileExists(atPath: sentinelPath) else { return }
+
+        Self.logger.info("IPC: sentinel file detected, resetting socket")
+
+        // Tear down old listener
+        acceptSource?.cancel()
+        acceptSource = nil
+        let oldFd = listenSocket
+        listenSocket = -1
+        if oldFd >= 0 {
+            Darwin.close(oldFd)
+        }
+
+        // Rebind the socket
+        bindAndListen()
+
+        // Remove sentinel to signal readiness to the waiting client
+        unlink(sentinelPath)
+        Self.logger.info("IPC: socket reset complete, sentinel removed")
     }
 
     private func handleClient(fd: Int32) {

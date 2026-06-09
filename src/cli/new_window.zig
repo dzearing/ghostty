@@ -283,11 +283,8 @@ fn runArgs(
         },
     ) catch |err| switch (err) {
         error.NoRunningInstance => {
-            global.pending_ipc_json = buildIpcJson(global.alloc, "new-window", arguments) catch {
-                try stderr.print("Failed to build IPC JSON for auto-launch\n", .{});
-                return 1;
-            };
-            return 200;
+            try stderr.print("No running Ghoztty instance found. Launch Ghoztty first.\n", .{});
+            return 1;
         },
         error.IPCFailed => return 1,
         else => {
