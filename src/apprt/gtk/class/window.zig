@@ -1744,7 +1744,7 @@ pub const Window = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const name = "Ghostty";
-        const icon = "com.mitchellh.ghostty";
+        const icon = "com.dzearing.ghoztty";
         const website = "https://ghostty.org";
 
         if (adw_version.supportsDialogs()) {
