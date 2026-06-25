@@ -34,6 +34,11 @@ class HeroPaneContainer: NSView {
     private var currentIndex: Int = -1
     private let gap: CGFloat = 40
 
+    /// Pending debounced reflow, used to coalesce the expensive grid reflow during
+    /// a continuous divider drag (see scheduleReflow).
+    private var pendingReflow: DispatchWorkItem?
+    private let reflowDebounce: TimeInterval = 0.08
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -54,6 +59,22 @@ class HeroPaneContainer: NSView {
         if changed { relayout() }
         updateBackgroundColor()
         animateToIndex(selectedIndex)
+
+        // When hero mode first activates (or the pane set changes) our bounds are
+        // often still zero during this SwiftUI update pass, so the reflows above
+        // no-op. Defer one reflow to the next runloop tick, by which point AppKit
+        // has laid us out with real bounds.
+        //
+        // Gated on `changed` on purpose: SwiftUI also calls update() on every
+        // divider-drag tick (the parent re-renders). An ungated reflow here would
+        // fire immediately (synchronously) every tick, bypassing the debounce
+        // below and blocking the main thread. During a drag `changed` is false,
+        // so the drag's reflows go solely through the debounced layout() path.
+        if changed {
+            DispatchQueue.main.async { [weak self] in
+                self?.scheduleReflow(immediate: true)
+            }
+        }
     }
 
     private func rebuildIfNeeded(leaves: [Ghostty.SurfaceView]) -> Bool {
@@ -110,11 +131,62 @@ class HeroPaneContainer: NSView {
         if currentIndex >= 0 {
             strip.frame.origin.y = -CGFloat(currentIndex) * stride
         }
+
+        // Reflow the terminal grid for the visible hero pane only. layout() runs
+        // on every divider-drag tick, and a grid reflow (ghostty_surface_set_size)
+        // is expensive — doing it synchronously here would block the main thread
+        // and make the divider stutter instead of gliding with the cursor. So the
+        // layout-driven reflow is debounced: the pane visually resizes immediately
+        // (frames above) and the grid re-wraps once the drag settles. Off-screen
+        // carousel slots are left stale and reflow lazily when selected.
+        scheduleReflow(immediate: false)
+    }
+
+    /// Reflows the visible hero pane's terminal grid to match its slot bounds via
+    /// the same path the normal split chain uses (sizeDidChange ->
+    /// ghostty_surface_set_size). Only the selected slot is reflowed; off-screen
+    /// slots reflow lazily the moment they are selected/scrolled into view.
+    ///
+    /// `immediate` reflows synchronously — used for discrete events (activation,
+    /// selecting a different pane) that should re-wrap right away. Otherwise the
+    /// reflow is debounced so a stream of layout passes during a divider drag
+    /// collapses into a single reflow when the drag settles, keeping the drag
+    /// smooth.
+    private func scheduleReflow(immediate: Bool) {
+        pendingReflow?.cancel()
+        pendingReflow = nil
+
+        guard !immediate else {
+            reflowSelectedSlotNow()
+            return
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.pendingReflow = nil
+            self?.reflowSelectedSlotNow()
+        }
+        pendingReflow = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + reflowDebounce, execute: work)
+    }
+
+    private func reflowSelectedSlotNow() {
+        guard currentIndex >= 0, currentIndex < slots.count else { return }
+        slots[currentIndex].notifyReflowIfNeeded()
     }
 
     private func animateToIndex(_ index: Int) {
+        let indexChanged = currentIndex != index
         let shouldAnimate = currentIndex >= 0 && currentIndex != index
         currentIndex = index
+
+        // Only reflow here on an actual selection change. update() calls this on
+        // every SwiftUI re-render (including each divider-drag tick); an ungated
+        // immediate reflow would block the main thread every tick. On a real
+        // selection change we reflow the newly visible pane right away so its grid
+        // matches the hero area before/as it scrolls in.
+        if indexChanged {
+            scheduleReflow(immediate: true)
+        }
 
         let h = bounds.height
         guard h > 0 else { return }
@@ -143,6 +215,10 @@ private class HeroPaneStrip: NSView {
 private class HeroPaneSlot: NSView {
     let surfaceView: Ghostty.SurfaceView
 
+    /// The last size we notified the terminal core about. Used to skip
+    /// redundant (expensive) reflows when the size hasn't actually changed.
+    private var lastNotifiedSize: CGSize = .zero
+
     init(surfaceView: Ghostty.SurfaceView) {
         self.surfaceView = surfaceView
         super.init(frame: .zero)
@@ -158,5 +234,27 @@ private class HeroPaneSlot: NSView {
     override func layout() {
         super.layout()
         surfaceView.frame = bounds
+    }
+
+    /// Notify the terminal core that this slot's surface has resized so its
+    /// grid re-wraps to the new dimensions. This is the same entry point the
+    /// normal split-resize chain uses (SurfaceScrollView -> sizeDidChange ->
+    /// ghostty_surface_set_size). Hero mode bypasses that chain by assigning
+    /// frames directly, so the visible slot must call it explicitly.
+    ///
+    /// No-ops if the size is zero or unchanged since the last notification,
+    /// which lets the container call this freely on every layout pass.
+    func notifyReflowIfNeeded() {
+        let size = bounds.size
+        guard size.width > 0, size.height > 0 else { return }
+        guard size != lastNotifiedSize else { return }
+        lastNotifiedSize = size
+        // Disable implicit CALayer animations so the surface jumps straight to
+        // the new size instead of interpolating its bounds.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        surfaceView.frame = bounds
+        surfaceView.sizeDidChange(size)
+        CATransaction.commit()
     }
 }

@@ -89,9 +89,13 @@ class HeroCarouselContainer: NSView {
             needsInitialSnapshot = true
         }
 
-        if bounds.width > 0 {
-            relayout(animated: false)
-        }
+        // Defer bounds-driven layout to layout(), which always runs with the
+        // final frame. Relaying out here too is redundant and can position the
+        // strip from stale bounds: during a divider drag SwiftUI hasn't applied
+        // the new frame yet, so our bounds are still the previous tick's value.
+        // layout() runs on every drag tick (the carousel width changes each
+        // tick), so a single relayout there is sufficient.
+        needsLayout = true
 
         if state.selectedIndex != currentIndex {
             scrollOffset = 0
@@ -103,8 +107,21 @@ class HeroCarouselContainer: NSView {
     }
 
     private var thumbSize: CGSize {
-        let w = bounds.width * 0.88
-        let h = w / max(heroAspectRatio, 0.1)
+        // Thumbnails mirror the hero pane's aspect ratio. Width is driven by the
+        // carousel width, but we must cap the resulting height to the carousel's
+        // visible height — otherwise dragging the divider to widen the carousel
+        // (which shrinks heroAspectRatio) makes the selected tile grow taller and
+        // taller, spilling out of the viewport. When the height would exceed the
+        // cap we shrink the width instead, preserving the aspect ratio.
+        let ar = max(heroAspectRatio, 0.1)
+        let maxW = bounds.width * 0.88
+        let maxH = bounds.height * 0.7
+        var w = maxW
+        var h = w / ar
+        if h > maxH {
+            h = maxH
+            w = h * ar
+        }
         return CGSize(width: w, height: h)
     }
 

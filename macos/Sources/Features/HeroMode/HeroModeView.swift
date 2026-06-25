@@ -106,7 +106,14 @@ struct HeroDivider: View {
             }
         }
         .gesture(
-            DragGesture()
+            // Measure the drag in the GLOBAL coordinate space, not the divider's
+            // local space. The divider moves as `ratio` changes, so a .local
+            // gesture re-bases its translation every frame as the view slides
+            // under the cursor — that feedback makes the divider oscillate
+            // between two positions (you see two copies of the line while
+            // dragging). Global space is fixed, so translation tracks the cursor
+            // cleanly and the divider glides.
+            DragGesture(coordinateSpace: .global)
                 .onChanged { value in
                     if !isDragging {
                         isDragging = true
