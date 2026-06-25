@@ -70,12 +70,62 @@ demanded before WP2/WP3 expand (§17):
 WP3-full and WP2-full can proceed in parallel (separate worktrees) since they only
 share the WP1 wire contract, which is frozen. WP4 waits on WP3-full's C API.
 
-## Build & test in THIS environment (important quirk)
+## Toolchain status (BLOCKER for full builds — read before WP3-full)
 
-There is **no system `zig`**. A zig 0.15.2 toolchain was used from another
-session's scratchpad. The bigger gotcha: **zig 0.15.2 cannot link the native
-macOS-26 SDK** (even hello-world fails with undefined libSystem symbols). Work
-around it by down-targeting:
+Investigated + web-researched 2026-06-25. **Root cause is a known, FIXED zig bug,
+not a fundamental limitation** (ziglang/zig issue #31658, fix PR #31673,
+backported to 0.15.2): the **macOS 26.4 SDK** (shipped with Xcode/CLT **26.4**)
+changed its `.tbd` stub files so zig's MachO linker fails to match `aarch64-macos`
+against `arm64e-macos` entries → every libSystem symbol (`_abort`, `_bzero`,
+`__availability_version_check`, …) goes unresolved. It blocks `zig build` entirely
+because the build *runner* is compiled for the native host (min macOS 26.4) before
+build.zig's own macOS-13 down-targeting applies. Confirmed: the same code links
+fine at an older min-version / older SDK. **Users on macOS 26.4 but the 26.2/26.3
+SDK build fine** — it is the 26.4 SDK specifically.
+
+Confirmed dead ends (don't re-try): `MACOSX_DEPLOYMENT_TARGET`/`SDKROOT` env
+(zig calls `xcrun --show-sdk-path`, ignores them; reads host version from the
+SIP-protected SystemVersion.plist); `-flld` (LLD unsupported for macho in 0.15.2);
+patching the bundled std macos.zig (doesn't change the compiler's baked-in
+detection); zig 0.16.0 (links 26.4 fine but the repo `requireZig`s exactly 0.15.2
+and 0.16 breaks the 0.15-era build.zig/codebase).
+
+**This machine's state (2026-06-25):** macOS 26.4; **full `/Applications/Xcode.app`
+is installed but it is 26.4** (broken SDK); `xcode-select` points at CLT (also
+26.4). An older **`MacOSX15.4.sdk` exists on disk** but zig won't use it (uses
+xcrun's default). Important: **Nix cannot build Ghostty's macOS app at all** (no
+Swift 6 / xcodebuild support) — `nix develop` only provides the dev shell; the
+`.app` is built with **zig + full Xcode** directly (ghostty.org/docs/install/build).
+
+### The fix (requires a ≤26.3 SDK active — a user download from Apple)
+
+To run `zig build` (and build the `.app`), get a **macOS 26.3 (or 26.2) SDK** as
+the active developer dir. Two routes:
+
+- **Recommended (also unblocks the `.app`): Xcode 26.3.** Download Xcode 26.3 from
+  developer.apple.com, install side-by-side as `/Applications/Xcode_26.3.app`,
+  then:
+  ```sh
+  sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+  rm -rf ~/.cache/zig ~/git/ghoztty-remote/.zig-cache
+  # build the debug app (NEVER touch /Applications/Ghoztty.app):
+  cd ~/git/ghoztty-remote && zig build -Doptimize=Debug   # → zig-out/Ghoztty-Debug.app
+  ```
+  Xcode 26.3 gives BOTH the working 26.3 SDK AND the Swift 6/xcodebuild/Metal
+  toolchain the `.app` requires.
+- **Lighter interim (unblocks `zig build` of libghostty/CLI/tests, NOT the `.app`):
+  Command Line Tools for Xcode 26.3** (~1 GB vs Xcode's ~10 GB), then
+  `sudo xcode-select --switch /Library/Developer/CommandLineTools` + clear caches.
+- **No-download alternative:** a zig 0.15.2 binary with PR #31673 backported (the
+  nix `brew."0.15.2"` zig-overlay variant may already include it; unverified).
+
+### What works locally TODAY without any of that (use for WP3-full Zig dev)
+
+- Per-module unit tests: `zig test -target aarch64-macos.13.0.0 src/remote/<m>.zig`
+- Explicit-target compiles/cross-compiles: `zig build-exe/-lib/-obj -target …`
+  (e.g. the WP2 Windows spike). Only `zig build` and `.app` runs are blocked.
+
+### Down-target commands (host module tests)
 
 - **Host unit tests** (WP1, WP3, future host modules):
   `zig test -target aarch64-macos.13.0.0 src/remote/<module>.zig`
