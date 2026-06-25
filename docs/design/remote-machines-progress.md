@@ -1,12 +1,29 @@
 # Remote Machines — implementation progress
 
-> **Resume point.** After a context reset, read this file first ("go to progress").
-> It is the durable tracker for building the remote-machines feature; the design
-> spec is `docs/design/remote-machines.md` (§18 = work packages, the source of
-> truth for scope and order). Keep this file updated as packages land.
+> **Resume point.** This is the durable tracker for the remote-machines feature.
+> The design spec is `docs/design/remote-machines.md` (§18 = work packages).
 
-_Last updated: 2026-06-24. Branch: `feature/remote-machines` (integration branch;
-merges to `main` once green as a whole)._
+## ▶ ON RESUME — when the user says "go" (or "go to progress")
+
+A fresh session should, in order:
+1. Read THIS file end-to-end, then skim the design doc §3, §4, §18.
+2. Set up the build env (no system zig — see "Toolchain status" below):
+   ```sh
+   export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH
+   export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+   ```
+3. Sanity-check: `git log --oneline -8`, `zig test src/remote/connection.zig`
+   (expect "All N tests passed"), and that the working tree is clean
+   (`rm -rf zig-pkg` if a stray pkg-cache dir appears).
+4. Continue from **"Recommended next actions"** below. **Delegate implementation
+   to subagents** (the user wants the orchestrator's context kept lean): give each
+   a self-contained brief, have it implement + `zig test`/`zig build`-verify +
+   commit on `feature/remote-machines` with the `Co-Authored-By: Claude Opus 4.8
+   (1M context)` trailer, then report back concisely. The orchestrator keeps THIS
+   file + the memory updated after each increment lands.
+
+_Last updated: 2026-06-25. Branch: `feature/remote-machines` (integration branch;
+merges to `main` once green as a whole). HEAD should be at/after `d6b463753`._
 
 ## Status at a glance
 
@@ -62,25 +79,37 @@ demanded before WP2/WP3 expand (§17):
 
 ## Recommended next actions (in order)
 
-1. **WP3-full** — `src/remote/connection.zig` (ssh spawn with `SSH_ASKPASS`
-   interactive-auth + first-contact host-key flow §4.1; two SSH channels; MPSC
-   writer; demux reader feeding the WP3 inbound rings; heartbeat/RTT; reconnect
-   state machine; steal w/ epoch fence) + `src/termio/Remote.zig`; extend
-   `src/termio/backend.zig` (add the `remote` arm to all 3 unions + 11 switches);
-   **plumb the new `ghostty_surface_config_s` fields and branch
-   `src/Surface.zig:682` (backend construction) + `:1340` (childExitedAbnormally)**;
-   expose the `ghostty_remote_*` C API. Headless test over `ssh localhost`.
-   *Do the `Surface.zig:682` change carefully — the design calls it the
-   highest-mechanical-risk, load-bearing edit (§3.2).*
-2. **WP2-full** — `src/remote/agent/` → `ghoztty-agent`. Prep: the
-   `Command.zig`→`CommandCore` extraction (assessment in FINDINGS.md: ~2–4 h, 3
-   thin couplings). Then daemonize, session table w/ grid model + ring +
-   tombstones, OPEN/ATTACH/DATA/RESIZE/SIGNAL/DETACH/CLOSE/EXIT/META, containment
-   groups. Reuse `win32.zig` from the spike (fold into `src/os/windows.zig` `exp`).
-3. **WP4** — Swift connection context once WP3-full's C API exists.
+WP3-full's connection.zig (inc.1–3) + termio.Remote/backend (inc.4a) are DONE — the
+whole client transport is built and libghostty compiles with a `.remote` backend.
+Two tracks now run in PARALLEL (worktree-isolated subagents; the client + the agent
+share only the frozen WP1 wire contract):
 
-WP3-full and WP2-full can proceed in parallel (separate worktrees) since they only
-share the WP1 wire contract, which is frozen. WP4 waits on WP3-full's C API.
+1. **WP3-full inc.4b (client wiring)** 🔨 — `Surface.zig:682` construct `.remote`
+   from a connection handle in surface config; finish the `:1339/:1340`
+   `childExitedAbnormally` arm; add `ghostty_remote_connection_t connection` +
+   `session_id` to `ghostty_surface_config_s` (`include/ghostty.h` +
+   `apprt/embedded.zig` Options) and plumb through; expose the `ghostty_remote_*`
+   C API (connect/open/attach). Compile via `zig build -Doptimize=Debug` (Zig-green
+   = reaches the xcodebuild step). *§3.2 calls Surface.zig:682 the highest-mechanical-
+   risk, load-bearing edit — do it carefully.*
+2. **WP2-full agent inc.1 (the other half)** 🔨 — `src/remote/agent/` session-server
+   core that speaks WP1 protocol: HELLO, OPEN (spawn child), DATA both ways with
+   byte_offset, ATTACH (seq-anchored snapshot stub), RESIZE/SIGNAL/DETACH/CLOSE/EXIT,
+   session table w/ random UUIDs + raw ring + tombstones. POSIX first; child-spawn
+   abstracted so tests use a pipe-backed fake child (real pty + Command.zig→CommandCore
+   refactor + Windows + containment come in later increments). Standalone `zig test`,
+   NEW files only (no shared-file edits → parallel-safe). Reuse `win32.zig` from the
+   spike later.
+
+Then: **inc.3b** (real reconnect driver + ssh Transport `Stream`-over-ssh), wire the
+agent into a `zig build agent` exe target, then **WP4** (Swift connection context,
+once 4b's C API exists), then end-to-end over `ssh localhost`.
+
+**Parallel-work protocol:** each parallel subagent works in its own git worktree
+(`isolation: "worktree"`) and commits there; the orchestrator cherry-picks the
+reported SHAs back onto `feature/remote-machines` and re-verifies the combined build.
+4b and agent-inc.1 touch disjoint files (Surface/C-API vs new `src/remote/agent/*`),
+so cherry-picks should not conflict.
 
 ## Toolchain status — ✅ SOLVED for Zig (one sudo step left for the .app)
 
