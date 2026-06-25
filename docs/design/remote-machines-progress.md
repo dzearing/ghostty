@@ -39,14 +39,45 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | ↳ inc.2 | health: `RttEstimator`, `LinkState` FSM, heartbeat, PONG/DETACHED handling | ✅ Done — 40 tests | `07ca686d8` |
 | ↳ inc.3 | channel/session lifecycle (OPEN/ATTACH/CLOSE/DETACH), resync §7.3, steal §5.3, FLOW-pause | ✅ Done — 50 tests | `176d85ad4` |
 | ↳ inc.4a | `termio.Remote` (Backend contract) + `backend.zig` `.remote` arm — **libghostty compiles with remote backend** | ✅ Done | `d6b463753` |
-| ↳ inc.4b | `Surface.zig:682` construct `.remote` + `ghostty_surface_config_s` + `ghostty_remote_*` C API | 🔨 In progress | — |
-| ↳ inc.3b | real reconnect driver (stream swap + re-ATTACH) + ssh Transport (`Stream` over ssh subprocess) | ⛔ Deferred | — |
+| ↳ inc.4b | `Surface.zig:682` construct `.remote` + `ghostty_surface_config_s` + `ghostty_remote_*` C API | ✅ Done — Zig build green | `de230b6de` |
+| ↳ inc.3b | real reconnect driver (stream swap + re-ATTACH) + ssh Transport (`Stream` over ssh subprocess) | ⛔ NEXT (client) | — |
+| **WP2** | Agent daemon | 🔨 **Started (parallel)** | see below |
+| ↳ agent inc.1 | `src/remote/agent/` session-server core (HELLO/OPEN/DATA/ATTACH/RESIZE/SIGNAL/DETACH/CLOSE/EXIT, session table, ring, tombstones) over abstract transport + fake child | ✅ Done — 18 tests | `c4b09c774`→`26af4f78a` |
+| ↳ agent next | real PTY via `Command.zig`→`CommandCore`; real grid snapshot (§7.3); daemonize; `zig build agent` exe target; Windows (reuse spike `win32.zig`); containment/RPC (§9) | ⛔ Next (agent) | — |
 
 connection.zig is a complete-enough client transport (50 tests, native green). Build
 loop confirmed: `zig build -Doptimize=Debug` compiles all Zig (336/339; only the
 final `xcodebuild` step fails because `xcode-select` is still CLT — that's the
 P1-run gate, see Toolchain status). `src/remote/*` are part of the libghostty
 module (relative imports; no build.zig.zon change needed).
+
+### Current frontier — what's real vs stub (read before continuing)
+
+Both halves of the conversation now exist and pass tests in isolation, sharing the
+frozen WP1 protocol — but **they have not been run against each other yet, and there
+is no live ssh transport**, so nothing connects end-to-end:
+
+- **Client**: libghostty compiles with a `.remote` backend + the C API. The
+  C API the Swift app binds to (commit `de230b6de`):
+  `ghostty_surface_config_s` gained `ghostty_remote_connection_t connection`
+  (opaque `void*`; non-NULL ⇒ `.remote`) + `const char* session_id`. Functions:
+  `ghostty_remote_connection_new(const ghostty_remote_config_s*)` (host/user/port/
+  jump), `_start`, `_wait_handshake`, `_latency_ms` (→ -1 unknown), `_free`.
+  **`_start` returns false today (TODO)** — the `ssh`-backed `connection.Stream`
+  doesn't exist, so `remoteBackend()` falls back to local. The ssh Transport is the
+  one missing piece before a real connection can be built.
+- **Agent** (`src/remote/agent/{session,server}.zig`, 18 tests): full frame routing,
+  session table (crypto UUIDs, ring, tombstones, gap-fill), MPSC writer. **Stubs:**
+  fake buffer-backed child (no real PTY — `// TODO(pty)` for `Command.zig`→
+  `CommandCore`), `snapshot_at_offset` = current byte offset (no grid model yet),
+  no daemonization, not in any build target. Test it with:
+  `zig test --dep protocol -Mroot=src/remote/agent/server.zig -Mprotocol=src/remote/protocol.zig`
+
+**Highest-leverage next step:** the **ssh Transport** (`Stream` over an `ssh`
+subprocess, §4.1) — it unblocks the client's live dial AND lets the client
+`connection.zig` talk to the agent `server.zig` for the first real end-to-end test
+(even `ssh localhost`). Pair it with the agent's real-PTY increment + a `zig build
+agent` exe target. Then: inc.3b reconnect driver, WP4 Swift.
 | WP2-full | Agent daemon (Linux + Windows) | ⛔ **Not started** | — |
 | WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3-full C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
