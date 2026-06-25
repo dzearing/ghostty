@@ -70,9 +70,42 @@ demanded before WP2/WP3 expand (§17):
 WP3-full and WP2-full can proceed in parallel (separate worktrees) since they only
 share the WP1 wire contract, which is frozen. WP4 waits on WP3-full's C API.
 
-## Toolchain status (BLOCKER for full builds — read before WP3-full)
+## Toolchain status — ✅ SOLVED for Zig (one sudo step left for the .app)
 
-Investigated + web-researched 2026-06-25. **Root cause is a known, FIXED zig bug,
+**Resolved 2026-06-25 with NO Apple download.** Homebrew ships a `zig@0.15`
+bottle built FOR macOS 26 (`arm64_tahoe`) that already includes the #31673 linker
+fix:
+
+```sh
+brew install zig@0.15 gettext        # done; zig@0.15 = 0.15.2, keg-only
+# Use this zig + point SDK detection at the already-installed Xcode 26.4:
+export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+```
+
+Verified working with that env:
+- `zig test src/remote/protocol.zig` / `inbound_ring.zig` — pass on the **native**
+  target (no more `-target aarch64-macos.13` needed).
+- `zig build -Doptimize=Debug` compiles+links the **entire Zig core 100%**
+  (`336/339` steps; `libghostty.a` + `GhosttyKit.xcframework` produced — so
+  `Surface.zig`/`backend.zig` and all WP3-full targets compile).
+
+**One step remains ONLY to package/run the macOS `.app`** (not needed for WP3-full
+Zig dev): the final `xcodebuild` step uses the *system* `xcode-select` dir, which
+is still CLT. Point it at the installed Xcode (no download — Xcode 26.4 is already
+present; sudo needed):
+```sh
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+# then, if `xcrun --find metal` fails, one-time: install the Metal toolchain
+#   xcodebuild -downloadComponent MetalToolchain
+zig build -Doptimize=Debug      # → zig-out/Ghoztty-Debug.app (NEVER /Applications/Ghoztty.app)
+```
+
+Everything below is the prior investigation, kept for reference.
+
+<details><summary>Original investigation (root cause, dead ends)</summary>
+
+### Root cause is a known, FIXED zig bug
 not a fundamental limitation** (ziglang/zig issue #31658, fix PR #31673,
 backported to 0.15.2): the **macOS 26.4 SDK** (shipped with Xcode/CLT **26.4**)
 changed its `.tbd` stub files so zig's MachO linker fails to match `aarch64-macos`
@@ -141,6 +174,8 @@ the active developer dir. Two routes:
   build.zig**, so they don't affect the main build yet; wire them in WP3-full.
 - **Never touch `/Applications/Ghoztty.app`** (user's primary terminal). Debug
   build only: `zig-out/Ghoztty-Debug.app`.
+
+</details>
 
 ## Conventions
 
