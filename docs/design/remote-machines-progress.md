@@ -17,7 +17,10 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | WP1 | Protocol lib (`src/remote/protocol.zig`) | ✅ **Done** — 21 tests green | `81275a9d4` |
 | WP3-spike | Inbound ring + ChannelTable (`src/remote/inbound_ring.zig`) | ✅ **Spike done, gate passed** — 6 tests green | `7210e230e` |
 | WP2-spike | Windows agent risks (`src/remote/agent/spike/`) | ✅ **Spike done** — cross-compiles x86_64+aarch64 windows | `7168891fb` |
-| WP3-full | Client connection + `termio.Remote` + C API | ⛔ **Not started** (next on critical path) | — |
+| WP3-full | Client connection + `termio.Remote` + C API | 🔨 **In progress** (delegated to subagents) | see below |
+| ↳ inc.1 | `connection.zig` transport core (Stream, handshake, MPSC writer, demux→rings) — 33 tests | ✅ Done | `ca02e266b` |
+| ↳ inc.2 | heartbeat/RTT + reconnect state machine + steal epoch | 🔨 In progress | — |
+| ↳ inc.3 | `termio.Remote` + `backend.zig` + `Surface.zig` + C API | ⛔ Next | — |
 | WP2-full | Agent daemon (Linux + Windows) | ⛔ **Not started** | — |
 | WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3-full C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
