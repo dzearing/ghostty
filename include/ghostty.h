@@ -59,6 +59,13 @@ typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
 
+// Opaque handle to a remote-machine connection (see ghostty_remote_*). A
+// connection is keyed by (host, user, port, jump-chain) and multiplexes N
+// remote panes/sessions; it is owned by the Zig core and lives in the GUI
+// process (a GUI crash disposes it; remote-side persistence is by session_id,
+// see the remote-machines design doc §3.4/§3.5).
+typedef void* ghostty_remote_connection_t;
+
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
 // Zig change.
@@ -477,6 +484,19 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+
+  // Remote-machine backend (remote-machines design §3.2). When `connection`
+  // is non-NULL, the surface is constructed with the `.remote` termio backend
+  // riding on that connection instead of the local exec/pty backend. The
+  // connection must already be started and handshake-complete (see
+  // ghostty_remote_connection_start / _wait_handshake). It is caller-owned and
+  // may be shared across surfaces; it is NOT freed when the surface is freed.
+  //
+  // `session_id` is the agent session to ATTACH to (re-attach to an existing
+  // remote session); NULL means OPEN a brand-new session. Ignored when
+  // `connection` is NULL.
+  ghostty_remote_connection_t connection;
+  const char* session_id;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1228,6 +1248,47 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+
+// Remote machines (remote-machines design §3.5/§3.2). A connection is keyed by
+// (host, user, port, jump-chain) and multiplexes N remote panes/sessions. The
+// returned handle is owned by the caller and must be released with
+// ghostty_remote_connection_free.
+//
+// NOTE (WP3): the live SSH dial is not implemented yet. `_new` records the
+// dial parameters and constructs the connection object but does NOT yet spawn
+// `ssh`; `_start` therefore currently returns false ("not yet implemented").
+// The ABI shape is stable so the Swift app can bind against it now.
+typedef struct {
+  const char* host;        // Required: remote host (alias or address).
+  const char* user;        // Optional (NULL): SSH user; NULL uses ssh defaults.
+  uint16_t port;           // SSH port; 0 means the ssh default (22).
+  const char* jump;        // Optional (NULL): comma-separated ProxyJump chain.
+} ghostty_remote_config_s;
+
+// Create a remote connection handle from dial parameters. Returns NULL on
+// allocation failure or invalid parameters (e.g. NULL host). The handle is not
+// connected yet — call ghostty_remote_connection_start.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new(
+    const ghostty_remote_config_s*);
+
+// Start the connection: dial SSH, spawn the reader/writer threads, and send
+// the client HELLO. Returns true on success. WP3: currently returns false
+// (live SSH dial not yet wired).
+GHOSTTY_API bool ghostty_remote_connection_start(ghostty_remote_connection_t);
+
+// Block until the protocol handshake completes (or fails). Returns true if the
+// handshake negotiated successfully. Safe to call only after _start succeeded.
+GHOSTTY_API bool ghostty_remote_connection_wait_handshake(
+    ghostty_remote_connection_t);
+
+// Current smoothed latency in milliseconds, or -1 if not yet measured.
+GHOSTTY_API int32_t ghostty_remote_connection_latency_ms(
+    ghostty_remote_connection_t);
+
+// Shut down and free the connection. Detaches all panes (sessions survive on
+// the remote for later re-attach by session_id). Caller must ensure no surface
+// still references this connection.
+GHOSTTY_API void ghostty_remote_connection_free(ghostty_remote_connection_t);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);

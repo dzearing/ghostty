@@ -26,6 +26,7 @@ const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
 const termio = @import("termio.zig");
+const remote_connection = @import("remote/connection.zig");
 const font = @import("font/main.zig");
 const Command = @import("Command.zig");
 const exit_diagnostics = @import("exit_diagnostics.zig");
@@ -54,6 +55,24 @@ pub const min_window_height_cells: u32 = 4;
 /// The maximum number of key tables that can be active at any
 /// given time. `activate_key_table` calls after this are ignored.
 const max_active_key_tables = 8;
+
+/// Describes that a surface should be constructed with the `.remote` termio
+/// backend (riding on a caller-owned `RemoteConnection`) instead of the local
+/// exec/pty backend. An apprt surface returns this from `remoteBackend()` when
+/// the surface config carried a remote connection handle (remote-machines
+/// design §3.2). The connection is borrowed (NOT owned by the Surface): it is
+/// caller-owned and may be shared across surfaces.
+pub const RemoteBackend = struct {
+    /// The shared connection to ride on. Must already be started +
+    /// handshake-complete (`termio.Remote` opens/attaches synchronously in
+    /// `threadEnter`).
+    connection: *remote_connection.Connection,
+
+    /// Non-null ⇒ ATTACH to this existing agent session; null ⇒ OPEN a new one.
+    /// Borrowed for the duration of the construction call only (duped into the
+    /// backend's arena by `termio.Remote.init`).
+    session_id: ?[]const u8 = null,
+};
 
 /// Unique ID used to identify this surface for IPC purposes. It is
 /// exposed to the commands running in surfaces as the environment variable
@@ -644,7 +663,12 @@ pub fn init(
             break :env internal_os.getEnvMap(alloc) catch
                 std.process.EnvMap.init(alloc);
         };
-        errdefer env.deinit();
+        // `env` is consumed by exactly one owner: the exec backend takes it
+        // (`Subprocess` stores + frees it), or the remote backend (which has no
+        // local env) frees it eagerly. `env_owned` tracks whether this scope
+        // still owns it so the errdefer doesn't double-free what a backend took.
+        var env_owned = true;
+        errdefer if (env_owned) env.deinit();
 
         // don't leak GHOSTTY_LOG to any subprocesses
         env.remove("GHOSTTY_LOG");
@@ -655,21 +679,60 @@ pub fn init(
         try env.put("GHOZTTY_WINDOW_NAME", surface_id_str);
         try env.put("GHOZTTY_PANE_NAME", surface_id_str);
 
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        // The working directory we'd hand to either backend.
+        const working_directory: ?[]const u8 =
+            if (config.@"working-directory") |wd| wd.value() else null;
+
+        // Initialize our IO backend. If the apprt surface carries a remote
+        // connection handle (remote-machines design §3.2), build the `.remote`
+        // backend riding on that caller-owned connection; otherwise build the
+        // local exec/pty backend. This is the ONLY backend construction site.
+        //
+        // `remote_command` (when remote) is a single command string sourced
+        // from the same surface config Exec uses; it lives in this arena until
+        // `Remote.init` dupes it into the backend's own arena.
+        var remote_command: ?[:0]const u8 = null;
+        var backend: termio.Backend = backend: {
+            if (rt_surface.remoteBackend()) |rb| {
+                // Remote backend: no local subprocess/pty. The connection is
+                // borrowed (caller-owned). Env, shell-integration, and the
+                // resources-dir all live on the agent side, so the local env
+                // map is not consumed by this backend — free it here.
+                env.deinit();
+                env_owned = false;
+                if (command) |c| remote_command = try c.string(alloc);
+                errdefer if (remote_command) |rc| alloc.free(rc);
+
+                const io_remote = try termio.Remote.init(alloc, .{
+                    .conn = rb.connection,
+                    .session_id = rb.session_id,
+                    .command = remote_command,
+                    .working_directory = working_directory,
+                    .term = config.term,
+                });
+                break :backend .{ .remote = io_remote };
+            }
+
+            const io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = working_directory,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            // Exec now owns env (Subprocess stores + frees it); release our
+            // ownership so the scope errdefer won't double-free it.
+            env_owned = false;
+            break :backend .{ .exec = io_exec };
+        };
+        errdefer backend.deinit();
+        defer if (remote_command) |rc| alloc.free(rc);
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -679,7 +742,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1338,9 +1401,12 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
-        // A remote backend has no local subprocess args; the remote command is
-        // surfaced via agent metadata in a later increment (§3.3). Use an empty
-        // command so the overlay still renders the runtime/exit info.
+        // A remote backend has no local `subprocess.args`. The command text for
+        // the overlay should come from the agent-reported `foreground_cmd`
+        // (§3.3 / canonical JSON model §9.7), which isn't plumbed to the backend
+        // yet. Use an empty command so the overlay still renders the
+        // runtime/exit info; the remote command line is filled in later.
+        // TODO(wp3): source the overlay command from agent `foreground_cmd`.
         .remote => &[_][:0]const u8{},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});

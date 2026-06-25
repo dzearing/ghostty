@@ -18,6 +18,7 @@ const terminal = @import("../terminal/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
+const remote_connection = @import("../remote/connection.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
@@ -575,6 +576,72 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+/// The Zig object behind an opaque `ghostty_remote_connection_t`
+/// (remote-machines design §3.5). A connection is keyed by
+/// (host, user, port, jump-chain) and multiplexes N remote panes/sessions. It
+/// is owned by the caller (the Swift app) and lives in the GUI process — a GUI
+/// crash disposes it; remote-side persistence is by `session_id`.
+///
+/// WP3 status: this records the dial parameters and is the stable ABI handle
+/// the Swift app binds to, but the live SSH dial is NOT yet implemented, so
+/// `connection` stays null until a later increment wires the `ssh`-backed
+/// `Stream`s and calls `Connection.create`/`start`.
+pub const RemoteConnectionHandle = struct {
+    alloc: Allocator,
+
+    /// Dial parameters (duped into `alloc`, owned by this handle).
+    host: [:0]const u8,
+    user: ?[:0]const u8,
+    port: u16,
+    jump: ?[:0]const u8,
+
+    /// The live transport connection, or null until the SSH dial is wired
+    /// (WP3). When non-null it is owned by this handle and freed in `destroy`.
+    connection: ?*remote_connection.Connection = null,
+
+    /// Create a handle from dial parameters. Dupes all strings.
+    pub fn create(
+        alloc: Allocator,
+        host: []const u8,
+        user: ?[]const u8,
+        port: u16,
+        jump: ?[]const u8,
+    ) !*RemoteConnectionHandle {
+        const self = try alloc.create(RemoteConnectionHandle);
+        errdefer alloc.destroy(self);
+
+        const host_dup = try alloc.dupeZ(u8, host);
+        errdefer alloc.free(host_dup);
+        const user_dup = if (user) |u| try alloc.dupeZ(u8, u) else null;
+        errdefer if (user_dup) |u| alloc.free(u);
+        const jump_dup = if (jump) |j| try alloc.dupeZ(u8, j) else null;
+        errdefer if (jump_dup) |j| alloc.free(j);
+
+        self.* = .{
+            .alloc = alloc,
+            .host = host_dup,
+            .user = user_dup,
+            .port = port,
+            .jump = jump_dup,
+        };
+        return self;
+    }
+
+    /// Shut down the live connection (if any) and free the handle. The caller
+    /// must ensure no surface still references this handle.
+    pub fn destroy(self: *RemoteConnectionHandle) void {
+        const alloc = self.alloc;
+        if (self.connection) |conn| {
+            conn.shutdown();
+            conn.destroy(alloc);
+        }
+        alloc.free(self.host);
+        if (self.user) |u| alloc.free(u);
+        if (self.jump) |j| alloc.free(j);
+        alloc.destroy(self);
+    }
+};
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -588,6 +655,15 @@ pub const Surface = struct {
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
+
+    /// Remote-machine backend for this surface, if any (remote-machines design
+    /// §3.2). Copied from `Options.connection`/`.session_id` at init and read
+    /// by `CoreSurface.init` via `remoteBackend()` to construct the `.remote`
+    /// termio backend. The handle is borrowed (caller-owned). `session_id`
+    /// is borrowed for the duration of `CoreSurface.init` only (the remote
+    /// backend dupes it), so we only retain the raw C pointer here.
+    remote_connection: ?*RemoteConnectionHandle = null,
+    remote_session_id: ?[*:0]const u8 = null,
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -630,6 +706,23 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Remote-machine backend (remote-machines design §3.2). When non-null,
+        /// the surface is constructed with the `.remote` termio backend riding
+        /// on this caller-owned connection instead of the local exec/pty
+        /// backend. The connection must already be started and
+        /// handshake-complete. It is NOT freed when the surface is freed.
+        ///
+        /// C type: `ghostty_remote_connection_t` (opaque `void*`), as returned
+        /// by `ghostty_remote_connection_new`.
+        connection: ?*RemoteConnectionHandle = null,
+
+        /// The agent session to ATTACH to (re-attach to an existing remote
+        /// session); null ⇒ OPEN a brand-new session. Ignored when `connection`
+        /// is null.
+        ///
+        /// C type: `const char*`.
+        session_id: ?[*:0]const u8 = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -644,6 +737,11 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            // Remote backend handle (remote-machines design §3.2). Recorded
+            // before `core_surface.init` so `remoteBackend()` can branch the
+            // backend construction (Surface.zig).
+            .remote_connection = opts.connection,
+            .remote_session_id = opts.session_id,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1115,6 +1213,36 @@ pub const Surface = struct {
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
+        };
+    }
+
+    /// Returns the remote-machine backend for this surface, or null for a local
+    /// surface (remote-machines design §3.2). `CoreSurface.init` calls this at
+    /// the single backend-construction site to decide between the `.remote` and
+    /// `.exec` backends. The connection is borrowed (caller-owned); `session_id`
+    /// is borrowed for the duration of the construction call only.
+    pub fn remoteBackend(self: *const Surface) ?CoreSurface.RemoteBackend {
+        const handle = self.remote_connection orelse return null;
+
+        // The handle exists but the live connection has not been established
+        // yet (WP3: the SSH dial is not wired, so `_start` never populates
+        // this). Without a live connection we cannot build the `.remote`
+        // backend; fall back to local rather than crashing.
+        const conn = handle.connection orelse {
+            log.warn(
+                "remote surface requested but connection not established; " ++
+                    "falling back to local backend (WP3: ssh dial not wired)",
+                .{},
+            );
+            return null;
+        };
+
+        return .{
+            .connection = conn,
+            .session_id = if (self.remote_session_id) |s|
+                std.mem.sliceTo(s, 0)
+            else
+                null,
         };
     }
 
@@ -1847,6 +1975,104 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
+    }
+
+    // -------------------------------------------------------------------------
+    // Remote machines (remote-machines design §3.5/§3.2). The C ABI the Swift
+    // app binds to for the remote-connection lifecycle. WP3: the live SSH dial
+    // is not implemented yet — `_start` returns false ("not yet implemented");
+    // the rest of the ABI is real-shaped so the Swift binding is stable.
+    // -------------------------------------------------------------------------
+
+    /// C type: `ghostty_remote_config_s`. Dial parameters for a remote
+    /// connection key (host, user, port, jump-chain).
+    const RemoteConfigC = extern struct {
+        host: ?[*:0]const u8 = null,
+        user: ?[*:0]const u8 = null,
+        port: u16 = 0,
+        jump: ?[*:0]const u8 = null,
+    };
+
+    /// Create a remote connection handle from dial parameters. Returns null on
+    /// allocation failure or invalid parameters (e.g. a null/empty host). The
+    /// handle is NOT connected yet; call `ghostty_remote_connection_start`.
+    export fn ghostty_remote_connection_new(
+        cfg: *const RemoteConfigC,
+    ) ?*RemoteConnectionHandle {
+        const host_c = cfg.host orelse {
+            log.warn("ghostty_remote_connection_new: host is required", .{});
+            return null;
+        };
+        const host = std.mem.sliceTo(host_c, 0);
+        if (host.len == 0) {
+            log.warn("ghostty_remote_connection_new: host is empty", .{});
+            return null;
+        }
+        const user = if (cfg.user) |u| std.mem.sliceTo(u, 0) else null;
+        const jump = if (cfg.jump) |j| std.mem.sliceTo(j, 0) else null;
+
+        return RemoteConnectionHandle.create(
+            global.alloc,
+            host,
+            user,
+            cfg.port,
+            jump,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new failed err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Start the connection: dial SSH, spawn the reader/writer threads, and
+    /// send the client HELLO. Returns true on success.
+    ///
+    /// WP3: the `ssh`-backed `Stream` transport does not exist yet, so this
+    /// currently returns false. The signature + ownership are final.
+    export fn ghostty_remote_connection_start(
+        handle: *RemoteConnectionHandle,
+    ) bool {
+        // TODO(wp3): spawn `ssh <user>@<host> -p <port> [-J <jump>] ghoztty-agent`
+        // via Command.zig, build control+data `connection.Stream`s over its two
+        // SSH channels, then `Connection.create(...)` + `start()` and store it
+        // in `handle.connection`. Until that transport lands there is nothing to
+        // dial.
+        _ = handle;
+        log.warn(
+            "ghostty_remote_connection_start: ssh dial not yet implemented (WP3)",
+            .{},
+        );
+        return false;
+    }
+
+    /// Block until the protocol handshake completes (or fails). Returns true if
+    /// the handshake negotiated successfully. Only meaningful after a
+    /// successful `_start`.
+    export fn ghostty_remote_connection_wait_handshake(
+        handle: *RemoteConnectionHandle,
+    ) bool {
+        const conn = handle.connection orelse return false;
+        _ = conn.waitHandshake() catch |err| {
+            log.warn("remote connection handshake failed err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Current smoothed latency in milliseconds, or -1 if not yet measured or
+    /// the connection isn't established.
+    export fn ghostty_remote_connection_latency_ms(
+        handle: *RemoteConnectionHandle,
+    ) i32 {
+        const conn = handle.connection orelse return -1;
+        const ms = conn.latencyMs() orelse return -1;
+        return std.math.cast(i32, ms) orelse std.math.maxInt(i32);
+    }
+
+    /// Shut down and free the connection handle. Detaches all panes (remote
+    /// sessions survive for later re-attach by session_id). The caller must
+    /// ensure no surface still references this handle.
+    export fn ghostty_remote_connection_free(handle: *RemoteConnectionHandle) void {
+        handle.destroy();
     }
 
     /// Tell the surface that it needs to schedule a render
