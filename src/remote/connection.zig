@@ -1,4 +1,14 @@
-//! Client-side `RemoteConnection` transport core (WP3, increment 1).
+//! Client-side `RemoteConnection` transport core (WP3, increments 1 + 2).
+//!
+//! Increment 2 layers **health & link-state tracking** on top of the increment-1
+//! transport (§5.1/§5.2/§6.4): a heartbeat driver thread (PING/PONG with RTT
+//! sampling per RFC 6298), a pure `LinkState` FSM that *decides* when to
+//! reconnect (with full-jitter backoff), a pure `RttEstimator`, internal
+//! handling of `.ping`/`.pong`/`.detached` control frames, a reader-exit
+//! signal that drives the FSM on a non-deliberate EOF, and observability
+//! (`state`/`latencyMs`/`setStateHandler`). It does NOT perform a real
+//! reconnect (re-dialing streams + re-handshake + re-ATTACH) — that is the next
+//! increment; the FSM only computes the decision and the backoff delay.
 //!
 //! This is the byte-pump that sits between the two SSH channels of one remote
 //! connection (§4.3: a *control* channel and a *data* channel, each a separate
@@ -117,6 +127,272 @@ const OutFrame = struct {
     payload: []u8,
 };
 
+// -----------------------------------------------------------------------------
+// Heartbeat payload (PING / PONG, §6.4)
+// -----------------------------------------------------------------------------
+
+/// The binary payload of a `.ping`/`.pong` control frame (§6.4 "control frames
+/// carry dwell-adjusted timestamp/timestamp_reply + frame seq"). We keep a tiny
+/// fixed binary form (no JSON) so heartbeats are cheap on the hot control lane:
+///
+///   `hb_seq u64 BE | send_ms u64 BE | reply_ms u64 BE`
+///
+/// - `hb_seq`   — a heartbeat sequence the heartbeat driver owns (NOT the wire
+///   `frame_seq`, which is owned solely by the writer thread). PONGs echo it so
+///   we can match a reply to its outstanding PING and ignore stale/duplicate ones.
+/// - `send_ms`  — the client clock (ms) when the PING was stamped. Echoed in the
+///   PONG so RTT = now − send_ms is computed without per-ping bookkeeping of the
+///   send time (the agent reflects it back verbatim).
+/// - `reply_ms` — set in a PONG to the responder's clock when it replied (unused
+///   by the v1 one-way RTT calc; reserved for dwell adjustment, §6.4). 0 in a PING.
+const Heartbeat = struct {
+    hb_seq: u64,
+    send_ms: u64,
+    reply_ms: u64 = 0,
+
+    const encoded_len = 8 + 8 + 8;
+
+    fn encodeInto(self: Heartbeat, dst: []u8) []u8 {
+        assert(dst.len >= encoded_len);
+        std.mem.writeInt(u64, dst[0..8], self.hb_seq, .big);
+        std.mem.writeInt(u64, dst[8..16], self.send_ms, .big);
+        std.mem.writeInt(u64, dst[16..24], self.reply_ms, .big);
+        return dst[0..encoded_len];
+    }
+
+    fn decode(payload: []const u8) protocol.ProtocolError!Heartbeat {
+        if (payload.len < encoded_len) return error.MalformedPayload;
+        return .{
+            .hb_seq = std.mem.readInt(u64, payload[0..8], .big),
+            .send_ms = std.mem.readInt(u64, payload[8..16], .big),
+            .reply_ms = std.mem.readInt(u64, payload[16..24], .big),
+        };
+    }
+};
+
+// -----------------------------------------------------------------------------
+// RttEstimator (RFC 6298, §6.4) — pure
+// -----------------------------------------------------------------------------
+
+/// Smoothed round-trip-time estimator per RFC 6298 (§6.4). Units are
+/// **milliseconds** throughout (samples in, SRTT/RTTVAR/RTO out). Pure: no
+/// threads, no clock — feed it measured RTT samples and read the smoothed values.
+///
+/// First sample seeds `SRTT = R`, `RTTVAR = R/2`. Subsequent samples apply the
+/// standard α=1/8, β=1/4 EWMA updates; RTO = SRTT + K·RTTVAR with K=4, clamped
+/// to a 1 ms floor (we have no 1 s minimum like TCP — this is an app heartbeat,
+/// not a retransmit timer).
+pub const RttEstimator = struct {
+    /// α = 1/8, β = 1/4, K = 4 (RFC 6298 §2). Held as f64 for the EWMA math.
+    const alpha: f64 = 1.0 / 8.0;
+    const beta: f64 = 1.0 / 4.0;
+    const k: f64 = 4.0;
+
+    /// Health buckets (§6.4): green <~80 ms SRTT, yellow up to ~250 ms, red above.
+    /// `unknown` until the first sample lands.
+    pub const Health = enum { unknown, green, yellow, red };
+    const green_max_ms: f64 = 80.0;
+    const yellow_max_ms: f64 = 250.0;
+
+    srtt: f64 = 0,
+    rttvar: f64 = 0,
+    /// False until the first `addSample`, so seeding vs. update is unambiguous.
+    seeded: bool = false,
+
+    /// Feed one measured RTT sample (ms). Applies the RFC 6298 seed-or-update.
+    pub fn addSample(self: *RttEstimator, rtt_ms: f64) void {
+        const r = if (rtt_ms < 0) 0 else rtt_ms;
+        if (!self.seeded) {
+            self.srtt = r;
+            self.rttvar = r / 2.0;
+            self.seeded = true;
+            return;
+        }
+        // RTTVAR ← (1−β)·RTTVAR + β·|SRTT − R|   (uses the OLD SRTT, per RFC 6298)
+        self.rttvar = (1.0 - beta) * self.rttvar + beta * @abs(self.srtt - r);
+        // SRTT   ← (1−α)·SRTT + α·R
+        self.srtt = (1.0 - alpha) * self.srtt + alpha * r;
+    }
+
+    /// Smoothed RTT (ms), rounded. 0 before the first sample.
+    pub fn srttMs(self: RttEstimator) u32 {
+        if (!self.seeded) return 0;
+        return @intFromFloat(@round(self.srtt));
+    }
+
+    /// Retransmit-style timeout (ms) = SRTT + K·RTTVAR, floored at 1 ms. The
+    /// heartbeat driver uses this only as an advisory; missed-ack counting is the
+    /// authoritative loss signal.
+    pub fn rtoMs(self: RttEstimator) u32 {
+        if (!self.seeded) return 0;
+        const rto = self.srtt + k * self.rttvar;
+        return @intFromFloat(@round(@max(rto, 1.0)));
+    }
+
+    /// Health badge bucket from the current SRTT (§6.4).
+    pub fn health(self: RttEstimator) Health {
+        if (!self.seeded) return .unknown;
+        if (self.srtt < green_max_ms) return .green;
+        if (self.srtt < yellow_max_ms) return .yellow;
+        return .red;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// LinkState FSM (§5.1/§5.2) — pure
+// -----------------------------------------------------------------------------
+
+/// The connection-lifecycle state machine (§5.1), driven by explicit events. Pure
+/// and side-effect-free: it owns no threads and reads no wall clock except through
+/// the injected `nowMs` (defaults to real monotonic). It *decides* state and
+/// computes the reconnect backoff; it does NOT actually reconnect (next increment).
+///
+/// Threading: `LinkState` is NOT internally synchronized. `Connection` owns one and
+/// guards every access with `state_mutex` (the same lock that guards the thread
+/// handles), so all transitions are serialized.
+pub const LinkState = struct {
+    /// §5.1 states. `reattaching` is entered only by `onResyncDone`'s precondition
+    /// in the real flow; this increment exposes the transition but never drives a
+    /// real resync (so `reconnecting → reattaching` is a future-increment edge that
+    /// `markReattaching` makes available for tests/next increment).
+    pub const State = enum { connected, degraded, reconnecting, reattaching, dead };
+
+    /// §5.1 thresholds (missed heartbeat counts). ~2 missed → degraded; 3 missed
+    /// (or any transport error) → reconnecting.
+    pub const degraded_misses: u32 = 2;
+    pub const reconnect_misses: u32 = 3;
+
+    /// Full-jitter backoff schedule (§5.1): base 500 ms, cap 30 s, reset on success.
+    pub const backoff_base_ms: u64 = 500;
+    pub const backoff_cap_ms: u64 = 30_000;
+    /// Attempts beyond which we give up and declare the session DEAD (§5.1 "backoff
+    /// cap exceeded"). The delay caps well before this; this bounds total wall time.
+    pub const max_attempts: u32 = 10;
+
+    state: State = .connected,
+    /// Reconnect attempt counter; index into the (capped) backoff schedule. Reset to
+    /// 0 on any success (`onHeartbeatAck`/`onResyncDone`).
+    attempt: u32 = 0,
+    /// Injected PRNG for full-jitter backoff (deterministic in tests via a seed).
+    rand: std.Random,
+
+    pub fn init(rand: std.Random) LinkState {
+        return .{ .rand = rand };
+    }
+
+    /// A heartbeat PONG (or any authentic packet) arrived: §5.1 "any authentic pkt
+    /// → CONNECTED". Clears the reconnect attempt counter. No-op if already dead.
+    pub fn onHeartbeatAck(self: *LinkState) void {
+        if (self.state == .dead) return;
+        self.state = .connected;
+        self.attempt = 0;
+    }
+
+    /// `missed` heartbeats in a row with no ack (§5.1). 2 → degraded, 3+ → reconnecting.
+    /// Monotonic w.r.t. the running count; never downgrades dead.
+    pub fn onHeartbeatMissed(self: *LinkState, missed: u32) void {
+        if (self.state == .dead) return;
+        if (missed >= reconnect_misses) {
+            self.toReconnecting();
+        } else if (missed >= degraded_misses) {
+            // Only slide *into* degraded from a healthier state; don't pull
+            // reconnecting back to degraded on a still-missing tick.
+            if (self.state == .connected) self.state = .degraded;
+        }
+    }
+
+    /// A transport-level error (reader EOF / write failure, §5.2): jump straight to
+    /// reconnecting regardless of the missed count.
+    pub fn onTransportError(self: *LinkState) void {
+        if (self.state == .dead) return;
+        self.toReconnecting();
+    }
+
+    /// The sequence-anchored resync finished (§5.4/§7.3): REATTACHING → CONNECTED.
+    /// Only meaningful from `reattaching`; clears the attempt counter on success.
+    pub fn onResyncDone(self: *LinkState) void {
+        if (self.state == .dead) return;
+        self.state = .connected;
+        self.attempt = 0;
+    }
+
+    /// The agent evicted us (DETACHED, §5.3) or the session is gone: terminal DEAD.
+    pub fn onSessionGone(self: *LinkState) void {
+        self.state = .dead;
+    }
+
+    /// Mark that the (future) reconnect succeeded in re-dialing and we are applying
+    /// the snapshot. RECONNECTING → REATTACHING. Exposed for the next increment.
+    pub fn markReattaching(self: *LinkState) void {
+        if (self.state == .reconnecting) self.state = .reattaching;
+    }
+
+    fn toReconnecting(self: *LinkState) void {
+        // Entering reconnecting from a live state starts a fresh backoff schedule.
+        if (self.state == .connected or self.state == .degraded) self.attempt = 0;
+        self.state = .reconnecting;
+    }
+
+    /// Compute the next full-jitter backoff delay (ms) and advance the attempt
+    /// counter (§5.1). The uncapped ceiling is `base · 2^attempt`; we clamp it to
+    /// `cap`, then pick a uniform random delay in `[0, ceiling]` (AWS "full jitter").
+    /// When `attempt` exceeds `max_attempts` the caller should treat the link as
+    /// DEAD; `nextBackoffMs` still returns the capped delay so callers that ignore
+    /// the cap don't get UB. `onHeartbeatAck`/`onResyncDone` reset `attempt`.
+    pub fn nextBackoffMs(self: *LinkState) u64 {
+        const attempt = self.attempt;
+        self.attempt +%= 1;
+        // ceiling = base << attempt, saturating at the cap (avoid u64 shift UB).
+        const shift: u6 = @intCast(@min(attempt, 40));
+        const raw_ceiling = backoff_base_ms *| (@as(u64, 1) << shift);
+        const ceiling = @min(raw_ceiling, backoff_cap_ms);
+        return self.rand.intRangeAtMost(u64, 0, ceiling);
+    }
+
+    /// True once we've exhausted the reconnect budget (§5.1 "backoff cap exceeded").
+    pub fn attemptsExhausted(self: LinkState) bool {
+        return self.attempt >= max_attempts;
+    }
+};
+
+/// Injected millisecond clock. Defaults to a real monotonic-ish source; tests
+/// inject a fake so heartbeat/RTT logic is deterministic without wall-clock sleeps.
+pub const Clock = struct {
+    ctx: *anyopaque,
+    nowMs: *const fn (ctx: *anyopaque) u64,
+
+    fn now(self: Clock) u64 {
+        return self.nowMs(self.ctx);
+    }
+
+    /// The default real clock: a monotonic millisecond counter. `ctx` is unused.
+    pub fn real() Clock {
+        return .{ .ctx = undefined, .nowMs = realNowMs };
+    }
+    fn realNowMs(_: *anyopaque) u64 {
+        // Monotonic on darwin/linux (UPTIME_RAW / BOOTTIME); falls back to wall
+        // clock only if the monotonic clock is unavailable.
+        const inst = std.time.Instant.now() catch {
+            return @intCast(@max(std.time.milliTimestamp(), 0));
+        };
+        // Convert the platform Instant to ms via its ns-since an epoch-ish zero.
+        // `since` needs an earlier instant; use a process-lifetime anchor.
+        return @intCast(@divFloor(instantNs(inst), std.time.ns_per_ms));
+    }
+    fn instantNs(inst: std.time.Instant) u128 {
+        if (@TypeOf(inst.timestamp) == u64) return inst.timestamp;
+        const ts = inst.timestamp;
+        return @as(u128, @intCast(ts.sec)) * std.time.ns_per_s + @as(u128, @intCast(ts.nsec));
+    }
+};
+
+/// State-change observer (§6.4 health badge / §5.x banners). Fired by the
+/// `Connection` AFTER a transition, with the old and new state. Invoked while
+/// holding `state_mutex` — the handler must NOT call back into `Connection`
+/// methods that take `state_mutex` (it would deadlock); copy what it needs and
+/// return promptly.
+pub const StateHandler = *const fn (ctx: *anyopaque, conn: *Connection, old: LinkState.State, new: LinkState.State) void;
+
 /// The client side of one remote connection's transport. Heap-allocated because
 /// the writer and the two reader threads all reference it for their lifetime.
 pub const Connection = struct {
@@ -159,6 +435,48 @@ pub const Connection = struct {
     ctrl_handler: ?ControlHandler = null,
     ctrl_handler_ctx: *anyopaque = undefined,
 
+    // --- Health & link state (increment 2) ------------------------------------
+    /// Injected millisecond clock (real by default, fake in tests).
+    clock: Clock = Clock.real(),
+    /// Heartbeat interval (ms). Injectable; default 3000 (§5.1 interactive).
+    heartbeat_interval_ms: u64 = 3000,
+
+    /// The link-state FSM (§5.1) and the RTT estimator (§6.4). BOTH are guarded by
+    /// `state_mutex` — every read/write goes through it so transitions serialize and
+    /// the observer fires exactly once per change.
+    link: LinkState = undefined,
+    rtt: RttEstimator = .{},
+    /// Storage for the default-seeded PRNG when the caller doesn't inject one. Lives
+    /// inside the `Connection` so the `std.Random` interface stays valid for life.
+    default_prng: std.Random.DefaultPrng = undefined,
+    /// Cached SRTT (ms) published for the lock-free `latencyMs` read path. Stored
+    /// under `state_mutex`; read atomically (monotonic) without the lock. 0 = none.
+    latency_ms: std.atomic.Value(u32) = .{ .raw = 0 },
+
+    /// Set once a `.detached` (steal/eviction, §5.3) lands; surfaced to callers and
+    /// drives the FSM to DEAD. Read atomically.
+    evicted: std.atomic.Value(bool) = .{ .raw = false },
+
+    /// State-change observer (optional), invoked under `state_mutex` after a change.
+    state_handler: ?StateHandler = null,
+    state_handler_ctx: *anyopaque = undefined,
+
+    // --- Heartbeat driver (increment 2) ---------------------------------------
+    /// Heartbeat sequence the driver owns (NOT `frame_seq`; see `Heartbeat`).
+    hb_seq: u64 = 0,
+    /// The hb_seq of the most recent PING for which we are still awaiting a PONG,
+    /// and whether one is outstanding. Guarded by `hb_mutex`.
+    hb_mutex: std.Thread.Mutex = .{},
+    hb_outstanding: bool = false,
+    hb_pending_seq: u64 = 0,
+    hb_pending_send_ms: u64 = 0,
+    /// Consecutive missed heartbeat intervals (no PONG before the next tick).
+    /// Guarded by `hb_mutex`.
+    hb_missed: u32 = 0,
+    /// Wakes the heartbeat thread out of its interval sleep on shutdown.
+    hb_wake: std.Thread.ResetEvent = .{},
+    heartbeat_thread: ?std.Thread = null,
+
     // --- Lifecycle ------------------------------------------------------------
     /// Set by `shutdown`; observed by the writer to drain-and-exit. Guarded by
     /// `write_mutex` for the writer's condition wait.
@@ -170,6 +488,19 @@ pub const Connection = struct {
     control_thread: ?std.Thread = null,
     data_thread: ?std.Thread = null,
 
+    /// Tunables for health/heartbeat behavior (increment 2). All have production
+    /// defaults; tests inject a fake clock, a tiny interval, and a seeded PRNG to
+    /// stay deterministic and fast.
+    pub const Options = struct {
+        /// Millisecond clock (default: real monotonic).
+        clock: Clock = Clock.real(),
+        /// Heartbeat interval in ms (default 3000, §5.1).
+        heartbeat_interval_ms: u64 = 3000,
+        /// PRNG for the full-jitter reconnect backoff. Defaults to a seed derived
+        /// from the real clock; tests pass a fixed-seed PRNG for determinism.
+        rand: ?std.Random = null,
+    };
+
     /// Allocate and initialize a connection over the two given channel streams.
     /// Does not spawn any thread or touch the wire — call `start` for that.
     pub fn create(
@@ -177,6 +508,17 @@ pub const Connection = struct {
         control: Stream,
         data: Stream,
         local_hello: protocol.Hello,
+    ) !*Connection {
+        return createOpts(alloc, control, data, local_hello, .{});
+    }
+
+    /// `create` with explicit health/heartbeat tunables (increment 2).
+    pub fn createOpts(
+        alloc: Allocator,
+        control: Stream,
+        data: Stream,
+        local_hello: protocol.Hello,
+        opts: Options,
     ) !*Connection {
         const self = try alloc.create(Connection);
         errdefer alloc.destroy(self);
@@ -187,7 +529,15 @@ pub const Connection = struct {
             .local_hello = local_hello,
             .encoding = local_hello.transfer_encoding,
             .channels = ring.ChannelTable.init(alloc),
+            .clock = opts.clock,
+            .heartbeat_interval_ms = opts.heartbeat_interval_ms,
         };
+        // Seed the embedded PRNG (used only when no PRNG was injected).
+        self.default_prng = std.Random.DefaultPrng.init(blk: {
+            const t = std.time.milliTimestamp();
+            break :blk @bitCast(t);
+        });
+        self.link = LinkState.init(opts.rand orelse self.default_prng.random());
         return self;
     }
 
@@ -221,6 +571,16 @@ pub const Connection = struct {
             self.control_thread = null;
         }
         self.data_thread = try std.Thread.spawn(.{}, dataReaderLoop, .{self});
+        errdefer {
+            self.data.close();
+            if (self.data_thread) |t| t.join();
+            self.data_thread = null;
+        }
+
+        // The heartbeat driver (increment 2). It waits for the handshake itself, so
+        // it can be spawned now; it ticks only once the link is up. Shutdown wakes it
+        // via `hb_wake` and joins it in the same safe (claim-then-join-unlocked) path.
+        self.heartbeat_thread = try std.Thread.spawn(.{}, heartbeatLoop, .{self});
 
         self.started = true;
     }
@@ -292,6 +652,64 @@ pub const Connection = struct {
         self.ctrl_handler = handler;
     }
 
+    // --- Observability (increment 2, §6.4) -----------------------------------
+
+    /// Register the link-state observer, fired on every FSM transition (§5.1). See
+    /// `StateHandler`: it runs under `state_mutex`, so it must not re-enter
+    /// `Connection` methods that take that lock.
+    pub fn setStateHandler(self: *Connection, ctx: *anyopaque, handler: StateHandler) void {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        self.state_handler_ctx = ctx;
+        self.state_handler = handler;
+    }
+
+    /// The current link state (§5.1). Thread-safe (takes `state_mutex`).
+    pub fn state(self: *Connection) LinkState.State {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        return self.link.state;
+    }
+
+    /// The current smoothed RTT in ms (§6.4), or null before the first PONG.
+    /// Lock-free read of the published cache.
+    pub fn latencyMs(self: *Connection) ?u32 {
+        const v = self.latency_ms.load(.monotonic);
+        return if (v == 0) null else v;
+    }
+
+    /// The current RTT health badge bucket (§6.4). Thread-safe.
+    pub fn health(self: *Connection) RttEstimator.Health {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        return self.rtt.health();
+    }
+
+    /// True once the agent evicted us (DETACHED steal, §5.3). Lock-free.
+    pub fn isEvicted(self: *Connection) bool {
+        return self.evicted.load(.monotonic);
+    }
+
+    /// Apply `f` to `self.link` under `state_mutex`, then fire the observer if the
+    /// state changed and republish the cached SRTT. Centralizes the
+    /// "transition + notify" so every state-mutating event path is consistent.
+    /// `f` must take `*LinkState` and is given the lock-held FSM.
+    fn withLink(self: *Connection, comptime f: fn (*LinkState) void) void {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        const old = self.link.state;
+        f(&self.link);
+        const new = self.link.state;
+        if (new != old) {
+            if (self.state_handler) |h| {
+                // Fired UNDER `state_mutex` (see `StateHandler` doc) so notifications
+                // are strictly serialized and ordered. The handler must not re-enter
+                // a `state_mutex`-taking method.
+                h(self.state_handler_ctx, self, old, new);
+            }
+        }
+    }
+
     /// Copy `payload` into queue-owned memory, append the record, and wake the
     /// writer. Safe to call from any thread (MPSC). On a closed connection the
     /// frame is dropped (the writer is gone / draining).
@@ -343,19 +761,32 @@ pub const Connection = struct {
         const writer = self.writer_thread;
         const control = self.control_thread;
         const data = self.data_thread;
+        const heartbeat = self.heartbeat_thread;
         self.writer_thread = null;
         self.control_thread = null;
         self.data_thread = null;
+        self.heartbeat_thread = null;
         self.state_mutex.unlock();
 
-        // Wake the writer to drain-and-exit, and unblock both reader reads.
+        // Wake the writer to drain-and-exit, unblock both reader reads, and wake the
+        // heartbeat thread out of its interval sleep so it exits promptly.
         self.signalClose();
         self.control.close();
         self.data.close();
+        self.hb_wake.set();
+
+        // Unblock the heartbeat thread if it is still parked on the handshake event
+        // (shutdown before the handshake completed): publish a failed handshake here
+        // BEFORE joining, mirroring the post-join unblock below. (The post-join block
+        // remains for the reader-completes-handshake race.)
+        if (heartbeat != null and !self.handshake_done.isSet()) {
+            self.completeHandshake(error.Incompatible);
+        }
 
         if (writer) |t| t.join();
         if (control) |t| t.join();
         if (data) |t| t.join();
+        if (heartbeat) |t| t.join();
 
         self.state_mutex.lock();
         defer self.state_mutex.unlock();
@@ -379,6 +810,7 @@ pub const Connection = struct {
         assert(self.writer_thread == null);
         assert(self.control_thread == null);
         assert(self.data_thread == null);
+        assert(self.heartbeat_thread == null);
         self.write_queue.deinit(alloc);
         self.channels.deinit();
         alloc.destroy(self);
@@ -475,17 +907,108 @@ pub const Connection = struct {
         // If the handshake failed, there is nothing more to route.
         if (std.meta.isError(self.negotiated)) return;
 
-        // --- Routing phase: dispatch every control frame to the handler. ---
+        // --- Routing phase: internally handle health frames, then dispatch. ---
         while (true) {
-            while (reader.next() catch return) |frame| {
+            while (reader.next() catch {
+                // A protocol error on the control lane is a transport failure, not a
+                // clean shutdown: drive the FSM toward reconnecting (§5.2).
+                self.signalTransportError();
+                return;
+            }) |frame| {
+                // Internal handling first (PONG/PING/DETACHED, §6.4/§5.3); the user
+                // handler is then ALWAYS invoked so callers can observe every frame
+                // (the simpler, consistent policy — internal handling is additive).
+                self.handleControlInternal(frame);
                 if (self.ctrl_handler) |handler| {
                     handler(self.ctrl_handler_ctx, self, frame);
                 }
             }
-            const n = self.control.read(&scratch) catch return;
-            if (n == 0) return; // EOF
-            reader.push(scratch[0..n]) catch return;
+            const n = self.control.read(&scratch) catch {
+                self.signalTransportError();
+                return;
+            };
+            if (n == 0) {
+                // EOF on the control lane. If this is a deliberate shutdown the FSM
+                // change is irrelevant (we're tearing down); otherwise it signals a
+                // dropped link (§5.2).
+                self.signalTransportError();
+                return; // EOF
+            }
+            reader.push(scratch[0..n]) catch {
+                self.signalTransportError();
+                return;
+            };
         }
+    }
+
+    /// Internal control-frame handling done by the control reader BEFORE the user
+    /// handler (increment 2). Consumes health/lifecycle semantics additively:
+    ///   - `.pong`  → match by hb_seq, sample RTT, reset misses, FSM → connected.
+    ///   - `.ping`  → reply with a `.pong` echoing the timestamp (bidirectional).
+    ///   - `.detached` → record eviction (§5.3) and drive the FSM to DEAD.
+    /// Other frame types are ignored here (the user handler still sees them).
+    fn handleControlInternal(self: *Connection, frame: protocol.Frame) void {
+        switch (frame.type) {
+            .pong => {
+                const hb = Heartbeat.decode(frame.payload) catch return;
+                self.onPong(hb);
+            },
+            .ping => {
+                const hb = Heartbeat.decode(frame.payload) catch return;
+                // Reply echoing the sender's timestamp; stamp our clock as reply_ms.
+                var buf: [Heartbeat.encoded_len]u8 = undefined;
+                const reply: Heartbeat = .{
+                    .hb_seq = hb.hb_seq,
+                    .send_ms = hb.send_ms,
+                    .reply_ms = self.clock.now(),
+                };
+                _ = reply.encodeInto(&buf);
+                // Best-effort; a write failure surfaces via the reader's EOF path.
+                self.writeControl(.pong, protocol.control_channel, &buf) catch {};
+            },
+            .detached => {
+                // Server-initiated eviction / steal (§5.3): terminal DEAD.
+                self.evicted.store(true, .monotonic);
+                self.withLink(LinkState.onSessionGone);
+            },
+            else => {},
+        }
+    }
+
+    /// Process a matched PONG: compute RTT, feed the estimator, publish latency, and
+    /// drive the FSM back to connected (§6.4/§5.1). Ignores stale/duplicate PONGs
+    /// (a hb_seq that isn't the outstanding one).
+    fn onPong(self: *Connection, hb: Heartbeat) void {
+        self.hb_mutex.lock();
+        const matched = self.hb_outstanding and hb.hb_seq == self.hb_pending_seq;
+        if (matched) {
+            self.hb_outstanding = false;
+            self.hb_missed = 0;
+        }
+        self.hb_mutex.unlock();
+        if (!matched) return;
+
+        // RTT = now − send_ms (the agent reflected send_ms back verbatim). Guard
+        // against a non-monotonic / clock-skewed sample (now < send_ms → 0).
+        const now = self.clock.now();
+        const rtt_ms: f64 = if (now >= hb.send_ms) @floatFromInt(now - hb.send_ms) else 0;
+
+        self.state_mutex.lock();
+        self.rtt.addSample(rtt_ms);
+        const srtt = self.rtt.srttMs();
+        self.state_mutex.unlock();
+        // Publish for the lock-free `latencyMs` reader (clamp 0→1 so 0 still means
+        // "no sample yet" while a real ~0 ms RTT reports 1 ms).
+        self.latency_ms.store(if (srtt == 0) 1 else srtt, .monotonic);
+
+        // Any authentic packet → CONNECTED (§5.1).
+        self.withLink(LinkState.onHeartbeatAck);
+    }
+
+    /// Drive the FSM on a non-deliberate reader exit / write failure (§5.2). Safe to
+    /// call during shutdown too: the state move is harmless when we're tearing down.
+    fn signalTransportError(self: *Connection) void {
+        self.withLink(LinkState.onTransportError);
     }
 
     /// Parse a peer HELLO payload and negotiate it against our local HELLO.
@@ -515,16 +1038,109 @@ pub const Connection = struct {
         var scratch: [read_buf_size]u8 = undefined;
 
         while (true) {
-            while (reader.next() catch return) |frame| {
+            while (reader.next() catch {
+                self.signalTransportError();
+                return;
+            }) |frame| {
                 if (frame.type != .data) continue; // ignore non-DATA on this lane
                 const dp = protocol.DataPayload.decode(frame.payload) catch continue;
                 // Route the raw bytes; `.unknown` (stale/hostile channel) is dropped.
                 _ = self.channels.pushTo(frame.channel, dp.bytes);
             }
-            const n = self.data.read(&scratch) catch return;
-            if (n == 0) return; // EOF
-            reader.push(scratch[0..n]) catch return;
+            const n = self.data.read(&scratch) catch {
+                self.signalTransportError();
+                return;
+            };
+            if (n == 0) {
+                self.signalTransportError();
+                return; // EOF
+            }
+            reader.push(scratch[0..n]) catch {
+                self.signalTransportError();
+                return;
+            };
         }
+    }
+
+    // --- Heartbeat driver (increment 2, §6.4) --------------------------------
+
+    /// The heartbeat thread. Waits for the handshake, then every `interval_ms`:
+    ///   1. If a prior PING is still outstanding (no PONG arrived since), count it as
+    ///      a missed interval and drive `LinkState.onHeartbeatMissed`.
+    ///   2. Stamp and send a fresh PING (new hb_seq + send_ms) on the control lane.
+    ///   3. Sleep on `hb_wake.timedWait(interval)` so `shutdown` wakes it immediately.
+    /// Exits when `closed` (woken via `hb_wake`).
+    fn heartbeatLoop(self: *Connection) void {
+        // Don't heartbeat until the link is actually up. `waitHandshake` is unblocked
+        // by `shutdown` too (with an error), so this also exits cleanly on an early
+        // teardown.
+        _ = self.waitHandshake() catch {
+            return; // handshake failed or we're shutting down: nothing to ping.
+        };
+
+        const interval_ns = self.heartbeat_interval_ms *| std.time.ns_per_ms;
+        while (true) {
+            if (self.isClosed()) return;
+
+            // (1) Account for an unanswered prior PING as a missed interval.
+            self.hb_mutex.lock();
+            if (self.hb_outstanding) {
+                self.hb_missed +|= 1;
+            }
+            const missed = self.hb_missed;
+            self.hb_mutex.unlock();
+            if (missed > 0) {
+                // Drive the FSM with the running missed count (§5.1 thresholds).
+                self.onMissed(missed);
+            }
+
+            // (2) Stamp and send a fresh PING. hb_seq is OWNED here (not frame_seq).
+            const send_ms = self.clock.now();
+            self.hb_mutex.lock();
+            self.hb_seq +%= 1;
+            const seq = self.hb_seq;
+            self.hb_pending_seq = seq;
+            self.hb_pending_send_ms = send_ms;
+            self.hb_outstanding = true;
+            self.hb_mutex.unlock();
+
+            var buf: [Heartbeat.encoded_len]u8 = undefined;
+            const ping: Heartbeat = .{ .hb_seq = seq, .send_ms = send_ms };
+            _ = ping.encodeInto(&buf);
+            // A write failure here is observed by the readers' EOF/error path which
+            // drives the FSM; the heartbeat just keeps its bookkeeping consistent.
+            self.writeControl(.ping, protocol.control_channel, &buf) catch {};
+
+            // (3) Sleep until the next tick or an immediate shutdown wake.
+            self.hb_wake.timedWait(interval_ns) catch {
+                // Timed out → next interval. (A set event means shutdown: loop top
+                // sees `closed` and exits.)
+                continue;
+            };
+            // Event was set (shutdown). Exit promptly.
+            return;
+        }
+    }
+
+    /// Apply a running missed-count to the FSM via the serialized transition path.
+    /// Wrapped because `withLink` needs a `fn(*LinkState)` and we must close over the
+    /// count — a tiny per-call closure struct does that.
+    fn onMissed(self: *Connection, missed: u32) void {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        const old = self.link.state;
+        self.link.onHeartbeatMissed(missed);
+        const new = self.link.state;
+        if (new != old) {
+            if (self.state_handler) |h| h(self.state_handler_ctx, self, old, new);
+        }
+    }
+
+    /// Lock-free-ish read of the closed flag (under `write_mutex`, like the writer).
+    fn isClosed(self: *Connection) bool {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        return self.closed;
     }
 };
 
@@ -1077,4 +1693,457 @@ test "shutdown before handshake unblocks waiters" {
     try conn.start();
     conn.shutdown();
     try testing.expectError(error.Incompatible, conn.waitHandshake());
+}
+
+// =============================================================================
+// Increment 2 tests: RTT estimator, link-state FSM, heartbeat/health integration
+// =============================================================================
+
+// --- RttEstimator (RFC 6298) -------------------------------------------------
+
+test "RttEstimator: RFC 6298 seed + EWMA convergence and health buckets" {
+    var est: RttEstimator = .{};
+    try testing.expectEqual(RttEstimator.Health.unknown, est.health());
+    try testing.expectEqual(@as(u32, 0), est.srttMs());
+
+    // First sample R=100 seeds SRTT=R, RTTVAR=R/2 (RFC 6298 §2.2).
+    est.addSample(100);
+    try testing.expectEqual(@as(u32, 100), est.srttMs());
+    try testing.expectApproxEqAbs(@as(f64, 50), est.rttvar, 1e-9);
+    // RTO = SRTT + K·RTTVAR = 100 + 4·50 = 300.
+    try testing.expectEqual(@as(u32, 300), est.rtoMs());
+
+    // Second sample R=100 (no change): RTTVAR ← 0.75·50 + 0.25·0 = 37.5;
+    // SRTT ← 0.875·100 + 0.125·100 = 100.
+    est.addSample(100);
+    try testing.expectApproxEqAbs(@as(f64, 100), est.srtt, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 37.5), est.rttvar, 1e-9);
+
+    // A spike to R=200: RTTVAR ← 0.75·37.5 + 0.25·|100−200| = 28.125 + 25 = 53.125;
+    // SRTT ← 0.875·100 + 0.125·200 = 112.5.
+    est.addSample(200);
+    try testing.expectApproxEqAbs(@as(f64, 112.5), est.srtt, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 53.125), est.rttvar, 1e-9);
+
+    // SRTT 112.5 ms is in the yellow band (80 ≤ x < 250).
+    try testing.expectEqual(RttEstimator.Health.yellow, est.health());
+
+    // Feed many low samples; SRTT converges toward green (<80).
+    var i: usize = 0;
+    while (i < 50) : (i += 1) est.addSample(10);
+    try testing.expect(est.srtt < RttEstimator.green_max_ms);
+    try testing.expectEqual(RttEstimator.Health.green, est.health());
+
+    // Feed many high samples; SRTT climbs into red (≥250).
+    i = 0;
+    while (i < 100) : (i += 1) est.addSample(400);
+    try testing.expect(est.srtt >= 250);
+    try testing.expectEqual(RttEstimator.Health.red, est.health());
+}
+
+// --- LinkState FSM -----------------------------------------------------------
+
+test "LinkState: full transition table" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const S = LinkState.State;
+
+    // connected → degraded at 2 missed, → reconnecting at 3 missed.
+    {
+        var ls = LinkState.init(prng.random());
+        try testing.expectEqual(S.connected, ls.state);
+        ls.onHeartbeatMissed(1);
+        try testing.expectEqual(S.connected, ls.state); // 1 miss: still connected
+        ls.onHeartbeatMissed(2);
+        try testing.expectEqual(S.degraded, ls.state);
+        ls.onHeartbeatMissed(3);
+        try testing.expectEqual(S.reconnecting, ls.state);
+        // Any authentic packet → connected, resets attempt.
+        _ = ls.nextBackoffMs();
+        ls.onHeartbeatAck();
+        try testing.expectEqual(S.connected, ls.state);
+        try testing.expectEqual(@as(u32, 0), ls.attempt);
+    }
+
+    // degraded → connected on ack.
+    {
+        var ls = LinkState.init(prng.random());
+        ls.onHeartbeatMissed(2);
+        try testing.expectEqual(S.degraded, ls.state);
+        ls.onHeartbeatAck();
+        try testing.expectEqual(S.connected, ls.state);
+    }
+
+    // transport error from any live state → reconnecting.
+    {
+        var ls = LinkState.init(prng.random());
+        ls.onTransportError();
+        try testing.expectEqual(S.reconnecting, ls.state);
+        ls = LinkState.init(prng.random());
+        ls.onHeartbeatMissed(2); // degraded
+        ls.onTransportError();
+        try testing.expectEqual(S.reconnecting, ls.state);
+    }
+
+    // reconnecting → reattaching → connected (resync done).
+    {
+        var ls = LinkState.init(prng.random());
+        ls.onTransportError();
+        ls.markReattaching();
+        try testing.expectEqual(S.reattaching, ls.state);
+        ls.onResyncDone();
+        try testing.expectEqual(S.connected, ls.state);
+        try testing.expectEqual(@as(u32, 0), ls.attempt);
+    }
+
+    // session gone / eviction → dead, and dead is terminal.
+    {
+        var ls = LinkState.init(prng.random());
+        ls.onSessionGone();
+        try testing.expectEqual(S.dead, ls.state);
+        ls.onHeartbeatAck(); // ignored once dead
+        try testing.expectEqual(S.dead, ls.state);
+        ls.onHeartbeatMissed(5);
+        try testing.expectEqual(S.dead, ls.state);
+        ls.onTransportError();
+        try testing.expectEqual(S.dead, ls.state);
+    }
+
+    // A still-missing tick must not drag reconnecting back to degraded.
+    {
+        var ls = LinkState.init(prng.random());
+        ls.onHeartbeatMissed(3); // reconnecting
+        ls.onHeartbeatMissed(2); // still missing — stays reconnecting
+        try testing.expectEqual(S.reconnecting, ls.state);
+    }
+}
+
+test "LinkState: full-jitter backoff grows, caps, and resets (fixed seed)" {
+    var prng = std.Random.DefaultPrng.init(0xABCD);
+    var ls = LinkState.init(prng.random());
+
+    // Every delay must lie within [0, capped ceiling]. Track the max we see at each
+    // attempt; the ceiling grows geometrically until it pins at the cap.
+    var max_seen: u64 = 0;
+    var attempt: u32 = 0;
+    while (attempt < 20) : (attempt += 1) {
+        const expected_shift: u6 = @intCast(@min(attempt, 40));
+        const raw = LinkState.backoff_base_ms *| (@as(u64, 1) << expected_shift);
+        const ceiling = @min(raw, LinkState.backoff_cap_ms);
+        const d = ls.nextBackoffMs();
+        try testing.expect(d <= ceiling);
+        if (d > max_seen) max_seen = d;
+    }
+    // Once attempts are large the ceiling is the cap; no delay ever exceeds it.
+    try testing.expect(max_seen <= LinkState.backoff_cap_ms);
+    // Attempt counter advanced once per call.
+    try testing.expectEqual(@as(u32, 20), ls.attempt);
+    try testing.expect(ls.attemptsExhausted());
+
+    // A success resets the schedule: the next ceiling is the base again.
+    ls.onHeartbeatAck();
+    try testing.expectEqual(@as(u32, 0), ls.attempt);
+    const d0 = ls.nextBackoffMs();
+    try testing.expect(d0 <= LinkState.backoff_base_ms); // attempt 0 ceiling == base
+    try testing.expect(!ls.attemptsExhausted());
+
+    // Demonstrate growth: collect the ceiling-bound at low attempts is monotonic.
+    var ls2 = LinkState.init(prng.random());
+    var prev_ceiling: u64 = 0;
+    var a: u32 = 0;
+    while (a < 6) : (a += 1) {
+        const raw = LinkState.backoff_base_ms *| (@as(u64, 1) << @as(u6, @intCast(a)));
+        const ceiling = @min(raw, LinkState.backoff_cap_ms);
+        try testing.expect(ceiling >= prev_ceiling);
+        prev_ceiling = ceiling;
+        _ = ls2.nextBackoffMs();
+    }
+}
+
+// --- Integration: a heartbeat-aware mock agent over the loopback -------------
+
+/// A deterministic, injectable millisecond clock for the integration tests. Each
+/// `advance` bumps the value; `Clock` reads it lock-free under an atomic.
+const FakeClock = struct {
+    now_ms: std.atomic.Value(u64) = .{ .raw = 1000 },
+
+    fn clock(self: *FakeClock) Clock {
+        return .{ .ctx = self, .nowMs = nowMs };
+    }
+    fn nowMs(ctx: *anyopaque) u64 {
+        const self: *FakeClock = @ptrCast(@alignCast(ctx));
+        return self.now_ms.load(.monotonic);
+    }
+    fn advance(self: *FakeClock, by: u64) void {
+        _ = self.now_ms.fetchAdd(by, .monotonic);
+    }
+};
+
+/// An agent thread that handshakes, then services control frames: by default it
+/// replies to each PING with a matching PONG (so the client computes RTT and stays
+/// CONNECTED). It can be told to stop replying, to send a DETACHED, or to close.
+const HealthAgentCtx = struct {
+    agent: *MockAgent,
+    /// When false, PINGs are read but NOT answered (drives missed acks).
+    reply_to_pings: std.atomic.Value(bool) = .{ .raw = true },
+    /// When set, the agent sends a DETACHED then keeps servicing.
+    send_detached: std.atomic.Value(bool) = .{ .raw = false },
+    detached_sent: std.Thread.ResetEvent = .{},
+    /// Count of PONGs we've sent (observable by the test).
+    pongs_sent: std.atomic.Value(u32) = .{ .raw = 0 },
+    /// Optional reply RTT to bake into the echoed PONG by advancing a shared clock.
+    err: ?anyerror = null,
+
+    fn run(self: *HealthAgentCtx) void {
+        self.body() catch |e| {
+            // EOF on shutdown surfaces as a benign error; only record real ones.
+            self.err = e;
+        };
+    }
+    fn body(self: *HealthAgentCtx) !void {
+        _ = try self.agent.handshake();
+        while (true) {
+            if (self.send_detached.swap(false, .monotonic)) {
+                try self.agent.sendFrame(.{
+                    .type = .detached,
+                    .channel = protocol.control_channel,
+                    .seq = 0,
+                    .payload = "",
+                });
+                self.detached_sent.set();
+            }
+            const frame = (try self.agent.nextFrame()) orelse return; // EOF: done
+            switch (frame.type) {
+                .ping => {
+                    if (!self.reply_to_pings.load(.monotonic)) continue;
+                    // Echo the PING's heartbeat payload back as a PONG verbatim.
+                    var buf: [Heartbeat.encoded_len]u8 = undefined;
+                    const hb = try Heartbeat.decode(frame.payload);
+                    _ = hb.encodeInto(&buf);
+                    try self.agent.sendFrame(.{
+                        .type = .pong,
+                        .channel = protocol.control_channel,
+                        .seq = 0,
+                        .payload = &buf,
+                    });
+                    _ = self.pongs_sent.fetchAdd(1, .monotonic);
+                },
+                else => {},
+            }
+        }
+    }
+};
+
+/// Spin until `cond()` is true or we exceed a generous spin budget (deterministic;
+/// no fixed sleeps — the agent thread makes progress on its own).
+fn spinUntil(comptime ctx_t: type, ctx: *ctx_t, cond: *const fn (*ctx_t) bool) !void {
+    var spins: usize = 0;
+    while (!cond(ctx)) {
+        spins += 1;
+        if (spins > 5_000_000) return error.Timeout;
+        std.Thread.yield() catch {};
+    }
+}
+
+const StateRec = struct {
+    conn: *Connection,
+    last_old: std.atomic.Value(u32) = .{ .raw = 0 },
+    last_new: std.atomic.Value(u32) = .{ .raw = 0 },
+    transitions: std.atomic.Value(u32) = .{ .raw = 0 },
+    saw_dead: std.atomic.Value(bool) = .{ .raw = false },
+    saw_reconnecting: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn handler(ctx: *anyopaque, _: *Connection, old: LinkState.State, new: LinkState.State) void {
+        const self: *StateRec = @ptrCast(@alignCast(ctx));
+        self.last_old.store(@intFromEnum(old), .monotonic);
+        self.last_new.store(@intFromEnum(new), .monotonic);
+        _ = self.transitions.fetchAdd(1, .monotonic);
+        if (new == .dead) self.saw_dead.store(true, .monotonic);
+        if (new == .reconnecting) self.saw_reconnecting.store(true, .monotonic);
+    }
+};
+
+test "heartbeat integration: PONG → latency computed, link stays connected" {
+    const alloc = testing.allocator;
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    var fake = FakeClock{};
+    const conn = try Connection.createOpts(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+        .{ .clock = fake.clock(), .heartbeat_interval_ms = 2 }, // tiny interval
+    );
+    defer conn.destroy(alloc);
+
+    var agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer agent.deinit();
+    var hctx = HealthAgentCtx{ .agent = &agent };
+    const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+
+    try conn.start();
+    _ = try conn.waitHandshake();
+
+    // Wait until at least one PONG has been answered.
+    try spinUntil(HealthAgentCtx, &hctx, struct {
+        fn f(c: *HealthAgentCtx) bool {
+            return c.pongs_sent.load(.monotonic) >= 1;
+        }
+    }.f);
+
+    // The client should have a latency sample and be CONNECTED.
+    try spinUntil(Connection, conn, struct {
+        fn f(c: *Connection) bool {
+            return c.latencyMs() != null;
+        }
+    }.f);
+    try testing.expectEqual(LinkState.State.connected, conn.state());
+    try testing.expect(conn.latencyMs() != null);
+
+    conn.shutdown();
+    ath.join();
+}
+
+test "heartbeat integration: silent agent → missed acks → degraded → reconnecting" {
+    const alloc = testing.allocator;
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    var fake = FakeClock{};
+    const conn = try Connection.createOpts(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+        .{ .clock = fake.clock(), .heartbeat_interval_ms = 1 },
+    );
+    defer conn.destroy(alloc);
+
+    var rec = StateRec{ .conn = conn };
+    conn.setStateHandler(&rec, StateRec.handler);
+
+    var agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer agent.deinit();
+    // Agent reads PINGs but never answers → the client racks up missed acks.
+    var hctx = HealthAgentCtx{ .agent = &agent };
+    hctx.reply_to_pings.store(false, .monotonic);
+    const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+
+    try conn.start();
+    _ = try conn.waitHandshake();
+
+    // With a 1 ms interval and no replies, the missed count climbs; the FSM passes
+    // through degraded (2 missed) and reaches reconnecting (3 missed).
+    try spinUntil(StateRec, &rec, struct {
+        fn f(c: *StateRec) bool {
+            return c.saw_reconnecting.load(.monotonic);
+        }
+    }.f);
+    try testing.expect(rec.saw_reconnecting.load(.monotonic));
+
+    conn.shutdown();
+    ath.join();
+}
+
+test "DETACHED steal: client is evicted and the FSM goes DEAD with a notification" {
+    const alloc = testing.allocator;
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    var fake = FakeClock{};
+    const conn = try Connection.createOpts(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+        .{ .clock = fake.clock(), .heartbeat_interval_ms = 50 },
+    );
+    defer conn.destroy(alloc);
+
+    var rec = StateRec{ .conn = conn };
+    conn.setStateHandler(&rec, StateRec.handler);
+
+    var agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer agent.deinit();
+    var hctx = HealthAgentCtx{ .agent = &agent };
+    const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+
+    try conn.start();
+    _ = try conn.waitHandshake();
+
+    // Trigger the agent to send a DETACHED (steal/eviction, §5.3).
+    hctx.send_detached.store(true, .monotonic);
+    // Nudge the agent loop: send a PING so it cycles and emits the DETACHED. We do
+    // this by waiting for the agent to flag it sent.
+    hctx.detached_sent.wait();
+
+    // The client must observe eviction and a DEAD link, and the observer must fire.
+    try spinUntil(Connection, conn, struct {
+        fn f(c: *Connection) bool {
+            return c.isEvicted() and c.state() == .dead;
+        }
+    }.f);
+    try testing.expect(conn.isEvicted());
+    try testing.expectEqual(LinkState.State.dead, conn.state());
+    try spinUntil(StateRec, &rec, struct {
+        fn f(c: *StateRec) bool {
+            return c.saw_dead.load(.monotonic);
+        }
+    }.f);
+    try testing.expect(rec.saw_dead.load(.monotonic));
+
+    conn.shutdown();
+    ath.join();
+}
+
+test "reader EOF (agent closes) drives onTransportError → reconnecting" {
+    const alloc = testing.allocator;
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    var fake = FakeClock{};
+    const conn = try Connection.createOpts(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+        .{ .clock = fake.clock(), .heartbeat_interval_ms = 1000 },
+    );
+    defer conn.destroy(alloc);
+
+    var rec = StateRec{ .conn = conn };
+    conn.setStateHandler(&rec, StateRec.handler);
+
+    var agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer agent.deinit();
+    var hctx = HealthAgentCtx{ .agent = &agent };
+    const ath = try std.Thread.spawn(.{}, HealthAgentCtx.run, .{&hctx});
+
+    try conn.start();
+    _ = try conn.waitHandshake();
+
+    // Close BOTH directions of the control loopback → the client's control reader
+    // sees EOF (NOT a deliberate shutdown, so the FSM moves to reconnecting) and the
+    // agent's reader also EOFs so its thread can exit cleanly.
+    ctrl_lb.agent_to_client.close();
+    ctrl_lb.client_to_agent.close();
+
+    try spinUntil(StateRec, &rec, struct {
+        fn f(c: *StateRec) bool {
+            return c.saw_reconnecting.load(.monotonic);
+        }
+    }.f);
+    try testing.expect(rec.saw_reconnecting.load(.monotonic));
+
+    ath.join();
+    conn.shutdown();
 }
