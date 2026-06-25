@@ -1139,6 +1139,42 @@ pub const Connection = struct {
         try self.writeData(pane.id, offset, bytes);
     }
 
+    /// Emit `FLOW{resume}` for `channel` (§3.4 consumer-side counterpart to the
+    /// producer-side `FLOW{pause}`). The pane's IO thread calls this once its
+    /// inbound ring drain crosses back under the low-water mark (the
+    /// `inbound_ring.PopResult.send_resume` edge), telling the agent it may resume
+    /// draining that session's PTY. The target channel is carried in the FLOW
+    /// payload; the frame itself rides the control channel (§4.2). Best-effort: a
+    /// dead link silently drops it (the resync re-establishes flow on reconnect).
+    pub fn sendFlowResume(self: *Connection, channel: u128) !void {
+        const flow: protocol.Flow = .{ .channel = channel, .op = .@"resume" };
+        var buf: [protocol.Flow.encoded_len]u8 = undefined;
+        _ = flow.encodeInto(&buf);
+        try self.writeControl(.flow, protocol.control_channel, &buf);
+    }
+
+    /// Emit `RESIZE{rows, cols, px_w, px_h}` for `pane`'s channel (§3.3/§6.5). The
+    /// pane's IO thread calls this on a grid/screen size change; the agent applies
+    /// it to the remote PTY (TIOCSWINSZ / ConPTY). Best-effort on a dead link.
+    pub fn sendResize(
+        self: *Connection,
+        pane: *Pane,
+        rows: u16,
+        cols: u16,
+        px_w: u16,
+        px_h: u16,
+    ) !void {
+        const resize: protocol.Resize = .{
+            .rows = rows,
+            .cols = cols,
+            .px_w = px_w,
+            .px_h = px_h,
+        };
+        const json = try protocol.encodeJson(self.alloc, resize);
+        defer self.alloc.free(json);
+        try self.writeControl(.resize, pane.id, json);
+    }
+
     /// Insert `pane` into the `panes` map under `panes_mutex`.
     fn trackPane(self: *Connection, pane: *Pane) !void {
         self.panes_mutex.lock();
