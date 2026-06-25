@@ -18,9 +18,18 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | WP3-spike | Inbound ring + ChannelTable (`src/remote/inbound_ring.zig`) | ✅ **Spike done, gate passed** — 6 tests green | `7210e230e` |
 | WP2-spike | Windows agent risks (`src/remote/agent/spike/`) | ✅ **Spike done** — cross-compiles x86_64+aarch64 windows | `7168891fb` |
 | WP3-full | Client connection + `termio.Remote` + C API | 🔨 **In progress** (delegated to subagents) | see below |
-| ↳ inc.1 | `connection.zig` transport core (Stream, handshake, MPSC writer, demux→rings) — 33 tests | ✅ Done | `ca02e266b` |
-| ↳ inc.2 | heartbeat/RTT + reconnect state machine + steal epoch | 🔨 In progress | — |
-| ↳ inc.3 | `termio.Remote` + `backend.zig` + `Surface.zig` + C API | ⛔ Next | — |
+| ↳ inc.1 | `connection.zig` transport core (Stream, handshake, MPSC writer, demux→rings) | ✅ Done — 33 tests | `ca02e266b` |
+| ↳ inc.2 | health: `RttEstimator`, `LinkState` FSM, heartbeat, PONG/DETACHED handling | ✅ Done — 40 tests | `07ca686d8` |
+| ↳ inc.3 | channel/session lifecycle (OPEN/ATTACH/CLOSE/DETACH), resync §7.3, steal §5.3, FLOW-pause | ✅ Done — 50 tests | `176d85ad4` |
+| ↳ inc.4a | `termio.Remote` (Backend contract) + `backend.zig` `.remote` arm — **libghostty compiles with remote backend** | ✅ Done | `d6b463753` |
+| ↳ inc.4b | `Surface.zig:682` construct `.remote` + `ghostty_surface_config_s` + `ghostty_remote_*` C API | 🔨 In progress | — |
+| ↳ inc.3b | real reconnect driver (stream swap + re-ATTACH) + ssh Transport (`Stream` over ssh subprocess) | ⛔ Deferred | — |
+
+connection.zig is a complete-enough client transport (50 tests, native green). Build
+loop confirmed: `zig build -Doptimize=Debug` compiles all Zig (336/339; only the
+final `xcodebuild` step fails because `xcode-select` is still CLT — that's the
+P1-run gate, see Toolchain status). `src/remote/*` are part of the libghostty
+module (relative imports; no build.zig.zon change needed).
 | WP2-full | Agent daemon (Linux + Windows) | ⛔ **Not started** | — |
 | WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3-full C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
