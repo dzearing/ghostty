@@ -142,36 +142,33 @@ reported SHAs back onto `feature/remote-machines` and re-verifies the combined b
 4b and agent-inc.1 touch disjoint files (Surface/C-API vs new `src/remote/agent/*`),
 so cherry-picks should not conflict.
 
-## Toolchain status — ✅ SOLVED for Zig (one sudo step left for the .app)
+## Toolchain status — ✅ FULLY SOLVED (the runnable `.app` builds)
 
 **Resolved 2026-06-25 with NO Apple download.** Homebrew ships a `zig@0.15`
 bottle built FOR macOS 26 (`arm64_tahoe`) that already includes the #31673 linker
-fix:
+fix. Setup (one-time, all done):
 
 ```sh
-brew install zig@0.15 gettext        # done; zig@0.15 = 0.15.2, keg-only
-# Use this zig + point SDK detection at the already-installed Xcode 26.4:
+brew install zig@0.15 gettext        # zig@0.15 = 0.15.2, keg-only
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer   # DONE
+```
+
+Every shell that builds/tests must export:
+```sh
 export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 ```
 
-Verified working with that env:
-- `zig test src/remote/protocol.zig` / `inbound_ring.zig` — pass on the **native**
-  target (no more `-target aarch64-macos.13` needed).
-- `zig build -Doptimize=Debug` compiles+links the **entire Zig core 100%**
-  (`336/339` steps; `libghostty.a` + `GhosttyKit.xcframework` produced — so
-  `Surface.zig`/`backend.zig` and all WP3-full targets compile).
+VERIFIED end-to-end:
+- `zig test src/remote/<module>.zig` — native target, no `-target` needed.
+- `zig build -Doptimize=Debug` → **`zig-out/Ghoztty-Debug.app`** (complete,
+  code-signed; bundle id `com.mitchellh.ghostty.debug`; 142 MB `ghoztty` binary).
+  Full pipeline works: zig core + xcodebuild (Xcode 26.4) + Metal toolchain +
+  Swift + signing. **NEVER touch `/Applications/Ghoztty.app`** (user's primary
+  terminal) — debug build only.
 
-**One step remains ONLY to package/run the macOS `.app`** (not needed for WP3-full
-Zig dev): the final `xcodebuild` step uses the *system* `xcode-select` dir, which
-is still CLT. Point it at the installed Xcode (no download — Xcode 26.4 is already
-present; sudo needed):
-```sh
-sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
-# then, if `xcrun --find metal` fails, one-time: install the Metal toolchain
-#   xcodebuild -downloadComponent MetalToolchain
-zig build -Doptimize=Debug      # → zig-out/Ghoztty-Debug.app (NEVER /Applications/Ghoztty.app)
-```
+(Historical: before the `xcode-select` switch, the build stopped at the final
+xcodebuild step — that gate is now cleared.)
 
 Everything below is the prior investigation, kept for reference.
 
