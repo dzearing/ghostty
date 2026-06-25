@@ -393,6 +393,113 @@ pub const Clock = struct {
 /// return promptly.
 pub const StateHandler = *const fn (ctx: *anyopaque, conn: *Connection, old: LinkState.State, new: LinkState.State) void;
 
+// -----------------------------------------------------------------------------
+// Channel / session lifecycle (increment 3, §3.3/§4.2/§7.3)
+// -----------------------------------------------------------------------------
+
+/// A request/response correlation slot for a control-channel RPC that has a reply
+/// (OPEN→OPENED, ATTACH→ATTACHED, §4.2). The caller parks on `done`; the control
+/// reader, when it sees the matching reply frame, fills `result` and sets `done`.
+/// Keyed by the request/reply `Frame.channel` in `Connection.pending` (one
+/// outstanding RPC per channel id — OPEN and ATTACH never race on the same fresh
+/// channel id).
+///
+/// `result` is one of:
+///   - `error.ConnectionClosed` — set by `shutdown` to unblock a parked caller.
+///   - `error.MalformedReply`   — the reply payload failed to parse.
+///   - a duped, caller-owned payload slice (`[]u8`) — the raw JSON of the reply,
+///     which the waking caller parses (and frees) on its own thread so no parsing
+///     happens on the control reader.
+const PendingRpc = struct {
+    done: std.Thread.ResetEvent = .{},
+    /// Filled by the responder (control reader) before `done.set()`. The expected
+    /// reply frame type, so a wrong-type reply on the channel is rejected.
+    want: protocol.FrameType,
+    /// The result. `null` until filled. The payload bytes are heap-owned by the
+    /// connection allocator and become the caller's to free on success.
+    result: PendingError![]u8 = error.ConnectionClosed,
+
+    const PendingError = error{ ConnectionClosed, MalformedReply, WrongReply };
+};
+
+/// A remote pane handle (§3.3): one opened/attached session's client-side state.
+/// Heap-allocated and owned by the `Connection` (created by `openChannel`/
+/// `attachChannel`, freed by `closeChannel`/`detachChannel`). A future
+/// `termio.Remote` pane drives input through `writeInput` and drains output from
+/// `ring`.
+///
+/// ## Ownership / teardown contract (§3.4)
+/// The connection's data reader pushes inbound DATA into `ring` under the channel
+/// table lock. The pane's consumer (the future `termio.Remote` IO thread) drains
+/// `ring`. Teardown order is strict (mirrors §3.4 and `ChannelTable`'s invariant):
+///   1. The consumer STOPS draining `ring` (and is joined by its owner).
+///   2. The owner calls `closeChannel`/`detachChannel`, which deregisters the
+///      channel under the table lock — after which no in-flight `pushTo` can touch
+///      the ring — then frees the ring and the `Pane`.
+/// Calling `closeChannel`/`detachChannel` while the consumer is still draining is a
+/// use-after-free hazard and a programmer error.
+pub const Pane = struct {
+    /// The cryptographically-random channel id (§7.1) minted at open/attach. Never
+    /// reused for another session.
+    id: u128,
+    /// The agent-assigned session id (duped, connection-owned). Empty for a pane
+    /// whose attach did not yield one (e.g. `not_found`).
+    session_id: []u8,
+    /// The child pid reported by OPENED (0 for an attach, which doesn't report it).
+    pid: i64,
+    /// The inbound ring the pane's consumer drains. Connection-owned; registered in
+    /// the channel table for the pane's lifetime.
+    ring: *ring.Channel,
+    /// Outbound byte offset (§4.2): advanced by `writeInput` per DATA frame so the
+    /// agent can resync the *client→agent* stream. The pane owns this counter.
+    out_offset: protocol.ByteOffset = .{},
+
+    /// Inbound resync watermark (§7.3): DATA with absolute `byte_offset <=
+    /// discard_below` is dropped; only the suffix with offset `> discard_below`
+    /// lands in `ring`. 0 (the open-new default) discards nothing. Set to
+    /// `snapshot_at_offset` by `attachChannel`. Read by the data reader under
+    /// `resync_mutex`; cleared (set to 0 conceptually "passed") once the watermark
+    /// is crossed so the steady state takes the fast path.
+    discard_below: u64 = 0,
+    /// True until the inbound stream has advanced past `discard_below` (so the
+    /// data reader can shortcut to "route normally" without per-frame compares).
+    /// Guarded by `resync_mutex`.
+    resync_active: bool = false,
+};
+
+/// The outcome of `attachChannel` (§3.3/§5.3/§7.3). Surfaces everything the caller
+/// needs to decide recovery tier (§7.4) or to retry a steal with `force=true`.
+pub const AttachOutcome = struct {
+    /// The pane handle. Non-null on `.alive` (the channel is registered and live);
+    /// null on `.dead`/`.not_found`/`attached_elsewhere` (nothing was registered —
+    /// the caller cleans up by retrying or giving up; no `closeChannel` needed).
+    pane: ?*Pane,
+    /// Liveness tier from the agent (§7.4).
+    status: protocol.Attached.AttachStatus,
+    /// The byte offset the grid snapshot was captured at (§7.3); the pane's
+    /// `discard_below` was set to this on `.alive`.
+    snapshot_at_offset: u64,
+    /// The session already had an attached bridge (§5.3). When true with
+    /// `force=false`, the caller may retry `attachChannel(..., force=true)` to steal.
+    attached_elsewhere: bool,
+    /// Present iff `status == .dead` (tombstone exit code, §7.1/§7.4).
+    exit_code: ?i64,
+    rows: u16,
+    cols: u16,
+    /// Duped from the reply and owned here (null when the reply omitted them).
+    cwd: ?[]u8,
+    title: ?[]u8,
+    alloc: Allocator,
+
+    /// Free any owned strings (`cwd`/`title`). Does NOT free `pane` — a live pane is
+    /// torn down via `closeChannel`/`detachChannel`.
+    pub fn deinit(self: *AttachOutcome) void {
+        if (self.cwd) |c| self.alloc.free(c);
+        if (self.title) |t| self.alloc.free(t);
+        self.* = undefined;
+    }
+};
+
 /// The client side of one remote connection's transport. Heap-allocated because
 /// the writer and the two reader threads all reference it for their lifetime.
 pub const Connection = struct {
@@ -417,6 +524,26 @@ pub const Connection = struct {
     /// Inbound DATA routing table (§3.4). The data reader pushes into it under its
     /// lock; the caller registers/deregisters the per-pane channels.
     channels: ring.ChannelTable,
+
+    // --- Channel/session lifecycle (increment 3) ------------------------------
+    /// `channel id → *Pane` for every pane this connection opened/attached. Guarded
+    /// by `panes_mutex`. The data reader consults it (separately from the channel
+    /// table) to apply the per-channel resync discard (§7.3) before routing; the
+    /// lifecycle methods insert/remove. Never locked while the channel-table lock is
+    /// held (and vice-versa) — the two locks are always taken independently, so
+    /// there is no lock-ordering inversion with the §3.4 push path.
+    panes_mutex: std.Thread.Mutex = .{},
+    panes: std.AutoHashMapUnmanaged(u128, *Pane) = .empty,
+
+    /// Pending control-channel RPCs awaiting their reply (OPEN→OPENED,
+    /// ATTACH→ATTACHED), keyed by request `Frame.channel`. Guarded by `rpc_mutex`.
+    /// The control reader fills + wakes the matching slot; `shutdown` fails them all.
+    rpc_mutex: std.Thread.Mutex = .{},
+    pending: std.AutoHashMapUnmanaged(u128, *PendingRpc) = .empty,
+    /// Set by `failPendingRpcs` (shutdown) under `rpc_mutex`. Once set, no new RPC
+    /// may park — `rpcCall` fails immediately — closing the register-then-shutdown
+    /// race where a slot is inserted just after `failPendingRpcs` already iterated.
+    rpc_closed: bool = false,
 
     // --- MPSC writer queue ----------------------------------------------------
     write_mutex: std.Thread.Mutex = .{},
@@ -783,6 +910,14 @@ pub const Connection = struct {
             self.completeHandshake(error.Incompatible);
         }
 
+        // Fail every parked RPC caller BEFORE joining so an OPEN/ATTACH blocked on
+        // `done.wait()` wakes promptly (its caller may be the thread joining nothing
+        // here, but in general it is a separate caller thread). After the readers
+        // join, no new slot can be filled, so do it once here; callers remove their
+        // own slot, but mark+set unblocks them regardless. (Filling under the lock,
+        // setting after — same claim-then-act discipline as the handshake unblock.)
+        self.failPendingRpcs();
+
         if (writer) |t| t.join();
         if (control) |t| t.join();
         if (data) |t| t.join();
@@ -813,7 +948,305 @@ pub const Connection = struct {
         assert(self.heartbeat_thread == null);
         self.write_queue.deinit(alloc);
         self.channels.deinit();
+        // Any panes still registered at destroy (the caller didn't close/detach
+        // them) are freed here so the connection owns no leaks. Their channels were
+        // already deregistered-or-irrelevant since all threads have joined.
+        var it = self.panes.iterator();
+        while (it.next()) |entry| {
+            const pane = entry.value_ptr.*;
+            pane.ring.deinit(alloc);
+            alloc.destroy(pane.ring);
+            alloc.free(pane.session_id);
+            alloc.destroy(pane);
+        }
+        self.panes.deinit(alloc);
+        // The pending map must be empty after `shutdown` (it fails+removes all).
+        assert(self.pending.count() == 0);
+        self.pending.deinit(alloc);
         alloc.destroy(self);
+    }
+
+    // --- Channel / session lifecycle (increment 3, §3.3/§4.2/§7.3) -----------
+
+    /// Open a brand-new remote session (§3.3 open-new). Mints a fresh
+    /// cryptographically-random channel id (§7.1 — NEVER reused), registers an
+    /// inbound ring for it, sends `OPEN` (JSON) on that channel, awaits
+    /// `OPENED{session_id, pid}`, and returns the owned `*Pane`. On any failure
+    /// nothing is left registered and the pane is not created (caller owns nothing).
+    ///
+    /// `open` is the §4.2 payload (cwd/command/shell/term/env/rows/cols/...). The
+    /// caller need not set a channel — this method owns channel-id minting.
+    pub fn openChannel(self: *Connection, open: protocol.Open) !*Pane {
+        const id = std.crypto.random.int(u128);
+
+        // Allocate + register the inbound ring first so any inbound DATA that races
+        // the OPENED reply already has a home (the agent only streams DATA after it
+        // has sent OPENED, but registering first is harmless and simpler).
+        const ch = try self.alloc.create(ring.Channel);
+        errdefer self.alloc.destroy(ch);
+        ch.* = try ring.Channel.init(self.alloc, id, .{});
+        errdefer ch.deinit(self.alloc);
+        try self.registerChannel(ch);
+        errdefer self.deregisterChannel(id);
+
+        // Send OPEN and await OPENED on the same channel id.
+        const open_json = try protocol.encodeJson(self.alloc, open);
+        defer self.alloc.free(open_json);
+        const reply = try self.rpcCall(id, .open, .opened, open_json);
+        defer self.alloc.free(reply);
+
+        var parsed = protocol.parseJson(protocol.Opened, self.alloc, reply) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        const session_id = try self.alloc.dupe(u8, parsed.value.session_id);
+        errdefer self.alloc.free(session_id);
+
+        const pane = try self.alloc.create(Pane);
+        errdefer self.alloc.destroy(pane);
+        pane.* = .{
+            .id = id,
+            .session_id = session_id,
+            .pid = parsed.value.pid,
+            .ring = ch,
+        };
+        try self.trackPane(pane);
+        return pane;
+    }
+
+    /// Re-attach to an existing session (§3.3 attach / §7.3 sequence-anchored
+    /// resync / §5.3 steal). Mints a fresh channel id (§7.1), registers an inbound
+    /// ring, sends `ATTACH{session_id, rows, cols, last_byte_offset, force}`, and
+    /// awaits `ATTACHED`. Returns an `AttachOutcome`:
+    ///   - `.alive`: a live `*Pane` is returned (registered + tracked) with
+    ///     `discard_below = snapshot_at_offset` so the data reader drops already-
+    ///     applied DATA (§7.3).
+    ///   - `.dead` / `.not_found`: no pane; the channel is deregistered/freed here.
+    ///   - `attached_elsewhere && !force`: no pane; the caller may retry with
+    ///     `force=true` to steal (§5.3). We do NOT auto-steal.
+    ///
+    /// The caller frees the outcome's `cwd`/`title` via `AttachOutcome.deinit`.
+    pub fn attachChannel(
+        self: *Connection,
+        session_id: []const u8,
+        rows: u16,
+        cols: u16,
+        last_byte_offset: u64,
+        force: bool,
+    ) !AttachOutcome {
+        const id = std.crypto.random.int(u128);
+
+        // The ring is registered for the duration of the call. On any early return
+        // (error, dead/not_found, or a non-forced steal) we tear it back down; only
+        // a kept pane disarms this by flipping `keep_channel`.
+        const ch = try self.alloc.create(ring.Channel);
+        errdefer self.alloc.destroy(ch);
+        ch.* = try ring.Channel.init(self.alloc, id, .{});
+        errdefer ch.deinit(self.alloc);
+        try self.registerChannel(ch);
+        var keep_channel = false;
+        errdefer if (!keep_channel) self.deregisterChannel(id);
+
+        const attach: protocol.Attach = .{
+            .session_id = session_id,
+            .rows = rows,
+            .cols = cols,
+            .last_byte_offset = last_byte_offset,
+            .force = force,
+        };
+        const attach_json = try protocol.encodeJson(self.alloc, attach);
+        defer self.alloc.free(attach_json);
+        const reply = try self.rpcCall(id, .attach, .attached, attach_json);
+        defer self.alloc.free(reply);
+
+        var parsed = protocol.parseJson(protocol.Attached, self.alloc, reply) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        const a = parsed.value;
+
+        const cwd = if (a.cwd) |c| try self.alloc.dupe(u8, c) else null;
+        errdefer if (cwd) |c| self.alloc.free(c);
+        const title = if (a.title) |t| try self.alloc.dupe(u8, t) else null;
+        errdefer if (title) |t| self.alloc.free(t);
+
+        var outcome: AttachOutcome = .{
+            .pane = null,
+            .status = a.status,
+            .snapshot_at_offset = a.snapshot_at_offset,
+            .attached_elsewhere = a.attached_elsewhere,
+            .exit_code = a.exit_code,
+            .rows = a.rows,
+            .cols = a.cols,
+            .cwd = cwd,
+            .title = title,
+            .alloc = self.alloc,
+        };
+
+        // Only a live, non-stolen attach yields a pane. For everything else
+        // (.dead/.not_found, or a non-forced steal) we keep no pane and explicitly
+        // tear the channel back down here (a value return doesn't fire `errdefer`).
+        const keep = a.status == .alive and !(a.attached_elsewhere and !force);
+        if (!keep) {
+            self.deregisterChannel(id);
+            ch.deinit(self.alloc);
+            self.alloc.destroy(ch);
+            return outcome; // value return: no errdefer fires
+        }
+
+        const sid = try self.alloc.dupe(u8, session_id);
+        errdefer self.alloc.free(sid);
+        const pane = try self.alloc.create(Pane);
+        errdefer self.alloc.destroy(pane);
+        pane.* = .{
+            .id = id,
+            .session_id = sid,
+            .pid = 0, // an attach does not report a pid (OPENED does)
+            .ring = ch,
+            .discard_below = a.snapshot_at_offset,
+            // Arm the resync discard only if there is actually something to drop.
+            .resync_active = a.snapshot_at_offset > 0,
+        };
+        try self.trackPane(pane);
+        keep_channel = true; // the pane now owns the registered ring
+        outcome.pane = pane;
+        return outcome;
+    }
+
+    /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote
+    /// session), then deregister and free the pane locally. The caller MUST have
+    /// stopped its consumer from draining `pane.ring` first (teardown order §3.4).
+    /// Closing is best-effort on the wire (a dead link drops the frame); the local
+    /// teardown always completes.
+    pub fn closeChannel(self: *Connection, pane: *Pane) void {
+        self.writeControl(.close, pane.id, "") catch {};
+        self.teardownPane(pane);
+    }
+
+    /// Detach a pane (§3.3 / `Exec.deinit` analogue): send `DETACH` (stop streaming
+    /// but KEEP the remote session alive for a later re-attach), then deregister and
+    /// free the pane locally. Same teardown-order precondition as `closeChannel`.
+    pub fn detachChannel(self: *Connection, pane: *Pane) void {
+        self.writeControl(.detach, pane.id, "") catch {};
+        self.teardownPane(pane);
+    }
+
+    /// Frame `bytes` as DATA with the pane's monotonic outbound `byte_offset` (§4.2)
+    /// and enqueue it on the data stream. The offset advances by `bytes.len` so the
+    /// agent can resync the client→agent stream. Safe to call from the pane's IO
+    /// thread (the only writer of `pane.out_offset`).
+    pub fn writeInput(self: *Connection, pane: *Pane, bytes: []const u8) !void {
+        const offset = pane.out_offset.advance(bytes.len);
+        try self.writeData(pane.id, offset, bytes);
+    }
+
+    /// Insert `pane` into the `panes` map under `panes_mutex`.
+    fn trackPane(self: *Connection, pane: *Pane) !void {
+        self.panes_mutex.lock();
+        defer self.panes_mutex.unlock();
+        try self.panes.put(self.alloc, pane.id, pane);
+    }
+
+    /// Common local teardown for `closeChannel`/`detachChannel`: remove the pane
+    /// from the resync map, deregister its channel under the table lock (after which
+    /// no `pushTo` can touch the ring), then free the ring, session id, and pane.
+    fn teardownPane(self: *Connection, pane: *Pane) void {
+        self.panes_mutex.lock();
+        _ = self.panes.remove(pane.id);
+        self.panes_mutex.unlock();
+
+        // Deregister under the table lock: any in-flight `pushTo` has finished and no
+        // new one can find the channel, so the ring is safe to free (§3.4 invariant).
+        self.deregisterChannel(pane.id);
+        pane.ring.deinit(self.alloc);
+        self.alloc.destroy(pane.ring);
+        self.alloc.free(pane.session_id);
+        self.alloc.destroy(pane);
+    }
+
+    /// Issue a control-channel RPC on `channel` and block until the matching reply
+    /// (`want`) arrives, or the link closes. Parks a `PendingRpc` (stack-owned)
+    /// keyed by `channel`, sends the request, then waits on the slot's event. The
+    /// returned slice is the duped reply payload (caller frees). The slot is always
+    /// removed from the map before returning.
+    fn rpcCall(
+        self: *Connection,
+        channel: u128,
+        req: protocol.FrameType,
+        want: protocol.FrameType,
+        payload: []const u8,
+    ) ![]u8 {
+        var slot: PendingRpc = .{ .want = want };
+
+        // Register the slot, refusing to start a second RPC on the same channel id
+        // (the ids are CSPRNG-unique per call, so this only guards programmer error).
+        self.rpc_mutex.lock();
+        if (self.rpc_closed) {
+            // Already shutting down: don't park (we'd hang — `failPendingRpcs` has
+            // run). Fail fast under the same lock that gates registration.
+            self.rpc_mutex.unlock();
+            return error.ConnectionClosed;
+        }
+        if (self.pending.contains(channel)) {
+            self.rpc_mutex.unlock();
+            return error.RpcInFlight;
+        }
+        self.pending.put(self.alloc, channel, &slot) catch |e| {
+            self.rpc_mutex.unlock();
+            return e;
+        };
+        self.rpc_mutex.unlock();
+        // From here, always remove our slot before returning.
+        defer {
+            self.rpc_mutex.lock();
+            _ = self.pending.remove(channel);
+            self.rpc_mutex.unlock();
+        }
+
+        try self.writeControl(req, channel, payload);
+        slot.done.wait();
+        return slot.result; // []u8 (caller-owned) or a PendingError
+    }
+
+    /// Deliver a reply frame to a parked RPC caller, if one is waiting on this
+    /// `channel`. Called by the control reader's internal handler. Dupes the payload
+    /// into the slot (the caller frees it), or stores `WrongReply` on a type
+    /// mismatch, then sets the slot's event. Returns true if it consumed a waiter.
+    fn deliverRpcReply(self: *Connection, frame: protocol.Frame) bool {
+        self.rpc_mutex.lock();
+        const slot = self.pending.get(frame.channel) orelse {
+            self.rpc_mutex.unlock();
+            return false;
+        };
+        // Fill the result under the lock so it is published before `done.set()`.
+        if (frame.type != slot.want) {
+            slot.result = error.WrongReply;
+        } else if (self.alloc.dupe(u8, frame.payload)) |owned| {
+            slot.result = owned;
+        } else |_| {
+            slot.result = error.MalformedReply;
+        }
+        const done = &slot.done;
+        self.rpc_mutex.unlock();
+        done.set();
+        return true;
+    }
+
+    /// Fail every still-parked RPC caller with `ConnectionClosed` (called by
+    /// `shutdown`). We only set the result + event; the caller removes its own slot.
+    fn failPendingRpcs(self: *Connection) void {
+        self.rpc_mutex.lock();
+        // Latch closed so any RPC that registers AFTER this iteration fails fast in
+        // `rpcCall` rather than parking forever (the register-vs-shutdown race).
+        self.rpc_closed = true;
+        var it = self.pending.valueIterator();
+        while (it.next()) |slot_ptr| {
+            const slot = slot_ptr.*;
+            if (!slot.done.isSet()) {
+                slot.result = error.ConnectionClosed;
+                slot.done.set();
+            }
+        }
+        self.rpc_mutex.unlock();
     }
 
     // --- Writer thread (MPSC drain) ------------------------------------------
@@ -942,13 +1375,20 @@ pub const Connection = struct {
     }
 
     /// Internal control-frame handling done by the control reader BEFORE the user
-    /// handler (increment 2). Consumes health/lifecycle semantics additively:
+    /// handler (increment 2 + 3). Consumes health/lifecycle semantics additively:
+    ///   - `.opened`/`.attached` → wake the parked RPC caller for that channel (§4.2).
     ///   - `.pong`  → match by hb_seq, sample RTT, reset misses, FSM → connected.
     ///   - `.ping`  → reply with a `.pong` echoing the timestamp (bidirectional).
     ///   - `.detached` → record eviction (§5.3) and drive the FSM to DEAD.
     /// Other frame types are ignored here (the user handler still sees them).
     fn handleControlInternal(self: *Connection, frame: protocol.Frame) void {
         switch (frame.type) {
+            .opened, .attached => {
+                // Reply to an OPEN/ATTACH RPC: hand the payload to the parked caller
+                // keyed by this channel id. If no caller is waiting (stale/duplicate
+                // reply), it's dropped here; the user handler still observes it.
+                _ = self.deliverRpcReply(frame);
+            },
             .pong => {
                 const hb = Heartbeat.decode(frame.payload) catch return;
                 self.onPong(hb);
@@ -1028,10 +1468,73 @@ pub const Connection = struct {
         self.handshake_done.set();
     }
 
+    /// Route one inbound DATA chunk for `channel` into its ring, applying the §7.3
+    /// sequence-anchored resync discard and §4.3 FLOW{pause} emission.
+    ///
+    /// Resync (§7.3): if the channel's pane has `resync_active` with a `discard_below`
+    /// watermark `W`, we push only the bytes whose ABSOLUTE offset is `> W`. The chunk
+    /// spans `[byte_offset, byte_offset + len)`:
+    ///   - ends at/below `W` (`byte_offset + len <= W`) → drop the whole chunk;
+    ///   - straddles `W` → drop the prefix, push the suffix `(W - byte_offset ..]`;
+    ///   - starts above `W` → push whole (and we can disarm resync — watermark passed).
+    /// This is byte-accurate, not whole-frame-approximate. We track no separate
+    /// `applied_offset` beyond `discard_below` because the watermark fully determines
+    /// the cut and the agent guarantees in-order, gap-free DATA after the snapshot.
+    ///
+    /// FLOW (§4.3): when the channel-table push reports `send_pause` (ring crossed
+    /// high-water), emit one `FLOW{channel, pause}` on the control lane. FLOW{resume}
+    /// is emitted by the pane's CONSUMER thread once it drains back under low-water
+    /// (a later increment, in `termio.Remote`) — NOT here.
+    fn routeInboundData(self: *Connection, channel: u128, byte_offset: u64, bytes: []const u8) void {
+        var to_push = bytes;
+
+        // Consult the per-channel resync watermark (separate lock from the table).
+        self.panes_mutex.lock();
+        if (self.panes.get(channel)) |pane| {
+            if (pane.resync_active) {
+                // §7.3: discard every byte whose ABSOLUTE offset is <= W; keep offset
+                // > W. The first absolute offset we keep is `keep_from = W + 1`.
+                const keep_from = pane.discard_below + 1;
+                const chunk_end = byte_offset +% bytes.len; // exclusive
+                if (chunk_end <= keep_from) {
+                    // Last byte's offset (chunk_end-1) is still <= W: drop it all,
+                    // stay armed for the next chunk.
+                    self.panes_mutex.unlock();
+                    return;
+                } else if (byte_offset < keep_from) {
+                    // Straddles: drop the prefix below `keep_from`, push the suffix.
+                    const drop: usize = @intCast(keep_from - byte_offset);
+                    to_push = bytes[drop..];
+                    pane.resync_active = false; // watermark crossed
+                } else {
+                    // Starts at/above `keep_from`: keep whole, disarm.
+                    pane.resync_active = false;
+                }
+            }
+        }
+        self.panes_mutex.unlock();
+
+        // Route the (possibly trimmed) bytes; `.unknown` (stale/hostile channel) is
+        // dropped. On a high-water crossing, emit a single FLOW{pause}.
+        const res = self.channels.pushTo(channel, to_push);
+        switch (res) {
+            .unknown => {},
+            .routed => |push| {
+                if (push.send_pause) {
+                    var buf: [protocol.Flow.encoded_len]u8 = undefined;
+                    const flow: protocol.Flow = .{ .channel = channel, .op = .pause };
+                    _ = flow.encodeInto(&buf);
+                    // Best-effort: a dead link surfaces via the readers' EOF path.
+                    self.writeControl(.flow, protocol.control_channel, &buf) catch {};
+                }
+            },
+        }
+    }
+
     /// The data reader. Loops read → push → drain. For each DATA frame, decode the
-    /// payload and route the raw child bytes into the target channel's inbound ring
-    /// (`pushTo`). An unknown channel id is dropped (§15 M3 — never crash). Non-DATA
-    /// frames on the data stream are ignored. Exits on EOF or a protocol error.
+    /// payload and route the raw child bytes via `routeInboundData` (resync discard
+    /// §7.3 + FLOW{pause} §4.3). An unknown channel id is dropped (§15 M3 — never
+    /// crash). Non-DATA frames on the data stream are ignored. Exits on EOF/error.
     fn dataReaderLoop(self: *Connection) void {
         var reader = protocol.Reader.init(self.alloc, self.encoding);
         defer reader.deinit();
@@ -1044,8 +1547,7 @@ pub const Connection = struct {
             }) |frame| {
                 if (frame.type != .data) continue; // ignore non-DATA on this lane
                 const dp = protocol.DataPayload.decode(frame.payload) catch continue;
-                // Route the raw bytes; `.unknown` (stale/hostile channel) is dropped.
-                _ = self.channels.pushTo(frame.channel, dp.bytes);
+                self.routeInboundData(frame.channel, dp.byte_offset, dp.bytes);
             }
             const n = self.data.read(&scratch) catch {
                 self.signalTransportError();
@@ -1316,6 +1818,13 @@ const MockAgent = struct {
         defer wire.deinit(self.alloc);
         try protocol.writeFrame(self.alloc, self.encoding, frame, &wire);
         try self.stream.writeAll(wire.items);
+    }
+
+    /// Send a JSON control frame (OPENED/ATTACHED/...) on `channel`.
+    fn sendJson(self: *MockAgent, ftype: protocol.FrameType, channel: u128, value: anytype) !void {
+        const json = try protocol.encodeJson(self.alloc, value);
+        defer self.alloc.free(json);
+        try self.sendFrame(.{ .type = ftype, .channel = channel, .seq = 0, .payload = json });
     }
 
     /// Read the client HELLO and reply with an agent HELLO in the same encoding.
@@ -2146,4 +2655,480 @@ test "reader EOF (agent closes) drives onTransportError → reconnecting" {
 
     ath.join();
     conn.shutdown();
+}
+
+// =============================================================================
+// Increment 3 tests: channel/session lifecycle, resync (§7.3), steal (§5.3),
+// FLOW{pause} (§4.3)
+// =============================================================================
+
+/// A lifecycle-aware mock agent. Handshakes on the control stream, then services
+/// control frames on its own thread:
+///   - `OPEN`   → reply `OPENED{session_id, pid}` on the same channel.
+///   - `ATTACH` → reply `ATTACHED{...}` (configurable) on the same channel.
+///   - `CLOSE`  / `DETACH` → record which arrived (and the channel).
+///   - `PING`   → reply `PONG` (so the link stays healthy during a test).
+/// The channel id the client minted is observed from the OPEN/ATTACH frame and
+/// published via `seen_channel` + `saw_request` so the test can send DATA on it.
+const LifecycleAgent = struct {
+    ctrl: *MockAgent,
+    alloc: Allocator,
+
+    // OPENED reply contents.
+    session_id: []const u8 = "sess-1",
+    pid: i64 = 4242,
+
+    // ATTACHED reply contents (only used when an ATTACH arrives).
+    attach_status: protocol.Attached.AttachStatus = .alive,
+    snapshot_at_offset: u64 = 0,
+    attached_elsewhere_first: bool = false, // true → first ATTACH reports stolen
+    exit_code: ?i64 = null,
+
+    // Observations (atomics / events so the test thread can read them safely).
+    seen_channel: std.atomic.Value(u128) = .{ .raw = 0 },
+    saw_request: std.Thread.ResetEvent = .{},
+    saw_close: std.atomic.Value(bool) = .{ .raw = false },
+    saw_detach: std.atomic.Value(bool) = .{ .raw = false },
+    close_detach_seen: std.Thread.ResetEvent = .{},
+    attach_count: std.atomic.Value(u32) = .{ .raw = 0 },
+    err: ?anyerror = null,
+
+    fn run(self: *LifecycleAgent) void {
+        self.body() catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn body(self: *LifecycleAgent) !void {
+        _ = try self.ctrl.handshake();
+        while (true) {
+            const frame = (try self.ctrl.nextFrame()) orelse return; // EOF: done
+            switch (frame.type) {
+                .open => {
+                    self.seen_channel.store(frame.channel, .monotonic);
+                    self.saw_request.set();
+                    try self.ctrl.sendJson(.opened, frame.channel, protocol.Opened{
+                        .session_id = self.session_id,
+                        .pid = self.pid,
+                    });
+                },
+                .attach => {
+                    const n = self.attach_count.fetchAdd(1, .monotonic);
+                    self.seen_channel.store(frame.channel, .monotonic);
+                    self.saw_request.set();
+                    // If configured, the FIRST attach reports attached_elsewhere; a
+                    // retry (which carries force=true) succeeds.
+                    const elsewhere = self.attached_elsewhere_first and n == 0;
+                    try self.ctrl.sendJson(.attached, frame.channel, protocol.Attached{
+                        .status = self.attach_status,
+                        .rows = 24,
+                        .cols = 80,
+                        .cwd = "/home/me",
+                        .title = "remote",
+                        .snapshot_at_offset = self.snapshot_at_offset,
+                        .exit_code = self.exit_code,
+                        .attached_elsewhere = elsewhere,
+                    });
+                },
+                .close => {
+                    self.saw_close.store(true, .monotonic);
+                    self.close_detach_seen.set();
+                },
+                .detach => {
+                    self.saw_detach.store(true, .monotonic);
+                    self.close_detach_seen.set();
+                },
+                .ping => {
+                    var buf: [Heartbeat.encoded_len]u8 = undefined;
+                    const hb = try Heartbeat.decode(frame.payload);
+                    _ = hb.encodeInto(&buf);
+                    try self.ctrl.sendFrame(.{
+                        .type = .pong,
+                        .channel = protocol.control_channel,
+                        .seq = 0,
+                        .payload = &buf,
+                    });
+                },
+                else => {},
+            }
+        }
+    }
+};
+
+/// Shared scaffolding for the lifecycle tests: a control + data loopback, a
+/// Connection (raw encoding, long heartbeat so it doesn't interfere), a started
+/// lifecycle agent thread, and a separate data-stream MockAgent for DATA.
+const LifecycleHarness = struct {
+    alloc: Allocator,
+    ctrl_lb: Loopback,
+    data_lb: Loopback,
+    conn: *Connection,
+    ctrl_agent: MockAgent,
+    data_agent: MockAgent,
+    agent: LifecycleAgent,
+    thread: std.Thread = undefined,
+
+    fn create(alloc: Allocator) !*LifecycleHarness {
+        const h = try alloc.create(LifecycleHarness);
+        h.* = .{
+            .alloc = alloc,
+            .ctrl_lb = Loopback.init(alloc),
+            .data_lb = Loopback.init(alloc),
+            .conn = undefined,
+            .ctrl_agent = undefined,
+            .data_agent = undefined,
+            .agent = undefined,
+        };
+        h.conn = try Connection.createOpts(
+            alloc,
+            h.ctrl_lb.clientStream(),
+            h.data_lb.clientStream(),
+            .{ .transfer_encoding = .raw },
+            .{ .heartbeat_interval_ms = 100_000 }, // effectively never during a test
+        );
+        h.ctrl_agent = MockAgent.init(alloc, h.ctrl_lb.agentStream(), .raw);
+        h.data_agent = MockAgent.init(alloc, h.data_lb.agentStream(), .raw);
+        h.agent = .{ .ctrl = &h.ctrl_agent, .alloc = alloc };
+        return h;
+    }
+
+    /// Configure the agent BEFORE calling `start` (the agent thread reads the
+    /// config fields). Returns a pointer for in-place tweaks.
+    fn configure(h: *LifecycleHarness) *LifecycleAgent {
+        return &h.agent;
+    }
+
+    fn start(h: *LifecycleHarness) !void {
+        h.thread = try std.Thread.spawn(.{}, LifecycleAgent.run, .{&h.agent});
+        try h.conn.start();
+        _ = try h.conn.waitHandshake();
+    }
+
+    fn destroy(h: *LifecycleHarness) void {
+        h.conn.shutdown();
+        h.thread.join();
+        h.conn.destroy(h.alloc);
+        h.ctrl_agent.deinit();
+        h.data_agent.deinit();
+        h.ctrl_lb.deinit();
+        h.data_lb.deinit();
+        h.alloc.destroy(h);
+    }
+};
+
+test "openChannel: returns a pane with the agent's session_id/pid and routes DATA" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.session_id = "session-abc";
+    a.pid = 9001;
+    try h.start();
+
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
+
+    // The agent received a well-formed OPEN on the pane's channel id.
+    a.saw_request.wait();
+    try testing.expectEqual(pane.id, a.seen_channel.load(.monotonic));
+    // The pane carries the agent-assigned identity.
+    try testing.expectEqualStrings("session-abc", pane.session_id);
+    try testing.expectEqual(@as(i64, 9001), pane.pid);
+
+    // Subsequent agent DATA on that channel lands in the pane's ring.
+    try agentSendData(&h.data_agent, pane.id, 0, "hello from the agent");
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, "hello from the agent".len);
+    try testing.expectEqualStrings("hello from the agent", got.items);
+
+    try testing.expect(a.err == null);
+    // Teardown the pane explicitly (consumer has stopped draining: the test owns it).
+    h.conn.closeChannel(pane);
+}
+
+test "writeInput: bytes reach the agent as DATA with monotonic byte_offset" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    try h.start();
+
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80 });
+    h.agent.saw_request.wait();
+
+    // Two writes; the agent should see them as DATA with offsets 0 then 5.
+    try h.conn.writeInput(pane, "hello");
+    try h.conn.writeInput(pane, "world!");
+
+    const f1 = (try h.data_agent.nextFrame()) orelse return error.NoData;
+    try testing.expectEqual(protocol.FrameType.data, f1.type);
+    try testing.expectEqual(pane.id, f1.channel);
+    const dp1 = try protocol.DataPayload.decode(f1.payload);
+    try testing.expectEqual(@as(u64, 0), dp1.byte_offset);
+    try testing.expectEqualStrings("hello", dp1.bytes);
+
+    const f2 = (try h.data_agent.nextFrame()) orelse return error.NoData;
+    const dp2 = try protocol.DataPayload.decode(f2.payload);
+    try testing.expectEqual(@as(u64, 5), dp2.byte_offset); // advanced by "hello".len
+    try testing.expectEqualStrings("world!", dp2.bytes);
+
+    h.conn.closeChannel(pane);
+}
+
+test "attachChannel: alive with snapshot — byte-accurate resync discard (§7.3)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .alive;
+    a.snapshot_at_offset = 10; // discard absolute offsets <= 10; keep > 10
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("session-xyz", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, outcome.status);
+    try testing.expectEqual(@as(u64, 10), outcome.snapshot_at_offset);
+    try testing.expect(!outcome.attached_elsewhere);
+    const pane = outcome.pane orelse return error.NoPane;
+    try testing.expectEqualStrings("/home/me", outcome.cwd.?);
+    try testing.expectEqualStrings("remote", outcome.title.?);
+
+    h.agent.saw_request.wait();
+    const ch = pane.id;
+
+    // Frame A: offsets [0,5) — entirely <= 10 → dropped whole.
+    try agentSendData(&h.data_agent, ch, 0, "AAAAA");
+    // Frame B: offsets [5,15) — straddles 10. Bytes at abs 5..10 dropped (<=10),
+    // bytes at abs 11..14 kept ("PpQq" below maps so that the kept suffix is the
+    // last 4 bytes). 10-byte payload: indices 0..9 → abs 5..14. Keep abs > 10 ⇒
+    // abs 11,12,13,14 ⇒ indices 6,7,8,9.
+    try agentSendData(&h.data_agent, ch, 5, "0123456789");
+    // Frame C: offsets [15,20) — all > 10 → kept whole.
+    try agentSendData(&h.data_agent, ch, 15, "TAILX");
+
+    // Expected landed bytes: suffix of B (indices 6..9 = "6789") + all of C.
+    const expected = "6789TAILX";
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, expected.len);
+    try testing.expectEqualStrings(expected, got.items);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "attachChannel: dead status surfaces exit_code; no pane" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.exit_code = 137;
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("gone", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.dead, outcome.status);
+    try testing.expectEqual(@as(i64, 137), outcome.exit_code.?);
+    try testing.expect(outcome.pane == null);
+}
+
+test "attachChannel: not_found surfaces; no pane" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .not_found;
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("nope", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.not_found, outcome.status);
+    try testing.expect(outcome.pane == null);
+}
+
+test "attachChannel: steal — attached_elsewhere without force, then force succeeds (§5.3)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .alive;
+    a.attached_elsewhere_first = true; // first ATTACH reports stolen
+    try h.start();
+
+    // First attempt: no force → attached_elsewhere, no pane (we do NOT auto-steal).
+    var first = try h.conn.attachChannel("contended", 24, 80, 0, false);
+    defer first.deinit();
+    try testing.expect(first.attached_elsewhere);
+    try testing.expect(first.pane == null);
+
+    // Retry with force=true → the agent (n==1) no longer reports elsewhere; success.
+    var second = try h.conn.attachChannel("contended", 24, 80, 0, true);
+    defer second.deinit();
+    try testing.expect(!second.attached_elsewhere);
+    const pane = second.pane orelse return error.NoPane;
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, second.status);
+
+    try testing.expectEqual(@as(u32, 2), a.attach_count.load(.monotonic));
+    h.conn.closeChannel(pane);
+}
+
+test "FLOW pause: a full undrained ring makes the agent receive FLOW{channel, pause} (§4.3)" {
+    const alloc = testing.allocator;
+    // Small control/data loopback; a tiny-capacity channel so a little DATA fills it.
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    const conn = try Connection.createOpts(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+        .{ .heartbeat_interval_ms = 100_000 },
+    );
+    defer conn.destroy(alloc);
+
+    var ctrl_agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer ctrl_agent.deinit();
+    var data_agent = MockAgent.init(alloc, data_lb.agentStream(), .raw);
+    defer data_agent.deinit();
+
+    // Register a small channel directly (no pane needed for the pure FLOW path);
+    // capacity 64, high_water 48 so ~48 undrained bytes trip the pause edge.
+    const ch_id: u128 = 0xF10F10;
+    var ch = try ring.Channel.init(alloc, ch_id, .{ .capacity = 64, .high_water = 48, .low_water = 8 });
+    defer ch.deinit(alloc);
+    try conn.registerChannel(&ch);
+
+    // The control agent answers the handshake (and would PONG, but we never PING).
+    var hctx = HandshakeAgentCtx{ .agent = &ctrl_agent };
+    const cth = try std.Thread.spawn(.{}, HandshakeAgentCtx.run, .{&hctx});
+
+    try conn.start();
+    _ = try conn.waitHandshake();
+    cth.join();
+
+    // Drive enough DATA (never draining the ring) to cross high-water.
+    const block = [_]u8{'x'} ** 16;
+    var off: u64 = 0;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try agentSendData(&data_agent, ch_id, off, &block);
+        off += block.len;
+    }
+
+    // The client's data reader must emit exactly a FLOW{pause} for this channel on
+    // the control lane. Read control frames until we see it.
+    var saw_pause = false;
+    var guard: usize = 0;
+    while (!saw_pause) {
+        guard += 1;
+        if (guard > 1000) return error.NoFlowPause;
+        const frame = (try ctrl_agent.nextFrame()) orelse break;
+        if (frame.type == .flow) {
+            const flow = try protocol.Flow.decode(frame.payload);
+            try testing.expectEqual(ch_id, flow.channel);
+            try testing.expectEqual(protocol.FlowOp.pause, flow.op);
+            saw_pause = true;
+        }
+    }
+    try testing.expect(saw_pause);
+
+    conn.shutdown();
+    conn.deregisterChannel(ch_id);
+}
+
+test "closeChannel sends CLOSE and deregisters; later DATA is dropped" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    try h.start();
+
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80 });
+    h.agent.saw_request.wait();
+    const ch = pane.id;
+
+    h.conn.closeChannel(pane);
+    // The agent must receive a CLOSE frame.
+    h.agent.close_detach_seen.wait();
+    try testing.expect(h.agent.saw_close.load(.monotonic));
+    try testing.expect(!h.agent.saw_detach.load(.monotonic));
+
+    // A later DATA to that (now-unknown) channel id must be dropped, not crash.
+    try agentSendData(&h.data_agent, ch, 0, "after-close");
+    // Nudge the data reader a moment; nothing should crash (we can't read a freed
+    // ring, but the connection's data reader simply drops the unknown channel).
+    std.Thread.yield() catch {};
+}
+
+test "detachChannel sends DETACH (not CLOSE) and deregisters" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    try h.start();
+
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80 });
+    h.agent.saw_request.wait();
+    const ch = pane.id;
+
+    h.conn.detachChannel(pane);
+    h.agent.close_detach_seen.wait();
+    try testing.expect(h.agent.saw_detach.load(.monotonic));
+    try testing.expect(!h.agent.saw_close.load(.monotonic));
+
+    // Later DATA to the deregistered channel is dropped, no crash.
+    try agentSendData(&h.data_agent, ch, 0, "after-detach");
+    std.Thread.yield() catch {};
+}
+
+test "shutdown unblocks a parked OPEN caller with an error" {
+    const alloc = testing.allocator;
+    var ctrl_lb = Loopback.init(alloc);
+    defer ctrl_lb.deinit();
+    var data_lb = Loopback.init(alloc);
+    defer data_lb.deinit();
+
+    const conn = try Connection.createOpts(
+        alloc,
+        ctrl_lb.clientStream(),
+        data_lb.clientStream(),
+        .{ .transfer_encoding = .raw },
+        .{ .heartbeat_interval_ms = 100_000 },
+    );
+    defer conn.destroy(alloc);
+
+    // An agent that handshakes but NEVER replies to OPEN, so the call parks.
+    var agent = MockAgent.init(alloc, ctrl_lb.agentStream(), .raw);
+    defer agent.deinit();
+    var hctx = HandshakeAgentCtx{ .agent = &agent };
+    const ath = try std.Thread.spawn(.{}, HandshakeAgentCtx.run, .{&hctx});
+
+    try conn.start();
+    _ = try conn.waitHandshake();
+    ath.join();
+
+    // Park an openChannel on a background thread; shutdown must wake it with an err.
+    const OpenCaller = struct {
+        conn: *Connection,
+        result: anyerror!void = {},
+        done: std.Thread.ResetEvent = .{},
+        fn run(s: *@This()) void {
+            if (s.conn.openChannel(.{ .rows = 24, .cols = 80 })) |_| {
+                s.result = error.UnexpectedSuccess;
+            } else |e| {
+                s.result = e;
+            }
+            s.done.set();
+        }
+    };
+    var oc = OpenCaller{ .conn = conn };
+    const oth = try std.Thread.spawn(.{}, OpenCaller.run, .{&oc});
+
+    // Give the OPEN a moment to register its pending slot, then shut down.
+    // (No reply will come; shutdown is what unblocks it.)
+    conn.shutdown();
+    oc.done.wait();
+    oth.join();
+    try testing.expectError(error.ConnectionClosed, oc.result);
 }
