@@ -36,6 +36,21 @@ jobs:
         run: |
           zig build -Doptimize=ReleaseFast -Demit-macos-app -Dxcframework-target=native -Dversion-string="$VERSION"
 
+      - name: Verify release build mode
+        run: |
+          # Guard against ever publishing a Debug/ReleaseSafe build. Such a build
+          # shows the in-app "You're running a debug build" warning and is much
+          # slower. Assert the freshly built binary reports ReleaseFast before we
+          # codesign, notarize, and ship it via the Sparkle appcast.
+          APP="macos/build/ReleaseLocal/Ghoztty.app/Contents/MacOS/ghoztty"
+          VERSION_OUT="$("$APP" +version)"
+          echo "$VERSION_OUT"
+          if ! echo "$VERSION_OUT" | grep -qE 'build mode[[:space:]]*:[[:space:]]*\.ReleaseFast'; then
+            echo "::error::Refusing to release: built binary is not ReleaseFast (would ship a debug/safe build that shows the in-app debug warning and degrades performance)."
+            exit 1
+          fi
+          echo "✅ Verified ReleaseFast build."
+
       - name: Codesign app bundle
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
