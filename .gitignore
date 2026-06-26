@@ -32,3 +32,6 @@ vgcore.*
 temp/
 macos/macos/
 .superpowers/
+
+# Ephemeral git worktrees created by Claude Code subagents
+.claude/worktrees/
