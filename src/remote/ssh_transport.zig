@@ -54,6 +54,7 @@ const EnvMap = std.process.EnvMap;
 
 const connection = @import("connection.zig");
 const protocol = @import("protocol.zig");
+const client_mux = @import("client_mux.zig");
 
 const log = std.log.scoped(.remote_ssh);
 
@@ -287,6 +288,60 @@ pub fn buildArgs(
     return try list.toOwnedSlice(alloc);
 }
 
+/// Build args for the SINGLE-subprocess dial mode (§4.3): ONE
+/// `ssh host -- ghoztty-agent [--session=<uuid>]` invocation with NO `--channel`
+/// split. The single-process agent (`agent/main.zig`) multiplexes both lanes onto
+/// its one stdin/stdout, so the client folds its two logical lanes onto this one
+/// subprocess via `ClientMux`. There is no second subprocess, so no ControlMaster
+/// is needed; we keep `BatchMode`/`StrictHostKeyChecking`/port/jump/askpass.
+pub fn buildArgsSingle(
+    alloc: Allocator,
+    cfg: DialConfig,
+) ![]const [:0]const u8 {
+    var list: std.ArrayList([:0]const u8) = .empty;
+    errdefer list.deinit(alloc);
+
+    const H = struct {
+        fn add(l: *std.ArrayList([:0]const u8), a: Allocator, v: []const u8) !void {
+            try l.append(a, try a.dupeZ(u8, v));
+        }
+        fn addFmt(l: *std.ArrayList([:0]const u8), a: Allocator, comptime fmt: []const u8, fargs: anytype) !void {
+            try l.append(a, try std.fmt.allocPrintSentinel(a, fmt, fargs, 0));
+        }
+    };
+
+    try H.add(&list, alloc, "ssh");
+    try H.add(&list, alloc, "-o");
+    try H.add(&list, alloc, "BatchMode=no");
+    try H.add(&list, alloc, "-o");
+    try H.add(&list, alloc, "StrictHostKeyChecking=accept-new");
+
+    if (cfg.port != 0) {
+        try H.add(&list, alloc, "-p");
+        try H.addFmt(&list, alloc, "{d}", .{cfg.port});
+    }
+    if (cfg.jump) |j| {
+        try H.add(&list, alloc, "-J");
+        try H.add(&list, alloc, j);
+    }
+
+    if (cfg.user) |u| {
+        try H.addFmt(&list, alloc, "{s}@{s}", .{ u, cfg.host });
+    } else {
+        try H.add(&list, alloc, cfg.host);
+    }
+
+    // The remote command. No `--channel`: the single-process agent muxes both
+    // lanes onto its one stdio pipe pair.
+    try H.add(&list, alloc, "--");
+    try H.add(&list, alloc, cfg.agent_path);
+    if (cfg.session_id) |sid| {
+        try H.addFmt(&list, alloc, "--session={s}", .{sid});
+    }
+
+    return try list.toOwnedSlice(alloc);
+}
+
 /// Build the environment for the `ssh` subprocess: a copy of the parent
 /// environment plus the SSH_ASKPASS interactive-auth plumbing (§4.1). When
 /// `cfg.askpass_path` is null, only the parent env is returned (no askpass).
@@ -487,6 +542,101 @@ pub fn Transport(comptime CommandT: type) type {
     };
 }
 
+/// A live SINGLE-subprocess ssh transport (§4.3): ONE `ssh host -- ghoztty-agent`
+/// child, a `ClientMux` folding the client's two logical lanes onto that one
+/// `ChildStream`, and the `Connection` riding the mux's two lanes. This is the
+/// path that talks to the single-process agent WITHOUT daemonization (the
+/// two-channel `Transport` above is retained as the future daemon design).
+///
+/// Generic over `CommandT` exactly like `Transport`.
+pub fn SingleTransport(comptime CommandT: type) type {
+    return struct {
+        const Self = @This();
+        const Child = ChildChannel(CommandT);
+
+        alloc: Allocator,
+        child: Child,
+        mux: *client_mux.ClientMux,
+        conn: *connection.Connection,
+
+        /// Dial a remote connection over ONE ssh subprocess. Spawns the child,
+        /// stands up the `ClientMux` over its `ChildStream`, creates the
+        /// `Connection` over the mux's two lanes, spawns the inbound demux pump,
+        /// and `start`s the connection (queues the HELLO + spawns the pump
+        /// threads). Does NOT block on the handshake — the caller does that via
+        /// `Connection.waitHandshake`.
+        pub fn dial(alloc: Allocator, cfg: DialConfig) !*Self {
+            const self = try alloc.create(Self);
+            errdefer alloc.destroy(self);
+
+            const env = try buildEnv(alloc, cfg);
+            defer {
+                env.deinit();
+                alloc.destroy(env);
+            }
+
+            // ONE subprocess, no `--channel`.
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            const args = buildArgsSingle(arena.allocator(), cfg) catch |e| {
+                arena.deinit();
+                return e;
+            };
+            // `spawnChannel` only uses `channel` for a log label; `.control` is fine.
+            var child = spawnChannel(CommandT, alloc, args, env, .control) catch |e| {
+                arena.deinit();
+                return e;
+            };
+            arena.deinit();
+            errdefer teardownChild(CommandT, alloc, child);
+
+            // Pin the transfer encoding (§4.2). `.cobs` survives a CR/LF-mangling
+            // hop; the client decides the encoding (the agent echoes it).
+            const encoding: protocol.TransferEncoding = .cobs;
+
+            const mux = try client_mux.ClientMux.create(alloc, child.stream(), encoding);
+            errdefer mux.destroy();
+
+            const lanes = mux.streams();
+            const hello: protocol.Hello = .{ .transfer_encoding = encoding };
+            const conn = try connection.Connection.create(
+                alloc,
+                lanes.control,
+                lanes.data,
+                hello,
+            );
+            errdefer conn.destroy(alloc);
+
+            self.* = .{
+                .alloc = alloc,
+                .child = child,
+                .mux = mux,
+                .conn = conn,
+            };
+
+            // Spawn the inbound demux pump BEFORE starting the connection so the
+            // peer HELLO is demuxed onto the control lane as soon as it arrives.
+            _ = try self.mux.startPump();
+            try self.conn.start();
+            return self;
+        }
+
+        /// Shut down the connection (closes the lane streams → the mux closes the
+        /// underlying ChildStream → the child sees stdin EOF and exits, and the
+        /// pump's blocked read unblocks), join the pump, reap the child, and free.
+        pub fn deinit(self: *Self) void {
+            const alloc = self.alloc;
+            self.conn.shutdown();
+            self.conn.destroy(alloc);
+            // `shutdown` closed the lane streams, which closed the mux + transport.
+            self.mux.joinPump();
+            reapChild(CommandT, &self.child);
+            alloc.destroy(self.child.stream_impl);
+            self.mux.destroy();
+            alloc.destroy(self);
+        }
+    };
+}
+
 /// Build args for `channel`, spawn the subprocess, and free the args (the fork
 /// copied argv before exec). `env`/`cpath` are owned by the caller.
 fn spawnChild(
@@ -624,6 +774,36 @@ test "buildArgs: jump host" {
         if (std.mem.eql(u8, a, "bastion.example")) saw_jump = true;
     }
     try testing.expect(saw_j and saw_jump);
+}
+
+test "buildArgsSingle: ONE subprocess, no --channel, no ControlMaster" {
+    const alloc = testing.allocator;
+    const cfg: DialConfig = .{
+        .host = "host.example",
+        .user = "bob",
+        .port = 2222,
+        .agent_path = "/opt/ghoztty-agent",
+        .session_id = "abc-123",
+    };
+    const args = try buildArgsSingle(alloc, cfg);
+    defer {
+        for (args) |a| alloc.free(a);
+        alloc.free(args);
+    }
+    try testing.expectEqualStrings("ssh", args[0]);
+    var saw_dest = false;
+    var saw_agent = false;
+    var saw_session = false;
+    for (args) |a| {
+        // The single-process path must NOT split lanes or open a ControlMaster.
+        try testing.expect(std.mem.indexOf(u8, a, "--channel") == null);
+        try testing.expect(std.mem.indexOf(u8, a, "ControlMaster") == null);
+        try testing.expect(std.mem.indexOf(u8, a, "ControlPath") == null);
+        if (std.mem.eql(u8, a, "bob@host.example")) saw_dest = true;
+        if (std.mem.eql(u8, a, "/opt/ghoztty-agent")) saw_agent = true;
+        if (std.mem.eql(u8, a, "--session=abc-123")) saw_session = true;
+    }
+    try testing.expect(saw_dest and saw_agent and saw_session);
 }
 
 test "buildEnv: askpass plumbing set when configured" {
