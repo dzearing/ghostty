@@ -17,11 +17,29 @@
 //! `Server.onChildOutput`, which takes that lock). The child is heap-owned by the
 //! `PtySpawner` and freed on `terminate`.
 //!
+//! ## Cross-platform (§13)
+//!
+//! The OS-specific operations branch on `builtin.os.tag` exactly the way
+//! `src/pty.zig` does. On **POSIX** the child runs on a real pty: a forked shell
+//! on the SLAVE fds, the MASTER fd pumped/written via `posix.read`/`posix.write`,
+//! and signalled via `kill(2)` on the child's process group. On **Windows** the
+//! child runs on a **ConPTY** (`WindowsPty`): the shell is spawned with null stdio
+//! + `pseudo_console = pty.pseudo_console` (mirrors `src/termio/Exec.zig:1027` and
+//! the proven `conpty_smoke.zig`), child output is pumped via
+//! `ReadFile(pty.out_pipe)`, input is written via `WriteFile(pty.in_pipe)`, signals
+//! map to ConPTY-friendly equivalents (Ctrl-C → `0x03` on the input pipe; kill →
+//! `TerminateProcess`), and teardown closes the pty (→ `ClosePseudoConsole`) BEFORE
+//! joining the reader so its blocked `ReadFile` EOFs (the smoke's deadlock fix).
+//! The public `PtySpawner`/`session.Child` interface is byte-for-byte identical on
+//! both — only the internal per-OS syscall arm differs.
+//!
 //! Deferred (later increments): daemonization, idle-TTL GC, Job/containment caps,
-//! a real grid-model snapshot (§7.3). Windows ConPTY is out of scope here (the
-//! POSIX path only) — the spike (`spike/main.zig`) covers the Windows risks.
+//! a real grid-model snapshot (§7.3). On Windows, Job-Object subtree kill +
+//! `GenerateConsoleCtrlEvent` group signalling are future hardening; this arm uses
+//! the simplest robust ConPTY paths (see `spike/FINDINGS.md` §5).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -30,6 +48,11 @@ const CommandCore = @import("../../CommandCore.zig");
 const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const server = @import("server.zig");
+
+/// On Windows the OS-specific arms reach `ReadFile`/`WriteFile`/`TerminateProcess`
+/// straight from `std.os.windows` — the same kernel32 surface the smoke uses.
+const windows = std.os.windows;
+const is_windows = builtin.os.tag == .windows;
 
 const log = std.log.scoped(.agent_pty);
 
@@ -46,6 +69,9 @@ pub const PtyChild = struct {
 
     pty: Pty,
     cmd: Command,
+    /// On POSIX this is the child pid; on Windows `posix.pid_t == windows.HANDLE`,
+    /// so this holds the child's process HANDLE (what `CommandCore.startWindows`
+    /// stores in `cmd.pid`) — used directly by `TerminateProcess`.
     pid: posix.pid_t,
 
     /// The owning data channel + output sink, published by `attach` after the
@@ -112,7 +138,16 @@ pub const PtyChild = struct {
         self.attached.wait();
         var buf: [read_buf_size]u8 = undefined;
         while (true) {
-            const n = posix.read(self.pty.master, &buf) catch |err| switch (err) {
+            const n = if (is_windows) blk: {
+                // Windows: ConPTY output side. `ReadFile(out_pipe)` blocks until
+                // bytes arrive and returns 0 (with BROKEN_PIPE) once the ConPTY
+                // tears down after the child exits / `ClosePseudoConsole` runs —
+                // that is our EOF (mirrors `conpty_smoke.zig`'s reader).
+                var read: windows.DWORD = 0;
+                if (windows.kernel32.ReadFile(self.pty.out_pipe, &buf, buf.len, &read, null) == 0)
+                    break :blk 0;
+                break :blk @as(usize, read);
+            } else posix.read(self.pty.master, &buf) catch |err| switch (err) {
                 // On Linux a pty master read after the slave hangs up yields EIO;
                 // treat it as EOF rather than an error.
                 error.InputOutput => 0,
@@ -142,6 +177,16 @@ pub const PtyChild = struct {
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *PtyChild = @ptrCast(@alignCast(ctx));
+        if (is_windows) {
+            // Windows: feed the ConPTY input side. `WriteFile(in_pipe)` is the
+            // smoke-proven input path (`conpty_smoke.zig`). Return the count so the
+            // caller loops on a short write, exactly like the POSIX branch.
+            var written: windows.DWORD = 0;
+            if (bytes.len == 0) return 0;
+            if (windows.kernel32.WriteFile(self.pty.in_pipe, bytes.ptr, @intCast(bytes.len), &written, null) == 0)
+                return error.BrokenPipe;
+            return @intCast(written);
+        }
         return posix.write(self.pty.master, bytes);
     }
 
@@ -161,6 +206,35 @@ pub const PtyChild = struct {
 
     fn signalFn(ctx: *anyopaque, name: []const u8) anyerror!void {
         const self: *PtyChild = @ptrCast(@alignCast(ctx));
+
+        // Windows has no POSIX signals. Map the names we care about onto the
+        // ConPTY-friendly equivalents (see `spike/FINDINGS.md` §5):
+        //   - INT / QUIT / TSTP / "Ctrl-C" intent → write 0x03 (ETX) to the ConPTY
+        //     input pipe. This is the robust, smoke-proven interrupt path: the
+        //     ConPTY delivers it to the foreground child as a console Ctrl-C. We do
+        //     NOT use `GenerateConsoleCtrlEvent` because the agent's child is not
+        //     spawned into its own console process group here, so 0x03-on-input is
+        //     the simplest correct path.
+        //   - KILL / TERM / HUP → hard `TerminateProcess(hProcess, 1)`. Windows has
+        //     no catchable TERM-vs-KILL distinction for a non-cooperating child, so
+        //     both escalate to an unconditional terminate (exit code 1).
+        //   - Anything else (CONT, USR1/2, WINCH, ...) → ignored (no analogue).
+        if (is_windows) {
+            if (eqlAny(name, &.{ "INT", "QUIT", "TSTP" })) {
+                var written: windows.DWORD = 0;
+                const etx = [_]u8{0x03};
+                if (windows.kernel32.WriteFile(self.pty.in_pipe, &etx, 1, &written, null) == 0)
+                    log.warn("windows interrupt (0x03) write failed", .{});
+                return;
+            }
+            if (eqlAny(name, &.{ "KILL", "TERM", "HUP" })) {
+                if (windows.kernel32.TerminateProcess(self.pid, 1) == 0)
+                    log.warn("TerminateProcess failed", .{});
+                return;
+            }
+            return; // no ConPTY analogue — drop silently (untrusted input, §15 M3)
+        }
+
         const sig = sigFromName(name) orelse return;
         // The child is its own session/process-group leader (pty.childPreExec calls
         // setsid), so its pgid == pid. Signal the whole group with kill(-pid). If
@@ -181,6 +255,22 @@ pub const PtyChild = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.reaped) return self.exit_code;
+
+        if (is_windows) {
+            // Non-blocking reap on Windows: poll the process HANDLE with a zero
+            // timeout (we must NOT use `CommandCore.wait` here — it blocks on
+            // `WaitForSingleObject(INFINITE)`). WAIT_OBJECT_0 means the process is
+            // signalled (exited); WAIT_TIMEOUT means still running.
+            const status = windows.kernel32.WaitForSingleObject(self.pid, 0);
+            if (status != windows.WAIT_OBJECT_0) return null; // still running
+            var exit_code: windows.DWORD = 0;
+            if (windows.kernel32.GetExitCodeProcess(self.pid, &exit_code) == 0)
+                return null;
+            const code: i64 = @intCast(exit_code);
+            self.reaped = true;
+            self.exit_code = code;
+            return code;
+        }
 
         // A genuinely non-blocking reap: `waitpid(WNOHANG)` returns pid 0 when the
         // child has no status yet (we must NOT use `CommandCore.wait(false)` here —
@@ -212,13 +302,24 @@ pub const PtyChild = struct {
         const already_reaped = self.reaped;
         self.mutex.unlock();
 
-        // Hard kill the process group if it hasn't already exited.
+        // Hard kill the child if it hasn't already exited.
+        //   - POSIX: SIGKILL the whole process group (`-pid`), uncatchable.
+        //   - Windows: `TerminateProcess(hProcess, 1)` — there is no process-group
+        //     analogue here, so we terminate the ConPTY's root child directly.
         if (!already_reaped) {
-            posix.kill(-self.pid, posix.SIG.KILL) catch {};
+            if (is_windows) {
+                _ = windows.kernel32.TerminateProcess(self.pid, 1);
+            } else {
+                posix.kill(-self.pid, posix.SIG.KILL) catch {};
+            }
         }
 
-        // Close the master fd: this hangs up the slave and EOFs the reader's read.
-        // (Pty.deinit closes the master.)
+        // Tear down the pty BEFORE joining the reader (the smoke-proven ordering):
+        //   - POSIX: closing the master fd hangs up the slave and EOFs the reader's
+        //     `read`.
+        //   - Windows: `pty.deinit` calls `ClosePseudoConsole`, which is what gives
+        //     the reader's blocked `ReadFile(out_pipe)` its EOF. Closing it AFTER
+        //     the join would deadlock (see `conpty_smoke.zig`'s teardown note).
         self.pty.deinit();
 
         // Join the reader (now unblocked by EOF). Ensure it was at least allowed to
@@ -238,6 +339,13 @@ pub const PtyChild = struct {
         self.alloc.destroy(self);
     }
 };
+
+/// True if `name` case-insensitively equals any entry in `set`. Used by the
+/// Windows SIGNAL arm to group POSIX signal names onto ConPTY actions.
+fn eqlAny(name: []const u8, set: []const []const u8) bool {
+    for (set) |s| if (std.ascii.eqlIgnoreCase(name, s)) return true;
+    return false;
+}
 
 /// Map a POSIX signal NAME (no "SIG" prefix, e.g. "INT", "TERM") to its number.
 /// Unknown names → null (ignored, never a crash — untrusted input, §15 M3).
@@ -295,7 +403,11 @@ pub const PtySpawner = struct {
     fn spawnFn(ctx: *anyopaque, open: protocol.Open) anyerror!server.Spawner.Result {
         const self: *PtySpawner = @ptrCast(@alignCast(ctx));
         const pc = try self.spawnChild(open);
-        return .{ .child = pc.child(), .pid = @intCast(pc.pid) };
+        // `Result.pid` is an i64 identifier for the monitor view. On POSIX `pc.pid`
+        // is the integer pid; on Windows it is the process HANDLE (a pointer), so we
+        // surface its integer value (the OS process id is not separately tracked).
+        const pid_i64: i64 = if (is_windows) @intCast(@intFromPtr(pc.pid)) else @intCast(pc.pid);
+        return .{ .child = pc.child(), .pid = pid_i64 };
     }
 
     /// Open a pty, fork+exec the shell on its slave, return the owned `*PtyChild`.
@@ -317,17 +429,27 @@ pub const PtySpawner = struct {
         const pc = try self.alloc.create(PtyChild);
         errdefer self.alloc.destroy(pc);
 
-        // Resolve the shell: OPEN.shell → $SHELL → /bin/sh.
+        // Resolve the default shell, per-OS:
+        //   - POSIX: OPEN.shell → $SHELL → /bin/sh.
+        //   - Windows: OPEN.shell → %COMSPEC% → C:\Windows\System32\cmd.exe.
         const shell_path = blk: {
             if (open.shell) |s| if (s.len > 0) break :blk s;
+            if (is_windows) {
+                if (self.env.get("COMSPEC")) |s| if (s.len > 0) break :blk s;
+                break :blk "C:\\Windows\\System32\\cmd.exe";
+            }
             if (self.env.get("SHELL")) |s| if (s.len > 0) break :blk s;
             break :blk "/bin/sh";
         };
 
-        // Build argv. With a command: `<shell> -lic <command>`. Without: `<shell>
-        // -li` (login interactive). `startCommand` copies these into its own fork
-        // arena before exec, so in the PARENT they are dead after `start()` returns
-        // — we free them right after (see below).
+        // Build argv. `startCommand`/`startWindows` copies these before exec, so in
+        // the PARENT they are dead after `start()` returns — we free them right
+        // after (see the deferred frees below).
+        //   - POSIX: with a command → `<shell> -lic <command>`; without → `<shell>
+        //     -li` (login interactive) — mirroring the local CLI's shell convention.
+        //   - Windows: cmd.exe-style. With a command → `<shell> /c <command>`;
+        //     without → just `<shell>` (an interactive cmd.exe). `-lic`/`-li` are
+        //     POSIX-shell flags with no Windows analogue.
         const shell_z = try self.alloc.dupeZ(u8, shell_path);
         defer self.alloc.free(shell_z);
 
@@ -338,7 +460,12 @@ pub const PtySpawner = struct {
         }
         // argv[0] is the shell path (a fresh dupe so freeing the list frees it).
         try args_list.append(self.alloc, try self.alloc.dupeZ(u8, shell_path));
-        if (open.command) |cmd| {
+        if (is_windows) {
+            if (open.command) |cmd| if (cmd.len > 0) {
+                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "/c"));
+                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
+            };
+        } else if (open.command) |cmd| {
             if (cmd.len > 0) {
                 try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-lic"));
                 try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
@@ -350,9 +477,36 @@ pub const PtySpawner = struct {
         }
         const args = args_list.items;
 
-        // The slave fd is handed to the child as stdin/stdout/stderr; the pty's
-        // childPreExec (setsid + TIOCSCTTY) runs via os_pre_exec so the child gets
-        // a controlling terminal and its own process group.
+        if (is_windows) {
+            // Windows: spawn the shell as a ConPTY child. Mirrors the canonical
+            // terminal wiring (`src/termio/Exec.zig:1027`) and the proven
+            // `conpty_smoke.zig`: stdin/stdout/stderr are null (the ConPTY owns the
+            // child's std handles via PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE) and
+            // `pseudo_console` carries `pty.pseudo_console`. No `os_pre_exec`
+            // (there is no fork; setsid/TIOCSCTTY are POSIX-only).
+            pc.* = .{
+                .alloc = self.alloc,
+                .pty = pty,
+                .cmd = .{
+                    .path = shell_z,
+                    .args = args,
+                    .env = self.env,
+                    .cwd = open.cwd,
+                    .stdin = null,
+                    .stdout = null,
+                    .stderr = null,
+                    .pseudo_console = pty.pseudo_console,
+                },
+                .pid = undefined,
+            };
+            try pc.cmd.start(self.alloc);
+            pc.pid = pc.cmd.pid.?;
+            return pc;
+        }
+
+        // POSIX: the slave fd is handed to the child as stdin/stdout/stderr; the
+        // pty's childPreExec (setsid + TIOCSCTTY) runs via os_pre_exec so the child
+        // gets a controlling terminal and its own process group.
         const slave_file: std.fs.File = .{ .handle = pty.slave };
 
         pc.* = .{
@@ -384,8 +538,11 @@ pub const PtySpawner = struct {
 
 /// Runs in the forked child before exec: set up the controlling terminal via the
 /// pty (`setsid` + `TIOCSCTTY`, then close the master/slave pair). Returns null on
-/// success (continue to exec); a non-null exit code aborts the child.
+/// success (continue to exec); a non-null exit code aborts the child. POSIX-only —
+/// Windows has no fork/pre-exec hook (the ConPTY wires the child's std handles), so
+/// the Windows spawn path never installs this; the stub keeps the file compiling.
 fn ptyPreExec(cmd: *Command) ?u8 {
+    if (is_windows) return null;
     const pc = cmd.getData(PtyChild) orelse return null;
     pc.pty.childPreExec() catch return 1;
     return null;
