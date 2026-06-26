@@ -22,8 +22,8 @@ A fresh session should, in order:
    (1M context)` trailer, then report back concisely. The orchestrator keeps THIS
    file + the memory updated after each increment lands.
 
-_Last updated: 2026-06-25. Branch: `feature/remote-machines` (integration branch;
-merges to `main` once green as a whole). HEAD should be at/after `d6b463753`._
+_Last updated: 2026-06-26. Branch: `feature/remote-machines` (integration branch;
+merges to `main` once green as a whole). HEAD at/after `b58e33f60`._
 
 ## Status at a glance
 
@@ -34,52 +34,17 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | WP1 | Protocol lib (`src/remote/protocol.zig`) | ✅ **Done** — 21 tests green | `81275a9d4` |
 | WP3-spike | Inbound ring + ChannelTable (`src/remote/inbound_ring.zig`) | ✅ **Spike done, gate passed** — 6 tests green | `7210e230e` |
 | WP2-spike | Windows agent risks (`src/remote/agent/spike/`) | ✅ **Spike done** — cross-compiles x86_64+aarch64 windows | `7168891fb` |
-| WP3-full | Client connection + `termio.Remote` + C API | 🔨 **In progress** (delegated to subagents) | see below |
+| WP3-full | Client connection + `termio.Remote` + C API | ✅ **inc.1–4b done**; inc.3b (ssh+reconnect) next | see below |
 | ↳ inc.1 | `connection.zig` transport core (Stream, handshake, MPSC writer, demux→rings) | ✅ Done — 33 tests | `ca02e266b` |
 | ↳ inc.2 | health: `RttEstimator`, `LinkState` FSM, heartbeat, PONG/DETACHED handling | ✅ Done — 40 tests | `07ca686d8` |
 | ↳ inc.3 | channel/session lifecycle (OPEN/ATTACH/CLOSE/DETACH), resync §7.3, steal §5.3, FLOW-pause | ✅ Done — 50 tests | `176d85ad4` |
 | ↳ inc.4a | `termio.Remote` (Backend contract) + `backend.zig` `.remote` arm — **libghostty compiles with remote backend** | ✅ Done | `d6b463753` |
 | ↳ inc.4b | `Surface.zig:682` construct `.remote` + `ghostty_surface_config_s` + `ghostty_remote_*` C API | ✅ Done — Zig build green | `de230b6de` |
 | ↳ inc.3b | real reconnect driver (stream swap + re-ATTACH) + ssh Transport (`Stream` over ssh subprocess) | ⛔ NEXT (client) | — |
-| **WP2** | Agent daemon | 🔨 **Started (parallel)** | see below |
+| **WP2** | Agent daemon | 🔨 **agent inc.1 done**; real-PTY + build target next | see below |
 | ↳ agent inc.1 | `src/remote/agent/` session-server core (HELLO/OPEN/DATA/ATTACH/RESIZE/SIGNAL/DETACH/CLOSE/EXIT, session table, ring, tombstones) over abstract transport + fake child | ✅ Done — 18 tests | `c4b09c774`→`26af4f78a` |
 | ↳ agent next | real PTY via `Command.zig`→`CommandCore`; real grid snapshot (§7.3); daemonize; `zig build agent` exe target; Windows (reuse spike `win32.zig`); containment/RPC (§9) | ⛔ Next (agent) | — |
-
-connection.zig is a complete-enough client transport (50 tests, native green). Build
-loop confirmed: `zig build -Doptimize=Debug` compiles all Zig (336/339; only the
-final `xcodebuild` step fails because `xcode-select` is still CLT — that's the
-P1-run gate, see Toolchain status). `src/remote/*` are part of the libghostty
-module (relative imports; no build.zig.zon change needed).
-
-### Current frontier — what's real vs stub (read before continuing)
-
-Both halves of the conversation now exist and pass tests in isolation, sharing the
-frozen WP1 protocol — but **they have not been run against each other yet, and there
-is no live ssh transport**, so nothing connects end-to-end:
-
-- **Client**: libghostty compiles with a `.remote` backend + the C API. The
-  C API the Swift app binds to (commit `de230b6de`):
-  `ghostty_surface_config_s` gained `ghostty_remote_connection_t connection`
-  (opaque `void*`; non-NULL ⇒ `.remote`) + `const char* session_id`. Functions:
-  `ghostty_remote_connection_new(const ghostty_remote_config_s*)` (host/user/port/
-  jump), `_start`, `_wait_handshake`, `_latency_ms` (→ -1 unknown), `_free`.
-  **`_start` returns false today (TODO)** — the `ssh`-backed `connection.Stream`
-  doesn't exist, so `remoteBackend()` falls back to local. The ssh Transport is the
-  one missing piece before a real connection can be built.
-- **Agent** (`src/remote/agent/{session,server}.zig`, 18 tests): full frame routing,
-  session table (crypto UUIDs, ring, tombstones, gap-fill), MPSC writer. **Stubs:**
-  fake buffer-backed child (no real PTY — `// TODO(pty)` for `Command.zig`→
-  `CommandCore`), `snapshot_at_offset` = current byte offset (no grid model yet),
-  no daemonization, not in any build target. Test it with:
-  `zig test --dep protocol -Mroot=src/remote/agent/server.zig -Mprotocol=src/remote/protocol.zig`
-
-**Highest-leverage next step:** the **ssh Transport** (`Stream` over an `ssh`
-subprocess, §4.1) — it unblocks the client's live dial AND lets the client
-`connection.zig` talk to the agent `server.zig` for the first real end-to-end test
-(even `ssh localhost`). Pair it with the agent's real-PTY increment + a `zig build
-agent` exe target. Then: inc.3b reconnect driver, WP4 Swift.
-| WP2-full | Agent daemon (Linux + Windows) | ⛔ **Not started** | — |
-| WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3-full C API | — |
+| WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3 C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
 | WP6 | Tunneling | ⛔ Not started (P2) | — |
 | WP7 | Connection Manager UI | ⛔ Not started (P3) | — |
@@ -87,8 +52,33 @@ agent` exe target. Then: inc.3b reconnect driver, WP4 Swift.
 | WP9 | Ports + Activity UI | ⛔ Not started (P3) | — |
 | WP10 | Skill, docs, CI, Windows harness, e2e | ⛔ Not started (P3) | — |
 
-**Phase (§16):** P1 (core remote panes) in progress. WP1 + the two gating spikes
-are complete; the full WP2/WP3 and then WP4 remain to finish P1.
+**Phase (§16):** P1 (core remote panes) in progress — WP1 + both gating spikes
+done; WP3 client transport DONE through inc.4b; WP2 agent core (inc.1) done.
+**Toolchain ✅ fully solved** — `zig build -Doptimize=Debug` produces a runnable
+`zig-out/Ghoztty-Debug.app` (see "Toolchain status"). P1 still needs the ssh
+Transport + the agent's real PTY, then WP4 (Swift).
+
+### Current frontier — what's real vs stub (read before continuing)
+
+Both halves of the conversation exist and pass tests in isolation, sharing the
+frozen WP1 protocol — but **they have not talked to each other yet, and there is no
+live ssh transport**, so nothing connects end-to-end:
+
+- **Client** — libghostty compiles with a `.remote` backend + the C API the Swift
+  app binds to (commit `de230b6de`): `ghostty_surface_config_s` gained
+  `ghostty_remote_connection_t connection` (opaque `void*`; non-NULL ⇒ `.remote`) +
+  `const char* session_id`. Functions: `ghostty_remote_connection_new(const
+  ghostty_remote_config_s*)` (host/user/port/jump), `_start`, `_wait_handshake`,
+  `_latency_ms` (→ -1 unknown), `_free`. **`_start` returns false today (TODO)** —
+  the `ssh`-backed `connection.Stream` doesn't exist yet, so `remoteBackend()`
+  falls back to local. That ssh Transport is the one missing piece before a real
+  connection can be dialed.
+- **Agent** (`src/remote/agent/{session,server}.zig`, 18 tests) — full frame
+  routing, session table (crypto UUIDs, ring, tombstones, gap-fill), MPSC writer.
+  **Stubs:** fake buffer-backed child (no real PTY — `// TODO(pty)` for
+  `Command.zig`→`CommandCore`), `snapshot_at_offset` = current byte offset (no grid
+  model yet), no daemonization, not in any build target. Test it with:
+  `zig test --dep protocol -Mroot=src/remote/agent/server.zig -Mprotocol=src/remote/protocol.zig`
 
 ## What "spike done" means here
 
@@ -110,37 +100,41 @@ demanded before WP2/WP3 expand (§17):
 
 ## Recommended next actions (in order)
 
-WP3-full's connection.zig (inc.1–3) + termio.Remote/backend (inc.4a) are DONE — the
-whole client transport is built and libghostty compiles with a `.remote` backend.
-Two tracks now run in PARALLEL (worktree-isolated subagents; the client + the agent
-share only the frozen WP1 wire contract):
+The full client transport (connection.zig inc.1–3, termio.Remote+backend inc.4a,
+Surface+C-API inc.4b) and the agent session-server core (inc.1) are DONE and tested.
+**The single thing blocking a first real end-to-end pane is the ssh Transport.** Do
+these in order; delegate each to a subagent (keep the orchestrator lean):
 
-1. **WP3-full inc.4b (client wiring)** 🔨 — `Surface.zig:682` construct `.remote`
-   from a connection handle in surface config; finish the `:1339/:1340`
-   `childExitedAbnormally` arm; add `ghostty_remote_connection_t connection` +
-   `session_id` to `ghostty_surface_config_s` (`include/ghostty.h` +
-   `apprt/embedded.zig` Options) and plumb through; expose the `ghostty_remote_*`
-   C API (connect/open/attach). Compile via `zig build -Doptimize=Debug` (Zig-green
-   = reaches the xcodebuild step). *§3.2 calls Surface.zig:682 the highest-mechanical-
-   risk, load-bearing edit — do it carefully.*
-2. **WP2-full agent inc.1 (the other half)** 🔨 — `src/remote/agent/` session-server
-   core that speaks WP1 protocol: HELLO, OPEN (spawn child), DATA both ways with
-   byte_offset, ATTACH (seq-anchored snapshot stub), RESIZE/SIGNAL/DETACH/CLOSE/EXIT,
-   session table w/ random UUIDs + raw ring + tombstones. POSIX first; child-spawn
-   abstracted so tests use a pipe-backed fake child (real pty + Command.zig→CommandCore
-   refactor + Windows + containment come in later increments). Standalone `zig test`,
-   NEW files only (no shared-file edits → parallel-safe). Reuse `win32.zig` from the
-   spike later.
+1. **ssh Transport** (highest leverage) — a `connection.Stream` impl backed by an
+   `ssh` subprocess providing the two channels (control + data), with the
+   `SSH_ASKPASS` interactive-auth + first-contact host-key flow (§4.1). This (a)
+   makes the client C-API `_start` real, and (b) lets `connection.zig` ↔ the agent
+   `server.zig` connect for the FIRST real end-to-end test (even `ssh localhost`).
+   NOTE: pulls in `Command.zig`, which drags `config.zig`/`global.zig`/`apprt` — do
+   the `Command.zig`→`CommandCore` extraction first (assessment in
+   `src/remote/agent/spike/FINDINGS.md`: ~2–4 h, 3 thin couplings). That refactor
+   ALSO unblocks the agent's real PTY (next item).
+2. **Agent real PTY + `zig build agent` exe target** — replace the fake child with a
+   real pty-backed child via `src/pty.zig` (+ `CommandCore`); add the executable
+   build target so the agent can actually run; first end-to-end smoke over
+   `ssh localhost` (agent on the same box).
+3. **WP3 inc.3b — real reconnect driver** — drive the LinkState FSM's reconnect
+   decision into an actual re-dial: tear down old reader/writer, swap to fresh
+   Streams, re-handshake, re-ATTACH each live pane with its `last_byte_offset`,
+   re-arm `discard_below` from the new snapshot, respawn threads.
+4. **WP4 — Swift connection context** (binds the `ghostty_remote_*` C API:
+   `+connect`/`+disconnect`/`+reconnect`, `machine:` title, split/new-window
+   inheritance). Then the §6.5 `vim`-over-ssh fidelity check + the WP3 4-pane
+   inbound-ring integration benchmark (§3.4 gate).
 
-Then: **inc.3b** (real reconnect driver + ssh Transport `Stream`-over-ssh), wire the
-agent into a `zig build agent` exe target, then **WP4** (Swift connection context,
-once 4b's C API exists), then end-to-end over `ssh localhost`.
+Later: real grid-model snapshot (§7.3/§13.1), then P2 (WP5/6/8) and P3 (WP7/9/10).
 
-**Parallel-work protocol:** each parallel subagent works in its own git worktree
-(`isolation: "worktree"`) and commits there; the orchestrator cherry-picks the
-reported SHAs back onto `feature/remote-machines` and re-verifies the combined build.
-4b and agent-inc.1 touch disjoint files (Surface/C-API vs new `src/remote/agent/*`),
-so cherry-picks should not conflict.
+**Parallel-work protocol (when running tracks concurrently):** give each subagent
+`isolation: "worktree"`; it commits in its worktree; the orchestrator cherry-picks
+the reported SHA back onto `feature/remote-machines` and re-verifies the combined
+build (the worktree may branch off a stale base — subagents should `git reset --hard
+feature/remote-machines` first, as the inc.4b/agent runs did). Prefer disjoint file
+sets across parallel tracks so cherry-picks don't conflict.
 
 ## Toolchain status — ✅ FULLY SOLVED (the runnable `.app` builds)
 
