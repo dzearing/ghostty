@@ -188,6 +188,7 @@ pub const std_options: std.Options = .{
 test {
     _ = @import("pty.zig");
     _ = @import("Command.zig");
+    _ = @import("CommandCore.zig");
     _ = @import("font/main.zig");
     _ = @import("apprt.zig");
     _ = @import("renderer.zig");
