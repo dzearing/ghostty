@@ -103,6 +103,18 @@ class BaseTerminalController: NSWindowController,
 
     var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
 
+    /// The remote machine this window's terminals run on, if any. When set, the
+    /// window title is suffixed with the machine name and new splits/tabs inherit
+    /// the same machine + connection.
+    var remoteMachine: Machine? {
+        didSet { applyTitleToWindow() }
+    }
+
+    /// Strong owner of the shared remote connection handle for this window. Held
+    /// here so the handle outlives every surface/split in the window; freed
+    /// (exactly once) when this controller is deallocated. See `RemoteConnection`.
+    var remoteConnection: RemoteConnection?
+
     private static var _nextWindowId: Int = 0
     private static func nextWindowId() -> Int {
         _nextWindowId += 1
@@ -298,6 +310,18 @@ class BaseTerminalController: NSWindowController,
         // Inject the window name env var.
         if effectiveConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] == nil {
             effectiveConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
+        }
+
+        // Remote inheritance: if this window is bound to a remote machine, new
+        // splits open on the SAME machine over the SAME shared connection. The
+        // incoming config (e.g. from a keybind notification) won't carry these,
+        // so we inject them here. The handle is owned by `remoteConnection`
+        // (this controller) and shared, never freed per-surface.
+        if let remoteConnection, effectiveConfig.remoteConnection == nil {
+            effectiveConfig.remoteMachine = remoteConnection.machine
+            effectiveConfig.remoteConnection = remoteConnection.handle
+            // session_id stays nil: each split opens a fresh remote session on
+            // the same machine/connection.
         }
 
         // Create a new surface view
@@ -1026,6 +1050,11 @@ class BaseTerminalController: NSWindowController,
         if let termWindow = window as? TerminalWindow,
            termWindow.activityState != .idle {
             title += " (\(termWindow.activityState.rawValue))"
+        }
+
+        // Suffix the window title with the remote machine name, if any.
+        if let remoteMachine {
+            title += " — \(remoteMachine.name)"
         }
 
         window.title = title

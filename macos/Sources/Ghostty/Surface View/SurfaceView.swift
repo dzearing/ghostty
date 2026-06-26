@@ -643,6 +643,23 @@ extension Ghostty {
         var backgroundTintNSColor: NSColor?
         #endif
 
+        // MARK: Remote machine (remote-machines design WP4)
+
+        /// The remote machine this surface (and its window/splits) runs on, if any.
+        /// Used for window title and inheritance; the live connection is carried
+        /// separately in `remoteConnection`.
+        var remoteMachine: Machine?
+
+        /// A live, handshake-complete remote connection handle. When non-nil the
+        /// surface is constructed with the `.remote` termio backend riding on this
+        /// connection. The handle is owned by a `RemoteConnection` held strongly by
+        /// the window's `TerminalController`; it is NOT freed when the surface is
+        /// freed. All surfaces/splits in the same remote window share one handle.
+        var remoteConnection: ghostty_remote_connection_t?
+
+        /// The agent session to ATTACH to, or nil to OPEN a brand-new session.
+        var remoteSessionId: String?
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -731,6 +748,19 @@ extension Ghostty {
                                 return try envVars.withUnsafeMutableBufferPointer { buffer in
                                     config.env_vars = buffer.baseAddress
                                     config.env_var_count = environmentVariables.count
+
+                                    // Remote machine backend: when we have a live
+                                    // connection, point the C config at it. A non-NULL
+                                    // connection makes libghostty use the `.remote`
+                                    // backend. session_id == NULL ⇒ new session.
+                                    if let remoteConnection {
+                                        config.connection = remoteConnection
+                                        return try remoteSessionId.withCString { cSessionId in
+                                            config.session_id = cSessionId
+                                            return try body(&config)
+                                        }
+                                    }
+
                                     return try body(&config)
                                 }
                             }

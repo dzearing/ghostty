@@ -423,8 +423,25 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return nil
         }
 
+        // Remote inheritance: a new tab in a remote window opens on the SAME
+        // machine over the SAME shared connection. Seed the base config with the
+        // parent's remote machine/connection so the initial surface is remote,
+        // and carry the strong connection owner onto the new controller.
+        var effectiveBaseConfig = baseConfig
+        if let parentRemote = parentController.remoteConnection,
+           (effectiveBaseConfig?.remoteConnection == nil) {
+            var cfg = effectiveBaseConfig ?? Ghostty.SurfaceConfiguration()
+            cfg.remoteMachine = parentRemote.machine
+            cfg.remoteConnection = parentRemote.handle
+            effectiveBaseConfig = cfg
+        }
+
         // Create a new window and add it to the parent
-        let controller = TerminalController.init(ghostty, withBaseConfig: baseConfig)
+        let controller = TerminalController.init(ghostty, withBaseConfig: effectiveBaseConfig)
+        if let parentRemote = parentController.remoteConnection {
+            controller.remoteConnection = parentRemote
+            controller.remoteMachine = parentRemote.machine
+        }
         guard let window = controller.window else { return controller }
 
         // If the parent is miniaturized, then macOS exhibits really strange behaviors

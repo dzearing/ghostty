@@ -969,6 +969,53 @@ class AppDelegate: NSObject,
         _ = TerminalController.newWindow(ghostty)
     }
 
+    /// New Remote Window (Cmd-Shift-N): pick a remote machine, dial it over TCP,
+    /// and open a window whose terminal runs on that machine. Splits/tabs in the
+    /// window inherit the same machine + connection.
+    @IBAction func newRemoteWindow(_ sender: Any?) {
+        let machines = MachineRegistry.shared.machines
+        MachineChooser.present(machines: machines) { [weak self] selected in
+            guard let self, let machine = selected else { return }
+            self.openRemoteWindow(on: machine)
+        }
+    }
+
+    /// Dials `machine` and opens a remote window on success. Shows an alert on
+    /// connection failure.
+    @MainActor
+    private func openRemoteWindow(on machine: Machine) {
+        // Dial the agent over TCP. This blocks through the handshake and returns
+        // a connection handle, or NULL on failure.
+        let handle: ghostty_remote_connection_t? = machine.host.withCString { hostPtr in
+            ghostty_remote_connection_new_tcp(hostPtr, machine.port)
+        }
+
+        guard let handle else {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't connect to \(machine.name)"
+            alert.informativeText = "Failed to reach \(machine.endpoint). Make sure the Ghoztty agent is running and reachable."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        // Wrap the handle in a strong owner; the controller below holds the only
+        // strong reference and frees it (once) when the window is deallocated.
+        let connection = RemoteConnection(handle: handle, machine: machine)
+
+        // Build the base surface config that puts the first surface on the
+        // remote machine (new session: session_id stays nil).
+        var cfg = Ghostty.SurfaceConfiguration()
+        cfg.remoteMachine = machine
+        cfg.remoteConnection = handle
+        cfg.remoteSessionId = nil
+
+        let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
+        controller.remoteMachine = machine
+        controller.remoteConnection = connection
+    }
+
     @IBAction func newTab(_ sender: Any?) {
         _ = TerminalController.newTab(
             ghostty,
