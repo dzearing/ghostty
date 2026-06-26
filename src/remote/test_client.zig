@@ -56,6 +56,7 @@ pub fn main() !void {
     };
     defer alloc.free(opts.host);
     defer if (opts.exec) |c| alloc.free(c);
+    defer if (opts.query_cwd_dir) |c| alloc.free(c);
 
     const encoding = encodingFromEnv(alloc);
 
@@ -87,11 +88,41 @@ pub fn main() !void {
     defer sess.deinit(dialed.conn);
     diag("session opened: id={s} channel=0x{x} pid={d}\n", .{ sess.session_id, sess.channel, sess.pid });
 
-    if (opts.exec) |cmd| {
+    if (opts.query_cwd_dir) |dir| {
+        try runQueryCwd(alloc, dialed.conn, &sess, dir);
+    } else if (opts.exec) |cmd| {
         try runExec(dialed.conn, &sess, cmd, opts.timeout_secs);
     } else {
         try runInteractive(dialed.conn, &sess);
     }
+}
+
+/// `--query-cwd=<dir>`: cd the remote shell to <dir>, then ask the agent for the
+/// session's cwd via the on-demand query and print it. Proves the agent reads the
+/// child's REAL working directory (the Windows PEB path for cmd.exe).
+fn runQueryCwd(
+    alloc: Allocator,
+    conn: *connection.Connection,
+    sess: *Session,
+    dir: []const u8,
+) !void {
+    // cd the remote shell. CR is the portable Enter (cmd.exe needs it; POSIX maps it).
+    var line: [1024]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&line, "cd {s}\r", .{dir});
+    try sess.writeInput(conn, cmd);
+    diag("query-cwd: sent 'cd {s}', waiting for the shell to settle...\n", .{dir});
+    std.Thread.sleep(1500 * std.time.ns_per_ms);
+
+    const cwd = conn.queryCwd(sess.session_id) catch |err| {
+        diag("query-cwd: FAILED err={s} (agent build may predate GET_CWD, or query timed out)\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer alloc.free(cwd);
+    // stdout carries only the answer (clean for assertions); diagnostics on stderr.
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(cwd) catch {};
+    stdout.writeAll("\n") catch {};
+    diag("query-cwd: OK — agent reported cwd = '{s}'\n", .{cwd});
 }
 
 // -----------------------------------------------------------------------------
@@ -624,6 +655,10 @@ const Opts = struct {
     exec: ?[]u8 = null,
     timeout_secs: u64 = 3,
     catchup_demo: bool = false,
+    /// `--query-cwd=<dir>`: open a session, `cd <dir>`, then call the agent's
+    /// on-demand cwd query and print the result. Proves the agent reads the
+    /// child's real working directory (incl. the Windows PEB path for cmd.exe).
+    query_cwd_dir: ?[]u8 = null,
 };
 
 fn parseArgs(alloc: Allocator) !Opts {
@@ -650,6 +685,8 @@ fn parseArgs(alloc: Allocator) !Opts {
             opts.timeout_secs = std.fmt.parseInt(u64, args[i], 10) catch return error.Usage;
         } else if (std.mem.eql(u8, a, "--catchup-demo")) {
             opts.catchup_demo = true;
+        } else if (std.mem.startsWith(u8, a, "--query-cwd=")) {
+            opts.query_cwd_dir = try alloc.dupe(u8, a["--query-cwd=".len..]);
         } else {
             return error.Usage;
         }
