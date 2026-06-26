@@ -64,6 +64,8 @@ pub fn build(b: *std.Build) !void {
         "Run the app under valgrind",
     );
     const test_step = b.step("test", "Run tests");
+    const agent_step = b.step("agent", "Build the ghoztty-agent (remote-machines daemon)");
+    const test_agent_step = b.step("test-agent", "Run the ghoztty-agent tests (incl. real-pty)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -83,6 +85,31 @@ pub fn build(b: *std.Build) !void {
 
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
+
+    // Ghoztty remote-machines agent (WP2). A standalone, GUI-free daemon exe
+    // built on demand via `zig build agent`. It is not part of the default
+    // install graph this increment (daemonization/packaging is deferred).
+    {
+        const agent = try buildpkg.GhosttyAgent.init(b, &config, &deps);
+        agent_step.dependOn(&agent.install_step.step);
+
+        // `zig build test-agent` runs the agent's tests, including the real-pty
+        // child end-to-end tests (which need pty-c + os deps, so they can't run
+        // under the pure `agent_test.zig` standalone command).
+        const agent_test = b.addTest(.{
+            .name = "ghoztty-agent-test",
+            .filters = test_filters,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/agent_main.zig"),
+                .target = config.target,
+                .optimize = .Debug,
+            }),
+            .use_llvm = true,
+        });
+        if (!config.emit_lib_vt) _ = try deps.add(agent_test);
+        const agent_test_run = b.addRunArtifact(agent_test);
+        test_agent_step.dependOn(&agent_test_run.step);
+    }
 
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);

@@ -32,10 +32,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-// `protocol` is the shared wire contract (`src/remote/protocol.zig`). It is wired
-// in as a named module so the agent unit-tests standalone without reaching
-// "outside the module path"; see the test command in this file's footer.
-const protocol = @import("protocol");
+// `protocol` is the shared wire contract (`src/remote/protocol.zig`), imported
+// relatively — the same path the `zig build agent` graph uses. Standalone tests
+// root one level up (`src/remote/agent_test.zig`) so this `../` stays inside the
+// module path; see `server.zig`'s "Running the tests" note.
+const protocol = @import("../protocol.zig");
 
 // -----------------------------------------------------------------------------
 // Caps (§7.1 "Resource caps & TTL")
@@ -79,6 +80,19 @@ pub const Child = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Optional: called once by the `Server` immediately after the session is
+        /// registered, handing the child its owning channel and an opaque
+        /// "deliver output" sink. A real pty child starts (or unblocks) its
+        /// master-fd reader thread here so output is routed to the right channel;
+        /// the fake child (tests pump output out-of-band) leaves this null. The
+        /// sink is `fn(server_ctx, channel, bytes)` — exactly `Server.onChildOutput`
+        /// bound to the server pointer. Best-effort; never fails.
+        attach: ?*const fn (
+            ctx: *anyopaque,
+            sink_ctx: *anyopaque,
+            sink: *const fn (sink_ctx: *anyopaque, channel: u128, bytes: []const u8) void,
+            channel: u128,
+        ) void = null,
         /// Write `bytes` to the child's stdin/pty master. Returns bytes written
         /// (caller loops on a short write). Error ⇒ the child's input side is gone.
         write: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!usize,
@@ -95,6 +109,17 @@ pub const Child = struct {
         /// handle. Idempotent. Called on `CLOSE` and on session teardown.
         terminate: *const fn (ctx: *anyopaque) void,
     };
+
+    /// Hand the child its owning channel + output sink (see `VTable.attach`).
+    /// No-op when the impl declines (`attach == null`).
+    pub fn attach(
+        self: Child,
+        sink_ctx: *anyopaque,
+        sink: *const fn (sink_ctx: *anyopaque, channel: u128, bytes: []const u8) void,
+        channel: u128,
+    ) void {
+        if (self.vtable.attach) |f| f(self.ctx, sink_ctx, sink, channel);
+    }
 
     pub fn write(self: Child, bytes: []const u8) anyerror!usize {
         return self.vtable.write(self.ctx, bytes);

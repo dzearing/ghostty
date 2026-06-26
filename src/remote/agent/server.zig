@@ -45,21 +45,19 @@
 //!
 //! ## Running the tests
 //!
-//! These modules depend on `../protocol.zig`, which a plain
-//! `zig test src/remote/agent/server.zig` can't reach ("import outside module
-//! path"). Wire `protocol` in as a named module:
+//! These modules import `../protocol.zig` relatively (the same path the real
+//! `zig build agent` graph uses). A `zig test` rooted at this file's directory
+//! can't reach `../protocol.zig` ("import outside module path"), so root the test
+//! one level up via the aggregator `src/remote/agent_test.zig`:
 //!
-//!   zig test --dep protocol \
-//!     -Mroot=src/remote/agent/server.zig \
-//!     -Mprotocol=src/remote/protocol.zig
+//!   zig test -Mroot=src/remote/agent_test.zig
 //!
-//! (same shape for `session.zig`). The real build wires this via `build.zig`,
-//! which is out of scope for this increment.
+//! The real build wires the agent exe via `build.zig` (`zig build agent`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const protocol = @import("protocol");
+const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 
 /// Scratch read buffer per reader thread's blocking `Stream.read`.
@@ -602,12 +600,26 @@ pub const Server = struct {
         const channel = s.channel;
         const id_copy = s.id_str; // value copy; safe to use after unlock
         const pid = s.pid;
+        const child = s.child; // value copy of the vtable handle
         self.sess_mutex.unlock();
+
+        // Hand the (real pty) child its channel + output sink so its reader thread
+        // routes master-fd output to `onChildOutput`. Done AFTER unlock because the
+        // sink itself takes `sess_mutex` (a reader callback racing the handshake
+        // would otherwise deadlock). The fake child ignores this (attach == null).
+        child.attach(self, onChildOutputTrampoline, channel);
 
         self.sendJson(.opened, channel, protocol.Opened{
             .session_id = id_copy[0..],
             .pid = pid,
         }) catch {};
+    }
+
+    /// Adapts `onChildOutput` to the `session.Child` sink signature (a free fn
+    /// pointer over `*anyopaque`). The pty child's reader thread calls this.
+    fn onChildOutputTrampoline(ctx: *anyopaque, channel: u128, bytes: []const u8) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.onChildOutput(channel, bytes);
     }
 
     fn handleAttach(self: *Server, payload: []const u8) void {
