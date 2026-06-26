@@ -418,6 +418,13 @@ const PendingRpc = struct {
     /// The result. `null` until filled. The payload bytes are heap-owned by the
     /// connection allocator and become the caller's to free on success.
     result: PendingError![]u8 = error.ConnectionClosed,
+    /// The channel the reply frame actually arrived on (filled by `deliverRpcReply`
+    /// before `done.set()`). For OPEN/ATTACH the agent is **channel-authoritative**:
+    /// it mints its OWN session channel and replies OPENED/ATTACHED on THAT channel
+    /// (not the channel the request was sent on). The caller adopts this as the
+    /// pane's data-channel id. For a same-channel reply it simply equals the request
+    /// channel.
+    reply_channel: u128 = 0,
 
     const PendingError = error{ ConnectionClosed, MalformedReply, WrongReply };
 };
@@ -540,6 +547,16 @@ pub const Connection = struct {
     /// The control reader fills + wakes the matching slot; `shutdown` fails them all.
     rpc_mutex: std.Thread.Mutex = .{},
     pending: std.AutoHashMapUnmanaged(u128, *PendingRpc) = .empty,
+    /// Secondary correlation for the **channel-authoritative** OPEN/ATTACH replies
+    /// (§4.2/§7.1). The agent mints its own session channel and sends OPENED/ATTACHED
+    /// on it, so the reply's `Frame.channel` does NOT match the channel the client
+    /// sent OPEN/ATTACH on — `pending` (keyed by request channel) can't find the
+    /// waiter. These two single slots (one per reply type, since a surface has at
+    /// most one OPEN and one ATTACH in flight) let `deliverRpcReply` rendezvous by
+    /// reply *type* when the channel lookup misses, and hand the caller the
+    /// agent-chosen channel via `PendingRpc.reply_channel`. Guarded by `rpc_mutex`.
+    pending_opened: ?*PendingRpc = null,
+    pending_attached: ?*PendingRpc = null,
     /// Set by `failPendingRpcs` (shutdown) under `rpc_mutex`. Once set, no new RPC
     /// may park — `rpcCall` fails immediately — closing the register-then-shutdown
     /// race where a slot is inserted just after `failPendingRpcs` already iterated.
@@ -977,27 +994,36 @@ pub const Connection = struct {
     /// `open` is the §4.2 payload (cwd/command/shell/term/env/rows/cols/...). The
     /// caller need not set a channel — this method owns channel-id minting.
     pub fn openChannel(self: *Connection, open: protocol.Open) !*Pane {
-        const id = std.crypto.random.int(u128);
+        // Mint a fresh channel id for the OUTBOUND OPEN frame (§7.1). The agent is
+        // **channel-authoritative**: it mints its OWN session channel and replies
+        // OPENED on it (see `deliverRpcReply`/`rpcCall`). So we send OPEN on our
+        // minted channel but adopt the channel the OPENED reply arrives on as the
+        // pane's real data channel. (When the peer echoes on our channel — the
+        // loopback mock agents — the adopted channel equals `req_channel`, so this is
+        // a no-op there. The real agent gives us its own channel.)
+        const req_channel = std.crypto.random.int(u128);
 
-        // Allocate + register the inbound ring first so any inbound DATA that races
-        // the OPENED reply already has a home (the agent only streams DATA after it
-        // has sent OPENED, but registering first is harmless and simpler).
+        // Send OPEN and await OPENED; learn the agent's data channel from the reply.
+        // We register the inbound ring AFTER OPENED on the agent-chosen channel — the
+        // agent streams DATA only after it has sent OPENED, so nothing is lost (this
+        // matches the proven frame-level path in `test_client.zig`).
+        const open_json = try protocol.encodeJson(self.alloc, open);
+        defer self.alloc.free(open_json);
+        const rpc = try self.rpcCall(req_channel, .open, .opened, open_json);
+        defer self.alloc.free(rpc.payload);
+        const id = rpc.channel; // agent-authoritative data channel
+
+        var parsed = protocol.parseJson(protocol.Opened, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        // Register the inbound ring on the agent's channel so output DATA lands.
         const ch = try self.alloc.create(ring.Channel);
         errdefer self.alloc.destroy(ch);
         ch.* = try ring.Channel.init(self.alloc, id, .{});
         errdefer ch.deinit(self.alloc);
         try self.registerChannel(ch);
         errdefer self.deregisterChannel(id);
-
-        // Send OPEN and await OPENED on the same channel id.
-        const open_json = try protocol.encodeJson(self.alloc, open);
-        defer self.alloc.free(open_json);
-        const reply = try self.rpcCall(id, .open, .opened, open_json);
-        defer self.alloc.free(reply);
-
-        var parsed = protocol.parseJson(protocol.Opened, self.alloc, reply) catch
-            return error.MalformedReply;
-        defer parsed.deinit();
 
         const session_id = try self.alloc.dupe(u8, parsed.value.session_id);
         errdefer self.alloc.free(session_id);
@@ -1034,18 +1060,21 @@ pub const Connection = struct {
         last_byte_offset: u64,
         force: bool,
     ) !AttachOutcome {
-        const id = std.crypto.random.int(u128);
-
-        // The ring is registered for the duration of the call. On any early return
-        // (error, dead/not_found, or a non-forced steal) we tear it back down; only
-        // a kept pane disarms this by flipping `keep_channel`.
-        const ch = try self.alloc.create(ring.Channel);
-        errdefer self.alloc.destroy(ch);
-        ch.* = try ring.Channel.init(self.alloc, id, .{});
-        errdefer ch.deinit(self.alloc);
-        try self.registerChannel(ch);
-        var keep_channel = false;
-        errdefer if (!keep_channel) self.deregisterChannel(id);
+        // Mint a fresh channel id for the OUTBOUND ATTACH frame (§7.1). As with
+        // OPEN, the agent is **channel-authoritative**: it replies ATTACHED on the
+        // session's own channel (or on `control_channel` for `not_found`), so we
+        // adopt the channel the ATTACHED reply arrives on and register the inbound
+        // ring on THAT channel only once the session is confirmed alive.
+        //
+        // NOTE (§7.3): the agent emits gap-fill/replay DATA right after ATTACHED. We
+        // register the ring as soon as ATTACHED is parsed; the brief window between
+        // the control-lane ATTACHED and the first data-lane replay frame is covered
+        // because both ride the agent's single writer (ATTACHED enqueued first) — but
+        // since control/data are separate lanes, deep-scrollback resume should prefer
+        // the frame-level path (`test_client.zig`'s `Attach`) which pre-registers on
+        // the known stable channel. For a fresh attach (`last_byte_offset == 0`,
+        // §7.3 snapshot-from-head) there is nothing earlier than the snapshot to miss.
+        const req_channel = std.crypto.random.int(u128);
 
         const attach: protocol.Attach = .{
             .session_id = session_id,
@@ -1056,13 +1085,25 @@ pub const Connection = struct {
         };
         const attach_json = try protocol.encodeJson(self.alloc, attach);
         defer self.alloc.free(attach_json);
-        const reply = try self.rpcCall(id, .attach, .attached, attach_json);
-        defer self.alloc.free(reply);
+        const rpc = try self.rpcCall(req_channel, .attach, .attached, attach_json);
+        defer self.alloc.free(rpc.payload);
+        const id = rpc.channel; // agent-authoritative session channel
 
-        var parsed = protocol.parseJson(protocol.Attached, self.alloc, reply) catch
+        var parsed = protocol.parseJson(protocol.Attached, self.alloc, rpc.payload) catch
             return error.MalformedReply;
         defer parsed.deinit();
         const a = parsed.value;
+
+        // Register the inbound ring on the agent's channel. On any early return
+        // (dead/not_found, or a non-forced steal) we tear it back down; only a kept
+        // pane disarms this by flipping `keep_channel`.
+        const ch = try self.alloc.create(ring.Channel);
+        errdefer self.alloc.destroy(ch);
+        ch.* = try ring.Channel.init(self.alloc, id, .{});
+        errdefer ch.deinit(self.alloc);
+        try self.registerChannel(ch);
+        var keep_channel = false;
+        errdefer if (!keep_channel) self.deregisterChannel(id);
 
         const cwd = if (a.cwd) |c| try self.alloc.dupe(u8, c) else null;
         errdefer if (cwd) |c| self.alloc.free(c);
@@ -1199,22 +1240,36 @@ pub const Connection = struct {
         self.alloc.destroy(pane);
     }
 
-    /// Issue a control-channel RPC on `channel` and block until the matching reply
-    /// (`want`) arrives, or the link closes. Parks a `PendingRpc` (stack-owned)
-    /// keyed by `channel`, sends the request, then waits on the slot's event. The
-    /// returned slice is the duped reply payload (caller frees). The slot is always
-    /// removed from the map before returning.
+    /// The result of an `rpcCall`: the duped reply payload (caller frees) plus the
+    /// channel the reply actually arrived on (the agent-authoritative session channel
+    /// for OPEN/ATTACH; equal to the request channel otherwise).
+    const RpcResult = struct { payload: []u8, channel: u128 };
+
+    /// Issue a control-channel RPC and block until the matching reply (`want`)
+    /// arrives, or the link closes. Parks a stack-owned `PendingRpc` and waits on its
+    /// event.
+    ///
+    /// Correlation (§4.2): OPEN/ATTACH replies are **channel-authoritative** — the
+    /// agent mints its own session channel and sends OPENED/ATTACHED on it, so the
+    /// reply does NOT come back on `channel`. For those we register a single
+    /// by-reply-type slot (`pending_opened`/`pending_attached`) that
+    /// `deliverRpcReply` matches by reply type and stamps with the agent's channel.
+    /// Every other RPC correlates by the request `channel` via `pending` (the
+    /// same-channel case, used by the loopback mock agents). On return,
+    /// `RpcResult.channel` is the channel the caller should adopt.
     fn rpcCall(
         self: *Connection,
         channel: u128,
         req: protocol.FrameType,
         want: protocol.FrameType,
         payload: []const u8,
-    ) ![]u8 {
-        var slot: PendingRpc = .{ .want = want };
+    ) !RpcResult {
+        var slot: PendingRpc = .{ .want = want, .reply_channel = channel };
 
-        // Register the slot, refusing to start a second RPC on the same channel id
-        // (the ids are CSPRNG-unique per call, so this only guards programmer error).
+        // OPEN/ATTACH correlate by reply type (the agent picks the reply channel);
+        // all other RPCs correlate by the request channel.
+        const by_type = want == .opened or want == .attached;
+
         self.rpc_mutex.lock();
         if (self.rpc_closed) {
             // Already shutting down: don't park (we'd hang — `failPendingRpcs` has
@@ -1222,34 +1277,72 @@ pub const Connection = struct {
             self.rpc_mutex.unlock();
             return error.ConnectionClosed;
         }
-        if (self.pending.contains(channel)) {
-            self.rpc_mutex.unlock();
-            return error.RpcInFlight;
+        if (by_type) {
+            const existing = if (want == .opened) self.pending_opened else self.pending_attached;
+            if (existing != null) {
+                self.rpc_mutex.unlock();
+                return error.RpcInFlight;
+            }
+            if (want == .opened) self.pending_opened = &slot else self.pending_attached = &slot;
+        } else {
+            if (self.pending.contains(channel)) {
+                self.rpc_mutex.unlock();
+                return error.RpcInFlight;
+            }
+            self.pending.put(self.alloc, channel, &slot) catch |e| {
+                self.rpc_mutex.unlock();
+                return e;
+            };
         }
-        self.pending.put(self.alloc, channel, &slot) catch |e| {
-            self.rpc_mutex.unlock();
-            return e;
-        };
         self.rpc_mutex.unlock();
         // From here, always remove our slot before returning.
         defer {
             self.rpc_mutex.lock();
-            _ = self.pending.remove(channel);
+            if (by_type) {
+                if (want == .opened) {
+                    if (self.pending_opened == &slot) self.pending_opened = null;
+                } else {
+                    if (self.pending_attached == &slot) self.pending_attached = null;
+                }
+            } else {
+                _ = self.pending.remove(channel);
+            }
             self.rpc_mutex.unlock();
         }
 
         try self.writeControl(req, channel, payload);
         slot.done.wait();
-        return slot.result; // []u8 (caller-owned) or a PendingError
+        const owned = try slot.result; // []u8 (caller-owned) or a PendingError
+        return .{ .payload = owned, .channel = slot.reply_channel };
     }
 
-    /// Deliver a reply frame to a parked RPC caller, if one is waiting on this
-    /// `channel`. Called by the control reader's internal handler. Dupes the payload
-    /// into the slot (the caller frees it), or stores `WrongReply` on a type
-    /// mismatch, then sets the slot's event. Returns true if it consumed a waiter.
+    /// Deliver a reply frame to a parked RPC caller. Called by the control reader's
+    /// internal handler. Correlation order (§4.2):
+    ///   1. By the reply's `Frame.channel` via `pending` (same-channel RPCs — the
+    ///      loopback mock agents echo OPENED/ATTACHED on the request channel).
+    ///   2. If that misses and the frame is OPENED/ATTACHED, by reply *type* via the
+    ///      single by-type slot — this is the **channel-authoritative** real-agent
+    ///      path: the agent minted its own session channel and replied on it. We
+    ///      stamp the agent's channel into `slot.reply_channel` so the caller adopts
+    ///      it as the pane's data channel.
+    /// Dupes the payload into the slot (the caller frees it), or stores `WrongReply`
+    /// on a type mismatch, then sets the slot's event. Returns true if it consumed a
+    /// waiter.
     fn deliverRpcReply(self: *Connection, frame: protocol.Frame) bool {
         self.rpc_mutex.lock();
-        const slot = self.pending.get(frame.channel) orelse {
+        const slot = self.pending.get(frame.channel) orelse blk: {
+            // Channel miss: try the by-reply-type slot for the agent-authoritative
+            // OPEN/ATTACH reply. The agent chose `frame.channel`; record it so the
+            // caller registers its inbound ring on the right (agent) channel.
+            const by_type: ?*PendingRpc = switch (frame.type) {
+                .opened => self.pending_opened,
+                .attached => self.pending_attached,
+                else => null,
+            };
+            if (by_type) |s| {
+                s.reply_channel = frame.channel;
+                break :blk s;
+            }
             self.rpc_mutex.unlock();
             return false;
         };
@@ -1280,6 +1373,15 @@ pub const Connection = struct {
             if (!slot.done.isSet()) {
                 slot.result = error.ConnectionClosed;
                 slot.done.set();
+            }
+        }
+        // Also fail any parked OPEN/ATTACH waiter correlated by reply type.
+        for ([_]?*PendingRpc{ self.pending_opened, self.pending_attached }) |maybe| {
+            if (maybe) |slot| {
+                if (!slot.done.isSet()) {
+                    slot.result = error.ConnectionClosed;
+                    slot.done.set();
+                }
             }
         }
         self.rpc_mutex.unlock();

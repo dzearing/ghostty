@@ -20,6 +20,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const remote_connection = @import("../remote/connection.zig");
 const ssh_transport = @import("../remote/ssh_transport.zig");
+const tcp_dial = @import("../remote/tcp_dial.zig");
 const CommandCore = @import("../CommandCore.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
@@ -603,9 +604,27 @@ pub const RemoteConnectionHandle = struct {
     /// down in `destroy`.
     transport: ?*Transport = null,
 
+    /// The live TCP transport, or null. Populated by
+    /// `ghostty_remote_connection_new_tcp` (WP4): a direct TCP dial to a
+    /// listening `ghoztty-agent` (e.g. over Tailscale / localhost), which
+    /// completes the HELLO handshake before returning. Mutually exclusive with
+    /// `transport` (an `_new_tcp` handle never goes through the SSH `_start`
+    /// path). Owns the socket + mux + `Connection`; torn down in `destroy`.
+    tcp: ?*tcp_dial.Dialed = null,
+
     /// The transport is parameterized by the GUI-free spawn core so the
     /// agent-launch subprocess uses no-op rlimits / empty pre_exec hooks.
     pub const Transport = ssh_transport.Transport(CommandCore.DefaultCommand);
+
+    /// The live `Connection` for this handle, from whichever transport (SSH or
+    /// TCP) is established, or null if neither has dialed yet. The single seam
+    /// every downstream reader (`remoteBackend`, `_wait_handshake`,
+    /// `_latency_ms`) goes through so the two transports are interchangeable.
+    pub fn conn(self: *const RemoteConnectionHandle) ?*remote_connection.Connection {
+        if (self.transport) |t| return t.conn;
+        if (self.tcp) |d| return d.conn;
+        return null;
+    }
 
     /// Create a handle from dial parameters. Dupes all strings.
     pub fn create(
@@ -643,6 +662,12 @@ pub const RemoteConnectionHandle = struct {
         // ssh children observe EOF on stdin and exit), reaps both children, and
         // frees the connection + control-path.
         if (self.transport) |t| t.deinit();
+        // `Dialed.deinit` performs the strict TCP teardown (conn.shutdown →
+        // mux.joinPump → free conn/mux/socket), closing the socket fd.
+        if (self.tcp) |d| {
+            d.deinit();
+            alloc.destroy(d);
+        }
         alloc.free(self.host);
         if (self.user) |u| alloc.free(u);
         if (self.jump) |j| alloc.free(j);
@@ -1232,19 +1257,18 @@ pub const Surface = struct {
     pub fn remoteBackend(self: *const Surface) ?CoreSurface.RemoteBackend {
         const handle = self.remote_connection orelse return null;
 
-        // The handle exists but the live transport has not been established yet
-        // (the caller must `_start` it before building a remote surface).
-        // Without a live connection we cannot build the `.remote` backend; fall
-        // back to local rather than crashing.
-        const transport = handle.transport orelse {
+        // The handle exists but the live transport (SSH or TCP) has not been
+        // established yet (the caller must `_start` / `_new_tcp` it before
+        // building a remote surface). Without a live connection we cannot build
+        // the `.remote` backend; fall back to local rather than crashing.
+        const conn = handle.conn() orelse {
             log.warn(
                 "remote surface requested but connection not established; " ++
-                    "falling back to local backend (call _start first)",
+                    "falling back to local backend (call _start / _new_tcp first)",
                 .{},
             );
             return null;
         };
-        const conn = transport.conn;
 
         return .{
             .connection = conn,
@@ -2042,7 +2066,10 @@ pub const CAPI = struct {
     export fn ghostty_remote_connection_start(
         handle: *RemoteConnectionHandle,
     ) bool {
-        if (handle.transport != null) return true; // already dialed
+        if (handle.transport != null) return true; // already dialed (ssh)
+        // A TCP handle (`_new_tcp`) is already fully established (dial completed
+        // the handshake), so `_start` is a no-op for it.
+        if (handle.tcp != null) return true;
 
         const cfg: ssh_transport.DialConfig = .{
             .host = std.mem.sliceTo(handle.host, 0),
@@ -2063,14 +2090,70 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Create a remote connection by dialing a TCP-listening `ghoztty-agent`
+    /// directly at `host:port` (WP4). Unlike the SSH path, `tcp_dial.dial`
+    /// connects the socket, folds the two logical lanes through a `ClientMux`,
+    /// stands up the `Connection`, AND blocks through the HELLO handshake before
+    /// returning — so the returned handle is FULLY ESTABLISHED. A subsequent
+    /// `ghostty_remote_connection_start` is therefore a no-op (it returns true
+    /// because `conn()` is already live); `_wait_handshake` will return true
+    /// immediately. The handle stores the `Dialed` transport where `conn()`
+    /// (and thus `remoteBackend`/`_wait_handshake`/`_latency_ms`/`_free`) reads
+    /// it, exactly mirroring the SSH path.
+    ///
+    /// Returns null on a null/empty host or any dial/handshake failure. The
+    /// encoding is pinned to `.raw` (a clean TCP/Tailscale hop, matching the
+    /// agent's default).
+    export fn ghostty_remote_connection_new_tcp(
+        host: [*:0]const u8,
+        port: u16,
+    ) ?*RemoteConnectionHandle {
+        const host_slice = std.mem.sliceTo(host, 0);
+        if (host_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_tcp: host is empty", .{});
+            return null;
+        }
+
+        const alloc = global.alloc;
+
+        // Record the dial parameters on the handle (host/port; no user/jump for
+        // the direct TCP path) so the handle is uniform with the SSH one.
+        const handle = RemoteConnectionHandle.create(
+            alloc,
+            host_slice,
+            null,
+            port,
+            null,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new_tcp: handle alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer handle.destroy();
+
+        // Dial: connect + mux + Connection + HELLO handshake (blocks). On any
+        // failure the handle is destroyed (no transport was attached).
+        const dialed = alloc.create(tcp_dial.Dialed) catch |err| {
+            log.err("ghostty_remote_connection_new_tcp: Dialed alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer alloc.destroy(dialed);
+        dialed.* = tcp_dial.dial(alloc, host_slice, port, .raw) catch |err| {
+            log.err("ghostty_remote_connection_new_tcp: tcp dial failed err={}", .{err});
+            return null;
+        };
+
+        handle.tcp = dialed;
+        return handle;
+    }
+
     /// Block until the protocol handshake completes (or fails). Returns true if
     /// the handshake negotiated successfully. Only meaningful after a
     /// successful `_start`.
     export fn ghostty_remote_connection_wait_handshake(
         handle: *RemoteConnectionHandle,
     ) bool {
-        const transport = handle.transport orelse return false;
-        _ = transport.conn.waitHandshake() catch |err| {
+        const conn = handle.conn() orelse return false;
+        _ = conn.waitHandshake() catch |err| {
             log.warn("remote connection handshake failed err={}", .{err});
             return false;
         };
@@ -2082,8 +2165,8 @@ pub const CAPI = struct {
     export fn ghostty_remote_connection_latency_ms(
         handle: *RemoteConnectionHandle,
     ) i32 {
-        const transport = handle.transport orelse return -1;
-        const ms = transport.conn.latencyMs() orelse return -1;
+        const conn = handle.conn() orelse return -1;
+        const ms = conn.latencyMs() orelse return -1;
         return std.math.cast(i32, ms) orelse std.math.maxInt(i32);
     }
 

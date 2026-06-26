@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) !void {
     const test_agent_step = b.step("test-agent", "Run the ghoztty-agent tests (incl. real-pty)");
     const conpty_smoke_step = b.step("conpty-smoke", "Build the ConPTY runtime smoke exe (Windows, cross-compile)");
     const remote_test_client_step = b.step("remote-test-client", "Build the remote-test-client (drives a TCP ghoztty-agent)");
+    const wp4_e2e_step = b.step("wp4-e2e", "Build the WP4 headless e2e harness (Connection.openChannel over TCP vs the real agent)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -120,6 +121,16 @@ pub fn build(b: *std.Build) !void {
     {
         const client = try buildpkg.GhosttyRemoteTestClient.init(b, &config);
         remote_test_client_step.dependOn(&client.install_step.step);
+    }
+
+    // Ghoztty WP4 Phase-1 headless e2e de-risk harness. Spawns the real
+    // ghoztty-agent on a localhost TCP port and drives the high-level
+    // `Connection.openChannel` (the same call termio/Remote.zig makes) to prove the
+    // client/agent channel rendezvous round-trips against the real,
+    // channel-authoritative agent. Built on demand via `zig build wp4-e2e`.
+    {
+        const harness = try buildpkg.GhosttyWp4E2e.init(b, &config);
+        wp4_e2e_step.dependOn(&harness.install_step.step);
     }
 
     // Ghoztty ConPTY runtime smoke exe (WP2, §13). A tiny standalone Windows .exe

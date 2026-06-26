@@ -1271,6 +1271,16 @@ typedef struct {
 GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new(
     const ghostty_remote_config_s*);
 
+// Create a remote connection by dialing a TCP-listening ghoztty-agent directly
+// at host:port (WP4). This connects the socket and BLOCKS through the HELLO
+// handshake before returning, so the handle is fully established — a subsequent
+// ghostty_remote_connection_start is a no-op (returns true) and
+// _wait_handshake returns true immediately. Returns NULL on a NULL/empty host
+// or any dial/handshake failure. The transport encoding is raw (a clean
+// TCP/Tailscale hop). Free with ghostty_remote_connection_free.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_tcp(
+    const char* host, uint16_t port);
+
 // Start the connection: dial SSH, spawn the reader/writer threads, and send
 // the client HELLO. Returns true on success. WP3: currently returns false
 // (live SSH dial not yet wired).
