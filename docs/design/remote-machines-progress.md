@@ -40,7 +40,8 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | ↳ inc.3 | channel/session lifecycle (OPEN/ATTACH/CLOSE/DETACH), resync §7.3, steal §5.3, FLOW-pause | ✅ Done — 50 tests | `176d85ad4` |
 | ↳ inc.4a | `termio.Remote` (Backend contract) + `backend.zig` `.remote` arm — **libghostty compiles with remote backend** | ✅ Done | `d6b463753` |
 | ↳ inc.4b | `Surface.zig:682` construct `.remote` + `ghostty_surface_config_s` + `ghostty_remote_*` C API | ✅ Done — Zig build green | `de230b6de` |
-| ↳ inc.3b | real reconnect driver (stream swap + re-ATTACH) + ssh Transport (`Stream` over ssh subprocess) | ⛔ NEXT (client) | — |
+| ↳ CommandCore | `Command.zig`→`CommandCore` extraction (DI of rlimits/pre_exec/post_fork; §17) — GUI-free spawn core; unblocks ssh Transport + agent PTY | ✅ Done — full debug build green | `ed98b22fe` |
+| ↳ inc.3b | real reconnect driver (stream swap + re-ATTACH) + ssh Transport (`Stream` over ssh subprocess) | 🔨 IN PROGRESS (ssh Transport) | — |
 | **WP2** | Agent daemon | 🔨 **agent inc.1 done**; real-PTY + build target next | see below |
 | ↳ agent inc.1 | `src/remote/agent/` session-server core (HELLO/OPEN/DATA/ATTACH/RESIZE/SIGNAL/DETACH/CLOSE/EXIT, session table, ring, tombstones) over abstract transport + fake child | ✅ Done — 18 tests | `c4b09c774`→`26af4f78a` |
 | ↳ agent next | real PTY via `Command.zig`→`CommandCore`; real grid snapshot (§7.3); daemonize; `zig build agent` exe target; Windows (reuse spike `win32.zig`); containment/RPC (§9) | ⛔ Next (agent) | — |
