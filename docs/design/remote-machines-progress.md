@@ -48,7 +48,11 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | ↳ agent inc.1 | `src/remote/agent/` session-server core (HELLO/OPEN/DATA/ATTACH/RESIZE/SIGNAL/DETACH/CLOSE/EXIT, session table, ring, tombstones) over abstract transport + fake child | ✅ Done — 18 tests | `c4b09c774`→`26af4f78a` |
 | ↳ agent real PTY | real POSIX pty child (`pty_child.zig`), `zig build agent`→`ghoztty-agent`, single-stdio `StdioMux`, smoke round-trips `echo` through pty/ring/DATA | ✅ Done — 40 tests + binary smoke | `8a9f7bc14` |
 | ↳ ConPTY smoke | **NEW (Windows pivot):** minimal cross-compiled `ghoztty-conpty-smoke.exe` to runtime-prove ConPTY on the user's real Windows box (reuses in-tree `pty.zig` WindowsPty + `CommandCore.startWindows`) | 🔨 IN PROGRESS | — |
-| ↳ Windows agent | cross-platform `pty_child` (ConPTY handles/ReadFile/WriteFile/ConsoleCtrl), **TCP transport** (Tailscale-reachable; both lanes muxed over one socket), `ghoztty-agent.exe` cross-build | ⛔ Next — blocked on ConPTY smoke + client mux | — |
+| ↳ Windows ConPTY arm | `pty_child.zig` cross-platform: Windows ConPTY (ReadFile/WriteFile/0x03-interrupt/TerminateProcess/close-before-join); POSIX identical (75 tests); cross-compiles to .exe | ✅ Done | `e2e72045d` |
+| ↳ TCP + daemon + client | socket Stream, agent TCP listen (loop-accept daemon, default 0.0.0.0:7777), client TCP dialer, Mac `remote-test-client` exe; **Mac-localhost e2e drives a real shell over TCP** | ✅ Done — e2e green | `85faeb456` |
+| ↳ **M1 networked agent.exe** | combined: `ghoztty-agent.exe` (TCP listen + ConPTY) cross-compiled both arches, on `/Volumes/share/ghoztty-windows/` | ✅ Built — awaiting user Windows run | — |
+| ↳ M2 catch-up | daemon session-survival across disconnect + client reconnect/replay (close-laptop scenario) | ⛔ Next | — |
+| ↳ channel rendezvous | client `Connection.openChannel` vs server-authoritative channel mismatch (test_client works around it); reconcile before WP4/Swift | ⛔ Cleanup | — |
 | WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3 C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
 | WP6 | Tunneling | ⛔ Not started (P2) | — |
