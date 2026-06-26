@@ -980,10 +980,24 @@ class AppDelegate: NSObject,
         }
     }
 
-    /// Dials `machine` and opens a remote window on success. Shows an alert on
-    /// connection failure.
+    /// Open a remote window for an ad-hoc `host:port` (used by the
+    /// `+new-remote-window` IPC trigger). Mirrors the menu flow exactly: it
+    /// builds a `Machine` and routes through `openRemoteWindow(on:)`, which
+    /// dials and opens the window on the main thread. Returns nil on success or
+    /// an error message on failure (e.g. the dial failed).
     @MainActor
-    private func openRemoteWindow(on machine: Machine) {
+    func openRemoteWindow(host: String, port: UInt16) -> String? {
+        let machine = Machine(name: host, host: host, port: port)
+        return openRemoteWindow(on: machine)
+    }
+
+    /// Dials `machine` and opens a remote window on success. Shows an alert on
+    /// connection failure. Returns nil on success, or an error message string
+    /// on failure (callers that drive this headlessly use the return value;
+    /// the interactive menu path also surfaces an alert).
+    @MainActor
+    @discardableResult
+    private func openRemoteWindow(on machine: Machine) -> String? {
         // Dial the agent over TCP. This blocks through the handshake and returns
         // a connection handle, or NULL on failure.
         let handle: ghostty_remote_connection_t? = machine.host.withCString { hostPtr in
@@ -997,7 +1011,7 @@ class AppDelegate: NSObject,
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
             alert.runModal()
-            return
+            return "failed to reach \(machine.endpoint): the agent is not running or not reachable"
         }
 
         // Wrap the handle in a strong owner; the controller below holds the only
@@ -1014,6 +1028,7 @@ class AppDelegate: NSObject,
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
         controller.remoteMachine = machine
         controller.remoteConnection = connection
+        return nil
     }
 
     @IBAction func newTab(_ sender: Any?) {

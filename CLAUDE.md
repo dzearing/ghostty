@@ -86,6 +86,28 @@ ghoztty +set-state --target=dev --state=idle
 
 Processes can also set state via OSC escape sequence: `\033]7777;<state>\007`
 
+### `ghoztty +new-remote-window`
+
+Open a terminal window whose shell runs on a remote machine via a `ghoztty-agent`
+reached over TCP. Drives the same flow as the Cmd-Shift-N "New Remote Window" menu
+action (dial the agent, build a remote surface, open the window), so the remote
+path is scriptable/testable from the shell.
+
+```
+ghoztty +new-remote-window --host=<host> --port=<port>
+```
+
+- `--host`: Agent host (DNS name or literal IP). Required.
+- `--port`: Agent TCP port. Required.
+
+```bash
+ghoztty +new-remote-window --host=127.0.0.1 --port=7777
+```
+
+The remote session uses the remote machine's own default shell and working
+directory (the local shell/pwd are NOT forwarded — they would not exist on a
+different OS such as a Windows ConPTY agent).
+
 ### Naming
 
 - `+new-window --target=<name>` registers a **window**

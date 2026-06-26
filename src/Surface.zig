@@ -700,14 +700,37 @@ pub fn init(
                 // map is not consumed by this backend — free it here.
                 env.deinit();
                 env_owned = false;
-                if (command) |c| remote_command = try c.string(alloc);
+
+                // The command to run on the REMOTE machine. CRITICAL: we must
+                // NOT inherit the local `config.command` *default* (e.g. the
+                // user's macOS login shell like `/bin/zsh`). The remote agent
+                // runs a different OS (e.g. a Windows ConPTY agent) where that
+                // path does not exist; an OPEN carrying it makes the agent's
+                // session spawn fail and never reply OPENED, wedging the IO
+                // thread forever in `openChannel` (blank surface + hung quit).
+                // A remote window must use the remote's OWN default shell, so we
+                // only forward a command that was EXPLICITLY requested for this
+                // surface (apprt sets `wait-after-command` on an explicit `-e` /
+                // `--command`); otherwise we send null and the agent picks its
+                // default shell — matching the proven `remote-test-client` path.
+                if (command) |c| {
+                    if (config.@"wait-after-command") remote_command = try c.string(alloc);
+                }
                 errdefer if (remote_command) |rc| alloc.free(rc);
 
+                // Likewise, do NOT forward the local working directory. By
+                // default Ghostty inherits the launching surface's pwd (e.g. a
+                // macOS path like `/Users/dzearing`), which does not exist on a
+                // remote machine (e.g. a Windows agent). An OPEN carrying it
+                // makes the agent's chdir/spawn fail and never reply OPENED —
+                // the same wedge as the command above. The remote session starts
+                // in the agent's own default cwd. (A future explicit "remote cwd"
+                // can be plumbed through like an explicit remote command.)
                 const io_remote = try termio.Remote.init(alloc, .{
                     .conn = rb.connection,
                     .session_id = rb.session_id,
                     .command = remote_command,
-                    .working_directory = working_directory,
+                    .working_directory = null,
                     .term = config.term,
                 });
                 break :backend .{ .remote = io_remote };

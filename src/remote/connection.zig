@@ -426,8 +426,16 @@ const PendingRpc = struct {
     /// channel.
     reply_channel: u128 = 0,
 
-    const PendingError = error{ ConnectionClosed, MalformedReply, WrongReply };
+    const PendingError = error{ ConnectionClosed, MalformedReply, WrongReply, Timeout };
 };
+
+/// Default timeout for a session-establishing RPC (OPEN / ATTACH). If the agent
+/// never replies — e.g. the requested remote command fails to spawn so the agent
+/// sends no OPENED — the RPC MUST NOT block its caller (the pane's IO thread)
+/// forever: that wedges the surface (blank, never drains) and the app's quit
+/// (the IO thread can't join). We bound the wait so a failed OPEN surfaces as an
+/// error the backend handles (DETACH + give up) instead of a deadlock.
+const rpc_open_timeout_ns: u64 = 10 * std.time.ns_per_s;
 
 /// A remote pane handle (§3.3): one opened/attached session's client-side state.
 /// Heap-allocated and owned by the `Connection` (created by `openChannel`/
@@ -584,6 +592,9 @@ pub const Connection = struct {
     clock: Clock = Clock.real(),
     /// Heartbeat interval (ms). Injectable; default 3000 (§5.1 interactive).
     heartbeat_interval_ms: u64 = 3000,
+    /// Timeout (ns) for a session-establishing RPC (OPEN/ATTACH). Injectable so
+    /// tests can use a tiny bound; production default is `rpc_open_timeout_ns`.
+    rpc_open_timeout_ns: u64 = rpc_open_timeout_ns,
 
     /// The link-state FSM (§5.1) and the RTT estimator (§6.4). BOTH are guarded by
     /// `state_mutex` — every read/write goes through it so transitions serialize and
@@ -643,6 +654,9 @@ pub const Connection = struct {
         /// PRNG for the full-jitter reconnect backoff. Defaults to a seed derived
         /// from the real clock; tests pass a fixed-seed PRNG for determinism.
         rand: ?std.Random = null,
+        /// OPEN/ATTACH RPC timeout in ns (default `rpc_open_timeout_ns`). Tests
+        /// pass a tiny value to assert the no-deadlock-on-silent-agent path fast.
+        rpc_open_timeout_ns: u64 = rpc_open_timeout_ns,
     };
 
     /// Allocate and initialize a connection over the two given channel streams.
@@ -675,6 +689,7 @@ pub const Connection = struct {
             .channels = ring.ChannelTable.init(alloc),
             .clock = opts.clock,
             .heartbeat_interval_ms = opts.heartbeat_interval_ms,
+            .rpc_open_timeout_ns = opts.rpc_open_timeout_ns,
         };
         // Seed the embedded PRNG (used only when no PRNG was injected).
         self.default_prng = std.Random.DefaultPrng.init(blk: {
@@ -1009,7 +1024,7 @@ pub const Connection = struct {
         // matches the proven frame-level path in `test_client.zig`).
         const open_json = try protocol.encodeJson(self.alloc, open);
         defer self.alloc.free(open_json);
-        const rpc = try self.rpcCall(req_channel, .open, .opened, open_json);
+        const rpc = try self.rpcCall(req_channel, .open, .opened, open_json, self.rpc_open_timeout_ns);
         defer self.alloc.free(rpc.payload);
         const id = rpc.channel; // agent-authoritative data channel
 
@@ -1085,7 +1100,7 @@ pub const Connection = struct {
         };
         const attach_json = try protocol.encodeJson(self.alloc, attach);
         defer self.alloc.free(attach_json);
-        const rpc = try self.rpcCall(req_channel, .attach, .attached, attach_json);
+        const rpc = try self.rpcCall(req_channel, .attach, .attached, attach_json, self.rpc_open_timeout_ns);
         defer self.alloc.free(rpc.payload);
         const id = rpc.channel; // agent-authoritative session channel
 
@@ -1257,12 +1272,16 @@ pub const Connection = struct {
     /// Every other RPC correlates by the request `channel` via `pending` (the
     /// same-channel case, used by the loopback mock agents). On return,
     /// `RpcResult.channel` is the channel the caller should adopt.
+    /// `timeout_ns` bounds how long we park on the reply (null ⇒ wait forever).
+    /// A timeout returns `error.Timeout`; the slot is removed by the trailing
+    /// `defer` exactly as on the success path, so a late reply is safely dropped.
     fn rpcCall(
         self: *Connection,
         channel: u128,
         req: protocol.FrameType,
         want: protocol.FrameType,
         payload: []const u8,
+        timeout_ns: ?u64,
     ) !RpcResult {
         var slot: PendingRpc = .{ .want = want, .reply_channel = channel };
 
@@ -1311,7 +1330,18 @@ pub const Connection = struct {
         }
 
         try self.writeControl(req, channel, payload);
-        slot.done.wait();
+        if (timeout_ns) |ns| {
+            slot.done.timedWait(ns) catch {
+                // The agent never replied in time (e.g. the remote command
+                // failed to spawn, so no OPENED is coming). Fail rather than
+                // wedge the caller. The trailing `defer` removes our slot under
+                // `rpc_mutex`, so a reply that lands after this is dropped by
+                // `deliverRpcReply` (no waiter found) — no use-after-free.
+                return error.Timeout;
+            };
+        } else {
+            slot.done.wait();
+        }
         const owned = try slot.result; // []u8 (caller-owned) or a PendingError
         return .{ .payload = owned, .channel = slot.reply_channel };
     }
@@ -2821,6 +2851,10 @@ const LifecycleAgent = struct {
     snapshot_at_offset: u64 = 0,
     attached_elsewhere_first: bool = false, // true → first ATTACH reports stolen
     exit_code: ?i64 = null,
+    /// When true the agent receives OPEN but NEVER replies OPENED (models a remote
+    /// session whose command/cwd failed to spawn). Exercises the RPC timeout so a
+    /// silent agent can't wedge the caller (the pane IO thread) forever.
+    silent_open: bool = false,
 
     // Observations (atomics / events so the test thread can read them safely).
     seen_channel: std.atomic.Value(u128) = .{ .raw = 0 },
@@ -2845,6 +2879,10 @@ const LifecycleAgent = struct {
                 .open => {
                     self.seen_channel.store(frame.channel, .monotonic);
                     self.saw_request.set();
+                    // Model a remote session that fails to spawn (bad command/cwd):
+                    // the agent never sends OPENED. The client's OPEN RPC must time
+                    // out rather than block forever.
+                    if (self.silent_open) continue;
                     try self.ctrl.sendJson(.opened, frame.channel, protocol.Opened{
                         .session_id = self.session_id,
                         .pid = self.pid,
@@ -2907,6 +2945,10 @@ const LifecycleHarness = struct {
     thread: std.Thread = undefined,
 
     fn create(alloc: Allocator) !*LifecycleHarness {
+        return createWithTimeout(alloc, rpc_open_timeout_ns);
+    }
+
+    fn createWithTimeout(alloc: Allocator, rpc_timeout_ns: u64) !*LifecycleHarness {
         const h = try alloc.create(LifecycleHarness);
         h.* = .{
             .alloc = alloc,
@@ -2922,7 +2964,10 @@ const LifecycleHarness = struct {
             h.ctrl_lb.clientStream(),
             h.data_lb.clientStream(),
             .{ .transfer_encoding = .raw },
-            .{ .heartbeat_interval_ms = 100_000 }, // effectively never during a test
+            .{
+                .heartbeat_interval_ms = 100_000, // effectively never during a test
+                .rpc_open_timeout_ns = rpc_timeout_ns,
+            },
         );
         h.ctrl_agent = MockAgent.init(alloc, h.ctrl_lb.agentStream(), .raw);
         h.data_agent = MockAgent.init(alloc, h.data_lb.agentStream(), .raw);
@@ -2982,6 +3027,32 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
     try testing.expect(a.err == null);
     // Teardown the pane explicitly (consumer has stopped draining: the test owns it).
     h.conn.closeChannel(pane);
+}
+
+test "openChannel: a silent agent (no OPENED) times out instead of deadlocking" {
+    const alloc = testing.allocator;
+    // Tiny RPC timeout so the test is fast; the agent receives OPEN but never
+    // replies OPENED (the real-world cause was a bad command/cwd making the
+    // remote session fail to spawn — the WP4 GUI stall/hung-quit regression).
+    const h = try LifecycleHarness.createWithTimeout(alloc, 50 * std.time.ns_per_ms);
+    defer h.destroy();
+    h.configure().silent_open = true;
+    try h.start();
+
+    const t = std.time.milliTimestamp();
+    try testing.expectError(error.Timeout, h.conn.openChannel(.{ .rows = 24, .cols = 80 }));
+    const elapsed = std.time.milliTimestamp() - t;
+
+    // It returned (did not hang) and roughly respected the bound. Generous upper
+    // bound to stay robust on a loaded CI host.
+    try testing.expect(elapsed < 5_000);
+    // The agent did see the OPEN (so we exercised the no-reply path, not a drop).
+    try testing.expect(h.agent.saw_request.isSet());
+    // No pane/channel was registered on the failed OPEN (caller owns nothing).
+    h.conn.panes_mutex.lock();
+    const pane_count = h.conn.panes.count();
+    h.conn.panes_mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), pane_count);
 }
 
 test "writeInput: bytes reach the agent as DATA with monotonic byte_offset" {

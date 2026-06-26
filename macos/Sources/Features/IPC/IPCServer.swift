@@ -319,6 +319,8 @@ class IPCServer {
             return handleSendKeys(request)
         case "set-state":
             return handleSetState(request)
+        case "new-remote-window":
+            return handleNewRemoteWindow(request)
         default:
             return IPCResponse(success: false, error: "unknown action: \(request.action)")
         }
@@ -786,6 +788,59 @@ class IPCServer {
 
         Self.logger.info("IPC: set activity state for '\(target)' to '\(stateStr)'")
 
+        return .ok
+    }
+
+    /// Open a remote-machine window, dialing the agent at `--host=<h> --port=<p>`.
+    ///
+    /// This drives the EXACT same code path as the Cmd-Shift-N "New Remote
+    /// Window" menu action (`AppDelegate.openRemoteWindow`): the dial + window
+    /// open run on the MAIN thread, just like the menu. It exists so the remote
+    /// window GUI flow can be triggered headlessly from the shell (macOS blocks
+    /// synthesized keystrokes), making it scriptable and test-reproducible.
+    ///
+    /// We dispatch to main and block this IPC worker on a semaphore so the
+    /// reply reflects whether the dial+open succeeded. Note: the dial itself is
+    /// synchronous (it completes the handshake) and runs on the main thread —
+    /// exactly as the menu does — so this faithfully reproduces any main-thread
+    /// stall the menu path would hit.
+    private func handleNewRemoteWindow(_ request: IPCRequest) -> IPCResponse {
+        guard let arguments = request.arguments else {
+            return IPCResponse(success: false, error: "--host and --port are required for +new-remote-window")
+        }
+
+        var host: String?
+        var port: UInt16?
+        for arg in arguments {
+            if let value = arg.dropPrefix("--host=") {
+                host = String(value)
+            } else if let value = arg.dropPrefix("--port=") {
+                port = UInt16(value)
+            }
+        }
+
+        guard let host, !host.isEmpty else {
+            return IPCResponse(success: false, error: "--host is required for +new-remote-window")
+        }
+        guard let port, port != 0 else {
+            return IPCResponse(success: false, error: "--port is required for +new-remote-window")
+        }
+
+        var errorMessage: String?
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            defer { semaphore.signal() }
+            guard let appDelegate = NSApp.delegate as? AppDelegate else {
+                errorMessage = "app delegate unavailable"
+                return
+            }
+            errorMessage = appDelegate.openRemoteWindow(host: host, port: port)
+        }
+        semaphore.wait()
+
+        if let errorMessage {
+            return IPCResponse(success: false, error: errorMessage)
+        }
         return .ok
     }
 
