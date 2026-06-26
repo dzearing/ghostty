@@ -6,6 +6,14 @@ const apprt = @import("../apprt.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// Wake up the app event loop. The `none` runtime has no event loop (it is
+    /// the CLI/headless artifact), so this is a no-op. It exists so code that is
+    /// generic over the runtime — e.g. `App.Mailbox.push`, exercised by headless
+    /// harnesses that drive a real `Termio` — can compile and link.
+    pub fn wakeup(self: *const App) void {
+        _ = self;
+    }
+
     pub fn performIpc(
         alloc: Allocator,
         _: apprt.ipc.Target,

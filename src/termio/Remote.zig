@@ -144,8 +144,9 @@ pub fn initTerminal(self: *Remote, t: *terminal.Terminal) void {
     };
 
     // Seed our grid/screen size from the terminal. This can't fail because we
-    // haven't opened a channel yet, so `resize` only records the sizes.
-    self.resize(.{
+    // haven't opened a channel yet (null `td`), so `resize` only records the
+    // sizes; `threadEnter` sends them in `OPEN`.
+    self.resize(null, .{
         .columns = t.cols,
         .rows = t.rows,
     }, .{
@@ -272,38 +273,37 @@ pub fn focusGained(
     // TODO(wp3): explicit focus-tracking forwarding if/when the agent opts in.
 }
 
+/// Resize the remote pane. Mirrors `Exec.resize`, which forwards the new geometry
+/// to the local pty via `TIOCSWINSZ`; here we forward it to the agent's remote pty
+/// via a `RESIZE` control frame.
+///
+/// `td` is null ONLY for the `initTerminal` seed call (before any channel exists):
+/// then we just record the size, which `threadEnter` sends in `OPEN`. For every
+/// live resize the IO thread passes its `ThreadData` (which owns the pane handle),
+/// and we send the wire `RESIZE` so the remote shell is told its new window size
+/// and repaints. Without this, a surface that starts at 0x0 (the GUI: the Cocoa
+/// SurfaceView lays out AFTER `ghostty_surface_new`) would OPEN a 0x0 remote pty
+/// and the resize that follows would never reach the agent — the remote shell
+/// stays 0x0 and never paints, so the window renders BLANK (WP4 bug).
 pub fn resize(
     self: *Remote,
+    td: ?*termio.Termio.ThreadData,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
 ) !void {
     self.grid_size = grid_size;
     self.screen_size = screen_size;
 
-    // Before the channel exists (the `initTerminal` seed call), just record the
-    // sizes; `threadEnter` sends them in `OPEN`. We detect "no channel yet" by the
-    // resize being driven from `init`-time state — the connection-side send only
-    // happens once we have a pane, which lives in ThreadData, not here. Since this
-    // method has no access to ThreadData, the live RESIZE is sent from the IO
-    // thread's resize handler via `resizeChannel` below. Recording here keeps the
-    // OPEN payload current.
-}
-
-/// Send a live `RESIZE` for the pane. Called by the IO thread (it owns the pane
-/// pointer via ThreadData). Separated from `resize` because `resize` has no
-/// ThreadData handle; `backend.zig` calls `resize` (which records the size) and
-/// the surface's resize path drives the per-thread send. For increment 4a the
-/// recorded size is authoritative for `OPEN`; the live wire `RESIZE` is emitted
-/// here.
-fn resizeChannel(td: *termio.Termio.ThreadData, grid: renderer.GridSize, screen: renderer.ScreenSize) void {
-    assert(td.backend == .remote);
-    const rd = &td.backend.remote;
+    // No channel yet (the `initTerminal` seed): just record; `OPEN` carries it.
+    const td_live = td orelse return;
+    assert(td_live.backend == .remote);
+    const rd = &td_live.backend.remote;
     rd.conn.sendResize(
         rd.pane,
-        @intCast(@min(grid.rows, std.math.maxInt(u16))),
-        @intCast(@min(grid.columns, std.math.maxInt(u16))),
-        @intCast(@min(screen.width, std.math.maxInt(u16))),
-        @intCast(@min(screen.height, std.math.maxInt(u16))),
+        @intCast(@min(grid_size.rows, std.math.maxInt(u16))),
+        @intCast(@min(grid_size.columns, std.math.maxInt(u16))),
+        @intCast(@min(screen_size.width, std.math.maxInt(u16))),
+        @intCast(@min(screen_size.height, std.math.maxInt(u16))),
     ) catch |err| log.warn("error sending RESIZE err={}", .{err});
 }
 
@@ -469,9 +469,3 @@ pub const ThreadData = struct {
     }
 };
 
-// Keep `resizeChannel` referenced so it is analyzed (it is the per-thread live
-// RESIZE path the surface resize handler will call in increment 4b). Without a
-// reference Zig would lazily skip it; we want it to compile now.
-comptime {
-    _ = &resizeChannel;
-}

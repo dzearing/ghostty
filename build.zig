@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) !void {
     const conpty_smoke_step = b.step("conpty-smoke", "Build the ConPTY runtime smoke exe (Windows, cross-compile)");
     const remote_test_client_step = b.step("remote-test-client", "Build the remote-test-client (drives a TCP ghoztty-agent)");
     const wp4_e2e_step = b.step("wp4-e2e", "Build the WP4 headless e2e harness (Connection.openChannel over TCP vs the real agent)");
+    const remote_backend_e2e_step = b.step("remote-backend-e2e", "Build the WP4 headless RENDER harness (real Termio/.remote backend grid render vs the real agent)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -131,6 +132,16 @@ pub fn build(b: *std.Build) !void {
     {
         const harness = try buildpkg.GhosttyWp4E2e.init(b, &config);
         wp4_e2e_step.dependOn(&harness.install_step.step);
+    }
+
+    // Ghoztty WP4 headless RENDER de-risk harness. Stands up a REAL Termio with a
+    // `.remote` backend on a REAL IO thread (the exact GUI lifecycle) against the
+    // real agent over TCP, and asserts the terminal GRID renders remote output —
+    // the render assertion the GUI lacks. Reproduces the "blank window" bug
+    // headlessly. Built on demand via `zig build remote-backend-e2e`.
+    {
+        const harness = try buildpkg.GhosttyRemoteBackendE2e.init(b, &config, &deps);
+        remote_backend_e2e_step.dependOn(&harness.install_step.step);
     }
 
     // Ghoztty ConPTY runtime smoke exe (WP2, §13). A tiny standalone Windows .exe

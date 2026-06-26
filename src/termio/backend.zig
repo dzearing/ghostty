@@ -75,12 +75,16 @@ pub const Backend = union(Kind) {
 
     pub fn resize(
         self: *Backend,
+        td: *termio.Termio.ThreadData,
         grid_size: renderer.GridSize,
         screen_size: renderer.ScreenSize,
     ) !void {
         switch (self.*) {
+            // Exec resizes the local pty and ignores ThreadData.
             .exec => |*exec| try exec.resize(grid_size, screen_size),
-            .remote => |*remote| try remote.resize(grid_size, screen_size),
+            // Remote forwards the live RESIZE to the agent; it needs ThreadData
+            // (which owns the pane handle) to address the remote pty.
+            .remote => |*remote| try remote.resize(td, grid_size, screen_size),
         }
     }
 
