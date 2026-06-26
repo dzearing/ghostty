@@ -596,6 +596,7 @@ pub const Server = struct {
             .signal => self.handleSignal(frame.channel, frame.payload),
             .detach => self.handleDetach(frame.channel),
             .close => self.handleClose(frame.channel),
+            .get_cwd => self.handleGetCwd(frame.channel, frame.payload),
             .ping => self.handlePing(frame.payload),
             .flow => self.handleFlow(frame.payload),
             // Frames the agent never receives (it produces these) or that are out
@@ -808,6 +809,46 @@ pub const Server = struct {
         if (unlinked) |u| self.store.table.freeUnlinked(u);
     }
 
+    /// `GET_CWD` (§WP4): on-demand "what is this session's child cwd?". Looks the
+    /// session up by `session_id`, queries the OS for its child process's CURRENT
+    /// working directory, and replies `CWD{session_id, path?, ok}` on the SAME
+    /// request channel (the client correlates the reply by request channel).
+    ///
+    /// The OS query (`proc_pidinfo` / PEB read) runs OUTSIDE `store.mutex`: we
+    /// snapshot the `session.Child` handle under the lock, drop the lock, then
+    /// query. A `Child` handle stays valid until the child is `terminate`d, and a
+    /// concurrent CLOSE only terminates after unlinking, so the worst case is the
+    /// query failing gracefully (→ `ok = false`), never a use-after-free of the
+    /// session table entry.
+    fn handleGetCwd(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.GetCwd, self.alloc, payload) catch return;
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        // Snapshot the child handle (a value copy of the vtable handle) under the
+        // lock; do the OS query unlocked.
+        self.store.mutex.lock();
+        const s = self.store.table.getByIdStr(req.session_id);
+        const child: ?session.Child = if (s) |sess| (if (sess.alive) sess.child else null) else null;
+        self.store.mutex.unlock();
+
+        // Stable copy of the session_id for the reply (the parsed value is freed by
+        // the trailing defer before sendJson runs through the writer queue).
+        var id_buf: [64]u8 = undefined;
+        const id_len = @min(req.session_id.len, id_buf.len);
+        @memcpy(id_buf[0..id_len], req.session_id[0..id_len]);
+        const id_copy = id_buf[0..id_len];
+
+        const cwd: ?[]u8 = if (child) |c| c.queryCwd(self.alloc) else null;
+        defer if (cwd) |p| self.alloc.free(p);
+
+        self.sendJson(.cwd, channel, protocol.Cwd{
+            .session_id = id_copy,
+            .path = cwd,
+            .ok = cwd != null,
+        }) catch {};
+    }
+
     fn handlePing(self: *Server, payload: []const u8) void {
         // Echo the PING payload back verbatim as PONG (carries the client's
         // timestamp for RTT, §6.4). Payload is opaque to the agent.
@@ -971,6 +1012,9 @@ const FakeChild = struct {
     last_signal: ?[]const u8 = null,
     exit_code: ?i64 = null,
     terminated: bool = false,
+    /// When set, `queryCwd` returns a copy of this (models the OS cwd read). When
+    /// null the vtable's `queryCwd` is still wired but returns null (query failed).
+    fake_cwd: ?[]const u8 = null,
     mutex: std.Thread.Mutex = .{},
     alloc: Allocator,
 
@@ -983,7 +1027,13 @@ const FakeChild = struct {
         .signal = sg,
         .tryWait = tw,
         .terminate = tm,
+        .queryCwd = qcwd,
     };
+    fn qcwd(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
+        const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        const c = self.fake_cwd orelse return null;
+        return alloc.dupe(u8, c) catch null;
+    }
     fn wr(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
         self.mutex.lock();
@@ -1234,6 +1284,63 @@ test "handshake: agent echoes pinned encoding, negotiates" {
         try testing.expectEqual(enc, neg.transfer_encoding);
         try testing.expectEqual(protocol.proto_version, neg.proto_version);
     }
+}
+
+test "GET_CWD→CWD: agent replies with the child's queried cwd on the request channel" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc, .fake_cwd = "/private/tmp" };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(7);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const opened = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // Issue GET_CWD on a fresh request channel; the agent must echo CWD on it.
+    const req_ch: u128 = 0xC0FFEE;
+    try h.client.sendControlJson(.get_cwd, req_ch, protocol.GetCwd{
+        .session_id = opened.id[0..],
+    });
+    const reply = try h.client.waitControl(.cwd);
+    try testing.expectEqual(req_ch, reply.channel);
+    var parsed = try protocol.parseJson(protocol.Cwd, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expect(parsed.value.ok);
+    try testing.expect(parsed.value.path != null);
+    try testing.expectEqualStrings("/private/tmp", parsed.value.path.?);
+    try testing.expectEqualStrings(opened.id[0..], parsed.value.session_id);
+}
+
+test "GET_CWD→CWD: unknown session replies ok=false (graceful, no crash)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(8);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.get_cwd, 0xABCD, protocol.GetCwd{
+        .session_id = "ffffffffffffffffffffffffffffffff",
+    });
+    const reply = try h.client.waitControl(.cwd);
+    var parsed = try protocol.parseJson(protocol.Cwd, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expect(!parsed.value.ok);
+    try testing.expect(parsed.value.path == null);
 }
 
 test "OPEN→OPENED then child output streams as DATA with advancing byte_offsets" {

@@ -987,7 +987,15 @@ class AppDelegate: NSObject,
     /// an error message on failure (e.g. the dial failed).
     @MainActor
     func openRemoteWindow(host: String, port: UInt16) -> String? {
-        let machine = Machine(name: host, host: host, port: port)
+        // Resolve a friendly NAME from the registry so an IPC-opened window's
+        // title matches the menu flow (e.g. `maximushome` instead of the raw
+        // IP). Match on host+port first, then host alone; fall back to the host
+        // string when the machine is unknown.
+        let registry = MachineRegistry.shared.machines
+        let known = registry.first { $0.host == host && $0.port == port }
+            ?? registry.first { $0.host == host }
+        let machine = known.map { Machine(name: $0.name, host: host, port: port) }
+            ?? Machine(name: host, host: host, port: port)
         return openRemoteWindow(on: machine)
     }
 

@@ -497,6 +497,15 @@ typedef struct {
   // `connection` is NULL.
   ghostty_remote_connection_t connection;
   const char* session_id;
+
+  // Explicit REMOTE working directory for an OPEN-new remote session (§WP4).
+  // This is the cwd ON THE REMOTE MACHINE the new pane should start in — set by
+  // the split/tab path from an on-demand cwd query of the parent remote pane.
+  // It is forwarded verbatim to the agent's OPEN. It is DISTINCT from
+  // `working_directory` above (a LOCAL path that must never reach a remote
+  // agent). NULL means "no remote cwd hint" — the agent uses its own default.
+  // Ignored when `connection` is NULL.
+  const char* remote_working_directory;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1299,6 +1308,19 @@ GHOSTTY_API int32_t ghostty_remote_connection_latency_ms(
 // the remote for later re-attach by session_id). Caller must ensure no surface
 // still references this connection.
 GHOSTTY_API void ghostty_remote_connection_free(ghostty_remote_connection_t);
+
+// On-demand query for a remote session's child working directory. Blocks
+// (bounded timeout) for the agent's reply. On success the returned string holds
+// the UTF-8 path; on failure (no connection, unknown session, agent query
+// failed, or timeout) it is empty (ptr == NULL). Free with ghostty_string_free.
+// Used at split/tab time so a new remote pane inherits the parent's cwd.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd(
+    ghostty_remote_connection_t, const char* session_id);
+
+// The live remote agent session id for a surface, or an empty string (ptr ==
+// NULL) for a local surface or one whose remote pane is not yet resolved. Free
+// with ghostty_string_free.
+GHOSTTY_API ghostty_string_s ghostty_surface_remote_session_id(ghostty_surface_t);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);

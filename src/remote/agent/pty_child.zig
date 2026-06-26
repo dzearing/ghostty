@@ -104,6 +104,7 @@ pub const PtyChild = struct {
         .signal = signalFn,
         .tryWait = tryWaitFn,
         .terminate = terminateFn,
+        .queryCwd = queryCwdFn,
     };
 
     // --- attach: publish channel + sink, start the reader ---------------------
@@ -289,6 +290,33 @@ pub const PtyChild = struct {
         return code;
     }
 
+    // --- queryCwd: read the child's CURRENT working directory from the OS -------
+
+    /// Ask the OS for the child shell's *current* working directory. This is the
+    /// on-demand cwd query the client uses at split/tab time so a new remote pane
+    /// inherits the parent's cwd. It reads the CHILD process's actual cwd (not any
+    /// OSC-7 hint), so it works even for shells that never emit OSC 7 (cmd.exe).
+    ///
+    /// Returns a fresh `alloc`-owned UTF-8 slice, or null on any failure (child
+    /// gone, syscall error, malformed data). Never crashes on a hostile/buggy
+    /// child — all reads are bounds-checked.
+    fn queryCwdFn(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
+        const self: *PtyChild = @ptrCast(@alignCast(ctx));
+
+        // If we've already reaped the child there's nothing to query.
+        self.mutex.lock();
+        const dead = self.reaped or self.closed;
+        self.mutex.unlock();
+        if (dead) return null;
+
+        return switch (builtin.os.tag) {
+            .macos => queryCwdMacos(self.pid, alloc),
+            .linux => queryCwdLinux(self.pid, alloc),
+            .windows => queryCwdWindows(self.pid, alloc),
+            else => null,
+        };
+    }
+
     // --- terminate: SIGKILL + reap + join + free -------------------------------
 
     fn terminateFn(ctx: *anyopaque) void {
@@ -361,6 +389,159 @@ fn sigFromName(name: []const u8) ?u8 {
         if (std.ascii.eqlIgnoreCase(name, entry[0])) return @intCast(entry[1]);
     }
     return null;
+}
+
+// -----------------------------------------------------------------------------
+// Per-OS cwd query (on-demand split-cwd inheritance, WP4)
+// -----------------------------------------------------------------------------
+//
+// Each helper reads the CHILD process's *current* working directory directly
+// from the OS — independent of any OSC-7 hint — so cwd inheritance works even
+// for shells that never report their cwd (e.g. cmd.exe). All return a fresh
+// `alloc`-owned UTF-8 slice or null; none ever crash on bad data.
+
+/// macOS: `proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size)` →
+/// `info.pvi_cdir.vip_path` (a NUL-terminated absolute path).
+fn queryCwdMacos(pid: posix.pid_t, alloc: Allocator) ?[]u8 {
+    if (builtin.os.tag != .macos) return null;
+    const PROC_PIDVNODEPATHINFO: c_int = 9;
+
+    // Mirror the libproc structs exactly (C ABI). We only read `pvi_cdir.vip_path`,
+    // but the whole struct must be laid out correctly so the field lands at the
+    // right offset; declaring them `extern struct` lets Zig compute C offsets.
+    const MAXPATHLEN = 1024;
+    const fsid_t = extern struct { val: [2]i32 };
+    const vinfo_stat = extern struct {
+        vst_dev: u32,
+        vst_mode: u16,
+        vst_nlink: u16,
+        vst_ino: u64,
+        vst_uid: u32,
+        vst_gid: u32,
+        vst_atime: i64,
+        vst_atimensec: i64,
+        vst_mtime: i64,
+        vst_mtimensec: i64,
+        vst_ctime: i64,
+        vst_ctimensec: i64,
+        vst_birthtime: i64,
+        vst_birthtimensec: i64,
+        vst_size: i64,
+        vst_blocks: i64,
+        vst_blksize: i32,
+        vst_flags: u32,
+        vst_gen: u32,
+        vst_rdev: u32,
+        vst_qspare: [2]i64,
+    };
+    const vnode_info = extern struct {
+        vi_stat: vinfo_stat,
+        vi_type: c_int,
+        vi_pad: c_int,
+        vi_fsid: fsid_t,
+    };
+    const vnode_info_path = extern struct {
+        vip_vi: vnode_info,
+        vip_path: [MAXPATHLEN]u8,
+    };
+    const proc_vnodepathinfo = extern struct {
+        pvi_cdir: vnode_info_path,
+        pvi_rdir: vnode_info_path,
+    };
+
+    const proc_pidinfo = struct {
+        extern "c" fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: ?*anyopaque,
+            buffersize: c_int,
+        ) c_int;
+    }.proc_pidinfo;
+
+    var info: proc_vnodepathinfo = undefined;
+    const want: c_int = @sizeOf(proc_vnodepathinfo);
+    const got = proc_pidinfo(@intCast(pid), PROC_PIDVNODEPATHINFO, 0, &info, want);
+    // A successful call returns the number of bytes written (== struct size).
+    if (got < want) return null;
+    const path = std.mem.sliceTo(&info.pvi_cdir.vip_path, 0);
+    if (path.len == 0) return null;
+    return alloc.dupe(u8, path) catch null;
+}
+
+/// Linux fallback: `readlink("/proc/<pid>/cwd")`.
+fn queryCwdLinux(pid: posix.pid_t, alloc: Allocator) ?[]u8 {
+    if (builtin.os.tag != .linux) return null;
+    var path_buf: [64]u8 = undefined;
+    const link = std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
+    var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = posix.readlink(link, &out_buf) catch return null;
+    if (target.len == 0) return null;
+    return alloc.dupe(u8, target) catch null;
+}
+
+/// Windows: read the child's `PEB->ProcessParameters->CurrentDirectory.DosPath`.
+/// `handle` here is the child's process HANDLE (POSIX `pid_t == windows.HANDLE`).
+///
+///   1. `NtQueryInformationProcess(ProcessBasicInformation)` → `PebBaseAddress`.
+///   2. `ReadProcessMemory` the child's PEB → `ProcessParameters` pointer.
+///   3. `ReadProcessMemory` the `RTL_USER_PROCESS_PARAMETERS` →
+///      `CurrentDirectory.DosPath` (a `UNICODE_STRING`).
+///   4. `ReadProcessMemory` its UTF-16 buffer and convert to UTF-8.
+///
+/// We use the std `PEB` / `RTL_USER_PROCESS_PARAMETERS` / `UNICODE_STRING` ABI
+/// types (no hand-rolled offsets) and the std `ReadProcessMemory` wrapper. This
+/// is the standard cross-process cwd read; every read is bounds-checked against
+/// the untrusted child and any failure returns null (never crashes).
+fn queryCwdWindows(handle: posix.pid_t, alloc: Allocator) ?[]u8 {
+    if (builtin.os.tag != .windows) return null;
+
+    // 1. PEB base address via NtQueryInformationProcess.
+    var pbi: windows.PROCESS_BASIC_INFORMATION = undefined;
+    var ret_len: windows.ULONG = 0;
+    const st = windows.ntdll.NtQueryInformationProcess(
+        handle,
+        .ProcessBasicInformation,
+        &pbi,
+        @sizeOf(windows.PROCESS_BASIC_INFORMATION),
+        &ret_len,
+    );
+    if (st != .SUCCESS) return null;
+
+    // 2. Read the child's PEB, then take ProcessParameters (a remote pointer).
+    var peb: windows.PEB = undefined;
+    _ = windows.ReadProcessMemory(
+        handle,
+        @ptrCast(pbi.PebBaseAddress),
+        std.mem.asBytes(&peb),
+    ) catch return null;
+    const pp_addr = @intFromPtr(peb.ProcessParameters);
+    if (pp_addr == 0) return null;
+
+    // 3. Read the RTL_USER_PROCESS_PARAMETERS; take CurrentDirectory.DosPath.
+    var params: windows.RTL_USER_PROCESS_PARAMETERS = undefined;
+    _ = windows.ReadProcessMemory(
+        handle,
+        @ptrFromInt(pp_addr),
+        std.mem.asBytes(&params),
+    ) catch return null;
+
+    const us = params.CurrentDirectory.DosPath; // UNICODE_STRING
+    const buf_ptr = us.Buffer orelse return null;
+    const wlen: usize = us.Length / 2; // Length is in BYTES
+    // A path far over MAX_PATH*2 is bogus; reject it (untrusted child).
+    if (wlen == 0 or wlen > 32768) return null;
+
+    // 4. Read the UTF-16 path buffer out of the child and convert to UTF-8.
+    const wbuf = alloc.alloc(u16, wlen) catch return null;
+    defer alloc.free(wbuf);
+    _ = windows.ReadProcessMemory(
+        handle,
+        @ptrCast(buf_ptr),
+        std.mem.sliceAsBytes(wbuf),
+    ) catch return null;
+
+    return std.unicode.utf16LeToUtf8Alloc(alloc, wbuf) catch null;
 }
 
 // -----------------------------------------------------------------------------

@@ -84,6 +84,9 @@ pub const FrameType = enum(u8) {
     exit = 0x20, // A→C  {code, runtime_ms} (ordered after final DATA)
     meta = 0x21, // A→C  {cwd?, title?, listening_ports?, foreground_cmd?}
 
+    get_cwd = 0x22, // C→A  {session_id}  on-demand "what is this session's cwd?"
+    cwd = 0x23, // A→C  {session_id, path?, ok}  reply to GET_CWD
+
     rpc = 0x30, // C→A  JSON-RPC 2.0 request (§9.5)
     rpc_result = 0x31, // A→C  JSON-RPC 2.0 response / subscription notification
 
@@ -457,6 +460,26 @@ pub const Meta = struct {
     title: ?[]const u8 = null,
     listening_ports: ?[]const u16 = null,
     foreground_cmd: ?[]const u8 = null,
+};
+
+/// `GET_CWD` (0x22). On-demand request for a session's child working directory.
+/// The client sends this at split/tab time so a new remote pane can inherit the
+/// parent pane's cwd. No continuous tracking: the agent answers by querying the
+/// OS for the child process's CURRENT working directory (works even for shells
+/// like cmd.exe that emit no OSC 7). Correlates by the request `Frame.channel`
+/// (same-channel RPC), so any channel id may be used; the agent echoes the reply
+/// on that same channel.
+pub const GetCwd = struct {
+    session_id: []const u8,
+};
+
+/// `CWD` (0x23). Reply to `GET_CWD`. `ok == false` (and `path == null`) when the
+/// query failed (session gone, or the OS cwd read failed); the client then opens
+/// the new pane with no cwd hint rather than failing.
+pub const Cwd = struct {
+    session_id: []const u8,
+    path: ?[]const u8 = null,
+    ok: bool = false,
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
@@ -862,6 +885,8 @@ fn sampleFrames(alloc: Allocator) ![]Frame {
     try list.append(alloc, .{ .type = .close, .channel = control_channel, .seq = 10, .payload = "" });
     try list.append(alloc, .{ .type = .exit, .channel = control_channel, .seq = 11, .payload = "{}" });
     try list.append(alloc, .{ .type = .meta, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .get_cwd, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .cwd, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc, .channel = control_channel, .seq = 13, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc_result, .channel = control_channel, .seq = 14, .payload = "{}" });
     try list.append(alloc, .{ .type = .tunnel, .channel = control_channel, .seq = 15, .payload = "{}" });

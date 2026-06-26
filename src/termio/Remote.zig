@@ -80,6 +80,17 @@ exit_code: ?u32 = null,
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
 
+/// The LIVE agent session id, published once `threadEnter` resolves the pane
+/// (OPEN-new learns it from the agent's OPENED; ATTACH already knows it). Stored
+/// here on the STABLE backend (`Termio.backend.remote`) so the GUI thread can
+/// read it cross-thread for an on-demand cwd query (§WP4). It points into the IO
+/// thread's `pane.session_id` (stable for the pane's lifetime). Published/cleared
+/// with release/acquire ordering; readers must treat the slice as borrowed and
+/// only valid while the pane is alive (the GUI reads it synchronously to issue a
+/// query right after, well before any teardown).
+live_session_id: std.atomic.Value(?[*]const u8) = .init(null),
+live_session_id_len: std.atomic.Value(usize) = .init(0),
+
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
 /// machinery here (that all lives on the agent side), but the connection handle
@@ -132,6 +143,18 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
 pub fn deinit(self: *Remote) void {
     self.arena.deinit();
     self.* = undefined;
+}
+
+/// The LIVE agent session id for this backend, or null if no pane is currently
+/// resolved (pre-`threadEnter` or post-`threadExit`). Lock-free; safe to call
+/// from any thread. The returned slice borrows the pane's `session_id` and is
+/// only valid while the pane is alive — callers use it synchronously (e.g. to
+/// issue a cwd query) and must not retain it. (§WP4)
+pub fn liveSessionId(self: *const Remote) ?[]const u8 {
+    const ptr = self.live_session_id.load(.acquire) orelse return null;
+    const len = self.live_session_id_len.load(.acquire);
+    if (len == 0) return null;
+    return ptr[0..len];
 }
 
 /// Initialize the terminal state for this backend (mirrors `Exec.initTerminal`):
@@ -206,6 +229,16 @@ pub fn threadEnter(
     // §3.3) so the remote session survives for a later re-attach.
     errdefer self.conn.detachChannel(pane);
 
+    // Publish the resolved live session id on the STABLE backend so the GUI thread
+    // can read it for an on-demand cwd query (§WP4). `pane.session_id` is stable
+    // for the pane's lifetime; we publish the pointer + len with release ordering
+    // (the len last so a reader that sees a non-null ptr also sees the right len).
+    const sid = pane.session_id;
+    if (sid.len > 0) {
+        self.live_session_id.store(sid.ptr, .release);
+        self.live_session_id_len.store(sid.len, .release);
+    }
+
     // The async handle the demux thread notifies to wake THIS pane's IO thread.
     // It is registered on this thread's xev loop; its callback drains the ring.
     var ring_async = try xev.Async.init();
@@ -254,6 +287,12 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     // (after which no in-flight demux `pushTo` can touch the ring) and frees the
     // ring + pane. DETACH keeps the remote session alive for a later re-attach
     // (NOT CLOSE — a `+close` would route through a different path, §3.3).
+    // Un-publish the live session id BEFORE the pane (and its `session_id`
+    // backing) is freed by detach, so the GUI thread never reads a dangling
+    // slice. Clear the len first, then the ptr (mirror of the publish order).
+    self.live_session_id_len.store(0, .release);
+    self.live_session_id.store(null, .release);
+
     self.conn.detachChannel(rd.pane);
     rd.pane = undefined;
 }

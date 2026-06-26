@@ -433,6 +433,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             var cfg = effectiveBaseConfig ?? Ghostty.SurfaceConfiguration()
             cfg.remoteMachine = parentRemote.machine
             cfg.remoteConnection = parentRemote.handle
+            // Remote cwd inheritance (§WP4): a new tab opens in the parent's
+            // focused remote pane's current directory. Resolve it on demand from
+            // the agent (works for cmd.exe too — the agent reads the child's OS
+            // cwd). On failure the new pane opens in the agent's default cwd.
+            if cfg.remoteWorkingDirectory == nil,
+               let parentSurface = parentController.focusedSurface {
+                cfg.remoteWorkingDirectory = BaseTerminalController.queryRemoteCwd(
+                    of: parentSurface, on: parentRemote.handle)
+            }
             effectiveBaseConfig = cfg
         }
 

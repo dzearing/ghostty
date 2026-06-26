@@ -698,6 +698,13 @@ pub const Surface = struct {
     remote_connection: ?*RemoteConnectionHandle = null,
     remote_session_id: ?[*:0]const u8 = null,
 
+    /// Explicit REMOTE working directory for an OPEN-new remote session (§WP4),
+    /// copied from `Options.remote_working_directory`. Borrowed for the duration
+    /// of `CoreSurface.init` only (the remote backend dupes it). Distinct from
+    /// the LOCAL `config.@"working-directory"` so the stall-fix invariant holds:
+    /// a fresh remote window (no parent, no explicit remote cwd) forwards NO cwd.
+    remote_working_directory: ?[*:0]const u8 = null,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -756,6 +763,15 @@ pub const Surface = struct {
         ///
         /// C type: `const char*`.
         session_id: ?[*:0]const u8 = null,
+
+        /// Explicit REMOTE working directory for an OPEN-new remote session
+        /// (§WP4): the cwd ON THE REMOTE MACHINE, set by the split/tab path from
+        /// an on-demand cwd query of the parent pane. Forwarded verbatim to the
+        /// agent's OPEN. DISTINCT from `working_directory` (a local path that
+        /// must never reach a remote agent). Null ⇒ no remote cwd hint.
+        ///
+        /// C type: `const char*`.
+        remote_working_directory: ?[*:0]const u8 = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -775,6 +791,7 @@ pub const Surface = struct {
             // backend construction (Surface.zig).
             .remote_connection = opts.connection,
             .remote_session_id = opts.session_id,
+            .remote_working_directory = opts.remote_working_directory,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1276,6 +1293,12 @@ pub const Surface = struct {
                 std.mem.sliceTo(s, 0)
             else
                 null,
+            // The EXPLICIT remote cwd (split/tab inheritance, §WP4). Empty ⇒ null
+            // so a stray empty string never forwards a cwd.
+            .working_directory = if (self.remote_working_directory) |w| wd: {
+                const s = std.mem.sliceTo(w, 0);
+                break :wd if (s.len > 0) s else null;
+            } else null,
         };
     }
 
@@ -2175,6 +2198,41 @@ pub const CAPI = struct {
     /// ensure no surface still references this handle.
     export fn ghostty_remote_connection_free(handle: *RemoteConnectionHandle) void {
         handle.destroy();
+    }
+
+    /// On-demand query for a remote session's child working directory (§WP4).
+    /// Sends `GET_CWD{session_id}` over the connection and blocks (bounded
+    /// timeout) for the `CWD` reply. Returns a caller-owned UTF-8 `String` on
+    /// success (free with `ghostty_string_free`), or an empty String if the
+    /// connection isn't established, the session is unknown, the agent's cwd
+    /// query failed, or the RPC timed out. Used by the Swift split/tab path so a
+    /// new remote pane inherits the parent's cwd.
+    export fn ghostty_remote_connection_query_cwd(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+    ) String {
+        const conn = handle.conn() orelse return .empty;
+        const sid = std.mem.sliceTo(session_id, 0);
+        if (sid.len == 0) return .empty;
+
+        const path = conn.queryCwd(sid) catch |err| {
+            log.debug("remote query_cwd failed err={}", .{err});
+            return .empty;
+        };
+        defer handle.alloc.free(path);
+        // Re-dupe into the C-API allocator (matching `ghostty_string_free`).
+        const copy = handle.alloc.dupeZ(u8, path) catch return .empty;
+        return .fromSlice(copy);
+    }
+
+    /// The LIVE remote agent session id for `surface`, or an empty String if it
+    /// is a local surface or its remote pane is not yet resolved. Returns a
+    /// caller-owned UTF-8 `String` (free with `ghostty_string_free`). (§WP4)
+    export fn ghostty_surface_remote_session_id(surface: *Surface) String {
+        const sid = surface.core_surface.remoteSessionId() orelse return .empty;
+        if (sid.len == 0) return .empty;
+        const copy = surface.app.core_app.alloc.dupeZ(u8, sid) catch return .empty;
+        return .fromSlice(copy);
     }
 
     /// Tell the surface that it needs to schedule a render

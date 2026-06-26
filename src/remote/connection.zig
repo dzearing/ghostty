@@ -1055,6 +1055,36 @@ pub const Connection = struct {
         return pane;
     }
 
+    /// On-demand query for a remote session's child working directory (§WP4).
+    /// Sends `GET_CWD{session_id}` and awaits `CWD{session_id, path?, ok}`, then
+    /// returns a NEW caller-owned copy of the path (caller frees with `self.alloc`),
+    /// or null if the agent reported failure (`ok == false`) or returned an empty
+    /// path.
+    ///
+    /// This is a same-channel RPC: we mint a fresh request channel, send GET_CWD on
+    /// it, and the agent echoes CWD on that channel — correlated by the `pending`
+    /// map (NOT the by-type slot, which is reserved for OPEN/ATTACH). It uses the
+    /// same bounded `rpc_open_timeout_ns` + parked-slot mechanism as `openChannel`,
+    /// so a missing/late reply returns `error.Timeout` rather than hanging.
+    pub fn queryCwd(self: *Connection, session_id: []const u8) ![]u8 {
+        const req_channel = std.crypto.random.int(u128);
+        const get: protocol.GetCwd = .{ .session_id = session_id };
+        const json = try protocol.encodeJson(self.alloc, get);
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .get_cwd, .cwd, json, self.rpc_open_timeout_ns);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Cwd, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        if (!parsed.value.ok) return error.CwdUnavailable;
+        const path = parsed.value.path orelse return error.CwdUnavailable;
+        if (path.len == 0) return error.CwdUnavailable;
+        return self.alloc.dupe(u8, path);
+    }
+
     /// Re-attach to an existing session (§3.3 attach / §7.3 sequence-anchored
     /// resync / §5.3 steal). Mints a fresh channel id (§7.1), registers an inbound
     /// ring, sends `ATTACH{session_id, rows, cols, last_byte_offset, force}`, and
@@ -1555,6 +1585,13 @@ pub const Connection = struct {
                 // Reply to an OPEN/ATTACH RPC: hand the payload to the parked caller
                 // keyed by this channel id. If no caller is waiting (stale/duplicate
                 // reply), it's dropped here; the user handler still observes it.
+                _ = self.deliverRpcReply(frame);
+            },
+            .cwd => {
+                // Reply to a GET_CWD RPC (§WP4). Same-channel correlation: the agent
+                // echoes CWD on the request channel, so `deliverRpcReply` matches it
+                // via the `pending` map keyed by `frame.channel`. Dropped if no
+                // caller is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
             .pong => {
@@ -2856,6 +2893,12 @@ const LifecycleAgent = struct {
     /// silent agent can't wedge the caller (the pane IO thread) forever.
     silent_open: bool = false,
 
+    // GET_CWD reply contents. `cwd_reply == null` ⇒ reply CWD{ok=false}; else
+    // reply CWD{ok=true, path}. When `silent_cwd` is true the agent receives
+    // GET_CWD but never replies (exercises the queryCwd RPC timeout).
+    cwd_reply: ?[]const u8 = "/private/tmp",
+    silent_cwd: bool = false,
+
     // Observations (atomics / events so the test thread can read them safely).
     seen_channel: std.atomic.Value(u128) = .{ .raw = 0 },
     saw_request: std.Thread.ResetEvent = .{},
@@ -2904,6 +2947,18 @@ const LifecycleAgent = struct {
                         .snapshot_at_offset = self.snapshot_at_offset,
                         .exit_code = self.exit_code,
                         .attached_elsewhere = elsewhere,
+                    });
+                },
+                .get_cwd => {
+                    // Reply CWD on the SAME request channel (same-channel RPC).
+                    if (self.silent_cwd) continue;
+                    var parsed = protocol.parseJson(protocol.GetCwd, self.alloc, frame.payload) catch continue;
+                    defer parsed.deinit();
+                    const sid = parsed.value.session_id;
+                    try self.ctrl.sendJson(.cwd, frame.channel, protocol.Cwd{
+                        .session_id = sid,
+                        .path = self.cwd_reply,
+                        .ok = self.cwd_reply != null,
                     });
                 },
                 .close => {
@@ -3027,6 +3082,39 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
     try testing.expect(a.err == null);
     // Teardown the pane explicitly (consumer has stopped draining: the test owns it).
     h.conn.closeChannel(pane);
+}
+
+test "queryCwd: returns the agent's reported path for a session" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.cwd_reply = "/private/tmp/work";
+    try h.start();
+
+    const cwd = try h.conn.queryCwd("sess-1");
+    defer alloc.free(cwd);
+    try testing.expectEqualStrings("/private/tmp/work", cwd);
+}
+
+test "queryCwd: agent reporting ok=false surfaces CwdUnavailable (no hang)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    h.configure().cwd_reply = null; // agent replies CWD{ok=false}
+    try h.start();
+
+    try testing.expectError(error.CwdUnavailable, h.conn.queryCwd("sess-1"));
+}
+
+test "queryCwd: a silent agent (no CWD reply) times out instead of deadlocking" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.createWithTimeout(alloc, 50 * std.time.ns_per_ms);
+    defer h.destroy();
+    h.configure().silent_cwd = true;
+    try h.start();
+
+    try testing.expectError(error.Timeout, h.conn.queryCwd("sess-1"));
 }
 
 test "openChannel: a silent agent (no OPENED) times out instead of deadlocking" {

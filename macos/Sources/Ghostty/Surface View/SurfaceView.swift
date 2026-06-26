@@ -660,6 +660,13 @@ extension Ghostty {
         /// The agent session to ATTACH to, or nil to OPEN a brand-new session.
         var remoteSessionId: String?
 
+        /// Explicit REMOTE working directory for an OPEN-new remote session
+        /// (§WP4): the cwd ON THE REMOTE MACHINE the new pane should start in.
+        /// Set by the split/tab path from an on-demand cwd query of the parent
+        /// remote pane. DISTINCT from `workingDirectory` (a local path) — it is
+        /// forwarded to the agent's OPEN and never confused with a local path.
+        var remoteWorkingDirectory: String?
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -757,7 +764,13 @@ extension Ghostty {
                                         config.connection = remoteConnection
                                         return try remoteSessionId.withCString { cSessionId in
                                             config.session_id = cSessionId
-                                            return try body(&config)
+                                            // Explicit REMOTE cwd (split/tab
+                                            // inheritance, §WP4). nil ⇒ NULL ⇒ the
+                                            // agent uses its own default cwd.
+                                            return try remoteWorkingDirectory.withCString { cRemoteWd in
+                                                config.remote_working_directory = cRemoteWd
+                                                return try body(&config)
+                                            }
                                         }
                                     }
 

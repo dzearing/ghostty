@@ -108,6 +108,11 @@ pub const Child = struct {
         /// Terminate the child unconditionally (SIGKILL + reap) and release its
         /// handle. Idempotent. Called on `CLOSE` and on session teardown.
         terminate: *const fn (ctx: *anyopaque) void,
+        /// Optional: query the child process's CURRENT working directory by asking
+        /// the OS (e.g. macOS `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, Windows PEB
+        /// read). Returns a NEW `alloc`-owned UTF-8 slice (caller frees), or null
+        /// if the query is unsupported or fails. The fake child leaves this null.
+        queryCwd: ?*const fn (ctx: *anyopaque, alloc: Allocator) ?[]u8 = null,
     };
 
     /// Hand the child its owning channel + output sink (see `VTable.attach`).
@@ -149,6 +154,13 @@ pub const Child = struct {
 
     pub fn terminate(self: Child) void {
         self.vtable.terminate(self.ctx);
+    }
+
+    /// Query the child's current working directory (see `VTable.queryCwd`).
+    /// Returns null when the impl declines or the OS query fails.
+    pub fn queryCwd(self: Child, alloc: Allocator) ?[]u8 {
+        const f = self.vtable.queryCwd orelse return null;
+        return f(self.ctx, alloc);
     }
 };
 

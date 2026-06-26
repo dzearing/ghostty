@@ -322,6 +322,17 @@ class BaseTerminalController: NSWindowController,
             effectiveConfig.remoteConnection = remoteConnection.handle
             // session_id stays nil: each split opens a fresh remote session on
             // the same machine/connection.
+
+            // Remote cwd inheritance (§WP4): a new split should open in the PARENT
+            // remote pane's current directory. We resolve it on demand by asking
+            // the agent for the parent session's child cwd, then forward it to the
+            // new pane's OPEN. cmd.exe (no OSC 7) works too — the agent reads the
+            // child process's actual cwd from the OS. If anything fails the new
+            // pane just opens in the agent's default cwd.
+            if effectiveConfig.remoteWorkingDirectory == nil {
+                effectiveConfig.remoteWorkingDirectory =
+                    Self.queryRemoteCwd(of: oldView, on: remoteConnection.handle)
+            }
         }
 
         // Create a new surface view
@@ -360,6 +371,32 @@ class BaseTerminalController: NSWindowController,
         }
 
         return newView
+    }
+
+    /// Resolve the REMOTE working directory to seed a new split/tab with, by
+    /// asking the agent for the parent remote pane's current child cwd (§WP4).
+    /// Returns nil if `parent` is not a (resolved) remote surface or the query
+    /// fails — the caller then opens the new pane in the agent's default cwd.
+    ///
+    /// This is an on-demand RPC: get the parent surface's live remote session id,
+    /// then `GET_CWD` it over the shared connection. The agent reads the child
+    /// process's actual cwd from the OS, so it works even for shells that emit no
+    /// OSC 7 (e.g. cmd.exe).
+    static func queryRemoteCwd(
+        of parent: Ghostty.SurfaceView,
+        on connection: ghostty_remote_connection_t
+    ) -> String? {
+        guard let surface = parent.surface else { return nil }
+
+        let sid = Ghostty.AllocatedString(
+            ghostty_surface_remote_session_id(surface)).string
+        guard !sid.isEmpty else { return nil }
+
+        let cwd = sid.withCString { cSid in
+            Ghostty.AllocatedString(
+                ghostty_remote_connection_query_cwd(connection, cSid)).string
+        }
+        return cwd.isEmpty ? nil : cwd
     }
 
     /// Move focus to a surface view.

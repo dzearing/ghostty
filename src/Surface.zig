@@ -72,6 +72,15 @@ pub const RemoteBackend = struct {
     /// Borrowed for the duration of the construction call only (duped into the
     /// backend's arena by `termio.Remote.init`).
     session_id: ?[]const u8 = null,
+
+    /// Explicit REMOTE working directory for an OPEN-new session (§WP4): the cwd
+    /// ON THE REMOTE MACHINE the new pane should start in (e.g. the parent pane's
+    /// cwd, resolved by an on-demand query at split time). Forwarded verbatim to
+    /// the agent's OPEN. DISTINCT from the local `working-directory` config — a
+    /// local path must never reach a remote agent (the stall-fix invariant).
+    /// Null ⇒ no remote cwd hint (the agent uses its own default). Borrowed for
+    /// the construction call only.
+    working_directory: ?[]const u8 = null,
 };
 
 /// Unique ID used to identify this surface for IPC purposes. It is
@@ -718,19 +727,21 @@ pub fn init(
                 }
                 errdefer if (remote_command) |rc| alloc.free(rc);
 
-                // Likewise, do NOT forward the local working directory. By
-                // default Ghostty inherits the launching surface's pwd (e.g. a
-                // macOS path like `/Users/dzearing`), which does not exist on a
-                // remote machine (e.g. a Windows agent). An OPEN carrying it
-                // makes the agent's chdir/spawn fail and never reply OPENED —
-                // the same wedge as the command above. The remote session starts
-                // in the agent's own default cwd. (A future explicit "remote cwd"
-                // can be plumbed through like an explicit remote command.)
+                // Working directory (§WP4): we must NEVER forward the LOCAL
+                // `config.@"working-directory"` — by default Ghostty inherits the
+                // launching surface's pwd (e.g. a macOS path), which does not
+                // exist on a remote machine (e.g. a Windows agent); an OPEN
+                // carrying it makes the agent's chdir/spawn fail and never reply
+                // OPENED (the stall wedge). We ONLY forward an EXPLICIT remote cwd
+                // (`rb.working_directory`), which the split/tab path resolves by
+                // querying the parent remote pane's actual cwd. A fresh remote
+                // window (no parent, no explicit remote cwd) forwards null and the
+                // agent starts the session in its own default cwd.
                 const io_remote = try termio.Remote.init(alloc, .{
                     .conn = rb.connection,
                     .session_id = rb.session_id,
                     .command = remote_command,
-                    .working_directory = null,
+                    .working_directory = rb.working_directory,
                     .term = config.term,
                 });
                 break :backend .{ .remote = io_remote };
@@ -1047,6 +1058,19 @@ pub fn needsConfirmQuit(self: *Surface) bool {
             defer self.renderer_state.mutex.unlock();
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
+    };
+}
+
+/// The LIVE remote agent session id for this surface, or null if this is a local
+/// surface or its remote pane is not yet resolved. Lock-free (the backend
+/// publishes the id atomically); the returned slice borrows the live pane's
+/// session_id and must be used synchronously, not retained. Used by the split/tab
+/// path to issue an on-demand cwd query so a new remote pane inherits the parent's
+/// cwd (§WP4).
+pub fn remoteSessionId(self: *const Surface) ?[]const u8 {
+    return switch (self.io.backend) {
+        .remote => |*r| r.liveSessionId(),
+        else => null,
     };
 }
 
