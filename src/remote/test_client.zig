@@ -200,19 +200,27 @@ fn runExec(
 ) !void {
     const stdout = std.fs.File.stdout();
 
-    // Send "<cmd>\n" as input.
+    // Send "<cmd>\r" as input. The line terminator is CR (\r), NOT LF: cmd.exe
+    // only treats CR as Enter, and POSIX ptys map CR→NL on input (ICRNL), so CR
+    // is the portable "Enter" across both remote OSes.
     var line: [4096]u8 = undefined;
     if (cmd.len + 1 > line.len) return error.CommandTooLong;
     @memcpy(line[0..cmd.len], cmd);
-    line[cmd.len] = '\n';
+    line[cmd.len] = '\r';
     try sess.writeInput(conn, line[0 .. cmd.len + 1]);
     diag("sent {d} bytes of input; draining output (idle timeout {d}s) ...\n", .{ cmd.len + 1, timeout_secs });
 
-    // Drain the ring until `timeout_secs` of idle (no new bytes), printing to stdout.
+    // Drain the ring until `timeout_secs` of idle (no new bytes), printing to
+    // stdout. A HARD absolute cap (idle*4, min 15s) guarantees we always exit
+    // cleanly even if the remote streams continuously (e.g. a ConPTY that
+    // repaints on a timer) — so the client never has to be killed mid-stream,
+    // which would leave the agent's writer blocked on a dead socket.
     const idle_ns: i128 = @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s;
+    const hard_cap_ms: i64 = @max(@as(i64, @intCast(timeout_secs)) * 4 * std.time.ms_per_s, 15 * std.time.ms_per_s);
     var buf: [16 * 1024]u8 = undefined;
     var total_rx: usize = 0;
-    var last_byte_ms = std.time.milliTimestamp();
+    const start_ms = std.time.milliTimestamp();
+    var last_byte_ms = start_ms;
     while (true) {
         const r = sess.ch.pop(&buf);
         if (r.read > 0) {
@@ -225,8 +233,13 @@ fn runExec(
             diag("\nsession evicted; stopping\n", .{});
             break;
         }
-        const idle = @as(i128, std.time.milliTimestamp() - last_byte_ms) * std.time.ns_per_ms;
+        const now = std.time.milliTimestamp();
+        const idle = @as(i128, now - last_byte_ms) * std.time.ns_per_ms;
         if (idle >= idle_ns) break;
+        if (now - start_ms >= hard_cap_ms) {
+            diag("\nhard cap reached ({d}ms); stopping\n", .{hard_cap_ms});
+            break;
+        }
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     diag("done: received {d} bytes total\n", .{total_rx});
