@@ -8,6 +8,7 @@ pub const GitVersion = @import("GitVersion.zig");
 
 // Artifacts
 pub const GhosttyAgent = @import("GhosttyAgent.zig");
+pub const GhosttyConptySmoke = @import("GhosttyConptySmoke.zig");
 pub const GhosttyBench = @import("GhosttyBench.zig");
 pub const GhosttyDist = @import("GhosttyDist.zig");
 pub const GhosttyDocs = @import("GhosttyDocs.zig");

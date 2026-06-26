@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run tests");
     const agent_step = b.step("agent", "Build the ghoztty-agent (remote-machines daemon)");
     const test_agent_step = b.step("test-agent", "Run the ghoztty-agent tests (incl. real-pty)");
+    const conpty_smoke_step = b.step("conpty-smoke", "Build the ConPTY runtime smoke exe (Windows, cross-compile)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -109,6 +110,15 @@ pub fn build(b: *std.Build) !void {
         if (!config.emit_lib_vt) _ = try deps.add(agent_test);
         const agent_test_run = b.addRunArtifact(agent_test);
         test_agent_step.dependOn(&agent_test_run.step);
+    }
+
+    // Ghoztty ConPTY runtime smoke exe (WP2, §13). A tiny standalone Windows .exe
+    // that proves the in-tree ConPTY machinery works on real hardware. Built on
+    // demand via `zig build conpty-smoke -Dtarget=<arch>-windows`. The artifact is
+    // named per-arch (ghoztty-conpty-smoke-<arch>.exe) so both arches coexist.
+    {
+        const smoke = try buildpkg.GhosttyConptySmoke.init(b, &config, &deps);
+        conpty_smoke_step.dependOn(&smoke.install_step.step);
     }
 
     // Ghostty docs
