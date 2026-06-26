@@ -1074,6 +1074,18 @@ pub fn remoteSessionId(self: *const Surface) ?[]const u8 {
     };
 }
 
+/// The command this surface's remote pane was OPENed with, or null if it is a
+/// local surface or its remote pane uses the agent's default shell. The returned
+/// slice borrows the backend's arena (immutable after init) and must be used
+/// synchronously, not retained. Used by the new-window/tab/split path so a new
+/// remote frame inherits the parent frame's command (§WP4).
+pub fn remoteCommand(self: *const Surface) ?[]const u8 {
+    return switch (self.io.backend) {
+        .remote => |*r| r.remoteCommand(),
+        else => null,
+    };
+}
+
 /// Called from the app thread to handle mailbox messages to our specific
 /// surface.
 pub fn handleMessage(self: *Surface, msg: Message) !void {

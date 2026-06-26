@@ -1317,10 +1317,22 @@ GHOSTTY_API void ghostty_remote_connection_free(ghostty_remote_connection_t);
 GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd(
     ghostty_remote_connection_t, const char* session_id);
 
+// Like ghostty_remote_connection_query_cwd but with an explicit timeout in
+// milliseconds (0 => default 10s). Run on a background thread with a tight bound
+// so a new remote frame's cwd inheritance never blocks the main thread.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd_timeout(
+    ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
+
 // The live remote agent session id for a surface, or an empty string (ptr ==
 // NULL) for a local surface or one whose remote pane is not yet resolved. Free
 // with ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_remote_session_id(ghostty_surface_t);
+
+// The command a surface's remote pane was OPENed with, or an empty string (ptr
+// == NULL) for a local surface or one whose remote pane uses the agent's default
+// shell. Free with ghostty_string_free. Used so a new window/tab/split inherits
+// the parent remote frame's command.
+GHOSTTY_API ghostty_string_s ghostty_surface_remote_command(ghostty_surface_t);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);

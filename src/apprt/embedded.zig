@@ -2211,11 +2211,38 @@ pub const CAPI = struct {
         handle: *RemoteConnectionHandle,
         session_id: [*:0]const u8,
     ) String {
+        return queryCwdImpl(handle, session_id, null);
+    }
+
+    /// Like `ghostty_remote_connection_query_cwd` but with an explicit timeout in
+    /// MILLISECONDS (0 ⇒ use the default 10s bound). The Swift GUI runs this on a
+    /// BACKGROUND queue with a tight bound so a new remote frame's cwd inheritance
+    /// never blocks the main thread and never waits long on a slow/wedged agent.
+    export fn ghostty_remote_connection_query_cwd_timeout(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ms: u32,
+    ) String {
+        const ns: ?u64 = if (timeout_ms == 0)
+            null
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+        return queryCwdImpl(handle, session_id, ns);
+    }
+
+    fn queryCwdImpl(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ns: ?u64,
+    ) String {
         const conn = handle.conn() orelse return .empty;
         const sid = std.mem.sliceTo(session_id, 0);
         if (sid.len == 0) return .empty;
 
-        const path = conn.queryCwd(sid) catch |err| {
+        const path = (if (timeout_ns) |ns|
+            conn.queryCwdTimeout(sid, ns)
+        else
+            conn.queryCwd(sid)) catch |err| {
             log.debug("remote query_cwd failed err={}", .{err});
             return .empty;
         };
@@ -2232,6 +2259,19 @@ pub const CAPI = struct {
         const sid = surface.core_surface.remoteSessionId() orelse return .empty;
         if (sid.len == 0) return .empty;
         const copy = surface.app.core_app.alloc.dupeZ(u8, sid) catch return .empty;
+        return .fromSlice(copy);
+    }
+
+    /// The command `surface`'s remote pane was OPENed with, or an empty String if
+    /// it is a local surface or its remote pane uses the agent's default shell.
+    /// Returns a caller-owned UTF-8 `String` (free with `ghostty_string_free`).
+    /// Used by the Swift new-window/tab/split path so a new remote frame inherits
+    /// the parent frame's command (§WP4). The result is a snapshot; it does not
+    /// borrow the backend.
+    export fn ghostty_surface_remote_command(surface: *Surface) String {
+        const cmd = surface.core_surface.remoteCommand() orelse return .empty;
+        if (cmd.len == 0) return .empty;
+        const copy = surface.app.core_app.alloc.dupeZ(u8, cmd) catch return .empty;
         return .fromSlice(copy);
     }
 

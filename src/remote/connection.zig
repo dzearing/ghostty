@@ -1067,12 +1067,20 @@ pub const Connection = struct {
     /// same bounded `rpc_open_timeout_ns` + parked-slot mechanism as `openChannel`,
     /// so a missing/late reply returns `error.Timeout` rather than hanging.
     pub fn queryCwd(self: *Connection, session_id: []const u8) ![]u8 {
+        return self.queryCwdTimeout(session_id, self.rpc_open_timeout_ns);
+    }
+
+    /// `queryCwd` with an explicit RPC timeout (ns). Used by the GUI so a cwd
+    /// query for a new split/tab/window can be bounded tightly (it runs off the
+    /// main thread but a tight bound keeps a fresh frame from waiting on a slow
+    /// or wedged agent). `error.Timeout` on no reply within `timeout_ns`.
+    pub fn queryCwdTimeout(self: *Connection, session_id: []const u8, timeout_ns: u64) ![]u8 {
         const req_channel = std.crypto.random.int(u128);
         const get: protocol.GetCwd = .{ .session_id = session_id };
         const json = try protocol.encodeJson(self.alloc, get);
         defer self.alloc.free(json);
 
-        const rpc = try self.rpcCall(req_channel, .get_cwd, .cwd, json, self.rpc_open_timeout_ns);
+        const rpc = try self.rpcCall(req_channel, .get_cwd, .cwd, json, timeout_ns);
         defer self.alloc.free(rpc.payload);
 
         var parsed = protocol.parseJson(protocol.Cwd, self.alloc, rpc.payload) catch
@@ -3115,6 +3123,41 @@ test "queryCwd: a silent agent (no CWD reply) times out instead of deadlocking" 
     try h.start();
 
     try testing.expectError(error.Timeout, h.conn.queryCwd("sess-1"));
+}
+
+test "queryCwdTimeout: explicit bound returns the path on a responsive agent" {
+    const alloc = testing.allocator;
+    // The connection's DEFAULT RPC timeout is the long production value; this
+    // proves the EXPLICIT bound passed by the GUI path still returns the path
+    // when the agent replies (a healthy agent answers in ms).
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    h.configure().cwd_reply = "C:\\Windows";
+    try h.start();
+
+    const cwd = try h.conn.queryCwdTimeout("sess-1", 1500 * std.time.ns_per_ms);
+    defer alloc.free(cwd);
+    try testing.expectEqualStrings("C:\\Windows", cwd);
+}
+
+test "queryCwdTimeout: a tight bound on a silent agent fails fast (GUI never stalls)" {
+    const alloc = testing.allocator;
+    // The GUI new-window/tab/split path passes a tight explicit bound so a slow
+    // or wedged agent can't beachball. Prove the explicit bound (NOT the
+    // connection's 10s default) governs: a silent agent returns error.Timeout
+    // well under the default.
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    h.configure().silent_cwd = true;
+    try h.start();
+
+    const t = std.time.milliTimestamp();
+    try testing.expectError(
+        error.Timeout,
+        h.conn.queryCwdTimeout("sess-1", 80 * std.time.ns_per_ms),
+    );
+    const elapsed = std.time.milliTimestamp() - t;
+    try testing.expect(elapsed < 5_000);
 }
 
 test "openChannel: a silent agent (no OPENED) times out instead of deadlocking" {

@@ -342,6 +342,11 @@ class IPCServer {
         var shell: String?
         var state: String?
         var noActivate: Bool = false
+        // When true, `+new-window` mirrors the keyboard/menu "New Window" action:
+        // it resolves the focused/preferred window as the parent and inherits its
+        // REMOTE host + command + cwd (§WP4). Lets the inheriting path be driven
+        // headlessly (the normal IPC path has no parent and never inherits).
+        var fromFocused: Bool = false
     }
 
     private func handleNewWindow(_ request: IPCRequest) -> IPCResponse {
@@ -401,6 +406,22 @@ class IPCServer {
                 config.backgroundTint = Color(nsColor)
                 config.backgroundTintNSColor = nsColor
             }
+        }
+
+        // `--from-focused`: mirror the keyboard/menu "New Window" action so the
+        // new window inherits the focused window's REMOTE host + command + cwd
+        // (§WP4). This is the only IPC path that resolves a parent; it builds the
+        // window asynchronously (off-main cwd query) so we can't return its
+        // controller for naming/registry — `--from-focused` is for the inheriting
+        // case, not for `--target`/`--name` registration.
+        if parsed.fromFocused {
+            DispatchQueue.main.async { [ghostty = self.ghostty] in
+                TerminalController.newWindowInheritingRemote(
+                    ghostty,
+                    withBaseConfig: config,
+                    from: TerminalController.preferredParent?.window)
+            }
+            return .ok
         }
 
         let windowTint: Color? = config.backgroundTint
@@ -1494,6 +1515,11 @@ class IPCServer {
 
             if arg == "--no-activate" {
                 result.noActivate = true
+                continue
+            }
+
+            if arg == "--from-focused" {
+                result.fromFocused = true
                 continue
             }
         }

@@ -245,6 +245,54 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     // by something like an App Intent) then we prefer the most previous main.
     static private(set) weak var lastMain: TerminalController?
 
+    /// The "new window" action with REMOTE inheritance (§WP4). If `parent` is a
+    /// remote window, the new window opens on the SAME host over the SAME shared
+    /// connection, running the parent pane's COMMAND, in the parent pane's CWD.
+    ///
+    /// The CWD is a blocking agent RPC, so it is resolved OFF the main thread (the
+    /// UI never blocks/beachballs) and the window is created in the completion. A
+    /// LOCAL parent (or none) creates a normal local window immediately. This is
+    /// the entry point used by the keyboard/menu "New Window" action; callers that
+    /// need the controller synchronously use `newWindow(...)` directly.
+    static func newWindowInheritingRemote(
+        _ ghostty: Ghostty.App,
+        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil,
+        from parent: NSWindow? = nil
+    ) {
+        // Only inherit when the parent is a remote window and the incoming config
+        // isn't already remote-bound.
+        guard let parentController = parent?.windowController as? TerminalController,
+              let parentRemote = parentController.remoteConnection,
+              (baseConfig?.remoteConnection == nil),
+              let parentSurface = parentController.focusedSurface else {
+            // Local (or no) parent: normal local window, created synchronously.
+            _ = newWindow(ghostty, withBaseConfig: baseConfig, withParent: parent)
+            return
+        }
+
+        BaseTerminalController.resolveRemoteInheritance(
+            from: parentSurface,
+            on: parentRemote.handle
+        ) { command, cwd in
+            var cfg = baseConfig ?? Ghostty.SurfaceConfiguration()
+            cfg.remoteMachine = parentRemote.machine
+            cfg.remoteConnection = parentRemote.handle
+            if cfg.command == nil, let command {
+                cfg.command = command
+                cfg.waitAfterCommand = true
+            }
+            if cfg.remoteWorkingDirectory == nil, let cwd {
+                cfg.remoteWorkingDirectory = cwd
+            }
+            let controller = newWindow(ghostty, withBaseConfig: cfg, withParent: parent)
+            // Carry the strong connection owner onto the new window so the shared
+            // handle outlives every surface/split and its splits/tabs keep
+            // inheriting the same machine + connection.
+            controller.remoteConnection = parentRemote
+            controller.remoteMachine = parentRemote.machine
+        }
+    }
+
     /// The "new window" action.
     static func newWindow(
         _ ghostty: Ghostty.App,
@@ -424,27 +472,62 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         // Remote inheritance: a new tab in a remote window opens on the SAME
-        // machine over the SAME shared connection. Seed the base config with the
-        // parent's remote machine/connection so the initial surface is remote,
-        // and carry the strong connection owner onto the new controller.
-        var effectiveBaseConfig = baseConfig
+        // machine over the SAME shared connection, running the parent pane's
+        // COMMAND, in the parent pane's CWD. Seed the base config with the parent's
+        // remote machine/connection so the initial surface is remote, and carry the
+        // strong connection owner onto the new controller.
+        //
+        // The CWD is a blocking agent RPC, so we resolve it OFF the main thread
+        // (never beachball the UI) and build the tab in the completion. The COMMAND
+        // is a cheap synchronous snapshot. A remote new-tab is therefore created
+        // asynchronously and this call returns nil (the notification/menu callers
+        // ignore the return).
         if let parentRemote = parentController.remoteConnection,
-           (effectiveBaseConfig?.remoteConnection == nil) {
-            var cfg = effectiveBaseConfig ?? Ghostty.SurfaceConfiguration()
-            cfg.remoteMachine = parentRemote.machine
-            cfg.remoteConnection = parentRemote.handle
-            // Remote cwd inheritance (§WP4): a new tab opens in the parent's
-            // focused remote pane's current directory. Resolve it on demand from
-            // the agent (works for cmd.exe too — the agent reads the child's OS
-            // cwd). On failure the new pane opens in the agent's default cwd.
-            if cfg.remoteWorkingDirectory == nil,
-               let parentSurface = parentController.focusedSurface {
-                cfg.remoteWorkingDirectory = BaseTerminalController.queryRemoteCwd(
-                    of: parentSurface, on: parentRemote.handle)
+           (baseConfig?.remoteConnection == nil),
+           let parentSurface = parentController.focusedSurface {
+            BaseTerminalController.resolveRemoteInheritance(
+                from: parentSurface,
+                on: parentRemote.handle
+            ) { command, cwd in
+                var cfg = baseConfig ?? Ghostty.SurfaceConfiguration()
+                cfg.remoteMachine = parentRemote.machine
+                cfg.remoteConnection = parentRemote.handle
+                if cfg.command == nil, let command {
+                    cfg.command = command
+                    cfg.waitAfterCommand = true
+                }
+                if cfg.remoteWorkingDirectory == nil, let cwd {
+                    cfg.remoteWorkingDirectory = cwd
+                }
+                _ = buildTab(
+                    ghostty,
+                    parent: parent,
+                    parentController: parentController,
+                    baseConfig: cfg,
+                    undoBaseConfig: baseConfig)
             }
-            effectiveBaseConfig = cfg
+            return nil
         }
 
+        return buildTab(
+            ghostty,
+            parent: parent,
+            parentController: parentController,
+            baseConfig: baseConfig,
+            undoBaseConfig: baseConfig)
+    }
+
+    /// Build the new-tab window and attach it to `parent`'s tab group. Split out
+    /// of `newTab` so the remote path can call it AFTER an off-main cwd/command
+    /// resolve, while the local path calls it synchronously.
+    @discardableResult
+    private static func buildTab(
+        _ ghostty: Ghostty.App,
+        parent: NSWindow,
+        parentController: TerminalController,
+        baseConfig effectiveBaseConfig: Ghostty.SurfaceConfiguration?,
+        undoBaseConfig: Ghostty.SurfaceConfiguration?
+    ) -> TerminalController? {
         // Create a new window and add it to the parent
         let controller = TerminalController.init(ghostty, withBaseConfig: effectiveBaseConfig)
         if let parentRemote = parentController.remoteConnection {
@@ -540,7 +623,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                     _ = TerminalController.newTab(
                         ghostty,
                         from: parent,
-                        withBaseConfig: baseConfig)
+                        withBaseConfig: undoBaseConfig)
                 }
             }
         }

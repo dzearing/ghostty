@@ -57,6 +57,8 @@ pub fn main() !void {
     defer alloc.free(opts.host);
     defer if (opts.exec) |c| alloc.free(c);
     defer if (opts.query_cwd_dir) |c| alloc.free(c);
+    defer if (opts.open_command) |c| alloc.free(c);
+    defer if (opts.open_cwd) |c| alloc.free(c);
 
     const encoding = encodingFromEnv(alloc);
 
@@ -80,15 +82,21 @@ pub fn main() !void {
     });
 
     // OPEN a shell session and learn the agent-chosen data channel + session id.
+    // When `--open-command` is set, the command rides in the OPEN payload (the
+    // GUI inheritance path), otherwise the agent opens its default shell.
     const dims = ttyDims();
-    var sess = Session.open(alloc, dialed.conn, dims.rows, dims.cols) catch |err| {
+    var sess = Session.openFull(alloc, dialed.conn, dims.rows, dims.cols, opts.open_command, opts.open_cwd) catch |err| {
         diag("open failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer sess.deinit(dialed.conn);
     diag("session opened: id={s} channel=0x{x} pid={d}\n", .{ sess.session_id, sess.channel, sess.pid });
 
-    if (opts.query_cwd_dir) |dir| {
+    if (opts.open_command != null or opts.open_cwd != null) {
+        // Drain the OPEN command's output to prove it ran on the remote.
+        diag("open-command: draining output (idle timeout {d}s)...\n", .{opts.timeout_secs});
+        try drainOutput(dialed.conn, &sess, opts.timeout_secs);
+    } else if (opts.query_cwd_dir) |dir| {
         try runQueryCwd(alloc, dialed.conn, &sess, dir);
     } else if (opts.exec) |cmd| {
         try runExec(dialed.conn, &sess, cmd, opts.timeout_secs);
@@ -326,10 +334,34 @@ const Session = struct {
 
     /// Send OPEN, wait for OPENED (on the agent's channel), register a ring there.
     fn open(alloc: Allocator, conn: *connection.Connection, rows: u16, cols: u16) !Session {
+        return openWithCommand(alloc, conn, rows, cols, null);
+    }
+
+    /// Like `open` but with an explicit OPEN `command` — the EXACT path the GUI's
+    /// new window/tab/split uses to inherit the parent frame's command (the
+    /// command rides in the OPEN payload, not as input). null ⇒ agent default shell.
+    fn openWithCommand(
+        alloc: Allocator,
+        conn: *connection.Connection,
+        rows: u16,
+        cols: u16,
+        command: ?[]const u8,
+    ) !Session {
+        return openFull(alloc, conn, rows, cols, command, null);
+    }
+
+    fn openFull(
+        alloc: Allocator,
+        conn: *connection.Connection,
+        rows: u16,
+        cols: u16,
+        command: ?[]const u8,
+        cwd: ?[]const u8,
+    ) !Session {
         pending = .{};
         conn.setControlHandler(undefined, onControl);
 
-        const open_payload: protocol.Open = .{ .rows = rows, .cols = cols };
+        const open_payload: protocol.Open = .{ .rows = rows, .cols = cols, .command = command, .cwd = cwd };
         const json = try protocol.encodeJson(alloc, open_payload);
         defer alloc.free(json);
         // The agent ignores the OPEN frame's channel and mints its own; we send on
@@ -514,8 +546,6 @@ fn runExec(
     cmd: []const u8,
     timeout_secs: u64,
 ) !void {
-    const stdout = std.fs.File.stdout();
-
     // Send "<cmd>\r" as input. The line terminator is CR (\r), NOT LF: cmd.exe
     // only treats CR as Enter, and POSIX ptys map CR→NL on input (ICRNL), so CR
     // is the portable "Enter" across both remote OSes.
@@ -525,7 +555,17 @@ fn runExec(
     line[cmd.len] = '\r';
     try sess.writeInput(conn, line[0 .. cmd.len + 1]);
     diag("sent {d} bytes of input; draining output (idle timeout {d}s) ...\n", .{ cmd.len + 1, timeout_secs });
+    try drainOutput(conn, sess, timeout_secs);
+}
 
+/// Drain the session's output ring to stdout until `timeout_secs` of idle (or a
+/// hard cap). Shared by `--exec` (post-input) and `--open-command` (post-OPEN).
+fn drainOutput(
+    conn: *connection.Connection,
+    sess: *Session,
+    timeout_secs: u64,
+) !void {
+    const stdout = std.fs.File.stdout();
     // Drain the ring until `timeout_secs` of idle (no new bytes), printing to
     // stdout. A HARD absolute cap (idle*4, min 15s) guarantees we always exit
     // cleanly even if the remote streams continuously (e.g. a ConPTY that
@@ -659,6 +699,14 @@ const Opts = struct {
     /// on-demand cwd query and print the result. Proves the agent reads the
     /// child's real working directory (incl. the Windows PEB path for cmd.exe).
     query_cwd_dir: ?[]u8 = null,
+    /// `--open-command=<cmd>`: put <cmd> in the OPEN payload (NOT as input) and
+    /// drain its output. This is the exact path the GUI's new window/tab/split
+    /// uses to inherit the parent frame's command — proves the OPEN `command`
+    /// field runs on the remote.
+    open_command: ?[]u8 = null,
+    /// `--open-cwd=<dir>`: the OPEN payload's cwd (the GUI forwards the parent
+    /// pane's queried cwd here so the new frame starts in the same directory).
+    open_cwd: ?[]u8 = null,
 };
 
 fn parseArgs(alloc: Allocator) !Opts {
@@ -687,6 +735,10 @@ fn parseArgs(alloc: Allocator) !Opts {
             opts.catchup_demo = true;
         } else if (std.mem.startsWith(u8, a, "--query-cwd=")) {
             opts.query_cwd_dir = try alloc.dupe(u8, a["--query-cwd=".len..]);
+        } else if (std.mem.startsWith(u8, a, "--open-command=")) {
+            opts.open_command = try alloc.dupe(u8, a["--open-command=".len..]);
+        } else if (std.mem.startsWith(u8, a, "--open-cwd=")) {
+            opts.open_cwd = try alloc.dupe(u8, a["--open-cwd=".len..]);
         } else {
             return error.Usage;
         }
@@ -699,6 +751,7 @@ fn usage() void {
         \\usage:
         \\  remote-test-client <host> <port>                      interactive (Ctrl-] to quit)
         \\  remote-test-client <host> <port> --exec "<cmd>" [--timeout <secs>]
+        \\  remote-test-client <host> <port> --open-command=<cmd>  run <cmd> via the OPEN payload (GUI inherit path)
         \\  remote-test-client <host> <port> --catchup-demo       close-laptop catch-up demo (PASS/FAIL)
         \\
     , .{});

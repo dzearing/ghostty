@@ -157,6 +157,20 @@ pub fn liveSessionId(self: *const Remote) ?[]const u8 {
     return ptr[0..len];
 }
 
+/// The command this remote pane was OPENed with, or null if it uses the agent's
+/// default shell. Immutable after `init` (duped into `arena` and never mutated),
+/// so it is safe to read from any thread. The returned slice borrows the
+/// backend's arena and is only valid while the backend is alive — callers use it
+/// synchronously (e.g. to seed a new window's command) and must not retain it.
+/// Used so a new window/tab/split inherits the parent remote frame's command
+/// (§WP4): if the parent ran an explicit command we re-run it; if it used the
+/// default shell (null) the new frame also uses the default shell.
+pub fn remoteCommand(self: *const Remote) ?[]const u8 {
+    const cmd = self.command orelse return null;
+    if (cmd.len == 0) return null;
+    return cmd;
+}
+
 /// Initialize the terminal state for this backend (mirrors `Exec.initTerminal`):
 /// set the initial pwd if we have a working-directory hint and seed the grid /
 /// screen size from the terminal. The pwd is otherwise resolved lazily from the

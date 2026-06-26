@@ -737,7 +737,15 @@ class AppDelegate: NSObject,
     @objc private func ghosttyNewWindow(_ notification: Notification) {
         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
         let config = configAny as? Ghostty.SurfaceConfiguration
-        _ = TerminalController.newWindow(ghostty, withBaseConfig: config)
+
+        // Resolve the parent window so a "new window" from a REMOTE frame inherits
+        // the same host + command + cwd (§WP4). The notification's object is the
+        // originating surface view (for a key-bound new-window); fall back to the
+        // preferred/key window otherwise.
+        let parent = (notification.object as? Ghostty.SurfaceView)?.window
+            ?? TerminalController.preferredParent?.window
+        TerminalController.newWindowInheritingRemote(
+            ghostty, withBaseConfig: config, from: parent)
     }
 
     @objc private func ghosttyNewTab(_ notification: Notification) {

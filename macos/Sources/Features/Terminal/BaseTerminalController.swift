@@ -317,23 +317,70 @@ class BaseTerminalController: NSWindowController,
         // incoming config (e.g. from a keybind notification) won't carry these,
         // so we inject them here. The handle is owned by `remoteConnection`
         // (this controller) and shared, never freed per-surface.
+        //
+        // The new split also inherits the parent pane's COMMAND (re-run it; nil ⇒
+        // agent default shell) and its CWD. The cwd is a blocking agent RPC, so we
+        // must NOT resolve it on the main thread (it would beachball on a slow or
+        // wedged agent). We snapshot the command + session id cheaply, then resolve
+        // the cwd OFF the main thread and finish the split in the completion. This
+        // means the remote split is created asynchronously (a few ms on a healthy
+        // agent); callers that need the new view should use the keybind/notification
+        // path (which ignores the return) — the synchronous return is preserved for
+        // LOCAL splits only.
         if let remoteConnection, effectiveConfig.remoteConnection == nil {
             effectiveConfig.remoteMachine = remoteConnection.machine
             effectiveConfig.remoteConnection = remoteConnection.handle
             // session_id stays nil: each split opens a fresh remote session on
             // the same machine/connection.
-
-            // Remote cwd inheritance (§WP4): a new split should open in the PARENT
-            // remote pane's current directory. We resolve it on demand by asking
-            // the agent for the parent session's child cwd, then forward it to the
-            // new pane's OPEN. cmd.exe (no OSC 7) works too — the agent reads the
-            // child process's actual cwd from the OS. If anything fails the new
-            // pane just opens in the agent's default cwd.
-            if effectiveConfig.remoteWorkingDirectory == nil {
-                effectiveConfig.remoteWorkingDirectory =
-                    Self.queryRemoteCwd(of: oldView, on: remoteConnection.handle)
+            if effectiveConfig.command == nil,
+               let parentCommand = Self.remoteInheritance(of: oldView).command {
+                effectiveConfig.command = parentCommand
+                // `wait-after-command` makes libghostty forward this as an EXPLICIT
+                // remote command in the OPEN (otherwise it's treated as a default
+                // shell and dropped). Matches the explicit `-e`/`--command` path.
+                effectiveConfig.waitAfterCommand = true
             }
+
+            let alreadyHasCwd = effectiveConfig.remoteWorkingDirectory != nil
+            Self.resolveRemoteInheritance(
+                from: oldView,
+                on: remoteConnection.handle
+            ) { [weak self] _, cwd in
+                guard let self else { return }
+                var cfg = effectiveConfig
+                if !alreadyHasCwd, let cwd { cfg.remoteWorkingDirectory = cwd }
+                _ = self.finishSplit(
+                    config: cfg,
+                    at: oldView,
+                    direction: direction,
+                    ratio: ratio,
+                    hasExplicitTint: hasExplicitTint)
+            }
+            return nil
         }
+
+        return finishSplit(
+            config: effectiveConfig,
+            at: oldView,
+            direction: direction,
+            ratio: ratio,
+            hasExplicitTint: hasExplicitTint)
+    }
+
+    /// Build the new surface, insert it into the tree, and finalize focus/undo.
+    /// Split out of `newSplit` so the remote path can call it AFTER an off-main
+    /// cwd query, while the local path calls it synchronously.
+    @discardableResult
+    private func finishSplit(
+        config effectiveConfig: Ghostty.SurfaceConfiguration,
+        at oldView: Ghostty.SurfaceView,
+        direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
+        ratio: Double,
+        hasExplicitTint: Bool
+    ) -> Ghostty.SurfaceView? {
+        // The parent may have been removed from the tree while we were resolving
+        // the remote cwd off the main thread.
+        guard surfaceTree.root?.node(view: oldView) != nil else { return nil }
 
         // Create a new surface view
         guard let ghostty_app = ghostty.app else { return nil }
@@ -397,6 +444,86 @@ class BaseTerminalController: NSWindowController,
                 ghostty_remote_connection_query_cwd(connection, cSid)).string
         }
         return cwd.isEmpty ? nil : cwd
+    }
+
+    /// The remote inheritance to seed a new window/tab/split from a parent remote
+    /// frame (§WP4): the parent pane's COMMAND (so the new frame re-runs it; nil
+    /// ⇒ the agent default shell) and its live SESSION ID (so we can query its
+    /// cwd off the main thread). These are cheap, non-blocking snapshots read
+    /// directly from the surface — no network. The cwd itself is resolved
+    /// separately/asynchronously by `queryRemoteCwd(sessionId:on:)` because it is
+    /// a blocking agent RPC that must NEVER run on the main thread.
+    struct RemoteInheritance {
+        let command: String?
+        let sessionId: String?
+    }
+
+    /// Snapshot the parent remote frame's command + session id without blocking.
+    static func remoteInheritance(of parent: Ghostty.SurfaceView) -> RemoteInheritance {
+        guard let surface = parent.surface else {
+            return RemoteInheritance(command: nil, sessionId: nil)
+        }
+        let command = Ghostty.AllocatedString(
+            ghostty_surface_remote_command(surface)).string
+        let sid = Ghostty.AllocatedString(
+            ghostty_surface_remote_session_id(surface)).string
+        return RemoteInheritance(
+            command: command.isEmpty ? nil : command,
+            sessionId: sid.isEmpty ? nil : sid)
+    }
+
+    /// Resolve a remote pane's child cwd from an already-snapshotted `sessionId`.
+    /// This is a bounded agent RPC (default `timeoutMs`) that takes a plain
+    /// session id so it can be called from a BACKGROUND queue (the surface pointer
+    /// is not touched here). Returns nil on any failure (the new frame then opens
+    /// in the agent's default cwd). MUST be called off the main thread.
+    static func queryRemoteCwd(
+        sessionId: String,
+        on connection: ghostty_remote_connection_t,
+        timeoutMs: UInt32 = remoteCwdQueryTimeoutMs
+    ) -> String? {
+        guard !sessionId.isEmpty else { return nil }
+        let cwd = sessionId.withCString { cSid in
+            Ghostty.AllocatedString(
+                ghostty_remote_connection_query_cwd_timeout(
+                    connection, cSid, timeoutMs)).string
+        }
+        return cwd.isEmpty ? nil : cwd
+    }
+
+    /// Tight bound (ms) for an on-demand cwd query that seeds a new remote frame.
+    /// A healthy agent replies in single-digit ms; this caps the wait on the
+    /// BACKGROUND queue so a slow/wedged agent only delays the new frame briefly
+    /// (it then opens in the agent's default cwd) instead of stalling for 10s.
+    static let remoteCwdQueryTimeoutMs: UInt32 = 1500
+
+    /// Resolve the remote inheritance for a new frame OFF the main thread, then
+    /// invoke `build` on the main thread with the resolved `command` + `cwd`.
+    ///
+    /// This is the single non-blocking entry point used by the new
+    /// window/tab/split paths (§WP4). The COMMAND is a cheap synchronous snapshot;
+    /// the CWD is a blocking agent RPC, so we hop to a background queue for it and
+    /// only return to the main thread to build the frame. The UI never blocks. If
+    /// the parent surface has no live remote session, `build` runs immediately on
+    /// the main thread with a nil cwd (the agent's default).
+    @MainActor
+    static func resolveRemoteInheritance(
+        from parent: Ghostty.SurfaceView,
+        on connection: ghostty_remote_connection_t,
+        build: @escaping @MainActor (_ command: String?, _ cwd: String?) -> Void
+    ) {
+        let inherit = remoteInheritance(of: parent)
+        guard let sessionId = inherit.sessionId else {
+            // No resolved remote session: nothing to query, build immediately.
+            build(inherit.command, nil)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cwd = queryRemoteCwd(sessionId: sessionId, on: connection)
+            DispatchQueue.main.async {
+                build(inherit.command, cwd)
+            }
+        }
     }
 
     /// Move focus to a surface view.
