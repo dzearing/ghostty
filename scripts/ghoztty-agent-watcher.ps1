@@ -11,16 +11,32 @@
 # always runs from the same local path, so you'll never be prompted again.
 
 $ErrorActionPreference = 'Continue'
-$Share   = '\\homeassistant\share\ghoztty-windows\ghoztty-agent.exe'
-$RunDir  = Join-Path $env:LOCALAPPDATA 'ghoztty'
-$Local   = Join-Path $RunDir 'ghoztty-agent.exe'
-$LogOut  = Join-Path $RunDir 'agent.out.log'
-$LogErr  = Join-Path $RunDir 'agent.err.log'
-$Listen  = '0.0.0.0:7777'
-$PollSec = 3
+$ShareDir   = '\\homeassistant\share\ghoztty-windows'
+$Share      = Join-Path $ShareDir 'ghoztty-agent.exe'
+$ShareLogs  = Join-Path $ShareDir 'logs'           # mirrored here so Claude can read from /Volumes/share
+$RunDir     = Join-Path $env:LOCALAPPDATA 'ghoztty'
+$Local      = Join-Path $RunDir 'ghoztty-agent.exe'
+$LogOut     = Join-Path $RunDir 'agent.out.log'
+$LogErr     = Join-Path $RunDir 'agent.err.log'
+$WatcherLog = Join-Path $RunDir 'watcher.log'
+$Listen     = '0.0.0.0:7777'
+$PollSec    = 3
 
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
-function Log($m){ Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }
+try { New-Item -ItemType Directory -Force -Path $ShareLogs | Out-Null } catch {}
+function Log($m){
+  $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m
+  Write-Host $line
+  try { Add-Content -LiteralPath $WatcherLog -Value $line } catch {}
+}
+# Mirror local logs to the share so Claude can read them remotely (best-effort).
+function SyncLogs(){
+  try {
+    foreach ($f in @($LogOut, $LogErr, $WatcherLog)) {
+      if (Test-Path $f) { Copy-Item -LiteralPath $f -Destination (Join-Path $ShareLogs (Split-Path $f -Leaf)) -Force -ErrorAction SilentlyContinue }
+    }
+  } catch {}
+}
 function HashOf($p){ if (Test-Path $p) { (Get-FileHash -Algorithm SHA256 $p).Hash } else { $null } }
 
 $proc = $null
@@ -66,5 +82,6 @@ while ($true) {
   } catch {
     Log "ERROR: $($_.Exception.Message)"
   }
+  SyncLogs
   Start-Sleep -Seconds $PollSec
 }
