@@ -175,8 +175,10 @@ const OutFrame = struct {
 // Server
 // -----------------------------------------------------------------------------
 
-/// The agent's per-connection server: owns the two streams, the session table, the
-/// writer thread, and the reader threads. One `Server` per accepted ssh
+/// The agent's per-connection server: owns the two streams, the writer thread, and
+/// the reader threads, and BRIDGES frames to/from a SHARED, daemon-scoped
+/// `SessionStore` (the table + lock + children outlive this Server, so sessions
+/// survive a client disconnect — §7.1 close-laptop). One `Server` per accepted
 /// connection. Heap-allocated (`create`) so its address is stable for the threads.
 pub const Server = struct {
     alloc: Allocator,
@@ -187,9 +189,17 @@ pub const Server = struct {
     clock: Clock,
     spawner: Spawner,
 
-    /// Session registry (§7.1). Guarded by `sess_mutex`.
-    sess_mutex: std.Thread.Mutex = .{},
-    table: session.SessionTable,
+    /// DAEMON-scoped session registry (§7.1 survival). SHARED across connections —
+    /// owned by the daemon (`main.zig`), NOT by this per-connection Server, so
+    /// sessions outlive a client disconnect (the close-laptop scenario). All table
+    /// access goes through `store.mutex`. The previous design owned a per-connection
+    /// `SessionTable`+mutex here; lifting it to the store is what makes reconnect
+    /// catch-up possible.
+    store: *session.SessionStore,
+    /// Channels this connection currently has bound (so disconnect can DETACH just
+    /// its own sessions, leaving others — future multi-client — untouched). Guarded
+    /// by `store.mutex`.
+    bound_channels: std.ArrayList(u128) = .empty,
 
     /// Outbound MPSC queue + the single writer thread (§3.4).
     write_mutex: std.Thread.Mutex = .{},
@@ -210,9 +220,6 @@ pub const Server = struct {
 
     /// Per-session ring size (from Options), read by `create`'s table inserts.
     ring_bytes: usize = session.default_ring_bytes,
-    /// Owned PRNG, freed in `destroy`. Always allocated (even when the caller
-    /// supplied `opts.rng`) for uniform teardown.
-    prng: *std.Random.DefaultPrng,
 
     pub const Options = struct {
         /// The pinned transfer encoding for this connection (§4.2). The agent
@@ -226,30 +233,22 @@ pub const Server = struct {
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
         clock: ?Clock = null,
-        /// Deterministic RNG override for id/channel minting (tests). When null a
-        /// fresh OS-seeded `DefaultPrng` is created and owned by the server.
-        rng: ?std.Random = null,
     };
 
+    /// Stand up a per-connection Server over a SHARED daemon `store` (the registry
+    /// that outlives connections, §7.1 survival). The store owns the session table,
+    /// its lock, the id RNG, and the idle-TTL reaper; this Server only bridges
+    /// frames to/from it for the life of one connection.
     pub fn create(
         alloc: Allocator,
         control: Stream,
         data: Stream,
         spawner: Spawner,
+        store: *session.SessionStore,
         opts: Options,
     ) Allocator.Error!*Server {
         const self = try alloc.create(Server);
         errdefer alloc.destroy(self);
-
-        // Own a PRNG if the caller didn't supply one. Seeded from the OS so session
-        // ids are unpredictable (§7.1 crypto-random) in production; deterministic
-        // in tests via `opts.rng`.
-        const prng = try alloc.create(std.Random.DefaultPrng);
-        errdefer alloc.destroy(prng);
-        var seed: u64 = 0;
-        std.crypto.random.bytes(std.mem.asBytes(&seed));
-        prng.* = std.Random.DefaultPrng.init(seed);
-        const rng = opts.rng orelse prng.random();
 
         self.* = .{
             .alloc = alloc,
@@ -262,9 +261,8 @@ pub const Server = struct {
             },
             .clock = opts.clock orelse Clock.real(),
             .spawner = spawner,
-            .table = session.SessionTable.init(alloc, rng),
+            .store = store,
             .ring_bytes = opts.ring_bytes,
-            .prng = prng,
         };
         return self;
     }
@@ -306,9 +304,20 @@ pub const Server = struct {
         return self.negotiated;
     }
 
-    /// Stop everything: close streams (unblocks reader threads at EOF), wake + drain
-    /// the writer, join all threads. Safe to call once; idempotent on the flag.
+    /// Stop everything for THIS connection: DETACH every session this connection
+    /// bound (clear its bridge so the store stops framing to our dying writer, but
+    /// KEEP the child running and ringing — the close-laptop survival path, §7.1),
+    /// then close streams (unblocks reader threads at EOF), wake + drain the writer,
+    /// and join all OUR threads. The sessions and their pty children are untouched;
+    /// they live on in the store until reattached or idle-reaped. Safe to call once.
+    ///
+    /// CRITICAL (the wedge fix): we detach by clearing per-session bridge pointers
+    /// under the store lock — we do NOT terminate any child here. Terminating a
+    /// child joins its pty reader thread, whose output sink takes the store lock; if
+    /// we did that while holding the lock (as the old `handleClose` did) the reader
+    /// could never make progress and the join would hang, wedging the accept loop.
     pub fn shutdown(self: *Server) void {
+        self.detachAll();
         self.signalClose();
         self.control.close();
         self.data.close();
@@ -325,14 +334,35 @@ pub const Server = struct {
         }
     }
 
-    /// Free the server (must be shut down first). Frees the session table (which
-    /// terminates every child), any still-queued outbound payloads, and the PRNG.
+    /// DETACH every session this connection bound: under the store lock, clear the
+    /// session's bridge (point output nowhere) + `bound` flag and stop streaming, so
+    /// the orphaned session keeps ringing output but frames nothing to our dead
+    /// writer. Does NOT terminate children (survival, §7.1). Idempotent.
+    fn detachAll(self: *Server) void {
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
+        for (self.bound_channels.items) |ch| {
+            const s = self.store.table.getByChannel(ch) orelse continue;
+            if (s.bridge_ctx == @as(?*anyopaque, self)) {
+                s.bridge_ctx = null;
+                s.bridge_data = null;
+                s.bridge_exit = null;
+                s.bound = false;
+                s.streaming = false;
+                s.last_activity_ms = self.clock.now();
+            }
+        }
+        self.bound_channels.clearRetainingCapacity();
+    }
+
+    /// Free the server (must be shut down first). Frees per-connection state only;
+    /// the SHARED session store (and its children) is owned by the daemon and
+    /// outlives this Server — `destroy` never touches the table.
     pub fn destroy(self: *Server, alloc: Allocator) void {
         assert(self.control_thread == null and self.data_thread == null and self.writer_thread == null);
-        self.table.deinit();
+        self.bound_channels.deinit(self.alloc);
         for (self.write_queue.items) |f| self.alloc.free(f.payload);
         self.write_queue.deinit(self.alloc);
-        alloc.destroy(self.prng);
         alloc.destroy(self);
     }
 
@@ -388,50 +418,50 @@ pub const Server = struct {
         try self.enqueue(.data, .data, channel, payload);
     }
 
-    // --- Child output delivery (called by the spawner's reader, or by tests) --
+    // --- Child output delivery ------------------------------------------------
+    //
+    // The pty reader thread's output sink points at the STORE (stable across
+    // reconnects), not at this per-connection Server — see `store.onChildOutput`.
+    // The store records into the ring + reaps, and (when a connection is bound)
+    // calls back into the bound Server's bridge to actually frame DATA / EXIT onto
+    // the wire. These two trampolines are that bridge.
 
-    /// Deliver `bytes` of child output for the session on `channel`: record into
-    /// the session ring (advancing the outbound offset) and, if streaming is not
-    /// FLOW-paused, frame it as DATA. Then reap-check the child and, if it exited,
-    /// emit EXIT ordered AFTER this final DATA (§4.2 "EXIT ordered after final
-    /// DATA"). Takes the session lock. Unknown channel ⇒ ignored.
-    pub fn onChildOutput(self: *Server, channel: u128, bytes: []const u8) void {
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
-        const s = self.table.getByChannel(channel) orelse return;
-        if (!s.alive) return;
-        const now = self.clock.now();
-        if (bytes.len > 0) {
-            const at = s.recordOutput(bytes, now);
-            if (s.streaming) {
-                self.sendData(s.channel, at, bytes) catch {};
-            }
-        }
-        self.reapLocked(s, now);
+    /// Bridge: frame a live child-output chunk as DATA on `channel`. Installed on a
+    /// session (`bridge_data`) when this connection binds it; called by
+    /// `store.onChildOutput` under the store lock.
+    fn bridgeData(ctx: *anyopaque, channel: u128, byte_offset: u64, bytes: []const u8) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.sendData(channel, byte_offset, bytes) catch {};
     }
 
-    /// Reap a session's child if it exited; emit EXIT (after any final DATA already
-    /// enqueued) and mark the tombstone. Caller holds `sess_mutex`.
-    fn reapLocked(self: *Server, s: *session.Session, now: i64) void {
-        if (!s.alive) return;
-        const code = s.child.tryWait() orelse return;
-        s.markExited(code, now);
-        const runtime: u64 = @intCast(@max(0, now - s.created_ms));
-        self.sendJson(.exit, s.channel, protocol.Exit{
+    /// Bridge: frame EXIT on `channel` (ordered after the final DATA). Installed as
+    /// `bridge_exit`; called by `store.onChildOutput` when the child reaps.
+    fn bridgeExit(ctx: *anyopaque, channel: u128, code: i64, runtime_ms: u64) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.sendJson(.exit, channel, protocol.Exit{
             .code = code,
-            .runtime_ms = runtime,
+            .runtime_ms = runtime_ms,
         }) catch {};
     }
 
-    /// Explicitly poll every live session for exit (the real agent's `waitpid`
-    /// reaper does this on SIGCHLD; tests call it after marking a fake child
-    /// exited). Emits EXIT for any that have exited.
+    /// Test/back-compat shim: deliver child output through the store (which bridges
+    /// to this Server if bound). Real production output arrives via the store sink
+    /// installed on the pty child; tests still call `server.onChildOutput(...)`.
+    pub fn onChildOutput(self: *Server, channel: u128, bytes: []const u8) void {
+        self.store.onChildOutput(channel, bytes);
+    }
+
+    /// Explicitly poll every live session for exit (tests call it after marking a
+    /// fake child exited). Delegates a zero-length nudge per channel through the
+    /// store so any exited child reaps + emits EXIT via the bridge.
     pub fn reapAll(self: *Server) void {
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
-        const now = self.clock.now();
-        var it = self.table.by_id.valueIterator();
-        while (it.next()) |sp| self.reapLocked(sp.*, now);
+        self.store.mutex.lock();
+        var channels: std.ArrayList(u128) = .empty;
+        defer channels.deinit(self.alloc);
+        var it = self.store.table.by_id.valueIterator();
+        while (it.next()) |sp| channels.append(self.alloc, sp.*.channel) catch {};
+        self.store.mutex.unlock();
+        for (channels.items) |ch| self.store.onChildOutput(ch, &.{});
     }
 
     // --- Writer thread (single writer; seq == wire order) ---------------------
@@ -579,12 +609,12 @@ pub const Server = struct {
         defer parsed.deinit();
         const open = parsed.value;
 
-        // Spawn the (fake, this increment) child. A spawn failure simply yields no
-        // OPENED; a real agent would reply with an error META (out of scope).
+        // Spawn the child (real pty). A spawn failure simply yields no OPENED; a real
+        // agent would reply with an error META (out of scope).
         const spawned = self.spawner.spawn(open) catch return;
 
-        self.sess_mutex.lock();
-        const s = self.table.create(
+        self.store.mutex.lock();
+        const s = self.store.table.create(
             spawned.child,
             spawned.pid,
             open.rows,
@@ -592,22 +622,27 @@ pub const Server = struct {
             self.ring_bytes,
             self.clock.now(),
         ) catch {
-            // Cap hit or OOM: terminate the orphaned child, drop.
-            self.sess_mutex.unlock();
+            // Cap hit or OOM: terminate the orphaned child OUTSIDE the lock (the
+            // terminate→reader-join deadlock rule), then drop.
+            self.store.mutex.unlock();
             spawned.child.terminate();
             return;
         };
+        // Bind the new session to THIS connection: install the outbound bridge so
+        // live output frames to our writer, mark it bound (so the idle reaper leaves
+        // it alone), and track its channel so disconnect detaches just our sessions.
+        self.bindLocked(s);
         const channel = s.channel;
         const id_copy = s.id_str; // value copy; safe to use after unlock
         const pid = s.pid;
         const child = s.child; // value copy of the vtable handle
-        self.sess_mutex.unlock();
+        self.store.mutex.unlock();
 
         // Hand the (real pty) child its channel + output sink so its reader thread
-        // routes master-fd output to `onChildOutput`. Done AFTER unlock because the
-        // sink itself takes `sess_mutex` (a reader callback racing the handshake
-        // would otherwise deadlock). The fake child ignores this (attach == null).
-        child.attach(self, onChildOutputTrampoline, channel);
+        // routes master-fd output to the STORE (stable across reconnects). Done
+        // AFTER unlock because the sink itself takes the store lock. The fake child
+        // ignores this (attach == null).
+        child.attach(self.store, session.SessionStore.onChildOutputTrampoline, channel);
 
         self.sendJson(.opened, channel, protocol.Opened{
             .session_id = id_copy[0..],
@@ -615,11 +650,18 @@ pub const Server = struct {
         }) catch {};
     }
 
-    /// Adapts `onChildOutput` to the `session.Child` sink signature (a free fn
-    /// pointer over `*anyopaque`). The pty child's reader thread calls this.
-    fn onChildOutputTrampoline(ctx: *anyopaque, channel: u128, bytes: []const u8) void {
-        const self: *Server = @ptrCast(@alignCast(ctx));
-        self.onChildOutput(channel, bytes);
+    /// Bind session `s` to this connection: point its outbound bridge at us, mark it
+    /// bound + streaming, and record its channel for detach-on-disconnect. Caller
+    /// holds `store.mutex`. Idempotent-ish: re-binding repoints the bridge.
+    fn bindLocked(self: *Server, s: *session.Session) void {
+        s.bridge_ctx = self;
+        s.bridge_data = bridgeData;
+        s.bridge_exit = bridgeExit;
+        s.bound = true;
+        s.streaming = true;
+        // Track the channel once (avoid dupes across re-attach within one conn).
+        for (self.bound_channels.items) |c| if (c == s.channel) return;
+        self.bound_channels.append(self.alloc, s.channel) catch {};
     }
 
     fn handleAttach(self: *Server, payload: []const u8) void {
@@ -627,10 +669,10 @@ pub const Server = struct {
         defer parsed.deinit();
         const att = parsed.value;
 
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
 
-        const s = self.table.getByIdStr(att.session_id) orelse {
+        const s = self.store.table.getByIdStr(att.session_id) orelse {
             // Unknown session → not_found. We reply on the control channel; the
             // client correlates by session_id in its pending-attach table.
             self.sendJson(.attached, protocol.control_channel, protocol.Attached{
@@ -650,13 +692,18 @@ pub const Server = struct {
             return;
         }
 
-        // Alive: capture the snapshot anchor S (= current outbound offset; a real
-        // grid snapshot is `// TODO(snapshot)`). Resume the session's dims to the
-        // attaching client's geometry and (re)enable streaming.
+        // Alive: (re)BIND the session to THIS connection — this is the close-laptop
+        // reconnect path. The session may have been orphaned (its previous
+        // connection dropped); binding repoints the bridge at our writer so live
+        // output resumes flowing, and clears the orphan/idle-reap eligibility.
+        self.bindLocked(s);
+
+        // Capture the snapshot anchor S (= current outbound offset; a real grid
+        // snapshot is `// TODO(snapshot)`). Resume the session's dims to the
+        // attaching client's geometry.
         const now = self.clock.now();
         s.rows = att.rows;
         s.cols = att.cols;
-        s.streaming = true;
         s.last_activity_ms = now;
         s.child.resize(att.rows, att.cols, 0, 0) catch {};
         const snapshot_at = s.snapshotOffset();
@@ -670,17 +717,37 @@ pub const Server = struct {
             .snapshot_at_offset = snapshot_at,
         }) catch {};
 
-        // Gap-fill (§7.3): if the client's last_byte_offset < S and the ring still
-        // retains `(last_byte_offset, S]`, replay it as DATA so the viewport has no
-        // hole. If evicted, we skip it (v1 honesty: scrollback may be truncated);
-        // the forthcoming snapshot makes the visible grid exact. Live DATA then
-        // resumes naturally from offset > S via onChildOutput.
+        // Gap-fill / CATCH-UP (§7.3): replay everything the client missed while it
+        // was gone. If the client's last_byte_offset < S and the ring still retains
+        // `(last_byte_offset, S]`, replay it as DATA so reconnect has NO hole — this
+        // is the bytes the remote produced during the disconnect. If the requested
+        // start was evicted (deep scrollback overran the ring), replay what's
+        // retained from the ring base and prepend a clear truncation marker (v1
+        // honesty; the forthcoming grid snapshot makes the visible grid exact). Live
+        // DATA then resumes from offset > S via the store sink.
         if (att.last_byte_offset < snapshot_at) {
-            const want: usize = @intCast(snapshot_at - att.last_byte_offset);
-            const tmp = self.alloc.alloc(u8, want) catch return;
-            defer self.alloc.free(tmp);
-            if (s.ring.slice(att.last_byte_offset, snapshot_at, tmp)) |n| {
-                self.sendData(s.channel, att.last_byte_offset, tmp[0..n]) catch {};
+            const base = s.ring.base_offset;
+            var replay_from = att.last_byte_offset;
+            if (replay_from < base) {
+                // The exact resume point was evicted. Emit a marker, then replay from
+                // the oldest byte we still have.
+                const lost = base - att.last_byte_offset;
+                var marker_buf: [96]u8 = undefined;
+                const marker = std.fmt.bufPrint(
+                    &marker_buf,
+                    "\r\n[ghoztty: {d} bytes of scrollback lost during disconnect]\r\n",
+                    .{lost},
+                ) catch "";
+                if (marker.len > 0) self.sendData(s.channel, att.last_byte_offset, marker) catch {};
+                replay_from = base;
+            }
+            const want: usize = @intCast(snapshot_at - replay_from);
+            if (want > 0) {
+                const tmp = self.alloc.alloc(u8, want) catch return;
+                defer self.alloc.free(tmp);
+                if (s.ring.slice(replay_from, snapshot_at, tmp)) |n| {
+                    self.sendData(s.channel, replay_from, tmp[0..n]) catch {};
+                }
             }
         }
     }
@@ -689,9 +756,9 @@ pub const Server = struct {
         var parsed = protocol.parseJson(protocol.Resize, self.alloc, payload) catch return;
         defer parsed.deinit();
         const rz = parsed.value;
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
-        const s = self.table.getByChannel(channel) orelse return;
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
+        const s = self.store.table.getByChannel(channel) orelse return;
         if (!s.alive) return;
         s.rows = rz.rows;
         s.cols = rz.cols;
@@ -704,29 +771,41 @@ pub const Server = struct {
         var parsed = protocol.parseJson(protocol.Signal, self.alloc, payload) catch return;
         defer parsed.deinit();
         const sig = parsed.value;
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
-        const s = self.table.getByChannel(channel) orelse return;
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
+        const s = self.store.table.getByChannel(channel) orelse return;
         if (!s.alive) return;
         s.setSignal(sig.name) catch {};
         s.child.signal(sig.name) catch {};
     }
 
     fn handleDetach(self: *Server, channel: u128) void {
-        // Stop streaming; keep the session alive (§4.2/§7.1).
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
-        const s = self.table.getByChannel(channel) orelse return;
+        // Explicit DETACH: stop streaming + unbind from this connection, but KEEP
+        // the session alive + ringing (§4.2/§7.1). After this the session is an
+        // orphan (idle-TTL eligible) until a new ATTACH.
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
+        const s = self.store.table.getByChannel(channel) orelse return;
         s.streaming = false;
+        if (s.bridge_ctx == @as(?*anyopaque, self)) {
+            s.bridge_ctx = null;
+            s.bridge_data = null;
+            s.bridge_exit = null;
+            s.bound = false;
+            s.last_activity_ms = self.clock.now();
+        }
     }
 
     fn handleClose(self: *Server, channel: u128) void {
         // Terminate the child + free the session (§4.2). Idempotent on a stale
-        // channel (closing a nonexistent target succeeds silently).
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
-        const s = self.table.getByChannel(channel) orelse return;
-        self.table.remove(s.id);
+        // channel (closing a nonexistent target succeeds silently). Two-phase to
+        // avoid the deadlock: UNLINK under the lock, then terminate+free OUTSIDE it
+        // (terminate joins the pty reader, whose sink takes this very lock).
+        self.store.mutex.lock();
+        const s = self.store.table.getByChannel(channel);
+        const unlinked = if (s) |sess| self.store.table.unlink(sess.id) else null;
+        self.store.mutex.unlock();
+        if (unlinked) |u| self.store.table.freeUnlinked(u);
     }
 
     fn handlePing(self: *Server, payload: []const u8) void {
@@ -737,9 +816,9 @@ pub const Server = struct {
 
     fn handleFlow(self: *Server, payload: []const u8) void {
         const flow = protocol.Flow.decode(payload) catch return;
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
-        const s = self.table.getByChannel(flow.channel) orelse return;
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
+        const s = self.store.table.getByChannel(flow.channel) orelse return;
         switch (flow.op) {
             .pause => s.streaming = false,
             .@"resume" => s.streaming = true,
@@ -751,10 +830,10 @@ pub const Server = struct {
 
     fn handleInboundData(self: *Server, frame: protocol.Frame) void {
         const dp = protocol.DataPayload.decode(frame.payload) catch return;
-        self.sess_mutex.lock();
-        defer self.sess_mutex.unlock();
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
         // Ownership check (§15 M3): the channel must belong to a session we own.
-        const s = self.table.getByChannel(frame.channel) orelse return;
+        const s = self.store.table.getByChannel(frame.channel) orelse return;
         if (!s.alive) return;
         // Write keystrokes to the child. A short/failed write is non-fatal here.
         s.child.writeAll(dp.bytes) catch {};
@@ -1054,11 +1133,14 @@ const MockClient = struct {
     }
 };
 
-/// Build a server + a mock client wired over two loopbacks, all on `enc`.
+/// Build a server + a mock client wired over two loopbacks, all on `enc`. Owns a
+/// daemon-scoped `SessionStore` (shared registry), mirroring production: the store
+/// outlives the Server, so tests reach the table via `h.server.store.{mutex,table}`.
 const Harness = struct {
     alloc: Allocator,
     ctrl_lb: *Loopback,
     data_lb: *Loopback,
+    store: *session.SessionStore,
     server: *Server,
     client: MockClient,
     clock: *TestClock,
@@ -1077,16 +1159,22 @@ const Harness = struct {
         const data_lb = try alloc.create(Loopback);
         data_lb.* = Loopback.init(alloc);
 
+        const store = try alloc.create(session.SessionStore);
+        // No reaper thread in tests (deterministic): idle reaping is invoked
+        // explicitly via `store.reapIdle()` where a test wants it. A huge TTL keeps
+        // sessions from ever idling out under the fixed test clock.
+        store.* = session.SessionStore.init(alloc, rng, clock, TestClock.now, std.math.maxInt(i64));
+
         const server = try Server.create(
             alloc,
             ctrl_lb.agentStream(),
             data_lb.agentStream(),
             spawner.spawner(),
+            store,
             .{
                 .encoding = enc,
                 .ring_bytes = ring_bytes,
                 .clock = clock.clock(),
-                .rng = rng,
             },
         );
         const client = MockClient.init(alloc, ctrl_lb.clientStream(), data_lb.clientStream(), enc);
@@ -1094,6 +1182,7 @@ const Harness = struct {
             .alloc = alloc,
             .ctrl_lb = ctrl_lb,
             .data_lb = data_lb,
+            .store = store,
             .server = server,
             .client = client,
             .clock = clock,
@@ -1105,6 +1194,8 @@ const Harness = struct {
         self.server.shutdown();
         self.client.deinit();
         self.server.destroy(self.alloc);
+        self.store.deinit();
+        self.alloc.destroy(self.store);
         self.ctrl_lb.deinit();
         self.data_lb.deinit();
         self.alloc.destroy(self.ctrl_lb);
@@ -1363,15 +1454,15 @@ test "child exit emits EXIT after final DATA; reattach → dead+exit_code; CLOSE
     // Spin until the session is gone.
     var spins: usize = 0;
     while (spins < 10_000) : (spins += 1) {
-        h.server.sess_mutex.lock();
-        const gone = h.server.table.getByChannel(o.channel) == null;
-        h.server.sess_mutex.unlock();
+        h.server.store.mutex.lock();
+        const gone = h.server.store.table.getByChannel(o.channel) == null;
+        h.server.store.mutex.unlock();
         if (gone) break;
         std.Thread.yield() catch {};
     }
-    h.server.sess_mutex.lock();
-    try testing.expect(h.server.table.getByChannel(o.channel) == null);
-    h.server.sess_mutex.unlock();
+    h.server.store.mutex.lock();
+    try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
+    h.server.store.mutex.unlock();
     try testing.expect(fc.terminated);
 }
 
@@ -1403,10 +1494,10 @@ test "RESIZE and SIGNAL are recorded on the child" {
     try testing.expectEqual([4]u16{ 50, 120, 1, 2 }, fc.last_resize.?);
     try testing.expectEqualSlices(u8, "INT", fc.last_signal.?);
     // Session dims updated.
-    h.server.sess_mutex.lock();
-    const s = h.server.table.getByChannel(o.channel).?;
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByChannel(o.channel).?;
     try testing.expectEqual(@as(u16, 50), s.rows);
-    h.server.sess_mutex.unlock();
+    h.server.store.mutex.unlock();
 }
 
 test "FLOW pause halts streaming; resume continues from buffered offset" {
@@ -1436,9 +1527,9 @@ test "FLOW pause halts streaming; resume continues from buffered offset" {
     // Spin until the pause is applied.
     var spins: usize = 0;
     while (spins < 10_000) : (spins += 1) {
-        h.server.sess_mutex.lock();
-        const paused = !h.server.table.getByChannel(o.channel).?.streaming;
-        h.server.sess_mutex.unlock();
+        h.server.store.mutex.lock();
+        const paused = !h.server.store.table.getByChannel(o.channel).?.streaming;
+        h.server.store.mutex.unlock();
         if (paused) break;
         std.Thread.yield() catch {};
     }
@@ -1454,9 +1545,9 @@ test "FLOW pause halts streaming; resume continues from buffered offset" {
     });
     spins = 0;
     while (spins < 10_000) : (spins += 1) {
-        h.server.sess_mutex.lock();
-        const live = h.server.table.getByChannel(o.channel).?.streaming;
-        h.server.sess_mutex.unlock();
+        h.server.store.mutex.lock();
+        const live = h.server.store.table.getByChannel(o.channel).?.streaming;
+        h.server.store.mutex.unlock();
         if (live) break;
         std.Thread.yield() catch {};
     }
@@ -1505,18 +1596,18 @@ test "DETACH stops streaming but keeps the session alive" {
     try h.client.sendControlRaw(.detach, o.channel, "");
     var spins: usize = 0;
     while (spins < 10_000) : (spins += 1) {
-        h.server.sess_mutex.lock();
-        const s = h.server.table.getByChannel(o.channel).?;
+        h.server.store.mutex.lock();
+        const s = h.server.store.table.getByChannel(o.channel).?;
         const detached = !s.streaming and s.alive;
-        h.server.sess_mutex.unlock();
+        h.server.store.mutex.unlock();
         if (detached) break;
         std.Thread.yield() catch {};
     }
-    h.server.sess_mutex.lock();
-    const s = h.server.table.getByChannel(o.channel).?;
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByChannel(o.channel).?;
     try testing.expect(!s.streaming);
     try testing.expect(s.alive);
-    h.server.sess_mutex.unlock();
+    h.server.store.mutex.unlock();
 }
 
 test "unknown channel DATA is ignored (no crash, no child write)" {
@@ -1569,4 +1660,180 @@ test "clean shutdown joins all threads without hanging or leaking" {
     h.server.onChildOutput(o.channel, "some output"); // exercise the streaming path
     _ = try h.client.nextData();
     h.deinit(); // must not hang; testing.allocator catches leaks
+}
+
+// --- P1: session survival across disconnect + reconnect catch-up --------------
+
+/// A second connection (Server + client + loopbacks) over an EXISTING shared store,
+/// modeling a reconnect. The store/spawner/clock are owned by the first Harness.
+const ReConn = struct {
+    alloc: Allocator,
+    ctrl_lb: *Loopback,
+    data_lb: *Loopback,
+    server: *Server,
+    client: MockClient,
+
+    fn init(h: *Harness, enc: protocol.TransferEncoding) !ReConn {
+        const alloc = h.alloc;
+        const ctrl_lb = try alloc.create(Loopback);
+        ctrl_lb.* = Loopback.init(alloc);
+        const data_lb = try alloc.create(Loopback);
+        data_lb.* = Loopback.init(alloc);
+        const server = try Server.create(
+            alloc,
+            ctrl_lb.agentStream(),
+            data_lb.agentStream(),
+            h.spawner.spawner(),
+            h.store,
+            .{ .encoding = enc, .ring_bytes = 4096, .clock = h.clock.clock() },
+        );
+        const client = MockClient.init(alloc, ctrl_lb.clientStream(), data_lb.clientStream(), enc);
+        return .{ .alloc = alloc, .ctrl_lb = ctrl_lb, .data_lb = data_lb, .server = server, .client = client };
+    }
+    fn deinit(self: *ReConn) void {
+        self.server.shutdown();
+        self.client.deinit();
+        self.server.destroy(self.alloc);
+        self.ctrl_lb.deinit();
+        self.data_lb.deinit();
+        self.alloc.destroy(self.ctrl_lb);
+        self.alloc.destroy(self.data_lb);
+    }
+};
+
+test "P1: session survives connection drop; reattach replays the ring gap (catch-up)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 1000 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(20);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Conn 1: open, see some live output (offsets 0..5), then DROP the connection
+    // WITHOUT closing the session (shutdown DETACHes, never terminates).
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    var id_buf: [32]u8 = o.id;
+    h.server.onChildOutput(o.channel, "hello"); // offset 0, S=5
+    _ = try h.client.nextData();
+    h.server.shutdown(); // laptop close: detach, keep session + ring alive
+
+    // The session must STILL be in the shared store, alive, ringing.
+    h.store.mutex.lock();
+    const survived = h.store.table.getByChannel(o.channel);
+    try testing.expect(survived != null);
+    try testing.expect(survived.?.alive);
+    try testing.expect(!survived.?.bound); // orphaned now
+    h.store.mutex.unlock();
+
+    // While disconnected, the child keeps producing — recorded into the ring even
+    // though no connection is bound (offsets 5..16).
+    h.server.onChildOutput(o.channel, "WORLD-GAP!!"); // offset 5, S=16
+
+    // Conn 2: reconnect over the SAME store and ATTACH with last_byte_offset=5
+    // (everything we'd seen). The agent must replay (5,16] = "WORLD-GAP!!".
+    var rc = try ReConn.init(&h, .raw);
+    defer rc.deinit();
+    try rc.server.start();
+    try rc.client.handshake();
+    _ = try rc.server.waitHandshake();
+
+    try rc.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+        .last_byte_offset = 5,
+    });
+    const af = try rc.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+    try testing.expectEqual(@as(u64, 16), ap.value.snapshot_at_offset);
+
+    // The replayed gap arrives as DATA at offset 5 — the bytes produced WHILE GONE.
+    const d = try rc.client.nextData();
+    const dp = try protocol.DataPayload.decode(d.?.payload);
+    try testing.expectEqual(@as(u64, 5), dp.byte_offset);
+    try testing.expectEqualSlices(u8, "WORLD-GAP!!", dp.bytes);
+
+    // And live streaming resumes on the NEW connection (offset 16 forward).
+    h.server.onChildOutput(o.channel, "+live");
+    const d2 = try rc.client.nextData();
+    const dp2 = try protocol.DataPayload.decode(d2.?.payload);
+    try testing.expectEqual(@as(u64, 16), dp2.byte_offset);
+    try testing.expectEqualSlices(u8, "+live", dp2.bytes);
+}
+
+test "P1: explicit DETACH orphans the session (kept alive, unbound, not streaming)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(21);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    try h.client.sendControlRaw(.detach, o.channel, "");
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        h.store.mutex.lock();
+        const s = h.store.table.getByChannel(o.channel).?;
+        const orphaned = !s.streaming and !s.bound and s.alive;
+        h.store.mutex.unlock();
+        if (orphaned) break;
+        std.Thread.yield() catch {};
+    }
+    h.store.mutex.lock();
+    const s = h.store.table.getByChannel(o.channel).?;
+    try testing.expect(s.alive and !s.streaming and !s.bound);
+    h.store.mutex.unlock();
+}
+
+test "P1: idle-TTL reaper evicts an orphaned session once past the TTL" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 0 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var prng = std.Random.DefaultPrng.init(22);
+
+    // Build a store with a SMALL idle TTL (100ms) and no reaper thread; we invoke
+    // reapIdle explicitly under the fixed clock.
+    const store = try alloc.create(session.SessionStore);
+    defer alloc.destroy(store);
+    store.* = session.SessionStore.init(alloc, prng.random(), &clock, TestClock.now, 100);
+    defer store.deinit();
+
+    // A bound session is NEVER reaped, even past TTL.
+    const s = try store.table.create(fc.child(), 1, 24, 80, 1024, 0);
+    const channel = s.channel; // capture: `s` becomes dangling once reaped + freed
+    s.bound = true;
+    s.last_activity_ms = 0;
+    clock.ms = 10_000; // way past TTL
+    store.reapIdle();
+    try testing.expect(store.table.getByChannel(channel) != null); // bound ⇒ kept
+
+    // Orphan it; now it is reaped once last_activity is older than the TTL.
+    s.bound = false;
+    s.last_activity_ms = 10_000;
+    clock.ms = 10_050; // only 50ms idle (< 100ms TTL) ⇒ still kept
+    store.reapIdle();
+    try testing.expect(store.table.getByChannel(channel) != null);
+
+    clock.ms = 10_200; // 200ms idle (> 100ms TTL) ⇒ reaped + child terminated
+    store.reapIdle();
+    try testing.expect(store.table.getByChannel(channel) == null);
+    try testing.expect(fc.terminated);
 }

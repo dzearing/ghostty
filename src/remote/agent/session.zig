@@ -298,6 +298,27 @@ pub const Session = struct {
     alive: bool = true,
     exit_code: ?i64 = null,
 
+    /// True while a live connection (`Server`) is bound to this session — i.e. a
+    /// client is currently attached and receiving its stream. Cleared when that
+    /// connection disconnects (DETACH-on-drop, §7.1 survival): the session keeps
+    /// running and ringing output, but is now an ORPHAN eligible for idle-TTL
+    /// reaping. Re-set when a new connection ATTACHes. The idle reaper only evicts
+    /// orphans (`!bound`), so an attached session never times out.
+    bound: bool = false,
+
+    /// The currently-bound connection's outbound bridge: where live child→client
+    /// DATA frames are enqueued. Null while orphaned (no live connection) — output
+    /// still flows into `ring` but is not framed onto any wire. (Re)pointed under
+    /// the store lock on OPEN/ATTACH and cleared on disconnect. `bridge_ctx` is the
+    /// bound `*Server` as an opaque pointer; `bridge_data` frames a DATA chunk on
+    /// the session's channel. Kept opaque so `session.zig` needn't import
+    /// `server.zig` (avoids an import cycle).
+    bridge_ctx: ?*anyopaque = null,
+    bridge_data: ?*const fn (ctx: *anyopaque, channel: u128, byte_offset: u64, bytes: []const u8) void = null,
+    /// Frames EXIT on the session's channel (ordered after final DATA). Same
+    /// lifetime/locking rules as `bridge_data`.
+    bridge_exit: ?*const fn (ctx: *anyopaque, channel: u128, code: i64, runtime_ms: u64) void = null,
+
     /// Timestamps (ms). `last_activity_ms` drives the idle-TTL reaper (`// TODO(gc)`).
     created_ms: i64,
     last_activity_ms: i64,
@@ -496,10 +517,34 @@ pub const SessionTable = struct {
     }
 
     /// Remove + free a session (terminating its child). Idempotent on a stale id.
+    ///
+    /// DEADLOCK WARNING: `child.terminate()` joins the child's pty reader thread,
+    /// and that reader's output sink (`Server.onChildOutput`) takes the session
+    /// lock. So this MUST NOT be called while the session lock is held, or the
+    /// reader can never make progress and the join hangs forever. Callers that
+    /// hold the lock must use the two-phase `unlink` + `freeUnlinked` instead
+    /// (unlink under the lock, free outside it). This convenience form is for
+    /// lock-free contexts (tests, single-threaded teardown).
     pub fn remove(self: *SessionTable, id: u128) void {
-        const s = self.by_id.get(id) orelse return;
+        const s = self.unlink(id) orelse return;
+        self.freeUnlinked(s);
+    }
+
+    /// Phase 1 of removal: detach `id` from both indexes and return the orphaned
+    /// `*Session` WITHOUT terminating its child. Safe to call under the session
+    /// lock (it only touches the maps). Returns null on a stale id. The caller
+    /// owns the returned session and MUST eventually `freeUnlinked` it.
+    pub fn unlink(self: *SessionTable, id: u128) ?*Session {
+        const s = self.by_id.get(id) orelse return null;
         _ = self.by_id.remove(id);
         _ = self.by_channel.remove(s.channel);
+        return s;
+    }
+
+    /// Phase 2 of removal: terminate the child (joins its reader thread) and free
+    /// the session. MUST be called WITHOUT the session lock held (terminate joins
+    /// the reader, which needs the lock — see `remove`'s deadlock warning).
+    pub fn freeUnlinked(self: *SessionTable, s: *Session) void {
         s.child.terminate();
         s.deinit();
         self.alloc.destroy(s);
@@ -519,6 +564,192 @@ pub const SessionTable = struct {
             v = (v << 4) | d;
         }
         return v;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// SessionStore — DAEMON-SCOPED session registry (P1 close-laptop survival)
+// -----------------------------------------------------------------------------
+
+/// Default idle-TTL before an orphaned (no live connection bound) session is
+/// reaped (§7.1 "Resource caps & TTL"). A generous 10 minutes: long enough to
+/// close a laptop, ride an elevator, and reconnect without losing the shell, but
+/// bounded so abandoned sessions don't leak forever. `last_activity_ms` is bumped
+/// on every output chunk and on (re)attach, so an actively-running session never
+/// idles out.
+pub const default_idle_ttl_ms: i64 = 10 * 60 * 1000;
+
+/// The agent's DAEMON-scoped session store: a `SessionTable` plus the single mutex
+/// that guards ALL access to it, a clock, and a background idle-TTL reaper. It
+/// OUTLIVES any individual connection (`Server`) — this is what makes the
+/// close-laptop / reconnect-and-catch-up scenario work: when a client disconnects,
+/// its `Server` is torn down but the sessions, their pty children, and their
+/// output rings remain here, still streaming into their rings, until either a new
+/// connection re-`ATTACH`es them or the idle-TTL reaps them.
+///
+/// Locking discipline (§3.4): the `mutex` is the ONE lock guarding the table and
+/// every `Session`'s mutable fields. The deadlock rule from `SessionTable.remove`
+/// applies store-wide: NEVER call `child.terminate()` (which joins a reader thread
+/// whose sink takes this lock) while holding `mutex`. The store's own teardown
+/// paths (`closeSession`, `reapIdle`, `deinit`) all unlink under the lock and free
+/// outside it.
+pub const SessionStore = struct {
+    mutex: std.Thread.Mutex = .{},
+    table: SessionTable,
+    clock_ctx: *anyopaque,
+    nowFn: *const fn (ctx: *anyopaque) i64,
+    idle_ttl_ms: i64,
+
+    /// Background reaper: wakes periodically to evict idle orphaned sessions.
+    reaper: ?std.Thread = null,
+    reaper_mutex: std.Thread.Mutex = .{},
+    reaper_cond: std.Thread.Condition = .{},
+    reaper_stop: bool = false,
+
+    pub fn init(
+        alloc: Allocator,
+        rng: std.Random,
+        clock_ctx: *anyopaque,
+        nowFn: *const fn (ctx: *anyopaque) i64,
+        idle_ttl_ms: i64,
+    ) SessionStore {
+        return .{
+            .table = SessionTable.init(alloc, rng),
+            .clock_ctx = clock_ctx,
+            .nowFn = nowFn,
+            .idle_ttl_ms = idle_ttl_ms,
+        };
+    }
+
+    fn now(self: *SessionStore) i64 {
+        return self.nowFn(self.clock_ctx);
+    }
+
+    /// The child output sink, bound to a session's channel via `child.attach`. This
+    /// is store-scoped (NOT per-connection) so it stays valid across reconnects:
+    /// the pty reader thread routes output here for the life of the child. It:
+    ///   1. records `bytes` into the session ring (always — survives disconnect),
+    ///   2. if a connection is bound + streaming, frames it as DATA via the bridge,
+    ///   3. reap-checks the child; on exit, frames EXIT (after the final DATA) and
+    ///      tombstones the session.
+    /// Takes the store lock. Unknown channel ⇒ ignored. A zero-length call is a
+    /// reap nudge (the pty reader sends one on EOF).
+    pub fn onChildOutput(self: *SessionStore, channel: u128, bytes: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.table.getByChannel(channel) orelse return;
+        if (!s.alive) return;
+        const now_ms = self.now();
+        if (bytes.len > 0) {
+            const at = s.recordOutput(bytes, now_ms);
+            if (s.streaming and s.bound) {
+                if (s.bridge_data) |f| f(s.bridge_ctx.?, s.channel, at, bytes);
+            }
+        }
+        // Reap-check: emit EXIT (after the final DATA already bridged) on exit.
+        const code = s.child.tryWait() orelse return;
+        s.markExited(code, now_ms);
+        const runtime: u64 = @intCast(@max(0, now_ms - s.created_ms));
+        if (s.bound) {
+            if (s.bridge_exit) |f| f(s.bridge_ctx.?, s.channel, code, runtime);
+        }
+    }
+
+    /// Trampoline matching `session.Child` sink signature; bound via `child.attach`.
+    pub fn onChildOutputTrampoline(ctx: *anyopaque, channel: u128, bytes: []const u8) void {
+        const self: *SessionStore = @ptrCast(@alignCast(ctx));
+        self.onChildOutput(channel, bytes);
+    }
+
+    /// Start the background idle-TTL reaper thread. Optional — when not started
+    /// (tests), idle reaping happens only via explicit `reapIdle` calls.
+    pub fn startReaper(self: *SessionStore) !void {
+        if (self.reaper != null) return;
+        self.reaper = try std.Thread.spawn(.{}, reaperLoop, .{self});
+    }
+
+    fn reaperLoop(self: *SessionStore) void {
+        // Wake at most once a second (or on stop) to check for idle orphans.
+        const tick_ns: u64 = 1 * std.time.ns_per_s;
+        while (true) {
+            self.reaper_mutex.lock();
+            if (!self.reaper_stop) self.reaper_cond.timedWait(&self.reaper_mutex, tick_ns) catch {};
+            const stop = self.reaper_stop;
+            self.reaper_mutex.unlock();
+            if (stop) break;
+            self.reapIdle();
+        }
+    }
+
+    /// Evict any session whose `bound` connection is gone (orphaned) AND whose
+    /// `last_activity_ms` is older than the idle-TTL. Tombstones (exited children)
+    /// are also reaped once idle. Unlinks under the lock, frees outside it.
+    pub fn reapIdle(self: *SessionStore) void {
+        const cutoff = self.now() - self.idle_ttl_ms;
+        // Phase 1: collect victims' ids under the lock.
+        var victims: std.ArrayList(u128) = .empty;
+        defer victims.deinit(self.table.alloc);
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (s.bound) continue; // a live connection owns it; never reap
+            if (s.last_activity_ms <= cutoff) {
+                victims.append(self.table.alloc, s.id) catch {};
+            }
+        }
+        // Phase 2: unlink each victim under the lock, free outside.
+        var unlinked: std.ArrayList(*Session) = .empty;
+        defer unlinked.deinit(self.table.alloc);
+        for (victims.items) |id| {
+            if (self.table.unlink(id)) |s| unlinked.append(self.table.alloc, s) catch {};
+        }
+        self.mutex.unlock();
+        for (unlinked.items) |s| self.table.freeUnlinked(s);
+    }
+
+    /// Explicit CLOSE: unlink the session on `channel` under the lock and free it
+    /// outside (terminating its child). Idempotent on a stale channel.
+    pub fn closeByChannel(self: *SessionStore, channel: u128) void {
+        self.mutex.lock();
+        const s = self.table.getByChannel(channel) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        const unlinked = self.table.unlink(s.id);
+        self.mutex.unlock();
+        if (unlinked) |u| self.table.freeUnlinked(u);
+    }
+
+    /// Free the whole store: stop the reaper, then tear down every session. Unlinks
+    /// all sessions under the lock, then terminates+frees them OUTSIDE the lock so a
+    /// child reader thread mid-delivery (blocked on the lock) can drain and let its
+    /// `terminate` join complete (the deadlock fix, applied store-wide).
+    pub fn deinit(self: *SessionStore) void {
+        if (self.reaper) |t| {
+            self.reaper_mutex.lock();
+            self.reaper_stop = true;
+            self.reaper_cond.signal();
+            self.reaper_mutex.unlock();
+            t.join();
+            self.reaper = null;
+        }
+        const alloc = self.table.alloc; // capture before `self.table` is invalidated
+        // Phase 1: unlink everything under the lock.
+        var unlinked: std.ArrayList(*Session) = .empty;
+        defer unlinked.deinit(alloc);
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| unlinked.append(alloc, sp.*) catch {};
+        self.table.by_id.clearRetainingCapacity();
+        self.table.by_channel.clearRetainingCapacity();
+        self.mutex.unlock();
+        // Phase 2: terminate + free OUTSIDE the lock.
+        for (unlinked.items) |s| self.table.freeUnlinked(s);
+        // The maps are now empty; deinit them (no children left to terminate).
+        self.table.by_id.deinit(alloc);
+        self.table.by_channel.deinit(alloc);
+        self.table = undefined;
     }
 };
 

@@ -9,11 +9,22 @@
 //!      logical lanes muxed onto it. Shuts down on stdin EOF (client hung up).
 //!
 //!   2. **TCP listen daemon** (`--listen <addr:port>`, default `0.0.0.0:7777` when
-//!      run with NO args): bind, listen, then loop — accept a connection, build a
-//!      `Mux` over the socket, stand up a `Server` with a fresh `PtySpawner`, run
-//!      until the socket EOFs (client disconnect), tear that connection down, and
-//!      loop back to accept the NEXT connection. This is the real-network backbone
-//!      for cross-machine tests (Mac ↔ Windows over Tailscale).
+//!      run with NO args): bind, listen, then loop — accept a connection and serve
+//!      it on its OWN thread (a `Mux` + `Server` over the socket, sharing the
+//!      daemon-scoped session store), so the accept loop NEVER blocks on one
+//!      connection's lifecycle. The real-network backbone for cross-machine tests
+//!      (Mac ↔ Windows over Tailscale).
+//!
+//! ### SESSION SURVIVAL (P1, §7.1) — the close-laptop scenario
+//! The session table + pty children + output rings live in a DAEMON-scoped
+//! `SessionStore` that OUTLIVES any connection. When a client disconnects, its
+//! per-connection `Server` is torn down but its sessions are merely DETACHed
+//! (output keeps flowing into their rings); they are NEVER terminated on a mere
+//! drop. A reconnecting client `ATTACH`es by session id with its last byte offset,
+//! and the agent replays the ring gap `(last_byte_offset, S]` — catching the client
+//! up to everything the remote produced while it was gone — then resumes live
+//! streaming. Orphaned sessions are reaped by a background idle-TTL thread
+//! (`session.default_idle_ttl_ms`, 10 min) so abandoned shells don't leak.
 //!
 //! ### SECURITY (this increment)
 //! The TCP listener is **unauthenticated**: any host that can reach the port can
@@ -28,11 +39,12 @@
 //! control lane). The `Server`'s two reader threads consume their lanes unchanged.
 //!
 //! ## Deferred (this increment)
-//!   - Session SURVIVAL across reconnects (each accepted connection gets fresh
-//!     sessions; the daemon just stays alive in the accept loop so reconnect works).
+//!   - A real grid-model snapshot on ATTACH (§7.3): `snapshot_at_offset` is the
+//!     current outbound offset and resync replays the raw ring from there. Exact-
+//!     grid reconstruction (so deep-scrollback eviction is invisible) is future.
 //!   - Authentication / TLS on the listener (see SECURITY above).
 //!   - Daemonization / single-instance / detach (§4.1).
-//!   - Idle-TTL GC, RPC, tunnels.
+//!   - RPC, tunnels, multi-client fan-out to one session (§5.3 steal).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,6 +52,7 @@ const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const protocol = @import("../protocol.zig");
 const server = @import("server.zig");
+const session = @import("session.zig");
 const pty_child = @import("pty_child.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
@@ -125,8 +138,30 @@ fn parseAddr(spec: []const u8) !std.net.Address {
 // -----------------------------------------------------------------------------
 
 fn runStdio(alloc: Allocator, encoding: protocol.TransferEncoding) !void {
+    // stdio mode handles exactly ONE connection (the ssh pipe pair), but it still
+    // uses the same shared-store core so the lifecycle code is identical. The store
+    // is created here, lives for the single connection, and is torn down on EOF.
+    const seed = blk: {
+        var s: u64 = 0;
+        std.crypto.random.bytes(std.mem.asBytes(&s));
+        break :blk s;
+    };
+    var rng = std.Random.DefaultPrng.init(seed);
+
+    var spawner = try pty_child.PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    var store = session.SessionStore.init(
+        alloc,
+        rng.random(),
+        undefined,
+        realNow,
+        session.default_idle_ttl_ms,
+    );
+    defer store.deinit();
+
     var stdio = mux_mod.StdioStream.init(std.fs.File.stdin(), std.fs.File.stdout());
-    try serveOne(alloc, encoding, stdio.stream());
+    try serveOne(alloc, encoding, &store, spawner.spawner(), stdio.stream());
 }
 
 // -----------------------------------------------------------------------------
@@ -141,6 +176,31 @@ fn runListen(alloc: Allocator, encoding: protocol.TransferEncoding, addr: std.ne
     };
     defer listener.deinit();
 
+    // DAEMON-SCOPED shared session store + spawner (§7.1 survival). These OUTLIVE
+    // every connection: a client disconnect tears down its per-connection Server but
+    // leaves the sessions, their pty children, and their output rings alive in the
+    // store, still streaming, ready for a reconnect to ATTACH and catch up. The
+    // store's background reaper evicts sessions left orphaned past the idle-TTL.
+    const seed = blk: {
+        var s: u64 = 0;
+        std.crypto.random.bytes(std.mem.asBytes(&s));
+        break :blk s;
+    };
+    var rng = std.Random.DefaultPrng.init(seed);
+
+    var spawner = try pty_child.PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    var store = session.SessionStore.init(
+        alloc,
+        rng.random(),
+        undefined,
+        realNow,
+        session.default_idle_ttl_ms,
+    );
+    defer store.deinit();
+    try store.startReaper();
+
     const stdout = std.fs.File.stdout();
     // Stdout is line-flushed by the OS for a pipe; print + the newline is enough
     // for an orchestrator polling for readiness.
@@ -152,35 +212,91 @@ fn runListen(alloc: Allocator, encoding: protocol.TransferEncoding, addr: std.ne
             error.ConnectionAborted, error.ConnectionResetByPeer => continue,
             else => return err,
         };
-        // Wrap the accepted socket and serve it on THIS thread until it EOFs. A
-        // single-connection-at-a-time daemon is fine for the cross-machine test;
-        // concurrent clients are a later increment.
-        var ss = socket_stream.SocketStream.init(conn.stream.handle);
-        serveOne(alloc, encoding, ss.serverStream()) catch |err| {
-            std.debug.print("ghoztty-agent: connection error: {s}\n", .{@errorName(err)});
+        // Serve each accepted connection on its OWN detached thread so the accept
+        // loop NEVER blocks on one connection's lifecycle (a slow/dead/wedging client
+        // can no longer starve new connections — the P0 "never wedge" guarantee). The
+        // per-connection worker owns the socket fd and frees its own resources.
+        const worker = ConnWorker.create(alloc, encoding, &store, spawner.spawner(), conn.stream.handle) catch |err| {
+            std.debug.print("ghoztty-agent: failed to start worker: {s}\n", .{@errorName(err)});
+            std.posix.close(conn.stream.handle);
+            continue;
         };
-        // serveOne's mux closed the socket fd already (mux.close → ss.close).
+        const t = std.Thread.spawn(.{}, ConnWorker.run, .{worker}) catch |err| {
+            std.debug.print("ghoztty-agent: failed to spawn worker thread: {s}\n", .{@errorName(err)});
+            worker.destroy();
+            continue;
+        };
+        t.detach();
     }
 }
 
-/// Stand up a `Mux` + `Server` + `PtySpawner` over one transport `server.Stream`,
-/// run until the transport EOFs, then tear it all down. Shared by both modes.
+/// Wall-clock `now` for the `SessionStore` (matches its `nowFn` signature).
+fn realNow(_: *anyopaque) i64 {
+    return std.time.milliTimestamp();
+}
+
+/// A per-connection worker: owns the accepted socket fd, builds a `Mux` + `Server`
+/// over it (sharing the daemon `store`), runs until the socket EOFs, then tears the
+/// connection down (DETACHing — never terminating — its sessions) and frees itself.
+/// Heap-allocated so it can run on a detached thread.
+const ConnWorker = struct {
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    fd: std.posix.socket_t,
+
+    fn create(
+        alloc: Allocator,
+        encoding: protocol.TransferEncoding,
+        store: *session.SessionStore,
+        spawner: server.Spawner,
+        fd: std.posix.socket_t,
+    ) !*ConnWorker {
+        const self = try alloc.create(ConnWorker);
+        self.* = .{
+            .alloc = alloc,
+            .encoding = encoding,
+            .store = store,
+            .spawner = spawner,
+            .fd = fd,
+        };
+        return self;
+    }
+
+    fn destroy(self: *ConnWorker) void {
+        self.alloc.destroy(self);
+    }
+
+    fn run(self: *ConnWorker) void {
+        var ss = socket_stream.SocketStream.init(self.fd);
+        serveOne(self.alloc, self.encoding, self.store, self.spawner, ss.serverStream()) catch |err| {
+            std.debug.print("ghoztty-agent: connection error: {s}\n", .{@errorName(err)});
+        };
+        // serveOne's mux closed the socket fd already (mux.close → ss.close).
+        self.destroy();
+    }
+};
+
+/// Stand up a `Mux` + `Server` over one transport `server.Stream`, sharing the
+/// daemon `store` + `spawner`, run until the transport EOFs, then tear the
+/// connection down. Shared by both stdio and TCP modes.
 fn serveOne(
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
     transport: server.Stream,
 ) !void {
     var mux = try mux_mod.Mux.create(alloc, transport, encoding);
     defer mux.destroy();
 
-    var spawner = try pty_child.PtySpawner.init(alloc);
-    defer spawner.deinit();
-
     const srv = try server.Server.create(
         alloc,
         mux.controlStream(),
         mux.dataStream(),
-        spawner.spawner(),
+        spawner,
+        store,
         .{ .encoding = encoding },
     );
     defer srv.destroy(alloc);
@@ -190,7 +306,8 @@ fn serveOne(
     // Pump the transport → lane fifos until EOF. Blocks this thread.
     mux.pumpInput();
 
-    // EOF: the client hung up. Tear the server down (joins its threads).
+    // EOF: the client hung up. Tear the per-connection server down — this DETACHes
+    // (never terminates) its sessions, so they survive in the store for reconnect.
     srv.shutdown();
 }
 
