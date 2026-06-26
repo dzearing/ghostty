@@ -19,6 +19,8 @@ const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const remote_connection = @import("../remote/connection.zig");
+const ssh_transport = @import("../remote/ssh_transport.zig");
+const CommandCore = @import("../CommandCore.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
@@ -582,10 +584,11 @@ pub const EnvVar = extern struct {
 /// is owned by the caller (the Swift app) and lives in the GUI process — a GUI
 /// crash disposes it; remote-side persistence is by `session_id`.
 ///
-/// WP3 status: this records the dial parameters and is the stable ABI handle
-/// the Swift app binds to, but the live SSH dial is NOT yet implemented, so
-/// `connection` stays null until a later increment wires the `ssh`-backed
-/// `Stream`s and calls `Connection.create`/`start`.
+/// WP3 status: this records the dial parameters AND, once `_start` succeeds,
+/// owns a live `ssh_transport.Transport` (the two `ssh` subprocesses + the
+/// `Connection` byte-pump). The transport is built with the GUI-free
+/// `CommandCore.DefaultCommand` spawn core so no apprt/config graph is pulled
+/// into the agent-launch path (§17).
 pub const RemoteConnectionHandle = struct {
     alloc: Allocator,
 
@@ -595,9 +598,14 @@ pub const RemoteConnectionHandle = struct {
     port: u16,
     jump: ?[:0]const u8,
 
-    /// The live transport connection, or null until the SSH dial is wired
-    /// (WP3). When non-null it is owned by this handle and freed in `destroy`.
-    connection: ?*remote_connection.Connection = null,
+    /// The live ssh transport, or null until `_start` dials successfully. When
+    /// non-null it owns the two ssh subprocesses + the `Connection` and is torn
+    /// down in `destroy`.
+    transport: ?*Transport = null,
+
+    /// The transport is parameterized by the GUI-free spawn core so the
+    /// agent-launch subprocess uses no-op rlimits / empty pre_exec hooks.
+    pub const Transport = ssh_transport.Transport(CommandCore.DefaultCommand);
 
     /// Create a handle from dial parameters. Dupes all strings.
     pub fn create(
@@ -627,14 +635,14 @@ pub const RemoteConnectionHandle = struct {
         return self;
     }
 
-    /// Shut down the live connection (if any) and free the handle. The caller
+    /// Shut down the live transport (if any) and free the handle. The caller
     /// must ensure no surface still references this handle.
     pub fn destroy(self: *RemoteConnectionHandle) void {
         const alloc = self.alloc;
-        if (self.connection) |conn| {
-            conn.shutdown();
-            conn.destroy(alloc);
-        }
+        // `Transport.deinit` shuts the connection down, closes the streams (the
+        // ssh children observe EOF on stdin and exit), reaps both children, and
+        // frees the connection + control-path.
+        if (self.transport) |t| t.deinit();
         alloc.free(self.host);
         if (self.user) |u| alloc.free(u);
         if (self.jump) |j| alloc.free(j);
@@ -1224,18 +1232,19 @@ pub const Surface = struct {
     pub fn remoteBackend(self: *const Surface) ?CoreSurface.RemoteBackend {
         const handle = self.remote_connection orelse return null;
 
-        // The handle exists but the live connection has not been established
-        // yet (WP3: the SSH dial is not wired, so `_start` never populates
-        // this). Without a live connection we cannot build the `.remote`
-        // backend; fall back to local rather than crashing.
-        const conn = handle.connection orelse {
+        // The handle exists but the live transport has not been established yet
+        // (the caller must `_start` it before building a remote surface).
+        // Without a live connection we cannot build the `.remote` backend; fall
+        // back to local rather than crashing.
+        const transport = handle.transport orelse {
             log.warn(
                 "remote surface requested but connection not established; " ++
-                    "falling back to local backend (WP3: ssh dial not wired)",
+                    "falling back to local backend (call _start first)",
                 .{},
             );
             return null;
         };
+        const conn = transport.conn;
 
         return .{
             .connection = conn,
@@ -2023,25 +2032,35 @@ pub const CAPI = struct {
         };
     }
 
-    /// Start the connection: dial SSH, spawn the reader/writer threads, and
-    /// send the client HELLO. Returns true on success.
+    /// Start the connection: dial SSH (two `ssh` subprocesses sharing one
+    /// ControlMaster — control + data channels, §4.3), spawn the reader/writer
+    /// threads, and send the client HELLO. Returns true on success.
     ///
-    /// WP3: the `ssh`-backed `Stream` transport does not exist yet, so this
-    /// currently returns false. The signature + ownership are final.
+    /// Idempotent: calling it again on an already-started handle is a no-op that
+    /// returns true. The handshake itself is awaited separately via
+    /// `_wait_handshake` (this only confirms the dial + thread spawn succeeded).
     export fn ghostty_remote_connection_start(
         handle: *RemoteConnectionHandle,
     ) bool {
-        // TODO(wp3): spawn `ssh <user>@<host> -p <port> [-J <jump>] ghoztty-agent`
-        // via Command.zig, build control+data `connection.Stream`s over its two
-        // SSH channels, then `Connection.create(...)` + `start()` and store it
-        // in `handle.connection`. Until that transport lands there is nothing to
-        // dial.
-        _ = handle;
-        log.warn(
-            "ghostty_remote_connection_start: ssh dial not yet implemented (WP3)",
-            .{},
-        );
-        return false;
+        if (handle.transport != null) return true; // already dialed
+
+        const cfg: ssh_transport.DialConfig = .{
+            .host = std.mem.sliceTo(handle.host, 0),
+            .user = if (handle.user) |u| std.mem.sliceTo(u, 0) else null,
+            .port = handle.port,
+            .jump = if (handle.jump) |j| std.mem.sliceTo(j, 0) else null,
+            // agent_path / askpass_path / session_id are wired in later
+            // increments (agent push path + GUI askpass helper); the defaults
+            // dial a bare `ghoztty-agent` with key-only auth, sufficient to
+            // bring up the transport end-to-end against a deployed agent.
+        };
+
+        const transport = RemoteConnectionHandle.Transport.dial(handle.alloc, cfg) catch |err| {
+            log.err("ghostty_remote_connection_start: ssh dial failed err={}", .{err});
+            return false;
+        };
+        handle.transport = transport;
+        return true;
     }
 
     /// Block until the protocol handshake completes (or fails). Returns true if
@@ -2050,8 +2069,8 @@ pub const CAPI = struct {
     export fn ghostty_remote_connection_wait_handshake(
         handle: *RemoteConnectionHandle,
     ) bool {
-        const conn = handle.connection orelse return false;
-        _ = conn.waitHandshake() catch |err| {
+        const transport = handle.transport orelse return false;
+        _ = transport.conn.waitHandshake() catch |err| {
             log.warn("remote connection handshake failed err={}", .{err});
             return false;
         };
@@ -2063,8 +2082,8 @@ pub const CAPI = struct {
     export fn ghostty_remote_connection_latency_ms(
         handle: *RemoteConnectionHandle,
     ) i32 {
-        const conn = handle.connection orelse return -1;
-        const ms = conn.latencyMs() orelse return -1;
+        const transport = handle.transport orelse return -1;
+        const ms = transport.conn.latencyMs() orelse return -1;
         return std.math.cast(i32, ms) orelse std.math.maxInt(i32);
     }
 

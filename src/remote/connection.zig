@@ -3168,3 +3168,10 @@ test "shutdown unblocks a parked OPEN caller with an error" {
     oth.join();
     try testing.expectError(error.ConnectionClosed, oc.result);
 }
+
+// Pull in the ssh Transport test suite (§4.1) so `zig test src/remote/connection.zig`
+// exercises the real `connection.Stream`-over-ssh implementation alongside the
+// in-memory loopback transport tests above.
+test {
+    _ = @import("ssh_transport.zig");
+}
