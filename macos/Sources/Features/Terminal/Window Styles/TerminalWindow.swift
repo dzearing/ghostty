@@ -24,6 +24,10 @@ class TerminalWindow: NSWindow {
     /// Update notification UI in titlebar
     private let updateAccessory = NSTitlebarAccessoryViewController()
 
+    /// Hostname pill shown at the trailing edge of the titlebar for remote
+    /// windows. Absent (hidden) for local windows.
+    private let machinePillAccessory = NSTitlebarAccessoryViewController()
+
     /// Visual indicator that mirrors the selected tab color.
     private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
         let view = NSHostingView(rootView: TabColorIndicatorView(tabColor: tabColor))
@@ -57,6 +61,19 @@ class TerminalWindow: NSWindow {
     var activityState: Ghostty.ActivityState = .idle {
         didSet {
             guard activityState != oldValue else { return }
+            NSAccessibility.post(element: self, notification: .valueChanged)
+        }
+    }
+
+    /// The remote machine this window's terminals run on, set by the controller.
+    /// nil for local windows. Setting this updates the titlebar hostname pill and
+    /// the `AXGhosttyMachine` accessibility attribute.
+    var remoteMachine: Machine? {
+        didSet {
+            guard remoteMachine != oldValue else { return }
+            updateMachinePill()
+            // Notify assistive tech / external tools (e.g. ztabby) that the
+            // window's machine attribute changed.
             NSAccessibility.post(element: self, notification: .valueChanged)
         }
     }
@@ -161,6 +178,16 @@ class TerminalWindow: NSWindow {
                 addTitlebarAccessoryViewController(updateAccessory)
                 updateAccessory.view.translatesAutoresizingMaskIntoConstraints = false
             }
+
+            // Create the remote-machine hostname pill accessory. Starts hidden;
+            // shown only when `remoteMachine` is set on a remote window.
+            machinePillAccessory.layoutAttribute = .right
+            machinePillAccessory.view = NonDraggableHostingView(
+                rootView: MachinePillView(machineName: nil))
+            machinePillAccessory.view.translatesAutoresizingMaskIntoConstraints = false
+            machinePillAccessory.isHidden = true
+            addTitlebarAccessoryViewController(machinePillAccessory)
+            updateMachinePill()
         }
 
         // Setup the accessory view for tabs that shows our keyboard shortcuts,
@@ -853,20 +880,54 @@ extension TerminalWindow: TabTitleEditorDelegate {
     }
 }
 
+// MARK: Remote Machine Pill
+
+extension TerminalWindow {
+    /// Refresh the titlebar hostname pill to reflect the current `remoteMachine`.
+    /// Shows a "● name" capsule for remote windows; hides the accessory entirely
+    /// for local windows.
+    fileprivate func updateMachinePill() {
+        guard styleMask.contains(.titled),
+              let hosting = machinePillAccessory.view as? NonDraggableHostingView<MachinePillView>
+        else { return }
+
+        let name = remoteMachine?.name
+        hosting.rootView = MachinePillView(machineName: name)
+        machinePillAccessory.isHidden = (name == nil)
+    }
+}
+
 // MARK: Accessibility
 
 extension TerminalWindow {
     static let axActivityState = NSAccessibility.Attribute(rawValue: "AXWindowActivityState")
 
+    /// Cross-tool accessibility contract (consumed by ztabby and other external
+    /// tools to group terminal windows by machine):
+    ///
+    ///   Attribute: `AXGhosttyMachine`
+    ///   Value:     the remote machine's display name (e.g. "maximushome") for a
+    ///              remote window, or the literal string "Local" for a local
+    ///              window. Always a non-nil String.
+    static let axGhosttyMachine = NSAccessibility.Attribute(rawValue: "AXGhosttyMachine")
+
+    /// The value published for `AXGhosttyMachine`: the machine display name, or
+    /// "Local" when this is not a remote window.
+    static let axLocalMachineValue = "Local"
+
     override func accessibilityAttributeNames() -> [NSAccessibility.Attribute] {
         var names = super.accessibilityAttributeNames()
         names.append(Self.axActivityState)
+        names.append(Self.axGhosttyMachine)
         return names
     }
 
     override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
         if attribute == Self.axActivityState {
             return activityState.rawValue
+        }
+        if attribute == Self.axGhosttyMachine {
+            return remoteMachine?.name ?? Self.axLocalMachineValue
         }
         return super.accessibilityAttributeValue(attribute)
     }

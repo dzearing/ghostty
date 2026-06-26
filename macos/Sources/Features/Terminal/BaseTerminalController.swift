@@ -107,7 +107,13 @@ class BaseTerminalController: NSWindowController,
     /// window title is suffixed with the machine name and new splits/tabs inherit
     /// the same machine + connection.
     var remoteMachine: Machine? {
-        didSet { applyTitleToWindow() }
+        didSet {
+            // Publish the machine to the window so it can render the titlebar
+            // hostname pill and expose the `AXGhosttyMachine` accessibility
+            // attribute. Local windows leave this nil.
+            (window as? TerminalWindow)?.remoteMachine = remoteMachine
+            applyTitleToWindow()
+        }
     }
 
     /// Strong owner of the shared remote connection handle for this window. Held
@@ -1216,10 +1222,9 @@ class BaseTerminalController: NSWindowController,
             title += " (\(termWindow.activityState.rawValue))"
         }
 
-        // Suffix the window title with the remote machine name, if any.
-        if let remoteMachine {
-            title += " — \(remoteMachine.name)"
-        }
+        // The remote machine name is shown as a titlebar pill (see
+        // TerminalWindow.machinePillAccessory / MachinePillView) rather than a
+        // plain title suffix, so it is intentionally not appended here.
 
         window.title = title
     }
@@ -1527,6 +1532,12 @@ class BaseTerminalController: NSWindowController,
 
         // Set our update overlay state
         updateOverlayIsVisible = defaultUpdateOverlayVisibility()
+
+        // Sync the remote machine to the window (pill + AXGhosttyMachine attr) in
+        // case it was set on the controller before the window finished loading.
+        if let remoteMachine, let termWindow = window as? TerminalWindow {
+            termWindow.remoteMachine = remoteMachine
+        }
     }
 
     func defaultUpdateOverlayVisibility() -> Bool {

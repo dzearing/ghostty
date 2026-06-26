@@ -1,19 +1,27 @@
 import SwiftUI
 import AppKit
 
-/// A simple, filterable chooser for picking a remote `Machine`. Modeled on the
-/// command palette's list/sheet pattern but intentionally minimal for the first
-/// launchable build. Invokes `onSelect` with the chosen machine (or `onCancel`
-/// if dismissed).
+/// The result of the window-target chooser: either a normal local window or a
+/// specific remote `Machine`.
+enum WindowTarget: Hashable {
+    case local
+    case remote(Machine)
+}
+
+/// A simple, filterable chooser for picking where to open a new window: the
+/// local machine or a registered remote `Machine`. Modeled on the command
+/// palette's list/sheet pattern but intentionally minimal. Invokes `onSelect`
+/// with the chosen target (or `onCancel` if dismissed).
 struct MachineChooserView: View {
     let machines: [Machine]
-    var onSelect: (Machine) -> Void
+    var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
 
     @State private var query: String = ""
-    @State private var selection: Machine.ID?
+    @State private var selection: WindowTarget?
 
-    private var filtered: [Machine] {
+    /// Filtered remote machines based on the search query.
+    private var filteredMachines: [Machine] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return machines }
         return machines.filter {
@@ -22,9 +30,25 @@ struct MachineChooserView: View {
         }
     }
 
+    /// Whether the "Local" entry matches the current query (always shown when
+    /// the query is empty, or when it matches "local").
+    private var showsLocal: Bool {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return q.isEmpty || "local".localizedCaseInsensitiveContains(q)
+    }
+
+    /// The ordered list of targets shown in the list: "Local" first, then the
+    /// filtered remote machines.
+    private var targets: [WindowTarget] {
+        var result: [WindowTarget] = []
+        if showsLocal { result.append(.local) }
+        result.append(contentsOf: filteredMachines.map { .remote($0) })
+        return result
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Open Remote Window")
+            Text("New Window")
                 .font(.headline)
                 .padding([.top, .horizontal], 16)
                 .padding(.bottom, 8)
@@ -36,24 +60,11 @@ struct MachineChooserView: View {
                 .onSubmit { submit() }
 
             List(selection: $selection) {
-                ForEach(filtered) { machine in
-                    HStack(spacing: 10) {
-                        Image(systemName: "server.rack")
-                            .foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(machine.name)
-                                .font(.body)
-                            Text(machine.endpoint)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                    .contentShape(Rectangle())
-                    .tag(machine.id)
-                    .onTapGesture(count: 2) {
-                        onSelect(machine)
-                    }
+                ForEach(targets, id: \.self) { target in
+                    row(for: target)
+                        .contentShape(Rectangle())
+                        .tag(target)
+                        .onTapGesture(count: 2) { onSelect(target) }
                 }
             }
             .frame(minHeight: 160)
@@ -62,7 +73,7 @@ struct MachineChooserView: View {
                 Spacer()
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
-                Button("Connect") { submit() }
+                Button("Open") { submit() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(resolvedSelection == nil)
             }
@@ -70,57 +81,80 @@ struct MachineChooserView: View {
         }
         .frame(width: 420)
         .onAppear {
-            // Preselect the first machine for immediate Enter-to-connect.
-            if selection == nil { selection = filtered.first?.id }
+            // Preselect the first target for immediate Enter-to-open.
+            if selection == nil { selection = targets.first }
         }
     }
 
-    /// The currently selected machine, falling back to the first filtered row.
-    private var resolvedSelection: Machine? {
-        if let selection, let m = machines.first(where: { $0.id == selection }) {
-            return m
+    @ViewBuilder
+    private func row(for target: WindowTarget) -> some View {
+        switch target {
+        case .local:
+            HStack(spacing: 10) {
+                Image(systemName: "laptopcomputer")
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Local")
+                        .font(.body)
+                    Text("This machine")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+        case .remote(let machine):
+            HStack(spacing: 10) {
+                Image(systemName: "server.rack")
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(machine.name)
+                        .font(.body)
+                    Text(machine.endpoint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
         }
-        return filtered.first
+    }
+
+    /// The currently selected target, falling back to the first row.
+    private var resolvedSelection: WindowTarget? {
+        if let selection, targets.contains(selection) {
+            return selection
+        }
+        return targets.first
     }
 
     private func submit() {
-        if let m = resolvedSelection {
-            onSelect(m)
+        if let target = resolvedSelection {
+            onSelect(target)
         }
     }
 }
 
-/// Presents the machine chooser as an application-modal sheet/window and calls
-/// `completion` with the chosen machine, or nil if the user cancelled.
+/// Presents the window-target chooser as an application-modal sheet/window and
+/// calls `completion` with the chosen target, or nil if the user cancelled.
 ///
-/// If the registry has exactly one machine, the chooser is skipped and that
-/// machine is returned immediately (faster first-build flow). The chooser is
-/// still built for when several machines are configured.
+/// The chooser always lists a "Local" entry first (a normal local window),
+/// followed by every registered remote machine. It is shown whenever there is at
+/// least one registered machine — even a single machine — so the user always has
+/// the Local-vs-remote choice. Callers should special-case the zero-machine case
+/// before calling this (e.g. just open a local window directly).
 @MainActor
 enum MachineChooser {
     static func present(
         machines: [Machine],
-        completion: @escaping (Machine?) -> Void
+        completion: @escaping (WindowTarget?) -> Void
     ) {
-        guard !machines.isEmpty else {
-            completion(nil)
-            return
-        }
-
-        // Skip the dialog when there's only one machine.
-        if machines.count == 1 {
-            completion(machines[0])
-            return
-        }
-
         var windowRef: NSWindow?
 
-        let finish: (Machine?) -> Void = { machine in
+        let finish: (WindowTarget?) -> Void = { target in
             if let windowRef {
                 NSApp.stopModal()
                 windowRef.orderOut(nil)
             }
-            completion(machine)
+            completion(target)
         }
 
         let view = MachineChooserView(
@@ -132,7 +166,7 @@ enum MachineChooser {
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
         window.styleMask = [.titled]
-        window.title = "Open Remote Window"
+        window.title = "New Window"
         window.isReleasedWhenClosed = false
         window.center()
         windowRef = window

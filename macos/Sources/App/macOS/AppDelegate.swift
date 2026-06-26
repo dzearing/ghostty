@@ -977,14 +977,31 @@ class AppDelegate: NSObject,
         _ = TerminalController.newWindow(ghostty)
     }
 
-    /// New Remote Window (Cmd-Shift-N): pick a remote machine, dial it over TCP,
-    /// and open a window whose terminal runs on that machine. Splits/tabs in the
-    /// window inherit the same machine + connection.
+    /// New Window with target picker (Cmd-Shift-N): always shows a chooser
+    /// listing "Local" plus every registered remote machine whenever at least
+    /// one machine is registered (even a single machine — no auto-skip).
+    /// Selecting "Local" opens a normal local window; selecting a machine dials
+    /// it over TCP and opens a window whose terminal runs on that machine
+    /// (splits/tabs inherit the same machine + connection). With zero machines
+    /// registered, this just opens a local window.
     @IBAction func newRemoteWindow(_ sender: Any?) {
         let machines = MachineRegistry.shared.machines
+
+        // No machines registered: nothing remote to choose, so just open a
+        // normal local window.
+        guard !machines.isEmpty else {
+            _ = TerminalController.newWindow(ghostty)
+            return
+        }
+
         MachineChooser.present(machines: machines) { [weak self] selected in
-            guard let self, let machine = selected else { return }
-            self.openRemoteWindow(on: machine)
+            guard let self, let target = selected else { return }
+            switch target {
+            case .local:
+                _ = TerminalController.newWindow(self.ghostty)
+            case .remote(let machine):
+                self.openRemoteWindow(on: machine)
+            }
         }
     }
 
