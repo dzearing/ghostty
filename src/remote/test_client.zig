@@ -110,7 +110,12 @@ pub fn main() !void {
 ///      with NO gap, and that streaming continues live. Print PASS/FAIL with the
 ///      observed line numbers.
 fn runCatchupDemo(alloc: Allocator, host: []const u8, port: u16, encoding: protocol.TransferEncoding) !void {
-    const counter_cmd = "i=0; while true; do echo line $i; i=$((i+1)); sleep 1; done";
+    // The counter command is overridable via GHOZTTY_CATCHUP_CMD so the same demo
+    // can drive a Windows shell (e.g. a PowerShell counter) — it just has to emit
+    // "line N" lines for countLines() to track. Default is a POSIX sh loop.
+    const counter_cmd = std.process.getEnvVarOwned(alloc, "GHOZTTY_CATCHUP_CMD") catch
+        try alloc.dupe(u8, "i=0; while true; do echo line $i; i=$((i+1)); sleep 1; done");
+    defer alloc.free(counter_cmd);
 
     // --- Phase 1: dial + OPEN the counter session ----------------------------
     diag("[catchup] phase 1: dialing {s}:{d} and opening counter session\n", .{ host, port });
@@ -125,7 +130,8 @@ fn runCatchupDemo(alloc: Allocator, host: []const u8, port: u16, encoding: proto
 
     // Kick off the counter loop as the session command (sent as input).
     {
-        var line: [256]u8 = undefined;
+        var line: [1024]u8 = undefined;
+        if (counter_cmd.len + 1 > line.len) return error.CounterCmdTooLong;
         @memcpy(line[0..counter_cmd.len], counter_cmd);
         line[counter_cmd.len] = '\r';
         try sess.writeInput(d1.conn, line[0 .. counter_cmd.len + 1]);
