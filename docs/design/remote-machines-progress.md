@@ -54,6 +54,7 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | ↳ auto-deploy | Windows `ghoztty-agent-watcher.ps1` hot-swaps a new .exe dropped on the share; Mac `scripts/deploy-windows-agent.sh` builds+drops. Removes user from test loop | ✅ Done | `98b936c65`,`20740030e` |
 | ↳ **M2 catch-up** | daemon never wedges (per-conn threads + two-phase teardown) + session-survival (`SessionStore`, detach-not-terminate, idle-TTL, ATTACH ring-replay). **PROVEN LIVE on Windows** (PowerShell session survived disconnect, caught up no-gap) | ✅ Done — 123 agent tests | `44220cd0c`,`dd6d4b46c` |
 | ↳ channel rendezvous | client `Connection.openChannel` vs server-authoritative channel mismatch; test_client works around it at frame level — **must reconcile for WP4 Surface/.remote path** | ⛔ WP4 prereq | — |
+| ↳ WP4 render fix | `Remote.resize` dropped the post-layout 0×0→real resize so the remote pty stayed 0×0 (blank surface); now forwards live RESIZE. Headless harness (`remote-backend-e2e`) proves the grid renders | ✅ Done | `fd198da81` |
 | **WP4** | macOS UI: machine chooser (Cmd-Shift-N) + remote windows + inheritance | ⛔ Next — blueprint in `remote-machines-wp4-macos-ui.md` | — |
 | WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3 C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
