@@ -92,13 +92,18 @@ pub fn main() !void {
         windows.INVALID_HANDLE_VALUE;
 
     // 1. Open the ConPTY at 80x25.
+    //
+    // NOTE: no `defer pty.deinit()` here. The reader thread blocks in
+    // ReadFile(out_pipe), which only hits EOF once the pseudoconsole is closed
+    // (ClosePseudoConsole, inside deinit). If deinit were deferred to end-of-main
+    // it would run AFTER `thread.join()` → classic ConPTY teardown deadlock. So we
+    // call deinit explicitly below, BEFORE the join, to unblock the reader.
     var pty = try Pty.open(.{
         .ws_row = 25,
         .ws_col = 80,
         .ws_xpixel = 0,
         .ws_ypixel = 0,
     });
-    defer pty.deinit();
 
     // Resolve cmd.exe from %COMSPEC%, falling back to the well-known path.
     // `cmd.path`/`cmd.args` need null-terminated strings; getEnvVarOwned returns
@@ -148,9 +153,11 @@ pub fn main() !void {
         }
     }
 
-    // 5. Reap the child, then join the reader (the ConPTY out_pipe hits EOF once
-    //    the console tears down after the child exits).
+    // 5. Reap the child, then tear down the ConPTY BEFORE joining the reader.
+    //    Closing the pseudoconsole (inside pty.deinit) is what gives the reader's
+    //    blocked ReadFile(out_pipe) its EOF; do it first or join() deadlocks.
     const exit = try cmd.wait(true);
+    pty.deinit();
     thread.join();
 
     var line_buf: [128]u8 = undefined;
