@@ -23,7 +23,8 @@ A fresh session should, in order:
    file + the memory updated after each increment lands.
 
 _Last updated: 2026-06-26. Branch: `feature/remote-machines` (integration branch;
-merges to `main` once green as a whole). HEAD at/after `b58e33f60`._
+merges to `main` once green as a whole). HEAD at/after `8a9f7bc14` (CommandCore +
+ssh Transport + agent real-PTY landed; Windows-exe e2e push in flight)._
 
 ## Status at a glance
 
@@ -41,10 +42,13 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | ↳ inc.4a | `termio.Remote` (Backend contract) + `backend.zig` `.remote` arm — **libghostty compiles with remote backend** | ✅ Done | `d6b463753` |
 | ↳ inc.4b | `Surface.zig:682` construct `.remote` + `ghostty_surface_config_s` + `ghostty_remote_*` C API | ✅ Done — Zig build green | `de230b6de` |
 | ↳ CommandCore | `Command.zig`→`CommandCore` extraction (DI of rlimits/pre_exec/post_fork; §17) — GUI-free spawn core; unblocks ssh Transport + agent PTY | ✅ Done — full debug build green | `ed98b22fe` |
-| ↳ inc.3b | real reconnect driver (stream swap + re-ATTACH) + ssh Transport (`Stream` over ssh subprocess) | 🔨 IN PROGRESS (ssh Transport) | — |
-| **WP2** | Agent daemon | 🔨 **agent inc.1 done**; real-PTY + build target next | see below |
+| ↳ ssh Transport | `connection.Stream` over ssh subprocess: two-channel ControlMaster (§4.3), `ChildStream` over pipes, SSH_ASKPASS/host-key, C-API `_start` now dials | ✅ Done — 60 tests + full build | `1766a783a` |
+| ↳ client mux | client-side lane mux: two logical streams over ONE transport stream (mirrors agent `StdioMux`) — reconciles framing mismatch (see frontier) | 🔨 IN PROGRESS | — |
+| **WP2** | Agent daemon | 🔨 **agent inc.1 + real-PTY done**; Windows ConPTY next | see below |
 | ↳ agent inc.1 | `src/remote/agent/` session-server core (HELLO/OPEN/DATA/ATTACH/RESIZE/SIGNAL/DETACH/CLOSE/EXIT, session table, ring, tombstones) over abstract transport + fake child | ✅ Done — 18 tests | `c4b09c774`→`26af4f78a` |
-| ↳ agent next | real PTY via `Command.zig`→`CommandCore`; real grid snapshot (§7.3); daemonize; `zig build agent` exe target; Windows (reuse spike `win32.zig`); containment/RPC (§9) | ⛔ Next (agent) | — |
+| ↳ agent real PTY | real POSIX pty child (`pty_child.zig`), `zig build agent`→`ghoztty-agent`, single-stdio `StdioMux`, smoke round-trips `echo` through pty/ring/DATA | ✅ Done — 40 tests + binary smoke | `8a9f7bc14` |
+| ↳ ConPTY smoke | **NEW (Windows pivot):** minimal cross-compiled `ghoztty-conpty-smoke.exe` to runtime-prove ConPTY on the user's real Windows box (reuses in-tree `pty.zig` WindowsPty + `CommandCore.startWindows`) | 🔨 IN PROGRESS | — |
+| ↳ Windows agent | cross-platform `pty_child` (ConPTY handles/ReadFile/WriteFile/ConsoleCtrl), **TCP transport** (Tailscale-reachable; both lanes muxed over one socket), `ghoztty-agent.exe` cross-build | ⛔ Next — blocked on ConPTY smoke + client mux | — |
 | WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3 C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
 | WP6 | Tunneling | ⛔ Not started (P2) | — |
@@ -59,11 +63,31 @@ done; WP3 client transport DONE through inc.4b; WP2 agent core (inc.1) done.
 `zig-out/Ghoztty-Debug.app` (see "Toolchain status"). P1 still needs the ssh
 Transport + the agent's real PTY, then WP4 (Swift).
 
-### Current frontier — what's real vs stub (read before continuing)
+### Current frontier — Windows e2e pivot + the framing mismatch (read before continuing)
 
-Both halves of the conversation exist and pass tests in isolation, sharing the
-frozen WP1 protocol — but **they have not talked to each other yet, and there is no
-live ssh transport**, so nothing connects end-to-end:
+**Target chosen 2026-06-26:** the user has a **real Windows machine** (regular
+Windows, NOT WSL) on the same network (+ Tailscale available). The first real
+end-to-end test is **Mac client → Windows `ghoztty-agent.exe`** driving a real
+Windows shell. `ssh localhost` is OFF on this Mac (Remote Login disabled), so we
+go cross-machine to Windows instead. Plan: **TCP transport over Tailscale** (agent
+listens; Mac dials) — simplest first hop; ssh-on-Windows + the two-channel
+ControlMaster path come later. Good news: **Windows ConPTY support already exists
+in-tree** (`src/pty.zig` `WindowsPty` + `CommandCore.startWindows` ConPTY spawn) —
+only `pty_child.zig` is POSIX-specific. The spike's deferred "does ConPTY work at
+runtime" validation is unlocked by this Windows box.
+
+**⚠ Cross-track FRAMING MISMATCH being reconciled (client mux, in progress):** the
+ssh-transport track dials **two** ssh channels (→ two agent processes); the agent
+is a **single** process muxing both lanes on one stdio (`StdioMux`, ignores argv).
+The two-channel design (§4.3 control/data isolation) needs agent **daemonization**
+(deferred) to rendezvous two channel-processes. Interim fix = a **client-side mux**
+(symmetric to the agent's `StdioMux`): the client's two logical `Connection`
+streams ride ONE transport stream (ssh-single-subprocess OR TCP). Routing rule both
+ends share: `frame.type == .data` → data lane, else → control lane. This is what
+makes any single-stream e2e (incl. the Windows TCP path) work now.
+
+Both halves exist and pass tests in isolation, sharing the frozen WP1 protocol —
+but **they have not talked to each other yet**, so nothing connects end-to-end:
 
 - **Client** — libghostty compiles with a `.remote` backend + the C API the Swift
   app binds to (commit `de230b6de`): `ghostty_surface_config_s` gained
@@ -99,36 +123,30 @@ demanded before WP2/WP3 expand (§17):
   reassignment) require a real Windows host — see
   `src/remote/agent/spike/FINDINGS.md` §"On-Windows test procedure".
 
-## Recommended next actions (in order)
+## Recommended next actions (in order) — Windows e2e push
 
-The full client transport (connection.zig inc.1–3, termio.Remote+backend inc.4a,
-Surface+C-API inc.4b) and the agent session-server core (inc.1) are DONE and tested.
-**The single thing blocking a first real end-to-end pane is the ssh Transport.** Do
-these in order; delegate each to a subagent (keep the orchestrator lean):
+CommandCore, the ssh Transport, and the agent real-PTY are DONE. The goal now is a
+**first real cross-machine pane: Mac client → Windows `ghoztty-agent.exe`** over
+TCP/Tailscale. Delegate each to a worktree subagent (keep the orchestrator lean).
 
-1. **ssh Transport** (highest leverage) — a `connection.Stream` impl backed by an
-   `ssh` subprocess providing the two channels (control + data), with the
-   `SSH_ASKPASS` interactive-auth + first-contact host-key flow (§4.1). This (a)
-   makes the client C-API `_start` real, and (b) lets `connection.zig` ↔ the agent
-   `server.zig` connect for the FIRST real end-to-end test (even `ssh localhost`).
-   NOTE: pulls in `Command.zig`, which drags `config.zig`/`global.zig`/`apprt` — do
-   the `Command.zig`→`CommandCore` extraction first (assessment in
-   `src/remote/agent/spike/FINDINGS.md`: ~2–4 h, 3 thin couplings). That refactor
-   ALSO unblocks the agent's real PTY (next item).
-2. **Agent real PTY + `zig build agent` exe target** — replace the fake child with a
-   real pty-backed child via `src/pty.zig` (+ `CommandCore`); add the executable
-   build target so the agent can actually run; first end-to-end smoke over
-   `ssh localhost` (agent on the same box).
-3. **WP3 inc.3b — real reconnect driver** — drive the LinkState FSM's reconnect
-   decision into an actual re-dial: tear down old reader/writer, swap to fresh
-   Streams, re-handshake, re-ATTACH each live pane with its `last_byte_offset`,
-   re-arm `discard_below` from the new snapshot, respawn threads.
-4. **WP4 — Swift connection context** (binds the `ghostty_remote_*` C API:
-   `+connect`/`+disconnect`/`+reconnect`, `machine:` title, split/new-window
-   inheritance). Then the §6.5 `vim`-over-ssh fidelity check + the WP3 4-pane
-   inbound-ring integration benchmark (§3.4 gate).
+1. **ConPTY runtime smoke** (in progress) — minimal cross-compiled
+   `ghoztty-conpty-smoke.exe` the user runs on their Windows box to prove (a) a
+   zig-cross-compiled exe runs on regular Windows and (b) ConPTY spawns a shell at
+   runtime. Reuses in-tree `pty.zig` WindowsPty + `CommandCore.startWindows`.
+2. **Client-side lane mux** (in progress) — two logical `Connection` streams over
+   ONE transport stream (mirrors agent `StdioMux`; rule: `.data`→data, else→control).
+   Unblocks every single-stream e2e path (TCP + single-ssh).
+3. **Windows agent exe** (blocked on 1+2) — make `pty_child.zig` cross-platform
+   (ConPTY handles, `ReadFile`/`WriteFile`, `GenerateConsoleCtrlEvent` for signals);
+   add a **TCP transport** (agent listens on a Tailscale-reachable port, both lanes
+   muxed over one socket via the client mux ↔ a server-side equivalent; client dials
+   TCP); `zig build` cross-target → `ghoztty-agent.exe`. Then the real e2e: user runs
+   the exe, Mac client OPENs a session + drives a Windows shell, prove round-trip.
+4. **Then**: real reconnect driver (WP3 inc.3b), Swift connection context (WP4,
+   binds `ghostty_remote_*`), §6.5 vim-over-ssh fidelity, §3.4 4-pane benchmark.
 
-Later: real grid-model snapshot (§7.3/§13.1), then P2 (WP5/6/8) and P3 (WP7/9/10).
+Later: real grid-model snapshot (§7.3/§13.1), agent daemonization to enable the
+two-channel ssh path (§4.1/§4.3), then P2 (WP5/6/8) and P3 (WP7/9/10).
 
 **Parallel-work protocol (when running tracks concurrently):** give each subagent
 `isolation: "worktree"`; it commits in its worktree; the orchestrator cherry-picks
