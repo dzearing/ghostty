@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) !void {
     const agent_step = b.step("agent", "Build the ghoztty-agent (remote-machines daemon)");
     const test_agent_step = b.step("test-agent", "Run the ghoztty-agent tests (incl. real-pty)");
     const conpty_smoke_step = b.step("conpty-smoke", "Build the ConPTY runtime smoke exe (Windows, cross-compile)");
+    const remote_test_client_step = b.step("remote-test-client", "Build the remote-test-client (drives a TCP ghoztty-agent)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -110,6 +111,15 @@ pub fn build(b: *std.Build) !void {
         if (!config.emit_lib_vt) _ = try deps.add(agent_test);
         const agent_test_run = b.addRunArtifact(agent_test);
         test_agent_step.dependOn(&agent_test_run.step);
+    }
+
+    // Ghoztty remote-machines test client (WP: TCP transport). A headless native
+    // CLI that dials a TCP-listening ghoztty-agent and relays a shell session —
+    // the orchestrator's tool for cross-machine end-to-end tests. Built on demand
+    // via `zig build remote-test-client`.
+    {
+        const client = try buildpkg.GhosttyRemoteTestClient.init(b, &config);
+        remote_test_client_step.dependOn(&client.install_step.step);
     }
 
     // Ghoztty ConPTY runtime smoke exe (WP2, §13). A tiny standalone Windows .exe
