@@ -50,9 +50,11 @@ Order (§18): **WP1 → {WP2, WP3} → WP4 → {WP5, WP6, WP8} → {WP7, WP9} �
 | ↳ ConPTY smoke | **NEW (Windows pivot):** minimal cross-compiled `ghoztty-conpty-smoke.exe` to runtime-prove ConPTY on the user's real Windows box (reuses in-tree `pty.zig` WindowsPty + `CommandCore.startWindows`) | 🔨 IN PROGRESS | — |
 | ↳ Windows ConPTY arm | `pty_child.zig` cross-platform: Windows ConPTY (ReadFile/WriteFile/0x03-interrupt/TerminateProcess/close-before-join); POSIX identical (75 tests); cross-compiles to .exe | ✅ Done | `e2e72045d` |
 | ↳ TCP + daemon + client | socket Stream, agent TCP listen (loop-accept daemon, default 0.0.0.0:7777), client TCP dialer, Mac `remote-test-client` exe; **Mac-localhost e2e drives a real shell over TCP** | ✅ Done — e2e green | `85faeb456` |
-| ↳ **M1 networked agent.exe** | combined: `ghoztty-agent.exe` (TCP listen + ConPTY) cross-compiled both arches, on `/Volumes/share/ghoztty-windows/` | ✅ Built — awaiting user Windows run | — |
-| ↳ M2 catch-up | daemon session-survival across disconnect + client reconnect/replay (close-laptop scenario) | ⛔ Next | — |
-| ↳ channel rendezvous | client `Connection.openChannel` vs server-authoritative channel mismatch (test_client works around it); reconcile before WP4/Swift | ⛔ Cleanup | — |
+| ↳ **M1 networked agent.exe** | `ghoztty-agent.exe` (TCP listen + ConPTY); **PROVEN LIVE** — Mac drove real `cmd.exe` on the Windows box over Tailscale | ✅ Done | — |
+| ↳ auto-deploy | Windows `ghoztty-agent-watcher.ps1` hot-swaps a new .exe dropped on the share; Mac `scripts/deploy-windows-agent.sh` builds+drops. Removes user from test loop | ✅ Done | `98b936c65`,`20740030e` |
+| ↳ **M2 catch-up** | daemon never wedges (per-conn threads + two-phase teardown) + session-survival (`SessionStore`, detach-not-terminate, idle-TTL, ATTACH ring-replay). **PROVEN LIVE on Windows** (PowerShell session survived disconnect, caught up no-gap) | ✅ Done — 123 agent tests | `44220cd0c`,`dd6d4b46c` |
+| ↳ channel rendezvous | client `Connection.openChannel` vs server-authoritative channel mismatch; test_client works around it at frame level — **must reconcile for WP4 Surface/.remote path** | ⛔ WP4 prereq | — |
+| **WP4** | macOS UI: machine chooser (Cmd-Shift-N) + remote windows + inheritance | ⛔ Next — blueprint in `remote-machines-wp4-macos-ui.md` | — |
 | WP4 | Swift connection context (`+connect` etc.) | ⛔ Blocked on WP3 C API | — |
 | WP5 | Manifest + resumability | ⛔ Not started (P2) | — |
 | WP6 | Tunneling | ⛔ Not started (P2) | — |
