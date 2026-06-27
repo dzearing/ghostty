@@ -111,6 +111,11 @@ pub const Options = struct {
 ///     found). Can be used without `--target` to search across all
 ///     registered targets.
 ///
+///   * `--from-focused`: Split the app's currently focused window/surface,
+///     mirroring a keyboard split exactly. On a remote window the new pane
+///     inherits the SAME machine/connection plus the parent's command and
+///     cwd (full remote inheritance). Ignores `--command`/`--name`/`--target`.
+///
 ///   * `--command=<command>`: The command to run in the split pane.
 ///
 ///   * `--shell=<path>`: The shell to use when running `--command`.

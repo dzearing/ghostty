@@ -212,19 +212,17 @@ pub fn threadEnter(
             0,
             false,
         );
-        errdefer outcome.deinit();
+        defer outcome.deinit();
         const p = outcome.pane orelse {
             // .dead / .not_found / attached_elsewhere(!force): nothing registered.
             // The caller (4b) decides recovery tier (§7.4); for now this is fatal
-            // to the pane bring-up.
-            outcome.deinit();
+            // to the pane bring-up. (`defer outcome.deinit()` frees it once.)
             log.warn(
                 "attach did not yield a live pane status={} attached_elsewhere={}",
                 .{ outcome.status, outcome.attached_elsewhere },
             );
             return error.RemoteAttachFailed;
         };
-        outcome.deinit();
         break :pane p;
     } else pane: {
         // OPEN-new: start a brand-new remote session (§3.3 open-new).

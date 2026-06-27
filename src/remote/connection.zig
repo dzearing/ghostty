@@ -565,6 +565,20 @@ pub const Connection = struct {
     /// agent-chosen channel via `PendingRpc.reply_channel`. Guarded by `rpc_mutex`.
     pending_opened: ?*PendingRpc = null,
     pending_attached: ?*PendingRpc = null,
+    /// Serializes by-type (OPEN→OPENED / ATTACH→ATTACHED) RPCs so the SINGLE
+    /// `pending_opened`/`pending_attached` slot is never contended. Each remote
+    /// pane runs on its OWN IO thread and opens a session on this SHARED
+    /// Connection; rapidly creating splits/tabs/windows fires several OPENs at
+    /// once. Without serialization the second concurrent OPEN found the slot
+    /// occupied and failed with `error.RpcInFlight`, leaving that pane dead (and,
+    /// downstream, crashing the GUI bring-up). A thread takes this lock for the
+    /// FULL duration of its by-type `rpcCall` (send → await reply → slot cleanup),
+    /// so concurrent OPENs queue and each completes in turn. Lock ordering: this
+    /// is acquired OUTSIDE `rpc_mutex` (never the reverse) — `deliverRpcReply`,
+    /// the writer, and shutdown only ever take `rpc_mutex`, so there is no
+    /// inversion. Same-channel RPCs (GET_CWD etc.) do NOT take this lock; they
+    /// already correlate by their own fresh request channel.
+    open_rpc_mutex: std.Thread.Mutex = .{},
     /// Set by `failPendingRpcs` (shutdown) under `rpc_mutex`. Once set, no new RPC
     /// may park — `rpcCall` fails immediately — closing the register-then-shutdown
     /// race where a slot is inserted just after `failPendingRpcs` already iterated.
@@ -1327,6 +1341,14 @@ pub const Connection = struct {
         // all other RPCs correlate by the request channel.
         const by_type = want == .opened or want == .attached;
 
+        // Serialize by-type RPCs so the single `pending_opened`/`pending_attached`
+        // slot is never contended. Rapid splits/tabs/windows on a remote machine
+        // fire several OPENs concurrently (each pane on its own IO thread); they
+        // now queue here and each completes in turn instead of the loser failing
+        // with `error.RpcInFlight`. Acquired OUTSIDE `rpc_mutex` (see field doc).
+        if (by_type) self.open_rpc_mutex.lock();
+        defer if (by_type) self.open_rpc_mutex.unlock();
+
         self.rpc_mutex.lock();
         if (self.rpc_closed) {
             // Already shutting down: don't park (we'd hang — `failPendingRpcs` has
@@ -1335,11 +1357,10 @@ pub const Connection = struct {
             return error.ConnectionClosed;
         }
         if (by_type) {
-            const existing = if (want == .opened) self.pending_opened else self.pending_attached;
-            if (existing != null) {
-                self.rpc_mutex.unlock();
-                return error.RpcInFlight;
-            }
+            // `open_rpc_mutex` guarantees exclusivity here, so the slot is free.
+            // (Assert rather than fail: a non-null slot would be a serialization
+            // bug, not a recoverable in-flight collision.)
+            assert(if (want == .opened) self.pending_opened == null else self.pending_attached == null);
             if (want == .opened) self.pending_opened = &slot else self.pending_attached = &slot;
         } else {
             if (self.pending.contains(channel)) {
@@ -2890,6 +2911,12 @@ const LifecycleAgent = struct {
     // OPENED reply contents.
     session_id: []const u8 = "sess-1",
     pid: i64 = 4242,
+    /// When true, each OPEN gets a fresh, unique session id (so N concurrent
+    /// OPENs produce N distinct panes). The id buffers are owned by the agent and
+    /// freed on `deinit` via `session_buf`.
+    unique_sessions: bool = false,
+    open_count: std.atomic.Value(u32) = .{ .raw = 0 },
+    session_bufs: std.ArrayList([]u8) = .empty,
 
     // ATTACHED reply contents (only used when an ATTACH arrives).
     attach_status: protocol.Attached.AttachStatus = .alive,
@@ -2934,8 +2961,15 @@ const LifecycleAgent = struct {
                     // the agent never sends OPENED. The client's OPEN RPC must time
                     // out rather than block forever.
                     if (self.silent_open) continue;
+                    var sid = self.session_id;
+                    if (self.unique_sessions) {
+                        const n = self.open_count.fetchAdd(1, .monotonic);
+                        const buf = try std.fmt.allocPrint(self.alloc, "sess-{d}", .{n});
+                        try self.session_bufs.append(self.alloc, buf);
+                        sid = buf;
+                    }
                     try self.ctrl.sendJson(.opened, frame.channel, protocol.Opened{
-                        .session_id = self.session_id,
+                        .session_id = sid,
                         .pid = self.pid,
                     });
                 },
@@ -3053,6 +3087,8 @@ const LifecycleHarness = struct {
     fn destroy(h: *LifecycleHarness) void {
         h.conn.shutdown();
         h.thread.join();
+        for (h.agent.session_bufs.items) |b| h.alloc.free(b);
+        h.agent.session_bufs.deinit(h.alloc);
         h.conn.destroy(h.alloc);
         h.ctrl_agent.deinit();
         h.data_agent.deinit();
@@ -3184,6 +3220,58 @@ test "openChannel: a silent agent (no OPENED) times out instead of deadlocking" 
     const pane_count = h.conn.panes.count();
     h.conn.panes_mutex.unlock();
     try testing.expectEqual(@as(usize, 0), pane_count);
+}
+
+test "openChannel: N concurrent OPENs on one Connection all succeed (rapid remote splits)" {
+    // Regression (rapid remote split panes crashed on the ~3rd pane): each remote
+    // pane's IO thread calls `openChannel` on the SHARED Connection concurrently.
+    // The single by-type `pending_opened` slot used to reject all-but-one with
+    // `error.RpcInFlight`, leaving panes non-functional. OPENs must now serialize
+    // safely so every concurrent split gets a live pane.
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    // The agent mints a fresh session id per OPEN so every pane is distinct.
+    const a = h.configure();
+    a.unique_sessions = true;
+    try h.start();
+
+    const N = 6;
+    const Worker = struct {
+        conn: *Connection,
+        result: ?anyerror = null,
+        pane: ?*Pane = null,
+        fn run(self: *@This()) void {
+            self.pane = self.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" }) catch |e| {
+                self.result = e;
+                return;
+            };
+        }
+    };
+    var workers: [N]Worker = undefined;
+    var threads: [N]std.Thread = undefined;
+    for (&workers, 0..) |*w, i| {
+        w.* = .{ .conn = h.conn };
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{w});
+    }
+    for (threads) |t| t.join();
+
+    // Every concurrent OPEN must have produced a live pane (no RpcInFlight).
+    for (workers) |w| {
+        if (w.result) |e| {
+            std.debug.print("concurrent OPEN failed: {}\n", .{e});
+            return e;
+        }
+        try testing.expect(w.pane != null);
+    }
+    // All N panes are tracked and distinct.
+    h.conn.panes_mutex.lock();
+    const pane_count = h.conn.panes.count();
+    h.conn.panes_mutex.unlock();
+    try testing.expectEqual(@as(usize, N), pane_count);
+
+    // Teardown every pane explicitly (the test owns them; no consumer is draining).
+    for (workers) |w| if (w.pane) |p| h.conn.closeChannel(p);
 }
 
 test "writeInput: bytes reach the agent as DATA with monotonic byte_offset" {

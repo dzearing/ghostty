@@ -550,6 +550,42 @@ class IPCServer {
             ratio = 0.5
         }
 
+        // `--from-focused`: mirror the keyboard/menu split exactly. Resolve the
+        // app's focused window + its focused surface and call the REAL
+        // `newSplit(at: focusedSurface, ...)` — the same path a Cmd-D split takes.
+        // This is the faithful REMOTE-inheriting split: `newSplit` injects the
+        // window's shared remote connection + parent command/cwd (BaseTerminal
+        // Controller §WP4). Unlike `--target`/`--pane` we pass NO command/cwd of
+        // our own, so inheritance is never suppressed. Used to drive rapid remote
+        // splits (each opens a fresh session on the same machine/connection).
+        if parsed.fromFocused {
+            let directionStr = parsed.splitDirection ?? "right"
+            guard let direction = Self.parseSplitDirection(directionStr) else {
+                return IPCResponse(success: false, error: "invalid direction: \(directionStr)")
+            }
+            DispatchQueue.main.async {
+                guard let controller = TerminalController.preferredParent else {
+                    Self.logger.warning("IPC: +split --from-focused: no focused window")
+                    return
+                }
+                guard let surfaceView = controller.focusedSurface else {
+                    Self.logger.warning("IPC: +split --from-focused: no focused surface")
+                    return
+                }
+                // Empty config so `newSplit` performs full remote inheritance
+                // (connection + parent command + cwd). The tint/name plumbing is
+                // intentionally omitted here — this trigger is the inheriting case.
+                let splitConfig = Ghostty.SurfaceConfiguration()
+                _ = controller.newSplit(
+                    at: surfaceView,
+                    direction: direction,
+                    baseConfig: splitConfig,
+                    ratio: ratio
+                )
+            }
+            return .ok
+        }
+
         // Resolve --pane targeting: find the named pane's surface and controller
         if let paneName = parsed.pane {
             pruneStaleTargets()
