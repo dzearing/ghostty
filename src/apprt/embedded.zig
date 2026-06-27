@@ -806,6 +806,19 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
+                // `openDirAbsolute` ASSERTS the path is absolute (an `unreachable`
+                // panic, NOT a catchable error) before it opens anything. A
+                // non-absolute path here — e.g. a remote pane's `C:\…` cwd that
+                // leaked into the local working_directory — would crash the whole
+                // app instead of logging. Skip any non-absolute path defensively
+                // so a bad cwd can never bring down the process.
+                if (!std.fs.path.isAbsolute(wd)) {
+                    log.warn(
+                        "requested working directory is not absolute on this platform; ignoring dir={s}",
+                        .{wd},
+                    );
+                    break :wd;
+                }
                 var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
                     log.warn(
                         "error opening requested working directory dir={s} err={}",
@@ -1254,6 +1267,14 @@ pub const Surface = struct {
 
         const working_directory: ?[*:0]const u8 = wd: {
             if (!apprt.surface.shouldInheritWorkingDirectory(context, &self.app.config)) break :wd null;
+            // A remote pane's pwd is a path ON THE REMOTE MACHINE (e.g. a Windows
+            // `C:\…` path). It is meaningless — and may not even be absolute — on
+            // the LOCAL filesystem, so it must NEVER be lowered into the local
+            // `working_directory` (which `Surface.init` feeds to `openDirAbsolute`,
+            // a hard `isAbsolute` assert). Remote cwd inheritance is carried
+            // separately via `remote_working_directory`, resolved by an on-demand
+            // agent cwd query in the apprt (§WP4). Local panes are unaffected.
+            if (self.remote_connection != null) break :wd null;
             const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
             defer self.app.core_app.alloc.free(cwd);
             break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
