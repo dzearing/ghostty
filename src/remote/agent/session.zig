@@ -589,7 +589,7 @@ pub const SessionTable = struct {
 /// bounded so abandoned sessions don't leak forever. `last_activity_ms` is bumped
 /// on every output chunk and on (re)attach, so an actively-running session never
 /// idles out.
-pub const default_idle_ttl_ms: i64 = 10 * 60 * 1000;
+pub const default_idle_ttl_ms: i64 = 5 * 60 * 1000;
 
 /// The agent's DAEMON-scoped session store: a `SessionTable` plus the single mutex
 /// that guards ALL access to it, a clock, and a background idle-TTL reaper. It
