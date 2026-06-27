@@ -28,6 +28,12 @@ class TerminalWindow: NSWindow {
     /// windows. Absent (hidden) for local windows.
     private let machinePillAccessory = NSTitlebarAccessoryViewController()
 
+    /// Observable backing for the machine pill. The pill's hosting view is bound to
+    /// this ONCE; updating `machineName` re-renders the SwiftUI body in place so the
+    /// titlebar accessory re-measures its width (the same mechanism the reset-zoom
+    /// accessory uses). Replacing the hosting view's rootView does NOT re-measure.
+    private let machinePillModel = MachinePillModel()
+
     /// Visual indicator that mirrors the selected tab color.
     private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
         let view = NSHostingView(rootView: TabColorIndicatorView(tabColor: tabColor))
@@ -181,12 +187,21 @@ class TerminalWindow: NSWindow {
 
             // Create the remote-machine hostname pill accessory. Starts hidden;
             // shown only when `remoteMachine` is set on a remote window.
+            // Bind the hosting view to the observable model ONCE (mirrors the
+            // reset-zoom accessory). The body renders empty until a machine name is
+            // set, then re-renders in place so the titlebar re-measures its width.
+            // Mirror the (working) update accessory EXACTLY: a NonDraggableHostingView
+            // bound to a stable @ObservedObject model, added first, then
+            // translatesAutoresizingMaskIntoConstraints disabled AFTER the add. The
+            // model's @Published changes re-render the body in place so the titlebar
+            // re-measures the accessory width.
+            // NOTE: a LEADING (.left) accessory makes macOS center the window title.
+            // Keep it trailing (.right) so the title stays left-aligned.
             machinePillAccessory.layoutAttribute = .right
             machinePillAccessory.view = NonDraggableHostingView(
-                rootView: MachinePillView(machineName: nil))
-            machinePillAccessory.view.translatesAutoresizingMaskIntoConstraints = false
-            machinePillAccessory.isHidden = true
+                rootView: MachinePillView(model: machinePillModel))
             addTitlebarAccessoryViewController(machinePillAccessory)
+            machinePillAccessory.view.translatesAutoresizingMaskIntoConstraints = false
             updateMachinePill()
         }
 
@@ -887,13 +902,11 @@ extension TerminalWindow {
     /// Shows a "● name" capsule for remote windows; hides the accessory entirely
     /// for local windows.
     fileprivate func updateMachinePill() {
-        guard styleMask.contains(.titled),
-              let hosting = machinePillAccessory.view as? NonDraggableHostingView<MachinePillView>
-        else { return }
-
-        let name = remoteMachine?.name
-        hosting.rootView = MachinePillView(machineName: name)
-        machinePillAccessory.isHidden = (name == nil)
+        guard styleMask.contains(.titled) else { return }
+        // Drive the SwiftUI model; the model-bound hosting view re-renders in place
+        // and the titlebar re-measures the accessory width (empty ⇒ 0 ⇒ invisible).
+        machinePillModel.topPadding = viewModel.accessoryTopPadding
+        machinePillModel.machineName = remoteMachine?.name
     }
 }
 
