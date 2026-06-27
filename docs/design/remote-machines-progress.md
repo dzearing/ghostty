@@ -3,6 +3,12 @@
 > **Resume point.** This is the durable tracker for the remote-machines feature.
 > The design spec is `docs/design/remote-machines.md` (§18 = work packages).
 
+> **🔴 2026-06-26 HANDOFF:** read **`docs/design/remote-machines-CONTINUATION.md`** FIRST —
+> it has the current state + the **ACTIVE BUG** (Cmd-Shift-D split-down in a remote window
+> panics `reached unreachable code`) + hard-won learnings (crash dumps are unreadable to us;
+> IPC repros ≠ keyboard path; get the stack via terminal-launched debug binary; keep the
+> remote path isolated + verify local AND remote before saying "done").
+
 ## ▶ ON RESUME — when the user says "go" (or "go to progress")
 
 A fresh session should, in order:
