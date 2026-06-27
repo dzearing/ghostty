@@ -360,7 +360,12 @@ extension Ghostty {
                 self.error = Ghostty.Error.apiFailed
                 return
             }
-            self.surfaceModel = Ghostty.Surface(cSurface: surface)
+            self.surfaceModel = Ghostty.Surface(
+                cSurface: surface,
+                // Retain the remote connection owner (if any) until after this
+                // surface's deferred free, so its IO-thread `detachChannel` can't
+                // outlive the connection (teardown use-after-free).
+                connectionKeepAlive: surface_cfg.connectionKeepAlive)
 
             // Apply background tint after the terminal IO has finished initializing.
             // The IO thread resets colors during startup, so we delay briefly.

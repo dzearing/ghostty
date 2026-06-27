@@ -1056,6 +1056,9 @@ class AppDelegate: NSObject,
         var cfg = Ghostty.SurfaceConfiguration()
         cfg.remoteMachine = machine
         cfg.remoteConnection = handle
+        // Retain the connection owner on the surface so it outlives the surface's
+        // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+        cfg.connectionKeepAlive = connection
         cfg.remoteSessionId = nil
 
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)

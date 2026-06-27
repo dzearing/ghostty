@@ -657,6 +657,15 @@ extension Ghostty {
         /// freed. All surfaces/splits in the same remote window share one handle.
         var remoteConnection: ghostty_remote_connection_t?
 
+        /// Strong owner of the remote connection (the `RemoteConnection` class), held
+        /// only so the new `Ghostty.Surface` can retain it and keep the connection
+        /// alive across its DEFERRED `ghostty_surface_free` (which detaches this
+        /// pane's channel on the connection). Without this the connection can be
+        /// freed before the async surface free runs → channel-table use-after-free.
+        /// Set alongside `remoteConnection` at every remote-surface creation site.
+        /// Typed `AnyObject` to avoid a Ghostty→Features module dependency.
+        var connectionKeepAlive: AnyObject?
+
         /// The agent session to ATTACH to, or nil to OPEN a brand-new session.
         var remoteSessionId: String?
 

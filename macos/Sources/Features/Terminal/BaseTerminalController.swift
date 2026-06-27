@@ -336,6 +336,9 @@ class BaseTerminalController: NSWindowController,
         if let remoteConnection, effectiveConfig.remoteConnection == nil {
             effectiveConfig.remoteMachine = remoteConnection.machine
             effectiveConfig.remoteConnection = remoteConnection.handle
+            // Keep the connection owner alive across the new surface's deferred free
+            // (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+            effectiveConfig.connectionKeepAlive = remoteConnection
             // session_id stays nil: each split opens a fresh remote session on
             // the same machine/connection.
             if effectiveConfig.command == nil,

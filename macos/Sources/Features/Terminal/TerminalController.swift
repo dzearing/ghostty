@@ -277,6 +277,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             var cfg = baseConfig ?? Ghostty.SurfaceConfiguration()
             cfg.remoteMachine = parentRemote.machine
             cfg.remoteConnection = parentRemote.handle
+            // Keep the connection owner alive across the new surface's deferred free
+            // (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+            cfg.connectionKeepAlive = parentRemote
             if cfg.command == nil, let command {
                 cfg.command = command
                 cfg.waitAfterCommand = true
@@ -492,6 +495,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 var cfg = baseConfig ?? Ghostty.SurfaceConfiguration()
                 cfg.remoteMachine = parentRemote.machine
                 cfg.remoteConnection = parentRemote.handle
+                // Keep the connection owner alive across the new surface's deferred
+                // free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+                cfg.connectionKeepAlive = parentRemote
                 if cfg.command == nil, let command {
                     cfg.command = command
                     cfg.waitAfterCommand = true
