@@ -1,6 +1,9 @@
 import SwiftUI
 import AppKit
 import GhosttyKit
+#if canImport(Charts)
+import Charts
+#endif
 
 // MARK: - Source
 
@@ -58,6 +61,18 @@ struct HostReading: Equatable {
     var load1: Float? = nil
 }
 
+/// One point in the header's rolling CPU/Memory trend charts. `seq` is a
+/// monotonically increasing sample index used as the chart X value (we only show
+/// the trend shape, so the X unit is arbitrary).
+struct HostSample: Identifiable, Equatable {
+    let seq: Int
+    /// CPU%, normalized 0..100 across all cores.
+    let cpuPct: Double
+    /// Memory used, as a fraction 0..1 of total (so the chart Y is 0..100%).
+    let memFraction: Double
+    var id: Int { seq }
+}
+
 /// Owns the live data for a single Activity Monitor panel, parameterized over a
 /// `MonitorSource`. Drives a periodically-refreshed process table and (for remote
 /// sources) a host-metrics subscription for header CPU%. Supports switching the
@@ -83,6 +98,16 @@ final class RemoteActivityMonitorModel: ObservableObject {
     /// Header host reading (CPU% live for remote / local-sampled; mem/ncpu/uptime
     /// from the last snapshot).
     @Published private(set) var host = HostReading()
+    /// Rolling time-series for the header trend charts (oldest → newest), capped at
+    /// `maxSamples`. Appended once per host update (each metrics tick for remote,
+    /// each refresh for local) and CLEARED on every source switch so one machine's
+    /// history never bleeds into another's.
+    @Published private(set) var samples: [HostSample] = []
+
+    /// Max points retained in the trend ring buffers (~60 samples ≈ 90s at 1.5s).
+    private let maxSamples = 60
+    /// Monotonic sample index used as the chart X value.
+    private var sampleSeq = 0
     /// The most recent process table.
     @Published private(set) var procs: [ProcRow] = []
     /// True while we have never received a proc snapshot for the current source.
@@ -164,10 +189,13 @@ final class RemoteActivityMonitorModel: ObservableObject {
 
         teardownCurrentSource()
 
-        // Reset published state for the new source.
+        // Reset published state for the new source. Clearing the trend buffers
+        // here guarantees one machine's history never bleeds into another's.
         source = newSource
         procs = []
         host = HostReading()
+        samples = []
+        sampleSeq = 0
         truncated = false
         lastRefreshFailed = false
         isLoading = true
@@ -343,6 +371,10 @@ final class RemoteActivityMonitorModel: ObservableObject {
                         // subscription's cpuPct (snapshot cpu is one-shot zero).
                         if isLocal { merged.cpuPct = host.cpuPct }
                         self.host = merged
+                        // Local has no metrics subscription, so drive the trend
+                        // charts off each refresh's host snapshot. (Remote drives
+                        // them from the live metrics tick in `ingest`.)
+                        if isLocal { self.appendSample(from: merged) }
                         self.isLoading = false
                     } else {
                         self.isLoading = false
@@ -364,6 +396,20 @@ final class RemoteActivityMonitorModel: ObservableObject {
         if raw.uptime_s != 0 { h.uptimeS = raw.uptime_s }
         h.load1 = raw.load1 < 0 ? nil : raw.load1
         host = h
+        // Remote: drive the trend charts off the live metrics tick.
+        appendSample(from: h)
+    }
+
+    /// Append one point to the rolling trend buffers, dropping the oldest beyond
+    /// `maxSamples`. Main-actor.
+    private func appendSample(from h: HostReading) {
+        let cpu = Double(max(0, min(100, h.cpuPct)))
+        let memFrac = h.memTotal > 0 ? Double(h.memUsed) / Double(h.memTotal) : 0
+        sampleSeq += 1
+        samples.append(HostSample(seq: sampleSeq, cpuPct: cpu, memFraction: max(0, min(1, memFrac))))
+        if samples.count > maxSamples {
+            samples.removeFirst(samples.count - maxSamples)
+        }
     }
 
     // MARK: Process control (Kill / Spawn)
@@ -535,15 +581,19 @@ struct RemoteActivityMonitorView: View {
 
             Spacer()
 
-            statBlock(
+            trendGauge(
                 label: "CPU",
                 value: String(format: "%.0f%%", normalizedHostCPU),
-                detail: "\(model.host.ncpu) cores"
+                detail: "\(model.host.ncpu) cores",
+                tint: .blue,
+                metric: .cpu
             )
-            statBlock(
+            trendGauge(
                 label: "Memory",
                 value: memString(model.host.memUsed),
-                detail: "of \(memString(model.host.memTotal))"
+                detail: "of \(memString(model.host.memTotal))",
+                tint: .green,
+                metric: .memory
             )
             if let load1 = model.host.load1 {
                 statBlock(
@@ -555,6 +605,86 @@ struct RemoteActivityMonitorView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+
+    /// Which header metric a trend gauge plots.
+    private enum TrendMetric { case cpu, memory }
+
+    /// A compact header gauge: the current value + label over a live sparkline of
+    /// the metric's recent history. Falls back to a plain text block (no chart) on
+    /// systems without Swift Charts.
+    @ViewBuilder
+    private func trendGauge(label: String, value: String, detail: String, tint: Color, metric: TrendMetric) -> some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            Text(value)
+                .font(.system(.title3, design: .rounded).weight(.semibold))
+                .monospacedDigit()
+            sparkline(tint: tint, metric: metric)
+                .frame(width: 140, height: 34)
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The sparkline chart for a metric (Y fixed 0..100), or a thin baseline when
+    /// there isn't enough history yet / Charts is unavailable.
+    @ViewBuilder
+    private func sparkline(tint: Color, metric: TrendMetric) -> some View {
+        #if canImport(Charts)
+        if #available(macOS 13.0, *) {
+            let points = model.samples
+            Chart(points) { s in
+                let y = metric == .cpu ? s.cpuPct : s.memFraction * 100
+                AreaMark(
+                    x: .value("t", s.seq),
+                    y: .value("v", y)
+                )
+                .interpolationMethod(.catmullRom)
+                .foregroundStyle(
+                    .linearGradient(
+                        colors: [tint.opacity(0.35), tint.opacity(0.04)],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                )
+                LineMark(
+                    x: .value("t", s.seq),
+                    y: .value("v", y)
+                )
+                .interpolationMethod(.catmullRom)
+                .foregroundStyle(tint)
+                .lineStyle(StrokeStyle(lineWidth: 1.5))
+            }
+            .chartYScale(domain: 0...100)
+            .chartXAxis(.hidden)
+            .chartYAxis(.hidden)
+            .chartLegend(.hidden)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.25))
+            )
+        } else {
+            sparklineFallback(tint: tint)
+        }
+        #else
+        sparklineFallback(tint: tint)
+        #endif
+    }
+
+    /// A static placeholder used when Swift Charts isn't available.
+    private func sparklineFallback(tint: Color) -> some View {
+        RoundedRectangle(cornerRadius: 5)
+            .fill(tint.opacity(0.12))
+            .overlay(
+                Rectangle()
+                    .fill(tint.opacity(0.4))
+                    .frame(height: 1),
+                alignment: .bottom
+            )
     }
 
     /// The machine switcher: a menu-style Picker listing Local + every registered
