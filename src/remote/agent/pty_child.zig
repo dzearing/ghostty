@@ -48,6 +48,7 @@ const CommandCore = @import("../../CommandCore.zig");
 const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const server = @import("server.zig");
+const proc_spawn = @import("proc_spawn.zig");
 
 /// On Windows the OS-specific arms reach `ReadFile`/`WriteFile`/`TerminateProcess`
 /// straight from `std.os.windows` — the same kernel32 surface the smoke uses.
@@ -577,7 +578,7 @@ pub const PtySpawner = struct {
     /// A `server.Spawner` handle over this spawner — plug straight into
     /// `Server.create`.
     pub fn spawner(self: *PtySpawner) server.Spawner {
-        return .{ .ctx = self, .spawnFn = spawnFn };
+        return .{ .ctx = self, .spawnFn = spawnFn, .spawnDetachedFn = spawnDetachedFn };
     }
 
     /// Matches `server.Spawner.spawnFn`: turn an OPEN into a `Child` + pid.
@@ -589,6 +590,15 @@ pub const PtySpawner = struct {
         // surface its integer value (the OS process id is not separately tracked).
         const pid_i64: i64 = if (is_windows) @intCast(@intFromPtr(pc.pid)) else @intCast(pc.pid);
         return .{ .child = pc.child(), .pid = pid_i64 };
+    }
+
+    /// Matches `server.Spawner.spawnDetachedFn`: launch a detached process for
+    /// `PROC_SPAWN` (§9.3, inc 5). Delegates to `proc_spawn.spawnDetached` (which
+    /// pulls `CommandCore`, kept out of `server.zig` per `proc_spawn.zig`'s doc).
+    fn spawnDetachedFn(ctx: *anyopaque, cmd: []const u8, cwd: ?[]const u8) server.Spawner.SpawnResult {
+        const self: *PtySpawner = @ptrCast(@alignCast(ctx));
+        const out = proc_spawn.spawnDetached(self.alloc, cmd, cwd);
+        return .{ .ok = out.ok, .pid = out.pid, .@"error" = out.@"error" };
     }
 
     /// Open a pty, fork+exec the shell on its slave, return the owned `*PtyChild`.

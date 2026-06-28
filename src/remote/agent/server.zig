@@ -55,12 +55,14 @@
 //! The real build wires the agent exe via `build.zig` (`zig build agent`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const metrics = @import("metrics.zig");
 const proc = @import("proc.zig");
+const proc_control = @import("proc_control.zig");
 
 /// Scratch read buffer per reader thread's blocking `Stream.read`.
 const read_buf_size = 64 * 1024;
@@ -146,14 +148,32 @@ pub const Clock = struct {
 pub const Spawner = struct {
     ctx: *anyopaque,
     spawnFn: *const fn (ctx: *anyopaque, open: protocol.Open) anyerror!Result,
+    /// Launch a DETACHED process (no session/pty) for `PROC_SPAWN` (§9.3, inc 5).
+    /// Injected (rather than imported by `server.zig`) so `server.zig`'s transport
+    /// graph stays free of `CommandCore` — see `proc_spawn.zig`'s module doc. The
+    /// real agent wires `pty_child.PtySpawner.spawnDetachedTrampoline`.
+    spawnDetachedFn: *const fn (ctx: *anyopaque, cmd: []const u8, cwd: ?[]const u8) SpawnResult,
 
     pub const Result = struct {
         child: session.Child,
         pid: i64,
     };
 
+    /// Result of a detached spawn (mirrors `proc_spawn.SpawnOutcome` but defined
+    /// here so `server.zig` needn't import `proc_spawn.zig`). `@"error"` is a static
+    /// string (never owned).
+    pub const SpawnResult = struct {
+        ok: bool = false,
+        pid: ?i64 = null,
+        @"error": ?[]const u8 = null,
+    };
+
     pub fn spawn(self: Spawner, open: protocol.Open) anyerror!Result {
         return self.spawnFn(self.ctx, open);
+    }
+
+    pub fn spawnDetached(self: Spawner, cmd: []const u8, cwd: ?[]const u8) SpawnResult {
+        return self.spawnDetachedFn(self.ctx, cmd, cwd);
     }
 };
 
@@ -631,8 +651,10 @@ pub const Server = struct {
             .metrics_sub => self.handleMetricsSub(frame.payload),
             .metrics_unsub => self.handleMetricsUnsub(),
             .proc_list => self.handleProcList(frame.channel, frame.payload),
-            // `.proc_kill`/`.proc_spawn` are later increments; frames the agent never
-            // receives (it produces the *_result/snapshot replies) or out of scope: ignore.
+            .proc_kill => self.handleProcKill(frame.channel, frame.payload),
+            .proc_spawn => self.handleProcSpawn(frame.channel, frame.payload),
+            // The remaining types are agent→client replies (the agent produces
+            // them) or out of scope: ignore.
             else => {},
         }
     }
@@ -1026,6 +1048,40 @@ pub const Server = struct {
         }) catch {};
     }
 
+    /// `PROC_KILL` (§9.3, inc 4): terminate the requested pid and reply
+    /// `PROC_KILL_RESULT{pid, ok, error?}` on the SAME request channel (same-channel
+    /// correlation, like `PROC_LIST`/`GET_CWD`). The OS kill runs UNLOCKED (it
+    /// touches no session-store state). A malformed payload is ignored (untrusted).
+    fn handleProcKill(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.ProcKill, self.alloc, payload) catch return;
+        defer parsed.deinit();
+        const pid = parsed.value.pid;
+
+        const out = proc_control.killProc(pid, parsed.value.signal);
+        self.sendJson(.proc_kill_result, channel, protocol.ProcKillResult{
+            .pid = pid,
+            .ok = out.ok,
+            .@"error" = out.@"error",
+        }) catch {};
+    }
+
+    /// `PROC_SPAWN` (§9.3, inc 5): launch a detached process via the platform shell
+    /// and reply `PROC_SPAWN_RESULT{ok, pid?, error?}` on the request channel. The
+    /// spawn runs UNLOCKED. A malformed payload is ignored (untrusted).
+    fn handleProcSpawn(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.ProcSpawn, self.alloc, payload) catch return;
+        defer parsed.deinit();
+
+        // Spawn via the injected spawner (keeps `CommandCore` out of server.zig's
+        // graph — see `proc_spawn.zig`). Runs UNLOCKED (no session-store state).
+        const out = self.spawner.spawnDetached(parsed.value.cmd, parsed.value.cwd);
+        self.sendJson(.proc_spawn_result, channel, protocol.ProcSpawnResult{
+            .ok = out.ok,
+            .pid = out.pid,
+            .@"error" = out.@"error",
+        }) catch {};
+    }
+
     // --- Inbound DATA (client keystrokes) ------------------------------------
 
     fn handleInboundData(self: *Server, frame: protocol.Frame) void {
@@ -1241,7 +1297,7 @@ const FakeSpawner = struct {
     pid_base: i64 = 1000,
 
     fn spawner(self: *FakeSpawner) Spawner {
-        return .{ .ctx = self, .spawnFn = spawn };
+        return .{ .ctx = self, .spawnFn = spawn, .spawnDetachedFn = spawnDetached };
     }
     fn spawn(ctx: *anyopaque, _: protocol.Open) anyerror!Spawner.Result {
         const self: *FakeSpawner = @ptrCast(@alignCast(ctx));
@@ -1249,6 +1305,21 @@ const FakeSpawner = struct {
         const fc = self.children[self.next];
         self.next += 1;
         return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)) };
+    }
+    /// REAL detached spawn so the `PROC_SPAWN`→`PROC_KILL` round-trip test
+    /// exercises a genuine OS process. Uses `std.process.Child` directly (std-only,
+    /// so this stays out of `CommandCore` and keeps `server.zig`'s graph importable
+    /// by the client transport — the real agent injects `proc_spawn.spawnDetached`
+    /// via `pty_child`). POSIX-only (the agent tests skip on Windows).
+    fn spawnDetached(_: *anyopaque, cmd: []const u8, cwd: ?[]const u8) Spawner.SpawnResult {
+        if (builtin.os.tag == .windows) return .{ .ok = false, .@"error" = "unsupported in test" };
+        var child = std.process.Child.init(&.{ "/bin/sh", "-lc", cmd }, std.heap.page_allocator);
+        child.cwd = cwd;
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch |err| return .{ .ok = false, .@"error" = @errorName(err) };
+        return .{ .ok = true, .pid = @intCast(child.id) };
     }
 };
 
@@ -1578,6 +1649,70 @@ test "PROC_LIST→PROC_SNAPSHOT: agent enumerates real processes on the request 
     try testing.expect(saw_named);
     // ncpu is read directly each host sample → > 0 on a real machine.
     try testing.expect(parsed.value.host.ncpu >= 1);
+}
+
+test "PROC_SPAWN→PROC_SPAWN_RESULT then PROC_KILL→PROC_KILL_RESULT round-trip" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(41);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Spawn a harmless short sleeper on the request channel; the agent must echo
+    // PROC_SPAWN_RESULT{ok=true, pid>0} on it (same-channel correlation).
+    const req_ch: u128 = 0x5A11AD;
+    try h.client.sendControlJson(.proc_spawn, req_ch, protocol.ProcSpawn{
+        .cmd = "sleep 0.2",
+    });
+    const sreply = try h.client.waitControl(.proc_spawn_result);
+    try testing.expectEqual(req_ch, sreply.channel);
+    var sparsed = try protocol.parseJson(protocol.ProcSpawnResult, alloc, sreply.payload);
+    defer sparsed.deinit();
+    try testing.expect(sparsed.value.ok);
+    try testing.expect(sparsed.value.pid != null);
+    const pid = sparsed.value.pid.?;
+    try testing.expect(pid > 0);
+
+    // Kill that pid (default TERM). The agent replies PROC_KILL_RESULT; ok should be
+    // true (the sleeper is alive), but accept either since it may have already
+    // exited and been reaped — the contract is "no crash, a structured result".
+    const kill_ch: u128 = 0x11A11;
+    try h.client.sendControlJson(.proc_kill, kill_ch, protocol.ProcKill{ .pid = pid });
+    const kreply = try h.client.waitControl(.proc_kill_result);
+    try testing.expectEqual(kill_ch, kreply.channel);
+    var kparsed = try protocol.parseJson(protocol.ProcKillResult, alloc, kreply.payload);
+    defer kparsed.deinit();
+    try testing.expectEqual(pid, kparsed.value.pid);
+    try testing.expect(kparsed.value.ok or kparsed.value.@"error" != null);
+}
+
+test "PROC_KILL a bogus pid → ok=false (graceful)" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(42);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const req_ch: u128 = 0xB0_6051;
+    try h.client.sendControlJson(.proc_kill, req_ch, protocol.ProcKill{ .pid = 2147483600 });
+    const reply = try h.client.waitControl(.proc_kill_result);
+    try testing.expectEqual(req_ch, reply.channel);
+    var parsed = try protocol.parseJson(protocol.ProcKillResult, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expect(!parsed.value.ok);
+    try testing.expect(parsed.value.@"error" != null);
 }
 
 test "OPEN→OPENED then child output streams as DATA with advancing byte_offsets" {

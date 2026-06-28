@@ -22,6 +22,10 @@ const remote_connection = @import("../remote/connection.zig");
 const remote_protocol = @import("../remote/protocol.zig");
 const ssh_transport = @import("../remote/ssh_transport.zig");
 const tcp_dial = @import("../remote/tcp_dial.zig");
+const remote_proc = @import("../remote/agent/proc.zig");
+const remote_metrics = @import("../remote/agent/metrics.zig");
+const remote_proc_control = @import("../remote/agent/proc_control.zig");
+const remote_proc_spawn = @import("../remote/agent/proc_spawn.zig");
 const CommandCore = @import("../CommandCore.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
@@ -2505,6 +2509,225 @@ pub const CAPI = struct {
             a.free(std.mem.sliceTo(r.cmd, 0));
         }
         a.free(rows);
+    }
+
+    /// Kill a process on the REMOTE host by pid (§9.3 process control, inc 4).
+    /// SYNCHRONOUS: blocks on the RPC reply up to `timeout_ms` (0 ⇒ default 5s), so
+    /// run it OFF the main thread. `signal` is a NUL-terminated C string; an empty
+    /// string ⇒ the agent's default terminate ("TERM"). On POSIX "TERM"/"KILL"
+    /// select the signal; on Windows both map to TerminateProcess. Returns true iff
+    /// the agent reported the kill succeeded; false on no connection / agent error /
+    /// timeout.
+    export fn ghostty_remote_connection_proc_kill(
+        handle: *RemoteConnectionHandle,
+        pid: i64,
+        signal: [*:0]const u8,
+        timeout_ms: u32,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        const sig_slice = std.mem.sliceTo(signal, 0);
+        const sig: ?[]const u8 = if (sig_slice.len == 0) null else sig_slice;
+        const ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var out = conn.killProc(pid, sig, ns) catch |err| {
+            log.debug("remote proc_kill failed err={}", .{err});
+            return false;
+        };
+        defer out.deinit();
+        return out.ok;
+    }
+
+    /// Spawn a DETACHED process on the REMOTE host (§9.3 process control, inc 5).
+    /// SYNCHRONOUS: blocks on the RPC reply up to `timeout_ms` (0 ⇒ default 5s); run
+    /// OFF the main thread. `cmd` is run through the remote platform shell. `cwd` is
+    /// a NUL-terminated C string; an empty string ⇒ the agent's default cwd. Returns
+    /// the spawned pid (> 0), or -1 on failure (no connection / agent error /
+    /// timeout). On Windows the "pid" is the integer value of the child's process
+    /// HANDLE (matching the process-list ids).
+    export fn ghostty_remote_connection_proc_spawn(
+        handle: *RemoteConnectionHandle,
+        cmd: [*:0]const u8,
+        cwd: [*:0]const u8,
+        timeout_ms: u32,
+    ) i64 {
+        const conn = handle.conn() orelse return -1;
+        const cmd_slice = std.mem.sliceTo(cmd, 0);
+        if (cmd_slice.len == 0) return -1;
+        const cwd_slice = std.mem.sliceTo(cwd, 0);
+        const cwd_opt: ?[]const u8 = if (cwd_slice.len == 0) null else cwd_slice;
+        const ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var out = conn.spawnProc(cmd_slice, cwd_opt, ns) catch |err| {
+            log.debug("remote proc_spawn failed err={}", .{err});
+            return -1;
+        };
+        defer out.deinit();
+        if (!out.ok) return -1;
+        return out.pid orelse -1;
+    }
+
+    // -------------------------------------------------------------------------
+    // LOCAL (in-process) activity-monitor provider — the "Local" machine in the
+    // panel's switcher. Unlike the remote `_remote_connection_*` calls, these take
+    // NO connection handle: they sample / kill / spawn IN THIS PROCESS using the
+    // SAME `proc.ProcSampler` / `metrics.Sampler` / `proc_control` code the agent
+    // uses. A mutex-guarded global holds PERSISTENT samplers so local per-process
+    // and host CPU% deltas work across polls (the first poll reads 0%). The panel
+    // polls from a background queue, so every entry point locks `local_mutex`.
+    //
+    // `ghostty_local_proc_list` reuses the SAME `ghostty_proc_list_s` struct as the
+    // remote path, but `ghostty_local_proc_list_free` frees via the app/global
+    // allocator (`global.alloc`) — there is NO handle whose `.alloc` to use — so it
+    // is a DISTINCT free function from `ghostty_remote_connection_proc_list_free`.
+    // -------------------------------------------------------------------------
+
+    /// Persistent local samplers + their guard. Created lazily on first use so a
+    /// build that never opens the Local machine pays nothing. The samplers keep
+    /// prev-tick baselines so repeated `_local_proc_list` polls yield real CPU%.
+    const LocalSamplers = struct {
+        var mutex: std.Thread.Mutex = .{};
+        var proc_sampler: ?remote_proc.ProcSampler = null;
+        var host_sampler: remote_metrics.Sampler = remote_metrics.Sampler.init();
+
+        /// Caller must hold `mutex`. Returns the lazily-created proc sampler.
+        fn procSamplerLocked(alloc: Allocator) *remote_proc.ProcSampler {
+            if (proc_sampler == null) proc_sampler = remote_proc.ProcSampler.init(alloc);
+            return &proc_sampler.?;
+        }
+    };
+
+    /// A one-shot snapshot of THIS machine's process table (§9.3, the "Local"
+    /// machine). SYNCHRONOUS but cheap (a local OS enumeration). The host metrics
+    /// come from a persistent local `Sampler`, so host CPU% is a real delta after
+    /// the first poll. `timeout_ms` is accepted for API symmetry with the remote
+    /// call but unused (there is no RPC). Free with `ghostty_local_proc_list_free`.
+    export fn ghostty_local_proc_list(timeout_ms: u32) ghostty_proc_list_s {
+        _ = timeout_ms;
+        const a = global.alloc;
+
+        const empty: ghostty_proc_list_s = .{
+            .ok = false,
+            .truncated = false,
+            .host = .{ .cpu_pct = 0, .mem_used = 0, .mem_total = 0, .ncpu = 0, .uptime_s = 0, .load1 = -1 },
+            .procs = empty_procs_sentinel[0..].ptr,
+            .procs_len = 0,
+        };
+
+        LocalSamplers.mutex.lock();
+        defer LocalSamplers.mutex.unlock();
+
+        const host = LocalSamplers.host_sampler.sample();
+        const sampler = LocalSamplers.procSamplerLocked(a);
+
+        var procs: std.ArrayListUnmanaged(remote_protocol.Proc) = .empty;
+        defer {
+            for (procs.items) |p| {
+                a.free(@constCast(p.name));
+                if (p.user) |u| a.free(@constCast(u));
+                if (p.cmd) |c| a.free(@constCast(c));
+            }
+            procs.deinit(a);
+        }
+        const truncated = sampler.sample(a, &procs, 0) catch return empty;
+
+        // Marshal into the SAME C struct as the remote path (dup strings, empty-
+        // string sentinels for null user/cmd, safe partial-failure cleanup).
+        const arr = a.alloc(ghostty_proc_s, procs.items.len) catch return empty;
+        var filled: usize = 0;
+        for (procs.items, 0..) |p, i| {
+            const name = a.dupeZ(u8, p.name) catch break;
+            const user = a.dupeZ(u8, p.user orelse "") catch {
+                a.free(name);
+                break;
+            };
+            const cmd = a.dupeZ(u8, p.cmd orelse "") catch {
+                a.free(name);
+                a.free(user);
+                break;
+            };
+            arr[i] = .{
+                .pid = p.pid,
+                .ppid = p.ppid,
+                .cpu_pct = p.cpu_pct,
+                .mem_bytes = p.mem_bytes,
+                .name = name.ptr,
+                .user = user.ptr,
+                .cmd = cmd.ptr,
+            };
+            filled = i + 1;
+        }
+        if (filled != procs.items.len) {
+            for (arr[0..filled]) |r| {
+                a.free(std.mem.sliceTo(r.name, 0));
+                a.free(std.mem.sliceTo(r.user, 0));
+                a.free(std.mem.sliceTo(r.cmd, 0));
+            }
+            a.free(arr);
+            return empty;
+        }
+
+        return .{
+            .ok = true,
+            .truncated = truncated,
+            .host = .{
+                .cpu_pct = host.cpu_pct,
+                .mem_used = host.mem_used,
+                .mem_total = host.mem_total,
+                .ncpu = host.ncpu,
+                .uptime_s = host.uptime_s orelse 0,
+                .load1 = host.load1 orelse -1,
+            },
+            .procs = arr.ptr,
+            .procs_len = arr.len,
+        };
+    }
+
+    /// Free a `ghostty_proc_list_s` returned by `ghostty_local_proc_list`. Unlike
+    /// `ghostty_remote_connection_proc_list_free` (which uses the handle's
+    /// allocator), this frees via the app/global allocator — local lists carry no
+    /// handle. Always safe (a failed/empty list has `procs_len == 0`).
+    export fn ghostty_local_proc_list_free(list: ghostty_proc_list_s) void {
+        if (list.procs_len == 0) return;
+        const a = global.alloc;
+        const rows = list.procs[0..list.procs_len];
+        for (rows) |r| {
+            a.free(std.mem.sliceTo(r.name, 0));
+            a.free(std.mem.sliceTo(r.user, 0));
+            a.free(std.mem.sliceTo(r.cmd, 0));
+        }
+        a.free(rows);
+    }
+
+    /// Kill a process on THIS machine by pid (§9.3, the "Local" machine). `signal`
+    /// is a NUL-terminated C string; empty ⇒ default terminate ("TERM"). Returns
+    /// true iff the kill succeeded. In-process (no RPC), guarded by `local_mutex`
+    /// only for symmetry — `killProc` itself is a stateless OS call.
+    export fn ghostty_local_proc_kill(pid: i64, signal: [*:0]const u8) bool {
+        const sig_slice = std.mem.sliceTo(signal, 0);
+        const sig: ?[]const u8 = if (sig_slice.len == 0) null else sig_slice;
+        const out = remote_proc_control.killProc(pid, sig);
+        return out.ok;
+    }
+
+    /// Spawn a DETACHED process on THIS machine (§9.3, the "Local" machine). `cmd`
+    /// is run through the local platform shell. `cwd` is a NUL-terminated C string;
+    /// empty ⇒ the current working directory. Returns the spawned pid (> 0), or -1
+    /// on failure. In-process (no RPC).
+    export fn ghostty_local_proc_spawn(cmd: [*:0]const u8, cwd: [*:0]const u8) i64 {
+        const a = global.alloc;
+        const cmd_slice = std.mem.sliceTo(cmd, 0);
+        if (cmd_slice.len == 0) return -1;
+        const cwd_slice = std.mem.sliceTo(cwd, 0);
+        const cwd_opt: ?[]const u8 = if (cwd_slice.len == 0) null else cwd_slice;
+        const out = remote_proc_spawn.spawnDetached(a, cmd_slice, cwd_opt);
+        if (!out.ok) return -1;
+        return out.pid orelse -1;
     }
 
     /// The LIVE remote agent session id for `surface`, or an empty String if it

@@ -556,6 +556,38 @@ pub const OwnedProcSnapshot = struct {
     }
 };
 
+/// A caller-owned result of a `PROC_KILL` RPC (§9.3 process control, inc 4). The
+/// optional `error_msg` is duped into `alloc` (the parsed JSON arena is freed
+/// before `killProc` returns), so free with `deinit`.
+pub const ProcKillOutcome = struct {
+    pid: i64,
+    ok: bool,
+    /// Agent-reported failure reason (e.g. "permission denied", "no such
+    /// process"), or null on success. Owned; freed by `deinit`.
+    error_msg: ?[]const u8 = null,
+    alloc: Allocator,
+
+    pub fn deinit(self: *ProcKillOutcome) void {
+        if (self.error_msg) |m| self.alloc.free(@constCast(m));
+        self.* = undefined;
+    }
+};
+
+/// A caller-owned result of a `PROC_SPAWN` RPC (§9.3 process control, inc 5).
+/// `pid` is set iff `ok`. `error_msg` is duped into `alloc`; free with `deinit`.
+pub const ProcSpawnOutcome = struct {
+    ok: bool,
+    pid: ?i64 = null,
+    /// Agent-reported spawn failure reason, or null on success. Owned.
+    error_msg: ?[]const u8 = null,
+    alloc: Allocator,
+
+    pub fn deinit(self: *ProcSpawnOutcome) void {
+        if (self.error_msg) |m| self.alloc.free(@constCast(m));
+        self.* = undefined;
+    }
+};
+
 /// The client side of one remote connection's transport. Heap-allocated because
 /// the writer and the two reader threads all reference it for their lifetime.
 pub const Connection = struct {
@@ -1282,6 +1314,79 @@ pub const Connection = struct {
         };
     }
 
+    /// Kill a remote process by pid (§9.3 process control, inc 4). Sends
+    /// `PROC_KILL{pid, signal}` and awaits `PROC_KILL_RESULT{pid, ok, error?}`,
+    /// returning a caller-owned `ProcKillOutcome` (any error string is duped into
+    /// `self.alloc`). `signal` of null ⇒ the agent's default terminate; "TERM" /
+    /// "KILL" select the POSIX signal (on Windows both map to TerminateProcess).
+    /// Same-channel RPC (mirrors `requestProcSnapshot`), bounded by `timeout_ns`
+    /// (`error.Timeout` on no reply). Free the result with `.deinit`.
+    pub fn killProc(
+        self: *Connection,
+        pid: i64,
+        signal: ?[]const u8,
+        timeout_ns: u64,
+    ) !ProcKillOutcome {
+        const req_channel = std.crypto.random.int(u128);
+        const req: protocol.ProcKill = .{ .pid = pid, .signal = signal };
+        const json = try protocol.encodeJson(self.alloc, req);
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .proc_kill, .proc_kill_result, json, timeout_ns);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.ProcKillResult, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        const err_copy: ?[]const u8 = if (parsed.value.@"error") |m|
+            try self.alloc.dupe(u8, m)
+        else
+            null;
+        return .{
+            .pid = parsed.value.pid,
+            .ok = parsed.value.ok,
+            .error_msg = err_copy,
+            .alloc = self.alloc,
+        };
+    }
+
+    /// Spawn a detached process on the remote host (§9.3 process control, inc 5).
+    /// Sends `PROC_SPAWN{cmd, cwd}` and awaits `PROC_SPAWN_RESULT{ok, pid?,
+    /// error?}`, returning a caller-owned `ProcSpawnOutcome` (any error string is
+    /// duped into `self.alloc`). The agent runs `cmd` through its platform shell,
+    /// detached, with no pty. Same-channel RPC, bounded by `timeout_ns`. Free with
+    /// `.deinit`.
+    pub fn spawnProc(
+        self: *Connection,
+        cmd: []const u8,
+        cwd: ?[]const u8,
+        timeout_ns: u64,
+    ) !ProcSpawnOutcome {
+        const req_channel = std.crypto.random.int(u128);
+        const req: protocol.ProcSpawn = .{ .cmd = cmd, .cwd = cwd };
+        const json = try protocol.encodeJson(self.alloc, req);
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .proc_spawn, .proc_spawn_result, json, timeout_ns);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.ProcSpawnResult, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        const err_copy: ?[]const u8 = if (parsed.value.@"error") |m|
+            try self.alloc.dupe(u8, m)
+        else
+            null;
+        return .{
+            .ok = parsed.value.ok,
+            .pid = parsed.value.pid,
+            .error_msg = err_copy,
+            .alloc = self.alloc,
+        };
+    }
+
     /// Re-attach to an existing session (§3.3 attach / §7.3 sequence-anchored
     /// resync / §5.3 steal). Mints a fresh channel id (§7.1), registers an inbound
     /// ring, sends `ATTACH{session_id, rows, cols, last_byte_offset, force}`, and
@@ -1802,6 +1907,12 @@ pub const Connection = struct {
                 // Reply to a PROC_LIST RPC (§9.3 process view). Same-channel
                 // correlation, exactly like CWD: the agent echoes PROC_SNAPSHOT on the
                 // request channel. Dropped if no caller is parked (late reply).
+                _ = self.deliverRpcReply(frame);
+            },
+            .proc_kill_result, .proc_spawn_result => {
+                // Replies to PROC_KILL / PROC_SPAWN RPCs (§9.3 process control, inc
+                // 4+5). Same-channel correlation, like PROC_SNAPSHOT. Dropped if no
+                // caller is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
             .pong => {
@@ -3140,6 +3251,14 @@ const LifecycleAgent = struct {
     saw_metrics_unsub: std.atomic.Value(bool) = .{ .raw = false },
     saw_proc_list: std.atomic.Value(bool) = .{ .raw = false },
 
+    // PROC_KILL / PROC_SPAWN reply config (inc 4+5). A PROC_KILL for `kill_fail_pid`
+    // replies ok=false (models no-such-pid); any other pid succeeds. PROC_SPAWN
+    // always replies ok=true with `spawn_pid`.
+    saw_proc_kill: std.atomic.Value(bool) = .{ .raw = false },
+    saw_proc_spawn: std.atomic.Value(bool) = .{ .raw = false },
+    kill_fail_pid: i64 = -424242, // a sentinel no real test pid uses
+    spawn_pid: i64 = 99001,
+
     // Observations (atomics / events so the test thread can read them safely).
     seen_channel: std.atomic.Value(u128) = .{ .raw = 0 },
     saw_request: std.Thread.ResetEvent = .{},
@@ -3265,6 +3384,31 @@ const LifecycleAgent = struct {
                         .host = .{ .cpu_pct = 7.5, .mem_used = 4 * 1024 * 1024 * 1024, .mem_total = 16 * 1024 * 1024 * 1024, .ncpu = 8 },
                         .procs = &procs,
                         .truncated = true,
+                    });
+                },
+                .proc_kill => {
+                    // Reply PROC_KILL_RESULT on the SAME request channel. A "magic"
+                    // bogus pid models a failure (ok=false, error); anything else
+                    // succeeds (echoing the requested pid).
+                    self.saw_proc_kill.store(true, .monotonic);
+                    var parsed = protocol.parseJson(protocol.ProcKill, self.alloc, frame.payload) catch continue;
+                    defer parsed.deinit();
+                    const pid = parsed.value.pid;
+                    const ok = pid != self.kill_fail_pid;
+                    try self.ctrl.sendJson(.proc_kill_result, frame.channel, protocol.ProcKillResult{
+                        .pid = pid,
+                        .ok = ok,
+                        .@"error" = if (ok) null else "no such process",
+                    });
+                },
+                .proc_spawn => {
+                    // Reply PROC_SPAWN_RESULT on the request channel with a fixed
+                    // synthetic pid.
+                    self.saw_proc_spawn.store(true, .monotonic);
+                    try self.ctrl.sendJson(.proc_spawn_result, frame.channel, protocol.ProcSpawnResult{
+                        .ok = true,
+                        .pid = self.spawn_pid,
+                        .@"error" = null,
                     });
                 },
                 else => {},
@@ -3555,6 +3699,45 @@ test "requestProcSnapshot: owned deep copy round-trips and frees clean" {
     try testing.expectEqualStrings("ghoztty-agent", snap.procs[1].name);
     try testing.expectEqual(@as(f32, 12.5), snap.procs[1].cpu_pct);
     try testing.expectEqualStrings("ghoztty-agent --listen", snap.procs[1].cmd.?);
+    try testing.expect(a.err == null);
+}
+
+test "killProc: round-trips ok and surfaces the agent error string" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    try h.start();
+
+    // A normal pid: ok=true, no error.
+    var ok = try h.conn.killProc(4242, "TERM", 2 * std.time.ns_per_s);
+    defer ok.deinit();
+    try testing.expect(a.saw_proc_kill.load(.monotonic));
+    try testing.expectEqual(@as(i64, 4242), ok.pid);
+    try testing.expect(ok.ok);
+    try testing.expect(ok.error_msg == null);
+
+    // The sentinel "fail" pid: ok=false with an owned error string.
+    var bad = try h.conn.killProc(a.kill_fail_pid, null, 2 * std.time.ns_per_s);
+    defer bad.deinit();
+    try testing.expect(!bad.ok);
+    try testing.expectEqualStrings("no such process", bad.error_msg.?);
+    try testing.expect(a.err == null);
+}
+
+test "spawnProc: round-trips ok with the agent-reported pid" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    try h.start();
+
+    var out = try h.conn.spawnProc("sleep 1", "/tmp", 2 * std.time.ns_per_s);
+    defer out.deinit();
+    try testing.expect(a.saw_proc_spawn.load(.monotonic));
+    try testing.expect(out.ok);
+    try testing.expectEqual(@as(i64, 99001), out.pid.?);
+    try testing.expect(out.error_msg == null);
     try testing.expect(a.err == null);
 }
 

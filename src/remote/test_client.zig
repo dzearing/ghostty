@@ -59,6 +59,7 @@ pub fn main() !void {
     defer if (opts.query_cwd_dir) |c| alloc.free(c);
     defer if (opts.open_command) |c| alloc.free(c);
     defer if (opts.open_cwd) |c| alloc.free(c);
+    defer if (opts.spawn) |c| alloc.free(c);
 
     const encoding = encodingFromEnv(alloc);
 
@@ -92,6 +93,17 @@ pub fn main() !void {
     // snapshot, print the top N rows, and exit.
     if (opts.ps) {
         try runPs(dialed.conn, opts.ps_count);
+        return;
+    }
+
+    // `--spawn="<cmd>"` and `--kill=<pid>` are machine-wide process control (inc
+    // 4+5) and need no session OPEN: drive the one-shot RPC and print the result.
+    if (opts.spawn) |cmd| {
+        try runSpawn(dialed.conn, cmd);
+        return;
+    }
+    if (opts.kill) |pid| {
+        try runKill(dialed.conn, pid);
         return;
     }
 
@@ -245,6 +257,56 @@ fn runPs(conn: *connection.Connection, count: u32) !void {
             p.mem_bytes / (1024 * 1024),
             p.name,
         });
+    }
+}
+
+// -----------------------------------------------------------------------------
+// --spawn / --kill: drive the inc-4/inc-5 process-control RPCs headlessly
+// -----------------------------------------------------------------------------
+
+/// `--spawn="<cmd>"`: ask the agent to launch `<cmd>` detached via its platform
+/// shell, then print the spawned pid to stdout (clean for the orchestrator to
+/// capture) and a diag line. Drives `Connection.spawnProc` end-to-end against the
+/// live agent (e.g. spawn calc.exe on the Windows box).
+fn runSpawn(conn: *connection.Connection, cmd: []const u8) !void {
+    diag("spawn: launching '{s}' on the remote (detached)...\n", .{cmd});
+    var out = conn.spawnProc(cmd, null, 5 * std.time.ns_per_s) catch |err| {
+        diag("spawn: FAILED err={s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer out.deinit();
+    if (!out.ok) {
+        diag("spawn: agent reported failure: {s}\n", .{out.error_msg orelse "(no detail)"});
+        std.process.exit(1);
+    }
+    const pid = out.pid orelse {
+        diag("spawn: ok but no pid returned\n", .{});
+        std.process.exit(1);
+    };
+    diag("spawn: OK — pid={d}\n", .{pid});
+    // stdout carries ONLY the pid (so `--spawn` output can be captured directly).
+    const stdout = std.fs.File.stdout();
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}\n", .{pid}) catch return;
+    stdout.writeAll(s) catch {};
+}
+
+/// `--kill=<pid>`: ask the agent to terminate `<pid>` (default TERM). Prints the
+/// ok/error result. Drives `Connection.killProc` end-to-end.
+fn runKill(conn: *connection.Connection, pid: i64) !void {
+    diag("kill: terminating pid={d} on the remote...\n", .{pid});
+    var out = conn.killProc(pid, null, 5 * std.time.ns_per_s) catch |err| {
+        diag("kill: FAILED err={s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer out.deinit();
+    if (out.ok) {
+        diag("kill: OK — pid={d} terminated\n", .{out.pid});
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll("ok\n") catch {};
+    } else {
+        diag("kill: agent reported failure: {s}\n", .{out.error_msg orelse "(no detail)"});
+        std.process.exit(1);
     }
 }
 
@@ -834,6 +896,12 @@ const Opts = struct {
     /// live (Windows) agent.
     ps: bool = false,
     ps_count: u32 = 20,
+    /// `--spawn="<cmd>"`: ask the agent to launch <cmd> detached, print the pid.
+    /// Machine-wide — needs no session OPEN. Drives the inc-5 process-spawn path.
+    spawn: ?[]u8 = null,
+    /// `--kill=<pid>`: ask the agent to terminate <pid> (default TERM). Drives the
+    /// inc-4 process-kill path.
+    kill: ?i64 = null,
 };
 
 fn parseArgs(alloc: Allocator) !Opts {
@@ -876,6 +944,10 @@ fn parseArgs(alloc: Allocator) !Opts {
         } else if (std.mem.startsWith(u8, a, "--ps=")) {
             opts.ps = true;
             opts.ps_count = std.fmt.parseInt(u32, a["--ps=".len..], 10) catch return error.Usage;
+        } else if (std.mem.startsWith(u8, a, "--spawn=")) {
+            opts.spawn = try alloc.dupe(u8, a["--spawn=".len..]);
+        } else if (std.mem.startsWith(u8, a, "--kill=")) {
+            opts.kill = std.fmt.parseInt(i64, a["--kill=".len..], 10) catch return error.Usage;
         } else {
             return error.Usage;
         }
@@ -891,6 +963,8 @@ fn usage() void {
         \\  remote-test-client <host> <port> --open-command=<cmd>  run <cmd> via the OPEN payload (GUI inherit path)
         \\  remote-test-client <host> <port> --metrics[=N]        print the first N host-metrics pushes (default 3)
         \\  remote-test-client <host> <port> --ps[=N]             print a process snapshot, top N rows (default 20)
+        \\  remote-test-client <host> <port> --spawn="<cmd>"      spawn <cmd> detached on the remote; print the pid
+        \\  remote-test-client <host> <port> --kill=<pid>         terminate <pid> on the remote (default TERM)
         \\  remote-test-client <host> <port> --catchup-demo       close-laptop catch-up demo (PASS/FAIL)
         \\
     , .{});

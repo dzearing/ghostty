@@ -1347,6 +1347,59 @@ test "PROC_SNAPSHOT/Proc JSON round-trips (incl. null cmd/user elision)" {
     try testing.expectEqual(@as(u32, 8), sp.value.host.ncpu);
 }
 
+test "PROC_KILL / PROC_SPAWN JSON payloads round-trip (incl. null elision)" {
+    const alloc = testing.allocator;
+
+    // PROC_KILL with an explicit signal, and the result with an error.
+    const kill: ProcKill = .{ .pid = 1234, .signal = "KILL" };
+    const kj = try encodeJson(alloc, kill);
+    defer alloc.free(kj);
+    var kp = try parseJson(ProcKill, alloc, kj);
+    defer kp.deinit();
+    try testing.expectEqual(@as(i64, 1234), kp.value.pid);
+    try testing.expectEqualStrings("KILL", kp.value.signal.?);
+
+    // PROC_KILL with no signal: the field is elided (null default at the agent).
+    const kill2: ProcKill = .{ .pid = 5 };
+    const kj2 = try encodeJson(alloc, kill2);
+    defer alloc.free(kj2);
+    try testing.expect(std.mem.indexOf(u8, kj2, "signal") == null);
+
+    const kres: ProcKillResult = .{ .pid = 1234, .ok = false, .@"error" = "permission denied" };
+    const krj = try encodeJson(alloc, kres);
+    defer alloc.free(krj);
+    var krp = try parseJson(ProcKillResult, alloc, krj);
+    defer krp.deinit();
+    try testing.expectEqual(@as(i64, 1234), krp.value.pid);
+    try testing.expect(!krp.value.ok);
+    try testing.expectEqualStrings("permission denied", krp.value.@"error".?);
+
+    // A success result elides the error field.
+    const kok: ProcKillResult = .{ .pid = 7, .ok = true };
+    const koj = try encodeJson(alloc, kok);
+    defer alloc.free(koj);
+    try testing.expect(std.mem.indexOf(u8, koj, "error") == null);
+
+    // PROC_SPAWN with a cwd; the result carries a pid.
+    const spawn: ProcSpawn = .{ .cmd = "calc.exe", .cwd = "C:\\Users" };
+    const sj = try encodeJson(alloc, spawn);
+    defer alloc.free(sj);
+    var sp = try parseJson(ProcSpawn, alloc, sj);
+    defer sp.deinit();
+    try testing.expectEqualStrings("calc.exe", sp.value.cmd);
+    try testing.expectEqualStrings("C:\\Users", sp.value.cwd.?);
+    try testing.expect(sp.value.detached); // default true
+
+    const sres: ProcSpawnResult = .{ .ok = true, .pid = 4242 };
+    const srj = try encodeJson(alloc, sres);
+    defer alloc.free(srj);
+    var srp = try parseJson(ProcSpawnResult, alloc, srj);
+    defer srp.deinit();
+    try testing.expect(srp.value.ok);
+    try testing.expectEqual(@as(i64, 4242), srp.value.pid.?);
+    try testing.expect(srp.value.@"error" == null);
+}
+
 test "JSON-RPC request/response envelope" {
     const alloc = testing.allocator;
 

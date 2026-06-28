@@ -1397,6 +1397,57 @@ GHOSTTY_API ghostty_proc_list_s ghostty_remote_connection_proc_list(
 GHOSTTY_API void ghostty_remote_connection_proc_list_free(
     ghostty_remote_connection_t, ghostty_proc_list_s);
 
+// Kill a process on the REMOTE host by pid (activity monitor process control).
+// SYNCHRONOUS: blocks on the RPC reply up to timeout_ms (0 => default 5s), so run
+// it OFF the main thread. signal is a NUL-terminated string; "" => the agent's
+// default terminate. On POSIX "TERM"/"KILL" select the signal; on Windows there
+// is NO real SIGTERM — both "TERM" and "KILL" map to TerminateProcess. Returns
+// true iff the agent reported success (false on no connection / error / timeout).
+GHOSTTY_API bool ghostty_remote_connection_proc_kill(
+    ghostty_remote_connection_t, int64_t pid, const char* signal,
+    uint32_t timeout_ms);
+
+// Spawn a DETACHED process on the REMOTE host (run through the remote platform
+// shell, no pty). SYNCHRONOUS: blocks on the RPC reply up to timeout_ms (0 =>
+// default 5s); run OFF the main thread. cwd is a NUL-terminated string; "" => the
+// agent's default cwd. Returns the spawned pid (> 0) or -1 on failure. On Windows
+// the "pid" is the integer value of the child's process HANDLE (matches the
+// process-list ids).
+GHOSTTY_API int64_t ghostty_remote_connection_proc_spawn(
+    ghostty_remote_connection_t, const char* cmd, const char* cwd,
+    uint32_t timeout_ms);
+
+// ---------------------------------------------------------------------------
+// LOCAL (in-process) activity-monitor provider — the "Local" machine in the
+// panel's switcher. These take NO connection handle: they sample / kill / spawn
+// IN THIS PROCESS using the same code the remote agent uses. Persistent local
+// samplers (guarded by an internal mutex) keep CPU% baselines across polls, so
+// the first ghostty_local_proc_list reads 0% CPU and later polls read real
+// deltas. All are SYNCHRONOUS; the proc-list is cheap (a local OS enumeration)
+// but should still be called off the main thread, consistent with the remote API.
+// ---------------------------------------------------------------------------
+
+// A one-shot snapshot of THIS machine's process table. Reuses the SAME
+// ghostty_proc_list_s struct as the remote path (host is filled from the local
+// metrics sampler). timeout_ms is accepted for symmetry but unused (no RPC). Free
+// with ghostty_local_proc_list_free (NOT the remote free — local lists carry no
+// connection handle).
+GHOSTTY_API ghostty_proc_list_s ghostty_local_proc_list(uint32_t timeout_ms);
+
+// Free a snapshot returned by ghostty_local_proc_list. Frees via the app/global
+// allocator (no handle). Always safe (an empty list frees nothing).
+GHOSTTY_API void ghostty_local_proc_list_free(ghostty_proc_list_s);
+
+// Kill a process on THIS machine by pid. signal is a NUL-terminated string; "" =>
+// default terminate ("TERM"). See the remote _proc_kill note on Windows TERM/KILL
+// semantics. Returns true iff the kill succeeded. In-process (no RPC).
+GHOSTTY_API bool ghostty_local_proc_kill(int64_t pid, const char* signal);
+
+// Spawn a DETACHED process on THIS machine (run through the local platform shell,
+// no pty). cwd is a NUL-terminated string; "" => the current working directory.
+// Returns the spawned pid (> 0) or -1 on failure. In-process (no RPC).
+GHOSTTY_API int64_t ghostty_local_proc_spawn(const char* cmd, const char* cwd);
+
 // The live remote agent session id for a surface, or an empty string (ptr ==
 // NULL) for a local surface or one whose remote pane is not yet resolved. Free
 // with ghostty_string_free.
