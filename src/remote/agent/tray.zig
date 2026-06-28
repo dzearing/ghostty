@@ -38,14 +38,18 @@ const session = @import("session.zig");
 /// Show the agent tray icon and run the Win32 message loop until the user picks
 /// Exit. BLOCKS the calling thread (must be the main thread — see the module doc).
 ///
-/// On non-Windows targets this is a no-op (returns immediately) so the caller can
-/// fall through to running the accept loop directly.
+/// On non-Windows targets this is a no-op (returns `false` immediately) so the
+/// caller can fall through to running the accept loop directly.
+///
+/// Returns `true` ONLY if the tray actually showed and the message loop ran to a
+/// user-chosen Exit. Returns `false` if any tray setup step failed — the caller
+/// MUST NOT exit the process on `false` (the daemon keeps serving headless).
 ///
 /// `store` is the daemon-scoped session store (snapshotted under its lock when the
 /// menu opens). `build_hash` is a short build identifier shown in the About line.
-pub fn run(store: *session.SessionStore, build_hash: []const u8) void {
-    if (builtin.os.tag != .windows) return;
-    win.run(store, build_hash);
+pub fn run(store: *session.SessionStore, build_hash: []const u8) bool {
+    if (builtin.os.tag != .windows) return false;
+    return win.run(store, build_hash);
 }
 
 // =============================================================================
@@ -205,14 +209,15 @@ const win = if (builtin.os.tag == .windows) struct {
     const tray_tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty Agent");
 
     /// Driver: register the class + hidden host window, add the tray icon, run the
-    /// message loop until Exit. Any setup failure here is fatal-to-the-tray-only;
-    /// `main.zig`'s caller falls back to the headless accept loop, so we just
-    /// return on failure (the daemon keeps serving).
-    fn run(store: *session.SessionStore, build_hash: []const u8) void {
+    /// message loop until Exit. Any setup failure here is fatal-to-the-tray-only:
+    /// we return `false` so `main.zig`'s caller keeps serving headless (the daemon
+    /// NEVER dies because the UI couldn't start). Returns `true` only after the
+    /// message loop ran to a user-chosen Exit.
+    fn run(store: *session.SessionStore, build_hash: []const u8) bool {
         g_store = store;
         g_build_hash = build_hash;
 
-        const hinst = GetModuleHandleW(null) orelse return;
+        const hinst = GetModuleHandleW(null) orelse return false;
 
         var wc: WNDCLASSEXW = .{
             .cbSize = @sizeOf(WNDCLASSEXW),
@@ -242,7 +247,7 @@ const win = if (builtin.os.tag == .windows) struct {
             null,
             hinst,
             null,
-        ) orelse return;
+        ) orelse return false;
 
         // Add the tray icon, wired to deliver mouse events as WM_TRAY.
         g_nid = .{
@@ -258,7 +263,7 @@ const win = if (builtin.os.tag == .windows) struct {
             // Couldn't place the icon — tear the window down and bail so the caller
             // falls back to headless serving.
             _ = DestroyWindow(hwnd);
-            return;
+            return false;
         }
 
         // Blocking message loop on this (main) thread. Returns when WM_QUIT is
@@ -272,6 +277,7 @@ const win = if (builtin.os.tag == .windows) struct {
             _ = DispatchMessageW(&msg);
         }
         // Loop exited (Exit chosen); the icon was already removed in onExit.
+        return true;
     }
 
     /// Copy a NUL-terminated UTF-16 literal into a fixed szTip buffer (truncating).

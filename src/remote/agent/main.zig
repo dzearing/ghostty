@@ -259,13 +259,19 @@ fn runListen(
             .listener = &listener,
         };
         if (std.Thread.spawn(.{}, acceptLoopThread, .{args})) |t| {
-            t.detach();
-            // Blocks until the user chooses Exit. On non-windows this is a no-op,
-            // but we're already gated on `.windows` here.
-            tray.run(&store, build_hash);
-            // Exit chosen: the accept loop thread + reaper are detached daemon
-            // threads; a clean process exit tears everything down.
-            std.process.exit(0);
+            // Hand the MAIN thread to the tray message loop. It returns TRUE only if
+            // the tray actually showed and the user picked Exit; FALSE if any tray
+            // setup step failed (RegisterClass / CreateWindow / Shell_NotifyIcon).
+            if (tray.run(&store, build_hash)) {
+                // User chose Exit: a clean process exit tears down the (still-running)
+                // accept loop + reaper daemon threads.
+                std.process.exit(0);
+            }
+            // Tray setup FAILED — never kill the daemon just because the UI couldn't
+            // start. The accept loop is the whole daemon and is already serving on
+            // the worker thread; park the main thread on it so the process lives on.
+            t.join();
+            return;
         } else |err| {
             // Couldn't spawn the worker thread — fall through to the main-thread
             // accept loop so the daemon still serves (no tray, but functional).
