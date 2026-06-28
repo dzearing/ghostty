@@ -117,7 +117,11 @@ struct MachineChooserView: View {
                     row(for: target)
                         .contentShape(Rectangle())
                         .tag(target)
-                        .onTapGesture(count: 2) { onSelect(target) }
+                        // Double-click opens. Use a SIMULTANEOUS gesture (not
+                        // `.onTapGesture`) so it rides alongside the List's native
+                        // single-click selection + hover instead of swallowing it —
+                        // `.onTapGesture` here breaks single-click select entirely.
+                        .simultaneousGesture(TapGesture(count: 2).onEnded { onSelect(target) })
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: false))
@@ -291,30 +295,26 @@ enum MachineChooser {
         window.isMovableByWindowBackground = true
         windowRef = window
 
-        // Center the panel over the anchor window (or the active screen). We
-        // size-to-fit first so the centering math uses the real frame.
-        window.layoutIfNeeded()
-        let panelSize = window.frame.size
-        if let anchor = anchorWindow {
-            let a = anchor.frame
-            let origin = NSPoint(
-                x: a.midX - panelSize.width / 2,
-                y: a.midY - panelSize.height / 2
-            )
-            window.setFrameOrigin(origin)
-        } else if let screen = NSScreen.main {
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+
+        // Center AFTER ordering front: only then has the SwiftUI hosting view laid
+        // out and driven the panel to its real size, so `window.frame.size` is
+        // correct (reading it before layout gave a stale height → off-center).
+        // Center on the SCREEN (the anchor window's screen, else the main screen)
+        // so the chooser lands in the middle of the display regardless of where
+        // the terminal window happens to sit.
+        let targetScreen = anchorWindow?.screen ?? NSScreen.main
+        if let screen = targetScreen {
             let v = screen.visibleFrame
-            let origin = NSPoint(
-                x: v.midX - panelSize.width / 2,
-                y: v.midY - panelSize.height / 2
-            )
-            window.setFrameOrigin(origin)
+            let size = window.frame.size
+            window.setFrameOrigin(NSPoint(
+                x: v.midX - size.width / 2,
+                y: v.midY - size.height / 2
+            ))
         } else {
             window.center()
         }
-
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
         // Begin probing remote machines for live metrics now that the picker is
         // on screen. Dials happen off the main thread; rows update as samples
         // arrive (or fall back to "Unreachable").
