@@ -57,6 +57,154 @@ const is_windows = builtin.os.tag == .windows;
 
 const log = std.log.scoped(.agent_pty);
 
+// =============================================================================
+// Windows kill-on-close Job Object — no orphaned PTY shells
+// =============================================================================
+//
+// The agent spawns a `cmd.exe` (+ `conhost.exe`) per remote session via ConPTY.
+// When the agent process is KILLED (the deploy watcher SIGKILLs the old agent to
+// hot-swap a new build, or any crash), those ConPTY children would be ORPHANED
+// and survive forever — piling up on the Windows box and exhausting resources.
+//
+// Fix: a process-global Windows Job Object owned by the agent, created with
+// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Every per-session PTY child is assigned
+// to it right after spawn. The agent holds the job handle for its entire life
+// and NEVER closes it — so when the agent process exits for ANY reason (SIGKILL,
+// crash, normal), the OS closes the handle, which (because no other handle is
+// open) TERMINATES every assigned child. No orphans.
+//
+// Lifetime correctness:
+//   - The job ties child lifetime to the AGENT process, NOT the client. A CLIENT
+//     disconnect does NOT kill the agent, so the job stays open and the remote
+//     shell SURVIVES for reconnect (§7.1). ✅
+//   - `proc_spawn` (Activity Monitor "New Process") children are spawned in
+//     `proc_spawn.zig` with `CREATE_BREAKAWAY_FROM_JOB` and are NEVER assigned to
+//     this job, so they intentionally OUTLIVE the agent. ✅
+//   - Nested jobs: Windows 8+ allows a process already in a job to be assigned to
+//     a nested job, so even if the agent itself is launched inside an outer job
+//     (e.g. a deploy harness's job), assigning the ConPTY child here still works.
+//     The PTY child is NOT spawned with `CREATE_BREAKAWAY_FROM_JOB`, so it remains
+//     assignable to our job.
+//
+// Failure handling: if `CreateJobObjectW` / `SetInformationJobObject` /
+// `AssignProcessToJobObject` fails (e.g. an OS/policy that forbids it), we LOG
+// and continue — the child just isn't job-managed (falls back to today's
+// behavior, no crash).
+
+/// Win32 Job Object surface that `std.os.windows` does not expose. Values are
+/// ABI-stable Win32 constants (winnt.h / jobapi2.h). Same `extern "kernel32"`
+/// pattern the codebase already uses for `CreateToolhelp32Snapshot` etc.
+const win_job = if (is_windows) struct {
+    const W = std.os.windows;
+    const DWORD = W.DWORD;
+    const HANDLE = W.HANDLE;
+    const BOOL = W.BOOL;
+    const LPCWSTR = W.LPCWSTR;
+    const ULONGLONG = u64;
+    const SIZE_T = usize;
+    const LARGE_INTEGER = i64;
+
+    /// Terminate all processes associated with the job when the LAST handle to
+    /// the job is closed (winnt.h: 0x00002000). Holding the handle for the agent
+    /// process lifetime makes "agent exits → job handle closes → children die".
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+
+    /// JobObjectExtendedLimitInformation (winnt.h JOBOBJECTINFOCLASS = 9).
+    const JobObjectExtendedLimitInformation: c_int = 9;
+
+    const IO_COUNTERS = extern struct {
+        ReadOperationCount: ULONGLONG = 0,
+        WriteOperationCount: ULONGLONG = 0,
+        OtherOperationCount: ULONGLONG = 0,
+        ReadTransferCount: ULONGLONG = 0,
+        WriteTransferCount: ULONGLONG = 0,
+        OtherTransferCount: ULONGLONG = 0,
+    };
+
+    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: LARGE_INTEGER = 0,
+        PerJobUserTimeLimit: LARGE_INTEGER = 0,
+        LimitFlags: DWORD = 0,
+        MinimumWorkingSetSize: SIZE_T = 0,
+        MaximumWorkingSetSize: SIZE_T = 0,
+        ActiveProcessLimit: DWORD = 0,
+        Affinity: usize = 0,
+        PriorityClass: DWORD = 0,
+        SchedulingClass: DWORD = 0,
+    };
+
+    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION = .{},
+        IoInfo: IO_COUNTERS = .{},
+        ProcessMemoryLimit: SIZE_T = 0,
+        JobMemoryLimit: SIZE_T = 0,
+        PeakProcessMemoryUsed: SIZE_T = 0,
+        PeakJobMemoryUsed: SIZE_T = 0,
+    };
+
+    extern "kernel32" fn CreateJobObjectW(
+        lpJobAttributes: ?*W.SECURITY_ATTRIBUTES,
+        lpName: ?LPCWSTR,
+    ) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetInformationJobObject(
+        hJob: HANDLE,
+        JobObjectInformationClass: c_int,
+        lpJobObjectInformation: *const anyopaque,
+        cbJobObjectInformationLength: DWORD,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn AssignProcessToJobObject(
+        hJob: HANDLE,
+        hProcess: HANDLE,
+    ) callconv(.winapi) BOOL;
+} else struct {};
+
+/// Process-global, lazily-initialized kill-on-close job handle. Created once on
+/// first PTY spawn and held for the agent's lifetime (NEVER closed — its closure
+/// on process exit is the whole mechanism). `null` once creation has failed (we
+/// don't retry; spawns then fall back to today's un-managed behavior).
+const PtyJob = if (is_windows) struct {
+    var once = std.once(init);
+    var handle: ?windows.HANDLE = null;
+
+    /// Build the job + set its kill-on-close limit. Runs exactly once.
+    fn init() void {
+        const h = win_job.CreateJobObjectW(null, null) orelse {
+            log.warn("CreateJobObjectW failed (gle={d}); PTY children will not be job-managed (may orphan)", .{@intFromEnum(windows.kernel32.GetLastError())});
+            return;
+        };
+        var info: win_job.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = .{};
+        info.BasicLimitInformation.LimitFlags = win_job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (win_job.SetInformationJobObject(
+            h,
+            win_job.JobObjectExtendedLimitInformation,
+            &info,
+            @sizeOf(win_job.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+        ) == 0) {
+            log.warn("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed (gle={d}); PTY children will not be job-managed (may orphan)", .{@intFromEnum(windows.kernel32.GetLastError())});
+            windows.CloseHandle(h);
+            return;
+        }
+        // Hold the handle for the process lifetime — do NOT close it.
+        handle = h;
+    }
+
+    /// Get the (lazily-created) job handle, or null if creation failed.
+    fn get() ?windows.HANDLE {
+        once.call();
+        return handle;
+    }
+
+    /// Assign a freshly-spawned PTY child to the kill-on-close job. Best-effort:
+    /// on failure we LOG and continue (the child just isn't job-managed). Called
+    /// ONLY for per-session PTY shells — never for `proc_spawn` detached procs.
+    fn assign(hProcess: windows.HANDLE) void {
+        const h = get() orelse return; // job unavailable: fall back, no crash
+        if (win_job.AssignProcessToJobObject(h, hProcess) == 0) {
+            log.warn("AssignProcessToJobObject failed (gle={d}); this PTY child may orphan if the agent is killed", .{@intFromEnum(windows.kernel32.GetLastError())});
+        }
+    }
+} else struct {};
+
 /// The GUI-free command type used to fork+exec the shell on the pty slave.
 const Command = CommandCore.DefaultCommand;
 
@@ -694,6 +842,13 @@ pub const PtySpawner = struct {
             };
             try pc.cmd.start(self.alloc);
             pc.pid = pc.cmd.pid.?;
+            // Tie this per-session PTY child (the `cmd.exe`/`conhost.exe` ConPTY
+            // subtree) to the agent's kill-on-close job so it dies WITH the agent
+            // instead of orphaning when the agent is killed/redeployed. The child
+            // was NOT spawned with CREATE_BREAKAWAY_FROM_JOB, so it is assignable
+            // even if the agent itself lives in an outer job (Windows 8+ nested
+            // jobs). proc_spawn's detached procs are excluded (they breakaway).
+            PtyJob.assign(pc.pid);
             return pc;
         }
 
