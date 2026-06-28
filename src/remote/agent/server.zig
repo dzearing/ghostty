@@ -814,27 +814,40 @@ pub const Server = struct {
         var parsed = protocol.parseJson(protocol.Resize, self.alloc, payload) catch return;
         defer parsed.deinit();
         const rz = parsed.value;
+        // Update dims + snapshot the child under the lock; do the (potentially
+        // blocking) ConPTY resize OUTSIDE it — never hold the global store lock
+        // across child I/O (see handleInboundData).
         self.store.mutex.lock();
-        defer self.store.mutex.unlock();
-        const s = self.store.table.getByChannel(channel) orelse return;
-        if (!s.alive) return;
-        s.rows = rz.rows;
-        s.cols = rz.cols;
-        s.px_w = rz.px_w;
-        s.px_h = rz.px_h;
-        s.child.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch {};
+        const child: ?session.Child = blk: {
+            const s = self.store.table.getByChannel(channel) orelse break :blk null;
+            if (!s.alive) break :blk null;
+            s.rows = rz.rows;
+            s.cols = rz.cols;
+            s.px_w = rz.px_w;
+            s.px_h = rz.px_h;
+            break :blk s.child;
+        };
+        self.store.mutex.unlock();
+        if (child) |c| c.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch {};
     }
 
     fn handleSignal(self: *Server, channel: u128, payload: []const u8) void {
         var parsed = protocol.parseJson(protocol.Signal, self.alloc, payload) catch return;
         defer parsed.deinit();
         const sig = parsed.value;
+        // Record the signal + snapshot the child under the lock; DELIVER it outside
+        // the lock. signal() writes to the child's input pipe (Ctrl-C → 0x03), the
+        // SAME blocking-WriteFile hazard as handleInboundData — never hold the global
+        // store lock across it.
         self.store.mutex.lock();
-        defer self.store.mutex.unlock();
-        const s = self.store.table.getByChannel(channel) orelse return;
-        if (!s.alive) return;
-        s.setSignal(sig.name) catch {};
-        s.child.signal(sig.name) catch {};
+        const child: ?session.Child = blk: {
+            const s = self.store.table.getByChannel(channel) orelse break :blk null;
+            if (!s.alive) break :blk null;
+            s.setSignal(sig.name) catch {};
+            break :blk s.child;
+        };
+        self.store.mutex.unlock();
+        if (child) |c| c.signal(sig.name) catch {};
     }
 
     fn handleDetach(self: *Server, channel: u128) void {
@@ -1107,13 +1120,25 @@ pub const Server = struct {
 
     fn handleInboundData(self: *Server, frame: protocol.Frame) void {
         const dp = protocol.DataPayload.decode(frame.payload) catch return;
+
+        // Snapshot the owning session's child handle under the lock, then write
+        // OUTSIDE it. `writeAll` is a blocking PTY/ConPTY input-pipe write that can
+        // stall INDEFINITELY when the pipe is back-pressured or the peer conhost has
+        // wedged. Holding the DAEMON-SCOPED `store.mutex` across it would wedge EVERY
+        // session on this agent — both input (other `handleInboundData`s) AND output
+        // (the child-output sink also takes `store.mutex`) — which is the remote-
+        // window "sits there not responding" bug. A `session.Child` is a value-copy
+        // vtable handle that stays valid until the child is `terminate`d, and CLOSE
+        // only terminates AFTER unlinking under this lock, so the worst case is the
+        // write failing gracefully, never a use-after-free of the table entry. (Same
+        // lock→snapshot→unlock→IO discipline as `handleGetCwd`.)
         self.store.mutex.lock();
-        defer self.store.mutex.unlock();
-        // Ownership check (§15 M3): the channel must belong to a session we own.
-        const s = self.store.table.getByChannel(frame.channel) orelse return;
-        if (!s.alive) return;
-        // Write keystrokes to the child. A short/failed write is non-fatal here.
-        s.child.writeAll(dp.bytes) catch {};
+        const s = self.store.table.getByChannel(frame.channel);
+        const child: ?session.Child = if (s) |sess| (if (sess.alive) sess.child else null) else null;
+        self.store.mutex.unlock();
+
+        // A short/failed write is non-fatal here.
+        if (child) |c| c.writeAll(dp.bytes) catch {};
     }
 };
 
@@ -1251,6 +1276,13 @@ const FakeChild = struct {
     /// When set, `queryCwd` returns a copy of this (models the OS cwd read). When
     /// null the vtable's `queryCwd` is still wired but returns null (query failed).
     fake_cwd: ?[]const u8 = null,
+    /// Optional write gate (wedge test): when both are set, `write` signals
+    /// `gate_entered` and then BLOCKS on `gate_release` before sinking the bytes —
+    /// modeling a stalled ConPTY input pipe whose `WriteFile` never returns. Lets a
+    /// test observe whether the agent holds the global store lock across a blocked
+    /// child write. Null in every other test (no behavior change).
+    gate_entered: ?*std.Thread.ResetEvent = null,
+    gate_release: ?*std.Thread.ResetEvent = null,
     mutex: std.Thread.Mutex = .{},
     alloc: Allocator,
 
@@ -1272,6 +1304,10 @@ const FakeChild = struct {
     }
     fn wr(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        // Optional wedge gate: announce we're inside the write, then block until
+        // the test releases us (models a stalled ConPTY input pipe).
+        if (self.gate_entered) |e| e.set();
+        if (self.gate_release) |r| r.wait();
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.input.appendSlice(self.alloc, bytes);
@@ -1567,6 +1603,53 @@ test "GET_CWD→CWD: agent replies with the child's queried cwd on the request c
     try testing.expect(parsed.value.path != null);
     try testing.expectEqualStrings("/private/tmp", parsed.value.path.?);
     try testing.expectEqualStrings(opened.id[0..], parsed.value.session_id);
+}
+
+test "WEDGE: a session's blocking child write must NOT hold the global store lock" {
+    // Reproduction + regression guard for the agent WEDGE. handleInboundData used
+    // to call child.writeAll() WHILE HOLDING the daemon-scoped store.mutex. On
+    // Windows a stalled ConPTY input pipe makes that WriteFile block indefinitely,
+    // so the GLOBAL store lock is held indefinitely and EVERY other session wedges
+    // — input (handleInboundData) AND output (the child-output sink also takes
+    // store.mutex). Symptom: a remote window "sits there not responding", `exit`
+    // never reaches the shell. The fix snapshots the child handle under the lock,
+    // releases the lock, THEN writes (same pattern as handleGetCwd). This test
+    // asserts the store lock is ACQUIRABLE while one session's child write blocks.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var gate_entered: std.Thread.ResetEvent = .{};
+    var gate_release: std.Thread.ResetEvent = .{};
+    var fc: FakeChild = .{
+        .alloc = alloc,
+        .gate_entered = &gate_entered,
+        .gate_release = &gate_release,
+    };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(99);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit(); // runs LAST: joins the data thread (released below first)
+    defer gate_release.set(); // runs BEFORE deinit so the blocked write can finish
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const opened = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // Send keystrokes: the agent's data thread enters child.writeAll and BLOCKS
+    // there (gate held), modeling a stalled input pipe.
+    try h.client.sendDataInput(opened.channel, 0, "exit\r");
+    gate_entered.wait(); // the data thread is now inside the blocking write
+
+    // THE ASSERTION: with that write in flight, the global store lock must be FREE.
+    // Pre-fix the data thread holds store.mutex for the whole blocked write, so a
+    // concurrent session (or the output sink) can never make progress → tryLock
+    // returns false → wedge. Post-fix the lock was released before the write.
+    const acquired = h.store.mutex.tryLock();
+    if (acquired) h.store.mutex.unlock();
+    try testing.expect(acquired);
 }
 
 test "GET_CWD→CWD: unknown session replies ok=false (graceful, no crash)" {
