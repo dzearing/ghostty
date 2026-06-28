@@ -1346,13 +1346,17 @@ struct MachineCard: View {
                         lineWidth: isSelected ? 2 : 1
                     )
             )
-            // A distinct focus ring drawn OUTSIDE the card border, so keyboard
-            // focus (arrowed-to, not yet committed) reads differently from the
-            // active accent highlight.
+            // A distinct focus ring drawn OUTSIDE the card border for keyboard
+            // focus (arrowed-to, not yet committed). Only shown when the focused
+            // card is NOT the active one — otherwise the active card's own accent
+            // border + this ring stack into a double border.
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
                     .inset(by: -2.5)
-                    .strokeBorder(Color.accentColor.opacity(isFocused ? 0.9 : 0), lineWidth: 2)
+                    .strokeBorder(
+                        Color.accentColor.opacity(isFocused && !isSelected ? 0.9 : 0),
+                        lineWidth: 2
+                    )
             )
             .contentShape(RoundedRectangle(cornerRadius: 8))
         }
