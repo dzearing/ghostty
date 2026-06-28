@@ -29,7 +29,22 @@ struct MachineChooserView: View {
     /// Index into `targets` of the highlighted row. Bound to `List(selection:)`
     /// so the native selection highlight + focus ring track the keyboard.
     @State private var selectedIndex: Int = 0
+    /// Index of the row currently under the pointer (for hover feedback).
+    @State private var hoveredIndex: Int?
     @FocusState private var isFilterFocused: Bool
+
+    /// The background for row `idx`: accent when selected, a faint wash on hover,
+    /// else clear. Drives the manual selection/hover highlight.
+    @ViewBuilder
+    private func rowHighlight(_ idx: Int) -> some View {
+        if selectedIndex == idx {
+            Color.accentColor.opacity(0.25)
+        } else if hoveredIndex == idx {
+            Color.primary.opacity(0.06)
+        } else {
+            Color.clear
+        }
+    }
 
     /// Filtered remote machines based on the search query.
     private var filteredMachines: [Machine] {
@@ -105,26 +120,54 @@ struct MachineChooserView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 8)
 
-            List(selection: Binding(
-                get: { resolvedSelection },
-                set: { newValue in
-                    if let newValue, let idx = targets.firstIndex(of: newValue) {
-                        selectedIndex = idx
+            // Rows are a ScrollView+VStack, NOT a `List`: a SwiftUI List swallows
+            // row taps for its own selection machinery, so `.onTapGesture` there
+            // never fired (single-click select was dead; only the explicit
+            // double-click gesture worked). In a plain VStack the tap reliably
+            // fires. Selection is driven manually off `selectedIndex`; a single tap
+            // selects, a double tap opens, `.onHover` gives feedback.
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(Array(targets.enumerated()), id: \.element) { idx, target in
+                        HStack(spacing: 0) {
+                            // The main row area is a Button so a single click
+                            // reliably SELECTS (a SwiftUI `.onTapGesture` here did
+                            // not respond to clicks; a Button action does). A double
+                            // click opens via a simultaneous gesture.
+                            Button {
+                                selectedIndex = idx
+                            } label: {
+                                row(for: target)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .simultaneousGesture(TapGesture(count: 2).onEnded { onSelect(target) })
+
+                            // Secondary affordance (remote only): open the Activity
+                            // Monitor. A SIBLING button so it doesn't nest inside the
+                            // selection button.
+                            if case .remote(let machine) = target {
+                                Button {
+                                    onActivityMonitor(machine)
+                                } label: {
+                                    Image(systemName: "chart.bar.xaxis")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Open Activity Monitor for \(machine.name)")
+                                .padding(.trailing, 6)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(rowHighlight(idx))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .onHover { hovering in hoveredIndex = hovering ? idx : nil }
                     }
                 }
-            )) {
-                ForEach(Array(targets.enumerated()), id: \.element) { _, target in
-                    row(for: target)
-                        .contentShape(Rectangle())
-                        .tag(target)
-                        // Double-click opens. Use a SIMULTANEOUS gesture (not
-                        // `.onTapGesture`) so it rides alongside the List's native
-                        // single-click selection + hover instead of swallowing it —
-                        // `.onTapGesture` here breaks single-click select entirely.
-                        .simultaneousGesture(TapGesture(count: 2).onEnded { onSelect(target) })
-                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
             }
-            .listStyle(.inset(alternatesRowBackgrounds: false))
             .frame(minHeight: 180)
 
             HStack {
@@ -178,15 +221,9 @@ struct MachineChooserView: View {
                     metricsSubline(for: machine)
                 }
                 Spacer()
-                // Secondary affordance: open the Activity Monitor for this machine
-                // (dials a fresh connection). Selecting the row still opens a window.
-                Button {
-                    onActivityMonitor(machine)
-                } label: {
-                    Image(systemName: "chart.bar.xaxis")
-                }
-                .buttonStyle(.borderless)
-                .help("Open Activity Monitor for \(machine.name)")
+                // (The Activity-Monitor chart affordance is rendered as a sibling
+                // button in the row wrapper, NOT here, so it doesn't nest inside the
+                // row's selection button.)
             }
         }
     }
@@ -295,17 +332,17 @@ enum MachineChooser {
         window.isMovableByWindowBackground = true
         windowRef = window
 
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        // Size the window to the SwiftUI content's natural size BEFORE centering.
+        // The view fixes its width at 440; force a layout so `fittingSize` returns
+        // the real height, then set the content size. Without this, the panel's
+        // frame size is still its default at center time (width ≈ 0 → the left edge
+        // lands at the screen midpoint, so it appears shoved to the right).
+        hosting.view.layoutSubtreeIfNeeded()
+        window.setContentSize(hosting.view.fittingSize)
 
-        // Center AFTER ordering front: only then has the SwiftUI hosting view laid
-        // out and driven the panel to its real size, so `window.frame.size` is
-        // correct (reading it before layout gave a stale height → off-center).
-        // Center on the SCREEN (the anchor window's screen, else the main screen)
-        // so the chooser lands in the middle of the display regardless of where
-        // the terminal window happens to sit.
-        let targetScreen = anchorWindow?.screen ?? NSScreen.main
-        if let screen = targetScreen {
+        // Center on the SCREEN (anchor window's screen, else main) so the chooser
+        // lands in the middle of the display regardless of the terminal's position.
+        if let screen = anchorWindow?.screen ?? NSScreen.main {
             let v = screen.visibleFrame
             let size = window.frame.size
             window.setFrameOrigin(NSPoint(
@@ -315,6 +352,9 @@ enum MachineChooser {
         } else {
             window.center()
         }
+
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
         // Begin probing remote machines for live metrics now that the picker is
         // on screen. Dials happen off the main thread; rows update as samples
         // arrive (or fall back to "Unreachable").
