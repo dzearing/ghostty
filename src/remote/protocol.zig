@@ -96,6 +96,18 @@ pub const FrameType = enum(u8) {
     pong = 0x51, // both heartbeat reply (carries timestamp_reply)
 
     flow = 0x60, // both {channel, op, n}
+
+    // Remote machine activity monitor (host metrics + process control). Pushed on
+    // the control channel; metrics is a server→client stream gated by a sub/unsub.
+    proc_list = 0x70, // C→A  {sort?, limit?}
+    proc_snapshot = 0x71, // A→C  {ok, host, procs, truncated}
+    metrics_sub = 0x72, // C→A  {interval_ms}
+    metrics = 0x73, // A→C  {host}  (pushed every interval until unsub)
+    metrics_unsub = 0x74, // C→A  {}
+    proc_kill = 0x75, // C→A  {pid, signal?}
+    proc_kill_result = 0x76, // A→C  {pid, ok, error?}
+    proc_spawn = 0x77, // C→A  {cmd, cwd?, detached?}
+    proc_spawn_result = 0x78, // A→C  {ok, pid?, error?}
 };
 
 // -----------------------------------------------------------------------------
@@ -493,6 +505,103 @@ pub const Tunnel = struct {
 
     pub const Op = enum { add, start, stop, remove };
     pub const Type = enum { L, R, D };
+};
+
+// -----------------------------------------------------------------------------
+// Remote machine activity monitor (§9.3 host/proc view) — JSON payloads
+// -----------------------------------------------------------------------------
+//
+// The agent samples machine-wide host metrics and (later increments) the process
+// table; the client renders an activity monitor. These ride the control channel.
+// `metrics` is a server-push stream: the client subscribes (`metrics_sub`), the
+// agent pushes a `metrics` frame every `interval_ms` until `metrics_unsub`.
+
+/// Machine-wide host resource snapshot. Scalars only (no allocation), so a sampler
+/// can return one by value. `cpu_pct` is the busy fraction since the previous
+/// sample (0 on the first). `uptime_s`/`load1` are null where the OS has no cheap
+/// equivalent (e.g. Windows has no load average).
+pub const HostMetrics = struct {
+    /// Busy CPU percentage 0..100 across all cores since the previous sample.
+    cpu_pct: f32 = 0,
+    /// Used physical memory in bytes.
+    mem_used: u64 = 0,
+    /// Total physical memory in bytes.
+    mem_total: u64 = 0,
+    /// Logical CPU count.
+    ncpu: u32 = 0,
+    /// Seconds since boot, if available.
+    uptime_s: ?u64 = null,
+    /// 1-minute load average, if the OS exposes one (POSIX only).
+    load1: ?f32 = null,
+};
+
+/// One process-table row (later increments populate the table). Strings borrow the
+/// agent's snapshot buffer until encoded; null `user`/`cmd` ⇒ unavailable.
+pub const Proc = struct {
+    pid: i64,
+    ppid: i64 = 0,
+    name: []const u8,
+    cpu_pct: f32 = 0,
+    mem_bytes: u64 = 0,
+    user: ?[]const u8 = null,
+    cmd: ?[]const u8 = null,
+};
+
+/// `PROC_LIST` (0x70). Request the process table; `sort`/`limit` shape the reply.
+pub const ProcList = struct {
+    sort: ?[]const u8 = null,
+    limit: ?u32 = null,
+};
+
+/// `PROC_SNAPSHOT` (0x71). Reply to `PROC_LIST`: host metrics + a process slice.
+/// `truncated` is set when `limit` clipped the table.
+pub const ProcSnapshot = struct {
+    ok: bool = false,
+    host: HostMetrics = .{},
+    procs: []const Proc = &.{},
+    truncated: bool = false,
+};
+
+/// `METRICS_SUB` (0x72). Subscribe to the pushed host-metrics stream.
+pub const MetricsSub = struct {
+    interval_ms: u32 = 1000,
+};
+
+/// `METRICS` (0x73). One pushed host-metrics sample (control channel).
+pub const Metrics = struct {
+    host: HostMetrics = .{},
+};
+
+/// `METRICS_UNSUB` (0x74). Stop the pushed metrics stream. No fields.
+pub const MetricsUnsub = struct {};
+
+/// `PROC_KILL` (0x75). Signal/kill a process by pid. `signal` defaults (agent-side)
+/// to a terminate when null.
+pub const ProcKill = struct {
+    pid: i64,
+    signal: ?[]const u8 = null,
+};
+
+/// `PROC_KILL_RESULT` (0x76). Reply to `PROC_KILL`.
+pub const ProcKillResult = struct {
+    pid: i64,
+    ok: bool = false,
+    @"error": ?[]const u8 = null,
+};
+
+/// `PROC_SPAWN` (0x77). Launch a process on the remote host. `detached` ⇒ not tied
+/// to a session's child lifetime.
+pub const ProcSpawn = struct {
+    cmd: []const u8,
+    cwd: ?[]const u8 = null,
+    detached: bool = true,
+};
+
+/// `PROC_SPAWN_RESULT` (0x78). Reply to `PROC_SPAWN`.
+pub const ProcSpawnResult = struct {
+    ok: bool = false,
+    pid: ?i64 = null,
+    @"error": ?[]const u8 = null,
 };
 
 /// Encode any of the JSON payload structs above to a byte slice owned by `alloc`.
@@ -893,6 +1002,15 @@ fn sampleFrames(alloc: Allocator) ![]Frame {
     try list.append(alloc, .{ .type = .ping, .channel = control_channel, .seq = 16, .payload = "" });
     try list.append(alloc, .{ .type = .pong, .channel = control_channel, .seq = 17, .payload = "" });
     try list.append(alloc, .{ .type = .flow, .channel = control_channel, .seq = 18, .payload = fl_buf });
+    try list.append(alloc, .{ .type = .proc_list, .channel = control_channel, .seq = 19, .payload = "{}" });
+    try list.append(alloc, .{ .type = .proc_snapshot, .channel = control_channel, .seq = 20, .payload = "{}" });
+    try list.append(alloc, .{ .type = .metrics_sub, .channel = control_channel, .seq = 21, .payload = "{}" });
+    try list.append(alloc, .{ .type = .metrics, .channel = control_channel, .seq = 22, .payload = "{}" });
+    try list.append(alloc, .{ .type = .metrics_unsub, .channel = control_channel, .seq = 23, .payload = "{}" });
+    try list.append(alloc, .{ .type = .proc_kill, .channel = control_channel, .seq = 24, .payload = "{}" });
+    try list.append(alloc, .{ .type = .proc_kill_result, .channel = control_channel, .seq = 25, .payload = "{}" });
+    try list.append(alloc, .{ .type = .proc_spawn, .channel = control_channel, .seq = 26, .payload = "{}" });
+    try list.append(alloc, .{ .type = .proc_spawn_result, .channel = control_channel, .seq = 27, .payload = "{}" });
 
     return list.toOwnedSlice(alloc);
 }
@@ -1161,6 +1279,72 @@ test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     defer ap.deinit();
     try testing.expectEqual(Attached.AttachStatus.alive, ap.value.status);
     try testing.expectEqual(@as(u64, 42), ap.value.snapshot_at_offset);
+}
+
+test "METRICS/HostMetrics JSON round-trips with null optional elision" {
+    const alloc = testing.allocator;
+
+    // A POSIX-shaped sample carries uptime + load1; a Windows-shaped one leaves
+    // both null. Encode the latter and confirm the null optionals are elided.
+    const m: Metrics = .{ .host = .{
+        .cpu_pct = 12.5,
+        .mem_used = 8 * 1024 * 1024 * 1024,
+        .mem_total = 16 * 1024 * 1024 * 1024,
+        .ncpu = 10,
+    } };
+    const mj = try encodeJson(alloc, m);
+    defer alloc.free(mj);
+    try testing.expect(std.mem.indexOf(u8, mj, "uptime_s") == null); // null elided
+    try testing.expect(std.mem.indexOf(u8, mj, "load1") == null);
+
+    var mp = try parseJson(Metrics, alloc, mj);
+    defer mp.deinit();
+    try testing.expectEqual(@as(f32, 12.5), mp.value.host.cpu_pct);
+    try testing.expectEqual(@as(u32, 10), mp.value.host.ncpu);
+    try testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), mp.value.host.mem_total);
+    try testing.expect(mp.value.host.uptime_s == null);
+    try testing.expect(mp.value.host.load1 == null);
+
+    // With the POSIX optionals present they round-trip as set.
+    const m2: Metrics = .{ .host = .{ .ncpu = 4, .uptime_s = 3600, .load1 = 0.75 } };
+    const mj2 = try encodeJson(alloc, m2);
+    defer alloc.free(mj2);
+    var mp2 = try parseJson(Metrics, alloc, mj2);
+    defer mp2.deinit();
+    try testing.expectEqual(@as(u64, 3600), mp2.value.host.uptime_s.?);
+    try testing.expectEqual(@as(f32, 0.75), mp2.value.host.load1.?);
+}
+
+test "PROC_SNAPSHOT/Proc JSON round-trips (incl. null cmd/user elision)" {
+    const alloc = testing.allocator;
+
+    const procs = [_]Proc{
+        .{ .pid = 1, .ppid = 0, .name = "init", .cpu_pct = 0.0, .mem_bytes = 4096 },
+        .{ .pid = 4321, .ppid = 1, .name = "zsh", .cpu_pct = 3.5, .mem_bytes = 2_000_000, .user = "alice", .cmd = "-zsh" },
+    };
+    const snap: ProcSnapshot = .{
+        .ok = true,
+        .host = .{ .ncpu = 8, .mem_total = 1024 },
+        .procs = &procs,
+        .truncated = false,
+    };
+    const sj = try encodeJson(alloc, snap);
+    defer alloc.free(sj);
+    // The first proc's null user/cmd are elided; the second's are present.
+    try testing.expect(std.mem.indexOf(u8, sj, "\"alice\"") != null);
+    try testing.expect(std.mem.indexOf(u8, sj, "\"-zsh\"") != null);
+
+    var sp = try parseJson(ProcSnapshot, alloc, sj);
+    defer sp.deinit();
+    try testing.expect(sp.value.ok);
+    try testing.expectEqual(@as(usize, 2), sp.value.procs.len);
+    try testing.expectEqual(@as(i64, 1), sp.value.procs[0].pid);
+    try testing.expectEqualStrings("init", sp.value.procs[0].name);
+    try testing.expect(sp.value.procs[0].user == null);
+    try testing.expect(sp.value.procs[0].cmd == null);
+    try testing.expectEqualStrings("alice", sp.value.procs[1].user.?);
+    try testing.expectEqualStrings("-zsh", sp.value.procs[1].cmd.?);
+    try testing.expectEqual(@as(u32, 8), sp.value.host.ncpu);
 }
 
 test "JSON-RPC request/response envelope" {

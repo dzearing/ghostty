@@ -59,6 +59,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
+const metrics = @import("metrics.zig");
 
 /// Scratch read buffer per reader thread's blocking `Stream.read`.
 const read_buf_size = 64 * 1024;
@@ -218,6 +219,18 @@ pub const Server = struct {
     control_thread: ?std.Thread = null,
     data_thread: ?std.Thread = null,
 
+    /// Host-metrics push pump (§9.3). A per-connection thread, lazily spawned on the
+    /// first `metrics_sub` and torn down on `metrics_unsub` or shutdown. It samples
+    /// the host every `metrics_interval_ms` and pushes a `metrics` frame on the
+    /// control channel. Its own mutex/cond gate a timed wait so a stop request wakes
+    /// it promptly (rather than sleeping out the full interval). MUST NOT outlive the
+    /// Server — joined in `shutdown()`, asserted null in `destroy()` (UAF discipline).
+    metrics_thread: ?std.Thread = null,
+    metrics_mutex: std.Thread.Mutex = .{},
+    metrics_cond: std.Thread.Condition = .{},
+    metrics_interval_ms: u32 = 0, // 0 ⇒ unsubscribed
+    metrics_stop: bool = false,
+
     /// Per-session ring size (from Options), read by `create`'s table inserts.
     ring_bytes: usize = session.default_ring_bytes,
 
@@ -318,6 +331,11 @@ pub const Server = struct {
     /// could never make progress and the join would hang, wedging the accept loop.
     pub fn shutdown(self: *Server) void {
         self.detachAll();
+        // Stop + join the metrics pump BEFORE the streams close path completes: it
+        // is a per-connection thread that frames onto our writer, so it must never
+        // outlive the Server (the just-fixed UAF class). Signalling stop wakes its
+        // timed cond wait immediately rather than waiting out the interval.
+        self.stopMetricsPump();
         self.signalClose();
         self.control.close();
         self.data.close();
@@ -360,6 +378,7 @@ pub const Server = struct {
     /// outlives this Server — `destroy` never touches the table.
     pub fn destroy(self: *Server, alloc: Allocator) void {
         assert(self.control_thread == null and self.data_thread == null and self.writer_thread == null);
+        assert(self.metrics_thread == null);
         self.bound_channels.deinit(self.alloc);
         for (self.write_queue.items) |f| self.alloc.free(f.payload);
         self.write_queue.deinit(self.alloc);
@@ -599,8 +618,10 @@ pub const Server = struct {
             .get_cwd => self.handleGetCwd(frame.channel, frame.payload),
             .ping => self.handlePing(frame.payload),
             .flow => self.handleFlow(frame.payload),
-            // Frames the agent never receives (it produces these) or that are out
-            // of scope this increment: ignore.
+            .metrics_sub => self.handleMetricsSub(frame.payload),
+            .metrics_unsub => self.handleMetricsUnsub(),
+            // `.proc_list`/`.proc_kill`/`.proc_spawn` are later increments; frames the
+            // agent never receives (it produces these) or out of scope: ignore.
             else => {},
         }
     }
@@ -864,6 +885,82 @@ pub const Server = struct {
             .pause => s.streaming = false,
             .@"resume" => s.streaming = true,
             .credit => {}, // v2; ignored in v1
+        }
+    }
+
+    // --- Host metrics push (§9.3) --------------------------------------------
+
+    /// `METRICS_SUB`: record the requested interval and lazily spawn the pump thread
+    /// (one per connection). A re-subscription just updates the interval; the running
+    /// pump picks it up on its next loop. A malformed payload is ignored (untrusted).
+    fn handleMetricsSub(self: *Server, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.MetricsSub, self.alloc, payload) catch return;
+        defer parsed.deinit();
+        // Clamp to a sane floor so a hostile/zero interval can't busy-spin the pump.
+        const interval = @max(parsed.value.interval_ms, 50);
+
+        self.metrics_mutex.lock();
+        self.metrics_interval_ms = interval;
+        const need_spawn = self.metrics_thread == null;
+        if (need_spawn) self.metrics_stop = false;
+        self.metrics_cond.signal(); // wake an existing pump to pick up a new interval
+        self.metrics_mutex.unlock();
+
+        if (need_spawn) {
+            self.metrics_thread = std.Thread.spawn(.{}, metricsPumpLoop, .{self}) catch null;
+        }
+    }
+
+    /// `METRICS_UNSUB`: stop + join the pump (idempotent).
+    fn handleMetricsUnsub(self: *Server) void {
+        self.stopMetricsPump();
+    }
+
+    /// Signal the pump to stop, wake its timed wait, and join it. Idempotent and
+    /// safe to call with no pump running. Called by `metrics_unsub` and `shutdown`.
+    fn stopMetricsPump(self: *Server) void {
+        self.metrics_mutex.lock();
+        self.metrics_stop = true;
+        self.metrics_interval_ms = 0;
+        self.metrics_cond.signal();
+        self.metrics_mutex.unlock();
+        if (self.metrics_thread) |t| {
+            t.join();
+            self.metrics_thread = null;
+        }
+    }
+
+    /// The metrics pump: own a `metrics.Sampler`, and until stopped, sample the host
+    /// and push a `metrics` frame on the control channel, then wait `interval_ms`
+    /// (a timed cond wait so stop wakes us immediately). Exits on stop or `closed`.
+    fn metricsPumpLoop(self: *Server) void {
+        var sampler = metrics.Sampler.init();
+        while (true) {
+            // Snapshot the interval + stop flag under the lock.
+            self.metrics_mutex.lock();
+            if (self.metrics_stop or self.closed) {
+                self.metrics_mutex.unlock();
+                return;
+            }
+            const interval_ms = self.metrics_interval_ms;
+            self.metrics_mutex.unlock();
+
+            const host = sampler.sample();
+            self.sendJson(.metrics, protocol.control_channel, protocol.Metrics{
+                .host = host,
+            }) catch {};
+
+            // Timed wait: wake early if stop is signalled mid-interval.
+            self.metrics_mutex.lock();
+            if (!self.metrics_stop and !self.closed) {
+                self.metrics_cond.timedWait(
+                    &self.metrics_mutex,
+                    @as(u64, interval_ms) * std.time.ns_per_ms,
+                ) catch {};
+            }
+            const stop = self.metrics_stop or self.closed;
+            self.metrics_mutex.unlock();
+            if (stop) return;
         }
     }
 
@@ -1341,6 +1438,49 @@ test "GET_CWD→CWD: unknown session replies ok=false (graceful, no crash)" {
     defer parsed.deinit();
     try testing.expect(!parsed.value.ok);
     try testing.expect(parsed.value.path == null);
+}
+
+test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(30);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Subscribe with a small interval; at least one metrics frame must arrive with a
+    // decodable HostMetrics (cpu_pct may be 0 on the first sample, no baseline yet).
+    try h.client.sendControlJson(.metrics_sub, protocol.control_channel, protocol.MetricsSub{
+        .interval_ms = 10,
+    });
+    const m1 = try h.client.waitControl(.metrics);
+    var mp = try protocol.parseJson(protocol.Metrics, alloc, m1.payload);
+    defer mp.deinit();
+    // ncpu is read directly each sample (not delta-based) so it must be > 0 on a
+    // real host; cpu_pct is allowed to be 0 on the first push.
+    try testing.expect(mp.value.host.ncpu >= 1);
+    try testing.expect(mp.value.host.cpu_pct >= 0);
+
+    // A second push should follow (the pump loops on the interval).
+    const m2 = try h.client.waitControl(.metrics);
+    var mp2 = try protocol.parseJson(protocol.Metrics, alloc, m2.payload);
+    defer mp2.deinit();
+
+    // Unsubscribe: the pump stops + joins. The harness deinit (shutdown) must then
+    // tear down with no hang/leak (testing.allocator catches leaks).
+    try h.client.sendControlJson(.metrics_unsub, protocol.control_channel, protocol.MetricsUnsub{});
+    // Give the unsub a moment to be processed (control reader is async); spin until
+    // the pump thread is torn down.
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        if (h.server.metrics_thread == null) break;
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(h.server.metrics_thread == null);
 }
 
 test "OPEN→OPENED then child output streams as DATA with advancing byte_offsets" {

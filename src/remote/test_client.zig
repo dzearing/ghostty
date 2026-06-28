@@ -81,6 +81,13 @@ pub fn main() !void {
         @tagName(dialed.negotiated.transfer_encoding),
     });
 
+    // `--metrics` is machine-wide and needs no session OPEN: subscribe, print the
+    // first N pushed metrics frames, unsubscribe, and exit.
+    if (opts.metrics) {
+        try runMetrics(alloc, dialed.conn, opts.metrics_count);
+        return;
+    }
+
     // OPEN a shell session and learn the agent-chosen data channel + session id.
     // When `--open-command` is set, the command rides in the OPEN payload (the
     // GUI inheritance path), otherwise the agent opens its default shell.
@@ -131,6 +138,74 @@ fn runQueryCwd(
     stdout.writeAll(cwd) catch {};
     stdout.writeAll("\n") catch {};
     diag("query-cwd: OK — agent reported cwd = '{s}'\n", .{cwd});
+}
+
+// -----------------------------------------------------------------------------
+// --metrics: drive the inc-1 host-metrics push stream headlessly
+// -----------------------------------------------------------------------------
+
+/// A thread-safe sink that the control handler funnels pushed `metrics` frames into.
+/// The handler runs on the connection's control reader thread, so the count + the
+/// "done" event are shared with `main`'s thread under a mutex / ResetEvent.
+const MetricsSink = struct {
+    mutex: std.Thread.Mutex = .{},
+    received: u32 = 0,
+    want: u32 = 0,
+    done: std.Thread.ResetEvent = .{},
+
+    var instance: MetricsSink = .{};
+
+    /// Control-frame handler: decode + print each `metrics` frame's HostMetrics to
+    /// stderr (diag), and signal `done` once `want` frames have arrived.
+    fn onControl(_: *anyopaque, _: *connection.Connection, frame: protocol.Frame) void {
+        if (frame.type != .metrics) return;
+        var parsed = protocol.parseJson(protocol.Metrics, std.heap.page_allocator, frame.payload) catch return;
+        defer parsed.deinit();
+        const host = parsed.value.host;
+
+        instance.mutex.lock();
+        instance.received += 1;
+        const n = instance.received;
+        const reached = n >= instance.want;
+        instance.mutex.unlock();
+
+        diag(
+            "[metrics #{d}] cpu={d:.1}% mem_used={d} mem_total={d} ncpu={d} uptime_s={?d} load1={?d:.2}\n",
+            .{ n, host.cpu_pct, host.mem_used, host.mem_total, host.ncpu, host.uptime_s, host.load1 },
+        );
+        if (reached) instance.done.set();
+    }
+};
+
+/// `--metrics[=N]`: subscribe to the agent's host-metrics push stream, print the
+/// first N frames (default 3) to stderr, then unsubscribe and return. Uses the
+/// `Connection` transport primitives directly (`setControlHandler` + `writeControl`)
+/// — no inc-2 `subscribeMetrics` helper needed. Metrics ride the CONTROL channel.
+fn runMetrics(alloc: Allocator, conn: *connection.Connection, count: u32) !void {
+    MetricsSink.instance = .{ .want = @max(count, 1) };
+    conn.setControlHandler(undefined, MetricsSink.onControl);
+
+    // Subscribe (push every ~500ms so a few frames arrive quickly).
+    const sub: protocol.MetricsSub = .{ .interval_ms = 500 };
+    const sub_json = try protocol.encodeJson(alloc, sub);
+    defer alloc.free(sub_json);
+    try conn.writeControl(.metrics_sub, protocol.control_channel, sub_json);
+    diag("metrics: subscribed (interval=500ms), waiting for {d} frame(s)...\n", .{MetricsSink.instance.want});
+
+    // Wait (bounded) for the requested number of pushes.
+    const timeout_ns = @as(u64, MetricsSink.instance.want + 5) * std.time.ns_per_s;
+    MetricsSink.instance.done.timedWait(timeout_ns) catch {
+        diag("metrics: TIMED OUT waiting for pushes (got {d}/{d})\n", .{
+            MetricsSink.instance.received, MetricsSink.instance.want,
+        });
+    };
+
+    // Unsubscribe so the agent's pump stops, then give the frame a moment to flush.
+    const unsub_json = try protocol.encodeJson(alloc, protocol.MetricsUnsub{});
+    defer alloc.free(unsub_json);
+    conn.writeControl(.metrics_unsub, protocol.control_channel, unsub_json) catch {};
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    diag("metrics: done (received {d} frame(s))\n", .{MetricsSink.instance.received});
 }
 
 // -----------------------------------------------------------------------------
@@ -707,6 +782,12 @@ const Opts = struct {
     /// `--open-cwd=<dir>`: the OPEN payload's cwd (the GUI forwards the parent
     /// pane's queried cwd here so the new frame starts in the same directory).
     open_cwd: ?[]u8 = null,
+    /// `--metrics[=N]`: subscribe to the agent's pushed host-metrics stream, print
+    /// the first N (default 3) `metrics` frames to stderr, then unsubscribe + exit.
+    /// Machine-wide — needs no session OPEN. Drives the inc-1 metrics path headlessly
+    /// against the live (Windows) agent.
+    metrics: bool = false,
+    metrics_count: u32 = 3,
 };
 
 fn parseArgs(alloc: Allocator) !Opts {
@@ -739,6 +820,11 @@ fn parseArgs(alloc: Allocator) !Opts {
             opts.open_command = try alloc.dupe(u8, a["--open-command=".len..]);
         } else if (std.mem.startsWith(u8, a, "--open-cwd=")) {
             opts.open_cwd = try alloc.dupe(u8, a["--open-cwd=".len..]);
+        } else if (std.mem.eql(u8, a, "--metrics")) {
+            opts.metrics = true;
+        } else if (std.mem.startsWith(u8, a, "--metrics=")) {
+            opts.metrics = true;
+            opts.metrics_count = std.fmt.parseInt(u32, a["--metrics=".len..], 10) catch return error.Usage;
         } else {
             return error.Usage;
         }
@@ -752,6 +838,7 @@ fn usage() void {
         \\  remote-test-client <host> <port>                      interactive (Ctrl-] to quit)
         \\  remote-test-client <host> <port> --exec "<cmd>" [--timeout <secs>]
         \\  remote-test-client <host> <port> --open-command=<cmd>  run <cmd> via the OPEN payload (GUI inherit path)
+        \\  remote-test-client <host> <port> --metrics[=N]        print the first N host-metrics pushes (default 3)
         \\  remote-test-client <host> <port> --catchup-demo       close-laptop catch-up demo (PASS/FAIL)
         \\
     , .{});
