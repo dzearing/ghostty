@@ -31,6 +31,31 @@
 > `./scripts/deploy-windows-agent.sh`). Then the user opens Cmd-Shift-N to confirm live
 > CPU/mem vs Task Manager.
 
+> **Increment 3 ✅ DONE + VISUALLY VERIFIED LIVE** (3a `871c94915`, 3b `9e8ff621b`).
+> 3a: agent process enumeration (`src/remote/agent/proc.zig` — Windows Toolhelp +
+> `GetProcessTimes`/`K32GetProcessMemoryInfo`; macOS libproc `proc_listpids`+`PROC_PIDTBSDINFO`;
+> per-connection `ProcSampler` with per-pid CPU deltas); `proc_list`/`proc_snapshot` wired in
+> the agent; client `Connection.requestProcSnapshot` → `OwnedProcSnapshot`; C API
+> `ghostty_proc_list_s` + `ghostty_remote_connection_proc_list`/`_proc_list_free` (free takes
+> `(handle, list)`); `remote-test-client --ps`. Per-proc `cpu_pct` = percent of ONE core
+> (UI normalizes by ncpu). 3b: `RemoteActivityMonitorView` non-modal panel — live host CPU/mem
+> header (via inc-2 metrics subscription), sortable/searchable process `Table`, refresh; THREE
+> entry points: clickable titlebar pill, command-palette "Open Remote Activity Monitor", and a
+> chart-icon button per remote row in the ⌘⇧N picker. `presentReusing` (window's connection,
+> no free) vs `presentDialing` (fresh connection, unsubscribe-before-free, `freeAfterRefresh`
+> race guard). **Verified live:** opened against maximushome → 302 procs, real CPU deltas
+> (AbioticFactor 15.4%, msedge 7.8%), 29.7/63.7 GB, 32 cores; picker showed CPU 8% · 29.7/63.7 GB
+> (no IP). Windows proc list also confirmed headless via `--ps` (135 user procs w/ real mem).
+> Entry points #1 (pill) and #2 (palette) are built + compiled; #3 (picker button) visually
+> verified. macOS proc impl uses libproc not sysctl (agent-internal, no wire change).
+>
+> **Remaining: Increment 4 (kill), 5 (spawn), 6 (polish + idle-shell close-confirm).** GUI is
+> now drivable by the orchestrator (Accessibility + Screen Recording granted to Ghoztty.app) —
+> raise the debug app by unix-id and CONFIRM frontmost before any keystroke (the release app
+> shares the "ghoztty" process name; never key into the live session). NOTE: two same-bundle-id
+> debug copies exist (`zig-out/...` and `macos/build/Debug/...`) → `open` can hit a transient
+> launchd `spawn failed`; relaunch resolves it.
+
 > Original plan below (the increment-1 frame opcodes are the only deviation).
 
 > Status (orig): **PLANNED, not started.** Branch base: `feature/remote-machines`.
