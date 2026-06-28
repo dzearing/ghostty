@@ -34,6 +34,10 @@ class TerminalWindow: NSWindow {
     /// accessory uses). Replacing the hosting view's rootView does NOT re-measure.
     private let machinePillModel = MachinePillModel()
 
+    /// Tracks whether the inline leading title+pill accessory is currently installed
+    /// (and the system title hidden). Only true for remote windows.
+    private var inlineTitleEnabled = false
+
     /// Visual indicator that mirrors the selected tab color.
     private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
         let view = NSHostingView(rootView: TabColorIndicatorView(tabColor: tabColor))
@@ -187,21 +191,18 @@ class TerminalWindow: NSWindow {
 
             // Create the remote-machine hostname pill accessory. Starts hidden;
             // shown only when `remoteMachine` is set on a remote window.
-            // Bind the hosting view to the observable model ONCE (mirrors the
-            // reset-zoom accessory). The body renders empty until a machine name is
-            // set, then re-renders in place so the titlebar re-measures its width.
-            // Mirror the (working) update accessory EXACTLY: a NonDraggableHostingView
-            // bound to a stable @ObservedObject model, added first, then
-            // translatesAutoresizingMaskIntoConstraints disabled AFTER the add. The
-            // model's @Published changes re-render the body in place so the titlebar
-            // re-measures the accessory width.
-            // NOTE: a LEADING (.left) accessory makes macOS center the window title.
-            // Keep it trailing (.right) so the title stays left-aligned.
-            machinePillAccessory.layoutAttribute = .right
+            //
+            // For a REMOTE window we hide the system title and render our own LEADING
+            // "title ● machine" view (so the pill sits inline right after the title).
+            // A leading accessory makes macOS center the *system* title, but we hide
+            // it, so there is nothing to center. The accessory is bound to a stable
+            // @ObservedObject model (in-place re-render) and is only ADDED for remote
+            // windows (see setInlineTitleEnabled) — adding it for a local window would
+            // center that window's title. translatesAutoresizingMaskIntoConstraints is
+            // disabled AFTER the add so the titlebar installs the sizing constraints.
+            machinePillAccessory.layoutAttribute = .left
             machinePillAccessory.view = NonDraggableHostingView(
-                rootView: MachinePillView(model: machinePillModel))
-            addTitlebarAccessoryViewController(machinePillAccessory)
-            machinePillAccessory.view.translatesAutoresizingMaskIntoConstraints = false
+                rootView: MachineTitlePillView(model: machinePillModel))
             updateMachinePill()
         }
 
@@ -443,6 +444,8 @@ class TerminalWindow: NSWindow {
 
     override var title: String {
         didSet {
+            // Keep the inline leading title (remote windows) in sync with the title.
+            machinePillModel.title = title
             // Whenever we change the window title we must also update our
             // tab title if we're using custom fonts.
             tab.attributedTitle = attributedTitle
@@ -904,9 +907,37 @@ extension TerminalWindow {
     fileprivate func updateMachinePill() {
         guard styleMask.contains(.titled) else { return }
         // Drive the SwiftUI model; the model-bound hosting view re-renders in place
-        // and the titlebar re-measures the accessory width (empty ⇒ 0 ⇒ invisible).
+        // and the titlebar re-measures the accessory width.
+        let name = remoteMachine?.name
         machinePillModel.topPadding = viewModel.accessoryTopPadding
-        machinePillModel.machineName = remoteMachine?.name
+        machinePillModel.title = title
+        machinePillModel.isKeyWindow = isKeyWindow
+        machinePillModel.machineName = name
+        // Remote ⇒ inline leading title+pill (system title hidden). Local ⇒ system
+        // title, no accessory (a leading accessory would center the local title).
+        setInlineTitleEnabled(name != nil)
+    }
+
+    /// Install/remove the leading "title ● machine" accessory and hide/show the
+    /// system title accordingly. Only meaningful on `.titled` windows; the tabs
+    /// window styles force accessories to `.right`, so the inline title is a base /
+    /// transparent-style affordance.
+    private func setInlineTitleEnabled(_ enabled: Bool) {
+        guard styleMask.contains(.titled) else { return }
+        guard enabled != inlineTitleEnabled else { return }
+        inlineTitleEnabled = enabled
+        if enabled {
+            titleVisibility = .hidden
+            if !titlebarAccessoryViewControllers.contains(where: { $0 === machinePillAccessory }) {
+                addTitlebarAccessoryViewController(machinePillAccessory)
+                machinePillAccessory.view.translatesAutoresizingMaskIntoConstraints = false
+            }
+        } else {
+            titleVisibility = .visible
+            if let idx = titlebarAccessoryViewControllers.firstIndex(where: { $0 === machinePillAccessory }) {
+                removeTitlebarAccessoryViewController(at: idx)
+            }
+        }
     }
 }
 
