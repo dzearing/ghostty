@@ -1323,6 +1323,39 @@ GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd(
 GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd_timeout(
     ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
 
+// A host-metrics snapshot pushed by the remote agent (activity monitor). Mirrors
+// the wire HostMetrics. uptime_s is 0 when the remote OS doesn't expose uptime;
+// load1 is -1 when there is no load average (e.g. Windows).
+typedef struct {
+  float cpu_pct;     // busy CPU % 0..100 across all cores since the prev sample
+  uint64_t mem_used; // used physical memory, bytes
+  uint64_t mem_total; // total physical memory, bytes
+  uint32_t ncpu;     // logical CPU count
+  uint64_t uptime_s; // seconds since boot, 0 if unknown
+  float load1;       // 1-minute load average, -1 if unknown
+} ghostty_host_metrics_s;
+
+// Callback for each pushed host-metrics sample. IMPORTANT: it fires on the
+// connection's control-reader thread, NOT the main thread — hop to the main
+// queue before touching UI. The metrics pointer borrows stack storage valid only
+// for the duration of the call; copy the fields out. The void* is the userdata
+// passed to ghostty_remote_connection_metrics_subscribe.
+typedef void (*ghostty_metrics_callback)(const ghostty_host_metrics_s*, void*);
+
+// Subscribe to the remote host's pushed metrics stream. The agent pushes a
+// sample every interval_ms; each is delivered to the callback. Returns false if
+// the connection isn't established. The caller MUST call _metrics_unsubscribe (or
+// _free) before freeing anything userdata points at. A second subscribe replaces
+// the callback.
+GHOSTTY_API bool ghostty_remote_connection_metrics_subscribe(
+    ghostty_remote_connection_t, uint32_t interval_ms,
+    ghostty_metrics_callback, void* userdata);
+
+// Stop the pushed metrics stream and clear the callback. After this returns no
+// further metrics callback fires. Safe to call when not subscribed (no-op).
+GHOSTTY_API void ghostty_remote_connection_metrics_unsubscribe(
+    ghostty_remote_connection_t);
+
 // The live remote agent session id for a surface, or an empty string (ptr ==
 // NULL) for a local surface or one whose remote pane is not yet resolved. Free
 // with ghostty_string_free.

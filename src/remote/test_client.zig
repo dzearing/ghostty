@@ -144,9 +144,9 @@ fn runQueryCwd(
 // --metrics: drive the inc-1 host-metrics push stream headlessly
 // -----------------------------------------------------------------------------
 
-/// A thread-safe sink that the control handler funnels pushed `metrics` frames into.
-/// The handler runs on the connection's control reader thread, so the count + the
-/// "done" event are shared with `main`'s thread under a mutex / ResetEvent.
+/// A thread-safe sink for the pushed `HostMetrics`. The handler runs on the
+/// connection's control-reader thread, so the count + the "done" event are shared
+/// with `main`'s thread under a mutex / ResetEvent.
 const MetricsSink = struct {
     mutex: std.Thread.Mutex = .{},
     received: u32 = 0,
@@ -155,14 +155,11 @@ const MetricsSink = struct {
 
     var instance: MetricsSink = .{};
 
-    /// Control-frame handler: decode + print each `metrics` frame's HostMetrics to
-    /// stderr (diag), and signal `done` once `want` frames have arrived.
-    fn onControl(_: *anyopaque, _: *connection.Connection, frame: protocol.Frame) void {
-        if (frame.type != .metrics) return;
-        var parsed = protocol.parseJson(protocol.Metrics, std.heap.page_allocator, frame.payload) catch return;
-        defer parsed.deinit();
-        const host = parsed.value.host;
-
+    /// `connection.MetricsHandler`: print each pushed `HostMetrics` to stderr
+    /// (diag) and signal `done` once `want` samples have arrived. This is the inc-2
+    /// high-level API under test (driven via `Connection.subscribeMetrics`), NOT a
+    /// raw control handler.
+    fn onMetrics(_: *anyopaque, host: protocol.HostMetrics) void {
         instance.mutex.lock();
         instance.received += 1;
         const n = instance.received;
@@ -178,18 +175,14 @@ const MetricsSink = struct {
 };
 
 /// `--metrics[=N]`: subscribe to the agent's host-metrics push stream, print the
-/// first N frames (default 3) to stderr, then unsubscribe and return. Uses the
-/// `Connection` transport primitives directly (`setControlHandler` + `writeControl`)
-/// — no inc-2 `subscribeMetrics` helper needed. Metrics ride the CONTROL channel.
-fn runMetrics(alloc: Allocator, conn: *connection.Connection, count: u32) !void {
+/// first N frames (default 3) to stderr, then unsubscribe and return. Drives the
+/// inc-2 high-level `Connection.subscribeMetrics`/`unsubscribeMetrics` API so the
+/// new client API round-trips real pushes end-to-end against the native agent.
+fn runMetrics(_: Allocator, conn: *connection.Connection, count: u32) !void {
     MetricsSink.instance = .{ .want = @max(count, 1) };
-    conn.setControlHandler(undefined, MetricsSink.onControl);
 
     // Subscribe (push every ~500ms so a few frames arrive quickly).
-    const sub: protocol.MetricsSub = .{ .interval_ms = 500 };
-    const sub_json = try protocol.encodeJson(alloc, sub);
-    defer alloc.free(sub_json);
-    try conn.writeControl(.metrics_sub, protocol.control_channel, sub_json);
+    try conn.subscribeMetrics(500, undefined, MetricsSink.onMetrics);
     diag("metrics: subscribed (interval=500ms), waiting for {d} frame(s)...\n", .{MetricsSink.instance.want});
 
     // Wait (bounded) for the requested number of pushes.
@@ -200,10 +193,9 @@ fn runMetrics(alloc: Allocator, conn: *connection.Connection, count: u32) !void 
         });
     };
 
-    // Unsubscribe so the agent's pump stops, then give the frame a moment to flush.
-    const unsub_json = try protocol.encodeJson(alloc, protocol.MetricsUnsub{});
-    defer alloc.free(unsub_json);
-    conn.writeControl(.metrics_unsub, protocol.control_channel, unsub_json) catch {};
+    // Unsubscribe so the agent's pump stops (clears the handler slot under the
+    // write mutex), then give the unsub frame a moment to flush.
+    conn.unsubscribeMetrics();
     std.Thread.sleep(100 * std.time.ns_per_ms);
     diag("metrics: done (received {d} frame(s))\n", .{MetricsSink.instance.received});
 }

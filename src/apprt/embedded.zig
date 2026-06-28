@@ -19,6 +19,7 @@ const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const remote_connection = @import("../remote/connection.zig");
+const remote_protocol = @import("../remote/protocol.zig");
 const ssh_transport = @import("../remote/ssh_transport.zig");
 const tcp_dial = @import("../remote/tcp_dial.zig");
 const CommandCore = @import("../CommandCore.zig");
@@ -579,6 +580,27 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+/// C-ABI host metrics snapshot (remote-machines activity monitor, §9.3). Mirrors
+/// `protocol.HostMetrics`; the optional `uptime_s`/`load1` use sentinel values
+/// when the remote OS doesn't expose them (`uptime_s = 0` ⇒ unknown is fine since
+/// a real uptime is always > 0; `load1 = -1` ⇒ unknown, e.g. Windows has no load
+/// average).
+const ghostty_host_metrics_s = extern struct {
+    cpu_pct: f32,
+    mem_used: u64,
+    mem_total: u64,
+    ncpu: u32,
+    uptime_s: u64, // 0 if unknown
+    load1: f32, // -1 if unknown
+};
+
+/// Callback invoked for each pushed host-metrics sample. NOTE: it fires on the
+/// connection's control-reader thread (NOT the GUI main thread) — the Swift side
+/// must hop to the main queue before touching UI. The `ghostty_host_metrics_s`
+/// pointer borrows stack storage valid only for the duration of the call; copy
+/// the fields out. `userdata` is the opaque pointer passed to `_metrics_subscribe`.
+const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyopaque) callconv(.c) void;
+
 /// The Zig object behind an opaque `ghostty_remote_connection_t`
 /// (remote-machines design §3.5). A connection is keyed by
 /// (host, user, port, jump-chain) and multiplexes N remote panes/sessions. It
@@ -591,6 +613,13 @@ pub const EnvVar = extern struct {
 /// `CommandCore.DefaultCommand` spawn core so no apprt/config graph is pulled
 /// into the agent-launch path (§17).
 pub const RemoteConnectionHandle = struct {
+    /// Trampoline state for an active host-metrics subscription: the C callback +
+    /// the caller's opaque `userdata`. Stored inline (no heap free). See `metrics_cb`.
+    pub const MetricsTrampoline = struct {
+        cb: GhosttyMetricsCallback,
+        userdata: ?*anyopaque,
+    };
+
     alloc: Allocator,
 
     /// Dial parameters (duped into `alloc`, owned by this handle).
@@ -603,6 +632,16 @@ pub const RemoteConnectionHandle = struct {
     /// non-null it owns the two ssh subprocesses + the `Connection` and is torn
     /// down in `destroy`.
     transport: ?*Transport = null,
+
+    /// Trampoline state for an active host-metrics subscription (§9.3), or null
+    /// when not subscribed. The Zig `MetricsHandler` registered with the
+    /// `Connection` receives `protocol.HostMetrics`; this struct carries the C
+    /// callback + the caller's `userdata` so the handler can marshal the snapshot
+    /// into a `ghostty_host_metrics_s` and invoke `cb(&hm, userdata)`. It lives
+    /// inline on the handle (no heap free needed); `subscribeMetrics` passes
+    /// `&self.metrics_cb.?` as the handler ctx, so it must stay pinned for the
+    /// life of the subscription (the handle is heap-allocated and stable).
+    metrics_cb: ?MetricsTrampoline = null,
 
     /// The live TCP transport, or null. Populated by
     /// `ghostty_remote_connection_new_tcp` (WP4): a direct TCP dial to a
@@ -658,6 +697,14 @@ pub const RemoteConnectionHandle = struct {
     /// must ensure no surface still references this handle.
     pub fn destroy(self: *RemoteConnectionHandle) void {
         const alloc = self.alloc;
+        // Defensively clear any lingering metrics subscription BEFORE the transport
+        // teardown so no metrics callback can fire mid-teardown (clearing the
+        // handler slot under the connection's write mutex). The subsequent
+        // shutdown joins the control reader, after which no callback can fire.
+        if (self.metrics_cb != null) {
+            if (self.conn()) |c| c.unsubscribeMetrics();
+            self.metrics_cb = null;
+        }
         // `Transport.deinit` shuts the connection down, closes the streams (the
         // ssh children observe EOF on stdin and exit), reaps both children, and
         // frees the connection + control-path.
@@ -2271,6 +2318,57 @@ pub const CAPI = struct {
         // Re-dupe into the C-API allocator (matching `ghostty_string_free`).
         const copy = handle.alloc.dupeZ(u8, path) catch return .empty;
         return .fromSlice(copy);
+    }
+
+    /// Zig-side `MetricsHandler` trampoline: marshal `protocol.HostMetrics` into a
+    /// stack `ghostty_host_metrics_s` (optionals → sentinels) and invoke the stored
+    /// C callback with the caller's `userdata`. `ctx` is the handle's
+    /// `&metrics_cb.?` trampoline (pinned for the subscription's life). Fires on the
+    /// connection's control-reader thread.
+    fn metricsTrampoline(ctx: *anyopaque, host: remote_protocol.HostMetrics) void {
+        const tramp: *const RemoteConnectionHandle.MetricsTrampoline = @ptrCast(@alignCast(ctx));
+        const hm: ghostty_host_metrics_s = .{
+            .cpu_pct = host.cpu_pct,
+            .mem_used = host.mem_used,
+            .mem_total = host.mem_total,
+            .ncpu = host.ncpu,
+            .uptime_s = host.uptime_s orelse 0,
+            .load1 = host.load1 orelse -1,
+        };
+        tramp.cb(&hm, tramp.userdata);
+    }
+
+    /// Subscribe to the remote host's pushed metrics stream (§9.3). The agent then
+    /// pushes a sample every `interval_ms`; each is delivered to `callback` (on the
+    /// control-reader thread — see `GhosttyMetricsCallback`). Returns false if the
+    /// connection isn't established. The caller MUST call
+    /// `ghostty_remote_connection_metrics_unsubscribe` (or `_free`) before freeing
+    /// anything `userdata` points at. A second subscribe replaces the callback.
+    export fn ghostty_remote_connection_metrics_subscribe(
+        handle: *RemoteConnectionHandle,
+        interval_ms: u32,
+        callback: GhosttyMetricsCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        // Store the trampoline inline on the handle (pinned: the handle is stable),
+        // then hand its address to `subscribeMetrics` as the Zig handler ctx.
+        handle.metrics_cb = .{ .cb = callback, .userdata = userdata };
+        conn.subscribeMetrics(interval_ms, &handle.metrics_cb.?, metricsTrampoline) catch {
+            handle.metrics_cb = null;
+            return false;
+        };
+        return true;
+    }
+
+    /// Stop the pushed metrics stream and clear the callback. After this returns no
+    /// further metrics callback fires (the connection clears the handler slot under
+    /// its write mutex). Safe to call when not subscribed (no-op).
+    export fn ghostty_remote_connection_metrics_unsubscribe(
+        handle: *RemoteConnectionHandle,
+    ) void {
+        if (handle.conn()) |conn| conn.unsubscribeMetrics();
+        handle.metrics_cb = null;
     }
 
     /// The LIVE remote agent session id for `surface`, or an empty String if it

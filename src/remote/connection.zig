@@ -117,6 +117,19 @@ const StreamId = enum { control, data };
 /// and is valid ONLY for the duration of the call — copy it out to retain it.
 pub const ControlHandler = *const fn (ctx: *anyopaque, conn: *Connection, frame: protocol.Frame) void;
 
+/// A dedicated handler for the pushed host-metrics stream (§9.3). Registered by
+/// `subscribeMetrics`, invoked by the control reader for every inbound `.metrics`
+/// frame, and cleared by `unsubscribeMetrics`. It is a SEPARATE slot from
+/// `ControlHandler` so the metrics subscriber never clobbers an unrelated control
+/// handler (and vice versa).
+///
+/// IMPORTANT (threading): the handler fires on the connection's control-reader
+/// thread, NOT the caller's thread. The caller MUST call `unsubscribeMetrics`
+/// (which clears the slot under the write mutex) before freeing any context the
+/// handler captures, or the reader could invoke a dangling pointer. `host` is a
+/// by-value snapshot (no borrowed storage), so it is safe to copy out.
+pub const MetricsHandler = *const fn (ctx: *anyopaque, host: protocol.HostMetrics) void;
+
 /// One queued outbound frame, owned by the writer queue until the writer emits it.
 /// `payload` is a private heap copy the queue owns and frees; the caller's slice is
 /// not retained past `enqueue`.
@@ -601,6 +614,14 @@ pub const Connection = struct {
     ctrl_handler: ?ControlHandler = null,
     ctrl_handler_ctx: *anyopaque = undefined,
 
+    /// Dedicated handler slot for the pushed host-metrics stream (§9.3), separate
+    /// from `ctrl_handler` so the two never clobber each other. Set by
+    /// `subscribeMetrics`, read on the control-reader hot path, cleared by
+    /// `unsubscribeMetrics` — all stores/loads ordered by `write_mutex` exactly
+    /// like `ctrl_handler` (publish discipline; see `setControlHandler`).
+    metrics_handler: ?MetricsHandler = null,
+    metrics_handler_ctx: *anyopaque = undefined,
+
     // --- Health & link state (increment 2) ------------------------------------
     /// Injected millisecond clock (real by default, fake in tests).
     clock: Clock = Clock.real(),
@@ -823,6 +844,58 @@ pub const Connection = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         self.ctrl_handler = handler;
+    }
+
+    // --- Host-metrics subscription (§9.3, activity monitor) ------------------
+
+    /// Subscribe to the agent's pushed host-metrics stream. Publishes the
+    /// dedicated `metrics_handler` slot (under `write_mutex`, same publish
+    /// discipline as `setControlHandler`) and sends `METRICS_SUB{interval_ms}`;
+    /// the agent then pushes a `.metrics` frame on the control channel every
+    /// `interval_ms` until `unsubscribeMetrics`.
+    ///
+    /// The handler fires on the control-reader thread (see `MetricsHandler`). The
+    /// caller MUST call `unsubscribeMetrics` before freeing `ctx`.
+    pub fn subscribeMetrics(
+        self: *Connection,
+        interval_ms: u32,
+        ctx: *anyopaque,
+        handler: MetricsHandler,
+    ) !void {
+        // Publish the handler slot BEFORE sending the subscription so the first
+        // pushed frame is never dropped for lack of a handler.
+        {
+            self.metrics_handler_ctx = ctx;
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            self.metrics_handler = handler;
+        }
+
+        const sub: protocol.MetricsSub = .{ .interval_ms = interval_ms };
+        const json = try protocol.encodeJson(self.alloc, sub);
+        defer self.alloc.free(json);
+        try self.writeControl(.metrics_sub, protocol.control_channel, json);
+    }
+
+    /// Unsubscribe from the pushed host-metrics stream. Sends `METRICS_UNSUB{}`
+    /// (best-effort — a send failure on a closing connection is ignored) and then
+    /// clears the `metrics_handler` slot under `write_mutex`, so no further
+    /// callback fires after this returns. Safe to call when not subscribed (the
+    /// unsub send is harmless and the slot is already null).
+    pub fn unsubscribeMetrics(self: *Connection) void {
+        const json = protocol.encodeJson(self.alloc, protocol.MetricsUnsub{}) catch null;
+        if (json) |j| {
+            defer self.alloc.free(j);
+            self.writeControl(.metrics_unsub, protocol.control_channel, j) catch {};
+        }
+
+        // Clear the handler slot under the same lock the reader's publish/observe
+        // is ordered by, so a concurrent control-reader either sees the handler
+        // (before this) or null (after) — never a torn value, and never a stale
+        // handler after we return.
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        self.metrics_handler = null;
     }
 
     // --- Observability (increment 2, §6.4) -----------------------------------
@@ -1644,6 +1717,22 @@ pub const Connection = struct {
                 // Server-initiated eviction / steal (§5.3): terminal DEAD.
                 self.evicted.store(true, .monotonic);
                 self.withLink(LinkState.onSessionGone);
+            },
+            .metrics => {
+                // Pushed host-metrics sample (§9.3). Decode and hand the by-value
+                // snapshot to the dedicated metrics handler if one is registered.
+                // Decode failures are dropped silently (hostile-input discipline,
+                // mirroring `.pong`). This is additive: the user `ctrl_handler`
+                // still observes the frame afterward in `controlReaderLoop`.
+                var parsed = protocol.parseJson(protocol.Metrics, self.alloc, frame.payload) catch return;
+                defer parsed.deinit();
+                // Read the slot under the same lock its publish is ordered by, so
+                // we never observe a torn pointer vs. subscribe/unsubscribe.
+                self.write_mutex.lock();
+                const handler = self.metrics_handler;
+                const ctx = self.metrics_handler_ctx;
+                self.write_mutex.unlock();
+                if (handler) |h| h(ctx, parsed.value.host);
             },
             else => {},
         }
@@ -2934,6 +3023,14 @@ const LifecycleAgent = struct {
     cwd_reply: ?[]const u8 = "/private/tmp",
     silent_cwd: bool = false,
 
+    // METRICS push contents. On `.metrics_sub` the agent pushes `metrics_push_count`
+    // `.metrics` frames on the control channel (the first reporting `cpu_pct = 0`,
+    // the rest a non-zero delta) so a subscriber can assert it receives decodable
+    // `HostMetrics`. `.metrics_unsub` is recorded via `saw_metrics_unsub`.
+    metrics_push_count: u32 = 2,
+    saw_metrics_sub: std.atomic.Value(bool) = .{ .raw = false },
+    saw_metrics_unsub: std.atomic.Value(bool) = .{ .raw = false },
+
     // Observations (atomics / events so the test thread can read them safely).
     seen_channel: std.atomic.Value(u128) = .{ .raw = 0 },
     saw_request: std.Thread.ResetEvent = .{},
@@ -3021,6 +3118,29 @@ const LifecycleAgent = struct {
                         .seq = 0,
                         .payload = &buf,
                     });
+                },
+                .metrics_sub => {
+                    self.saw_metrics_sub.store(true, .monotonic);
+                    // Push `metrics_push_count` metrics frames on the control
+                    // channel (first cpu_pct=0, then a non-zero delta), as the real
+                    // agent's per-connection push pump does.
+                    var i: u32 = 0;
+                    while (i < self.metrics_push_count) : (i += 1) {
+                        const host: protocol.HostMetrics = .{
+                            .cpu_pct = if (i == 0) 0 else 12.5,
+                            .mem_used = 8 * 1024 * 1024 * 1024,
+                            .mem_total = 16 * 1024 * 1024 * 1024,
+                            .ncpu = 10,
+                            .uptime_s = 3600,
+                            .load1 = 1.5,
+                        };
+                        try self.ctrl.sendJson(.metrics, protocol.control_channel, protocol.Metrics{
+                            .host = host,
+                        });
+                    }
+                },
+                .metrics_unsub => {
+                    self.saw_metrics_unsub.store(true, .monotonic);
                 },
                 else => {},
             }
@@ -3194,6 +3314,92 @@ test "queryCwdTimeout: a tight bound on a silent agent fails fast (GUI never sta
     );
     const elapsed = std.time.milliTimestamp() - t;
     try testing.expect(elapsed < 5_000);
+}
+
+// --- Host-metrics subscription (§9.3) ----------------------------------------
+
+/// A thread-safe sink for the pushed `HostMetrics`. The handler fires on the
+/// connection's control-reader thread, so the count + the last sample + the
+/// "got enough" event are shared with the test thread under a mutex / ResetEvent.
+const MetricsRec = struct {
+    mutex: std.Thread.Mutex = .{},
+    count: u32 = 0,
+    want: u32 = 0,
+    last: protocol.HostMetrics = .{},
+    enough: std.Thread.ResetEvent = .{},
+
+    fn handler(ctx: *anyopaque, host: protocol.HostMetrics) void {
+        const self: *MetricsRec = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        self.count += 1;
+        self.last = host;
+        const reached = self.count >= self.want;
+        self.mutex.unlock();
+        if (reached) self.enough.set();
+    }
+};
+
+test "subscribeMetrics: handler receives decodable HostMetrics pushes" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.metrics_push_count = 2;
+    try h.start();
+
+    var rec: MetricsRec = .{ .want = 2 };
+    try h.conn.subscribeMetrics(500, &rec, MetricsRec.handler);
+
+    // Wait (bounded) for both pushed frames.
+    rec.enough.timedWait(2 * std.time.ns_per_s) catch {};
+
+    rec.mutex.lock();
+    const count = rec.count;
+    const last = rec.last;
+    rec.mutex.unlock();
+
+    try testing.expect(a.saw_metrics_sub.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), count);
+    // The second push carries the non-zero delta + the static fields the agent set.
+    try testing.expectEqual(@as(f32, 12.5), last.cpu_pct);
+    try testing.expectEqual(@as(u64, 8 * 1024 * 1024 * 1024), last.mem_used);
+    try testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), last.mem_total);
+    try testing.expectEqual(@as(u32, 10), last.ncpu);
+    try testing.expectEqual(@as(?u64, 3600), last.uptime_s);
+    try testing.expectEqual(@as(?f32, 1.5), last.load1);
+
+    h.conn.unsubscribeMetrics();
+    try testing.expect(a.err == null);
+}
+
+test "unsubscribeMetrics: clears the handler slot (no callback after)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.metrics_push_count = 1;
+    try h.start();
+
+    var rec: MetricsRec = .{ .want = 1 };
+    try h.conn.subscribeMetrics(500, &rec, MetricsRec.handler);
+    rec.enough.timedWait(2 * std.time.ns_per_s) catch {};
+
+    // Unsubscribe: the slot is cleared under the write mutex, so no later push
+    // can re-enter `rec` (which is about to leave scope).
+    h.conn.unsubscribeMetrics();
+    try testing.expect(h.conn.metrics_handler == null);
+
+    // The agent recorded the unsub.
+    var spins: usize = 0;
+    while (!a.saw_metrics_unsub.load(.monotonic) and spins < 1000) : (spins += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(a.saw_metrics_unsub.load(.monotonic));
+
+    // A second unsubscribe is a harmless no-op (slot already null).
+    h.conn.unsubscribeMetrics();
+    try testing.expect(h.conn.metrics_handler == null);
+    try testing.expect(a.err == null);
 }
 
 test "openChannel: a silent agent (no OPENED) times out instead of deadlocking" {
