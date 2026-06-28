@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import GhosttyKit
 #if canImport(Charts)
 import Charts
@@ -130,6 +131,28 @@ final class RemoteActivityMonitorModel: ObservableObject {
     /// The machine list for the switcher, mirrored from the registry.
     @Published private(set) var machines: [Machine] = MachineRegistry.shared.machines
 
+    /// Per-source summaries for the machine-card carousel (status dot + uptime +
+    /// tiny cpu/mem). Driven for inactive REMOTE cards by a lifetime probe and for
+    /// the LOCAL card by a light one-shot sampler; the ACTIVE card prefers the live
+    /// `host`. Keyed by `MonitorSource`.
+    struct CardSummary: Equatable {
+        enum State: Equatable { case connecting, failed, live }
+        var state: State = .connecting
+        var uptimeS: UInt64 = 0
+        var cpuPct: Float = 0
+        var memUsed: UInt64 = 0
+        var memTotal: UInt64 = 0
+    }
+    @Published private(set) var cardSummaries: [MonitorSource: CardSummary] = [:]
+
+    /// Lifetime probe feeding the inactive remote cards' summaries (same dial +
+    /// metrics-subscribe used by the ⌘⇧N picker). Torn down in `stop()`.
+    private let cardProbe = MachineMetricsProbe()
+    /// Light timer that samples the LOCAL host for its card summary.
+    private var localCardTimer: Timer?
+    /// Bridges the probe's `@Published readings` into `cardSummaries`.
+    private var probeObserver: AnyCancellable?
+
     /// The connection state of the active source. `nil` for `.local`.
     private struct RemoteState {
         let handle: ghostty_remote_connection_t
@@ -175,15 +198,102 @@ final class RemoteActivityMonitorModel: ObservableObject {
     /// poll timer for all). Call once after construction.
     func start() {
         guard !stopped else { return }
+        startCardSummaries()
         beginCurrentSource()
     }
 
-    /// Tear down everything for good: stop the active source and forbid restart.
-    /// Idempotent.
+    /// Tear down everything for good: stop the active source, the card probe, and
+    /// forbid restart. Idempotent.
     func stop() {
         guard !stopped else { return }
         stopped = true
         teardownCurrentSource()
+        probeObserver = nil
+        cardProbe.stop()
+        localCardTimer?.invalidate()
+        localCardTimer = nil
+    }
+
+    // MARK: Card summaries (carousel)
+
+    /// Spin up the lifetime sources that feed every card's summary: one
+    /// `MachineMetricsProbe` across all registered machines (inactive remote cards)
+    /// and a light local sampler (the Local card). The active card prefers `host`.
+    private func startCardSummaries() {
+        // Seed initial states so cards render immediately.
+        cardSummaries[.local] = CardSummary(state: .connecting)
+        for m in machines { cardSummaries[.remote(m)] = CardSummary(state: .connecting) }
+
+        // Bridge the probe's readings → cardSummaries on every publish.
+        probeObserver = cardProbe.$readings
+            .receive(on: RunLoop.main)
+            .sink { [weak self] readings in
+                guard let self, !self.stopped else { return }
+                for m in self.machines {
+                    guard let reading = readings[m.id] else { continue }
+                    let key = MonitorSource.remote(m)
+                    var s = self.cardSummaries[key] ?? CardSummary()
+                    switch reading {
+                    case .connecting: s.state = .connecting
+                    case .failed: s.state = .failed
+                    case .live(let hm):
+                        s.state = .live
+                        s.cpuPct = hm.cpuPct
+                        s.memUsed = hm.memUsed
+                        s.memTotal = hm.memTotal
+                        s.uptimeS = hm.uptimeS
+                    }
+                    self.cardSummaries[key] = s
+                }
+            }
+        cardProbe.start(machines)
+
+        // Sample Local now and on a light timer.
+        sampleLocalCard()
+        let t = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.sampleLocalCard() }
+        }
+        localCardTimer = t
+    }
+
+    /// The summary to show on a card. For the ACTIVE source we prefer the live
+    /// `host` (freshest), falling back to the probe/local-sampled summary.
+    func summary(for src: MonitorSource) -> CardSummary {
+        if src == source, host.ncpu > 0 || host.uptimeS > 0 {
+            let state: CardSummary.State =
+                (lastRefreshFailed && procs.isEmpty) ? .failed
+                : switching ? .connecting
+                : .live
+            return CardSummary(
+                state: state,
+                uptimeS: host.uptimeS,
+                cpuPct: host.cpuPct,
+                memUsed: host.memUsed,
+                memTotal: host.memTotal
+            )
+        }
+        return cardSummaries[src] ?? CardSummary()
+    }
+
+    /// One-shot local host sample (off-main) feeding the Local card summary.
+    private func sampleLocalCard() {
+        guard !stopped else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let list = ghostty_local_proc_list(0)
+            let h = list.host
+            let cpu = h.cpu_pct, memU = h.mem_used, memT = h.mem_total, up = h.uptime_s
+            let ok = list.ok
+            ghostty_local_proc_list_free(list)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, !self.stopped else { return }
+                    var s = self.cardSummaries[.local] ?? CardSummary()
+                    s.state = ok ? .live : .failed
+                    s.cpuPct = cpu; s.memUsed = memU; s.memTotal = memT; s.uptimeS = up
+                    self.cardSummaries[.local] = s
+                }
+            }
+        }
     }
 
     /// Switch the panel to a different source. Tears down the current source
@@ -546,6 +656,8 @@ struct RemoteActivityMonitorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            cardCarousel
+            Divider()
             header
             Divider()
             controlBar
@@ -579,12 +691,42 @@ struct RemoteActivityMonitorView: View {
         }
     }
 
-    // MARK: Header (switcher + gauges)
+    // MARK: Card carousel (machine switcher)
+
+    /// All sources in card order: Local first, then every registered machine.
+    private var allSources: [MonitorSource] {
+        [.local] + model.machines.map { .remote($0) }
+    }
+
+    /// A horizontal carousel of machine cards above the charts. Clicking any card
+    /// switches to that source in ONE click (`model.switchTo`). The active card is
+    /// highlighted with an accent border/fill.
+    private var cardCarousel: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(allSources, id: \.self) { src in
+                    MachineCard(
+                        source: src,
+                        summary: model.summary(for: src),
+                        isSelected: src == model.source,
+                        switching: model.switching && src == model.source
+                    ) {
+                        model.switchTo(src)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+        }
+    }
+
+    // MARK: Header (gauges)
 
     private var header: some View {
         HStack(alignment: .center, spacing: 20) {
             VStack(alignment: .leading, spacing: 4) {
-                machineSwitcher
+                Text(model.source.label)
+                    .font(.headline)
                 Text(subline)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -613,37 +755,6 @@ struct RemoteActivityMonitorView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-    }
-
-    /// The machine switcher: a menu-style Picker listing Local + every registered
-    /// machine. Changing it switches the source in place.
-    private var machineSwitcher: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 7, height: 7)
-            Picker("Machine", selection: Binding(
-                get: { model.source },
-                set: { model.switchTo($0) }
-            )) {
-                Text("Local").tag(MonitorSource.local)
-                ForEach(model.machines) { machine in
-                    Text(machine.name).tag(MonitorSource.remote(machine))
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .fixedSize()
-            if model.switching {
-                ProgressView().controlSize(.small)
-            }
-        }
-    }
-
-    private var statusColor: Color {
-        if model.switching { return .yellow }
-        if model.lastRefreshFailed && model.procs.isEmpty { return .red }
-        return .green
     }
 
     private func statBlock(label: String, value: String, detail: String) -> some View {
@@ -1104,5 +1215,103 @@ struct TrendGaugeView: View {
                     .frame(height: 1),
                 alignment: .bottom
             )
+    }
+}
+
+// MARK: - Machine card
+
+/// A single tappable card in the switcher carousel: status dot + name + a small
+/// uptime/CPU/mem summary. The active card is highlighted; tapping switches to it
+/// in one click. Pure presentation — `onSelect` does the source switch.
+struct MachineCard: View {
+    let source: MonitorSource
+    let summary: RemoteActivityMonitorModel.CardSummary
+    let isSelected: Bool
+    /// True only for the active card while it is mid-dial.
+    let switching: Bool
+    let onSelect: () -> Void
+
+    private var statusColor: Color {
+        if switching { return .yellow }
+        switch summary.state {
+        case .connecting: return .yellow
+        case .failed: return .red
+        case .live: return .green
+        }
+    }
+
+    private var summaryLine: String {
+        switch summary.state {
+        case .connecting where !switching: return "connecting…"
+        case .failed: return "unreachable"
+        default:
+            if summary.uptimeS > 0 { return Self.uptimeString(summary.uptimeS) }
+            return switching ? "connecting…" : "—"
+        }
+    }
+
+    private var metricLine: String? {
+        guard summary.state == .live, summary.memTotal > 0 else { return nil }
+        let cpu = Int(max(0, min(100, summary.cpuPct)).rounded())
+        let memPct = Int((Double(summary.memUsed) / Double(summary.memTotal) * 100).rounded())
+        return "CPU \(cpu)% · Mem \(memPct)%"
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 7, height: 7)
+                    Text(source.label)
+                        .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                        .lineLimit(1)
+                    if switching {
+                        Spacer(minLength: 2)
+                        ProgressView().controlSize(.mini)
+                    }
+                }
+                Text(summaryLine)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(metricLine ?? " ")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            .frame(width: 160, height: 56, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected
+                        ? Color.accentColor.opacity(0.15)
+                        : Color(nsColor: .quaternaryLabelColor).opacity(0.18))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(
+                        isSelected ? Color.accentColor : Color.secondary.opacity(0.25),
+                        lineWidth: isSelected ? 2 : 1
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .help("Switch to \(source.label)")
+    }
+
+    /// "up Nd Nh" / "up Nh Nm" / "up Nm" from a seconds count.
+    static func uptimeString(_ s: UInt64) -> String {
+        guard s > 0 else { return "—" }
+        let days = s / 86_400
+        let hours = (s % 86_400) / 3_600
+        let mins = (s % 3_600) / 60
+        if days > 0 { return "up \(days)d \(hours)h" }
+        if hours > 0 { return "up \(hours)h \(mins)m" }
+        return "up \(mins)m"
     }
 }

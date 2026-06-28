@@ -29,6 +29,9 @@ final class MachineMetricsProbe: ObservableObject {
         var ncpu: UInt32
         /// 1-minute load average, or nil if the remote OS doesn't expose one.
         var load1: Float?
+        /// Host uptime in seconds (0 if the remote OS doesn't report it). Surfaced
+        /// so the Activity Monitor's machine cards can show "up Nd Nh".
+        var uptimeS: UInt64
     }
 
     /// The per-machine probe state shown in the picker.
@@ -139,7 +142,8 @@ final class MachineMetricsProbe: ObservableObject {
             memUsed: raw.mem_used,
             memTotal: raw.mem_total,
             ncpu: raw.ncpu,
-            load1: raw.load1 < 0 ? nil : raw.load1
+            load1: raw.load1 < 0 ? nil : raw.load1,
+            uptimeS: raw.uptime_s
         )
         readings[id] = .live(metrics)
     }
