@@ -56,6 +56,27 @@
 > debug copies exist (`zig-out/...` and `macos/build/Debug/...`) → `open` can hit a transient
 > launchd `spawn failed`; relaunch resolves it.
 
+> **Increments 4+5 (kill/spawn) + Panel v2 redesign ✅ DONE + VERIFIED LIVE**
+> (backend `6d6bb8bbf`,`7be14ad81`,`59e0c87c1`; UI `04c03f9e6`,`ac4b8c401`,`b359f5a12`,`f24d7f472`).
+> Backend: agent `proc_kill` (Win `TerminateProcess`/posix TERM→KILL; perm-denied surfaced),
+> `proc_spawn` DETACHED that PERSISTS on Windows via direct `CreateProcessW` +
+> `CREATE_NEW_CONSOLE|CREATE_NEW_PROCESS_GROUP|CREATE_BREAKAWAY_FROM_JOB` (the null-`\Device\Null`
+> stdio in `CommandCore.startWindows` was killing console apps; new path gives the child its own
+> console) + real pid via `dwProcessId`; full exec path in `Proc.cmd` (macOS `proc_pidpath`, Win
+> `QueryFullProcessImageNameW`, Linux readlink); client `killProc`/`spawnProc`; C API remote
+> `proc_kill`/`proc_spawn` + LOCAL in-process `ghostty_local_proc_list`/`_free`/`_kill`/`_spawn`
+> (persistent local sampler). Live-verified on Windows: spawned notepad/ping persist with real
+> pids + full paths, killed by pid; system-service kill → "permission denied".
+> Panel v2 (per user feedback, all verified live in the GUI): machine-card **carousel** above the
+> charts (Local + remotes, per-card uptime + mini CPU/mem via the picker's `MachineMetricsProbe`,
+> 1-click switch, active highlighted) replacing the dropdown; filter moved to TOP; manual refresh
+> button REMOVED (auto-poll 1.5s); bigger CPU/Mem **trend charts** (Swift Charts, 240×64, 0/50/100%
+> Y refs, hover tooltip w/ value-at-time); Load block removed; selectable rows + **Kill** button
+> (confirm dialog) + **New Process** spawn sheet; **Path** column (full exec path) replaced User.
+> Switching Local⇄maximushome live-verified (16-core Mac local procs ⇄ 32-core Windows).
+> ⏳ KNOWN CLEANUP for inc 6: temporary `spawn: diag:` note still rides in `ProcSpawnResult.error`
+> on success (UI unaffected — C API returns pid only); remove it. Then idle-shell close-confirm.
+
 > Original plan below (the increment-1 frame opcodes are the only deviation).
 
 > Status (orig): **PLANNED, not started.** Branch base: `feature/remote-machines`.
