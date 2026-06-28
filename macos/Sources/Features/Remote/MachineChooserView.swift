@@ -16,6 +16,9 @@ enum WindowTarget: Hashable {
 /// `onSelect` with the chosen target (or `onCancel` if dismissed).
 struct MachineChooserView: View {
     let machines: [Machine]
+    /// Live per-machine metrics for the remote rows, refreshed while the picker
+    /// is open. Drives each remote row's subline in place of the IP:port.
+    @ObservedObject var probe: MachineMetricsProbe
     var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
 
@@ -165,13 +168,38 @@ struct MachineChooserView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(machine.name)
                         .font(.body)
-                    Text(machine.endpoint)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    metricsSubline(for: machine)
                 }
                 Spacer()
             }
         }
+    }
+
+    /// The remote-row subline: live CPU/memory once metrics arrive, or a
+    /// graceful placeholder while connecting / when unreachable. Deliberately
+    /// never shows the host:port (the user does not want the IP displayed).
+    private func metricsSubline(for machine: Machine) -> some View {
+        Text(sublineText(for: machine))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    /// The text shown in a remote row's subline for the machine's probe state.
+    private func sublineText(for machine: Machine) -> String {
+        switch probe.readings[machine.id] {
+        case .live(let m):
+            return "CPU \(Int(m.cpuPct.rounded()))%  ·  \(memString(m.memUsed)) / \(memString(m.memTotal))"
+        case .failed:
+            return "Unreachable"
+        case .connecting, nil:
+            return "Connecting…"
+        }
+    }
+
+    /// Format a byte count as gigabytes with one decimal (e.g. "12.3 GB").
+    private func memString(_ bytes: UInt64) -> String {
+        let gb = Double(bytes) / 1_073_741_824.0
+        return String(format: "%.1f GB", gb)
     }
 
     /// Move the highlighted selection by `delta` rows, clamped to the list.
@@ -214,7 +242,15 @@ enum MachineChooser {
 
         var windowRef: NSWindow?
 
+        // Live metrics probe for the picker's lifetime. Owns one short-lived
+        // connection per remote machine; torn down in `finish` regardless of
+        // outcome (pick remote, pick Local, or cancel).
+        let probe = MachineMetricsProbe()
+
         let finish: (WindowTarget?) -> Void = { target in
+            // Tear down all probe connections BEFORE handing control back, so
+            // no probe connection outlives the picker no matter the choice.
+            probe.stop()
             if let windowRef {
                 NSApp.stopModal()
                 windowRef.orderOut(nil)
@@ -224,6 +260,7 @@ enum MachineChooser {
 
         let view = MachineChooserView(
             machines: machines,
+            probe: probe,
             onSelect: { finish($0) },
             onCancel: { finish(nil) }
         )
@@ -260,6 +297,10 @@ enum MachineChooser {
 
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        // Begin probing remote machines for live metrics now that the picker is
+        // on screen. Dials happen off the main thread; rows update as samples
+        // arrive (or fall back to "Unreachable").
+        probe.start(machines)
         NSApp.runModal(for: window)
     }
 }
