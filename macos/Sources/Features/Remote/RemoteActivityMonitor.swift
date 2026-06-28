@@ -2,41 +2,64 @@ import SwiftUI
 import AppKit
 import GhosttyKit
 
-/// Presents and tracks Remote Activity Monitor panels — one non-modal window per
-/// machine. Two entry styles:
+/// Presents and tracks Activity Monitor panels — one non-modal window per source.
+/// Entry styles:
 ///
 /// - `presentReusing`: opens on an EXISTING connection owned by a remote window.
 ///   The panel does NOT free it (the window's `RemoteConnection` is the sole
-///   owner). The model is created with `ownsConnection: false`.
+///   owner). The model's initial source is `.remote(machine)` with
+///   `ownsConnection: false`.
 /// - `presentDialing`: dials a FRESH connection off-main, opens the panel as its
 ///   sole owner (`ownsConnection: true`), and frees it via `model.stop()` when the
 ///   window closes.
+/// - `presentLocal`: opens the panel on the in-process `.local` source (no
+///   connection).
 ///
-/// A small registry keyed by `Machine.ID` focuses an existing panel instead of
+/// Once open, the panel's in-window machine switcher can move to any other source
+/// (dialing fresh owned connections / freeing them) WITHOUT opening a second
+/// window — the registry only governs the INITIAL open.
+///
+/// A registry keyed by `MonitorSource` focuses an existing panel instead of
 /// opening a duplicate. Closing a panel always calls `model.stop()` exactly once
 /// (window-close → delegate), so connections never leak.
 @MainActor
 enum RemoteActivityMonitor {
-    /// Open windows keyed by machine. A strong reference keeps each panel alive.
-    private static var windows: [Machine.ID: NSWindow] = [:]
+    /// Open windows keyed by their INITIAL source. A strong reference keeps each
+    /// panel alive.
+    private static var windows: [MonitorSource: NSWindow] = [:]
 
     /// Open (or focus) a monitor on an EXISTING, externally-owned connection.
     static func presentReusing(connection: ghostty_remote_connection_t, machine: Machine) {
-        if focusExisting(machine) { return }
+        let source = MonitorSource.remote(machine)
+        if focusExisting(source) { return }
         let model = RemoteActivityMonitorModel(
-            machine: machine,
+            source: source,
             handle: connection,
             ownsConnection: false
         )
         model.start()
-        openWindow(for: machine, model: model)
+        openWindow(for: source, title: "Activity — \(machine.name)", model: model)
+    }
+
+    /// Open (or focus) a monitor on the in-process LOCAL source.
+    static func presentLocal() {
+        let source = MonitorSource.local
+        if focusExisting(source) { return }
+        let model = RemoteActivityMonitorModel(
+            source: source,
+            handle: nil,
+            ownsConnection: false
+        )
+        model.start()
+        openWindow(for: source, title: "Activity — Local", model: model)
     }
 
     /// Dial a FRESH connection off-main and open a monitor that owns it. Shows a
     /// connecting placeholder window immediately; on dial failure replaces it with
     /// an error alert and closes.
     static func presentDialing(machine: Machine) {
-        if focusExisting(machine) { return }
+        let source = MonitorSource.remote(machine)
+        if focusExisting(source) { return }
 
         let host = machine.host
         let port = machine.port
@@ -48,10 +71,10 @@ enum RemoteActivityMonitor {
             }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    // A panel for this machine may have appeared while we dialed.
-                    if windows[machine.id] != nil {
+                    // A panel for this source may have appeared while we dialed.
+                    if windows[source] != nil {
                         if let handle { ghostty_remote_connection_free(handle) }
-                        focus(machine)
+                        focus(source)
                         return
                     }
                     guard let handle else {
@@ -59,20 +82,20 @@ enum RemoteActivityMonitor {
                         return
                     }
                     let model = RemoteActivityMonitorModel(
-                        machine: machine,
+                        source: source,
                         handle: handle,
                         ownsConnection: true
                     )
                     model.start()
-                    openWindow(for: machine, model: model)
+                    openWindow(for: source, title: "Activity — \(machine.name)", model: model)
                 }
             }
         }
     }
 
     /// Command-palette entry point. If the surface's window is a REMOTE window,
-    /// open on its existing connection; otherwise present the machine chooser and,
-    /// on a remote selection, dial a fresh connection.
+    /// open on its existing connection; otherwise present the machine chooser and
+    /// open Local in-process or dial a fresh connection for the picked machine.
     static func openFromPalette(surfaceView: Ghostty.SurfaceView) {
         if let controller = surfaceView.window?.windowController as? BaseTerminalController,
            let connection = controller.remoteConnection {
@@ -81,12 +104,16 @@ enum RemoteActivityMonitor {
         }
 
         let machines = MachineRegistry.shared.machines
-        guard !machines.isEmpty else { return }
+        guard !machines.isEmpty else {
+            // No remote machines registered: just open the local monitor.
+            presentLocal()
+            return
+        }
         MachineChooser.present(machines: machines) { selected in
             guard let selected else { return }
             switch selected {
             case .local:
-                break // No local Activity Monitor; the user picked Local.
+                presentLocal()
             case .remote(let machine):
                 presentDialing(machine: machine)
             }
@@ -95,36 +122,36 @@ enum RemoteActivityMonitor {
 
     // MARK: - Internals
 
-    /// Focus the existing panel for `machine` if one is open. Returns true if so.
-    private static func focusExisting(_ machine: Machine) -> Bool {
-        guard windows[machine.id] != nil else { return false }
-        focus(machine)
+    /// Focus the existing panel for `source` if one is open. Returns true if so.
+    private static func focusExisting(_ source: MonitorSource) -> Bool {
+        guard windows[source] != nil else { return false }
+        focus(source)
         return true
     }
 
-    private static func focus(_ machine: Machine) {
-        guard let window = windows[machine.id] else { return }
+    private static func focus(_ source: MonitorSource) {
+        guard let window = windows[source] else { return }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
 
-    private static func openWindow(for machine: Machine, model: RemoteActivityMonitorModel) {
+    private static func openWindow(for source: MonitorSource, title: String, model: RemoteActivityMonitorModel) {
         let view = RemoteActivityMonitorView(model: model)
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.title = "Activity — \(machine.name)"
+        window.title = title
         window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 640, height: 460))
+        window.setContentSize(NSSize(width: 700, height: 480))
 
         // On close: stop the model (unsubscribe + free if owned) exactly once and
         // drop our registry reference so the window deallocates.
-        let delegate = MonitorWindowDelegate(machineID: machine.id, model: model)
+        let delegate = MonitorWindowDelegate(source: source, model: model)
         window.delegate = delegate
         // Keep the delegate alive for the window's lifetime.
         objc_setAssociatedObject(window, &Self.delegateKey, delegate, .OBJC_ASSOCIATION_RETAIN)
 
-        windows[machine.id] = window
+        windows[source] = window
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -140,9 +167,9 @@ enum RemoteActivityMonitor {
     }
 
     /// Called by the window delegate when a panel closes.
-    fileprivate static func windowClosed(machineID: Machine.ID, model: RemoteActivityMonitorModel) {
+    fileprivate static func windowClosed(source: MonitorSource, model: RemoteActivityMonitorModel) {
         model.stop()
-        windows.removeValue(forKey: machineID)
+        windows.removeValue(forKey: source)
     }
 
     private static var delegateKey: UInt8 = 0
@@ -151,17 +178,17 @@ enum RemoteActivityMonitor {
 /// Tears down a monitor model when its window closes. One per panel; retained via
 /// associated object on the window so it lives exactly as long as the window.
 private final class MonitorWindowDelegate: NSObject, NSWindowDelegate {
-    private let machineID: Machine.ID
+    private let source: MonitorSource
     private let model: RemoteActivityMonitorModel
 
-    init(machineID: Machine.ID, model: RemoteActivityMonitorModel) {
-        self.machineID = machineID
+    init(source: MonitorSource, model: RemoteActivityMonitorModel) {
+        self.source = source
         self.model = model
     }
 
     func windowWillClose(_ notification: Notification) {
         MainActor.assumeIsolated {
-            RemoteActivityMonitor.windowClosed(machineID: machineID, model: model)
+            RemoteActivityMonitor.windowClosed(source: source, model: model)
         }
     }
 }
