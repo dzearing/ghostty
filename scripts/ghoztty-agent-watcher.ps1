@@ -38,6 +38,15 @@ function SyncLogs(){
   } catch {}
 }
 function HashOf($p){ if (Test-Path $p) { (Get-FileHash -Algorithm SHA256 $p).Hash } else { $null } }
+# Tree-kill a pid: terminate the process AND its descendant tree (the agent's
+# per-session ConPTY children -- cmd.exe / conhost.exe). A plain .Kill() leaves
+# those children ORPHANED on every redeploy; they pile up forever, clutter the
+# box, and a wedged/orphaned conhost can stall the next agent. `taskkill /T`
+# walks the child tree. Best-effort: ignore failures (already-gone pids, etc.).
+function KillTree($procId){
+  if (-not $procId) { return }
+  try { & taskkill.exe /F /T /PID $procId 2>$null | Out-Null } catch {}
+}
 
 $proc = $null
 $deployed = $null
@@ -57,10 +66,12 @@ while ($true) {
       elseif (-not $alive)        { Log "agent exited; restarting." }
 
       # Stop the agent we started, plus any strays running from our local path.
-      if ($alive) { Log "stopping old agent (pid $($proc.Id))"; try { $proc.Kill(); $proc.WaitForExit(5000) | Out-Null } catch {} }
+      # Tree-kill so each agent's ConPTY children (cmd.exe/conhost.exe) die WITH it
+      # instead of orphaning on every redeploy.
+      if ($alive) { Log "stopping old agent tree (pid $($proc.Id))"; KillTree $proc.Id; try { $proc.WaitForExit(5000) | Out-Null } catch {} }
       Get-Process -Name 'ghoztty-agent' -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $Local } |
-        ForEach-Object { try { $_.Kill() } catch {} }
+        ForEach-Object { KillTree $_.Id }
       Start-Sleep -Milliseconds 500
 
       # Copy the new build over the stable local path (retry past the brief exe lock).
