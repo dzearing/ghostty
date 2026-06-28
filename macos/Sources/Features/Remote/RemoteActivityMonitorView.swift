@@ -544,29 +544,55 @@ final class RemoteActivityMonitorModel: ObservableObject {
     // MARK: Process control (Kill / Spawn)
 
     /// Kill `row` on the current source (signal "TERM"), then force a refresh so it
-    /// disappears. Surfaces failures via `actionError`.
+    /// disappears. Surfaces failures via `actionError`. Convenience for N==1.
     func kill(_ row: ProcRow) {
-        guard !stopped else { return }
+        killSelected([row])
+    }
+
+    /// Kill every row in `rows` on the current source (signal "TERM"), sequentially
+    /// on one background hop, then force a SINGLE refresh at the end. Failures are
+    /// aggregated into one `actionError` ("Killed 3 of 5 (2 failed: …)"). On full
+    /// success `onAllSucceeded` runs on the main actor (used to clear selection).
+    func killSelected(_ rows: [ProcRow], onAllSucceeded: (() -> Void)? = nil) {
+        guard !stopped, !rows.isEmpty else { onAllSucceeded?(); return }
         let isLocal = remote == nil
         let handle = remote?.handle
-        let pid = row.pid
-        let name = row.name
+        // Marshal the pid/name pairs up front so the closure captures plain values.
+        let targets: [(pid: Int64, name: String)] = rows.map { ($0.pid, $0.name) }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let ok: Bool = "TERM".withCString { sig in
-                if isLocal {
-                    return ghostty_local_proc_kill(pid, sig)
-                } else {
-                    return ghostty_remote_connection_proc_kill(handle!, pid, sig, 0)
+            var failed: [(pid: Int64, name: String)] = []
+            for t in targets {
+                let ok: Bool = "TERM".withCString { sig in
+                    if isLocal {
+                        return ghostty_local_proc_kill(t.pid, sig)
+                    } else {
+                        return ghostty_remote_connection_proc_kill(handle!, t.pid, sig, 0)
+                    }
                 }
+                if !ok { failed.append(t) }
             }
+            let total = targets.count
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self, !self.stopped else { return }
-                    if ok {
-                        self.refresh()
+                    // One refresh after the whole batch so survivors/casualties
+                    // settle in a single table update.
+                    self.refresh()
+                    if failed.isEmpty {
+                        onAllSucceeded?()
+                        return
+                    }
+                    let killed = total - failed.count
+                    if total == 1 {
+                        let only = failed[0]
+                        self.actionError = "Couldn't kill \(only.name.isEmpty ? "process" : only.name) (PID \(only.pid)). It may require elevated privileges."
                     } else {
-                        self.actionError = "Couldn't kill \(name.isEmpty ? "process" : name) (PID \(pid)). It may require elevated privileges."
+                        // List up to a few failed names so the cause is concrete.
+                        let names = failed.prefix(3).map { $0.name.isEmpty ? "PID \($0.pid)" : $0.name }
+                        var detail = names.joined(separator: ", ")
+                        if failed.count > names.count { detail += ", …" }
+                        self.actionError = "Killed \(killed) of \(total) (\(failed.count) failed: \(detail)). Some may require elevated privileges."
                     }
                 }
             }
@@ -634,11 +660,14 @@ struct RemoteActivityMonitorView: View {
     @ObservedObject var model: RemoteActivityMonitorModel
 
     @State private var query: String = ""
-    @State private var selectedPID: Int64?
+    /// Multi-row selection, keyed by `ProcRow.id` (pid). SwiftUI `Table` drives
+    /// native Cmd/Shift-click multi-select into this set.
+    @State private var selection = Set<Int64>()
     @State private var sortOrder: [KeyPathComparator<ProcRow>] = [
         .init(\.cpuPctPerCore, order: .reverse)
     ]
-    @State private var confirmingKill: ProcRow?
+    /// The rows pending a kill confirmation (1 ⇒ single, N ⇒ bulk). nil ⇒ no dialog.
+    @State private var confirmingKill: [ProcRow]?
     @State private var showingSpawn = false
     /// When false (default) the table shows ONLY ghoztty-spawned processes (the
     /// agent / this app and its descendant tree); when true it shows every process.
@@ -699,10 +728,22 @@ struct RemoteActivityMonitorView: View {
         return base.sorted(using: sortOrder)
     }
 
-    /// The currently selected row resolved from the selected pid.
-    private var selectedRow: ProcRow? {
-        guard let pid = selectedPID else { return nil }
-        return model.procs.first { $0.pid == pid }
+    /// The currently selected rows resolved from the selected pids (against the full
+    /// proc list, so a row hidden by the current filter/search but still selected is
+    /// still resolved). Order is unspecified; only used for counts + the kill batch.
+    private var selectedRows: [ProcRow] {
+        guard !selection.isEmpty else { return [] }
+        return model.procs.filter { selection.contains($0.pid) }
+    }
+
+    /// The confirmation-dialog title: one process names it (PID); many give a count.
+    private var killConfirmTitle: String {
+        guard let rows = confirmingKill, !rows.isEmpty else { return "Kill process?" }
+        if rows.count == 1 {
+            let r = rows[0]
+            return "Kill \(r.name.isEmpty ? "process" : r.name) (PID \(r.pid))?"
+        }
+        return "Kill \(rows.count) processes?"
     }
 
     var body: some View {
@@ -718,22 +759,24 @@ struct RemoteActivityMonitorView: View {
         }
         .frame(minWidth: 620, minHeight: 380)
         .confirmationDialog(
-            confirmingKill.map { "Kill \($0.name.isEmpty ? "process" : $0.name) (PID \($0.pid))?" } ?? "Kill process?",
+            killConfirmTitle,
             isPresented: Binding(
                 get: { confirmingKill != nil },
                 set: { if !$0 { confirmingKill = nil } }
             ),
             titleVisibility: .visible
         ) {
-            if let row = confirmingKill {
-                Button("Kill", role: .destructive) {
-                    model.kill(row)
+            if let rows = confirmingKill, !rows.isEmpty {
+                Button(rows.count == 1 ? "Kill" : "Kill \(rows.count)", role: .destructive) {
+                    model.killSelected(rows) { selection.removeAll() }
                     confirmingKill = nil
                 }
             }
             Button("Cancel", role: .cancel) { confirmingKill = nil }
         } message: {
-            Text("This sends a termination signal to the process.")
+            Text(confirmingKill?.count ?? 0 > 1
+                ? "This sends a termination signal to each selected process."
+                : "This sends a termination signal to the process.")
         }
         .sheet(isPresented: $showingSpawn) {
             NewProcessSheet(sourceLabel: model.source.label) { cmd, cwd in
@@ -894,15 +937,19 @@ struct RemoteActivityMonitorView: View {
 
             countLabel
 
-            // Kill appears only when a row is selected (the user asked for it "on
-            // the right side when selected").
-            if let row = selectedRow {
+            // Kill appears whenever one or more rows are selected; the label counts
+            // them ("Kill" for 1, "Kill N" for N>1).
+            if !selectedRows.isEmpty {
+                let rows = selectedRows
                 Button(role: .destructive) {
-                    confirmingKill = row
+                    confirmingKill = rows
                 } label: {
-                    Label("Kill", systemImage: "xmark.octagon")
+                    Label(rows.count == 1 ? "Kill" : "Kill \(rows.count)",
+                          systemImage: "xmark.octagon")
                 }
-                .help("Terminate \(row.name.isEmpty ? "PID \(row.pid)" : row.name)")
+                .help(rows.count == 1
+                    ? "Terminate \(rows[0].name.isEmpty ? "PID \(rows[0].pid)" : rows[0].name)"
+                    : "Terminate \(rows.count) selected processes")
             }
 
             Button {
@@ -936,7 +983,7 @@ struct RemoteActivityMonitorView: View {
     // MARK: Table (selectable)
 
     private var table: some View {
-        Table(of: ProcRow.self, selection: $selectedPID, sortOrder: $sortOrder) {
+        Table(of: ProcRow.self, selection: $selection, sortOrder: $sortOrder) {
             TableColumn("PID", value: \.pid) { row in
                 Text(String(row.pid)).monospacedDigit()
             }
@@ -996,6 +1043,15 @@ struct RemoteActivityMonitorView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+        }
+        // Prune pids that no longer exist (process exited, source/filter switched)
+        // so the Kill count stays honest. The Table already ignores stale ids; this
+        // keeps `selection` itself in sync.
+        .onChange(of: model.procs) { newProcs in
+            guard !selection.isEmpty else { return }
+            let live = Set(newProcs.map { $0.pid })
+            let pruned = selection.intersection(live)
+            if pruned.count != selection.count { selection = pruned }
         }
     }
 
