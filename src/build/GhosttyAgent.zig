@@ -38,6 +38,21 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
 
     if (cfg.pie) exe.pie = true;
 
+    // On Windows the agent shows a system-tray icon in listen-daemon mode (the
+    // deploy watcher launches it as the always-on daemon). Build it as the GUI
+    // subsystem so Windows never allocates a console window for it — no stray
+    // black box pops up next to the tray. Logging is unaffected: the watcher
+    // redirects stdout/stderr to log files (inherited handles work regardless of
+    // subsystem), so the readiness banner is still captured. This is windows-only;
+    // the macOS host + the `test-agent` build are left untouched.
+    if (cfg.target.result.os.tag == .windows) {
+        exe.subsystem = .Windows;
+        // The tray pulls in user32/shell32. kernel32 is auto-linked, but these
+        // are not, so request them explicitly (windows-target only).
+        exe.linkSystemLibrary("user32");
+        exe.linkSystemLibrary("shell32");
+    }
+
     // The agent module is rooted at `src/` (via `src/agent_main.zig`), so its
     // files import `protocol.zig`, `pty.zig`, and `CommandCore.zig` by relative
     // path — exactly like the rest of the app. No named `protocol` module is

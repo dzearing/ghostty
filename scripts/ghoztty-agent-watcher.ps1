@@ -82,7 +82,10 @@ while ($true) {
       }
       if (-not $copied) { Log "ERROR: could not copy new build (still locked?); will retry next poll"; Start-Sleep -Seconds $PollSec; continue }
 
-      # Launch it (no window; stdout/stderr -> log files).
+      # Launch it. The agent is now a GUI-subsystem exe that shows a SYSTEM-TRAY
+      # icon in listen mode (no console window pops up), so do NOT pass --headless
+      # (that would suppress the tray). stdout/stderr still go to the log files via
+      # inherited handles, so the readiness banner below is captured as before.
       $proc = Start-Process -FilePath $Local -ArgumentList @('--listen', $Listen) `
                 -PassThru -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr
       $deployed = $srcHash

@@ -56,8 +56,15 @@ const session = @import("session.zig");
 const pty_child = @import("pty_child.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
+const tray = @import("tray.zig");
 
 const default_listen = "0.0.0.0:7777";
+
+/// Short build identifier shown in the Windows tray About line. No build/version
+/// constant is wired into the agent's standalone module graph (it roots at `src/`
+/// without `build_config`), so a literal placeholder is used; `// TODO(version)`
+/// thread the real version through if/when the agent module gains build_config.
+const build_hash = "dev";
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -71,7 +78,7 @@ pub fn main() !void {
     const mode = try parseArgs(alloc);
     switch (mode) {
         .stdio => try runStdio(alloc, encoding),
-        .listen => |addr| try runListen(alloc, encoding, addr),
+        .listen => |l| try runListen(alloc, encoding, l.addr, l.headless),
     }
 }
 
@@ -85,18 +92,36 @@ fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
 
 const Mode = union(enum) {
     stdio,
-    listen: std.net.Address,
+    listen: Listen,
+};
+
+/// TCP listen-daemon parameters. `headless` suppresses the Windows system-tray
+/// icon (for CI / non-interactive runs); the default (tray ON) is what the deploy
+/// watcher uses so the human running the Windows box gets a visible daemon handle.
+const Listen = struct {
+    addr: std.net.Address,
+    headless: bool = false,
 };
 
 /// Parse `--stdio` | `--listen <addr:port>` | (no args ⇒ default TCP listen).
+/// `--headless` (anywhere on the line) suppresses the tray for listen mode; the
+/// stdio path is ALWAYS headless (an ssh-piped agent has no desktop to draw on).
 fn parseArgs(alloc: Allocator) !Mode {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
+    // Pre-scan for --headless so it can appear before OR after --listen.
+    var headless = false;
+    for (args[1..]) |a| {
+        if (std.mem.eql(u8, a, "--headless")) headless = true;
+    }
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--stdio")) {
+        if (std.mem.eql(u8, a, "--headless")) {
+            continue; // handled in the pre-scan above
+        } else if (std.mem.eql(u8, a, "--stdio")) {
             return .stdio;
         } else if (std.mem.eql(u8, a, "--listen")) {
             i += 1;
@@ -104,16 +129,16 @@ fn parseArgs(alloc: Allocator) !Mode {
                 std.debug.print("ghoztty-agent: --listen requires <addr:port>\n", .{});
                 return error.InvalidArgs;
             }
-            return .{ .listen = try parseAddr(args[i]) };
+            return .{ .listen = .{ .addr = try parseAddr(args[i]), .headless = headless } };
         } else if (std.mem.startsWith(u8, a, "--listen=")) {
-            return .{ .listen = try parseAddr(a["--listen=".len..]) };
+            return .{ .listen = .{ .addr = try parseAddr(a["--listen=".len..]), .headless = headless } };
         } else {
             std.debug.print("ghoztty-agent: unknown argument '{s}'\n", .{a});
             return error.InvalidArgs;
         }
     }
     // No args: default to the TCP listen daemon so a bare invocation "just works".
-    return .{ .listen = try parseAddr(default_listen) };
+    return .{ .listen = .{ .addr = try parseAddr(default_listen), .headless = headless } };
 }
 
 /// Parse "host:port" into a `std.net.Address`. Host may be an IPv4/IPv6 literal.
@@ -169,7 +194,12 @@ fn runStdio(alloc: Allocator, encoding: protocol.TransferEncoding) !void {
 // Mux + Server + PtySpawner (no session survival this increment).
 // -----------------------------------------------------------------------------
 
-fn runListen(alloc: Allocator, encoding: protocol.TransferEncoding, addr: std.net.Address) !void {
+fn runListen(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    addr: std.net.Address,
+    headless: bool,
+) !void {
     var listener = addr.listen(.{ .reuse_address = true }) catch |err| {
         std.debug.print("ghoztty-agent: failed to bind {f}: {s}\n", .{ addr, @errorName(err) });
         return err;
@@ -203,9 +233,79 @@ fn runListen(alloc: Allocator, encoding: protocol.TransferEncoding, addr: std.ne
 
     const stdout = std.fs.File.stdout();
     // Stdout is line-flushed by the OS for a pipe; print + the newline is enough
-    // for an orchestrator polling for readiness.
+    // for an orchestrator polling for readiness. (Even though the Windows agent is
+    // built as the GUI subsystem so no console pops up, the deploy watcher
+    // redirects stdout to a log file — an inherited handle — so this banner is
+    // still captured and the readiness poll still works.)
     stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent: listening on {f}\n", .{addr}) catch "ghoztty-agent: listening\n") catch {};
 
+    // The accept loop is the whole daemon. WHERE it runs depends on the tray:
+    //
+    //   • Windows + tray (the default, !headless): the Win32 message loop MUST own
+    //     the MAIN thread (it pumps the window that owns the tray icon), so we run
+    //     the accept loop on a detached worker thread and hand the main thread to
+    //     `tray.run`. When the user picks Exit, `tray.run` returns and we exit the
+    //     process. If tray setup fails, we FALL BACK to the main-thread accept loop
+    //     below — the daemon must never fail to serve because the UI broke.
+    //
+    //   • Everything else (headless, or any non-Windows OS): run the accept loop on
+    //     the MAIN thread exactly as before — unchanged behavior.
+    if (builtin.os.tag == .windows and !headless) {
+        const args: AcceptArgs = .{
+            .alloc = alloc,
+            .encoding = encoding,
+            .store = &store,
+            .spawner = spawner.spawner(),
+            .listener = &listener,
+        };
+        if (std.Thread.spawn(.{}, acceptLoopThread, .{args})) |t| {
+            t.detach();
+            // Blocks until the user chooses Exit. On non-windows this is a no-op,
+            // but we're already gated on `.windows` here.
+            tray.run(&store, build_hash);
+            // Exit chosen: the accept loop thread + reaper are detached daemon
+            // threads; a clean process exit tears everything down.
+            std.process.exit(0);
+        } else |err| {
+            // Couldn't spawn the worker thread — fall through to the main-thread
+            // accept loop so the daemon still serves (no tray, but functional).
+            std.debug.print("ghoztty-agent: tray worker spawn failed ({s}); serving headless\n", .{@errorName(err)});
+        }
+    }
+
+    // Headless / non-windows / tray-fallback: run the accept loop right here.
+    try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener);
+}
+
+/// Bundles the accept-loop parameters so they can ride a single `std.Thread.spawn`
+/// argument (the Windows tray path runs the loop on a worker thread).
+const AcceptArgs = struct {
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    listener: *std.net.Server,
+};
+
+/// Thread entry wrapper: run the accept loop, logging (but never propagating) a
+/// fatal accept error — this is a detached daemon thread.
+fn acceptLoopThread(args: AcceptArgs) void {
+    acceptLoop(args.alloc, args.encoding, args.store, args.spawner, args.listener) catch |err| {
+        std.debug.print("ghoztty-agent: accept loop error: {s}\n", .{@errorName(err)});
+    };
+}
+
+/// THE DAEMON: accept connections forever, serving each on its own detached
+/// thread. This is the loop that was previously inlined in `runListen`; it was
+/// extracted verbatim so it can run on EITHER the main thread (headless / non-
+/// windows) or a worker thread (so the Windows tray can own the main thread).
+fn acceptLoop(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    listener: *std.net.Server,
+) !void {
     while (true) {
         const conn = listener.accept() catch |err| switch (err) {
             // Transient accept errors: keep the daemon alive.
@@ -216,7 +316,7 @@ fn runListen(alloc: Allocator, encoding: protocol.TransferEncoding, addr: std.ne
         // loop NEVER blocks on one connection's lifecycle (a slow/dead/wedging client
         // can no longer starve new connections — the P0 "never wedge" guarantee). The
         // per-connection worker owns the socket fd and frees its own resources.
-        const worker = ConnWorker.create(alloc, encoding, &store, spawner.spawner(), conn.stream.handle) catch |err| {
+        const worker = ConnWorker.create(alloc, encoding, store, spawner, conn.stream.handle) catch |err| {
             std.debug.print("ghoztty-agent: failed to start worker: {s}\n", .{@errorName(err)});
             std.posix.close(conn.stream.handle);
             continue;
