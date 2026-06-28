@@ -632,6 +632,10 @@ struct RemoteActivityMonitorView: View {
     ]
     @State private var confirmingKill: ProcRow?
     @State private var showingSpawn = false
+    /// The carousel card the keyboard focus highlight is on. Arrows move it;
+    /// Return/Space commits a `switchTo` (so arrowing doesn't dial on every press).
+    /// Seeded to the active source's index on appear.
+    @State private var focusedCardIndex: Int = 0
 
     /// Processes filtered by the search query (name or pid substring), sorted.
     private var filtered: [ProcRow] {
@@ -699,41 +703,74 @@ struct RemoteActivityMonitorView: View {
     }
 
     /// A horizontal carousel of machine cards above the charts. Clicking any card
-    /// switches to that source in ONE click (`model.switchTo`). The active card is
-    /// highlighted with an accent border/fill.
+    /// switches to that source in ONE click (`model.switchTo`). LEFT/RIGHT arrows
+    /// move a focus ring between cards; Return/Space commits the switch (so arrowing
+    /// never dials a remote connection). The active card has the accent
+    /// fill/border; the focused card gets a distinct focus ring.
     private var cardCarousel: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
-                ForEach(allSources, id: \.self) { src in
-                    MachineCard(
-                        source: src,
-                        summary: model.summary(for: src),
-                        isSelected: src == model.source,
-                        switching: model.switching && src == model.source
-                    ) {
-                        model.switchTo(src)
+            ZStack {
+                // Invisible keyboard-shortcut buttons drive arrow/commit regardless
+                // of which subview holds focus (the proven MachineChooserView
+                // pattern; avoids macOS-14-only .onKeyPress).
+                Group {
+                    Button { moveFocus(-1) } label: { Color.clear }
+                        .keyboardShortcut(.leftArrow, modifiers: [])
+                    Button { moveFocus(1) } label: { Color.clear }
+                        .keyboardShortcut(.rightArrow, modifiers: [])
+                    Button { commitFocusedCard() } label: { Color.clear }
+                        .keyboardShortcut(.return, modifiers: [])
+                    Button { commitFocusedCard() } label: { Color.clear }
+                        .keyboardShortcut(.space, modifiers: [])
+                }
+                .buttonStyle(.plain)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+
+                HStack(spacing: 10) {
+                    ForEach(Array(allSources.enumerated()), id: \.element) { idx, src in
+                        MachineCard(
+                            source: src,
+                            summary: model.summary(for: src),
+                            isSelected: src == model.source,
+                            isFocused: idx == focusedCardIndex,
+                            switching: model.switching && src == model.source
+                        ) {
+                            focusedCardIndex = idx
+                            model.switchTo(src)
+                        }
                     }
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
         }
+        .onAppear {
+            // Seed the focus ring on the active card.
+            if let i = allSources.firstIndex(of: model.source) { focusedCardIndex = i }
+        }
+    }
+
+    /// Move the focus ring by `delta`, clamped to the card range.
+    private func moveFocus(_ delta: Int) {
+        let count = allSources.count
+        guard count > 0 else { return }
+        focusedCardIndex = min(max(focusedCardIndex + delta, 0), count - 1)
+    }
+
+    /// Commit (switch to) the currently focused card's source.
+    private func commitFocusedCard() {
+        guard allSources.indices.contains(focusedCardIndex) else { return }
+        model.switchTo(allSources[focusedCardIndex])
     }
 
     // MARK: Header (gauges)
 
+    /// The two trend charts, split 50/50 across the full panel width. The
+    /// redundant active-machine title/uptime block is intentionally gone — the
+    /// carousel above already shows the selected machine + its uptime.
     private var header: some View {
-        HStack(alignment: .center, spacing: 20) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(model.source.label)
-                    .font(.headline)
-                Text(subline)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
+        HStack(alignment: .center, spacing: 16) {
             TrendGaugeView(
                 title: "CPU",
                 value: String(format: "%.0f%%", normalizedHostCPU),
@@ -743,6 +780,7 @@ struct RemoteActivityMonitorView: View {
                 samples: model.samples,
                 memTotal: model.host.memTotal
             )
+            .frame(maxWidth: .infinity)
             TrendGaugeView(
                 title: "Memory",
                 value: memString(model.host.memUsed),
@@ -752,6 +790,7 @@ struct RemoteActivityMonitorView: View {
                 samples: model.samples,
                 memTotal: model.host.memTotal
             )
+            .frame(maxWidth: .infinity)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -1025,8 +1064,7 @@ struct TrendGaugeView: View {
     /// Total RAM in bytes, used to label the 100% reference for memory.
     let memTotal: UInt64
 
-    /// Chart dimensions — notably larger than the original 140×34 sparkline.
-    private static let chartWidth: CGFloat = 240
+    /// Chart height (width expands to fill the gauge's half of the row).
     private static let chartHeight: CGFloat = 64
 
     /// The seq of the sample under the pointer, or nil when not hovering.
@@ -1057,8 +1095,11 @@ struct TrendGaugeView: View {
                     .foregroundStyle(.secondary)
             }
             chart
-                .frame(width: Self.chartWidth, height: Self.chartHeight)
+                // Expand to fill the gauge's half of the row (the parent applies
+                // `.frame(maxWidth: .infinity)` for the 50/50 split); keep height.
+                .frame(maxWidth: .infinity, minHeight: Self.chartHeight, maxHeight: Self.chartHeight)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -1221,12 +1262,16 @@ struct TrendGaugeView: View {
 // MARK: - Machine card
 
 /// A single tappable card in the switcher carousel: status dot + name + a small
-/// uptime/CPU/mem summary. The active card is highlighted; tapping switches to it
-/// in one click. Pure presentation — `onSelect` does the source switch.
+/// uptime/CPU/mem summary. The active (selected) card is accent-highlighted; the
+/// keyboard-focused card gets a distinct focus ring (so "focused-but-not-yet-
+/// switched" reads differently from "currently active"). Tapping switches in one
+/// click. Pure presentation — `onSelect` does the source switch.
 struct MachineCard: View {
     let source: MonitorSource
     let summary: RemoteActivityMonitorModel.CardSummary
     let isSelected: Bool
+    /// True when the keyboard focus ring is on this card (arrow navigation).
+    let isFocused: Bool
     /// True only for the active card while it is mid-dial.
     let switching: Bool
     let onSelect: () -> Void
@@ -1297,6 +1342,14 @@ struct MachineCard: View {
                         isSelected ? Color.accentColor : Color.secondary.opacity(0.25),
                         lineWidth: isSelected ? 2 : 1
                     )
+            )
+            // A distinct focus ring drawn OUTSIDE the card border, so keyboard
+            // focus (arrowed-to, not yet committed) reads differently from the
+            // active accent highlight.
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .inset(by: -2.5)
+                    .strokeBorder(Color.accentColor.opacity(isFocused ? 0.9 : 0), lineWidth: 2)
             )
             .contentShape(RoundedRectangle(cornerRadius: 8))
         }
