@@ -13,6 +13,24 @@
 > **live metrics push proven against the native macOS agent.** ⏳ Windows sampler is
 > compile-only until the agent is redeployed (needs the SMB share mounted).
 >
+> **Increment 2 ✅ CODE-COMPLETE, builds green** (2a `e72817c77`, 2b `23d3938e8`).
+> 2a: client `Connection.subscribeMetrics(interval,ctx,handler)`/`unsubscribeMetrics`
+> (dedicated handler slot fired from `handleControlInternal` on `.metrics`; pushes ride
+> the EXISTING control-reader thread — no new client thread to join); C API
+> `ghostty_host_metrics_s` + `ghostty_remote_connection_metrics_subscribe/_unsubscribe`
+> (callback fires on the reader thread → Swift hops to main; unsubscribe clears the slot
+> under lock before free → no UAF). Live-verified via `remote-test-client --metrics=3`
+> against the native agent (real CPU deltas). 2b: the Cmd-Shift-N picker now dials each
+> machine on open (`MachineMetricsProbe`), subscribes, and shows live **CPU% · used/total
+> GB** IN PLACE OF the IP:port ("Connecting…"/"Unreachable"/live); probes torn down on
+> dismiss. Closes progress-doc item #4. `zig build -Doptimize=Debug` green (connection 72
+> tests, full app links).
+> ⏳ **LIVE GUI VERIFY PENDING:** the picker is GUI (orchestrator can't drive Cmd-Shift-N)
+> AND maximushome still runs the pre-metrics agent → rows sit at "Connecting…" until the
+> metrics-capable agent is redeployed (needs the SMB share mounted, then
+> `./scripts/deploy-windows-agent.sh`). Then the user opens Cmd-Shift-N to confirm live
+> CPU/mem vs Task Manager.
+
 > Original plan below (the increment-1 frame opcodes are the only deviation).
 
 > Status (orig): **PLANNED, not started.** Branch base: `feature/remote-machines`.
