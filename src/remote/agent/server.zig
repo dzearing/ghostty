@@ -1048,7 +1048,20 @@ pub const Server = struct {
             .host = host,
             .procs = procs.items,
             .truncated = truncated,
+            .agent_pid = currentPid(),
         }) catch {};
+    }
+
+    /// This agent process's own pid, used by the client as the root of the
+    /// "ghoztty-spawned" descendant tree. Cheap (one syscall); cross-OS.
+    fn currentPid() i64 {
+        if (builtin.os.tag == .windows) {
+            const k32 = struct {
+                extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) std.os.windows.DWORD;
+            };
+            return @intCast(k32.GetCurrentProcessId());
+        }
+        return @intCast(std.c.getpid());
     }
 
     /// `PROC_KILL` (§9.3, inc 4): terminate the requested pid and reply

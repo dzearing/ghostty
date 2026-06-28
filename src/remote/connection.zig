@@ -542,6 +542,9 @@ pub const OwnedProcSnapshot = struct {
     procs: []protocol.Proc,
     /// The agent clipped the table to the requested limit.
     truncated: bool,
+    /// The agent's own pid (root of the "ghoztty-spawned" descendant tree). 0 =
+    /// unknown (agent pre-dates this field).
+    agent_pid: i64 = 0,
     alloc: Allocator,
 
     /// Free the owned process slice and every string it owns.
@@ -1310,6 +1313,7 @@ pub const Connection = struct {
             .host = parsed.value.host,
             .procs = procs,
             .truncated = parsed.value.truncated,
+            .agent_pid = parsed.value.agent_pid,
             .alloc = self.alloc,
         };
     }

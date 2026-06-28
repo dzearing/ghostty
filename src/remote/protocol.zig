@@ -560,6 +560,10 @@ pub const ProcSnapshot = struct {
     host: HostMetrics = .{},
     procs: []const Proc = &.{},
     truncated: bool = false,
+    /// The agent's own pid (0 = unknown / agent pre-dates this field). The client
+    /// uses it as the root of the "ghoztty-spawned" descendant tree so the activity
+    /// monitor can default to showing only processes the agent launched.
+    agent_pid: i64 = 0,
 };
 
 /// `METRICS_SUB` (0x72). Subscribe to the pushed host-metrics stream.
@@ -1327,6 +1331,7 @@ test "PROC_SNAPSHOT/Proc JSON round-trips (incl. null cmd/user elision)" {
         .host = .{ .ncpu = 8, .mem_total = 1024 },
         .procs = &procs,
         .truncated = false,
+        .agent_pid = 4321,
     };
     const sj = try encodeJson(alloc, snap);
     defer alloc.free(sj);
@@ -1345,6 +1350,14 @@ test "PROC_SNAPSHOT/Proc JSON round-trips (incl. null cmd/user elision)" {
     try testing.expectEqualStrings("alice", sp.value.procs[1].user.?);
     try testing.expectEqualStrings("-zsh", sp.value.procs[1].cmd.?);
     try testing.expectEqual(@as(u32, 8), sp.value.host.ncpu);
+    try testing.expectEqual(@as(i64, 4321), sp.value.agent_pid);
+
+    // Back-compat: a snapshot JSON from an old agent (no agent_pid) parses with
+    // agent_pid defaulting to 0.
+    var old = try parseJson(ProcSnapshot, alloc,
+        "{\"ok\":true,\"host\":{},\"procs\":[],\"truncated\":false}");
+    defer old.deinit();
+    try testing.expectEqual(@as(i64, 0), old.value.agent_pid);
 }
 
 test "PROC_KILL / PROC_SPAWN JSON payloads round-trip (incl. null elision)" {

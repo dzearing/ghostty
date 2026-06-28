@@ -116,6 +116,11 @@ final class RemoteActivityMonitorModel: ObservableObject {
     private var sampleSeq = 0
     /// The most recent process table.
     @Published private(set) var procs: [ProcRow] = []
+    /// Root pid of the "ghoztty-spawned" process tree for the current source
+    /// (remote: the agent's own pid; local: this app's own pid). 0 ⇒ unknown (an
+    /// old agent that doesn't report it) — the UI then falls back to showing all
+    /// rows regardless of the toggle.
+    @Published private(set) var rootPid: Int64 = 0
     /// True while we have never received a proc snapshot for the current source.
     @Published private(set) var isLoading = true
     /// True if the last snapshot was clipped by the agent's row cap.
@@ -308,6 +313,7 @@ final class RemoteActivityMonitorModel: ObservableObject {
         // here guarantees one machine's history never bleeds into another's.
         source = newSource
         procs = []
+        rootPid = 0
         host = HostReading()
         samples = []
         sampleSeq = 0
@@ -426,6 +432,7 @@ final class RemoteActivityMonitorModel: ObservableObject {
             // Marshal everything out of the C structs BEFORE freeing.
             let ok = list.ok
             let truncated = list.truncated
+            let rootPid = list.agent_pid
             let host = HostReading(
                 cpuPct: list.host.cpu_pct,
                 memUsed: list.host.mem_used,
@@ -474,6 +481,7 @@ final class RemoteActivityMonitorModel: ObservableObject {
                     self.lastRefreshFailed = !ok
                     if ok {
                         self.truncated = truncated
+                        self.rootPid = rootPid
                         self.procs = rows
                         var merged = self.host
                         merged.memUsed = host.memUsed
@@ -632,19 +640,58 @@ struct RemoteActivityMonitorView: View {
     ]
     @State private var confirmingKill: ProcRow?
     @State private var showingSpawn = false
+    /// When false (default) the table shows ONLY ghoztty-spawned processes (the
+    /// agent / this app and its descendant tree); when true it shows every process.
+    @State private var showAll = false
     /// The carousel card the keyboard focus highlight is on. Arrows move it;
     /// Return/Space commits a `switchTo` (so arrowing doesn't dial on every press).
     /// Seeded to the active source's index on appear.
     @State private var focusedCardIndex: Int = 0
 
-    /// Processes filtered by the search query (name or pid substring), sorted.
+    /// Whether filtering to ghoztty-spawned processes is even possible: requires a
+    /// known root pid. When the agent pre-dates the `agent_pid` field (`rootPid ==
+    /// 0`) we can't compute the descendant set, so we always show everything.
+    private var canFilterSpawned: Bool { model.rootPid != 0 }
+
+    /// Whether the table is currently restricted to ghoztty-spawned processes.
+    private var spawnedOnlyActive: Bool { canFilterSpawned && !showAll }
+
+    /// The set of pids that are ghoztty-spawned: `rootPid` plus every transitive
+    /// descendant (BFS over a ppid→children adjacency map). Robust to cycles
+    /// (visited set) and missing parents (a pid with no path to `rootPid` is simply
+    /// excluded). Empty when there's no known root.
+    private var spawnedPIDs: Set<Int64> {
+        let root = model.rootPid
+        guard root != 0 else { return [] }
+        // children[ppid] = [pid, …]
+        var children: [Int64: [Int64]] = [:]
+        for p in model.procs {
+            children[p.ppid, default: []].append(p.pid)
+        }
+        var result: Set<Int64> = [root]
+        var queue: [Int64] = [root]
+        while let pid = queue.popLast() {
+            guard let kids = children[pid] else { continue }
+            for kid in kids where !result.contains(kid) {
+                result.insert(kid)
+                queue.append(kid)
+            }
+        }
+        return result
+    }
+
+    /// Processes for the table: ghoztty-spawned filter (unless "Show all" / no known
+    /// root), THEN the search query (name or pid substring), THEN sort. The toggle
+    /// and search compose.
     private var filtered: [ProcRow] {
+        var base = model.procs
+        if spawnedOnlyActive {
+            let spawned = spawnedPIDs
+            base = base.filter { spawned.contains($0.pid) }
+        }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base: [ProcRow]
-        if q.isEmpty {
-            base = model.procs
-        } else {
-            base = model.procs.filter {
+        if !q.isEmpty {
+            base = base.filter {
                 $0.name.localizedCaseInsensitiveContains(q) ||
                 String($0.pid).contains(q)
             }
@@ -833,11 +880,19 @@ struct RemoteActivityMonitorView: View {
                     .foregroundStyle(.orange)
             }
 
+            // Show all vs. ghoztty-spawned only. Disabled (forced on) when the agent
+            // pre-dates the agent_pid field so we never imply an empty list.
+            Toggle("Show all", isOn: $showAll)
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+                .disabled(!canFilterSpawned)
+                .help(canFilterSpawned
+                    ? "When off, show only processes Ghoztty started (the agent and its descendants)."
+                    : "This agent pre-dates spawned-process filtering, so all processes are shown.")
+
             Spacer()
 
-            Text("\(filtered.count) processes")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            countLabel
 
             // Kill appears only when a row is selected (the user asked for it "on
             // the right side when selected").
@@ -859,6 +914,23 @@ struct RemoteActivityMonitorView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    /// The process-count label. When restricted to ghoztty-spawned processes, show
+    /// "N of M" (visible of total) so the user knows more exist; otherwise the plain
+    /// "M processes".
+    @ViewBuilder
+    private var countLabel: some View {
+        let total = model.procs.count
+        let shown = filtered.count
+        Text(spawnedOnlyActive && query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "\(shown) of \(total)"
+            : "\(shown) processes")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .help(spawnedOnlyActive
+                ? "Showing \(shown) Ghoztty-spawned of \(total) total processes."
+                : "\(shown) processes")
     }
 
     // MARK: Table (selectable)

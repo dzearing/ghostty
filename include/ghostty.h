@@ -1382,6 +1382,9 @@ typedef struct {
   ghostty_host_metrics_s host;
   ghostty_proc_s* procs;     // procs_len rows (valid pointer even when len == 0)
   size_t procs_len;
+  int64_t agent_pid;         // root pid of the "ghoztty-spawned" tree (remote: the
+                             // agent's pid; local: this app's pid). 0 = unknown
+                             // (old agent); UI then shows all rows.
 } ghostty_proc_list_s;
 
 // Fetch the remote host's process table. SYNCHRONOUS: this blocks on the RPC reply

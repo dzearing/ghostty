@@ -247,6 +247,7 @@ fn runPs(conn: *connection.Connection, count: u32) !void {
             snap.host.load1,
         },
     );
+    diag("ps: agent_pid={d}\n", .{snap.agent_pid});
     diag("ps: {d} process(es){s}\n", .{ snap.procs.len, if (snap.truncated) " (truncated)" else "" });
     diag("{s:>8} {s:>8} {s:>7} {s:>10}  {s}\n", .{ "PID", "PPID", "CPU%", "MEM(MB)", "NAME" });
     for (snap.procs) |p| {

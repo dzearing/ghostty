@@ -631,6 +631,10 @@ const ghostty_proc_list_s = extern struct {
     host: ghostty_host_metrics_s,
     procs: [*]ghostty_proc_s,
     procs_len: usize,
+    /// The root pid of the "ghoztty-spawned" process tree (remote: the agent's own
+    /// pid; local: this app's own pid). 0 = unknown (old agent that did not report
+    /// it). The UI defaults to showing only descendants of this pid.
+    agent_pid: i64,
 };
 
 /// A stable, never-freed empty array so a failed/empty `ghostty_proc_list_s` has a
@@ -2424,6 +2428,7 @@ pub const CAPI = struct {
             .host = .{ .cpu_pct = 0, .mem_used = 0, .mem_total = 0, .ncpu = 0, .uptime_s = 0, .load1 = -1 },
             .procs = empty_procs_sentinel[0..].ptr,
             .procs_len = 0,
+            .agent_pid = 0,
         };
 
         const conn = handle.conn() orelse return empty;
@@ -2490,6 +2495,7 @@ pub const CAPI = struct {
             },
             .procs = arr.ptr,
             .procs_len = arr.len,
+            .agent_pid = snap.agent_pid,
         };
     }
 
@@ -2611,12 +2617,25 @@ pub const CAPI = struct {
         _ = timeout_ms;
         const a = global.alloc;
 
+        // Local "ghoztty-spawned" root = this running app's own pid; the UI shows
+        // its descendants by default.
+        const self_pid: i64 = pid: {
+            if (builtin.os.tag == .windows) {
+                const k32 = struct {
+                    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) std.os.windows.DWORD;
+                };
+                break :pid @intCast(k32.GetCurrentProcessId());
+            }
+            break :pid @intCast(std.c.getpid());
+        };
+
         const empty: ghostty_proc_list_s = .{
             .ok = false,
             .truncated = false,
             .host = .{ .cpu_pct = 0, .mem_used = 0, .mem_total = 0, .ncpu = 0, .uptime_s = 0, .load1 = -1 },
             .procs = empty_procs_sentinel[0..].ptr,
             .procs_len = 0,
+            .agent_pid = self_pid,
         };
 
         LocalSamplers.mutex.lock();
@@ -2685,6 +2704,7 @@ pub const CAPI = struct {
             },
             .procs = arr.ptr,
             .procs_len = arr.len,
+            .agent_pid = self_pid,
         };
     }
 
