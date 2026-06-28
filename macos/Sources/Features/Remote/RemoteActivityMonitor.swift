@@ -93,31 +93,22 @@ enum RemoteActivityMonitor {
         }
     }
 
-    /// Command-palette entry point. If the surface's window is a REMOTE window,
-    /// open on its existing connection; otherwise present the machine chooser and
-    /// open Local in-process or dial a fresh connection for the picked machine.
+    /// Command-palette entry point. Opens the Activity Monitor DIRECTLY: on the
+    /// current window's connection if it's a remote window, else the Local monitor.
+    /// The panel's own machine carousel lets the user switch to any registered
+    /// machine from there — so we never route through the window-chooser (which is
+    /// the wrong UI here, and breaks as a nested modal when launched from the
+    /// command palette: its `runModal` can't take over event routing from the
+    /// palette, leaving it click/keyboard-dead).
     static func openFromPalette(surfaceView: Ghostty.SurfaceView) {
         if let controller = surfaceView.window?.windowController as? BaseTerminalController,
            let connection = controller.remoteConnection {
             presentReusing(connection: connection.handle, machine: connection.machine)
             return
         }
-
-        let machines = MachineRegistry.shared.machines
-        guard !machines.isEmpty else {
-            // No remote machines registered: just open the local monitor.
-            presentLocal()
-            return
-        }
-        MachineChooser.present(machines: machines) { selected in
-            guard let selected else { return }
-            switch selected {
-            case .local:
-                presentLocal()
-            case .remote(let machine):
-                presentDialing(machine: machine)
-            }
-        }
+        // Local (or non-remote) window: open the Local monitor; switch machines via
+        // the in-panel carousel.
+        presentLocal()
     }
 
     // MARK: - Internals
