@@ -70,6 +70,11 @@ struct HostSample: Identifiable, Equatable {
     let cpuPct: Double
     /// Memory used, as a fraction 0..1 of total (so the chart Y is 0..100%).
     let memFraction: Double
+    /// Absolute memory used in bytes (for the hover annotation's "X GB").
+    let memUsed: UInt64
+    /// Wall-clock time the sample was taken (for the hover "Xs ago"). `Date` is
+    /// fine on the Swift side; only the Zig agent forbids wall-clock time.
+    let at: Date
     var id: Int { seq }
 }
 
@@ -406,7 +411,13 @@ final class RemoteActivityMonitorModel: ObservableObject {
         let cpu = Double(max(0, min(100, h.cpuPct)))
         let memFrac = h.memTotal > 0 ? Double(h.memUsed) / Double(h.memTotal) : 0
         sampleSeq += 1
-        samples.append(HostSample(seq: sampleSeq, cpuPct: cpu, memFraction: max(0, min(1, memFrac))))
+        samples.append(HostSample(
+            seq: sampleSeq,
+            cpuPct: cpu,
+            memFraction: max(0, min(1, memFrac)),
+            memUsed: h.memUsed,
+            at: Date()
+        ))
         if samples.count > maxSamples {
             samples.removeFirst(samples.count - maxSamples)
         }
@@ -581,110 +592,27 @@ struct RemoteActivityMonitorView: View {
 
             Spacer()
 
-            trendGauge(
-                label: "CPU",
+            TrendGaugeView(
+                title: "CPU",
                 value: String(format: "%.0f%%", normalizedHostCPU),
                 detail: "\(model.host.ncpu) cores",
                 tint: .blue,
-                metric: .cpu
+                metric: .cpu,
+                samples: model.samples,
+                memTotal: model.host.memTotal
             )
-            trendGauge(
-                label: "Memory",
+            TrendGaugeView(
+                title: "Memory",
                 value: memString(model.host.memUsed),
                 detail: "of \(memString(model.host.memTotal))",
                 tint: .green,
-                metric: .memory
+                metric: .memory,
+                samples: model.samples,
+                memTotal: model.host.memTotal
             )
-            if let load1 = model.host.load1 {
-                statBlock(
-                    label: "Load",
-                    value: String(format: "%.2f", load1),
-                    detail: "1 min"
-                )
-            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-    }
-
-    /// Which header metric a trend gauge plots.
-    private enum TrendMetric { case cpu, memory }
-
-    /// A compact header gauge: the current value + label over a live sparkline of
-    /// the metric's recent history. Falls back to a plain text block (no chart) on
-    /// systems without Swift Charts.
-    @ViewBuilder
-    private func trendGauge(label: String, value: String, detail: String, tint: Color, metric: TrendMetric) -> some View {
-        VStack(alignment: .trailing, spacing: 2) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-            Text(value)
-                .font(.system(.title3, design: .rounded).weight(.semibold))
-                .monospacedDigit()
-            sparkline(tint: tint, metric: metric)
-                .frame(width: 140, height: 34)
-            Text(detail)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// The sparkline chart for a metric (Y fixed 0..100), or a thin baseline when
-    /// there isn't enough history yet / Charts is unavailable.
-    @ViewBuilder
-    private func sparkline(tint: Color, metric: TrendMetric) -> some View {
-        #if canImport(Charts)
-        if #available(macOS 13.0, *) {
-            let points = model.samples
-            Chart(points) { s in
-                let y = metric == .cpu ? s.cpuPct : s.memFraction * 100
-                AreaMark(
-                    x: .value("t", s.seq),
-                    y: .value("v", y)
-                )
-                .interpolationMethod(.catmullRom)
-                .foregroundStyle(
-                    .linearGradient(
-                        colors: [tint.opacity(0.35), tint.opacity(0.04)],
-                        startPoint: .top, endPoint: .bottom
-                    )
-                )
-                LineMark(
-                    x: .value("t", s.seq),
-                    y: .value("v", y)
-                )
-                .interpolationMethod(.catmullRom)
-                .foregroundStyle(tint)
-                .lineStyle(StrokeStyle(lineWidth: 1.5))
-            }
-            .chartYScale(domain: 0...100)
-            .chartXAxis(.hidden)
-            .chartYAxis(.hidden)
-            .chartLegend(.hidden)
-            .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.25))
-            )
-        } else {
-            sparklineFallback(tint: tint)
-        }
-        #else
-        sparklineFallback(tint: tint)
-        #endif
-    }
-
-    /// A static placeholder used when Swift Charts isn't available.
-    private func sparklineFallback(tint: Color) -> some View {
-        RoundedRectangle(cornerRadius: 5)
-            .fill(tint.opacity(0.12))
-            .overlay(
-                Rectangle()
-                    .fill(tint.opacity(0.4))
-                    .frame(height: 1),
-                alignment: .bottom
-            )
     }
 
     /// The machine switcher: a menu-style Picker listing Local + every registered
@@ -814,11 +742,17 @@ struct RemoteActivityMonitorView: View {
             }
             .width(min: 70, ideal: 90, max: 110)
 
-            TableColumn("User", value: \.user) { row in
-                Text(row.user.isEmpty ? "—" : row.user)
+            // Full executable path (from ghostty_proc_s.cmd). May be empty until
+            // the agent populates it; long paths truncate at the head with the
+            // full path on hover.
+            TableColumn("Path", value: \.cmd) { row in
+                Text(row.cmd.isEmpty ? "—" : row.cmd)
                     .lineLimit(1)
+                    .truncationMode(.head)
+                    .foregroundStyle(.secondary)
+                    .help(row.cmd.isEmpty ? "" : row.cmd)
             }
-            .width(min: 70, ideal: 100)
+            .width(min: 120, ideal: 240)
         } rows: {
             ForEach(filtered) { row in
                 TableRow(row)
@@ -954,5 +888,221 @@ private struct NewProcessSheet: View {
         }
         .padding(20)
         .frame(width: 380)
+    }
+}
+
+// MARK: - Trend gauge
+
+/// Which header metric a trend gauge plots.
+enum TrendMetric { case cpu, memory }
+
+/// A prominent header gauge: a title + current value over a live area/line
+/// sparkline of the metric's recent history, with faint 0/50/100 Y reference
+/// gridlines (so a spike's height reads against full scale) and a hover lollipop
+/// (`RuleMark` + annotation) showing the value at the pointer and how long ago.
+///
+/// Y is fixed 0..100 for both metrics (CPU% directly; memory as
+/// `memFraction*100`, i.e. % of total RAM). Falls back to a plain text block on
+/// systems without Swift Charts.
+struct TrendGaugeView: View {
+    let title: String
+    let value: String
+    let detail: String
+    let tint: Color
+    let metric: TrendMetric
+    let samples: [HostSample]
+    /// Total RAM in bytes, used to label the 100% reference for memory.
+    let memTotal: UInt64
+
+    /// Chart dimensions — notably larger than the original 140×34 sparkline.
+    private static let chartWidth: CGFloat = 240
+    private static let chartHeight: CGFloat = 64
+
+    /// The seq of the sample under the pointer, or nil when not hovering.
+    @State private var hoverSeq: Int?
+
+    /// The y-value (0..100) plotted for a sample under this gauge's metric.
+    private func y(_ s: HostSample) -> Double {
+        metric == .cpu ? s.cpuPct : s.memFraction * 100
+    }
+
+    private var hoveredSample: HostSample? {
+        guard let hoverSeq else { return nil }
+        return samples.first { $0.seq == hoverSeq }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Text(value)
+                    .font(.system(.title2, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            chart
+                .frame(width: Self.chartWidth, height: Self.chartHeight)
+        }
+    }
+
+    @ViewBuilder
+    private var chart: some View {
+        #if canImport(Charts)
+        if #available(macOS 13.0, *) {
+            chartBody
+        } else {
+            fallback
+        }
+        #else
+        fallback
+        #endif
+    }
+
+    #if canImport(Charts)
+    @available(macOS 13.0, *)
+    private var chartBody: some View {
+        let hovered = hoveredSample
+        return Chart {
+            ForEach(samples) { s in
+                AreaMark(x: .value("t", s.seq), y: .value("v", y(s)))
+                    .interpolationMethod(.catmullRom)
+                    .foregroundStyle(
+                        .linearGradient(
+                            colors: [tint.opacity(0.35), tint.opacity(0.04)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                LineMark(x: .value("t", s.seq), y: .value("v", y(s)))
+                    .interpolationMethod(.catmullRom)
+                    .foregroundStyle(tint)
+                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+            }
+
+            // Hover lollipop: a vertical rule + dot at the hovered sample.
+            if let hovered {
+                RuleMark(x: .value("t", hovered.seq))
+                    .foregroundStyle(.secondary.opacity(0.5))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                PointMark(x: .value("t", hovered.seq), y: .value("v", y(hovered)))
+                    .foregroundStyle(tint)
+                    .symbolSize(40)
+            }
+        }
+        .chartYScale(domain: 0...100)
+        .chartXAxis(.hidden)
+        // Faint reference gridlines + labels at 0 / 50 / 100 so the scale and the
+        // headroom up to 100% are readable.
+        .chartYAxis {
+            AxisMarks(position: .trailing, values: [0, 50, 100]) { v in
+                AxisGridLine()
+                    .foregroundStyle(.secondary.opacity(0.18))
+                AxisValueLabel {
+                    if let iv = v.as(Int.self) {
+                        Text(yLabel(iv))
+                            .font(.system(size: 8))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .chartLegend(.hidden)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.25))
+        )
+        // Map pointer X → nearest HostSample by `seq` (the chart's X value).
+        .chartOverlay { proxy in
+            GeometryReader { geo in
+                Rectangle().fill(.clear).contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let pt):
+                            // `plotAreaFrame` is the macOS-13 spelling (plotFrame
+                            // is 14+). Resolve the anchor in our geometry.
+                            let xInPlot = pt.x - geo[proxy.plotAreaFrame].origin.x
+                            guard let rawSeq: Double = proxy.value(atX: xInPlot) else {
+                                hoverSeq = nil; return
+                            }
+                            hoverSeq = nearestSeq(to: rawSeq)
+                        case .ended:
+                            hoverSeq = nil
+                        }
+                    }
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if let hovered { tooltip(for: hovered) }
+        }
+    }
+    #endif
+
+    /// The nearest sample's seq to a (possibly fractional) X value from the chart.
+    private func nearestSeq(to rawSeq: Double) -> Int? {
+        guard !samples.isEmpty else { return nil }
+        return samples.min(by: {
+            abs(Double($0.seq) - rawSeq) < abs(Double($1.seq) - rawSeq)
+        })?.seq
+    }
+
+    /// The trailing Y-axis label for a reference value. For memory, 100% is total
+    /// RAM, so we annotate it with the GB figure to make "% of total" clear.
+    private func yLabel(_ iv: Int) -> String {
+        if metric == .memory, iv == 100, memTotal > 0 {
+            return "100% · \(Self.gb(memTotal))"
+        }
+        return "\(iv)%"
+    }
+
+    /// A small hover annotation showing the value at the pointer + how long ago.
+    private func tooltip(for s: HostSample) -> some View {
+        let ago = max(0, Int(Date().timeIntervalSince(s.at).rounded()))
+        let valueText: String
+        switch metric {
+        case .cpu:
+            valueText = "CPU \(Int(s.cpuPct.rounded()))%"
+        case .memory:
+            valueText = "Mem \(Self.gb(s.memUsed)) (\(Int((s.memFraction * 100).rounded()))%)"
+        }
+        return VStack(alignment: .leading, spacing: 1) {
+            Text(valueText)
+                .font(.system(size: 10, weight: .semibold))
+                .monospacedDigit()
+            Text(ago <= 0 ? "now" : "\(ago)s ago")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.95))
+                .shadow(radius: 1)
+        )
+        .padding(4)
+        .allowsHitTesting(false)
+    }
+
+    private static func gb(_ bytes: UInt64) -> String {
+        let gb = Double(bytes) / 1_073_741_824.0
+        if gb >= 1 { return String(format: "%.1f GB", gb) }
+        let mb = Double(bytes) / 1_048_576.0
+        return String(format: "%.0f MB", mb)
+    }
+
+    /// A static placeholder used when Swift Charts isn't available.
+    private var fallback: some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(tint.opacity(0.12))
+            .overlay(
+                Rectangle()
+                    .fill(tint.opacity(0.4))
+                    .frame(height: 1),
+                alignment: .bottom
+            )
     }
 }
