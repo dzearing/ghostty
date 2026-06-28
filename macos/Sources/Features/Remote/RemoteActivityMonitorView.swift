@@ -1147,14 +1147,19 @@ struct TrendGaugeView: View {
         }
         .chartYScale(domain: 0...100)
         .chartXAxis(.hidden)
-        // Faint reference gridlines + labels at 0 / 50 / 100 so the scale and the
-        // headroom up to 100% are readable.
+        // Soft reference gridlines at 0/25/50/75/100 (the 50% midline a touch
+        // stronger; the 25/75 quarter lines fainter) so the scale + headroom read
+        // at a glance without hard lines. Labels only at 0/50/100 to keep the
+        // small chart uncluttered.
         .chartYAxis {
-            AxisMarks(position: .trailing, values: [0, 50, 100]) { v in
+            AxisMarks(position: .trailing, values: [0, 25, 50, 75, 100]) { v in
+                let iv = v.as(Int.self) ?? 0
                 AxisGridLine()
-                    .foregroundStyle(.secondary.opacity(0.18))
-                AxisValueLabel {
-                    if let iv = v.as(Int.self) {
+                    .foregroundStyle(.secondary.opacity(
+                        iv == 50 ? 0.20 : (iv == 0 || iv == 100 ? 0.15 : 0.10)
+                    ))
+                if iv == 0 || iv == 50 || iv == 100 {
+                    AxisValueLabel {
                         Text(yLabel(iv))
                             .font(.system(size: 8))
                             .foregroundStyle(.secondary)
@@ -1201,12 +1206,10 @@ struct TrendGaugeView: View {
         })?.seq
     }
 
-    /// The trailing Y-axis label for a reference value. For memory, 100% is total
-    /// RAM, so we annotate it with the GB figure to make "% of total" clear.
+    /// The trailing Y-axis label for a reference value. Plain percentages — the
+    /// total RAM is already shown in the header ("of 64.0 GB"), so repeating it on
+    /// the memory chart's 100% mark is redundant.
     private func yLabel(_ iv: Int) -> String {
-        if metric == .memory, iv == 100, memTotal > 0 {
-            return "100% · \(Self.gb(memTotal))"
-        }
         return "\(iv)%"
     }
 
