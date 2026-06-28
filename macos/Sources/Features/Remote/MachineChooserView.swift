@@ -21,6 +21,9 @@ struct MachineChooserView: View {
     @ObservedObject var probe: MachineMetricsProbe
     var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
+    /// Secondary action: open the Remote Activity Monitor for a machine instead of
+    /// a window. Triggered by the per-row chart button.
+    var onActivityMonitor: (Machine) -> Void
 
     @State private var query: String = ""
     /// Index into `targets` of the highlighted row. Bound to `List(selection:)`
@@ -171,6 +174,15 @@ struct MachineChooserView: View {
                     metricsSubline(for: machine)
                 }
                 Spacer()
+                // Secondary affordance: open the Activity Monitor for this machine
+                // (dials a fresh connection). Selecting the row still opens a window.
+                Button {
+                    onActivityMonitor(machine)
+                } label: {
+                    Image(systemName: "chart.bar.xaxis")
+                }
+                .buttonStyle(.borderless)
+                .help("Open Activity Monitor for \(machine.name)")
             }
         }
     }
@@ -262,7 +274,13 @@ enum MachineChooser {
             machines: machines,
             probe: probe,
             onSelect: { finish($0) },
-            onCancel: { finish(nil) }
+            onCancel: { finish(nil) },
+            onActivityMonitor: { machine in
+                // Dismiss the chooser (tearing down its probes via `finish`) and
+                // open the Activity Monitor on a freshly-dialed connection.
+                finish(nil)
+                RemoteActivityMonitor.presentDialing(machine: machine)
+            }
         )
 
         let hosting = NSHostingController(rootView: view)

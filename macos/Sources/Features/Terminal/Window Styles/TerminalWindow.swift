@@ -913,6 +913,17 @@ extension TerminalWindow {
         machinePillModel.title = title
         machinePillModel.isKeyWindow = isKeyWindow
         machinePillModel.machineName = name
+        // Clicking the pill opens the Remote Activity Monitor on THIS window's
+        // existing connection (the window's `RemoteConnection` stays the sole
+        // owner — `presentReusing` does not free it).
+        machinePillModel.onTap = { [weak self] in
+            guard let self,
+                  let connection = self.terminalController?.remoteConnection else { return }
+            RemoteActivityMonitor.presentReusing(
+                connection: connection.handle,
+                machine: connection.machine
+            )
+        }
         // Remote ⇒ inline leading title+pill (system title hidden). Local ⇒ system
         // title, no accessory (a leading accessory would center the local title).
         setInlineTitleEnabled(name != nil)

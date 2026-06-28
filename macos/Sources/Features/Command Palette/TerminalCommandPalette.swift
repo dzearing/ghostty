@@ -67,7 +67,7 @@ struct TerminalCommandPaletteView: View {
             sections.append(CommandPaletteSection(title: nil, options: updates))
         }
 
-        let rest = jumpOptions + terminalOptions
+        let rest = jumpOptions + terminalOptions + remoteOptions
 
         let defaultSorted = rest.sorted { a, b in
             let aNormalized = a.title.replacingOccurrences(of: ":", with: "\t")
@@ -153,6 +153,21 @@ struct TerminalCommandPaletteView: View {
                     onAction(c.action)
                 }
             }
+    }
+
+    /// Native (Swift-side) commands for the remote feature. Currently just the
+    /// Remote Activity Monitor opener. These are NOT core binding actions — they
+    /// run a closure directly (like `jumpOptions`/`updateOptions`).
+    private var remoteOptions: [CommandOption] {
+        var options: [CommandOption] = []
+        options.append(CommandOption(
+            title: "Open Remote Activity Monitor",
+            description: "Show CPU, memory, and the process table for a remote machine",
+            leadingIcon: "chart.bar.xaxis"
+        ) {
+            RemoteActivityMonitor.openFromPalette(surfaceView: surfaceView)
+        })
+        return options
     }
 
     /// Commands for jumping to other terminal surfaces.

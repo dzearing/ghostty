@@ -20,6 +20,12 @@ final class MachinePillModel: ObservableObject {
     /// Top padding to vertically center content in the titlebar. Mirrors the
     /// reset-zoom / update accessories' `accessoryTopPadding` convention.
     @Published var topPadding: CGFloat = 4
+
+    /// Invoked when the pill capsule is clicked. Set by `TerminalWindow` (which
+    /// knows its `remoteMachine` + `RemoteConnection`) to open the Remote Activity
+    /// Monitor on the window's existing connection. Not `@Published` (it doesn't
+    /// affect layout; it's read at tap time).
+    var onTap: (() -> Void)?
 }
 
 /// The rounded "● name" capsule identifying which machine a window's terminals run
@@ -68,7 +74,17 @@ struct MachineTitlePillView: View {
                     .foregroundStyle(model.isKeyWindow ? .primary : .secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                MachinePillCapsule(machineName: model.machineName)
+                // The pill is a button so clicking it opens the Activity Monitor.
+                // `.plain` keeps the capsule's own styling; hit-testing works
+                // because the hosting view is a NonDraggableHostingView (clicks
+                // are not swallowed by window dragging).
+                Button {
+                    model.onTap?()
+                } label: {
+                    MachinePillCapsule(machineName: model.machineName)
+                }
+                .buttonStyle(.plain)
+                .help(model.machineName.map { "Open Activity Monitor for \($0)" } ?? "")
                 Spacer(minLength: 0)
             }
             Spacer(minLength: 0)
