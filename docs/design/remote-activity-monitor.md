@@ -1,6 +1,21 @@
 # Remote Machine Activity Monitor — design / plan
 
-> Status: **PLANNED, not started.** Branch base: `feature/remote-machines`.
+> Status: **IN PROGRESS.** Branch base: `feature/remote-machines`.
+>
+> **Increment 1 ✅ DONE** (`eb292348b`): metrics/proc opcode block `0x70–0x78` +
+> JSON payload structs in `protocol.zig` (NOTE: the table below's suggested `0x30+`
+> COLLIDES with the existing `rpc`/`rpc_result` 0x30/0x31 — we used `0x70+` instead);
+> cross-platform host-metrics `Sampler` (`src/remote/agent/metrics.zig`, macOS/Linux/
+> Windows behind `builtin.os.tag`); agent `metrics_sub`/`metrics`/`metrics_unsub` with
+> a per-connection push pump joined under `shutdown()` before `destroy()` (UAF
+> discipline); `remote-test-client --metrics[=N]`. Metrics pushed on `control_channel`.
+> Verified: protocol 23 tests, agent 51 tests, native + `x86_64-windows-gnu` builds;
+> **live metrics push proven against the native macOS agent.** ⏳ Windows sampler is
+> compile-only until the agent is redeployed (needs the SMB share mounted).
+>
+> Original plan below (the increment-1 frame opcodes are the only deviation).
+
+> Status (orig): **PLANNED, not started.** Branch base: `feature/remote-machines`.
 > Author handoff for a fresh session. Builds directly on the existing remote stack
 > (`src/remote/*`, the agent, the C API, and WP4 macOS UI). Read
 > `docs/design/remote-machines.md` and `…-progress.md` first.
