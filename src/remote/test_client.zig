@@ -88,6 +88,13 @@ pub fn main() !void {
         return;
     }
 
+    // `--ps` is machine-wide and needs no session OPEN: request one process-table
+    // snapshot, print the top N rows, and exit.
+    if (opts.ps) {
+        try runPs(dialed.conn, opts.ps_count);
+        return;
+    }
+
     // OPEN a shell session and learn the agent-chosen data channel + session id.
     // When `--open-command` is set, the command rides in the OPEN payload (the
     // GUI inheritance path), otherwise the agent opens its default shell.
@@ -198,6 +205,47 @@ fn runMetrics(_: Allocator, conn: *connection.Connection, count: u32) !void {
     conn.unsubscribeMetrics();
     std.Thread.sleep(100 * std.time.ns_per_ms);
     diag("metrics: done (received {d} frame(s))\n", .{MetricsSink.instance.received});
+}
+
+// -----------------------------------------------------------------------------
+// --ps: drive the inc-3a process-snapshot request headlessly
+// -----------------------------------------------------------------------------
+
+/// `--ps[=N]`: request ONE process-table snapshot via the high-level
+/// `Connection.requestProcSnapshot` API and print the top N rows (default 20) as a
+/// table to stderr (diag), plus the host summary line and `truncated`. Drives the
+/// inc-3a path end-to-end against the live native agent.
+fn runPs(conn: *connection.Connection, count: u32) !void {
+    const n = @max(count, 1);
+    diag("ps: requesting process snapshot (limit={d})...\n", .{n});
+    var snap = conn.requestProcSnapshot(null, n, 5 * std.time.ns_per_s) catch |err| {
+        diag("ps: FAILED err={s} (agent build may predate PROC_LIST, or it timed out)\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer snap.deinit();
+
+    diag(
+        "ps: host cpu={d:.1}% mem={d}/{d} MB ncpu={d} uptime_s={?d} load1={?d:.2}\n",
+        .{
+            snap.host.cpu_pct,
+            snap.host.mem_used / (1024 * 1024),
+            snap.host.mem_total / (1024 * 1024),
+            snap.host.ncpu,
+            snap.host.uptime_s,
+            snap.host.load1,
+        },
+    );
+    diag("ps: {d} process(es){s}\n", .{ snap.procs.len, if (snap.truncated) " (truncated)" else "" });
+    diag("{s:>8} {s:>8} {s:>7} {s:>10}  {s}\n", .{ "PID", "PPID", "CPU%", "MEM(MB)", "NAME" });
+    for (snap.procs) |p| {
+        diag("{d:>8} {d:>8} {d:>7.1} {d:>10}  {s}\n", .{
+            p.pid,
+            p.ppid,
+            p.cpu_pct,
+            p.mem_bytes / (1024 * 1024),
+            p.name,
+        });
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -780,6 +828,12 @@ const Opts = struct {
     /// against the live (Windows) agent.
     metrics: bool = false,
     metrics_count: u32 = 3,
+    /// `--ps[=N]`: request ONE process-table snapshot and print the top N rows
+    /// (default 20) as a table to stderr. Machine-wide — needs no session OPEN.
+    /// Drives the inc-3a `Connection.requestProcSnapshot` path headlessly against the
+    /// live (Windows) agent.
+    ps: bool = false,
+    ps_count: u32 = 20,
 };
 
 fn parseArgs(alloc: Allocator) !Opts {
@@ -817,6 +871,11 @@ fn parseArgs(alloc: Allocator) !Opts {
         } else if (std.mem.startsWith(u8, a, "--metrics=")) {
             opts.metrics = true;
             opts.metrics_count = std.fmt.parseInt(u32, a["--metrics=".len..], 10) catch return error.Usage;
+        } else if (std.mem.eql(u8, a, "--ps")) {
+            opts.ps = true;
+        } else if (std.mem.startsWith(u8, a, "--ps=")) {
+            opts.ps = true;
+            opts.ps_count = std.fmt.parseInt(u32, a["--ps=".len..], 10) catch return error.Usage;
         } else {
             return error.Usage;
         }
@@ -831,6 +890,7 @@ fn usage() void {
         \\  remote-test-client <host> <port> --exec "<cmd>" [--timeout <secs>]
         \\  remote-test-client <host> <port> --open-command=<cmd>  run <cmd> via the OPEN payload (GUI inherit path)
         \\  remote-test-client <host> <port> --metrics[=N]        print the first N host-metrics pushes (default 3)
+        \\  remote-test-client <host> <port> --ps[=N]             print a process snapshot, top N rows (default 20)
         \\  remote-test-client <host> <port> --catchup-demo       close-laptop catch-up demo (PASS/FAIL)
         \\
     , .{});

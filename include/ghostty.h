@@ -1356,6 +1356,47 @@ GHOSTTY_API bool ghostty_remote_connection_metrics_subscribe(
 GHOSTTY_API void ghostty_remote_connection_metrics_unsubscribe(
     ghostty_remote_connection_t);
 
+// One row of the remote host's process table (activity monitor process view).
+// name/user/cmd are ALWAYS non-NULL NUL-terminated UTF-8 C strings — an empty
+// string ("") means "unavailable", never a NULL pointer. cpu_pct is PER-CORE: a
+// fully-busy single thread is ~100; a multithreaded process can exceed 100.
+// Divide by host.ncpu for a Task-Manager-style 0..100 total.
+typedef struct {
+  int64_t pid;
+  int64_t ppid;
+  float cpu_pct;      // per-core busy % (may exceed 100 for multithreaded procs)
+  uint64_t mem_bytes; // resident/working-set bytes
+  const char* name;   // process name (never NULL; "" if unknown)
+  const char* user;   // owning user (never NULL; "" if unavailable)
+  const char* cmd;    // command line (never NULL; "" if unavailable)
+} ghostty_proc_s;
+
+// A one-shot snapshot of the remote host's process table. ok == false means the
+// call failed (no connection, agent error, or timeout) and procs_len == 0. The
+// host field mirrors ghostty_host_metrics_s (cpu_pct may be 0 here — a one-shot
+// host read has no baseline; subscribe to the metrics stream for an accurate host
+// CPU%). Free with ghostty_remote_connection_proc_list_free.
+typedef struct {
+  bool ok;
+  bool truncated;            // the agent clipped the table to its default cap
+  ghostty_host_metrics_s host;
+  ghostty_proc_s* procs;     // procs_len rows (valid pointer even when len == 0)
+  size_t procs_len;
+} ghostty_proc_list_s;
+
+// Fetch the remote host's process table. SYNCHRONOUS: this blocks on the RPC reply
+// up to timeout_ms (0 => default 10s), so run it OFF the main thread. Returns a
+// snapshot with ok == false (and procs_len == 0) on failure. Free the result with
+// ghostty_remote_connection_proc_list_free.
+GHOSTTY_API ghostty_proc_list_s ghostty_remote_connection_proc_list(
+    ghostty_remote_connection_t, uint32_t timeout_ms);
+
+// Free a process-table snapshot returned by ghostty_remote_connection_proc_list.
+// Takes the same connection handle (its allocator owns the rows/strings). Always
+// safe (a failed/empty snapshot frees nothing).
+GHOSTTY_API void ghostty_remote_connection_proc_list_free(
+    ghostty_remote_connection_t, ghostty_proc_list_s);
+
 // The live remote agent session id for a surface, or an empty string (ptr ==
 // NULL) for a local surface or one whose remote pane is not yet resolved. Free
 // with ghostty_string_free.

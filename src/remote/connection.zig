@@ -528,6 +528,34 @@ pub const AttachOutcome = struct {
     }
 };
 
+/// A caller-owned, deep copy of a `PROC_SNAPSHOT` reply (§9.3 process view). The
+/// parsed JSON arena that backed the reply is freed inside `requestProcSnapshot`
+/// before it returns, so every `Proc` and its `name`/`user`/`cmd` strings are duped
+/// into the connection allocator and owned here. Free with `deinit`.
+pub const OwnedProcSnapshot = struct {
+    /// Host metrics sampled by the agent at snapshot time. `cpu_pct` may be 0 (a
+    /// one-shot host read with no prior baseline — subscribe to live metrics for an
+    /// accurate host CPU%); the rest (mem/ncpu/uptime) are instantaneous.
+    host: protocol.HostMetrics,
+    /// The process rows. Owned; `procs[i].name` is always set, `user`/`cmd` may be
+    /// null. cpu_pct is per-core (see `agent/proc.zig`).
+    procs: []protocol.Proc,
+    /// The agent clipped the table to the requested limit.
+    truncated: bool,
+    alloc: Allocator,
+
+    /// Free the owned process slice and every string it owns.
+    pub fn deinit(self: *OwnedProcSnapshot) void {
+        for (self.procs) |p| {
+            self.alloc.free(@constCast(p.name));
+            if (p.user) |u| self.alloc.free(@constCast(u));
+            if (p.cmd) |c| self.alloc.free(@constCast(c));
+        }
+        self.alloc.free(self.procs);
+        self.* = undefined;
+    }
+};
+
 /// The client side of one remote connection's transport. Heap-allocated because
 /// the writer and the two reader threads all reference it for their lifetime.
 pub const Connection = struct {
@@ -1180,6 +1208,80 @@ pub const Connection = struct {
         return self.alloc.dupe(u8, path);
     }
 
+    /// Request the remote host's process table (§9.3 process view). Sends
+    /// `PROC_LIST{sort, limit}` and awaits `PROC_SNAPSHOT{ok, host, procs,
+    /// truncated}`, returning a caller-owned DEEP COPY (`OwnedProcSnapshot`): every
+    /// `Proc` + its strings are duped into `self.alloc` so the result outlives the
+    /// transient parsed-JSON arena (freed before this returns). Free with
+    /// `OwnedProcSnapshot.deinit`.
+    ///
+    /// Same-channel RPC (mirrors `queryCwdTimeout`): a fresh request channel, the
+    /// agent echoes `PROC_SNAPSHOT` on it, correlated via the `pending` map. Bounded
+    /// by `timeout_ns` — a missing/late reply returns `error.Timeout` rather than
+    /// hanging. `error.ProcUnavailable` if the agent reported `ok == false`. `limit`
+    /// of 0 asks for the agent's default cap.
+    pub fn requestProcSnapshot(
+        self: *Connection,
+        sort: ?[]const u8,
+        limit: u32,
+        timeout_ns: u64,
+    ) !OwnedProcSnapshot {
+        const req_channel = std.crypto.random.int(u128);
+        const req: protocol.ProcList = .{
+            .sort = sort,
+            .limit = if (limit == 0) null else limit,
+        };
+        const json = try protocol.encodeJson(self.alloc, req);
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .proc_list, .proc_snapshot, json, timeout_ns);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.ProcSnapshot, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        if (!parsed.value.ok) return error.ProcUnavailable;
+
+        // Deep-copy the procs out of the parsed arena into caller-owned memory.
+        const src = parsed.value.procs;
+        var procs = try self.alloc.alloc(protocol.Proc, src.len);
+        // On a mid-copy failure, free what we've duped so far (no leak).
+        var filled: usize = 0;
+        errdefer {
+            for (procs[0..filled]) |p| {
+                self.alloc.free(@constCast(p.name));
+                if (p.user) |u| self.alloc.free(@constCast(u));
+                if (p.cmd) |c| self.alloc.free(@constCast(c));
+            }
+            self.alloc.free(procs);
+        }
+        for (src, 0..) |p, i| {
+            const name = try self.alloc.dupe(u8, p.name);
+            errdefer self.alloc.free(name);
+            const user: ?[]const u8 = if (p.user) |u| try self.alloc.dupe(u8, u) else null;
+            errdefer if (user) |u| self.alloc.free(u);
+            const cmd: ?[]const u8 = if (p.cmd) |c| try self.alloc.dupe(u8, c) else null;
+            procs[i] = .{
+                .pid = p.pid,
+                .ppid = p.ppid,
+                .name = name,
+                .cpu_pct = p.cpu_pct,
+                .mem_bytes = p.mem_bytes,
+                .user = user,
+                .cmd = cmd,
+            };
+            filled = i + 1;
+        }
+
+        return .{
+            .host = parsed.value.host,
+            .procs = procs,
+            .truncated = parsed.value.truncated,
+            .alloc = self.alloc,
+        };
+    }
+
     /// Re-attach to an existing session (§3.3 attach / §7.3 sequence-anchored
     /// resync / §5.3 steal). Mints a fresh channel id (§7.1), registers an inbound
     /// ring, sends `ATTACH{session_id, rows, cols, last_byte_offset, force}`, and
@@ -1694,6 +1796,12 @@ pub const Connection = struct {
                 // echoes CWD on the request channel, so `deliverRpcReply` matches it
                 // via the `pending` map keyed by `frame.channel`. Dropped if no
                 // caller is parked (a late reply after a timeout).
+                _ = self.deliverRpcReply(frame);
+            },
+            .proc_snapshot => {
+                // Reply to a PROC_LIST RPC (§9.3 process view). Same-channel
+                // correlation, exactly like CWD: the agent echoes PROC_SNAPSHOT on the
+                // request channel. Dropped if no caller is parked (late reply).
                 _ = self.deliverRpcReply(frame);
             },
             .pong => {
@@ -3030,6 +3138,7 @@ const LifecycleAgent = struct {
     metrics_push_count: u32 = 2,
     saw_metrics_sub: std.atomic.Value(bool) = .{ .raw = false },
     saw_metrics_unsub: std.atomic.Value(bool) = .{ .raw = false },
+    saw_proc_list: std.atomic.Value(bool) = .{ .raw = false },
 
     // Observations (atomics / events so the test thread can read them safely).
     seen_channel: std.atomic.Value(u128) = .{ .raw = 0 },
@@ -3141,6 +3250,22 @@ const LifecycleAgent = struct {
                 },
                 .metrics_unsub => {
                     self.saw_metrics_unsub.store(true, .monotonic);
+                },
+                .proc_list => {
+                    // Reply PROC_SNAPSHOT on the SAME request channel (same-channel
+                    // RPC, like CWD). A small fixed table so the client can assert the
+                    // owned deep copy round-trips + frees clean.
+                    self.saw_proc_list.store(true, .monotonic);
+                    const procs = [_]protocol.Proc{
+                        .{ .pid = 1, .ppid = 0, .name = "init", .cpu_pct = 0, .mem_bytes = 1024 * 1024, .user = "root", .cmd = null },
+                        .{ .pid = 4242, .ppid = 1, .name = "ghoztty-agent", .cpu_pct = 12.5, .mem_bytes = 8 * 1024 * 1024, .user = "me", .cmd = "ghoztty-agent --listen" },
+                    };
+                    try self.ctrl.sendJson(.proc_snapshot, frame.channel, protocol.ProcSnapshot{
+                        .ok = true,
+                        .host = .{ .cpu_pct = 7.5, .mem_used = 4 * 1024 * 1024 * 1024, .mem_total = 16 * 1024 * 1024 * 1024, .ncpu = 8 },
+                        .procs = &procs,
+                        .truncated = true,
+                    });
                 },
                 else => {},
             }
@@ -3399,6 +3524,37 @@ test "unsubscribeMetrics: clears the handler slot (no callback after)" {
     // A second unsubscribe is a harmless no-op (slot already null).
     h.conn.unsubscribeMetrics();
     try testing.expect(h.conn.metrics_handler == null);
+    try testing.expect(a.err == null);
+}
+
+test "requestProcSnapshot: owned deep copy round-trips and frees clean" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    try h.start();
+
+    var snap = try h.conn.requestProcSnapshot(null, 25, 2 * std.time.ns_per_s);
+    defer snap.deinit(); // testing.allocator flags any leak in the owned copy
+
+    try testing.expect(a.saw_proc_list.load(.monotonic));
+    try testing.expect(snap.truncated);
+    try testing.expectEqual(@as(u32, 8), snap.host.ncpu);
+    try testing.expectEqual(@as(f32, 7.5), snap.host.cpu_pct);
+    try testing.expectEqual(@as(usize, 2), snap.procs.len);
+
+    // First row: pid 1 init, owned strings duped out of the parsed arena.
+    try testing.expectEqual(@as(i64, 1), snap.procs[0].pid);
+    try testing.expectEqualStrings("init", snap.procs[0].name);
+    try testing.expectEqualStrings("root", snap.procs[0].user.?);
+    try testing.expect(snap.procs[0].cmd == null);
+
+    // Second row: pid 4242, with a cmd string.
+    try testing.expectEqual(@as(i64, 4242), snap.procs[1].pid);
+    try testing.expectEqual(@as(i64, 1), snap.procs[1].ppid);
+    try testing.expectEqualStrings("ghoztty-agent", snap.procs[1].name);
+    try testing.expectEqual(@as(f32, 12.5), snap.procs[1].cpu_pct);
+    try testing.expectEqualStrings("ghoztty-agent --listen", snap.procs[1].cmd.?);
     try testing.expect(a.err == null);
 }
 

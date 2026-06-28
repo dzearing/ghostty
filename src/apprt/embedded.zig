@@ -601,6 +601,39 @@ const ghostty_host_metrics_s = extern struct {
 /// the fields out. `userdata` is the opaque pointer passed to `_metrics_subscribe`.
 const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyopaque) callconv(.c) void;
 
+/// One process-table row (activity monitor, §9.3 process view). Mirrors the wire
+/// `Proc`. `name`/`user`/`cmd` are always non-null NUL-terminated C strings — an
+/// empty string means "unavailable" (the agent left `user`/`cmd` null), NEVER a
+/// NULL pointer (so the Swift side can read them unconditionally). `cpu_pct` is
+/// per-core: a fully-busy single thread reads ~100; a multithreaded process can
+/// exceed 100. Normalize by `ghostty_host_metrics_s.ncpu` for a 0..100 total.
+const ghostty_proc_s = extern struct {
+    pid: i64,
+    ppid: i64,
+    cpu_pct: f32,
+    mem_bytes: u64,
+    name: [*:0]const u8,
+    user: [*:0]const u8,
+    cmd: [*:0]const u8,
+};
+
+/// A snapshot of the remote host's process table returned by
+/// `ghostty_remote_connection_proc_list`. `ok == false` ⇒ the call failed (no
+/// connection / agent error / timeout) and `procs_len == 0`. Free with
+/// `ghostty_remote_connection_proc_list_free`.
+const ghostty_proc_list_s = extern struct {
+    ok: bool,
+    truncated: bool,
+    host: ghostty_host_metrics_s,
+    procs: [*]ghostty_proc_s,
+    procs_len: usize,
+};
+
+/// A stable, never-freed empty array so a failed/empty `ghostty_proc_list_s` has a
+/// valid (non-dangling) `procs` pointer — `_proc_list_free` short-circuits on
+/// `procs_len == 0` and never touches it.
+var empty_procs_sentinel: [0]ghostty_proc_s = .{};
+
 /// The Zig object behind an opaque `ghostty_remote_connection_t`
 /// (remote-machines design §3.5). A connection is keyed by
 /// (host, user, port, jump-chain) and multiplexes N remote panes/sessions. It
@@ -2369,6 +2402,109 @@ pub const CAPI = struct {
     ) void {
         if (handle.conn()) |conn| conn.unsubscribeMetrics();
         handle.metrics_cb = null;
+    }
+
+    /// A one-shot snapshot of the remote host's process table (§9.3). Mirrors a wire
+    /// `PROC_SNAPSHOT`. The marshaling here is SYNCHRONOUS (the call blocks on the RPC
+    /// reply up to `timeout_ms`); the Swift caller should run it OFF the main thread.
+    /// `cpu_pct` is per-core (>100 is possible for a multithreaded process); divide by
+    /// `host.ncpu` for a Task-Manager-style 0..100 total. `name`/`user`/`cmd` are
+    /// always non-null C strings (empty string ⇒ unavailable, never NULL).
+    export fn ghostty_remote_connection_proc_list(
+        handle: *RemoteConnectionHandle,
+        timeout_ms: u32,
+    ) ghostty_proc_list_s {
+        const empty: ghostty_proc_list_s = .{
+            .ok = false,
+            .truncated = false,
+            .host = .{ .cpu_pct = 0, .mem_used = 0, .mem_total = 0, .ncpu = 0, .uptime_s = 0, .load1 = -1 },
+            .procs = empty_procs_sentinel[0..].ptr,
+            .procs_len = 0,
+        };
+
+        const conn = handle.conn() orelse return empty;
+        const ns: u64 = if (timeout_ms == 0)
+            10 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var snap = conn.requestProcSnapshot(null, 0, ns) catch |err| {
+            log.debug("remote proc_list failed err={}", .{err});
+            return empty;
+        };
+        defer snap.deinit();
+
+        const a = handle.alloc;
+        // Single heap allocation for the proc array; each string is its own dupeZ.
+        // On any partial failure free what we've built and return the empty sentinel
+        // (so `_free` is always safe — it sees procs_len == 0).
+        const arr = a.alloc(ghostty_proc_s, snap.procs.len) catch return empty;
+        var filled: usize = 0;
+        for (snap.procs, 0..) |p, i| {
+            const name = a.dupeZ(u8, p.name) catch break;
+            const user = a.dupeZ(u8, p.user orelse "") catch {
+                a.free(name);
+                break;
+            };
+            const cmd = a.dupeZ(u8, p.cmd orelse "") catch {
+                a.free(name);
+                a.free(user);
+                break;
+            };
+            arr[i] = .{
+                .pid = p.pid,
+                .ppid = p.ppid,
+                .cpu_pct = p.cpu_pct,
+                .mem_bytes = p.mem_bytes,
+                .name = name.ptr,
+                .user = user.ptr,
+                .cmd = cmd.ptr,
+            };
+            filled = i + 1;
+        }
+        if (filled != snap.procs.len) {
+            // A string dup failed mid-way: free the rows we did build + the array.
+            for (arr[0..filled]) |r| {
+                a.free(std.mem.sliceTo(r.name, 0));
+                a.free(std.mem.sliceTo(r.user, 0));
+                a.free(std.mem.sliceTo(r.cmd, 0));
+            }
+            a.free(arr);
+            return empty;
+        }
+
+        return .{
+            .ok = true,
+            .truncated = snap.truncated,
+            .host = .{
+                .cpu_pct = snap.host.cpu_pct,
+                .mem_used = snap.host.mem_used,
+                .mem_total = snap.host.mem_total,
+                .ncpu = snap.host.ncpu,
+                .uptime_s = snap.host.uptime_s orelse 0,
+                .load1 = snap.host.load1 orelse -1,
+            },
+            .procs = arr.ptr,
+            .procs_len = arr.len,
+        };
+    }
+
+    /// Free a `ghostty_proc_list_s` returned by `_proc_list`. Frees every row's
+    /// strings then the row array. Always safe: a failed/empty list has
+    /// `procs_len == 0` and `procs` pointing at a static sentinel (never freed).
+    export fn ghostty_remote_connection_proc_list_free(
+        handle: *RemoteConnectionHandle,
+        list: ghostty_proc_list_s,
+    ) void {
+        if (list.procs_len == 0) return;
+        const a = handle.alloc;
+        const rows = list.procs[0..list.procs_len];
+        for (rows) |r| {
+            a.free(std.mem.sliceTo(r.name, 0));
+            a.free(std.mem.sliceTo(r.user, 0));
+            a.free(std.mem.sliceTo(r.cmd, 0));
+        }
+        a.free(rows);
     }
 
     /// The LIVE remote agent session id for `surface`, or an empty String if it

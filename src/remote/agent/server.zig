@@ -60,6 +60,7 @@ const assert = std.debug.assert;
 const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const metrics = @import("metrics.zig");
+const proc = @import("proc.zig");
 
 /// Scratch read buffer per reader thread's blocking `Stream.read`.
 const read_buf_size = 64 * 1024;
@@ -231,6 +232,13 @@ pub const Server = struct {
     metrics_interval_ms: u32 = 0, // 0 ⇒ unsubscribed
     metrics_stop: bool = false,
 
+    /// Process-table sampler for `proc_list` (§9.3 process view). Unlike the metrics
+    /// pump it needs no thread: `proc_list` is request/reply, sampled synchronously on
+    /// the control reader. It holds per-pid CPU baselines across calls so a repeated
+    /// `proc_list` yields real per-process CPU% (the first call on a pid reads 0).
+    /// Owned by the Server; init in `create`, freed in `destroy`.
+    proc_sampler: proc.ProcSampler = undefined,
+
     /// Per-session ring size (from Options), read by `create`'s table inserts.
     ring_bytes: usize = session.default_ring_bytes,
 
@@ -277,6 +285,7 @@ pub const Server = struct {
             .store = store,
             .ring_bytes = opts.ring_bytes,
         };
+        self.proc_sampler = proc.ProcSampler.init(alloc);
         return self;
     }
 
@@ -379,6 +388,7 @@ pub const Server = struct {
     pub fn destroy(self: *Server, alloc: Allocator) void {
         assert(self.control_thread == null and self.data_thread == null and self.writer_thread == null);
         assert(self.metrics_thread == null);
+        self.proc_sampler.deinit();
         self.bound_channels.deinit(self.alloc);
         for (self.write_queue.items) |f| self.alloc.free(f.payload);
         self.write_queue.deinit(self.alloc);
@@ -620,8 +630,9 @@ pub const Server = struct {
             .flow => self.handleFlow(frame.payload),
             .metrics_sub => self.handleMetricsSub(frame.payload),
             .metrics_unsub => self.handleMetricsUnsub(),
-            // `.proc_list`/`.proc_kill`/`.proc_spawn` are later increments; frames the
-            // agent never receives (it produces these) or out of scope: ignore.
+            .proc_list => self.handleProcList(frame.channel, frame.payload),
+            // `.proc_kill`/`.proc_spawn` are later increments; frames the agent never
+            // receives (it produces the *_result/snapshot replies) or out of scope: ignore.
             else => {},
         }
     }
@@ -962,6 +973,57 @@ pub const Server = struct {
             self.metrics_mutex.unlock();
             if (stop) return;
         }
+    }
+
+    // --- Process table (§9.3 process view) -----------------------------------
+
+    /// `PROC_LIST` (§9.3): enumerate the host's processes and reply
+    /// `PROC_SNAPSHOT{ok, host, procs, truncated}` on the SAME request channel (the
+    /// client correlates the reply by request channel, like `GET_CWD`/`CWD`).
+    ///
+    /// Synchronous request/reply — no pump thread. The OS enumeration runs UNLOCKED
+    /// (it touches no session-store state; it queries the whole machine), matching the
+    /// `handleGetCwd` discipline. `host.cpu_pct` here may read 0: a fresh local host
+    /// `Sampler` has no prior tick baseline for a one-shot read — the panel subscribes
+    /// to the live `metrics` stream separately for an accurate host CPU%. The
+    /// per-process `proc_sampler` DOES persist baselines across `proc_list` calls, so
+    /// repeated polls yield real per-process CPU%.
+    ///
+    /// All proc strings are owned by `self.alloc`; we free them (and the list) after
+    /// `sendJson` has encoded the snapshot to JSON. On any error we reply `ok=false`.
+    fn handleProcList(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.ProcList, self.alloc, payload) catch {
+            self.sendJson(.proc_snapshot, channel, protocol.ProcSnapshot{ .ok = false }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+        const limit: u32 = parsed.value.limit orelse 0;
+
+        // A one-shot host sample (no baseline ⇒ cpu_pct may be 0; that's fine).
+        var host_sampler = metrics.Sampler.init();
+        const host = host_sampler.sample();
+
+        var procs: std.ArrayList(protocol.Proc) = .empty;
+        defer {
+            for (procs.items) |p| {
+                self.alloc.free(@constCast(p.name));
+                if (p.user) |u| self.alloc.free(@constCast(u));
+                if (p.cmd) |c| self.alloc.free(@constCast(c));
+            }
+            procs.deinit(self.alloc);
+        }
+
+        const truncated = self.proc_sampler.sample(self.alloc, &procs, limit) catch {
+            self.sendJson(.proc_snapshot, channel, protocol.ProcSnapshot{ .ok = false, .host = host }) catch {};
+            return;
+        };
+
+        self.sendJson(.proc_snapshot, channel, protocol.ProcSnapshot{
+            .ok = true,
+            .host = host,
+            .procs = procs.items,
+            .truncated = truncated,
+        }) catch {};
     }
 
     // --- Inbound DATA (client keystrokes) ------------------------------------
@@ -1481,6 +1543,41 @@ test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {
         std.Thread.yield() catch {};
     }
     try testing.expect(h.server.metrics_thread == null);
+}
+
+test "PROC_LIST→PROC_SNAPSHOT: agent enumerates real processes on the request channel" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(40);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Request the process table on a fresh request channel; the agent must echo
+    // PROC_SNAPSHOT on it (same-channel correlation, like GET_CWD).
+    const req_ch: u128 = 0xC0FFEE_F00D;
+    try h.client.sendControlJson(.proc_list, req_ch, protocol.ProcList{ .limit = 50 });
+    const reply = try h.client.waitControl(.proc_snapshot);
+    try testing.expectEqual(req_ch, reply.channel);
+
+    var parsed = try protocol.parseJson(protocol.ProcSnapshot, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expect(parsed.value.ok);
+    // A real host always has running processes; the agent's own process is one.
+    try testing.expect(parsed.value.procs.len > 0);
+    // Each row must decode with a non-empty name and a non-negative cpu_pct.
+    var saw_named = false;
+    for (parsed.value.procs) |p| {
+        try testing.expect(p.cpu_pct >= 0);
+        if (p.name.len > 0) saw_named = true;
+    }
+    try testing.expect(saw_named);
+    // ncpu is read directly each host sample → > 0 on a real machine.
+    try testing.expect(parsed.value.host.ncpu >= 1);
 }
 
 test "OPEN→OPENED then child output streams as DATA with advancing byte_offsets" {
