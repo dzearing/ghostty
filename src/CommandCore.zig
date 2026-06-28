@@ -143,6 +143,16 @@ pub fn Command(comptime opts: Options) type {
         rlimits: Rlimits = .{},
         pseudo_console: if (builtin.os.tag == .windows) ?windows.exp.HPCON else void =
             if (builtin.os.tag == .windows) null else {},
+        /// Extra `dwCreationFlags` bits OR'd into the Windows `CreateProcessW` call
+        /// (ignored on POSIX). Default 0 ⇒ no change for existing callers. The
+        /// headless agent's DETACHED process spawn (`remote/agent/proc_spawn.zig`)
+        /// sets `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`
+        /// so a launched process survives independently of the agent (it is not torn
+        /// down with the agent's console / job object). Read defensively via
+        /// `@hasField` in `startWindows`, so the hand-written GUI `Command.zig`
+        /// (which has no such field) is unaffected.
+        windows_creation_flags: if (builtin.os.tag == .windows) windows.DWORD else void =
+            if (builtin.os.tag == .windows) 0 else {},
         data: ?*anyopaque = null,
         pid: ?posix.pid_t = null,
 
@@ -364,6 +374,10 @@ fn startWindows(comptime T: type, self: *T, arena: Allocator) !void {
 
     var flags: windows.DWORD = windows.exp.CREATE_UNICODE_ENVIRONMENT;
     if (attribute_list != null) flags |= windows.exp.EXTENDED_STARTUPINFO_PRESENT;
+    // Optional caller-supplied creation flags (e.g. a detached agent spawn that
+    // must break away from the agent's console/job). Read via `@hasField` so the
+    // GUI `Command.zig` (no such field) compiles unchanged.
+    if (@hasField(T, "windows_creation_flags")) flags |= self.windows_creation_flags;
 
     var process_information: windows.PROCESS_INFORMATION = undefined;
     if (windows.exp.kernel32.CreateProcessW(

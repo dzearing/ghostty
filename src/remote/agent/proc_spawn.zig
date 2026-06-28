@@ -98,23 +98,79 @@ fn spawnWindows(alloc: Allocator, cmd: []const u8, cwd: ?[]const u8) SpawnOutcom
 
     var args = [_][:0]const u8{ shell_z, flag_z, cmd_z };
 
+    // DETACHED spawn: the launched process must outlive the agent's console / any
+    // job object the agent is enrolled in. We OR these into `CreateProcessW`'s
+    // dwCreationFlags (via the `windows_creation_flags` field threaded into
+    // `CommandCore.startWindows`):
+    //   - DETACHED_PROCESS          — no shared console with the agent.
+    //   - CREATE_NEW_PROCESS_GROUP  — its own process group (not signaled with us).
+    //   - CREATE_BREAKAWAY_FROM_JOB — escape a kill-on-job-close job the agent may
+    //     live in (e.g. ssh-shellhost / a Windows service container). This is the
+    //     cause of detached children (notepad.exe, ping) vanishing immediately: the
+    //     inherited job is torn down with the agent's console.
+    // BREAKAWAY fails (CreateProcessW returns 0) if the agent's job forbids
+    // breakaway; in that case we retry WITHOUT it (the process then shares the
+    // job's fate, but that is strictly better than failing the spawn outright).
+    const detached_base: windows.DWORD = windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP;
+
     var c: CommandCore.DefaultCommand = .{
         .path = shell_z,
         .args = &args,
         .cwd = cwd,
+        .windows_creation_flags = detached_base | windows.CREATE_BREAKAWAY_FROM_JOB,
         // No ConPTY (pseudo_console null), stdio null ⇒ \Device\Null (see
-        // CommandCore.startWindows). The child runs detached.
+        // CommandCore.startWindows).
     };
-    c.start(alloc) catch |err| return .{ .ok = false, .@"error" = @errorName(err) };
-    // On Windows `cmd.pid` is the process HANDLE (posix.pid_t == windows.HANDLE).
-    // The monitor view uses the integer value of that handle as the pid id, to
-    // match `pty_child.zig`'s convention. No reaping needed (no zombies on
-    // Windows); we intentionally leak the handle (the child is detached) — the
-    // agent process exit closes all its handles.
-    const handle = c.pid orelse return .{ .ok = false, .@"error" = "no pid" };
-    const pid_i64: i64 = @intCast(@intFromPtr(handle));
-    return .{ .ok = true, .pid = pid_i64 };
+    c.start(alloc) catch {
+        // Most likely: the agent's job forbids breakaway. Retry detached but
+        // without CREATE_BREAKAWAY_FROM_JOB.
+        var c2: CommandCore.DefaultCommand = .{
+            .path = shell_z,
+            .args = &args,
+            .cwd = cwd,
+            .windows_creation_flags = detached_base,
+        };
+        c2.start(alloc) catch |err2| return .{ .ok = false, .@"error" = @errorName(err2) };
+        return windowsResult(c2.pid);
+    };
+    return windowsResult(c.pid);
 }
+
+/// Map a CommandCore Windows `pid` field (which holds the child's process HANDLE,
+/// since `posix.pid_t == windows.HANDLE`) to the REAL OS process id via
+/// `GetProcessId`. This matches `proc.zig`'s Toolhelp `th32ProcessID` and what
+/// `proc_control.killProc`'s `OpenProcess(pid)` expects — so a spawned process's
+/// reported pid is the same id it appears under in `proc_list` and can be killed
+/// by. We intentionally leak the process HANDLE (the child is detached); the
+/// agent's eventual exit closes all its handles, which does NOT terminate a
+/// broken-away child.
+fn windowsResult(handle_opt: ?posix.pid_t) SpawnOutcome {
+    const handle = handle_opt orelse return .{ .ok = false, .@"error" = "no pid" };
+    const real_pid = windows.GetProcessId(@ptrCast(handle));
+    if (real_pid == 0) return .{ .ok = false, .@"error" = "GetProcessId failed" };
+    return .{ .ok = true, .pid = @intCast(real_pid) };
+}
+
+// =============================================================================
+// Windows — CreateProcessW detached flags + GetProcessId (compiled only on Win)
+// =============================================================================
+//
+// std exposes these creation flags only as booleans inside an internal struct and
+// has no `GetProcessId`, so we name the standard Win32 constant values + prototype
+// the one extern we need.
+
+const windows = struct {
+    const W = std.os.windows;
+    const DWORD = W.DWORD;
+    const HANDLE = W.HANDLE;
+
+    // dwCreationFlags bits (winbase.h). Values are ABI-stable Win32 constants.
+    const DETACHED_PROCESS: DWORD = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: DWORD = 0x00000200;
+    const CREATE_BREAKAWAY_FROM_JOB: DWORD = 0x01000000;
+
+    extern "kernel32" fn GetProcessId(Process: HANDLE) callconv(.winapi) DWORD;
+};
 
 // =============================================================================
 // Tests (native macOS/Linux exercise the real spawn round-trip)
