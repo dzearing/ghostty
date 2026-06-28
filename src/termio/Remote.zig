@@ -487,6 +487,33 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
         if (res.send_resume) rd.conn.sendFlowResume(ch.id) catch |err|
             log.warn("error sending FLOW resume err={}", .{err});
     }
+
+    // EXIT handling, mirroring local Exec (`Exec.zig` `processExit` →
+    // `surface_mailbox.push(.child_exited)` → `Surface.childExited`). The agent
+    // frames `EXIT` AFTER the session's final DATA (§6.4), and the control reader
+    // turns it into `ch.signalExit` (which also wakes us); we check it only AFTER
+    // the drain loop above has emptied the ring for this wake, so the shell's
+    // final bytes have already rendered before we ask the surface to close. The
+    // `rd.exited` guard makes this fire EXACTLY once even though `ringReady`
+    // re-arms and may wake again. This reuses `Surface.childExited`'s existing
+    // close / `wait-after-command` logic, so a remote shell `exit` closes the
+    // pane just like a local one — no special remote close path.
+    if (!rd.exited and ch.isExited()) {
+        rd.exited = true;
+        // Coerce the agent's i64 exit code to the surface message's u32. A negative
+        // code (e.g. a signal encoded as <0 by some agents) saturates to 0 rather
+        // than wrapping to a huge value; a normal 0..255 status passes through.
+        const code: u32 = if (ch.exit_code < 0)
+            0
+        else if (ch.exit_code > std.math.maxInt(u32))
+            std.math.maxInt(u32)
+        else
+            @intCast(ch.exit_code);
+        _ = td.surface_mailbox.push(.{ .child_exited = .{
+            .exit_code = code,
+            .runtime_ms = ch.runtime_ms,
+        } }, .{ .forever = {} });
+    }
 }
 
 /// The thread-local data for the remote backend. Lives inside

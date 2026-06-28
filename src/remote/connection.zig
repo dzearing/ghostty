@@ -1932,6 +1932,34 @@ pub const Connection = struct {
                 // Best-effort; a write failure surfaces via the reader's EOF path.
                 self.writeControl(.pong, protocol.control_channel, &buf) catch {};
             },
+            .exit => {
+                // The remote child reaped: the agent frames `EXIT{code,runtime_ms}`
+                // on the per-session control channel, ordered AFTER the session's
+                // final DATA (§6.4). Signal it on the pane's inbound ring so the
+                // Remote backend's drain, running on the pane's IO thread, turns it
+                // into the surface `.child_exited` close — the SAME path local Exec
+                // uses (`Exec.zig` → `Surface.childExited`), so remote panes honor
+                // the same close / `wait-after-command` behavior. The signal is
+                // delivered under the channel-table lock (`withChannel`) so the ring
+                // can't be freed mid-call (§3.4 teardown invariant). An unknown
+                // channel (late/duplicate EXIT after teardown, or hostile id) is
+                // dropped silently — never a crash. Additive: the user `ctrl_handler`
+                // still observes the frame afterward in `controlReaderLoop`.
+                var parsed = protocol.parseJson(protocol.Exit, self.alloc, frame.payload) catch return;
+                defer parsed.deinit();
+                const ExitSig = struct {
+                    code: i64,
+                    runtime_ms: u64,
+                    fn apply(self_sig: @This(), ch: *ring.Channel) void {
+                        ch.signalExit(self_sig.code, self_sig.runtime_ms);
+                    }
+                };
+                _ = self.channels.withChannel(
+                    frame.channel,
+                    ExitSig{ .code = parsed.value.code, .runtime_ms = parsed.value.runtime_ms },
+                    ExitSig.apply,
+                );
+            },
             .detached => {
                 // Server-initiated eviction / steal (§5.3): terminal DEAD.
                 self.evicted.store(true, .monotonic);
@@ -3514,6 +3542,61 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
 
     try testing.expect(a.err == null);
     // Teardown the pane explicitly (consumer has stopped draining: the test owns it).
+    h.conn.closeChannel(pane);
+}
+
+test "EXIT frame: signals the pane's ring so the consumer can close the pane" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.session_id = "sess-exit";
+    try h.start();
+
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
+    a.saw_request.wait();
+
+    // Not exited until the agent reports it.
+    try testing.expect(!pane.ring.isExited());
+
+    // The agent frames EXIT on the per-session CONTROL channel (the pane's channel
+    // id), ordered after any final DATA. The connection's control reader routes it
+    // through `handleControlInternal` → `signalExit` on this pane's ring.
+    try h.ctrl_agent.sendJson(.exit, pane.id, protocol.Exit{ .code = 137, .runtime_ms = 4242 });
+
+    // The control thread observes the frame asynchronously; spin until it lands.
+    const RingWait = struct {
+        ring: *ring.Channel,
+        fn done(self: *@This()) bool {
+            return self.ring.isExited();
+        }
+    };
+    var rw: RingWait = .{ .ring = pane.ring };
+    try spinUntil(RingWait, &rw, RingWait.done);
+
+    // The cached code/runtime are visible (acquire/release pairing in signalExit),
+    // exactly what the Remote backend's drain coerces into `.child_exited`.
+    try testing.expectEqual(@as(i64, 137), pane.ring.exit_code);
+    try testing.expectEqual(@as(u64, 4242), pane.ring.runtime_ms);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "EXIT frame: an unknown channel id is dropped without crashing" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    try h.start();
+
+    // No pane is registered for this channel; the control reader must drop the EXIT
+    // (late/duplicate after teardown, or hostile id) and keep servicing the link.
+    try h.ctrl_agent.sendJson(.exit, 0xDEADBEEF, protocol.Exit{ .code = 1, .runtime_ms = 0 });
+
+    // The link is still healthy afterward: an OPEN still round-trips.
+    h.configure().session_id = "still-alive";
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80 });
+    try testing.expectEqualStrings("still-alive", pane.session_id);
     h.conn.closeChannel(pane);
 }
 

@@ -199,6 +199,24 @@ pub const Channel = struct {
     /// are claimed via CAS to make each `FLOW` edge fire exactly once.
     paused: Atomic(bool) = .init(false),
 
+    /// Set true once the connection's control reader observes the agent's `EXIT`
+    /// frame for this channel (`signalExit`). The pane's consumer (the Remote
+    /// backend's drain) reads it via `isExited` AFTER it has drained the ring for
+    /// a wake, so the shell's final output renders before the pane is closed
+    /// (EXIT is wire-ordered after the final DATA, §6.4 — and the consumer drains
+    /// before checking this, preserving that ordering end-to-end).
+    ///
+    /// Written by the producer (control reader) with release ordering and read by
+    /// the consumer (pane IO thread) with acquire ordering, so `exit_code` /
+    /// `runtime_ms` — plain fields stored BEFORE the atomic store — are visible to
+    /// any consumer that observes `exited == true`.
+    exited: Atomic(bool) = .init(false),
+    /// The agent-reported exit code (i64 on the wire). Valid only once `exited` is
+    /// observed true. Producer-written before the `exited` release store.
+    exit_code: i64 = 0,
+    /// The agent-reported child runtime in ms. Valid only once `exited` is true.
+    runtime_ms: u64 = 0,
+
     pub const InitOptions = struct {
         capacity: usize = default_capacity,
         /// Pause threshold; defaults to `capacity * 3/4` (== 192 KiB at the
@@ -262,6 +280,25 @@ pub const Channel = struct {
     pub fn isPaused(self: *const Channel) bool {
         return self.paused.load(.acquire);
     }
+
+    /// Producer entry point: record that the agent reported this session exited,
+    /// then wake the consumer so its next drain observes `isExited` and turns it
+    /// into the surface "child exited → close pane" message (mirroring local
+    /// Exec). Stores `code`/`runtime` BEFORE the `exited` release store so the
+    /// consumer, which loads `exited` with acquire, sees them. Idempotent at the
+    /// caller's discretion (the control reader only signals once per `EXIT`).
+    pub fn signalExit(self: *Channel, code: i64, runtime: u64) void {
+        self.exit_code = code;
+        self.runtime_ms = runtime;
+        self.exited.store(true, .release);
+        self.waker.wake();
+    }
+
+    /// Consumer entry point: has the agent reported this session exited? Acquire
+    /// load so that, if true, `exit_code`/`runtime_ms` are visible.
+    pub fn isExited(self: *const Channel) bool {
+        return self.exited.load(.acquire);
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -309,6 +346,26 @@ pub const ChannelTable = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.map.count();
+    }
+
+    /// Look up `id` and run `f` against the `*Channel` under the table lock, so the
+    /// channel cannot be freed mid-call (the §3.4 teardown invariant — exactly the
+    /// guarantee `pushTo` relies on). Returns true if the channel existed (and `f`
+    /// ran), false if unknown (stale/hostile id — dropped, never a crash). Used by
+    /// the control reader to deliver an `EXIT` signal to a live channel. `f` must
+    /// take no other lock that could invert against the table lock (`signalExit`
+    /// only stores fields + wakes — no lock), preserving the §3.4 lock ordering.
+    pub fn withChannel(
+        self: *ChannelTable,
+        id: u128,
+        ctx: anytype,
+        comptime f: fn (@TypeOf(ctx), *Channel) void,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ch = self.map.get(id) orelse return false;
+        f(ctx, ch);
+        return true;
     }
 
     /// The result of routing a frame's bytes to a channel.
@@ -440,6 +497,71 @@ test "ChannelTable: register / route / deregister; unknown id is graceful" {
     // After deregister, routing is unknown again (the pane will free `ch` only
     // after its consumer thread has joined — teardown order §3.4).
     try testing.expect(table.pushTo(0xABCD, "x") == .unknown);
+}
+
+test "Channel: signalExit sets isExited, publishes code/runtime, and wakes" {
+    const alloc = testing.allocator;
+
+    // A waker that records it fired, so we prove signalExit nudges the consumer.
+    const Flag = struct {
+        woke: bool = false,
+        fn wake(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.woke = true;
+        }
+    };
+    var flag: Flag = .{};
+
+    var ch = try Channel.init(alloc, 7, .{
+        .capacity = 64,
+        .waker = .{ .ctx = &flag, .wakeFn = Flag.wake },
+    });
+    defer ch.deinit(alloc);
+
+    // Before any signal: not exited.
+    try testing.expect(!ch.isExited());
+    try testing.expect(!flag.woke);
+
+    ch.signalExit(137, 4242);
+
+    // After signal: exited is observable, the cached code/runtime are visible
+    // (acquire/release pairing), and the consumer was woken.
+    try testing.expect(ch.isExited());
+    try testing.expectEqual(@as(i64, 137), ch.exit_code);
+    try testing.expectEqual(@as(u64, 4242), ch.runtime_ms);
+    try testing.expect(flag.woke);
+}
+
+test "ChannelTable: withChannel delivers to a registered channel; unknown is graceful" {
+    const alloc = testing.allocator;
+    var table = ChannelTable.init(alloc);
+    defer table.deinit();
+
+    var ch = try Channel.init(alloc, 0xBEEF, .{ .capacity = 64 });
+    defer ch.deinit(alloc);
+
+    const Sig = struct {
+        code: i64,
+        runtime: u64,
+        fn apply(self: @This(), c: *Channel) void {
+            c.signalExit(self.code, self.runtime);
+        }
+    };
+
+    // Unknown id (not yet registered): no crash, returns false.
+    try testing.expect(!table.withChannel(0xBEEF, Sig{ .code = 1, .runtime = 0 }, Sig.apply));
+    try testing.expect(!ch.isExited());
+
+    try table.register(&ch);
+    // Registered: the callback runs under the table lock and reaches the channel.
+    try testing.expect(table.withChannel(0xBEEF, Sig{ .code = 9, .runtime = 11 }, Sig.apply));
+    try testing.expect(ch.isExited());
+    try testing.expectEqual(@as(i64, 9), ch.exit_code);
+    try testing.expectEqual(@as(u64, 11), ch.runtime_ms);
+
+    table.deregister(0xBEEF);
+    // After deregister: unknown again (graceful).
+    try testing.expect(!table.withChannel(0xBEEF, Sig{ .code = 0, .runtime = 0 }, Sig.apply));
 }
 
 // --- Concurrent SPSC integrity ------------------------------------------------
