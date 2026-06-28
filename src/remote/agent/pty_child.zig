@@ -597,8 +597,10 @@ pub const PtySpawner = struct {
     /// pulls `CommandCore`, kept out of `server.zig` per `proc_spawn.zig`'s doc).
     fn spawnDetachedFn(ctx: *anyopaque, cmd: []const u8, cwd: ?[]const u8) server.Spawner.SpawnResult {
         const self: *PtySpawner = @ptrCast(@alignCast(ctx));
+        // `self.alloc` is the same allocator the Server uses, so the Windows
+        // diagnostic note (when `free_error`) is freed by `handleProcSpawn` correctly.
         const out = proc_spawn.spawnDetached(self.alloc, cmd, cwd);
-        return .{ .ok = out.ok, .pid = out.pid, .@"error" = out.@"error" };
+        return .{ .ok = out.ok, .pid = out.pid, .@"error" = out.@"error", .free_error = out.free_error };
     }
 
     /// Open a pty, fork+exec the shell on its slave, return the owned `*PtyChild`.

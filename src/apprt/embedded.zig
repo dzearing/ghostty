@@ -2726,6 +2726,11 @@ pub const CAPI = struct {
         const cwd_slice = std.mem.sliceTo(cwd, 0);
         const cwd_opt: ?[]const u8 = if (cwd_slice.len == 0) null else cwd_slice;
         const out = remote_proc_spawn.spawnDetached(a, cmd_slice, cwd_opt);
+        // The Windows path may return an allocated diagnostic note we don't surface
+        // through this i64-only C API — free it so it doesn't leak.
+        if (out.free_error) {
+            if (out.@"error") |m| a.free(@constCast(m));
+        }
         if (!out.ok) return -1;
         return out.pid orelse -1;
     }

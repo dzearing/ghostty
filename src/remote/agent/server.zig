@@ -160,12 +160,15 @@ pub const Spawner = struct {
     };
 
     /// Result of a detached spawn (mirrors `proc_spawn.SpawnOutcome` but defined
-    /// here so `server.zig` needn't import `proc_spawn.zig`). `@"error"` is a static
-    /// string (never owned).
+    /// here so `server.zig` needn't import `proc_spawn.zig`). `@"error"` is usually a
+    /// static string, but when `free_error` is true it was allocated from the
+    /// agent's allocator (the Windows diagnostic note) and `handleProcSpawn` frees it
+    /// after encoding the reply.
     pub const SpawnResult = struct {
         ok: bool = false,
         pid: ?i64 = null,
         @"error": ?[]const u8 = null,
+        free_error: bool = false,
     };
 
     pub fn spawn(self: Spawner, open: protocol.Open) anyerror!Result {
@@ -1075,6 +1078,11 @@ pub const Server = struct {
         // Spawn via the injected spawner (keeps `CommandCore` out of server.zig's
         // graph — see `proc_spawn.zig`). Runs UNLOCKED (no session-store state).
         const out = self.spawner.spawnDetached(parsed.value.cmd, parsed.value.cwd);
+        // The Windows path may return an ALLOCATED diagnostic note in `@"error"`
+        // (free_error). `sendJson` encodes synchronously, so free after it returns.
+        defer if (out.free_error) {
+            if (out.@"error") |m| self.alloc.free(@constCast(m));
+        };
         self.sendJson(.proc_spawn_result, channel, protocol.ProcSpawnResult{
             .ok = out.ok,
             .pid = out.pid,

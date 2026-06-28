@@ -167,12 +167,14 @@ pub const ProcSampler = struct {
                 busy_ns = ti.pti_total_user +% ti.pti_total_system;
             }
 
-            // user: best-effort getpwuid(uid) → pw_name.
-            const user: ?[]const u8 = blk: {
-                const pw = c.getpwuid(bsd.pbi_uid) orelse break :blk null;
-                const uname = std.mem.sliceTo(pw.pw_name, 0);
-                if (uname.len == 0) break :blk null;
-                break :blk alloc.dupe(u8, uname) catch null;
+            // cmd: full executable image path via libproc `proc_pidpath`. One extra
+            // syscall per pid; best-effort (null on a vanished/protected pid). The UI
+            // shows this as the "Path" column. `user` stays null (UI drops it).
+            const cmd: ?[]const u8 = blk: {
+                var path_buf: [c.PROC_PIDPATHINFO_MAXSIZE]u8 = undefined;
+                const n = c.proc_pidpath(pid32, &path_buf, path_buf.len);
+                if (n <= 0) break :blk null;
+                break :blk alloc.dupe(u8, path_buf[0..@intCast(n)]) catch null;
             };
 
             const cpu_pct = self.cpuForPid(&next, pid, busy_ns, now);
@@ -183,11 +185,11 @@ pub const ProcSampler = struct {
                 .name = name,
                 .cpu_pct = cpu_pct,
                 .mem_bytes = mem_bytes,
-                .user = user,
-                .cmd = null,
+                .user = null,
+                .cmd = cmd,
             }) catch {
                 alloc.free(name);
-                if (user) |u| alloc.free(u);
+                if (cmd) |x| alloc.free(x);
                 break;
             };
         }
@@ -238,6 +240,10 @@ pub const ProcSampler = struct {
             // pids (0/4) deny it → include the row with 0s rather than failing.
             var busy_100ns: u64 = 0;
             var mem_bytes: u64 = 0;
+            // cmd: full executable image path. Reuses the SAME handle we open for
+            // cpu/mem; null on access-denied / system pids (per brief, don't fail the
+            // row). The UI shows this as the "Path" column. `user` stays null.
+            var cmd: ?[]const u8 = null;
             const h = w.OpenProcess(w.PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
             if (h != null) {
                 defer W.CloseHandle(h.?);
@@ -251,6 +257,14 @@ pub const ProcSampler = struct {
                 var pmc: w.PROCESS_MEMORY_COUNTERS = .{ .cb = @sizeOf(w.PROCESS_MEMORY_COUNTERS) };
                 if (w.K32GetProcessMemoryInfo(h.?, &pmc, pmc.cb) != 0) {
                     mem_bytes = pmc.WorkingSetSize;
+                }
+                // QueryFullProcessImageNameW(h, 0, buf, &len): the Win32-friendly full
+                // path (flags 0 ⇒ DOS path, not the \Device\ NT path). `len` is in/out
+                // WCHARs (set to capacity going in, receives the written length).
+                var path_w: [w.image_path_max]W.WCHAR = undefined;
+                var path_len: W.DWORD = @intCast(path_w.len);
+                if (w.QueryFullProcessImageNameW(h.?, 0, &path_w, &path_len) != 0 and path_len > 0) {
+                    cmd = std.unicode.utf16LeToUtf8Alloc(alloc, path_w[0..@intCast(path_len)]) catch null;
                 }
             }
 
@@ -267,9 +281,10 @@ pub const ProcSampler = struct {
                 .cpu_pct = cpu_pct,
                 .mem_bytes = mem_bytes,
                 .user = null, // token lookup is fiddly; left null for v1 (per brief)
-                .cmd = null,
+                .cmd = cmd,
             }) catch {
                 alloc.free(name);
+                if (cmd) |x| alloc.free(x);
                 break;
             };
         }
@@ -326,6 +341,10 @@ pub const ProcSampler = struct {
             const busy_ns: u64 = (parsed.utime +% parsed.stime) *% (std.time.ns_per_s / clk_tck);
             const mem_bytes = readLinuxRss(ent.name) *% std.heap.pageSize();
 
+            // cmd: full executable path via readlink("/proc/<pid>/exe"). Best-effort
+            // (null for kernel threads / permission-denied). The UI "Path" column.
+            const cmd: ?[]const u8 = readLinuxExe(alloc, ent.name);
+
             const cpu_pct = self.cpuForPid(&next, pid, busy_ns, now);
             out.append(alloc, .{
                 .pid = pid,
@@ -334,9 +353,10 @@ pub const ProcSampler = struct {
                 .cpu_pct = cpu_pct,
                 .mem_bytes = mem_bytes,
                 .user = null,
-                .cmd = null,
+                .cmd = cmd,
             }) catch {
                 alloc.free(name);
+                if (cmd) |x| alloc.free(x);
                 break;
             };
         }
@@ -379,6 +399,10 @@ const macos = struct {
     const MAXCOMLEN = 16;
     const uid_t = u32;
     const gid_t = u32;
+
+    // proc_pidpath() max path length (sys/proc_info.h: PROC_PIDPATHINFO_MAXSIZE =
+    // 4 * MAXPATHLEN = 4 * 1024). The full executable image path fits within this.
+    const PROC_PIDPATHINFO_MAXSIZE = 4 * 1024;
 
     // struct proc_bsdinfo (sys/proc_info.h, PROC_PIDTBSDINFO flavor). We read
     // pbi_ppid / pbi_comm / pbi_uid. pbi_comm is the (truncated) accounting name;
@@ -459,6 +483,10 @@ const macos = struct {
         buffersize: c_int,
     ) c_int;
     extern "c" fn getpwuid(uid: uid_t) ?*passwd;
+    // proc_pidpath(pid, buffer, buffersize): fills `buffer` with the process's full
+    // executable image path, returns the byte length (0 / -1 on failure). Stable
+    // libproc API (sys/proc_info.h).
+    extern "c" fn proc_pidpath(pid: c_int, buffer: *anyopaque, buffersize: u32) c_int;
 };
 
 // =============================================================================
@@ -477,6 +505,9 @@ const windows = struct {
     const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
 
     const MAX_PATH = 260;
+    // Buffer size (in WCHARs) for QueryFullProcessImageNameW. Generous enough for an
+    // extended-length image path without going to the full 32767 \\?\ maximum.
+    const image_path_max = 1024;
 
     const PROCESSENTRY32W = extern struct {
         dwSize: DWORD,
@@ -522,6 +553,15 @@ const windows = struct {
         Process: HANDLE,
         ppsmemCounters: *PROCESS_MEMORY_COUNTERS,
         cb: DWORD,
+    ) callconv(.winapi) BOOL;
+    // QueryFullProcessImageNameW(h, flags, buf, &len): full image path of a process.
+    // flags 0 ⇒ Win32 DOS path (e.g. C:\Windows\...); 1 ⇒ native \Device\ path. `len`
+    // is the buffer capacity in WCHARs on input and the written length on output.
+    extern "kernel32" fn QueryFullProcessImageNameW(
+        hProcess: HANDLE,
+        dwFlags: DWORD,
+        lpExeName: [*]WCHAR,
+        lpdwSize: *DWORD,
     ) callconv(.winapi) BOOL;
 };
 
@@ -587,6 +627,19 @@ fn readLinuxRss(pid_name: []const u8) u64 {
     return std.fmt.parseInt(u64, std.mem.trim(u8, rss, " \n"), 10) catch 0;
 }
 
+/// Read the full executable path via readlink("/proc/<pid>/exe"). Returns an
+/// allocator-owned copy, or null on failure (kernel threads have no exe link, and
+/// other-user processes deny it). Best-effort — never fails the row.
+fn readLinuxExe(alloc: Allocator, pid_name: []const u8) ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    var path_buf: [64]u8 = undefined;
+    const link = std.fmt.bufPrint(&path_buf, "/proc/{s}/exe", .{pid_name}) catch return null;
+    var target_buf: [4096]u8 = undefined;
+    const target = std.fs.cwd().readLink(link, &target_buf) catch return null;
+    if (target.len == 0) return null;
+    return alloc.dupe(u8, target) catch null;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -640,6 +693,16 @@ test "ProcSampler: enumerates own pid with a name; second sample yields cpu_pct 
         if (p.pid == my_pid) {
             found = true;
             try testing.expect(p.name.len > 0);
+            // cmd is the full executable image path. On macOS/Linux it must be the
+            // current process's absolute path (proc_pidpath / /proc/self/exe); a
+            // leading '/' is the cheap "is it absolute" check. (Windows paths are
+            // `X:\...`, so the absolute assertion is POSIX-only; the live Windows box
+            // validates that path separately.)
+            if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+                try testing.expect(p.cmd != null);
+                try testing.expect(p.cmd.?.len > 0);
+                try testing.expect(p.cmd.?[0] == '/');
+            }
         }
         try testing.expect(p.cpu_pct >= 0);
     }

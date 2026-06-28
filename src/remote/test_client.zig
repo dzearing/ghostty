@@ -284,6 +284,10 @@ fn runSpawn(conn: *connection.Connection, cmd: []const u8) !void {
         std.process.exit(1);
     };
     diag("spawn: OK — pid={d}\n", .{pid});
+    // On success the agent may still attach a diagnostic note in `error_msg` (the
+    // Windows path reports the creation-flags taken + the child's immediate exit
+    // state, so we can see whether the detached process actually persists).
+    if (out.error_msg) |note| diag("spawn: {s}\n", .{note});
     // stdout carries ONLY the pid (so `--spawn` output can be captured directly).
     const stdout = std.fs.File.stdout();
     var buf: [32]u8 = undefined;
