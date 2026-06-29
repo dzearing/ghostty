@@ -1024,6 +1024,59 @@ class AppDelegate: NSObject,
         return openRemoteWindow(on: machine)
     }
 
+    /// Opens a remote window by dialing a remote agent THROUGH a rendezvous
+    /// relay (`--relay=<base> --device=<id> [--token=<tok>]`). Mirrors the
+    /// host/port flow exactly, but dials with `ghostty_remote_connection_new_relay`
+    /// instead of the direct TCP dial. The `relay` base URL is used as the
+    /// machine's display "host" and the port is 0 (no TCP port for the relay
+    /// path). Returns nil on success or an error message on failure.
+    @MainActor
+    @discardableResult
+    func openRemoteWindow(relay: String, device: String, token: String) -> String? {
+        // Dial the agent through the relay. This blocks through the handshake and
+        // returns a connection handle, or NULL on failure.
+        let handle: ghostty_remote_connection_t? = relay.withCString { basePtr in
+            device.withCString { devicePtr in
+                token.withCString { tokenPtr in
+                    ghostty_remote_connection_new_relay(basePtr, devicePtr, tokenPtr)
+                }
+            }
+        }
+
+        guard let handle else {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't connect to \(device)"
+            alert.informativeText = "Failed to reach \(device) via the relay. Make sure the Ghoztty agent is running and the relay is reachable."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return "failed to reach \(device) via relay \(relay): the agent is not running or not reachable"
+        }
+
+        // The relay path has no TCP port; use the device id as the friendly name
+        // and the relay base as the display host (port 0).
+        let machine = Machine(name: device, host: relay, port: 0)
+
+        // Wrap the handle in a strong owner; the controller below holds the only
+        // strong reference and frees it (once) when the window is deallocated.
+        let connection = RemoteConnection(handle: handle, machine: machine)
+
+        // Build the base surface config that puts the first surface on the
+        // remote machine (new session: session_id stays nil).
+        var cfg = Ghostty.SurfaceConfiguration()
+        cfg.remoteMachine = machine
+        cfg.remoteConnection = handle
+        // Retain the connection owner on the surface so it outlives the surface's
+        // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+        cfg.connectionKeepAlive = connection
+        cfg.remoteSessionId = nil
+
+        let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
+        controller.remoteMachine = machine
+        controller.remoteConnection = connection
+        return nil
+    }
+
     /// Dials `machine` and opens a remote window on success. Shows an alert on
     /// connection failure. Returns nil on success, or an error message string
     /// on failure (callers that drive this headlessly use the return value;

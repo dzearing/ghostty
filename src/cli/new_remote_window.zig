@@ -13,6 +13,10 @@ pub const Options = struct {
     host: ?[:0]const u8 = null,
     port: u16 = 0,
 
+    relay: ?[:0]const u8 = null,
+    device: ?[:0]const u8 = null,
+    token: ?[:0]const u8 = null,
+
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
 
@@ -27,6 +31,12 @@ pub const Options = struct {
             self.host = try alloc.dupeZ(u8, arg["--host=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--port=")) {
             self.port = std.fmt.parseInt(u16, arg["--port=".len..], 10) catch return error.InvalidValue;
+        } else if (std.mem.startsWith(u8, arg, "--relay=")) {
+            self.relay = try alloc.dupeZ(u8, arg["--relay=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--device=")) {
+            self.device = try alloc.dupeZ(u8, arg["--device=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--token=")) {
+            self.token = try alloc.dupeZ(u8, arg["--token=".len..]);
         }
         try self._arguments.append(alloc, try alloc.dupeZ(u8, arg));
     }
@@ -87,18 +97,39 @@ fn runArgs(
         },
     };
 
-    if (opts.host == null) {
-        try stderr.print("Error: --host is required for +new-remote-window\n", .{});
-        return 1;
-    }
-    if (opts.port == 0) {
-        try stderr.print("Error: --port is required for +new-remote-window\n", .{});
-        return 1;
+    // Validation: require EITHER a direct TCP dial (--host + --port) OR a relay
+    // dial (--relay + --device). The relay path takes precedence when present.
+    const have_relay = opts.relay != null and opts.device != null;
+    if (!have_relay) {
+        if (opts.relay != null or opts.device != null) {
+            try stderr.print("Error: --relay and --device must be provided together\n", .{});
+            return 1;
+        }
+        if (opts.host == null) {
+            try stderr.print("Error: --host is required (or use --relay + --device) for +new-remote-window\n", .{});
+            return 1;
+        }
+        if (opts.port == 0) {
+            try stderr.print("Error: --port is required (or use --relay + --device) for +new-remote-window\n", .{});
+            return 1;
+        }
     }
 
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
+
+    // For the relay path, the running app lives in a DIFFERENT environment than
+    // this CLI process, so the relay auth token (normally read from
+    // GHOSTTY_RELAY_TOKEN) must be forwarded explicitly. If the user did not pass
+    // --token=, read it from this CLI's env and forward it through the IPC
+    // arguments so the running app receives it.
+    if (have_relay and opts.token == null) {
+        if (std.posix.getenv("GHOSTTY_RELAY_TOKEN")) |tok| {
+            const forwarded = try std.fmt.allocPrintSentinel(alloc, "--token={s}", .{tok}, 0);
+            try opts._arguments.append(alloc_gpa, forwarded);
+        }
+    }
 
     sendOpen(alloc, opts._arguments.items, stderr) catch |err| switch (err) {
         error.NoRunningInstance => {

@@ -6,7 +6,7 @@
 // /v1/agent/data?session=S AND the local target, then splice them. The client's
 // ssh thus reaches this machine's sshd through the relay, fully end-to-end.
 //
-// Auth: the device token is read from $GHOZTTY_DEVICE_TOKEN (issued once at
+// Auth: the device token is read from $GHOSTTY_DEVICE_TOKEN (issued once at
 // enrollment via POST /v1/client/devices).
 package main
 
@@ -32,9 +32,9 @@ func main() {
 	if *base == "" {
 		log.Fatal("relay-agent: -base is required")
 	}
-	token := os.Getenv("GHOZTTY_DEVICE_TOKEN")
+	token := os.Getenv("GHOSTTY_DEVICE_TOKEN")
 	if token == "" {
-		log.Fatal("relay-agent: GHOZTTY_DEVICE_TOKEN is empty")
+		log.Fatal("relay-agent: GHOSTTY_DEVICE_TOKEN is empty")
 	}
 	wsBase := toWS(*base)
 

@@ -22,6 +22,7 @@ const remote_connection = @import("../remote/connection.zig");
 const remote_protocol = @import("../remote/protocol.zig");
 const ssh_transport = @import("../remote/ssh_transport.zig");
 const tcp_dial = @import("../remote/tcp_dial.zig");
+const relay_dial = @import("../remote/relay_dial.zig");
 const remote_proc = @import("../remote/agent/proc.zig");
 const remote_metrics = @import("../remote/agent/metrics.zig");
 const remote_proc_control = @import("../remote/agent/proc_control.zig");
@@ -692,6 +693,15 @@ pub const RemoteConnectionHandle = struct {
     /// path). Owns the socket + mux + `Connection`; torn down in `destroy`.
     tcp: ?*tcp_dial.Dialed = null,
 
+    /// The live relay transport, or null. Populated by
+    /// `ghostty_remote_connection_new_relay`: dials a remote `ghoztty-agent`
+    /// THROUGH a rendezvous relay (the `relay-connect` byte-pipe helper tunnels a
+    /// framed connection over an authenticated WebSocket), completing the HELLO
+    /// handshake before returning. Mutually exclusive with `transport`/`tcp`.
+    /// Owns the helper child + child stream + mux + `Connection`; torn down in
+    /// `destroy`.
+    relay: ?*relay_dial.Dialed = null,
+
     /// The transport is parameterized by the GUI-free spawn core so the
     /// agent-launch subprocess uses no-op rlimits / empty pre_exec hooks.
     pub const Transport = ssh_transport.Transport(CommandCore.DefaultCommand);
@@ -703,6 +713,7 @@ pub const RemoteConnectionHandle = struct {
     pub fn conn(self: *const RemoteConnectionHandle) ?*remote_connection.Connection {
         if (self.transport) |t| return t.conn;
         if (self.tcp) |d| return d.conn;
+        if (self.relay) |d| return d.conn;
         return null;
     }
 
@@ -753,6 +764,13 @@ pub const RemoteConnectionHandle = struct {
         // `Dialed.deinit` performs the strict TCP teardown (conn.shutdown →
         // mux.joinPump → free conn/mux/socket), closing the socket fd.
         if (self.tcp) |d| {
+            d.deinit();
+            alloc.destroy(d);
+        }
+        // `relay_dial.Dialed.deinit` performs the strict relay teardown
+        // (conn.shutdown → mux.joinPump → free conn/mux → reap the helper child →
+        // free the env map + child stream).
+        if (self.relay) |d| {
             d.deinit();
             alloc.destroy(d);
         }
@@ -2275,6 +2293,80 @@ pub const CAPI = struct {
         };
 
         handle.tcp = dialed;
+        return handle;
+    }
+
+    /// Create a remote connection by dialing a remote `ghoztty-agent` THROUGH a
+    /// rendezvous relay. The `relay-connect` byte-pipe helper opens an
+    /// authenticated WebSocket to the relay (`base`) for `device` and splices it
+    /// to its stdio, giving a transparent framed pipe to the agent. Like the TCP
+    /// path, this stands up the `ClientMux` + `Connection` AND blocks through the
+    /// HELLO handshake before returning, so the returned handle is FULLY
+    /// ESTABLISHED (a subsequent `_start` is a no-op; `_wait_handshake` returns
+    /// true immediately). The handle stores the relay transport where `conn()`
+    /// (and thus `remoteBackend`/`_wait_handshake`/`_latency_ms`/`_free`) reads
+    /// it, exactly mirroring the TCP path.
+    ///
+    /// The helper executable is resolved from `GHOSTTY_RELAY_CONNECT` (if set) or
+    /// defaults to the bare command `relay-connect` (resolved via PATH). The relay
+    /// auth token (`token`) is passed to the helper via `GHOSTTY_RELAY_TOKEN`.
+    ///
+    /// Returns null on a null/empty `base`/`device` or any dial/handshake
+    /// failure. The encoding is pinned to `.raw` (a clean pipe, like TCP).
+    export fn ghostty_remote_connection_new_relay(
+        base: [*:0]const u8,
+        device: [*:0]const u8,
+        token: [*:0]const u8,
+    ) ?*RemoteConnectionHandle {
+        const base_slice = std.mem.sliceTo(base, 0);
+        const device_slice = std.mem.sliceTo(device, 0);
+        const token_slice = std.mem.sliceTo(token, 0);
+        if (base_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_relay: base is empty", .{});
+            return null;
+        }
+        if (device_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_relay: device is empty", .{});
+            return null;
+        }
+
+        const alloc = global.alloc;
+
+        // Resolve the helper path: GHOSTTY_RELAY_CONNECT overrides; otherwise the
+        // bare command resolved via PATH. `getEnvVarOwned` returns an owned slice
+        // that must outlive the dial call (the spawn reads it), so we free it only
+        // after `dial` returns.
+        const helper_owned: ?[]u8 = std.process.getEnvVarOwned(alloc, "GHOSTTY_RELAY_CONNECT") catch null;
+        defer if (helper_owned) |h| alloc.free(h);
+        const helper_path: []const u8 = helper_owned orelse "relay-connect";
+
+        // Record the dial parameters on the handle (device as the display host,
+        // port 0; no user/jump for the relay path) so the handle is uniform.
+        const handle = RemoteConnectionHandle.create(
+            alloc,
+            device_slice,
+            null,
+            0,
+            null,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new_relay: handle alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer handle.destroy();
+
+        // Dial: spawn helper + mux + Connection + HELLO handshake (blocks). On any
+        // failure the handle is destroyed (no transport was attached).
+        const dialed = alloc.create(relay_dial.Dialed) catch |err| {
+            log.err("ghostty_remote_connection_new_relay: Dialed alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer alloc.destroy(dialed);
+        dialed.* = relay_dial.dial(alloc, base_slice, device_slice, token_slice, helper_path, .raw) catch |err| {
+            log.err("ghostty_remote_connection_new_relay: relay dial failed err={}", .{err});
+            return null;
+        };
+
+        handle.relay = dialed;
         return handle;
     }
 

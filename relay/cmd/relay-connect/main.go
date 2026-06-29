@@ -7,7 +7,7 @@
 // it to this process's stdin/stdout. SSH then runs its handshake END-TO-END with
 // the remote sshd over this pipe — the relay only ever sees SSH ciphertext.
 //
-// Auth: the client bearer token is read from $GHOZTTY_RELAY_TOKEN (a Google ID
+// Auth: the client bearer token is read from $GHOSTTY_RELAY_TOKEN (a Google ID
 // token in production, or the DEV_CLIENT_TOKEN during bring-up).
 package main
 
@@ -30,9 +30,9 @@ func main() {
 	if *base == "" || *device == "" {
 		fatal("relay-connect: -base and -device are required")
 	}
-	token := os.Getenv("GHOZTTY_RELAY_TOKEN")
+	token := os.Getenv("GHOSTTY_RELAY_TOKEN")
 	if token == "" {
-		fatal("relay-connect: GHOZTTY_RELAY_TOKEN is empty")
+		fatal("relay-connect: GHOSTTY_RELAY_TOKEN is empty")
 	}
 
 	wsBase := toWS(*base)

@@ -1290,6 +1290,18 @@ GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new(
 GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_tcp(
     const char* host, uint16_t port);
 
+// Create a remote connection by dialing a remote ghoztty-agent THROUGH a
+// rendezvous relay. The relay-connect byte-pipe helper opens an authenticated
+// WebSocket to the relay (base) for device and splices it to its stdio, giving
+// a transparent framed pipe to the agent. Like _new_tcp, this BLOCKS through
+// the HELLO handshake before returning, so the handle is fully established. The
+// helper executable is resolved from GHOSTTY_RELAY_CONNECT or defaults to the
+// bare command "relay-connect" (PATH); the auth token is passed to the helper
+// via GHOSTTY_RELAY_TOKEN. Returns NULL on a NULL/empty base/device or any
+// dial/handshake failure. Free with ghostty_remote_connection_free.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_relay(
+    const char* base, const char* device, const char* token);
+
 // Start the connection: dial SSH, spawn the reader/writer threads, and send
 // the client HELLO. Returns true on success. WP3: currently returns false
 // (live SSH dial not yet wired).

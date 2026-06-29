@@ -868,19 +868,34 @@ class IPCServer {
 
         var host: String?
         var port: UInt16?
+        var relay: String?
+        var device: String?
+        var token: String?
         for arg in arguments {
             if let value = arg.dropPrefix("--host=") {
                 host = String(value)
             } else if let value = arg.dropPrefix("--port=") {
                 port = UInt16(value)
+            } else if let value = arg.dropPrefix("--relay=") {
+                relay = String(value)
+            } else if let value = arg.dropPrefix("--device=") {
+                device = String(value)
+            } else if let value = arg.dropPrefix("--token=") {
+                token = String(value)
             }
         }
 
-        guard let host, !host.isEmpty else {
-            return IPCResponse(success: false, error: "--host is required for +new-remote-window")
-        }
-        guard let port, port != 0 else {
-            return IPCResponse(success: false, error: "--port is required for +new-remote-window")
+        // Relay path: --relay + --device dial through a rendezvous relay. Takes
+        // precedence over the direct host:port path when both are present.
+        let useRelay = (relay?.isEmpty == false) && (device?.isEmpty == false)
+        if !useRelay {
+            guard host?.isEmpty == false else {
+                return IPCResponse(success: false, error: "--host is required (or use --relay + --device) for +new-remote-window")
+            }
+            guard let port, port != 0 else {
+                return IPCResponse(success: false, error: "--port is required (or use --relay + --device) for +new-remote-window")
+            }
+            _ = port
         }
 
         var errorMessage: String?
@@ -891,7 +906,14 @@ class IPCServer {
                 errorMessage = "app delegate unavailable"
                 return
             }
-            errorMessage = appDelegate.openRemoteWindow(host: host, port: port)
+            if useRelay {
+                errorMessage = appDelegate.openRemoteWindow(
+                    relay: relay!,
+                    device: device!,
+                    token: token ?? "")
+            } else {
+                errorMessage = appDelegate.openRemoteWindow(host: host!, port: port!)
+            }
         }
         semaphore.wait()
 
