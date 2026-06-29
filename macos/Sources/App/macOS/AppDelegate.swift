@@ -1000,7 +1000,15 @@ class AppDelegate: NSObject,
             case .local:
                 _ = TerminalController.newWindow(self.ghostty)
             case .remote(let machine):
-                self.openRemoteWindow(on: machine)
+                // Relay machines dial through the rendezvous relay; the token is
+                // read from the environment (never hardcoded). TCP machines use
+                // the direct host:port dial.
+                if let base = machine.relayBase, let device = machine.deviceID {
+                    let token = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_TOKEN"] ?? ""
+                    self.openRemoteWindow(relay: base, device: device, token: token)
+                } else {
+                    self.openRemoteWindow(on: machine)
+                }
             }
         }
     }
