@@ -1005,7 +1005,7 @@ class AppDelegate: NSObject,
                 // the direct host:port dial.
                 if let base = machine.relayBase, let device = machine.deviceID {
                     let token = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_TOKEN"] ?? ""
-                    self.openRemoteWindow(relay: base, device: device, token: token)
+                    self.openRemoteWindow(relay: base, device: device, token: token, name: machine.name)
                 } else {
                     self.openRemoteWindow(on: machine)
                 }
@@ -1040,7 +1040,7 @@ class AppDelegate: NSObject,
     /// path). Returns nil on success or an error message on failure.
     @MainActor
     @discardableResult
-    func openRemoteWindow(relay: String, device: String, token: String) -> String? {
+    func openRemoteWindow(relay: String, device: String, token: String, name: String? = nil) -> String? {
         // Dial the agent through the relay. This blocks through the handshake and
         // returns a connection handle, or NULL on failure.
         let handle: ghostty_remote_connection_t? = relay.withCString { basePtr in
@@ -1061,9 +1061,10 @@ class AppDelegate: NSObject,
             return "failed to reach \(device) via relay \(relay): the agent is not running or not reachable"
         }
 
-        // The relay path has no TCP port; use the device id as the friendly name
-        // and the relay base as the display host (port 0).
-        let machine = Machine(name: device, host: relay, port: 0)
+        // The relay path has no TCP port; prefer the chooser's friendly name (falls
+        // back to the device id for the headless CLI/IPC path). Carry the relay
+        // base + device id so the Machine is a proper relay machine.
+        let machine = Machine(name: name ?? device, host: relay, port: 0, relayBase: relay, deviceID: device)
 
         // Wrap the handle in a strong owner; the controller below holds the only
         // strong reference and frees it (once) when the window is deallocated.
