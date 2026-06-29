@@ -89,6 +89,13 @@ pub const DialConfig = struct {
     port: u16 = 0,
     /// Optional `-J` jump-host chain (comma-separated `[user@]host[:port],...`).
     jump: ?[]const u8 = null,
+    /// Optional `-o ProxyCommand=<cmd>`: tunnel the SSH connection through an
+    /// external byte-pipe helper instead of a direct TCP dial. This is how the
+    /// relay transport works — `ProxyCommand` runs `ghoztty-relay-connect`, which
+    /// pipes SSH over an authenticated `wss://` hop to the relay (Tailscale-free,
+    /// NAT-agnostic). SSH still runs its handshake end-to-end with the remote
+    /// sshd, so the relay only ever sees ciphertext. Null → a direct dial.
+    proxy_command: ?[]const u8 = null,
     /// Absolute path to the remote agent executable (§4.1: invoked by absolute
     /// path, never bare `$PATH`). Defaults to the bare command for tests/dev;
     /// production supplies the pushed `~/.local/share/...` path.
@@ -268,6 +275,10 @@ pub fn buildArgs(
         try H.add(&list, alloc, "-J");
         try H.add(&list, alloc, j);
     }
+    if (cfg.proxy_command) |pc| {
+        try H.add(&list, alloc, "-o");
+        try H.addFmt(&list, alloc, "ProxyCommand={s}", .{pc});
+    }
 
     // The destination: [user@]host.
     if (cfg.user) |u| {
@@ -323,6 +334,10 @@ pub fn buildArgsSingle(
     if (cfg.jump) |j| {
         try H.add(&list, alloc, "-J");
         try H.add(&list, alloc, j);
+    }
+    if (cfg.proxy_command) |pc| {
+        try H.add(&list, alloc, "-o");
+        try H.addFmt(&list, alloc, "ProxyCommand={s}", .{pc});
     }
 
     if (cfg.user) |u| {
@@ -774,6 +789,29 @@ test "buildArgs: jump host" {
         if (std.mem.eql(u8, a, "bastion.example")) saw_jump = true;
     }
     try testing.expect(saw_j and saw_jump);
+}
+
+test "buildArgs: proxy command (relay transport)" {
+    const alloc = testing.allocator;
+    const pc = "ghoztty-relay-connect -base https://relay -device d1";
+    const cfg: DialConfig = .{ .host = "d1", .proxy_command = pc };
+    inline for (.{ true, false }) |single| {
+        const args = if (single)
+            try buildArgsSingle(alloc, cfg)
+        else
+            try buildArgs(alloc, cfg, .control, "/tmp/cp.sock");
+        defer {
+            for (args) |a| alloc.free(a);
+            alloc.free(args);
+        }
+        var saw_o = false;
+        var saw_pc = false;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "-o")) saw_o = true;
+            if (std.mem.eql(u8, a, "ProxyCommand=" ++ pc)) saw_pc = true;
+        }
+        try testing.expect(saw_o and saw_pc);
+    }
 }
 
 test "buildArgsSingle: ONE subprocess, no --channel, no ControlMaster" {

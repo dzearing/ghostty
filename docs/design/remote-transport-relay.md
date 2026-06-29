@@ -243,12 +243,24 @@ New/changed pieces:
   **Remaining for prod:** register a Google OAuth client → set `GOOGLE_CLIENT_ID` +
   `ALLOWED_EMAILS` and disable `DEV_AUTH`; add audit logging + rate limits. Has an
   `e2e` smoke-test tool (`go run ./cmd/e2e`) and a `go test` integration test.
-- **WP-T2 — Client relay dialer.** `src/remote/relay_dial.zig` +
-  `ghostty_remote_connection_new_relay` C export +
-  `ghoztty-relay-connect` ProxyCommand helper; SSH carried over the bridged stream.
-- **WP-T3 — Agent relay mode.** `--relay=<url>` outbound registration in
-  `agent/main.zig`; bridged session → existing `ConnWorker`; retire/loopback-bind
-  the `0.0.0.0` listener.
+- **WP-T2 — Client relay transport. 🟡 TRANSPORT PROVEN (2026-06-28).** Realized as
+  **SSH-over-relay via `ProxyCommand`** (cleaner than a bespoke Zig WS dialer):
+  reuses the existing `ssh_transport.zig`, which already builds the full ssh argv and
+  now takes a `proxy_command` field emitting `-o ProxyCommand=` (done; unit-tested,
+  81/81). The ProxyCommand runs **`relay-connect`** (Go, `relay/cmd/relay-connect`):
+  it opens an authenticated `/v1/client/connect` WS and splices it to stdio, so ssh
+  handshakes end-to-end with the remote sshd through the relay (relay sees only
+  ciphertext). **Proven:** `ssh` from a Mac through the live relay into the VM's sshd.
+  **Remaining:** a thin `relayDialConfig` helper + `ghostty_remote_connection_new_relay`
+  C export that points `proxy_command` at `relay-connect` and sets host=device-id.
+- **WP-T3 — Agent relay connector. 🟡 PROVEN (2026-06-28).** Realized as
+  **`relay-agent`** (Go, `relay/cmd/relay-agent`): outbound registration on
+  `/v1/agent/control`, and per `open` it dials `/v1/agent/data?session=` and bridges
+  to a local target (the machine's sshd for SSH-over-relay; later the local
+  `ghoztty-agent` endpoint directly). Reconnect loop + systemd unit. This supersedes
+  the old "`--relay` flag inside `agent/main.zig` feeding `ConnWorker`" plan — the
+  connector is a separate sidecar, so the agent stays transport-agnostic. **Still
+  retire/loopback-bind** the legacy `0.0.0.0:7777` listener in `agent/main.zig`.
 - **WP-T4 — macOS sign-in + dynamic machine list.** OIDC sheet, token cache,
   device list from relay directory (replaces hardcoded `Machine.swift`), connect
   flow.
