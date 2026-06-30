@@ -24,10 +24,13 @@ Live test infra (DEV/bring-up only):
   on `127.0.0.1:8080` (systemd `ghoztty-relay`). **`DEV_AUTH=true`** (static token in
   `/etc/ghoztty-relay.env`; OIDC implemented but inactive). Teardown:
   `az group delete -n ghoztty-relay-rg --yes`.
-- **Windows box (`MaximusHome`):** `ghoztty-agent.exe` on `127.0.0.1:7777` (loopback) +
-  `relay-agent.exe` connector (outbound to relay), managed by
-  `ghoztty-agent-watcher.ps1` on `\\homeassistant\share\ghoztty-windows`. Devices
-  enrolled: `windows-home`, `windows-remote` (unused).
+- **Windows box (`MaximusHome`):** **SINGLE-BINARY** `ghoztty-agent.exe --relay=<base>`
+  (dials the relay itself via the native Zig WS client — no connector, no listener,
+  one systray), token from `%LOCALAPPDATA%\ghoztty\relay.env`. Managed by the
+  single-binary `ghoztty-agent-watcher.ps1` on `\\homeassistant\share\ghoztty-windows`
+  (re-run after a script change). Devices: `windows-home`, `windows-remote` (unused).
+  The Go `relay-connect`/`relay-agent` sidecars are DELETED — Go is only the relay
+  server now. Mac client dials the relay in-process (no subprocess).
 - **Mac client:** `Ghoztty-Debug.app` (`zig build -Doptimize=Debug`); `relay-connect`
   helper at `zig-out/bin/relay-connect`, found via `GHOSTTY_RELAY_CONNECT` (launchctl
   setenv for now — TODO: bundle into the .app). Dev client token via
