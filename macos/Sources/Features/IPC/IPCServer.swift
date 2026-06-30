@@ -871,6 +871,7 @@ class IPCServer {
         var relay: String?
         var device: String?
         var token: String?
+        var name: String?
         for arg in arguments {
             if let value = arg.dropPrefix("--host=") {
                 host = String(value)
@@ -882,6 +883,8 @@ class IPCServer {
                 device = String(value)
             } else if let value = arg.dropPrefix("--token=") {
                 token = String(value)
+            } else if let value = arg.dropPrefix("--name=") {
+                name = String(value)
             }
         }
 
@@ -910,7 +913,8 @@ class IPCServer {
                 errorMessage = appDelegate.openRemoteWindow(
                     relay: relay!,
                     device: device!,
-                    token: token ?? "")
+                    token: token ?? "",
+                    name: name)
             } else {
                 errorMessage = appDelegate.openRemoteWindow(host: host!, port: port!)
             }
