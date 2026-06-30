@@ -1,6 +1,6 @@
 //! `ghoztty-agent` entry point (WP2, §4.1–§4.2/§7.1) — the remote-host daemon.
 //!
-//! Two transport modes share the SAME session-server core (`server.zig`, real
+//! Three transport modes share the SAME session-server core (`server.zig`, real
 //! pty-backed children via `pty_child.zig`) and the SAME lane mux (`mux.zig`):
 //!
 //!   1. **stdio** (`--stdio`, or the default when stdin is not a tty / no listen
@@ -14,6 +14,14 @@
 //!      daemon-scoped session store), so the accept loop NEVER blocks on one
 //!      connection's lifecycle. The real-network backbone for cross-machine tests
 //!      (Mac ↔ Windows over Tailscale).
+//!
+//!   3. **Relay daemon** (`--relay <url>`): the single-binary rendezvous path (no
+//!      Go sidecar, no inbound port). Hold an authenticated `wss://` control
+//!      WebSocket to the relay; on each `{"type":"open","session":S}` command,
+//!      dial a per-session data WebSocket and serve it over the SAME `serveOne`
+//!      core (shared store) as an accepted socket. The device token is read from
+//!      `GHOSTTY_DEVICE_TOKEN`. Reconnects with backoff on a control drop
+//!      (sessions survive). Coexists with — does not replace — `--listen`.
 //!
 //! ### SESSION SURVIVAL (P1, §7.1) — the close-laptop scenario
 //! The session table + pty children + output rings live in a DAEMON-scoped
@@ -56,6 +64,7 @@ const session = @import("session.zig");
 const pty_child = @import("pty_child.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
+const ws_client = @import("../ws_client.zig");
 const tray = @import("tray.zig");
 
 const default_listen = "0.0.0.0:7777";
@@ -79,6 +88,17 @@ pub fn main() !void {
     switch (mode) {
         .stdio => try runStdio(alloc, encoding),
         .listen => |l| try runListen(alloc, encoding, l.addr, l.headless),
+        .relay => |r| {
+            // The device token authenticates the relay WebSockets. Required.
+            const token = std.process.getEnvVarOwned(alloc, "GHOSTTY_DEVICE_TOKEN") catch {
+                std.debug.print("ghoztty-agent: --relay requires GHOSTTY_DEVICE_TOKEN to be set\n", .{});
+                return error.MissingDeviceToken;
+            };
+            // `runRelay` loops forever (until the process is killed), so this free
+            // never actually runs — the token is effectively static.
+            defer alloc.free(token);
+            try runRelay(alloc, encoding, r.base_url, token, r.headless);
+        },
     }
 }
 
@@ -93,6 +113,14 @@ fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
 const Mode = union(enum) {
     stdio,
     listen: Listen,
+    relay: Relay,
+};
+
+/// Relay-mode parameters. `base_url` is the relay HTTPS/WSS base (owned — duped
+/// from argv so it outlives `argsFree`). `headless` suppresses the Windows tray.
+const Relay = struct {
+    base_url: []const u8,
+    headless: bool = false,
 };
 
 /// TCP listen-daemon parameters. `headless` suppresses the Windows system-tray
@@ -132,6 +160,17 @@ fn parseArgs(alloc: Allocator) !Mode {
             return .{ .listen = .{ .addr = try parseAddr(args[i]), .headless = headless } };
         } else if (std.mem.startsWith(u8, a, "--listen=")) {
             return .{ .listen = .{ .addr = try parseAddr(a["--listen=".len..]), .headless = headless } };
+        } else if (std.mem.eql(u8, a, "--relay")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("ghoztty-agent: --relay requires <url>\n", .{});
+                return error.InvalidArgs;
+            }
+            // Dupe the URL: `args` is freed (argsFree) when parseArgs returns, but
+            // relay mode needs the URL for the life of the daemon.
+            return .{ .relay = .{ .base_url = try alloc.dupe(u8, args[i]), .headless = headless } };
+        } else if (std.mem.startsWith(u8, a, "--relay=")) {
+            return .{ .relay = .{ .base_url = try alloc.dupe(u8, a["--relay=".len..]), .headless = headless } };
         } else {
             std.debug.print("ghoztty-agent: unknown argument '{s}'\n", .{a});
             return error.InvalidArgs;
@@ -416,6 +455,265 @@ fn serveOne(
     // (never terminates) its sessions, so they survive in the store for reconnect.
     srv.shutdown();
 }
+
+// -----------------------------------------------------------------------------
+// Relay daemon (`--relay <url>`): single binary, no Go sidecar, no localhost
+// listener. The agent holds an authenticated `wss://.../v1/agent/control`
+// WebSocket; on each `{"type":"open","session":S}` command it dials a data
+// WebSocket `.../v1/agent/data?session=S` and serves that session over it
+// EXACTLY like an accepted TCP socket (same `serveOne` core, same shared store,
+// so sessions survive a control reconnect). The relay bridges these WebSockets
+// verbatim to the client, so the client reaches this agent end-to-end with no
+// inbound port and no subprocess.
+// -----------------------------------------------------------------------------
+
+/// How long to back off before retrying after the control connection drops or
+/// fails to establish (matches the Go relay-agent's 3s reconnect cadence).
+const relay_backoff_ms = 3000;
+
+fn runRelay(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    base_url: []const u8,
+    token: []const u8,
+    headless: bool,
+) !void {
+    // Convert the https/wss base to a clean `wss://host` prefix (no trailing
+    // slash); the per-endpoint paths are appended by the loop/worker. Owned for
+    // the life of the daemon.
+    const ws_base = try wssBase(alloc, base_url);
+    defer alloc.free(ws_base);
+
+    // DAEMON-SCOPED shared session store + spawner (§7.1 survival) — identical to
+    // `runListen`. These OUTLIVE every data connection AND every control
+    // reconnect: sessions, their pty children, and their rings keep streaming
+    // across a control-WS drop, ready for a reconnecting client to ATTACH.
+    const seed = blk: {
+        var s: u64 = 0;
+        std.crypto.random.bytes(std.mem.asBytes(&s));
+        break :blk s;
+    };
+    var rng = std.Random.DefaultPrng.init(seed);
+
+    var spawner = try pty_child.PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    var store = session.SessionStore.init(
+        alloc,
+        rng.random(),
+        undefined,
+        realNow,
+        session.default_idle_ttl_ms,
+    );
+    defer store.deinit();
+    try store.startReaper();
+
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent: relay mode, control={s}/v1/agent/control\n", .{ws_base}) catch "ghoztty-agent: relay mode\n") catch {};
+
+    // The relay control loop is the whole daemon. WHERE it runs depends on the
+    // tray, exactly mirroring `runListen`'s accept-loop placement.
+    if (builtin.os.tag == .windows and !headless) {
+        const args: RelayArgs = .{
+            .alloc = alloc,
+            .encoding = encoding,
+            .ws_base = ws_base,
+            .token = token,
+            .store = &store,
+            .spawner = spawner.spawner(),
+        };
+        if (std.Thread.spawn(.{}, relayLoopThread, .{args})) |t| {
+            if (tray.run(&store, build_hash)) {
+                std.process.exit(0); // user chose Exit
+            }
+            // Tray setup failed: park the main thread on the (already-serving)
+            // control loop so the daemon lives on.
+            t.join();
+            return;
+        } else |err| {
+            std.debug.print("ghoztty-agent: tray worker spawn failed ({s}); serving headless\n", .{@errorName(err)});
+        }
+    }
+
+    // Headless / non-windows / tray-fallback: run the control loop right here.
+    relayLoop(alloc, encoding, ws_base, token, &store, spawner.spawner());
+}
+
+/// Convert an `https://host[:port]` / `wss://host[:port]` base to a normalized
+/// `wss://host[:port]` (trailing slashes trimmed). Owned by the caller.
+fn wssBase(alloc: Allocator, base: []const u8) ![]u8 {
+    const host_part = if (std.mem.startsWith(u8, base, "https://"))
+        base["https://".len..]
+    else if (std.mem.startsWith(u8, base, "wss://"))
+        base["wss://".len..]
+    else {
+        std.debug.print("ghoztty-agent: --relay url must start with https:// or wss://\n", .{});
+        return error.InvalidArgs;
+    };
+    const trimmed = std.mem.trimRight(u8, host_part, "/");
+    return std.fmt.allocPrint(alloc, "wss://{s}", .{trimmed});
+}
+
+/// Bundles the relay-loop parameters so they can ride a single `std.Thread.spawn`
+/// argument (the Windows tray path runs the loop on a worker thread).
+const RelayArgs = struct {
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    ws_base: []const u8,
+    token: []const u8,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+};
+
+fn relayLoopThread(args: RelayArgs) void {
+    relayLoop(args.alloc, args.encoding, args.ws_base, args.token, args.store, args.spawner);
+}
+
+/// THE RELAY DAEMON: hold the control WebSocket; on drop, back off and reconnect
+/// (reusing the SAME store, so sessions survive). Loops forever.
+fn relayLoop(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    ws_base: []const u8,
+    token: []const u8,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+) void {
+    const ctrl_url = std.fmt.allocPrint(alloc, "{s}/v1/agent/control", .{ws_base}) catch {
+        std.debug.print("ghoztty-agent: relay: out of memory building control url\n", .{});
+        return;
+    };
+    defer alloc.free(ctrl_url);
+
+    const authz = std.fmt.allocPrint(alloc, "Bearer {s}", .{token}) catch {
+        std.debug.print("ghoztty-agent: relay: out of memory building auth header\n", .{});
+        return;
+    };
+    defer alloc.free(authz);
+    const headers = [_]ws_client.Header{.{ .name = "Authorization", .value = authz }};
+
+    while (true) {
+        const ctrl = ws_client.WsClient.connectUrl(alloc, ctrl_url, &headers) catch |err| {
+            std.debug.print("ghoztty-agent: relay control connect failed ({s}); retry in {d}ms\n", .{ @errorName(err), relay_backoff_ms });
+            std.Thread.sleep(relay_backoff_ms * std.time.ns_per_ms);
+            continue;
+        };
+        std.debug.print("ghoztty-agent: relay control connected\n", .{});
+        serveControl(alloc, encoding, ws_base, token, store, spawner, ctrl);
+        ctrl.deinit();
+        std.debug.print("ghoztty-agent: relay control ended; reconnecting in {d}ms\n", .{relay_backoff_ms});
+        std.Thread.sleep(relay_backoff_ms * std.time.ns_per_ms);
+    }
+}
+
+/// Read control messages until the control WebSocket closes/errors. For each
+/// `{"type":"open","session":S}` command, spawn a detached worker that serves
+/// that session over its own data WebSocket. Non-`open` messages are ignored.
+fn serveControl(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    ws_base: []const u8,
+    token: []const u8,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    ctrl: *ws_client.WsClient,
+) void {
+    // One control command per WS message; 4 KiB is ample for the small JSON.
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = ctrl.readMessage(&buf) catch |err| {
+            std.debug.print("ghoztty-agent: relay control read error: {s}\n", .{@errorName(err)});
+            return;
+        };
+        if (n == 0) return; // clean close / EOF
+
+        const Msg = struct { @"type": []const u8 = "", session: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(Msg, alloc, buf[0..n], .{ .ignore_unknown_fields = true }) catch {
+            // Malformed JSON — ignore, keep the control connection alive.
+            continue;
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.@"type", "open")) continue;
+        if (parsed.value.session.len == 0) continue;
+
+        // Dup the session id for the detached worker (parsed.deinit frees it here).
+        const session_id = alloc.dupe(u8, parsed.value.session) catch continue;
+
+        const worker = RelayWorker.create(alloc, encoding, ws_base, token, store, spawner, session_id) catch |err| {
+            std.debug.print("ghoztty-agent: relay: failed to start session worker: {s}\n", .{@errorName(err)});
+            alloc.free(session_id);
+            continue;
+        };
+        const t = std.Thread.spawn(.{}, RelayWorker.run, .{worker}) catch |err| {
+            std.debug.print("ghoztty-agent: relay: failed to spawn session worker: {s}\n", .{@errorName(err)});
+            worker.destroy();
+            continue;
+        };
+        t.detach();
+    }
+}
+
+/// A per-session relay worker: dials the session's data WebSocket and serves it
+/// over the SAME `serveOne` core (sharing the daemon `store`/`spawner`) as a TCP
+/// connection, then frees itself. `ws_base`/`token` are borrowed (they live for
+/// the daemon's lifetime); `session_id` is owned and freed on teardown.
+const RelayWorker = struct {
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    ws_base: []const u8,
+    token: []const u8,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    session_id: []const u8,
+
+    fn create(
+        alloc: Allocator,
+        encoding: protocol.TransferEncoding,
+        ws_base: []const u8,
+        token: []const u8,
+        store: *session.SessionStore,
+        spawner: server.Spawner,
+        session_id: []const u8,
+    ) !*RelayWorker {
+        const self = try alloc.create(RelayWorker);
+        self.* = .{
+            .alloc = alloc,
+            .encoding = encoding,
+            .ws_base = ws_base,
+            .token = token,
+            .store = store,
+            .spawner = spawner,
+            .session_id = session_id,
+        };
+        return self;
+    }
+
+    fn destroy(self: *RelayWorker) void {
+        self.alloc.free(self.session_id);
+        self.alloc.destroy(self);
+    }
+
+    fn run(self: *RelayWorker) void {
+        defer self.destroy();
+
+        const url = std.fmt.allocPrint(self.alloc, "{s}/v1/agent/data?session={s}", .{ self.ws_base, self.session_id }) catch return;
+        defer self.alloc.free(url);
+        const authz = std.fmt.allocPrint(self.alloc, "Bearer {s}", .{self.token}) catch return;
+        defer self.alloc.free(authz);
+        const headers = [_]ws_client.Header{.{ .name = "Authorization", .value = authz }};
+
+        const dc = ws_client.WsClient.connectUrl(self.alloc, url, &headers) catch |err| {
+            std.debug.print("ghoztty-agent: relay data dial (session {s}): {s}\n", .{ self.session_id, @errorName(err) });
+            return;
+        };
+        // serveOne's mux closes the data stream (dc.close) on EOF; `deinit` is the
+        // final close + free of the WebSocket.
+        serveOne(self.alloc, self.encoding, self.store, self.spawner, dc.serverStream()) catch |err| {
+            std.debug.print("ghoztty-agent: relay session {s} error: {s}\n", .{ self.session_id, @errorName(err) });
+        };
+        dc.deinit();
+    }
+};
 
 test {
     std.testing.refAllDecls(@This());

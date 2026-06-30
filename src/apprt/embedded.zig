@@ -695,11 +695,10 @@ pub const RemoteConnectionHandle = struct {
 
     /// The live relay transport, or null. Populated by
     /// `ghostty_remote_connection_new_relay`: dials a remote `ghoztty-agent`
-    /// THROUGH a rendezvous relay (the `relay-connect` byte-pipe helper tunnels a
-    /// framed connection over an authenticated WebSocket), completing the HELLO
-    /// handshake before returning. Mutually exclusive with `transport`/`tcp`.
-    /// Owns the helper child + child stream + mux + `Connection`; torn down in
-    /// `destroy`.
+    /// THROUGH a rendezvous relay (a native `wss://` WebSocket tunnels a framed
+    /// connection over an authenticated link), completing the HELLO handshake
+    /// before returning. Mutually exclusive with `transport`/`tcp`. Owns the
+    /// WebSocket client + mux + `Connection`; torn down in `destroy`.
     relay: ?*relay_dial.Dialed = null,
 
     /// The transport is parameterized by the GUI-free spawn core so the
@@ -2297,19 +2296,17 @@ pub const CAPI = struct {
     }
 
     /// Create a remote connection by dialing a remote `ghoztty-agent` THROUGH a
-    /// rendezvous relay. The `relay-connect` byte-pipe helper opens an
-    /// authenticated WebSocket to the relay (`base`) for `device` and splices it
-    /// to its stdio, giving a transparent framed pipe to the agent. Like the TCP
-    /// path, this stands up the `ClientMux` + `Connection` AND blocks through the
-    /// HELLO handshake before returning, so the returned handle is FULLY
-    /// ESTABLISHED (a subsequent `_start` is a no-op; `_wait_handshake` returns
-    /// true immediately). The handle stores the relay transport where `conn()`
-    /// (and thus `remoteBackend`/`_wait_handshake`/`_latency_ms`/`_free`) reads
-    /// it, exactly mirroring the TCP path.
+    /// rendezvous relay. A native `wss://` WebSocket (`relay_dial`/`ws_client`)
+    /// opens an authenticated connection to the relay (`base`) for `device`,
+    /// giving a transparent framed byte pipe to the agent (no subprocess). Like
+    /// the TCP path, this stands up the `ClientMux` + `Connection` AND blocks
+    /// through the HELLO handshake before returning, so the returned handle is
+    /// FULLY ESTABLISHED (a subsequent `_start` is a no-op; `_wait_handshake`
+    /// returns true immediately). The handle stores the relay transport where
+    /// `conn()` (and thus `remoteBackend`/`_wait_handshake`/`_latency_ms`/`_free`)
+    /// reads it, exactly mirroring the TCP path.
     ///
-    /// The helper executable is resolved from `GHOSTTY_RELAY_CONNECT` (if set) or
-    /// defaults to the bare command `relay-connect` (resolved via PATH). The relay
-    /// auth token (`token`) is passed to the helper via `GHOSTTY_RELAY_TOKEN`.
+    /// The relay auth token (`token`) is sent as `Authorization: Bearer <token>`.
     ///
     /// Returns null on a null/empty `base`/`device` or any dial/handshake
     /// failure. The encoding is pinned to `.raw` (a clean pipe, like TCP).
@@ -2332,14 +2329,6 @@ pub const CAPI = struct {
 
         const alloc = global.alloc;
 
-        // Resolve the helper path: GHOSTTY_RELAY_CONNECT overrides; otherwise the
-        // bare command resolved via PATH. `getEnvVarOwned` returns an owned slice
-        // that must outlive the dial call (the spawn reads it), so we free it only
-        // after `dial` returns.
-        const helper_owned: ?[]u8 = std.process.getEnvVarOwned(alloc, "GHOSTTY_RELAY_CONNECT") catch null;
-        defer if (helper_owned) |h| alloc.free(h);
-        const helper_path: []const u8 = helper_owned orelse "relay-connect";
-
         // Record the dial parameters on the handle (device as the display host,
         // port 0; no user/jump for the relay path) so the handle is uniform.
         const handle = RemoteConnectionHandle.create(
@@ -2354,14 +2343,14 @@ pub const CAPI = struct {
         };
         errdefer handle.destroy();
 
-        // Dial: spawn helper + mux + Connection + HELLO handshake (blocks). On any
+        // Dial: WebSocket + mux + Connection + HELLO handshake (blocks). On any
         // failure the handle is destroyed (no transport was attached).
         const dialed = alloc.create(relay_dial.Dialed) catch |err| {
             log.err("ghostty_remote_connection_new_relay: Dialed alloc failed err={}", .{err});
             return null;
         };
         errdefer alloc.destroy(dialed);
-        dialed.* = relay_dial.dial(alloc, base_slice, device_slice, token_slice, helper_path, .raw) catch |err| {
+        dialed.* = relay_dial.dial(alloc, base_slice, device_slice, token_slice, .raw) catch |err| {
             log.err("ghostty_remote_connection_new_relay: relay dial failed err={}", .{err});
             return null;
         };

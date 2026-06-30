@@ -3,54 +3,44 @@
 //! `ghoztty-agent` reached THROUGH a rendezvous relay instead of a direct dial.
 //!
 //! It is the relay analogue of `tcp_dial.zig`: where that connects a TCP socket
-//! and wraps it as a `socket_stream.SocketStream`, this spawns the
-//! `relay-connect` byte-pipe helper and wraps its `(stdout, stdin)` pipe pair as
-//! an `ssh_transport.ChildStream`. The helper opens an authenticated WebSocket to
-//! the relay and splices it to its own stdin/stdout, so writing framed bytes to
-//! the child's stdin and reading framed bytes from its stdout is a transparent
-//! byte pipe to the remote agent. The rest is identical to the single-channel
-//! TCP path: ONE transport stream → `ClientMux` (folds the two logical lanes) →
+//! and wraps it as a `socket_stream.SocketStream`, this opens a native
+//! `wss://` WebSocket to the relay (`ws_client.WsClient`) and wraps its
+//! connection-side `Stream` as the single transport. The relay bridges those
+//! bytes verbatim to the target device, so the WebSocket is a transparent byte
+//! pipe to the remote agent — there is NO subprocess (the old Go `relay-connect`
+//! sidecar is gone). The rest is identical to the single-channel TCP path: ONE
+//! transport stream → `ClientMux` (folds the two logical lanes) →
 //! `Connection.create(control, data, hello)` → start the pump + the connection
 //! threads → handshake.
 //!
 //! ## Lifetime / teardown
-//! `Dialed` owns the helper child, its env map, the child stream, the mux, and
-//! the connection. `deinit` performs the strict teardown order:
+//! `Dialed` owns the WebSocket client, the mux, and the connection. `deinit`
+//! performs the strict teardown order:
 //!   1. `conn.shutdown()` — closes the two lane streams (→ mux closes the
-//!      transport `ChildStream`, closing the child's pipes and unblocking the
-//!      pump's blocked `read`) and joins the connection's writer/reader/
-//!      heartbeat threads.
+//!      transport WebSocket, which `shutdown`s the socket and unblocks the pump's
+//!      blocked `read`) and joins the connection's writer/reader/heartbeat
+//!      threads.
 //!   2. `mux.joinPump()` — joins the inbound demux thread (already unblocked).
-//!   3. free `conn`, `mux`; reap the helper child; free the env map and the
-//!      child-stream wrapper.
-//! The child's pipe fds are owned by the `ChildStream` (closed by the mux's
-//! `close` during `shutdown`), so the `Child`'s own stdin/stdout are nulled out
-//! after spawn to avoid a double close.
+//!   3. free `conn`, `mux`; `ws.deinit()` (best-effort close frame, close the
+//!      socket, free all WebSocket-owned memory).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
-const EnvMap = std.process.EnvMap;
 
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const client_mux = @import("client_mux.zig");
-const ssh_transport = @import("ssh_transport.zig");
+const ws_client = @import("ws_client.zig");
 
-/// A fully stood-up, handshaked client connection over a relay byte pipe. The
-/// caller drives `conn` (openChannel / writeInput / attachChannel / ...) and
-/// tears it all down with `deinit`.
+/// A fully stood-up, handshaked client connection over a relay WebSocket byte
+/// pipe. The caller drives `conn` (openChannel / writeInput / attachChannel /
+/// ...) and tears it all down with `deinit`.
 pub const Dialed = struct {
     alloc: Allocator,
-    /// The `relay-connect` helper subprocess, retained so we can reap it on
-    /// teardown. Its `stdin`/`stdout` Files are nulled after spawn — the fds are
-    /// owned by `stream_impl` — so its own teardown won't double-close them.
-    child: std.process.Child,
-    /// The environment handed to the child (parent env + GHOSTTY_RELAY_TOKEN),
-    /// owned here so it can be freed on teardown.
-    env_map: EnvMap,
-    /// The `connection.Stream` over the helper's (stdout, stdin) pipe pair.
-    stream_impl: *ssh_transport.ChildStream,
+    /// The native `wss://` WebSocket to the relay. Its `connectionStream()` is the
+    /// single transport the mux folds both lanes onto; owned here, freed on
+    /// teardown.
+    ws: *ws_client.WsClient,
     mux: *client_mux.ClientMux,
     conn: *connection.Connection,
     /// The negotiated parameters from the HELLO handshake.
@@ -63,14 +53,9 @@ pub const Dialed = struct {
         self.mux.joinPump();
         self.conn.destroy(self.alloc);
         self.mux.destroy();
-        // The child's stdin/stdout fds were owned by `stream_impl` and closed by
-        // the mux/conn shutdown above (the helper observes EOF on stdin and
-        // exits). Reap the helper so we don't leak a zombie (SIGTERM is a
-        // belt-and-suspenders nudge; stdin/stdout are null so `kill` won't
-        // double-close).
-        _ = self.child.kill() catch {};
-        self.env_map.deinit();
-        self.alloc.destroy(self.stream_impl);
+        // The transport WebSocket was already closed by the mux/conn shutdown
+        // above (mux.close → ws.close); `deinit` is the final close + free.
+        self.ws.deinit();
         self.* = undefined;
     }
 };
@@ -78,14 +63,18 @@ pub const Dialed = struct {
 /// The HELLO handshake failed (version/encoding mismatch or a dropped stream).
 pub const HandshakeFailed = error{HandshakeFailed};
 
-/// Spawn the `relay-connect` helper, wrap its stdio as the single transport,
-/// fold the two lanes through a `ClientMux`, create + start a `Connection`, and
-/// block until the HELLO handshake completes. On success returns a `Dialed` the
-/// caller owns; on any failure all partial resources are cleaned up (including
-/// killing/reaping the helper child) and the error is returned.
+/// Open a native `wss://` WebSocket to the relay for `device_id`, wrap it as the
+/// single transport, fold the two lanes through a `ClientMux`, create + start a
+/// `Connection`, and block until the HELLO handshake completes. On success
+/// returns a `Dialed` the caller owns; on any failure all partial resources are
+/// cleaned up (including the WebSocket) and the error is returned.
 ///
-/// The error set is inferred (it spans child spawn, allocation, thread spawn,
-/// and `error.HandshakeFailed`).
+/// `relay_base` is the relay HTTPS base (e.g. `https://relay.example.com`); it is
+/// converted to `wss://` and the client-connect path is appended. `token` is the
+/// device bearer token sent as `Authorization: Bearer <token>`.
+///
+/// The error set is inferred (it spans the WebSocket dial/upgrade, allocation,
+/// thread spawn, and `error.HandshakeFailed`).
 ///
 /// `encoding` is the pinned transfer encoding (must match what the agent runs
 /// with; `.raw` for a clean pipe, exactly like the direct TCP case).
@@ -94,73 +83,56 @@ pub fn dial(
     relay_base: []const u8,
     device_id: []const u8,
     token: []const u8,
-    connect_helper_path: []const u8,
     encoding: protocol.TransferEncoding,
 ) !Dialed {
-    // 1. Build the child's environment: a copy of the parent's, plus the relay
-    //    auth token (the helper reads GHOSTTY_RELAY_TOKEN to authenticate the
-    //    WebSocket). Owned here; freed on any error and on `deinit`.
-    var env_map = try std.process.getEnvMap(alloc);
-    errdefer env_map.deinit();
-    try env_map.put("GHOSTTY_RELAY_TOKEN", token);
+    // 1. Build the wss URL: convert the https base to wss and append the
+    //    client-connect path with the device query. Both strings are scratch and
+    //    freed before we return.
+    const host_part = if (std.mem.startsWith(u8, relay_base, "https://"))
+        relay_base["https://".len..]
+    else if (std.mem.startsWith(u8, relay_base, "wss://"))
+        relay_base["wss://".len..]
+    else
+        return error.InvalidRelayBase;
+    const host_trimmed = std.mem.trimRight(u8, host_part, "/");
 
-    // 1b. Spawn the helper: `relay-connect -base <https-url> -device <device-id>`.
-    //     stdin/stdout are pipes (the byte pipe); stderr is inherited so the
-    //     helper's diagnostics surface in the GUI process log.
-    const argv = [_][]const u8{ connect_helper_path, "-base", relay_base, "-device", device_id };
-    var child = std.process.Child.init(&argv, alloc);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-    child.env_map = &env_map;
-    try child.spawn();
-    // From here, on any error we must kill + reap the child. Registered before we
-    // null stdin/stdout so the deferred `kill` (which calls cleanupStreams) does
-    // not double-close the fds the `ChildStream` now owns.
-    errdefer _ = child.kill() catch {};
+    const url = try std.fmt.allocPrint(
+        alloc,
+        "wss://{s}/v1/client/connect?device={s}",
+        .{ host_trimmed, device_id },
+    );
+    defer alloc.free(url);
 
-    // 2. Take the pipe fds and hand them to a `ChildStream`. Null the `Child`'s
-    //    own copies so its teardown (`kill`/`wait`) won't double-close them.
-    const read_fd = child.stdout.?.handle; // parent reads the helper's stdout
-    const write_fd = child.stdin.?.handle; // parent writes the helper's stdin
-    child.stdout = null;
-    child.stdin = null;
+    // 2. Build the bearer auth header value.
+    const authz = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+    defer alloc.free(authz);
+    const headers = [_]ws_client.Header{.{ .name = "Authorization", .value = authz }};
 
-    const stream_impl = alloc.create(ssh_transport.ChildStream) catch |e| {
-        posix.close(read_fd);
-        posix.close(write_fd);
-        return e;
-    };
-    stream_impl.* = ssh_transport.ChildStream.init(read_fd, write_fd);
-    errdefer {
-        stream_impl.stream().close(); // closes the pipe fds (idempotent)
-        alloc.destroy(stream_impl);
-    }
+    // 3. Dial + TLS + WebSocket upgrade. From here, on any error we must free the
+    //    WebSocket.
+    const ws = try ws_client.WsClient.connectUrl(alloc, url, &headers);
+    errdefer ws.deinit();
 
-    // 3. Fold the two logical lanes onto the single child stream via the mux.
-    const mux = client_mux.ClientMux.create(alloc, stream_impl.stream(), encoding) catch |e| {
-        return e;
-    };
+    // 4. Fold the two logical lanes onto the WebSocket's connection-side stream.
+    const mux = try client_mux.ClientMux.create(alloc, ws.connectionStream(), encoding);
     errdefer mux.destroy();
 
-    // 4. Create the connection over the mux's two lanes with our HELLO.
+    // 5. Create the connection over the mux's two lanes with our HELLO.
     const hello: protocol.Hello = .{ .transfer_encoding = encoding };
-    const conn = connection.Connection.create(alloc, mux.streams().control, mux.streams().data, hello) catch |e| {
-        return e;
-    };
+    const conn = try connection.Connection.create(alloc, mux.streams().control, mux.streams().data, hello);
     errdefer conn.destroy(alloc);
 
-    // 5. Spawn the inbound demux pump, then start the connection threads.
-    _ = mux.startPump() catch |e| return e;
+    // 6. Spawn the inbound demux pump, then start the connection threads.
+    _ = try mux.startPump();
     errdefer {
         // If start fails after the pump is running, close the transport so the
         // pump exits, then join it.
         conn.shutdown(); // safe even if start partially ran
         mux.joinPump();
     }
-    conn.start() catch |e| return e;
+    try conn.start();
 
-    // 6. Block until the HELLO handshake completes (or fails).
+    // 7. Block until the HELLO handshake completes (or fails).
     const negotiated = conn.waitHandshake() catch {
         // Handshake failed: tear down (shutdown joins everything; pump joined too).
         conn.shutdown();
@@ -170,9 +142,7 @@ pub fn dial(
 
     return .{
         .alloc = alloc,
-        .child = child,
-        .env_map = env_map,
-        .stream_impl = stream_impl,
+        .ws = ws,
         .mux = mux,
         .conn = conn,
         .negotiated = negotiated,
@@ -184,25 +154,22 @@ pub fn dial(
 // =============================================================================
 //
 // A full round-trip needs a live relay + a remote agent, so we don't attempt
-// one here. Instead we verify the child-spawn + ChildStream wiring compiles and
-// that `dial` cleanly returns an error (and leaks nothing) when the helper path
-// is bogus so the spawn fails before any transport is stood up.
+// one here. Instead we verify that `dial` cleanly returns an error (and leaks
+// nothing) when the relay is unreachable, so the WebSocket dial fails before any
+// transport/mux/connection is stood up.
 
 const testing = std.testing;
 
-test "dial: bogus helper path cleanly returns an error (no leak)" {
+test "dial: unreachable relay cleanly returns an error (no leak)" {
     const alloc = testing.allocator;
-    // A nonexistent helper either fails to spawn synchronously (error.FileNotFound)
-    // or — on platforms where posix_spawn defers exec failure — spawns a phantom
-    // child that produces no HELLO, so the handshake fails (error.HandshakeFailed).
-    // Either way `dial` must return an error and free every partial resource; the
-    // testing allocator asserts no leak on teardown.
+    // 127.0.0.1:1 reliably refuses (nothing listens on port 1), so the WebSocket
+    // TCP connect fails fast. `dial` must return an error and free every partial
+    // resource; the testing allocator asserts no leak on teardown.
     if (dial(
         alloc,
-        "https://relay.example",
+        "https://127.0.0.1:1",
         "device-1",
         "tok",
-        "/nonexistent/relay-connect-binary-xyzzy",
         .raw,
     )) |d| {
         var dialed = d;
@@ -211,6 +178,17 @@ test "dial: bogus helper path cleanly returns an error (no leak)" {
     } else |_| {
         // Expected: any error, with all resources reclaimed.
     }
+}
+
+test "dial: non-TLS relay base is rejected" {
+    const alloc = testing.allocator;
+    try testing.expectError(error.InvalidRelayBase, dial(
+        alloc,
+        "http://relay.example",
+        "device-1",
+        "tok",
+        .raw,
+    ));
 }
 
 test {
