@@ -985,16 +985,18 @@ class AppDelegate: NSObject,
     /// (splits/tabs inherit the same machine + connection). With zero machines
     /// registered, this just opens a local window.
     @IBAction func newRemoteWindow(_ sender: Any?) {
-        let machines = MachineRegistry.shared.machines
+        let registry = MachineRegistry.shared
 
-        // No machines registered: nothing remote to choose, so just open a
-        // normal local window.
-        guard !machines.isEmpty else {
+        // Nothing remote to choose — no registered machine AND no relay
+        // account whose device list could populate on open — so just open a
+        // normal local window. (With a relay token configured the chooser is
+        // shown even at zero machines; it fetches the account list on open.)
+        guard !registry.machines.isEmpty || registry.hasRelayAccount else {
             _ = TerminalController.newWindow(ghostty)
             return
         }
 
-        MachineChooser.present(machines: machines) { [weak self] selected in
+        MachineChooser.present(registry: registry) { [weak self] selected in
             guard let self, let target = selected else { return }
             switch target {
             case .local:

@@ -15,7 +15,10 @@ enum WindowTarget: Hashable {
 /// list, Return opens the highlighted row, and Escape cancels. Invokes
 /// `onSelect` with the chosen target (or `onCancel` if dismissed).
 struct MachineChooserView: View {
-    let machines: [Machine]
+    /// Source of the machine list. Observed (not a snapshot) so rows update
+    /// live as the account device list is fetched from the relay on open
+    /// (WP-C2) and as rows are renamed/removed.
+    @ObservedObject var registry: MachineRegistry
     /// Live per-machine metrics for the remote rows, refreshed while the picker
     /// is open. Drives each remote row's subline in place of the IP:port.
     @ObservedObject var probe: MachineMetricsProbe
@@ -45,6 +48,9 @@ struct MachineChooserView: View {
             Color.clear
         }
     }
+
+    /// The current machine list (live from the registry).
+    private var machines: [Machine] { registry.machines }
 
     /// Filtered remote machines based on the search query.
     private var filteredMachines: [Machine] {
@@ -156,6 +162,21 @@ struct MachineChooserView: View {
                                 .buttonStyle(.borderless)
                                 .help("Open Activity Monitor for \(machine.name)")
                                 .padding(.trailing, 6)
+
+                                // Account-resource management (relay devices
+                                // only, WP-C2): rename or remove the host.
+                                if machine.isRelay {
+                                    Menu {
+                                        managementActions(for: machine)
+                                    } label: {
+                                        Image(systemName: "ellipsis.circle")
+                                    }
+                                    .menuStyle(.borderlessButton)
+                                    .menuIndicator(.hidden)
+                                    .fixedSize()
+                                    .help("Manage \(machine.name)")
+                                    .padding(.trailing, 6)
+                                }
                             }
                         }
                         .padding(.horizontal, 8)
@@ -163,12 +184,44 @@ struct MachineChooserView: View {
                         .background(rowHighlight(idx))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .onHover { hovering in hoveredIndex = hovering ? idx : nil }
+                        .contextMenu {
+                            if case .remote(let machine) = target, machine.isRelay {
+                                managementActions(for: machine)
+                            }
+                        }
                     }
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
             }
             .frame(minHeight: 180)
+            .onChange(of: machines) { _ in
+                // Keep the highlighted row valid as the account fetch or a
+                // removal changes the list.
+                clampSelection()
+            }
+
+            // Account-list refresh status (WP-C2): a small spinner while the
+            // device directory is being fetched, or the fetch error. Never
+            // blocks the list — stale/seeded rows stay usable.
+            if registry.isRefreshing || registry.lastRefreshError != nil {
+                HStack(spacing: 6) {
+                    if registry.isRefreshing {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Refreshing devices…")
+                    } else if let err = registry.lastRefreshError {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.yellow)
+                        Text("Couldn't refresh devices: \(err)")
+                            .lineLimit(2)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+            }
 
             HStack {
                 Spacer()
@@ -216,8 +269,18 @@ struct MachineChooserView: View {
                 Image(systemName: "server.rack")
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(machine.name)
-                        .font(.body)
+                    HStack(spacing: 6) {
+                        // Online/offline status dot for account (relay) devices
+                        // (WP-C2). Gray when the status is not yet known.
+                        if machine.isRelay {
+                            Circle()
+                                .fill(statusColor(for: machine))
+                                .frame(width: 8, height: 8)
+                                .accessibilityLabel(statusText(for: machine))
+                        }
+                        Text(machine.name)
+                            .font(.body)
+                    }
                     metricsSubline(for: machine)
                 }
                 Spacer()
@@ -226,6 +289,100 @@ struct MachineChooserView: View {
                 // row's selection button.)
             }
         }
+    }
+
+    /// The status-dot color for a relay machine: green online, gray offline
+    /// or unknown (pre-fetch).
+    private func statusColor(for machine: Machine) -> Color {
+        switch machine.online {
+        case true: return .green
+        case false: return Color.secondary.opacity(0.5)
+        default: return Color.secondary.opacity(0.25)
+        }
+    }
+
+    /// Accessible/subline description of a relay machine's directory status.
+    private func statusText(for machine: Machine) -> String {
+        switch machine.online {
+        case true: return "Online"
+        case false: return "Offline"
+        default: return "Status unknown"
+        }
+    }
+
+    /// The rename/remove actions for an account (relay) device, shared by the
+    /// per-row ellipsis menu and the row's context menu (WP-C2).
+    @ViewBuilder
+    private func managementActions(for machine: Machine) -> some View {
+        Button("Rename…") { promptRename(machine) }
+        Divider()
+        Button("Remove from Account…", role: .destructive) { confirmRemove(machine) }
+    }
+
+    /// Ask for confirmation, then delete the device from the relay account
+    /// (revoking its credential) and drop its row. Errors (401/404/network)
+    /// surface as an alert, never a crash. NSAlert is used (not a SwiftUI
+    /// sheet) because the chooser panel runs an AppKit modal session.
+    private func confirmRemove(_ machine: Machine) {
+        guard let deviceID = machine.deviceID else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Remove “\(machine.name)” from your account?"
+        alert.informativeText = "This deletes the device from the relay and revokes its credential. The agent on that machine will no longer be able to connect."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        if #available(macOS 11.0, *) {
+            alert.buttons.first?.hasDestructiveAction = true
+        }
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        Task { @MainActor in
+            do {
+                try await registry.removeFromAccount(deviceID: deviceID)
+            } catch {
+                showError(title: "Couldn't remove “\(machine.name)”", error: error)
+            }
+            clampSelection()
+        }
+    }
+
+    /// Prompt for a new name and rename the device on the relay account.
+    /// Errors surface as an alert.
+    private func promptRename(_ machine: Machine) {
+        guard let deviceID = machine.deviceID else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Rename “\(machine.name)”"
+        alert.informativeText = "Enter a new name for this device."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = machine.name
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let newName = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newName.isEmpty, newName != machine.name else { return }
+
+        Task { @MainActor in
+            do {
+                try await registry.renameOnAccount(deviceID: deviceID, to: newName)
+            } catch {
+                showError(title: "Couldn't rename “\(machine.name)”", error: error)
+            }
+        }
+    }
+
+    /// Show a warning alert for a failed account operation.
+    private func showError(title: String, error: Error) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     /// The remote-row subline: live CPU/memory once metrics arrive, or a
@@ -237,8 +394,11 @@ struct MachineChooserView: View {
             .foregroundStyle(.secondary)
     }
 
-    /// The text shown in a remote row's subline for the machine's probe state.
+    /// The text shown in a remote row's subline. Relay machines show their
+    /// directory status (the metrics probe is TCP-only, so probing them would
+    /// just read "Unreachable"); TCP machines show the live probe state.
     private func sublineText(for machine: Machine) -> String {
+        if machine.isRelay { return statusText(for: machine) }
         switch probe.readings[machine.id] {
         case .live(let m):
             return "CPU \(Int(m.cpuPct.rounded()))%  ·  \(memString(m.memUsed)) / \(memString(m.memTotal))"
@@ -279,14 +439,15 @@ struct MachineChooserView: View {
 /// `completion` with the chosen target, or nil if the user cancelled.
 ///
 /// The chooser always lists a "Local" entry first (a normal local window),
-/// followed by every registered remote machine. It is shown whenever there is at
-/// least one registered machine — even a single machine — so the user always has
-/// the Local-vs-remote choice. Callers should special-case the zero-machine case
-/// before calling this (e.g. just open a local window directly).
+/// followed by every registered remote machine. On open it refreshes the relay
+/// account's device list (WP-C2), so relay rows carry live online status and
+/// may appear/disappear as the fetch lands. Callers should special-case the
+/// nothing-to-choose case (no machines AND no relay account) before calling
+/// this (e.g. just open a local window directly).
 @MainActor
 enum MachineChooser {
     static func present(
-        machines: [Machine],
+        registry: MachineRegistry = .shared,
         completion: @escaping (WindowTarget?) -> Void
     ) {
         // Capture the window we're presenting over BEFORE we activate/raise our
@@ -312,7 +473,7 @@ enum MachineChooser {
         }
 
         let view = MachineChooserView(
-            machines: machines,
+            registry: registry,
             probe: probe,
             onSelect: { finish($0) },
             onCancel: { finish(nil) },
@@ -355,10 +516,18 @@ enum MachineChooser {
 
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        // Refresh the account device list from the relay on open (WP-C2). The
+        // continuation runs during the modal session (the modal panel runloop
+        // mode is a common mode, so main-queue work is delivered — the probe
+        // relies on the same behavior). Rows update in place as it lands.
+        Task { @MainActor in
+            await registry.refreshFromRelay()
+        }
         // Begin probing remote machines for live metrics now that the picker is
         // on screen. Dials happen off the main thread; rows update as samples
-        // arrive (or fall back to "Unreachable").
-        probe.start(machines)
+        // arrive (or fall back to "Unreachable"). Relay machines are skipped:
+        // the probe dials TCP only, and their subline shows directory status.
+        probe.start(registry.machines.filter { !$0.isRelay })
         NSApp.runModal(for: window)
     }
 }

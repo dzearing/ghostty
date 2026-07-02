@@ -24,6 +24,10 @@ struct Machine: Identifiable, Hashable {
     var relayBase: String?
     /// Agent device id used by the relay transport.
     var deviceID: String?
+    /// Live online status from the relay's device directory (WP-C2). Nil for
+    /// non-relay machines and for relay machines that haven't been refreshed
+    /// from the account list yet.
+    var online: Bool?
 
     init(
         id: UUID = UUID(),
@@ -31,7 +35,8 @@ struct Machine: Identifiable, Hashable {
         host: String,
         port: UInt16,
         relayBase: String? = nil,
-        deviceID: String? = nil
+        deviceID: String? = nil,
+        online: Bool? = nil
     ) {
         self.id = id
         self.name = name
@@ -39,6 +44,7 @@ struct Machine: Identifiable, Hashable {
         self.port = port
         self.relayBase = relayBase
         self.deviceID = deviceID
+        self.online = online
     }
 
     /// True when this machine is reached through a rendezvous relay.
@@ -85,36 +91,140 @@ struct Machine: Identifiable, Hashable {
 
 /// In-memory registry of known remote machines.
 ///
-/// Seeded with a single hardcoded entry so the remote-window feature is
-/// immediately usable. Config-file loading is a later phase.
+/// Relay machines are the account's resource list, fetched live from the
+/// relay's device directory (`GET /v1/client/devices`, WP-C2) whenever the
+/// chooser opens. A seeded fallback entry keeps the feature usable before the
+/// first successful fetch (and with no token configured); a successful fetch
+/// replaces every relay entry with the authoritative account list. Non-relay
+/// (direct TCP) entries are never touched by the fetch.
 ///
-/// TODO(wp4): load from ~/.config/ghostty (e.g. a `[machines]` section or a
-/// dedicated machines.toml) instead of (or in addition to) the seeded list.
+/// TODO(wp4): load TCP machines from ~/.config/ghostty (e.g. a `[machines]`
+/// section or a dedicated machines.toml) in addition to the account list.
 @MainActor
 final class MachineRegistry: ObservableObject {
     static let shared = MachineRegistry()
 
     @Published private(set) var machines: [Machine]
 
+    /// True while a directory fetch is in flight (drives the chooser's
+    /// footer spinner).
+    @Published private(set) var isRefreshing = false
+
+    /// The last directory-fetch failure, shown in the chooser footer. Cleared
+    /// when a refresh starts.
+    @Published private(set) var lastRefreshError: String?
+
+    /// Seeded entries that exist before (and independent of) any relay fetch.
+    private let seeded: [Machine]
+
+    /// Stable UUID per relay device id so SwiftUI identity (selection, rows)
+    /// survives refreshes that rebuild the `Machine` values.
+    private var deviceUUIDs: [String: UUID] = [:]
+
+    /// True when a relay client token is configured, i.e. the account device
+    /// list is reachable. The chooser opens even with zero machines when this
+    /// is set (the list populates on fetch).
+    var hasRelayAccount: Bool { RelayDirectoryClient.fromEnvironment() != nil }
+
     init() {
         // maximushome is reached through the rendezvous relay (WP-A1). The
         // `host` carries the relay base for display/filtering; the actual dial
         // uses `relayBase`/`deviceID`. The token is read from the environment
-        // (GHOSTTY_RELAY_TOKEN) at connect time, never hardcoded here.
-        let maximusRelayBase = "https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com"
-        self.machines = [
+        // (GHOSTTY_RELAY_TOKEN) at connect time, never hardcoded here. This
+        // seed is only the pre-fetch fallback: a successful directory fetch
+        // (WP-C2) replaces all relay entries with the live account list.
+        let relayBase = RelayDirectoryClient.defaultBase
+        self.seeded = [
             Machine(
                 name: "maximushome",
-                host: maximusRelayBase,
+                host: relayBase,
                 port: 0,
-                relayBase: maximusRelayBase,
+                relayBase: relayBase,
                 deviceID: "14e75262-0fe2-4126-91db-efceb2f15665"
             ),
         ]
+        self.machines = seeded
+        // Keep row identity stable when the fetch replaces a seeded entry
+        // with the same device from the account list.
+        for m in seeded {
+            if let d = m.deviceID { deviceUUIDs[d] = m.id }
+        }
     }
 
     func add(_ machine: Machine) {
         machines.append(machine)
+    }
+
+    /// Refresh the relay account's device list (WP-C2). On success, relay
+    /// machines are replaced by the fetched list (with online status); TCP
+    /// machines are untouched. On failure the current list is kept and
+    /// `lastRefreshError` is set. No-op when no client token is configured.
+    func refreshFromRelay() async {
+        guard let client = RelayDirectoryClient.fromEnvironment() else { return }
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        lastRefreshError = nil
+        defer { isRefreshing = false }
+        do {
+            apply(devices: try await client.listDevices())
+        } catch {
+            lastRefreshError = error.localizedDescription
+        }
+    }
+
+    /// Delete a device from the relay account (revoking its credential) and
+    /// drop it from the registry. Throws `DirectoryError` on 401/404/etc so
+    /// the caller can surface it; a 404 still removes the local row (the
+    /// device is already gone server-side).
+    func removeFromAccount(deviceID: String) async throws {
+        guard let client = RelayDirectoryClient.fromEnvironment() else {
+            throw RelayDirectoryClient.DirectoryError.noAccount
+        }
+        do {
+            try await client.delete(deviceID: deviceID)
+        } catch RelayDirectoryClient.DirectoryError.notFound {
+            machines.removeAll { $0.deviceID == deviceID }
+            throw RelayDirectoryClient.DirectoryError.notFound
+        }
+        machines.removeAll { $0.deviceID == deviceID }
+    }
+
+    /// Rename a device on the relay account and update the registry row with
+    /// the relay's response. Throws `DirectoryError` on failure.
+    func renameOnAccount(deviceID: String, to name: String) async throws {
+        guard let client = RelayDirectoryClient.fromEnvironment() else {
+            throw RelayDirectoryClient.DirectoryError.noAccount
+        }
+        let dev = try await client.rename(deviceID: deviceID, to: name)
+        if let idx = machines.firstIndex(where: { $0.deviceID == deviceID }) {
+            machines[idx].name = dev.name
+            machines[idx].online = dev.online
+        }
+    }
+
+    /// Rebuild `machines` from a fetched device list: authoritative relay
+    /// entries (stable UUIDs per device id) after any seeded TCP entries.
+    private func apply(devices: [RelayDirectoryClient.Device]) {
+        let relayBase = RelayDirectoryClient.defaultBase
+        let relayMachines = devices.map { dev -> Machine in
+            let uuid: UUID
+            if let existing = deviceUUIDs[dev.id] {
+                uuid = existing
+            } else {
+                uuid = UUID()
+                deviceUUIDs[dev.id] = uuid
+            }
+            return Machine(
+                id: uuid,
+                name: dev.name,
+                host: relayBase,
+                port: 0,
+                relayBase: relayBase,
+                deviceID: dev.id,
+                online: dev.online
+            )
+        }
+        machines = seeded.filter { !$0.isRelay } + relayMachines
     }
 }
 
