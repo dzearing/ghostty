@@ -28,6 +28,10 @@ Commits on `feature/remote-machines`:
   machine (`Machine.isLocalHostname`, normalized compare; pending live GUI verify)
 - `26338d255` — WP-C1: `PATCH`/`DELETE /v1/client/devices/{id}` — rename + delete
   w/ credential revocation + live-conn kick (NOT yet deployed to the Azure relay)
+- `5c6fade6c` — WP-B1 prep: OIDC path verified (fake-issuer tests, `{email,sub}`
+  identity, bounded JWKS fetches) + runbook `docs/design/relay-oidc-setup.md`
+- `361aa960e` — WP-C2: chooser lists account devices from the relay w/ online dot
+  + remove/rename (`RelayDirectoryClient.swift`; GUI render verify pending)
 
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
@@ -209,10 +213,17 @@ able to take one WP with only this doc + the repo.
   revokes. *Shipped:* `PATCH /v1/client/devices/{id}` (rename) +
   `DELETE /v1/client/devices/{id}` (delete + token revocation + live control/data
   conns kicked); owner-scoped 404s; tests in `relay/devices_crud_test.go`.
-- **WP-C2 — Resource management UI.** *Goal:* the chooser/manager lists account
-  resources with online status; **add** (guided install+sign-in) and **remove** a host.
-  Reuse spec §11.2 shape. *Files:* `macos/.../RemoteConnection/`. *Accept:* remove an
-  old host from the list; it disappears + its credential is revoked.
+- **WP-C2 — Resource management UI. ✅ BUILT (GUI verify pending).** *Goal:* the
+  chooser/manager lists account resources with online status; **add** (guided
+  install+sign-in) and **remove** a host. Reuse spec §11.2 shape. *Files:*
+  `macos/.../RemoteConnection/`. *Accept:* remove an old host from the list; it
+  disappears + its credential is revoked. *Shipped:* `RelayDirectoryClient.swift`
+  (list/rename/delete; base `GHOSTTY_RELAY_BASE` else Azure dev, token
+  `GHOSTTY_RELAY_TOKEN` — OIDC swaps `fromEnvironment()` only); chooser refreshes
+  from the relay on open, relay rows get online/offline dot + remove/rename via
+  ellipsis+context menu (NSAlert flows; chooser is an AppKit modal). HTTP layer
+  verified against a local relay; chooser RENDERING + Azure e2e still needs the
+  deferred debug-app relaunch. "Add" guided flow deferred to Phase B (device-code).
 
 ### Phase D — Resilience
 - **WP-D1 — Connection status surface.** *Goal:* online/offline/reconnecting per
