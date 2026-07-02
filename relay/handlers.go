@@ -40,6 +40,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/agent/data", h.handleAgentData)
 	mux.HandleFunc("GET /v1/client/devices", h.handleListDevices)
 	mux.HandleFunc("POST /v1/client/devices", h.handleEnrollDevice)
+	mux.HandleFunc("PATCH /v1/client/devices/{id}", h.handleRenameDevice)
+	mux.HandleFunc("DELETE /v1/client/devices/{id}", h.handleDeleteDevice)
 	mux.HandleFunc("GET /v1/client/connect", h.handleClientConnect)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -204,6 +206,82 @@ func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 		"name":  dev.Name,
 		"token": rawToken,
 	})
+}
+
+// handleRenameDevice: PATCH /v1/client/devices/{id} (JSON).
+// Renames a device owned by the caller. The ownership check happens inside the
+// store under its lock, so it cannot race with a concurrent delete.
+func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
+	email, err := h.auth.AuthenticateClient(r.Context(), r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	id := r.PathValue("id")
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Name == "" {
+		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
+		return
+	}
+
+	dev, err := h.store.RenameDevice(id, email, body.Name)
+	if err != nil {
+		h.logger.Error("rename failed", "device", id, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if dev == nil {
+		// Do not distinguish "not found" from "not yours": both are 404 so
+		// device IDs of other owners are not enumerable.
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
+
+	h.logger.Info("device renamed", "device", dev.ID, "owner", email, "name", dev.Name)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         dev.ID,
+		"name":       dev.Name,
+		"online":     h.dir.IsOnline(dev.ID),
+		"created_at": dev.CreatedAt,
+	})
+}
+
+// handleDeleteDevice: DELETE /v1/client/devices/{id}.
+// Removes a device owned by the caller AND revokes its credential: the token
+// hash is deleted from the store (so the token can never authenticate again)
+// and any live connections the device holds through the relay — control and
+// bridged data — are closed immediately.
+func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
+	email, err := h.auth.AuthenticateClient(r.Context(), r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	id := r.PathValue("id")
+
+	deleted, err := h.store.DeleteDevice(id, email)
+	if err != nil {
+		h.logger.Error("delete failed", "device", id, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !deleted {
+		// Same non-enumerable 404 as everywhere else.
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
+
+	// Credential is revoked (hash gone) — now sever anything still live.
+	h.dir.KickDevice(id)
+
+	h.logger.Info("device deleted", "device", id, "owner", email)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleClientConnect: GET /v1/client/connect?device=<id> (WebSocket).

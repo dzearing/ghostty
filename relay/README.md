@@ -34,6 +34,8 @@ architecture, §5 security).
 | GET    | `/v1/agent/data?session=<uuid>`   | device token | Agent dials back in response to `open`; matched to the session and bridged. |
 | GET    | `/v1/client/devices`              | OIDC         | List the caller's devices with online status. |
 | POST   | `/v1/client/devices`              | OIDC         | Enroll a device (`{"name":"..."}`); returns the raw device token **once**. |
+| PATCH  | `/v1/client/devices/{id}`         | OIDC         | Rename an owned device (`{"name":"..."}`); returns the updated device view. |
+| DELETE | `/v1/client/devices/{id}`         | OIDC         | Delete an owned device **and revoke its token**; any live agent connections are closed. Returns `204`. |
 | GET    | `/v1/client/connect?device=<id>`  | OIDC         | Open a session to an owned, online device and bridge it. |
 | GET    | `/healthz`                        | none         | Liveness probe. |
 
@@ -58,9 +60,12 @@ architecture, §5 security).
 - **Agents:** the presented device token is SHA-256'd and compared
   constant-time against the stored hash. **Raw tokens are never stored or
   logged** — only their SHA-256 hash is persisted to `devices.json`.
-- **Authorization:** a client may only list/connect devices whose `owner_email`
-  matches its verified email. Unknown / unowned device IDs return `404` (not
-  enumerable).
+- **Authorization:** a client may only list/connect/rename/delete devices whose
+  `owner_email` matches its verified email. Unknown / unowned device IDs return
+  `404` (not enumerable).
+- **Revocation:** deleting a device removes its token hash (the token can never
+  authenticate again) and immediately closes its live control connection and
+  any bridged sessions.
 - **Fail-closed:** any auth failure → HTTP 401 (or WS close 1008) and **no
   bridge**.
 - **Abuse bounds:** pending sessions are capped, session setup times out (~15s),
@@ -157,6 +162,21 @@ curl -s http://127.0.0.1:8080/v1/client/devices \
 # => {"devices":[{"id":"...","name":"testbox","online":false,"created_at":"..."}]}
 ```
 
+Rename and delete a device:
+
+```bash
+curl -s -X PATCH http://127.0.0.1:8080/v1/client/devices/<device-uuid> \
+  -H "Authorization: Bearer dev-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"newname"}'
+# => {"id":"...","name":"newname","online":false,"created_at":"..."}
+
+curl -s -X DELETE http://127.0.0.1:8080/v1/client/devices/<device-uuid> \
+  -H "Authorization: Bearer dev-secret-token"
+# => 204 No Content; the device token is revoked and any live agent
+#    connection is closed. A subsequent agent dial with that token gets 401.
+```
+
 ### 3. Verify bytes flow through the bridge
 
 The end-to-end flow (enroll → agent control WS → client connect WS → assert an
@@ -170,8 +190,10 @@ go test -run TestBridgeEndToEnd -v ./...
 ```
 
 This proves the bridge end-to-end without Google or Caddy. Other tests cover
-fail-closed auth (`TestUnauthorizedRejected`) and refusing offline devices
-(`TestConnectOfflineDevice`).
+fail-closed auth (`TestUnauthorizedRejected`), refusing offline devices
+(`TestConnectOfflineDevice`), and device CRUD in `devices_crud_test.go`:
+rename (`TestRenameDevice`), delete (`TestDeleteDevice`), delete-revokes-token
+(`TestDeleteRevokesCredential`), and owner scoping (`TestCrudOwnerScoping`).
 
 ## Source layout
 
@@ -185,3 +207,4 @@ fail-closed auth (`TestUnauthorizedRejected`) and refusing offline devices
 | `bridge.go`                   | The bidirectional `io.Copy` splice. |
 | `handlers.go`                 | HTTP/WebSocket endpoint handlers. |
 | `bridge_integration_test.go` | End-to-end bridge + auth tests. |
+| `devices_crud_test.go`       | Device rename/delete/revocation/owner-scoping tests. |

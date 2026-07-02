@@ -59,6 +59,9 @@ type pendingSession struct {
 	deviceID string
 	dataCh   chan *websocket.Conn // agent's data conn is delivered here (buffered 1)
 	done     chan struct{}        // closed by the client handler when bridging ends
+	// agentData is the claimed data conn (set under Directory.mu by ClaimData).
+	// Kept so KickDevice can tear down a live bridge when the device is deleted.
+	agentData *websocket.Conn
 }
 
 // Directory is the concurrency-safe in-memory registry of online agents and
@@ -164,8 +167,51 @@ func (d *Directory) ClaimData(sessionID, deviceID string, conn *websocket.Conn) 
 	// already delivered (duplicate dial) in which case we reject.
 	select {
 	case ps.dataCh <- conn:
+		ps.agentData = conn
 		return ps, true
 	default:
 		return nil, false
+	}
+}
+
+// KickDevice forcibly disconnects a device: its control connection (if any) is
+// closed and dropped from the registry, and any live or still-queued data
+// connections for its sessions are closed (which ends their bridges and tears
+// down the client side too). Called when a device is deleted so a revoked
+// machine loses access immediately, not just on its next dial.
+func (d *Directory) KickDevice(deviceID string) {
+	d.mu.Lock()
+	ac := d.agents[deviceID]
+	delete(d.agents, deviceID)
+
+	var conns []*websocket.Conn
+	for _, ps := range d.sessions {
+		if ps.deviceID != deviceID {
+			continue
+		}
+		if ps.agentData != nil {
+			conns = append(conns, ps.agentData)
+		} else {
+			// Delivered but not yet consumed by the client handler.
+			select {
+			case c := <-ps.dataCh:
+				conns = append(conns, c)
+			default:
+			}
+		}
+	}
+	d.mu.Unlock()
+
+	if ac != nil {
+		conns = append(conns, ac.conn)
+		d.logger.Info("agent kicked (device deleted)", "device", deviceID)
+	}
+
+	// Close asynchronously: Close writes the close frame immediately but then
+	// blocks for the peer's ack (up to its internal timeout). A device delete
+	// must not stall on an unresponsive agent, so the handshake wait happens
+	// off the request path. Close falls back to closing the socket on timeout.
+	for _, c := range conns {
+		go c.Close(websocket.StatusPolicyViolation, "device revoked")
 	}
 }

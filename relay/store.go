@@ -120,6 +120,54 @@ func (s *Store) ListByOwner(ownerEmail string) []*Device {
 	return out
 }
 
+// RenameDevice updates the display name of the device iff it exists AND is
+// owned by ownerEmail. The ownership check and the mutation happen under one
+// lock so they cannot race with a concurrent delete. Returns a copy of the
+// updated device, or nil if there is no such owned device (callers must not
+// distinguish "not found" from "not yours").
+func (s *Store) RenameDevice(id, ownerEmail, newName string) (*Device, error) {
+	ownerEmail = strings.ToLower(ownerEmail)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := s.devices[id]
+	if d == nil || d.OwnerEmail != ownerEmail {
+		return nil, nil
+	}
+
+	oldName := d.Name
+	d.Name = newName
+	if err := s.save(); err != nil {
+		d.Name = oldName // keep memory consistent with disk on persist failure
+		return nil, fmt.Errorf("persist rename: %w", err)
+	}
+
+	cp := *d
+	return &cp, nil
+}
+
+// DeleteDevice removes the device iff it exists AND is owned by ownerEmail.
+// Removal revokes the device credential: the token hash is gone, so the raw
+// token can never authenticate again (AuthenticateToken finds no match).
+// Returns whether a device was deleted.
+func (s *Store) DeleteDevice(id, ownerEmail string) (bool, error) {
+	ownerEmail = strings.ToLower(ownerEmail)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := s.devices[id]
+	if d == nil || d.OwnerEmail != ownerEmail {
+		return false, nil
+	}
+
+	delete(s.devices, id)
+	if err := s.save(); err != nil {
+		s.devices[id] = d // keep memory consistent with disk on persist failure
+		return false, fmt.Errorf("persist delete: %w", err)
+	}
+	return true, nil
+}
+
 // AuthenticateToken returns the device whose stored token hash matches the
 // presented raw token, or nil. The comparison is constant-time to avoid
 // leaking which (or whether a) device matched via timing.

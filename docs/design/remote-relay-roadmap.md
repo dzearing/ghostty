@@ -191,9 +191,12 @@ able to take one WP with only this doc + the repo.
   automatically (idempotent on repeat).
 
 ### Phase C — Resource management (CRUD + UI)
-- **WP-C1 — Relay resource CRUD.** *Goal:* add **rename** + **delete** (revoke
-  credential) to the owner-scoped directory (list/create exist). *Files:* relay
-  `handlers.go`/`store.go`. *Accept:* list/rename/delete via API; delete revokes.
+- **WP-C1 — Relay resource CRUD. ✅ DONE.** *Goal:* add **rename** + **delete**
+  (revoke credential) to the owner-scoped directory (list/create exist). *Files:*
+  relay `handlers.go`/`store.go`. *Accept:* list/rename/delete via API; delete
+  revokes. *Shipped:* `PATCH /v1/client/devices/{id}` (rename) +
+  `DELETE /v1/client/devices/{id}` (delete + token revocation + live control/data
+  conns kicked); owner-scoped 404s; tests in `relay/devices_crud_test.go`.
 - **WP-C2 — Resource management UI.** *Goal:* the chooser/manager lists account
   resources with online status; **add** (guided install+sign-in) and **remove** a host.
   Reuse spec §11.2 shape. *Files:* `macos/.../RemoteConnection/`. *Accept:* remove an

@@ -15,8 +15,9 @@ import (
 )
 
 // newTestServer wires up the full relay with DEV_AUTH enabled and returns an
-// httptest server plus the dev client token. No Google or Caddy involved.
-func newTestServer(t *testing.T) (*httptest.Server, string) {
+// httptest server, the dev client token, and the backing store (so tests can
+// seed devices for other owners). No Google or Caddy involved.
+func newTestServer(t *testing.T) (*httptest.Server, string, *Store) {
 	t.Helper()
 
 	cfg := &Config{
@@ -45,7 +46,7 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
-	return ts, cfg.DevClientToken
+	return ts, cfg.DevClientToken, store
 }
 
 func wsURL(httpURL, path string) string {
@@ -93,7 +94,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	ts, clientToken := newTestServer(t)
+	ts, clientToken, _ := newTestServer(t)
 	deviceID, deviceToken := enrollDevice(t, ts, clientToken, "testbox")
 
 	// 1. Agent opens its control WS.
@@ -169,7 +170,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 
 // TestUnauthorizedRejected confirms fail-closed behavior on the client paths.
 func TestUnauthorizedRejected(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 
 	// No token.
 	resp, err := http.Get(ts.URL + "/v1/client/devices")
@@ -200,7 +201,7 @@ func TestConnectOfflineDevice(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	ts, clientToken := newTestServer(t)
+	ts, clientToken, _ := newTestServer(t)
 	deviceID, _ := enrollDevice(t, ts, clientToken, "offlinebox")
 
 	_, resp, err := websocket.Dial(ctx, wsURL(ts.URL, "/v1/client/connect?device="+deviceID), &websocket.DialOptions{
