@@ -24,15 +24,22 @@ Commits on `feature/remote-machines`:
   `ghostty_remote_connection_hostname`); relay windows registered in the IPC
   `targetRegistry` (`+send-keys`/`+read` work on them); debug-app crash-loop fix
   (ad-hoc re-sign after the install `cp -R` — was SIGKILL "Code Signature Invalid")
+- `9ca6b1773` — pill SUPPRESSED when the agent-reported hostname is the local
+  machine (`Machine.isLocalHostname`, normalized compare; pending live GUI verify)
+- `26338d255` — WP-C1: `PATCH`/`DELETE /v1/client/devices/{id}` — rename + delete
+  w/ credential revocation + live-conn kick (NOT yet deployed to the Azure relay)
+
+WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
+client (`292a07368`) — no helper binary exists to bundle.
 
 Validated 2026-07-01: **one-liner Windows install** (relay serves `/dl/install.ps1`
 + `ghoztty-agent.exe` via Caddy `handle_path /dl/*` → `/var/www/ghoztty-dl`) proven
 on a SECOND box, the corp Cloud PC `CPC-dzear-IER1M` (device `windows-remote`) —
 pill shows the real hostname. Install: `$env:DEVICE_TOKEN='<tok>'; irm
 https://<fqdn>/dl/install.ps1 | iex` (re-run w/o token = binary update; don't mix
-with the SMB watcher on the same box). Pending user requirement: **suppress the
-pill when the target is the local machine** (see `ghoztty-remote-pill-not-local`
-memory).
+with the SMB watcher on the same box). The pill-not-local user requirement is
+IMPLEMENTED (`9ca6b1773`) but awaits live GUI verification (needs a debug-app
+relaunch, blocked while the user has live remote windows).
 
 Live test infra (DEV/bring-up only):
 - **Relay:** Azure VM `ghoztty-relay`, FQDN `ghoztty-relay-dz17575.westus2.cloudapp.azure.com`,
