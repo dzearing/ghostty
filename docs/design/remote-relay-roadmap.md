@@ -186,6 +186,11 @@ able to take one WP with only this doc + the repo.
   relay verifies real ID tokens; set `GOOGLE_CLIENT_ID`/`ALLOWED_EMAILS`; **disable
   `DEV_AUTH`**. *Files:* relay config/deploy. *Accept:* a real Google token authenticates;
   dev token rejected. (Needs ~10 min of Google Cloud Console clicks — document them.)
+  **Prep DONE:** OIDC path audited + verified against a fake local issuer
+  (`relay/auth_oidc_test.go`; identity now `{email, sub}`; bounded JWKS fetches);
+  click-by-click deploy runbook in `docs/design/relay-oidc-setup.md`. **Remaining:**
+  register the OAuth client in the console + flip the VM env per the runbook
+  (do it with the user present — the Mac dev-token flow 401s until WP-B2).
 - **WP-B2 — Client sign-in (macOS).** *Goal:* in-app Google OAuth (browser) → token in
   Keychain + refresh; signed-in identity drives all relay calls. *Files:* new
   `macos/.../RemoteConnection/` sign-in; wire token into the relay calls (replaces

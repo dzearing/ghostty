@@ -51,12 +51,24 @@ architecture, §5 security).
 | `DEV_CLIENT_TOKEN` | *(unset)*          | The static bearer accepted when `DEV_AUTH=true`. |
 | `DEV_EMAIL`        | *(unset)*          | Identity that a successful dev-auth maps to (becomes the device owner). |
 
+Setting up real Google OIDC (registering the OAuth client, flipping the VM from
+`DEV_AUTH` to `GOOGLE_CLIENT_ID`/`ALLOWED_EMAILS`, verification + rollback) is a
+~10 minute runbook: see **`../docs/design/relay-oidc-setup.md`**. `DEV_AUTH=true`
+and OIDC can coexist during transition — the static token and real ID tokens are
+both accepted until `DEV_AUTH` is turned off.
+
 ### Security model (summary)
 
 - **Clients:** the Google ID token is fully verified — signature against
   Google's JWKS (issuer `https://accounts.google.com`), `aud == GOOGLE_CLIENT_ID`,
-  `exp`, and `email_verified == true`. The email must then be on `ALLOWED_EMAILS`.
-  Presence of a token is never sufficient.
+  `exp`, `sub` present, and `email_verified == true`. The email must then be on
+  `ALLOWED_EMAILS`. Presence of a token is never sufficient. The verified
+  identity is `{email, sub}` (Google's stable subject ID). Every HTTP request
+  the OIDC machinery makes (discovery, JWKS refresh) is bounded by a 15s client
+  timeout. The whole path is exercised in `auth_oidc_test.go` against a fake
+  local issuer (self-minted RS256 tokens): valid accepted; wrong aud/iss,
+  expired, forged signature, unverified/missing email, and non-allowlisted
+  logins all rejected.
 - **Agents:** the presented device token is SHA-256'd and compared
   constant-time against the stored hash. **Raw tokens are never stored or
   logged** — only their SHA-256 hash is persisted to `devices.json`.
@@ -208,3 +220,4 @@ rename (`TestRenameDevice`), delete (`TestDeleteDevice`), delete-revokes-token
 | `handlers.go`                 | HTTP/WebSocket endpoint handlers. |
 | `bridge_integration_test.go` | End-to-end bridge + auth tests. |
 | `devices_crud_test.go`       | Device rename/delete/revocation/owner-scoping tests. |
+| `auth_oidc_test.go`          | OIDC client-auth tests against a fake local issuer (JWKS + self-minted RS256 tokens). |

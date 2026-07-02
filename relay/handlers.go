@@ -146,11 +146,12 @@ func (h *Handler) handleAgentData(w http.ResponseWriter, r *http.Request) {
 // handleListDevices: GET /v1/client/devices (JSON).
 // Returns the authenticated caller's devices with live online status.
 func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
-	email, err := h.auth.AuthenticateClient(r.Context(), r)
+	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	email := ident.Email
 
 	type deviceView struct {
 		ID        string    `json:"id"`
@@ -177,11 +178,12 @@ func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
 // Enrolls a new device owned by the caller and returns the raw device token
 // ONCE. The relay only ever stores the token's hash.
 func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
-	email, err := h.auth.AuthenticateClient(r.Context(), r)
+	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	email := ident.Email
 
 	var body struct {
 		Name string `json:"name"`
@@ -212,11 +214,12 @@ func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 // Renames a device owned by the caller. The ownership check happens inside the
 // store under its lock, so it cannot race with a concurrent delete.
 func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
-	email, err := h.auth.AuthenticateClient(r.Context(), r)
+	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	email := ident.Email
 
 	id := r.PathValue("id")
 
@@ -257,11 +260,12 @@ func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 // and any live connections the device holds through the relay — control and
 // bridged data — are closed immediately.
 func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
-	email, err := h.auth.AuthenticateClient(r.Context(), r)
+	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	email := ident.Email
 
 	id := r.PathValue("id")
 
@@ -288,11 +292,12 @@ func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 // Verifies ownership + online status, allocates a session, asks the agent to
 // dial back, waits for the data conn, then bridges the two streams.
 func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
-	email, err := h.auth.AuthenticateClient(r.Context(), r)
+	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	email := ident.Email
 
 	deviceID := r.URL.Query().Get("device")
 	if deviceID == "" {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 )
@@ -16,9 +17,26 @@ import (
 // token's signature against this issuer's published JWKS.
 const googleIssuer = "https://accounts.google.com"
 
+// oidcHTTPTimeout bounds every HTTP request the OIDC machinery makes: the
+// discovery fetch at startup AND the lazy JWKS fetch/refresh at verify time.
+// go-oidc's shared remote keyset lives on context.Background() (it outlives the
+// init context deliberately), so this per-request client timeout is the only
+// thing preventing a hung Google fetch from stalling auth forever.
+const oidcHTTPTimeout = 15 * time.Second
+
 // ErrUnauthorized is returned for any authentication/authorization failure.
 // Callers translate it into an HTTP 401 / WS 1008 and never bridge.
 var ErrUnauthorized = errors.New("unauthorized")
+
+// Identity is a verified, authorized caller identity.
+type Identity struct {
+	// Email is the verified email, lowercased, present on the allowlist.
+	Email string
+	// Sub is the issuer's stable subject identifier for the account (Google
+	// `sub`). Unlike email it can never change or be re-assigned, so it is the
+	// right long-term account key (roadmap §2.1). "dev" under DEV_AUTH.
+	Sub string
+}
 
 // Authenticator verifies client (human, OIDC) and agent (device-token) auth.
 // It is fail-closed: any error, missing token, or unmet condition rejects.
@@ -44,12 +62,20 @@ func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*A
 	}
 
 	if cfg.GoogleClientID != "" {
-		provider, err := oidc.NewProvider(ctx, googleIssuer)
+		issuer := googleIssuer
+		if cfg.IssuerURL != "" {
+			issuer = cfg.IssuerURL // tests only; production always uses Google
+		}
+		// The http.Client travels with the provider into its shared JWKS keyset
+		// (which go-oidc pins to context.Background()), so its Timeout bounds
+		// key fetches for the whole process lifetime — not just discovery.
+		httpClient := &http.Client{Timeout: oidcHTTPTimeout}
+		provider, err := oidc.NewProvider(oidc.ClientContext(ctx, httpClient), issuer)
 		if err != nil {
 			return nil, fmt.Errorf("init google oidc provider: %w", err)
 		}
 		a.verifier = provider.Verifier(&oidc.Config{ClientID: cfg.GoogleClientID})
-		logger.Info("OIDC client auth enabled", "issuer", googleIssuer)
+		logger.Info("OIDC client auth enabled", "issuer", issuer)
 	} else {
 		logger.Warn("GOOGLE_CLIENT_ID unset — OIDC client auth disabled")
 	}
@@ -58,30 +84,30 @@ func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*A
 }
 
 // AuthenticateClient verifies a human client request and returns the caller's
-// verified, authorized email. Order of checks:
+// verified, authorized identity (email + Google sub). Order of checks:
 //  1. (dev only) static DEV_CLIENT_TOKEN match -> DEV_EMAIL.
 //  2. Full Google ID-token verification: signature/issuer/aud/exp.
-//  3. email_verified == true.
+//  3. email_verified == true, email and sub present.
 //  4. email present in the allowlist.
 //
 // Presence of a token is never sufficient.
-func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request) (string, error) {
+func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request) (Identity, error) {
 	token := bearerToken(r)
 	if token == "" {
-		return "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
 	}
 
 	// Dev stand-in: constant-time compare against the static dev token. This is
 	// an explicit, opt-in credential and maps directly to DEV_EMAIL.
 	if a.cfg.DevAuth && a.cfg.DevClientToken != "" {
 		if subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.DevClientToken)) == 1 {
-			return strings.ToLower(a.cfg.DevEmail), nil
+			return Identity{Email: strings.ToLower(a.cfg.DevEmail), Sub: "dev"}, nil
 		}
 		// Not the dev token — fall through to real OIDC if configured.
 	}
 
 	if a.verifier == nil {
-		return "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
 	}
 
 	// Verify checks signature against Google's JWKS, the issuer, the audience
@@ -89,7 +115,13 @@ func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request)
 	idToken, err := a.verifier.Verify(ctx, token)
 	if err != nil {
 		a.logger.Warn("client id-token verification failed", "err", err)
-		return "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
+	}
+	if idToken.Subject == "" {
+		// `sub` is REQUIRED by the OIDC core spec; a token without one is
+		// malformed. Fail closed.
+		a.logger.Warn("client id-token missing sub")
+		return Identity{}, ErrUnauthorized
 	}
 
 	var claims struct {
@@ -97,11 +129,11 @@ func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request)
 		EmailVerified bool   `json:"email_verified"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
-		return "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
 	}
 	if !claims.EmailVerified || claims.Email == "" {
 		a.logger.Warn("client email not verified")
-		return "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
 	}
 
 	email := strings.ToLower(claims.Email)
@@ -109,10 +141,10 @@ func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request)
 		// Authorization gate: a valid Google login by anyone not on the
 		// allowlist is rejected.
 		a.logger.Warn("client email not on allowlist", "email", email)
-		return "", ErrUnauthorized
+		return Identity{}, ErrUnauthorized
 	}
 
-	return email, nil
+	return Identity{Email: email, Sub: idToken.Subject}, nil
 }
 
 // AuthenticateDevice verifies an agent request via its device token and returns

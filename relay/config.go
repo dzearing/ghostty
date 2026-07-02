@@ -18,6 +18,12 @@ type Config struct {
 	// tokens must be addressed to (the `aud` claim). Required for real OIDC.
 	GoogleClientID string
 
+	// IssuerURL overrides the OIDC issuer for TESTS ONLY (a local fake issuer
+	// serving its own discovery doc + JWKS). It is deliberately NOT read from
+	// the environment: production always verifies against the real Google
+	// issuer, and an env knob here would be an auth-bypass footgun.
+	IssuerURL string
+
 	// AllowedEmails is the authorization allowlist. A verified Google identity
 	// is necessary but NOT sufficient: the email must also appear here.
 	AllowedEmails []string
