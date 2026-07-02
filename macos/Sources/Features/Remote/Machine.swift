@@ -47,6 +47,40 @@ struct Machine: Identifiable, Hashable {
     /// A human-friendly string for display: the device id for relay machines,
     /// otherwise "host:port".
     var endpoint: String { isRelay ? (deviceID ?? host) : "\(host):\(port)" }
+
+    /// True when this machine's display name (the agent-reported hostname when
+    /// the agent delivered one in its HELLO) refers to THIS Mac. Used to
+    /// suppress remote-only UI (e.g. the titlebar hostname pill) for a "remote"
+    /// window whose agent actually runs on the local machine.
+    var isLocalMachine: Bool { Self.isLocalHostname(name) }
+
+    /// Whether `hostname` names the local machine.
+    ///
+    /// Hostnames arrive in mixed forms — mDNS `Foo.local` from an agent's
+    /// gethostname, bare `foo` from POSIX, arbitrary capitalization — so both
+    /// sides are normalized before comparing: lowercase, then strip a trailing
+    /// `.local` mDNS suffix. The local side considers both
+    /// `ProcessInfo.processInfo.hostName` and every `Host.current()` name to
+    /// cover the `.local`/bare variants macOS reports.
+    static func isLocalHostname(_ hostname: String) -> Bool {
+        let target = normalizeHostname(hostname)
+        guard !target.isEmpty else { return false }
+        return localHostnames.contains(target)
+    }
+
+    /// Normalized names of the local machine, computed once (hostname lookups
+    /// can be slow and the machine name effectively never changes mid-session).
+    private static let localHostnames: Set<String> = {
+        var names = Host.current().names
+        names.append(ProcessInfo.processInfo.hostName)
+        return Set(names.map(normalizeHostname))
+    }()
+
+    private static func normalizeHostname(_ s: String) -> String {
+        var s = s.lowercased()
+        if s.hasSuffix(".local") { s.removeLast(".local".count) }
+        return s
+    }
 }
 
 /// In-memory registry of known remote machines.

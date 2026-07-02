@@ -908,7 +908,14 @@ extension TerminalWindow {
         guard styleMask.contains(.titled) else { return }
         // Drive the SwiftUI model; the model-bound hosting view re-renders in place
         // and the titlebar re-measures the accessory width.
-        let name = remoteMachine?.name
+        //
+        // The pill is for REMOTE hosts only: a "remote" window whose agent runs
+        // on this same Mac (agent-reported hostname == local hostname) must look
+        // like a normal local window, so no pill is shown for it.
+        let name: String? = {
+            guard let machine = remoteMachine, !machine.isLocalMachine else { return nil }
+            return machine.name
+        }()
         machinePillModel.topPadding = viewModel.accessoryTopPadding
         machinePillModel.title = title
         machinePillModel.isKeyWindow = isKeyWindow
