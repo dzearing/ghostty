@@ -121,6 +121,12 @@ class BaseTerminalController: NSWindowController,
     /// (exactly once) when this controller is deallocated. See `RemoteConnection`.
     var remoteConnection: RemoteConnection?
 
+    /// WP-D2: this window's entry in the `RemoteSessionManifest`, when it is a
+    /// relay-backed remote window tracked for restore-on-relaunch. A clean
+    /// close removes the entry (see `windowWillClose`); app quit leaves it so
+    /// the window is restored (re-`ATTACH`ed) on the next launch.
+    var remoteManifestEntryID: UUID?
+
     private static var _nextWindowId: Int = 0
     private static func nextWindowId() -> Int {
         _nextWindowId += 1
@@ -1593,6 +1599,16 @@ class BaseTerminalController: NSWindowController,
 
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
+
+        // WP-D2: a clean close (user closed the window, or the remote child
+        // exited) removes this window from the remote-session restore
+        // manifest. App QUIT must NOT — the agent keeps detached sessions
+        // alive (detach ≠ terminate), so entries left behind at quit are
+        // re-attached on the next launch.
+        if let entryID = remoteManifestEntryID,
+           (NSApp.delegate as? AppDelegate)?.isQuitting != true {
+            RemoteSessionManifest.shared.remove(entryID)
+        }
 
         // Emit a final bell-state transition so any observers can clear state
         // without separately tracking NSWindow lifecycle events.

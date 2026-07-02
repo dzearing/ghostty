@@ -24,6 +24,21 @@
 //!
 //! This is a `zig build wp4-e2e`-able native harness in the same dependency-light
 //! client graph as `remote-test-client` (protocol/connection/tcp_dial only).
+//!
+//! ## Phase 2 — WP-D2 restore proof (window restore on relaunch)
+//! After the open proof, the harness proves the exact protocol flow the Mac
+//! client's relaunch-restore relies on (remote-relay-roadmap §2.4 / WP-D2),
+//! against the real agent:
+//!   1. dial #1, OPEN a shell (the window the user had open), remember its
+//!      session UUID (the manifest write),
+//!   2. drop the whole connection WITHOUT CLOSE (app quit ⇒ transport EOF ⇒
+//!      the agent DETACHES the session and keeps it alive — SessionStore,
+//!      detach ≠ terminate, spec §7.1),
+//!   3. dial #2 (the relaunch), `GET_CWD`-probe the remembered UUID (the
+//!      restore liveness probe) and assert a bogus UUID fails cleanly
+//!      (`CwdUnavailable`, the drop-the-manifest-entry tier),
+//!   4. `ATTACH` by UUID (same args as `termio/Remote.zig`) → status=alive →
+//!      live DATA round-trip through the re-attached pane.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -33,6 +48,7 @@ const connection = @import("connection.zig");
 const tcp_dial = @import("tcp_dial.zig");
 
 const marker = "wp4-foundation";
+const restore_marker = "wp4-d2-restore";
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -80,16 +96,32 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
+    if (!result) {
+        diag("[wp4-e2e] FAIL: did not observe the echoed marker in the inbound ring\n", .{});
+        _ = child.kill() catch {};
+        reaped = true;
+        std.process.exit(1);
+    }
+
+    // ---- Phase 2: WP-D2 restore proof (detach on disconnect → re-attach) ----
+    const restore_ok = runRestoreProof(alloc, port) catch |err| {
+        diag("[wp4-e2e] FAIL (restore): {s}\n", .{@errorName(err)});
+        _ = child.kill() catch {};
+        reaped = true;
+        std.process.exit(1);
+    };
+
     // Tear the agent down.
     _ = child.kill() catch {};
     reaped = true;
 
-    if (result) {
+    if (restore_ok) {
         const stdout = std.fs.File.stdout();
         stdout.writeAll("PASS: Connection.openChannel round-tripped '" ++ marker ++ "' over TCP against the real channel-authoritative agent\n") catch {};
+        stdout.writeAll("PASS: WP-D2 restore — session survived the dropped connection; GET_CWD probe + ATTACH-by-UUID round-tripped '" ++ restore_marker ++ "' on re-dial\n") catch {};
         std.process.exit(0);
     } else {
-        diag("[wp4-e2e] FAIL: did not observe the echoed marker in the inbound ring\n", .{});
+        diag("[wp4-e2e] FAIL (restore): see diagnostics above\n", .{});
         std.process.exit(1);
     }
 }
@@ -129,6 +161,81 @@ fn runProof(alloc: Allocator, port: u16) !bool {
 
     // Drain the pane's ring on the agent-authoritative channel until we see the
     // marker echoed back (the shell prints it), or we time out.
+    return drainForMarker(alloc, dialed.conn, pane, marker);
+}
+
+/// WP-D2 restore proof: OPEN on connection #1, drop the connection with NO
+/// CLOSE (the app quit), re-dial, GET_CWD-probe by session UUID (plus a bogus
+/// UUID that must fail cleanly), then ATTACH by UUID — with the same arguments
+/// `termio/Remote.zig` uses — and prove the re-attached pane is live.
+fn runRestoreProof(alloc: Allocator, port: u16) !bool {
+    // 1. First life: open a session and remember its UUID (the manifest write).
+    const session_id: []u8 = blk: {
+        var dialed = try tcp_dial.dial(alloc, "127.0.0.1", port, .raw);
+        // NOTE: no closeChannel — quitting the app only drops the transport;
+        // the agent must DETACH (keep alive), never terminate (§7.1).
+        defer dialed.deinit();
+        const pane = try dialed.conn.openChannel(.{
+            .rows = 24,
+            .cols = 80,
+            .term = "xterm-ghostty",
+        });
+        diag("[wp4-e2e] restore: opened session_id={s}; dropping connection WITHOUT close\n", .{pane.session_id});
+        break :blk try alloc.dupe(u8, pane.session_id);
+    };
+    defer alloc.free(session_id);
+
+    // 2. Second life: re-dial (the relaunch).
+    var dialed = try tcp_dial.dial(alloc, "127.0.0.1", port, .raw);
+    defer dialed.deinit();
+
+    // 3a. The restore liveness probe (AppDelegate.restoreRemoteWindows): a
+    // still-alive session answers GET_CWD with ok=true.
+    const cwd = try dialed.conn.queryCwdTimeout(session_id, 5 * std.time.ns_per_s);
+    diag("[wp4-e2e] restore: probe OK, session alive (cwd={s})\n", .{cwd});
+    alloc.free(cwd);
+
+    // 3b. A gone/unknown session must fail cleanly (the drop-the-manifest-entry
+    // tier) — no hang, no crash.
+    if (dialed.conn.queryCwdTimeout(
+        "00000000-dead-beef-0000-000000000000",
+        5 * std.time.ns_per_s,
+    )) |p| {
+        alloc.free(p);
+        diag("[wp4-e2e] restore FAIL: bogus session probe unexpectedly returned a cwd\n", .{});
+        return false;
+    } else |err| switch (err) {
+        error.CwdUnavailable => {},
+        else => return err,
+    }
+
+    // 4. Re-ATTACH by UUID (same args as termio/Remote.zig: offset 0, no force).
+    var outcome = try dialed.conn.attachChannel(session_id, 24, 80, 0, false);
+    defer outcome.deinit();
+    if (outcome.status != .alive or outcome.pane == null) {
+        diag("[wp4-e2e] restore FAIL: attach status={s} attached_elsewhere={}\n", .{
+            @tagName(outcome.status), outcome.attached_elsewhere,
+        });
+        return false;
+    }
+    const pane = outcome.pane.?;
+    defer dialed.conn.closeChannel(pane);
+    diag("[wp4-e2e] restore: ATTACH alive on channel=0x{x}; sending 'echo {s}\\r'\n", .{
+        pane.id, restore_marker,
+    });
+
+    try dialed.conn.writeInput(pane, "echo " ++ restore_marker ++ "\r");
+    return drainForMarker(alloc, dialed.conn, pane, restore_marker);
+}
+
+/// Drain `pane`'s inbound ring until `needle` shows up as completed shell
+/// OUTPUT (see `containsMarkerOutput`) or an 8s deadline passes.
+fn drainForMarker(
+    alloc: Allocator,
+    conn: *connection.Connection,
+    pane: *connection.Pane,
+    needle: []const u8,
+) !bool {
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
     var buf: [16 * 1024]u8 = undefined;
@@ -137,7 +244,7 @@ fn runProof(alloc: Allocator, port: u16) !bool {
     while (std.time.milliTimestamp() < deadline) {
         const r = pane.ring.pop(&buf);
         if (r.read == 0) {
-            if (dialed.conn.isEvicted()) break;
+            if (conn.isEvicted()) break;
             std.Thread.sleep(5 * std.time.ns_per_ms);
             continue;
         }
@@ -148,22 +255,22 @@ fn runProof(alloc: Allocator, port: u16) !bool {
         // beyond the bare command echo: count >= 2 occurrences OR a newline-led
         // occurrence (the command output line). Simplest robust check: the marker
         // appears and we've seen a CR/LF after it (output line completed).
-        if (containsMarkerOutput(acc.items)) {
-            diag("[wp4-e2e] observed marker in ring after {d} bytes\n", .{total});
+        if (containsMarkerOutput(acc.items, needle)) {
+            diag("[wp4-e2e] observed '{s}' in ring after {d} bytes\n", .{ needle, total });
             return true;
         }
     }
-    diag("[wp4-e2e] drained {d} bytes total without a confirmed marker output\n", .{total});
+    diag("[wp4-e2e] drained {d} bytes total without a confirmed '{s}' output\n", .{ total, needle });
     return false;
 }
 
-/// True once `text` contains the marker followed (somewhere later) by a line
+/// True once `text` contains `needle` followed (somewhere later) by a line
 /// terminator — i.e. the shell actually ran `echo` and printed the marker on its
 /// own line, not just the keystroke echo of the command we typed.
-fn containsMarkerOutput(text: []const u8) bool {
+fn containsMarkerOutput(text: []const u8, needle: []const u8) bool {
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, text, search_from, marker)) |idx| {
-        const after = idx + marker.len;
+    while (std.mem.indexOfPos(u8, text, search_from, needle)) |idx| {
+        const after = idx + needle.len;
         if (std.mem.indexOfAnyPos(u8, text, after, "\r\n") != null) return true;
         search_from = after;
     }

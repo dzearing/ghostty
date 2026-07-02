@@ -88,6 +88,12 @@ class AppDelegate: NSObject,
     /// This is only true before application has become active.
     private var applicationHasBecomeActive: Bool = false
 
+    /// WP-D2: true while the app is quitting. Window-close teardown checks
+    /// this so remote windows closed BY THE QUIT keep their entries in the
+    /// `RemoteSessionManifest` (they are restored, i.e. re-`ATTACH`ed, on the
+    /// next launch); only a user-initiated close removes an entry.
+    private(set) var isQuitting: Bool = false
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -233,6 +239,10 @@ class AppDelegate: NSObject,
             ipcServer.dispatchPendingJson(json)
         }
 
+        // WP-D2: re-attach any relay remote windows that were open when the
+        // app last quit (background dials; failures never alert).
+        restoreRemoteWindows()
+
         // Setup a local event monitor for app-level keyboard shortcuts. See
         // localEventHandler for more info why.
         _ = NSEvent.addLocalMonitorForEvents(
@@ -375,6 +385,11 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // WP-D2: assume the quit proceeds so remote windows torn down by it
+        // keep their restore-manifest entries. Reset on the (single) cancel
+        // path below.
+        isQuitting = true
+
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
 
@@ -428,6 +443,9 @@ class AppDelegate: NSObject,
             return .terminateNow
 
         default:
+            // Quit cancelled: subsequent window closes are user-initiated
+            // again and must remove their restore-manifest entries.
+            isQuitting = false
             return .terminateCancel
         }
     }
@@ -1051,15 +1069,7 @@ class AppDelegate: NSObject,
     ) -> String? {
         // Dial the agent through the relay. This blocks through the handshake and
         // returns a connection handle, or NULL on failure.
-        let handle: ghostty_remote_connection_t? = relay.withCString { basePtr in
-            device.withCString { devicePtr in
-                token.withCString { tokenPtr in
-                    ghostty_remote_connection_new_relay(basePtr, devicePtr, tokenPtr)
-                }
-            }
-        }
-
-        guard let handle else {
+        guard let handle = Self.dialRelay(base: relay, device: device, token: token) else {
             let alert = NSAlert()
             alert.messageText = "Couldn't connect to \(device)"
             alert.informativeText = "Failed to reach \(device) via the relay. Make sure the Ghoztty agent is running and the relay is reachable."
@@ -1069,6 +1079,49 @@ class AppDelegate: NSObject,
             return "failed to reach \(device) via relay \(relay): the agent is not running or not reachable"
         }
 
+        let controller = presentRemoteWindow(
+            handle: handle,
+            relay: relay,
+            device: device,
+            fallbackName: name,
+            sessionID: nil)
+        onOpen?(controller)
+        return nil
+    }
+
+    /// Dial a `ghoztty-agent` through the relay: WebSocket + mux + HELLO
+    /// handshake, blocking until connected. Returns nil on any failure. Pure C
+    /// call with no app state — safe off the main thread (the restore path
+    /// dials on a background queue so a slow/unreachable relay can't beachball
+    /// launch).
+    private static func dialRelay(
+        base: String,
+        device: String,
+        token: String
+    ) -> ghostty_remote_connection_t? {
+        base.withCString { basePtr in
+            device.withCString { devicePtr in
+                token.withCString { tokenPtr in
+                    ghostty_remote_connection_new_relay(basePtr, devicePtr, tokenPtr)
+                }
+            }
+        }
+    }
+
+    /// Build and show the terminal window for an already-dialed relay
+    /// connection. Shared by the interactive dial path (`sessionID` nil ⇒ OPEN
+    /// a fresh agent session) and the WP-D2 restore path (`sessionID` set ⇒
+    /// re-`ATTACH` to the persisted session). Registers the window in the
+    /// `RemoteSessionManifest` so it can be restored after a quit.
+    @MainActor
+    @discardableResult
+    private func presentRemoteWindow(
+        handle: ghostty_remote_connection_t,
+        relay: String,
+        device: String,
+        fallbackName: String?,
+        sessionID: String?
+    ) -> TerminalController {
         // The relay path has no TCP port. For the display name, prefer the
         // machine's own hostname reported by the agent in its HELLO (the pill
         // should show the real machine name); fall back to the chooser's
@@ -1078,7 +1131,7 @@ class AppDelegate: NSObject,
             .flatMap { String(cString: $0) }
             .flatMap { $0.isEmpty ? nil : $0 }
         let machine = Machine(
-            name: reportedHostname ?? name ?? device,
+            name: reportedHostname ?? fallbackName ?? device,
             host: relay,
             port: 0,
             relayBase: relay,
@@ -1089,20 +1142,102 @@ class AppDelegate: NSObject,
         let connection = RemoteConnection(handle: handle, machine: machine)
 
         // Build the base surface config that puts the first surface on the
-        // remote machine (new session: session_id stays nil).
+        // remote machine (session_id nil ⇒ OPEN new; non-nil ⇒ ATTACH).
         var cfg = Ghostty.SurfaceConfiguration()
         cfg.remoteMachine = machine
         cfg.remoteConnection = handle
         // Retain the connection owner on the surface so it outlives the surface's
         // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
         cfg.connectionKeepAlive = connection
-        cfg.remoteSessionId = nil
+        cfg.remoteSessionId = sessionID
 
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
         controller.remoteMachine = machine
         controller.remoteConnection = connection
-        onOpen?(controller)
-        return nil
+
+        // WP-D2: track this window for restore-on-relaunch and capture its
+        // agent session UUID once the termio thread has opened/attached the
+        // session (published async; for an ATTACH the id is already known but
+        // the capture confirms it against the live pane either way).
+        let entryID = RemoteSessionManifest.shared.register(
+            relayBase: relay,
+            deviceID: device,
+            name: machine.name,
+            sessionID: sessionID)
+        controller.remoteManifestEntryID = entryID
+        RemoteSessionManifest.captureSessionID(of: controller, entryID: entryID)
+
+        return controller
+    }
+
+    /// WP-D2: restore relay remote windows recorded in the manifest by a
+    /// previous run (quit with remote windows open). Runs at launch: each
+    /// entry is re-dialed through the relay on a BACKGROUND queue (no
+    /// beachball, no modal alerts — this is the restore path, not the
+    /// interactive dial) and, if its agent session is still alive, the window
+    /// is reopened re-`ATTACH`ed to that session.
+    ///
+    /// Failure handling, per entry:
+    /// - no session UUID was ever captured → dropped (nothing to attach to)
+    /// - relay/agent unreachable (dial fails) → entry is KEPT for the next
+    ///   launch (the machine may simply be offline right now)
+    /// - session gone on the agent (probe fails; expired TTL, agent restart)
+    ///   → dropped silently
+    private func restoreRemoteWindows() {
+        let entries = RemoteSessionManifest.shared.takeAll()
+        guard !entries.isEmpty else { return }
+
+        // Same env-based token sourcing as the interactive dial path (Phase B
+        // OIDC replaces this in one place).
+        let token = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_TOKEN"] ?? ""
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            for entry in entries {
+                guard let sessionID = entry.sessionID, !sessionID.isEmpty else {
+                    Self.logger.info("remote restore: dropping \(entry.deviceID, privacy: .public) — no session id was captured")
+                    continue
+                }
+
+                guard let handle = Self.dialRelay(
+                    base: entry.relayBase,
+                    device: entry.deviceID,
+                    token: token
+                ) else {
+                    // Relay or agent unreachable: keep the entry so the next
+                    // launch retries; never alert from the restore path.
+                    Self.logger.warning("remote restore: relay dial failed for \(entry.deviceID, privacy: .public); keeping entry for next launch")
+                    RemoteSessionManifest.shared.reinstate(entry)
+                    continue
+                }
+
+                // Liveness probe before opening any window: GET_CWD by session
+                // id answers ok=false for a dead/unknown session (bounded
+                // timeout). A gone session is dropped silently — no window,
+                // no alert.
+                let cwd = sessionID.withCString { cSid in
+                    Ghostty.AllocatedString(
+                        ghostty_remote_connection_query_cwd_timeout(handle, cSid, 5000)).string
+                }
+                guard !cwd.isEmpty else {
+                    Self.logger.info("remote restore: session \(sessionID, privacy: .public) on \(entry.deviceID, privacy: .public) is gone; dropping entry")
+                    ghostty_remote_connection_free(handle)
+                    continue
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else {
+                        ghostty_remote_connection_free(handle)
+                        return
+                    }
+                    self.presentRemoteWindow(
+                        handle: handle,
+                        relay: entry.relayBase,
+                        device: entry.deviceID,
+                        fallbackName: entry.name,
+                        sessionID: sessionID)
+                }
+            }
+        }
     }
 
     /// Dials `machine` and opens a remote window on success. Shows an alert on

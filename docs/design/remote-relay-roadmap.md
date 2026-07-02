@@ -32,6 +32,11 @@ Commits on `feature/remote-machines`:
   identity, bounded JWKS fetches) + runbook `docs/design/relay-oidc-setup.md`
 - `361aa960e` — WP-C2: chooser lists account devices from the relay w/ online dot
   + remove/rename (`RelayDirectoryClient.swift`; GUI render verify pending)
+- WP-D2 — remote windows RESTORE on relaunch: local `RemoteSessionManifest`
+  (UserDefaults) + re-`ATTACH` by session UUID through the relay at launch; clean
+  close removes the entry, quit keeps it; restore failures are silent (no modal);
+  protocol flow proven by the extended `wp4-e2e` harness (GUI quit/reopen verify
+  pending)
 
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
@@ -230,9 +235,27 @@ able to take one WP with only this doc + the repo.
   resource in the **Activity Monitor** + status pill; reconnect state machine (spec §5).
   *Accept:* kill a host's connector → UI shows offline/reconnecting; recovery shows
   online.
-- **WP-D2 — Window restore over relay.** *Goal:* local manifest of open remote
-  sessions; on relaunch re-`ATTACH` by UUID through the relay. *Accept:* open remote
-  windows, quit, reopen → windows restored to live sessions.
+- **WP-D2 — Window restore over relay. ✅ BUILT (GUI quit/reopen verify pending).**
+  *Goal:* local manifest of open remote sessions; on relaunch re-`ATTACH` by UUID
+  through the relay. *Accept:* open remote windows, quit, reopen → windows restored
+  to live sessions. *Shipped:* no protocol/agent changes needed — `ATTACH`-by-UUID,
+  `termio/Remote.zig` attach, and the C `session_id` plumbing already existed
+  end-to-end. New `RemoteSessionManifest.swift` (JSON `[Entry]` under the
+  `RemoteSessionManifest` `UserDefaults.ghostty` key; debug/release separate by
+  bundle id) records `{relayBase, deviceID, sessionID, name}` per open relay
+  window; the session UUID is captured by polling
+  `ghostty_surface_remote_session_id` after open. Clean close (user close / child
+  exit) removes the entry; quit keeps it (`AppDelegate.isQuitting` guards
+  `windowWillClose`). `AppDelegate.restoreRemoteWindows()` (launch) re-dials each
+  entry on a background queue (token from `GHOSTTY_RELAY_TOKEN`, NO modal alerts),
+  liveness-probes the session via `GET_CWD` (gone → entry dropped silently; relay
+  unreachable → entry kept for next launch), then reopens the window with
+  `remoteSessionId` set ⇒ re-`ATTACH`. Protocol flow proven headlessly by the
+  extended `wp4-e2e` harness (OPEN → drop conn w/o CLOSE → re-dial → probe good +
+  bogus UUID → ATTACH alive → live round-trip vs the real agent). Restore covers
+  relay windows opened via dial/restore paths; single root pane per window (split
+  layout restore = spec §7.2, later); inherited (Cmd-N-from-remote) windows not
+  yet tracked.
 
 ### Phase E — Operations
 - **WP-E1 — Relay productionization.** *Goal:* move relay to the home NUC (Cloudflare
