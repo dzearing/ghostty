@@ -17,6 +17,22 @@ Commits on `feature/remote-machines`:
 - `6f2560bca` — relay service (Go, `relay/`)
 - `628321b9a` — SSH-over-relay connectors + ssh `ProxyCommand`
 - `a8a485f5b` — client relay transport (`relay_dial.zig`, C export, CLI, Swift)
+- `292a07368` + `c6a…` — native Zig WS client; SINGLE-BINARY agent (`--relay`);
+  Go sidecars deleted
+- `f0482de02` — pill honors `--name` on the IPC/CLI path
+- `3f6dc90bc` — pill shows AGENT-REPORTED hostname (`Hello.hostname`,
+  `ghostty_remote_connection_hostname`); relay windows registered in the IPC
+  `targetRegistry` (`+send-keys`/`+read` work on them); debug-app crash-loop fix
+  (ad-hoc re-sign after the install `cp -R` — was SIGKILL "Code Signature Invalid")
+
+Validated 2026-07-01: **one-liner Windows install** (relay serves `/dl/install.ps1`
++ `ghoztty-agent.exe` via Caddy `handle_path /dl/*` → `/var/www/ghoztty-dl`) proven
+on a SECOND box, the corp Cloud PC `CPC-dzear-IER1M` (device `windows-remote`) —
+pill shows the real hostname. Install: `$env:DEVICE_TOKEN='<tok>'; irm
+https://<fqdn>/dl/install.ps1 | iex` (re-run w/o token = binary update; don't mix
+with the SMB watcher on the same box). Pending user requirement: **suppress the
+pill when the target is the local machine** (see `ghoztty-remote-pill-not-local`
+memory).
 
 Live test infra (DEV/bring-up only):
 - **Relay:** Azure VM `ghoztty-relay`, FQDN `ghoztty-relay-dz17575.westus2.cloudapp.azure.com`,
@@ -31,10 +47,12 @@ Live test infra (DEV/bring-up only):
   (re-run after a script change). Devices: `windows-home`, `windows-remote` (unused).
   The Go `relay-connect`/`relay-agent` sidecars are DELETED — Go is only the relay
   server now. Mac client dials the relay in-process (no subprocess).
-- **Mac client:** `Ghoztty-Debug.app` (`zig build -Doptimize=Debug`); `relay-connect`
-  helper at `zig-out/bin/relay-connect`, found via `GHOSTTY_RELAY_CONNECT` (launchctl
-  setenv for now — TODO: bundle into the .app). Dev client token via
-  `GHOSTTY_RELAY_TOKEN`.
+- **Mac client:** `Ghoztty-Debug.app` (`zig build -Doptimize=Debug`) dials the relay
+  in-process (native WS; no helper subprocess, no launchctl env). Dev CLIENT token via
+  `GHOSTTY_RELAY_TOKEN` env or `--token=` (CLIENT token, NOT a device token — a wrong
+  token 401s and pops a MODAL alert that blocks queued dials until dismissed). The
+  build re-signs the installed bundle ad-hoc (crash-loop fix); rebuild the native
+  test agent too (`zig build agent`) when protocol fields change.
 
 Conventions: env vars use **`GHOSTTY_`** (S, ghostty-fork inheritance), NOT GHOZTTY.
 Toolchain: `export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH;
@@ -42,10 +60,15 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`. GUI driving: s
 `ghoztty-gui-driving-now-possible` memory (process name `ghoztty`; confirm frontmost==debug
 pid before keystrokes; launch via `open`).
 
-How to prove the relay right now (no GUI):
+How to prove the relay right now:
 ```
-GHOSTTY_RELAY_TOKEN=<dev tok> ./zig-out/bin/relay-connect -base https://<fqdn> -device <id>
-# returns the remote target's bytes; the Go relay e2e test: cd relay && go test ./...
+# device list (dev CLIENT token lives in /etc/ghoztty-relay.env on the VM +
+# scratchpad relay-devtoken.txt):
+curl -H "Authorization: Bearer <dev tok>" https://<fqdn>/v1/client/devices
+# real window (debug app running):
+zig-out/Ghoztty-Debug.app/Contents/MacOS/ghoztty +new-remote-window \
+  --relay=https://<fqdn> --device=<device-id> --token=<dev tok> --name=<label>
+# Go relay e2e test: cd relay && go test ./...
 ```
 
 ---
