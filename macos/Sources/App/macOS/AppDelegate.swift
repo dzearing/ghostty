@@ -1040,7 +1040,13 @@ class AppDelegate: NSObject,
     /// path). Returns nil on success or an error message on failure.
     @MainActor
     @discardableResult
-    func openRemoteWindow(relay: String, device: String, token: String, name: String? = nil) -> String? {
+    func openRemoteWindow(
+        relay: String,
+        device: String,
+        token: String,
+        name: String? = nil,
+        onOpen: ((TerminalController) -> Void)? = nil
+    ) -> String? {
         // Dial the agent through the relay. This blocks through the handshake and
         // returns a connection handle, or NULL on failure.
         let handle: ghostty_remote_connection_t? = relay.withCString { basePtr in
@@ -1061,10 +1067,20 @@ class AppDelegate: NSObject,
             return "failed to reach \(device) via relay \(relay): the agent is not running or not reachable"
         }
 
-        // The relay path has no TCP port; prefer the chooser's friendly name (falls
-        // back to the device id for the headless CLI/IPC path). Carry the relay
-        // base + device id so the Machine is a proper relay machine.
-        let machine = Machine(name: name ?? device, host: relay, port: 0, relayBase: relay, deviceID: device)
+        // The relay path has no TCP port. For the display name, prefer the
+        // machine's own hostname reported by the agent in its HELLO (the pill
+        // should show the real machine name); fall back to the chooser's
+        // friendly name, then the device id (headless CLI/IPC path, old agent).
+        // Carry the relay base + device id so the Machine is a proper relay machine.
+        let reportedHostname: String? = ghostty_remote_connection_hostname(handle)
+            .flatMap { String(cString: $0) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let machine = Machine(
+            name: reportedHostname ?? name ?? device,
+            host: relay,
+            port: 0,
+            relayBase: relay,
+            deviceID: device)
 
         // Wrap the handle in a strong owner; the controller below holds the only
         // strong reference and frees it (once) when the window is deallocated.
@@ -1083,6 +1099,7 @@ class AppDelegate: NSObject,
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
         controller.remoteMachine = machine
         controller.remoteConnection = connection
+        onOpen?(controller)
         return nil
     }
 

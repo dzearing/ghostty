@@ -436,13 +436,18 @@ fn serveOne(
     var mux = try mux_mod.Mux.create(alloc, transport, encoding);
     defer mux.destroy();
 
+    // Advertise this machine's hostname in the HELLO so the client can label
+    // the window (pill) with the real machine name. Display-only, best-effort.
+    var host_buf: [256]u8 = undefined;
+    const hostname = hostName(&host_buf);
+
     const srv = try server.Server.create(
         alloc,
         mux.controlStream(),
         mux.dataStream(),
         spawner,
         store,
-        .{ .encoding = encoding },
+        .{ .encoding = encoding, .hostname = hostname },
     );
     defer srv.destroy(alloc);
 
@@ -455,6 +460,34 @@ fn serveOne(
     // (never terminates) its sessions, so they survive in the store for reconnect.
     srv.shutdown();
 }
+
+/// This machine's hostname for HELLO display, or null if unavailable. On Windows
+/// we ask for the DNS hostname (preserves case, matches `hostname` output) rather
+/// than %COMPUTERNAME% (uppercased NetBIOS name).
+fn hostName(out: []u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        var wbuf: [256]u16 = undefined;
+        var size: u32 = wbuf.len;
+        // 1 == ComputerNameDnsHostname
+        if (win32.GetComputerNameExW(1, &wbuf, &size) == 0) return null;
+        const n = std.unicode.utf16LeToUtf8(out, wbuf[0..size]) catch return null;
+        return if (n == 0) null else out[0..n];
+    } else {
+        var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const name = std.posix.gethostname(&buf) catch return null;
+        if (name.len == 0 or name.len > out.len) return null;
+        @memcpy(out[0..name.len], name);
+        return out[0..name.len];
+    }
+}
+
+const win32 = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn GetComputerNameExW(
+        NameType: c_int,
+        lpBuffer: [*]u16,
+        nSize: *u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
+} else struct {};
 
 // -----------------------------------------------------------------------------
 // Relay daemon (`--relay <url>`): single binary, no Go sidecar, no localhost

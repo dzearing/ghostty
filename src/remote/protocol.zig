@@ -354,6 +354,9 @@ pub const Hello = struct {
     proto_version: u16 = proto_version,
     transfer_encoding: TransferEncoding,
     capabilities: []const []const u8 = &.{},
+    /// The sender's machine hostname, for display (e.g. the client's window
+    /// pill). Optional: absent from older peers, and never load-bearing.
+    hostname: ?[]const u8 = null,
 
     /// Serialize to a JSON byte slice owned by `alloc`.
     pub fn encode(self: Hello, alloc: Allocator) Allocator.Error![]u8 {

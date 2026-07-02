@@ -914,7 +914,18 @@ class IPCServer {
                     relay: relay!,
                     device: device!,
                     token: token ?? "",
-                    name: name)
+                    name: name,
+                    onOpen: { [weak self] controller in
+                        // Register the window under its friendly name so
+                        // +send-keys / +read / +close can target it (mirrors the
+                        // +new-window --target path). The relay pill uses the
+                        // agent-reported hostname; the registry key stays the
+                        // caller-supplied --name for scriptability.
+                        if let target = name {
+                            self?.targetRegistry[target] = .window(WeakRef(controller))
+                            Self.logger.info("IPC: registered remote window target '\(target)'")
+                        }
+                    })
             } else {
                 errorMessage = appDelegate.openRemoteWindow(host: host!, port: port!)
             }

@@ -277,6 +277,9 @@ pub const Server = struct {
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
         clock: ?Clock = null,
+        /// This machine's hostname, advertised in the HELLO for client display
+        /// (the window pill). Must outlive `start()` (encoded there). Optional.
+        hostname: ?[]const u8 = null,
     };
 
     /// Stand up a per-connection Server over a SHARED daemon `store` (the registry
@@ -302,6 +305,7 @@ pub const Server = struct {
             .local_hello = .{
                 .transfer_encoding = opts.encoding,
                 .capabilities = opts.capabilities,
+                .hostname = opts.hostname,
             },
             .clock = opts.clock orelse Clock.real(),
             .spawner = spawner,

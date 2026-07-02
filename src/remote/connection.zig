@@ -608,6 +608,13 @@ pub const Connection = struct {
     /// both readers. Never changes for the life of the connection.
     encoding: protocol.TransferEncoding,
 
+    /// The peer's self-reported hostname from its HELLO (null if the peer did not
+    /// send one). Written once by the control reader BEFORE the handshake gate is
+    /// set; readers must only look after `waitHandshake` returns (the gate's
+    /// set/wait pair orders the write). Sentinel-terminated so the C API can hand
+    /// it out directly. Owned by the connection, freed in `destroy`.
+    peer_hostname: ?[:0]u8 = null,
+
     /// Per-connection frame sequence (§4.2). Assigned by the writer thread at send
     /// time so seq order matches wire order, single-writer (no atomics needed).
     frame_seq: protocol.FrameSeq = .{},
@@ -1130,6 +1137,7 @@ pub const Connection = struct {
         assert(self.heartbeat_thread == null);
         self.write_queue.deinit(alloc);
         self.channels.deinit();
+        if (self.peer_hostname) |h| alloc.free(h);
         // Any panes still registered at destroy (the caller didn't close/detach
         // them) are freed here so the connection owns no leaks. Their channels were
         // already deregistered-or-irrelevant since all threads have joined.
@@ -2029,7 +2037,22 @@ pub const Connection = struct {
     fn negotiatePeerHello(self: *Connection, payload: []const u8) protocol.ProtocolError!protocol.Negotiated {
         var parsed = protocol.Hello.parse(self.alloc, payload) catch return error.Incompatible;
         defer parsed.deinit();
+        // Capture the peer's display hostname before the parse arena is freed.
+        // Single write by the control reader, published to other threads by the
+        // handshake gate (completeHandshake's set). Best-effort: OOM just leaves
+        // it null, it is display-only.
+        if (parsed.value.hostname) |h| {
+            if (h.len > 0 and self.peer_hostname == null) {
+                self.peer_hostname = self.alloc.dupeZ(u8, h) catch null;
+            }
+        }
         return protocol.negotiate(self.local_hello, parsed.value);
+    }
+
+    /// The peer's self-reported hostname (display-only), or null. Only valid
+    /// after `waitHandshake` has returned successfully.
+    pub fn peerHostname(self: *const Connection) ?[:0]const u8 {
+        return self.peer_hostname;
     }
 
     /// Store the handshake outcome and wake `waitHandshake`. First writer wins so

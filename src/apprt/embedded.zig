@@ -2383,6 +2383,18 @@ pub const CAPI = struct {
         return std.math.cast(i32, ms) orelse std.math.maxInt(i32);
     }
 
+    /// The agent's self-reported hostname from its HELLO, or null if the peer
+    /// didn't send one (older agent) or the handshake hasn't completed. The
+    /// returned pointer is owned by the connection and valid until
+    /// `ghostty_remote_connection_free`; callers should copy it immediately.
+    export fn ghostty_remote_connection_hostname(
+        handle: *RemoteConnectionHandle,
+    ) ?[*:0]const u8 {
+        const conn = handle.conn() orelse return null;
+        const name = conn.peerHostname() orelse return null;
+        return name.ptr;
+    }
+
     /// Shut down and free the connection handle. Detaches all panes (remote
     /// sessions survive for later re-attach by session_id). The caller must
     /// ensure no surface still references this handle.

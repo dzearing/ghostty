@@ -12,6 +12,7 @@ const XCFramework = @import("GhosttyXCFramework.zig");
 build: *std.Build.Step.Run,
 open: *std.Build.Step.Run,
 copy: *std.Build.Step.Run,
+sign: *std.Build.Step.Run,
 xctest: *std.Build.Step.Run,
 
 pub const Deps = struct {
@@ -190,17 +191,37 @@ pub fn init(
         break :copy step;
     };
 
+    // Re-sign the copied bundle ad-hoc. `cp -R` above breaks the code-signature
+    // seal (the on-disk pages no longer match the sealed hashes), which makes
+    // the hardened-runtime binary fail page validation and get SIGKILL'd with
+    // "Code Signature Invalid" when the inner Mach-O is exec'd directly (e.g.
+    // running `.../MacOS/ghostty +new-window` as a CLI). A fresh ad-hoc sign of
+    // the installed copy re-seals it so it launches cleanly. Ad-hoc is correct
+    // here because local builds are only ever ad-hoc signed anyway.
+    const sign = sign: {
+        const step = RunStep.create(b, "codesign app bundle (ad-hoc)");
+        step.has_side_effects = true;
+        step.addArgs(&.{ "codesign", "--force", "--deep", "--sign", "-" });
+        step.addArg(b.fmt("{s}/{s}.app", .{ b.install_path, app_name }));
+        step.expectExitCode(0);
+        step.step.dependOn(&copy.step);
+        break :sign step;
+    };
+
     return .{
         .build = build,
         .open = open,
         .copy = copy,
+        .sign = sign,
         .xctest = xctest,
     };
 }
 
 pub fn install(self: *const Ghostty) void {
     const b = self.copy.step.owner;
-    b.getInstallStep().dependOn(&self.copy.step);
+    // Depend on the re-sign step, which itself depends on the copy — so the
+    // installed bundle is always re-sealed after the signature-breaking cp -R.
+    b.getInstallStep().dependOn(&self.sign.step);
 }
 
 pub fn installXcframework(self: *const Ghostty) void {
