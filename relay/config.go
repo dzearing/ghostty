@@ -26,6 +26,17 @@ type Config struct {
 	// poll request simply omits it.
 	GoogleClientSecret string
 
+	// GoogleDeviceClientID / GoogleDeviceClientSecret identify a SECOND OAuth
+	// client, of type "TVs and Limited Input devices", used only for the
+	// device-code self-enroll flow. Google restricts the device-code grant to
+	// that client type, while the Mac app signs in with a Desktop client
+	// (authorization-code + PKCE) — hence two clients. When set, enroll uses
+	// this pair for the device-code start/poll calls and ID tokens carrying
+	// this client ID as `aud` are accepted alongside GoogleClientID. When
+	// unset, enroll falls back to GoogleClientID/GoogleClientSecret.
+	GoogleDeviceClientID     string
+	GoogleDeviceClientSecret string
+
 	// RelayBaseURL is this relay's public https base URL (e.g.
 	// "https://relay.example.com"), returned to freshly enrolled agents so
 	// they know where to dial back. When unset it is derived per-request from
@@ -62,14 +73,16 @@ type Config struct {
 // LoadConfig reads configuration from the environment, applying defaults.
 func LoadConfig() *Config {
 	cfg := &Config{
-		ListenAddr:         getenv("LISTEN_ADDR", "127.0.0.1:8080"),
-		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
-		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
-		RelayBaseURL:       strings.TrimRight(os.Getenv("RELAY_BASE_URL"), "/"),
-		StateDir:           getenv("STATE_DIR", "./state"),
-		DevAuth:            strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),
-		DevClientToken:     os.Getenv("DEV_CLIENT_TOKEN"),
-		DevEmail:           os.Getenv("DEV_EMAIL"),
+		ListenAddr:               getenv("LISTEN_ADDR", "127.0.0.1:8080"),
+		GoogleClientID:           os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleClientSecret:       os.Getenv("GOOGLE_CLIENT_SECRET"),
+		GoogleDeviceClientID:     os.Getenv("GOOGLE_DEVICE_CLIENT_ID"),
+		GoogleDeviceClientSecret: os.Getenv("GOOGLE_DEVICE_CLIENT_SECRET"),
+		RelayBaseURL:             strings.TrimRight(os.Getenv("RELAY_BASE_URL"), "/"),
+		StateDir:                 getenv("STATE_DIR", "./state"),
+		DevAuth:                  strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),
+		DevClientToken:           os.Getenv("DEV_CLIENT_TOKEN"),
+		DevEmail:                 os.Getenv("DEV_EMAIL"),
 	}
 
 	for _, e := range strings.Split(os.Getenv("ALLOWED_EMAILS"), ",") {
@@ -80,6 +93,26 @@ func LoadConfig() *Config {
 	}
 
 	return cfg
+}
+
+// EnrollClientID returns the OAuth client ID to use for the device-code
+// enroll flow: the dedicated TV/limited-input client when configured,
+// otherwise the primary client (back-compat single-client setup).
+func (c *Config) EnrollClientID() string {
+	if c.GoogleDeviceClientID != "" {
+		return c.GoogleDeviceClientID
+	}
+	return c.GoogleClientID
+}
+
+// EnrollClientSecret returns the client secret paired with EnrollClientID.
+// The secret always travels with its own client: mixing the device client's
+// ID with the desktop client's secret would be rejected by Google.
+func (c *Config) EnrollClientSecret() string {
+	if c.GoogleDeviceClientID != "" {
+		return c.GoogleDeviceClientSecret
+	}
+	return c.GoogleClientSecret
 }
 
 // DevicesPath returns the path to the persisted device directory.

@@ -37,7 +37,7 @@ and keep working. Do the flip when you can live with that.
 6. Scopes: **no action needed.** The relay only ever reads `openid` + `email`
    claims, which are non-sensitive default scopes; nothing to register.
 
-### 1b. The OAuth client ID
+### 1b. The OAuth client ID — Desktop (Mac app sign-in)
 
 7. Left nav → **APIs & Services → Credentials** → **+ Create credentials →
    OAuth client ID**.
@@ -54,13 +54,25 @@ and keep working. Do the flip when you can live with that.
     needed for token-endpoint calls, e.g. the §4 curl check and WP-B2).
     Stash both in your password manager.
 
-> **Agents / device-code flow (WP-B3, future):** Google's device-code flow
-> ("OAuth for TVs and Limited-Input Devices") requires a **separate** client of
-> type **TVs and Limited Input devices** — a Desktop client cannot use that
-> grant. Tokens from that client carry *its* ID as `aud`, so when WP-B3 lands,
-> `GOOGLE_CLIENT_ID` on the relay must grow into a small allowlist of client
-> IDs (trivial relay change; not needed now). Today agents authenticate with
-> enrolled **device tokens**, which this flip does not touch.
+### 1b-2. The SECOND OAuth client — device-code enroll (agents)
+
+Google only allows the device-code grant ("OAuth for TVs and Limited-Input
+Devices") for clients of type **TVs and Limited Input devices** — the Desktop
+client above cannot use it. The agent self-enroll flow
+(`ghoztty-agent --enroll`) therefore needs its own client:
+
+11. **Credentials → + Create credentials → OAuth client ID** again.
+12. **Application type:** **TVs and Limited Input devices**.
+13. **Name:** `ghoztty-agent` → **Create**.
+14. Copy this client's **Client ID** and **Client secret** too. (No, there is
+    no missing field: TV/limited-input clients **do** get a client secret —
+    like Desktop secrets it is not confidential, but Google's token endpoint
+    requires it on device-code polls.) These become
+    `GOOGLE_DEVICE_CLIENT_ID` / `GOOGLE_DEVICE_CLIENT_SECRET` in §2.
+
+ID tokens minted through this client carry *its* ID as `aud`; the relay
+accepts either client's `aud` (explicit allowlist in `relay/auth.go`), so
+tokens from the enroll flow and from the Mac app's sign-in both verify.
 
 ## 2. Configure the relay VM (~2 min)
 
@@ -76,12 +88,18 @@ sudoedit /etc/ghoztty-relay.env
 Set:
 
 ```bash
-GOOGLE_CLIENT_ID=<the-client-id-from-step-10>.apps.googleusercontent.com
+GOOGLE_CLIENT_ID=<the-desktop-client-id-from-step-10>.apps.googleusercontent.com
+GOOGLE_DEVICE_CLIENT_ID=<the-tv-client-id-from-step-14>.apps.googleusercontent.com
+GOOGLE_DEVICE_CLIENT_SECRET=<the-tv-client-secret-from-step-14>
 ALLOWED_EMAILS=dzearing@gmail.com
 DEV_AUTH=false          # or delete the DEV_AUTH / DEV_CLIENT_TOKEN / DEV_EMAIL lines
 STATE_DIR=/var/lib/ghoztty-relay   # keep whatever is already there
 LISTEN_ADDR=127.0.0.1:8080         # keep
 ```
+
+(`GOOGLE_DEVICE_CLIENT_ID`/`_SECRET` drive the agent device-code enroll; if
+they are unset the relay falls back to `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`
+for enroll, which Google will refuse for a Desktop client — so set them.)
 
 Notes:
 - `ALLOWED_EMAILS` is comma-separated, case-insensitive. A valid Google login
@@ -171,7 +189,9 @@ both, which is a fine halfway state while WP-B2 is in flight.
 
 Per `relay/auth.go` (tested in `relay/auth_oidc_test.go` against a fake local
 issuer): RS256 signature against Google's published JWKS, `iss ==
-https://accounts.google.com`, `aud == GOOGLE_CLIENT_ID`, `exp`, `sub` present,
+https://accounts.google.com`, `aud ∈ {GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID}`
+(the second entry only when configured; fail-closed explicit allowlist),
+`exp`, `sub` present,
 `email_verified == true`, then `email ∈ ALLOWED_EMAILS`. Any failure →
 fail-closed 401, never bridged. The verified identity (email + Google `sub`)
 scopes all device CRUD and connects.

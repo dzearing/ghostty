@@ -27,6 +27,11 @@ const (
 	testKeyID    = "test-key-1"
 	allowedEmail = "owner@example.com"
 	testSub      = "google-sub-1234567890"
+
+	// The second OAuth client ("TVs and Limited Input devices") used by the
+	// device-code enroll flow when GOOGLE_DEVICE_CLIENT_ID is configured.
+	testDeviceClientID     = "test-device-client-id.apps.googleusercontent.com"
+	testDeviceClientSecret = "test-device-client-secret"
 )
 
 // fakeIssuer is a minimal OIDC identity provider: discovery doc + JWKS +
@@ -244,6 +249,55 @@ func TestOIDCForgedSignatureRejected(t *testing.T) {
 	token := mint(t, attackerKey, f.validClaims())
 	if _, err := a.AuthenticateClient(context.Background(), requestWithBearer(token)); err == nil {
 		t.Fatal("forged-signature token accepted")
+	}
+}
+
+// TestOIDCDualAudience: with GOOGLE_DEVICE_CLIENT_ID configured, client auth
+// accepts tokens addressed to EITHER client (the Mac app's Desktop client or
+// the enroll flow's TV/limited-input client) and still rejects any other aud.
+func TestOIDCDualAudience(t *testing.T) {
+	f := newFakeIssuer(t)
+	a := newOIDCAuthenticator(t, f, func(cfg *Config) {
+		cfg.GoogleDeviceClientID = testDeviceClientID
+		cfg.GoogleDeviceClientSecret = testDeviceClientSecret
+	})
+
+	for name, aud := range map[string]string{
+		"desktop client aud": testClientID,
+		"device client aud":  testDeviceClientID,
+	} {
+		t.Run(name, func(t *testing.T) {
+			claims := f.validClaims()
+			claims["aud"] = aud
+			ident, err := a.AuthenticateClient(context.Background(), requestWithBearer(mint(t, f.key, claims)))
+			if err != nil {
+				t.Fatalf("token with %s rejected: %v", name, err)
+			}
+			if ident.Email != allowedEmail || ident.Sub != testSub {
+				t.Errorf("ident = %+v, want %s/%s", ident, allowedEmail, testSub)
+			}
+		})
+	}
+
+	t.Run("unknown aud rejected", func(t *testing.T) {
+		claims := f.validClaims()
+		claims["aud"] = "someone-elses-client-id"
+		if _, err := a.AuthenticateClient(context.Background(), requestWithBearer(mint(t, f.key, claims))); err == nil {
+			t.Fatal("token with unknown aud accepted despite dual-client config")
+		}
+	})
+}
+
+// TestOIDCDeviceAudRejectedWhenUnconfigured: without GOOGLE_DEVICE_CLIENT_ID,
+// a token addressed to the device client is just an unknown aud — rejected.
+func TestOIDCDeviceAudRejectedWhenUnconfigured(t *testing.T) {
+	f := newFakeIssuer(t)
+	a := newOIDCAuthenticator(t, f, nil)
+
+	claims := f.validClaims()
+	claims["aud"] = testDeviceClientID
+	if _, err := a.AuthenticateClient(context.Background(), requestWithBearer(mint(t, f.key, claims))); err == nil {
+		t.Fatal("device-client aud accepted without GOOGLE_DEVICE_CLIENT_ID configured")
 	}
 }
 

@@ -46,6 +46,17 @@ type Authenticator struct {
 	verifier *oidc.IDTokenVerifier // nil if GOOGLE_CLIENT_ID is unset
 	allowed  map[string]bool       // lowercased allowlist
 
+	// allowedAuds is the `aud` allowlist for ID tokens: GOOGLE_CLIENT_ID (the
+	// Desktop client the Mac app signs in with) plus GOOGLE_DEVICE_CLIENT_ID
+	// (the TV/limited-input client the device-code enroll flow uses) when set.
+	// go-oidc's verifier only checks a single ClientID, so the verifier is
+	// built with SkipClientIDCheck and VerifyIDToken enforces membership in
+	// this list explicitly — one verifier, one signature check, and a
+	// fail-closed aud gate that rejects when the list is empty or no audience
+	// matches. (The two-verifier alternative would double signature/JWKS work
+	// and make "which verifier's error do we trust?" ambiguous.)
+	allowedAuds []string
+
 	// Device-code flow endpoints, taken from the issuer's OIDC discovery
 	// document (Google publishes device_authorization_endpoint =
 	// https://oauth2.googleapis.com/device/code). Deriving them from discovery
@@ -86,7 +97,14 @@ func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*A
 		if err != nil {
 			return nil, fmt.Errorf("init google oidc provider: %w", err)
 		}
-		a.verifier = provider.Verifier(&oidc.Config{ClientID: cfg.GoogleClientID})
+		// SkipClientIDCheck because we accept up to TWO audiences (see the
+		// allowedAuds field doc); the explicit aud gate lives in VerifyIDToken
+		// and fails closed.
+		a.verifier = provider.Verifier(&oidc.Config{SkipClientIDCheck: true})
+		a.allowedAuds = []string{cfg.GoogleClientID}
+		if cfg.GoogleDeviceClientID != "" && cfg.GoogleDeviceClientID != cfg.GoogleClientID {
+			a.allowedAuds = append(a.allowedAuds, cfg.GoogleDeviceClientID)
+		}
 		a.httpClient = httpClient
 
 		// Pull the device-code endpoints out of the discovery document for the
@@ -139,18 +157,23 @@ func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request)
 // raw ID token and returns the verified identity. It is the single shared
 // gate for both interactive client auth (AuthenticateClient) and device-code
 // self-enrollment (the /v1/enroll/poll success path): signature against the
-// issuer's JWKS, issuer, audience (== GOOGLE_CLIENT_ID), expiry, `sub`
-// present, `email_verified`, and membership in ALLOWED_EMAILS.
+// issuer's JWKS, issuer, audience (∈ {GOOGLE_CLIENT_ID,
+// GOOGLE_DEVICE_CLIENT_ID}), expiry, `sub` present, `email_verified`, and
+// membership in ALLOWED_EMAILS.
 func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identity, error) {
 	if token == "" || a.verifier == nil {
 		return Identity{}, ErrUnauthorized
 	}
 
-	// Verify checks signature against Google's JWKS, the issuer, the audience
-	// (== GOOGLE_CLIENT_ID), and expiry.
+	// Verify checks signature against Google's JWKS, the issuer, and expiry.
+	// The audience check is ours (SkipClientIDCheck): see allowedAuds.
 	idToken, err := a.verifier.Verify(ctx, token)
 	if err != nil {
 		a.logger.Warn("client id-token verification failed", "err", err)
+		return Identity{}, ErrUnauthorized
+	}
+	if !audAllowed(a.allowedAuds, idToken.Audience) {
+		a.logger.Warn("client id-token audience not allowed", "aud", idToken.Audience)
 		return Identity{}, ErrUnauthorized
 	}
 	if idToken.Subject == "" {
@@ -195,6 +218,20 @@ func (a *Authenticator) AuthenticateDevice(r *http.Request, store *Store) (*Devi
 		return nil, ErrUnauthorized
 	}
 	return dev, nil
+}
+
+// audAllowed reports whether any of the token's audiences appears on the
+// allowlist — the same membership rule go-oidc applies for its single
+// ClientID. Fail-closed: an empty allowlist or empty audience list rejects.
+func audAllowed(allowed, audiences []string) bool {
+	for _, aud := range audiences {
+		for _, ok := range allowed {
+			if aud != "" && aud == ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // bearerToken extracts a bearer token from the Authorization header, or "".

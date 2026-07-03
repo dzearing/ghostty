@@ -120,17 +120,23 @@ Design notes:
 - Abuse bounds: pending enrollments are capped (32), expire on Google's
   `expires_in`, and per-handle polling is throttled to the advertised
   interval without contacting Google.
-- Requires `GOOGLE_CLIENT_ID` (and normally `GOOGLE_CLIENT_SECRET`); the
-  device/token endpoints are read from Google's OIDC discovery document.
-  Without OIDC configured the endpoints answer `503`.
+- Requires `GOOGLE_CLIENT_ID`; the device/token endpoints are read from
+  Google's OIDC discovery document. Without OIDC configured the endpoints
+  answer `503`. Google restricts the device-code grant to clients of type
+  "TVs and Limited Input devices", so production sets
+  `GOOGLE_DEVICE_CLIENT_ID`/`GOOGLE_DEVICE_CLIENT_SECRET` (a second client of
+  that type) for the enroll calls; when unset, enroll falls back to
+  `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`.
 
 ## Configuration (environment variables)
 
 | Variable           | Default            | Purpose |
 |--------------------|--------------------|---------|
 | `LISTEN_ADDR`      | `127.0.0.1:8080`   | Plain-HTTP listen address (TLS handled by Caddy). |
-| `GOOGLE_CLIENT_ID` | *(unset)*          | OAuth/OIDC client ID; Google ID tokens must carry this as `aud`. Required for real client auth and for self-enrollment. |
-| `GOOGLE_CLIENT_SECRET` | *(unset)*      | OAuth client secret, used only when polling Google's token endpoint during self-enrollment (required by Google for desktop/TV client types; not confidential for those types). |
+| `GOOGLE_CLIENT_ID` | *(unset)*          | OAuth/OIDC client ID of the **Desktop** client the Mac app signs in with; ID tokens must carry this (or `GOOGLE_DEVICE_CLIENT_ID`) as `aud`. Required for real client auth and for self-enrollment. |
+| `GOOGLE_CLIENT_SECRET` | *(unset)*      | The Desktop client's secret. Used for Google's token endpoint during self-enrollment **only when** `GOOGLE_DEVICE_CLIENT_ID` is unset (single-client fallback). Not confidential for this client type. |
+| `GOOGLE_DEVICE_CLIENT_ID` | *(unset)*   | OAuth client ID of the **"TVs and Limited Input devices"** client used for device-code self-enrollment — Google only allows the device-code grant for that client type. When set, enroll start/poll present this client to Google, and ID tokens with this `aud` are accepted alongside `GOOGLE_CLIENT_ID`. When unset, enroll falls back to `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`. |
+| `GOOGLE_DEVICE_CLIENT_SECRET` | *(unset)* | The TV/limited-input client's secret, sent with enroll token polls when `GOOGLE_DEVICE_CLIENT_ID` is set. Not confidential for this client type. |
 | `RELAY_BASE_URL`   | *(unset)*          | Public https base URL returned to freshly enrolled agents (`relay_base`). When unset it is derived from the request `Host` header, which is correct behind Caddy. |
 | `ALLOWED_EMAILS`   | *(empty)*          | Comma-separated authorization allowlist of verified Google emails. A valid login by anyone not listed is rejected — including at self-enrollment. |
 | `STATE_DIR`        | `./state`          | Directory holding `devices.json` (persisted device hashes). |
@@ -147,7 +153,9 @@ both accepted until `DEV_AUTH` is turned off.
 ### Security model (summary)
 
 - **Clients:** the Google ID token is fully verified — signature against
-  Google's JWKS (issuer `https://accounts.google.com`), `aud == GOOGLE_CLIENT_ID`,
+  Google's JWKS (issuer `https://accounts.google.com`),
+  `aud ∈ {GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID}` (explicit fail-closed
+  allowlist; the second entry only when configured),
   `exp`, `sub` present, and `email_verified == true`. The email must then be on
   `ALLOWED_EMAILS`. Presence of a token is never sufficient. The verified
   identity is `{email, sub}` (Google's stable subject ID). Every HTTP request
@@ -199,7 +207,9 @@ relay.example.com {
 Run the service (e.g. under systemd) with production config:
 
 ```bash
-GOOGLE_CLIENT_ID="<your-oauth-client-id>.apps.googleusercontent.com" \
+GOOGLE_CLIENT_ID="<desktop-client-id>.apps.googleusercontent.com" \
+GOOGLE_DEVICE_CLIENT_ID="<tv-client-id>.apps.googleusercontent.com" \
+GOOGLE_DEVICE_CLIENT_SECRET="<tv-client-secret>" \
 ALLOWED_EMAILS="dzearing@gmail.com" \
 STATE_DIR=/var/lib/ghoztty-relay \
 LISTEN_ADDR=127.0.0.1:8080 \
@@ -216,7 +226,9 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/ghoztty-relay
-Environment=GOOGLE_CLIENT_ID=<client-id>.apps.googleusercontent.com
+Environment=GOOGLE_CLIENT_ID=<desktop-client-id>.apps.googleusercontent.com
+Environment=GOOGLE_DEVICE_CLIENT_ID=<tv-client-id>.apps.googleusercontent.com
+Environment=GOOGLE_DEVICE_CLIENT_SECRET=<tv-client-secret>
 Environment=ALLOWED_EMAILS=dzearing@gmail.com
 Environment=STATE_DIR=/var/lib/ghoztty-relay
 Environment=LISTEN_ADDR=127.0.0.1:8080

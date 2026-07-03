@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -39,13 +40,24 @@ type fakeGoogleDeviceFlow struct {
 
 	expiresIn int // seconds, reported to the relay
 	interval  int // seconds, reported to the relay
+
+	// wantClientID is the client_id /device/code must be called with (like
+	// real Google, an unknown client is refused). Defaults to testClientID;
+	// dual-client tests point it at testDeviceClientID.
+	wantClientID string
+
+	// Last form each endpoint received, for asserting which OAuth client
+	// (id/secret) the relay presented upstream.
+	lastDeviceCodeForm url.Values
+	lastTokenForm      url.Values
 }
 
 func newFakeGoogleDeviceFlow(f *fakeIssuer) *fakeGoogleDeviceFlow {
 	g := &fakeGoogleDeviceFlow{
-		grants:    make(map[string]*fakeGrant),
-		expiresIn: 600,
-		interval:  1, // keep tests fast; Google's real minimum is 5
+		grants:       make(map[string]*fakeGrant),
+		expiresIn:    600,
+		interval:     1, // keep tests fast; Google's real minimum is 5
+		wantClientID: testClientID,
 	}
 	f.deviceCodeHandler = g.handleDeviceCode
 	f.tokenHandler = g.handleToken
@@ -54,7 +66,11 @@ func newFakeGoogleDeviceFlow(f *fakeIssuer) *fakeGoogleDeviceFlow {
 
 func (g *fakeGoogleDeviceFlow) handleDeviceCode(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
-	if r.PostFormValue("client_id") != testClientID {
+	g.mu.Lock()
+	g.lastDeviceCodeForm = r.PostForm
+	wantClientID := g.wantClientID
+	g.mu.Unlock()
+	if r.PostFormValue("client_id") != wantClientID {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_client"})
 		return
@@ -79,6 +95,9 @@ func (g *fakeGoogleDeviceFlow) handleDeviceCode(w http.ResponseWriter, r *http.R
 
 func (g *fakeGoogleDeviceFlow) handleToken(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
+	g.mu.Lock()
+	g.lastTokenForm = r.PostForm
+	g.mu.Unlock()
 	writeErr := func(status int, code string) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -137,7 +156,8 @@ func (g *fakeGoogleDeviceFlow) setOutcome(t *testing.T, userCode, status, idToke
 
 // newEnrollTestServer wires the full relay in production posture (OIDC on,
 // DEV_AUTH off) against the fake issuer, with a fixed public base URL.
-func newEnrollTestServer(t *testing.T, f *fakeIssuer) (*httptest.Server, *Store) {
+// Optional mutate funcs adjust the Config before wiring (e.g. dual-client).
+func newEnrollTestServer(t *testing.T, f *fakeIssuer, mutate ...func(*Config)) (*httptest.Server, *Store) {
 	t.Helper()
 
 	cfg := &Config{
@@ -148,6 +168,9 @@ func newEnrollTestServer(t *testing.T, f *fakeIssuer) (*httptest.Server, *Store)
 		IssuerURL:          f.srv.URL,
 		AllowedEmails:      []string{allowedEmail},
 		RelayBaseURL:       "https://relay.test",
+	}
+	for _, m := range mutate {
+		m(cfg)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -435,6 +458,104 @@ func TestEnrollNonAllowlistedRejected(t *testing.T) {
 	}
 	if n := len(store.ListByOwner("stranger@example.com")) + len(store.ListByOwner(allowedEmail)); n != 0 {
 		t.Fatalf("rejected enrollment created %d devices", n)
+	}
+}
+
+// TestEnrollUsesDeviceClientWhenConfigured: with GOOGLE_DEVICE_CLIENT_ID/_SECRET
+// set, the relay presents THAT client (id + secret) to Google's device-code and
+// token endpoints — Google only allows the device-code grant for TV/limited-
+// input clients — and the resulting ID token (aud = device client) passes the
+// enroll-poll verification.
+func TestEnrollUsesDeviceClientWhenConfigured(t *testing.T) {
+	f := newFakeIssuer(t)
+	g := newFakeGoogleDeviceFlow(f)
+	g.wantClientID = testDeviceClientID // fake Google refuses any other client
+	ts, store := newEnrollTestServer(t, f, func(cfg *Config) {
+		cfg.GoogleDeviceClientID = testDeviceClientID
+		cfg.GoogleDeviceClientSecret = testDeviceClientSecret
+	})
+
+	start := enrollStart(t, ts, "tv-client-box")
+
+	g.mu.Lock()
+	dcForm := g.lastDeviceCodeForm
+	g.mu.Unlock()
+	if got := dcForm.Get("client_id"); got != testDeviceClientID {
+		t.Errorf("device-code client_id = %q, want %q", got, testDeviceClientID)
+	}
+
+	// Real-world shape: the ID token minted via the device client carries the
+	// DEVICE client's ID as aud.
+	claims := f.validClaims()
+	claims["aud"] = testDeviceClientID
+	g.setOutcome(t, start.UserCode, "approved", mint(t, f.key, claims))
+
+	status, body := enrollPoll(t, ts, start.DeviceCodeHandle)
+	if status != http.StatusOK || body["status"] != "complete" {
+		t.Fatalf("poll = %d %v, want 200 complete (device-client aud must verify)", status, body)
+	}
+
+	g.mu.Lock()
+	tokForm := g.lastTokenForm
+	g.mu.Unlock()
+	if got := tokForm.Get("client_id"); got != testDeviceClientID {
+		t.Errorf("token client_id = %q, want %q", got, testDeviceClientID)
+	}
+	if got := tokForm.Get("client_secret"); got != testDeviceClientSecret {
+		t.Errorf("token client_secret = %q, want %q", got, testDeviceClientSecret)
+	}
+
+	if id, _ := body["device_id"].(string); id == "" || store.Get(id) == nil {
+		t.Fatalf("enrolled device missing from store: %v", body)
+	}
+}
+
+// TestEnrollFallsBackToPrimaryClient: without GOOGLE_DEVICE_CLIENT_ID, the
+// enroll flow keeps today's behavior — GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET
+// go upstream.
+func TestEnrollFallsBackToPrimaryClient(t *testing.T) {
+	f := newFakeIssuer(t)
+	g := newFakeGoogleDeviceFlow(f)
+	ts, _ := newEnrollTestServer(t, f)
+
+	enrollToCompletion(t, ts, f, g, "fallback-box")
+
+	g.mu.Lock()
+	dcForm, tokForm := g.lastDeviceCodeForm, g.lastTokenForm
+	g.mu.Unlock()
+	if got := dcForm.Get("client_id"); got != testClientID {
+		t.Errorf("device-code client_id = %q, want %q", got, testClientID)
+	}
+	if got := tokForm.Get("client_id"); got != testClientID {
+		t.Errorf("token client_id = %q, want %q", got, testClientID)
+	}
+	if got := tokForm.Get("client_secret"); got != "test-client-secret" {
+		t.Errorf("token client_secret = %q, want %q", got, "test-client-secret")
+	}
+}
+
+// TestEnrollUnknownAudRejected: even with both clients configured, an ID token
+// addressed to some OTHER client id is terminally rejected at the enroll poll.
+func TestEnrollUnknownAudRejected(t *testing.T) {
+	f := newFakeIssuer(t)
+	g := newFakeGoogleDeviceFlow(f)
+	g.wantClientID = testDeviceClientID
+	ts, store := newEnrollTestServer(t, f, func(cfg *Config) {
+		cfg.GoogleDeviceClientID = testDeviceClientID
+		cfg.GoogleDeviceClientSecret = testDeviceClientSecret
+	})
+
+	start := enrollStart(t, ts, "wrong-aud-box")
+	claims := f.validClaims()
+	claims["aud"] = "someone-elses-client-id"
+	g.setOutcome(t, start.UserCode, "approved", mint(t, f.key, claims))
+
+	status, body := enrollPoll(t, ts, start.DeviceCodeHandle)
+	if status != http.StatusForbidden || body["status"] != "rejected" {
+		t.Fatalf("unknown-aud poll = %d %v, want 403 rejected", status, body)
+	}
+	if n := len(store.ListByOwner(allowedEmail)); n != 0 {
+		t.Fatalf("unknown-aud enrollment created %d devices", n)
 	}
 }
 

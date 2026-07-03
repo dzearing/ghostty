@@ -138,7 +138,7 @@ func (m *EnrollManager) Start(ctx context.Context, name string) (*enrollStartRes
 	m.mu.Unlock()
 
 	form := url.Values{
-		"client_id": {m.cfg.GoogleClientID},
+		"client_id": {m.cfg.EnrollClientID()},
 		"scope":     {"openid email"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.auth.deviceAuthURL,
@@ -346,12 +346,12 @@ func (m *EnrollManager) Poll(ctx context.Context, handle, relayBase string) poll
 // transport/5xx/malformed trouble.
 func (m *EnrollManager) exchangeDeviceCode(ctx context.Context, deviceCode string) (idToken, oauthErr string, err error) {
 	form := url.Values{
-		"client_id":   {m.cfg.GoogleClientID},
+		"client_id":   {m.cfg.EnrollClientID()},
 		"device_code": {deviceCode},
 		"grant_type":  {grantTypeDeviceCode},
 	}
-	if m.cfg.GoogleClientSecret != "" {
-		form.Set("client_secret", m.cfg.GoogleClientSecret)
+	if s := m.cfg.EnrollClientSecret(); s != "" {
+		form.Set("client_secret", s)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.auth.tokenURL,
