@@ -51,8 +51,30 @@ Commits on `feature/remote-machines`:
   green/yellow/red + status suffix (local suppression lifted while degraded);
   proven by `wp4-e2e` Phase 3 (GUI pill flow verify pending)
 
+- `ef84967d6` — loopback endpoints (127.x/::1/localhost) count as the local
+  machine for pill suppression (a TCP dial to 127.0.0.1 showed a "127.0.0.1" pill)
+
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
+
+**Validated live 2026-07-02 (GUI, debug app):** pill hidden for local-machine
+targets on BOTH paths (relay dial to a local `--relay` agent; TCP dial to
+127.0.0.1) and shown for MaximusHome; WP-C2 chooser fetches the account list w/
+online dots and the ellipsis menu's **Remove from Account** flow deleted
+`e2e-smoketest` end-to-end (confirm alert → relay DELETE → gone from API+list);
+WP-D2 restore proven TWICE (clean quit → relaunch → both remote windows
+re-ATTACH; keystrokes reach the restored MaximusHome session). The updated relay
+(CRUD + enroll + OIDC hardening) is DEPLOYED to the Azure VM (rename verified
+live; agents auto-reconnected after restart; DEV_AUTH still on). WP-D1 pill
+yellow/red flow still needs its GUI walkthrough (headless Phase-3 proof done).
+GOTCHAS learned: `+new-remote-window` to an OFFLINE device blocks ~2min then
+pops the modal error alert (queued dials hang behind it — dismiss via AX
+`click button "OK" of window 1`); quitting with open windows shows a
+"Close Ghoztty" confirm dialog (same AX click); scratchpad
+`device-token.txt` was a STALE device token — a wrong-device token makes the
+agent's control WS connect-then-drop in a 3s loop (dup-control kick); fresh
+tokens: `mac-local` device `bdd8c0fa-…` token in THIS session's scratchpad
+`mac-local-device.json`.
 
 Validated 2026-07-01: **one-liner Windows install** (relay serves `/dl/install.ps1`
 + `ghoztty-agent.exe` via Caddy `handle_path /dl/*` → `/var/www/ghoztty-dl`) proven
@@ -60,8 +82,7 @@ on a SECOND box, the corp Cloud PC `CPC-dzear-IER1M` (device `windows-remote`) �
 pill shows the real hostname. Install: `$env:DEVICE_TOKEN='<tok>'; irm
 https://<fqdn>/dl/install.ps1 | iex` (re-run w/o token = binary update; don't mix
 with the SMB watcher on the same box). The pill-not-local user requirement is
-IMPLEMENTED (`9ca6b1773`) but awaits live GUI verification (needs a debug-app
-relaunch, blocked while the user has live remote windows).
+DONE and LIVE-VERIFIED (`9ca6b1773` + `ef84967d6`, see the 2026-07-02 block).
 
 Live test infra (DEV/bring-up only):
 - **Relay:** Azure VM `ghoztty-relay`, FQDN `ghoztty-relay-dz17575.westus2.cloudapp.azure.com`,
