@@ -44,6 +44,14 @@ final class RemoteSessionManifest {
         var sessionID: String?
         /// Friendly display name (agent-reported hostname or chooser name).
         var name: String?
+        /// The USER-set window title (`BaseTerminalController.titleOverride`,
+        /// i.e. a manual rename via Change Title / the inline tab-title
+        /// editor / IPC set-title), captured so a restored window comes back
+        /// under the same title. Nil when the user never renamed the window
+        /// (the shell-computed title is transient and not persisted). Optional
+        /// so manifests persisted before this field decode fine (missing key
+        /// ⇒ nil, same as `Machine.hostname`).
+        var windowTitle: String? = nil
     }
 
     private let defaults: UserDefaults
@@ -68,14 +76,16 @@ final class RemoteSessionManifest {
         relayBase: String,
         deviceID: String,
         name: String?,
-        sessionID: String? = nil
+        sessionID: String? = nil,
+        windowTitle: String? = nil
     ) -> UUID {
         let entry = Entry(
             id: UUID(),
             relayBase: relayBase,
             deviceID: deviceID,
             sessionID: sessionID,
-            name: name)
+            name: name,
+            windowTitle: windowTitle)
         lock.lock()
         defer { lock.unlock() }
         entries.append(entry)
@@ -99,6 +109,20 @@ final class RemoteSessionManifest {
         lock.lock()
         defer { lock.unlock() }
         return entries.first(where: { $0.id == id })?.sessionID
+    }
+
+    /// Record the USER-set window title for an entry (nil ⇒ the user cleared
+    /// the rename, back to the shell-computed title). Called from the
+    /// `titleOverride` seam in `BaseTerminalController` on every user rename,
+    /// so the persisted title is correct even if the app never gets a clean
+    /// quit. Unknown ids are a no-op.
+    func updateWindowTitle(_ id: UUID, windowTitle: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
+        guard entries[idx].windowTitle != windowTitle else { return }
+        entries[idx].windowTitle = windowTitle
+        saveLocked()
     }
 
     /// Update the display name of EVERY entry for a device (account rename,

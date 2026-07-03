@@ -98,7 +98,22 @@ class BaseTerminalController: NSWindowController,
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
     var titleOverride: String? {
-        didSet { applyTitleToWindow() }
+        didSet {
+            applyTitleToWindow()
+
+            // Relay remote windows persist the user-set title in the restore
+            // manifest so a restored window (relaunch, or sign-out → sign-in)
+            // comes back under the same rename. Synced here — at the single
+            // choke point every user rename path funnels through (Change
+            // Title prompt, inline tab-title editor, IPC set-title, keybind
+            // action) — so the persisted title stays correct even if the app
+            // crashes before a clean quit. Shell OSC titles never touch this
+            // property, so transient titles are never persisted.
+            if let remoteManifestEntryID {
+                RemoteSessionManifest.shared.updateWindowTitle(
+                    remoteManifestEntryID, windowTitle: titleOverride)
+            }
+        }
     }
 
     var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
@@ -1647,6 +1662,13 @@ class BaseTerminalController: NSWindowController,
             let delegate = NSApp.delegate as? AppDelegate
             if delegate?.isQuitting != true && delegate?.isSigningOut != true {
                 RemoteSessionManifest.shared.remove(entryID)
+            } else {
+                // Preserved for restore: make sure the entry carries the
+                // window's final user-set title. The `titleOverride` didSet
+                // already keeps this in sync on every rename, so this is a
+                // last-moment belt-and-braces sync at the preservation point.
+                RemoteSessionManifest.shared.updateWindowTitle(
+                    entryID, windowTitle: titleOverride)
             }
         }
 

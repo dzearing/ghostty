@@ -1165,7 +1165,8 @@ class AppDelegate: NSObject,
         relay: String,
         device: String,
         fallbackName: String?,
-        sessionID: String?
+        sessionID: String?,
+        windowTitle: String? = nil
     ) -> TerminalController {
         // The relay path has no TCP port. The DISPLAY NAME wins: prefer the
         // account's friendly name for the device (`fallbackName` — the chooser
@@ -1212,9 +1213,19 @@ class AppDelegate: NSObject,
             relayBase: relay,
             deviceID: device,
             name: machine.name,
-            sessionID: sessionID)
+            sessionID: sessionID,
+            windowTitle: windowTitle)
         controller.remoteManifestEntryID = entryID
         RemoteSessionManifest.captureSessionID(of: controller, entryID: entryID)
+
+        // Re-apply the user-set window title preserved in the manifest entry
+        // (restore path). Applied through `titleOverride` — the same property
+        // a manual rename sets — AFTER the window/surface is built, so it
+        // takes precedence over later shell OSC title updates exactly like
+        // the original rename did.
+        if let windowTitle, !windowTitle.isEmpty {
+            controller.titleOverride = windowTitle
+        }
 
         return controller
     }
@@ -1396,7 +1407,8 @@ class AppDelegate: NSObject,
                         relay: entry.relayBase,
                         device: entry.deviceID,
                         fallbackName: entry.name,
-                        sessionID: sessionID)
+                        sessionID: sessionID,
+                        windowTitle: entry.windowTitle)
                 }
             }
         }

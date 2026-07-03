@@ -117,6 +117,89 @@ struct RemoteSessionManifestTests {
         #expect(reloaded.first { $0.deviceID == "dev-2" }?.name == "other")
     }
 
+    /// The user-set window title (a manual rename) round-trips through the
+    /// manifest across instances — this is what puts the title back on a
+    /// window restored after quit/relaunch or sign-out → sign-in. Clearing
+    /// the rename (nil) persists too.
+    @Test func windowTitleRoundTripsAcrossInstances() {
+        let defaults = makeDefaults()
+        let first = RemoteSessionManifest(defaults: defaults)
+
+        // Captured at register time (the restore path re-registers with the
+        // preserved title) ...
+        let a = first.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "box",
+            sessionID: "sess-a", windowTitle: "build watcher")
+        // ... or later via the rename seam (titleOverride didSet).
+        let b = first.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "box",
+            sessionID: "sess-b")
+        first.updateWindowTitle(b, windowTitle: "prod logs")
+        // Unknown id is a no-op.
+        first.updateWindowTitle(UUID(), windowTitle: "nope")
+
+        let reloaded = RemoteSessionManifest(defaults: defaults)
+        let entries = reloaded.takeAll()
+        #expect(entries.count == 2)
+        #expect(entries.first { $0.id == a }?.windowTitle == "build watcher")
+        #expect(entries.first { $0.id == b }?.windowTitle == "prod logs")
+
+        // Clearing the rename (user emptied the title ⇒ titleOverride nil)
+        // persists as nil.
+        let second = RemoteSessionManifest(defaults: defaults)
+        let c = second.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "box",
+            sessionID: "sess-c", windowTitle: "temporary")
+        second.updateWindowTitle(c, windowTitle: nil)
+        let third = RemoteSessionManifest(defaults: defaults)
+        let final = third.takeAll()
+        #expect(final.count == 1)
+        #expect(final[0].windowTitle == nil)
+    }
+
+    /// A manifest persisted BEFORE the `windowTitle` field existed (no such
+    /// key in the JSON) must still decode — the field is optional and simply
+    /// comes back nil.
+    @Test func decodesLegacyEntryWithoutWindowTitle() {
+        let defaults = makeDefaults()
+        let legacyJSON = """
+        [{"id":"00000000-0000-0000-0000-000000000001",\
+        "relayBase":"https://relay.test",\
+        "deviceID":"dev-legacy",\
+        "sessionID":"sess-legacy",\
+        "name":"old box"}]
+        """
+        defaults.set(Data(legacyJSON.utf8), forKey: RemoteSessionManifest.defaultsKey)
+
+        let manifest = RemoteSessionManifest(defaults: defaults)
+        let entries = manifest.takeAll()
+        #expect(entries.count == 1)
+        #expect(entries[0].deviceID == "dev-legacy")
+        #expect(entries[0].sessionID == "sess-legacy")
+        #expect(entries[0].name == "old box")
+        #expect(entries[0].windowTitle == nil)
+    }
+
+    /// An account/machine rename (`updateName`) must not clobber the user-set
+    /// WINDOW title — they are independent: the machine name feeds the pill
+    /// and default naming, the window title is the user's manual rename.
+    @Test func updateNameDoesNotClobberWindowTitle() {
+        let defaults = makeDefaults()
+        let manifest = RemoteSessionManifest(defaults: defaults)
+
+        let id = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "MaximusHome",
+            sessionID: "sess-1", windowTitle: "deploy shell")
+
+        manifest.updateName(deviceID: "dev-1", name: "Home PC")
+
+        let entries = RemoteSessionManifest(defaults: defaults).takeAll()
+        #expect(entries.count == 1)
+        #expect(entries[0].id == id)
+        #expect(entries[0].name == "Home PC")
+        #expect(entries[0].windowTitle == "deploy shell")
+    }
+
     /// The double-restore guard: entries whose id belongs to an OPEN window
     /// are reinstated (re-attaching would evict the live window); everything
     /// else restores. Order is preserved on both sides.
