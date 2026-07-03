@@ -88,6 +88,16 @@ class TerminalWindow: NSWindow {
         }
     }
 
+    /// WP-D1: the window's remote-connection status, set by the controller's
+    /// reconnect state machine. Drives the pill dot color (green/yellow/red)
+    /// and its status text. Meaningless (and unused) for local windows.
+    var remoteConnectionState: RemoteWindowConnectionState = .connected {
+        didSet {
+            guard remoteConnectionState != oldValue else { return }
+            updateMachinePill()
+        }
+    }
+
     /// Gets the terminal controller from the window controller.
     var terminalController: TerminalController? {
         windowController as? TerminalController
@@ -911,15 +921,19 @@ extension TerminalWindow {
         //
         // The pill is for REMOTE hosts only: a "remote" window whose agent runs
         // on this same Mac (agent-reported hostname == local hostname) must look
-        // like a normal local window, so no pill is shown for it.
+        // like a normal local window, so no pill is shown for it — EXCEPT while
+        // the connection is degraded (reconnecting/disconnected, WP-D1): a
+        // frozen window must always say why, even for a loopback agent.
         let name: String? = {
-            guard let machine = remoteMachine, !machine.isLocalMachine else { return nil }
+            guard let machine = remoteMachine else { return nil }
+            if machine.isLocalMachine && remoteConnectionState == .connected { return nil }
             return machine.name
         }()
         machinePillModel.topPadding = viewModel.accessoryTopPadding
         machinePillModel.title = title
         machinePillModel.isKeyWindow = isKeyWindow
         machinePillModel.machineName = name
+        machinePillModel.connectionState = remoteConnectionState
         // Clicking the pill opens the Remote Activity Monitor on THIS window's
         // existing connection (the window's `RemoteConnection` stays the sole
         // owner — `presentReusing` does not free it).

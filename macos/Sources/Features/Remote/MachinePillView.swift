@@ -9,6 +9,11 @@ final class MachinePillModel: ObservableObject {
     /// The machine display name, or nil when the window is local (pill hidden).
     @Published var machineName: String?
 
+    /// WP-D1: the window's connection status. Drives the pill dot color
+    /// (green = connected, yellow = reconnecting, red = disconnected) and a
+    /// status suffix while not connected.
+    @Published var connectionState: RemoteWindowConnectionState = .connected
+
     /// The window title, rendered inline before the pill on the leading edge (so the
     /// pill sits right after the title). Kept in sync with the window's `title`.
     @Published var title: String = ""
@@ -29,17 +34,52 @@ final class MachinePillModel: ObservableObject {
 }
 
 /// The rounded "● name" capsule identifying which machine a window's terminals run
-/// on. Renders nothing when `machineName` is nil.
+/// on. Renders nothing when `machineName` is nil. The dot reflects the window's
+/// connection status (WP-D1): green = connected, yellow = reconnecting,
+/// red = disconnected; a short status suffix is shown while not connected.
 struct MachinePillCapsule: View {
     let machineName: String?
+    var connectionState: RemoteWindowConnectionState = .connected
+
+    private var dotColor: Color {
+        switch connectionState {
+        case .connected: return .green
+        case .reconnecting: return .yellow
+        case .disconnected: return .red
+        }
+    }
+
+    private var label: String {
+        guard let machineName else { return "" }
+        switch connectionState {
+        case .connected:
+            return machineName
+        case .reconnecting(let attempt):
+            return "\(machineName) — reconnecting… (\(attempt))"
+        case .disconnected:
+            return "\(machineName) — disconnected"
+        }
+    }
+
+    private var helpText: String {
+        guard let machineName else { return "" }
+        switch connectionState {
+        case .connected:
+            return "Terminal runs on \(machineName)"
+        case .reconnecting(let attempt):
+            return "Connection to \(machineName) lost — reconnecting (attempt \(attempt))"
+        case .disconnected:
+            return "Connection to \(machineName) lost — could not reconnect"
+        }
+    }
 
     var body: some View {
-        if let machineName {
+        if machineName != nil {
             HStack(spacing: 5) {
                 Circle()
-                    .fill(Color.green)
+                    .fill(dotColor)
                     .frame(width: 6, height: 6)
-                Text(machineName)
+                Text(label)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
@@ -50,8 +90,8 @@ struct MachinePillCapsule: View {
                 Capsule()
                     .fill(.quaternary)
             )
-            .help("Terminal runs on \(machineName)")
-            .accessibilityLabel("Remote machine \(machineName)")
+            .help(helpText)
+            .accessibilityLabel(helpText)
         }
     }
 }
@@ -81,7 +121,9 @@ struct MachineTitlePillView: View {
                 Button {
                     model.onTap?()
                 } label: {
-                    MachinePillCapsule(machineName: model.machineName)
+                    MachinePillCapsule(
+                        machineName: model.machineName,
+                        connectionState: model.connectionState)
                 }
                 .buttonStyle(.plain)
                 .help(model.machineName.map { "Open Activity Monitor for \($0)" } ?? "")

@@ -1093,8 +1093,9 @@ class AppDelegate: NSObject,
     /// handshake, blocking until connected. Returns nil on any failure. Pure C
     /// call with no app state — safe off the main thread (the restore path
     /// dials on a background queue so a slow/unreachable relay can't beachball
-    /// launch).
-    private static func dialRelay(
+    /// launch). Internal (not private) so the WP-D1 reconnect path in
+    /// `BaseTerminalController` re-dials through the same seam.
+    static func dialRelay(
         base: String,
         device: String,
         token: String

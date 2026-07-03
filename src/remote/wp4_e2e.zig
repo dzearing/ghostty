@@ -39,6 +39,20 @@
 //!      (`CwdUnavailable`, the drop-the-manifest-entry tier),
 //!   4. `ATTACH` by UUID (same args as `termio/Remote.zig`) → status=alive →
 //!      live DATA round-trip through the re-attached pane.
+//!
+//! ## Phase 3 — WP-D1 connection-status proof (reconnect state machine)
+//! Proves the client-side §5.1 FSM + the primitives the GUI's reconnect loop
+//! (BaseTerminalController, WP-D1) drives, against a real agent DEATH:
+//!   1. dial, OPEN a session, register a state observer (the same seam
+//!      `ghostty_remote_connection_set_state_callback` exposes to Swift),
+//!   2. KILL the agent under the live connection → the reader EOF must drive
+//!      CONNECTED → RECONNECTING (§5.2) — the GUI's yellow-pill trigger,
+//!   3. start a fresh agent (the "agent is back" retry window) → the retry
+//!      loop's dial+handshake step succeeds,
+//!   4. probe the old session UUID on the new agent → fails cleanly
+//!      (a restarted agent lost its in-memory sessions) — the GUI's terminal
+//!      `disconnected` tier. (The happy re-ATTACH path is Phase 2: sessions
+//!      survive a CONNECTION drop while the agent lives.)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -111,17 +125,24 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Tear the agent down.
-    _ = child.kill() catch {};
-    reaped = true;
+    // ---- Phase 3: WP-D1 connection-status proof (kills the shared agent as
+    // its trigger, so it runs last). ----
+    const state_ok = runStateProof(alloc, agent_path, port, &child) catch |err| {
+        diag("[wp4-e2e] FAIL (state): {s}\n", .{@errorName(err)});
+        _ = child.kill() catch {};
+        reaped = true;
+        std.process.exit(1);
+    };
+    reaped = true; // the state proof killed (and reaped) the shared agent.
 
-    if (restore_ok) {
+    if (restore_ok and state_ok) {
         const stdout = std.fs.File.stdout();
         stdout.writeAll("PASS: Connection.openChannel round-tripped '" ++ marker ++ "' over TCP against the real channel-authoritative agent\n") catch {};
         stdout.writeAll("PASS: WP-D2 restore — session survived the dropped connection; GET_CWD probe + ATTACH-by-UUID round-tripped '" ++ restore_marker ++ "' on re-dial\n") catch {};
+        stdout.writeAll("PASS: WP-D1 status — agent death drove CONNECTED->RECONNECTING; retry-dial to a fresh agent handshook; a gone session probe failed cleanly (disconnected tier)\n") catch {};
         std.process.exit(0);
     } else {
-        diag("[wp4-e2e] FAIL (restore): see diagnostics above\n", .{});
+        diag("[wp4-e2e] FAIL: see diagnostics above\n", .{});
         std.process.exit(1);
     }
 }
@@ -226,6 +247,134 @@ fn runRestoreProof(alloc: Allocator, port: u16) !bool {
 
     try dialed.conn.writeInput(pane, "echo " ++ restore_marker ++ "\r");
     return drainForMarker(alloc, dialed.conn, pane, restore_marker);
+}
+
+/// WP-D1 connection-status proof. Kills the SHARED agent (`child`) as its
+/// disconnect trigger — must run last. On return (ok or error before the kill,
+/// which the caller handles) the shared agent is dead and reaped.
+fn runStateProof(
+    alloc: Allocator,
+    agent_path: []const u8,
+    port: u16,
+    child: *std.process.Child,
+) !bool {
+    // The observer the GUI registers via
+    // `ghostty_remote_connection_set_state_callback` (same `setStateHandler`
+    // seam). It must not call back into the connection (fired under the state
+    // lock), so it only records atomically — exactly like the Swift trampoline.
+    const Recorder = struct {
+        saw_reconnecting: std.atomic.Value(bool) = .{ .raw = false },
+        fn handler(
+            ctx: *anyopaque,
+            _: *connection.Connection,
+            _: connection.LinkState.State,
+            new: connection.LinkState.State,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (new == .reconnecting) self.saw_reconnecting.store(true, .monotonic);
+        }
+    };
+    var rec: Recorder = .{};
+
+    // 1. The "live window": dial + OPEN with the observer registered.
+    var dialed = try tcp_dial.dial(alloc, "127.0.0.1", port, .raw);
+    defer dialed.deinit();
+    dialed.conn.setStateHandler(&rec, Recorder.handler);
+
+    const pane = try dialed.conn.openChannel(.{
+        .rows = 24,
+        .cols = 80,
+        .term = "xterm-ghostty",
+    });
+    defer dialed.conn.closeChannel(pane);
+    const session_id = try alloc.dupe(u8, pane.session_id);
+    defer alloc.free(session_id);
+    if (dialed.conn.state() != .connected) {
+        diag("[wp4-e2e] state FAIL: expected connected after open, got {s}\n", .{
+            @tagName(dialed.conn.state()),
+        });
+        return false;
+    }
+    diag("[wp4-e2e] state: session {s} open, state=connected; killing the agent\n", .{session_id});
+
+    // 2. Kill the agent under the live connection (the WP-D1 acceptance
+    // trigger: "kill the agent under a live window").
+    _ = child.kill() catch {};
+
+    // 3. Reader EOF must drive CONNECTED → RECONNECTING (§5.2) promptly — this
+    // is what turns the GUI pill yellow and starts its retry loop.
+    {
+        const deadline = std.time.milliTimestamp() + 5000;
+        while (std.time.milliTimestamp() < deadline) {
+            if (rec.saw_reconnecting.load(.monotonic) and
+                dialed.conn.state() == .reconnecting) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        if (!rec.saw_reconnecting.load(.monotonic) or dialed.conn.state() != .reconnecting) {
+            diag("[wp4-e2e] state FAIL: no reconnecting transition after agent death (state={s})\n", .{
+                @tagName(dialed.conn.state()),
+            });
+            return false;
+        }
+    }
+    diag("[wp4-e2e] state: observed CONNECTED->RECONNECTING after agent death\n", .{});
+
+    // 4. "The agent comes back within the retry window": start a fresh agent
+    // and prove the retry loop's dial+handshake step succeeds against it.
+    const port2 = try freePort();
+    var addr_buf: [32]u8 = undefined;
+    const listen_arg = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port2});
+    var child2 = try spawnAgent(alloc, agent_path, listen_arg);
+    var reaped2 = false;
+    defer if (!reaped2) {
+        _ = child2.kill() catch {};
+    };
+    try waitForListening(alloc, &child2);
+
+    var dialed2 = try tcp_dial.dial(alloc, "127.0.0.1", port2, .raw);
+    defer dialed2.deinit();
+    diag("[wp4-e2e] state: retry-dial to the fresh agent handshook OK\n", .{});
+
+    // 5. A RESTARTED agent lost its in-memory sessions: the liveness probe for
+    // the old UUID must fail cleanly — the GUI's terminal `disconnected` tier
+    // (keep the window, stop retrying). No hang, no crash.
+    if (dialed2.conn.queryCwdTimeout(session_id, 5 * std.time.ns_per_s)) |p| {
+        alloc.free(p);
+        diag("[wp4-e2e] state FAIL: restarted agent unexpectedly knew the old session\n", .{});
+        return false;
+    } else |err| switch (err) {
+        error.CwdUnavailable => {},
+        else => return err,
+    }
+    diag("[wp4-e2e] state: gone-session probe failed cleanly (disconnected tier)\n", .{});
+
+    _ = child2.kill() catch {};
+    reaped2 = true;
+    return true;
+}
+
+/// Spawn an agent process on `listen_arg` with the raw encoding pinned (like
+/// main's shared agent). The caller must `waitForListening` and kill/reap it.
+fn spawnAgent(
+    alloc: Allocator,
+    agent_path: []const u8,
+    listen_arg: []const u8,
+) !std.process.Child {
+    var child = std.process.Child.init(
+        &.{ agent_path, "--listen", listen_arg },
+        alloc,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try cloneEnv(alloc, &env);
+    try env.put("GHOZTTY_AGENT_ENCODING", "raw");
+    child.env_map = &env;
+    try child.spawn();
+    // `spawn` consumed the env/argv; drop the dangling pointer for hygiene.
+    child.env_map = null;
+    return child;
 }
 
 /// Drain `pane`'s inbound ring until `needle` shows up as completed shell

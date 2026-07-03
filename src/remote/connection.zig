@@ -980,6 +980,16 @@ pub const Connection = struct {
         self.state_handler = handler;
     }
 
+    /// Clear the link-state observer. Takes `state_mutex`, so on return any
+    /// in-flight handler invocation has completed and no further one can fire —
+    /// the caller may then free whatever `ctx` pointed at (the teardown-safety
+    /// counterpart to `setStateHandler`, used by the C-API handle destroy path).
+    pub fn clearStateHandler(self: *Connection) void {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        self.state_handler = null;
+    }
+
     /// The current link state (§5.1). Thread-safe (takes `state_mutex`).
     pub fn state(self: *Connection) LinkState.State {
         self.state_mutex.lock();

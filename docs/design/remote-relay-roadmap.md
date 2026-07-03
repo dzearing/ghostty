@@ -44,6 +44,12 @@ Commits on `feature/remote-machines`:
   close removes the entry, quit keeps it; restore failures are silent (no modal);
   protocol flow proven by the extended `wp4-e2e` harness (GUI quit/reopen verify
   pending)
+- WP-D1 — connection status surface + reconnect: §5.1 `LinkState` exposed over C
+  (`ghostty_remote_connection_state`/`_set_state_callback`); per-window reconnect
+  machine in `BaseTerminalController` (backoff dial → `GET_CWD` probe →
+  re-`ATTACH` swap; exhausted/gone ⇒ `disconnected`, window kept); pill dot
+  green/yellow/red + status suffix (local suppression lifted while degraded);
+  proven by `wp4-e2e` Phase 3 (GUI pill flow verify pending)
 
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
@@ -245,10 +251,29 @@ able to take one WP with only this doc + the repo.
   deferred debug-app relaunch. "Add" guided flow deferred to Phase B (device-code).
 
 ### Phase D — Resilience
-- **WP-D1 — Connection status surface.** *Goal:* online/offline/reconnecting per
-  resource in the **Activity Monitor** + status pill; reconnect state machine (spec §5).
-  *Accept:* kill a host's connector → UI shows offline/reconnecting; recovery shows
-  online.
+- **WP-D1 — Connection status surface. ✅ BUILT (GUI verify pending).** *Goal:*
+  online/offline/reconnecting per resource in the **Activity Monitor** + status
+  pill; reconnect state machine (spec §5). *Accept:* kill a host's connector →
+  UI shows offline/reconnecting; recovery shows online. *Shipped:* the Zig §5.1
+  `LinkState` FSM (already reaching `reconnecting` on reader-EOF/missed
+  heartbeats) is now exposed over the C ABI
+  (`ghostty_remote_connection_state` + `_set_state_callback`, teardown-safe via
+  `Connection.clearStateHandler`); `RemoteConnection` (Swift) mirrors it and
+  posts `.ghosttyRemoteConnectionLinkDidChange`; `BaseTerminalController` runs
+  the per-WINDOW reconnect machine (`RemoteWindowConnectionState`:
+  `connected → reconnecting(1..5, backoff 1/2/4/8/15s ≈ 30s) → connected |
+  disconnected`) — each attempt re-dials (relay or TCP), `GET_CWD`-probes the
+  session, and on success swaps in a fresh root surface re-`ATTACH`ed by UUID
+  (the WP-D2 mechanism, same single-root-pane scope); session-gone/evicted or
+  exhausted retries ⇒ `disconnected`, window KEPT. Pill dot is now
+  green/yellow/red with a "— reconnecting… (N)"/"— disconnected" suffix;
+  local-machine pill suppression stays, EXCEPT a degraded window always shows
+  the pill (a frozen window must say why). Chooser online/offline dots =
+  WP-C2; Activity Monitor cards already show live/connecting/unreachable dots
+  (unchanged). Proven headlessly by `wp4-e2e` Phase 3 (agent kill →
+  CONNECTED→RECONNECTING observed via the same handler seam; retry-dial to a
+  fresh agent handshakes; gone-session probe fails cleanly). GUI pill
+  yellow→green/red flow still needs the deferred debug-app relaunch verify.
 - **WP-D2 — Window restore over relay. ✅ BUILT (GUI quit/reopen verify pending).**
   *Goal:* local manifest of open remote sessions; on relaunch re-`ATTACH` by UUID
   through the relay. *Accept:* open remote windows, quit, reopen → windows restored

@@ -237,6 +237,29 @@ final class MachineRegistry: ObservableObject {
     }
 }
 
+/// WP-D1: the per-WINDOW connection status shown in the titlebar pill and
+/// driven by `BaseTerminalController`'s reconnect state machine. Distinct from
+/// `RemoteConnection.LinkState` (the transport-level FSM of ONE connection
+/// handle): a window can outlive its original connection handle by dialing a
+/// replacement and re-`ATTACH`ing, so its status spans handles.
+enum RemoteWindowConnectionState: Equatable {
+    /// The window's connection is live.
+    case connected
+    /// The connection dropped; the controller is retrying (dial + re-ATTACH)
+    /// with backoff. `attempt` is 1-based for the "attempt N" UI.
+    case reconnecting(attempt: Int)
+    /// Retries exhausted (or the session is gone / we were evicted). The
+    /// window is kept, clearly marked; no further retries.
+    case disconnected
+}
+
+extension Notification.Name {
+    /// Posted (on the main queue) by `RemoteConnection` when its transport-level
+    /// link state changes. Object is the `RemoteConnection`.
+    static let ghosttyRemoteConnectionLinkDidChange =
+        Notification.Name("ghosttyRemoteConnectionLinkDidChange")
+}
+
 /// Strong owner of a live `ghostty_remote_connection_t`.
 ///
 /// The underlying connection handle may be shared by every surface/split in a
@@ -249,9 +272,57 @@ final class RemoteConnection {
     let handle: ghostty_remote_connection_t
     let machine: Machine
 
+    /// Transport-level link state (spec §5.1), mirrored from the Zig FSM.
+    /// Values match `GHOSTTY_REMOTE_CONN_*`.
+    enum LinkState: Int32 {
+        case connected = 0
+        case degraded = 1
+        case reconnecting = 2
+        case reattaching = 3
+        case dead = 4
+    }
+
+    /// The last observed transport link state. Main-thread only (updated by the
+    /// main-queue hop in the state callback).
+    private(set) var linkState: LinkState = .connected
+
+    /// Stable, weakly-owning context for the C state callback. The dispatched
+    /// main-queue blocks retain the box (not the connection), so a callback
+    /// that raced our dealloc resolves `owner` to nil instead of crashing.
+    private final class StateBox {
+        weak var owner: RemoteConnection?
+    }
+    private let stateBox = StateBox()
+
     init(handle: ghostty_remote_connection_t, machine: Machine) {
         self.handle = handle
         self.machine = machine
+
+        // Observe transport link-state transitions (WP-D1). The callback fires
+        // on a connection-internal thread with an internal lock held, so it
+        // must only capture the value and hop to the main queue.
+        stateBox.owner = self
+        ghostty_remote_connection_set_state_callback(handle, { state, userdata in
+            guard let userdata else { return }
+            let box = Unmanaged<StateBox>.fromOpaque(userdata).takeUnretainedValue()
+            DispatchQueue.main.async {
+                guard let owner = box.owner else { return }
+                let new = LinkState(rawValue: state) ?? .connected
+                guard owner.linkState != new else { return }
+                owner.linkState = new
+                NotificationCenter.default.post(
+                    name: .ghosttyRemoteConnectionLinkDidChange,
+                    object: owner)
+            }
+        }, Unmanaged.passUnretained(stateBox).toOpaque())
+
+        // Seed from the live FSM: a transition that happened BEFORE the
+        // callback registered (e.g. the link dropped right after the dial)
+        // would otherwise never be observed — the FSM only notifies on change.
+        let seeded = ghostty_remote_connection_state(handle)
+        if seeded >= 0, let state = LinkState(rawValue: seeded) {
+            linkState = state
+        }
     }
 
     /// Current round-trip latency to the agent in milliseconds, or nil if
@@ -262,6 +333,12 @@ final class RemoteConnection {
     }
 
     deinit {
+        // Clear the state callback FIRST: this synchronizes with an in-flight
+        // invocation (once it returns, no further callback can fire), so the
+        // free below can never race a callback into freed memory. Blocks
+        // already dispatched to main retain `stateBox` and no-op via the weak
+        // `owner`.
+        ghostty_remote_connection_set_state_callback(handle, nil, nil)
         // Last reference gone (window closed): release the connection. This is
         // the single, authoritative free site for the handle.
         ghostty_remote_connection_free(handle)

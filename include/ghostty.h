@@ -1316,6 +1316,34 @@ GHOSTTY_API bool ghostty_remote_connection_wait_handshake(
 GHOSTTY_API int32_t ghostty_remote_connection_latency_ms(
     ghostty_remote_connection_t);
 
+// Connection link-state values (remote-machines spec §5.1 FSM; WP-D1).
+// Mirrors the client connection's LinkState.State.
+typedef enum {
+  GHOSTTY_REMOTE_CONN_CONNECTED = 0,
+  GHOSTTY_REMOTE_CONN_DEGRADED = 1,
+  GHOSTTY_REMOTE_CONN_RECONNECTING = 2,
+  GHOSTTY_REMOTE_CONN_REATTACHING = 3,
+  GHOSTTY_REMOTE_CONN_DEAD = 4,
+} ghostty_remote_connection_state_e;
+
+// Current link state of the connection (a GHOSTTY_REMOTE_CONN_* value), or -1
+// if the connection isn't established.
+GHOSTTY_API int32_t ghostty_remote_connection_state(
+    ghostty_remote_connection_t);
+
+// Callback fired on every connection link-state transition. `state` is a
+// GHOSTTY_REMOTE_CONN_* value. Fires on a connection-internal thread while an
+// internal lock is held: do NOT call any ghostty_remote_connection_* API from
+// the callback; copy what you need and hop to another queue.
+typedef void (*ghostty_remote_state_cb)(int32_t state, void* userdata);
+
+// Register (or clear, with a NULL callback) the link-state observer. Clearing
+// synchronizes with an in-flight invocation: once this returns after passing
+// NULL, no further callback fires and userdata may be freed. A second register
+// replaces the callback.
+GHOSTTY_API void ghostty_remote_connection_set_state_callback(
+    ghostty_remote_connection_t, ghostty_remote_state_cb, void* userdata);
+
 // The agent's self-reported hostname from its HELLO, or NULL if the peer
 // didn't send one (older agent) or the handshake hasn't completed. Owned by
 // the connection, valid until _free; copy it immediately.

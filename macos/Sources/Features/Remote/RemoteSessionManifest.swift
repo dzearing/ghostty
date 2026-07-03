@@ -92,6 +92,15 @@ final class RemoteSessionManifest {
         saveLocked()
     }
 
+    /// The recorded agent session UUID for an entry, if known. Used by the
+    /// WP-D1 reconnect path as a fallback re-ATTACH target when the live
+    /// surface hasn't published its session id.
+    func sessionID(for id: UUID) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.first(where: { $0.id == id })?.sessionID
+    }
+
     /// Remove an entry (clean close: user closed the window or the remote
     /// child exited). Removing an unknown id is a no-op.
     func remove(_ id: UUID) {

@@ -606,6 +606,15 @@ const ghostty_host_metrics_s = extern struct {
 /// the fields out. `userdata` is the opaque pointer passed to `_metrics_subscribe`.
 const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyopaque) callconv(.c) void;
 
+/// Callback invoked on every connection link-state transition (§5.1 FSM;
+/// WP-D1 connection-status surface). `state` is a `GHOSTTY_REMOTE_CONN_*`
+/// value (the integer mirror of `connection.LinkState.State`). NOTE: it fires
+/// on a connection-internal thread (reader/heartbeat) while the connection's
+/// state lock is held — the callee must NOT call back into any
+/// `ghostty_remote_connection_*` API from the callback; copy what it needs
+/// and return promptly (the Swift side hops to the main queue).
+const GhosttyRemoteStateCallback = *const fn (i32, ?*anyopaque) callconv(.c) void;
+
 /// One process-table row (activity monitor, §9.3 process view). Mirrors the wire
 /// `Proc`. `name`/`user`/`cmd` are always non-null NUL-terminated C strings — an
 /// empty string means "unavailable" (the agent left `user`/`cmd` null), NEVER a
@@ -662,6 +671,15 @@ pub const RemoteConnectionHandle = struct {
         userdata: ?*anyopaque,
     };
 
+    /// Trampoline state for the link-state callback (WP-D1): the C callback +
+    /// the caller's opaque `userdata`. Stored inline on the handle (stable for
+    /// the handle's life) so its address can serve as the Zig `StateHandler`
+    /// ctx. See `state_cb` / `stateTrampoline`.
+    pub const StateTrampoline = struct {
+        cb: GhosttyRemoteStateCallback,
+        userdata: ?*anyopaque,
+    };
+
     alloc: Allocator,
 
     /// Dial parameters (duped into `alloc`, owned by this handle).
@@ -684,6 +702,13 @@ pub const RemoteConnectionHandle = struct {
     /// `&self.metrics_cb.?` as the handler ctx, so it must stay pinned for the
     /// life of the subscription (the handle is heap-allocated and stable).
     metrics_cb: ?MetricsTrampoline = null,
+
+    /// Trampoline state for the link-state observer (WP-D1), or null when not
+    /// registered. Same pinning discipline as `metrics_cb`: lives inline on the
+    /// heap-allocated handle so `&self.state_cb.?` stays valid for the life of
+    /// the registration; cleared (with the connection's `clearStateHandler`,
+    /// which synchronizes against an in-flight invocation) before teardown.
+    state_cb: ?StateTrampoline = null,
 
     /// The live TCP transport, or null. Populated by
     /// `ghostty_remote_connection_new_tcp` (WP4): a direct TCP dial to a
@@ -755,6 +780,14 @@ pub const RemoteConnectionHandle = struct {
         if (self.metrics_cb != null) {
             if (self.conn()) |c| c.unsubscribeMetrics();
             self.metrics_cb = null;
+        }
+        // Same for the link-state observer (WP-D1): the transport shutdown below
+        // drives reader-EOF transitions, which must NOT fire into a caller that
+        // is in the middle of freeing us. `clearStateHandler` takes the state
+        // lock, so any in-flight callback has returned when it does.
+        if (self.state_cb != null) {
+            if (self.conn()) |c| c.clearStateHandler();
+            self.state_cb = null;
         }
         // `Transport.deinit` shuts the connection down, closes the streams (the
         // ssh children observe EOF on stdin and exit), reaps both children, and
@@ -2381,6 +2414,62 @@ pub const CAPI = struct {
         const conn = handle.conn() orelse return -1;
         const ms = conn.latencyMs() orelse return -1;
         return std.math.cast(i32, ms) orelse std.math.maxInt(i32);
+    }
+
+    /// Integer mirror of `connection.LinkState.State` for the C ABI (WP-D1).
+    /// Kept in one place so `_state` and the state callback agree.
+    fn linkStateToC(s: remote_connection.LinkState.State) i32 {
+        return switch (s) {
+            .connected => 0, // GHOSTTY_REMOTE_CONN_CONNECTED
+            .degraded => 1, // GHOSTTY_REMOTE_CONN_DEGRADED
+            .reconnecting => 2, // GHOSTTY_REMOTE_CONN_RECONNECTING
+            .reattaching => 3, // GHOSTTY_REMOTE_CONN_REATTACHING
+            .dead => 4, // GHOSTTY_REMOTE_CONN_DEAD
+        };
+    }
+
+    /// Current link state of the connection (§5.1 FSM) as a
+    /// `GHOSTTY_REMOTE_CONN_*` value, or -1 if the connection isn't established.
+    export fn ghostty_remote_connection_state(
+        handle: *RemoteConnectionHandle,
+    ) i32 {
+        const conn = handle.conn() orelse return -1;
+        return linkStateToC(conn.state());
+    }
+
+    /// Zig-side `StateHandler` trampoline: map the FSM state to its C value and
+    /// invoke the stored C callback. Fires under the connection's state lock on
+    /// an internal thread — see `GhosttyRemoteStateCallback`.
+    fn stateTrampoline(
+        ctx: *anyopaque,
+        _: *remote_connection.Connection,
+        _: remote_connection.LinkState.State,
+        new: remote_connection.LinkState.State,
+    ) void {
+        const tramp: *const RemoteConnectionHandle.StateTrampoline = @ptrCast(@alignCast(ctx));
+        tramp.cb(linkStateToC(new), tramp.userdata);
+    }
+
+    /// Register (or, with a NULL callback, clear) an observer for connection
+    /// link-state transitions (WP-D1). The callback fires on a connection
+    /// thread with the state lock held — it must not call back into any
+    /// `ghostty_remote_connection_*` API; hop to another queue. Clearing
+    /// synchronizes with an in-flight invocation: once this returns with NULL,
+    /// no further callback fires and `userdata` may be freed. A second register
+    /// replaces the callback.
+    export fn ghostty_remote_connection_set_state_callback(
+        handle: *RemoteConnectionHandle,
+        callback: ?GhosttyRemoteStateCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        const conn = handle.conn() orelse return;
+        const cb = callback orelse {
+            conn.clearStateHandler();
+            handle.state_cb = null;
+            return;
+        };
+        handle.state_cb = .{ .cb = cb, .userdata = userdata };
+        conn.setStateHandler(&handle.state_cb.?, stateTrampoline);
     }
 
     /// The agent's self-reported hostname from its HELLO, or null if the peer
