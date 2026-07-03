@@ -917,6 +917,14 @@ class IPCServer {
                 if resolvedToken.isEmpty {
                     resolvedToken = await RelayAccount.resolveToken() ?? ""
                 }
+                // Signed out (and no dev token, no explicit --token): refuse
+                // BEFORE dialing — a tokenless relay dial is a guaranteed
+                // 401. The CLI gets this as the command's error output; no
+                // GUI alert from the IPC path.
+                guard !resolvedToken.isEmpty else {
+                    errorMessage = "not signed in: sign in via New Remote Window (Cmd-Shift-N) or pass --token= to open relay windows"
+                    return
+                }
                 errorMessage = appDelegate.openRemoteWindow(
                     relay: relay!,
                     device: device!,

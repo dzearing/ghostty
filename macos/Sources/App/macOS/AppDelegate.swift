@@ -94,6 +94,12 @@ class AppDelegate: NSObject,
     /// next launch); only a user-initiated close removes an entry.
     private(set) var isQuitting: Bool = false
 
+    /// WP-B2: true while sign-out is closing account-backed (relay) remote
+    /// windows. Same contract as `isQuitting`: `windowWillClose` preserves
+    /// those windows' `RemoteSessionManifest` entries so a later sign-in can
+    /// restore (re-`ATTACH`) them. See `relayAccountDidSignOut()`.
+    private(set) var isSigningOut: Bool = false
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -1030,7 +1036,14 @@ class AppDelegate: NSObject,
                 // TCP machines use the direct host:port dial.
                 if let base = machine.relayBase, let device = machine.deviceID {
                     Task { @MainActor in
-                        let token = await RelayAccount.resolveToken() ?? ""
+                        // Check the token seam BEFORE dialing: signed out with
+                        // no dev token ⇒ one clear refusal instead of a
+                        // tokenless dial into a guaranteed 401 that would
+                        // surface as the misleading "couldn't connect" modal.
+                        guard let token = await RelayAccount.resolveToken() else {
+                            Self.presentSignInRequiredAlert()
+                            return
+                        }
                         self.openRemoteWindow(relay: base, device: device, token: token, name: machine.name)
                     }
                 } else {
@@ -1074,6 +1087,15 @@ class AppDelegate: NSObject,
         name: String? = nil,
         onOpen: ((TerminalController) -> Void)? = nil
     ) -> String? {
+        // Defense in depth for the signed-out case: every caller resolves the
+        // WP-B2 token seam before calling, but an empty bearer must never
+        // reach the dial — it would 401 and surface as the misleading
+        // "couldn't connect" alert. Refuse with the sign-in message instead.
+        guard !token.isEmpty else {
+            Self.presentSignInRequiredAlert()
+            return "not signed in: sign in (or set GHOSTTY_RELAY_TOKEN) to open relay windows"
+        }
+
         // Dial the agent through the relay. This blocks through the handshake and
         // returns a connection handle, or NULL on failure.
         guard let handle = Self.dialRelay(base: relay, device: device, token: token) else {
@@ -1200,9 +1222,99 @@ class AppDelegate: NSObject,
             // signed-in account's ID token, dev env token fallback. Resolved
             // ONCE up front (may await a token refresh), then the blocking
             // dials run on a background queue as before.
-            let token = await RelayAccount.resolveToken() ?? ""
-            self?.restoreRemoteWindows(entries: entries, token: token)
+            //
+            // Signed out with no dev token ⇒ NO dial at all: put every entry
+            // back untouched and skip silently (the restore path never
+            // alerts). A later sign-in replays them via
+            // `relayAccountDidSignIn()`; a later launch retries the same way.
+            guard let token = await RelayAccount.resolveToken() else {
+                for entry in entries { RemoteSessionManifest.shared.reinstate(entry) }
+                return
+            }
+
+            // Double-restore guard: an entry still bound to an OPEN window
+            // (its controller carries the entry id) must not be re-attached —
+            // a second ATTACH to the same session would evict the live window
+            // (spec §5.3). Put those straight back; restore only the rest.
+            let openEntryIDs = Set(TerminalController.all.compactMap(\.remoteManifestEntryID))
+            let (restore, reinstate) = RemoteSessionManifest.partitionForRestore(
+                entries, openEntryIDs: openEntryIDs)
+            for entry in reinstate { RemoteSessionManifest.shared.reinstate(entry) }
+            guard !restore.isEmpty else { return }
+            self?.restoreRemoteWindows(entries: restore, token: token)
         }
+    }
+
+    // MARK: Relay account lifecycle (WP-B2 sign-out/sign-in window handling)
+
+    /// Sign-out hook, called by `RelayAccount.signOut()` AFTER the credentials
+    /// are cleared: close every account-backed remote window. "Account-backed"
+    /// means the window's machine is a RELAY machine (`remoteMachine.isRelay`)
+    /// — direct-TCP remote windows are not account resources and stay open.
+    ///
+    /// Closing runs with `isSigningOut` set, which — exactly like the
+    /// `isQuitting` quit path — preserves each window's
+    /// `RemoteSessionManifest` entry through `windowWillClose`, so a later
+    /// sign-in can restore (re-`ATTACH`) the windows. The agent keeps the
+    /// detached sessions alive (detach ≠ terminate — nothing is terminated
+    /// here). `windowWillClose` also cancels the window's WP-D1 reconnect
+    /// loop (generation bump + observer removal) before anything can re-dial.
+    func relayAccountDidSignOut() {
+        isSigningOut = true
+        defer { isSigningOut = false }
+        for controller in TerminalController.all {
+            guard controller.remoteMachine?.isRelay == true else { continue }
+            // close() (not performClose): no close-confirmation prompt — the
+            // remote session persists on the agent, nothing is being killed.
+            controller.window?.close()
+        }
+    }
+
+    /// Sign-in hook, called by `RelayAccount.signIn()` on success: replay the
+    /// manifest entries preserved at sign-out through the SAME restore path
+    /// as launch (`restoreRemoteWindows()` — dial + liveness-probe +
+    /// re-`ATTACH` on a background queue; sessions that died meanwhile drop
+    /// their entries silently).
+    ///
+    /// Deferred until no modal session is running: sign-in happens from the
+    /// app-modal machine chooser, and restored windows shouldn't fight the
+    /// modal panel for key status while it's still up.
+    func relayAccountDidSignIn() {
+        restoreRemoteWindowsAfterModal()
+    }
+
+    /// Run `restoreRemoteWindows()` once `NSApp` has no modal session (polls
+    /// on the main queue; delivered during the modal session because the
+    /// modal panel run-loop mode is a common mode). The chooser typically
+    /// closes within seconds of a sign-in; if some modal session is still
+    /// running after ~60s, restore anyway (windows just open behind it).
+    private func restoreRemoteWindowsAfterModal(attempt: Int = 0) {
+        if NSApp.modalWindow == nil || attempt >= 120 {
+            restoreRemoteWindows()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.restoreRemoteWindowsAfterModal(attempt: attempt + 1)
+        }
+    }
+
+    /// The single "you're signed out" refusal for account-backed dial paths
+    /// (chooser dial, remote-window/tab inheritance, defensive dial guard).
+    /// One small informational alert; the visibility guard keeps concurrent
+    /// refusals from stacking into a modal storm (extra requests are simply
+    /// dropped while it's up).
+    private static var signInRequiredAlertVisible = false
+    @MainActor
+    static func presentSignInRequiredAlert() {
+        guard !signInRequiredAlertVisible else { return }
+        signInRequiredAlertVisible = true
+        defer { signInRequiredAlertVisible = false }
+        let alert = NSAlert()
+        alert.messageText = "Sign in to open remote windows"
+        alert.informativeText = "Remote machines belong to your account. Use New Remote Window (⇧⌘N) → Sign In with Google, then try again."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     /// Second half of `restoreRemoteWindows()`: dial + probe + reopen each

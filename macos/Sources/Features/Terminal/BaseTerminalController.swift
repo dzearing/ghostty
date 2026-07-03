@@ -1634,10 +1634,15 @@ class BaseTerminalController: NSWindowController,
         // exited) removes this window from the remote-session restore
         // manifest. App QUIT must NOT — the agent keeps detached sessions
         // alive (detach ≠ terminate), so entries left behind at quit are
-        // re-attached on the next launch.
-        if let entryID = remoteManifestEntryID,
-           (NSApp.delegate as? AppDelegate)?.isQuitting != true {
-            RemoteSessionManifest.shared.remove(entryID)
+        // re-attached on the next launch. Sign-OUT likewise must not: it
+        // closes account-backed windows with `isSigningOut` set
+        // (`AppDelegate.relayAccountDidSignOut()`) so a later sign-in can
+        // restore them through the same manifest replay.
+        if let entryID = remoteManifestEntryID {
+            let delegate = NSApp.delegate as? AppDelegate
+            if delegate?.isQuitting != true && delegate?.isSigningOut != true {
+                RemoteSessionManifest.shared.remove(entryID)
+            }
         }
 
         // Emit a final bell-state transition so any observers can clear state
@@ -1828,8 +1833,21 @@ class BaseTerminalController: NSWindowController,
                 // Resolve the relay bearer through the WP-B2 seam BEFORE
                 // hopping to the dial thread (resolution may await a token
                 // refresh; the dial thread stays purely blocking C calls).
-                let token = machine.isRelay ? (await RelayAccount.resolveToken() ?? "") : ""
+                let token: String?
+                if machine.isRelay {
+                    // nil ⇒ signed out with no dev token: a re-dial is a
+                    // guaranteed 401, so don't dial at all. Mark the window
+                    // disconnected (silently — reconnect never alerts) and
+                    // keep its manifest entry; sign-in restores it.
+                    token = await RelayAccount.resolveToken()
+                } else {
+                    token = ""
+                }
                 guard let self, generation == self.remoteReconnectGeneration else { return }
+                guard let token else {
+                    self.remoteConnectionState = .disconnected
+                    return
+                }
 
             DispatchQueue.global(qos: .userInitiated).async {
                 // Dial + probe are blocking; never on the main thread.

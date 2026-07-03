@@ -133,6 +133,30 @@ final class RemoteSessionManifest {
         saveLocked()
     }
 
+    /// Split entries drained by `takeAll()` into those safe to restore and
+    /// those that must go straight back via `reinstate(_:)` because they are
+    /// still bound to an OPEN window (a live controller carries the entry id
+    /// as its `remoteManifestEntryID`). Re-attaching a session that already
+    /// has a live window would EVICT that window's client (spec §5.3); the
+    /// sign-in restore path can hit this when a window was opened via the
+    /// dev token while signed out. Pure and order-preserving, so the
+    /// suspend/replay bookkeeping is unit-testable.
+    static func partitionForRestore(
+        _ entries: [Entry],
+        openEntryIDs: Set<UUID>
+    ) -> (restore: [Entry], reinstate: [Entry]) {
+        var restore: [Entry] = []
+        var reinstate: [Entry] = []
+        for entry in entries {
+            if openEntryIDs.contains(entry.id) {
+                reinstate.append(entry)
+            } else {
+                restore.append(entry)
+            }
+        }
+        return (restore, reinstate)
+    }
+
     private func saveLocked() {
         if entries.isEmpty {
             defaults.removeObject(forKey: Self.defaultsKey)

@@ -185,6 +185,13 @@ final class RelayAccount: ObservableObject {
         refreshTask = nil
         self.email = email
         self.pictureURL = claims.picture.flatMap(URL.init(string:))
+        // Recover the remote windows suspended at sign-out: replay their
+        // preserved manifest entries through the launch-restore path. Only
+        // the real app account drives app-level window state (test instances
+        // with injected keychains must not).
+        if self === Self.shared {
+            (NSApp.delegate as? AppDelegate)?.relayAccountDidSignIn()
+        }
     }
 
     /// Forget the account: delete the Keychain item and drop the in-memory
@@ -196,6 +203,12 @@ final class RelayAccount: ObservableObject {
     /// (`GHOSTTY_RELAY_TOKEN`) remains available, sign-out empties the list
     /// (the dev token only repopulates it on the NEXT explicit refresh, e.g.
     /// reopening the chooser).
+    ///
+    /// And closes every open account-backed (relay) remote window via
+    /// `AppDelegate.relayAccountDidSignOut()`, preserving each window's
+    /// `RemoteSessionManifest` entry so `signIn()` can restore them. This is
+    /// unconditional for the same reason as the machine-list clear: the
+    /// windows are account resources regardless of any dev-token fallback.
     func signOut() {
         keychain.delete()
         cachedIDToken = nil
@@ -203,10 +216,15 @@ final class RelayAccount: ObservableObject {
         refreshTask = nil
         email = nil
         pictureURL = nil
-        // Only the real app account touches the shared registry (test
-        // instances with injected keychains must not).
+        // Only the real app account touches shared app state (test instances
+        // with injected keychains must not).
         if self === Self.shared {
             MachineRegistry.shared.clearRelayMachines()
+            // Account-backed remote windows must not outlive the account:
+            // close them now, preserving their manifest entries so a later
+            // sign-in restores them (the agent keeps the detached sessions
+            // alive — detach ≠ terminate).
+            (NSApp.delegate as? AppDelegate)?.relayAccountDidSignOut()
         }
     }
 

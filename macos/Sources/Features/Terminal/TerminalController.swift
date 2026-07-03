@@ -270,6 +270,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return
         }
 
+        // Signed out ⇒ no NEW account-backed surfaces (WP-B2), even though the
+        // parent's relay connection is already up. Sign-out closes account
+        // windows, so a relay parent still open here is a credential edge
+        // case — refuse consistently rather than mint new relay surfaces
+        // with no account. Direct-TCP parents are not account resources.
+        if parentRemote.machine.isRelay && !RelayAccount.hasCredentials {
+            AppDelegate.presentSignInRequiredAlert()
+            return
+        }
+
         BaseTerminalController.resolveRemoteInheritance(
             from: parentSurface,
             on: parentRemote.handle
@@ -488,6 +498,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if let parentRemote = parentController.remoteConnection,
            (baseConfig?.remoteConnection == nil),
            let parentSurface = parentController.focusedSurface {
+            // Signed out ⇒ no NEW account-backed surfaces (WP-B2) — same
+            // rule as `newWindowInheritingRemote`.
+            if parentRemote.machine.isRelay && !RelayAccount.hasCredentials {
+                AppDelegate.presentSignInRequiredAlert()
+                return nil
+            }
             BaseTerminalController.resolveRemoteInheritance(
                 from: parentSurface,
                 on: parentRemote.handle
