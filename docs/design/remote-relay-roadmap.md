@@ -86,6 +86,18 @@ Commits on `feature/remote-machines`:
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
 
+**2026-07-03 afternoon — `912299319` NAMESPACE PURGE:** all `com.mitchellh.*`
+identity strings → `com.dzearing.ghoztty.*` (debug bundle id, DockTile/UITests
+ids, Keychain service, ~40 notification names, UTType, pasteboard, queue
+labels, i18n domain, linux app-id/flatpak/desktop files; 53 files). HARD RULE
+(user): never use com.mitchellh.* — collides with upstream Ghostty on the same
+Mac (see the `ghoztty-no-mitchellh-namespace` memory). Deliberate leftovers:
+upstream URLs/credits, .po contents (regenerated), binary test fixture.
+Migration done: defaults exported old→new domain; Keychain item NOT copied
+(re-sign-in once); automation must target `com.dzearing.ghoztty.debug`.
+Also fixed latent bug: DockTilePlugin read the old suite the renamed release
+app never writes.
+
 **2026-07-03 mid-day — live dogfooding sprint (tip `a00550f84`; relay + `/dl`
 exe + install.ps1 all redeployed):**
 - `f2dbaeb2c` — Activity Monitor chart button dials RELAY machines via
