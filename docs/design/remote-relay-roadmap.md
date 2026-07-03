@@ -86,6 +86,47 @@ Commits on `feature/remote-machines`:
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
 
+**2026-07-03 mid-day — live dogfooding sprint (tip `a00550f84`; relay + `/dl`
+exe + install.ps1 all redeployed):**
+- `f2dbaeb2c` — Activity Monitor chart button dials RELAY machines via
+  `AppDelegate.dialRelay` (was TCP-only → silent no-op for account machines).
+- `ed8482d25` — SIGN-OUT CONTRACT (user-defined): sign-out closes all
+  account-backed windows (`isSigningOut` preserves their manifest entries),
+  every dial path (chooser/IPC/restore/reconnect/Cmd-N-inheritance) refuses
+  BEFORE dialing when signed out (one de-duped "Sign in…" alert; CLI gets error
+  text), sign-in replays the manifest (defers past the modal; double-restore
+  guard `partitionForRestore`).
+- `d538167e6` — TAILSCALE-STYLE BROWSER ENROLLMENT: `flow:"web"` on
+  enroll/start → relay-hosted `/enroll/<nonce>` → Google → `/enroll/callback`
+  (server-side exchange w/ new `GOOGLE_WEB_CLIENT_ID/_SECRET`; success page);
+  agent opens the default browser; device-code is now the headless fallback.
+  DEPLOYED but `web_enroll=false` until the user registers the Web client
+  (redirect URI `https://<fqdn>/enroll/callback`) and provides id+secret.
+- `ae77fbc1d` — agent tray Disconnect/Reconnect (`link_control.zig`: atomic
+  desired-state + ResetEvent + close-unblocks-read; tooltip/status line;
+  relay-mode only). Windows tray UI itself still needs on-box verification.
+- `881d09a91` — chooser primary button: "New" (was "Open"); "Restore (N)" when
+  the selected machine has manifest-restorable windows — restores ONLY that
+  machine's entries (`restoreRemoteWindows(matching:)`).
+- `71db69417` — agent SINGLE-INSTANCE guard (user hit 2 tray agents: installer
+  autostart + SMB watcher both supervising): named mutex `Local\GhozttyAgentDaemon`
+  (win) / flock `~/.config/ghoztty/agent.lock` (posix); daemon modes only
+  (`--stdio`/`--enroll` exempt); conflict = log + exit 183. Follow-up noted:
+  daemon doesn't re-read relay.env after re-enroll.
+- `37cca720a` — remote sessions advertise `TERM=xterm-256color` (was
+  xterm-ghostty — no terminfo on remote boxes; git/less printed "terminal is
+  not fully functional" on Windows) + agent sets `COLORTERM=truecolor`.
+- `a00550f84` — RENAME PROPAGATES: display name now wins over agent hostname in
+  the pill AND `AXGhosttyMachine` (ztabby consumes it); rename posts
+  `.ghosttyMachineDidRename` → open windows update pill/AX live; manifest
+  entries renamed too; `isLocalMachine` checks name AND hostname so suppression
+  survives renames.
+STILL OPEN: user to register the `ghoztty-web` OAuth client + paste id/secret
+(flips web enroll on); on-box Windows verification of tray items +
+single-instance (installer re-run picks up the new exe); GUI verify of the
+sign-out/restore cycle, New/Restore button, rename propagation, D1 pill
+walkthrough.
+
 **2026-07-03 morning — user-driven chooser polish + the SLEEP BUG (tip `a4e8e57c1`,
 relay + `/dl` exe redeployed):**
 - `9ce38cdaa`/`68d7baa8a` — signed-out chooser shows NO account machines (bug the
