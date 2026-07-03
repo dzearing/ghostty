@@ -22,8 +22,9 @@ enum WindowTarget: Hashable {
 /// Invokes `onSelect` with the chosen target (or `onCancel` if dismissed).
 struct MachineChooserView: View {
     /// Source of the machine list. Observed (not a snapshot) so rows update
-    /// live as the account device list is fetched from the relay on open
-    /// (WP-C2) and as rows are renamed/removed.
+    /// live as the account device list is fetched from the relay on open and
+    /// re-polled while the chooser stays open (WP-C2) and as rows are
+    /// renamed/removed.
     @ObservedObject var registry: MachineRegistry
     /// Live per-machine metrics for the remote rows, refreshed while the picker
     /// is open. Drives each remote row's subline in place of the IP:port.
@@ -45,6 +46,11 @@ struct MachineChooserView: View {
     /// Index into `targets` of the highlighted row. Bound to `List(selection:)`
     /// so the native selection highlight + focus ring track the keyboard.
     @State private var selectedIndex: Int = 0
+    /// Stable identity (registry UUID) of the highlighted MACHINE row, nil when
+    /// "Local" is highlighted. The background directory poll can insert/remove
+    /// rows above the highlight; re-anchoring by identity keeps the highlight
+    /// on the same machine instead of whatever slid into its index.
+    @State private var selectedMachineID: UUID?
     /// Index of the row currently under the pointer (for hover feedback).
     @State private var hoveredIndex: Int?
     @FocusState private var isFilterFocused: Bool
@@ -138,7 +144,7 @@ struct MachineChooserView: View {
                     .onSubmit { submit() }
                     .onChange(of: query) { _ in
                         // Keep the selection valid as the filtered list changes.
-                        clampSelection()
+                        reanchorSelection()
                     }
             }
             .padding([.top, .horizontal], 16)
@@ -159,7 +165,7 @@ struct MachineChooserView: View {
                             // not respond to clicks; a Button action does). A double
                             // click opens via a simultaneous gesture.
                             Button {
-                                selectedIndex = idx
+                                select(idx)
                             } label: {
                                 row(for: target)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -217,9 +223,9 @@ struct MachineChooserView: View {
             }
             .frame(minHeight: 180)
             .onChange(of: machines) { _ in
-                // Keep the highlighted row valid as the account fetch or a
-                // removal changes the list.
-                clampSelection()
+                // Keep the highlighted row valid — and on the SAME machine —
+                // as the account fetch/poll or a removal changes the list.
+                reanchorSelection()
             }
 
             // Account-list refresh status (WP-C2): a small spinner while the
@@ -269,7 +275,7 @@ struct MachineChooserView: View {
         .onAppear {
             // Preselect the first target so something is highlighted on open
             // and Enter immediately opens it.
-            selectedIndex = 0
+            select(0)
             // Focus the filter so typing narrows the list right away. Arrow
             // navigation still works via the invisible shortcut buttons above.
             // Dispatch to the next runloop turn so focus actually sticks
@@ -517,7 +523,7 @@ struct MachineChooserView: View {
             } catch {
                 showError(title: "Couldn't remove “\(machine.name)”", error: error)
             }
-            clampSelection()
+            reanchorSelection()
         }
     }
 
@@ -613,7 +619,40 @@ struct MachineChooserView: View {
     /// Move the highlighted selection by `delta` rows, clamped to the list.
     private func move(_ delta: Int) {
         guard !targets.isEmpty else { return }
-        selectedIndex = min(max(selectedIndex + delta, 0), targets.count - 1)
+        select(min(max(selectedIndex + delta, 0), targets.count - 1))
+    }
+
+    /// Highlight row `idx` and remember the machine identity under it, so a
+    /// later list change can re-anchor the highlight to the same machine.
+    private func select(_ idx: Int) {
+        selectedIndex = idx
+        selectedMachineID = machineID(at: idx)
+    }
+
+    /// The registry UUID of the machine at row `idx`, or nil for the Local
+    /// row / out-of-range indexes.
+    private func machineID(at idx: Int) -> UUID? {
+        guard targets.indices.contains(idx),
+              case .remote(let machine) = targets[idx]
+        else { return nil }
+        return machine.id
+    }
+
+    /// Re-anchor the highlight after the target list changed (query edit,
+    /// directory fetch/poll, or a removal): follow the previously highlighted
+    /// machine to its new row when it still exists, otherwise fall back to
+    /// clamping the index and re-anchoring on whatever row that lands on.
+    private func reanchorSelection() {
+        if let id = selectedMachineID,
+           let idx = targets.firstIndex(where: { target in
+               if case .remote(let machine) = target { return machine.id == id }
+               return false
+           }) {
+            selectedIndex = idx
+            return
+        }
+        clampSelection()
+        selectedMachineID = machineID(at: selectedIndex)
     }
 
     /// Clamp `selectedIndex` to the current (possibly newly filtered) list.
@@ -681,10 +720,11 @@ struct MachineChooserView: View {
 ///
 /// The chooser always lists a "Local" entry first (a normal local window),
 /// followed by every registered remote machine. On open it refreshes the relay
-/// account's device list (WP-C2), so relay rows carry live online status and
-/// may appear/disappear as the fetch lands. Callers should special-case the
-/// nothing-to-choose case (no machines AND no relay account) before calling
-/// this (e.g. just open a local window directly).
+/// account's device list (WP-C2) and keeps re-fetching it quietly every few
+/// seconds while the chooser stays open, so relay rows carry LIVE online
+/// status and may appear/disappear as devices come and go. Callers should
+/// special-case the nothing-to-choose case (no machines AND no relay account)
+/// before calling this (e.g. just open a local window directly).
 @MainActor
 enum MachineChooser {
     static func present(
@@ -696,6 +736,10 @@ enum MachineChooser {
         let anchorWindow = NSApp.keyWindow ?? NSApp.mainWindow
 
         var windowRef: NSWindow?
+        // Directory poll for the picker's lifetime (assigned below, before the
+        // modal session starts); cancelled in `finish` so no poll outlives the
+        // chooser.
+        var pollTask: Task<Void, Never>?
 
         // Live metrics probe for the picker's lifetime. Owns one short-lived
         // connection per remote machine; torn down in `finish` regardless of
@@ -706,6 +750,7 @@ enum MachineChooser {
             // Tear down all probe connections BEFORE handing control back, so
             // no probe connection outlives the picker no matter the choice.
             probe.stop()
+            pollTask?.cancel()
             if let windowRef {
                 NSApp.stopModal()
                 windowRef.orderOut(nil)
@@ -764,6 +809,22 @@ enum MachineChooser {
         // relies on the same behavior). Rows update in place as it lands.
         Task { @MainActor in
             await registry.refreshFromRelay()
+        }
+        // Keep the list LIVE while the chooser is open: re-fetch the directory
+        // every few seconds so online/offline indicators, names, hostnames,
+        // and appearing/disappearing devices track reality without reopening.
+        // `quiet:` refreshes never flash the footer spinner or transient error
+        // text, and the registry's in-flight guard makes a tick that overlaps
+        // a slow fetch a no-op (no request pile-up). Ticks are skipped
+        // entirely while signed out (no credentials — nothing to poll).
+        // Cancelled in `finish`, so the loop cannot outlive the chooser.
+        pollTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { break }
+                guard RelayAccount.hasCredentials else { continue }
+                await registry.refreshFromRelay(quiet: true)
+            }
         }
         // Begin probing remote machines for live metrics now that the picker is
         // on screen. Dials happen off the main thread; rows update as samples

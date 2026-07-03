@@ -119,7 +119,9 @@ struct Machine: Identifiable, Hashable {
 ///
 /// Relay machines are the account's resource list, fetched live from the
 /// relay's device directory (`GET /v1/client/devices`, WP-C2) whenever the
-/// chooser opens. They exist ONLY while account credentials exist: signing
+/// chooser opens — and re-fetched on a quiet poll while it stays open, so
+/// online status tracks reality. They exist ONLY while account credentials
+/// exist: signing
 /// out (or refreshing with no/rejected credentials) clears every relay entry
 /// — machines are per-account, so a signed-out chooser must never show a
 /// previous account's devices. Non-relay (direct TCP) entries are never
@@ -140,6 +142,19 @@ final class MachineRegistry: ObservableObject {
     /// The last directory-fetch failure, shown in the chooser footer. Cleared
     /// when a refresh starts.
     @Published private(set) var lastRefreshError: String?
+
+    /// True while ANY directory fetch is in flight, including quiet background
+    /// polls (which deliberately don't drive the published `isRefreshing`
+    /// spinner). This is the overlap guard: a poll tick that lands while a
+    /// fetch is still running simply no-ops instead of piling up requests.
+    private var refreshInFlight = false
+
+    /// Consecutive quiet-poll failures. A single blip while the chooser sits
+    /// open must not flash error UI (the last-known list stays useful), but a
+    /// PERSISTENT failure should surface the same way an initial-load failure
+    /// does — after this many misses in a row.
+    private var quietFailureCount = 0
+    private static let quietFailureThreshold = 3
 
     /// Stable UUID per relay device id so SwiftUI identity (selection, rows)
     /// survives refreshes that rebuild the `Machine` values.
@@ -179,15 +194,29 @@ final class MachineRegistry: ObservableObject {
     /// (401, e.g. an expired session), which additionally surfaces the error.
     /// Other failures (network blips) keep the current list and set
     /// `lastRefreshError`.
-    func refreshFromRelay() async {
-        guard !isRefreshing else { return }
+    ///
+    /// `quiet` marks a background poll tick (the chooser's live refresh):
+    /// the footer spinner stays off and a transient failure keeps the
+    /// last-known list WITHOUT flashing error text — only
+    /// `quietFailureThreshold` consecutive misses surface the error, and the
+    /// next success clears it. Auth failures are never quiet: an expired or
+    /// rejected session clears the list either way (account devices must not
+    /// outlive their authorization).
+    func refreshFromRelay(quiet: Bool = false) async {
+        guard !refreshInFlight else { return }
         guard RelayAccount.hasCredentials else {
             clearRelayMachines()
             return
         }
-        isRefreshing = true
-        lastRefreshError = nil
-        defer { isRefreshing = false }
+        refreshInFlight = true
+        if !quiet {
+            isRefreshing = true
+            lastRefreshError = nil
+        }
+        defer {
+            refreshInFlight = false
+            if !quiet { isRefreshing = false }
+        }
         // Token via the WP-B2 seam (account ID token, dev-token fallback);
         // may await a token refresh before the directory call.
         guard let client = await RelayDirectoryClient.current() else {
@@ -200,6 +229,10 @@ final class MachineRegistry: ObservableObject {
         }
         do {
             apply(devices: try await client.listDevices())
+            quietFailureCount = 0
+            // Publish-only-on-change, like `apply`: a steady-state poll must
+            // not churn observers every tick.
+            if lastRefreshError != nil { lastRefreshError = nil }
         } catch RelayDirectoryClient.DirectoryError.unauthorized {
             // Expired/rejected session: don't keep showing an account list we
             // are no longer authorized for.
@@ -207,6 +240,10 @@ final class MachineRegistry: ObservableObject {
             lastRefreshError =
                 RelayDirectoryClient.DirectoryError.unauthorized.localizedDescription
         } catch {
+            if quiet {
+                quietFailureCount += 1
+                guard quietFailureCount >= Self.quietFailureThreshold else { return }
+            }
             lastRefreshError = error.localizedDescription
         }
     }
@@ -260,7 +297,10 @@ final class MachineRegistry: ObservableObject {
     }
 
     /// Rebuild `machines` from a fetched device list: authoritative relay
-    /// entries (stable UUIDs per device id) after any direct-TCP entries.
+    /// entries (stable UUIDs per device id, relay's own — stable — order)
+    /// after any direct-TCP entries. Publishes only when something actually
+    /// changed, so a steady-state background poll doesn't churn observers
+    /// every tick.
     private func apply(devices: [RelayDirectoryClient.Device]) {
         let relayBase = RelayDirectoryClient.defaultBase
         let relayMachines = devices.map { dev -> Machine in
@@ -282,7 +322,8 @@ final class MachineRegistry: ObservableObject {
                 hostname: dev.hostname
             )
         }
-        machines = machines.filter { !$0.isRelay } + relayMachines
+        let updated = machines.filter { !$0.isRelay } + relayMachines
+        if updated != machines { machines = updated }
     }
 }
 
