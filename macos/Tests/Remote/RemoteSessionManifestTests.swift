@@ -88,6 +88,35 @@ struct RemoteSessionManifestTests {
         #expect(third.takeAll().isEmpty)
     }
 
+    /// An account rename (WP-C2) renames EVERY entry for that device — open
+    /// windows and restorable ones alike — and persists, so windows restored
+    /// after a quit come back under the new name. Other devices are untouched.
+    @Test func updateNameRenamesAllEntriesForDeviceAndPersists() {
+        let defaults = makeDefaults()
+        let manifest = RemoteSessionManifest(defaults: defaults)
+
+        _ = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "MaximusHome",
+            sessionID: "sess-1")
+        _ = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "MaximusHome",
+            sessionID: "sess-2")
+        _ = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-2", name: "other",
+            sessionID: "sess-3")
+
+        manifest.updateName(deviceID: "dev-1", name: "Home PC")
+        // Unknown device is a no-op.
+        manifest.updateName(deviceID: "dev-404", name: "nope")
+
+        // Persisted: a fresh instance over the same defaults sees the rename.
+        let reloaded = RemoteSessionManifest(defaults: defaults).takeAll()
+        #expect(reloaded.count == 3)
+        #expect(reloaded.filter { $0.deviceID == "dev-1" }.map(\.name) ==
+                ["Home PC", "Home PC"])
+        #expect(reloaded.first { $0.deviceID == "dev-2" }?.name == "other")
+    }
+
     /// The double-restore guard: entries whose id belongs to an OPEN window
     /// are reinstated (re-attaching would evict the live window); everything
     /// else restores. Order is preserved on both sides.

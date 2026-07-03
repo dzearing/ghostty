@@ -61,11 +61,21 @@ struct Machine: Identifiable, Hashable {
     /// otherwise "host:port".
     var endpoint: String { isRelay ? (deviceID ?? host) : "\(host):\(port)" }
 
-    /// True when this machine's display name (the agent-reported hostname when
-    /// the agent delivered one in its HELLO) refers to THIS Mac. Used to
-    /// suppress remote-only UI (e.g. the titlebar hostname pill) for a "remote"
-    /// window whose agent actually runs on the local machine.
-    var isLocalMachine: Bool { Self.isLocalHostname(name) }
+    /// True when this machine refers to THIS Mac. Used to suppress remote-only
+    /// UI (e.g. the titlebar machine pill) for a "remote" window whose agent
+    /// actually runs on the local machine, and to hide this Mac's own relay
+    /// device from the chooser list.
+    ///
+    /// Both identity fields are checked: the display `name` (which for a
+    /// direct-TCP/loopback machine carries the hostname or address) AND the
+    /// agent-reported `hostname`. The hostname check matters because `name` is
+    /// the user-facing display name — a machine renamed to "My Mac" whose
+    /// hostname is this Mac must still count as local.
+    var isLocalMachine: Bool {
+        if Self.isLocalHostname(name) { return true }
+        if let hostname, Self.isLocalHostname(hostname) { return true }
+        return false
+    }
 
     /// Whether `hostname` names the local machine.
     ///
@@ -218,8 +228,20 @@ final class MachineRegistry: ObservableObject {
         machines.removeAll { $0.deviceID == deviceID }
     }
 
+    /// userInfo key carrying the updated `Machine` in a
+    /// `.ghosttyMachineDidRename` notification.
+    static let renamedMachineKey = "machine"
+
     /// Rename a device on the relay account and update the registry row with
     /// the relay's response. Throws `DirectoryError` on failure.
+    ///
+    /// A successful rename also propagates LIVE to everything that carries the
+    /// old name:
+    /// - open windows on that device (via `.ghosttyMachineDidRename`, observed
+    ///   by `BaseTerminalController` — updates the titlebar pill, the window
+    ///   title suffix, and the `AXGhosttyMachine` accessibility attribute)
+    /// - the WP-D2 session manifest, so windows restored after a quit come
+    ///   back under the new name.
     func renameOnAccount(deviceID: String, to name: String) async throws {
         guard let client = await RelayDirectoryClient.current() else {
             throw RelayDirectoryClient.DirectoryError.noAccount
@@ -229,6 +251,11 @@ final class MachineRegistry: ObservableObject {
             machines[idx].name = dev.name
             machines[idx].online = dev.online
             machines[idx].hostname = dev.hostname
+            RemoteSessionManifest.shared.updateName(deviceID: deviceID, name: dev.name)
+            NotificationCenter.default.post(
+                name: .ghosttyMachineDidRename,
+                object: self,
+                userInfo: [Self.renamedMachineKey: machines[idx]])
         }
     }
 
@@ -280,6 +307,13 @@ extension Notification.Name {
     /// link state changes. Object is the `RemoteConnection`.
     static let ghosttyRemoteConnectionLinkDidChange =
         Notification.Name("ghosttyRemoteConnectionLinkDidChange")
+
+    /// Posted (on the main thread) by `MachineRegistry` after a device rename
+    /// succeeds on the relay account. userInfo[`MachineRegistry.renamedMachineKey`]
+    /// is the updated `Machine` (registry row). Open windows on that device
+    /// observe this to refresh their pill / title / `AXGhosttyMachine`.
+    static let ghosttyMachineDidRename =
+        Notification.Name("ghosttyMachineDidRename")
 }
 
 /// Strong owner of a live `ghostty_remote_connection_t`.
@@ -292,7 +326,19 @@ extension Notification.Name {
 /// controller (and therefore this object) is deallocated.
 final class RemoteConnection {
     let handle: ghostty_remote_connection_t
-    let machine: Machine
+
+    /// The machine this connection is dialed to. The connection's IDENTITY
+    /// (relay base + device id / host + port) never changes; the setter exists
+    /// only so an account rename can refresh the display fields (`name`,
+    /// `hostname`) — new tabs/splits inherit this snapshot, so it must not go
+    /// stale. Main-thread only, like `linkState`.
+    private(set) var machine: Machine
+
+    /// Refresh the machine snapshot after an account rename (display fields
+    /// only — see `machine`). Main-thread only.
+    func updateMachine(_ machine: Machine) {
+        self.machine = machine
+    }
 
     /// Transport-level link state (spec §5.1), mirrored from the Zig FSM.
     /// Values match `GHOSTTY_REMOTE_CONN_*`.

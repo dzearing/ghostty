@@ -919,11 +919,18 @@ extension TerminalWindow {
         // Drive the SwiftUI model; the model-bound hosting view re-renders in place
         // and the titlebar re-measures the accessory width.
         //
+        // The pill shows the machine's DISPLAY name (`Machine.name`: the
+        // account's friendly name, falling back to the agent-reported hostname,
+        // then the device id — resolved at window creation and kept fresh by
+        // the rename propagation in `BaseTerminalController`).
+        //
         // The pill is for REMOTE hosts only: a "remote" window whose agent runs
-        // on this same Mac (agent-reported hostname == local hostname) must look
-        // like a normal local window, so no pill is shown for it — EXCEPT while
-        // the connection is degraded (reconnecting/disconnected, WP-D1): a
-        // frozen window must always say why, even for a loopback agent.
+        // on this same Mac must look like a normal local window, so no pill is
+        // shown for it. `isLocalMachine` checks BOTH the display name and the
+        // agent-reported hostname (a device renamed to "My Mac" whose hostname
+        // is this Mac still counts as local) — EXCEPT while the connection is
+        // degraded (reconnecting/disconnected, WP-D1): a frozen window must
+        // always say why, even for a loopback agent.
         let name: String? = {
             guard let machine = remoteMachine else { return nil }
             if machine.isLocalMachine && remoteConnectionState == .connected { return nil }
@@ -982,9 +989,13 @@ extension TerminalWindow {
     /// tools to group terminal windows by machine):
     ///
     ///   Attribute: `AXGhosttyMachine`
-    ///   Value:     the remote machine's display name (e.g. "maximushome") for a
-    ///              remote window, or the literal string "Local" for a local
-    ///              window. Always a non-nil String.
+    ///   Value:     the remote machine's display name for a remote window —
+    ///              the account's friendly name (e.g. "Home PC", following
+    ///              renames live), falling back to the agent-reported hostname,
+    ///              then the device id — or the literal string "Local" for a
+    ///              local window. Always a non-nil String. A rename posts an
+    ///              AX value-changed notification on the window (see
+    ///              `remoteMachine.didSet`), so observers see updates live.
     static let axGhosttyMachine = NSAccessibility.Attribute(rawValue: "AXGhosttyMachine")
 
     /// The value published for `AXGhosttyMachine`: the machine display name, or

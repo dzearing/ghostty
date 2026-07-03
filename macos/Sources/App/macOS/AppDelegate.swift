@@ -1167,20 +1167,24 @@ class AppDelegate: NSObject,
         fallbackName: String?,
         sessionID: String?
     ) -> TerminalController {
-        // The relay path has no TCP port. For the display name, prefer the
-        // machine's own hostname reported by the agent in its HELLO (the pill
-        // should show the real machine name); fall back to the chooser's
-        // friendly name, then the device id (headless CLI/IPC path, old agent).
-        // Carry the relay base + device id so the Machine is a proper relay machine.
+        // The relay path has no TCP port. The DISPLAY NAME wins: prefer the
+        // account's friendly name for the device (`fallbackName` — the chooser
+        // row / manifest entry name, which follows renames), then the machine's
+        // own hostname reported by the agent in its HELLO, then the device id
+        // (headless CLI/IPC path with no --name, old agent). The agent-reported
+        // hostname is carried separately in `hostname` so local-machine pill
+        // suppression still recognizes a renamed local device. Carry the relay
+        // base + device id so the Machine is a proper relay machine.
         let reportedHostname: String? = ghostty_remote_connection_hostname(handle)
             .flatMap { String(cString: $0) }
             .flatMap { $0.isEmpty ? nil : $0 }
         let machine = Machine(
-            name: reportedHostname ?? fallbackName ?? device,
+            name: fallbackName ?? reportedHostname ?? device,
             host: relay,
             port: 0,
             relayBase: relay,
-            deviceID: device)
+            deviceID: device,
+            hostname: reportedHostname)
 
         // Wrap the handle in a strong owner; the controller below holds the only
         // strong reference and frees it (once) when the window is deallocated.

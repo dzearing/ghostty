@@ -240,6 +240,11 @@ class BaseTerminalController: NSWindowController,
             selector: #selector(ghosttyMaximizeDidToggle(_:)),
             name: .ghosttyMaximizeDidToggle,
             object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyMachineDidRename(_:)),
+            name: .ghosttyMachineDidRename,
+            object: nil)
 
         // Splits
         center.addObserver(
@@ -1780,6 +1785,36 @@ class BaseTerminalController: NSWindowController,
             remoteReconnectGeneration += 1
             remoteConnectionState = .disconnected
         }
+    }
+
+    /// A device was renamed on the relay account (WP-C2). If this window runs
+    /// on that device, adopt the new display name: the stored `Machine` (and
+    /// the shared connection's snapshot, which new tabs/splits inherit) get the
+    /// fresh `name`/`hostname`, and the `remoteMachine` didSet chain refreshes
+    /// the titlebar pill, the window-title suffix, and posts the accessibility
+    /// value-changed notification for `AXGhosttyMachine` consumers (ztabby).
+    @objc private func ghosttyMachineDidRename(_ notification: Notification) {
+        guard let renamed = notification.userInfo?[
+            MachineRegistry.renamedMachineKey] as? Machine,
+              let deviceID = renamed.deviceID else { return }
+
+        // Keep the shared connection's machine snapshot fresh so surfaces
+        // opened AFTER the rename (tabs/splits inheriting the connection)
+        // start with the new name.
+        if let connection = remoteConnection,
+           connection.machine.deviceID == deviceID {
+            var updated = connection.machine
+            updated.name = renamed.name
+            updated.hostname = renamed.hostname ?? updated.hostname
+            connection.updateMachine(updated)
+        }
+
+        guard var machine = remoteMachine, machine.deviceID == deviceID else { return }
+        machine.name = renamed.name
+        machine.hostname = renamed.hostname ?? machine.hostname
+        // didSet publishes to the TerminalWindow (pill + AXGhosttyMachine +
+        // AX valueChanged post) and re-applies the window title.
+        remoteMachine = machine
     }
 
     /// Kick off the reconnect retry loop: capture the re-ATTACH target (the

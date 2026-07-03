@@ -933,9 +933,10 @@ class IPCServer {
                     onOpen: { [weak self] controller in
                         // Register the window under its friendly name so
                         // +send-keys / +read / +close can target it (mirrors the
-                        // +new-window --target path). The relay pill uses the
-                        // agent-reported hostname; the registry key stays the
-                        // caller-supplied --name for scriptability.
+                        // +new-window --target path). The pill shows the
+                        // machine's display name (the caller-supplied --name
+                        // here, falling back to the agent-reported hostname);
+                        // the registry key stays the --name for scriptability.
                         if let target = name {
                             self?.targetRegistry[target] = .window(WeakRef(controller))
                             Self.logger.info("IPC: registered remote window target '\(target)'")

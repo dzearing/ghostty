@@ -101,6 +101,22 @@ final class RemoteSessionManifest {
         return entries.first(where: { $0.id == id })?.sessionID
     }
 
+    /// Update the display name of EVERY entry for a device (account rename,
+    /// WP-C2): windows restored after a quit must come back under the
+    /// machine's current name, whether their entry is bound to an open window
+    /// or waiting for a later launch. Unknown device ids are a no-op.
+    func updateName(deviceID: String, name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        var changed = false
+        for idx in entries.indices where entries[idx].deviceID == deviceID {
+            guard entries[idx].name != name else { continue }
+            entries[idx].name = name
+            changed = true
+        }
+        if changed { saveLocked() }
+    }
+
     /// Remove an entry (clean close: user closed the window or the remote
     /// child exited). Removing an unknown id is a no-op.
     func remove(_ id: UUID) {
