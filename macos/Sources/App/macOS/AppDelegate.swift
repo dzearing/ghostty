@@ -1073,18 +1073,30 @@ class AppDelegate: NSObject,
     /// builds a `Machine` and routes through `openRemoteWindow(on:)`, which
     /// dials and opens the window on the main thread. Returns nil on success or
     /// an error message on failure (e.g. the dial failed).
+    ///
+    /// `name` and `onOpen` mirror the relay overload: a caller-supplied
+    /// friendly name wins as the display name, and `onOpen` receives the
+    /// created controller so the IPC path can register it as a named target.
     @MainActor
-    func openRemoteWindow(host: String, port: UInt16) -> String? {
+    func openRemoteWindow(
+        host: String,
+        port: UInt16,
+        name: String? = nil,
+        onOpen: ((TerminalController) -> Void)? = nil
+    ) -> String? {
         // Resolve a friendly NAME from the registry so an IPC-opened window's
         // title matches the menu flow (e.g. `maximushome` instead of the raw
-        // IP). Match on host+port first, then host alone; fall back to the host
-        // string when the machine is unknown.
+        // IP). A caller-supplied --name wins; otherwise match the registry on
+        // host+port first, then host alone; fall back to the host string when
+        // the machine is unknown.
         let registry = MachineRegistry.shared.machines
         let known = registry.first { $0.host == host && $0.port == port }
             ?? registry.first { $0.host == host }
-        let machine = known.map { Machine(name: $0.name, host: host, port: port) }
-            ?? Machine(name: host, host: host, port: port)
-        return openRemoteWindow(on: machine)
+        let machine = Machine(
+            name: name ?? known?.name ?? host,
+            host: host,
+            port: port)
+        return openRemoteWindow(on: machine, onOpen: onOpen)
     }
 
     /// Opens a remote window by dialing a remote agent THROUGH a rendezvous
@@ -1420,7 +1432,10 @@ class AppDelegate: NSObject,
     /// the interactive menu path also surfaces an alert).
     @MainActor
     @discardableResult
-    private func openRemoteWindow(on machine: Machine) -> String? {
+    private func openRemoteWindow(
+        on machine: Machine,
+        onOpen: ((TerminalController) -> Void)? = nil
+    ) -> String? {
         // Dial the agent over TCP. This blocks through the handshake and returns
         // a connection handle, or NULL on failure.
         let handle: ghostty_remote_connection_t? = machine.host.withCString { hostPtr in
@@ -1454,6 +1469,7 @@ class AppDelegate: NSObject,
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
         controller.remoteMachine = machine
         controller.remoteConnection = connection
+        onOpen?(controller)
         return nil
     }
 

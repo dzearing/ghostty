@@ -15,6 +15,72 @@ pub const Errors = error{
     NoRunningInstance,
 };
 
+/// The JSON response the IPC server sends for every request:
+/// `{"success": <bool>, "error": <optional string>, ...}`. Unknown fields
+/// (e.g. the `data` payload of a `+read` response) are ignored by
+/// `parseResponse`.
+pub const Response = struct {
+    success: bool = false,
+    @"error": ?[]const u8 = null,
+};
+
+/// Parse the raw JSON response body from the IPC server. On failure the
+/// server includes a human-readable reason in `error` (e.g. "pane 'd1' not
+/// found in registry") which callers should surface to the user instead of a
+/// generic fallback. The returned `Parsed` owns the string memory; call
+/// `deinit` when done.
+pub fn parseResponse(
+    alloc: Allocator,
+    bytes: []const u8,
+) error{InvalidResponse}!std.json.Parsed(Response) {
+    return std.json.parseFromSlice(
+        Response,
+        alloc,
+        bytes,
+        .{ .ignore_unknown_fields = true },
+    ) catch error.InvalidResponse;
+}
+
+test "parseResponse: success" {
+    const testing = std.testing;
+    const parsed = try parseResponse(testing.allocator, "{\"success\":true}");
+    defer parsed.deinit();
+    try testing.expect(parsed.value.success);
+    try testing.expect(parsed.value.@"error" == null);
+}
+
+test "parseResponse: failure carries the server's error text" {
+    const testing = std.testing;
+    const parsed = try parseResponse(
+        testing.allocator,
+        "{\"success\":false,\"error\":\"pane 'd1' not found in registry\"}",
+    );
+    defer parsed.deinit();
+    try testing.expect(!parsed.value.success);
+    try testing.expectEqualStrings(
+        "pane 'd1' not found in registry",
+        parsed.value.@"error".?,
+    );
+}
+
+test "parseResponse: unknown fields are ignored" {
+    const testing = std.testing;
+    const parsed = try parseResponse(
+        testing.allocator,
+        "{\"success\":true,\"data\":{\"text\":\"hello\"}}",
+    );
+    defer parsed.deinit();
+    try testing.expect(parsed.value.success);
+}
+
+test "parseResponse: invalid JSON" {
+    const testing = std.testing;
+    try testing.expectError(
+        error.InvalidResponse,
+        parseResponse(testing.allocator, "not json"),
+    );
+}
+
 pub const Target = union(Key) {
     /// Open up a new window in a custom instance of Ghostty.
     class: [:0]const u8,

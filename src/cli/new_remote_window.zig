@@ -66,6 +66,9 @@ pub const Options = struct {
 ///
 ///   * `--host=<host>`: The agent host (DNS name or literal IP). Required.
 ///   * `--port=<port>`: The agent TCP port. Required.
+///   * `--name=<name>`: Register the new window under a name so it can be
+///     targeted later by `+send-keys`, `+read`, `+split`, and `+close`.
+///     Also used as the window's display name.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {

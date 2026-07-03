@@ -943,7 +943,19 @@ class IPCServer {
                         }
                     })
             } else {
-                errorMessage = appDelegate.openRemoteWindow(host: host!, port: port!)
+                errorMessage = appDelegate.openRemoteWindow(
+                    host: host!,
+                    port: port!,
+                    name: name,
+                    onOpen: { [weak self] controller in
+                        // Same registration as the relay path above: expose
+                        // the window under its friendly name so +send-keys /
+                        // +read / +close can target TCP remote windows too.
+                        if let target = name {
+                            self?.targetRegistry[target] = .window(WeakRef(controller))
+                            Self.logger.info("IPC: registered remote window target '\(target)'")
+                        }
+                    })
             }
         }
         semaphore.wait()
