@@ -97,6 +97,10 @@ pub const Options = struct {
     path: []const u8,
     /// Extra request headers (e.g. the bearer token). Borrowed.
     headers: []const Header = &.{},
+    /// TLS on (the production default). `false` gives a PLAINTEXT `ws://`
+    /// connection — use ONLY for loopback test servers (mirrors
+    /// `http_client.zig`'s `http://` support); real relays are always `wss://`.
+    tls: bool = true,
 };
 
 pub const ConnectError = error{
@@ -127,9 +131,10 @@ pub const WsClient = struct {
     tcp_reader: *std.net.Stream.Reader,
     tcp_writer: *std.net.Stream.Writer,
 
-    /// The TLS client. Plaintext app data goes through `tls_client.reader` /
+    /// The TLS client, or null for a plaintext (`tls: false`, loopback-test-only)
+    /// connection. When present, app data goes through `tls_client.reader` /
     /// `tls_client.writer`. Heap-pinned (its reader/writer use `@fieldParentPtr`).
-    tls_client: *tls.Client,
+    tls_client: ?*tls.Client,
 
     /// Serializes all writes to the single TLS encryptor (writer thread data
     /// frames vs. reader thread pong/close replies).
@@ -137,6 +142,15 @@ pub const WsClient = struct {
 
     /// Set once on close; makes both read and write fast-path to EOF/closed-lane.
     closed: std.atomic.Value(bool) = .{ .raw = false },
+
+    /// Wall-clock ms timestamp of the last successfully parsed INBOUND frame
+    /// (any opcode: data, ping, pong, close — all prove the link is alive).
+    /// Wall clock on purpose: monotonic clocks pause during system sleep on
+    /// macOS/Windows, but wall time keeps counting, so a keepalive comparing
+    /// `now - lastRxMillis()` sees the whole sleep gap immediately on wake and
+    /// declares the link stale on its first post-wake tick. Written by the
+    /// reader thread, read by the keepalive thread (see `agent/keepalive.zig`).
+    last_rx_ms: std.atomic.Value(i64) = .{ .raw = 0 },
 
     // --- In-flight inbound data-frame state (carried across `read` calls) ------
     /// Bytes still unread in the current binary/continuation frame's payload.
@@ -169,9 +183,9 @@ pub const WsClient = struct {
         const socket = try std.net.tcpConnectToHost(alloc, options.host, options.port);
         errdefer socket.close();
 
-        // --- System CA roots -------------------------------------------------
+        // --- System CA roots (TLS only; stays empty for plaintext) ------------
         var ca_bundle: Certificate.Bundle = .{};
-        try ca_bundle.rescan(alloc);
+        if (options.tls) try ca_bundle.rescan(alloc);
         errdefer ca_bundle.deinit(alloc);
 
         // --- Allocate the pinned buffers + IO wrappers -----------------------
@@ -192,16 +206,19 @@ pub const WsClient = struct {
         errdefer alloc.destroy(tcp_writer);
         tcp_writer.* = socket.writer(tcp_write_buf);
 
-        const tls_client = try alloc.create(tls.Client);
-        errdefer alloc.destroy(tls_client);
-
-        // --- TLS handshake (host verification ON) ----------------------------
-        tls_client.* = try tls.Client.init(tcp_reader.interface(), &tcp_writer.interface, .{
-            .host = .{ .explicit = options.host },
-            .ca = .{ .bundle = ca_bundle },
-            .read_buffer = tls_read_buf,
-            .write_buffer = tls_write_buf,
-        });
+        // --- TLS handshake (host verification ON), skipped for plaintext ------
+        const tls_client: ?*tls.Client = if (options.tls) blk: {
+            const t = try alloc.create(tls.Client);
+            errdefer alloc.destroy(t);
+            t.* = try tls.Client.init(tcp_reader.interface(), &tcp_writer.interface, .{
+                .host = .{ .explicit = options.host },
+                .ca = .{ .bundle = ca_bundle },
+                .read_buffer = tls_read_buf,
+                .write_buffer = tls_write_buf,
+            });
+            break :blk t;
+        } else null;
+        errdefer if (tls_client) |t| alloc.destroy(t);
 
         self.* = .{
             .alloc = alloc,
@@ -216,21 +233,35 @@ pub const WsClient = struct {
             .tls_write_buf = tls_write_buf,
         };
 
-        // --- WebSocket upgrade over the now-encrypted channel ----------------
+        // --- WebSocket upgrade over the (possibly encrypted) channel ---------
         try self.handshake(options);
+        // The 101 response counts as first inbound traffic: staleness windows
+        // start "now", not at epoch.
+        self.noteRx();
         return self;
     }
 
     /// Parse a `wss://host[:port]/path` (or `https://...`) URL and connect.
-    /// `ws://`/`http://` are rejected — this transport is TLS-only.
+    /// `ws://`/`http://` yield a PLAINTEXT connection — loopback test servers
+    /// only (same rule as `http_client.zig`); real relays are always TLS.
     pub fn connectUrl(alloc: Allocator, url: []const u8, headers: []const Header) !*WsClient {
         var rest = url;
+        var use_tls = true;
+        var port: u16 = 443;
         if (std.mem.startsWith(u8, rest, "wss://")) {
             rest = rest["wss://".len..];
         } else if (std.mem.startsWith(u8, rest, "https://")) {
             rest = rest["https://".len..];
+        } else if (std.mem.startsWith(u8, rest, "ws://")) {
+            use_tls = false;
+            port = 80;
+            rest = rest["ws://".len..];
+        } else if (std.mem.startsWith(u8, rest, "http://")) {
+            use_tls = false;
+            port = 80;
+            rest = rest["http://".len..];
         } else {
-            return error.WebSocketBadResponse; // not a TLS URL
+            return error.WebSocketBadResponse; // not a ws(s)/http(s) URL
         }
 
         // Split authority from path.
@@ -240,13 +271,12 @@ pub const WsClient = struct {
 
         // Split host from optional :port.
         var host = authority;
-        var port: u16 = 443;
         if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
             host = authority[0..colon];
             port = try std.fmt.parseInt(u16, authority[colon + 1 ..], 10);
         }
 
-        return connect(alloc, .{ .host = host, .port = port, .path = path, .headers = headers });
+        return connect(alloc, .{ .host = host, .port = port, .path = path, .headers = headers, .tls = use_tls });
     }
 
     /// Tear down: best-effort close frame, then close the socket + free all owned
@@ -255,7 +285,7 @@ pub const WsClient = struct {
     pub fn deinit(self: *WsClient) void {
         self.close();
         self.ca_bundle.deinit(self.alloc);
-        self.alloc.destroy(self.tls_client);
+        if (self.tls_client) |t| self.alloc.destroy(t);
         self.alloc.destroy(self.tcp_reader);
         self.alloc.destroy(self.tcp_writer);
         self.alloc.destroy(self.tcp_read_buf);
@@ -276,8 +306,8 @@ pub const WsClient = struct {
         var key_b64: [24]u8 = undefined; // base64 of 16 bytes = 24 chars (with pad)
         const key = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
 
-        // Build + send the upgrade request through the TLS writer.
-        const w = &self.tls_client.writer;
+        // Build + send the upgrade request through the app-data writer.
+        const w = self.appWriter();
         try w.print(
             "GET {s} HTTP/1.1\r\n" ++
                 "Host: {s}\r\n" ++
@@ -291,16 +321,16 @@ pub const WsClient = struct {
             try w.print("{s}: {s}\r\n", .{ h.name, h.value });
         }
         try w.writeAll("\r\n");
-        try self.flushTls();
+        try self.flushOut();
 
         // Compute the expected Sec-WebSocket-Accept = base64(sha1(key ++ GUID)).
         var expected_accept_buf: [28]u8 = undefined; // base64 of 20-byte sha1 = 28
         const expected_accept = computeAccept(key, &expected_accept_buf);
 
-        // Read the response status line + headers from the TLS reader. Anything
-        // buffered past the final CRLFCRLF (e.g. the first WS frame) stays in the
-        // reader for `read` to consume.
-        const r = &self.tls_client.reader;
+        // Read the response status line + headers from the app-data reader.
+        // Anything buffered past the final CRLFCRLF (e.g. the first WS frame)
+        // stays in the reader for `read` to consume.
+        const r = self.appReader();
 
         // Status line: require "HTTP/1.1 101".
         const status = try r.takeDelimiterInclusive('\n');
@@ -357,13 +387,43 @@ pub const WsClient = struct {
     // Byte ops shared by both vtable flavours
     // =========================================================================
 
+    /// The app-data reader: TLS plaintext when encrypted, the raw TCP reader
+    /// for a plaintext (loopback-test) connection.
+    fn appReader(self: *WsClient) *std.Io.Reader {
+        return if (self.tls_client) |t| &t.reader else self.tcp_reader.interface();
+    }
+
+    /// The app-data writer (counterpart of `appReader`).
+    fn appWriter(self: *WsClient) *std.Io.Writer {
+        return if (self.tls_client) |t| &t.writer else &self.tcp_writer.interface;
+    }
+
     /// Flush the TLS writer (encrypt buffered plaintext into the TCP write buffer)
     /// AND the underlying TCP writer (push the ciphertext onto the socket). The
     /// TLS `flush` only stages ciphertext; the socket isn't written until the TCP
-    /// writer is flushed too.
-    fn flushTls(self: *WsClient) !void {
-        try self.tls_client.writer.flush();
+    /// writer is flushed too. For plaintext connections only the TCP flush applies.
+    fn flushOut(self: *WsClient) !void {
+        if (self.tls_client) |t| try t.writer.flush();
         try self.tcp_writer.interface.flush();
+    }
+
+    /// Record "inbound traffic seen now" (any successfully parsed frame header).
+    fn noteRx(self: *WsClient) void {
+        self.last_rx_ms.store(std.time.milliTimestamp(), .monotonic);
+    }
+
+    /// Wall-clock ms timestamp of the last inbound frame (see `last_rx_ms`).
+    /// Safe to call from any thread.
+    pub fn lastRxMillis(self: *WsClient) i64 {
+        return self.last_rx_ms.load(.monotonic);
+    }
+
+    /// Send a masked, empty WS ping (RFC 6455 §5.5.2). Thread-safe with the
+    /// writer thread and the reader thread's pong replies (all frame emission is
+    /// serialized by `write_mtx`). The peer must answer with a pong, which the
+    /// read path counts as inbound traffic — this is the keepalive probe.
+    pub fn sendPing(self: *WsClient) !void {
+        try self.sendFrame(.ping, "");
     }
 
     /// Read up to `buf.len` bytes of inner payload, parsing/handling WS frames as
@@ -376,9 +436,10 @@ pub const WsClient = struct {
             // Serve bytes from an in-flight data frame first.
             if (self.frame_remaining > 0) {
                 const want: usize = @intCast(@min(@as(u64, buf.len), self.frame_remaining));
-                const n = self.tls_client.reader.readSliceShort(buf[0..want]) catch |err|
+                const n = self.appReader().readSliceShort(buf[0..want]) catch |err|
                     return self.mapReadErr(err);
                 if (n == 0) return 0; // EOF mid-frame
+                self.noteRx();
                 if (self.frame_masked) {
                     var i: usize = 0;
                     while (i < n) : (i += 1) {
@@ -392,7 +453,8 @@ pub const WsClient = struct {
             }
 
             // No in-flight data; parse the next frame header.
-            const frame = parseFrameHeader(&self.tls_client.reader) catch |err| return self.mapReadErr(err);
+            const frame = parseFrameHeader(self.appReader()) catch |err| return self.mapReadErr(err);
+            self.noteRx();
             switch (frame.opcode) {
                 .binary, .continuation, .text => {
                     // Begin (or continue) delivering a data frame. Empty frames
@@ -405,24 +467,24 @@ pub const WsClient = struct {
                 },
                 .ping => {
                     // Reply with a masked pong echoing the (small) payload.
-                    const payload = readControlPayload(&self.tls_client.reader, frame) catch |err|
+                    const payload = readControlPayload(self.appReader(), frame) catch |err|
                         return self.mapReadErr(err);
                     self.sendFrame(.pong, payload) catch {};
                     continue;
                 },
                 .pong => {
-                    _ = readControlPayload(&self.tls_client.reader, frame) catch |err| return self.mapReadErr(err);
+                    _ = readControlPayload(self.appReader(), frame) catch |err| return self.mapReadErr(err);
                     continue;
                 },
                 .close => {
-                    _ = readControlPayload(&self.tls_client.reader, frame) catch {};
+                    _ = readControlPayload(self.appReader(), frame) catch {};
                     // Best-effort close reply, then EOF.
                     self.sendFrame(.close, "") catch {};
                     return 0;
                 },
                 else => {
                     // Unknown opcode: discard its payload and keep going.
-                    _ = readControlPayload(&self.tls_client.reader, frame) catch |err| return self.mapReadErr(err);
+                    _ = readControlPayload(self.appReader(), frame) catch |err| return self.mapReadErr(err);
                     continue;
                 },
             }
@@ -441,7 +503,7 @@ pub const WsClient = struct {
     /// single message exceeds `buf.len` (`error.MessageTooLarge`).
     pub fn readMessage(self: *WsClient, buf: []u8) anyerror!usize {
         if (self.closed.load(.acquire)) return 0;
-        return messageFromReader(&self.tls_client.reader, buf, self);
+        return messageFromReader(self.appReader(), buf, self);
     }
 
     /// The reassembly core, factored out so it can be unit-tested over a synthetic
@@ -456,6 +518,9 @@ pub const WsClient = struct {
                 if (err == error.EndOfStream) return 0;
                 return err;
             };
+            // Any parseable inbound frame — ping, pong, data, even close —
+            // counts as link-liveness traffic for the keepalive.
+            if (self) |s| s.noteRx();
             switch (frame.opcode) {
                 .text, .binary, .continuation => {
                     if (frame.len > 0) {
@@ -598,7 +663,7 @@ pub const WsClient = struct {
         defer self.write_mtx.unlock();
         if (self.closed.load(.acquire)) return error.BrokenPipe;
 
-        const w = &self.tls_client.writer;
+        const w = self.appWriter();
 
         // Header: FIN=1, opcode; MASK=1, 7/16/64-bit length.
         var hdr: [14]u8 = undefined;
@@ -637,7 +702,7 @@ pub const WsClient = struct {
             off += take_n;
         }
 
-        try self.flushTls();
+        try self.flushOut();
     }
 
     /// Emit `bytes` as a single binary frame. Returns `bytes.len` on success, or
@@ -668,13 +733,13 @@ pub const WsClient = struct {
     fn sendCloseDuringShutdown(self: *WsClient) void {
         self.write_mtx.lock();
         defer self.write_mtx.unlock();
-        const w = &self.tls_client.writer;
+        const w = self.appWriter();
         var frame: [6]u8 = undefined;
         frame[0] = 0x80 | @as(u8, @intFromEnum(Opcode.close));
         frame[1] = 0x80 | 0; // masked, zero-length payload
         std.crypto.random.bytes(frame[2..6]); // mask key (no payload to mask)
         w.writeAll(&frame) catch return;
-        self.flushTls() catch {};
+        self.flushOut() catch {};
     }
 
     /// Public idempotent close (the `Stream` contract entry point).

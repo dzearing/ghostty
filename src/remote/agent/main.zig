@@ -73,6 +73,7 @@ const socket_stream = @import("../socket_stream.zig");
 const ws_client = @import("../ws_client.zig");
 const tray = @import("tray.zig");
 const enroll = @import("enroll.zig");
+const keepalive = @import("keepalive.zig");
 
 const default_listen = "0.0.0.0:7777";
 
@@ -672,16 +673,51 @@ fn relayLoop(
         return;
     };
     defer alloc.free(authz);
-    const headers = [_]ws_client.Header{.{ .name = "Authorization", .value = authz }};
+
+    // Advertise this machine's hostname on the control dial (same source as
+    // the HELLO's hostname, see `serveOne`) so the relay can label the device
+    // without waiting for a session. The relay tolerates its absence.
+    var host_buf: [256]u8 = undefined;
+    const maybe_host = hostName(&host_buf);
+
+    var headers_buf: [2]ws_client.Header = undefined;
+    headers_buf[0] = .{ .name = "Authorization", .value = authz };
+    var n_headers: usize = 1;
+    if (maybe_host) |hn| {
+        headers_buf[n_headers] = .{ .name = "X-Ghoztty-Hostname", .value = hn };
+        n_headers += 1;
+    }
+    const headers = headers_buf[0..n_headers];
 
     while (true) {
-        const ctrl = ws_client.WsClient.connectUrl(alloc, ctrl_url, &headers) catch |err| {
+        const ctrl = ws_client.WsClient.connectUrl(alloc, ctrl_url, headers) catch |err| {
             std.debug.print("ghoztty-agent: relay control connect failed ({s}); retry in {d}ms\n", .{ @errorName(err), relay_backoff_ms });
             std.Thread.sleep(relay_backoff_ms * std.time.ns_per_ms);
             continue;
         };
         std.debug.print("ghoztty-agent: relay control connected\n", .{});
+
+        // Dead-link detection (the sleep/wake fix): a side thread pings the
+        // relay every `ping_interval_ms` and, when NO inbound frame (relay
+        // heartbeat / pong / command) arrives within `stale_after_ms`, closes
+        // the WebSocket — which unblocks `serveControl`'s blocked read with
+        // EOF so this loop redials. Without it, a connection whose peer died
+        // while this machine slept blocks in `readMessage` forever. See
+        // `keepalive.zig` for the full design rationale.
+        var ka = keepalive.Keepalive{ .link = keepalive.wsLink(ctrl) };
+        const ka_thread: ?std.Thread = std.Thread.spawn(.{}, keepalive.Keepalive.run, .{&ka}) catch |err| blk: {
+            std.debug.print("ghoztty-agent: relay keepalive spawn failed ({s}); dead-link detection disabled for this connection\n", .{@errorName(err)});
+            break :blk null;
+        };
+
         serveControl(alloc, encoding, ws_base, token, store, spawner, ctrl);
+
+        // Stop the keepalive BEFORE deinit (it must not touch a freed client).
+        // If it went stale it has already returned; requestStop is idempotent.
+        if (ka_thread) |t| {
+            ka.requestStop();
+            t.join();
+        }
         ctrl.deinit();
         std.debug.print("ghoztty-agent: relay control ended; reconnecting in {d}ms\n", .{relay_backoff_ms});
         std.Thread.sleep(relay_backoff_ms * std.time.ns_per_ms);
