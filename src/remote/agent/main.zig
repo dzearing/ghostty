@@ -62,9 +62,12 @@
 //!     grid reconstruction (so deep-scrollback eviction is invisible) is future.
 //!   - Authentication / TLS on the listener (see SECURITY above).
 //!   - Daemonization / detach (§4.1). (Single-instance IS enforced: the daemon
-//!     modes `--listen`/`--relay` take a per-user-session guard — named mutex
-//!     on Windows, flock on POSIX — and a losing instance exits with code 183;
-//!     see `single_instance.zig`. `--stdio` and `--enroll` are exempt.)
+//!     modes `--listen`/`--relay` take a per-USER guard — Global\ named mutex
+//!     keyed by SID on Windows, flock on POSIX — and a losing instance exits
+//!     with code 183 after verifying the holder is alive via its heartbeat
+//!     file; a stuck holder is killed and replaced, and `--force-replace`
+//!     (alias `--replace`) replaces even a healthy one. See
+//!     `single_instance.zig`. `--stdio` and `--enroll` are exempt.)
 //!   - RPC, tunnels, multi-client fan-out to one session (§5.3 steal).
 
 const std = @import("std");
@@ -108,15 +111,15 @@ pub fn main() !void {
         .listen => |l| {
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
             // (bind, banner, tray icon). Exits the process on conflict.
-            var guard = acquireDaemonLockOrExit(alloc);
-            defer if (guard) |*g| g.release();
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
+            defer lock.release();
             try runListen(alloc, encoding, l.addr, l.headless);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup and
             // long before the tray could flash an icon).
-            var guard = acquireDaemonLockOrExit(alloc);
-            defer if (guard) |*g| g.release();
+            var lock = acquireDaemonLockOrExit(alloc, r.force_replace);
+            defer lock.release();
             // The device token authenticates the relay WebSockets. Required.
             // Precedence: the GHOSTTY_DEVICE_TOKEN env var wins; otherwise fall
             // back to the agent's own relay.env (written by `--enroll` and by
@@ -155,20 +158,38 @@ pub fn main() !void {
     }
 }
 
-/// Take the per-user-session daemon single-instance guard (named mutex on
-/// Windows, flock on POSIX — see `single_instance.zig`). Three outcomes:
-///   - acquired → return the guard; hold it for the daemon's lifetime (the OS
-///     releases it on exit OR crash, so no cleanup ordering matters).
-///   - already running → log + exit with `single_instance.already_running_exit_code`
-///     (183). The message + distinct code make a supervisor's respawn-and-exit
-///     loop self-explanatory in its captured stderr log.
-///   - guard infrastructure failed → log a warning and return null: the daemon
-///     serves anyway (availability beats guard integrity, same policy as tray
-///     failures).
+/// The held daemon single-instance state: the guard itself plus the liveness
+/// heartbeat a future challenger consults (see `single_instance` §Takeover).
+/// `release` matters only on main's error-return paths — production daemons
+/// hold both until the process dies.
+const DaemonLock = struct {
+    guard: ?single_instance.Guard,
+    heartbeat: ?*single_instance.Heartbeat,
+
+    fn release(self: *DaemonLock) void {
+        if (self.heartbeat) |hb| hb.stopAndFree();
+        if (self.guard) |*g| g.release();
+        self.* = .{ .guard = null, .heartbeat = null };
+    }
+};
+
+/// Take the per-user daemon single-instance guard (named mutex on Windows,
+/// flock on POSIX — see `single_instance.zig`), running the TAKEOVER protocol
+/// on contention: a responsive holder wins (we exit 183), a stuck one — or
+/// any holder, under `--force-replace` — is killed and replaced. Outcomes:
+///   - acquired (possibly after a takeover) → return the lock; the heartbeat
+///     ticker is started so future challengers can tell us from a corpse.
+///   - holder alive / not safely replaceable → log + exit with
+///     `single_instance.already_running_exit_code` (183). The message +
+///     distinct code make a supervisor's respawn-and-exit loop
+///     self-explanatory in its captured stderr log.
+///   - guard infrastructure failed → log a warning and return an empty lock:
+///     the daemon serves anyway (availability beats guard integrity, same
+///     policy as tray failures).
 /// Called BEFORE any user-visible daemon setup (bind / banner / tray icon), so
 /// a losing instance never flashes a tray icon or steals the port.
-fn acquireDaemonLockOrExit(alloc: Allocator) ?single_instance.Guard {
-    return single_instance.acquire(alloc) catch |err| switch (err) {
+fn acquireDaemonLockOrExit(alloc: Allocator, force_replace: bool) DaemonLock {
+    const guard = single_instance.acquireWithTakeover(alloc, force_replace) catch |err| switch (err) {
         error.AlreadyRunning => {
             // std.debug.print writes stderr, which the supervisors (installer
             // launcher / deploy watcher) redirect to agent.err.log — visible
@@ -178,9 +199,12 @@ fn acquireDaemonLockOrExit(alloc: Allocator) ?single_instance.Guard {
         },
         error.GuardUnavailable => {
             std.debug.print("ghoztty-agent: warning: single-instance guard unavailable; continuing without it\n", .{});
-            return null;
+            return .{ .guard = null, .heartbeat = null };
         },
     };
+    // We are THE daemon: announce liveness. A heartbeat failure only costs
+    // challenger-side takeover diagnostics, never the daemon.
+    return .{ .guard = guard, .heartbeat = single_instance.Heartbeat.start(alloc) };
 }
 
 fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
@@ -209,9 +233,12 @@ const Enroll = struct {
 
 /// Relay-mode parameters. `base_url` is the relay HTTPS/WSS base (owned — duped
 /// from argv so it outlives `argsFree`). `headless` suppresses the Windows tray.
+/// `force_replace` (`--force-replace`/`--replace`) kills a live single-instance
+/// holder instead of yielding to it.
 const Relay = struct {
     base_url: []const u8,
     headless: bool = false,
+    force_replace: bool = false,
 };
 
 /// TCP listen-daemon parameters. `headless` suppresses the Windows system-tray
@@ -220,6 +247,7 @@ const Relay = struct {
 const Listen = struct {
     addr: std.net.Address,
     headless: bool = false,
+    force_replace: bool = false,
 };
 
 /// Parse `--stdio` | `--listen <addr:port>` | `--relay <url>` |
@@ -229,6 +257,9 @@ const Listen = struct {
 /// `--enroll` (anywhere on the line) turns the `--relay` base into a one-shot
 /// enrollment instead of the relay daemon; `--no-browser`/`--headless-enroll`
 /// makes that enrollment use the device-code flow instead of the browser.
+/// `--force-replace` (alias `--replace`, daemon modes) makes THIS launch win
+/// the single-instance guard: the current holder is killed and replaced even
+/// if it is alive and responsive (see `single_instance.zig` §Takeover).
 fn parseArgs(alloc: Allocator) !Mode {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
@@ -238,18 +269,22 @@ fn parseArgs(alloc: Allocator) !Mode {
     var headless = false;
     var want_enroll = false;
     var no_browser = false;
+    var force_replace = false;
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--headless")) headless = true;
         if (std.mem.eql(u8, a, "--enroll")) want_enroll = true;
         if (std.mem.eql(u8, a, "--no-browser") or
             std.mem.eql(u8, a, "--headless-enroll")) no_browser = true;
+        if (std.mem.eql(u8, a, "--force-replace") or
+            std.mem.eql(u8, a, "--replace")) force_replace = true;
     }
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--headless") or std.mem.eql(u8, a, "--enroll") or
-            std.mem.eql(u8, a, "--no-browser") or std.mem.eql(u8, a, "--headless-enroll"))
+            std.mem.eql(u8, a, "--no-browser") or std.mem.eql(u8, a, "--headless-enroll") or
+            std.mem.eql(u8, a, "--force-replace") or std.mem.eql(u8, a, "--replace"))
         {
             continue; // handled in the pre-scan above
         } else if (std.mem.eql(u8, a, "--stdio")) {
@@ -260,9 +295,9 @@ fn parseArgs(alloc: Allocator) !Mode {
                 std.debug.print("ghoztty-agent: --listen requires <addr:port>\n", .{});
                 return error.InvalidArgs;
             }
-            return .{ .listen = .{ .addr = try parseAddr(args[i]), .headless = headless } };
+            return .{ .listen = .{ .addr = try parseAddr(args[i]), .headless = headless, .force_replace = force_replace } };
         } else if (std.mem.startsWith(u8, a, "--listen=")) {
-            return .{ .listen = .{ .addr = try parseAddr(a["--listen=".len..]), .headless = headless } };
+            return .{ .listen = .{ .addr = try parseAddr(a["--listen=".len..]), .headless = headless, .force_replace = force_replace } };
         } else if (std.mem.eql(u8, a, "--relay")) {
             i += 1;
             if (i >= args.len) {
@@ -273,11 +308,11 @@ fn parseArgs(alloc: Allocator) !Mode {
             // both relay and enroll modes need it past that.
             const url = try alloc.dupe(u8, args[i]);
             if (want_enroll) return .{ .enroll = .{ .base_url = url, .no_browser = no_browser } };
-            return .{ .relay = .{ .base_url = url, .headless = headless } };
+            return .{ .relay = .{ .base_url = url, .headless = headless, .force_replace = force_replace } };
         } else if (std.mem.startsWith(u8, a, "--relay=")) {
             const url = try alloc.dupe(u8, a["--relay=".len..]);
             if (want_enroll) return .{ .enroll = .{ .base_url = url, .no_browser = no_browser } };
-            return .{ .relay = .{ .base_url = url, .headless = headless } };
+            return .{ .relay = .{ .base_url = url, .headless = headless, .force_replace = force_replace } };
         } else {
             std.debug.print("ghoztty-agent: unknown argument '{s}'\n", .{a});
             return error.InvalidArgs;
@@ -288,7 +323,7 @@ fn parseArgs(alloc: Allocator) !Mode {
         return error.InvalidArgs;
     }
     // No args: default to the TCP listen daemon so a bare invocation "just works".
-    return .{ .listen = .{ .addr = try parseAddr(default_listen), .headless = headless } };
+    return .{ .listen = .{ .addr = try parseAddr(default_listen), .headless = headless, .force_replace = force_replace } };
 }
 
 /// Parse "host:port" into a `std.net.Address`. Host may be an IPv4/IPv6 literal.
@@ -932,13 +967,13 @@ fn serveControl(
         };
         if (n == 0) return; // clean close / EOF
 
-        const Msg = struct { @"type": []const u8 = "", session: []const u8 = "" };
+        const Msg = struct { type: []const u8 = "", session: []const u8 = "" };
         const parsed = std.json.parseFromSlice(Msg, alloc, buf[0..n], .{ .ignore_unknown_fields = true }) catch {
             // Malformed JSON — ignore, keep the control connection alive.
             continue;
         };
         defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.@"type", "open")) continue;
+        if (!std.mem.eql(u8, parsed.value.type, "open")) continue;
         if (parsed.value.session.len == 0) continue;
 
         // Dup the session id for the detached worker (parsed.deinit frees it here).

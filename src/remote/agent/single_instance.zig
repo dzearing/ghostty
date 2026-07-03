@@ -58,6 +58,38 @@
 //! default which is `--listen`). `--stdio` is a per-ssh-connection servant
 //! (many may legitimately coexist) and `--enroll` is a one-shot utility that
 //! must work WHILE a daemon runs — neither takes the lock.
+//!
+//! ## Takeover — "there should be only one" (`acquireWithTakeover`)
+//! Losing the guard race no longer means blind deference: the holder might be
+//! SIGSTOP'd, deadlocked, or an anomaly that leaked the lock. The winning
+//! daemon proves liveness by touching a HEARTBEAT file containing its PID
+//! (`agent.heartbeat`, sibling of the other per-user agent state:
+//! `%LOCALAPPDATA%\ghoztty\` on Windows, `$XDG_CONFIG_HOME|~/.config/ghoztty/`
+//! on POSIX; `GHOSTTY_AGENT_HEARTBEAT` overrides — tests) every
+//! `heartbeat_interval_ms` (10s). A challenger that hits AlreadyRunning:
+//!
+//!   1. Reads the heartbeat. FRESH (mtime age < `heartbeat_stale_after_ms`,
+//!      45s) → the holder is alive and responsive → yield (exit 183 upstream).
+//!   2. STALE → the holder is stuck. Verify the PID still names a
+//!      ghoztty-agent image (QueryFullProcessImageNameW / proc_pidpath /
+//!      /proc/<pid>/exe, best-effort) so PID reuse can't friendly-fire an
+//!      innocent process: confirmed-agent → kill it (TerminateProcess /
+//!      SIGKILL) and take the guard; confirmed-OTHER → never kill, yield with
+//!      a warning; unverifiable → kill only because the guard is provably
+//!      still held (re-checked immediately before the verdict).
+//!   3. NO heartbeat file at all → an old-binary (pre-heartbeat) holder or a
+//!      racing first run: treated as responsive → yield. (`--force-replace`
+//!      cannot help here either — with no PID on record there is nobody safe
+//!      to kill.)
+//!   4. After a kill, the OS frees the mutex/flock with the process; the
+//!      challenger retries acquisition in a short bounded loop (5 × 200ms)
+//!      and, if the guard is SOMEHOW still held, yields — when in doubt, die:
+//!      never two daemons.
+//!
+//! `--force-replace` (daemon modes) skips the freshness check and kills the
+//! recorded holder unconditionally (still refusing confirmed-other PIDs), for
+//! a human who wants THIS launch to win. The decision matrix is the pure
+//! `takeoverVerdict` (unit-tested); the kill/probe syscalls are thin glue.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -302,6 +334,26 @@ const win32 = if (builtin.os.tag == .windows) struct {
         lpBuffer: [*]u16,
         pcbBuffer: *u32,
     ) callconv(.winapi) windows.BOOL;
+
+    // --- takeover protocol ---
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn OpenProcess(
+        dwDesiredAccess: u32,
+        bInheritHandle: windows.BOOL,
+        dwProcessId: u32,
+    ) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn TerminateProcess(
+        hProcess: windows.HANDLE,
+        uExitCode: c_uint,
+    ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn QueryFullProcessImageNameW(
+        hProcess: windows.HANDLE,
+        dwFlags: u32,
+        lpExeName: [*]u16,
+        lpdwSize: *u32,
+    ) callconv(.winapi) windows.BOOL;
 } else struct {};
 
 // -----------------------------------------------------------------------------
@@ -353,10 +405,441 @@ pub fn acquirePath(path: []const u8) AcquireError!Guard {
 }
 
 // -----------------------------------------------------------------------------
+// Takeover — "there should be only one" (see the module doc §Takeover)
+// -----------------------------------------------------------------------------
+
+/// How often the guard HOLDER touches the heartbeat file.
+pub const heartbeat_interval_ms: u64 = 10_000;
+/// A heartbeat older than this marks the holder unresponsive (4.5 missed
+/// beats — generous enough for a paging stall, far below human patience).
+pub const heartbeat_stale_after_ms: i64 = 45_000;
+/// Post-kill guard re-acquisition: attempts × delay (the OS frees the
+/// mutex/flock with the dying process; 1s total is ample).
+const takeover_retry_attempts = 5;
+const takeover_retry_delay_ms = 200;
+
+/// Result of the best-effort "does this PID still name a ghoztty-agent?"
+/// probe that gates a kill (PID-reuse friendly-fire protection).
+pub const ImageCheck = enum {
+    /// PID resolves to an image whose basename starts with `ghoztty-agent`.
+    confirmed_agent,
+    /// PID resolves to some OTHER image: never kill it.
+    confirmed_other,
+    /// Couldn't resolve (no API, no permission, process gone).
+    unavailable,
+};
+
+/// What a challenger that lost the guard race should do about the holder.
+pub const Verdict = enum {
+    /// Holder is (presumed) alive and responsive: exit 183 as always.
+    yield,
+    /// Holder is stuck/anomalous and safely identified: kill it, then retry
+    /// the guard.
+    kill_and_take,
+    /// Anomaly detected but killing is unsafe (unidentified holder / foreign
+    /// PID): log loudly and exit 183 — when in doubt, never two daemons.
+    die,
+};
+
+/// THE takeover decision matrix — pure, unit-tested. Caller contract: only
+/// invoked while the guard is verifiably still held (the caller re-attempts
+/// acquisition immediately before asking), which is what makes killing on an
+/// `unavailable` image check acceptable: a stale heartbeat AND a genuinely
+/// held guard is a real anomaly, not a leftover file.
+///
+///   heartbeat_age_ms == null  → no/unreadable heartbeat file: an old-binary
+///     holder or a racing first run — nobody safe to kill. Yield (die under
+///     `force`, which promised a replacement it can't deliver).
+///   image == .confirmed_other → PID reuse: never friendly-fire, even forced.
+///   force                     → skip the freshness check, kill the holder.
+///   fresh (< stale_after_ms)  → responsive primary: yield.
+///   stale                     → kill and take over.
+pub fn takeoverVerdict(
+    force: bool,
+    heartbeat_age_ms: ?i64,
+    image: ImageCheck,
+    stale_after_ms: i64,
+) Verdict {
+    const age = heartbeat_age_ms orelse return if (force) .die else .yield;
+    if (image == .confirmed_other) return .die;
+    if (force) return .kill_and_take;
+    if (age < stale_after_ms) return .yield;
+    return .kill_and_take;
+}
+
+/// `acquire` + the takeover protocol: on AlreadyRunning, probe the holder's
+/// heartbeat and either yield (`error.AlreadyRunning`), or kill a stuck /
+/// force-replaced holder and take the guard. This is what the daemon modes
+/// call; `acquire` remains the raw primitive.
+pub fn acquireWithTakeover(alloc: Allocator, force: bool) AcquireError!Guard {
+    if (acquire(alloc)) |g| return g else |err| switch (err) {
+        error.AlreadyRunning => {},
+        error.GuardUnavailable => return error.GuardUnavailable,
+    }
+
+    // Probe the holder: heartbeat (PID + age) and what that PID runs today.
+    const hb = readHeartbeatDefault(alloc);
+    const image: ImageCheck = if (hb) |h| checkPidImage(h.pid) else .unavailable;
+
+    // Re-probe the guard right before deciding: (a) the holder may have
+    // exited since the first attempt — then we just take over, no kill —
+    // and (b) it upholds takeoverVerdict's "guard genuinely still held"
+    // contract for the unverifiable-image kill.
+    if (acquire(alloc)) |g| return g else |err| switch (err) {
+        error.AlreadyRunning => {},
+        error.GuardUnavailable => return error.GuardUnavailable,
+    }
+
+    switch (takeoverVerdict(force, if (hb) |h| h.age_ms else null, image, heartbeat_stale_after_ms)) {
+        .yield => return error.AlreadyRunning,
+        .die => {
+            std.debug.print(
+                "ghoztty-agent: single-instance anomaly: guard held but the holder can't be safely replaced (heartbeat {s}, pid image {s}); yielding — never two daemons\n",
+                .{
+                    if (hb != null) "present" else "missing",
+                    @tagName(image),
+                },
+            );
+            return error.AlreadyRunning;
+        },
+        .kill_and_take => {
+            const holder = hb.?; // null heartbeat can never reach kill_and_take
+            std.debug.print(
+                "ghoztty-agent: single-instance: holder pid {d} is {s} (heartbeat {d}ms old); killing it and taking over\n",
+                .{ holder.pid, if (force) "being force-replaced" else "unresponsive", holder.age_ms },
+            );
+            killPid(holder.pid) catch |err| {
+                std.debug.print("ghoztty-agent: single-instance: kill of pid {d} failed ({s}); yielding\n", .{ holder.pid, @errorName(err) });
+                return error.AlreadyRunning;
+            };
+            // The OS releases the mutex/flock as the holder dies — give it a
+            // few beats, then insist on actually WINNING the guard.
+            var attempt: usize = 0;
+            while (attempt < takeover_retry_attempts) : (attempt += 1) {
+                std.Thread.sleep(takeover_retry_delay_ms * std.time.ns_per_ms);
+                if (acquire(alloc)) |g| {
+                    std.debug.print("ghoztty-agent: single-instance: takeover complete (replaced pid {d})\n", .{holder.pid});
+                    return g;
+                } else |err| switch (err) {
+                    error.AlreadyRunning => continue,
+                    error.GuardUnavailable => return error.GuardUnavailable,
+                }
+            }
+            std.debug.print(
+                "ghoztty-agent: single-instance: guard still held {d}ms after killing pid {d}; yielding — never two daemons\n",
+                .{ takeover_retry_attempts * takeover_retry_delay_ms, holder.pid },
+            );
+            return error.AlreadyRunning;
+        },
+    }
+}
+
+// --- Heartbeat file ----------------------------------------------------------
+
+/// Resolve the heartbeat path: `GHOSTTY_AGENT_HEARTBEAT` override (tests),
+/// else `agent.heartbeat` next to the rest of the per-user agent state
+/// (`%LOCALAPPDATA%\ghoztty\` on Windows — same dir as relay.env — and
+/// `$XDG_CONFIG_HOME|~/.config/ghoztty/` on POSIX — same dir as agent.lock).
+/// Owned by the caller.
+pub fn heartbeatPath(alloc: Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(alloc, "GHOSTTY_AGENT_HEARTBEAT")) |p| {
+        if (p.len > 0) return p;
+        alloc.free(p);
+    } else |_| {}
+
+    if (builtin.os.tag == .windows) {
+        const local = try std.process.getEnvVarOwned(alloc, "LOCALAPPDATA");
+        defer alloc.free(local);
+        return std.fs.path.join(alloc, &.{ local, "ghoztty", "agent.heartbeat" });
+    }
+    if (std.process.getEnvVarOwned(alloc, "XDG_CONFIG_HOME")) |xdg| {
+        defer alloc.free(xdg);
+        if (xdg.len > 0) return std.fs.path.join(alloc, &.{ xdg, "ghoztty", "agent.heartbeat" });
+    } else |_| {}
+    const home = try std.process.getEnvVarOwned(alloc, "HOME");
+    defer alloc.free(home);
+    return std.fs.path.join(alloc, &.{ home, ".config", "ghoztty", "agent.heartbeat" });
+}
+
+/// One heartbeat tick: (re)write the file with our PID. The WRITE is the
+/// liveness signal (it bumps mtime); the content identifies who to kill when
+/// it goes stale. Public + path-parameterized so it's testable anywhere.
+pub fn writeHeartbeat(path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| {
+        std.fs.cwd().makePath(dir) catch {};
+    }
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    var buf: [32]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{d}\n", .{currentPid()}) catch unreachable;
+    try file.writeAll(line);
+}
+
+pub const HeartbeatInfo = struct { pid: i32, age_ms: i64 };
+
+/// Read + parse a heartbeat file: the holder's PID and the file's mtime age.
+/// Null on any problem (missing, unreadable, garbage PID) — callers treat
+/// that as "no heartbeat" (old-binary holder rule). Public for tests.
+pub fn readHeartbeat(path: []const u8) ?HeartbeatInfo {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+    const st = file.stat() catch return null;
+    var buf: [64]u8 = undefined;
+    const n = file.readAll(&buf) catch return null;
+    const pid = std.fmt.parseInt(i32, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch return null;
+    if (pid <= 0) return null;
+    const age_ns = std.time.nanoTimestamp() - st.mtime;
+    const age_ms_wide = @divTrunc(age_ns, std.time.ns_per_ms);
+    const age_ms: i64 = std.math.cast(i64, @max(0, age_ms_wide)) orelse std.math.maxInt(i64);
+    return .{ .pid = pid, .age_ms = age_ms };
+}
+
+fn readHeartbeatDefault(alloc: Allocator) ?HeartbeatInfo {
+    const path = heartbeatPath(alloc) catch return null;
+    defer alloc.free(path);
+    return readHeartbeat(path);
+}
+
+/// The holder's heartbeat writer: a daemon-lifetime thread touching the file
+/// every `heartbeat_interval_ms`. Start it right after winning the guard.
+/// Failures only cost takeover-ability, never the daemon (same availability-
+/// first policy as the guard itself and the tray).
+pub const Heartbeat = struct {
+    alloc: Allocator,
+    path: []u8,
+    interval_ms: u64,
+    stop_ev: std.Thread.ResetEvent = .{},
+    thread: ?std.Thread = null,
+
+    /// Resolve the default path, write the first beat synchronously (so the
+    /// file exists the moment the daemon is up), and spawn the ticker. Null
+    /// (with a log) when any of that fails.
+    pub fn start(alloc: Allocator) ?*Heartbeat {
+        const path = heartbeatPath(alloc) catch |err| {
+            std.debug.print("ghoztty-agent: heartbeat path unavailable ({s}); takeover-by-challenger disabled\n", .{@errorName(err)});
+            return null;
+        };
+        return startWithPath(alloc, path, heartbeat_interval_ms) orelse {
+            alloc.free(path);
+            return null;
+        };
+    }
+
+    /// Test seam: explicit path (takes ownership on success) and interval.
+    pub fn startWithPath(alloc: Allocator, path: []u8, interval_ms: u64) ?*Heartbeat {
+        const self = alloc.create(Heartbeat) catch return null;
+        self.* = .{ .alloc = alloc, .path = path, .interval_ms = interval_ms };
+        writeHeartbeat(path) catch |err| {
+            std.debug.print("ghoztty-agent: heartbeat write failed ({s}); takeover-by-challenger disabled\n", .{@errorName(err)});
+            alloc.destroy(self);
+            return null;
+        };
+        self.thread = std.Thread.spawn(.{}, Heartbeat.run, .{self}) catch |err| blk: {
+            std.debug.print("ghoztty-agent: heartbeat thread spawn failed ({s}); heartbeat will go stale\n", .{@errorName(err)});
+            break :blk null; // first beat exists; keep the daemon anyway
+        };
+        return self;
+    }
+
+    fn run(self: *Heartbeat) void {
+        while (true) {
+            if (self.stop_ev.timedWait(self.interval_ms * std.time.ns_per_ms)) |_| {
+                return; // stopped
+            } else |_| {}
+            writeHeartbeat(self.path) catch {}; // transient FS hiccup: next tick retries
+        }
+    }
+
+    /// Stop the ticker, remove the file (a clean exit shouldn't leave a
+    /// corpse for challengers to ponder), and free. Tests + main's error
+    /// paths; production daemons never stop.
+    pub fn stopAndFree(self: *Heartbeat) void {
+        self.stop_ev.set();
+        if (self.thread) |t| t.join();
+        std.fs.cwd().deleteFile(self.path) catch {};
+        self.alloc.free(self.path);
+        self.alloc.destroy(self);
+    }
+};
+
+// --- PID probes (best-effort, per platform) ----------------------------------
+
+/// Basename-of-image test shared by all platforms' `checkPidImage`: does it
+/// start with `ghoztty-agent` (matches the exe, the .exe, and the test
+/// binary)? Pure; public for tests.
+pub fn imageLooksLikeAgent(image_path: []const u8) bool {
+    const cut = std.mem.lastIndexOfAny(u8, image_path, "/\\");
+    const base = if (cut) |i| image_path[i + 1 ..] else image_path;
+    return std.ascii.startsWithIgnoreCase(base, "ghoztty-agent");
+}
+
+/// Best-effort: what does `pid` run right now? See `ImageCheck`.
+fn checkPidImage(pid: i32) ImageCheck {
+    switch (builtin.os.tag) {
+        .windows => {
+            const h = win32.OpenProcess(
+                win32.PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                @intCast(pid),
+            ) orelse return .unavailable;
+            defer std.os.windows.CloseHandle(h);
+            var buf16: [1024]u16 = undefined;
+            var size: u32 = buf16.len;
+            if (win32.QueryFullProcessImageNameW(h, 0, &buf16, &size) == 0) return .unavailable;
+            var buf8: [3072]u8 = undefined;
+            const n = std.unicode.utf16LeToUtf8(&buf8, buf16[0..size]) catch return .unavailable;
+            return if (imageLooksLikeAgent(buf8[0..n])) .confirmed_agent else .confirmed_other;
+        },
+        .linux => {
+            var pbuf: [64]u8 = undefined;
+            const proc = std.fmt.bufPrint(&pbuf, "/proc/{d}/exe", .{pid}) catch return .unavailable;
+            var tbuf: [std.fs.max_path_bytes]u8 = undefined;
+            const target = std.fs.cwd().readLink(proc, &tbuf) catch return .unavailable;
+            return if (imageLooksLikeAgent(target)) .confirmed_agent else .confirmed_other;
+        },
+        .macos => {
+            var buf: [1024]u8 = undefined;
+            const n = darwin.proc_pidpath(pid, &buf, buf.len);
+            if (n <= 0) return .unavailable;
+            return if (imageLooksLikeAgent(buf[0..@intCast(n)])) .confirmed_agent else .confirmed_other;
+        },
+        else => return .unavailable,
+    }
+}
+
+/// Terminate `pid` (TerminateProcess / SIGKILL). Only ever called on a PID
+/// `takeoverVerdict` approved.
+fn killPid(pid: i32) !void {
+    if (builtin.os.tag == .windows) {
+        const h = win32.OpenProcess(win32.PROCESS_TERMINATE, 0, @intCast(pid)) orelse
+            return error.OpenProcessFailed;
+        defer std.os.windows.CloseHandle(h);
+        if (win32.TerminateProcess(h, 1) == 0) return error.TerminateFailed;
+        return;
+    }
+    try std.posix.kill(@intCast(pid), std.posix.SIG.KILL);
+}
+
+fn currentPid() i32 {
+    return switch (builtin.os.tag) {
+        .windows => @intCast(win32.GetCurrentProcessId()),
+        .linux => @intCast(std.os.linux.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
+const darwin = if (builtin.os.tag == .macos) struct {
+    extern "c" fn proc_pidpath(pid: c_int, buffer: [*]u8, buffersize: u32) c_int;
+} else struct {};
+
+// -----------------------------------------------------------------------------
 // Tests. The Windows MUTEX mechanics are compile-verified only (by the
 // x86_64-windows-gnu agent build); the NAME composition is pure and tested
 // here on every host. The flock mechanics are tested for real (POSIX).
 // -----------------------------------------------------------------------------
+
+test "takeover verdict: the full decision matrix" {
+    const V = takeoverVerdict;
+    const stale = heartbeat_stale_after_ms;
+    const eq = std.testing.expectEqual;
+
+    // No heartbeat file: old-binary holder / racing first run — treated as
+    // responsive; force can't help (no PID on record → nobody safe to kill).
+    try eq(Verdict.yield, V(false, null, .unavailable, stale));
+    try eq(Verdict.die, V(true, null, .unavailable, stale));
+
+    // Fresh heartbeat → responsive primary → yield (boundary: strict <).
+    try eq(Verdict.yield, V(false, 0, .confirmed_agent, stale));
+    try eq(Verdict.yield, V(false, stale - 1, .unavailable, stale));
+
+    // Stale heartbeat → stuck holder → kill, when the PID is (confirmed_agent)
+    // or may be (unavailable — guard-still-held is the caller's precondition)
+    // an agent.
+    try eq(Verdict.kill_and_take, V(false, stale, .confirmed_agent, stale));
+    try eq(Verdict.kill_and_take, V(false, std.math.maxInt(i64), .unavailable, stale));
+
+    // PID reuse friendly-fire guard: a pid confirmed to be some OTHER program
+    // is never killed — not even under --force-replace.
+    try eq(Verdict.die, V(false, std.math.maxInt(i64), .confirmed_other, stale));
+    try eq(Verdict.die, V(true, 50, .confirmed_other, stale));
+
+    // --force-replace skips the freshness check (kills a HEALTHY holder).
+    try eq(Verdict.kill_and_take, V(true, 0, .confirmed_agent, stale));
+    try eq(Verdict.kill_and_take, V(true, 0, .unavailable, stale));
+}
+
+test "image check: basename must start with ghoztty-agent" {
+    try std.testing.expect(imageLooksLikeAgent("/usr/local/bin/ghoztty-agent"));
+    try std.testing.expect(imageLooksLikeAgent("C:\\Program Files\\Ghoztty\\ghoztty-agent.exe"));
+    try std.testing.expect(imageLooksLikeAgent("ghoztty-agent-test")); // the zig test binary
+    try std.testing.expect(imageLooksLikeAgent("/opt/GHOZTTY-AGENT.exe")); // case-insensitive
+    try std.testing.expect(!imageLooksLikeAgent("/usr/bin/python3"));
+    try std.testing.expect(!imageLooksLikeAgent("/home/x/ghoztty-agent/README")); // dir name doesn't count
+}
+
+test "heartbeat: write/read roundtrip reports our pid, fresh" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "agent.heartbeat" });
+    defer std.testing.allocator.free(path);
+
+    try writeHeartbeat(path);
+    const hb = readHeartbeat(path) orelse return error.HeartbeatUnreadable;
+    try std.testing.expectEqual(currentPid(), hb.pid);
+    try std.testing.expect(hb.age_ms >= 0);
+    try std.testing.expect(hb.age_ms < heartbeat_stale_after_ms); // just written = fresh
+}
+
+test "heartbeat: missing or garbage file reads as no-heartbeat" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "agent.heartbeat" });
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectEqual(@as(?HeartbeatInfo, null), readHeartbeat(path)); // missing
+
+    try tmp.dir.writeFile(.{ .sub_path = "agent.heartbeat", .data = "not-a-pid\n" });
+    try std.testing.expectEqual(@as(?HeartbeatInfo, null), readHeartbeat(path));
+
+    try tmp.dir.writeFile(.{ .sub_path = "agent.heartbeat", .data = "-5\n" });
+    try std.testing.expectEqual(@as(?HeartbeatInfo, null), readHeartbeat(path));
+}
+
+test "heartbeat writer: first beat is synchronous, ticker recreates a deleted file, stop removes it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "agent.heartbeat" });
+    // Ownership of `path` moves into the Heartbeat on success.
+
+    const hb = Heartbeat.startWithPath(alloc, path, 10) orelse {
+        alloc.free(path);
+        return error.HeartbeatStartFailed;
+    };
+    // First beat happened before startWithPath returned.
+    try std.testing.expect(readHeartbeat(hb.path) != null);
+
+    // Prove the ticker ticks: delete the file and watch it come back.
+    try tmp.dir.deleteFile("agent.heartbeat");
+    var waited_ms: u64 = 0;
+    while (readHeartbeat(hb.path) == null) {
+        if (waited_ms > 5_000) return error.TickerNeverRewrote;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        waited_ms += 10;
+    }
+
+    // Clean stop removes the corpse.
+    const path_copy = try alloc.dupe(u8, hb.path);
+    defer alloc.free(path_copy);
+    hb.stopAndFree();
+    try std.testing.expectEqual(@as(?HeartbeatInfo, null), readHeartbeat(path_copy));
+}
 
 test "global mutex name: SID suffix composes verbatim" {
     var buf: [256]u8 = undefined;
