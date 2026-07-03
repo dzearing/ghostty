@@ -30,10 +30,17 @@ const (
 )
 
 // fakeIssuer is a minimal OIDC identity provider: discovery doc + JWKS +
-// RS256 token minting.
+// RS256 token minting. Its discovery document also advertises device-code
+// endpoints (like Google's real one does); tests that exercise the enroll
+// flow install handlers for them via the two function fields, everything
+// else gets a 404 there.
 type fakeIssuer struct {
 	srv *httptest.Server
 	key *rsa.PrivateKey
+
+	// Device-flow handlers (WP-B3 enroll tests). Set before issuing requests.
+	deviceCodeHandler http.HandlerFunc // serves POST /device/code
+	tokenHandler      http.HandlerFunc // serves POST /token
 }
 
 func newFakeIssuer(t *testing.T) *fakeIssuer {
@@ -52,11 +59,26 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 			"issuer":                                f.srv.URL,
 			"authorization_endpoint":                f.srv.URL + "/auth",
 			"token_endpoint":                        f.srv.URL + "/token",
+			"device_authorization_endpoint":         f.srv.URL + "/device/code",
 			"jwks_uri":                              f.srv.URL + "/jwks",
 			"response_types_supported":              []string{"id_token"},
 			"subject_types_supported":               []string{"public"},
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})
+	})
+	mux.HandleFunc("/device/code", func(w http.ResponseWriter, r *http.Request) {
+		if f.deviceCodeHandler != nil {
+			f.deviceCodeHandler(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		if f.tokenHandler != nil {
+			f.tokenHandler(w, r)
+			return
+		}
+		http.NotFound(w, r)
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -23,11 +23,17 @@ import (
 // NEVER stored; only its SHA-256 hash (hex) is persisted. The raw token is
 // returned exactly once, at enrollment.
 type Device struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	OwnerEmail string    `json:"owner_email"`
-	TokenHash  string    `json:"token_hash"` // hex(SHA-256(raw token))
-	CreatedAt  time.Time `json:"created_at"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	OwnerEmail string `json:"owner_email"`
+	// OwnerSub is the owner's stable OIDC subject id (Google `sub`), recorded
+	// by device-code self-enrollment. Empty on devices enrolled before this
+	// field existed or via dev auth — email remains the ownership key, sub is
+	// the forward-looking account anchor (roadmap §2.1). omitempty keeps old
+	// devices.json files valid.
+	OwnerSub  string    `json:"owner_sub,omitempty"`
+	TokenHash string    `json:"token_hash"` // hex(SHA-256(raw token))
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Store is the concurrency-safe, file-backed device directory.
@@ -66,35 +72,113 @@ func LoadStore(path string, logger *slog.Logger) (*Store, error) {
 	return s, nil
 }
 
+// newDeviceToken generates a 32-byte high-entropy raw device token and its
+// hex-encoded SHA-256 hash (the only form the relay ever stores).
+func newDeviceToken() (raw, hashHex string, err error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", "", fmt.Errorf("generate token: %w", err)
+	}
+	raw = base64.RawURLEncoding.EncodeToString(buf)
+	sum := sha256.Sum256([]byte(raw))
+	return raw, hex.EncodeToString(sum[:]), nil
+}
+
 // CreateDevice enrolls a new device owned by ownerEmail. It generates a
 // 32-byte high-entropy token, stores only its SHA-256 hash, persists the
 // directory, and returns the device plus the RAW token (shown to the caller
 // once and never recoverable thereafter).
 func (s *Store) CreateDevice(ownerEmail, name string) (*Device, string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return nil, "", fmt.Errorf("generate token: %w", err)
+	rawToken, hash, err := newDeviceToken()
+	if err != nil {
+		return nil, "", err
 	}
-	rawToken := base64.RawURLEncoding.EncodeToString(buf)
-
-	sum := sha256.Sum256([]byte(rawToken))
 	dev := &Device{
 		ID:         uuid.NewString(),
 		Name:       name,
 		OwnerEmail: strings.ToLower(ownerEmail),
-		TokenHash:  hex.EncodeToString(sum[:]),
+		TokenHash:  hash,
 		CreatedAt:  time.Now().UTC(),
 	}
 
 	s.mu.Lock()
 	s.devices[dev.ID] = dev
-	err := s.save()
+	err = s.save()
 	s.mu.Unlock()
 	if err != nil {
 		return nil, "", fmt.Errorf("persist device: %w", err)
 	}
 
 	return dev, rawToken, nil
+}
+
+// UpsertDevice is the idempotent device-code self-enroll primitive. If a
+// device with the same (owner, name) already exists it keeps its identity
+// (same ID, same CreatedAt — chooser entries, session manifests, and rename
+// history stay attached) and ROTATES its credential: the new token replaces
+// the old hash, so the previous token is revoked at that instant. Otherwise a
+// new device is created. Exactly one credential is ever valid per device —
+// the schema stores a single TokenHash, and re-running the installer is the
+// recovery path for a lost token, which only works if the fresh token wins.
+//
+// If duplicate (owner, name) rows exist (possible via repeated manual POSTs),
+// the oldest one deterministically wins; the others are left untouched.
+// ownerSub, when non-empty, is recorded on the device (backfilling devices
+// enrolled before OwnerSub existed).
+//
+// Returns the device plus the RAW token, shown to the caller once.
+func (s *Store) UpsertDevice(ownerEmail, ownerSub, name string) (*Device, string, error) {
+	rawToken, hash, err := newDeviceToken()
+	if err != nil {
+		return nil, "", err
+	}
+	ownerEmail = strings.ToLower(ownerEmail)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var existing *Device
+	for _, d := range s.devices {
+		if d.OwnerEmail != ownerEmail || d.Name != name {
+			continue
+		}
+		if existing == nil ||
+			d.CreatedAt.Before(existing.CreatedAt) ||
+			(d.CreatedAt.Equal(existing.CreatedAt) && d.ID < existing.ID) {
+			existing = d
+		}
+	}
+
+	if existing != nil {
+		oldHash, oldSub := existing.TokenHash, existing.OwnerSub
+		existing.TokenHash = hash
+		if ownerSub != "" {
+			existing.OwnerSub = ownerSub
+		}
+		if err := s.save(); err != nil {
+			// Keep memory consistent with disk on persist failure.
+			existing.TokenHash, existing.OwnerSub = oldHash, oldSub
+			return nil, "", fmt.Errorf("persist upsert: %w", err)
+		}
+		cp := *existing
+		return &cp, rawToken, nil
+	}
+
+	dev := &Device{
+		ID:         uuid.NewString(),
+		Name:       name,
+		OwnerEmail: ownerEmail,
+		OwnerSub:   ownerSub,
+		TokenHash:  hash,
+		CreatedAt:  time.Now().UTC(),
+	}
+	s.devices[dev.ID] = dev
+	if err := s.save(); err != nil {
+		delete(s.devices, dev.ID)
+		return nil, "", fmt.Errorf("persist device: %w", err)
+	}
+	cp := *dev
+	return &cp, rawToken, nil
 }
 
 // Get returns the device with the given id, or nil.

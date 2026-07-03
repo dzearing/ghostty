@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -26,12 +28,20 @@ type Handler struct {
 	auth   *Authenticator
 	store  *Store
 	dir    *Directory
+	enroll *EnrollManager
 	logger *slog.Logger
 }
 
 // NewHandler constructs a Handler.
 func NewHandler(cfg *Config, auth *Authenticator, store *Store, dir *Directory, logger *slog.Logger) *Handler {
-	return &Handler{cfg: cfg, auth: auth, store: store, dir: dir, logger: logger}
+	return &Handler{
+		cfg:    cfg,
+		auth:   auth,
+		store:  store,
+		dir:    dir,
+		enroll: NewEnrollManager(cfg, auth, store, logger),
+		logger: logger,
+	}
 }
 
 // Register attaches all routes to mux. Method+path patterns require Go 1.22+.
@@ -43,6 +53,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /v1/client/devices/{id}", h.handleRenameDevice)
 	mux.HandleFunc("DELETE /v1/client/devices/{id}", h.handleDeleteDevice)
 	mux.HandleFunc("GET /v1/client/connect", h.handleClientConnect)
+	mux.HandleFunc("POST /v1/enroll/start", h.handleEnrollStart)
+	mux.HandleFunc("POST /v1/enroll/poll", h.handleEnrollPoll)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -358,6 +370,73 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 	}
+}
+
+// --- Self-enroll endpoints (WP-B3) -----------------------------------------
+
+// handleEnrollStart: POST /v1/enroll/start (JSON, UNAUTHENTICATED).
+// Body {"name":"<machine name>"}. Starts a Google device-code sign-in and
+// returns {verification_url, user_code, device_code_handle, interval,
+// expires_in}. The handle is an opaque relay-side stand-in for Google's
+// device_code, which never leaves the relay (see enroll.go for why).
+func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" || len(name) > maxEnrollNameLen {
+		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := h.enroll.Start(r.Context(), name)
+	switch {
+	case errors.Is(err, errEnrollUnavailable):
+		http.Error(w, "enrollment unavailable: relay has no OIDC device flow configured", http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, errEnrollBusy):
+		http.Error(w, "too many pending enrollments, retry later", http.StatusTooManyRequests)
+		return
+	case err != nil:
+		h.logger.Warn("enroll start failed", "err", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleEnrollPoll: POST /v1/enroll/poll (JSON, UNAUTHENTICATED, rate-limited
+// per handle). Body {"device_code_handle":"..."}. Pending -> 200
+// {"status":"pending"}; early poll -> 429 {"status":"slow_down"}; approval by
+// an allowlisted identity -> 200 {"status":"complete", device_id,
+// device_token, relay_base} exactly once; denied/expired/rejected are
+// terminal.
+func (h *Handler) handleEnrollPoll(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Handle string `json:"device_code_handle"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Handle == "" {
+		http.Error(w, "invalid body: expected {\"device_code_handle\":\"...\"}", http.StatusBadRequest)
+		return
+	}
+
+	out := h.enroll.Poll(r.Context(), body.Handle, h.relayBase(r))
+	writeJSON(w, out.status, out.body)
+}
+
+// relayBase is the public base URL handed to freshly enrolled agents:
+// RELAY_BASE_URL when configured, else derived from the request Host (correct
+// behind Caddy, which preserves Host and always terminates https).
+func (h *Handler) relayBase(r *http.Request) string {
+	if h.cfg.RelayBaseURL != "" {
+		return h.cfg.RelayBaseURL
+	}
+	return "https://" + r.Host
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

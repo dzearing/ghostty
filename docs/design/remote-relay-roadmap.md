@@ -32,6 +32,13 @@ Commits on `feature/remote-machines`:
   identity, bounded JWKS fetches) + runbook `docs/design/relay-oidc-setup.md`
 - `361aa960e` — WP-C2: chooser lists account devices from the relay w/ online dot
   + remove/rename (`RelayDirectoryClient.swift`; GUI render verify pending)
+- WP-B3 (relay half) — OAuth device-code SELF-ENROLL: unauthenticated
+  `POST /v1/enroll/start` (Google device-code via discovery; opaque handle,
+  Google's device_code never leaves the relay) + `POST /v1/enroll/poll`
+  (per-handle rate limit; ID token verified like client auth; idempotent
+  upsert: same owner+name → same device id, token ROTATED) → returns
+  `{device_id, device_token, relay_base}` once; `relay/enroll.go` +
+  `enroll_test.go` vs fake Google endpoints. Agent/installer half still TODO.
 - WP-D2 — remote windows RESTORE on relaunch: local `RemoteSessionManifest`
   (UserDefaults) + re-`ATTACH` by session UUID through the relay at launch; clean
   close removes the entry, quit keeps it; restore failures are silent (no modal);
@@ -209,7 +216,14 @@ able to take one WP with only this doc + the repo.
   device-code; on sign-in the machine **upserts itself** as a resource + gets a
   revocable credential. *Files:* relay device-code endpoints; agent/connector enroll
   flow; installer UX. *Accept:* install on a fresh box, sign in, it appears in the list
-  automatically (idempotent on repeat).
+  automatically (idempotent on repeat). **Relay half DONE:** `/v1/enroll/start` +
+  `/v1/enroll/poll` in `relay/enroll.go` (opaque handle, poll rate limit, idempotent
+  upsert w/ token rotation, same verifier + `ALLOWED_EMAILS` gate; endpoints from
+  OIDC discovery so the fake issuer covers them; new env: `GOOGLE_CLIENT_SECRET`,
+  optional `RELAY_BASE_URL`); tests in `relay/enroll_test.go`. **Remaining:** agent/
+  installer half (run enroll, print "visit URL, enter code", persist token) + note:
+  if a separate "TV/Limited Input" Google client is used, relay `aud` must accept
+  both client IDs (currently single `GOOGLE_CLIENT_ID` for both flows).
 
 ### Phase C — Resource management (CRUD + UI)
 - **WP-C1 — Relay resource CRUD. ✅ DONE.** *Goal:* add **rename** + **delete**

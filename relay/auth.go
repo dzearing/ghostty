@@ -45,6 +45,18 @@ type Authenticator struct {
 	logger   *slog.Logger
 	verifier *oidc.IDTokenVerifier // nil if GOOGLE_CLIENT_ID is unset
 	allowed  map[string]bool       // lowercased allowlist
+
+	// Device-code flow endpoints, taken from the issuer's OIDC discovery
+	// document (Google publishes device_authorization_endpoint =
+	// https://oauth2.googleapis.com/device/code). Deriving them from discovery
+	// means tests redirect them through the same test-only IssuerURL override
+	// as everything else — no separate endpoint knobs. Empty if the issuer
+	// does not advertise a device flow.
+	deviceAuthURL string
+	tokenURL      string
+	// httpClient is the bounded-timeout client shared with the OIDC provider;
+	// device-code HTTP calls reuse it so every outbound request is bounded.
+	httpClient *http.Client
 }
 
 // NewAuthenticator builds the authenticator. When GOOGLE_CLIENT_ID is set it
@@ -75,7 +87,21 @@ func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*A
 			return nil, fmt.Errorf("init google oidc provider: %w", err)
 		}
 		a.verifier = provider.Verifier(&oidc.Config{ClientID: cfg.GoogleClientID})
-		logger.Info("OIDC client auth enabled", "issuer", issuer)
+		a.httpClient = httpClient
+
+		// Pull the device-code endpoints out of the discovery document for the
+		// self-enroll flow (WP-B3). Absence is not an error: enrollment simply
+		// reports itself unavailable.
+		var disc struct {
+			DeviceAuthorizationEndpoint string `json:"device_authorization_endpoint"`
+			TokenEndpoint               string `json:"token_endpoint"`
+		}
+		if err := provider.Claims(&disc); err == nil {
+			a.deviceAuthURL = disc.DeviceAuthorizationEndpoint
+			a.tokenURL = disc.TokenEndpoint
+		}
+		logger.Info("OIDC client auth enabled", "issuer", issuer,
+			"device_flow", a.deviceAuthURL != "" && a.tokenURL != "")
 	} else {
 		logger.Warn("GOOGLE_CLIENT_ID unset — OIDC client auth disabled")
 	}
@@ -106,7 +132,17 @@ func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request)
 		// Not the dev token — fall through to real OIDC if configured.
 	}
 
-	if a.verifier == nil {
+	return a.VerifyIDToken(ctx, token)
+}
+
+// VerifyIDToken runs the full OIDC verification + allowlist authorization on a
+// raw ID token and returns the verified identity. It is the single shared
+// gate for both interactive client auth (AuthenticateClient) and device-code
+// self-enrollment (the /v1/enroll/poll success path): signature against the
+// issuer's JWKS, issuer, audience (== GOOGLE_CLIENT_ID), expiry, `sub`
+// present, `email_verified`, and membership in ALLOWED_EMAILS.
+func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identity, error) {
+	if token == "" || a.verifier == nil {
 		return Identity{}, ErrUnauthorized
 	}
 

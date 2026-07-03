@@ -37,15 +37,65 @@ architecture, §5 security).
 | PATCH  | `/v1/client/devices/{id}`         | OIDC         | Rename an owned device (`{"name":"..."}`); returns the updated device view. |
 | DELETE | `/v1/client/devices/{id}`         | OIDC         | Delete an owned device **and revoke its token**; any live agent connections are closed. Returns `204`. |
 | GET    | `/v1/client/connect?device=<id>`  | OIDC         | Open a session to an owned, online device and bridge it. |
+| POST   | `/v1/enroll/start`                | none         | Begin device-code **self-enroll** (`{"name":"<machine name>"}`); returns `{verification_url, user_code, device_code_handle, interval, expires_in}`. |
+| POST   | `/v1/enroll/poll`                 | none (rate-limited) | Poll a pending enrollment (`{"device_code_handle":"..."}`). Pending → `{"status":"pending"}`; approved → `{"status":"complete", device_id, device_token, relay_base}` **once**; denied/expired/rejected are terminal. |
 | GET    | `/healthz`                        | none         | Liveness probe. |
+
+## Self-enrollment (OAuth device-code flow)
+
+Agents on fresh machines enroll **themselves** — no pre-minted token to copy
+around. The installer:
+
+1. `POST /v1/enroll/start` with `{"name":"<hostname>"}` and prints:
+
+   ```
+   To register this machine, visit https://www.google.com/device
+   and enter code: WXYZ-1234
+   ```
+
+2. Polls `POST /v1/enroll/poll` with the returned `device_code_handle`
+   (respecting `interval`; premature polls get `429 {"status":"slow_down"}`).
+3. The owner signs in with Google (2FA and all) and approves.
+4. The next poll returns `{"status":"complete","device_id":...,
+   "device_token":...,"relay_base":...}` **exactly once**. The installer
+   persists the token (e.g. `%LOCALAPPDATA%\ghoztty\relay.env`) and starts
+   `ghoztty-agent --relay=<relay_base>`.
+
+Poll outcomes: `200 pending` (keep polling), `429 slow_down` (too fast),
+`200 complete` (done, single-shot), `403 denied` (owner refused),
+`410 expired` (code timed out), `403 rejected` (a real Google login that is
+not on `ALLOWED_EMAILS`), `404` (unknown or already-consumed handle). All
+4xx/410 outcomes except `429` are terminal — start over.
+
+Design notes:
+
+- **Google's `device_code` never leaves the relay.** The caller gets an
+  opaque 256-bit `device_code_handle` instead; the real code is a bearer
+  credential against Google's token endpoint, so keeping it server-side means
+  the relay alone controls the poll rate Google sees and the owner's ID token
+  never transits the (still-unauthenticated) agent box.
+- **Enrollment is idempotent**: same verified owner + same requested name →
+  the **same device id** with a **rotated credential** (the old token is
+  revoked). Re-running the installer is therefore also the lost-token
+  recovery path. A different name creates a distinct device.
+- The ID token produced by the sign-in is verified **exactly** like
+  interactive client auth (same verifier, same `ALLOWED_EMAILS`).
+- Abuse bounds: pending enrollments are capped (32), expire on Google's
+  `expires_in`, and per-handle polling is throttled to the advertised
+  interval without contacting Google.
+- Requires `GOOGLE_CLIENT_ID` (and normally `GOOGLE_CLIENT_SECRET`); the
+  device/token endpoints are read from Google's OIDC discovery document.
+  Without OIDC configured the endpoints answer `503`.
 
 ## Configuration (environment variables)
 
 | Variable           | Default            | Purpose |
 |--------------------|--------------------|---------|
 | `LISTEN_ADDR`      | `127.0.0.1:8080`   | Plain-HTTP listen address (TLS handled by Caddy). |
-| `GOOGLE_CLIENT_ID` | *(unset)*          | OAuth/OIDC client ID; Google ID tokens must carry this as `aud`. Required for real client auth. |
-| `ALLOWED_EMAILS`   | *(empty)*          | Comma-separated authorization allowlist of verified Google emails. A valid login by anyone not listed is rejected. |
+| `GOOGLE_CLIENT_ID` | *(unset)*          | OAuth/OIDC client ID; Google ID tokens must carry this as `aud`. Required for real client auth and for self-enrollment. |
+| `GOOGLE_CLIENT_SECRET` | *(unset)*      | OAuth client secret, used only when polling Google's token endpoint during self-enrollment (required by Google for desktop/TV client types; not confidential for those types). |
+| `RELAY_BASE_URL`   | *(unset)*          | Public https base URL returned to freshly enrolled agents (`relay_base`). When unset it is derived from the request `Host` header, which is correct behind Caddy. |
+| `ALLOWED_EMAILS`   | *(empty)*          | Comma-separated authorization allowlist of verified Google emails. A valid login by anyone not listed is rejected — including at self-enrollment. |
 | `STATE_DIR`        | `./state`          | Directory holding `devices.json` (persisted device hashes). |
 | `DEV_AUTH`         | `false`            | **Testing only.** Accept a static bearer as a stand-in for OIDC. Logs a loud warning at startup. |
 | `DEV_CLIENT_TOKEN` | *(unset)*          | The static bearer accepted when `DEV_AUTH=true`. |
@@ -81,7 +131,9 @@ both accepted until `DEV_AUTH` is turned off.
 - **Fail-closed:** any auth failure → HTTP 401 (or WS close 1008) and **no
   bridge**.
 - **Abuse bounds:** pending sessions are capped, session setup times out (~15s),
-  and control connections have a ping/pong heartbeat with timeout.
+  control connections have a ping/pong heartbeat with timeout, and the
+  unauthenticated enroll endpoints cap pending enrollments and throttle polls
+  per handle.
 
 ## Build
 
@@ -214,10 +266,12 @@ rename (`TestRenameDevice`), delete (`TestDeleteDevice`), delete-revokes-token
 | `main.go`                     | Wiring, HTTP server, graceful shutdown. |
 | `config.go`                   | Environment-variable configuration. |
 | `auth.go`                     | OIDC client verification, device-token verification, dev mode. |
-| `store.go`                    | Device persistence (`devices.json`), token hashing. |
+| `enroll.go`                   | OAuth device-code self-enrollment (start/poll state machine). |
+| `store.go`                    | Device persistence (`devices.json`), token hashing, idempotent upsert. |
 | `directory.go`                | Online-agent registry, control connections, pending sessions. |
 | `bridge.go`                   | The bidirectional `io.Copy` splice. |
 | `handlers.go`                 | HTTP/WebSocket endpoint handlers. |
 | `bridge_integration_test.go` | End-to-end bridge + auth tests. |
 | `devices_crud_test.go`       | Device rename/delete/revocation/owner-scoping tests. |
 | `auth_oidc_test.go`          | OIDC client-auth tests against a fake local issuer (JWKS + self-minted RS256 tokens). |
+| `enroll_test.go`             | Self-enroll tests against fake Google device-code/token endpoints (happy path, idempotent re-enroll, denied/expired, allowlist rejection, poll rate limit). |

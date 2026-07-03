@@ -18,6 +18,20 @@ type Config struct {
 	// tokens must be addressed to (the `aud` claim). Required for real OIDC.
 	GoogleClientID string
 
+	// GoogleClientSecret is the OAuth client secret, used ONLY for the
+	// device-code token polling in the self-enroll flow (Google's token
+	// endpoint requires it for TV/limited-input and desktop client types).
+	// Per Google, secrets of these client types are not treated as
+	// confidential; it grants nothing by itself. Optional — when unset the
+	// poll request simply omits it.
+	GoogleClientSecret string
+
+	// RelayBaseURL is this relay's public https base URL (e.g.
+	// "https://relay.example.com"), returned to freshly enrolled agents so
+	// they know where to dial back. When unset it is derived per-request from
+	// the Host header ("https://" + Host), which is correct behind Caddy.
+	RelayBaseURL string
+
 	// IssuerURL overrides the OIDC issuer for TESTS ONLY (a local fake issuer
 	// serving its own discovery doc + JWKS). It is deliberately NOT read from
 	// the environment: production always verifies against the real Google
@@ -48,12 +62,14 @@ type Config struct {
 // LoadConfig reads configuration from the environment, applying defaults.
 func LoadConfig() *Config {
 	cfg := &Config{
-		ListenAddr:     getenv("LISTEN_ADDR", "127.0.0.1:8080"),
-		GoogleClientID: os.Getenv("GOOGLE_CLIENT_ID"),
-		StateDir:       getenv("STATE_DIR", "./state"),
-		DevAuth:        strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),
-		DevClientToken: os.Getenv("DEV_CLIENT_TOKEN"),
-		DevEmail:       os.Getenv("DEV_EMAIL"),
+		ListenAddr:         getenv("LISTEN_ADDR", "127.0.0.1:8080"),
+		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		RelayBaseURL:       strings.TrimRight(os.Getenv("RELAY_BASE_URL"), "/"),
+		StateDir:           getenv("STATE_DIR", "./state"),
+		DevAuth:            strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),
+		DevClientToken:     os.Getenv("DEV_CLIENT_TOKEN"),
+		DevEmail:           os.Getenv("DEV_EMAIL"),
 	}
 
 	for _, e := range strings.Split(os.Getenv("ALLOWED_EMAILS"), ",") {
