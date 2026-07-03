@@ -133,11 +133,14 @@ exe + install.ps1 all redeployed):**
   `.ghosttyMachineDidRename` → open windows update pill/AX live; manifest
   entries renamed too; `isLocalMachine` checks name AND hostname so suppression
   survives renames.
-STILL OPEN: user to register the `ghoztty-web` OAuth client + paste id/secret
-(flips web enroll on); on-box Windows verification of tray items +
-single-instance (installer re-run picks up the new exe); GUI verify of the
-sign-out/restore cycle, New/Restore button, rename propagation, D1 pill
-walkthrough.
+- `d2d47f5b0` — restored windows KEEP user-set titles: manifest `windowTitle`
+  synced from `titleOverride.didSet` (all four rename paths; crash-safe),
+  re-applied as `titleOverride` on restore so OSC titles can't clobber it.
+  Sign-out/restore cycle VERIFIED live by the user (auto-restore on sign-in AND
+  the Restore (2) button path both work; user opted to keep auto-restore).
+STILL OPEN: see `remote-machines-CONTINUATION-3.md` (the standing-items queue —
+web OAuth client, MaximusHome installer re-run + on-box tray/single-instance
+verification, title/rename/D1 GUI passes, relay.env re-read follow-up, WP-E1).
 
 **2026-07-03 morning — user-driven chooser polish + the SLEEP BUG (tip `a4e8e57c1`,
 relay + `/dl` exe redeployed):**
