@@ -86,6 +86,25 @@ Commits on `feature/remote-machines`:
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
 
+**🎉 GOOGLE AUTH LIVE IN PRODUCTION POSTURE (2026-07-02 evening).** Two real
+OAuth clients registered in project `ghoztty-relay` (Desktop `ghoztty-client` +
+TV/limited-input `ghoztty-agent`; ids/secrets in the user's password manager;
+Desktop pair also in `launchctl setenv GHOSTTY_GOOGLE_CLIENT_ID/_SECRET` for the
+debug app). Relay `fcfeb0f07` (dual-aud allowlist) deployed with both pairs +
+`ALLOWED_EMAILS=dzearing@gmail.com`, and **`DEV_AUTH=false`** — dev/garbage/no
+tokens all 401. VALIDATED LIVE, all on the real Google + production relay:
+(1) `ghoztty-agent --enroll` → user entered code at google.com/device → device
+`6955eedc` "Davids-Personal-Macbook-Pro.local" created, credentials in
+`~/.config/ghoztty/relay.env` (0600), agent started from relay.env alone →
+ONLINE, and it appears in the chooser automatically; (2) in-app **Sign in with
+Google** (chooser footer shows `dzearing@gmail.com · Sign Out`); (3) chooser
+device-list fetch post-flip (only possible via ID token); (4) `+new-remote-window`
+with NO `--token` → cmd.exe window on MaximusHome via `RelayAccount.resolveToken()`.
+All 5 live agents stayed online through the flip (device tokens are separate).
+NOTE for future sessions: the scratchpad dev client token is DEAD — client-API
+curl checks need a fresh ID token (runbook §3) or the signed-in app. Rollback:
+`/etc/ghoztty-relay.env.bak` on the VM (§5 of the runbook).
+
 **Validated live 2026-07-02 (GUI, debug app):** pill hidden for local-machine
 targets on BOTH paths (relay dial to a local `--relay` agent; TCP dial to
 127.0.0.1) and shown for MaximusHome; WP-C2 chooser fetches the account list w/
