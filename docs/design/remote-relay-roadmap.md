@@ -50,9 +50,13 @@ Commits on `feature/remote-machines`:
   PROVEN e2e by `relay/agent_enroll_e2e_test.go` (real Zig binary vs fake-issuer
   relay; gated on `GHOZTTY_AGENT_BIN`). Installer updated: hosted install.ps1
   source now in-repo at `relay/deploy/install.ps1` — no DEVICE_TOKEN → runs
-  `--enroll` interactively. STILL TODO: upload the new install.ps1 to the VM
-  (`/var/www/ghoztty-dl/`) + register the real Google OAuth client (WP-B1;
-  until then the deployed relay is DEV_AUTH-only and enroll answers 503).
+  `--enroll` interactively. DEPLOYED 2026-07-02: the new install.ps1 AND the
+  enroll-capable `ghoztty-agent.exe` are uploaded to `/var/www/ghoztty-dl/`
+  (the SMB-share copy for MaximusHome's watcher was deliberately NOT swapped —
+  hot-swap restarts the agent and kills live sessions). STILL TODO: register
+  the real Google OAuth client (WP-B1; until then the deployed relay is
+  DEV_AUTH-only and enroll answers 503; the flip now also needs
+  `GOOGLE_CLIENT_SECRET` in /etc/ghoztty-relay.env).
 - WP-D2 — remote windows RESTORE on relaunch: local `RemoteSessionManifest`
   (UserDefaults) + re-`ATTACH` by session UUID through the relay at launch; clean
   close removes the entry, quit keeps it; restore failures are silent (no modal);
