@@ -37,8 +37,10 @@ architecture, §5 security).
 | PATCH  | `/v1/client/devices/{id}`         | OIDC         | Rename an owned device (`{"name":"..."}`); changes the display name **only** (never `hostname`); returns the updated device view. |
 | DELETE | `/v1/client/devices/{id}`         | OIDC         | Delete an owned device **and revoke its token**; any live agent connections are closed. Returns `204`. |
 | GET    | `/v1/client/connect?device=<id>`  | OIDC         | Open a session to an owned, online device and bridge it. |
-| POST   | `/v1/enroll/start`                | none         | Begin device-code **self-enroll** (`{"name":"<machine name>"}`); returns `{verification_url, user_code, device_code_handle, interval, expires_in}`. |
-| POST   | `/v1/enroll/poll`                 | none (rate-limited) | Poll a pending enrollment (`{"device_code_handle":"..."}`). Pending → `{"status":"pending"}`; approved → `{"status":"complete", device_id, device_token, relay_base}` **once**; denied/expired/rejected are terminal. |
+| POST   | `/v1/enroll/start`                | none         | Begin **self-enroll** (`{"name":"<machine name>", "flow":"web"\|"device"}`, flow defaults to `device`). Web → `{enroll_url, device_code_handle, interval, expires_in}` (503 when no Web OAuth client is configured — the agent's cue to fall back). Device → `{verification_url, user_code, device_code_handle, interval, expires_in}`. |
+| POST   | `/v1/enroll/poll`                 | none (rate-limited) | Poll a pending enrollment (`{"device_code_handle":"..."}`) — same endpoint for both flows. Pending → `{"status":"pending"}`; approved → `{"status":"complete", device_id, device_token, relay_base}` **once**; denied/expired/rejected are terminal. |
+| GET    | `/enroll/{nonce}`                 | none (browser) | Web-enroll entry link (single-use): 302 to Google's auth endpoint with the Web client and a fresh `state` bound to the pending enrollment. |
+| GET    | `/enroll/callback?code&state`     | none (browser) | The Web client's registered redirect URI: exchanges the code server-side, verifies the identity (same gate as everything else), upserts the device, renders a tiny success/error page. |
 | GET    | `/healthz`                        | none         | Liveness probe. |
 
 ### Device name vs hostname
@@ -56,21 +58,41 @@ Each device carries two independent labels:
 The chooser UI uses this to show e.g. "MaximusHome" with "(windows-home)" as
 subtext once the owner renames a device.
 
-## Self-enrollment (OAuth device-code flow)
+## Self-enrollment (browser flow, device-code fallback)
 
 Agents on fresh machines enroll **themselves** — no pre-minted token to copy
 around. The agent half is built in: `ghoztty-agent --enroll --relay=<base>`
 
-1. `POST /v1/enroll/start` with `{"name":"<hostname>"}` and prints:
+1. `POST /v1/enroll/start` with `{"name":"<hostname>","flow":"web"}`. On a
+   web-enabled relay the agent **opens the default browser** to the returned
+   `enroll_url` (best-effort — `rundll32 url.dll,FileProtocolHandler` on
+   Windows, `open` on macOS, `xdg-open` elsewhere) and prints:
+
+   ```
+   A browser window should have opened to add this machine to your account.
+   If it did not, visit: https://<relay>/enroll/<nonce>
+   ```
+
+   The owner approves the Google sign-in in the browser — no code to type.
+   Under the hood: `GET /enroll/<nonce>` (single-use) 302s to Google with the
+   Web client and a fresh in-memory `state`; Google lands back on
+   `GET /enroll/callback?code&state`, the relay exchanges the code
+   server-side, verifies the ID token, upserts the device, and shows
+   "✓ <machine> added to your account — you can close this tab".
+
+   **Fallback** — when the relay answers 503 (no `GOOGLE_WEB_CLIENT_ID`) or
+   `--no-browser`/`--headless-enroll` is passed, the agent restarts with the
+   device-code flow and prints the classic prompt:
 
    ```
    To add this machine to your account, visit https://www.google.com/device
    and enter code: WXYZ-1234
    ```
 
-2. Polls `POST /v1/enroll/poll` with the returned `device_code_handle`
-   (respecting `interval`; premature polls get `429 {"status":"slow_down"}`,
-   which grows the agent's poll interval by 5s per RFC 8628).
+2. Either way it polls `POST /v1/enroll/poll` with the returned
+   `device_code_handle` (respecting `interval`; premature device-flow polls
+   get `429 {"status":"slow_down"}`, which grows the agent's poll interval by
+   5s per RFC 8628).
 3. The owner signs in with Google (2FA and all) and approves.
 4. The next poll returns `{"status":"complete","device_id":...,
    "device_token":...,"relay_base":...}` **exactly once**. The agent persists
@@ -90,8 +112,9 @@ The one-liner installer served at `/dl/install.ps1` (source:
 `relay/deploy/install.ps1` in this repo; the live copy sits on the VM at
 `/var/www/ghoztty-dl/` — re-upload after editing) uses this flow. On a fresh
 box with no `DEVICE_TOKEN` it downloads the agent and runs
-`ghoztty-agent.exe --enroll --relay=<base>` interactively — visit the URL,
-sign in with Google, done — then installs the autostart launcher:
+`ghoztty-agent.exe --enroll --relay=<base>` interactively — a browser window
+opens, approve the Google sign-in, done — then installs the autostart
+launcher:
 
 ```powershell
 irm https://<relay>/dl/install.ps1 | iex
@@ -101,17 +124,21 @@ Setting `$env:DEVICE_TOKEN` beforehand still skips the interactive sign-in
 (pre-minted token path); re-running with an existing `relay.env` just updates
 the binary.
 
-### End-to-end test against the real agent binary
+### End-to-end tests against the real agent binary
 
 `agent_enroll_e2e_test.go` drives the REAL Zig agent's `--enroll` against this
-relay + the fake Google issuer (start → printed code → approval → poll →
-`relay.env` written → issued token authenticates `/v1/agent/control`). It is
-gated so `go test ./...` stays hermetic:
+relay + the fake Google issuer, once per flow: device-code (start → printed
+code → approval → poll) and web (printed link → redirect → callback), each
+ending with `relay.env` written and the issued token authenticating
+`/v1/agent/control`. They are gated so `go test ./...` stays hermetic:
 
 ```bash
 (cd .. && zig build agent)
-GHOZTTY_AGENT_BIN=$PWD/../zig-out/bin/ghoztty-agent go test -run TestAgentEnrollE2E -v .
+GHOZTTY_AGENT_BIN=$PWD/../zig-out/bin/ghoztty-agent go test -run TestAgentEnroll -v .
 ```
+
+(The web test sets `GHOZTTY_ENROLL_NO_OPEN=1` so no real browser pops up on
+the machine running the tests.)
 
 Poll outcomes: `200 pending` (keep polling), `429 slow_down` (too fast),
 `200 complete` (done, single-shot), `403 denied` (owner refused),
@@ -135,13 +162,23 @@ Design notes:
 - Abuse bounds: pending enrollments are capped (32), expire on Google's
   `expires_in`, and per-handle polling is throttled to the advertised
   interval without contacting Google.
-- Requires `GOOGLE_CLIENT_ID`; the device/token endpoints are read from
+- **Web-flow state binding**: the browser entry link carries a single-use
+  256-bit nonce; hitting it mints a fresh 256-bit `state` mapped in relay
+  memory to the pending enrollment (no signing needed). The Web client
+  secret, the authorization code exchange, and the ID token all stay
+  server-side; the browser and the agent never see them. Web enrollments
+  expire after 15 minutes.
+- Requires `GOOGLE_CLIENT_ID`; the auth/device/token endpoints are read from
   Google's OIDC discovery document. Without OIDC configured the endpoints
   answer `503`. Google restricts the device-code grant to clients of type
   "TVs and Limited Input devices", so production sets
   `GOOGLE_DEVICE_CLIENT_ID`/`GOOGLE_DEVICE_CLIENT_SECRET` (a second client of
   that type) for the enroll calls; when unset, enroll falls back to
-  `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`.
+  `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`. The web flow additionally needs
+  `GOOGLE_WEB_CLIENT_ID`/`GOOGLE_WEB_CLIENT_SECRET` (a "Web application"
+  client with `https://<relay>/enroll/callback` as an authorized redirect
+  URI); when unset, web start answers `503` and agents fall back to the
+  device-code flow.
 
 ## Configuration (environment variables)
 
@@ -152,7 +189,9 @@ Design notes:
 | `GOOGLE_CLIENT_SECRET` | *(unset)*      | The Desktop client's secret. Used for Google's token endpoint during self-enrollment **only when** `GOOGLE_DEVICE_CLIENT_ID` is unset (single-client fallback). Not confidential for this client type. |
 | `GOOGLE_DEVICE_CLIENT_ID` | *(unset)*   | OAuth client ID of the **"TVs and Limited Input devices"** client used for device-code self-enrollment — Google only allows the device-code grant for that client type. When set, enroll start/poll present this client to Google, and ID tokens with this `aud` are accepted alongside `GOOGLE_CLIENT_ID`. When unset, enroll falls back to `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`. |
 | `GOOGLE_DEVICE_CLIENT_SECRET` | *(unset)* | The TV/limited-input client's secret, sent with enroll token polls when `GOOGLE_DEVICE_CLIENT_ID` is set. Not confidential for this client type. |
-| `RELAY_BASE_URL`   | *(unset)*          | Public https base URL returned to freshly enrolled agents (`relay_base`). When unset it is derived from the request `Host` header, which is correct behind Caddy. |
+| `GOOGLE_WEB_CLIENT_ID` | *(unset)*      | OAuth client ID of the **"Web application"** client used for browser enrollment. The client must have `https://<relay>/enroll/callback` registered as an authorized redirect URI. ID tokens with this `aud` are accepted alongside the other clients. When unset, web enroll answers `503` and agents fall back to device-code. |
+| `GOOGLE_WEB_CLIENT_SECRET` | *(unset)*  | The Web client's secret, used server-side for the `/enroll/callback` code exchange. **Confidential** — keep it in the relay env only. |
+| `RELAY_BASE_URL`   | *(unset)*          | Public https base URL returned to freshly enrolled agents (`relay_base`) and used to build web-enroll URLs (`enroll_url`, the OAuth `redirect_uri`). When unset it is derived from the request `Host` header, which is correct behind Caddy. |
 | `ALLOWED_EMAILS`   | *(empty)*          | Comma-separated authorization allowlist of verified Google emails. A valid login by anyone not listed is rejected — including at self-enrollment. |
 | `STATE_DIR`        | `./state`          | Directory holding `devices.json` (persisted device hashes). |
 | `DEV_AUTH`         | `false`            | **Testing only.** Accept a static bearer as a stand-in for OIDC. Logs a loud warning at startup. |
@@ -169,8 +208,8 @@ both accepted until `DEV_AUTH` is turned off.
 
 - **Clients:** the Google ID token is fully verified — signature against
   Google's JWKS (issuer `https://accounts.google.com`),
-  `aud ∈ {GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID}` (explicit fail-closed
-  allowlist; the second entry only when configured),
+  `aud ∈ {GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID, GOOGLE_WEB_CLIENT_ID}`
+  (explicit fail-closed allowlist; the latter entries only when configured),
   `exp`, `sub` present, and `email_verified == true`. The email must then be on
   `ALLOWED_EMAILS`. Presence of a token is never sufficient. The verified
   identity is `{email, sub}` (Google's stable subject ID). Every HTTP request
@@ -225,6 +264,8 @@ Run the service (e.g. under systemd) with production config:
 GOOGLE_CLIENT_ID="<desktop-client-id>.apps.googleusercontent.com" \
 GOOGLE_DEVICE_CLIENT_ID="<tv-client-id>.apps.googleusercontent.com" \
 GOOGLE_DEVICE_CLIENT_SECRET="<tv-client-secret>" \
+GOOGLE_WEB_CLIENT_ID="<web-client-id>.apps.googleusercontent.com" \
+GOOGLE_WEB_CLIENT_SECRET="<web-client-secret>" \
 ALLOWED_EMAILS="dzearing@gmail.com" \
 STATE_DIR=/var/lib/ghoztty-relay \
 LISTEN_ADDR=127.0.0.1:8080 \
@@ -244,6 +285,8 @@ ExecStart=/usr/local/bin/ghoztty-relay
 Environment=GOOGLE_CLIENT_ID=<desktop-client-id>.apps.googleusercontent.com
 Environment=GOOGLE_DEVICE_CLIENT_ID=<tv-client-id>.apps.googleusercontent.com
 Environment=GOOGLE_DEVICE_CLIENT_SECRET=<tv-client-secret>
+Environment=GOOGLE_WEB_CLIENT_ID=<web-client-id>.apps.googleusercontent.com
+Environment=GOOGLE_WEB_CLIENT_SECRET=<web-client-secret>
 Environment=ALLOWED_EMAILS=dzearing@gmail.com
 Environment=STATE_DIR=/var/lib/ghoztty-relay
 Environment=LISTEN_ADDR=127.0.0.1:8080

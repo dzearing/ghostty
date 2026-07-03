@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"html"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -55,6 +57,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/client/connect", h.handleClientConnect)
 	mux.HandleFunc("POST /v1/enroll/start", h.handleEnrollStart)
 	mux.HandleFunc("POST /v1/enroll/poll", h.handleEnrollPoll)
+	// Browser-facing web-enroll leg. The literal "callback" segment wins over
+	// the {nonce} wildcard per ServeMux precedence, so both can coexist.
+	mux.HandleFunc("GET /enroll/callback", h.handleEnrollCallback)
+	mux.HandleFunc("GET /enroll/{nonce}", h.handleEnrollWeb)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -399,13 +405,21 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 // --- Self-enroll endpoints (WP-B3) -----------------------------------------
 
 // handleEnrollStart: POST /v1/enroll/start (JSON, UNAUTHENTICATED).
-// Body {"name":"<machine name>"}. Starts a Google device-code sign-in and
-// returns {verification_url, user_code, device_code_handle, interval,
-// expires_in}. The handle is an opaque relay-side stand-in for Google's
-// device_code, which never leaves the relay (see enroll.go for why).
+// Body {"name":"<machine name>", "flow":"device"|"web"} (flow defaults to
+// "device" for back-compat).
+//
+//   - device: starts a Google device-code sign-in and returns
+//     {verification_url, user_code, device_code_handle, interval, expires_in}.
+//     The handle is an opaque relay-side stand-in for Google's device_code,
+//     which never leaves the relay (see enroll.go for why).
+//   - web: returns {enroll_url, device_code_handle, interval, expires_in};
+//     the owner opens enroll_url in a browser and the agent polls the same
+//     /v1/enroll/poll. 503 when no Web OAuth client is configured — the
+//     agent falls back to the device flow.
 func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
+		Flow string `json:"flow"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
@@ -417,21 +431,116 @@ func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.enroll.Start(r.Context(), name)
+	switch body.Flow {
+	case "", flowDevice:
+		resp, err := h.enroll.Start(r.Context(), name)
+		switch {
+		case errors.Is(err, errEnrollUnavailable):
+			http.Error(w, "enrollment unavailable: relay has no OIDC device flow configured", http.StatusServiceUnavailable)
+			return
+		case errors.Is(err, errEnrollBusy):
+			http.Error(w, "too many pending enrollments, retry later", http.StatusTooManyRequests)
+			return
+		case err != nil:
+			h.logger.Warn("enroll start failed", "err", err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+	case flowWeb:
+		resp, err := h.enroll.StartWeb(name, h.relayBase(r))
+		switch {
+		case errors.Is(err, errEnrollUnavailable):
+			http.Error(w, "web enrollment unavailable: relay has no web OAuth client configured", http.StatusServiceUnavailable)
+			return
+		case errors.Is(err, errEnrollBusy):
+			http.Error(w, "too many pending enrollments, retry later", http.StatusTooManyRequests)
+			return
+		case err != nil:
+			h.logger.Warn("web enroll start failed", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+	default:
+		http.Error(w, "invalid flow: expected \"device\" or \"web\"", http.StatusBadRequest)
+	}
+}
+
+// handleEnrollWeb: GET /enroll/{nonce} (BROWSER, UNAUTHENTICATED).
+// The human-friendly single-use entry point printed/opened by the agent:
+// consumes the nonce and 302s to Google's auth endpoint with the Web client
+// and a fresh state bound to the pending enrollment.
+func (h *Handler) handleEnrollWeb(w http.ResponseWriter, r *http.Request) {
+	loc, err := h.enroll.AuthRedirectURL(r.PathValue("nonce"), h.relayBase(r))
 	switch {
 	case errors.Is(err, errEnrollUnavailable):
-		http.Error(w, "enrollment unavailable: relay has no OIDC device flow configured", http.StatusServiceUnavailable)
+		writeEnrollPage(w, http.StatusServiceUnavailable, false, "Enrollment unavailable",
+			"This relay has no browser sign-in configured.")
 		return
-	case errors.Is(err, errEnrollBusy):
-		http.Error(w, "too many pending enrollments, retry later", http.StatusTooManyRequests)
+	case errors.Is(err, errWebNonceUnknown):
+		writeEnrollPage(w, http.StatusNotFound, false, "Link invalid or expired",
+			"This enrollment link has already been used or has expired. "+
+				"Run the enrollment on the machine again to get a fresh link.")
 		return
 	case err != nil:
-		h.logger.Warn("enroll start failed", "err", err)
-		http.Error(w, "upstream error", http.StatusBadGateway)
+		h.logger.Warn("web enroll redirect failed", "err", err)
+		writeEnrollPage(w, http.StatusInternalServerError, false, "Something went wrong",
+			"Run the enrollment on the machine again.")
+		return
+	}
+	http.Redirect(w, r, loc, http.StatusFound)
+}
+
+// handleEnrollCallback: GET /enroll/callback?code&state (BROWSER,
+// UNAUTHENTICATED — this is the Web client's registered redirect URI).
+// Binds state back to the pending enrollment, exchanges the code, verifies
+// the identity, upserts the device, and tells the human what happened. The
+// agent's poll picks up the outcome.
+func (h *Handler) handleEnrollCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	state := q.Get("state")
+
+	// The owner clicked "cancel" on Google's page: Google sends error=... back.
+	if gerr := q.Get("error"); gerr != "" && state != "" {
+		if err := h.enroll.DenyByState(state); err == nil {
+			writeEnrollPage(w, http.StatusForbidden, false, "Sign-in cancelled",
+				"The machine was NOT added to your account. You can close this tab.")
+			return
+		}
+		writeEnrollPage(w, http.StatusBadRequest, false, "Link invalid or expired",
+			"Run the enrollment on the machine again to get a fresh link.")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	code := q.Get("code")
+	if code == "" || state == "" {
+		writeEnrollPage(w, http.StatusBadRequest, false, "Malformed callback",
+			"Missing code or state. Run the enrollment on the machine again.")
+		return
+	}
+
+	name, err := h.enroll.Callback(r.Context(), code, state)
+	switch {
+	case errors.Is(err, errWebStateUnknown):
+		writeEnrollPage(w, http.StatusBadRequest, false, "Link invalid or expired",
+			"This sign-in doesn't match a pending enrollment (already completed, "+
+				"or it expired). Run the enrollment on the machine again.")
+	case errors.Is(err, errWebRejected):
+		writeEnrollPage(w, http.StatusForbidden, false, "Account not allowed",
+			"The Google sign-in worked, but that account is not allowed on this relay. "+
+				"The machine was NOT added.")
+	case errors.Is(err, errWebExchange):
+		writeEnrollPage(w, http.StatusBadGateway, false, "Sign-in could not be completed",
+			"The code exchange with Google failed. Run the enrollment on the machine again.")
+	case err != nil:
+		writeEnrollPage(w, http.StatusInternalServerError, false, "Something went wrong",
+			"Run the enrollment on the machine again.")
+	default:
+		writeEnrollPage(w, http.StatusOK, true, name+" added to your account",
+			"You can close this tab — the machine finishes enrolling on its own "+
+				"within a few seconds.")
+	}
 }
 
 // handleEnrollPoll: POST /v1/enroll/poll (JSON, UNAUTHENTICATED, rate-limited
@@ -467,4 +576,31 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeEnrollPage renders the tiny self-contained HTML page the web-enroll
+// browser leg ends on (success or terse failure). No external assets.
+func writeEnrollPage(w http.ResponseWriter, status int, ok bool, title, detail string) {
+	mark, color := "✕", "#c0392b"
+	if ok {
+		mark, color = "✓", "#27ae60"
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ghoztty enrollment</title>
+<style>
+body{font:16px/1.5 -apple-system,system-ui,sans-serif;display:flex;min-height:100vh;margin:0;
+     align-items:center;justify-content:center;background:#f6f7f8;color:#1c1e21}
+main{max-width:26rem;padding:2rem;text-align:center}
+.mark{font-size:3rem;color:%s}
+h1{font-size:1.25rem;margin:.5rem 0}
+p{color:#555;margin:0}
+</style></head><body><main>
+<div class="mark">%s</div>
+<h1>%s</h1>
+<p>%s</p>
+</main></body></html>
+`, color, mark, html.EscapeString(title), html.EscapeString(detail))
 }

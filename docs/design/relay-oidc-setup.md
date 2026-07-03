@@ -74,6 +74,35 @@ ID tokens minted through this client carry *its* ID as `aud`; the relay
 accepts either client's `aud` (explicit allowlist in `relay/auth.go`), so
 tokens from the enroll flow and from the Mac app's sign-in both verify.
 
+### 1b-3. The THIRD OAuth client — browser (web) enroll
+
+The default enrollment UX is Tailscale-style: `ghoztty-agent --enroll` opens
+the owner's browser, they approve the Google sign-in, done — no code to type.
+That leg is a standard server-side authorization-code flow, which needs a
+client of type **Web application** with a fixed redirect URI on the relay:
+
+15. **Credentials → + Create credentials → OAuth client ID** once more.
+16. **Application type:** **Web application**.
+17. **Name:** `ghoztty-web-enroll` → **Create**.
+18. Under **Authorized redirect URIs → + Add URI**, enter EXACTLY:
+
+    ```
+    https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/enroll/callback
+    ```
+
+    (General form: `https://<relay-host>/enroll/callback` — it must match the
+    relay's public base char-for-char; Google rejects mismatched callbacks.)
+    No authorized JavaScript origins needed.
+19. Copy this client's **Client ID** and **Client secret**. These become
+    `GOOGLE_WEB_CLIENT_ID` / `GOOGLE_WEB_CLIENT_SECRET` in §2. Unlike the
+    Desktop/TV "secrets", a Web client secret IS confidential — it lives only
+    in the relay's env file and the code exchange happens server-side; it is
+    never given to agents or browsers.
+
+These env vars are **optional**: with them unset, web enrollment answers 503
+and agents automatically fall back to the §1b-2 device-code flow (that is
+also the headless path — `--no-browser`/`--headless-enroll` forces it).
+
 ## 2. Configure the relay VM (~2 min)
 
 SSH to the Azure VM (`ghoztty-relay-dz17575.westus2.cloudapp.azure.com`, RG
@@ -91,6 +120,8 @@ Set:
 GOOGLE_CLIENT_ID=<the-desktop-client-id-from-step-10>.apps.googleusercontent.com
 GOOGLE_DEVICE_CLIENT_ID=<the-tv-client-id-from-step-14>.apps.googleusercontent.com
 GOOGLE_DEVICE_CLIENT_SECRET=<the-tv-client-secret-from-step-14>
+GOOGLE_WEB_CLIENT_ID=<the-web-client-id-from-step-19>.apps.googleusercontent.com
+GOOGLE_WEB_CLIENT_SECRET=<the-web-client-secret-from-step-19>
 ALLOWED_EMAILS=dzearing@gmail.com
 DEV_AUTH=false          # or delete the DEV_AUTH / DEV_CLIENT_TOKEN / DEV_EMAIL lines
 STATE_DIR=/var/lib/ghoztty-relay   # keep whatever is already there
@@ -99,7 +130,9 @@ LISTEN_ADDR=127.0.0.1:8080         # keep
 
 (`GOOGLE_DEVICE_CLIENT_ID`/`_SECRET` drive the agent device-code enroll; if
 they are unset the relay falls back to `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`
-for enroll, which Google will refuse for a Desktop client — so set them.)
+for enroll, which Google will refuse for a Desktop client — so set them.
+`GOOGLE_WEB_CLIENT_ID`/`_SECRET` drive the browser enroll flow; leaving them
+unset just downgrades enrollment UX to the device-code prompt.)
 
 Notes:
 - `ALLOWED_EMAILS` is comma-separated, case-insensitive. A valid Google login
@@ -189,8 +222,9 @@ both, which is a fine halfway state while WP-B2 is in flight.
 
 Per `relay/auth.go` (tested in `relay/auth_oidc_test.go` against a fake local
 issuer): RS256 signature against Google's published JWKS, `iss ==
-https://accounts.google.com`, `aud ∈ {GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID}`
-(the second entry only when configured; fail-closed explicit allowlist),
+https://accounts.google.com`, `aud ∈ {GOOGLE_CLIENT_ID,
+GOOGLE_DEVICE_CLIENT_ID, GOOGLE_WEB_CLIENT_ID}`
+(the latter entries only when configured; fail-closed explicit allowlist),
 `exp`, `sub` present,
 `email_verified == true`, then `email ∈ ALLOWED_EMAILS`. Any failure →
 fail-closed 401, never bridged. The verified identity (email + Google `sub`)

@@ -1,15 +1,22 @@
-//! Agent-side OAuth device-code self-enroll (WP-B3, agent half).
+//! Agent-side OAuth self-enroll (agent half): browser-first, device-code
+//! fallback.
 //!
 //! `ghoztty-agent --enroll --relay=<base>` turns a fresh machine into an
 //! account-owned relay device with NO pre-minted credential:
 //!
-//!   1. `POST <base>/v1/enroll/start` with this machine's hostname as the
-//!      requested name → `{verification_url, user_code, device_code_handle,
-//!      interval, expires_in}`.
-//!   2. Print "visit <url>, enter code <XXXX-XXXX>" for the owner.
-//!   3. Poll `POST <base>/v1/enroll/poll` every `interval` seconds. A `429
-//!      slow_down` grows the interval by 5s (RFC 8628 §3.5); `denied` /
-//!      `expired` / `rejected` / `unknown` are terminal.
+//!   1. `POST <base>/v1/enroll/start` with this machine's hostname and
+//!      `"flow":"web"` → `{enroll_url, device_code_handle, interval,
+//!      expires_in}`. Open `enroll_url` in the default browser (best-effort;
+//!      the URL is always printed too) — the owner just approves the Google
+//!      sign-in there, no code to type. If the relay answers 503 (no web
+//!      OAuth client configured), if it ignored the flow field (older
+//!      relay), or if `--no-browser`/`--headless-enroll` was passed, fall
+//!      back to the device-code flow: start with the default flow and print
+//!      "visit <url>, enter code <XXXX-XXXX>".
+//!   3. Poll `POST <base>/v1/enroll/poll` every `interval` seconds — the
+//!      SAME poll for both flows. A `429 slow_down` grows the interval by 5s
+//!      (RFC 8628 §3.5); `denied` / `expired` / `rejected` / `unknown` are
+//!      terminal.
 //!   4. On `complete`, persist `RELAY_BASE` + `DEVICE_TOKEN` to the agent's
 //!      `relay.env` (`%LOCALAPPDATA%\ghoztty\relay.env` on Windows,
 //!      `$XDG_CONFIG_HOME/ghoztty/relay.env` or `~/.config/ghoztty/relay.env`
@@ -39,7 +46,7 @@ pub const min_interval_s: u32 = 1;
 // Wire types (JSON bodies of the relay's enroll endpoints)
 // -----------------------------------------------------------------------------
 
-/// Body of `POST /v1/enroll/start` (200).
+/// Body of `POST /v1/enroll/start` (200) for the device-code flow.
 pub const StartResponse = struct {
     verification_url: []const u8,
     user_code: []const u8,
@@ -47,6 +54,106 @@ pub const StartResponse = struct {
     interval: u32 = 5,
     expires_in: u32 = 900,
 };
+
+/// Body of `POST /v1/enroll/start` (200) when the agent ASKED for the web
+/// flow. Shape-tolerant: a current relay answers `{enroll_url, ...}`, while
+/// an older relay ignores the unknown `flow` field and starts a device-code
+/// grant (`{verification_url, user_code, ...}`) — both parse here and the
+/// present fields decide which UX runs (see `startFlowOf`).
+pub const StartAnyResponse = struct {
+    enroll_url: ?[]const u8 = null,
+    verification_url: ?[]const u8 = null,
+    user_code: ?[]const u8 = null,
+    device_code_handle: []const u8 = "",
+    interval: u32 = 5,
+    expires_in: u32 = 900,
+};
+
+/// What a 200 answer to a web-flow start actually granted.
+pub const StartFlow = enum {
+    /// `enroll_url` present: browser flow.
+    web,
+    /// Device-code fields present (older relay ignored `flow`).
+    device,
+    /// Neither — a protocol failure.
+    malformed,
+};
+
+/// Classify a parsed web-flow start body by which fields it carries.
+pub fn startFlowOf(body: StartAnyResponse) StartFlow {
+    if (body.device_code_handle.len == 0) return .malformed;
+    if (body.enroll_url) |u| {
+        if (u.len > 0) return .web;
+    }
+    if (body.verification_url != null and body.user_code != null) return .device;
+    return .malformed;
+}
+
+/// What the HTTP status of a web-flow start attempt means.
+pub const WebStartAction = enum {
+    /// 200 — parse the body (see `startFlowOf`).
+    proceed,
+    /// 503 — the relay has no web OAuth client; use the device-code flow.
+    fallback,
+    /// Anything else — enrollment refused, no point retrying another flow.
+    refused,
+};
+
+/// Classify the HTTP status of a `flow:"web"` start.
+pub fn webStartAction(status: u16) WebStartAction {
+    return switch (status) {
+        200 => .proceed,
+        503 => .fallback,
+        else => .refused,
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Opening the owner's browser (web flow, best-effort)
+// -----------------------------------------------------------------------------
+
+/// The platform command that opens a URL in the default browser.
+pub const BrowserCmd = struct {
+    argv_buf: [3][]const u8,
+    len: usize,
+
+    pub fn argv(self: *const BrowserCmd) []const []const u8 {
+        return self.argv_buf[0..self.len];
+    }
+};
+
+/// Per-OS `argv` for opening `url` in the default browser.
+pub fn browserOpenCmd(os_tag: std.Target.Os.Tag, url: []const u8) BrowserCmd {
+    return switch (os_tag) {
+        // rundll32 works from a GUI-subsystem exe with no console attached
+        // (the installer pipes our stdout, there is no shell to `start` in).
+        .windows => .{ .argv_buf = .{ "rundll32", "url.dll,FileProtocolHandler", url }, .len = 3 },
+        .macos => .{ .argv_buf = .{ "open", url, "" }, .len = 2 },
+        else => .{ .argv_buf = .{ "xdg-open", url, "" }, .len = 2 },
+    };
+}
+
+/// Try to open `url` in the default browser. Best-effort: returns false when
+/// the spawn fails or `GHOZTTY_ENROLL_NO_OPEN` is set (tests/automation); the
+/// caller always prints the URL as well.
+fn openBrowser(alloc: Allocator, url: []const u8) bool {
+    if (std.process.getEnvVarOwned(alloc, "GHOZTTY_ENROLL_NO_OPEN")) |v| {
+        defer alloc.free(v);
+        if (v.len > 0) return false;
+    } else |_| {}
+
+    const cmd = browserOpenCmd(builtin.os.tag, url);
+    var child = std.process.Child.init(cmd.argv(), alloc);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return false;
+    // Deliberately NOT waited: `open`/`rundll32`/`xdg-open` normally return
+    // immediately, but a misconfigured xdg-open can block until the browser
+    // closes — that must not stall the poll loop. The single unreaped child
+    // is collected when this short-lived enroll process exits.
+    return true;
+}
 
 /// Body of `POST /v1/enroll/poll` (any status). Every field is optional on the
 /// wire; `status` is the discriminator (`pending`, `slow_down`, `complete`,
@@ -260,21 +367,96 @@ fn say(comptime fmt: []const u8, args: anytype) void {
     std.fs.File.stdout().writeAll(msg) catch {};
 }
 
-/// Run the whole device-code enroll flow against `relay_base` (an `https://`
-/// or — for loopback tests — `http://` base URL), registering this machine as
-/// `machine_name`. On success relay.env is persisted and instructions are
-/// printed. Blocks for as long as the owner takes to sign in (bounded by the
-/// code's `expires_in`).
-pub fn run(alloc: Allocator, relay_base: []const u8, machine_name: []const u8) !void {
-    const base = std.mem.trimRight(u8, relay_base, "/");
+/// Options for `run`.
+pub const RunOptions = struct {
+    /// Skip the browser (web) flow entirely and use the device-code flow
+    /// (`--no-browser` / `--headless-enroll`).
+    no_browser: bool = false,
+};
 
-    // --- 1. Start: ask the relay for a user code -------------------------------
+/// Run the whole enroll flow against `relay_base` (an `https://` or — for
+/// loopback tests — `http://` base URL), registering this machine as
+/// `machine_name`. Tries the browser (web) flow first, falling back to the
+/// device-code flow when the relay does not offer it or `opts.no_browser` is
+/// set. On success relay.env is persisted and instructions are printed.
+/// Blocks for as long as the owner takes to sign in (bounded by the flow's
+/// `expires_in`).
+pub fn run(alloc: Allocator, relay_base: []const u8, machine_name: []const u8, opts: RunOptions) !void {
+    const base = std.mem.trimRight(u8, relay_base, "/");
     const start_url = try std.fmt.allocPrint(alloc, "{s}/v1/enroll/start", .{base});
     defer alloc.free(start_url);
-    const start_body = try std.json.Stringify.valueAlloc(alloc, .{ .name = machine_name }, .{});
-    defer alloc.free(start_body);
 
     say("ghoztty-agent: enrolling \"{s}\" with relay {s}\n", .{ machine_name, base });
+
+    // --- 1a. Browser (web) flow first: no code to type -------------------------
+    if (!opts.no_browser) web: {
+        const web_body = try std.json.Stringify.valueAlloc(
+            alloc,
+            .{ .name = machine_name, .flow = "web" },
+            .{},
+        );
+        defer alloc.free(web_body);
+
+        var resp = http_client.postJson(alloc, start_url, web_body) catch |err| {
+            say("ghoztty-agent: could not reach the relay ({s})\n", .{@errorName(err)});
+            return err;
+        };
+        defer resp.deinit(alloc);
+        switch (webStartAction(resp.status)) {
+            .proceed => {},
+            .fallback => {
+                say("ghoztty-agent: this relay has no browser sign-in; using the code flow\n", .{});
+                break :web;
+            },
+            .refused => {
+                say("ghoztty-agent: enroll start refused (HTTP {d}): {s}\n", .{
+                    resp.status, std.mem.trim(u8, resp.body, " \r\n"),
+                });
+                return EnrollError.EnrollRefused;
+            },
+        }
+
+        const parsed = std.json.parseFromSlice(StartAnyResponse, alloc, resp.body, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            say("ghoztty-agent: malformed enroll start response\n", .{});
+            return EnrollError.EnrollFailed;
+        };
+        defer parsed.deinit();
+        const s = parsed.value;
+        switch (startFlowOf(s)) {
+            .web => {
+                const enroll_url = s.enroll_url.?;
+                if (openBrowser(alloc, enroll_url)) {
+                    say(
+                        "\nA browser window should have opened to add this machine to your account.\nIf it did not, visit: {s}\n\n",
+                        .{enroll_url},
+                    );
+                } else {
+                    say(
+                        "\nTo add this machine to your account, visit: {s}\n\n",
+                        .{enroll_url},
+                    );
+                }
+                say("ghoztty-agent: waiting for the browser sign-in (link expires in {d}s)\n", .{s.expires_in});
+                return pollUntilDone(alloc, base, s.device_code_handle, s.interval, s.expires_in);
+            },
+            .device => {
+                // An older relay ignored the `flow` field and started a
+                // device-code grant — run its UX with what we got.
+                sayDeviceCodePrompt(s.verification_url.?, s.user_code.?, s.interval, s.expires_in);
+                return pollUntilDone(alloc, base, s.device_code_handle, s.interval, s.expires_in);
+            },
+            .malformed => {
+                say("ghoztty-agent: malformed enroll start response\n", .{});
+                return EnrollError.EnrollFailed;
+            },
+        }
+    }
+
+    // --- 1b. Device-code flow (headless / fallback) -----------------------------
+    const start_body = try std.json.Stringify.valueAlloc(alloc, .{ .name = machine_name }, .{});
+    defer alloc.free(start_body);
 
     var start_resp = http_client.postJson(alloc, start_url, start_body) catch |err| {
         say("ghoztty-agent: could not reach the relay ({s})\n", .{@errorName(err)});
@@ -304,28 +486,37 @@ pub fn run(alloc: Allocator, relay_base: []const u8, machine_name: []const u8) !
     defer start_parsed.deinit();
     const start = start_parsed.value;
 
-    // --- 2. Show the owner what to do ------------------------------------------
+    sayDeviceCodePrompt(start.verification_url, start.user_code, start.interval, start.expires_in);
+    return pollUntilDone(alloc, base, start.device_code_handle, start.interval, start.expires_in);
+}
+
+/// The device-code flow's "visit URL, enter code" prompt.
+fn sayDeviceCodePrompt(verification_url: []const u8, user_code: []const u8, interval_s: u32, expires_in_s: u32) void {
     say(
         "\nTo add this machine to your account, visit {s}\nand enter code: {s}\n\n",
-        .{ start.verification_url, start.user_code },
+        .{ verification_url, user_code },
     );
     say("ghoztty-agent: waiting for approval (polling every {d}s; code expires in {d}s)\n", .{
-        @max(start.interval, min_interval_s), start.expires_in,
+        @max(interval_s, min_interval_s), expires_in_s,
     });
+}
 
-    // --- 3. Poll until a terminal outcome --------------------------------------
+/// Poll `POST <base>/v1/enroll/poll` until a terminal outcome; on `complete`,
+/// persist relay.env and print how to start the agent. Shared by both flows —
+/// the relay's poll contract is identical.
+fn pollUntilDone(alloc: Allocator, base: []const u8, handle: []const u8, interval: u32, expires_in: u32) !void {
     const poll_url = try std.fmt.allocPrint(alloc, "{s}/v1/enroll/poll", .{base});
     defer alloc.free(poll_url);
     const poll_body = try std.json.Stringify.valueAlloc(
         alloc,
-        .{ .device_code_handle = start.device_code_handle },
+        .{ .device_code_handle = handle },
         .{},
     );
     defer alloc.free(poll_body);
 
-    var interval_s: u32 = @max(start.interval, min_interval_s);
+    var interval_s: u32 = @max(interval, min_interval_s);
     const deadline_ms: i64 = std.time.milliTimestamp() +
-        @as(i64, start.expires_in) * std.time.ms_per_s;
+        @as(i64, expires_in) * std.time.ms_per_s;
 
     while (true) {
         std.Thread.sleep(@as(u64, interval_s) * std.time.ns_per_s);
@@ -491,6 +682,72 @@ test "backoff arithmetic: slow_down adds 5s over the max of ours/theirs" {
     try testing.expectEqual(@as(u32, 5), nextIntervalOnPending(5, null));
     try testing.expectEqual(@as(u32, 10), nextIntervalOnPending(5, 10));
     try testing.expectEqual(@as(u32, 1), nextIntervalOnPending(0, null));
+}
+
+test "webStartAction: 200 proceeds, 503 falls back, the rest refuse" {
+    try testing.expectEqual(WebStartAction.proceed, webStartAction(200));
+    try testing.expectEqual(WebStartAction.fallback, webStartAction(503));
+    try testing.expectEqual(WebStartAction.refused, webStartAction(400));
+    try testing.expectEqual(WebStartAction.refused, webStartAction(429));
+    try testing.expectEqual(WebStartAction.refused, webStartAction(500));
+}
+
+test "StartAnyResponse + startFlowOf: web, old-relay device, malformed" {
+    const alloc = testing.allocator;
+
+    { // Current relay: web grant.
+        const p = try std.json.parseFromSlice(StartAnyResponse, alloc,
+            \\{"enroll_url":"https://relay.test/enroll/nonce-1",
+            \\ "device_code_handle":"handle-1","interval":2,"expires_in":900}
+        , .{ .ignore_unknown_fields = true });
+        defer p.deinit();
+        try testing.expectEqual(StartFlow.web, startFlowOf(p.value));
+        try testing.expectEqualStrings("https://relay.test/enroll/nonce-1", p.value.enroll_url.?);
+        try testing.expectEqual(@as(u32, 2), p.value.interval);
+    }
+    { // Older relay ignored `flow` and answered a device-code grant.
+        const p = try std.json.parseFromSlice(StartAnyResponse, alloc,
+            \\{"verification_url":"https://www.google.com/device","user_code":"WXYZ-1234",
+            \\ "device_code_handle":"handle-2","interval":5,"expires_in":600}
+        , .{ .ignore_unknown_fields = true });
+        defer p.deinit();
+        try testing.expectEqual(StartFlow.device, startFlowOf(p.value));
+    }
+    // Neither shape, or no handle: malformed.
+    try testing.expectEqual(StartFlow.malformed, startFlowOf(.{ .device_code_handle = "h" }));
+    try testing.expectEqual(StartFlow.malformed, startFlowOf(.{
+        .enroll_url = "https://relay.test/enroll/n",
+    }));
+    try testing.expectEqual(StartFlow.malformed, startFlowOf(.{
+        .device_code_handle = "h",
+        .enroll_url = "",
+    }));
+}
+
+test "browserOpenCmd: per-OS argv" {
+    const url = "https://relay.test/enroll/abc";
+    {
+        const cmd = browserOpenCmd(.windows, url);
+        const argv = cmd.argv();
+        try testing.expectEqual(@as(usize, 3), argv.len);
+        try testing.expectEqualStrings("rundll32", argv[0]);
+        try testing.expectEqualStrings("url.dll,FileProtocolHandler", argv[1]);
+        try testing.expectEqualStrings(url, argv[2]);
+    }
+    {
+        const cmd = browserOpenCmd(.macos, url);
+        const argv = cmd.argv();
+        try testing.expectEqual(@as(usize, 2), argv.len);
+        try testing.expectEqualStrings("open", argv[0]);
+        try testing.expectEqualStrings(url, argv[1]);
+    }
+    {
+        const cmd = browserOpenCmd(.linux, url);
+        const argv = cmd.argv();
+        try testing.expectEqual(@as(usize, 2), argv.len);
+        try testing.expectEqualStrings("xdg-open", argv[0]);
+        try testing.expectEqualStrings(url, argv[1]);
+    }
 }
 
 test "relay.env: format → parse round-trip" {

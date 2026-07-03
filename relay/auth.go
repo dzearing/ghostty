@@ -48,7 +48,9 @@ type Authenticator struct {
 
 	// allowedAuds is the `aud` allowlist for ID tokens: GOOGLE_CLIENT_ID (the
 	// Desktop client the Mac app signs in with) plus GOOGLE_DEVICE_CLIENT_ID
-	// (the TV/limited-input client the device-code enroll flow uses) when set.
+	// (the TV/limited-input client the device-code enroll flow uses) plus
+	// GOOGLE_WEB_CLIENT_ID (the Web client the browser enroll callback uses),
+	// each when set.
 	// go-oidc's verifier only checks a single ClientID, so the verifier is
 	// built with SkipClientIDCheck and VerifyIDToken enforces membership in
 	// this list explicitly — one verifier, one signature check, and a
@@ -57,13 +59,15 @@ type Authenticator struct {
 	// and make "which verifier's error do we trust?" ambiguous.)
 	allowedAuds []string
 
-	// Device-code flow endpoints, taken from the issuer's OIDC discovery
-	// document (Google publishes device_authorization_endpoint =
-	// https://oauth2.googleapis.com/device/code). Deriving them from discovery
-	// means tests redirect them through the same test-only IssuerURL override
-	// as everything else — no separate endpoint knobs. Empty if the issuer
-	// does not advertise a device flow.
+	// OAuth flow endpoints, taken from the issuer's OIDC discovery document
+	// (Google publishes device_authorization_endpoint =
+	// https://oauth2.googleapis.com/device/code, authorization_endpoint =
+	// https://accounts.google.com/o/oauth2/v2/auth). Deriving them from
+	// discovery means tests redirect them through the same test-only IssuerURL
+	// override as everything else — no separate endpoint knobs. Empty if the
+	// issuer does not advertise the flow.
 	deviceAuthURL string
+	authURL       string
 	tokenURL      string
 	// httpClient is the bounded-timeout client shared with the OIDC provider;
 	// device-code HTTP calls reuse it so every outbound request is bounded.
@@ -102,24 +106,29 @@ func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*A
 		// and fails closed.
 		a.verifier = provider.Verifier(&oidc.Config{SkipClientIDCheck: true})
 		a.allowedAuds = []string{cfg.GoogleClientID}
-		if cfg.GoogleDeviceClientID != "" && cfg.GoogleDeviceClientID != cfg.GoogleClientID {
-			a.allowedAuds = append(a.allowedAuds, cfg.GoogleDeviceClientID)
+		for _, aud := range []string{cfg.GoogleDeviceClientID, cfg.GoogleWebClientID} {
+			if aud != "" && !audAllowed(a.allowedAuds, []string{aud}) {
+				a.allowedAuds = append(a.allowedAuds, aud)
+			}
 		}
 		a.httpClient = httpClient
 
-		// Pull the device-code endpoints out of the discovery document for the
-		// self-enroll flow (WP-B3). Absence is not an error: enrollment simply
-		// reports itself unavailable.
+		// Pull the OAuth endpoints out of the discovery document for the
+		// self-enroll flows (device-code + web callback). Absence is not an
+		// error: enrollment simply reports itself unavailable.
 		var disc struct {
 			DeviceAuthorizationEndpoint string `json:"device_authorization_endpoint"`
+			AuthorizationEndpoint       string `json:"authorization_endpoint"`
 			TokenEndpoint               string `json:"token_endpoint"`
 		}
 		if err := provider.Claims(&disc); err == nil {
 			a.deviceAuthURL = disc.DeviceAuthorizationEndpoint
+			a.authURL = disc.AuthorizationEndpoint
 			a.tokenURL = disc.TokenEndpoint
 		}
 		logger.Info("OIDC client auth enabled", "issuer", issuer,
-			"device_flow", a.deviceAuthURL != "" && a.tokenURL != "")
+			"device_flow", a.deviceAuthURL != "" && a.tokenURL != "",
+			"web_enroll", cfg.GoogleWebClientID != "" && a.authURL != "" && a.tokenURL != "")
 	} else {
 		logger.Warn("GOOGLE_CLIENT_ID unset — OIDC client auth disabled")
 	}
@@ -155,10 +164,11 @@ func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request)
 
 // VerifyIDToken runs the full OIDC verification + allowlist authorization on a
 // raw ID token and returns the verified identity. It is the single shared
-// gate for both interactive client auth (AuthenticateClient) and device-code
-// self-enrollment (the /v1/enroll/poll success path): signature against the
-// issuer's JWKS, issuer, audience (∈ {GOOGLE_CLIENT_ID,
-// GOOGLE_DEVICE_CLIENT_ID}), expiry, `sub` present, `email_verified`, and
+// gate for interactive client auth (AuthenticateClient), device-code
+// self-enrollment (the /v1/enroll/poll success path), and web enrollment (the
+// /enroll/callback code exchange): signature against the issuer's JWKS,
+// issuer, audience (∈ {GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID,
+// GOOGLE_WEB_CLIENT_ID}), expiry, `sub` present, `email_verified`, and
 // membership in ALLOWED_EMAILS.
 func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identity, error) {
 	if token == "" || a.verifier == nil {

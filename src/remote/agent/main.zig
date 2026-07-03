@@ -25,9 +25,11 @@
 //!      drop (sessions survive). Coexists with — does not replace — `--listen`.
 //!
 //! Plus one one-shot utility mode: `--enroll --relay <url>` runs the OAuth
-//! device-code self-enrollment (WP-B3, `enroll.zig`) — "visit URL, enter code,
-//! sign in" — and persists the issued device credential to `relay.env`, after
-//! which `--relay <url>` just works.
+//! self-enrollment (`enroll.zig`) — opens the owner's browser to approve the
+//! sign-in (Tailscale-style), falling back to the device-code "visit URL,
+//! enter code" flow when the relay offers no web client or
+//! `--no-browser`/`--headless-enroll` is passed — and persists the issued
+//! device credential to `relay.env`, after which `--relay <url>` just works.
 //!
 //! ### SESSION SURVIVAL (P1, §7.1) — the close-laptop scenario
 //! The session table + pty children + output rings live in a DAEMON-scoped
@@ -120,13 +122,14 @@ pub fn main() !void {
             try runRelay(alloc, encoding, r.base_url, token, r.headless);
         },
         .enroll => |e| {
-            // Device-code self-enroll (WP-B3): register this machine (by its
-            // hostname) under the owner's account and persist the credential.
-            // Unlike relay mode this returns, so the duped URL is freed.
+            // Self-enroll (browser-first, device-code fallback): register this
+            // machine (by its hostname) under the owner's account and persist
+            // the credential. Unlike relay mode this returns, so the duped URL
+            // is freed.
             defer alloc.free(e.base_url);
             var host_buf: [256]u8 = undefined;
             const name = hostName(&host_buf) orelse "unknown-host";
-            try enroll.run(alloc, e.base_url, name);
+            try enroll.run(alloc, e.base_url, name, .{ .no_browser = e.no_browser });
         },
     }
 }
@@ -146,10 +149,13 @@ const Mode = union(enum) {
     enroll: Enroll,
 };
 
-/// Device-code self-enroll parameters (`--enroll --relay=<base>`). `base_url`
-/// is the relay HTTP(S) base to enroll against (owned — duped from argv).
+/// Self-enroll parameters (`--enroll --relay=<base>`). `base_url` is the
+/// relay HTTP(S) base to enroll against (owned — duped from argv).
+/// `no_browser` (`--no-browser` / `--headless-enroll`) skips the browser flow
+/// and uses the device-code flow directly.
 const Enroll = struct {
     base_url: []const u8,
+    no_browser: bool = false,
 };
 
 /// Relay-mode parameters. `base_url` is the relay HTTPS/WSS base (owned — duped
@@ -172,7 +178,8 @@ const Listen = struct {
 /// `--headless` (anywhere on the line) suppresses the tray for listen mode; the
 /// stdio path is ALWAYS headless (an ssh-piped agent has no desktop to draw on).
 /// `--enroll` (anywhere on the line) turns the `--relay` base into a one-shot
-/// device-code enrollment instead of the relay daemon.
+/// enrollment instead of the relay daemon; `--no-browser`/`--headless-enroll`
+/// makes that enrollment use the device-code flow instead of the browser.
 fn parseArgs(alloc: Allocator) !Mode {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
@@ -181,15 +188,20 @@ fn parseArgs(alloc: Allocator) !Mode {
     // after the mode argument they modify.
     var headless = false;
     var want_enroll = false;
+    var no_browser = false;
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--headless")) headless = true;
         if (std.mem.eql(u8, a, "--enroll")) want_enroll = true;
+        if (std.mem.eql(u8, a, "--no-browser") or
+            std.mem.eql(u8, a, "--headless-enroll")) no_browser = true;
     }
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--headless") or std.mem.eql(u8, a, "--enroll")) {
+        if (std.mem.eql(u8, a, "--headless") or std.mem.eql(u8, a, "--enroll") or
+            std.mem.eql(u8, a, "--no-browser") or std.mem.eql(u8, a, "--headless-enroll"))
+        {
             continue; // handled in the pre-scan above
         } else if (std.mem.eql(u8, a, "--stdio")) {
             return .stdio;
@@ -211,11 +223,11 @@ fn parseArgs(alloc: Allocator) !Mode {
             // Dupe the URL: `args` is freed (argsFree) when parseArgs returns, but
             // both relay and enroll modes need it past that.
             const url = try alloc.dupe(u8, args[i]);
-            if (want_enroll) return .{ .enroll = .{ .base_url = url } };
+            if (want_enroll) return .{ .enroll = .{ .base_url = url, .no_browser = no_browser } };
             return .{ .relay = .{ .base_url = url, .headless = headless } };
         } else if (std.mem.startsWith(u8, a, "--relay=")) {
             const url = try alloc.dupe(u8, a["--relay=".len..]);
-            if (want_enroll) return .{ .enroll = .{ .base_url = url } };
+            if (want_enroll) return .{ .enroll = .{ .base_url = url, .no_browser = no_browser } };
             return .{ .relay = .{ .base_url = url, .headless = headless } };
         } else {
             std.debug.print("ghoztty-agent: unknown argument '{s}'\n", .{a});

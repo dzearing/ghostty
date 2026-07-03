@@ -37,6 +37,18 @@ type Config struct {
 	GoogleDeviceClientID     string
 	GoogleDeviceClientSecret string
 
+	// GoogleWebClientID / GoogleWebClientSecret identify a THIRD OAuth client,
+	// of type "Web application", used for the browser-based enroll flow: the
+	// agent's --enroll opens a relay-hosted URL that 302s to Google's auth
+	// endpoint and lands back on GET /enroll/callback, where the relay
+	// exchanges the code with this client. The client MUST have
+	// `https://<relay>/enroll/callback` registered as an authorized redirect
+	// URI. Optional: when unset, web enrollment answers 503 and the agent
+	// falls back to the device-code flow. ID tokens carrying this client ID
+	// as `aud` are accepted alongside the desktop/device clients.
+	GoogleWebClientID     string
+	GoogleWebClientSecret string
+
 	// RelayBaseURL is this relay's public https base URL (e.g.
 	// "https://relay.example.com"), returned to freshly enrolled agents so
 	// they know where to dial back. When unset it is derived per-request from
@@ -78,6 +90,8 @@ func LoadConfig() *Config {
 		GoogleClientSecret:       os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleDeviceClientID:     os.Getenv("GOOGLE_DEVICE_CLIENT_ID"),
 		GoogleDeviceClientSecret: os.Getenv("GOOGLE_DEVICE_CLIENT_SECRET"),
+		GoogleWebClientID:        os.Getenv("GOOGLE_WEB_CLIENT_ID"),
+		GoogleWebClientSecret:    os.Getenv("GOOGLE_WEB_CLIENT_SECRET"),
 		RelayBaseURL:             strings.TrimRight(os.Getenv("RELAY_BASE_URL"), "/"),
 		StateDir:                 getenv("STATE_DIR", "./state"),
 		DevAuth:                  strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),

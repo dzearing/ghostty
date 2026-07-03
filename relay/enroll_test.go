@@ -157,7 +157,9 @@ func (g *fakeGoogleDeviceFlow) setOutcome(t *testing.T, userCode, status, idToke
 // newEnrollTestServer wires the full relay in production posture (OIDC on,
 // DEV_AUTH off) against the fake issuer, with a fixed public base URL.
 // Optional mutate funcs adjust the Config before wiring (e.g. dual-client).
-func newEnrollTestServer(t *testing.T, f *fakeIssuer, mutate ...func(*Config)) (*httptest.Server, *Store) {
+// The Handler is returned too so web-enroll tests can reach the manager
+// (e.g. to force-expire a pending enrollment).
+func newEnrollTestServer(t *testing.T, f *fakeIssuer, mutate ...func(*Config)) (*httptest.Server, *Store, *Handler) {
 	t.Helper()
 
 	cfg := &Config{
@@ -190,7 +192,7 @@ func newEnrollTestServer(t *testing.T, f *fakeIssuer, mutate ...func(*Config)) (
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
-	return ts, store
+	return ts, store, h
 }
 
 // enrollStart POSTs /v1/enroll/start and decodes the response.
@@ -278,7 +280,7 @@ func dialControl(t *testing.T, ts *httptest.Server, deviceToken string) (*websoc
 func TestEnrollHappyPath(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
-	ts, store := newEnrollTestServer(t, f)
+	ts, store, _ := newEnrollTestServer(t, f)
 
 	start := enrollStart(t, ts, "fresh-box")
 	if start.VerificationURL != "https://www.google.com/device" {
@@ -354,7 +356,7 @@ func TestEnrollHappyPath(t *testing.T) {
 func TestEnrollIdempotentReEnroll(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
-	ts, store := newEnrollTestServer(t, f)
+	ts, store, _ := newEnrollTestServer(t, f)
 
 	id1, tok1 := enrollToCompletion(t, ts, f, g, "same-box")
 	id2, tok2 := enrollToCompletion(t, ts, f, g, "same-box")
@@ -397,7 +399,7 @@ func TestEnrollIdempotentReEnroll(t *testing.T) {
 func TestEnrollDeniedTerminal(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
-	ts, store := newEnrollTestServer(t, f)
+	ts, store, _ := newEnrollTestServer(t, f)
 
 	start := enrollStart(t, ts, "denied-box")
 	g.setOutcome(t, start.UserCode, "denied", "")
@@ -419,7 +421,7 @@ func TestEnrollDeniedTerminal(t *testing.T) {
 func TestEnrollExpiredTerminal(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
-	ts, _ := newEnrollTestServer(t, f)
+	ts, _, _ := newEnrollTestServer(t, f)
 
 	start := enrollStart(t, ts, "slow-box")
 	g.setOutcome(t, start.UserCode, "expired", "")
@@ -439,7 +441,7 @@ func TestEnrollExpiredTerminal(t *testing.T) {
 func TestEnrollNonAllowlistedRejected(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
-	ts, store := newEnrollTestServer(t, f)
+	ts, store, _ := newEnrollTestServer(t, f)
 
 	start := enrollStart(t, ts, "intruder-box")
 	claims := f.validClaims()
@@ -470,7 +472,7 @@ func TestEnrollUsesDeviceClientWhenConfigured(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
 	g.wantClientID = testDeviceClientID // fake Google refuses any other client
-	ts, store := newEnrollTestServer(t, f, func(cfg *Config) {
+	ts, store, _ := newEnrollTestServer(t, f, func(cfg *Config) {
 		cfg.GoogleDeviceClientID = testDeviceClientID
 		cfg.GoogleDeviceClientSecret = testDeviceClientSecret
 	})
@@ -516,7 +518,7 @@ func TestEnrollUsesDeviceClientWhenConfigured(t *testing.T) {
 func TestEnrollFallsBackToPrimaryClient(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
-	ts, _ := newEnrollTestServer(t, f)
+	ts, _, _ := newEnrollTestServer(t, f)
 
 	enrollToCompletion(t, ts, f, g, "fallback-box")
 
@@ -540,7 +542,7 @@ func TestEnrollUnknownAudRejected(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
 	g.wantClientID = testDeviceClientID
-	ts, store := newEnrollTestServer(t, f, func(cfg *Config) {
+	ts, store, _ := newEnrollTestServer(t, f, func(cfg *Config) {
 		cfg.GoogleDeviceClientID = testDeviceClientID
 		cfg.GoogleDeviceClientSecret = testDeviceClientSecret
 	})
@@ -565,7 +567,7 @@ func TestEnrollUnknownAudRejected(t *testing.T) {
 func TestEnrollPollRateLimited(t *testing.T) {
 	f := newFakeIssuer(t)
 	g := newFakeGoogleDeviceFlow(f)
-	ts, _ := newEnrollTestServer(t, f)
+	ts, _, _ := newEnrollTestServer(t, f)
 
 	start := enrollStart(t, ts, "eager-box")
 
@@ -600,7 +602,7 @@ func TestEnrollPollRateLimited(t *testing.T) {
 func TestEnrollBadRequests(t *testing.T) {
 	f := newFakeIssuer(t)
 	newFakeGoogleDeviceFlow(f)
-	ts, _ := newEnrollTestServer(t, f)
+	ts, _, _ := newEnrollTestServer(t, f)
 
 	// Missing/empty name.
 	for _, body := range []string{``, `{}`, `{"name":""}`, `{"name":"   "}`} {

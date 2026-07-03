@@ -8,9 +8,10 @@
 #
 #   irm https://<relay>/dl/install.ps1 | iex
 #
-# With NO token set, a fresh box self-enrolls via the OAuth device-code flow:
-# the agent prints "visit <url>, enter code XXXX-XXXX", you sign in with
-# Google, and the credential lands in relay.env automatically (WP-B3).
+# With NO token set, a fresh box self-enrolls via Google sign-in: a browser
+# window opens on this machine — approve the sign-in there and the credential
+# lands in relay.env automatically. (If the relay has no web sign-in
+# configured, the agent falls back to "visit <url>, enter code XXXX-XXXX".)
 #
 # A pre-minted token still works (skips the interactive sign-in):
 #
@@ -56,11 +57,14 @@ if ($env:DEVICE_TOKEN) {
 } elseif (Test-Path $EnvFile) {
   Write-Host "   token : keeping existing relay.env"
 } else {
-  # Fresh box, no token: self-enroll via the OAuth device-code flow. The agent
-  # prints the "visit URL, enter code" prompt, polls the relay, and writes
-  # relay.env itself on success. NOTE: the agent is a GUI-subsystem exe, so its
+  # Fresh box, no token: self-enroll via Google sign-in. The agent opens the
+  # default browser to approve this machine (and prints the URL in case the
+  # browser did not open), polls the relay, and writes relay.env itself on
+  # success. Falls back to the "visit URL, enter code" device flow when the
+  # relay has no web sign-in. NOTE: the agent is a GUI-subsystem exe, so its
   # stdout only reaches this console through a pipeline — hence ForEach-Object.
   Write-Host "   token : none - enrolling this machine with your Google account..." -ForegroundColor Yellow
+  Write-Host "           a browser window should open - approve the sign-in there" -ForegroundColor Yellow
   & $ExePath --enroll --relay=$RelayBase 2>&1 | ForEach-Object { Write-Host "   $_" }
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path $EnvFile)) {
     Write-Error "Enrollment failed (exit $LASTEXITCODE). Re-run the installer to try again."
