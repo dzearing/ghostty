@@ -102,10 +102,11 @@ struct Machine: Identifiable, Hashable {
 ///
 /// Relay machines are the account's resource list, fetched live from the
 /// relay's device directory (`GET /v1/client/devices`, WP-C2) whenever the
-/// chooser opens. A seeded fallback entry keeps the feature usable before the
-/// first successful fetch (and with no token configured); a successful fetch
-/// replaces every relay entry with the authoritative account list. Non-relay
-/// (direct TCP) entries are never touched by the fetch.
+/// chooser opens. They exist ONLY while account credentials exist: signing
+/// out (or refreshing with no/rejected credentials) clears every relay entry
+/// — machines are per-account, so a signed-out chooser must never show a
+/// previous account's devices. Non-relay (direct TCP) entries are never
+/// touched by the fetch or by sign-out.
 ///
 /// TODO(wp4): load TCP machines from ~/.config/ghostty (e.g. a `[machines]`
 /// section or a dedicated machines.toml) in addition to the account list.
@@ -123,9 +124,6 @@ final class MachineRegistry: ObservableObject {
     /// when a refresh starts.
     @Published private(set) var lastRefreshError: String?
 
-    /// Seeded entries that exist before (and independent of) any relay fetch.
-    private let seeded: [Machine]
-
     /// Stable UUID per relay device id so SwiftUI identity (selection, rows)
     /// survives refreshes that rebuild the `Machine` values.
     private var deviceUUIDs: [String: UUID] = [:]
@@ -137,53 +135,60 @@ final class MachineRegistry: ObservableObject {
     var hasRelayAccount: Bool { RelayAccount.hasCredentials }
 
     init() {
-        // maximushome is reached through the rendezvous relay (WP-A1). The
-        // `host` carries the relay base for display/filtering; the actual dial
-        // uses `relayBase`/`deviceID`. The token is read from the environment
-        // (GHOSTTY_RELAY_TOKEN) at connect time, never hardcoded here. This
-        // seed is only the pre-fetch fallback: a successful directory fetch
-        // (WP-C2) replaces all relay entries with the live account list.
-        let relayBase = RelayDirectoryClient.defaultBase
-        self.seeded = [
-            Machine(
-                name: "maximushome",
-                host: relayBase,
-                port: 0,
-                relayBase: relayBase,
-                deviceID: "14e75262-0fe2-4126-91db-efceb2f15665"
-            ),
-        ]
-        self.machines = seeded
-        // Keep row identity stable when the fetch replaces a seeded entry
-        // with the same device from the account list.
-        for m in seeded {
-            if let d = m.deviceID { deviceUUIDs[d] = m.id }
-        }
+        // Relay machines are account resources and only ever come from the
+        // directory fetch — there is deliberately no pre-auth seed (a
+        // signed-out chooser must show no account devices). TCP machines can
+        // still be `add`ed at runtime.
+        self.machines = []
     }
 
     func add(_ machine: Machine) {
         machines.append(machine)
     }
 
+    /// Drop every relay (account) machine, keeping direct-TCP entries.
+    /// Called on sign-out and on credential-less/401 refreshes: the relay
+    /// list belongs to an account, so without a valid account it must not be
+    /// shown. Publishes immediately, so an open chooser re-renders live.
+    func clearRelayMachines() {
+        machines.removeAll { $0.isRelay }
+        deviceUUIDs.removeAll()
+    }
+
     /// Refresh the relay account's device list (WP-C2). On success, relay
     /// machines are replaced by the fetched list (with online status); TCP
-    /// machines are untouched. On failure the current list is kept and
-    /// `lastRefreshError` is set. No-op when no token source is configured.
+    /// machines are untouched. With no credentials at all, relay entries are
+    /// CLEARED (not kept stale) — same when the relay rejects the credentials
+    /// (401, e.g. an expired session), which additionally surfaces the error.
+    /// Other failures (network blips) keep the current list and set
+    /// `lastRefreshError`.
     func refreshFromRelay() async {
-        guard RelayAccount.hasCredentials else { return }
         guard !isRefreshing else { return }
+        guard RelayAccount.hasCredentials else {
+            clearRelayMachines()
+            return
+        }
         isRefreshing = true
         lastRefreshError = nil
         defer { isRefreshing = false }
         // Token via the WP-B2 seam (account ID token, dev-token fallback);
         // may await a token refresh before the directory call.
         guard let client = await RelayDirectoryClient.current() else {
+            // Credentials existed but no token could be resolved (e.g. the
+            // refresh-token grant failed) — treat like signed out.
+            clearRelayMachines()
             lastRefreshError =
                 RelayDirectoryClient.DirectoryError.noAccount.localizedDescription
             return
         }
         do {
             apply(devices: try await client.listDevices())
+        } catch RelayDirectoryClient.DirectoryError.unauthorized {
+            // Expired/rejected session: don't keep showing an account list we
+            // are no longer authorized for.
+            clearRelayMachines()
+            lastRefreshError =
+                RelayDirectoryClient.DirectoryError.unauthorized.localizedDescription
         } catch {
             lastRefreshError = error.localizedDescription
         }
@@ -220,7 +225,7 @@ final class MachineRegistry: ObservableObject {
     }
 
     /// Rebuild `machines` from a fetched device list: authoritative relay
-    /// entries (stable UUIDs per device id) after any seeded TCP entries.
+    /// entries (stable UUIDs per device id) after any direct-TCP entries.
     private func apply(devices: [RelayDirectoryClient.Device]) {
         let relayBase = RelayDirectoryClient.defaultBase
         let relayMachines = devices.map { dev -> Machine in
@@ -241,7 +246,7 @@ final class MachineRegistry: ObservableObject {
                 online: dev.online
             )
         }
-        machines = seeded.filter { !$0.isRelay } + relayMachines
+        machines = machines.filter { !$0.isRelay } + relayMachines
     }
 }
 

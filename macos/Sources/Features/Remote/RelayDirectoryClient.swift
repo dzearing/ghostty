@@ -11,7 +11,6 @@ import Foundation
 /// out. Use `current()` to build a client.
 struct RelayDirectoryClient {
     /// The dev relay base URL used when `GHOSTTY_RELAY_BASE` is not set.
-    /// Matches the WP-A1 seeded registry entry.
     static let defaultBase: String =
         ProcessInfo.processInfo.environment["GHOSTTY_RELAY_BASE"]
         ?? "https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com"

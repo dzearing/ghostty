@@ -179,12 +179,24 @@ final class RelayAccount: ObservableObject {
 
     /// Forget the account: delete the Keychain item and drop the in-memory
     /// token. Relay calls fall back to the dev token (if any) afterwards.
+    ///
+    /// Also clears the account's machine list from the shared registry —
+    /// machines are per-account resources, so a signed-out chooser must not
+    /// keep showing them. This clear is unconditional: even when a dev token
+    /// (`GHOSTTY_RELAY_TOKEN`) remains available, sign-out empties the list
+    /// (the dev token only repopulates it on the NEXT explicit refresh, e.g.
+    /// reopening the chooser).
     func signOut() {
         keychain.delete()
         cachedIDToken = nil
         refreshTask?.cancel()
         refreshTask = nil
         email = nil
+        // Only the real app account touches the shared registry (test
+        // instances with injected keychains must not).
+        if self === Self.shared {
+            MachineRegistry.shared.clearRelayMachines()
+        }
     }
 
     // MARK: - Tokens

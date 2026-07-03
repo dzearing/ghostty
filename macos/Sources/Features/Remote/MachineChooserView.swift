@@ -34,8 +34,12 @@ struct MachineChooserView: View {
     @ObservedObject var account: RelayAccount
 
     @State private var query: String = ""
-    /// True while the browser sign-in flow is running (disables the button).
+    /// True while the browser sign-in flow is running (shows the spinner row).
     @State private var isSigningIn = false
+    /// Hover state for the footer's sign-in link (underline + tint + cursor).
+    @State private var hoveringSignIn = false
+    /// Hover state for the footer's sign-out link.
+    @State private var hoveringSignOut = false
     /// Index into `targets` of the highlighted row. Bound to `List(selection:)`
     /// so the native selection highlight + focus ring track the keyboard.
     @State private var selectedIndex: Int = 0
@@ -210,7 +214,7 @@ struct MachineChooserView: View {
 
             // Account-list refresh status (WP-C2): a small spinner while the
             // device directory is being fetched, or the fetch error. Never
-            // blocks the list — stale/seeded rows stay usable.
+            // blocks the list — existing rows stay usable.
             if registry.isRefreshing || registry.lastRefreshError != nil {
                 HStack(spacing: 6) {
                     if registry.isRefreshing {
@@ -256,40 +260,90 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The account footer (WP-B2): a sign-in button when signed out, the
-    /// signed-in email + sign-out when signed in, or a pointer to the setup
-    /// doc when no Google client id is configured.
+    /// The account footer (WP-B2): a link-styled sign-in button when signed
+    /// out (pointer cursor + hover underline/tint), a monogram avatar + email
+    /// + sign-out link when signed in, a spinner while the browser flow runs,
+    /// or a pointer to the setup doc when no Google client id is configured.
     @ViewBuilder
     private var accountRow: some View {
         if let email = account.email {
-            HStack(spacing: 4) {
-                Image(systemName: "person.crop.circle.badge.checkmark")
+            HStack(spacing: 8) {
+                avatar(for: email)
                 Text(email)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text("·")
-                Button("Sign Out") { account.signOut() }
-                    .buttonStyle(.link)
+                    .foregroundStyle(.secondary)
+                    .help("Signed in as \(email)")
+                Button {
+                    account.signOut()
+                } label: {
+                    Text("Sign Out")
+                        .underline(hoveringSignOut)
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .onHover { inside in
+                    hoveringSignOut = inside
+                    if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+        } else if isSigningIn {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Waiting for browser sign-in…")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
         } else if RelayAccount.isConfigured {
             Button {
                 startSignIn()
             } label: {
-                Label(
-                    isSigningIn ? "Waiting for browser sign-in…" : "Sign in with Google…",
-                    systemImage: "person.crop.circle")
+                HStack(spacing: 5) {
+                    Image(systemName: "person.crop.circle")
+                    Text("Sign in with Google…")
+                        .underline(hoveringSignIn)
+                }
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.accentColor.opacity(hoveringSignIn ? 0.12 : 0)))
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.link)
+            .buttonStyle(.plain)
             .font(.caption)
-            .disabled(isSigningIn)
+            .onHover { inside in
+                hoveringSignIn = inside
+                if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
         } else {
             Text("Google client not configured — see docs/design/relay-oidc-setup.md")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
         }
+    }
+
+    /// A Google-style monogram avatar: the email's first letter in a filled
+    /// circle. Signals "a session exists" at a glance without any network
+    /// fetch (the ID token has no parsed `picture` claim to use).
+    private func avatar(for email: String) -> some View {
+        ZStack {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [Color.accentColor, Color.accentColor.opacity(0.65)],
+                        startPoint: .top,
+                        endPoint: .bottom))
+            Text(String(email.prefix(1)).uppercased())
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white)
+        }
+        .frame(width: 20, height: 20)
+        .accessibilityLabel("Signed in as \(email)")
     }
 
     /// Run the browser sign-in flow, then refresh the device list so the
@@ -325,7 +379,12 @@ struct MachineChooserView: View {
             }
         case .remote(let machine):
             HStack(spacing: 10) {
-                Image(systemName: "server.rack")
+                // A device that IS this Mac gets the laptop glyph (matching
+                // the "Local" row) instead of the server glyph, plus a
+                // "this Mac" tag below, so it doesn't read as a mystery
+                // duplicate of "Local". It stays in the list (it is still an
+                // account resource — rename/remove must keep working).
+                Image(systemName: machine.isLocalMachine ? "laptopcomputer" : "server.rack")
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
@@ -339,6 +398,14 @@ struct MachineChooserView: View {
                         }
                         Text(machine.name)
                             .font(.body)
+                        if machine.isLocalMachine {
+                            Text("this Mac")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                        }
                     }
                     metricsSubline(for: machine)
                 }
