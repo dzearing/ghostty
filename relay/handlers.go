@@ -68,14 +68,33 @@ var acceptOptions = &websocket.AcceptOptions{InsecureSkipVerify: true}
 
 // --- Agent endpoints -------------------------------------------------------
 
+// hostnameHeader is the optional agent-supplied header on control connects
+// carrying the machine's OS-reported hostname. Kept distinct from the
+// user-facing display name: rename changes the name, never the hostname.
+const hostnameHeader = "X-Ghoztty-Hostname"
+
+// maxHostnameLen bounds the agent-reported hostname (matches the enroll name
+// bound; RFC 1035 caps hostnames at 255 anyway).
+const maxHostnameLen = 128
+
 // handleAgentControl: GET /v1/agent/control (WebSocket).
 // Authenticates the device token, registers the device online, then holds the
 // connection open with a ping/pong heartbeat. Disconnect -> device offline.
+// If the agent sent an X-Ghoztty-Hostname header, the device's hostname is
+// upserted (older agents omit it — tolerated).
 func (h *Handler) handleAgentControl(w http.ResponseWriter, r *http.Request) {
 	dev, err := h.auth.AuthenticateDevice(r, h.store)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
+	}
+
+	// Record the agent-reported hostname before upgrading. Best-effort: a
+	// persist failure must not cost the device its connectivity.
+	if hn := strings.TrimSpace(r.Header.Get(hostnameHeader)); hn != "" && len(hn) <= maxHostnameLen {
+		if err := h.store.SetHostname(dev.ID, hn); err != nil {
+			h.logger.Warn("hostname upsert failed", "device", dev.ID, "err", err)
+		}
 	}
 
 	c, err := websocket.Accept(w, r, acceptOptions)
@@ -155,6 +174,28 @@ func (h *Handler) handleAgentData(w http.ResponseWriter, r *http.Request) {
 
 // --- Client endpoints ------------------------------------------------------
 
+// deviceView is the client-facing JSON shape of one device, shared by the
+// list and rename endpoints. Hostname is the OS-reported machine hostname
+// (distinct from the display Name; omitted when unknown).
+type deviceView struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Hostname  string    `json:"hostname,omitempty"`
+	Online    bool      `json:"online"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// viewOf renders a device with its live online status.
+func (h *Handler) viewOf(d *Device) deviceView {
+	return deviceView{
+		ID:        d.ID,
+		Name:      d.Name,
+		Hostname:  d.Hostname,
+		Online:    h.dir.IsOnline(d.ID),
+		CreatedAt: d.CreatedAt,
+	}
+}
+
 // handleListDevices: GET /v1/client/devices (JSON).
 // Returns the authenticated caller's devices with live online status.
 func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
@@ -165,22 +206,10 @@ func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
 	}
 	email := ident.Email
 
-	type deviceView struct {
-		ID        string    `json:"id"`
-		Name      string    `json:"name"`
-		Online    bool      `json:"online"`
-		CreatedAt time.Time `json:"created_at"`
-	}
-
 	devices := h.store.ListByOwner(email)
 	out := make([]deviceView, 0, len(devices))
 	for _, d := range devices {
-		out = append(out, deviceView{
-			ID:        d.ID,
-			Name:      d.Name,
-			Online:    h.dir.IsOnline(d.ID),
-			CreatedAt: d.CreatedAt,
-		})
+		out = append(out, h.viewOf(d))
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
@@ -258,12 +287,7 @@ func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("device renamed", "device", dev.ID, "owner", email, "name", dev.Name)
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":         dev.ID,
-		"name":       dev.Name,
-		"online":     h.dir.IsOnline(dev.ID),
-		"created_at": dev.CreatedAt,
-	})
+	writeJSON(w, http.StatusOK, h.viewOf(dev))
 }
 
 // handleDeleteDevice: DELETE /v1/client/devices/{id}.

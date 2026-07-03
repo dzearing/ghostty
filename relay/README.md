@@ -30,16 +30,31 @@ architecture, §5 security).
 
 | Method | Path                              | Auth         | Purpose |
 |--------|-----------------------------------|--------------|---------|
-| GET    | `/v1/agent/control`               | device token | Agent registers online; relay sends `{"type":"open","session":...}` commands; ping/pong heartbeat. |
+| GET    | `/v1/agent/control`               | device token | Agent registers online; relay sends `{"type":"open","session":...}` commands; ping/pong heartbeat. An optional `X-Ghoztty-Hostname` request header upserts the device's `hostname` (older agents omit it). |
 | GET    | `/v1/agent/data?session=<uuid>`   | device token | Agent dials back in response to `open`; matched to the session and bridged. |
-| GET    | `/v1/client/devices`              | OIDC         | List the caller's devices with online status. |
+| GET    | `/v1/client/devices`              | OIDC         | List the caller's devices with online status and `hostname` (see below). |
 | POST   | `/v1/client/devices`              | OIDC         | Enroll a device (`{"name":"..."}`); returns the raw device token **once**. |
-| PATCH  | `/v1/client/devices/{id}`         | OIDC         | Rename an owned device (`{"name":"..."}`); returns the updated device view. |
+| PATCH  | `/v1/client/devices/{id}`         | OIDC         | Rename an owned device (`{"name":"..."}`); changes the display name **only** (never `hostname`); returns the updated device view. |
 | DELETE | `/v1/client/devices/{id}`         | OIDC         | Delete an owned device **and revoke its token**; any live agent connections are closed. Returns `204`. |
 | GET    | `/v1/client/connect?device=<id>`  | OIDC         | Open a session to an owned, online device and bridge it. |
 | POST   | `/v1/enroll/start`                | none         | Begin device-code **self-enroll** (`{"name":"<machine name>"}`); returns `{verification_url, user_code, device_code_handle, interval, expires_in}`. |
 | POST   | `/v1/enroll/poll`                 | none (rate-limited) | Poll a pending enrollment (`{"device_code_handle":"..."}`). Pending → `{"status":"pending"}`; approved → `{"status":"complete", device_id, device_token, relay_base}` **once**; denied/expired/rejected are terminal. |
 | GET    | `/healthz`                        | none         | Liveness probe. |
+
+### Device name vs hostname
+
+Each device carries two independent labels:
+
+- **`name`** — the user-facing display name. Set at enrollment (device-code
+  enroll uses the machine name) and changed only by `PATCH`.
+- **`hostname`** — the machine's OS-reported hostname (`omitempty`; absent on
+  old devices whose agent hasn't reconnected yet). Seeded from the enrolled
+  machine name at creation by device-code self-enrollment, then kept fresh by
+  the agent: every `/v1/agent/control` connect may carry an
+  `X-Ghoztty-Hostname` header, which upserts it. Rename never touches it.
+
+The chooser UI uses this to show e.g. "MaximusHome" with "(windows-home)" as
+subtext once the owner renames a device.
 
 ## Self-enrollment (OAuth device-code flow)
 
@@ -275,6 +290,9 @@ curl -s http://127.0.0.1:8080/v1/client/devices \
 # => {"devices":[{"id":"...","name":"testbox","online":false,"created_at":"..."}]}
 ```
 
+Device-code-enrolled devices (and any device whose agent has connected with an
+`X-Ghoztty-Hostname` header) also carry `"hostname":"..."` in the view.
+
 Rename and delete a device:
 
 ```bash
@@ -306,7 +324,9 @@ This proves the bridge end-to-end without Google or Caddy. Other tests cover
 fail-closed auth (`TestUnauthorizedRejected`), refusing offline devices
 (`TestConnectOfflineDevice`), and device CRUD in `devices_crud_test.go`:
 rename (`TestRenameDevice`), delete (`TestDeleteDevice`), delete-revokes-token
-(`TestDeleteRevokesCredential`), and owner scoping (`TestCrudOwnerScoping`).
+(`TestDeleteRevokesCredential`), owner scoping (`TestCrudOwnerScoping`), and
+the hostname field (`TestDeviceHostname`: enroll seeds it, list returns it,
+rename preserves it, the control-connect header updates it).
 
 ## Source layout
 

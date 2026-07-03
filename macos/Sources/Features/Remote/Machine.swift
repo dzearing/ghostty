@@ -28,6 +28,11 @@ struct Machine: Identifiable, Hashable {
     /// non-relay machines and for relay machines that haven't been refreshed
     /// from the account list yet.
     var online: Bool?
+    /// The machine's OS-reported hostname from the relay's device directory.
+    /// Distinct from `name` (the user-facing display name, which a rename
+    /// changes while the hostname stays put). Nil when the relay doesn't know
+    /// it yet and for non-relay machines.
+    var hostname: String?
 
     init(
         id: UUID = UUID(),
@@ -36,7 +41,8 @@ struct Machine: Identifiable, Hashable {
         port: UInt16,
         relayBase: String? = nil,
         deviceID: String? = nil,
-        online: Bool? = nil
+        online: Bool? = nil,
+        hostname: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -45,6 +51,7 @@ struct Machine: Identifiable, Hashable {
         self.relayBase = relayBase
         self.deviceID = deviceID
         self.online = online
+        self.hostname = hostname
     }
 
     /// True when this machine is reached through a rendezvous relay.
@@ -221,6 +228,7 @@ final class MachineRegistry: ObservableObject {
         if let idx = machines.firstIndex(where: { $0.deviceID == deviceID }) {
             machines[idx].name = dev.name
             machines[idx].online = dev.online
+            machines[idx].hostname = dev.hostname
         }
     }
 
@@ -243,7 +251,8 @@ final class MachineRegistry: ObservableObject {
                 port: 0,
                 relayBase: relayBase,
                 deviceID: dev.id,
-                online: dev.online
+                online: dev.online,
+                hostname: dev.hostname
             )
         }
         machines = machines.filter { !$0.isRelay } + relayMachines

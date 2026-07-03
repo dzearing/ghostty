@@ -361,13 +361,27 @@ struct MachineChooserView: View {
         }
     }
 
+    /// Fixed width of the leading status-indicator column. Reserved in EVERY
+    /// row (an empty spacer for Local/TCP rows) so the icon and text columns
+    /// line up across all row types.
+    private static let statusColumnWidth: CGFloat = 12
+    /// Fixed width of the leading machine-glyph column. The glyphs differ in
+    /// intrinsic width (laptop vs server.rack), so without this the name/
+    /// subtext column drifts per row.
+    private static let iconColumnWidth: CGFloat = 28
+
     @ViewBuilder
     private func row(for target: WindowTarget) -> some View {
         switch target {
         case .local:
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                // Empty status slot: keeps the icon/text columns aligned with
+                // the device rows (which carry a status indicator here).
+                Color.clear
+                    .frame(width: Self.statusColumnWidth, height: 1)
                 Image(systemName: "laptopcomputer")
                     .foregroundStyle(.secondary)
+                    .frame(width: Self.iconColumnWidth)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Local")
                         .font(.body)
@@ -378,7 +392,8 @@ struct MachineChooserView: View {
                 Spacer()
             }
         case .remote(let machine):
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                statusIndicator(for: machine)
                 // A machine that IS this Mac gets the laptop glyph (matching
                 // the "Local" row) plus a "this Mac" tag, so it doesn't read
                 // as a mystery duplicate of "Local". Only non-relay (direct
@@ -386,16 +401,9 @@ struct MachineChooserView: View {
                 // Mac are filtered out of `machines` entirely.
                 Image(systemName: machine.isLocalMachine ? "laptopcomputer" : "server.rack")
                     .foregroundStyle(.secondary)
+                    .frame(width: Self.iconColumnWidth)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        // Online/offline status dot for account (relay) devices
-                        // (WP-C2). Gray when the status is not yet known.
-                        if machine.isRelay {
-                            Circle()
-                                .fill(statusColor(for: machine))
-                                .frame(width: 8, height: 8)
-                                .accessibilityLabel(statusText(for: machine))
-                        }
                         Text(machine.name)
                             .font(.body)
                         if machine.isLocalMachine {
@@ -407,7 +415,7 @@ struct MachineChooserView: View {
                                 .background(Capsule().fill(Color.secondary.opacity(0.18)))
                         }
                     }
-                    metricsSubline(for: machine)
+                    subline(for: machine)
                 }
                 Spacer()
                 // (The Activity-Monitor chart affordance is rendered as a sibling
@@ -417,17 +425,41 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The status-dot color for a relay machine: green online, gray offline
-    /// or unknown (pre-fetch).
-    private func statusColor(for machine: Machine) -> Color {
-        switch machine.online {
-        case true: return .green
-        case false: return Color.secondary.opacity(0.5)
-        default: return Color.secondary.opacity(0.25)
+    /// The leading status column for a device row. For relay machines the
+    /// status is SHAPE-coded, not just color-coded (colorblind-safe): online
+    /// is a filled circle with an inner ring mark (`circle.inset.filled`,
+    /// green), offline a HOLLOW circle (`circle`, gray), unknown (pre-fetch) a
+    /// dotted outline (`circle.dotted`). Non-relay rows get an equally sized
+    /// empty slot so all rows share one column grid.
+    @ViewBuilder
+    private func statusIndicator(for machine: Machine) -> some View {
+        if machine.isRelay {
+            Group {
+                switch machine.online {
+                case true:
+                    Image(systemName: "circle.inset.filled")
+                        .foregroundStyle(.green)
+                case false:
+                    Image(systemName: "circle")
+                        .foregroundStyle(.secondary)
+                default:
+                    Image(systemName: "circle.dotted")
+                        .foregroundStyle(Color.secondary.opacity(0.6))
+                }
+            }
+            .font(.system(size: 9, weight: .semibold))
+            .frame(width: Self.statusColumnWidth)
+            .accessibilityLabel(statusText(for: machine))
+            .help(statusText(for: machine))
+        } else {
+            Color.clear
+                .frame(width: Self.statusColumnWidth, height: 1)
         }
     }
 
-    /// Accessible/subline description of a relay machine's directory status.
+    /// Accessible description of a relay machine's directory status. Spoken /
+    /// tooltip only — the row never renders "Online"/"Offline" as text; the
+    /// leading shape indicator conveys it.
     private func statusText(for machine: Machine) -> String {
         switch machine.online {
         case true: return "Online"
@@ -511,20 +543,41 @@ struct MachineChooserView: View {
         alert.runModal()
     }
 
-    /// The remote-row subline: live CPU/memory once metrics arrive, or a
-    /// graceful placeholder while connecting / when unreachable. Deliberately
-    /// never shows the host:port (the user does not want the IP displayed).
-    private func metricsSubline(for machine: Machine) -> some View {
-        Text(sublineText(for: machine))
-            .font(.caption)
-            .foregroundStyle(.secondary)
+    /// The remote-row subline. Relay machines show the agent-reported hostname
+    /// in parentheses — only when it differs (case-insensitively) from the
+    /// display name, i.e. after a rename — and NEVER an "Online"/"Offline"
+    /// line: status is conveyed solely by the leading shape indicator. TCP
+    /// machines keep the live metrics probe state. Deliberately never shows
+    /// the host:port (the user does not want the IP displayed).
+    @ViewBuilder
+    private func subline(for machine: Machine) -> some View {
+        if machine.isRelay {
+            if let hostname = hostnameSubtext(for: machine) {
+                Text("(\(hostname))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            Text(tcpSublineText(for: machine))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
-    /// The text shown in a remote row's subline. Relay machines show their
-    /// directory status (the metrics probe is TCP-only, so probing them would
-    /// just read "Unreachable"); TCP machines show the live probe state.
-    private func sublineText(for machine: Machine) -> String {
-        if machine.isRelay { return statusText(for: machine) }
+    /// The hostname to show beneath a relay machine's name, or nil when the
+    /// relay doesn't know it or it matches the display name (showing
+    /// "MaximusHome" over "(maximushome)" would be noise).
+    private func hostnameSubtext(for machine: Machine) -> String? {
+        guard let hostname = machine.hostname,
+              !hostname.isEmpty,
+              hostname.caseInsensitiveCompare(machine.name) != .orderedSame
+        else { return nil }
+        return hostname
+    }
+
+    /// The subline for a direct-TCP machine: live CPU/memory once metrics
+    /// arrive, or a graceful placeholder while connecting / when unreachable.
+    private func tcpSublineText(for machine: Machine) -> String {
         switch probe.readings[machine.id] {
         case .live(let m):
             return "CPU \(Int(m.cpuPct.rounded()))%  ·  \(memString(m.memUsed)) / \(memString(m.memTotal))"

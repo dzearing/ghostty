@@ -16,10 +16,14 @@ struct RelayDirectoryClient {
         ?? "https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com"
 
     /// One device (account resource) as returned by the relay's list and
-    /// rename endpoints: `{"id":..., "name":..., "online":..., "created_at":...}`.
+    /// rename endpoints: `{"id":..., "name":..., "hostname":..., "online":...,
+    /// "created_at":...}`. `hostname` is the machine's OS-reported hostname —
+    /// distinct from the display `name` (rename changes only the name) — and
+    /// is omitted by the relay when unknown.
     struct Device: Decodable, Hashable {
         let id: String
         let name: String
+        let hostname: String?
         let online: Bool
     }
 

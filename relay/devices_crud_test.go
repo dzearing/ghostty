@@ -65,6 +65,108 @@ func listDevices(t *testing.T, ts *httptest.Server, token string) map[string]str
 	return m
 }
 
+// listDeviceViews fetches /v1/client/devices and returns id -> full device view.
+func listDeviceViews(t *testing.T, ts *httptest.Server, token string) map[string]deviceView {
+	t.Helper()
+
+	resp := doJSON(t, http.MethodGet, ts.URL+"/v1/client/devices", token, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want 200", resp.StatusCode)
+	}
+
+	var out struct {
+		Devices []deviceView `json:"devices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	m := make(map[string]deviceView, len(out.Devices))
+	for _, d := range out.Devices {
+		m[d.ID] = d
+	}
+	return m
+}
+
+// TestDeviceHostname covers the hostname field end to end: device-code enroll
+// seeds it from the machine name at creation, the list endpoint returns it,
+// rename changes ONLY the display name (hostname preserved), and an agent
+// control connect carrying X-Ghoztty-Hostname upserts it.
+func TestDeviceHostname(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	ts, clientToken, store := newTestServer(t)
+
+	// Device-code self-enroll path (UpsertDevice) seeds hostname = name.
+	dev, deviceToken, err := store.UpsertDevice("dev@example.com", "sub-123", "windows-home")
+	if err != nil {
+		t.Fatalf("upsert device: %v", err)
+	}
+	if dev.Hostname != "windows-home" {
+		t.Fatalf("enrolled hostname = %q, want %q", dev.Hostname, "windows-home")
+	}
+
+	// The list endpoint returns the hostname.
+	if got := listDeviceViews(t, ts, clientToken)[dev.ID]; got.Hostname != "windows-home" {
+		t.Fatalf("list hostname = %q, want %q", got.Hostname, "windows-home")
+	}
+
+	// Rename changes only the display name; hostname is preserved, and the
+	// rename response itself carries the (unchanged) hostname.
+	resp := doJSON(t, http.MethodPatch, ts.URL+"/v1/client/devices/"+dev.ID, clientToken, `{"name":"MaximusHome"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rename status = %d, want 200", resp.StatusCode)
+	}
+	var renamed deviceView
+	if err := json.NewDecoder(resp.Body).Decode(&renamed); err != nil {
+		t.Fatalf("decode rename resp: %v", err)
+	}
+	if renamed.Name != "MaximusHome" || renamed.Hostname != "windows-home" {
+		t.Fatalf("rename resp = %+v, want name=MaximusHome hostname=windows-home", renamed)
+	}
+	if got := listDeviceViews(t, ts, clientToken)[dev.ID]; got.Name != "MaximusHome" || got.Hostname != "windows-home" {
+		t.Fatalf("after rename list shows %+v, want name=MaximusHome hostname=windows-home", got)
+	}
+
+	// An agent control connect with X-Ghoztty-Hostname updates the hostname
+	// (the machine was renamed at the OS level, say).
+	hdr := bearerHeader(deviceToken)
+	hdr.Set("X-Ghoztty-Hostname", "windows-home-2")
+	control, _, err := websocket.Dial(ctx, wsURL(ts.URL, "/v1/agent/control"), &websocket.DialOptions{
+		HTTPHeader: hdr,
+	})
+	if err != nil {
+		t.Fatalf("agent control dial: %v", err)
+	}
+	defer control.CloseNow()
+
+	got := listDeviceViews(t, ts, clientToken)[dev.ID]
+	if got.Hostname != "windows-home-2" {
+		t.Fatalf("hostname after control connect = %q, want %q", got.Hostname, "windows-home-2")
+	}
+	if got.Name != "MaximusHome" {
+		t.Fatalf("name after control connect = %q, want %q (header must not touch name)", got.Name, "MaximusHome")
+	}
+	if !got.Online {
+		t.Fatalf("device not online after control connect")
+	}
+
+	// A control connect WITHOUT the header (older agent) leaves it untouched.
+	control.CloseNow()
+	control2, _, err := websocket.Dial(ctx, wsURL(ts.URL, "/v1/agent/control"), &websocket.DialOptions{
+		HTTPHeader: bearerHeader(deviceToken),
+	})
+	if err != nil {
+		t.Fatalf("agent control redial: %v", err)
+	}
+	defer control2.CloseNow()
+	if got := listDeviceViews(t, ts, clientToken)[dev.ID]; got.Hostname != "windows-home-2" {
+		t.Fatalf("hostname after headerless connect = %q, want %q", got.Hostname, "windows-home-2")
+	}
+}
+
 // TestRenameDevice covers PATCH /v1/client/devices/{id}: the new name is
 // returned, persisted, and visible in a subsequent list; bad input is a 400
 // and an unknown id is a 404.

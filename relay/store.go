@@ -23,8 +23,17 @@ import (
 // NEVER stored; only its SHA-256 hash (hex) is persisted. The raw token is
 // returned exactly once, at enrollment.
 type Device struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Hostname is the machine's OS-reported hostname, distinct from the
+	// user-facing display Name: rename changes Name only, never Hostname.
+	// Sources: seeded from the enrolled machine name by device-code
+	// self-enrollment at creation, then kept fresh by the agent's
+	// X-Ghoztty-Hostname header on each control connect. Empty on devices
+	// that predate this field (or enrolled via the manual client POST) whose
+	// agent has not yet connected with the header — omitempty keeps old
+	// devices.json files valid.
+	Hostname   string `json:"hostname,omitempty"`
 	OwnerEmail string `json:"owner_email"`
 	// OwnerSub is the owner's stable OIDC subject id (Google `sub`), recorded
 	// by device-code self-enrollment. Empty on devices enrolled before this
@@ -165,8 +174,13 @@ func (s *Store) UpsertDevice(ownerEmail, ownerSub, name string) (*Device, string
 	}
 
 	dev := &Device{
-		ID:         uuid.NewString(),
-		Name:       name,
+		ID:   uuid.NewString(),
+		Name: name,
+		// Device-code enrollment names the device after the machine's
+		// hostname, so at creation the two coincide. They diverge when the
+		// owner renames the device (rename never touches Hostname) and the
+		// hostname is thereafter refreshed by the agent's control connects.
+		Hostname:   name,
 		OwnerEmail: ownerEmail,
 		OwnerSub:   ownerSub,
 		TokenHash:  hash,
@@ -179,6 +193,28 @@ func (s *Store) UpsertDevice(ownerEmail, ownerSub, name string) (*Device, string
 	}
 	cp := *dev
 	return &cp, rawToken, nil
+}
+
+// SetHostname records the device's OS-reported hostname (from the agent's
+// X-Ghoztty-Hostname control-connect header). A no-op when the device is
+// unknown or the hostname is unchanged; persists otherwise. Display Name is
+// never touched — hostname and name are independent.
+func (s *Store) SetHostname(id, hostname string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := s.devices[id]
+	if d == nil || d.Hostname == hostname {
+		return nil
+	}
+
+	old := d.Hostname
+	d.Hostname = hostname
+	if err := s.save(); err != nil {
+		d.Hostname = old // keep memory consistent with disk on persist failure
+		return fmt.Errorf("persist hostname: %w", err)
+	}
+	return nil
 }
 
 // Get returns the device with the given id, or nil.
