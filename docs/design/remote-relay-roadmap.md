@@ -86,6 +86,33 @@ Commits on `feature/remote-machines`:
 WP-A2 (bundle `relay-connect`) is SUPERSEDED by the single-binary/in-process
 client (`292a07368`) — no helper binary exists to bundle.
 
+**2026-07-03 morning — user-driven chooser polish + the SLEEP BUG (tip `a4e8e57c1`,
+relay + `/dl` exe redeployed):**
+- `9ce38cdaa`/`68d7baa8a` — signed-out chooser shows NO account machines (bug the
+  user hit), seeded maximushome entry deleted, chooser stays reachable signed-out.
+- `366f557b4` — own-machine row hidden, "New Window" header dedupe, footer
+  divider, real Sign In/Out buttons, profile-photo avatar (`profile` scope —
+  needs one re-sign-in to take).
+- `ff9760acb` — device `hostname` field (seeded at enroll; upserted from the new
+  `X-Ghoztty-Hostname` control header) + "(hostname)" subtext under renamed
+  machines, Online/Offline text removed, shape-coded colorblind-safe status
+  (filled vs hollow circle), fixed-width icon column alignment.
+- `a4e8e57c1` — **agent keepalive**: real bug — Mac slept, relay heartbeat closed
+  the control WS, the agent sat on the dead TCP link forever ("connected", never
+  re-online until process restart). Now: ping every 20s, stale at 50s w/o inbound
+  (wall-clock, so wake detects within ~70s), teardown via the proven
+  close-unblocks-read contract, then the normal 3s redial. Proven by a
+  silent-server integration test + hostname backfill observed LIVE on first
+  connect. Real sleep/wake confirmation still pending (will happen organically).
+- User exercised delete+revoke from the UI and (accidentally) removed
+  windows-home/MaximusHome — re-enroll via the tokenless installer one-liner
+  (hosted exe has enroll+keepalive now). `windows-remote` still runs the OLD
+  binary (no hostname/keepalive until an installer re-run on that box).
+- GOTCHA: each debug rebuild re-signs ad-hoc → Keychain permission prompt
+  ("Always Allow") or full re-sign-in; and ALWAYS check app-process start time
+  vs binary mtime after a relaunch — a raced quit dialog left a stale instance
+  running and caused "I still see the same bugs".
+
 **🎉 GOOGLE AUTH LIVE IN PRODUCTION POSTURE (2026-07-02 evening).** Two real
 OAuth clients registered in project `ghoztty-relay` (Desktop `ghoztty-client` +
 TV/limited-input `ghoztty-agent`; ids/secrets in the user's password manager;
