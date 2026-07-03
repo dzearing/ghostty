@@ -113,8 +113,12 @@ pub const Config = struct {
     /// Working directory hint + the terminal's initial pwd.
     working_directory: ?[]const u8 = null,
 
-    /// TERM value advertised to the agent.
-    term: []const u8 = "xterm-ghostty",
+    /// TERM value advertised to the agent. Deliberately NOT `xterm-ghostty`:
+    /// the remote machine almost never has ghostty's terminfo installed, and an
+    /// unknown TERM breaks curses apps and pagers there (git's less prints
+    /// "terminal is not fully functional" on Windows). `xterm-256color` is
+    /// understood everywhere and matches our VT emulation closely.
+    term: []const u8 = "xterm-256color",
 };
 
 /// Initialize the remote backend state. Like `Exec.init`, this does NOT touch the

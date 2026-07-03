@@ -764,8 +764,11 @@ pub const PtySpawner = struct {
         });
         errdefer pty.deinit();
 
-        // Set TERM for the child.
+        // Set TERM for the child. COLORTERM signals 24-bit color support to
+        // apps that don't trust TERM alone (the emulating end is Ghostty, which
+        // renders truecolor regardless of the advertised TERM).
         try self.env.put("TERM", open.term);
+        try self.env.put("COLORTERM", "truecolor");
 
         const pc = try self.alloc.create(PtyChild);
         errdefer self.alloc.destroy(pc);
