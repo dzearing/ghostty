@@ -157,6 +157,45 @@ final class RemoteSessionManifest {
         return (restore, reinstate)
     }
 
+    /// The entries for ONE machine that could actually be restored right now:
+    /// same relay base + device id, a captured session UUID (something to
+    /// re-`ATTACH` to — entries that never resolved one are dropped at restore
+    /// anyway), and NOT currently bound to an open window (same open-entry
+    /// bookkeeping as `partitionForRestore(_:openEntryIDs:)`; re-attaching a
+    /// live window's session would evict it, spec §5.3). Drives the machine
+    /// chooser's contextual "Restore" button. Pure and order-preserving so
+    /// the query is unit-testable.
+    static func restorableEntries(
+        _ entries: [Entry],
+        relayBase: String,
+        deviceID: String,
+        openEntryIDs: Set<UUID>
+    ) -> [Entry] {
+        entries.filter { entry in
+            entry.relayBase == relayBase
+                && entry.deviceID == deviceID
+                && !(entry.sessionID?.isEmpty ?? true)
+                && !openEntryIDs.contains(entry.id)
+        }
+    }
+
+    /// Instance wrapper for `restorableEntries(_:relayBase:deviceID:openEntryIDs:)`
+    /// that snapshots the live entry list under the lock. Read-only: nothing
+    /// is drained (unlike `takeAll()`), so the chooser can query freely.
+    func restorableEntries(
+        relayBase: String,
+        deviceID: String,
+        openEntryIDs: Set<UUID>
+    ) -> [Entry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Self.restorableEntries(
+            entries,
+            relayBase: relayBase,
+            deviceID: deviceID,
+            openEntryIDs: openEntryIDs)
+    }
+
     private func saveLocked() {
         if entries.isEmpty {
             defaults.removeObject(forKey: Self.defaultsKey)

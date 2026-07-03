@@ -115,4 +115,66 @@ struct RemoteSessionManifestTests {
         #expect(nothing.isEmpty)
         #expect(everything.count == 3)
     }
+
+    /// The chooser's "Restore" query: only entries on the SAME relay base +
+    /// device, with a captured session UUID, and not bound to an open window
+    /// count as restorable. Order is preserved.
+    @Test func restorableEntriesFiltersMachineSessionAndOpenWindows() {
+        func entry(
+            relayBase: String = "https://relay.test",
+            deviceID: String = "dev-1",
+            sessionID: String? = "sess"
+        ) -> RemoteSessionManifest.Entry {
+            .init(id: UUID(), relayBase: relayBase, deviceID: deviceID,
+                  sessionID: sessionID, name: deviceID)
+        }
+
+        let match1 = entry()
+        let match2 = entry()
+        let openOnMachine = entry()                       // bound to an open window
+        let noSession = entry(sessionID: nil)             // never captured an id
+        let emptySession = entry(sessionID: "")           // degenerate: nothing to attach
+        let otherDevice = entry(deviceID: "dev-2")
+        let otherRelay = entry(relayBase: "https://other.test")
+
+        let all = [match1, noSession, otherDevice, match2, emptySession,
+                   otherRelay, openOnMachine]
+        let restorable = RemoteSessionManifest.restorableEntries(
+            all,
+            relayBase: "https://relay.test",
+            deviceID: "dev-1",
+            openEntryIDs: [openOnMachine.id])
+        #expect(restorable.map(\.id) == [match1.id, match2.id])
+
+        // No open windows ⇒ the open entry becomes restorable too.
+        let noneOpen = RemoteSessionManifest.restorableEntries(
+            all,
+            relayBase: "https://relay.test",
+            deviceID: "dev-1",
+            openEntryIDs: [])
+        #expect(noneOpen.map(\.id) == [match1.id, match2.id, openOnMachine.id])
+    }
+
+    /// The instance wrapper reads the live manifest without draining it —
+    /// unlike `takeAll()`, querying twice sees the same entries.
+    @Test func restorableEntriesInstanceQueryIsNonDestructive() {
+        let defaults = makeDefaults()
+        let manifest = RemoteSessionManifest(defaults: defaults)
+
+        let id = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "box",
+            sessionID: "sess-1")
+        _ = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "pending")
+
+        let first = manifest.restorableEntries(
+            relayBase: "https://relay.test", deviceID: "dev-1", openEntryIDs: [])
+        #expect(first.map(\.id) == [id])
+
+        // Non-destructive: same answer again, and takeAll still drains both.
+        let second = manifest.restorableEntries(
+            relayBase: "https://relay.test", deviceID: "dev-1", openEntryIDs: [])
+        #expect(second.map(\.id) == [id])
+        #expect(manifest.takeAll().count == 2)
+    }
 }

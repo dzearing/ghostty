@@ -1049,6 +1049,21 @@ class AppDelegate: NSObject,
                 } else {
                     self.openRemoteWindow(on: machine)
                 }
+            case .restoreRemote(let machine):
+                // Chooser's contextual "Restore": replay ONLY this machine's
+                // recoverable manifest entries through the same restore path
+                // as launch/sign-in. Same token pre-check as the dial path —
+                // signed out gets one clear refusal, not a silent no-op.
+                guard let base = machine.relayBase, let device = machine.deviceID else { return }
+                Task { @MainActor in
+                    guard await RelayAccount.resolveToken() != nil else {
+                        Self.presentSignInRequiredAlert()
+                        return
+                    }
+                    self.restoreRemoteWindows { entry in
+                        entry.relayBase == base && entry.deviceID == device
+                    }
+                }
             }
         }
     }
@@ -1213,7 +1228,14 @@ class AppDelegate: NSObject,
     ///   launch (the machine may simply be offline right now)
     /// - session gone on the agent (probe fails; expired TTL, agent restart)
     ///   → dropped silently
-    private func restoreRemoteWindows() {
+    ///
+    /// `matching` scopes WHICH entries are replayed: the default (all) is the
+    /// launch/sign-in behavior; the machine chooser's contextual "Restore"
+    /// passes a per-machine filter. Entries outside the filter are put back
+    /// untouched (reinstated), exactly like entries bound to open windows.
+    private func restoreRemoteWindows(
+        matching filter: @escaping (RemoteSessionManifest.Entry) -> Bool = { _ in true }
+    ) {
         let entries = RemoteSessionManifest.shared.takeAll()
         guard !entries.isEmpty else { return }
 
@@ -1237,9 +1259,13 @@ class AppDelegate: NSObject,
             // a second ATTACH to the same session would evict the live window
             // (spec §5.3). Put those straight back; restore only the rest.
             let openEntryIDs = Set(TerminalController.all.compactMap(\.remoteManifestEntryID))
-            let (restore, reinstate) = RemoteSessionManifest.partitionForRestore(
+            let (candidates, reinstate) = RemoteSessionManifest.partitionForRestore(
                 entries, openEntryIDs: openEntryIDs)
-            for entry in reinstate { RemoteSessionManifest.shared.reinstate(entry) }
+            // Entries outside the requested scope (per-machine Restore from
+            // the chooser) also go straight back, untouched.
+            let restore = candidates.filter(filter)
+            let skipped = candidates.filter { !filter($0) }
+            for entry in reinstate + skipped { RemoteSessionManifest.shared.reinstate(entry) }
             guard !restore.isEmpty else { return }
             self?.restoreRemoteWindows(entries: restore, token: token)
         }

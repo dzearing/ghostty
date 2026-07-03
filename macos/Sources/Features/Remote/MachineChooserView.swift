@@ -6,14 +6,20 @@ import AppKit
 enum WindowTarget: Hashable {
     case local
     case remote(Machine)
+    /// Restore the machine's recoverable manifest windows (WP-D2 entries with
+    /// a session to re-`ATTACH` that aren't bound to an open window) instead
+    /// of opening a new one. Produced by the chooser's contextual "Restore"
+    /// primary action; never shown as a list row.
+    case restoreRemote(Machine)
 }
 
 /// A native, filterable chooser for picking where to open a new window: the
 /// local machine or a registered remote `Machine`. Modeled on the command
 /// palette's keyboard pattern: the filter field keeps focus for typing, while
 /// invisible Up/Down shortcut buttons move the highlighted selection in the
-/// list, Return opens the highlighted row, and Escape cancels. Invokes
-/// `onSelect` with the chosen target (or `onCancel` if dismissed).
+/// list, Return triggers the highlighted row's primary action (New — or
+/// Restore when the machine has recoverable windows), and Escape cancels.
+/// Invokes `onSelect` with the chosen target (or `onCancel` if dismissed).
 struct MachineChooserView: View {
     /// Source of the machine list. Observed (not a snapshot) so rows update
     /// live as the account device list is fetched from the relay on open
@@ -160,7 +166,10 @@ struct MachineChooserView: View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .simultaneousGesture(TapGesture(count: 2).onEnded { onSelect(target) })
+                            // Double-click follows the PRIMARY action for the
+                            // row (New or Restore), not always "new", so it
+                            // stays consistent with the footer button.
+                            .simultaneousGesture(TapGesture(count: 2).onEnded { activate(target) })
 
                             // Secondary affordance (remote only): open the Activity
                             // Monitor. A SIBLING button so it doesn't nest inside the
@@ -240,13 +249,17 @@ struct MachineChooserView: View {
                 .padding(.top, 8)
 
             // Footer: account area (avatar + email + Sign Out, or Sign In)
-            // left-aligned; Cancel/Open right-aligned. One row.
+            // left-aligned; Cancel + the primary button right-aligned. The
+            // primary button reads "New" (it creates a new window) — or
+            // "Restore"/"Restore (N)" when the highlighted machine has
+            // recoverable windows. Recomputed on every render, so it live-
+            // updates as the selection moves.
             HStack {
                 accountRow
                 Spacer()
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
-                Button("Open") { submit() }
+                Button(primaryButtonTitle) { submit() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(resolvedSelection == nil)
             }
@@ -271,7 +284,7 @@ struct MachineChooserView: View {
     /// button when signed in, a standard "Sign In with Google" button when
     /// signed out, a spinner while the browser flow runs, or a pointer to the
     /// setup doc when no Google client id is configured. Plain bordered
-    /// buttons, styled like Cancel/Open — no link styling or cursor hacks.
+    /// buttons, styled like Cancel/New — no link styling or cursor hacks.
     @ViewBuilder
     private var accountRow: some View {
         if let email = account.email {
@@ -422,6 +435,9 @@ struct MachineChooserView: View {
                 // button in the row wrapper, NOT here, so it doesn't nest inside the
                 // row's selection button.)
             }
+        case .restoreRemote:
+            // Never appears in `targets`; it's an action result, not a row.
+            EmptyView()
         }
     }
 
@@ -608,6 +624,52 @@ struct MachineChooserView: View {
 
     private func submit() {
         if let target = resolvedSelection {
+            activate(target)
+        }
+    }
+
+    // MARK: Primary action (New vs Restore)
+
+    /// How many of `target`'s manifest windows could be restored right now:
+    /// relay entries with a captured session UUID that aren't bound to an
+    /// open window (the same open-entry bookkeeping the restore path's
+    /// `partitionForRestore` uses). Always 0 for Local and direct-TCP rows.
+    /// Computed on demand (the manifest isn't observable), so it refreshes
+    /// whenever the body re-renders — every selection change included.
+    private func restorableCount(for target: WindowTarget) -> Int {
+        guard case .remote(let machine) = target,
+              let relayBase = machine.relayBase,
+              let deviceID = machine.deviceID
+        else { return 0 }
+        let openEntryIDs = Set(TerminalController.all.compactMap(\.remoteManifestEntryID))
+        return RemoteSessionManifest.shared.restorableEntries(
+            relayBase: relayBase,
+            deviceID: deviceID,
+            openEntryIDs: openEntryIDs
+        ).count
+    }
+
+    /// The footer primary-button label for the current selection: "New" (it
+    /// creates a new window) unless the highlighted machine has recoverable
+    /// windows, then "Restore" — with the count when more than one.
+    private var primaryButtonTitle: String {
+        guard let target = resolvedSelection else { return "New" }
+        let count = restorableCount(for: target)
+        switch count {
+        case 0: return "New"
+        case 1: return "Restore"
+        default: return "Restore (\(count))"
+        }
+    }
+
+    /// Perform the primary action for `target`: restore its recoverable
+    /// windows when it has any, otherwise open a new window. Shared by the
+    /// footer button (Return) and the row double-click so both always follow
+    /// the label the button is showing.
+    private func activate(_ target: WindowTarget) {
+        if case .remote(let machine) = target, restorableCount(for: target) > 0 {
+            onSelect(.restoreRemote(machine))
+        } else {
             onSelect(target)
         }
     }
