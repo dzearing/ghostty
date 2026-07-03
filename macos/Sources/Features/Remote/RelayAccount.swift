@@ -64,6 +64,12 @@ final class RelayAccount: ObservableObject {
     /// chooser's account row.
     @Published private(set) var email: String?
 
+    /// The signed-in account's Google profile-photo URL (the ID-token
+    /// `picture` claim, from the `profile` scope), or nil when signed out or
+    /// when the session was created before the scope was requested — the UI
+    /// then shows a monogram until the user re-signs in.
+    @Published private(set) var pictureURL: URL?
+
     var isSignedIn: Bool { email != nil }
 
     private let endpoints: GoogleOAuth.Endpoints
@@ -90,7 +96,9 @@ final class RelayAccount: ObservableObject {
         self.openURL = openURL
         // Restore the signed-in identity across launches (the refresh token
         // outlives the app; the first relay call mints a fresh ID token).
-        self.email = keychain.load()?.email
+        let stored = keychain.load()
+        self.email = stored?.email
+        self.pictureURL = stored?.picture.flatMap(URL.init(string:))
     }
 
     // MARK: - OAuth client configuration
@@ -170,11 +178,13 @@ final class RelayAccount: ObservableObject {
         let claims = try GoogleOAuth.parseIDTokenClaims(idToken)
         guard let email = claims.email else { throw AccountError.badTokenResponse }
 
-        try keychain.save(.init(refreshToken: refreshToken, email: email))
+        try keychain.save(.init(
+            refreshToken: refreshToken, email: email, picture: claims.picture))
         cachedIDToken = .init(token: idToken, expiresIn: tokens.expiresIn)
         refreshTask?.cancel()
         refreshTask = nil
         self.email = email
+        self.pictureURL = claims.picture.flatMap(URL.init(string:))
     }
 
     /// Forget the account: delete the Keychain item and drop the in-memory
@@ -192,6 +202,7 @@ final class RelayAccount: ObservableObject {
         refreshTask?.cancel()
         refreshTask = nil
         email = nil
+        pictureURL = nil
         // Only the real app account touches the shared registry (test
         // instances with injected keychains must not).
         if self === Self.shared {
@@ -229,9 +240,18 @@ final class RelayAccount: ObservableObject {
         let tokens = try await task.value
         guard let idToken = tokens.idToken else { throw AccountError.badTokenResponse }
         cachedIDToken = .init(token: idToken, expiresIn: tokens.expiresIn)
-        // Google may rotate the refresh token; persist the newest one.
-        if let rotated = tokens.refreshToken, rotated != stored.refreshToken {
-            try? keychain.save(.init(refreshToken: rotated, email: stored.email))
+        // Google may rotate the refresh token, and a refreshed ID token minted
+        // with the `profile` scope carries the latest picture (sessions from
+        // before the scope was added carry none until re-sign-in). Persist
+        // whichever changed in one write.
+        let newRefresh = tokens.refreshToken ?? stored.refreshToken
+        let picture = (try? GoogleOAuth.parseIDTokenClaims(idToken))?.picture ?? stored.picture
+        if newRefresh != stored.refreshToken || picture != stored.picture {
+            try? keychain.save(.init(
+                refreshToken: newRefresh, email: stored.email, picture: picture))
+        }
+        if pictureURL?.absoluteString != picture {
+            pictureURL = picture.flatMap(URL.init(string:))
         }
         return idToken
     }
@@ -274,6 +294,10 @@ struct RelayAccountKeychain {
     struct Stored: Codable, Equatable {
         var refreshToken: String
         var email: String
+        /// Profile-photo URL from the `picture` claim. Optional so blobs
+        /// written before the `profile` scope decode unchanged (nil → the UI
+        /// shows the monogram).
+        var picture: String?
     }
 
     func load() -> Stored? {

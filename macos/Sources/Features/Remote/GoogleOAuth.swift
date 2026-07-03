@@ -92,7 +92,7 @@ enum GoogleOAuth {
         redirectURI: String,
         state: String,
         codeChallenge: String,
-        scopes: [String] = ["openid", "email"]
+        scopes: [String] = ["openid", "email", "profile"]
     ) -> URL {
         var comps = URLComponents(url: endpoints.authorization, resolvingAgainstBaseURL: false)!
         comps.queryItems = [
@@ -140,12 +140,20 @@ enum GoogleOAuth {
         var emailVerified: Bool?
         var exp: Double?
         var sub: String?
+        /// Display name (`profile` scope). Nil for sessions minted before the
+        /// scope was requested.
+        var name: String?
+        /// Profile-photo URL (`profile` scope). Nil for sessions minted before
+        /// the scope was requested — the UI falls back to a monogram.
+        var picture: String?
 
         enum CodingKeys: String, CodingKey {
             case email
             case emailVerified = "email_verified"
             case exp
             case sub
+            case name
+            case picture
         }
     }
 

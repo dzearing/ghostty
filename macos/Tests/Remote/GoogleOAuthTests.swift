@@ -63,12 +63,30 @@ struct GoogleOAuthTokenParsingTests {
             "email_verified": true,
             "exp": 1_900_000_000,
             "sub": "1234567890",
+            "name": "David Zearing",
+            "picture": "https://lh3.googleusercontent.com/a/ACg8ocK=s96-c",
         ])
         let claims = try GoogleOAuth.parseIDTokenClaims(idToken)
         #expect(claims.email == "dzearing@gmail.com")
         #expect(claims.emailVerified == true)
         #expect(claims.exp == 1_900_000_000)
         #expect(claims.sub == "1234567890")
+        #expect(claims.name == "David Zearing")
+        #expect(claims.picture == "https://lh3.googleusercontent.com/a/ACg8ocK=s96-c")
+    }
+
+    /// A token minted WITHOUT the `profile` scope (e.g. a session created
+    /// before the scope was added) has no `picture`/`name` — parsing must
+    /// still succeed with nil so the UI can fall back to the monogram.
+    @Test func claimsWithoutProfileScopeParseWithNilPicture() throws {
+        let idToken = Self.fakeJWT(claims: [
+            "email": "dzearing@gmail.com",
+            "exp": 1_900_000_000,
+        ])
+        let claims = try GoogleOAuth.parseIDTokenClaims(idToken)
+        #expect(claims.email == "dzearing@gmail.com")
+        #expect(claims.picture == nil)
+        #expect(claims.name == nil)
     }
 
     @Test func malformedIDTokenThrows() {
@@ -102,7 +120,7 @@ struct GoogleOAuthTokenParsingTests {
         #expect(query["client_id"] == "cid.apps.googleusercontent.com")
         #expect(query["redirect_uri"] == "http://127.0.0.1:49152")
         #expect(query["response_type"] == "code")
-        #expect(query["scope"] == "openid email")
+        #expect(query["scope"] == "openid email profile")
         #expect(query["code_challenge"] == "ch4llenge")
         #expect(query["code_challenge_method"] == "S256")
         #expect(query["state"] == "st4te")

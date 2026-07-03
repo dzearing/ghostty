@@ -36,10 +36,6 @@ struct MachineChooserView: View {
     @State private var query: String = ""
     /// True while the browser sign-in flow is running (shows the spinner row).
     @State private var isSigningIn = false
-    /// Hover state for the footer's sign-in link (underline + tint + cursor).
-    @State private var hoveringSignIn = false
-    /// Hover state for the footer's sign-out link.
-    @State private var hoveringSignOut = false
     /// Index into `targets` of the highlighted row. Bound to `List(selection:)`
     /// so the native selection highlight + focus ring track the keyboard.
     @State private var selectedIndex: Int = 0
@@ -60,8 +56,14 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The current machine list (live from the registry).
-    private var machines: [Machine] { registry.machines }
+    /// The current machine list (live from the registry), minus any relay
+    /// device that IS this Mac: it duplicates the pinned "Local — This machine"
+    /// row, so it is hidden from the chooser. Display-only filtering — the
+    /// machine stays in `MachineRegistry` (it is still an account resource that
+    /// other surfaces/management may need).
+    private var machines: [Machine] {
+        registry.machines.filter { !($0.isRelay && $0.isLocalMachine) }
+    }
 
     /// Filtered remote machines based on the search query.
     private var filteredMachines: [Machine] {
@@ -98,10 +100,9 @@ struct MachineChooserView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("New Window")
-                .font(.headline)
-                .padding([.top, .horizontal], 16)
-                .padding(.bottom, 8)
+            // No in-content header: the panel titlebar already says
+            // "New Window" — repeating it inside the content just wasted
+            // vertical space.
 
             // Invisible shortcut buttons that drive list navigation from the
             // keyboard regardless of which control has focus. Mirrors the
@@ -134,7 +135,7 @@ struct MachineChooserView: View {
                         clampSelection()
                     }
             }
-            .padding(.horizontal, 16)
+            .padding([.top, .horizontal], 16)
             .padding(.bottom, 8)
 
             // Rows are a ScrollView+VStack, NOT a `List`: a SwiftUI List swallows
@@ -234,6 +235,12 @@ struct MachineChooserView: View {
                 .padding(.top, 6)
             }
 
+            // Hairline separating the machine list from the footer row.
+            Divider()
+                .padding(.top, 8)
+
+            // Footer: account area (avatar + email + Sign Out, or Sign In)
+            // left-aligned; Cancel/Open right-aligned. One row.
             HStack {
                 accountRow
                 Spacer()
@@ -260,34 +267,24 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The account footer (WP-B2): a link-styled sign-in button when signed
-    /// out (pointer cursor + hover underline/tint), a monogram avatar + email
-    /// + sign-out link when signed in, a spinner while the browser flow runs,
-    /// or a pointer to the setup doc when no Google client id is configured.
+    /// The account footer (WP-B2): avatar + email + a standard "Sign Out"
+    /// button when signed in, a standard "Sign In with Google" button when
+    /// signed out, a spinner while the browser flow runs, or a pointer to the
+    /// setup doc when no Google client id is configured. Plain bordered
+    /// buttons, styled like Cancel/Open — no link styling or cursor hacks.
     @ViewBuilder
     private var accountRow: some View {
         if let email = account.email {
             HStack(spacing: 8) {
                 avatar(for: email)
                 Text(email)
+                    .font(.caption)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .foregroundStyle(.secondary)
                     .help("Signed in as \(email)")
-                Button {
-                    account.signOut()
-                } label: {
-                    Text("Sign Out")
-                        .underline(hoveringSignOut)
-                        .foregroundStyle(Color.accentColor)
-                }
-                .buttonStyle(.plain)
-                .onHover { inside in
-                    hoveringSignOut = inside
-                    if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                }
+                Button("Sign Out") { account.signOut() }
             }
-            .font(.caption)
         } else if isSigningIn {
             HStack(spacing: 6) {
                 ProgressView()
@@ -297,28 +294,7 @@ struct MachineChooserView: View {
             }
             .font(.caption)
         } else if RelayAccount.isConfigured {
-            Button {
-                startSignIn()
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "person.crop.circle")
-                    Text("Sign in with Google…")
-                        .underline(hoveringSignIn)
-                }
-                .foregroundStyle(Color.accentColor)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.accentColor.opacity(hoveringSignIn ? 0.12 : 0)))
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .font(.caption)
-            .onHover { inside in
-                hoveringSignIn = inside
-                if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-            }
+            Button("Sign In with Google") { startSignIn() }
         } else {
             Text("Google client not configured — see docs/design/relay-oidc-setup.md")
                 .font(.caption)
@@ -327,10 +303,36 @@ struct MachineChooserView: View {
         }
     }
 
-    /// A Google-style monogram avatar: the email's first letter in a filled
-    /// circle. Signals "a session exists" at a glance without any network
-    /// fetch (the ID token has no parsed `picture` claim to use).
+    /// The signed-in avatar: the Google profile photo when the session has a
+    /// `picture` claim (loaded asynchronously; AsyncImage's shared URLSession
+    /// caches it in URLCache), falling back to the monogram while loading or
+    /// when absent — e.g. a session signed in before the `profile` scope was
+    /// requested has no picture until the user re-signs in.
+    @ViewBuilder
     private func avatar(for email: String) -> some View {
+        Group {
+            if let url = account.pictureURL {
+                AsyncImage(url: url) { phase in
+                    if let image = phase.image {
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        monogram(for: email)
+                    }
+                }
+            } else {
+                monogram(for: email)
+            }
+        }
+        .frame(width: 20, height: 20)
+        .clipShape(Circle())
+        .accessibilityLabel("Signed in as \(email)")
+    }
+
+    /// A Google-style monogram circle: the email's first letter on an accent
+    /// gradient. The no-network fallback for the avatar.
+    private func monogram(for email: String) -> some View {
         ZStack {
             Circle()
                 .fill(
@@ -342,8 +344,6 @@ struct MachineChooserView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.white)
         }
-        .frame(width: 20, height: 20)
-        .accessibilityLabel("Signed in as \(email)")
     }
 
     /// Run the browser sign-in flow, then refresh the device list so the
@@ -379,11 +379,11 @@ struct MachineChooserView: View {
             }
         case .remote(let machine):
             HStack(spacing: 10) {
-                // A device that IS this Mac gets the laptop glyph (matching
-                // the "Local" row) instead of the server glyph, plus a
-                // "this Mac" tag below, so it doesn't read as a mystery
-                // duplicate of "Local". It stays in the list (it is still an
-                // account resource — rename/remove must keep working).
+                // A machine that IS this Mac gets the laptop glyph (matching
+                // the "Local" row) plus a "this Mac" tag, so it doesn't read
+                // as a mystery duplicate of "Local". Only non-relay (direct
+                // TCP loopback) entries can hit this: relay devices for this
+                // Mac are filtered out of `machines` entirely.
                 Image(systemName: machine.isLocalMachine ? "laptopcomputer" : "server.rack")
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
