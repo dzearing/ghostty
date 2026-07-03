@@ -7,7 +7,7 @@ import Security
 ///
 /// One instance (`shared`) owns:
 /// - the **refresh token** persisted in the Keychain (generic password,
-///   service `com.mitchellh.ghostty.relay-account`)
+///   service `com.dzearing.ghoztty.relay-account`)
 /// - a short-lived **ID token** cached in memory and refreshed via the refresh
 ///   token when it is expired or within 60s of expiry
 /// - the signed-in **email** (from the ID-token claims, for display)
@@ -88,7 +88,7 @@ final class RelayAccount: ObservableObject {
     init(
         endpoints: GoogleOAuth.Endpoints = .google,
         keychain: RelayAccountKeychain =
-            RelayAccountKeychain(service: "com.mitchellh.ghostty.relay-account"),
+            RelayAccountKeychain(service: "com.dzearing.ghoztty.relay-account"),
         openURL: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) }
     ) {
         self.endpoints = endpoints

@@ -342,7 +342,7 @@ enum GoogleOAuth {
 
         private let expectedState: String
         private let listener: NWListener
-        private let queue = DispatchQueue(label: "com.mitchellh.ghostty.oauth-loopback")
+        private let queue = DispatchQueue(label: "com.dzearing.ghoztty.oauth-loopback")
 
         // Queue-confined:
         private var portContinuation: CheckedContinuation<UInt16, Error>?

@@ -38,7 +38,7 @@
     -->
     <display_length compare="ge">360</display_length>
   </requires>
-  <translation type="gettext">com.mitchellh.ghostty</translation>
+  <translation type="gettext">com.dzearing.ghoztty</translation>
 
   <!--
     TODO: Generate manifest location data.

@@ -6,7 +6,7 @@ const Config = @import("Config.zig");
 const gresource = @import("../apprt/gtk/build/gresource.zig");
 const locales = @import("../os/i18n_locales.zig").locales;
 
-const domain = "com.mitchellh.ghostty";
+const domain = "com.dzearing.ghoztty";
 
 owner: *std.Build,
 steps: []*std.Build.Step,

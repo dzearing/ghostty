@@ -63,7 +63,7 @@ body:
     attributes:
       label: Ghostty Logs
       description: |
-        Provide any captured Ghostty logs or stacktraces during your issue reproduction in this field.  On Linux, logs can be found by running `ghostty` from the command-line; on macOS, logs can be viewed with `sudo log stream --level debug --predicate 'subsystem=="com.mitchellh.ghostty"'` from another terminal emulator.
+        Provide any captured Ghostty logs or stacktraces during your issue reproduction in this field.  On Linux, logs can be found by running `ghostty` from the command-line; on macOS, logs can be viewed with `sudo log stream --level debug --predicate 'subsystem=="com.dzearing.ghoztty"'` from another terminal emulator.
       render: text
   - type: textarea
     attributes:

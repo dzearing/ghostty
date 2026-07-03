@@ -43,8 +43,8 @@ jobs:
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6.7
         with:
-          bundle: com.mitchellh.ghostty
-          manifest-path: dist/flatpak/com.mitchellh.ghostty.yml
+          bundle: com.dzearing.ghoztty
+          manifest-path: dist/flatpak/com.dzearing.ghoztty.yml
           cache-key: flatpak-builder-${{ github.sha }}
           arch: ${{ matrix.variant.arch }}
           verbose: true

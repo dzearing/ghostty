@@ -16,7 +16,7 @@ class IPCServer {
     private var acceptSource: DispatchSourceRead?
     private var sentinelSource: DispatchSourceFileSystemObject?
     private var sentinelDirFd: Int32 = -1
-    private let queue = DispatchQueue(label: "com.mitchellh.ghostty.ipc", qos: .utility)
+    private let queue = DispatchQueue(label: "com.dzearing.ghoztty.ipc", qos: .utility)
     private var targetRegistry: [String: TargetEntry] = [:]
 
     private enum TargetEntry {

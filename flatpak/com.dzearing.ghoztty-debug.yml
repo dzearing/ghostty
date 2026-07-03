@@ -1,9 +1,10 @@
-app-id: com.mitchellh.ghostty
+app-id: com.dzearing.ghoztty-debug
 runtime: org.gnome.Platform
 runtime-version: "50"
 sdk: org.gnome.Sdk
 default-branch: tip
 command: ghostty
+rename-icon: com.dzearing.ghoztty
 finish-args:
   # 3D rendering
   - --device=dri
@@ -37,7 +38,7 @@ modules:
       append-path: /app/zig
     build-commands:
       - zig build
-        -Doptimize=ReleaseFast
+        -Doptimize=Debug
         -Dcpu=baseline
         -Dflatpak=true
         -Dstrip=false

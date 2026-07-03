@@ -188,7 +188,7 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 VERIFIED end-to-end:
 - `zig test src/remote/<module>.zig` — native target, no `-target` needed.
 - `zig build -Doptimize=Debug` → **`zig-out/Ghoztty-Debug.app`** (complete,
-  code-signed; bundle id `com.mitchellh.ghostty.debug`; 142 MB `ghoztty` binary).
+  code-signed; bundle id `com.dzearing.ghoztty.debug`; 142 MB `ghoztty` binary).
   Full pipeline works: zig core + xcodebuild (Xcode 26.4) + Metal toolchain +
   Swift + signing. **NEVER touch `/Applications/Ghoztty.app`** (user's primary
   terminal) — debug build only.
