@@ -3,7 +3,8 @@
 //!
 //! ## Why this exists
 //! `--relay` mode holds one control WebSocket to the relay and redials it
-//! forever (3s backoff). The Windows tray needs to let the human take that
+//! forever (3s base backoff, escalating on repeated fast drops — see
+//! `ReconnectBackoff`). The Windows tray needs to let the human take that
 //! link DOWN on demand — the agent goes offline on the relay, but LOCAL
 //! sessions stay alive (a control drop only ever DETACHes sessions, never
 //! terminates them — see `main.zig` §7.1), so bringing the link back UP
@@ -62,6 +63,80 @@ pub const Display = enum(u8) {
     offline,
 };
 
+/// The redial-delay schedule: fixed base cadence normally, exponential with a
+/// cap when connections keep dying young ("fast drops").
+///
+/// ## Why
+/// Live incident: two same-user daemons (a `Local\` mutex hole — see
+/// `single_instance.zig`) fought over ONE relay device token. The relay
+/// dup-control-kicks the older connection on every connect, so each loser
+/// redialed after a FIXED 3s forever → ~1100 reconnects/hour pegging the
+/// relay. Any "my connection comes up and then immediately dies, every time"
+/// pathology (dup token, relay-side auth flapping) has the same signature:
+/// the connection SUCCEEDS but never survives. Escalating only on that
+/// signature converges the fight to a slow heartbeat (capped delay) while
+/// leaving every healthy pattern at the base cadence:
+///
+///   - dial FAILURES (relay down/unreachable) keep the base delay — an outage
+///     shouldn't be slower to recover from than today;
+///   - a connection that survived `fast_drop_threshold_ms` resets the
+///     schedule — one-off drops and sleep/wake redial at the base delay
+///     (wall-clock lifetime: a machine that slept for hours counts as a
+///     long-lived connection, which is exactly right);
+///   - NEUTRAL drops (credential-change `bounce`, user Disconnect/stop) never
+///     count as fast drops — a re-enroll must redial with fresh credentials
+///     at the base delay, not inherit a fight's penalty (it may well END the
+///     fight).
+///
+/// Deterministic decision logic (this struct) is kept separate from the
+/// ±20% jitter (`jittered`) so the schedule is unit-testable; the jitter
+/// de-synchronizes multiple losers so they don't thundering-herd the relay.
+pub const ReconnectBackoff = struct {
+    /// Delay used for dial failures, for post-long-lived-connection redials,
+    /// and as the first fast-drop delay (`runLoop`'s `backoff_ms` argument;
+    /// 3s in production).
+    base_ms: u64,
+    /// Ceiling for the escalated delay (40× base = 120s in production).
+    cap_ms: u64,
+    /// A served connection that lived less than this is a fast drop.
+    fast_drop_threshold_ms: u64 = 30_000,
+    /// The un-jittered delay the NEXT fast drop will be told to sleep.
+    delay_ms: u64,
+
+    pub fn init(base_ms: u64, cap_ms: u64) ReconnectBackoff {
+        return .{ .base_ms = base_ms, .cap_ms = cap_ms, .delay_ms = base_ms };
+    }
+
+    /// Dial failed (never connected): retry at the base cadence. Leaves the
+    /// escalation state alone — only a SURVIVING connection earns a reset, so
+    /// a transient dial failure mid-fight doesn't unwind the backoff.
+    pub fn onDialFailed(self: *ReconnectBackoff) u64 {
+        return self.base_ms;
+    }
+
+    /// A served connection ended after `lifetime_ms`. `neutral` marks drops
+    /// that must not count as fast drops (credential bounce, user
+    /// Disconnect, stop). Returns the un-jittered delay to sleep before the
+    /// redial: base → 2×base → 4×base → … → cap on successive fast drops.
+    pub fn onConnectionEnded(self: *ReconnectBackoff, lifetime_ms: u64, neutral: bool) u64 {
+        if (neutral or lifetime_ms >= self.fast_drop_threshold_ms) {
+            self.delay_ms = self.base_ms;
+            return self.base_ms;
+        }
+        const delay = self.delay_ms;
+        self.delay_ms = @min(self.delay_ms *| 2, self.cap_ms);
+        return delay;
+    }
+
+    /// Apply ±20% uniform jitter. Kept out of the schedule methods so those
+    /// stay deterministic under test.
+    pub fn jittered(delay_ms: u64, rand: std.Random) u64 {
+        const span = delay_ms / 5; // 20%
+        if (span == 0) return delay_ms;
+        return delay_ms - span + rand.uintAtMost(u64, 2 * span);
+    }
+};
+
 /// The minimal connection surface `runLoop` needs. A vtable (rather than
 /// `*WsClient` directly) so the loop is unit-testable with a fake transport.
 pub const Transport = struct {
@@ -97,6 +172,10 @@ pub const LinkControl = struct {
     /// Wakes the loop out of ANY wait (backoff sleep or offline park) so a
     /// state change takes effect promptly. Only the loop thread waits/resets.
     wake: std.Thread.ResetEvent = .{},
+    /// Set by `bounce` when it closes a LIVE connection; consumed (swap) by
+    /// the loop when classifying why serve returned, so a credential-change
+    /// bounce is never mistaken for a fast drop (see `ReconnectBackoff`).
+    cred_bounce: std.atomic.Value(bool) = .{ .raw = false },
 
     /// Guards `live`. Registration is take-and-clear so the live connection
     /// is closed through here AT MOST once.
@@ -111,7 +190,7 @@ pub const LinkControl = struct {
     /// (if any) to unblock the loop's blocked serve/read. Idempotent.
     pub fn disconnect(self: *LinkControl) void {
         self.desired.store(.offline, .release);
-        self.closeLive();
+        _ = self.closeLive();
         self.wake.set();
     }
 
@@ -129,13 +208,22 @@ pub const LinkControl = struct {
     /// user-chosen Disconnect stays parked (the next user Reconnect dials
     /// with the new credentials anyway). Idempotent, any thread.
     pub fn bounce(self: *LinkControl) void {
-        self.closeLive();
+        // Mark BEFORE closing: the close is what unblocks the loop's serve,
+        // so the marker must already be visible when the loop classifies the
+        // drop (a marker set after could lose the race and get the bounce
+        // penalized as a fast drop).
+        self.cred_bounce.store(true, .release);
+        if (!self.closeLive()) {
+            // Nothing was live (parked offline / mid-backoff): clear the
+            // marker so it can't mislabel a LATER, unrelated drop.
+            self.cred_bounce.store(false, .release);
+        }
     }
 
     /// Terminate the loop from either state (closes a live connection first).
     pub fn stopLoop(self: *LinkControl) void {
         self.desired.store(.stop, .release);
-        self.closeLive();
+        _ = self.closeLive();
         self.wake.set();
     }
 
@@ -176,7 +264,7 @@ pub const LinkControl = struct {
         self.mutex.lock();
         self.live = .{ .transport = transport, .conn = conn };
         self.mutex.unlock();
-        if (self.desired.load(.acquire) != .online) self.closeLive();
+        if (self.desired.load(.acquire) != .online) _ = self.closeLive();
     }
 
     /// Unregister after `serve` returned (before the loop deinits the
@@ -189,22 +277,37 @@ pub const LinkControl = struct {
 
     /// Take-and-close the registered connection (at most once — the entry is
     /// cleared under the mutex before `close` runs, outside the lock).
-    fn closeLive(self: *LinkControl) void {
+    /// Returns whether there WAS a live connection to close.
+    fn closeLive(self: *LinkControl) bool {
         self.mutex.lock();
         const live = self.live;
         self.live = null;
         self.mutex.unlock();
-        if (live) |l| l.transport.vtable.close(l.transport.ctx, l.conn);
+        if (live) |l| {
+            l.transport.vtable.close(l.transport.ctx, l.conn);
+            return true;
+        }
+        return false;
     }
 };
 
 /// THE connect loop: park while offline, dial, serve until the connection
-/// ends, back off, repeat. Every wait is interruptible by the tray's
-/// `disconnect`/`reconnect`/`stopLoop`. Returns only on `.stop`.
+/// ends, back off (`ReconnectBackoff`: `backoff_ms` base cadence normally,
+/// escalating with jitter on repeated fast drops), repeat. Every wait is
+/// interruptible by the tray's `disconnect`/`reconnect`/`stopLoop`. Returns
+/// only on `.stop`.
 ///
 /// This is `main.zig`'s relay control loop with the transport abstracted out,
 /// so the suspend/resume transitions are unit-testable on any host.
 pub fn runLoop(link: *LinkControl, transport: Transport, backoff_ms: u64) void {
+    var backoff = ReconnectBackoff.init(backoff_ms, backoff_ms *| 40);
+    var prng = std.Random.DefaultPrng.init(seed: {
+        var s: u64 = 0;
+        std.crypto.random.bytes(std.mem.asBytes(&s));
+        break :seed s;
+    });
+    const rand = prng.random();
+
     while (true) {
         switch (link.awaitOnline()) {
             .stop => return,
@@ -213,27 +316,43 @@ pub fn runLoop(link: *LinkControl, transport: Transport, backoff_ms: u64) void {
         }
 
         const conn = transport.vtable.dial(transport.ctx) orelse {
-            // Dial failed: back off, but wake early on any tray toggle so a
-            // user Disconnect parks (and a Reconnect-after-Disconnect redials)
-            // without waiting out the backoff.
-            link.interruptibleSleep(backoff_ms);
+            // Dial failed: back off (base cadence — see ReconnectBackoff),
+            // but wake early on any tray toggle so a user Disconnect parks
+            // (and a Reconnect-after-Disconnect redials) without waiting out
+            // the backoff.
+            link.interruptibleSleep(ReconnectBackoff.jittered(backoff.onDialFailed(), rand));
             continue;
         };
 
         link.connected.store(true, .release);
         link.registerLive(transport, conn);
 
+        const served_from_ms = std.time.milliTimestamp();
         transport.vtable.serve(transport.ctx, conn);
+        const lifetime_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - served_from_ms));
 
         link.connected.store(false, .release);
         link.clearLive();
         transport.vtable.deinit(transport.ctx, conn);
 
-        // Connection ended (peer drop, keepalive stale-close, or user
-        // disconnect). Back off before redialing; a user disconnect has
-        // already set the wake event, so this returns immediately and the
-        // next awaitOnline parks.
-        link.interruptibleSleep(backoff_ms);
+        // Connection ended (peer drop, keepalive stale-close, credential
+        // bounce, or user disconnect). Classify it for the backoff schedule:
+        // bounce and not-desired-online drops are neutral (never fast drops).
+        const was_bounce = link.cred_bounce.swap(false, .acq_rel);
+        const neutral = was_bounce or link.desired.load(.acquire) != .online;
+        const delay_ms = backoff.onConnectionEnded(lifetime_ms, neutral);
+        if (delay_ms > backoff.base_ms) {
+            // Only above base — i.e. an actual fast-drop streak (dup-token
+            // fight signature). Visible in the agent log for on-box diagnosis.
+            std.debug.print(
+                "ghoztty-agent: relay control dropped after {d}ms (fast-drop streak); backing off {d}ms (cap {d}ms)\n",
+                .{ lifetime_ms, delay_ms, backoff.cap_ms },
+            );
+        }
+        // Back off before redialing; a user disconnect has already set the
+        // wake event, so this returns immediately and the next awaitOnline
+        // parks.
+        link.interruptibleSleep(ReconnectBackoff.jittered(delay_ms, rand));
     }
 }
 
@@ -620,6 +739,99 @@ test "integration: disconnect closes the real WsClient (unblocking its read); re
 
     link.stopLoop();
     t.join();
+}
+
+// -----------------------------------------------------------------------------
+// ReconnectBackoff: pure schedule tests (the incident math)
+// -----------------------------------------------------------------------------
+
+test "backoff: successive fast drops escalate base → 2x → 4x → … → cap, and stay capped" {
+    var b = ReconnectBackoff.init(3_000, 120_000);
+    // The production schedule from the incident fix: 3s, 6s, 12s, 24s, 48s,
+    // 96s, then capped at 120s forever.
+    const expected = [_]u64{ 3_000, 6_000, 12_000, 24_000, 48_000, 96_000, 120_000, 120_000, 120_000 };
+    for (expected) |want| {
+        try testing.expectEqual(want, b.onConnectionEnded(0, false));
+    }
+}
+
+test "backoff: a connection surviving the threshold resets the schedule to base" {
+    var b = ReconnectBackoff.init(3_000, 120_000);
+    // Escalate a few steps into a fight…
+    _ = b.onConnectionEnded(5_000, false); // → 3s (streak starts)
+    _ = b.onConnectionEnded(100, false); // → 6s
+    try testing.expectEqual(@as(u64, 12_000), b.onConnectionEnded(29_999, false));
+    // …then one connection survives ≥ 30s: full reset.
+    try testing.expectEqual(@as(u64, 3_000), b.onConnectionEnded(30_000, false));
+    // And the NEXT fast drop starts the schedule over from base.
+    try testing.expectEqual(@as(u64, 3_000), b.onConnectionEnded(0, false));
+    try testing.expectEqual(@as(u64, 6_000), b.onConnectionEnded(0, false));
+}
+
+test "backoff: neutral drops (credential bounce / user disconnect) never escalate and reset the streak" {
+    var b = ReconnectBackoff.init(3_000, 120_000);
+    // Deep in a fight…
+    for (0..6) |_| _ = b.onConnectionEnded(0, false);
+    try testing.expectEqual(@as(u64, 120_000), b.delay_ms);
+    // …a credential-change bounce (lifetime tiny, but neutral) gets the base
+    // delay — the redial with FRESH credentials may end the fight, so it
+    // must not inherit the penalty.
+    try testing.expectEqual(@as(u64, 3_000), b.onConnectionEnded(50, true));
+    try testing.expectEqual(@as(u64, 3_000), b.delay_ms);
+}
+
+test "backoff: dial failures use the base delay and leave the streak alone" {
+    var b = ReconnectBackoff.init(3_000, 120_000);
+    // Never-connected failures (relay down) stay at today's base cadence…
+    try testing.expectEqual(@as(u64, 3_000), b.onDialFailed());
+    try testing.expectEqual(@as(u64, 3_000), b.onDialFailed());
+    // …and mid-fight, a stray dial failure neither unwinds nor advances the
+    // escalation (only a surviving connection resets it).
+    _ = b.onConnectionEnded(0, false); // → 3s, next = 6s
+    _ = b.onConnectionEnded(0, false); // → 6s, next = 12s
+    try testing.expectEqual(@as(u64, 3_000), b.onDialFailed());
+    try testing.expectEqual(@as(u64, 12_000), b.onConnectionEnded(0, false));
+}
+
+test "backoff: jitter stays within ±20% and passes tiny delays through" {
+    var prng = std.Random.DefaultPrng.init(0x6f2a_9c1d_5e3b_8840);
+    const rand = prng.random();
+    for ([_]u64{ 3_000, 6_000, 120_000 }) |d| {
+        var lo: u64 = std.math.maxInt(u64);
+        var hi: u64 = 0;
+        for (0..2_000) |_| {
+            const j = ReconnectBackoff.jittered(d, rand);
+            try testing.expect(j >= d - d / 5);
+            try testing.expect(j <= d + d / 5);
+            lo = @min(lo, j);
+            hi = @max(hi, j);
+        }
+        try testing.expect(lo < hi); // it actually jitters
+    }
+    // Delays too small to jitter (span == 0) come back unchanged — the unit
+    // tests drive runLoop with millisecond backoffs.
+    try testing.expectEqual(@as(u64, 4), ReconnectBackoff.jittered(4, rand));
+}
+
+test "bounce marker: consumed by the drop it caused, absent otherwise" {
+    var fake = FakeTransport{};
+    var link = LinkControl{ .host = "test" };
+    const t = try std.Thread.spawn(.{}, runLoop, .{ &link, fake.transport(), 5 });
+
+    try poll(5_000, &link, isConnected);
+    link.bounce();
+    try poll(5_000, &fake, FakeTransport.dialed2);
+    // The marker was consumed classifying the bounce-drop — it must not
+    // linger to mislabel the next drop.
+    try testing.expect(!link.cred_bounce.load(.acquire));
+
+    link.stopLoop();
+    t.join();
+
+    // bounce with nothing live clears its own marker (parked link).
+    var parked = LinkControl{ .host = "test" };
+    parked.bounce();
+    try testing.expect(!parked.cred_bounce.load(.acquire));
 }
 
 test {

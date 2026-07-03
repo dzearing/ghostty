@@ -11,11 +11,27 @@
 //! distinct, documented exit code, so a supervisor's keep-alive loop degrades
 //! into a cheap respawn-and-exit heartbeat instead of a second daemon.
 //!
-//! ## Mechanism (per platform, per user session)
-//!   - **Windows**: a named mutex `Local\GhozttyAgentDaemon` via `CreateMutexW`.
-//!     The `Local\` prefix scopes it to the current LOGON SESSION, so two
-//!     different logged-in users each get their own agent (they don't block
-//!     each other) while two supervisors in the SAME session collide. The
+//! ## Mechanism (per platform, per user)
+//!   - **Windows**: a named mutex `Global\GhozttyAgentDaemon-<user-SID>` via
+//!     `CreateMutexW`. The GLOBAL namespace is shared across ALL logon
+//!     sessions, and the SID suffix keeps different users from blocking each
+//!     other. This matters because `Local\` scopes per LOGON SESSION, NOT per
+//!     user: a scheduled-task/service supervisor ("run whether user is logged
+//!     on or not") lives in a DIFFERENT logon session than an interactive
+//!     launch, so a `Local\`-only guard let two same-user daemons coexist —
+//!     exactly the live dup-daemon incident this rework fixes. Per MS "Kernel
+//!     object namespaces": creating a MUTEX in `Global\` requires NO special
+//!     privilege — the `SeCreateGlobalPrivilege` check is limited to
+//!     file-mapping and symbolic-link objects — and using a global named
+//!     object to detect "already an instance running across all sessions" is
+//!     the doc's own example. Fallback chain, so the guard never regresses
+//!     below the old behavior: SID unavailable → username suffix
+//!     (`GetUserNameW`); `Global\` create denied (AppContainer-style sandboxes
+//!     where the global namespace is unavailable) → the legacy per-session
+//!     `Local\GhozttyAgentDaemon`. An ACCESS_DENIED from `CreateMutexW` is
+//!     disambiguated with a minimal `OpenMutexW(SYNCHRONIZE)` probe: name
+//!     exists but is unopenable (e.g. the first daemon runs elevated) →
+//!     already running; name absent → namespace unusable → fall back. The
 //!     handle is held for the process lifetime; the OS destroys the mutex when
 //!     the last handle closes (normal exit OR crash), so no stale-lock cleanup
 //!     is ever needed. Detection is the classic `GetLastError() ==
@@ -84,7 +100,7 @@ pub const Guard = struct {
     }
 };
 
-/// Acquire the per-user-session daemon guard. See the module doc for the
+/// Acquire the per-user daemon guard. See the module doc for the
 /// platform mechanisms. `alloc` is only used transiently (path resolution on
 /// POSIX); the returned `Guard` owns no heap memory.
 pub fn acquire(alloc: Allocator) AcquireError!Guard {
@@ -95,36 +111,197 @@ pub fn acquire(alloc: Allocator) AcquireError!Guard {
 }
 
 // -----------------------------------------------------------------------------
-// Windows: named mutex
+// Windows: named mutex (Global\ per-user, with a Local\ fallback)
 // -----------------------------------------------------------------------------
 
-/// `Local\` = current logon session's namespace: same-session supervisors
-/// collide, different logged-in users don't.
-const mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\GhozttyAgentDaemon");
+/// UTF-8 prefix of the preferred (cross-logon-session) mutex name. The suffix
+/// is the current user's SID string — or the username when the SID can't be
+/// resolved — so distinct users never block each other while ALL of one
+/// user's logon sessions (interactive, scheduled task, service) share ONE
+/// guard. Public so the name composition is unit-testable off-Windows.
+pub const global_mutex_name_prefix = "Global\\GhozttyAgentDaemon-";
+
+/// Legacy pre-SID name, kept verbatim as the last-resort fallback (`Local\` =
+/// per-logon-session namespace — see the module doc for why that's too weak
+/// as the primary): sandboxed contexts without Global\ access still get
+/// today's per-session guard rather than none at all.
+const local_mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\GhozttyAgentDaemon");
+
+/// Compose `Global\GhozttyAgentDaemon-<user_id>` into `buf`. The id is
+/// sanitized: backslashes (illegal in a mutex name anywhere past the
+/// namespace prefix) and control characters become `_`. Pure — testable on
+/// any host; the Windows path converts the result to UTF-16 for CreateMutexW.
+pub fn composeGlobalMutexName(buf: []u8, user_id: []const u8) error{NameTooLong}![]const u8 {
+    const total = global_mutex_name_prefix.len + user_id.len;
+    if (total > buf.len) return error.NameTooLong;
+    @memcpy(buf[0..global_mutex_name_prefix.len], global_mutex_name_prefix);
+    for (user_id, global_mutex_name_prefix.len..) |c, i| {
+        buf[i] = if (c == '\\' or c < 0x20) '_' else c;
+    }
+    return buf[0..total];
+}
 
 fn acquireWindows() AcquireError!Guard {
     if (builtin.os.tag != .windows) unreachable;
-    // bInitialOwner = FALSE: we never wait on / own the mutex — its mere
-    // EXISTENCE (first creator wins) is the whole signal, which also means
-    // abandoned-mutex semantics can never bite us.
-    const handle = win32.CreateMutexW(null, 0, mutex_name) orelse {
-        return error.GuardUnavailable;
+
+    // Preferred: Global\ + per-user id (SID, else username). Any failure on
+    // this path degrades to the legacy Local\ guard — never below it.
+    var id_buf: [768]u8 = undefined; // UNLEN=256 UTF-16 units ≤ 768 UTF-8 bytes
+    if (windowsUserId(&id_buf)) |id| global: {
+        var name8: [800]u8 = undefined;
+        const name = composeGlobalMutexName(&name8, id) catch break :global;
+        var name16: [801]u16 = undefined;
+        const n16 = std.unicode.utf8ToUtf16Le(name16[0..800], name) catch break :global;
+        name16[n16] = 0;
+        switch (tryCreateMutex(name16[0..n16 :0])) {
+            .acquired => |h| return .{ .impl = .{ .handle = h } },
+            .already_running => return error.AlreadyRunning,
+            .namespace_unavailable => {},
+        }
+        std.debug.print(
+            "ghoztty-agent: single-instance: Global\\ mutex unavailable; falling back to the per-logon-session Local\\ mutex (guard will NOT span logon sessions)\n",
+            .{},
+        );
+    } else {
+        std.debug.print(
+            "ghoztty-agent: single-instance: user SID/name lookup failed; falling back to the per-logon-session Local\\ mutex (guard will NOT span logon sessions)\n",
+            .{},
+        );
+    }
+
+    // Fallback: the legacy per-logon-session guard (today's behavior).
+    return switch (tryCreateMutex(local_mutex_name)) {
+        .acquired => |h| .{ .impl = .{ .handle = h } },
+        .already_running => error.AlreadyRunning,
+        .namespace_unavailable => error.GuardUnavailable,
+    };
+}
+
+const CreateOutcome = union(enum) {
+    acquired: std.os.windows.HANDLE,
+    already_running,
+    /// The name couldn't be created OR proven to exist — the namespace (or
+    /// the mutex machinery) is unusable here; try the next fallback.
+    namespace_unavailable,
+};
+
+/// One CreateMutexW attempt with full outcome classification. bInitialOwner =
+/// FALSE: we never wait on / own the mutex — its mere EXISTENCE (first
+/// creator wins) is the whole signal, which also means abandoned-mutex
+/// semantics can never bite us.
+fn tryCreateMutex(name: [*:0]const u16) CreateOutcome {
+    if (builtin.os.tag != .windows) unreachable;
+    const handle = win32.CreateMutexW(null, 0, name) orelse {
+        if (std.os.windows.GetLastError() == .ACCESS_DENIED) {
+            // Ambiguous: either the name EXISTS but its DACL / integrity
+            // level refuses CreateMutexW's implicit MUTEX_ALL_ACCESS open
+            // (e.g. the first daemon runs elevated → that IS another
+            // instance), or the namespace itself is off limits (AppContainer-
+            // style sandbox). A minimal SYNCHRONIZE probe tells them apart.
+            if (win32.OpenMutexW(win32.SYNCHRONIZE, 0, name)) |h| {
+                std.os.windows.CloseHandle(h);
+                return .already_running;
+            }
+            if (std.os.windows.GetLastError() == .ACCESS_DENIED) return .already_running;
+            return .namespace_unavailable;
+        }
+        return .namespace_unavailable;
     };
     if (std.os.windows.GetLastError() == .ALREADY_EXISTS) {
         // Another instance created it first. Drop our handle (the winner's
         // handle keeps the mutex alive) and report the conflict.
         std.os.windows.CloseHandle(handle);
-        return error.AlreadyRunning;
+        return .already_running;
     }
-    return .{ .impl = .{ .handle = handle } };
+    return .{ .acquired = handle };
+}
+
+/// Resolve a stable per-user identity string for the mutex suffix, into `buf`:
+/// the current process token's user SID (canonical — identical across ALL of
+/// the user's logon sessions, elevated or not), else the bare username from
+/// `GetUserNameW`. Null when both fail (caller falls back to `Local\`).
+fn windowsUserId(buf: []u8) ?[]const u8 {
+    if (builtin.os.tag != .windows) unreachable;
+
+    sid: {
+        var tok: std.os.windows.HANDLE = undefined;
+        if (win32.OpenProcessToken(win32.GetCurrentProcess(), win32.TOKEN_QUERY, &tok) == 0) break :sid;
+        defer std.os.windows.CloseHandle(tok);
+
+        // TOKEN_USER (16 bytes on x64) + SECURITY_MAX_SID_SIZE (68) ≤ 128.
+        var info_buf: [128]u8 align(8) = undefined;
+        var ret_len: u32 = 0;
+        if (win32.GetTokenInformation(tok, win32.TokenUser, &info_buf, info_buf.len, &ret_len) == 0) break :sid;
+        const tu: *const win32.TOKEN_USER = @ptrCast(&info_buf);
+
+        var sid_w: ?[*:0]u16 = null;
+        if (win32.ConvertSidToStringSidW(tu.User.Sid, &sid_w) == 0) break :sid;
+        const s = sid_w orelse break :sid;
+        defer _ = win32.LocalFree(s);
+
+        const n = std.unicode.utf16LeToUtf8(buf, std.mem.span(s)) catch break :sid;
+        if (n == 0) break :sid;
+        return buf[0..n];
+    }
+
+    // Fallback: username. Less canonical than the SID (renames, collisions
+    // across domains) but still per-user and cross-session.
+    var name_w: [257]u16 = undefined;
+    var len: u32 = name_w.len;
+    if (win32.GetUserNameW(&name_w, &len) == 0) return null;
+    if (len <= 1) return null; // len includes the terminating NUL
+    const n = std.unicode.utf16LeToUtf8(buf, name_w[0 .. len - 1]) catch return null;
+    if (n == 0) return null;
+    return buf[0..n];
 }
 
 const win32 = if (builtin.os.tag == .windows) struct {
+    const windows = std.os.windows;
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TokenUser: c_int = 1; // TOKEN_INFORMATION_CLASS
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    const SID_AND_ATTRIBUTES = extern struct {
+        Sid: *anyopaque,
+        Attributes: u32,
+    };
+    const TOKEN_USER = extern struct {
+        User: SID_AND_ATTRIBUTES,
+    };
+
     extern "kernel32" fn CreateMutexW(
         lpMutexAttributes: ?*anyopaque,
-        bInitialOwner: std.os.windows.BOOL,
+        bInitialOwner: windows.BOOL,
         lpName: ?[*:0]const u16,
-    ) callconv(.winapi) ?std.os.windows.HANDLE;
+    ) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn OpenMutexW(
+        dwDesiredAccess: u32,
+        bInheritHandle: windows.BOOL,
+        lpName: [*:0]const u16,
+    ) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) windows.HANDLE;
+    extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "advapi32" fn OpenProcessToken(
+        ProcessHandle: windows.HANDLE,
+        DesiredAccess: u32,
+        TokenHandle: *windows.HANDLE,
+    ) callconv(.winapi) windows.BOOL;
+    extern "advapi32" fn GetTokenInformation(
+        TokenHandle: windows.HANDLE,
+        TokenInformationClass: c_int,
+        TokenInformation: ?*anyopaque,
+        TokenInformationLength: u32,
+        ReturnLength: *u32,
+    ) callconv(.winapi) windows.BOOL;
+    extern "advapi32" fn ConvertSidToStringSidW(
+        Sid: *anyopaque,
+        StringSid: *?[*:0]u16,
+    ) callconv(.winapi) windows.BOOL;
+    extern "advapi32" fn GetUserNameW(
+        lpBuffer: [*]u16,
+        pcbBuffer: *u32,
+    ) callconv(.winapi) windows.BOOL;
 } else struct {};
 
 // -----------------------------------------------------------------------------
@@ -176,9 +353,39 @@ pub fn acquirePath(path: []const u8) AcquireError!Guard {
 }
 
 // -----------------------------------------------------------------------------
-// Tests (POSIX-only mechanics; the Windows branch is compile-verified by the
-// x86_64-windows-gnu agent build)
+// Tests. The Windows MUTEX mechanics are compile-verified only (by the
+// x86_64-windows-gnu agent build); the NAME composition is pure and tested
+// here on every host. The flock mechanics are tested for real (POSIX).
 // -----------------------------------------------------------------------------
+
+test "global mutex name: SID suffix composes verbatim" {
+    var buf: [256]u8 = undefined;
+    const name = try composeGlobalMutexName(&buf, "S-1-5-21-3623811015-3361044348-30300820-1013");
+    try std.testing.expectEqualStrings(
+        "Global\\GhozttyAgentDaemon-S-1-5-21-3623811015-3361044348-30300820-1013",
+        name,
+    );
+}
+
+test "global mutex name: username fallback — backslash and control chars sanitized" {
+    // A mutex name may not contain '\' past the namespace prefix; a
+    // DOMAIN\user-shaped id must not smuggle one in (it would silently
+    // create the object under a nested name).
+    var buf: [256]u8 = undefined;
+    const name = try composeGlobalMutexName(&buf, "CORP\\dzearing\x01");
+    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-CORP_dzearing_", name);
+    // Exactly one backslash total: the Global\ namespace separator.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, name, "\\"),
+    );
+}
+
+test "global mutex name: oversized id errors instead of truncating" {
+    var buf: [64]u8 = undefined;
+    const long_id = "S-1-5-21-" ++ "9" ** 100;
+    try std.testing.expectError(error.NameTooLong, composeGlobalMutexName(&buf, long_id));
+}
 
 test "flock guard: second acquire fails, release frees it" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;

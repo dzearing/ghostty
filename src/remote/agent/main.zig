@@ -612,8 +612,13 @@ const win32 = if (builtin.os.tag == .windows) struct {
 // inbound port and no subprocess.
 // -----------------------------------------------------------------------------
 
-/// How long to back off before retrying after the control connection drops or
-/// fails to establish (matches the Go relay-agent's 3s reconnect cadence).
+/// BASE delay before redialing after the control connection drops or fails to
+/// establish (matches the Go relay-agent's 3s reconnect cadence). Repeated
+/// FAST drops (connection died < 30s after connecting — the dup-device-token
+/// fight signature) escalate exponentially from this base to a 40× (120s)
+/// cap with ±20% jitter, resetting once a connection survives 30s; see
+/// `link_control.ReconnectBackoff` for the schedule and its exemptions
+/// (dial failures, credential bounces, user Disconnect).
 const relay_backoff_ms = 3000;
 
 fn runRelay(
@@ -852,7 +857,7 @@ const RelayTransport = struct {
         }
 
         const ctrl = ws_client.WsClient.connectUrl(self.alloc, self.ctrl_url, headers_buf[0..n_headers]) catch |err| {
-            std.debug.print("ghoztty-agent: relay control connect failed ({s}); retry in {d}ms\n", .{ @errorName(err), relay_backoff_ms });
+            std.debug.print("ghoztty-agent: relay control connect failed ({s}); retrying (base {d}ms)\n", .{ @errorName(err), relay_backoff_ms });
             return null;
         };
         std.debug.print("ghoztty-agent: relay control connected\n", .{});
