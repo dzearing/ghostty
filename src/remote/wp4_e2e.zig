@@ -53,6 +53,27 @@
 //!      (a restarted agent lost its in-memory sessions) — the GUI's terminal
 //!      `disconnected` tier. (The happy re-ATTACH path is Phase 2: sessions
 //!      survive a CONNECTION drop while the agent lives.)
+//!
+//! ## Phase 4 — WP-D1 frozen-agent freeze/thaw proof (the wedged-window bug)
+//! Reproduces the live GUI repro headlessly: an agent that is UNREACHABLE but
+//! whose TCP listener still ACCEPTS (SIGSTOP — the kernel completes the 3WHS
+//! from the backlog and buffers the client HELLO; the frozen process never
+//! answers). Two bugs are covered:
+//!   1. a reconnect-attempt dial against the frozen agent must FAIL within the
+//!      handshake deadline (pre-fix: `tcp_dial.dial` parked forever inside
+//!      `waitHandshake`, so the GUI's attempt counter froze at "(1)" and
+//!      backoff never advanced),
+//!   2. after SIGCONT, the GUI's reconnect-swap ordering must not wedge the
+//!      session: new connection ATTACHes (rebinds the bridge), THEN the old
+//!      surface's teardown DETACH lands on the OLD connection. Pre-fix the
+//!      agent's `handleDetach` stopped `streaming` UNCONDITIONALLY — even when
+//!      the bridge already belonged to the NEW connection — so the freshly
+//!      swapped window got no output ever again (blank/wedged window, while
+//!      the pill claimed healthy).
+//! Also asserts the short-outage invariants that must keep working: the OLD
+//! connection self-heals to CONNECTED after the thaw (its transport never
+//! died), and the post-thaw ATTACH replays the pre-freeze content (grid not
+//! blank).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -63,6 +84,8 @@ const tcp_dial = @import("tcp_dial.zig");
 
 const marker = "wp4-foundation";
 const restore_marker = "wp4-d2-restore";
+const freeze_marker = "wp4-freeze-pre";
+const thaw_marker = "wp4-thaw-live";
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -135,16 +158,219 @@ pub fn main() !void {
     };
     reaped = true; // the state proof killed (and reaped) the shared agent.
 
-    if (restore_ok and state_ok) {
+    // ---- Phase 4: WP-D1 freeze/thaw proof (frozen agent: SIGSTOP/SIGCONT) ----
+    const freeze_ok = runFreezeThawProof(alloc, agent_path) catch |err| {
+        diag("[wp4-e2e] FAIL (freeze/thaw): {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    if (restore_ok and state_ok and freeze_ok) {
         const stdout = std.fs.File.stdout();
         stdout.writeAll("PASS: Connection.openChannel round-tripped '" ++ marker ++ "' over TCP against the real channel-authoritative agent\n") catch {};
         stdout.writeAll("PASS: WP-D2 restore — session survived the dropped connection; GET_CWD probe + ATTACH-by-UUID round-tripped '" ++ restore_marker ++ "' on re-dial\n") catch {};
         stdout.writeAll("PASS: WP-D1 status — agent death drove CONNECTED->RECONNECTING; retry-dial to a fresh agent handshook; a gone session probe failed cleanly (disconnected tier)\n") catch {};
+        stdout.writeAll("PASS: WP-D1 freeze/thaw — frozen-agent dial failed within the handshake deadline; old link self-healed on thaw; re-ATTACH replayed pre-freeze content; stale DETACH did not wedge the re-attached session\n") catch {};
         std.process.exit(0);
     } else {
         diag("[wp4-e2e] FAIL: see diagnostics above\n", .{});
         std.process.exit(1);
     }
+}
+
+/// Phase 4: the frozen-agent (SIGSTOP) freeze/thaw proof. See the module doc.
+///
+/// The GUI event sequence this replays headlessly (BaseTerminalController's
+/// WP-D1 reconnect loop, live-reproduced on 2026-07-03 with a loopback agent):
+///   conn A = the window's original connection; agent SIGSTOPped;
+///   A → reconnecting (3 missed heartbeats); the retry loop dials a
+///   REPLACEMENT connection — the frozen listener still tcp-accepts, so the
+///   dial must be bounded by a handshake deadline (bug 1); on SIGCONT the old
+///   link self-heals AND/OR the swap completes: new conn B ATTACHes (agent
+///   rebinds the session bridge to B), then the old surface teardown's DETACH
+///   arrives over A and must NOT strip the session's streaming flag from
+///   under B (bug 2).
+fn runFreezeThawProof(alloc: Allocator, agent_path: []const u8) !bool {
+    // Dedicated agent (the shared one died in Phase 3).
+    const port = try freePort();
+    var addr_buf: [32]u8 = undefined;
+    const listen_arg = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
+    var child = try spawnAgent(alloc, agent_path, listen_arg);
+    var reaped = false;
+    defer if (!reaped) {
+        // Make sure it isn't left SIGSTOPped (kill of a stopped process works,
+        // but resume first so the reap is prompt and deterministic).
+        _ = std.posix.kill(child.id, std.posix.SIG.CONT) catch {};
+        _ = child.kill() catch {};
+    };
+    try waitForListening(alloc, &child);
+
+    // conn A: the "window's" connection. OPEN + produce pre-freeze content.
+    var dialed_a = try tcp_dial.dial(alloc, "127.0.0.1", port, .raw);
+    defer dialed_a.deinit();
+    const pane_a = try dialed_a.conn.openChannel(.{
+        .rows = 24,
+        .cols = 80,
+        .term = "xterm-ghostty",
+    });
+    var pane_a_detached = false;
+    defer if (!pane_a_detached) dialed_a.conn.detachChannel(pane_a);
+    const session_id = try alloc.dupe(u8, pane_a.session_id);
+    defer alloc.free(session_id);
+
+    try dialed_a.conn.writeInput(pane_a, "echo " ++ freeze_marker ++ "\r");
+    if (!try drainForMarker(alloc, dialed_a.conn, pane_a, freeze_marker)) {
+        diag("[wp4-e2e] freeze FAIL: no pre-freeze echo\n", .{});
+        return false;
+    }
+
+    // FREEZE the agent. Its TCP listener keeps accepting at the kernel level
+    // (backlog), but the process answers nothing.
+    diag("[wp4-e2e] freeze: SIGSTOP agent pid={d}\n", .{child.id});
+    try std.posix.kill(child.id, std.posix.SIG.STOP);
+
+    // A must degrade to RECONNECTING via missed heartbeats (3 × 3000ms + slack).
+    {
+        const deadline = std.time.milliTimestamp() + 20_000;
+        while (std.time.milliTimestamp() < deadline) {
+            if (dialed_a.conn.state() == .reconnecting) break;
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        if (dialed_a.conn.state() != .reconnecting) {
+            diag("[wp4-e2e] freeze FAIL: conn A never hit reconnecting (state={s})\n", .{
+                @tagName(dialed_a.conn.state()),
+            });
+            return false;
+        }
+    }
+    diag("[wp4-e2e] freeze: conn A is reconnecting; dialing the frozen agent (the retry-loop attempt)\n", .{});
+
+    // Bug 1: the reconnect attempt's dial. The frozen listener tcp-accepts, so
+    // pre-fix `tcp_dial.dial` parked forever in `waitHandshake` (the GUI's
+    // attempt counter froze at "(1)"). With the handshake deadline it must
+    // come back with an error well before our 20s observation window ends.
+    const DialAttempt = struct {
+        alloc: Allocator,
+        port: u16,
+        done: std.atomic.Value(bool) = .{ .raw = false },
+        dialed: ?tcp_dial.Dialed = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            if (tcp_dial.dial(self.alloc, "127.0.0.1", self.port, .raw)) |d| {
+                self.dialed = d;
+            } else |e| {
+                self.err = e;
+            }
+            self.done.store(true, .release);
+        }
+    };
+    var attempt: DialAttempt = .{ .alloc = alloc, .port = port };
+    const dial_started_ms = std.time.milliTimestamp();
+    const attempt_thread = try std.Thread.spawn(.{}, DialAttempt.run, .{&attempt});
+    var attempt_joined = false;
+    // NOTE: pre-fix the thread never exits while the agent is frozen; we join
+    // it after SIGCONT below (the thaw unblocks the handshake) so the stack
+    // slot stays valid either way.
+
+    var dial_bounded = false;
+    {
+        const deadline = std.time.milliTimestamp() + 20_000;
+        while (std.time.milliTimestamp() < deadline) {
+            if (attempt.done.load(.acquire)) break;
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        const elapsed = std.time.milliTimestamp() - dial_started_ms;
+        if (!attempt.done.load(.acquire)) {
+            diag("[wp4-e2e] freeze FAIL (bug 1): dial against the frozen agent still HUNG after {d}ms — no handshake deadline, the GUI attempt counter freezes at (1)\n", .{elapsed});
+        } else if (attempt.dialed != null) {
+            diag("[wp4-e2e] freeze FAIL (bug 1): dial unexpectedly SUCCEEDED against a frozen agent\n", .{});
+            attempt.dialed.?.deinit();
+            attempt.dialed = null;
+        } else {
+            diag("[wp4-e2e] freeze: dial failed as it must ({s}) after {d}ms\n", .{
+                @errorName(attempt.err.?), elapsed,
+            });
+            dial_bounded = true;
+        }
+        if (attempt.done.load(.acquire)) {
+            attempt_thread.join();
+            attempt_joined = true;
+        }
+    }
+
+    // THAW.
+    diag("[wp4-e2e] thaw: SIGCONT agent\n", .{});
+    try std.posix.kill(child.id, std.posix.SIG.CONT);
+
+    // Reap the (pre-fix) hung dial attempt now that the thaw unblocked it.
+    if (!attempt_joined) {
+        attempt_thread.join();
+        if (attempt.dialed) |*d| d.deinit();
+    }
+
+    // Short-outage invariant: the OLD connection's transport never died
+    // (SIGSTOP keeps the socket healthy), so A must self-heal to CONNECTED.
+    {
+        const deadline = std.time.milliTimestamp() + 15_000;
+        while (std.time.milliTimestamp() < deadline) {
+            if (dialed_a.conn.state() == .connected) break;
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        if (dialed_a.conn.state() != .connected) {
+            diag("[wp4-e2e] thaw FAIL: conn A did not self-heal to connected (state={s})\n", .{
+                @tagName(dialed_a.conn.state()),
+            });
+            return false;
+        }
+    }
+    diag("[wp4-e2e] thaw: conn A self-healed to connected\n", .{});
+
+    // The GUI swap: dial the replacement (post-thaw it must handshake), probe,
+    // and re-ATTACH — the exact completeRemoteReconnect → threadEnter flow.
+    var dialed_b = try tcp_dial.dial(alloc, "127.0.0.1", port, .raw);
+    defer dialed_b.deinit();
+    const cwd = try dialed_b.conn.queryCwdTimeout(session_id, 5 * std.time.ns_per_s);
+    alloc.free(cwd);
+
+    var outcome = try dialed_b.conn.attachChannel(session_id, 24, 80, 0, false);
+    defer outcome.deinit();
+    const pane_b = outcome.pane orelse {
+        diag("[wp4-e2e] thaw FAIL: re-ATTACH yielded no pane (status={s} attached_elsewhere={})\n", .{
+            @tagName(outcome.status), outcome.attached_elsewhere,
+        });
+        return false;
+    };
+    defer dialed_b.conn.closeChannel(pane_b);
+
+    // Grid-not-blank proof: the attach gap-fill must replay the pre-freeze
+    // content (offset 0 → full retained ring).
+    if (!try drainForMarker(alloc, dialed_b.conn, pane_b, freeze_marker)) {
+        diag("[wp4-e2e] thaw FAIL: re-ATTACH replay did not contain the pre-freeze content\n", .{});
+        return false;
+    }
+    diag("[wp4-e2e] thaw: re-ATTACH replayed the pre-freeze content\n", .{});
+
+    // Bug 2: the old surface's teardown DETACH lands over conn A AFTER the new
+    // ATTACH rebound the session to conn B (the common completeRemoteReconnect
+    // ordering: the new SurfaceView ATTACHes as it spins up, then the old tree
+    // is released). The agent must treat it as a stale no-op — pre-fix it
+    // stopped `streaming` unconditionally and the swapped window went silent.
+    dialed_a.conn.detachChannel(pane_a);
+    pane_a_detached = true;
+    std.Thread.sleep(500 * std.time.ns_per_ms); // let the DETACH land
+
+    try dialed_b.conn.writeInput(pane_b, "echo " ++ thaw_marker ++ "\r");
+    const live = try drainForMarker(alloc, dialed_b.conn, pane_b, thaw_marker);
+    if (!live) {
+        diag("[wp4-e2e] thaw FAIL (bug 2): stale DETACH from the OLD connection wedged the re-attached session (no output after the swap)\n", .{});
+    } else {
+        diag("[wp4-e2e] thaw: re-attached session still live after the stale DETACH\n", .{});
+    }
+
+    _ = std.posix.kill(child.id, std.posix.SIG.CONT) catch {};
+    _ = child.kill() catch {};
+    reaped = true;
+    return dial_bounded and live;
 }
 
 /// Dial the agent, OPEN a shell via the high-level `Connection.openChannel`, send

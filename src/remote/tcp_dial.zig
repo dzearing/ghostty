@@ -53,13 +53,20 @@ pub const Dialed = struct {
 /// The HELLO handshake failed (version/encoding mismatch or a dropped stream).
 pub const HandshakeFailed = error{HandshakeFailed};
 
+/// Default deadline for the HELLO handshake (WP-D1). A peer that TCP-accepts
+/// but never answers (frozen/SIGSTOPped agent: the kernel backlog completes the
+/// connect; the process says nothing) must fail the dial instead of parking it
+/// forever — the GUI reconnect loop counts the failed attempt and backs off.
+pub const default_handshake_timeout_ns: u64 = 10 * std.time.ns_per_s;
+
 /// Connect to `host:port`, wrap the socket as the single transport, fold the two
 /// lanes through a `ClientMux`, create + start a `Connection`, and block until the
-/// HELLO handshake completes. On success returns a `Dialed` the caller owns; on any
-/// failure all partial resources are cleaned up and the error is returned.
+/// HELLO handshake completes — at most `default_handshake_timeout_ns`. On success
+/// returns a `Dialed` the caller owns; on any failure all partial resources are
+/// cleaned up and the error is returned.
 ///
-/// The error set is inferred (it spans TCP connect, allocation, thread spawn, and
-/// `error.HandshakeFailed`).
+/// The error set is inferred (it spans TCP connect, allocation, thread spawn,
+/// `error.HandshakeFailed`, and `error.HandshakeTimeout`).
 ///
 /// `encoding` is the pinned transfer encoding (must match what the agent runs with;
 /// `.raw` for a clean TCP/Tailscale hop).
@@ -68,6 +75,18 @@ pub fn dial(
     host: []const u8,
     port: u16,
     encoding: protocol.TransferEncoding,
+) !Dialed {
+    return dialTimeout(alloc, host, port, encoding, default_handshake_timeout_ns);
+}
+
+/// `dial` with an explicit HELLO-handshake deadline (ns). Tests use a short
+/// deadline; production callers should go through `dial`.
+pub fn dialTimeout(
+    alloc: Allocator,
+    host: []const u8,
+    port: u16,
+    encoding: protocol.TransferEncoding,
+    handshake_timeout_ns: u64,
 ) !Dialed {
     // 1. Connect the TCP socket. `tcpConnectToHost` resolves the host (DNS or a
     //    literal) and connects; we then own the stream's fd.
@@ -107,12 +126,19 @@ pub fn dial(
     }
     conn.start() catch |e| return e;
 
-    // 5. Block until the HELLO handshake completes (or fails).
-    const negotiated = conn.waitHandshake() catch {
+    // 5. Block until the HELLO handshake completes (or fails), bounded by the
+    //    deadline. On timeout the peer accepted TCP but never spoke (frozen
+    //    agent / half-open middlebox): tear down exactly like a failed
+    //    handshake (`shutdown` closes the lanes, unblocking + joining the
+    //    reader still parked on the HELLO) and surface `HandshakeTimeout`.
+    const negotiated = conn.waitHandshakeTimeout(handshake_timeout_ns) catch |err| {
         // Handshake failed: tear down (shutdown joins everything; pump joined too).
         conn.shutdown();
         mux.joinPump();
-        return error.HandshakeFailed;
+        return switch (err) {
+            error.HandshakeTimeout => error.HandshakeTimeout,
+            else => error.HandshakeFailed,
+        };
     };
 
     return .{

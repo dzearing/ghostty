@@ -858,17 +858,24 @@ pub const Server = struct {
         // Explicit DETACH: stop streaming + unbind from this connection, but KEEP
         // the session alive + ringing (§4.2/§7.1). After this the session is an
         // orphan (idle-TTL eligible) until a new ATTACH.
+        //
+        // OWNERSHIP GUARD (WP-D1 wedged-window fix): only the connection that
+        // currently OWNS the bridge may detach the session. During a reconnect
+        // swap the NEW connection ATTACHes (rebinding the bridge to itself)
+        // and only then does the old surface's teardown DETACH arrive over the
+        // still-open OLD connection. Unguarded, that stale DETACH stopped
+        // `streaming` out from under the new owner and the freshly re-attached
+        // window went permanently silent.
         self.store.mutex.lock();
         defer self.store.mutex.unlock();
         const s = self.store.table.getByChannel(channel) orelse return;
+        if (s.bridge_ctx != @as(?*anyopaque, self)) return; // stale: not ours
         s.streaming = false;
-        if (s.bridge_ctx == @as(?*anyopaque, self)) {
-            s.bridge_ctx = null;
-            s.bridge_data = null;
-            s.bridge_exit = null;
-            s.bound = false;
-            s.last_activity_ms = self.clock.now();
-        }
+        s.bridge_ctx = null;
+        s.bridge_data = null;
+        s.bridge_exit = null;
+        s.bound = false;
+        s.last_activity_ms = self.clock.now();
     }
 
     fn handleClose(self: *Server, channel: u128) void {
@@ -934,6 +941,11 @@ pub const Server = struct {
         self.store.mutex.lock();
         defer self.store.mutex.unlock();
         const s = self.store.table.getByChannel(flow.channel) orelse return;
+        // OWNERSHIP GUARD (same rule as handleDetach): only the bridge-owning
+        // connection may pause/resume the session's streaming — a stale FLOW
+        // from a superseded connection must not wedge (or spuriously resume)
+        // the new owner's stream.
+        if (s.bridge_ctx != @as(?*anyopaque, self)) return;
         switch (flow.op) {
             .pause => s.streaming = false,
             .@"resume" => s.streaming = true,
@@ -2387,6 +2399,69 @@ test "P1: explicit DETACH orphans the session (kept alive, unbound, not streamin
     const s = h.store.table.getByChannel(o.channel).?;
     try testing.expect(s.alive and !s.streaming and !s.bound);
     h.store.mutex.unlock();
+}
+
+test "WP-D1: stale DETACH from a superseded connection must not silence the new owner" {
+    // The reconnect-swap wedge: conn 1 owns a session; conn 2 ATTACHes (the
+    // agent rebinds the bridge — implicit steal); THEN conn 1's old surface
+    // teardown sends DETACH for the same channel. That stale DETACH must be a
+    // no-op: the session keeps streaming to conn 2. Pre-fix it stopped
+    // `streaming` unconditionally and the freshly swapped window went silent.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 1000 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(23);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Conn 1: open; some output so the attach below can anchor past it.
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    var id_buf: [32]u8 = o.id;
+    h.server.onChildOutput(o.channel, "hello"); // offsets [0,5)
+    _ = try h.client.nextData();
+
+    // Conn 2 over the SAME store: ATTACH rebinds the bridge (conn 1 still open).
+    var rc = try ReConn.init(&h, .raw);
+    defer rc.deinit();
+    try rc.server.start();
+    try rc.client.handshake();
+    _ = try rc.server.waitHandshake();
+    try rc.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+        .last_byte_offset = 5,
+    });
+    const af = try rc.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+
+    // Conn 1: the STALE DETACH (the swapped-out surface tearing down). Sync
+    // with a PING/PONG on the same control lane so we know it was processed.
+    try h.client.sendControlRaw(.detach, o.channel, "");
+    try h.client.sendControlRaw(.ping, protocol.control_channel, "stale-detach-sync");
+    _ = try h.client.waitControl(.pong);
+
+    // The session must STILL be bound + streaming to conn 2...
+    h.store.mutex.lock();
+    const s = h.store.table.getByChannel(o.channel).?;
+    try testing.expect(s.alive and s.bound and s.streaming);
+    h.store.mutex.unlock();
+
+    // ...and live output must still reach conn 2.
+    h.server.onChildOutput(o.channel, "+live");
+    const d = try rc.client.nextData();
+    const dp = try protocol.DataPayload.decode(d.?.payload);
+    try testing.expectEqual(@as(u64, 5), dp.byte_offset);
+    try testing.expectEqualSlices(u8, "+live", dp.bytes);
 }
 
 test "P1: idle-TTL reaper evicts an orphaned session once past the TTL" {

@@ -484,8 +484,11 @@ pub const Pane = struct {
 
     /// Inbound resync watermark (§7.3): DATA with absolute `byte_offset <=
     /// discard_below` is dropped; only the suffix with offset `> discard_below`
-    /// lands in `ring`. 0 (the open-new default) discards nothing. Set to
-    /// `snapshot_at_offset` by `attachChannel`. Read by the data reader under
+    /// lands in `ring`. 0 (the open-new default) discards nothing. Set by
+    /// `attachChannel` to `last_byte_offset - 1` (the last byte the client
+    /// already applied) so the agent's `[last_byte_offset, S)` gap-fill replay
+    /// is KEPT — it is the missing terminal content — while overlapping
+    /// already-applied bytes are dropped. Read by the data reader under
     /// `resync_mutex`; cleared (set to 0 conceptually "passed") once the watermark
     /// is crossed so the steady state takes the fast path.
     discard_below: u64 = 0,
@@ -504,8 +507,8 @@ pub const AttachOutcome = struct {
     pane: ?*Pane,
     /// Liveness tier from the agent (§7.4).
     status: protocol.Attached.AttachStatus,
-    /// The byte offset the grid snapshot was captured at (§7.3); the pane's
-    /// `discard_below` was set to this on `.alive`.
+    /// The byte offset the agent's replay anchor was captured at (§7.3; the
+    /// gap-fill replay covers `[last_byte_offset, snapshot_at_offset)`).
     snapshot_at_offset: u64,
     /// The session already had an attached bridge (§5.3). When true with
     /// `force=false`, the caller may retry `attachChannel(..., force=true)` to steal.
@@ -854,6 +857,25 @@ pub const Connection = struct {
     /// HELLO / dropped control stream surfaced as `error.Incompatible`).
     pub fn waitHandshake(self: *Connection) !protocol.Negotiated {
         self.handshake_done.wait();
+        return self.negotiated;
+    }
+
+    /// Bounded `waitHandshake` (WP-D1 reconnect hardening): block at most
+    /// `timeout_ns` for the handshake, then fail with `error.HandshakeTimeout`.
+    ///
+    /// Why this exists: a peer that TCP-accepts but never speaks (e.g. a
+    /// SIGSTOPped agent whose listener still completes connects from the
+    /// kernel backlog) would otherwise park the dialer FOREVER — the GUI's
+    /// reconnect attempt never fails, so its backoff/attempt counter freezes.
+    /// On timeout the connection is NOT torn down here; the caller owns the
+    /// teardown (`shutdown` unblocks the reader that is still waiting for the
+    /// HELLO and completes the handshake gate with an error).
+    pub fn waitHandshakeTimeout(
+        self: *Connection,
+        timeout_ns: u64,
+    ) !protocol.Negotiated {
+        self.handshake_done.timedWait(timeout_ns) catch
+            return error.HandshakeTimeout;
         return self.negotiated;
     }
 
@@ -1512,9 +1534,17 @@ pub const Connection = struct {
             .session_id = sid,
             .pid = 0, // an attach does not report a pid (OPENED does)
             .ring = ch,
-            .discard_below = a.snapshot_at_offset,
-            // Arm the resync discard only if there is actually something to drop.
-            .resync_active = a.snapshot_at_offset > 0,
+            // §7.3 resync discard, anchored at what THIS CLIENT already applied
+            // (`last_byte_offset` = next byte we expect), NOT at the agent's
+            // snapshot head. The agent's gap-fill replays `[last_byte_offset,
+            // snapshot_at)` — those bytes ARE the missing terminal content (no
+            // grid snapshot is transferred yet, `TODO(snapshot)` agent-side), so
+            // a discard watermark at `snapshot_at_offset` silently erased the
+            // entire replay and every reconnect/restore attach came up BLANK
+            // (the WP-D1 wedged-window bug). A fresh attach (offset 0) keeps
+            // everything; a resumed surface drops only the bytes it already has.
+            .discard_below = if (last_byte_offset > 0) last_byte_offset - 1 else 0,
+            .resync_active = last_byte_offset > 0,
         };
         try self.trackPane(pane);
         keep_channel = true; // the pane now owns the registered ring
@@ -3967,16 +3997,19 @@ test "writeInput: bytes reach the agent as DATA with monotonic byte_offset" {
     h.conn.closeChannel(pane);
 }
 
-test "attachChannel: alive with snapshot — byte-accurate resync discard (§7.3)" {
+test "attachChannel: resumed attach — byte-accurate resync discard anchored at last_byte_offset (§7.3)" {
     const alloc = testing.allocator;
     const h = try LifecycleHarness.create(alloc);
     defer h.destroy();
     const a = h.configure();
     a.attach_status = .alive;
-    a.snapshot_at_offset = 10; // discard absolute offsets <= 10; keep > 10
+    a.snapshot_at_offset = 10;
     try h.start();
 
-    var outcome = try h.conn.attachChannel("session-xyz", 24, 80, 0, false);
+    // The client already APPLIED absolute bytes [0,11) (last_byte_offset = 11 =
+    // next byte it expects). Replayed/overlapping bytes below that watermark
+    // must be dropped; everything from 11 on must land.
+    var outcome = try h.conn.attachChannel("session-xyz", 24, 80, 11, false);
     defer outcome.deinit();
     try testing.expectEqual(protocol.Attached.AttachStatus.alive, outcome.status);
     try testing.expectEqual(@as(u64, 10), outcome.snapshot_at_offset);
@@ -3988,18 +4021,54 @@ test "attachChannel: alive with snapshot — byte-accurate resync discard (§7.3
     h.agent.saw_request.wait();
     const ch = pane.id;
 
-    // Frame A: offsets [0,5) — entirely <= 10 → dropped whole.
+    // Frame A: offsets [0,5) — entirely already-applied (< 11) → dropped whole.
     try agentSendData(&h.data_agent, ch, 0, "AAAAA");
-    // Frame B: offsets [5,15) — straddles 10. Bytes at abs 5..10 dropped (<=10),
-    // bytes at abs 11..14 kept ("PpQq" below maps so that the kept suffix is the
-    // last 4 bytes). 10-byte payload: indices 0..9 → abs 5..14. Keep abs > 10 ⇒
-    // abs 11,12,13,14 ⇒ indices 6,7,8,9.
+    // Frame B: offsets [5,15) — straddles the watermark. Bytes at abs 5..10
+    // dropped (already applied), bytes at abs 11..14 kept. 10-byte payload:
+    // indices 0..9 → abs 5..14. Keep abs >= 11 ⇒ indices 6,7,8,9.
     try agentSendData(&h.data_agent, ch, 5, "0123456789");
-    // Frame C: offsets [15,20) — all > 10 → kept whole.
+    // Frame C: offsets [15,20) — all beyond the watermark → kept whole.
     try agentSendData(&h.data_agent, ch, 15, "TAILX");
 
     // Expected landed bytes: suffix of B (indices 6..9 = "6789") + all of C.
     const expected = "6789TAILX";
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, expected.len);
+    try testing.expectEqualStrings(expected, got.items);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "attachChannel: fresh attach (offset 0) keeps the FULL gap-fill replay (blank-window regression)" {
+    // WP-D1 wedged-window regression: a fresh attach (new surface, nothing
+    // applied locally — the reconnect swap and the WP-D2 relaunch restore)
+    // used to arm the resync discard at `snapshot_at_offset`, which threw away
+    // the agent's whole `[0, S)` replay and produced a BLANK re-attached
+    // window. Offset-0 attaches must deliver every replayed byte.
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .alive;
+    a.snapshot_at_offset = 10; // agent head; replay covers [0,10)
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("session-xyz", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, outcome.status);
+    const pane = outcome.pane orelse return error.NoPane;
+
+    h.agent.saw_request.wait();
+    const ch = pane.id;
+
+    // The gap-fill replay ([0,10)) followed by live output ([10,15)): ALL of it
+    // must reach the ring — nothing is "covered by a snapshot" (none is sent).
+    try agentSendData(&h.data_agent, ch, 0, "0123456789");
+    try agentSendData(&h.data_agent, ch, 10, "LIVE!");
+
+    const expected = "0123456789LIVE!";
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(alloc);
     try drainChannel(pane.ring, &got, alloc, expected.len);

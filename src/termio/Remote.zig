@@ -207,15 +207,32 @@ pub fn threadEnter(
     // Open a new session or attach to an existing one to obtain our pane.
     const pane: *connection.Pane = if (self.session_id) |sid| pane: {
         // ATTACH: re-attach to an existing agent session (§3.3 / §7.3).
+        const rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
+        const cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
         var outcome = try self.conn.attachChannel(
             sid,
-            @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
-            @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
+            rows,
+            cols,
             // We have no locally-applied byte offset yet (fresh attach from a new
-            // GUI process); the agent snapshots from its current head (§7.3).
+            // GUI process); the agent replays its retained ring from 0 (§7.3).
             0,
             false,
         );
+        // `attached_elsewhere` without force (§5.3): the session's bridge still
+        // belongs to another connection — for THIS surface that is our own
+        // superseded/zombie connection (the WP-D1 reconnect swap re-attaches
+        // the same window; WP-D2 restore re-attaches the same user's session
+        // after a relaunch), so reclaim it with force=true (the agent evicts
+        // the stale bridge and DETACHes the loser). Without the retry the
+        // swapped-in surface came up dead (no pane) while the UI said healthy.
+        if (outcome.pane == null and
+            outcome.status == .alive and
+            outcome.attached_elsewhere)
+        {
+            outcome.deinit();
+            log.info("attach: session attached elsewhere; reclaiming with force=true", .{});
+            outcome = try self.conn.attachChannel(sid, rows, cols, 0, true);
+        }
         defer outcome.deinit();
         const p = outcome.pane orelse {
             // .dead / .not_found / attached_elsewhere(!force): nothing registered.

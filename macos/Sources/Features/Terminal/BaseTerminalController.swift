@@ -158,6 +158,15 @@ class BaseTerminalController: NSWindowController,
     /// (and frees any connection it dialed).
     private var remoteReconnectGeneration: Int = 0
 
+    /// WP-D1: whether the current `.disconnected` state may self-heal. True
+    /// when we gave up because the AGENT was unreachable (retries exhausted /
+    /// every dial failed) but the window's own connection object is still
+    /// alive-and-retrying underneath — if its transport later recovers (e.g. a
+    /// long-frozen agent thaws), the link transition back to `.connected` is
+    /// authoritative and the window resumes. False for the terminal tiers
+    /// (session gone, evicted, signed out): those never self-heal.
+    private var remoteDisconnectMaySelfHeal: Bool = false
+
     /// WP-D2: this window's entry in the `RemoteSessionManifest`, when it is a
     /// relay-backed remote window tracked for restore-on-relaunch. A clean
     /// close removes the entry (see `windowWillClose`); app quit leaves it so
@@ -1793,11 +1802,21 @@ class BaseTerminalController: NSWindowController,
         guard connection === remoteConnection else { return }
         switch connection.linkState {
         case .connected, .degraded:
-            // The link recovered on its own (a heartbeat blip — possible only
-            // while the transport is still alive). Cancel any retry loop.
-            if case .reconnecting = remoteConnectionState {
+            // The link recovered on its own (a heartbeat blip, or a frozen
+            // agent thawing after we exhausted retries — possible only while
+            // the transport is still alive). Cancel any retry loop. A
+            // self-healable `.disconnected` (agent unreachable, window kept)
+            // also recovers here: the surfaces still ride THIS connection, so
+            // a genuine link-up transition means the window works again.
+            switch remoteConnectionState {
+            case .reconnecting:
                 remoteReconnectGeneration += 1
                 remoteConnectionState = .connected
+            case .disconnected where remoteDisconnectMaySelfHeal:
+                remoteReconnectGeneration += 1
+                remoteConnectionState = .connected
+            default:
+                break
             }
         case .reconnecting, .reattaching:
             beginRemoteReconnect()
@@ -1805,6 +1824,7 @@ class BaseTerminalController: NSWindowController,
             // Evicted (another client stole the session, §5.3) or the session
             // is gone: terminal. Keep the window, mark it clearly, stop.
             remoteReconnectGeneration += 1
+            remoteDisconnectMaySelfHeal = false
             remoteConnectionState = .disconnected
         }
     }
@@ -1855,6 +1875,7 @@ class BaseTerminalController: NSWindowController,
         // the WP-D2 restore manifest entry for this window.
         guard let sessionID = currentRemoteSessionID() ?? manifestSessionID() else {
             // Nothing to re-attach to (the session id never resolved).
+            remoteDisconnectMaySelfHeal = false
             remoteConnectionState = .disconnected
             return
         }
@@ -1902,6 +1923,8 @@ class BaseTerminalController: NSWindowController,
                 }
                 guard let self, generation == self.remoteReconnectGeneration else { return }
                 guard let token else {
+                    // Signed out: terminal until sign-in restores the window.
+                    self.remoteDisconnectMaySelfHeal = false
                     self.remoteConnectionState = .disconnected
                     return
                 }
@@ -1935,10 +1958,18 @@ class BaseTerminalController: NSWindowController,
                         // (agent restarted / TTL expired): retrying won't
                         // bring it back. Keep the window, mark it.
                         ghostty_remote_connection_free(handle)
+                        self.remoteDisconnectMaySelfHeal = false
                         self.remoteConnectionState = .disconnected
                         return
                     }
                     guard attempt < Self.remoteReconnectDelays.count else {
+                        // Retries exhausted with the agent UNREACHABLE. The
+                        // window's own connection object is still underneath
+                        // it and keeps heartbeating; if its transport later
+                        // recovers (frozen agent thaws), the link-up
+                        // transition self-heals this state (see
+                        // remoteLinkStateDidChange).
+                        self.remoteDisconnectMaySelfHeal = true
                         self.remoteConnectionState = .disconnected
                         return
                     }
@@ -1991,6 +2022,25 @@ class BaseTerminalController: NSWindowController,
         remoteConnectionState = .connected
         DispatchQueue.main.async {
             Ghostty.moveFocus(to: newView)
+        }
+
+        // Post-swap liveness verification: `.connected` above is a CLAIM — the
+        // new surface still has to re-`ATTACH` on its termio thread. If that
+        // attach fails (session raced away, RPC timeout, ...), the surface
+        // publishes no session id and the window would sit wedged behind a
+        // healthy pill. Verify the attach actually landed; if not, stop lying.
+        let verifyGeneration = remoteReconnectGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self,
+                  verifyGeneration == self.remoteReconnectGeneration,
+                  case .connected = self.remoteConnectionState,
+                  self.remoteConnection === newConnection else { return }
+            if self.currentRemoteSessionID() == nil {
+                // The re-ATTACH never yielded a live pane. Terminal tier:
+                // keep the window, mark it truthfully.
+                self.remoteDisconnectMaySelfHeal = false
+                self.remoteConnectionState = .disconnected
+            }
         }
     }
 

@@ -30,6 +30,7 @@ const Allocator = std.mem.Allocator;
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const client_mux = @import("client_mux.zig");
+const tcp_dial = @import("tcp_dial.zig");
 const ws_client = @import("ws_client.zig");
 
 /// A fully stood-up, handshaked client connection over a relay WebSocket byte
@@ -132,12 +133,21 @@ pub fn dial(
     }
     try conn.start();
 
-    // 7. Block until the HELLO handshake completes (or fails).
-    const negotiated = conn.waitHandshake() catch {
+    // 7. Block until the HELLO handshake completes (or fails), bounded by the
+    //    same deadline as the TCP dialer (WP-D1): an agent that upgraded the
+    //    WebSocket but never answers HELLO (frozen process; the relay happily
+    //    pipes nothing) must fail the dial instead of parking the reconnect
+    //    loop forever.
+    const negotiated = conn.waitHandshakeTimeout(
+        tcp_dial.default_handshake_timeout_ns,
+    ) catch |err| {
         // Handshake failed: tear down (shutdown joins everything; pump joined too).
         conn.shutdown();
         mux.joinPump();
-        return error.HandshakeFailed;
+        return switch (err) {
+            error.HandshakeTimeout => error.HandshakeTimeout,
+            else => error.HandshakeFailed,
+        };
     };
 
     return .{
