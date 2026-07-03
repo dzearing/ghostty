@@ -64,6 +64,17 @@ Commits on `feature/remote-machines`:
   re-`ATTACH` swap; exhausted/gone ⇒ `disconnected`, window kept); pill dot
   green/yellow/red + status suffix (local suppression lifted while degraded);
   proven by `wp4-e2e` Phase 3 (GUI pill flow verify pending)
+- WP-B2 — client Google sign-in (macOS): browser authorization-code + PKCE w/
+  loopback redirect (`GoogleOAuth.swift`), refresh token in Keychain, in-memory
+  ID token w/ 60s-leeway refresh (`RelayAccount.swift`); ONE token seam
+  `RelayAccount.resolveToken()` (account ID token → `GHOSTTY_RELAY_TOKEN`
+  fallback) now feeds the directory client, chooser dial, WP-D2 restore, WP-D1
+  reconnect, and IPC `+new-remote-window` (when no `--token`); chooser footer
+  sign-in/sign-out row; client id from `GHOSTTY_GOOGLE_CLIENT_ID` /
+  `defaults GhosttyGoogleClientID` (none baked in — Google client still
+  unregistered, see `relay-oidc-setup.md`); verified headlessly (swiftc
+  harness: PKCE vector, loopback, fake token endpoint, Keychain e2e) — real
+  Google client + live browser flow pending WP-B1 console registration
 
 - `ef84967d6` — loopback endpoints (127.x/::1/localhost) count as the local
   machine for pill suppression (a TCP dial to 127.0.0.1 showed a "127.0.0.1" pill)
@@ -248,11 +259,21 @@ able to take one WP with only this doc + the repo.
   click-by-click deploy runbook in `docs/design/relay-oidc-setup.md`. **Remaining:**
   register the OAuth client in the console + flip the VM env per the runbook
   (do it with the user present — the Mac dev-token flow 401s until WP-B2).
-- **WP-B2 — Client sign-in (macOS).** *Goal:* in-app Google OAuth (browser) → token in
-  Keychain + refresh; signed-in identity drives all relay calls. *Files:* new
-  `macos/.../RemoteConnection/` sign-in; wire token into the relay calls (replaces
-  `GHOSTTY_RELAY_TOKEN`). *Accept:* user signs in with Google+2FA; chooser loads their
-  resources.
+- **WP-B2 — Client sign-in (macOS). ✅ BUILT (needs the real Google client id).**
+  *Goal:* in-app Google OAuth (browser) → token in Keychain + refresh; signed-in
+  identity drives all relay calls. *Accept:* user signs in with Google+2FA; chooser
+  loads their resources. *Shipped:* `GoogleOAuth.swift` (PKCE + loopback-redirect
+  receiver + token client; endpoints injectable for tests only, relay `IssuerURL`
+  pattern) + `RelayAccount.swift` (Keychain refresh token, cached ID token w/ 60s
+  leeway, `signIn`/`signOut`/`email`); the single seam `RelayAccount.resolveToken()`
+  feeds `RelayDirectoryClient.current()`, the Cmd-Shift-N dial, WP-D2 restore,
+  WP-D1 reconnect, and IPC dials without `--token`; chooser footer shows
+  sign-in/signed-in state. Client id/secret via `GHOSTTY_GOOGLE_CLIENT_ID`/`_SECRET`
+  env or `GhosttyGoogleClientID`/`GhosttyGoogleClientSecret` defaults; when unset
+  the footer points at `relay-oidc-setup.md`. Verified headlessly (swiftc harness
+  incl. fake token endpoint + Keychain e2e; unit tests in
+  `macos/Tests/Remote/GoogleOAuthTests.swift`). **Remaining:** register the Google
+  client (WP-B1 runbook §1), then a live browser sign-in pass.
 - **WP-B3 — Agent device-code sign-in / self-enroll.** *Goal:* agent install runs OAuth
   device-code; on sign-in the machine **upserts itself** as a resource + gets a
   revocable credential. *Files:* relay device-code endpoints; agent/connector enroll

@@ -1824,9 +1824,16 @@ class BaseTerminalController: NSWindowController,
             guard let self, generation == self.remoteReconnectGeneration else { return }
             self.remoteConnectionState = .reconnecting(attempt: attempt)
 
+            Task { @MainActor [weak self] in
+                // Resolve the relay bearer through the WP-B2 seam BEFORE
+                // hopping to the dial thread (resolution may await a token
+                // refresh; the dial thread stays purely blocking C calls).
+                let token = machine.isRelay ? (await RelayAccount.resolveToken() ?? "") : ""
+                guard let self, generation == self.remoteReconnectGeneration else { return }
+
             DispatchQueue.global(qos: .userInitiated).async {
                 // Dial + probe are blocking; never on the main thread.
-                let handle = Self.dialRemoteMachine(machine)
+                let handle = Self.dialRemoteMachine(machine, relayToken: token)
                 var sessionAlive = false
                 if let handle {
                     let cwd = sessionID.withCString { cSid in
@@ -1866,6 +1873,7 @@ class BaseTerminalController: NSWindowController,
                         machine: machine,
                         sessionID: sessionID)
                 }
+            }
             }
         }
     }
@@ -1931,13 +1939,16 @@ class BaseTerminalController: NSWindowController,
     }
 
     /// Dial a replacement connection to `machine` (blocking; call off-main).
-    /// Relay machines re-dial through the relay (token from the same env
-    /// source as the interactive dial + WP-D2 restore paths; Phase B OIDC
-    /// replaces that sourcing in one place); TCP machines re-dial directly.
-    private static func dialRemoteMachine(_ machine: Machine) -> ghostty_remote_connection_t? {
+    /// Relay machines re-dial through the relay with `relayToken`, which the
+    /// caller resolved via the WP-B2 seam (`RelayAccount.resolveToken()` —
+    /// the same sourcing as the interactive dial + WP-D2 restore paths); TCP
+    /// machines re-dial directly and ignore the token.
+    private static func dialRemoteMachine(
+        _ machine: Machine,
+        relayToken: String
+    ) -> ghostty_remote_connection_t? {
         if machine.isRelay, let base = machine.relayBase, let device = machine.deviceID {
-            let token = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_TOKEN"] ?? ""
-            return AppDelegate.dialRelay(base: base, device: device, token: token)
+            return AppDelegate.dialRelay(base: base, device: device, token: relayToken)
         }
         return machine.host.withCString { hostPtr in
             ghostty_remote_connection_new_tcp(hostPtr, machine.port)

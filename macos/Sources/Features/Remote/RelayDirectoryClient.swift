@@ -5,9 +5,10 @@ import Foundation
 /// `docs/design/remote-relay-roadmap.md` and `relay/README.md` for the
 /// endpoint shapes.
 ///
-/// Auth matches the dial path's dev-token sourcing (WP-A1): a CLIENT bearer
-/// token from `GHOSTTY_RELAY_TOKEN`. Phase B replaces this with an OIDC
-/// sign-in; only `fromEnvironment()` should need to change then.
+/// Auth (WP-B2): the bearer comes from the single token-resolution seam
+/// (`RelayAccount.resolveToken()`) — the signed-in Google account's ID token
+/// first, falling back to the dev token (`GHOSTTY_RELAY_TOKEN`) when signed
+/// out. Use `current()` to build a client.
 struct RelayDirectoryClient {
     /// The dev relay base URL used when `GHOSTTY_RELAY_BASE` is not set.
     /// Matches the WP-A1 seeded registry entry.
@@ -38,9 +39,9 @@ struct RelayDirectoryClient {
         var errorDescription: String? {
             switch self {
             case .noAccount:
-                return "No relay client token is configured (GHOSTTY_RELAY_TOKEN)."
+                return "No relay account is available. Sign in with Google (or set GHOSTTY_RELAY_TOKEN for dev)."
             case .unauthorized:
-                return "The relay rejected the client token (401). Check GHOSTTY_RELAY_TOKEN."
+                return "The relay rejected the client token (401). Sign in again (or check GHOSTTY_RELAY_TOKEN)."
             case .notFound:
                 return "The relay doesn't know this device (404). It may already have been removed."
             case .http(let code):
@@ -54,14 +55,14 @@ struct RelayDirectoryClient {
     let base: URL
     let token: String
 
-    /// Resolve a directory client from the environment: base from
-    /// `GHOSTTY_RELAY_BASE` (defaulting to the dev relay) and the CLIENT token
-    /// from `GHOSTTY_RELAY_TOKEN`. Returns nil when no token is configured —
-    /// callers then skip account-list features entirely (hardcoded/TCP
-    /// registry entries keep working).
-    static func fromEnvironment() -> RelayDirectoryClient? {
-        guard let token = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_TOKEN"],
-              !token.isEmpty,
+    /// Resolve the CURRENT directory client: base from `GHOSTTY_RELAY_BASE`
+    /// (defaulting to the dev relay) and the CLIENT bearer from the WP-B2
+    /// token-resolution seam (`RelayAccount.resolveToken()` — signed-in
+    /// account's ID token, dev-token fallback). Returns nil when no token
+    /// source is available — callers then skip account-list features entirely
+    /// (hardcoded/TCP registry entries keep working).
+    static func current() async -> RelayDirectoryClient? {
+        guard let token = await RelayAccount.resolveToken(),
               let url = URL(string: defaultBase)
         else { return nil }
         return RelayDirectoryClient(base: url, token: token)

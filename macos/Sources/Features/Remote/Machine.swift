@@ -130,10 +130,11 @@ final class MachineRegistry: ObservableObject {
     /// survives refreshes that rebuild the `Machine` values.
     private var deviceUUIDs: [String: UUID] = [:]
 
-    /// True when a relay client token is configured, i.e. the account device
-    /// list is reachable. The chooser opens even with zero machines when this
-    /// is set (the list populates on fetch).
-    var hasRelayAccount: Bool { RelayDirectoryClient.fromEnvironment() != nil }
+    /// True when a relay token source is available (signed-in Google account
+    /// or dev token), i.e. the account device list is reachable. The chooser
+    /// opens even with zero machines when this is set (the list populates on
+    /// fetch).
+    var hasRelayAccount: Bool { RelayAccount.hasCredentials }
 
     init() {
         // maximushome is reached through the rendezvous relay (WP-A1). The
@@ -167,13 +168,20 @@ final class MachineRegistry: ObservableObject {
     /// Refresh the relay account's device list (WP-C2). On success, relay
     /// machines are replaced by the fetched list (with online status); TCP
     /// machines are untouched. On failure the current list is kept and
-    /// `lastRefreshError` is set. No-op when no client token is configured.
+    /// `lastRefreshError` is set. No-op when no token source is configured.
     func refreshFromRelay() async {
-        guard let client = RelayDirectoryClient.fromEnvironment() else { return }
+        guard RelayAccount.hasCredentials else { return }
         guard !isRefreshing else { return }
         isRefreshing = true
         lastRefreshError = nil
         defer { isRefreshing = false }
+        // Token via the WP-B2 seam (account ID token, dev-token fallback);
+        // may await a token refresh before the directory call.
+        guard let client = await RelayDirectoryClient.current() else {
+            lastRefreshError =
+                RelayDirectoryClient.DirectoryError.noAccount.localizedDescription
+            return
+        }
         do {
             apply(devices: try await client.listDevices())
         } catch {
@@ -186,7 +194,7 @@ final class MachineRegistry: ObservableObject {
     /// the caller can surface it; a 404 still removes the local row (the
     /// device is already gone server-side).
     func removeFromAccount(deviceID: String) async throws {
-        guard let client = RelayDirectoryClient.fromEnvironment() else {
+        guard let client = await RelayDirectoryClient.current() else {
             throw RelayDirectoryClient.DirectoryError.noAccount
         }
         do {
@@ -201,7 +209,7 @@ final class MachineRegistry: ObservableObject {
     /// Rename a device on the relay account and update the registry row with
     /// the relay's response. Throws `DirectoryError` on failure.
     func renameOnAccount(deviceID: String, to name: String) async throws {
-        guard let client = RelayDirectoryClient.fromEnvironment() else {
+        guard let client = await RelayDirectoryClient.current() else {
             throw RelayDirectoryClient.DirectoryError.noAccount
         }
         let dev = try await client.rename(deviceID: deviceID, to: name)

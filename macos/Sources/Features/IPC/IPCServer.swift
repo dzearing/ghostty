@@ -903,17 +903,24 @@ class IPCServer {
 
         var errorMessage: String?
         let semaphore = DispatchSemaphore(value: 0)
-        DispatchQueue.main.async {
+        Task { @MainActor in
             defer { semaphore.signal() }
             guard let appDelegate = NSApp.delegate as? AppDelegate else {
                 errorMessage = "app delegate unavailable"
                 return
             }
             if useRelay {
+                // An explicit --token wins; otherwise resolve through the
+                // WP-B2 seam (signed-in Google account's ID token, dev env
+                // token fallback) — same sourcing as the Cmd-Shift-N dial.
+                var resolvedToken = token ?? ""
+                if resolvedToken.isEmpty {
+                    resolvedToken = await RelayAccount.resolveToken() ?? ""
+                }
                 errorMessage = appDelegate.openRemoteWindow(
                     relay: relay!,
                     device: device!,
-                    token: token ?? "",
+                    token: resolvedToken,
                     name: name,
                     onOpen: { [weak self] controller in
                         // Register the window under its friendly name so

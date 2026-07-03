@@ -1020,12 +1020,15 @@ class AppDelegate: NSObject,
             case .local:
                 _ = TerminalController.newWindow(self.ghostty)
             case .remote(let machine):
-                // Relay machines dial through the rendezvous relay; the token is
-                // read from the environment (never hardcoded). TCP machines use
-                // the direct host:port dial.
+                // Relay machines dial through the rendezvous relay; the bearer
+                // comes from the WP-B2 token-resolution seam (signed-in Google
+                // account first, dev env token fallback — never hardcoded).
+                // TCP machines use the direct host:port dial.
                 if let base = machine.relayBase, let device = machine.deviceID {
-                    let token = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_TOKEN"] ?? ""
-                    self.openRemoteWindow(relay: base, device: device, token: token, name: machine.name)
+                    Task { @MainActor in
+                        let token = await RelayAccount.resolveToken() ?? ""
+                        self.openRemoteWindow(relay: base, device: device, token: token, name: machine.name)
+                    }
                 } else {
                     self.openRemoteWindow(on: machine)
                 }
@@ -1188,10 +1191,22 @@ class AppDelegate: NSObject,
         let entries = RemoteSessionManifest.shared.takeAll()
         guard !entries.isEmpty else { return }
 
-        // Same env-based token sourcing as the interactive dial path (Phase B
-        // OIDC replaces this in one place).
-        let token = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_TOKEN"] ?? ""
+        Task { @MainActor [weak self] in
+            // Same token-resolution seam as the interactive dial path (WP-B2):
+            // signed-in account's ID token, dev env token fallback. Resolved
+            // ONCE up front (may await a token refresh), then the blocking
+            // dials run on a background queue as before.
+            let token = await RelayAccount.resolveToken() ?? ""
+            self?.restoreRemoteWindows(entries: entries, token: token)
+        }
+    }
 
+    /// Second half of `restoreRemoteWindows()`: dial + probe + reopen each
+    /// manifest entry on a background queue using the already-resolved token.
+    private func restoreRemoteWindows(
+        entries: [RemoteSessionManifest.Entry],
+        token: String
+    ) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             for entry in entries {
                 guard let sessionID = entry.sessionID, !sessionID.isEmpty else {

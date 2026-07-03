@@ -28,7 +28,14 @@ struct MachineChooserView: View {
     /// a window. Triggered by the per-row chart button.
     var onActivityMonitor: (Machine) -> Void
 
+    /// Signed-in Google account state for the footer row (WP-B2). Observed so
+    /// the row flips between "Sign in with Google…" and "<email> · Sign Out"
+    /// as sign-in completes.
+    @ObservedObject var account: RelayAccount
+
     @State private var query: String = ""
+    /// True while the browser sign-in flow is running (disables the button).
+    @State private var isSigningIn = false
     /// Index into `targets` of the highlighted row. Bound to `List(selection:)`
     /// so the native selection highlight + focus ring track the keyboard.
     @State private var selectedIndex: Int = 0
@@ -224,6 +231,7 @@ struct MachineChooserView: View {
             }
 
             HStack {
+                accountRow
                 Spacer()
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
@@ -244,6 +252,57 @@ struct MachineChooserView: View {
             // (matches the command-palette workaround).
             DispatchQueue.main.async {
                 isFilterFocused = true
+            }
+        }
+    }
+
+    /// The account footer (WP-B2): a sign-in button when signed out, the
+    /// signed-in email + sign-out when signed in, or a pointer to the setup
+    /// doc when no Google client id is configured.
+    @ViewBuilder
+    private var accountRow: some View {
+        if let email = account.email {
+            HStack(spacing: 4) {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                Text(email)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("·")
+                Button("Sign Out") { account.signOut() }
+                    .buttonStyle(.link)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else if RelayAccount.isConfigured {
+            Button {
+                startSignIn()
+            } label: {
+                Label(
+                    isSigningIn ? "Waiting for browser sign-in…" : "Sign in with Google…",
+                    systemImage: "person.crop.circle")
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+            .disabled(isSigningIn)
+        } else {
+            Text("Google client not configured — see docs/design/relay-oidc-setup.md")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+    }
+
+    /// Run the browser sign-in flow, then refresh the device list so the
+    /// chooser fills with the account's machines.
+    private func startSignIn() {
+        isSigningIn = true
+        Task { @MainActor in
+            defer { isSigningIn = false }
+            do {
+                try await account.signIn()
+                await registry.refreshFromRelay()
+            } catch {
+                showError(title: "Google sign-in failed", error: error)
             }
         }
     }
@@ -482,7 +541,8 @@ enum MachineChooser {
                 // open the Activity Monitor on a freshly-dialed connection.
                 finish(nil)
                 RemoteActivityMonitor.presentDialing(machine: machine)
-            }
+            },
+            account: .shared
         )
 
         let hosting = NSHostingController(rootView: view)
