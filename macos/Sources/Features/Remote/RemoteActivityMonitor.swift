@@ -63,11 +63,40 @@ enum RemoteActivityMonitor {
 
         let host = machine.host
         let port = machine.port
+        let relayBase = machine.relayBase
+        let deviceID = machine.deviceID
 
+        Task { @MainActor in
+            // Account machines are reached through the relay, not TCP —
+            // machine.host/port are not dialable for them (port is 0). Resolve
+            // the account token on-main (WP-B2 seam), then dial off-main.
+            let token = machine.isRelay ? (await RelayAccount.resolveToken() ?? "") : ""
+            dialAndOpen(
+                source: source, machine: machine,
+                host: host, port: port,
+                relayBase: relayBase, deviceID: deviceID, token: token
+            )
+        }
+    }
+
+    private static func dialAndOpen(
+        source: MonitorSource,
+        machine: Machine,
+        host: String,
+        port: UInt16,
+        relayBase: String?,
+        deviceID: String?,
+        token: String
+    ) {
         DispatchQueue.global(qos: .userInitiated).async {
             // Dial blocks through the handshake; nil on failure.
-            let handle = host.withCString {
-                ghostty_remote_connection_new_tcp($0, port)
+            let handle: ghostty_remote_connection_t?
+            if let relayBase, let deviceID {
+                handle = AppDelegate.dialRelay(base: relayBase, device: deviceID, token: token)
+            } else {
+                handle = host.withCString {
+                    ghostty_remote_connection_new_tcp($0, port)
+                }
             }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
