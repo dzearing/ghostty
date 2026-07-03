@@ -59,7 +59,10 @@
 //!     current outbound offset and resync replays the raw ring from there. Exact-
 //!     grid reconstruction (so deep-scrollback eviction is invisible) is future.
 //!   - Authentication / TLS on the listener (see SECURITY above).
-//!   - Daemonization / single-instance / detach (§4.1).
+//!   - Daemonization / detach (§4.1). (Single-instance IS enforced: the daemon
+//!     modes `--listen`/`--relay` take a per-user-session guard — named mutex
+//!     on Windows, flock on POSIX — and a losing instance exits with code 183;
+//!     see `single_instance.zig`. `--stdio` and `--enroll` are exempt.)
 //!   - RPC, tunnels, multi-client fan-out to one session (§5.3 steal).
 
 const std = @import("std");
@@ -77,6 +80,7 @@ const tray = @import("tray.zig");
 const enroll = @import("enroll.zig");
 const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
+const single_instance = @import("single_instance.zig");
 
 const default_listen = "0.0.0.0:7777";
 
@@ -98,8 +102,18 @@ pub fn main() !void {
     const mode = try parseArgs(alloc);
     switch (mode) {
         .stdio => try runStdio(alloc, encoding),
-        .listen => |l| try runListen(alloc, encoding, l.addr, l.headless),
+        .listen => |l| {
+            // DAEMON mode: enforce single-instance BEFORE anything user-visible
+            // (bind, banner, tray icon). Exits the process on conflict.
+            var guard = acquireDaemonLockOrExit(alloc);
+            defer if (guard) |*g| g.release();
+            try runListen(alloc, encoding, l.addr, l.headless);
+        },
         .relay => |r| {
+            // DAEMON mode: single-instance first (before the token lookup and
+            // long before the tray could flash an icon).
+            var guard = acquireDaemonLockOrExit(alloc);
+            defer if (guard) |*g| g.release();
             // The device token authenticates the relay WebSockets. Required.
             // Precedence: the GHOSTTY_DEVICE_TOKEN env var wins; otherwise fall
             // back to the agent's own relay.env (written by `--enroll` and by
@@ -133,6 +147,34 @@ pub fn main() !void {
             try enroll.run(alloc, e.base_url, name, .{ .no_browser = e.no_browser });
         },
     }
+}
+
+/// Take the per-user-session daemon single-instance guard (named mutex on
+/// Windows, flock on POSIX — see `single_instance.zig`). Three outcomes:
+///   - acquired → return the guard; hold it for the daemon's lifetime (the OS
+///     releases it on exit OR crash, so no cleanup ordering matters).
+///   - already running → log + exit with `single_instance.already_running_exit_code`
+///     (183). The message + distinct code make a supervisor's respawn-and-exit
+///     loop self-explanatory in its captured stderr log.
+///   - guard infrastructure failed → log a warning and return null: the daemon
+///     serves anyway (availability beats guard integrity, same policy as tray
+///     failures).
+/// Called BEFORE any user-visible daemon setup (bind / banner / tray icon), so
+/// a losing instance never flashes a tray icon or steals the port.
+fn acquireDaemonLockOrExit(alloc: Allocator) ?single_instance.Guard {
+    return single_instance.acquire(alloc) catch |err| switch (err) {
+        error.AlreadyRunning => {
+            // std.debug.print writes stderr, which the supervisors (installer
+            // launcher / deploy watcher) redirect to agent.err.log — visible
+            // even though the Windows agent is a GUI-subsystem exe.
+            std.debug.print("ghoztty-agent: another instance is already running; exiting\n", .{});
+            std.process.exit(single_instance.already_running_exit_code);
+        },
+        error.GuardUnavailable => {
+            std.debug.print("ghoztty-agent: warning: single-instance guard unavailable; continuing without it\n", .{});
+            return null;
+        },
+    };
 }
 
 fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
@@ -931,4 +973,5 @@ test {
     std.testing.refAllDecls(@This());
     // Not reachable via pub decls, so reference explicitly for test discovery.
     _ = @import("link_control.zig");
+    _ = @import("single_instance.zig");
 }

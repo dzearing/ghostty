@@ -106,6 +106,13 @@ around. The agent half is built in: `ghoztty-agent --enroll --relay=<base>`
 var wins, else the agent falls back to `relay.env` — so enroll → run needs no
 env plumbing.
 
+The agent's daemon modes (`--relay`, `--listen`) are single-instance per user
+session: a second daemon logs `another instance is already running; exiting`
+and exits with code **183** (named mutex `Local\GhozttyAgentDaemon` on
+Windows; `flock` on `~/.config/ghoztty/agent.lock` elsewhere), so competing
+supervisors can't stack up duplicate agents — `--stdio` and `--enroll` are
+exempt and still work while a daemon runs.
+
 ### Hosted Windows installer
 
 The one-liner installer served at `/dl/install.ps1` (source:
