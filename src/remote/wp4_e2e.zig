@@ -95,6 +95,17 @@ pub fn main() !void {
     const agent_path = try resolveAgentPath(alloc);
     defer alloc.free(agent_path);
 
+    // Opt-in long-freeze soak (GHOZTTY_E2E_LONG_FREEZE=1): replays the exact
+    // live-GUI outage timeline (175s SIGSTOP with the Swift retry schedule
+    // running against the frozen listener) instead of the normal phases.
+    // ~3.5 minutes; not part of the default run. This is the harness that
+    // exonerated the Zig connection layer during the 2026-07-03 wedged-window
+    // investigation (old link healed 58ms after SIGCONT).
+    if (std.process.hasEnvVar(alloc, "GHOZTTY_E2E_LONG_FREEZE") catch false) {
+        const ok = try runLongFreezeExperiment(alloc, agent_path);
+        std.process.exit(if (ok) 0 else 1);
+    }
+
     // Pick an ephemeral port the agent will bind. We bind+close to learn a free
     // port, then hand it to the agent (a tiny race window, acceptable for a test).
     const port = try freePort();
@@ -113,6 +124,7 @@ pub fn main() !void {
     defer env.deinit();
     try cloneEnv(alloc, &env);
     try env.put("GHOZTTY_AGENT_ENCODING", "raw");
+    try putIsolatedLock(alloc, &env);
     child.env_map = &env;
     try child.spawn();
 
@@ -175,6 +187,87 @@ pub fn main() !void {
         diag("[wp4-e2e] FAIL: see diagnostics above\n", .{});
         std.process.exit(1);
     }
+}
+
+/// Opt-in long-freeze soak: mirror the live GUI repro exactly — 175s SIGSTOP
+/// with the Swift retry schedule (5 dial attempts, delays 1/2/4/8/15s, each
+/// bounded at 10s) run DURING the freeze, then SIGCONT, then check that the
+/// ORIGINAL connection self-heals at the Zig level and its pane still
+/// round-trips I/O. Also regression cover for the agent-side thaw crash: the
+/// 5 stale backlog sockets are accepted at SIGCONT, which used to panic the
+/// agent (setsockopt EINVAL → std `unreachable`) — the post-thaw dial+attach
+/// here fails loudly if the agent died.
+fn runLongFreezeExperiment(alloc: Allocator, agent_path: []const u8) !bool {
+    const port = try freePort();
+    var addr_buf: [32]u8 = undefined;
+    const listen_arg = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
+    var child = try spawnAgent(alloc, agent_path, listen_arg);
+    defer {
+        _ = std.posix.kill(child.id, std.posix.SIG.CONT) catch {};
+        _ = child.kill() catch {};
+    }
+    try waitForListening(alloc, &child);
+
+    var dialed_a = try tcp_dial.dial(alloc, "127.0.0.1", port, .raw);
+    defer dialed_a.deinit();
+    const pane_a = try dialed_a.conn.openChannel(.{
+        .rows = 24,
+        .cols = 80,
+        .term = "xterm-ghostty",
+    });
+    defer dialed_a.conn.detachChannel(pane_a);
+    try dialed_a.conn.writeInput(pane_a, "echo " ++ freeze_marker ++ "\r");
+    if (!try drainForMarker(alloc, dialed_a.conn, pane_a, freeze_marker)) return false;
+
+    const t0 = std.time.milliTimestamp();
+    diag("[exp] t=0 SIGSTOP\n", .{});
+    try std.posix.kill(child.id, std.posix.SIG.STOP);
+
+    // Wait for reconnecting.
+    while (dialed_a.conn.state() != .reconnecting) std.Thread.sleep(50 * std.time.ns_per_ms);
+    diag("[exp] t={d}ms conn A reconnecting\n", .{std.time.milliTimestamp() - t0});
+
+    // The Swift schedule: delays between attempts 1/2/4/8/15s, each dial 10s.
+    const delays = [_]u64{ 1, 2, 4, 8, 15 };
+    for (delays, 1..) |d, i| {
+        std.Thread.sleep(d * std.time.ns_per_s);
+        const s = std.time.milliTimestamp();
+        if (tcp_dial.dial(alloc, "127.0.0.1", port, .raw)) |dd| {
+            var dd2 = dd;
+            diag("[exp] attempt {d}: dial unexpectedly SUCCEEDED\n", .{i});
+            dd2.deinit();
+        } else |err| {
+            diag("[exp] t={d}ms attempt {d}: dial failed ({s}) after {d}ms\n", .{
+                std.time.milliTimestamp() - t0, i, @errorName(err), std.time.milliTimestamp() - s,
+            });
+        }
+    }
+
+    // Keep frozen until t=175s.
+    while (std.time.milliTimestamp() - t0 < 175_000) std.Thread.sleep(500 * std.time.ns_per_ms);
+    diag("[exp] t={d}ms SIGCONT (conn A state={s})\n", .{
+        std.time.milliTimestamp() - t0, @tagName(dialed_a.conn.state()),
+    });
+    try std.posix.kill(child.id, std.posix.SIG.CONT);
+
+    // Does A self-heal?
+    {
+        const deadline = std.time.milliTimestamp() + 20_000;
+        while (std.time.milliTimestamp() < deadline) {
+            if (dialed_a.conn.state() == .connected) break;
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        diag("[exp] t={d}ms conn A state={s}\n", .{
+            std.time.milliTimestamp() - t0, @tagName(dialed_a.conn.state()),
+        });
+        if (dialed_a.conn.state() != .connected) return false;
+    }
+
+    // Does the ORIGINAL pane still round-trip?
+    try dialed_a.conn.writeInput(pane_a, "echo " ++ thaw_marker ++ "\r");
+    const live = try drainForMarker(alloc, dialed_a.conn, pane_a, thaw_marker);
+    diag("[exp] original-pane round-trip after thaw: {}\n", .{live});
+    return live;
 }
 
 /// Phase 4: the frozen-agent (SIGSTOP) freeze/thaw proof. See the module doc.
@@ -596,11 +689,27 @@ fn spawnAgent(
     defer env.deinit();
     try cloneEnv(alloc, &env);
     try env.put("GHOZTTY_AGENT_ENCODING", "raw");
+    try putIsolatedLock(alloc, &env);
     child.env_map = &env;
     try child.spawn();
     // `spawn` consumed the env/argv; drop the dangling pointer for hygiene.
     child.env_map = null;
     return child;
+}
+
+/// Point `GHOSTTY_AGENT_LOCK` at a unique temp path so harness agents never
+/// collide with a user's real running agent (or each other) on the per-user
+/// single-instance guard — a live `ghoztty-agent --listen` on the box would
+/// otherwise make every spawn here exit 183 (`AgentNeverListened`).
+fn putIsolatedLock(alloc: Allocator, env: *std.process.EnvMap) !void {
+    const tmp = env.get("TMPDIR") orelse "/tmp";
+    const path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/wp4-e2e-agent-{d}-{d}.lock",
+        .{ std.mem.trimRight(u8, tmp, "/"), std.c.getpid(), std.time.nanoTimestamp() },
+    );
+    defer alloc.free(path);
+    try env.put("GHOSTTY_AGENT_LOCK", path);
 }
 
 /// Drain `pane`'s inbound ring until `needle` shows up as completed shell

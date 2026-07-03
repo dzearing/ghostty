@@ -53,13 +53,23 @@ pub const SocketStream = struct {
             .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => {
                 // SO_NOSIGPIPE: a write to a reset peer returns EPIPE instead of
                 // raising SIGPIPE. Best-effort (ignore failure).
+                //
+                // MUST go through libc directly, NOT `posix.setsockopt`: the std
+                // wrapper treats `EINVAL` as `unreachable`, but Darwin returns
+                // EINVAL for a socket that was RESET while sitting in the accept
+                // backlog (e.g. a reconnect dial that hit its handshake deadline
+                // and closed while the agent was frozen). The std wrapper turned
+                // that into a PANIC inside the agent's accept path — one stale
+                // queued connection at thaw killed the whole agent (and every
+                // live session with it). The `catch {}` never got a chance.
                 const one: c_int = 1;
-                posix.setsockopt(
+                _ = std.c.setsockopt(
                     fd,
                     posix.SOL.SOCKET,
                     posix.SO.NOSIGPIPE,
-                    std.mem.asBytes(&one),
-                ) catch {};
+                    &one,
+                    @sizeOf(c_int),
+                );
             },
             else => {},
         }
@@ -292,6 +302,22 @@ test "SocketStream: close unblocks a blocked read" {
     a.serverStream().close();
     t.join();
     try testing.expect(r.got_eof);
+}
+
+test "SocketStream: init on a dead/invalid fd must not panic (agent thaw crash)" {
+    // Field crash (WP-D1 freeze/thaw): reconnect dials that hit their
+    // handshake deadline close while the agent is SIGSTOPped; at thaw the
+    // agent accept()s those already-reset backlog sockets and `init`'s
+    // SO_NOSIGPIPE setsockopt gets EINVAL — which `std.posix.setsockopt`
+    // declares `unreachable`, panicking the WHOLE agent (all sessions lost).
+    // `init` must be best-effort on ANY fd state. A closed fd exercises the
+    // same std `unreachable` class (EBADF) deterministically.
+    const pair = try loopbackPair();
+    posix.close(pair.a);
+    posix.close(pair.b);
+    // Pre-fix: panics inside std.posix.setsockopt (EBADF => unreachable).
+    // Post-fix (raw libc call): a silent no-op.
+    _ = SocketStream.init(pair.a);
 }
 
 test {

@@ -14,4 +14,5 @@ test {
     _ = @import("agent/session.zig");
     _ = @import("agent/metrics.zig");
     _ = @import("agent/keepalive.zig");
+    _ = @import("socket_stream.zig");
 }

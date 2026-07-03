@@ -418,6 +418,8 @@ final class RemoteConnection {
                 guard let owner = box.owner else { return }
                 let new = LinkState(rawValue: state) ?? .connected
                 guard owner.linkState != new else { return }
+                Ghostty.logger.info(
+                    "remote link state: \(String(describing: owner.linkState)) -> \(String(describing: new)) (\(owner.machine.name, privacy: .public))")
                 owner.linkState = new
                 NotificationCenter.default.post(
                     name: .ghosttyRemoteConnectionLinkDidChange,

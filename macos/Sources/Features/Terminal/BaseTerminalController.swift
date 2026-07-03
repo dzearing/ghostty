@@ -1800,6 +1800,8 @@ class BaseTerminalController: NSWindowController,
     ///                                    └─ session gone/evicted ─► disconnected
     private func remoteLinkStateDidChange(_ connection: RemoteConnection) {
         guard connection === remoteConnection else { return }
+        Ghostty.logger.info(
+            "remote reconnect: link=\(String(describing: connection.linkState)) window-state=\(String(describing: self.remoteConnectionState)) selfHealable=\(self.remoteDisconnectMaySelfHeal)")
         switch connection.linkState {
         case .connected, .degraded:
             // The link recovered on its own (a heartbeat blip, or a frozen
@@ -1889,45 +1891,48 @@ class BaseTerminalController: NSWindowController,
             sessionID: sessionID)
     }
 
-    /// Schedule reconnect attempt `attempt` (1-based) after its backoff delay.
-    /// Each attempt dials a REPLACEMENT connection off-main, liveness-probes
-    /// the session (`GET_CWD`, bounded), and either completes the reconnect,
-    /// gives up (session gone / retries exhausted), or schedules the next
-    /// attempt. A stale `generation` (cancelation: window closed, link
-    /// recovered, newer loop) makes any stage no-op and free what it dialed.
-    private func scheduleRemoteReconnectAttempt(
-        _ attempt: Int,
+    /// The outcome of one dial+probe cycle (`dialAndProbeRemote`), delivered on
+    /// the main thread with the generation already validated.
+    private enum RemoteProbeOutcome {
+        /// The agent answered and the session is alive: `handle` is a fresh,
+        /// handshaked connection the receiver now owns (swap or free it).
+        case sessionAlive(ghostty_remote_connection_t)
+        /// The agent answered but the session is gone (restart / TTL): terminal.
+        case sessionGone
+        /// The dial failed (unreachable, handshake timeout, 401, ...).
+        case unreachable
+        /// Relay machine with no bearer token (signed out): terminal until
+        /// sign-in restores the window.
+        case signedOut
+    }
+
+    /// One dial + liveness-probe cycle against `machine` for `sessionID`:
+    /// resolve the relay bearer (WP-B2 seam), dial a REPLACEMENT connection
+    /// off-main (bounded by the Zig-side handshake deadline), `GET_CWD`-probe
+    /// the session (bounded), then deliver the outcome on the main thread.
+    /// A stale `generation` (cancelation: window closed, link recovered, newer
+    /// loop) silently frees whatever was dialed and never calls `outcome`.
+    private func dialAndProbeRemote(
         generation: Int,
         machine: Machine,
-        sessionID: String
+        sessionID: String,
+        outcome: @escaping (BaseTerminalController, RemoteProbeOutcome) -> Void
     ) {
-        let delay = Self.remoteReconnectDelays[
-            min(attempt, Self.remoteReconnectDelays.count) - 1]
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        Task { @MainActor [weak self] in
+            // Resolve the relay bearer BEFORE hopping to the dial thread
+            // (resolution may await a token refresh; the dial thread stays
+            // purely blocking C calls).
+            let token: String?
+            if machine.isRelay {
+                token = await RelayAccount.resolveToken()
+            } else {
+                token = ""
+            }
             guard let self, generation == self.remoteReconnectGeneration else { return }
-            self.remoteConnectionState = .reconnecting(attempt: attempt)
-
-            Task { @MainActor [weak self] in
-                // Resolve the relay bearer through the WP-B2 seam BEFORE
-                // hopping to the dial thread (resolution may await a token
-                // refresh; the dial thread stays purely blocking C calls).
-                let token: String?
-                if machine.isRelay {
-                    // nil ⇒ signed out with no dev token: a re-dial is a
-                    // guaranteed 401, so don't dial at all. Mark the window
-                    // disconnected (silently — reconnect never alerts) and
-                    // keep its manifest entry; sign-in restores it.
-                    token = await RelayAccount.resolveToken()
-                } else {
-                    token = ""
-                }
-                guard let self, generation == self.remoteReconnectGeneration else { return }
-                guard let token else {
-                    // Signed out: terminal until sign-in restores the window.
-                    self.remoteDisconnectMaySelfHeal = false
-                    self.remoteConnectionState = .disconnected
-                    return
-                }
+            guard let token else {
+                outcome(self, .signedOut)
+                return
+            }
 
             DispatchQueue.global(qos: .userInitiated).async {
                 // Dial + probe are blocking; never on the main thread.
@@ -1949,37 +1954,139 @@ class BaseTerminalController: NSWindowController,
                         return
                     }
                     if let handle, sessionAlive {
-                        self.completeRemoteReconnect(
-                            handle: handle, machine: machine, sessionID: sessionID)
-                        return
-                    }
-                    if let handle {
-                        // The agent is reachable but the session is gone
-                        // (agent restarted / TTL expired): retrying won't
-                        // bring it back. Keep the window, mark it.
+                        outcome(self, .sessionAlive(handle))
+                    } else if let handle {
                         ghostty_remote_connection_free(handle)
-                        self.remoteDisconnectMaySelfHeal = false
-                        self.remoteConnectionState = .disconnected
-                        return
+                        outcome(self, .sessionGone)
+                    } else {
+                        outcome(self, .unreachable)
                     }
+                }
+            }
+        }
+    }
+
+    /// Schedule reconnect attempt `attempt` (1-based) after its backoff delay.
+    /// Each attempt dials a REPLACEMENT connection off-main, liveness-probes
+    /// the session (`GET_CWD`, bounded), and either completes the reconnect,
+    /// gives up (session gone / retries exhausted → slow background re-dial),
+    /// or schedules the next attempt. A stale `generation` (cancelation:
+    /// window closed, link recovered, newer loop) makes any stage no-op and
+    /// free what it dialed.
+    private func scheduleRemoteReconnectAttempt(
+        _ attempt: Int,
+        generation: Int,
+        machine: Machine,
+        sessionID: String
+    ) {
+        let delay = Self.remoteReconnectDelays[
+            min(attempt, Self.remoteReconnectDelays.count) - 1]
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, generation == self.remoteReconnectGeneration else { return }
+            self.remoteConnectionState = .reconnecting(attempt: attempt)
+
+            self.dialAndProbeRemote(
+                generation: generation,
+                machine: machine,
+                sessionID: sessionID
+            ) { controller, outcome in
+                switch outcome {
+                case .sessionAlive(let handle):
+                    controller.completeRemoteReconnect(
+                        handle: handle, machine: machine, sessionID: sessionID)
+                case .sessionGone:
+                    // The agent is reachable but the session is gone (agent
+                    // restarted / TTL expired): retrying won't bring it back.
+                    // Keep the window, mark it. Terminal.
+                    Ghostty.logger.info(
+                        "remote reconnect: session gone on attempt \(attempt); disconnected (terminal)")
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .signedOut:
+                    // Signed out: terminal until sign-in restores the window
+                    // (reconnect never alerts; the manifest entry is kept).
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .unreachable:
                     guard attempt < Self.remoteReconnectDelays.count else {
-                        // Retries exhausted with the agent UNREACHABLE. The
-                        // window's own connection object is still underneath
-                        // it and keeps heartbeating; if its transport later
-                        // recovers (frozen agent thaws), the link-up
-                        // transition self-heals this state (see
-                        // remoteLinkStateDidChange).
-                        self.remoteDisconnectMaySelfHeal = true
-                        self.remoteConnectionState = .disconnected
+                        // Retries exhausted with the agent UNREACHABLE. Show
+                        // the truthful red pill, but DON'T give up for good:
+                        // the window's own connection keeps heartbeating (its
+                        // transport may self-heal, e.g. a frozen agent thaws
+                        // — see remoteLinkStateDidChange), AND a slow
+                        // background re-dial keeps probing so recovery works
+                        // even when the old transport is gone for good.
+                        Ghostty.logger.info(
+                            "remote reconnect: retries exhausted; disconnected (self-healable, background re-dial armed)")
+                        controller.remoteDisconnectMaySelfHeal = true
+                        controller.remoteConnectionState = .disconnected
+                        controller.scheduleRemoteRedialProbe(
+                            generation: generation,
+                            machine: machine,
+                            sessionID: sessionID)
                         return
                     }
-                    self.scheduleRemoteReconnectAttempt(
+                    controller.scheduleRemoteReconnectAttempt(
                         attempt + 1,
                         generation: generation,
                         machine: machine,
                         sessionID: sessionID)
                 }
             }
+        }
+    }
+
+    /// Cadence for the slow background re-dial that keeps running after the
+    /// fast retry budget is exhausted (window kept, red pill): base interval
+    /// plus jitter, forever, until the window closes / the link self-heals /
+    /// a probe succeeds / the session is confirmed gone.
+    private static let remoteRedialInterval: TimeInterval = 45
+
+    /// Schedule the next background re-dial probe. Unlike the fast attempts,
+    /// this NEVER touches the pill on failure — the window stays truthfully
+    /// red "disconnected" until a probe actually finds the agent AND the
+    /// session, at which point the normal reconnect swap completes and turns
+    /// it green. Canceled by any generation bump (window closed, link
+    /// self-healed, sign-out, a fresh reconnect loop).
+    private func scheduleRemoteRedialProbe(
+        generation: Int,
+        machine: Machine,
+        sessionID: String
+    ) {
+        let delay = Self.remoteRedialInterval + TimeInterval.random(in: 0...15)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, generation == self.remoteReconnectGeneration else { return }
+            // Only while still in the self-healable disconnected tier.
+            guard case .disconnected = self.remoteConnectionState,
+                  self.remoteDisconnectMaySelfHeal else { return }
+
+            self.dialAndProbeRemote(
+                generation: generation,
+                machine: machine,
+                sessionID: sessionID
+            ) { controller, outcome in
+                switch outcome {
+                case .sessionAlive(let handle):
+                    Ghostty.logger.info(
+                        "remote reconnect: background re-dial probe succeeded; swapping")
+                    controller.completeRemoteReconnect(
+                        handle: handle, machine: machine, sessionID: sessionID)
+                case .sessionGone:
+                    // Agent came back without the session: now it IS terminal.
+                    Ghostty.logger.info(
+                        "remote reconnect: background re-dial found agent but session gone; terminal")
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .signedOut:
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .unreachable:
+                    // Still unreachable: keep the red pill, probe again later.
+                    controller.scheduleRemoteRedialProbe(
+                        generation: generation,
+                        machine: machine,
+                        sessionID: sessionID)
+                }
             }
         }
     }

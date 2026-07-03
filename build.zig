@@ -113,6 +113,23 @@ pub fn build(b: *std.Build) !void {
         if (!config.emit_lib_vt) _ = try deps.add(agent_test);
         const agent_test_run = b.addRunArtifact(agent_test);
         test_agent_step.dependOn(&agent_test_run.step);
+
+        // The agent-core aggregator (`src/remote/agent_test.zig`: server,
+        // session store, metrics, keepalive, socket stream). Previously only
+        // runnable by hand via `zig test -Mroot=src/remote/agent_test.zig`,
+        // so its ~140 tests ran in NO build step; wire it into `test-agent`.
+        const agent_core_test = b.addTest(.{
+            .name = "ghoztty-agent-core-test",
+            .filters = test_filters,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/remote/agent_test.zig"),
+                .target = config.target,
+                .optimize = .Debug,
+            }),
+            .use_llvm = true,
+        });
+        const agent_core_test_run = b.addRunArtifact(agent_core_test);
+        test_agent_step.dependOn(&agent_core_test_run.step);
     }
 
     // Ghoztty remote-machines test client (WP: TCP transport). A headless native
