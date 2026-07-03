@@ -20,8 +20,14 @@
 //!      WebSocket to the relay; on each `{"type":"open","session":S}` command,
 //!      dial a per-session data WebSocket and serve it over the SAME `serveOne`
 //!      core (shared store) as an accepted socket. The device token is read from
-//!      `GHOSTTY_DEVICE_TOKEN`. Reconnects with backoff on a control drop
-//!      (sessions survive). Coexists with — does not replace — `--listen`.
+//!      `GHOSTTY_DEVICE_TOKEN`, falling back to the agent's persisted
+//!      `relay.env` (see `enroll.zig`). Reconnects with backoff on a control
+//!      drop (sessions survive). Coexists with — does not replace — `--listen`.
+//!
+//! Plus one one-shot utility mode: `--enroll --relay <url>` runs the OAuth
+//! device-code self-enrollment (WP-B3, `enroll.zig`) — "visit URL, enter code,
+//! sign in" — and persists the issued device credential to `relay.env`, after
+//! which `--relay <url>` just works.
 //!
 //! ### SESSION SURVIVAL (P1, §7.1) — the close-laptop scenario
 //! The session table + pty children + output rings live in a DAEMON-scoped
@@ -66,6 +72,7 @@ const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
 const ws_client = @import("../ws_client.zig");
 const tray = @import("tray.zig");
+const enroll = @import("enroll.zig");
 
 const default_listen = "0.0.0.0:7777";
 
@@ -90,14 +97,35 @@ pub fn main() !void {
         .listen => |l| try runListen(alloc, encoding, l.addr, l.headless),
         .relay => |r| {
             // The device token authenticates the relay WebSockets. Required.
-            const token = std.process.getEnvVarOwned(alloc, "GHOSTTY_DEVICE_TOKEN") catch {
-                std.debug.print("ghoztty-agent: --relay requires GHOSTTY_DEVICE_TOKEN to be set\n", .{});
+            // Precedence: the GHOSTTY_DEVICE_TOKEN env var wins; otherwise fall
+            // back to the agent's own relay.env (written by `--enroll` and by
+            // the Windows installer), so enroll → run needs no env plumbing.
+            const token = blk: {
+                if (std.process.getEnvVarOwned(alloc, "GHOSTTY_DEVICE_TOKEN")) |t| break :blk t else |_| {}
+                if (enroll.loadDeviceToken(alloc)) |t| break :blk t;
+                std.debug.print(
+                    "ghoztty-agent: --relay needs a device token: set GHOSTTY_DEVICE_TOKEN " ++
+                        "or enroll this machine first with `ghoztty-agent --enroll --relay=<base>`\n",
+                    .{},
+                );
+                // This is the only relay-mode path that returns (runRelay loops
+                // forever), so free the duped URL to keep the GPA exit clean.
+                alloc.free(r.base_url);
                 return error.MissingDeviceToken;
             };
             // `runRelay` loops forever (until the process is killed), so this free
             // never actually runs — the token is effectively static.
             defer alloc.free(token);
             try runRelay(alloc, encoding, r.base_url, token, r.headless);
+        },
+        .enroll => |e| {
+            // Device-code self-enroll (WP-B3): register this machine (by its
+            // hostname) under the owner's account and persist the credential.
+            // Unlike relay mode this returns, so the duped URL is freed.
+            defer alloc.free(e.base_url);
+            var host_buf: [256]u8 = undefined;
+            const name = hostName(&host_buf) orelse "unknown-host";
+            try enroll.run(alloc, e.base_url, name);
         },
     }
 }
@@ -114,6 +142,13 @@ const Mode = union(enum) {
     stdio,
     listen: Listen,
     relay: Relay,
+    enroll: Enroll,
+};
+
+/// Device-code self-enroll parameters (`--enroll --relay=<base>`). `base_url`
+/// is the relay HTTP(S) base to enroll against (owned — duped from argv).
+const Enroll = struct {
+    base_url: []const u8,
 };
 
 /// Relay-mode parameters. `base_url` is the relay HTTPS/WSS base (owned — duped
@@ -131,23 +166,29 @@ const Listen = struct {
     headless: bool = false,
 };
 
-/// Parse `--stdio` | `--listen <addr:port>` | (no args ⇒ default TCP listen).
+/// Parse `--stdio` | `--listen <addr:port>` | `--relay <url>` |
+/// `--enroll --relay <url>` | (no args ⇒ default TCP listen).
 /// `--headless` (anywhere on the line) suppresses the tray for listen mode; the
 /// stdio path is ALWAYS headless (an ssh-piped agent has no desktop to draw on).
+/// `--enroll` (anywhere on the line) turns the `--relay` base into a one-shot
+/// device-code enrollment instead of the relay daemon.
 fn parseArgs(alloc: Allocator) !Mode {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    // Pre-scan for --headless so it can appear before OR after --listen.
+    // Pre-scan for the order-independent flags so they can appear before OR
+    // after the mode argument they modify.
     var headless = false;
+    var want_enroll = false;
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--headless")) headless = true;
+        if (std.mem.eql(u8, a, "--enroll")) want_enroll = true;
     }
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--headless")) {
+        if (std.mem.eql(u8, a, "--headless") or std.mem.eql(u8, a, "--enroll")) {
             continue; // handled in the pre-scan above
         } else if (std.mem.eql(u8, a, "--stdio")) {
             return .stdio;
@@ -167,14 +208,22 @@ fn parseArgs(alloc: Allocator) !Mode {
                 return error.InvalidArgs;
             }
             // Dupe the URL: `args` is freed (argsFree) when parseArgs returns, but
-            // relay mode needs the URL for the life of the daemon.
-            return .{ .relay = .{ .base_url = try alloc.dupe(u8, args[i]), .headless = headless } };
+            // both relay and enroll modes need it past that.
+            const url = try alloc.dupe(u8, args[i]);
+            if (want_enroll) return .{ .enroll = .{ .base_url = url } };
+            return .{ .relay = .{ .base_url = url, .headless = headless } };
         } else if (std.mem.startsWith(u8, a, "--relay=")) {
-            return .{ .relay = .{ .base_url = try alloc.dupe(u8, a["--relay=".len..]), .headless = headless } };
+            const url = try alloc.dupe(u8, a["--relay=".len..]);
+            if (want_enroll) return .{ .enroll = .{ .base_url = url } };
+            return .{ .relay = .{ .base_url = url, .headless = headless } };
         } else {
             std.debug.print("ghoztty-agent: unknown argument '{s}'\n", .{a});
             return error.InvalidArgs;
         }
+    }
+    if (want_enroll) {
+        std.debug.print("ghoztty-agent: --enroll requires --relay=<base url>\n", .{});
+        return error.InvalidArgs;
     }
     // No args: default to the TCP listen daemon so a bare invocation "just works".
     return .{ .listen = .{ .addr = try parseAddr(default_listen), .headless = headless } };

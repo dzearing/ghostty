@@ -44,22 +44,59 @@ architecture, §5 security).
 ## Self-enrollment (OAuth device-code flow)
 
 Agents on fresh machines enroll **themselves** — no pre-minted token to copy
-around. The installer:
+around. The agent half is built in: `ghoztty-agent --enroll --relay=<base>`
 
 1. `POST /v1/enroll/start` with `{"name":"<hostname>"}` and prints:
 
    ```
-   To register this machine, visit https://www.google.com/device
+   To add this machine to your account, visit https://www.google.com/device
    and enter code: WXYZ-1234
    ```
 
 2. Polls `POST /v1/enroll/poll` with the returned `device_code_handle`
-   (respecting `interval`; premature polls get `429 {"status":"slow_down"}`).
+   (respecting `interval`; premature polls get `429 {"status":"slow_down"}`,
+   which grows the agent's poll interval by 5s per RFC 8628).
 3. The owner signs in with Google (2FA and all) and approves.
 4. The next poll returns `{"status":"complete","device_id":...,
-   "device_token":...,"relay_base":...}` **exactly once**. The installer
-   persists the token (e.g. `%LOCALAPPDATA%\ghoztty\relay.env`) and starts
-   `ghoztty-agent --relay=<relay_base>`.
+   "device_token":...,"relay_base":...}` **exactly once**. The agent persists
+   `RELAY_BASE` + `DEVICE_TOKEN` to its `relay.env`
+   (`%LOCALAPPDATA%\ghoztty\relay.env` on Windows,
+   `~/.config/ghoztty/relay.env` — or `$XDG_CONFIG_HOME` — elsewhere;
+   `GHOSTTY_RELAY_ENV` overrides the full path) and prints
+   `Enrolled as device <id>. Start the agent with: ghoztty-agent --relay=<base>`.
+
+`--relay` mode then finds the token by itself: the `GHOSTTY_DEVICE_TOKEN` env
+var wins, else the agent falls back to `relay.env` — so enroll → run needs no
+env plumbing.
+
+### Hosted Windows installer
+
+The one-liner installer served at `/dl/install.ps1` (source:
+`relay/deploy/install.ps1` in this repo; the live copy sits on the VM at
+`/var/www/ghoztty-dl/` — re-upload after editing) uses this flow. On a fresh
+box with no `DEVICE_TOKEN` it downloads the agent and runs
+`ghoztty-agent.exe --enroll --relay=<base>` interactively — visit the URL,
+sign in with Google, done — then installs the autostart launcher:
+
+```powershell
+irm https://<relay>/dl/install.ps1 | iex
+```
+
+Setting `$env:DEVICE_TOKEN` beforehand still skips the interactive sign-in
+(pre-minted token path); re-running with an existing `relay.env` just updates
+the binary.
+
+### End-to-end test against the real agent binary
+
+`agent_enroll_e2e_test.go` drives the REAL Zig agent's `--enroll` against this
+relay + the fake Google issuer (start → printed code → approval → poll →
+`relay.env` written → issued token authenticates `/v1/agent/control`). It is
+gated so `go test ./...` stays hermetic:
+
+```bash
+(cd .. && zig build agent)
+GHOZTTY_AGENT_BIN=$PWD/../zig-out/bin/ghoztty-agent go test -run TestAgentEnrollE2E -v .
+```
 
 Poll outcomes: `200 pending` (keep polling), `429 slow_down` (too fast),
 `200 complete` (done, single-shot), `403 denied` (owner refused),
@@ -275,3 +312,5 @@ rename (`TestRenameDevice`), delete (`TestDeleteDevice`), delete-revokes-token
 | `devices_crud_test.go`       | Device rename/delete/revocation/owner-scoping tests. |
 | `auth_oidc_test.go`          | OIDC client-auth tests against a fake local issuer (JWKS + self-minted RS256 tokens). |
 | `enroll_test.go`             | Self-enroll tests against fake Google device-code/token endpoints (happy path, idempotent re-enroll, denied/expired, allowlist rejection, poll rate limit). |
+| `agent_enroll_e2e_test.go`   | Gated e2e: the REAL Zig `ghoztty-agent --enroll` against this relay + the fake issuer (`GHOZTTY_AGENT_BIN`). |
+| `deploy/install.ps1`         | Source of the hosted Windows one-liner installer (`/dl/install.ps1` on the VM — re-upload after editing). |

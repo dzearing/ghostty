@@ -38,7 +38,21 @@ Commits on `feature/remote-machines`:
   (per-handle rate limit; ID token verified like client auth; idempotent
   upsert: same owner+name → same device id, token ROTATED) → returns
   `{device_id, device_token, relay_base}` once; `relay/enroll.go` +
-  `enroll_test.go` vs fake Google endpoints. Agent/installer half still TODO.
+  `enroll_test.go` vs fake Google endpoints.
+- WP-B3 (agent half) — `ghoztty-agent --enroll --relay=<base>`: prints
+  "visit <url>, enter code XXXX-XXXX", polls (slow_down +5s; denied/expired/
+  rejected terminal), persists `RELAY_BASE`+`DEVICE_TOKEN` to relay.env
+  (`%LOCALAPPDATA%\ghoztty\relay.env` / `~/.config/ghoztty/relay.env`;
+  `GHOSTTY_RELAY_ENV` overrides — tests use it). `--relay` mode now falls back
+  to relay.env when `GHOSTTY_DEVICE_TOKEN` is unset (env wins), so enroll→run
+  is seamless. New: `src/remote/http_client.zig` (native TLS or plaintext-http
+  JSON POST; http:// is for loopback test relays), `src/remote/agent/enroll.zig`.
+  PROVEN e2e by `relay/agent_enroll_e2e_test.go` (real Zig binary vs fake-issuer
+  relay; gated on `GHOZTTY_AGENT_BIN`). Installer updated: hosted install.ps1
+  source now in-repo at `relay/deploy/install.ps1` — no DEVICE_TOKEN → runs
+  `--enroll` interactively. STILL TODO: upload the new install.ps1 to the VM
+  (`/var/www/ghoztty-dl/`) + register the real Google OAuth client (WP-B1;
+  until then the deployed relay is DEV_AUTH-only and enroll answers 503).
 - WP-D2 — remote windows RESTORE on relaunch: local `RemoteSessionManifest`
   (UserDefaults) + re-`ATTACH` by session UUID through the relay at launch; clean
   close removes the entry, quit keeps it; restore failures are silent (no modal);
@@ -247,10 +261,17 @@ able to take one WP with only this doc + the repo.
   `/v1/enroll/poll` in `relay/enroll.go` (opaque handle, poll rate limit, idempotent
   upsert w/ token rotation, same verifier + `ALLOWED_EMAILS` gate; endpoints from
   OIDC discovery so the fake issuer covers them; new env: `GOOGLE_CLIENT_SECRET`,
-  optional `RELAY_BASE_URL`); tests in `relay/enroll_test.go`. **Remaining:** agent/
-  installer half (run enroll, print "visit URL, enter code", persist token) + note:
-  if a separate "TV/Limited Input" Google client is used, relay `aud` must accept
-  both client IDs (currently single `GOOGLE_CLIENT_ID` for both flows).
+  optional `RELAY_BASE_URL`); tests in `relay/enroll_test.go`. **Agent half DONE:**
+  `ghoztty-agent --enroll --relay=<base>` (`src/remote/agent/enroll.zig` +
+  `src/remote/http_client.zig`) prints the code prompt, polls with slow_down
+  backoff, persists relay.env; `--relay` falls back to relay.env for the token;
+  installer source `relay/deploy/install.ps1` enrolls interactively when no
+  DEVICE_TOKEN; e2e-proven vs the fake-issuer relay by
+  `relay/agent_enroll_e2e_test.go`. **Remaining:** upload the new install.ps1 to
+  the VM + do WP-B1 (real Google client) so the deployed relay's enroll
+  endpoints stop answering 503; note: if a separate "TV/Limited Input" Google
+  client is used, relay `aud` must accept both client IDs (currently single
+  `GOOGLE_CLIENT_ID` for both flows).
 
 ### Phase C — Resource management (CRUD + UI)
 - **WP-C1 — Relay resource CRUD. ✅ DONE.** *Goal:* add **rename** + **delete**
