@@ -76,6 +76,7 @@ const ws_client = @import("../ws_client.zig");
 const tray = @import("tray.zig");
 const enroll = @import("enroll.zig");
 const keepalive = @import("keepalive.zig");
+const link_control = @import("link_control.zig");
 
 const default_listen = "0.0.0.0:7777";
 
@@ -363,7 +364,8 @@ fn runListen(
             // Hand the MAIN thread to the tray message loop. It returns TRUE only if
             // the tray actually showed and the user picked Exit; FALSE if any tray
             // setup step failed (RegisterClass / CreateWindow / Shell_NotifyIcon).
-            if (tray.run(&store, build_hash)) {
+            // No relay link in listen mode → null (no Disconnect/Reconnect items).
+            if (tray.run(&store, build_hash, null)) {
                 // User chose Exit: a clean process exit tears down the (still-running)
                 // accept loop + reaper daemon threads.
                 std.process.exit(0);
@@ -606,6 +608,11 @@ fn runRelay(
     const stdout = std.fs.File.stdout();
     stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent: relay mode, control={s}/v1/agent/control\n", .{ws_base}) catch "ghoztty-agent: relay mode\n") catch {};
 
+    // User-controlled relay link state (tray Disconnect/Reconnect). The tray
+    // toggles it from its message-pump thread; the control loop obeys it.
+    // `host` (scheme stripped) is what the tooltip shows: "Connected to <host>".
+    var link = link_control.LinkControl{ .host = ws_base["wss://".len..] };
+
     // The relay control loop is the whole daemon. WHERE it runs depends on the
     // tray, exactly mirroring `runListen`'s accept-loop placement.
     if (builtin.os.tag == .windows and !headless) {
@@ -616,10 +623,11 @@ fn runRelay(
             .token = token,
             .store = &store,
             .spawner = spawner.spawner(),
+            .link = &link,
         };
         if (std.Thread.spawn(.{}, relayLoopThread, .{args})) |t| {
-            if (tray.run(&store, build_hash)) {
-                std.process.exit(0); // user chose Exit
+            if (tray.run(&store, build_hash, &link)) {
+                std.process.exit(0); // user chose Exit (from any link state)
             }
             // Tray setup failed: park the main thread on the (already-serving)
             // control loop so the daemon lives on.
@@ -631,7 +639,7 @@ fn runRelay(
     }
 
     // Headless / non-windows / tray-fallback: run the control loop right here.
-    relayLoop(alloc, encoding, ws_base, token, &store, spawner.spawner());
+    relayLoop(alloc, encoding, ws_base, token, &store, spawner.spawner(), &link);
 }
 
 /// Convert an `https://host[:port]` / `wss://host[:port]` base to a normalized
@@ -658,14 +666,19 @@ const RelayArgs = struct {
     token: []const u8,
     store: *session.SessionStore,
     spawner: server.Spawner,
+    link: *link_control.LinkControl,
 };
 
 fn relayLoopThread(args: RelayArgs) void {
-    relayLoop(args.alloc, args.encoding, args.ws_base, args.token, args.store, args.spawner);
+    relayLoop(args.alloc, args.encoding, args.ws_base, args.token, args.store, args.spawner, args.link);
 }
 
 /// THE RELAY DAEMON: hold the control WebSocket; on drop, back off and reconnect
-/// (reusing the SAME store, so sessions survive). Loops forever.
+/// (reusing the SAME store, so sessions survive). The loop itself lives in
+/// `link_control.runLoop` so the user-facing suspend/resume transitions (tray
+/// Disconnect/Reconnect via `link`) are unit-testable; this function builds the
+/// real-WsClient `Transport` it drives. Runs until the process exits (the tray
+/// Exit path) — `link.stopLoop` would return it, but nothing calls that today.
 fn relayLoop(
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -673,6 +686,7 @@ fn relayLoop(
     token: []const u8,
     store: *session.SessionStore,
     spawner: server.Spawner,
+    link: *link_control.LinkControl,
 ) void {
     const ctrl_url = std.fmt.allocPrint(alloc, "{s}/v1/agent/control", .{ws_base}) catch {
         std.debug.print("ghoztty-agent: relay: out of memory building control url\n", .{});
@@ -699,42 +713,110 @@ fn relayLoop(
         headers_buf[n_headers] = .{ .name = "X-Ghoztty-Hostname", .value = hn };
         n_headers += 1;
     }
-    const headers = headers_buf[0..n_headers];
 
-    while (true) {
-        const ctrl = ws_client.WsClient.connectUrl(alloc, ctrl_url, headers) catch |err| {
+    var transport = RelayTransport{
+        .alloc = alloc,
+        .encoding = encoding,
+        .ws_base = ws_base,
+        .token = token,
+        .store = store,
+        .spawner = spawner,
+        .ctrl_url = ctrl_url,
+        .headers = headers_buf[0..n_headers],
+    };
+    link_control.runLoop(link, transport.transport(), relay_backoff_ms);
+}
+
+/// One live relay control connection: the WebSocket plus its keepalive
+/// (dead-link detection) thread. Heap-allocated per dial so the keepalive's
+/// `*Keepalive` stays stable while its thread runs.
+const RelayConn = struct {
+    ctrl: *ws_client.WsClient,
+    ka: keepalive.Keepalive,
+    ka_thread: ?std.Thread,
+};
+
+/// The production `link_control.Transport`: dial the authenticated control
+/// WebSocket (+ spawn its keepalive), serve it with `serveControl`, close it
+/// via `WsClient.close` (idempotent; unblocks the blocked control read — the
+/// same contract the keepalive and the tray's Disconnect rely on).
+const RelayTransport = struct {
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    ws_base: []const u8,
+    token: []const u8,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    ctrl_url: []const u8,
+    headers: []const ws_client.Header,
+
+    fn transport(self: *RelayTransport) link_control.Transport {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable: link_control.Transport.VTable = .{
+        .dial = dial,
+        .serve = serve,
+        .close = close,
+        .deinit = deinit,
+    };
+
+    fn dial(ctx: *anyopaque) ?*anyopaque {
+        const self: *RelayTransport = @ptrCast(@alignCast(ctx));
+        const ctrl = ws_client.WsClient.connectUrl(self.alloc, self.ctrl_url, self.headers) catch |err| {
             std.debug.print("ghoztty-agent: relay control connect failed ({s}); retry in {d}ms\n", .{ @errorName(err), relay_backoff_ms });
-            std.Thread.sleep(relay_backoff_ms * std.time.ns_per_ms);
-            continue;
+            return null;
         };
         std.debug.print("ghoztty-agent: relay control connected\n", .{});
+
+        const conn = self.alloc.create(RelayConn) catch {
+            ctrl.deinit();
+            return null;
+        };
+        conn.* = .{ .ctrl = ctrl, .ka = .{ .link = keepalive.wsLink(ctrl) }, .ka_thread = null };
 
         // Dead-link detection (the sleep/wake fix): a side thread pings the
         // relay every `ping_interval_ms` and, when NO inbound frame (relay
         // heartbeat / pong / command) arrives within `stale_after_ms`, closes
         // the WebSocket — which unblocks `serveControl`'s blocked read with
-        // EOF so this loop redials. Without it, a connection whose peer died
+        // EOF so the loop redials. Without it, a connection whose peer died
         // while this machine slept blocks in `readMessage` forever. See
         // `keepalive.zig` for the full design rationale.
-        var ka = keepalive.Keepalive{ .link = keepalive.wsLink(ctrl) };
-        const ka_thread: ?std.Thread = std.Thread.spawn(.{}, keepalive.Keepalive.run, .{&ka}) catch |err| blk: {
+        conn.ka_thread = std.Thread.spawn(.{}, keepalive.Keepalive.run, .{&conn.ka}) catch |err| blk: {
             std.debug.print("ghoztty-agent: relay keepalive spawn failed ({s}); dead-link detection disabled for this connection\n", .{@errorName(err)});
             break :blk null;
         };
+        return conn;
+    }
 
-        serveControl(alloc, encoding, ws_base, token, store, spawner, ctrl);
+    fn serve(ctx: *anyopaque, connp: *anyopaque) void {
+        const self: *RelayTransport = @ptrCast(@alignCast(ctx));
+        const conn: *RelayConn = @ptrCast(@alignCast(connp));
+        serveControl(self.alloc, self.encoding, self.ws_base, self.token, self.store, self.spawner, conn.ctrl);
+    }
 
+    /// Thread-safe, idempotent; unblocks `serveControl`'s blocked read with
+    /// EOF. This is what the tray's Disconnect ends up calling (via
+    /// `LinkControl.closeLive`) — and what the keepalive calls on staleness.
+    fn close(_: *anyopaque, connp: *anyopaque) void {
+        const conn: *RelayConn = @ptrCast(@alignCast(connp));
+        conn.ctrl.close();
+    }
+
+    fn deinit(ctx: *anyopaque, connp: *anyopaque) void {
+        const self: *RelayTransport = @ptrCast(@alignCast(ctx));
+        const conn: *RelayConn = @ptrCast(@alignCast(connp));
         // Stop the keepalive BEFORE deinit (it must not touch a freed client).
         // If it went stale it has already returned; requestStop is idempotent.
-        if (ka_thread) |t| {
-            ka.requestStop();
+        if (conn.ka_thread) |t| {
+            conn.ka.requestStop();
             t.join();
         }
-        ctrl.deinit();
-        std.debug.print("ghoztty-agent: relay control ended; reconnecting in {d}ms\n", .{relay_backoff_ms});
-        std.Thread.sleep(relay_backoff_ms * std.time.ns_per_ms);
+        conn.ctrl.deinit();
+        self.alloc.destroy(conn);
+        std.debug.print("ghoztty-agent: relay control ended\n", .{});
     }
-}
+};
 
 /// Read control messages until the control WebSocket closes/errors. For each
 /// `{"type":"open","session":S}` command, spawn a detached worker that serves
@@ -847,4 +929,6 @@ const RelayWorker = struct {
 
 test {
     std.testing.refAllDecls(@This());
+    // Not reachable via pub decls, so reference explicitly for test discovery.
+    _ = @import("link_control.zig");
 }

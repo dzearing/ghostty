@@ -1,11 +1,20 @@
 //! Windows system-tray UI for the `ghoztty-agent` listen daemon.
 //!
-//! When the agent runs in TCP listen-daemon mode on Windows (the default — the
-//! deploy watcher launches it as `ghoztty-agent --listen ...`), it shows a tray
-//! icon so the human running the Windows box has a visible, dismissable handle on
-//! the daemon: confirm it's alive, see the live session count, and Quit it
-//! cleanly. `--headless` suppresses this (CI / ssh-piped / stdio paths), keeping
-//! the previous behavior exactly.
+//! When the agent runs in TCP listen-daemon or relay mode on Windows (the
+//! default — the deploy watcher launches it as `ghoztty-agent --listen ...`), it
+//! shows a tray icon so the human running the Windows box has a visible,
+//! dismissable handle on the daemon: confirm it's alive, see the live session
+//! count, and Quit it cleanly. `--headless` suppresses this (CI / ssh-piped /
+//! stdio paths), keeping the previous behavior exactly.
+//!
+//! In RELAY mode the caller also passes a `link_control.LinkControl`: the menu
+//! then carries a live status line plus a Disconnect/Reconnect item (one item
+//! that retitles by state), and the tooltip tracks the link ("connected to
+//! <host>" / "reconnecting…" / "disconnected (by user)", refreshed on every
+//! tray callback via NIM_MODIFY). `LinkControl`'s methods are thread-safe by
+//! contract, so the message-pump thread calls them directly; the control loop
+//! reacts promptly (close-the-live-WebSocket + wake-event, see link_control.zig).
+//! `--listen` mode passes null and gets the previous menu exactly.
 //!
 //! ## Threading contract (mirrors `main.zig`'s wiring)
 //! Win32 message loops MUST run on the thread that created the window, so the
@@ -34,6 +43,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("session.zig");
+const link_control = @import("link_control.zig");
 
 /// Show the agent tray icon and run the Win32 message loop until the user picks
 /// Exit. BLOCKS the calling thread (must be the main thread — see the module doc).
@@ -47,9 +57,17 @@ const session = @import("session.zig");
 ///
 /// `store` is the daemon-scoped session store (snapshotted under its lock when the
 /// menu opens). `build_hash` is a short build identifier shown in the About line.
-pub fn run(store: *session.SessionStore, build_hash: []const u8) bool {
+/// `link` is the relay-link control (relay mode only; pass null in `--listen` TCP
+/// mode, where there is no relay link): non-null adds a status line plus a
+/// Disconnect/Reconnect item to the menu and a live-status tooltip. Its methods
+/// are thread-safe, so the message-pump thread may call them directly.
+pub fn run(
+    store: *session.SessionStore,
+    build_hash: []const u8,
+    link: ?*link_control.LinkControl,
+) bool {
     if (builtin.os.tag != .windows) return false;
-    return win.run(store, build_hash);
+    return win.run(store, build_hash, link);
 }
 
 // =============================================================================
@@ -78,6 +96,7 @@ const win = if (builtin.os.tag == .windows) struct {
     const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
     const WM_DESTROY: UINT = 0x0002;
     const WM_COMMAND: UINT = 0x0111;
+    const WM_MOUSEMOVE: UINT = 0x0200;
     const WM_LBUTTONUP: UINT = 0x0202;
     const WM_RBUTTONUP: UINT = 0x0205;
     const WM_APP: UINT = 0x8000;
@@ -90,6 +109,8 @@ const win = if (builtin.os.tag == .windows) struct {
     const ID_ABOUT: UINT = 1001;
     const ID_UPDATE: UINT = 1002;
     const ID_EXIT: UINT = 1003;
+    const ID_DISCONNECT: UINT = 1004;
+    const ID_RECONNECT: UINT = 1005;
 
     // AppendMenuW flags.
     const MF_STRING: UINT = 0x0000;
@@ -110,6 +131,7 @@ const win = if (builtin.os.tag == .windows) struct {
 
     // Shell_NotifyIcon messages + flags.
     const NIM_ADD: DWORD = 0x0000;
+    const NIM_MODIFY: DWORD = 0x0001;
     const NIM_DELETE: DWORD = 0x0002;
     const NIF_MESSAGE: UINT = 0x0001;
     const NIF_ICON: UINT = 0x0002;
@@ -203,6 +225,10 @@ const win = if (builtin.os.tag == .windows) struct {
     // tray) so a file-scoped global is fine and avoids GWLP_USERDATA dancing.
     var g_store: ?*session.SessionStore = null;
     var g_build_hash: []const u8 = "dev";
+    /// Relay-link control, or null in `--listen` mode (no relay link → no
+    /// Disconnect/Reconnect UI). Thread-safe by contract; the message-pump
+    /// thread calls disconnect/reconnect/display on it directly.
+    var g_link: ?*link_control.LinkControl = null;
     var g_nid: NOTIFYICONDATAW = undefined; // retained so Exit can NIM_DELETE it.
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyAgentTrayWnd");
@@ -213,9 +239,14 @@ const win = if (builtin.os.tag == .windows) struct {
     /// we return `false` so `main.zig`'s caller keeps serving headless (the daemon
     /// NEVER dies because the UI couldn't start). Returns `true` only after the
     /// message loop ran to a user-chosen Exit.
-    fn run(store: *session.SessionStore, build_hash: []const u8) bool {
+    fn run(
+        store: *session.SessionStore,
+        build_hash: []const u8,
+        link: ?*link_control.LinkControl,
+    ) bool {
         g_store = store;
         g_build_hash = build_hash;
+        g_link = link;
 
         const hinst = GetModuleHandleW(null) orelse return false;
 
@@ -259,6 +290,7 @@ const win = if (builtin.os.tag == .windows) struct {
             .hIcon = LoadIconW(null, IDI_APPLICATION),
         };
         copyTip(&g_nid.szTip, tray_tip);
+        setTipText(); // relay mode: reflect the link state from the start
         if (Shell_NotifyIconW(NIM_ADD, &g_nid) == 0) {
             // Couldn't place the icon — tear the window down and bail so the caller
             // falls back to headless serving.
@@ -280,6 +312,27 @@ const win = if (builtin.os.tag == .windows) struct {
         return true;
     }
 
+    /// Rewrite `g_nid.szTip` from the current relay-link state. No-op when
+    /// there is no link (`--listen` mode keeps the static "Ghoztty Agent" tip).
+    /// Does NOT call Shell_NotifyIcon — pair with NIM_ADD (setup) or use
+    /// `updateTip` (NIM_MODIFY) once the icon exists.
+    fn setTipText() void {
+        const lk = g_link orelse return;
+        _ = switch (lk.display()) {
+            .connected => fmtUtf16(&g_nid.szTip, "Ghoztty Agent \u{2014} connected to ", lk.host, ""),
+            .reconnecting => fmtUtf16(&g_nid.szTip, "Ghoztty Agent \u{2014} reconnecting", "\u{2026}", ""),
+            .offline => fmtUtf16(&g_nid.szTip, "Ghoztty Agent \u{2014} disconnected (by user)", "", ""),
+        };
+    }
+
+    /// Refresh the live tray icon's tooltip from the current relay-link state
+    /// (NIM_MODIFY with the flags already in `g_nid`). No-op in `--listen` mode.
+    fn updateTip() void {
+        if (g_link == null) return;
+        setTipText();
+        _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    }
+
     /// Copy a NUL-terminated UTF-16 literal into a fixed szTip buffer (truncating).
     fn copyTip(dst: []u16, src: [*:0]const u16) void {
         var i: usize = 0;
@@ -292,6 +345,11 @@ const win = if (builtin.os.tag == .windows) struct {
             WM_TRAY => {
                 // Shell_NotifyIcon stuffs the originating mouse message into the
                 // low word of lParam. Open the menu on either button release.
+                // On ANY callback (including hover mouse-moves) refresh the
+                // tooltip first, so the tip the shell is about to show reflects
+                // the CURRENT relay-link state (cheap: text + NIM_MODIFY;
+                // no-op in --listen mode).
+                updateTip();
                 const mouse: UINT = @truncate(@as(usize, @bitCast(lParam)) & 0xFFFF);
                 if (mouse == WM_LBUTTONUP or mouse == WM_RBUTTONUP) {
                     showMenu(hwnd);
@@ -303,6 +361,18 @@ const win = if (builtin.os.tag == .windows) struct {
                 switch (id) {
                     ID_ABOUT => onAbout(hwnd),
                     ID_UPDATE => onUpdate(hwnd),
+                    ID_DISCONNECT => {
+                        // Take the relay link down: closes the live control WS
+                        // and suspends the reconnect loop. Local sessions stay
+                        // alive (detach, not terminate).
+                        if (g_link) |lk| lk.disconnect();
+                        updateTip();
+                    },
+                    ID_RECONNECT => {
+                        // Resume the loop immediately (no backoff wait).
+                        if (g_link) |lk| lk.reconnect();
+                        updateTip();
+                    },
                     ID_EXIT => onExit(),
                     else => {},
                 }
@@ -328,6 +398,27 @@ const win = if (builtin.os.tag == .windows) struct {
         const hdr = fmtUtf16(&hdr_buf, "Ghoztty Agent ", g_build_hash, "");
         _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, hdr);
         _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+
+        // Relay-link section (relay mode only): a status line + ONE item that
+        // retitles by state — "Disconnect" while connected/reconnecting,
+        // "Reconnect" while disconnected-by-user. `--listen` mode (g_link null)
+        // shows none of this.
+        if (g_link) |lk| {
+            var st_buf: [160]u16 = undefined;
+            const d = lk.display();
+            const st = switch (d) {
+                .connected => fmtUtf16(&st_buf, "Relay: connected to ", lk.host, ""),
+                .reconnecting => fmtUtf16(&st_buf, "Relay: reconnecting", "\u{2026}", ""),
+                .offline => fmtUtf16(&st_buf, "Relay: disconnected (by user)", "", ""),
+            };
+            _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, st);
+            if (d == .offline) {
+                _ = AppendMenuW(menu, MF_STRING, ID_RECONNECT, lit("Reconnect"));
+            } else {
+                _ = AppendMenuW(menu, MF_STRING, ID_DISCONNECT, lit("Disconnect"));
+            }
+            _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+        }
 
         _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, lit("About"));
 
