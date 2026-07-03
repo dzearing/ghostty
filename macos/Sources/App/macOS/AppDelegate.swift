@@ -1005,11 +1005,15 @@ class AppDelegate: NSObject,
     @IBAction func newRemoteWindow(_ sender: Any?) {
         let registry = MachineRegistry.shared
 
-        // Nothing remote to choose — no registered machine AND no relay
-        // account whose device list could populate on open — so just open a
-        // normal local window. (With a relay token configured the chooser is
-        // shown even at zero machines; it fetches the account list on open.)
-        guard !registry.machines.isEmpty || registry.hasRelayAccount else {
+        // Nothing remote to choose — no registered machine, no relay account,
+        // AND no Google client to sign in with — so just open a normal local
+        // window. The Google-client check matters when SIGNED OUT at zero
+        // machines: the chooser is the only sign-in surface, so it must open
+        // (showing just "Local" + the sign-in footer) or sign-in is
+        // unreachable from the UI.
+        guard !registry.machines.isEmpty || registry.hasRelayAccount
+            || RelayAccount.isConfigured
+        else {
             _ = TerminalController.newWindow(ghostty)
             return
         }
