@@ -71,7 +71,16 @@ struct Machine: Identifiable, Hashable {
     static func isLocalHostname(_ hostname: String) -> Bool {
         let target = normalizeHostname(hostname)
         guard !target.isEmpty else { return false }
+        if isLoopback(target) { return true }
         return localHostnames.contains(target)
+    }
+
+    /// Loopback endpoints are the local machine by definition: a TCP dial to
+    /// 127.0.0.0/8, `::1`, or `localhost` never leaves this Mac, so the pill
+    /// (remote-only UI) must not show for them either.
+    private static func isLoopback(_ normalized: String) -> Bool {
+        if normalized == "localhost" || normalized == "::1" { return true }
+        return normalized.hasPrefix("127.")
     }
 
     /// Normalized names of the local machine, computed once (hostname lookups
