@@ -70,8 +70,14 @@
    check the device stays/returns Online after the Mac sleeps).
 
 **Engineering follow-ups (small, noted by subagents):**
-9. Agent daemon doesn't re-read `relay.env` after a re-enroll (needs restart);
-   enroll's relay.env write racing a live daemon deserves atomic write+signal.
+9. ~~Agent daemon doesn't re-read `relay.env` after a re-enroll (needs restart);
+   enroll's relay.env write racing a live daemon deserves atomic write+signal.~~
+   DONE: `saveRelayEnv` is atomic (tmp+rename, both OSes); the relay daemon
+   watches relay.env (5s stat poll, `src/remote/agent/relay_creds.zig`) and
+   on a token change bounces the control link and redials with the new
+   credential. `GHOSTTY_DEVICE_TOKEN` still wins (change logged + ignored);
+   tray Disconnect stays parked. Verified live (rotate relay.env under a
+   running `--relay` daemon → "reconnecting with the new credential").
 10. Chooser list is fetch-on-open only — live online/offline updates while the
     chooser is open would be nice.
 11. WP-E1 productionization: move relay to the home NUC behind a Cloudflare

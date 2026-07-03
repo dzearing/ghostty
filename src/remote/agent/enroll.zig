@@ -307,16 +307,39 @@ pub fn relayEnvPath(alloc: Allocator) ![]u8 {
 
 /// Write relay.env at `path` (creating parent directories; mode 0600 on
 /// POSIX — it holds a bearer credential).
+///
+/// The write is ATOMIC: content lands in a `.tmp` sibling first, then a
+/// rename publishes it over the target (plain rename(2) on POSIX; on Windows
+/// zig's `Dir.rename` issues FILE_RENAME_INFORMATION with ReplaceIfExists —
+/// MoveFileEx-replace semantics — so an existing relay.env is replaced, not
+/// an error). A live `--relay` daemon polls this file for a re-enroll (see
+/// `relay_creds.zig`) and must never observe a half-written credential.
 pub fn saveRelayEnv(alloc: Allocator, path: []const u8, relay_base: []const u8, device_token: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
     const content = try formatRelayEnv(alloc, relay_base, device_token);
     defer alloc.free(content);
 
+    // Fixed `.tmp` suffix (same directory, so the rename never crosses a
+    // filesystem). Concurrent enrolls racing on it just end last-writer-wins,
+    // exactly like they would on the target itself.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(tmp_path);
+
     var flags: std.fs.File.CreateFlags = .{ .truncate = true };
     if (builtin.os.tag != .windows) flags.mode = 0o600;
-    const file = try std.fs.cwd().createFile(path, flags);
-    defer file.close();
-    try file.writeAll(content);
+    {
+        // Declared before the create/close pair so on error (LIFO) the file
+        // closes BEFORE the delete — Windows can't delete an open file.
+        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+        const file = try std.fs.cwd().createFile(tmp_path, flags);
+        defer file.close();
+        try file.writeAll(content);
+        // Durable before the rename publishes it: a crash must not leave a
+        // valid-looking relay.env with garbage (or empty) content.
+        try file.sync();
+    }
+    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try std.fs.cwd().rename(tmp_path, path);
 }
 
 /// Load + parse relay.env at `path`. A missing file is an empty env, not an
@@ -799,11 +822,17 @@ test "relay.env: save → load round-trip on disk" {
     try testing.expectEqualStrings("https://relay.test", env.relay_base.?);
     try testing.expectEqualStrings("tok-1", env.device_token.?);
 
-    // Overwrite rotates the credential in place.
+    // Overwrite rotates the credential in place — the atomic tmp+rename path
+    // must replace an EXISTING target (the re-enroll case).
     try saveRelayEnv(alloc, path, "https://relay.test", "tok-2");
     var env2 = try loadRelayEnv(alloc, path);
     defer env2.deinit(alloc);
     try testing.expectEqualStrings("tok-2", env2.device_token.?);
+
+    // The staging file is consumed by the rename, never left behind.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(tmp_path);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
 }
 
 test "relay.env: missing file loads as empty" {

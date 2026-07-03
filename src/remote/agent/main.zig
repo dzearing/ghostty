@@ -21,7 +21,9 @@
 //!      dial a per-session data WebSocket and serve it over the SAME `serveOne`
 //!      core (shared store) as an accepted socket. The device token is read from
 //!      `GHOSTTY_DEVICE_TOKEN`, falling back to the agent's persisted
-//!      `relay.env` (see `enroll.zig`). Reconnects with backoff on a control
+//!      `relay.env` (see `enroll.zig`); relay.env is then WATCHED so a
+//!      re-enroll's new token is adopted without a restart (`relay_creds.zig`).
+//!      Reconnects with backoff on a control
 //!      drop (sessions survive). Coexists with — does not replace — `--listen`.
 //!
 //! Plus one one-shot utility mode: `--enroll --relay <url>` runs the OAuth
@@ -80,6 +82,7 @@ const tray = @import("tray.zig");
 const enroll = @import("enroll.zig");
 const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
+const relay_creds = @import("relay_creds.zig");
 const single_instance = @import("single_instance.zig");
 
 const default_listen = "0.0.0.0:7777";
@@ -118,9 +121,13 @@ pub fn main() !void {
             // Precedence: the GHOSTTY_DEVICE_TOKEN env var wins; otherwise fall
             // back to the agent's own relay.env (written by `--enroll` and by
             // the Windows installer), so enroll → run needs no env plumbing.
-            const token = blk: {
-                if (std.process.getEnvVarOwned(alloc, "GHOSTTY_DEVICE_TOKEN")) |t| break :blk t else |_| {}
-                if (enroll.loadDeviceToken(alloc)) |t| break :blk t;
+            // The SOURCE travels along: a relay.env sourced token may be hot-
+            // reloaded on a re-enroll, an env-sourced one never is (see
+            // `relay_creds.zig`).
+            const TokenInit = struct { token: []u8, source: relay_creds.Source };
+            const ti: TokenInit = blk: {
+                if (std.process.getEnvVarOwned(alloc, "GHOSTTY_DEVICE_TOKEN")) |t| break :blk .{ .token = t, .source = .env } else |_| {}
+                if (enroll.loadDeviceToken(alloc)) |t| break :blk .{ .token = t, .source = .relay_env };
                 std.debug.print(
                     "ghoztty-agent: --relay needs a device token: set GHOSTTY_DEVICE_TOKEN " ++
                         "or enroll this machine first with `ghoztty-agent --enroll --relay=<base>`\n",
@@ -131,10 +138,9 @@ pub fn main() !void {
                 alloc.free(r.base_url);
                 return error.MissingDeviceToken;
             };
-            // `runRelay` loops forever (until the process is killed), so this free
-            // never actually runs — the token is effectively static.
-            defer alloc.free(token);
-            try runRelay(alloc, encoding, r.base_url, token, r.headless);
+            // Token ownership moves into runRelay's `Creds` (it must stay
+            // alive as long as any connection borrows a snapshot of it).
+            try runRelay(alloc, encoding, r.base_url, ti.token, ti.source, r.headless);
         },
         .enroll => |e| {
             // Self-enroll (browser-first, device-code fallback): register this
@@ -614,7 +620,8 @@ fn runRelay(
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
     base_url: []const u8,
-    token: []const u8,
+    token: []u8,
+    token_source: relay_creds.Source,
     headless: bool,
 ) !void {
     // Convert the https/wss base to a clean `wss://host` prefix (no trailing
@@ -655,6 +662,31 @@ fn runRelay(
     // `host` (scheme stripped) is what the tooltip shows: "Connected to <host>".
     var link = link_control.LinkControl{ .host = ws_base["wss://".len..] };
 
+    // LIVE relay credentials: every control dial snapshots the current token,
+    // so a re-enroll's rotation lands on the next dial. Owns `token` from
+    // here on. Referenced by the loop thread and the watcher thread; this
+    // frame outlives both (runRelay never returns while they run).
+    var creds = relay_creds.Creds.init(alloc, token_source, token);
+    defer creds.deinit();
+
+    // Watch relay.env so a re-enroll is adopted WITHOUT an agent restart:
+    // on a token change the watcher swaps the credential and bounces the
+    // control link (tray Disconnect stays parked — bounce never overrides the
+    // user's desired state). Watch failures only cost the hot-reload feature,
+    // never the daemon (same availability-first policy as tray failures).
+    var creds_watch: relay_creds.Watcher = undefined;
+    if (enroll.relayEnvPath(alloc)) |env_path| {
+        creds_watch = relay_creds.Watcher.init(alloc, env_path, &creds, &link, ws_base);
+        if (std.Thread.spawn(.{}, relay_creds.Watcher.run, .{&creds_watch})) |t| {
+            t.detach(); // daemon-lifetime thread; nothing ever joins it
+        } else |err| {
+            std.debug.print("ghoztty-agent: relay.env watch disabled ({s}); a re-enroll needs an agent restart\n", .{@errorName(err)});
+            creds_watch.deinit();
+        }
+    } else |err| {
+        std.debug.print("ghoztty-agent: relay.env path unavailable ({s}); a re-enroll needs an agent restart\n", .{@errorName(err)});
+    }
+
     // The relay control loop is the whole daemon. WHERE it runs depends on the
     // tray, exactly mirroring `runListen`'s accept-loop placement.
     if (builtin.os.tag == .windows and !headless) {
@@ -662,7 +694,7 @@ fn runRelay(
             .alloc = alloc,
             .encoding = encoding,
             .ws_base = ws_base,
-            .token = token,
+            .creds = &creds,
             .store = &store,
             .spawner = spawner.spawner(),
             .link = &link,
@@ -681,7 +713,7 @@ fn runRelay(
     }
 
     // Headless / non-windows / tray-fallback: run the control loop right here.
-    relayLoop(alloc, encoding, ws_base, token, &store, spawner.spawner(), &link);
+    relayLoop(alloc, encoding, ws_base, &creds, &store, spawner.spawner(), &link);
 }
 
 /// Convert an `https://host[:port]` / `wss://host[:port]` base to a normalized
@@ -705,14 +737,14 @@ const RelayArgs = struct {
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
     ws_base: []const u8,
-    token: []const u8,
+    creds: *relay_creds.Creds,
     store: *session.SessionStore,
     spawner: server.Spawner,
     link: *link_control.LinkControl,
 };
 
 fn relayLoopThread(args: RelayArgs) void {
-    relayLoop(args.alloc, args.encoding, args.ws_base, args.token, args.store, args.spawner, args.link);
+    relayLoop(args.alloc, args.encoding, args.ws_base, args.creds, args.store, args.spawner, args.link);
 }
 
 /// THE RELAY DAEMON: hold the control WebSocket; on drop, back off and reconnect
@@ -725,7 +757,7 @@ fn relayLoop(
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
     ws_base: []const u8,
-    token: []const u8,
+    creds: *relay_creds.Creds,
     store: *session.SessionStore,
     spawner: server.Spawner,
     link: *link_control.LinkControl,
@@ -736,35 +768,22 @@ fn relayLoop(
     };
     defer alloc.free(ctrl_url);
 
-    const authz = std.fmt.allocPrint(alloc, "Bearer {s}", .{token}) catch {
-        std.debug.print("ghoztty-agent: relay: out of memory building auth header\n", .{});
-        return;
-    };
-    defer alloc.free(authz);
-
     // Advertise this machine's hostname on the control dial (same source as
     // the HELLO's hostname, see `serveOne`) so the relay can label the device
-    // without waiting for a session. The relay tolerates its absence.
+    // without waiting for a session. The relay tolerates its absence. Lives
+    // on this frame, which outlives the loop (runLoop blocks until exit).
     var host_buf: [256]u8 = undefined;
     const maybe_host = hostName(&host_buf);
-
-    var headers_buf: [2]ws_client.Header = undefined;
-    headers_buf[0] = .{ .name = "Authorization", .value = authz };
-    var n_headers: usize = 1;
-    if (maybe_host) |hn| {
-        headers_buf[n_headers] = .{ .name = "X-Ghoztty-Hostname", .value = hn };
-        n_headers += 1;
-    }
 
     var transport = RelayTransport{
         .alloc = alloc,
         .encoding = encoding,
         .ws_base = ws_base,
-        .token = token,
+        .creds = creds,
         .store = store,
         .spawner = spawner,
         .ctrl_url = ctrl_url,
-        .headers = headers_buf[0..n_headers],
+        .host = maybe_host,
     };
     link_control.runLoop(link, transport.transport(), relay_backoff_ms);
 }
@@ -774,6 +793,12 @@ fn relayLoop(
 /// `*Keepalive` stays stable while its thread runs.
 const RelayConn = struct {
     ctrl: *ws_client.WsClient,
+    /// The device token this connection authenticated with — a `Creds`
+    /// snapshot taken at dial time. Session workers spawned off this control
+    /// connection reuse it for their data dials (the relay expects the same
+    /// credential on both). Stable for the daemon's lifetime (a reload
+    /// RETIRES old tokens, never frees them — see `relay_creds.Creds`).
+    token: []const u8,
     ka: keepalive.Keepalive,
     ka_thread: ?std.Thread,
 };
@@ -786,11 +811,13 @@ const RelayTransport = struct {
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
     ws_base: []const u8,
-    token: []const u8,
+    creds: *relay_creds.Creds,
     store: *session.SessionStore,
     spawner: server.Spawner,
     ctrl_url: []const u8,
-    headers: []const ws_client.Header,
+    /// Hostname advertised on the control dial (X-Ghoztty-Hostname), if any.
+    /// Borrowed from `relayLoop`'s frame (which outlives the loop).
+    host: ?[]const u8,
 
     fn transport(self: *RelayTransport) link_control.Transport {
         return .{ .ctx = self, .vtable = &vtable };
@@ -805,7 +832,26 @@ const RelayTransport = struct {
 
     fn dial(ctx: *anyopaque) ?*anyopaque {
         const self: *RelayTransport = @ptrCast(@alignCast(ctx));
-        const ctrl = ws_client.WsClient.connectUrl(self.alloc, self.ctrl_url, self.headers) catch |err| {
+
+        // Snapshot the CURRENT device token per dial: a relay.env reload
+        // (re-enroll) swaps it between dials, and the whole point of the
+        // watcher's bounce is that THIS dial authenticates with the fresh
+        // one. The snapshot stays valid for the connection's lifetime (Creds
+        // retires — never frees — superseded tokens).
+        const token = self.creds.current();
+        const authz = std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}) catch return null;
+        // Headers are only read during the WS handshake; free right after.
+        defer self.alloc.free(authz);
+
+        var headers_buf: [2]ws_client.Header = undefined;
+        headers_buf[0] = .{ .name = "Authorization", .value = authz };
+        var n_headers: usize = 1;
+        if (self.host) |hn| {
+            headers_buf[n_headers] = .{ .name = "X-Ghoztty-Hostname", .value = hn };
+            n_headers += 1;
+        }
+
+        const ctrl = ws_client.WsClient.connectUrl(self.alloc, self.ctrl_url, headers_buf[0..n_headers]) catch |err| {
             std.debug.print("ghoztty-agent: relay control connect failed ({s}); retry in {d}ms\n", .{ @errorName(err), relay_backoff_ms });
             return null;
         };
@@ -815,7 +861,7 @@ const RelayTransport = struct {
             ctrl.deinit();
             return null;
         };
-        conn.* = .{ .ctrl = ctrl, .ka = .{ .link = keepalive.wsLink(ctrl) }, .ka_thread = null };
+        conn.* = .{ .ctrl = ctrl, .token = token, .ka = .{ .link = keepalive.wsLink(ctrl) }, .ka_thread = null };
 
         // Dead-link detection (the sleep/wake fix): a side thread pings the
         // relay every `ping_interval_ms` and, when NO inbound frame (relay
@@ -834,7 +880,7 @@ const RelayTransport = struct {
     fn serve(ctx: *anyopaque, connp: *anyopaque) void {
         const self: *RelayTransport = @ptrCast(@alignCast(ctx));
         const conn: *RelayConn = @ptrCast(@alignCast(connp));
-        serveControl(self.alloc, self.encoding, self.ws_base, self.token, self.store, self.spawner, conn.ctrl);
+        serveControl(self.alloc, self.encoding, self.ws_base, conn.token, self.store, self.spawner, conn.ctrl);
     }
 
     /// Thread-safe, idempotent; unblocks `serveControl`'s blocked read with
@@ -909,8 +955,10 @@ fn serveControl(
 
 /// A per-session relay worker: dials the session's data WebSocket and serves it
 /// over the SAME `serveOne` core (sharing the daemon `store`/`spawner`) as a TCP
-/// connection, then frees itself. `ws_base`/`token` are borrowed (they live for
-/// the daemon's lifetime); `session_id` is owned and freed on teardown.
+/// connection, then frees itself. `ws_base`/`token` are borrowed (ws_base lives
+/// for the daemon's lifetime; token is the control connection's Creds snapshot,
+/// which `relay_creds.Creds` keeps alive for the daemon's lifetime even across
+/// a reload); `session_id` is owned and freed on teardown.
 const RelayWorker = struct {
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -973,5 +1021,6 @@ test {
     std.testing.refAllDecls(@This());
     // Not reachable via pub decls, so reference explicitly for test discovery.
     _ = @import("link_control.zig");
+    _ = @import("relay_creds.zig");
     _ = @import("single_instance.zig");
 }

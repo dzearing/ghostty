@@ -122,6 +122,16 @@ pub const LinkControl = struct {
         self.wake.set();
     }
 
+    /// Credentials changed (relay.env reload — see `relay_creds.zig`): close
+    /// the LIVE connection (if any) so the loop redials promptly with fresh
+    /// credentials. Unlike `disconnect` this leaves the desired state alone:
+    /// an online link drops and redials after one backoff, while a
+    /// user-chosen Disconnect stays parked (the next user Reconnect dials
+    /// with the new credentials anyway). Idempotent, any thread.
+    pub fn bounce(self: *LinkControl) void {
+        self.closeLive();
+    }
+
     /// Terminate the loop from either state (closes a live connection first).
     pub fn stopLoop(self: *LinkControl) void {
         self.desired.store(.stop, .release);
@@ -391,6 +401,40 @@ test "disconnect landing mid-dial closes the fresh connection immediately" {
     link.stopLoop();
     t.join();
     try testing.expectEqual(@as(u32, 1), fake.deinits.load(.monotonic));
+}
+
+test "bounce drops the live link but stays online (redials)" {
+    var fake = FakeTransport{};
+    var link = LinkControl{ .host = "test" };
+    const t = try std.Thread.spawn(.{}, runLoop, .{ &link, fake.transport(), 5 });
+
+    try poll(5_000, &link, isConnected);
+    link.bounce();
+    // The connection was closed and — unlike disconnect — the loop redials.
+    try poll(5_000, &fake, FakeTransport.dialed2);
+    try poll(5_000, &link, isConnected);
+    try testing.expectEqual(@as(u32, 1), fake.closes.load(.monotonic));
+
+    link.stopLoop();
+    t.join();
+}
+
+test "bounce while user-disconnected is a no-op (stays parked)" {
+    var fake = FakeTransport{};
+    var link = LinkControl{ .host = "test" };
+    const t = try std.Thread.spawn(.{}, runLoop, .{ &link, fake.transport(), 5 });
+
+    try poll(5_000, &link, isConnected);
+    link.disconnect();
+    try poll(5_000, &link, isOffline);
+
+    link.bounce(); // creds changed while parked: nothing to close, no redial
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 1), fake.dials.load(.monotonic));
+    try testing.expectEqual(Display.offline, link.display());
+
+    link.stopLoop();
+    t.join();
 }
 
 test "stopLoop exits cleanly while connected" {
