@@ -49,6 +49,26 @@ Invoke-WebRequest -Uri "$RelayBase/dl/ghoztty-agent.exe" -OutFile $tmp -UseBasic
 Move-Item -Force $tmp $ExePath
 Write-Host ("   agent : downloaded ({0:N1} MB)" -f ((Get-Item $ExePath).Length / 1MB))
 
+# --- report the installed version ----------------------------------------------
+# GUI-subsystem exe: capture stdout via redirection files. Older binaries don't
+# know --version (and might not exit), so bound the wait and kill on timeout.
+$agentVersion = $null
+try {
+  $verOut = Join-Path $RunDir 'version-check.out'
+  $verErr = Join-Path $RunDir 'version-check.err'
+  $vp = Start-Process -FilePath $ExePath -ArgumentList '--version' -PassThru `
+          -RedirectStandardOutput $verOut -RedirectStandardError $verErr
+  if (-not $vp.WaitForExit(5000)) { try { $vp.Kill() } catch {} }
+  $agentVersion = (Get-Content $verOut -ErrorAction SilentlyContinue |
+                     Where-Object { $_ -match '\S' } | Select-Object -First 1)
+  Remove-Item $verOut, $verErr -ErrorAction SilentlyContinue
+} catch {}
+if ($agentVersion) {
+  Write-Host "   ver   : $agentVersion"
+} else {
+  Write-Host "   ver   : unknown (binary predates --version)"
+}
+
 # --- credential config ---------------------------------------------------------
 if ($env:DEVICE_TOKEN) {
   # Pre-minted token provided: write relay.env directly (legacy/manual path).

@@ -1,0 +1,54 @@
+# Caddyfile for the ghoztty relay VM.
+#
+# The live copy lives ON THE VM at /etc/caddy/Caddyfile — it is NOT deployed
+# from this repo. This file is the in-repo reference: after editing the VM's
+# Caddyfile, mirror the change here (and vice versa).
+#
+# Routing layout (order matters conceptually, but Caddy `handle` blocks are
+# mutually exclusive and matched by path specificity):
+#
+#   /dl/*            -> file_server from /var/www/ghoztty-dl
+#                       (ghoztty-agent.exe, install.ps1, version.json)
+#   /   (exact)      -> file_server from /var/www/ghoztty-www (landing page)
+#   everything else  -> reverse_proxy to the Go relay on 127.0.0.1:8080
+#
+# Relay routes that MUST keep reaching the proxy (from relay/handlers.go):
+#   GET  /v1/agent/control        GET    /v1/agent/data
+#   GET  /v1/client/devices       POST   /v1/client/devices
+#   PATCH /v1/client/devices/{id} DELETE /v1/client/devices/{id}
+#   GET  /v1/client/connect
+#   POST /v1/enroll/start         POST   /v1/enroll/poll
+#   GET  /enroll/callback         GET    /enroll/{nonce}
+#   GET  /healthz
+#
+# `handle /` matches ONLY the exact path "/", so none of the above are
+# shadowed by the landing page.
+#
+# Apply on the VM:
+#   sudo nano /etc/caddy/Caddyfile        # make it match this file
+#   sudo caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+
+ghoztty-relay-dz17575.westus2.cloudapp.azure.com {
+	# Downloads. handle_path strips the /dl prefix before the filesystem
+	# lookup, so /dl/ghoztty-agent.exe -> /var/www/ghoztty-dl/ghoztty-agent.exe.
+	# CORS: the GitHub Pages site (https://dzearing.github.io) fetches
+	# /dl/version.json cross-origin to show the current agent version.
+	handle_path /dl/* {
+		root * /var/www/ghoztty-dl
+		header Access-Control-Allow-Origin "*"
+		file_server
+	}
+
+	# Landing page (self-contained single file: index.html).
+	handle / {
+		root * /var/www/ghoztty-www
+		file_server
+	}
+
+	# Everything else -> Go relay. Caddy proxies WebSocket upgrades
+	# (wss:// for /v1/agent/* and /v1/client/connect) automatically.
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
+}

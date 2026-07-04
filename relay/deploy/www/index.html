@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghoztty Remote Agent</title>
+<style>
+  :root {
+    --bg: #0c0e12;
+    --bg-panel: #14171d;
+    --bg-code: #0a0c10;
+    --border: #262b33;
+    --text: #e6e9ee;
+    --text-dim: #9aa3b0;
+    --accent: #7aa2f7;
+    --accent-soft: rgba(122, 162, 247, 0.12);
+    --green: #9ece6a;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  main {
+    width: 100%;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 72px 24px 48px;
+    flex: 1;
+  }
+  .mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .mark .glyph {
+    width: 44px; height: 44px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, #1c2230, #10131a);
+    border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+  }
+  h1 {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+  }
+  .version-badge {
+    display: none; /* shown by JS when /dl/version.json resolves */
+    font: 12px/1 var(--mono);
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid rgba(122, 162, 247, 0.25);
+    border-radius: 999px;
+    padding: 5px 10px;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  .pitch {
+    color: var(--text-dim);
+    font-size: 18px;
+    margin-bottom: 40px;
+    max-width: 56ch;
+  }
+  h2 {
+    font-size: 14px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 40px 0 14px;
+  }
+  .install-card {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .install-card .bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .install-card .bar .os { font-weight: 600; color: var(--text); }
+  .codewrap {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+  }
+  pre {
+    flex: 1;
+    overflow-x: auto;
+    padding: 18px 84px 18px 16px;
+    background: var(--bg-code);
+  }
+  code { font: 14px/1.5 var(--mono); color: var(--green); white-space: pre; }
+  code .p { color: var(--text-dim); user-select: none; }
+  .copy-btn {
+    position: absolute;
+    top: 12px; right: 12px;
+    font: 12px/1 var(--mono);
+    color: var(--text-dim);
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 12px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+  .copy-btn.ok { color: var(--green); border-color: var(--green); }
+  .alt {
+    margin-top: 12px;
+    font-size: 14px;
+    color: var(--text-dim);
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul.features {
+    list-style: none;
+    display: grid;
+    gap: 10px;
+  }
+  ul.features li {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 15px;
+  }
+  ul.features li::before {
+    content: "▸";
+    color: var(--accent);
+    flex: none;
+  }
+  ul.features li b { font-weight: 600; }
+  ul.features li span { color: var(--text-dim); }
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 20px 24px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="mark">
+    <div class="glyph" aria-hidden="true">&#128123;</div>
+    <h1>Ghoztty Remote Agent <span class="version-badge" id="version-badge"></span></h1>
+  </div>
+  <p class="pitch">Connect this machine to your Ghoztty terminal from anywhere.</p>
+
+  <h2>Install on Windows</h2>
+  <div class="install-card">
+    <div class="bar">
+      <span><span class="os">Windows</span> &middot; paste into PowerShell</span>
+    </div>
+    <div class="codewrap">
+      <pre><code id="install-cmd"><span class="p">PS&gt;</span> irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code></pre>
+      <button class="copy-btn" id="copy-btn" type="button" aria-label="Copy install command">Copy</button>
+    </div>
+  </div>
+  <p class="alt">
+    Prefer the binary? <a href="/dl/ghoztty-agent.exe">Download ghoztty-agent.exe</a> directly.
+    Signing in with your Google account during install links the machine to you.
+  </p>
+
+  <h2>What it does</h2>
+  <ul class="features">
+    <li><div><b>Outbound-only connection</b> &mdash; <span>the agent dials out over WSS (port 443); nothing listens on your machine and no inbound firewall rules are needed.</span></div></li>
+    <li><div><b>Google sign-in enrollment</b> &mdash; <span>a browser window opens once during install to approve this machine on your account.</span></div></li>
+    <li><div><b>Auto-updates</b> &mdash; <span>the agent keeps itself current with the latest published build.</span></div></li>
+    <li><div><b>Tray icon</b> &mdash; <span>a system-tray icon shows connection status, with a Disconnect option when you want it offline.</span></div></li>
+  </ul>
+</main>
+
+<footer>
+  Ghoztty &mdash; <a href="#">GitHub repository</a>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // Keep the one-liner correct for whatever host is serving this page.
+  var cmdEl = document.getElementById("install-cmd");
+  if (location.protocol === "https:" || location.protocol === "http:") {
+    var base = location.protocol + "//" + location.host;
+    cmdEl.innerHTML = '<span class="p">PS&gt;</span> ' +
+      "irm " + base + "/dl/install.ps1 | iex";
+  }
+
+  // Copy button — copies the command without the "PS>" prompt decoration.
+  var btn = document.getElementById("copy-btn");
+  btn.addEventListener("click", function () {
+    var text = cmdEl.textContent.replace(/^PS>\s*/, "");
+    function done() {
+      btn.textContent = "Copied!";
+      btn.classList.add("ok");
+      setTimeout(function () {
+        btn.textContent = "Copy";
+        btn.classList.remove("ok");
+      }, 1600);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallback(); });
+    } else {
+      fallback();
+    }
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) { /* ignore */ }
+      document.body.removeChild(ta);
+    }
+  });
+
+  // Current published version — graceful no-op if version.json is missing.
+  fetch("/dl/version.json", { cache: "no-store" })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (v) {
+      var win = v && v["windows-x86_64"];
+      if (win && win.version) {
+        var badge = document.getElementById("version-badge");
+        badge.textContent = "v" + win.version;
+        badge.style.display = "inline-block";
+      }
+    })
+    .catch(function () { /* no version info available */ });
+})();
+</script>
+</body>
+</html>
