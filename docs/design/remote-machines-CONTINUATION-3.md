@@ -80,9 +80,20 @@ cosmetics now. The watcher script still embeds a DEAD fallback DEVICE_TOKEN —
 delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
 
 **New gotchas (bit us today):**
-- The pill text is NOT in the AX window `title` and `AXGhosttyMachine` doesn't
-  carry link state — automation must screenshot to read pill state. (Follow-up
-  idea: expose link state as an AX attribute.)
+- ~~The pill text is NOT in the AX window `title` and `AXGhosttyMachine` doesn't
+  carry link state — automation must screenshot to read pill state.~~ FIXED
+  07-03 late (`97530c9ac`): every terminal window now exposes
+  **`AXGhosttyLinkState`** — `connected` | `reconnecting:<attempt>` (1-based) |
+  `disconnected` | `local`; updates live from the same didSet that recolors the
+  pill dot. VERIFIED via loopback freeze/thaw: `connected` → `reconnecting:1`
+  (~12s after SIGSTOP) → `connected` after SIGCONT (`disconnected` not
+  exercised live; mapping unit-tested). Read it with:
+  `osascript -e 'tell application "System Events" to tell (first application
+  process whose bundle identifier is "com.dzearing.ghoztty.debug") to get
+  {value of attribute "AXGhosttyMachine", value of attribute
+  "AXGhosttyLinkState"} of every window'`.
+  Bonus learned: `--name`-pinned windows report the pinned name in
+  `AXGhosttyMachine` (loopback window read `lb`, not `127.0.0.1`).
 - A `kill -STOP`'d process started by a Bash tool call gets pending teardown
   signals DELIVERED AT SIGCONT (nohup doesn't cover it) — run whole
   freeze/thaw cycles in ONE tool call, and verify the exact PID is alive
@@ -92,6 +103,19 @@ delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
   Cancel — click by name ("Close").
 - Loopback TCP windows report `AXGhosttyMachine="127.0.0.1"`, not "Local" —
   undecided whether that's right for ztabby.
+
+## 2026-07-03 LATE SESSION (tip `81792453a`) — automation follow-ups
+
+Two worktree-subagent commits cherry-picked, rebuilt, relaunched, live-verified:
+- `97530c9ac` `AXGhosttyLinkState` AX attribute (see gotchas — the screenshot
+  workaround is dead).
+- `81792453a` IPC registry names persist in the manifest across restore (see
+  item 5).
+Relay health checked: MaximusHome churn stopped EXACTLY at the evening exe
+rollout (~18 onlines/min → silence at 23:35Z); since then one reconnect at
+00:01Z + a 2-device blip 04:27–04:30Z, zero errors — the dup-agent fix holds.
+Keychain stable-signing carry-over held again this session (rebuild →
+relaunch → manifest restore dialed MaximusHome with NO prompt).
 
 ## Standing items (the queue)
 
@@ -123,9 +147,19 @@ delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
    did NOT clobber it, while an un-titled sibling window correctly FOLLOWED
    OSC titles; quit → relaunch → manifest replayed and the user title
    SURVIVED. Bonus verified: sign-in manifest replay (user's re-sign-in
-   auto-restored an old MaximusHome window). Follow-up noted: IPC registry
-   names (`--name=mx`) do NOT survive restore — `+read --name=mx` →
-   "not found" after relaunch; persist the name in the manifest someday.
+   auto-restored an old MaximusHome window). ~~Follow-up: IPC registry
+   names do NOT survive restore~~ FIXED + VERIFIED 07-03 late
+   (`81792453a`): manifest `Entry.ipcName` (optional — legacy entries
+   decode fine, confirmed against the live pre-fix manifest); restore
+   re-registers via `IPCServer.registerRestoredRemoteWindow` (name-taken
+   ⇒ existing live target wins, idempotent CLI semantics); both launch
+   and sign-in replay paths covered; 18/18 manifest tests. Live round
+   trip: `+new-remote-window --relay=… --device=<MaximusHome>
+   --name=mx` → `+send-keys`/`+read` OK → quit → relaunch → `+read
+   --name=mx` and `+send-keys --target=mx` still work (replayed
+   scrollback even kept the pre-quit output). NOTE: local-window
+   `+new-window --target=` names still don't survive relaunch (no
+   manifest for local windows — separate, probably fine).
 6. ~~Rename→open-window propagation~~ DONE (fix `37f81c4a7` cherry-picked,
    rebuilt, VERIFIED live): device rename via chooser ⋯ now flips a
    manifest-RESTORED window's pill/`AXGhosttyMachine` within ~1s (verified
@@ -179,7 +213,10 @@ delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
 8. Real sleep/wake keepalive confirmation (happens organically overnight —
    check the device stays/returns Online after the Mac sleeps). Partial
    organic evidence 07-03: this Mac's agent re-onlined cleanly 3× in an hour
-   and held a stable conn all day.
+   and held a stable conn all day; late-session relay check: agent process
+   up since 6:11AM local, both devices quiet on the relay for hours (one
+   clean 2-device re-online blip 04:27Z). Looking good — call it done after
+   one overnight pass.
 
 **Engineering follow-ups (small, noted by subagents):**
 9. ~~Agent daemon doesn't re-read `relay.env` after a re-enroll (needs restart);
