@@ -468,8 +468,9 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Update the size of our pty (local) or forward a RESIZE to the agent
+    // (remote). The remote backend needs `td` to address its pane.
+    try self.backend.resize(td, grid_size, size.terminal());
 
     // Enter the critical area that we want to keep small
     {

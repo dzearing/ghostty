@@ -6,6 +6,14 @@ const apprt = @import("../apprt.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// Wake up the app event loop. The `none` runtime has no event loop (it is
+    /// the CLI/headless artifact), so this is a no-op. It exists so code that is
+    /// generic over the runtime — e.g. `App.Mailbox.push`, exercised by headless
+    /// harnesses that drive a real `Termio` — can compile and link.
+    pub fn wakeup(self: *const App) void {
+        _ = self;
+    }
+
     pub fn performIpc(
         alloc: Allocator,
         _: apprt.ipc.Target,
@@ -31,7 +39,10 @@ pub const App = struct {
         arguments: ?[][:0]const u8,
     ) (Allocator.Error || std.posix.WriteError || apprt.ipc.Errors)!bool {
         var buf: [256]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&buf);
+        // Streaming (not positional) writer: the CLI command that called us
+        // has its own buffered stderr writer, and mixing a positional writer
+        // with it corrupts/reorders output when stderr is a file or pipe.
+        var stderr_writer = std.fs.File.stderr().writerStreaming(&buf);
         const stderr = &stderr_writer.interface;
 
         const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
@@ -145,19 +156,25 @@ pub const App = struct {
             return error.IPCFailed;
         };
 
-        const parsed = std.json.parseFromSlice(
-            struct { success: bool = false },
-            alloc,
-            resp_buf,
-            .{ .ignore_unknown_fields = true },
-        ) catch {
+        const parsed = apprt.ipc.parseResponse(alloc, resp_buf) catch {
             stderr.print("IPC response is not valid JSON\n", .{}) catch {};
             stderr.flush() catch {};
             return error.IPCFailed;
         };
         defer parsed.deinit();
 
-        return parsed.value.success;
+        // On failure the server includes a human-readable reason (e.g.
+        // "pane 'd1' not found in registry"). Print it here so EVERY CLI
+        // action surfaces the real cause instead of a generic fallback.
+        if (!parsed.value.success) {
+            if (parsed.value.@"error") |msg| {
+                stderr.print("{s}\n", .{msg}) catch {};
+                stderr.flush() catch {};
+            }
+            return false;
+        }
+
+        return true;
     }
 
     fn connectUnixSocket(path: [:0]const u8) !std.posix.fd_t {

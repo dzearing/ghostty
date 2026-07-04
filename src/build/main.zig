@@ -7,6 +7,8 @@ pub const Config = @import("Config.zig");
 pub const GitVersion = @import("GitVersion.zig");
 
 // Artifacts
+pub const GhosttyAgent = @import("GhosttyAgent.zig");
+pub const GhosttyConptySmoke = @import("GhosttyConptySmoke.zig");
 pub const GhosttyBench = @import("GhosttyBench.zig");
 pub const GhosttyDist = @import("GhosttyDist.zig");
 pub const GhosttyDocs = @import("GhosttyDocs.zig");
@@ -14,6 +16,9 @@ pub const GhosttyExe = @import("GhosttyExe.zig");
 pub const GhosttyFrameData = @import("GhosttyFrameData.zig");
 pub const GhosttyLib = @import("GhosttyLib.zig");
 pub const GhosttyLibVt = @import("GhosttyLibVt.zig");
+pub const GhosttyRemoteTestClient = @import("GhosttyRemoteTestClient.zig");
+pub const GhosttyWp4E2e = @import("GhosttyWp4E2e.zig");
+pub const GhosttyRemoteBackendE2e = @import("GhosttyRemoteBackendE2e.zig");
 pub const GhosttyResources = @import("GhosttyResources.zig");
 pub const GhosttyI18n = @import("GhosttyI18n.zig");
 pub const GhosttyXcodebuild = @import("GhosttyXcodebuild.zig");

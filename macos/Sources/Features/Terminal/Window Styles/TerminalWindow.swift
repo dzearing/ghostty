@@ -24,6 +24,20 @@ class TerminalWindow: NSWindow {
     /// Update notification UI in titlebar
     private let updateAccessory = NSTitlebarAccessoryViewController()
 
+    /// Hostname pill shown at the trailing edge of the titlebar for remote
+    /// windows. Absent (hidden) for local windows.
+    private let machinePillAccessory = NSTitlebarAccessoryViewController()
+
+    /// Observable backing for the machine pill. The pill's hosting view is bound to
+    /// this ONCE; updating `machineName` re-renders the SwiftUI body in place so the
+    /// titlebar accessory re-measures its width (the same mechanism the reset-zoom
+    /// accessory uses). Replacing the hosting view's rootView does NOT re-measure.
+    private let machinePillModel = MachinePillModel()
+
+    /// Tracks whether the inline leading title+pill accessory is currently installed
+    /// (and the system title hidden). Only true for remote windows.
+    private var inlineTitleEnabled = false
+
     /// Visual indicator that mirrors the selected tab color.
     private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
         let view = NSHostingView(rootView: TabColorIndicatorView(tabColor: tabColor))
@@ -57,6 +71,33 @@ class TerminalWindow: NSWindow {
     var activityState: Ghostty.ActivityState = .idle {
         didSet {
             guard activityState != oldValue else { return }
+            NSAccessibility.post(element: self, notification: .valueChanged)
+        }
+    }
+
+    /// The remote machine this window's terminals run on, set by the controller.
+    /// nil for local windows. Setting this updates the titlebar hostname pill and
+    /// the `AXGhosttyMachine` accessibility attribute.
+    var remoteMachine: Machine? {
+        didSet {
+            guard remoteMachine != oldValue else { return }
+            updateMachinePill()
+            // Notify assistive tech / external tools (e.g. ztabby) that the
+            // window's machine attribute changed.
+            NSAccessibility.post(element: self, notification: .valueChanged)
+        }
+    }
+
+    /// WP-D1: the window's remote-connection status, set by the controller's
+    /// reconnect state machine. Drives the pill dot color (green/yellow/red)
+    /// and its status text. Meaningless (and unused) for local windows.
+    var remoteConnectionState: RemoteWindowConnectionState = .connected {
+        didSet {
+            guard remoteConnectionState != oldValue else { return }
+            updateMachinePill()
+            // Notify assistive tech / external tools that the window's
+            // `AXGhosttyLinkState` attribute changed (same trigger that
+            // recolors the pill dot), so observers see updates live.
             NSAccessibility.post(element: self, notification: .valueChanged)
         }
     }
@@ -161,6 +202,22 @@ class TerminalWindow: NSWindow {
                 addTitlebarAccessoryViewController(updateAccessory)
                 updateAccessory.view.translatesAutoresizingMaskIntoConstraints = false
             }
+
+            // Create the remote-machine hostname pill accessory. Starts hidden;
+            // shown only when `remoteMachine` is set on a remote window.
+            //
+            // For a REMOTE window we hide the system title and render our own LEADING
+            // "title ● machine" view (so the pill sits inline right after the title).
+            // A leading accessory makes macOS center the *system* title, but we hide
+            // it, so there is nothing to center. The accessory is bound to a stable
+            // @ObservedObject model (in-place re-render) and is only ADDED for remote
+            // windows (see setInlineTitleEnabled) — adding it for a local window would
+            // center that window's title. translatesAutoresizingMaskIntoConstraints is
+            // disabled AFTER the add so the titlebar installs the sizing constraints.
+            machinePillAccessory.layoutAttribute = .left
+            machinePillAccessory.view = NonDraggableHostingView(
+                rootView: MachineTitlePillView(model: machinePillModel))
+            updateMachinePill()
         }
 
         // Setup the accessory view for tabs that shows our keyboard shortcuts,
@@ -401,6 +458,8 @@ class TerminalWindow: NSWindow {
 
     override var title: String {
         didSet {
+            // Keep the inline leading title (remote windows) in sync with the title.
+            machinePillModel.title = title
             // Whenever we change the window title we must also update our
             // tab title if we're using custom fonts.
             tab.attributedTitle = attributedTitle
@@ -853,20 +912,137 @@ extension TerminalWindow: TabTitleEditorDelegate {
     }
 }
 
+// MARK: Remote Machine Pill
+
+extension TerminalWindow {
+    /// Refresh the titlebar hostname pill to reflect the current `remoteMachine`.
+    /// Shows a "● name" capsule for remote windows; hides the accessory entirely
+    /// for local windows.
+    fileprivate func updateMachinePill() {
+        guard styleMask.contains(.titled) else { return }
+        // Drive the SwiftUI model; the model-bound hosting view re-renders in place
+        // and the titlebar re-measures the accessory width.
+        //
+        // The pill shows the machine's DISPLAY name (`Machine.name`: the
+        // account's friendly name, falling back to the agent-reported hostname,
+        // then the device id — resolved at window creation and kept fresh by
+        // the rename propagation in `BaseTerminalController`).
+        //
+        // The pill is for REMOTE hosts only: a "remote" window whose agent runs
+        // on this same Mac must look like a normal local window, so no pill is
+        // shown for it. `isLocalMachine` checks BOTH the display name and the
+        // agent-reported hostname (a device renamed to "My Mac" whose hostname
+        // is this Mac still counts as local) — EXCEPT while the connection is
+        // degraded (reconnecting/disconnected, WP-D1): a frozen window must
+        // always say why, even for a loopback agent.
+        let name: String? = {
+            guard let machine = remoteMachine else { return nil }
+            if machine.isLocalMachine && remoteConnectionState == .connected { return nil }
+            return machine.name
+        }()
+        machinePillModel.topPadding = viewModel.accessoryTopPadding
+        machinePillModel.title = title
+        machinePillModel.isKeyWindow = isKeyWindow
+        machinePillModel.machineName = name
+        machinePillModel.connectionState = remoteConnectionState
+        // Clicking the pill opens the Remote Activity Monitor on THIS window's
+        // existing connection (the window's `RemoteConnection` stays the sole
+        // owner — `presentReusing` does not free it).
+        machinePillModel.onTap = { [weak self] in
+            guard let self,
+                  let connection = self.terminalController?.remoteConnection else { return }
+            RemoteActivityMonitor.presentReusing(
+                connection: connection.handle,
+                machine: connection.machine
+            )
+        }
+        // Remote ⇒ inline leading title+pill (system title hidden). Local ⇒ system
+        // title, no accessory (a leading accessory would center the local title).
+        setInlineTitleEnabled(name != nil)
+    }
+
+    /// Install/remove the leading "title ● machine" accessory and hide/show the
+    /// system title accordingly. Only meaningful on `.titled` windows; the tabs
+    /// window styles force accessories to `.right`, so the inline title is a base /
+    /// transparent-style affordance.
+    private func setInlineTitleEnabled(_ enabled: Bool) {
+        guard styleMask.contains(.titled) else { return }
+        guard enabled != inlineTitleEnabled else { return }
+        inlineTitleEnabled = enabled
+        if enabled {
+            titleVisibility = .hidden
+            if !titlebarAccessoryViewControllers.contains(where: { $0 === machinePillAccessory }) {
+                addTitlebarAccessoryViewController(machinePillAccessory)
+                machinePillAccessory.view.translatesAutoresizingMaskIntoConstraints = false
+            }
+        } else {
+            titleVisibility = .visible
+            if let idx = titlebarAccessoryViewControllers.firstIndex(where: { $0 === machinePillAccessory }) {
+                removeTitlebarAccessoryViewController(at: idx)
+            }
+        }
+    }
+}
+
 // MARK: Accessibility
 
 extension TerminalWindow {
     static let axActivityState = NSAccessibility.Attribute(rawValue: "AXWindowActivityState")
 
+    /// Cross-tool accessibility contract (consumed by ztabby and other external
+    /// tools to group terminal windows by machine):
+    ///
+    ///   Attribute: `AXGhosttyMachine`
+    ///   Value:     the remote machine's display name for a remote window —
+    ///              the account's friendly name (e.g. "Home PC", following
+    ///              renames live), falling back to the agent-reported hostname,
+    ///              then the device id — or the literal string "Local" for a
+    ///              local window. Always a non-nil String. A rename posts an
+    ///              AX value-changed notification on the window (see
+    ///              `remoteMachine.didSet`), so observers see updates live.
+    static let axGhosttyMachine = NSAccessibility.Attribute(rawValue: "AXGhosttyMachine")
+
+    /// The value published for `AXGhosttyMachine`: the machine display name, or
+    /// "Local" when this is not a remote window.
+    static let axLocalMachineValue = "Local"
+
+    /// Cross-tool accessibility contract (consumed by GUI automation to read a
+    /// remote window's link health without screenshotting the pill dot):
+    ///
+    ///   Attribute: `AXGhosttyLinkState`
+    ///   Value:     "connected", "reconnecting:<attempt>" (attempt is the
+    ///              1-based retry counter shown in the pill), or
+    ///              "disconnected" for a remote window — see
+    ///              `RemoteWindowConnectionState.axValue` — or the literal
+    ///              string "local" for a local window. Always a non-nil
+    ///              String. A state change posts an AX value-changed
+    ///              notification on the window (see
+    ///              `remoteConnectionState.didSet`), so observers see updates
+    ///              live.
+    static let axGhosttyLinkState = NSAccessibility.Attribute(rawValue: "AXGhosttyLinkState")
+
+    /// The value published for `AXGhosttyLinkState` when this is not a remote
+    /// window.
+    static let axLocalLinkStateValue = "local"
+
     override func accessibilityAttributeNames() -> [NSAccessibility.Attribute] {
         var names = super.accessibilityAttributeNames()
         names.append(Self.axActivityState)
+        names.append(Self.axGhosttyMachine)
+        names.append(Self.axGhosttyLinkState)
         return names
     }
 
     override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
         if attribute == Self.axActivityState {
             return activityState.rawValue
+        }
+        if attribute == Self.axGhosttyMachine {
+            return remoteMachine?.name ?? Self.axLocalMachineValue
+        }
+        if attribute == Self.axGhosttyLinkState {
+            guard remoteMachine != nil else { return Self.axLocalLinkStateValue }
+            return remoteConnectionState.axValue
         }
         return super.accessibilityAttributeValue(attribute)
     }

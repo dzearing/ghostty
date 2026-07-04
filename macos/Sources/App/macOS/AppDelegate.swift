@@ -88,6 +88,18 @@ class AppDelegate: NSObject,
     /// This is only true before application has become active.
     private var applicationHasBecomeActive: Bool = false
 
+    /// WP-D2: true while the app is quitting. Window-close teardown checks
+    /// this so remote windows closed BY THE QUIT keep their entries in the
+    /// `RemoteSessionManifest` (they are restored, i.e. re-`ATTACH`ed, on the
+    /// next launch); only a user-initiated close removes an entry.
+    private(set) var isQuitting: Bool = false
+
+    /// WP-B2: true while sign-out is closing account-backed (relay) remote
+    /// windows. Same contract as `isQuitting`: `windowWillClose` preserves
+    /// those windows' `RemoteSessionManifest` entries so a later sign-in can
+    /// restore (re-`ATTACH`) them. See `relayAccountDidSignOut()`.
+    private(set) var isSigningOut: Bool = false
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -169,6 +181,18 @@ class AppDelegate: NSObject,
         ghostty.delegate = self
     }
 
+    /// True when this process is the HOST APP for a unit-test run
+    /// (`xcodebuild test` injects the XCTest bundle into a fresh app
+    /// instance). Used to skip launch side effects that fight the user's
+    /// real running app over shared machine state (IPC socket, remote
+    /// session manifest).
+    private static var isTestHost: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["XCTestConfigurationFilePath"] != nil
+            || env["XCTestBundlePath"] != nil
+            || env["XCTestSessionIdentifier"] != nil
+    }
+
     // MARK: - NSApplicationDelegate
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -224,13 +248,27 @@ class AppDelegate: NSObject,
         // This registers the Ghostty => Services menu to exist.
         NSApp.servicesMenu = menuServices
 
-        ipcServer.start()
+        // Unit tests use this app as their TEST HOST (xcodebuild test spawns a
+        // second app instance). That instance must not touch shared machine
+        // state the REAL running app owns: starting the IPC server would
+        // unlink+steal the live app's socket, and the remote-window restore
+        // would dial/ATTACH the live manifest's sessions (evicting the real
+        // windows) and can block on a Keychain prompt (RelayAccount token),
+        // hanging the test runner. Tests exercise these paths directly with
+        // injected state instead.
+        if !Self.isTestHost {
+            ipcServer.start()
 
-        if let jsonPtr = ghostty_pending_ipc_json() {
-            let json = String(cString: jsonPtr)
-            ghostty_consume_pending_ipc_json()
-            hasPendingIpc = true
-            ipcServer.dispatchPendingJson(json)
+            if let jsonPtr = ghostty_pending_ipc_json() {
+                let json = String(cString: jsonPtr)
+                ghostty_consume_pending_ipc_json()
+                hasPendingIpc = true
+                ipcServer.dispatchPendingJson(json)
+            }
+
+            // WP-D2: re-attach any relay remote windows that were open when
+            // the app last quit (background dials; failures never alert).
+            restoreRemoteWindows()
         }
 
         // Setup a local event monitor for app-level keyboard shortcuts. See
@@ -380,6 +418,11 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // WP-D2: assume the quit proceeds so remote windows torn down by it
+        // keep their restore-manifest entries. Reset on the (single) cancel
+        // path below.
+        isQuitting = true
+
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
 
@@ -433,6 +476,9 @@ class AppDelegate: NSObject,
             return .terminateNow
 
         default:
+            // Quit cancelled: subsequent window closes are user-initiated
+            // again and must remove their restore-manifest entries.
+            isQuitting = false
             return .terminateCancel
         }
     }
@@ -742,7 +788,15 @@ class AppDelegate: NSObject,
     @objc private func ghosttyNewWindow(_ notification: Notification) {
         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
         let config = configAny as? Ghostty.SurfaceConfiguration
-        _ = TerminalController.newWindow(ghostty, withBaseConfig: config)
+
+        // Resolve the parent window so a "new window" from a REMOTE frame inherits
+        // the same host + command + cwd (§WP4). The notification's object is the
+        // originating surface view (for a key-bound new-window); fall back to the
+        // preferred/key window otherwise.
+        let parent = (notification.object as? Ghostty.SurfaceView)?.window
+            ?? TerminalController.preferredParent?.window
+        TerminalController.newWindowInheritingRemote(
+            ghostty, withBaseConfig: config, from: parent)
     }
 
     @objc private func ghosttyNewTab(_ notification: Notification) {
@@ -972,6 +1026,522 @@ class AppDelegate: NSObject,
 
     @IBAction func newWindow(_ sender: Any?) {
         _ = TerminalController.newWindow(ghostty)
+    }
+
+    /// New Window with target picker (Cmd-Shift-N): always shows a chooser
+    /// listing "Local" plus every registered remote machine whenever at least
+    /// one machine is registered (even a single machine — no auto-skip).
+    /// Selecting "Local" opens a normal local window; selecting a machine dials
+    /// it over TCP and opens a window whose terminal runs on that machine
+    /// (splits/tabs inherit the same machine + connection). With zero machines
+    /// registered, this just opens a local window.
+    @IBAction func newRemoteWindow(_ sender: Any?) {
+        let registry = MachineRegistry.shared
+
+        // Nothing remote to choose — no registered machine, no relay account,
+        // AND no Google client to sign in with — so just open a normal local
+        // window. The Google-client check matters when SIGNED OUT at zero
+        // machines: the chooser is the only sign-in surface, so it must open
+        // (showing just "Local" + the sign-in footer) or sign-in is
+        // unreachable from the UI.
+        guard !registry.machines.isEmpty || registry.hasRelayAccount
+            || RelayAccount.isConfigured
+        else {
+            _ = TerminalController.newWindow(ghostty)
+            return
+        }
+
+        MachineChooser.present(registry: registry) { [weak self] selected in
+            guard let self, let target = selected else { return }
+            switch target {
+            case .local:
+                _ = TerminalController.newWindow(self.ghostty)
+            case .remote(let machine):
+                // Relay machines dial through the rendezvous relay; the bearer
+                // comes from the WP-B2 token-resolution seam (signed-in Google
+                // account first, dev env token fallback — never hardcoded).
+                // TCP machines use the direct host:port dial.
+                if let base = machine.relayBase, let device = machine.deviceID {
+                    Task { @MainActor in
+                        // Check the token seam BEFORE dialing: signed out with
+                        // no dev token ⇒ one clear refusal instead of a
+                        // tokenless dial into a guaranteed 401 that would
+                        // surface as the misleading "couldn't connect" modal.
+                        guard let token = await RelayAccount.resolveToken() else {
+                            Self.presentSignInRequiredAlert()
+                            return
+                        }
+                        self.openRemoteWindow(relay: base, device: device, token: token, name: machine.name)
+                    }
+                } else {
+                    self.openRemoteWindow(on: machine)
+                }
+            case .restoreRemote(let machine):
+                // Chooser's contextual "Restore": replay ONLY this machine's
+                // recoverable manifest entries through the same restore path
+                // as launch/sign-in. Same token pre-check as the dial path —
+                // signed out gets one clear refusal, not a silent no-op.
+                guard let base = machine.relayBase, let device = machine.deviceID else { return }
+                Task { @MainActor in
+                    guard await RelayAccount.resolveToken() != nil else {
+                        Self.presentSignInRequiredAlert()
+                        return
+                    }
+                    self.restoreRemoteWindows { entry in
+                        entry.relayBase == base && entry.deviceID == device
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a remote window for an ad-hoc `host:port` (used by the
+    /// `+new-remote-window` IPC trigger). Mirrors the menu flow exactly: it
+    /// builds a `Machine` and routes through `openRemoteWindow(on:)`, which
+    /// dials and opens the window on the main thread. Returns nil on success or
+    /// an error message on failure (e.g. the dial failed).
+    ///
+    /// `name` and `onOpen` mirror the relay overload: a caller-supplied
+    /// friendly name wins as the display name, and `onOpen` receives the
+    /// created controller so the IPC path can register it as a named target.
+    @MainActor
+    func openRemoteWindow(
+        host: String,
+        port: UInt16,
+        name: String? = nil,
+        onOpen: ((TerminalController) -> Void)? = nil
+    ) -> String? {
+        // Resolve a friendly NAME from the registry so an IPC-opened window's
+        // title matches the menu flow (e.g. `maximushome` instead of the raw
+        // IP). A caller-supplied --name wins; otherwise match the registry on
+        // host+port first, then host alone; fall back to the host string when
+        // the machine is unknown.
+        let registry = MachineRegistry.shared.machines
+        let known = registry.first { $0.host == host && $0.port == port }
+            ?? registry.first { $0.host == host }
+        let machine = Machine(
+            name: name ?? known?.name ?? host,
+            host: host,
+            port: port,
+            namePinned: name != nil)
+        return openRemoteWindow(on: machine, onOpen: onOpen)
+    }
+
+    /// Opens a remote window by dialing a remote agent THROUGH a rendezvous
+    /// relay (`--relay=<base> --device=<id> [--token=<tok>]`). Mirrors the
+    /// host/port flow exactly, but dials with `ghostty_remote_connection_new_relay`
+    /// instead of the direct TCP dial. The `relay` base URL is used as the
+    /// machine's display "host" and the port is 0 (no TCP port for the relay
+    /// path). Returns nil on success or an error message on failure.
+    @MainActor
+    @discardableResult
+    func openRemoteWindow(
+        relay: String,
+        device: String,
+        token: String,
+        name: String? = nil,
+        namePinned: Bool = false,
+        ipcName: String? = nil,
+        onOpen: ((TerminalController) -> Void)? = nil
+    ) -> String? {
+        // Defense in depth for the signed-out case: every caller resolves the
+        // WP-B2 token seam before calling, but an empty bearer must never
+        // reach the dial — it would 401 and surface as the misleading
+        // "couldn't connect" alert. Refuse with the sign-in message instead.
+        guard !token.isEmpty else {
+            Self.presentSignInRequiredAlert()
+            return "not signed in: sign in (or set GHOSTTY_RELAY_TOKEN) to open relay windows"
+        }
+
+        // Dial the agent through the relay. This blocks through the handshake and
+        // returns a connection handle, or NULL on failure.
+        guard let handle = Self.dialRelay(base: relay, device: device, token: token) else {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't connect to \(device)"
+            alert.informativeText = "Failed to reach \(device) via the relay. Make sure the Ghoztty agent is running and the relay is reachable."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return "failed to reach \(device) via relay \(relay): the agent is not running or not reachable"
+        }
+
+        let controller = presentRemoteWindow(
+            handle: handle,
+            relay: relay,
+            device: device,
+            fallbackName: name,
+            namePinned: namePinned,
+            sessionID: nil,
+            ipcName: ipcName)
+        onOpen?(controller)
+        return nil
+    }
+
+    /// Dial a `ghoztty-agent` through the relay: WebSocket + mux + HELLO
+    /// handshake, blocking until connected. Returns nil on any failure. Pure C
+    /// call with no app state — safe off the main thread (the restore path
+    /// dials on a background queue so a slow/unreachable relay can't beachball
+    /// launch). Internal (not private) so the WP-D1 reconnect path in
+    /// `BaseTerminalController` re-dials through the same seam.
+    static func dialRelay(
+        base: String,
+        device: String,
+        token: String
+    ) -> ghostty_remote_connection_t? {
+        base.withCString { basePtr in
+            device.withCString { devicePtr in
+                token.withCString { tokenPtr in
+                    ghostty_remote_connection_new_relay(basePtr, devicePtr, tokenPtr)
+                }
+            }
+        }
+    }
+
+    /// Build and show the terminal window for an already-dialed relay
+    /// connection. Shared by the interactive dial path (`sessionID` nil ⇒ OPEN
+    /// a fresh agent session) and the WP-D2 restore path (`sessionID` set ⇒
+    /// re-`ATTACH` to the persisted session). Registers the window in the
+    /// `RemoteSessionManifest` so it can be restored after a quit; on the
+    /// restore path `replacingManifestEntry` carries the OLD entry's id so
+    /// the registration atomically supersedes it (mark-don't-drain).
+    @MainActor
+    @discardableResult
+    private func presentRemoteWindow(
+        handle: ghostty_remote_connection_t,
+        relay: String,
+        device: String,
+        fallbackName: String?,
+        namePinned: Bool = false,
+        sessionID: String?,
+        windowTitle: String? = nil,
+        ipcName: String? = nil,
+        replacingManifestEntry: UUID? = nil
+    ) -> TerminalController {
+        // The relay path has no TCP port. The DISPLAY NAME wins: prefer the
+        // account's friendly name for the device (`fallbackName` — the chooser
+        // row / manifest entry name, which follows renames), then the machine's
+        // own hostname reported by the agent in its HELLO, then the device id
+        // (headless CLI/IPC path with no --name, old agent). The agent-reported
+        // hostname is carried separately in `hostname` so local-machine pill
+        // suppression still recognizes a renamed local device. Carry the relay
+        // base + device id so the Machine is a proper relay machine.
+        // `namePinned` marks an EXPLICIT caller-supplied name (IPC `--name=`):
+        // account renames must not overwrite it (see Machine.namePinned).
+        let reportedHostname: String? = ghostty_remote_connection_hostname(handle)
+            .flatMap { String(cString: $0) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let machine = Machine(
+            name: fallbackName ?? reportedHostname ?? device,
+            host: relay,
+            port: 0,
+            relayBase: relay,
+            deviceID: device,
+            hostname: reportedHostname,
+            namePinned: namePinned && fallbackName != nil)
+
+        // Wrap the handle in a strong owner; the controller below holds the only
+        // strong reference and frees it (once) when the window is deallocated.
+        let connection = RemoteConnection(handle: handle, machine: machine)
+
+        // Build the base surface config that puts the first surface on the
+        // remote machine (session_id nil ⇒ OPEN new; non-nil ⇒ ATTACH).
+        var cfg = Ghostty.SurfaceConfiguration()
+        cfg.remoteMachine = machine
+        cfg.remoteConnection = handle
+        // Retain the connection owner on the surface so it outlives the surface's
+        // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+        cfg.connectionKeepAlive = connection
+        cfg.remoteSessionId = sessionID
+
+        let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
+        controller.remoteMachine = machine
+        controller.remoteConnection = connection
+
+        // WP-D2: track this window for restore-on-relaunch and capture its
+        // agent session UUID once the termio thread has opened/attached the
+        // session (published async; for an ATTACH the id is already known but
+        // the capture confirms it against the live pane either way).
+        let entryID = RemoteSessionManifest.shared.register(
+            relayBase: relay,
+            deviceID: device,
+            name: machine.name,
+            sessionID: sessionID,
+            windowTitle: windowTitle,
+            namePinned: machine.namePinned,
+            ipcName: ipcName,
+            replacing: replacingManifestEntry)
+        controller.remoteManifestEntryID = entryID
+        RemoteSessionManifest.captureSessionID(of: controller, entryID: entryID)
+
+        // Restore path: put the window back in the IPC target registry under
+        // its persisted name so `+read`/`+send-keys`/`+close --target=` keep
+        // working across a quit/relaunch. (The fresh IPC dial path registers
+        // via its onOpen callback instead; if the name was re-taken meanwhile
+        // the existing registration wins — see registerRestoredRemoteWindow.)
+        if replacingManifestEntry != nil, let ipcName, !ipcName.isEmpty {
+            ipcServer.registerRestoredRemoteWindow(name: ipcName, controller: controller)
+        }
+
+        // Re-apply the user-set window title preserved in the manifest entry
+        // (restore path). Applied through `titleOverride` — the same property
+        // a manual rename sets — AFTER the window/surface is built, so it
+        // takes precedence over later shell OSC title updates exactly like
+        // the original rename did.
+        if let windowTitle, !windowTitle.isEmpty {
+            controller.titleOverride = windowTitle
+        }
+
+        return controller
+    }
+
+    /// WP-D2: restore relay remote windows recorded in the manifest by a
+    /// previous run (quit with remote windows open). Runs at launch: each
+    /// entry is re-dialed through the relay on a BACKGROUND queue (no
+    /// beachball, no modal alerts — this is the restore path, not the
+    /// interactive dial) and, if its agent session is still alive, the window
+    /// is reopened re-`ATTACH`ed to that session.
+    ///
+    /// Failure handling, per entry:
+    /// - no session UUID was ever captured → dropped (nothing to attach to)
+    /// - relay/agent unreachable (dial fails) → entry is KEPT for the next
+    ///   launch (the machine may simply be offline right now)
+    /// - session gone on the agent (probe fails; expired TTL, agent restart)
+    ///   → dropped silently
+    ///
+    /// `matching` scopes WHICH entries are replayed: the default (all) is the
+    /// launch/sign-in behavior; the machine chooser's contextual "Restore"
+    /// passes a per-machine filter. Entries outside the filter are released
+    /// untouched (they never left the manifest), exactly like entries bound
+    /// to open windows.
+    ///
+    /// Crash safety (mark-don't-drain): the snapshot below only MARKS entries
+    /// restore-in-flight — nothing is removed from the persisted manifest
+    /// until each entry's fate is decided (success ⇒ superseded by the fresh
+    /// window's entry; session gone ⇒ removed; anything else ⇒ released for a
+    /// later retry). `RelayAccount.resolveToken()` can block indefinitely on
+    /// a Keychain prompt; a kill/crash anywhere in this flow must not lose
+    /// restorable windows.
+    private func restoreRemoteWindows(
+        matching filter: @escaping (RemoteSessionManifest.Entry) -> Bool = { _ in true }
+    ) {
+        let entries = RemoteSessionManifest.shared.snapshotForRestore()
+        guard !entries.isEmpty else { return }
+
+        Task { @MainActor [weak self] in
+            // Same token-resolution seam as the interactive dial path (WP-B2):
+            // signed-in account's ID token, dev env token fallback. Resolved
+            // ONCE up front (may await a token refresh), then the blocking
+            // dials run on a background queue as before.
+            //
+            // Signed out with no dev token ⇒ NO dial at all: release every
+            // entry untouched and skip silently (the restore path never
+            // alerts). A later sign-in replays them via
+            // `relayAccountDidSignIn()`; a later launch retries the same way.
+            guard let self, let token = await RelayAccount.resolveToken() else {
+                RemoteSessionManifest.shared.releaseRestore(entries.map(\.id))
+                return
+            }
+
+            // Double-restore guard: an entry still bound to an OPEN window
+            // (its controller carries the entry id) must not be re-attached —
+            // a second ATTACH to the same session would evict the live window
+            // (spec §5.3). Release those untouched; restore only the rest.
+            let openEntryIDs = Set(TerminalController.all.compactMap(\.remoteManifestEntryID))
+            let (candidates, skipOpen) = RemoteSessionManifest.partitionForRestore(
+                entries, openEntryIDs: openEntryIDs)
+            // Entries outside the requested scope (per-machine Restore from
+            // the chooser) are also released, untouched.
+            let restore = candidates.filter(filter)
+            let skipped = candidates.filter { !filter($0) }
+            RemoteSessionManifest.shared.releaseRestore((skipOpen + skipped).map(\.id))
+            guard !restore.isEmpty else { return }
+            self.restoreRemoteWindows(entries: restore, token: token)
+        }
+    }
+
+    // MARK: Relay account lifecycle (WP-B2 sign-out/sign-in window handling)
+
+    /// Sign-out hook, called by `RelayAccount.signOut()` AFTER the credentials
+    /// are cleared: close every account-backed remote window. "Account-backed"
+    /// means the window's machine is a RELAY machine (`remoteMachine.isRelay`)
+    /// — direct-TCP remote windows are not account resources and stay open.
+    ///
+    /// Closing runs with `isSigningOut` set, which — exactly like the
+    /// `isQuitting` quit path — preserves each window's
+    /// `RemoteSessionManifest` entry through `windowWillClose`, so a later
+    /// sign-in can restore (re-`ATTACH`) the windows. The agent keeps the
+    /// detached sessions alive (detach ≠ terminate — nothing is terminated
+    /// here). `windowWillClose` also cancels the window's WP-D1 reconnect
+    /// loop (generation bump + observer removal) before anything can re-dial.
+    func relayAccountDidSignOut() {
+        isSigningOut = true
+        defer { isSigningOut = false }
+        for controller in TerminalController.all {
+            guard controller.remoteMachine?.isRelay == true else { continue }
+            // close() (not performClose): no close-confirmation prompt — the
+            // remote session persists on the agent, nothing is being killed.
+            controller.window?.close()
+        }
+    }
+
+    /// Sign-in hook, called by `RelayAccount.signIn()` on success: replay the
+    /// manifest entries preserved at sign-out through the SAME restore path
+    /// as launch (`restoreRemoteWindows()` — dial + liveness-probe +
+    /// re-`ATTACH` on a background queue; sessions that died meanwhile drop
+    /// their entries silently).
+    ///
+    /// Deferred until no modal session is running: sign-in happens from the
+    /// app-modal machine chooser, and restored windows shouldn't fight the
+    /// modal panel for key status while it's still up.
+    func relayAccountDidSignIn() {
+        restoreRemoteWindowsAfterModal()
+    }
+
+    /// Run `restoreRemoteWindows()` once `NSApp` has no modal session (polls
+    /// on the main queue; delivered during the modal session because the
+    /// modal panel run-loop mode is a common mode). The chooser typically
+    /// closes within seconds of a sign-in; if some modal session is still
+    /// running after ~60s, restore anyway (windows just open behind it).
+    private func restoreRemoteWindowsAfterModal(attempt: Int = 0) {
+        if NSApp.modalWindow == nil || attempt >= 120 {
+            restoreRemoteWindows()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.restoreRemoteWindowsAfterModal(attempt: attempt + 1)
+        }
+    }
+
+    /// The single "you're signed out" refusal for account-backed dial paths
+    /// (chooser dial, remote-window/tab inheritance, defensive dial guard).
+    /// One small informational alert; the visibility guard keeps concurrent
+    /// refusals from stacking into a modal storm (extra requests are simply
+    /// dropped while it's up).
+    private static var signInRequiredAlertVisible = false
+    @MainActor
+    static func presentSignInRequiredAlert() {
+        guard !signInRequiredAlertVisible else { return }
+        signInRequiredAlertVisible = true
+        defer { signInRequiredAlertVisible = false }
+        let alert = NSAlert()
+        alert.messageText = "Sign in to open remote windows"
+        alert.informativeText = "Remote machines belong to your account. Use New Remote Window (⇧⌘N) → Sign In with Google, then try again."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    /// Second half of `restoreRemoteWindows()`: dial + probe + reopen each
+    /// manifest entry on a background queue using the already-resolved token.
+    private func restoreRemoteWindows(
+        entries: [RemoteSessionManifest.Entry],
+        token: String
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            for entry in entries {
+                guard let sessionID = entry.sessionID, !sessionID.isEmpty else {
+                    // Nothing to attach to — this entry can never restore.
+                    Self.logger.info("remote restore: dropping \(entry.deviceID, privacy: .public) — no session id was captured")
+                    RemoteSessionManifest.shared.remove(entry.id)
+                    continue
+                }
+
+                guard let handle = Self.dialRelay(
+                    base: entry.relayBase,
+                    device: entry.deviceID,
+                    token: token
+                ) else {
+                    // Relay or agent unreachable: release the entry untouched
+                    // (it never left the manifest) so the next launch retries;
+                    // never alert from the restore path.
+                    Self.logger.warning("remote restore: relay dial failed for \(entry.deviceID, privacy: .public); keeping entry for next launch")
+                    RemoteSessionManifest.shared.releaseRestore([entry.id])
+                    continue
+                }
+
+                // Liveness probe before opening any window: GET_CWD by session
+                // id answers ok=false for a dead/unknown session (bounded
+                // timeout). A gone session is dropped silently — no window,
+                // no alert.
+                let cwd = sessionID.withCString { cSid in
+                    Ghostty.AllocatedString(
+                        ghostty_remote_connection_query_cwd_timeout(handle, cSid, 5000)).string
+                }
+                guard !cwd.isEmpty else {
+                    Self.logger.info("remote restore: session \(sessionID, privacy: .public) on \(entry.deviceID, privacy: .public) is gone; dropping entry")
+                    ghostty_remote_connection_free(handle)
+                    RemoteSessionManifest.shared.remove(entry.id)
+                    continue
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else {
+                        ghostty_remote_connection_free(handle)
+                        RemoteSessionManifest.shared.releaseRestore([entry.id])
+                        return
+                    }
+                    // Success: the fresh window's registration atomically
+                    // supersedes the old entry (register(..., replacing:)).
+                    self.presentRemoteWindow(
+                        handle: handle,
+                        relay: entry.relayBase,
+                        device: entry.deviceID,
+                        fallbackName: entry.name,
+                        namePinned: entry.namePinned == true,
+                        sessionID: sessionID,
+                        windowTitle: entry.windowTitle,
+                        ipcName: entry.ipcName,
+                        replacingManifestEntry: entry.id)
+                }
+            }
+        }
+    }
+
+    /// Dials `machine` and opens a remote window on success. Shows an alert on
+    /// connection failure. Returns nil on success, or an error message string
+    /// on failure (callers that drive this headlessly use the return value;
+    /// the interactive menu path also surfaces an alert).
+    @MainActor
+    @discardableResult
+    private func openRemoteWindow(
+        on machine: Machine,
+        onOpen: ((TerminalController) -> Void)? = nil
+    ) -> String? {
+        // Dial the agent over TCP. This blocks through the handshake and returns
+        // a connection handle, or NULL on failure.
+        let handle: ghostty_remote_connection_t? = machine.host.withCString { hostPtr in
+            ghostty_remote_connection_new_tcp(hostPtr, machine.port)
+        }
+
+        guard let handle else {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't connect to \(machine.name)"
+            alert.informativeText = "Failed to reach \(machine.endpoint). Make sure the Ghoztty agent is running and reachable."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return "failed to reach \(machine.endpoint): the agent is not running or not reachable"
+        }
+
+        // Wrap the handle in a strong owner; the controller below holds the only
+        // strong reference and frees it (once) when the window is deallocated.
+        let connection = RemoteConnection(handle: handle, machine: machine)
+
+        // Build the base surface config that puts the first surface on the
+        // remote machine (new session: session_id stays nil).
+        var cfg = Ghostty.SurfaceConfiguration()
+        cfg.remoteMachine = machine
+        cfg.remoteConnection = handle
+        // Retain the connection owner on the surface so it outlives the surface's
+        // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+        cfg.connectionKeepAlive = connection
+        cfg.remoteSessionId = nil
+
+        let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
+        controller.remoteMachine = machine
+        controller.remoteConnection = connection
+        onOpen?(controller)
+        return nil
     }
 
     @IBAction func newTab(_ sender: Any?) {

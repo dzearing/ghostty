@@ -111,6 +111,11 @@ pub const Options = struct {
 ///     found). Can be used without `--target` to search across all
 ///     registered targets.
 ///
+///   * `--from-focused`: Split the app's currently focused window/surface,
+///     mirroring a keyboard split exactly. On a remote window the new pane
+///     inherits the SAME machine/connection plus the parent's command and
+///     cwd (full remote inheritance). Ignores `--command`/`--name`/`--target`.
+///
 ///   * `--command=<command>`: The command to run in the split pane.
 ///
 ///   * `--shell=<path>`: The shell to use when running `--command`.
@@ -134,7 +139,7 @@ pub fn run(alloc: Allocator) !u8 {
     defer iter.deinit();
 
     var buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buffer);
+    var stderr_writer = std.fs.File.stderr().writerStreaming(&buffer);
     const stderr = &stderr_writer.interface;
 
     const result = runArgs(alloc, &iter, stderr);
@@ -181,6 +186,7 @@ fn runArgs(
         },
     }) return 0;
 
-    try stderr.print("+split is not supported on this platform.\n", .{});
+    // sendIpc already printed the server's error text (if any) to stderr.
+    try stderr.print("+split failed.\n", .{});
     return 1;
 }

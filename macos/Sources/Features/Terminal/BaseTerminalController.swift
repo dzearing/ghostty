@@ -98,10 +98,87 @@ class BaseTerminalController: NSWindowController,
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
     var titleOverride: String? {
-        didSet { applyTitleToWindow() }
+        didSet {
+            applyTitleToWindow()
+
+            // Relay remote windows persist the user-set title in the restore
+            // manifest so a restored window (relaunch, or sign-out → sign-in)
+            // comes back under the same rename. Synced here — at the single
+            // choke point every user rename path funnels through (Change
+            // Title prompt, inline tab-title editor, IPC set-title, keybind
+            // action) — so the persisted title stays correct even if the app
+            // crashes before a clean quit. Shell OSC titles never touch this
+            // property, so transient titles are never persisted.
+            if let remoteManifestEntryID {
+                RemoteSessionManifest.shared.updateWindowTitle(
+                    remoteManifestEntryID, windowTitle: titleOverride)
+            }
+        }
     }
 
     var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
+
+    /// The remote machine this window's terminals run on, if any. When set, the
+    /// window title is suffixed with the machine name and new splits/tabs inherit
+    /// the same machine + connection.
+    var remoteMachine: Machine? {
+        didSet {
+            // Publish the machine to the window so it can render the titlebar
+            // hostname pill and expose the `AXGhosttyMachine` accessibility
+            // attribute. Local windows leave this nil.
+            (window as? TerminalWindow)?.remoteMachine = remoteMachine
+            applyTitleToWindow()
+        }
+    }
+
+    /// Strong owner of the shared remote connection handle for this window. Held
+    /// here so the handle outlives every surface/split in the window; freed
+    /// (exactly once) when this controller is deallocated. See `RemoteConnection`.
+    /// A successful WP-D1 reconnect REPLACES this with a freshly-dialed
+    /// connection (the old one is released once its last surface deallocates).
+    var remoteConnection: RemoteConnection? {
+        didSet { bindRemoteConnectionStateObserver() }
+    }
+
+    /// WP-D1: this window's connection status (reconnect state machine output).
+    /// Drives the titlebar pill dot (green/yellow/red). Main-thread only.
+    var remoteConnectionState: RemoteWindowConnectionState = .connected {
+        didSet {
+            guard remoteConnectionState != oldValue else { return }
+            (window as? TerminalWindow)?.remoteConnectionState = remoteConnectionState
+        }
+    }
+
+    /// Observer token for the current `remoteConnection`'s link-state
+    /// notifications (rebound whenever `remoteConnection` changes).
+    private var remoteLinkObserver: NSObjectProtocol?
+
+    /// Monotonic generation for the reconnect retry loop. Bumped to cancel:
+    /// any queued attempt/completion that observes a stale generation no-ops
+    /// (and frees any connection it dialed).
+    private var remoteReconnectGeneration: Int = 0
+
+    /// WP-D1: whether the current `.disconnected` state may self-heal. True
+    /// when we gave up because the AGENT was unreachable (retries exhausted /
+    /// every dial failed) but the window's own connection object is still
+    /// alive-and-retrying underneath — if its transport later recovers (e.g. a
+    /// long-frozen agent thaws), the link transition back to `.connected` is
+    /// authoritative and the window resumes. False for the terminal tiers
+    /// (session gone, evicted, signed out): those never self-heal.
+    private var remoteDisconnectMaySelfHeal: Bool = false
+
+    /// Debug-only: true while a forced reconnect swap (the
+    /// `/tmp/ghoztty-debug-force-reconnect-swap` hook) is in flight, so the
+    /// abandoned original connection's self-recovery is ignored until the
+    /// replacement dial resolves. Never set in release builds. See
+    /// `debugShouldForceReconnectSwap`.
+    private var debugForcingReconnectSwap: Bool = false
+
+    /// WP-D2: this window's entry in the `RemoteSessionManifest`, when it is a
+    /// relay-backed remote window tracked for restore-on-relaunch. A clean
+    /// close removes the entry (see `windowWillClose`); app quit leaves it so
+    /// the window is restored (re-`ATTACH`ed) on the next launch.
+    var remoteManifestEntryID: UUID?
 
     private static var _nextWindowId: Int = 0
     private static func nextWindowId() -> Int {
@@ -194,6 +271,19 @@ class BaseTerminalController: NSWindowController,
             selector: #selector(ghosttyMaximizeDidToggle(_:)),
             name: .ghosttyMaximizeDidToggle,
             object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyMachineDidRename(_:)),
+            name: .ghosttyMachineDidRename,
+            object: nil)
+        // WP-D1: a reconnect that ran (and failed) during a DARK wake —
+        // display off, surface allocation can fail — must self-heal promptly
+        // at REAL wake: reset the backoff and kick a fresh attempt.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil)
 
         // Splits
         center.addObserver(
@@ -263,6 +353,7 @@ class BaseTerminalController: NSWindowController,
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
@@ -300,6 +391,79 @@ class BaseTerminalController: NSWindowController,
             effectiveConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
         }
 
+        // Remote inheritance: if this window is bound to a remote machine, new
+        // splits open on the SAME machine over the SAME shared connection. The
+        // incoming config (e.g. from a keybind notification) won't carry these,
+        // so we inject them here. The handle is owned by `remoteConnection`
+        // (this controller) and shared, never freed per-surface.
+        //
+        // The new split also inherits the parent pane's COMMAND (re-run it; nil ⇒
+        // agent default shell) and its CWD. The cwd is a blocking agent RPC, so we
+        // must NOT resolve it on the main thread (it would beachball on a slow or
+        // wedged agent). We snapshot the command + session id cheaply, then resolve
+        // the cwd OFF the main thread and finish the split in the completion. This
+        // means the remote split is created asynchronously (a few ms on a healthy
+        // agent); callers that need the new view should use the keybind/notification
+        // path (which ignores the return) — the synchronous return is preserved for
+        // LOCAL splits only.
+        if let remoteConnection, effectiveConfig.remoteConnection == nil {
+            effectiveConfig.remoteMachine = remoteConnection.machine
+            effectiveConfig.remoteConnection = remoteConnection.handle
+            // Keep the connection owner alive across the new surface's deferred free
+            // (channel detach). See SurfaceConfiguration.connectionKeepAlive.
+            effectiveConfig.connectionKeepAlive = remoteConnection
+            // session_id stays nil: each split opens a fresh remote session on
+            // the same machine/connection.
+            if effectiveConfig.command == nil,
+               let parentCommand = Self.remoteInheritance(of: oldView).command {
+                effectiveConfig.command = parentCommand
+                // `wait-after-command` makes libghostty forward this as an EXPLICIT
+                // remote command in the OPEN (otherwise it's treated as a default
+                // shell and dropped). Matches the explicit `-e`/`--command` path.
+                effectiveConfig.waitAfterCommand = true
+            }
+
+            let alreadyHasCwd = effectiveConfig.remoteWorkingDirectory != nil
+            Self.resolveRemoteInheritance(
+                from: oldView,
+                on: remoteConnection.handle
+            ) { [weak self] _, cwd in
+                guard let self else { return }
+                var cfg = effectiveConfig
+                if !alreadyHasCwd, let cwd { cfg.remoteWorkingDirectory = cwd }
+                _ = self.finishSplit(
+                    config: cfg,
+                    at: oldView,
+                    direction: direction,
+                    ratio: ratio,
+                    hasExplicitTint: hasExplicitTint)
+            }
+            return nil
+        }
+
+        return finishSplit(
+            config: effectiveConfig,
+            at: oldView,
+            direction: direction,
+            ratio: ratio,
+            hasExplicitTint: hasExplicitTint)
+    }
+
+    /// Build the new surface, insert it into the tree, and finalize focus/undo.
+    /// Split out of `newSplit` so the remote path can call it AFTER an off-main
+    /// cwd query, while the local path calls it synchronously.
+    @discardableResult
+    private func finishSplit(
+        config effectiveConfig: Ghostty.SurfaceConfiguration,
+        at oldView: Ghostty.SurfaceView,
+        direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
+        ratio: Double,
+        hasExplicitTint: Bool
+    ) -> Ghostty.SurfaceView? {
+        // The parent may have been removed from the tree while we were resolving
+        // the remote cwd off the main thread.
+        guard surfaceTree.root?.node(view: oldView) != nil else { return nil }
+
         // Create a new surface view
         guard let ghostty_app = ghostty.app else { return nil }
         let newView = Ghostty.SurfaceView(ghostty_app, baseConfig: effectiveConfig)
@@ -336,6 +500,112 @@ class BaseTerminalController: NSWindowController,
         }
 
         return newView
+    }
+
+    /// Resolve the REMOTE working directory to seed a new split/tab with, by
+    /// asking the agent for the parent remote pane's current child cwd (§WP4).
+    /// Returns nil if `parent` is not a (resolved) remote surface or the query
+    /// fails — the caller then opens the new pane in the agent's default cwd.
+    ///
+    /// This is an on-demand RPC: get the parent surface's live remote session id,
+    /// then `GET_CWD` it over the shared connection. The agent reads the child
+    /// process's actual cwd from the OS, so it works even for shells that emit no
+    /// OSC 7 (e.g. cmd.exe).
+    static func queryRemoteCwd(
+        of parent: Ghostty.SurfaceView,
+        on connection: ghostty_remote_connection_t
+    ) -> String? {
+        guard let surface = parent.surface else { return nil }
+
+        let sid = Ghostty.AllocatedString(
+            ghostty_surface_remote_session_id(surface)).string
+        guard !sid.isEmpty else { return nil }
+
+        let cwd = sid.withCString { cSid in
+            Ghostty.AllocatedString(
+                ghostty_remote_connection_query_cwd(connection, cSid)).string
+        }
+        return cwd.isEmpty ? nil : cwd
+    }
+
+    /// The remote inheritance to seed a new window/tab/split from a parent remote
+    /// frame (§WP4): the parent pane's COMMAND (so the new frame re-runs it; nil
+    /// ⇒ the agent default shell) and its live SESSION ID (so we can query its
+    /// cwd off the main thread). These are cheap, non-blocking snapshots read
+    /// directly from the surface — no network. The cwd itself is resolved
+    /// separately/asynchronously by `queryRemoteCwd(sessionId:on:)` because it is
+    /// a blocking agent RPC that must NEVER run on the main thread.
+    struct RemoteInheritance {
+        let command: String?
+        let sessionId: String?
+    }
+
+    /// Snapshot the parent remote frame's command + session id without blocking.
+    static func remoteInheritance(of parent: Ghostty.SurfaceView) -> RemoteInheritance {
+        guard let surface = parent.surface else {
+            return RemoteInheritance(command: nil, sessionId: nil)
+        }
+        let command = Ghostty.AllocatedString(
+            ghostty_surface_remote_command(surface)).string
+        let sid = Ghostty.AllocatedString(
+            ghostty_surface_remote_session_id(surface)).string
+        return RemoteInheritance(
+            command: command.isEmpty ? nil : command,
+            sessionId: sid.isEmpty ? nil : sid)
+    }
+
+    /// Resolve a remote pane's child cwd from an already-snapshotted `sessionId`.
+    /// This is a bounded agent RPC (default `timeoutMs`) that takes a plain
+    /// session id so it can be called from a BACKGROUND queue (the surface pointer
+    /// is not touched here). Returns nil on any failure (the new frame then opens
+    /// in the agent's default cwd). MUST be called off the main thread.
+    static func queryRemoteCwd(
+        sessionId: String,
+        on connection: ghostty_remote_connection_t,
+        timeoutMs: UInt32 = remoteCwdQueryTimeoutMs
+    ) -> String? {
+        guard !sessionId.isEmpty else { return nil }
+        let cwd = sessionId.withCString { cSid in
+            Ghostty.AllocatedString(
+                ghostty_remote_connection_query_cwd_timeout(
+                    connection, cSid, timeoutMs)).string
+        }
+        return cwd.isEmpty ? nil : cwd
+    }
+
+    /// Tight bound (ms) for an on-demand cwd query that seeds a new remote frame.
+    /// A healthy agent replies in single-digit ms; this caps the wait on the
+    /// BACKGROUND queue so a slow/wedged agent only delays the new frame briefly
+    /// (it then opens in the agent's default cwd) instead of stalling for 10s.
+    static let remoteCwdQueryTimeoutMs: UInt32 = 1500
+
+    /// Resolve the remote inheritance for a new frame OFF the main thread, then
+    /// invoke `build` on the main thread with the resolved `command` + `cwd`.
+    ///
+    /// This is the single non-blocking entry point used by the new
+    /// window/tab/split paths (§WP4). The COMMAND is a cheap synchronous snapshot;
+    /// the CWD is a blocking agent RPC, so we hop to a background queue for it and
+    /// only return to the main thread to build the frame. The UI never blocks. If
+    /// the parent surface has no live remote session, `build` runs immediately on
+    /// the main thread with a nil cwd (the agent's default).
+    @MainActor
+    static func resolveRemoteInheritance(
+        from parent: Ghostty.SurfaceView,
+        on connection: ghostty_remote_connection_t,
+        build: @escaping @MainActor (_ command: String?, _ cwd: String?) -> Void
+    ) {
+        let inherit = remoteInheritance(of: parent)
+        guard let sessionId = inherit.sessionId else {
+            // No resolved remote session: nothing to query, build immediately.
+            build(inherit.command, nil)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cwd = queryRemoteCwd(sessionId: sessionId, on: connection)
+            DispatchQueue.main.async {
+                build(inherit.command, cwd)
+            }
+        }
     }
 
     /// Move focus to a surface view.
@@ -1028,6 +1298,10 @@ class BaseTerminalController: NSWindowController,
             title += " (\(termWindow.activityState.rawValue))"
         }
 
+        // The remote machine name is shown as a titlebar pill (see
+        // TerminalWindow.machinePillAccessory / MachinePillView) rather than a
+        // plain title suffix, so it is intentionally not appended here.
+
         window.title = title
     }
 
@@ -1334,6 +1608,12 @@ class BaseTerminalController: NSWindowController,
 
         // Set our update overlay state
         updateOverlayIsVisible = defaultUpdateOverlayVisibility()
+
+        // Sync the remote machine to the window (pill + AXGhosttyMachine attr) in
+        // case it was set on the controller before the window finished loading.
+        if let remoteMachine, let termWindow = window as? TerminalWindow {
+            termWindow.remoteMachine = remoteMachine
+        }
     }
 
     func defaultUpdateOverlayVisibility() -> Bool {
@@ -1386,6 +1666,36 @@ class BaseTerminalController: NSWindowController,
 
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
+
+        // WP-D1: cancel any in-flight reconnect retry loop and stop observing
+        // link-state changes — the window is going away.
+        remoteReconnectGeneration += 1
+        if let remoteLinkObserver {
+            NotificationCenter.default.removeObserver(remoteLinkObserver)
+            self.remoteLinkObserver = nil
+        }
+
+        // WP-D2: a clean close (user closed the window, or the remote child
+        // exited) removes this window from the remote-session restore
+        // manifest. App QUIT must NOT — the agent keeps detached sessions
+        // alive (detach ≠ terminate), so entries left behind at quit are
+        // re-attached on the next launch. Sign-OUT likewise must not: it
+        // closes account-backed windows with `isSigningOut` set
+        // (`AppDelegate.relayAccountDidSignOut()`) so a later sign-in can
+        // restore them through the same manifest replay.
+        if let entryID = remoteManifestEntryID {
+            let delegate = NSApp.delegate as? AppDelegate
+            if delegate?.isQuitting != true && delegate?.isSigningOut != true {
+                RemoteSessionManifest.shared.remove(entryID)
+            } else {
+                // Preserved for restore: make sure the entry carries the
+                // window's final user-set title. The `titleOverride` didSet
+                // already keeps this in sync on every rename, so this is a
+                // last-moment belt-and-braces sync at the preservation point.
+                RemoteSessionManifest.shared.updateWindowTitle(
+                    entryID, windowTitle: titleOverride)
+            }
+        }
 
         // Emit a final bell-state transition so any observers can clear state
         // without separately tracking NSWindow lifecycle events.
@@ -1456,6 +1766,614 @@ class BaseTerminalController: NSWindowController,
     func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? {
         guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return nil }
         return appDelegate.undoManager
+    }
+
+    // MARK: Remote Reconnect (WP-D1)
+
+    /// Backoff delays (seconds) before each reconnect attempt: ~30s total
+    /// across 5 attempts, per remote-machines spec §5.1 (jitter omitted — a
+    /// single GUI client retrying one host doesn't need thundering-herd
+    /// protection).
+    private static let remoteReconnectDelays: [TimeInterval] = [1, 2, 4, 8, 15]
+
+    /// (Re)bind the transport link-state observer to the CURRENT
+    /// `remoteConnection`. Called from `remoteConnection`'s didSet, so a
+    /// reconnect swap automatically stops listening to the dead connection and
+    /// starts listening to its replacement.
+    private func bindRemoteConnectionStateObserver() {
+        if let remoteLinkObserver {
+            NotificationCenter.default.removeObserver(remoteLinkObserver)
+            self.remoteLinkObserver = nil
+        }
+        guard let connection = remoteConnection else { return }
+        remoteLinkObserver = NotificationCenter.default.addObserver(
+            forName: .ghosttyRemoteConnectionLinkDidChange,
+            object: connection,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let connection = notification.object as? RemoteConnection else { return }
+            self.remoteLinkStateDidChange(connection)
+        }
+        // Evaluate the CURRENT state too: a link that dropped before this
+        // controller adopted the connection (its transition already fired, or
+        // was seeded at RemoteConnection init) would otherwise never be seen.
+        if connection.linkState != .connected {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, connection === self.remoteConnection else { return }
+                self.remoteLinkStateDidChange(connection)
+            }
+        }
+    }
+
+    /// The transport link state changed on this window's connection (main
+    /// thread). Maps the Zig FSM (spec §5.1) onto the per-window reconnect
+    /// state machine:
+    ///
+    ///   connected ──link drops──► reconnecting(1..N) ──dial+re-ATTACH ok──► connected
+    ///                                    │
+    ///                                    ├─ retries exhausted ─► disconnected (window kept)
+    ///                                    └─ session gone/evicted ─► disconnected
+    private func remoteLinkStateDidChange(_ connection: RemoteConnection) {
+        guard connection === remoteConnection else { return }
+        // This is the FIRST line read when tracing a reconnect: it must persist
+        // (.warning maps to OSLog error level) and be readable — os_log redacts
+        // string interpolation by default, so every field is tagged .public
+        // (link/window state, self-healable, machine name, session id are not
+        // secrets and must be greppable in `log show`).
+        Ghostty.logger.warning(
+            "remote reconnect: link=\(String(describing: connection.linkState), privacy: .public) window-state=\(String(describing: self.remoteConnectionState), privacy: .public) selfHealable=\(self.remoteDisconnectMaySelfHeal, privacy: .public) machine=\(connection.machine.name, privacy: .public) session=\(self.currentRemoteSessionID() ?? "-", privacy: .public)")
+
+        // Debug-only: force a real reconnect SWAP on the next transport wobble
+        // (see debug hook docs on `debugShouldFailReconnectSwap`). A loopback
+        // agent's ORIGINAL connection self-recovers before any replacement dial
+        // completes, so a plain freeze/thaw never exercises the swap path; this
+        // abandons the original and dials a replacement immediately.
+        if Self.debugShouldForceReconnectSwap(),
+           !debugForcingReconnectSwap,
+           case .connected = remoteConnectionState,
+           connection.linkState != .connected {
+            debugForcingReconnectSwap = true
+            Ghostty.logger.warning(
+                "remote reconnect: debug force-swap hook armed; abandoning original connection machine=\(connection.machine.name, privacy: .public) session=\(self.currentRemoteSessionID() ?? "-", privacy: .public)")
+            beginRemoteReconnect()
+            return
+        }
+
+        switch connection.linkState {
+        case .connected, .degraded:
+            // A forced swap is in flight (debug hook): ignore the abandoned
+            // original's self-recovery so it can't cancel the replacement dial.
+            if debugForcingReconnectSwap { break }
+            // The link recovered on its own (a heartbeat blip, or a frozen
+            // agent thawing after we exhausted retries — possible only while
+            // the transport is still alive). Cancel any retry loop. A
+            // self-healable `.disconnected` (agent unreachable, window kept)
+            // also recovers here: the surfaces still ride THIS connection, so
+            // a genuine link-up transition means the window works again.
+            switch remoteConnectionState {
+            case .reconnecting:
+                remoteReconnectGeneration += 1
+                remoteConnectionState = .connected
+            case .disconnected where remoteDisconnectMaySelfHeal:
+                remoteReconnectGeneration += 1
+                remoteConnectionState = .connected
+            default:
+                break
+            }
+        case .reconnecting, .reattaching:
+            beginRemoteReconnect()
+        case .dead:
+            // Evicted (another client stole the session, §5.3) or the session
+            // is gone: terminal. Keep the window, mark it clearly, stop.
+            remoteReconnectGeneration += 1
+            remoteDisconnectMaySelfHeal = false
+            remoteConnectionState = .disconnected
+        }
+    }
+
+    /// A device was renamed on the relay account (WP-C2). If this window runs
+    /// on that device, adopt the new display name: the stored `Machine` (and
+    /// the shared connection's snapshot, which new tabs/splits inherit) get the
+    /// fresh `name`/`hostname`, and the `remoteMachine` didSet chain refreshes
+    /// the titlebar pill, the window-title suffix, and posts the accessibility
+    /// value-changed notification for `AXGhosttyMachine` consumers (ztabby).
+    @objc private func ghosttyMachineDidRename(_ notification: Notification) {
+        guard let renamed = notification.userInfo?[
+            MachineRegistry.renamedMachineKey] as? Machine,
+              let deviceID = renamed.deviceID else { return }
+
+        // Keep the shared connection's machine snapshot fresh so surfaces
+        // opened AFTER the rename (tabs/splits inheriting the connection)
+        // start with the new name.
+        if let connection = remoteConnection,
+           connection.machine.deviceID == deviceID {
+            var updated = connection.machine
+            if !updated.namePinned { updated.name = renamed.name }
+            updated.hostname = renamed.hostname ?? updated.hostname
+            connection.updateMachine(updated)
+        }
+
+        guard var machine = remoteMachine, machine.deviceID == deviceID else { return }
+        // An explicit caller-supplied label (IPC `+new-remote-window
+        // --name=mx`) is INTENTIONAL and wins over account renames: the
+        // window keeps "mx" while only the agent-reported hostname refreshes
+        // (it feeds local-machine pill suppression). Chooser-opened and
+        // manifest-restored windows are not pinned and adopt the new name.
+        if !machine.namePinned { machine.name = renamed.name }
+        machine.hostname = renamed.hostname ?? machine.hostname
+        // didSet publishes to the TerminalWindow (pill + AXGhosttyMachine +
+        // AX valueChanged post) and re-applies the window title.
+        remoteMachine = machine
+    }
+
+    /// Kick off the reconnect retry loop: capture the re-ATTACH target (the
+    /// window's root pane's agent session UUID — the pane object outlives the
+    /// dead transport), then dial + liveness-probe + re-`ATTACH` with backoff
+    /// off the main thread. No-op if a loop is already running or the window
+    /// is already disconnected/closing.
+    private func beginRemoteReconnect() {
+        guard case .connected = remoteConnectionState else { return }
+        guard let connection = remoteConnection, window != nil else { return }
+        // Don't fight app termination: quit closes the transport deliberately;
+        // detached sessions are re-attached by WP-D2 restore on next launch.
+        if (NSApp.delegate as? AppDelegate)?.isQuitting == true { return }
+
+        // Prefer the live session id straight off the surface; fall back to
+        // the WP-D2 restore manifest entry for this window.
+        guard let sessionID = currentRemoteSessionID() ?? manifestSessionID() else {
+            // Nothing to re-attach to (the session id never resolved).
+            remoteDisconnectMaySelfHeal = false
+            remoteConnectionState = .disconnected
+            return
+        }
+
+        remoteReconnectGeneration += 1
+        remoteConnectionState = .reconnecting(attempt: 1)
+        scheduleRemoteReconnectAttempt(
+            1,
+            generation: remoteReconnectGeneration,
+            machine: connection.machine,
+            sessionID: sessionID)
+    }
+
+    /// The system finished a FULL wake (`NSWorkspace.didWakeNotification` —
+    /// dark wakes don't post it). A reconnect that ran during sleep or a dark
+    /// wake may have burned its retry budget (agent unreachable mid-sleep) or
+    /// aborted its swap (surface alloc fails with the display off); with power
+    /// back, don't wait out backoff timers or the slow re-dial cadence — reset
+    /// and kick a fresh attempt immediately.
+    @objc private func workspaceDidWake(_ notification: Notification) {
+        switch remoteConnectionState {
+        case .reconnecting:
+            break
+        case .disconnected where remoteDisconnectMaySelfHeal:
+            break
+        default:
+            return
+        }
+        guard let connection = remoteConnection, window != nil else { return }
+        guard let sessionID = currentRemoteSessionID() ?? manifestSessionID() else { return }
+        Ghostty.logger.warning(
+            "remote reconnect: full wake; resetting backoff, kicking attempt machine=\(connection.machine.name, privacy: .public) session=\(sessionID, privacy: .public)")
+        // Bump cancels any pending backoff attempt / background re-dial probe.
+        remoteReconnectGeneration += 1
+        remoteConnectionState = .reconnecting(attempt: 1)
+        scheduleRemoteReconnectAttempt(
+            1,
+            generation: remoteReconnectGeneration,
+            machine: connection.machine,
+            sessionID: sessionID)
+    }
+
+    /// The outcome of one dial+probe cycle (`dialAndProbeRemote`), delivered on
+    /// the main thread with the generation already validated.
+    private enum RemoteProbeOutcome {
+        /// The agent answered and the session is alive: `handle` is a fresh,
+        /// handshaked connection the receiver now owns (swap or free it).
+        case sessionAlive(ghostty_remote_connection_t)
+        /// The agent answered but the session is gone (restart / TTL): terminal.
+        case sessionGone
+        /// The dial failed (unreachable, handshake timeout, 401, ...).
+        case unreachable
+        /// Relay machine with no bearer token (signed out): terminal until
+        /// sign-in restores the window.
+        case signedOut
+    }
+
+    /// One dial + liveness-probe cycle against `machine` for `sessionID`:
+    /// resolve the relay bearer (WP-B2 seam), dial a REPLACEMENT connection
+    /// off-main (bounded by the Zig-side handshake deadline), `GET_CWD`-probe
+    /// the session (bounded), then deliver the outcome on the main thread.
+    /// A stale `generation` (cancelation: window closed, link recovered, newer
+    /// loop) silently frees whatever was dialed and never calls `outcome`.
+    private func dialAndProbeRemote(
+        generation: Int,
+        machine: Machine,
+        sessionID: String,
+        outcome: @escaping (BaseTerminalController, RemoteProbeOutcome) -> Void
+    ) {
+        Task { @MainActor [weak self] in
+            // Resolve the relay bearer BEFORE hopping to the dial thread
+            // (resolution may await a token refresh; the dial thread stays
+            // purely blocking C calls).
+            let token: String?
+            if machine.isRelay {
+                token = await RelayAccount.resolveToken()
+            } else {
+                token = ""
+            }
+            guard let self, generation == self.remoteReconnectGeneration else { return }
+            guard let token else {
+                outcome(self, .signedOut)
+                return
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Dial + probe are blocking; never on the main thread.
+                let handle = Self.dialRemoteMachine(machine, relayToken: token)
+                var sessionAlive = false
+                if let handle {
+                    let cwd = sessionID.withCString { cSid in
+                        Ghostty.AllocatedString(
+                            ghostty_remote_connection_query_cwd_timeout(
+                                handle, cSid, 5000)).string
+                    }
+                    sessionAlive = !cwd.isEmpty
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, generation == self.remoteReconnectGeneration else {
+                        // Canceled while dialing: don't leak the connection.
+                        if let handle { ghostty_remote_connection_free(handle) }
+                        return
+                    }
+                    if let handle, sessionAlive {
+                        outcome(self, .sessionAlive(handle))
+                    } else if let handle {
+                        ghostty_remote_connection_free(handle)
+                        outcome(self, .sessionGone)
+                    } else {
+                        outcome(self, .unreachable)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Schedule reconnect attempt `attempt` (1-based) after its backoff delay.
+    /// Each attempt dials a REPLACEMENT connection off-main, liveness-probes
+    /// the session (`GET_CWD`, bounded), and either completes the reconnect,
+    /// gives up (session gone / retries exhausted → slow background re-dial),
+    /// or schedules the next attempt. A stale `generation` (cancelation:
+    /// window closed, link recovered, newer loop) makes any stage no-op and
+    /// free what it dialed.
+    private func scheduleRemoteReconnectAttempt(
+        _ attempt: Int,
+        generation: Int,
+        machine: Machine,
+        sessionID: String
+    ) {
+        let delay = Self.remoteReconnectDelays[
+            min(attempt, Self.remoteReconnectDelays.count) - 1]
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, generation == self.remoteReconnectGeneration else { return }
+            self.remoteConnectionState = .reconnecting(attempt: attempt)
+
+            self.dialAndProbeRemote(
+                generation: generation,
+                machine: machine,
+                sessionID: sessionID
+            ) { controller, outcome in
+                // A forced swap (debug hook) has reached its dial outcome; the
+                // replacement is now committing or retrying, so drop the
+                // original-recovery suppression regardless of branch.
+                controller.debugForcingReconnectSwap = false
+                switch outcome {
+                case .sessionAlive(let handle):
+                    if controller.completeRemoteReconnect(
+                        handle: handle, machine: machine, sessionID: sessionID) { return }
+                    // Swap-create failed (surface init — e.g. dark-wake OOM):
+                    // the old grid is kept; treat exactly like `.unreachable`.
+                    controller.remoteReconnectAttemptFailed(
+                        attempt,
+                        generation: generation,
+                        machine: machine,
+                        sessionID: sessionID)
+                case .sessionGone:
+                    // The agent is reachable but the session is gone (agent
+                    // restarted / TTL expired): retrying won't bring it back.
+                    // Keep the window, mark it. Terminal.
+                    Ghostty.logger.error(
+                        "remote reconnect: session gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt, privacy: .public); disconnected (terminal)")
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .signedOut:
+                    // Signed out: terminal until sign-in restores the window
+                    // (reconnect never alerts; the manifest entry is kept).
+                    Ghostty.logger.error(
+                        "remote reconnect: signed out machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt, privacy: .public); disconnected (terminal until sign-in)")
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .unreachable:
+                    controller.remoteReconnectAttemptFailed(
+                        attempt,
+                        generation: generation,
+                        machine: machine,
+                        sessionID: sessionID)
+                }
+            }
+        }
+    }
+
+    /// Attempt `attempt` failed without a terminal verdict (agent unreachable,
+    /// or the reconnect swap couldn't build its replacement surface): schedule
+    /// the next backoff attempt, or — budget exhausted — drop to the truthful
+    /// red pill and arm the slow background re-dial. The window's own
+    /// connection keeps heartbeating underneath (its transport may self-heal,
+    /// e.g. a frozen agent thaws — see remoteLinkStateDidChange).
+    private func remoteReconnectAttemptFailed(
+        _ attempt: Int,
+        generation: Int,
+        machine: Machine,
+        sessionID: String
+    ) {
+        guard attempt < Self.remoteReconnectDelays.count else {
+            Ghostty.logger.error(
+                "remote reconnect: retries exhausted machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt, privacy: .public); disconnected (self-healable, background re-dial armed)")
+            remoteDisconnectMaySelfHeal = true
+            remoteConnectionState = .disconnected
+            scheduleRemoteRedialProbe(
+                generation: generation,
+                machine: machine,
+                sessionID: sessionID)
+            return
+        }
+        scheduleRemoteReconnectAttempt(
+            attempt + 1,
+            generation: generation,
+            machine: machine,
+            sessionID: sessionID)
+    }
+
+    /// Cadence for the slow background re-dial that keeps running after the
+    /// fast retry budget is exhausted (window kept, red pill): base interval
+    /// plus jitter, forever, until the window closes / the link self-heals /
+    /// a probe succeeds / the session is confirmed gone.
+    private static let remoteRedialInterval: TimeInterval = 45
+
+    /// Schedule the next background re-dial probe. Unlike the fast attempts,
+    /// this NEVER touches the pill on failure — the window stays truthfully
+    /// red "disconnected" until a probe actually finds the agent AND the
+    /// session, at which point the normal reconnect swap completes and turns
+    /// it green. Canceled by any generation bump (window closed, link
+    /// self-healed, sign-out, a fresh reconnect loop).
+    private func scheduleRemoteRedialProbe(
+        generation: Int,
+        machine: Machine,
+        sessionID: String
+    ) {
+        let delay = Self.remoteRedialInterval + TimeInterval.random(in: 0...15)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, generation == self.remoteReconnectGeneration else { return }
+            // Only while still in the self-healable disconnected tier.
+            guard case .disconnected = self.remoteConnectionState,
+                  self.remoteDisconnectMaySelfHeal else { return }
+
+            self.dialAndProbeRemote(
+                generation: generation,
+                machine: machine,
+                sessionID: sessionID
+            ) { controller, outcome in
+                switch outcome {
+                case .sessionAlive(let handle):
+                    Ghostty.logger.warning(
+                        "remote reconnect: background re-dial probe succeeded machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); swapping")
+                    if controller.completeRemoteReconnect(
+                        handle: handle, machine: machine, sessionID: sessionID) { return }
+                    // Swap-create failed (surface init): the old grid and the
+                    // red pill are kept; probe again later like `.unreachable`.
+                    controller.scheduleRemoteRedialProbe(
+                        generation: generation,
+                        machine: machine,
+                        sessionID: sessionID)
+                case .sessionGone:
+                    // Agent came back without the session: now it IS terminal.
+                    Ghostty.logger.error(
+                        "remote reconnect: background re-dial found agent but session gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); disconnected (terminal)")
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .signedOut:
+                    Ghostty.logger.error(
+                        "remote reconnect: background re-dial signed out machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); disconnected (terminal until sign-in)")
+                    controller.remoteDisconnectMaySelfHeal = false
+                    controller.remoteConnectionState = .disconnected
+                case .unreachable:
+                    // Still unreachable: keep the red pill, probe again later.
+                    controller.scheduleRemoteRedialProbe(
+                        generation: generation,
+                        machine: machine,
+                        sessionID: sessionID)
+                }
+            }
+        }
+    }
+
+    /// A replacement connection is up and the session is alive: swap the
+    /// window onto it by re-`ATTACH`ing in a fresh root surface (the same
+    /// mechanism as WP-D2 window restore — the agent restores the terminal
+    /// contents via its snapshot/scrollback replay). The old (dead-transport)
+    /// surfaces are released with the old tree; the old `RemoteConnection` is
+    /// freed once its last surface deallocates.
+    ///
+    /// Scope (matches WP-D2): the window is re-attached as a single root pane.
+    /// Split panes' sessions stay detached-alive on the agent.
+    /// Returns false when the replacement surface could not be created (the
+    /// swap is ABORTED and the old tree kept — see below); the caller must
+    /// then treat the attempt like `.unreachable` (retry ladder / background
+    /// re-dial). The dialed `handle` is consumed either way (owned by the new
+    /// `RemoteConnection`, which frees it if the swap aborts).
+    private func completeRemoteReconnect(
+        handle: ghostty_remote_connection_t,
+        machine: Machine,
+        sessionID: String
+    ) -> Bool {
+        guard let ghosttyApp = ghostty.app else {
+            ghostty_remote_connection_free(handle)
+            Ghostty.logger.error(
+                "remote reconnect: swap aborted, ghostty app gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public)")
+            return false
+        }
+
+        let newConnection = RemoteConnection(handle: handle, machine: machine)
+
+        var cfg = Ghostty.SurfaceConfiguration()
+        cfg.remoteMachine = machine
+        cfg.remoteConnection = handle
+        cfg.connectionKeepAlive = newConnection
+        cfg.remoteSessionId = sessionID
+        cfg.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
+
+        // Debug-build-only deterministic failure hook: skips creating the
+        // real view so the guard below takes the failure path (the orchestrator
+        // can't force a real surface-alloc OOM). See debugShouldFailReconnectSwap.
+        let newView: Ghostty.SurfaceView? = Self.debugShouldFailReconnectSwap()
+            ? nil
+            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg)
+
+        guard let newView, newView.error == nil else {
+            // `ghostty_surface_new` FAILED (seen in production: OutOfMemory
+            // allocating Metal/IOSurface during a dark wake). Do NOT swap:
+            // the old grid — dead transport but intact contents — beats a
+            // SurfaceErrorView. Keep `surfaceTree`/`remoteConnection` as they
+            // are; the caller retries like an unreachable attempt.
+            //
+            // Ownership: `newConnection` is the sole strong owner of `handle`
+            // (a failed SurfaceView never constructed its `surfaceModel`, so
+            // nothing retains the keep-alive); dropping it here frees the
+            // dialed handle exactly once via RemoteConnection.deinit.
+            Ghostty.logger.error(
+                "remote reconnect: swap-create FAILED (surface init) machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); keeping old grid, will retry")
+            return false
+        }
+
+        // The replacement becomes this window's shared connection (new
+        // splits/tabs ride it); rebinds the link observer via didSet.
+        remoteConnection = newConnection
+        surfaceTree = SplitTree(view: newView)
+        remoteConnectionState = .connected
+        // .warning maps to OSLog .error level, so this persists too — one
+        // breadcrumb pairing every failure trail with its recovery.
+        Ghostty.logger.warning(
+            "remote reconnect: swap complete machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public)")
+        DispatchQueue.main.async {
+            Ghostty.moveFocus(to: newView)
+        }
+
+        // Post-swap liveness verification: `.connected` above is a CLAIM — the
+        // new surface still has to re-`ATTACH` on its termio thread. If that
+        // attach fails (session raced away, RPC timeout, ...), the surface
+        // publishes no session id and the window would sit wedged behind a
+        // healthy pill. Verify the attach actually landed; if not, stop lying.
+        let verifyGeneration = remoteReconnectGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self,
+                  verifyGeneration == self.remoteReconnectGeneration,
+                  case .connected = self.remoteConnectionState,
+                  self.remoteConnection === newConnection else { return }
+            if self.currentRemoteSessionID() == nil {
+                // The re-ATTACH never yielded a live pane. Terminal tier:
+                // keep the window, mark it truthfully.
+                Ghostty.logger.error(
+                    "remote reconnect: post-swap verify FAILED, re-ATTACH published no session id machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); disconnected (terminal)")
+                self.remoteDisconnectMaySelfHeal = false
+                self.remoteConnectionState = .disconnected
+            }
+        }
+        return true
+    }
+
+    // MARK: Debug reconnect-swap hooks
+    //
+    // Two debug-only (never release) hook files let the orchestrator drive the
+    // reconnect swap path deterministically on a loopback agent:
+    //
+    //   /tmp/ghoztty-debug-force-reconnect-swap — when present, the next
+    //     transport wobble (.degraded/.reconnecting) ABANDONS the original
+    //     connection and dials a REPLACEMENT + re-ATTACH swap immediately, even
+    //     though the original would self-recover. This is what a plain agent
+    //     freeze/thaw otherwise fails to exercise (the original TCP link
+    //     recovers before any replacement dial completes).
+    //
+    //   /tmp/ghoztty-debug-fail-reconnect-swap — when present, that swap's
+    //     surface creation is treated as FAILED (the deterministic stand-in for
+    //     the dark-wake `ghostty_surface_new` OOM), so the abort/guard path
+    //     runs: the old grid is kept and the pill stays reconnecting/red.
+    //
+    // Both are gated on the libghostty build mode (the exact condition behind
+    // the "debug build" warning banner in `TerminalView`), so they cannot
+    // trigger in release (ReleaseFast) builds regardless of the files.
+    private static let debugFailReconnectSwapHookPath =
+        "/tmp/ghoztty-debug-fail-reconnect-swap"
+    private static let debugForceReconnectSwapHookPath =
+        "/tmp/ghoztty-debug-force-reconnect-swap"
+
+    /// Whether debug reconnect-swap hooks are honored at all (debug /
+    /// release-safe builds ONLY). Mirrors the `TerminalView` debug banner gate.
+    private static var debugReconnectHooksEnabled: Bool {
+        Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG
+            || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE
+    }
+
+    /// Whether the reconnect swap should be forced to fail (debug hook).
+    private static func debugShouldFailReconnectSwap() -> Bool {
+        guard debugReconnectHooksEnabled else { return false }
+        return FileManager.default.fileExists(
+            atPath: debugFailReconnectSwapHookPath)
+    }
+
+    /// Whether a reconnect swap should be forced on the next transport wobble
+    /// (debug hook).
+    private static func debugShouldForceReconnectSwap() -> Bool {
+        guard debugReconnectHooksEnabled else { return false }
+        return FileManager.default.fileExists(
+            atPath: debugForceReconnectSwapHookPath)
+    }
+
+    /// The agent session UUID of this window's first live remote pane, read
+    /// directly off the surface (non-blocking; the termio thread publishes it
+    /// after OPEN/ATTACH and the pane outlives a dead transport).
+    private func currentRemoteSessionID() -> String? {
+        for view in surfaceTree {
+            guard let surface = view.surface else { continue }
+            let sid = Ghostty.AllocatedString(
+                ghostty_surface_remote_session_id(surface)).string
+            if !sid.isEmpty { return sid }
+        }
+        return nil
+    }
+
+    /// The session UUID recorded in the WP-D2 restore manifest for this window.
+    private func manifestSessionID() -> String? {
+        guard let remoteManifestEntryID else { return nil }
+        return RemoteSessionManifest.shared.sessionID(for: remoteManifestEntryID)
+    }
+
+    /// Dial a replacement connection to `machine` (blocking; call off-main).
+    /// Relay machines re-dial through the relay with `relayToken`, which the
+    /// caller resolved via the WP-B2 seam (`RelayAccount.resolveToken()` —
+    /// the same sourcing as the interactive dial + WP-D2 restore paths); TCP
+    /// machines re-dial directly and ignore the token.
+    private static func dialRemoteMachine(
+        _ machine: Machine,
+        relayToken: String
+    ) -> ghostty_remote_connection_t? {
+        if machine.isRelay, let base = machine.relayBase, let device = machine.deviceID {
+            return AppDelegate.dialRelay(base: base, device: device, token: relayToken)
+        }
+        return machine.host.withCString { hostPtr in
+            ghostty_remote_connection_new_tcp(hostPtr, machine.port)
+        }
     }
 
     // MARK: First Responder

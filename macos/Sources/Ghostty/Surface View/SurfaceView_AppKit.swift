@@ -357,10 +357,21 @@ extension Ghostty {
                 ghostty_surface_new(app, &surface_cfg_c)
             }
             guard let surface = surface else {
+                // Persisted breadcrumb (.error survives in the unified log):
+                // a bare SurfaceErrorView with no trace is undiagnosable hours
+                // later. Known real-world cause: OutOfMemory allocating
+                // Metal/IOSurface resources during a dark wake (display off).
+                Ghostty.logger.error(
+                    "ghostty_surface_new failed; surface error view will render: remote=\(surface_cfg.remoteConnection != nil, privacy: .public) machine=\(surface_cfg.remoteMachine?.name ?? "-", privacy: .public) session=\(surface_cfg.remoteSessionId ?? "-", privacy: .public)")
                 self.error = Ghostty.Error.apiFailed
                 return
             }
-            self.surfaceModel = Ghostty.Surface(cSurface: surface)
+            self.surfaceModel = Ghostty.Surface(
+                cSurface: surface,
+                // Retain the remote connection owner (if any) until after this
+                // surface's deferred free, so its IO-thread `detachChannel` can't
+                // outlive the connection (teardown use-after-free).
+                connectionKeepAlive: surface_cfg.connectionKeepAlive)
 
             // Apply background tint after the terminal IO has finished initializing.
             // The IO thread resets colors during startup, so we delay briefly.

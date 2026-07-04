@@ -59,6 +59,13 @@ typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
 
+// Opaque handle to a remote-machine connection (see ghostty_remote_*). A
+// connection is keyed by (host, user, port, jump-chain) and multiplexes N
+// remote panes/sessions; it is owned by the Zig core and lives in the GUI
+// process (a GUI crash disposes it; remote-side persistence is by session_id,
+// see the remote-machines design doc §3.4/§3.5).
+typedef void* ghostty_remote_connection_t;
+
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
 // Zig change.
@@ -477,6 +484,28 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+
+  // Remote-machine backend (remote-machines design §3.2). When `connection`
+  // is non-NULL, the surface is constructed with the `.remote` termio backend
+  // riding on that connection instead of the local exec/pty backend. The
+  // connection must already be started and handshake-complete (see
+  // ghostty_remote_connection_start / _wait_handshake). It is caller-owned and
+  // may be shared across surfaces; it is NOT freed when the surface is freed.
+  //
+  // `session_id` is the agent session to ATTACH to (re-attach to an existing
+  // remote session); NULL means OPEN a brand-new session. Ignored when
+  // `connection` is NULL.
+  ghostty_remote_connection_t connection;
+  const char* session_id;
+
+  // Explicit REMOTE working directory for an OPEN-new remote session (§WP4).
+  // This is the cwd ON THE REMOTE MACHINE the new pane should start in — set by
+  // the split/tab path from an on-demand cwd query of the parent remote pane.
+  // It is forwarded verbatim to the agent's OPEN. It is DISTINCT from
+  // `working_directory` above (a LOCAL path that must never reach a remote
+  // agent). NULL means "no remote cwd hint" — the agent uses its own default.
+  // Ignored when `connection` is NULL.
+  const char* remote_working_directory;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1228,6 +1257,256 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+
+// Remote machines (remote-machines design §3.5/§3.2). A connection is keyed by
+// (host, user, port, jump-chain) and multiplexes N remote panes/sessions. The
+// returned handle is owned by the caller and must be released with
+// ghostty_remote_connection_free.
+//
+// NOTE (WP3): the live SSH dial is not implemented yet. `_new` records the
+// dial parameters and constructs the connection object but does NOT yet spawn
+// `ssh`; `_start` therefore currently returns false ("not yet implemented").
+// The ABI shape is stable so the Swift app can bind against it now.
+typedef struct {
+  const char* host;        // Required: remote host (alias or address).
+  const char* user;        // Optional (NULL): SSH user; NULL uses ssh defaults.
+  uint16_t port;           // SSH port; 0 means the ssh default (22).
+  const char* jump;        // Optional (NULL): comma-separated ProxyJump chain.
+} ghostty_remote_config_s;
+
+// Create a remote connection handle from dial parameters. Returns NULL on
+// allocation failure or invalid parameters (e.g. NULL host). The handle is not
+// connected yet — call ghostty_remote_connection_start.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new(
+    const ghostty_remote_config_s*);
+
+// Create a remote connection by dialing a TCP-listening ghoztty-agent directly
+// at host:port (WP4). This connects the socket and BLOCKS through the HELLO
+// handshake before returning, so the handle is fully established — a subsequent
+// ghostty_remote_connection_start is a no-op (returns true) and
+// _wait_handshake returns true immediately. Returns NULL on a NULL/empty host
+// or any dial/handshake failure. The transport encoding is raw (a clean
+// TCP/Tailscale hop). Free with ghostty_remote_connection_free.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_tcp(
+    const char* host, uint16_t port);
+
+// Create a remote connection by dialing a remote ghoztty-agent THROUGH a
+// rendezvous relay. The relay-connect byte-pipe helper opens an authenticated
+// WebSocket to the relay (base) for device and splices it to its stdio, giving
+// a transparent framed pipe to the agent. Like _new_tcp, this BLOCKS through
+// the HELLO handshake before returning, so the handle is fully established. The
+// helper executable is resolved from GHOSTTY_RELAY_CONNECT or defaults to the
+// bare command "relay-connect" (PATH); the auth token is passed to the helper
+// via GHOSTTY_RELAY_TOKEN. Returns NULL on a NULL/empty base/device or any
+// dial/handshake failure. Free with ghostty_remote_connection_free.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_relay(
+    const char* base, const char* device, const char* token);
+
+// Start the connection: dial SSH, spawn the reader/writer threads, and send
+// the client HELLO. Returns true on success. WP3: currently returns false
+// (live SSH dial not yet wired).
+GHOSTTY_API bool ghostty_remote_connection_start(ghostty_remote_connection_t);
+
+// Block until the protocol handshake completes (or fails). Returns true if the
+// handshake negotiated successfully. Safe to call only after _start succeeded.
+GHOSTTY_API bool ghostty_remote_connection_wait_handshake(
+    ghostty_remote_connection_t);
+
+// Current smoothed latency in milliseconds, or -1 if not yet measured.
+GHOSTTY_API int32_t ghostty_remote_connection_latency_ms(
+    ghostty_remote_connection_t);
+
+// Connection link-state values (remote-machines spec §5.1 FSM; WP-D1).
+// Mirrors the client connection's LinkState.State.
+typedef enum {
+  GHOSTTY_REMOTE_CONN_CONNECTED = 0,
+  GHOSTTY_REMOTE_CONN_DEGRADED = 1,
+  GHOSTTY_REMOTE_CONN_RECONNECTING = 2,
+  GHOSTTY_REMOTE_CONN_REATTACHING = 3,
+  GHOSTTY_REMOTE_CONN_DEAD = 4,
+} ghostty_remote_connection_state_e;
+
+// Current link state of the connection (a GHOSTTY_REMOTE_CONN_* value), or -1
+// if the connection isn't established.
+GHOSTTY_API int32_t ghostty_remote_connection_state(
+    ghostty_remote_connection_t);
+
+// Callback fired on every connection link-state transition. `state` is a
+// GHOSTTY_REMOTE_CONN_* value. Fires on a connection-internal thread while an
+// internal lock is held: do NOT call any ghostty_remote_connection_* API from
+// the callback; copy what you need and hop to another queue.
+typedef void (*ghostty_remote_state_cb)(int32_t state, void* userdata);
+
+// Register (or clear, with a NULL callback) the link-state observer. Clearing
+// synchronizes with an in-flight invocation: once this returns after passing
+// NULL, no further callback fires and userdata may be freed. A second register
+// replaces the callback.
+GHOSTTY_API void ghostty_remote_connection_set_state_callback(
+    ghostty_remote_connection_t, ghostty_remote_state_cb, void* userdata);
+
+// The agent's self-reported hostname from its HELLO, or NULL if the peer
+// didn't send one (older agent) or the handshake hasn't completed. Owned by
+// the connection, valid until _free; copy it immediately.
+GHOSTTY_API const char* ghostty_remote_connection_hostname(
+    ghostty_remote_connection_t);
+
+// Shut down and free the connection. Detaches all panes (sessions survive on
+// the remote for later re-attach by session_id). Caller must ensure no surface
+// still references this connection.
+GHOSTTY_API void ghostty_remote_connection_free(ghostty_remote_connection_t);
+
+// On-demand query for a remote session's child working directory. Blocks
+// (bounded timeout) for the agent's reply. On success the returned string holds
+// the UTF-8 path; on failure (no connection, unknown session, agent query
+// failed, or timeout) it is empty (ptr == NULL). Free with ghostty_string_free.
+// Used at split/tab time so a new remote pane inherits the parent's cwd.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd(
+    ghostty_remote_connection_t, const char* session_id);
+
+// Like ghostty_remote_connection_query_cwd but with an explicit timeout in
+// milliseconds (0 => default 10s). Run on a background thread with a tight bound
+// so a new remote frame's cwd inheritance never blocks the main thread.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd_timeout(
+    ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
+
+// A host-metrics snapshot pushed by the remote agent (activity monitor). Mirrors
+// the wire HostMetrics. uptime_s is 0 when the remote OS doesn't expose uptime;
+// load1 is -1 when there is no load average (e.g. Windows).
+typedef struct {
+  float cpu_pct;     // busy CPU % 0..100 across all cores since the prev sample
+  uint64_t mem_used; // used physical memory, bytes
+  uint64_t mem_total; // total physical memory, bytes
+  uint32_t ncpu;     // logical CPU count
+  uint64_t uptime_s; // seconds since boot, 0 if unknown
+  float load1;       // 1-minute load average, -1 if unknown
+} ghostty_host_metrics_s;
+
+// Callback for each pushed host-metrics sample. IMPORTANT: it fires on the
+// connection's control-reader thread, NOT the main thread — hop to the main
+// queue before touching UI. The metrics pointer borrows stack storage valid only
+// for the duration of the call; copy the fields out. The void* is the userdata
+// passed to ghostty_remote_connection_metrics_subscribe.
+typedef void (*ghostty_metrics_callback)(const ghostty_host_metrics_s*, void*);
+
+// Subscribe to the remote host's pushed metrics stream. The agent pushes a
+// sample every interval_ms; each is delivered to the callback. Returns false if
+// the connection isn't established. The caller MUST call _metrics_unsubscribe (or
+// _free) before freeing anything userdata points at. A second subscribe replaces
+// the callback.
+GHOSTTY_API bool ghostty_remote_connection_metrics_subscribe(
+    ghostty_remote_connection_t, uint32_t interval_ms,
+    ghostty_metrics_callback, void* userdata);
+
+// Stop the pushed metrics stream and clear the callback. After this returns no
+// further metrics callback fires. Safe to call when not subscribed (no-op).
+GHOSTTY_API void ghostty_remote_connection_metrics_unsubscribe(
+    ghostty_remote_connection_t);
+
+// One row of the remote host's process table (activity monitor process view).
+// name/user/cmd are ALWAYS non-NULL NUL-terminated UTF-8 C strings — an empty
+// string ("") means "unavailable", never a NULL pointer. cpu_pct is PER-CORE: a
+// fully-busy single thread is ~100; a multithreaded process can exceed 100.
+// Divide by host.ncpu for a Task-Manager-style 0..100 total.
+typedef struct {
+  int64_t pid;
+  int64_t ppid;
+  float cpu_pct;      // per-core busy % (may exceed 100 for multithreaded procs)
+  uint64_t mem_bytes; // resident/working-set bytes
+  const char* name;   // process name (never NULL; "" if unknown)
+  const char* user;   // owning user (never NULL; "" if unavailable)
+  const char* cmd;    // command line (never NULL; "" if unavailable)
+} ghostty_proc_s;
+
+// A one-shot snapshot of the remote host's process table. ok == false means the
+// call failed (no connection, agent error, or timeout) and procs_len == 0. The
+// host field mirrors ghostty_host_metrics_s (cpu_pct may be 0 here — a one-shot
+// host read has no baseline; subscribe to the metrics stream for an accurate host
+// CPU%). Free with ghostty_remote_connection_proc_list_free.
+typedef struct {
+  bool ok;
+  bool truncated;            // the agent clipped the table to its default cap
+  ghostty_host_metrics_s host;
+  ghostty_proc_s* procs;     // procs_len rows (valid pointer even when len == 0)
+  size_t procs_len;
+  int64_t agent_pid;         // root pid of the "ghoztty-spawned" tree (remote: the
+                             // agent's pid; local: this app's pid). 0 = unknown
+                             // (old agent); UI then shows all rows.
+} ghostty_proc_list_s;
+
+// Fetch the remote host's process table. SYNCHRONOUS: this blocks on the RPC reply
+// up to timeout_ms (0 => default 10s), so run it OFF the main thread. Returns a
+// snapshot with ok == false (and procs_len == 0) on failure. Free the result with
+// ghostty_remote_connection_proc_list_free.
+GHOSTTY_API ghostty_proc_list_s ghostty_remote_connection_proc_list(
+    ghostty_remote_connection_t, uint32_t timeout_ms);
+
+// Free a process-table snapshot returned by ghostty_remote_connection_proc_list.
+// Takes the same connection handle (its allocator owns the rows/strings). Always
+// safe (a failed/empty snapshot frees nothing).
+GHOSTTY_API void ghostty_remote_connection_proc_list_free(
+    ghostty_remote_connection_t, ghostty_proc_list_s);
+
+// Kill a process on the REMOTE host by pid (activity monitor process control).
+// SYNCHRONOUS: blocks on the RPC reply up to timeout_ms (0 => default 5s), so run
+// it OFF the main thread. signal is a NUL-terminated string; "" => the agent's
+// default terminate. On POSIX "TERM"/"KILL" select the signal; on Windows there
+// is NO real SIGTERM — both "TERM" and "KILL" map to TerminateProcess. Returns
+// true iff the agent reported success (false on no connection / error / timeout).
+GHOSTTY_API bool ghostty_remote_connection_proc_kill(
+    ghostty_remote_connection_t, int64_t pid, const char* signal,
+    uint32_t timeout_ms);
+
+// Spawn a DETACHED process on the REMOTE host (run through the remote platform
+// shell, no pty). SYNCHRONOUS: blocks on the RPC reply up to timeout_ms (0 =>
+// default 5s); run OFF the main thread. cwd is a NUL-terminated string; "" => the
+// agent's default cwd. Returns the spawned pid (> 0) or -1 on failure. On Windows
+// the "pid" is the integer value of the child's process HANDLE (matches the
+// process-list ids).
+GHOSTTY_API int64_t ghostty_remote_connection_proc_spawn(
+    ghostty_remote_connection_t, const char* cmd, const char* cwd,
+    uint32_t timeout_ms);
+
+// ---------------------------------------------------------------------------
+// LOCAL (in-process) activity-monitor provider — the "Local" machine in the
+// panel's switcher. These take NO connection handle: they sample / kill / spawn
+// IN THIS PROCESS using the same code the remote agent uses. Persistent local
+// samplers (guarded by an internal mutex) keep CPU% baselines across polls, so
+// the first ghostty_local_proc_list reads 0% CPU and later polls read real
+// deltas. All are SYNCHRONOUS; the proc-list is cheap (a local OS enumeration)
+// but should still be called off the main thread, consistent with the remote API.
+// ---------------------------------------------------------------------------
+
+// A one-shot snapshot of THIS machine's process table. Reuses the SAME
+// ghostty_proc_list_s struct as the remote path (host is filled from the local
+// metrics sampler). timeout_ms is accepted for symmetry but unused (no RPC). Free
+// with ghostty_local_proc_list_free (NOT the remote free — local lists carry no
+// connection handle).
+GHOSTTY_API ghostty_proc_list_s ghostty_local_proc_list(uint32_t timeout_ms);
+
+// Free a snapshot returned by ghostty_local_proc_list. Frees via the app/global
+// allocator (no handle). Always safe (an empty list frees nothing).
+GHOSTTY_API void ghostty_local_proc_list_free(ghostty_proc_list_s);
+
+// Kill a process on THIS machine by pid. signal is a NUL-terminated string; "" =>
+// default terminate ("TERM"). See the remote _proc_kill note on Windows TERM/KILL
+// semantics. Returns true iff the kill succeeded. In-process (no RPC).
+GHOSTTY_API bool ghostty_local_proc_kill(int64_t pid, const char* signal);
+
+// Spawn a DETACHED process on THIS machine (run through the local platform shell,
+// no pty). cwd is a NUL-terminated string; "" => the current working directory.
+// Returns the spawned pid (> 0) or -1 on failure. In-process (no RPC).
+GHOSTTY_API int64_t ghostty_local_proc_spawn(const char* cmd, const char* cwd);
+
+// The live remote agent session id for a surface, or an empty string (ptr ==
+// NULL) for a local surface or one whose remote pane is not yet resolved. Free
+// with ghostty_string_free.
+GHOSTTY_API ghostty_string_s ghostty_surface_remote_session_id(ghostty_surface_t);
+
+// The command a surface's remote pane was OPENed with, or an empty string (ptr
+// == NULL) for a local surface or one whose remote pane uses the agent's default
+// shell. Free with ghostty_string_free. Used so a new window/tab/split inherits
+// the parent remote frame's command.
+GHOSTTY_API ghostty_string_s ghostty_surface_remote_command(ghostty_surface_t);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);

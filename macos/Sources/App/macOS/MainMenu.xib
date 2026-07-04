@@ -172,6 +172,12 @@
                                     <action selector="newWindow:" target="-1" id="pnf-fE-gHi"/>
                                 </connections>
                             </menuItem>
+                            <menuItem title="New Remote Window" keyEquivalent="n" id="Rmt-Wn-001">
+                                <modifierMask key="keyEquivalentModifierMask" command="YES" shift="YES"/>
+                                <connections>
+                                    <action selector="newRemoteWindow:" target="-1" id="Rmt-Wn-002"/>
+                                </connections>
+                            </menuItem>
                             <menuItem title="New Tab" id="uTG-Vz-hJU">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <connections>

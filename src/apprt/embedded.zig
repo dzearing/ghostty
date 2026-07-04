@@ -18,6 +18,16 @@ const terminal = @import("../terminal/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
+const remote_connection = @import("../remote/connection.zig");
+const remote_protocol = @import("../remote/protocol.zig");
+const ssh_transport = @import("../remote/ssh_transport.zig");
+const tcp_dial = @import("../remote/tcp_dial.zig");
+const relay_dial = @import("../remote/relay_dial.zig");
+const remote_proc = @import("../remote/agent/proc.zig");
+const remote_metrics = @import("../remote/agent/metrics.zig");
+const remote_proc_control = @import("../remote/agent/proc_control.zig");
+const remote_proc_spawn = @import("../remote/agent/proc_spawn.zig");
+const CommandCore = @import("../CommandCore.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
@@ -353,7 +363,10 @@ pub const App = struct {
         arguments: ?[][:0]const u8,
     ) (Allocator.Error || std.posix.WriteError || apprt.ipc.Errors)!bool {
         var buf: [256]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&buf);
+        // Streaming (not positional) writer: the CLI command that called us
+        // has its own buffered stderr writer, and mixing a positional writer
+        // with it corrupts/reorders output when stderr is a file or pipe.
+        var stderr_writer = std.fs.File.stderr().writerStreaming(&buf);
         const stderr = &stderr_writer.interface;
 
         const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
@@ -467,19 +480,25 @@ pub const App = struct {
             return error.IPCFailed;
         };
 
-        const parsed = std.json.parseFromSlice(
-            struct { success: bool = false },
-            alloc,
-            resp_buf,
-            .{ .ignore_unknown_fields = true },
-        ) catch {
+        const parsed = apprt.ipc.parseResponse(alloc, resp_buf) catch {
             stderr.print("IPC response is not valid JSON\n", .{}) catch {};
             stderr.flush() catch {};
             return error.IPCFailed;
         };
         defer parsed.deinit();
 
-        return parsed.value.success;
+        // On failure the server includes a human-readable reason (e.g.
+        // "pane 'd1' not found in registry"). Print it here so EVERY CLI
+        // action surfaces the real cause instead of a generic fallback.
+        if (!parsed.value.success) {
+            if (parsed.value.@"error") |msg| {
+                stderr.print("{s}\n", .{msg}) catch {};
+                stderr.flush() catch {};
+            }
+            return false;
+        }
+
+        return true;
     }
 
     fn connectUnixSocket(path: [:0]const u8) !std.posix.fd_t {
@@ -575,6 +594,234 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+/// C-ABI host metrics snapshot (remote-machines activity monitor, §9.3). Mirrors
+/// `protocol.HostMetrics`; the optional `uptime_s`/`load1` use sentinel values
+/// when the remote OS doesn't expose them (`uptime_s = 0` ⇒ unknown is fine since
+/// a real uptime is always > 0; `load1 = -1` ⇒ unknown, e.g. Windows has no load
+/// average).
+const ghostty_host_metrics_s = extern struct {
+    cpu_pct: f32,
+    mem_used: u64,
+    mem_total: u64,
+    ncpu: u32,
+    uptime_s: u64, // 0 if unknown
+    load1: f32, // -1 if unknown
+};
+
+/// Callback invoked for each pushed host-metrics sample. NOTE: it fires on the
+/// connection's control-reader thread (NOT the GUI main thread) — the Swift side
+/// must hop to the main queue before touching UI. The `ghostty_host_metrics_s`
+/// pointer borrows stack storage valid only for the duration of the call; copy
+/// the fields out. `userdata` is the opaque pointer passed to `_metrics_subscribe`.
+const GhosttyMetricsCallback = *const fn (?*const ghostty_host_metrics_s, ?*anyopaque) callconv(.c) void;
+
+/// Callback invoked on every connection link-state transition (§5.1 FSM;
+/// WP-D1 connection-status surface). `state` is a `GHOSTTY_REMOTE_CONN_*`
+/// value (the integer mirror of `connection.LinkState.State`). NOTE: it fires
+/// on a connection-internal thread (reader/heartbeat) while the connection's
+/// state lock is held — the callee must NOT call back into any
+/// `ghostty_remote_connection_*` API from the callback; copy what it needs
+/// and return promptly (the Swift side hops to the main queue).
+const GhosttyRemoteStateCallback = *const fn (i32, ?*anyopaque) callconv(.c) void;
+
+/// One process-table row (activity monitor, §9.3 process view). Mirrors the wire
+/// `Proc`. `name`/`user`/`cmd` are always non-null NUL-terminated C strings — an
+/// empty string means "unavailable" (the agent left `user`/`cmd` null), NEVER a
+/// NULL pointer (so the Swift side can read them unconditionally). `cpu_pct` is
+/// per-core: a fully-busy single thread reads ~100; a multithreaded process can
+/// exceed 100. Normalize by `ghostty_host_metrics_s.ncpu` for a 0..100 total.
+const ghostty_proc_s = extern struct {
+    pid: i64,
+    ppid: i64,
+    cpu_pct: f32,
+    mem_bytes: u64,
+    name: [*:0]const u8,
+    user: [*:0]const u8,
+    cmd: [*:0]const u8,
+};
+
+/// A snapshot of the remote host's process table returned by
+/// `ghostty_remote_connection_proc_list`. `ok == false` ⇒ the call failed (no
+/// connection / agent error / timeout) and `procs_len == 0`. Free with
+/// `ghostty_remote_connection_proc_list_free`.
+const ghostty_proc_list_s = extern struct {
+    ok: bool,
+    truncated: bool,
+    host: ghostty_host_metrics_s,
+    procs: [*]ghostty_proc_s,
+    procs_len: usize,
+    /// The root pid of the "ghoztty-spawned" process tree (remote: the agent's own
+    /// pid; local: this app's own pid). 0 = unknown (old agent that did not report
+    /// it). The UI defaults to showing only descendants of this pid.
+    agent_pid: i64,
+};
+
+/// A stable, never-freed empty array so a failed/empty `ghostty_proc_list_s` has a
+/// valid (non-dangling) `procs` pointer — `_proc_list_free` short-circuits on
+/// `procs_len == 0` and never touches it.
+var empty_procs_sentinel: [0]ghostty_proc_s = .{};
+
+/// The Zig object behind an opaque `ghostty_remote_connection_t`
+/// (remote-machines design §3.5). A connection is keyed by
+/// (host, user, port, jump-chain) and multiplexes N remote panes/sessions. It
+/// is owned by the caller (the Swift app) and lives in the GUI process — a GUI
+/// crash disposes it; remote-side persistence is by `session_id`.
+///
+/// WP3 status: this records the dial parameters AND, once `_start` succeeds,
+/// owns a live `ssh_transport.Transport` (the two `ssh` subprocesses + the
+/// `Connection` byte-pump). The transport is built with the GUI-free
+/// `CommandCore.DefaultCommand` spawn core so no apprt/config graph is pulled
+/// into the agent-launch path (§17).
+pub const RemoteConnectionHandle = struct {
+    /// Trampoline state for an active host-metrics subscription: the C callback +
+    /// the caller's opaque `userdata`. Stored inline (no heap free). See `metrics_cb`.
+    pub const MetricsTrampoline = struct {
+        cb: GhosttyMetricsCallback,
+        userdata: ?*anyopaque,
+    };
+
+    /// Trampoline state for the link-state callback (WP-D1): the C callback +
+    /// the caller's opaque `userdata`. Stored inline on the handle (stable for
+    /// the handle's life) so its address can serve as the Zig `StateHandler`
+    /// ctx. See `state_cb` / `stateTrampoline`.
+    pub const StateTrampoline = struct {
+        cb: GhosttyRemoteStateCallback,
+        userdata: ?*anyopaque,
+    };
+
+    alloc: Allocator,
+
+    /// Dial parameters (duped into `alloc`, owned by this handle).
+    host: [:0]const u8,
+    user: ?[:0]const u8,
+    port: u16,
+    jump: ?[:0]const u8,
+
+    /// The live ssh transport, or null until `_start` dials successfully. When
+    /// non-null it owns the two ssh subprocesses + the `Connection` and is torn
+    /// down in `destroy`.
+    transport: ?*Transport = null,
+
+    /// Trampoline state for an active host-metrics subscription (§9.3), or null
+    /// when not subscribed. The Zig `MetricsHandler` registered with the
+    /// `Connection` receives `protocol.HostMetrics`; this struct carries the C
+    /// callback + the caller's `userdata` so the handler can marshal the snapshot
+    /// into a `ghostty_host_metrics_s` and invoke `cb(&hm, userdata)`. It lives
+    /// inline on the handle (no heap free needed); `subscribeMetrics` passes
+    /// `&self.metrics_cb.?` as the handler ctx, so it must stay pinned for the
+    /// life of the subscription (the handle is heap-allocated and stable).
+    metrics_cb: ?MetricsTrampoline = null,
+
+    /// Trampoline state for the link-state observer (WP-D1), or null when not
+    /// registered. Same pinning discipline as `metrics_cb`: lives inline on the
+    /// heap-allocated handle so `&self.state_cb.?` stays valid for the life of
+    /// the registration; cleared (with the connection's `clearStateHandler`,
+    /// which synchronizes against an in-flight invocation) before teardown.
+    state_cb: ?StateTrampoline = null,
+
+    /// The live TCP transport, or null. Populated by
+    /// `ghostty_remote_connection_new_tcp` (WP4): a direct TCP dial to a
+    /// listening `ghoztty-agent` (e.g. over Tailscale / localhost), which
+    /// completes the HELLO handshake before returning. Mutually exclusive with
+    /// `transport` (an `_new_tcp` handle never goes through the SSH `_start`
+    /// path). Owns the socket + mux + `Connection`; torn down in `destroy`.
+    tcp: ?*tcp_dial.Dialed = null,
+
+    /// The live relay transport, or null. Populated by
+    /// `ghostty_remote_connection_new_relay`: dials a remote `ghoztty-agent`
+    /// THROUGH a rendezvous relay (a native `wss://` WebSocket tunnels a framed
+    /// connection over an authenticated link), completing the HELLO handshake
+    /// before returning. Mutually exclusive with `transport`/`tcp`. Owns the
+    /// WebSocket client + mux + `Connection`; torn down in `destroy`.
+    relay: ?*relay_dial.Dialed = null,
+
+    /// The transport is parameterized by the GUI-free spawn core so the
+    /// agent-launch subprocess uses no-op rlimits / empty pre_exec hooks.
+    pub const Transport = ssh_transport.Transport(CommandCore.DefaultCommand);
+
+    /// The live `Connection` for this handle, from whichever transport (SSH or
+    /// TCP) is established, or null if neither has dialed yet. The single seam
+    /// every downstream reader (`remoteBackend`, `_wait_handshake`,
+    /// `_latency_ms`) goes through so the two transports are interchangeable.
+    pub fn conn(self: *const RemoteConnectionHandle) ?*remote_connection.Connection {
+        if (self.transport) |t| return t.conn;
+        if (self.tcp) |d| return d.conn;
+        if (self.relay) |d| return d.conn;
+        return null;
+    }
+
+    /// Create a handle from dial parameters. Dupes all strings.
+    pub fn create(
+        alloc: Allocator,
+        host: []const u8,
+        user: ?[]const u8,
+        port: u16,
+        jump: ?[]const u8,
+    ) !*RemoteConnectionHandle {
+        const self = try alloc.create(RemoteConnectionHandle);
+        errdefer alloc.destroy(self);
+
+        const host_dup = try alloc.dupeZ(u8, host);
+        errdefer alloc.free(host_dup);
+        const user_dup = if (user) |u| try alloc.dupeZ(u8, u) else null;
+        errdefer if (user_dup) |u| alloc.free(u);
+        const jump_dup = if (jump) |j| try alloc.dupeZ(u8, j) else null;
+        errdefer if (jump_dup) |j| alloc.free(j);
+
+        self.* = .{
+            .alloc = alloc,
+            .host = host_dup,
+            .user = user_dup,
+            .port = port,
+            .jump = jump_dup,
+        };
+        return self;
+    }
+
+    /// Shut down the live transport (if any) and free the handle. The caller
+    /// must ensure no surface still references this handle.
+    pub fn destroy(self: *RemoteConnectionHandle) void {
+        const alloc = self.alloc;
+        // Defensively clear any lingering metrics subscription BEFORE the transport
+        // teardown so no metrics callback can fire mid-teardown (clearing the
+        // handler slot under the connection's write mutex). The subsequent
+        // shutdown joins the control reader, after which no callback can fire.
+        if (self.metrics_cb != null) {
+            if (self.conn()) |c| c.unsubscribeMetrics();
+            self.metrics_cb = null;
+        }
+        // Same for the link-state observer (WP-D1): the transport shutdown below
+        // drives reader-EOF transitions, which must NOT fire into a caller that
+        // is in the middle of freeing us. `clearStateHandler` takes the state
+        // lock, so any in-flight callback has returned when it does.
+        if (self.state_cb != null) {
+            if (self.conn()) |c| c.clearStateHandler();
+            self.state_cb = null;
+        }
+        // `Transport.deinit` shuts the connection down, closes the streams (the
+        // ssh children observe EOF on stdin and exit), reaps both children, and
+        // frees the connection + control-path.
+        if (self.transport) |t| t.deinit();
+        // `Dialed.deinit` performs the strict TCP teardown (conn.shutdown →
+        // mux.joinPump → free conn/mux/socket), closing the socket fd.
+        if (self.tcp) |d| {
+            d.deinit();
+            alloc.destroy(d);
+        }
+        // `relay_dial.Dialed.deinit` performs the strict relay teardown
+        // (conn.shutdown → mux.joinPump → free conn/mux → reap the helper child →
+        // free the env map + child stream).
+        if (self.relay) |d| {
+            d.deinit();
+            alloc.destroy(d);
+        }
+        alloc.free(self.host);
+        if (self.user) |u| alloc.free(u);
+        if (self.jump) |j| alloc.free(j);
+        alloc.destroy(self);
+    }
+};
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -588,6 +835,22 @@ pub const Surface = struct {
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
+
+    /// Remote-machine backend for this surface, if any (remote-machines design
+    /// §3.2). Copied from `Options.connection`/`.session_id` at init and read
+    /// by `CoreSurface.init` via `remoteBackend()` to construct the `.remote`
+    /// termio backend. The handle is borrowed (caller-owned). `session_id`
+    /// is borrowed for the duration of `CoreSurface.init` only (the remote
+    /// backend dupes it), so we only retain the raw C pointer here.
+    remote_connection: ?*RemoteConnectionHandle = null,
+    remote_session_id: ?[*:0]const u8 = null,
+
+    /// Explicit REMOTE working directory for an OPEN-new remote session (§WP4),
+    /// copied from `Options.remote_working_directory`. Borrowed for the duration
+    /// of `CoreSurface.init` only (the remote backend dupes it). Distinct from
+    /// the LOCAL `config.@"working-directory"` so the stall-fix invariant holds:
+    /// a fresh remote window (no parent, no explicit remote cwd) forwards NO cwd.
+    remote_working_directory: ?[*:0]const u8 = null,
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -630,6 +893,32 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Remote-machine backend (remote-machines design §3.2). When non-null,
+        /// the surface is constructed with the `.remote` termio backend riding
+        /// on this caller-owned connection instead of the local exec/pty
+        /// backend. The connection must already be started and
+        /// handshake-complete. It is NOT freed when the surface is freed.
+        ///
+        /// C type: `ghostty_remote_connection_t` (opaque `void*`), as returned
+        /// by `ghostty_remote_connection_new`.
+        connection: ?*RemoteConnectionHandle = null,
+
+        /// The agent session to ATTACH to (re-attach to an existing remote
+        /// session); null ⇒ OPEN a brand-new session. Ignored when `connection`
+        /// is null.
+        ///
+        /// C type: `const char*`.
+        session_id: ?[*:0]const u8 = null,
+
+        /// Explicit REMOTE working directory for an OPEN-new remote session
+        /// (§WP4): the cwd ON THE REMOTE MACHINE, set by the split/tab path from
+        /// an on-demand cwd query of the parent pane. Forwarded verbatim to the
+        /// agent's OPEN. DISTINCT from `working_directory` (a local path that
+        /// must never reach a remote agent). Null ⇒ no remote cwd hint.
+        ///
+        /// C type: `const char*`.
+        remote_working_directory: ?[*:0]const u8 = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -644,6 +933,12 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            // Remote backend handle (remote-machines design §3.2). Recorded
+            // before `core_surface.init` so `remoteBackend()` can branch the
+            // backend construction (Surface.zig).
+            .remote_connection = opts.connection,
+            .remote_session_id = opts.session_id,
+            .remote_working_directory = opts.remote_working_directory,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -658,6 +953,19 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
+                // `openDirAbsolute` ASSERTS the path is absolute (an `unreachable`
+                // panic, NOT a catchable error) before it opens anything. A
+                // non-absolute path here — e.g. a remote pane's `C:\…` cwd that
+                // leaked into the local working_directory — would crash the whole
+                // app instead of logging. Skip any non-absolute path defensively
+                // so a bad cwd can never bring down the process.
+                if (!std.fs.path.isAbsolute(wd)) {
+                    log.warn(
+                        "requested working directory is not absolute on this platform; ignoring dir={s}",
+                        .{wd},
+                    );
+                    break :wd;
+                }
                 var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
                     log.warn(
                         "error opening requested working directory dir={s} err={}",
@@ -1106,6 +1414,14 @@ pub const Surface = struct {
 
         const working_directory: ?[*:0]const u8 = wd: {
             if (!apprt.surface.shouldInheritWorkingDirectory(context, &self.app.config)) break :wd null;
+            // A remote pane's pwd is a path ON THE REMOTE MACHINE (e.g. a Windows
+            // `C:\…` path). It is meaningless — and may not even be absolute — on
+            // the LOCAL filesystem, so it must NEVER be lowered into the local
+            // `working_directory` (which `Surface.init` feeds to `openDirAbsolute`,
+            // a hard `isAbsolute` assert). Remote cwd inheritance is carried
+            // separately via `remote_working_directory`, resolved by an on-demand
+            // agent cwd query in the apprt (§WP4). Local panes are unaffected.
+            if (self.remote_connection != null) break :wd null;
             const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
             defer self.app.core_app.alloc.free(cwd);
             break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
@@ -1115,6 +1431,42 @@ pub const Surface = struct {
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
+        };
+    }
+
+    /// Returns the remote-machine backend for this surface, or null for a local
+    /// surface (remote-machines design §3.2). `CoreSurface.init` calls this at
+    /// the single backend-construction site to decide between the `.remote` and
+    /// `.exec` backends. The connection is borrowed (caller-owned); `session_id`
+    /// is borrowed for the duration of the construction call only.
+    pub fn remoteBackend(self: *const Surface) ?CoreSurface.RemoteBackend {
+        const handle = self.remote_connection orelse return null;
+
+        // The handle exists but the live transport (SSH or TCP) has not been
+        // established yet (the caller must `_start` / `_new_tcp` it before
+        // building a remote surface). Without a live connection we cannot build
+        // the `.remote` backend; fall back to local rather than crashing.
+        const conn = handle.conn() orelse {
+            log.warn(
+                "remote surface requested but connection not established; " ++
+                    "falling back to local backend (call _start / _new_tcp first)",
+                .{},
+            );
+            return null;
+        };
+
+        return .{
+            .connection = conn,
+            .session_id = if (self.remote_session_id) |s|
+                std.mem.sliceTo(s, 0)
+            else
+                null,
+            // The EXPLICIT remote cwd (split/tab inheritance, §WP4). Empty ⇒ null
+            // so a stray empty string never forwards a cwd.
+            .working_directory = if (self.remote_working_directory) |w| wd: {
+                const s = std.mem.sliceTo(w, 0);
+                break :wd if (s.len > 0) s else null;
+            } else null,
         };
     }
 
@@ -1847,6 +2199,774 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
+    }
+
+    // -------------------------------------------------------------------------
+    // Remote machines (remote-machines design §3.5/§3.2). The C ABI the Swift
+    // app binds to for the remote-connection lifecycle. WP3: the live SSH dial
+    // is not implemented yet — `_start` returns false ("not yet implemented");
+    // the rest of the ABI is real-shaped so the Swift binding is stable.
+    // -------------------------------------------------------------------------
+
+    /// C type: `ghostty_remote_config_s`. Dial parameters for a remote
+    /// connection key (host, user, port, jump-chain).
+    const RemoteConfigC = extern struct {
+        host: ?[*:0]const u8 = null,
+        user: ?[*:0]const u8 = null,
+        port: u16 = 0,
+        jump: ?[*:0]const u8 = null,
+    };
+
+    /// Create a remote connection handle from dial parameters. Returns null on
+    /// allocation failure or invalid parameters (e.g. a null/empty host). The
+    /// handle is NOT connected yet; call `ghostty_remote_connection_start`.
+    export fn ghostty_remote_connection_new(
+        cfg: *const RemoteConfigC,
+    ) ?*RemoteConnectionHandle {
+        const host_c = cfg.host orelse {
+            log.warn("ghostty_remote_connection_new: host is required", .{});
+            return null;
+        };
+        const host = std.mem.sliceTo(host_c, 0);
+        if (host.len == 0) {
+            log.warn("ghostty_remote_connection_new: host is empty", .{});
+            return null;
+        }
+        const user = if (cfg.user) |u| std.mem.sliceTo(u, 0) else null;
+        const jump = if (cfg.jump) |j| std.mem.sliceTo(j, 0) else null;
+
+        return RemoteConnectionHandle.create(
+            global.alloc,
+            host,
+            user,
+            cfg.port,
+            jump,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new failed err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Start the connection: dial SSH (two `ssh` subprocesses sharing one
+    /// ControlMaster — control + data channels, §4.3), spawn the reader/writer
+    /// threads, and send the client HELLO. Returns true on success.
+    ///
+    /// Idempotent: calling it again on an already-started handle is a no-op that
+    /// returns true. The handshake itself is awaited separately via
+    /// `_wait_handshake` (this only confirms the dial + thread spawn succeeded).
+    export fn ghostty_remote_connection_start(
+        handle: *RemoteConnectionHandle,
+    ) bool {
+        if (handle.transport != null) return true; // already dialed (ssh)
+        // A TCP handle (`_new_tcp`) is already fully established (dial completed
+        // the handshake), so `_start` is a no-op for it.
+        if (handle.tcp != null) return true;
+
+        const cfg: ssh_transport.DialConfig = .{
+            .host = std.mem.sliceTo(handle.host, 0),
+            .user = if (handle.user) |u| std.mem.sliceTo(u, 0) else null,
+            .port = handle.port,
+            .jump = if (handle.jump) |j| std.mem.sliceTo(j, 0) else null,
+            // agent_path / askpass_path / session_id are wired in later
+            // increments (agent push path + GUI askpass helper); the defaults
+            // dial a bare `ghoztty-agent` with key-only auth, sufficient to
+            // bring up the transport end-to-end against a deployed agent.
+        };
+
+        const transport = RemoteConnectionHandle.Transport.dial(handle.alloc, cfg) catch |err| {
+            log.err("ghostty_remote_connection_start: ssh dial failed err={}", .{err});
+            return false;
+        };
+        handle.transport = transport;
+        return true;
+    }
+
+    /// Create a remote connection by dialing a TCP-listening `ghoztty-agent`
+    /// directly at `host:port` (WP4). Unlike the SSH path, `tcp_dial.dial`
+    /// connects the socket, folds the two logical lanes through a `ClientMux`,
+    /// stands up the `Connection`, AND blocks through the HELLO handshake before
+    /// returning — so the returned handle is FULLY ESTABLISHED. A subsequent
+    /// `ghostty_remote_connection_start` is therefore a no-op (it returns true
+    /// because `conn()` is already live); `_wait_handshake` will return true
+    /// immediately. The handle stores the `Dialed` transport where `conn()`
+    /// (and thus `remoteBackend`/`_wait_handshake`/`_latency_ms`/`_free`) reads
+    /// it, exactly mirroring the SSH path.
+    ///
+    /// Returns null on a null/empty host or any dial/handshake failure. The
+    /// encoding is pinned to `.raw` (a clean TCP/Tailscale hop, matching the
+    /// agent's default).
+    export fn ghostty_remote_connection_new_tcp(
+        host: [*:0]const u8,
+        port: u16,
+    ) ?*RemoteConnectionHandle {
+        const host_slice = std.mem.sliceTo(host, 0);
+        if (host_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_tcp: host is empty", .{});
+            return null;
+        }
+
+        const alloc = global.alloc;
+
+        // Record the dial parameters on the handle (host/port; no user/jump for
+        // the direct TCP path) so the handle is uniform with the SSH one.
+        const handle = RemoteConnectionHandle.create(
+            alloc,
+            host_slice,
+            null,
+            port,
+            null,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new_tcp: handle alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer handle.destroy();
+
+        // Dial: connect + mux + Connection + HELLO handshake (blocks). On any
+        // failure the handle is destroyed (no transport was attached).
+        const dialed = alloc.create(tcp_dial.Dialed) catch |err| {
+            log.err("ghostty_remote_connection_new_tcp: Dialed alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer alloc.destroy(dialed);
+        dialed.* = tcp_dial.dial(alloc, host_slice, port, .raw) catch |err| {
+            log.err("ghostty_remote_connection_new_tcp: tcp dial failed err={}", .{err});
+            return null;
+        };
+
+        handle.tcp = dialed;
+        return handle;
+    }
+
+    /// Create a remote connection by dialing a remote `ghoztty-agent` THROUGH a
+    /// rendezvous relay. A native `wss://` WebSocket (`relay_dial`/`ws_client`)
+    /// opens an authenticated connection to the relay (`base`) for `device`,
+    /// giving a transparent framed byte pipe to the agent (no subprocess). Like
+    /// the TCP path, this stands up the `ClientMux` + `Connection` AND blocks
+    /// through the HELLO handshake before returning, so the returned handle is
+    /// FULLY ESTABLISHED (a subsequent `_start` is a no-op; `_wait_handshake`
+    /// returns true immediately). The handle stores the relay transport where
+    /// `conn()` (and thus `remoteBackend`/`_wait_handshake`/`_latency_ms`/`_free`)
+    /// reads it, exactly mirroring the TCP path.
+    ///
+    /// The relay auth token (`token`) is sent as `Authorization: Bearer <token>`.
+    ///
+    /// Returns null on a null/empty `base`/`device` or any dial/handshake
+    /// failure. The encoding is pinned to `.raw` (a clean pipe, like TCP).
+    export fn ghostty_remote_connection_new_relay(
+        base: [*:0]const u8,
+        device: [*:0]const u8,
+        token: [*:0]const u8,
+    ) ?*RemoteConnectionHandle {
+        const base_slice = std.mem.sliceTo(base, 0);
+        const device_slice = std.mem.sliceTo(device, 0);
+        const token_slice = std.mem.sliceTo(token, 0);
+        if (base_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_relay: base is empty", .{});
+            return null;
+        }
+        if (device_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_relay: device is empty", .{});
+            return null;
+        }
+
+        const alloc = global.alloc;
+
+        // Record the dial parameters on the handle (device as the display host,
+        // port 0; no user/jump for the relay path) so the handle is uniform.
+        const handle = RemoteConnectionHandle.create(
+            alloc,
+            device_slice,
+            null,
+            0,
+            null,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new_relay: handle alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer handle.destroy();
+
+        // Dial: WebSocket + mux + Connection + HELLO handshake (blocks). On any
+        // failure the handle is destroyed (no transport was attached).
+        const dialed = alloc.create(relay_dial.Dialed) catch |err| {
+            log.err("ghostty_remote_connection_new_relay: Dialed alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer alloc.destroy(dialed);
+        dialed.* = relay_dial.dial(alloc, base_slice, device_slice, token_slice, .raw) catch |err| {
+            log.err("ghostty_remote_connection_new_relay: relay dial failed err={}", .{err});
+            return null;
+        };
+
+        handle.relay = dialed;
+        return handle;
+    }
+
+    /// Block until the protocol handshake completes (or fails). Returns true if
+    /// the handshake negotiated successfully. Only meaningful after a
+    /// successful `_start`.
+    export fn ghostty_remote_connection_wait_handshake(
+        handle: *RemoteConnectionHandle,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        _ = conn.waitHandshake() catch |err| {
+            log.warn("remote connection handshake failed err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Current smoothed latency in milliseconds, or -1 if not yet measured or
+    /// the connection isn't established.
+    export fn ghostty_remote_connection_latency_ms(
+        handle: *RemoteConnectionHandle,
+    ) i32 {
+        const conn = handle.conn() orelse return -1;
+        const ms = conn.latencyMs() orelse return -1;
+        return std.math.cast(i32, ms) orelse std.math.maxInt(i32);
+    }
+
+    /// Integer mirror of `connection.LinkState.State` for the C ABI (WP-D1).
+    /// Kept in one place so `_state` and the state callback agree.
+    fn linkStateToC(s: remote_connection.LinkState.State) i32 {
+        return switch (s) {
+            .connected => 0, // GHOSTTY_REMOTE_CONN_CONNECTED
+            .degraded => 1, // GHOSTTY_REMOTE_CONN_DEGRADED
+            .reconnecting => 2, // GHOSTTY_REMOTE_CONN_RECONNECTING
+            .reattaching => 3, // GHOSTTY_REMOTE_CONN_REATTACHING
+            .dead => 4, // GHOSTTY_REMOTE_CONN_DEAD
+        };
+    }
+
+    /// Current link state of the connection (§5.1 FSM) as a
+    /// `GHOSTTY_REMOTE_CONN_*` value, or -1 if the connection isn't established.
+    export fn ghostty_remote_connection_state(
+        handle: *RemoteConnectionHandle,
+    ) i32 {
+        const conn = handle.conn() orelse return -1;
+        return linkStateToC(conn.state());
+    }
+
+    /// Zig-side `StateHandler` trampoline: map the FSM state to its C value and
+    /// invoke the stored C callback. Fires under the connection's state lock on
+    /// an internal thread — see `GhosttyRemoteStateCallback`.
+    fn stateTrampoline(
+        ctx: *anyopaque,
+        _: *remote_connection.Connection,
+        _: remote_connection.LinkState.State,
+        new: remote_connection.LinkState.State,
+    ) void {
+        const tramp: *const RemoteConnectionHandle.StateTrampoline = @ptrCast(@alignCast(ctx));
+        tramp.cb(linkStateToC(new), tramp.userdata);
+    }
+
+    /// Register (or, with a NULL callback, clear) an observer for connection
+    /// link-state transitions (WP-D1). The callback fires on a connection
+    /// thread with the state lock held — it must not call back into any
+    /// `ghostty_remote_connection_*` API; hop to another queue. Clearing
+    /// synchronizes with an in-flight invocation: once this returns with NULL,
+    /// no further callback fires and `userdata` may be freed. A second register
+    /// replaces the callback.
+    export fn ghostty_remote_connection_set_state_callback(
+        handle: *RemoteConnectionHandle,
+        callback: ?GhosttyRemoteStateCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        const conn = handle.conn() orelse return;
+        const cb = callback orelse {
+            conn.clearStateHandler();
+            handle.state_cb = null;
+            return;
+        };
+        handle.state_cb = .{ .cb = cb, .userdata = userdata };
+        conn.setStateHandler(&handle.state_cb.?, stateTrampoline);
+    }
+
+    /// The agent's self-reported hostname from its HELLO, or null if the peer
+    /// didn't send one (older agent) or the handshake hasn't completed. The
+    /// returned pointer is owned by the connection and valid until
+    /// `ghostty_remote_connection_free`; callers should copy it immediately.
+    export fn ghostty_remote_connection_hostname(
+        handle: *RemoteConnectionHandle,
+    ) ?[*:0]const u8 {
+        const conn = handle.conn() orelse return null;
+        const name = conn.peerHostname() orelse return null;
+        return name.ptr;
+    }
+
+    /// Shut down and free the connection handle. Detaches all panes (remote
+    /// sessions survive for later re-attach by session_id). The caller must
+    /// ensure no surface still references this handle.
+    export fn ghostty_remote_connection_free(handle: *RemoteConnectionHandle) void {
+        handle.destroy();
+    }
+
+    /// On-demand query for a remote session's child working directory (§WP4).
+    /// Sends `GET_CWD{session_id}` over the connection and blocks (bounded
+    /// timeout) for the `CWD` reply. Returns a caller-owned UTF-8 `String` on
+    /// success (free with `ghostty_string_free`), or an empty String if the
+    /// connection isn't established, the session is unknown, the agent's cwd
+    /// query failed, or the RPC timed out. Used by the Swift split/tab path so a
+    /// new remote pane inherits the parent's cwd.
+    export fn ghostty_remote_connection_query_cwd(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+    ) String {
+        return queryCwdImpl(handle, session_id, null);
+    }
+
+    /// Like `ghostty_remote_connection_query_cwd` but with an explicit timeout in
+    /// MILLISECONDS (0 ⇒ use the default 10s bound). The Swift GUI runs this on a
+    /// BACKGROUND queue with a tight bound so a new remote frame's cwd inheritance
+    /// never blocks the main thread and never waits long on a slow/wedged agent.
+    export fn ghostty_remote_connection_query_cwd_timeout(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ms: u32,
+    ) String {
+        const ns: ?u64 = if (timeout_ms == 0)
+            null
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+        return queryCwdImpl(handle, session_id, ns);
+    }
+
+    fn queryCwdImpl(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ns: ?u64,
+    ) String {
+        const conn = handle.conn() orelse return .empty;
+        const sid = std.mem.sliceTo(session_id, 0);
+        if (sid.len == 0) return .empty;
+
+        const path = (if (timeout_ns) |ns|
+            conn.queryCwdTimeout(sid, ns)
+        else
+            conn.queryCwd(sid)) catch |err| {
+            log.debug("remote query_cwd failed err={}", .{err});
+            return .empty;
+        };
+        defer handle.alloc.free(path);
+        // Re-dupe into the C-API allocator (matching `ghostty_string_free`).
+        const copy = handle.alloc.dupeZ(u8, path) catch return .empty;
+        return .fromSlice(copy);
+    }
+
+    /// Zig-side `MetricsHandler` trampoline: marshal `protocol.HostMetrics` into a
+    /// stack `ghostty_host_metrics_s` (optionals → sentinels) and invoke the stored
+    /// C callback with the caller's `userdata`. `ctx` is the handle's
+    /// `&metrics_cb.?` trampoline (pinned for the subscription's life). Fires on the
+    /// connection's control-reader thread.
+    fn metricsTrampoline(ctx: *anyopaque, host: remote_protocol.HostMetrics) void {
+        const tramp: *const RemoteConnectionHandle.MetricsTrampoline = @ptrCast(@alignCast(ctx));
+        const hm: ghostty_host_metrics_s = .{
+            .cpu_pct = host.cpu_pct,
+            .mem_used = host.mem_used,
+            .mem_total = host.mem_total,
+            .ncpu = host.ncpu,
+            .uptime_s = host.uptime_s orelse 0,
+            .load1 = host.load1 orelse -1,
+        };
+        tramp.cb(&hm, tramp.userdata);
+    }
+
+    /// Subscribe to the remote host's pushed metrics stream (§9.3). The agent then
+    /// pushes a sample every `interval_ms`; each is delivered to `callback` (on the
+    /// control-reader thread — see `GhosttyMetricsCallback`). Returns false if the
+    /// connection isn't established. The caller MUST call
+    /// `ghostty_remote_connection_metrics_unsubscribe` (or `_free`) before freeing
+    /// anything `userdata` points at. A second subscribe replaces the callback.
+    export fn ghostty_remote_connection_metrics_subscribe(
+        handle: *RemoteConnectionHandle,
+        interval_ms: u32,
+        callback: GhosttyMetricsCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        // Store the trampoline inline on the handle (pinned: the handle is stable),
+        // then hand its address to `subscribeMetrics` as the Zig handler ctx.
+        handle.metrics_cb = .{ .cb = callback, .userdata = userdata };
+        conn.subscribeMetrics(interval_ms, &handle.metrics_cb.?, metricsTrampoline) catch {
+            handle.metrics_cb = null;
+            return false;
+        };
+        return true;
+    }
+
+    /// Stop the pushed metrics stream and clear the callback. After this returns no
+    /// further metrics callback fires (the connection clears the handler slot under
+    /// its write mutex). Safe to call when not subscribed (no-op).
+    export fn ghostty_remote_connection_metrics_unsubscribe(
+        handle: *RemoteConnectionHandle,
+    ) void {
+        if (handle.conn()) |conn| conn.unsubscribeMetrics();
+        handle.metrics_cb = null;
+    }
+
+    /// A one-shot snapshot of the remote host's process table (§9.3). Mirrors a wire
+    /// `PROC_SNAPSHOT`. The marshaling here is SYNCHRONOUS (the call blocks on the RPC
+    /// reply up to `timeout_ms`); the Swift caller should run it OFF the main thread.
+    /// `cpu_pct` is per-core (>100 is possible for a multithreaded process); divide by
+    /// `host.ncpu` for a Task-Manager-style 0..100 total. `name`/`user`/`cmd` are
+    /// always non-null C strings (empty string ⇒ unavailable, never NULL).
+    export fn ghostty_remote_connection_proc_list(
+        handle: *RemoteConnectionHandle,
+        timeout_ms: u32,
+    ) ghostty_proc_list_s {
+        const empty: ghostty_proc_list_s = .{
+            .ok = false,
+            .truncated = false,
+            .host = .{ .cpu_pct = 0, .mem_used = 0, .mem_total = 0, .ncpu = 0, .uptime_s = 0, .load1 = -1 },
+            .procs = empty_procs_sentinel[0..].ptr,
+            .procs_len = 0,
+            .agent_pid = 0,
+        };
+
+        const conn = handle.conn() orelse return empty;
+        const ns: u64 = if (timeout_ms == 0)
+            10 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var snap = conn.requestProcSnapshot(null, 0, ns) catch |err| {
+            log.debug("remote proc_list failed err={}", .{err});
+            return empty;
+        };
+        defer snap.deinit();
+
+        const a = handle.alloc;
+        // Single heap allocation for the proc array; each string is its own dupeZ.
+        // On any partial failure free what we've built and return the empty sentinel
+        // (so `_free` is always safe — it sees procs_len == 0).
+        const arr = a.alloc(ghostty_proc_s, snap.procs.len) catch return empty;
+        var filled: usize = 0;
+        for (snap.procs, 0..) |p, i| {
+            const name = a.dupeZ(u8, p.name) catch break;
+            const user = a.dupeZ(u8, p.user orelse "") catch {
+                a.free(name);
+                break;
+            };
+            const cmd = a.dupeZ(u8, p.cmd orelse "") catch {
+                a.free(name);
+                a.free(user);
+                break;
+            };
+            arr[i] = .{
+                .pid = p.pid,
+                .ppid = p.ppid,
+                .cpu_pct = p.cpu_pct,
+                .mem_bytes = p.mem_bytes,
+                .name = name.ptr,
+                .user = user.ptr,
+                .cmd = cmd.ptr,
+            };
+            filled = i + 1;
+        }
+        if (filled != snap.procs.len) {
+            // A string dup failed mid-way: free the rows we did build + the array.
+            for (arr[0..filled]) |r| {
+                a.free(std.mem.sliceTo(r.name, 0));
+                a.free(std.mem.sliceTo(r.user, 0));
+                a.free(std.mem.sliceTo(r.cmd, 0));
+            }
+            a.free(arr);
+            return empty;
+        }
+
+        return .{
+            .ok = true,
+            .truncated = snap.truncated,
+            .host = .{
+                .cpu_pct = snap.host.cpu_pct,
+                .mem_used = snap.host.mem_used,
+                .mem_total = snap.host.mem_total,
+                .ncpu = snap.host.ncpu,
+                .uptime_s = snap.host.uptime_s orelse 0,
+                .load1 = snap.host.load1 orelse -1,
+            },
+            .procs = arr.ptr,
+            .procs_len = arr.len,
+            .agent_pid = snap.agent_pid,
+        };
+    }
+
+    /// Free a `ghostty_proc_list_s` returned by `_proc_list`. Frees every row's
+    /// strings then the row array. Always safe: a failed/empty list has
+    /// `procs_len == 0` and `procs` pointing at a static sentinel (never freed).
+    export fn ghostty_remote_connection_proc_list_free(
+        handle: *RemoteConnectionHandle,
+        list: ghostty_proc_list_s,
+    ) void {
+        if (list.procs_len == 0) return;
+        const a = handle.alloc;
+        const rows = list.procs[0..list.procs_len];
+        for (rows) |r| {
+            a.free(std.mem.sliceTo(r.name, 0));
+            a.free(std.mem.sliceTo(r.user, 0));
+            a.free(std.mem.sliceTo(r.cmd, 0));
+        }
+        a.free(rows);
+    }
+
+    /// Kill a process on the REMOTE host by pid (§9.3 process control, inc 4).
+    /// SYNCHRONOUS: blocks on the RPC reply up to `timeout_ms` (0 ⇒ default 5s), so
+    /// run it OFF the main thread. `signal` is a NUL-terminated C string; an empty
+    /// string ⇒ the agent's default terminate ("TERM"). On POSIX "TERM"/"KILL"
+    /// select the signal; on Windows both map to TerminateProcess. Returns true iff
+    /// the agent reported the kill succeeded; false on no connection / agent error /
+    /// timeout.
+    export fn ghostty_remote_connection_proc_kill(
+        handle: *RemoteConnectionHandle,
+        pid: i64,
+        signal: [*:0]const u8,
+        timeout_ms: u32,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        const sig_slice = std.mem.sliceTo(signal, 0);
+        const sig: ?[]const u8 = if (sig_slice.len == 0) null else sig_slice;
+        const ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var out = conn.killProc(pid, sig, ns) catch |err| {
+            log.debug("remote proc_kill failed err={}", .{err});
+            return false;
+        };
+        defer out.deinit();
+        return out.ok;
+    }
+
+    /// Spawn a DETACHED process on the REMOTE host (§9.3 process control, inc 5).
+    /// SYNCHRONOUS: blocks on the RPC reply up to `timeout_ms` (0 ⇒ default 5s); run
+    /// OFF the main thread. `cmd` is run through the remote platform shell. `cwd` is
+    /// a NUL-terminated C string; an empty string ⇒ the agent's default cwd. Returns
+    /// the spawned pid (> 0), or -1 on failure (no connection / agent error /
+    /// timeout). On Windows the "pid" is the integer value of the child's process
+    /// HANDLE (matching the process-list ids).
+    export fn ghostty_remote_connection_proc_spawn(
+        handle: *RemoteConnectionHandle,
+        cmd: [*:0]const u8,
+        cwd: [*:0]const u8,
+        timeout_ms: u32,
+    ) i64 {
+        const conn = handle.conn() orelse return -1;
+        const cmd_slice = std.mem.sliceTo(cmd, 0);
+        if (cmd_slice.len == 0) return -1;
+        const cwd_slice = std.mem.sliceTo(cwd, 0);
+        const cwd_opt: ?[]const u8 = if (cwd_slice.len == 0) null else cwd_slice;
+        const ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var out = conn.spawnProc(cmd_slice, cwd_opt, ns) catch |err| {
+            log.debug("remote proc_spawn failed err={}", .{err});
+            return -1;
+        };
+        defer out.deinit();
+        if (!out.ok) return -1;
+        return out.pid orelse -1;
+    }
+
+    // -------------------------------------------------------------------------
+    // LOCAL (in-process) activity-monitor provider — the "Local" machine in the
+    // panel's switcher. Unlike the remote `_remote_connection_*` calls, these take
+    // NO connection handle: they sample / kill / spawn IN THIS PROCESS using the
+    // SAME `proc.ProcSampler` / `metrics.Sampler` / `proc_control` code the agent
+    // uses. A mutex-guarded global holds PERSISTENT samplers so local per-process
+    // and host CPU% deltas work across polls (the first poll reads 0%). The panel
+    // polls from a background queue, so every entry point locks `local_mutex`.
+    //
+    // `ghostty_local_proc_list` reuses the SAME `ghostty_proc_list_s` struct as the
+    // remote path, but `ghostty_local_proc_list_free` frees via the app/global
+    // allocator (`global.alloc`) — there is NO handle whose `.alloc` to use — so it
+    // is a DISTINCT free function from `ghostty_remote_connection_proc_list_free`.
+    // -------------------------------------------------------------------------
+
+    /// Persistent local samplers + their guard. Created lazily on first use so a
+    /// build that never opens the Local machine pays nothing. The samplers keep
+    /// prev-tick baselines so repeated `_local_proc_list` polls yield real CPU%.
+    const LocalSamplers = struct {
+        var mutex: std.Thread.Mutex = .{};
+        var proc_sampler: ?remote_proc.ProcSampler = null;
+        var host_sampler: remote_metrics.Sampler = remote_metrics.Sampler.init();
+
+        /// Caller must hold `mutex`. Returns the lazily-created proc sampler.
+        fn procSamplerLocked(alloc: Allocator) *remote_proc.ProcSampler {
+            if (proc_sampler == null) proc_sampler = remote_proc.ProcSampler.init(alloc);
+            return &proc_sampler.?;
+        }
+    };
+
+    /// A one-shot snapshot of THIS machine's process table (§9.3, the "Local"
+    /// machine). SYNCHRONOUS but cheap (a local OS enumeration). The host metrics
+    /// come from a persistent local `Sampler`, so host CPU% is a real delta after
+    /// the first poll. `timeout_ms` is accepted for API symmetry with the remote
+    /// call but unused (there is no RPC). Free with `ghostty_local_proc_list_free`.
+    export fn ghostty_local_proc_list(timeout_ms: u32) ghostty_proc_list_s {
+        _ = timeout_ms;
+        const a = global.alloc;
+
+        // Local "ghoztty-spawned" root = this running app's own pid; the UI shows
+        // its descendants by default.
+        const self_pid: i64 = pid: {
+            if (builtin.os.tag == .windows) {
+                const k32 = struct {
+                    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) std.os.windows.DWORD;
+                };
+                break :pid @intCast(k32.GetCurrentProcessId());
+            }
+            break :pid @intCast(std.c.getpid());
+        };
+
+        const empty: ghostty_proc_list_s = .{
+            .ok = false,
+            .truncated = false,
+            .host = .{ .cpu_pct = 0, .mem_used = 0, .mem_total = 0, .ncpu = 0, .uptime_s = 0, .load1 = -1 },
+            .procs = empty_procs_sentinel[0..].ptr,
+            .procs_len = 0,
+            .agent_pid = self_pid,
+        };
+
+        LocalSamplers.mutex.lock();
+        defer LocalSamplers.mutex.unlock();
+
+        const host = LocalSamplers.host_sampler.sample();
+        const sampler = LocalSamplers.procSamplerLocked(a);
+
+        var procs: std.ArrayListUnmanaged(remote_protocol.Proc) = .empty;
+        defer {
+            for (procs.items) |p| {
+                a.free(@constCast(p.name));
+                if (p.user) |u| a.free(@constCast(u));
+                if (p.cmd) |c| a.free(@constCast(c));
+            }
+            procs.deinit(a);
+        }
+        const truncated = sampler.sample(a, &procs, 0) catch return empty;
+
+        // Marshal into the SAME C struct as the remote path (dup strings, empty-
+        // string sentinels for null user/cmd, safe partial-failure cleanup).
+        const arr = a.alloc(ghostty_proc_s, procs.items.len) catch return empty;
+        var filled: usize = 0;
+        for (procs.items, 0..) |p, i| {
+            const name = a.dupeZ(u8, p.name) catch break;
+            const user = a.dupeZ(u8, p.user orelse "") catch {
+                a.free(name);
+                break;
+            };
+            const cmd = a.dupeZ(u8, p.cmd orelse "") catch {
+                a.free(name);
+                a.free(user);
+                break;
+            };
+            arr[i] = .{
+                .pid = p.pid,
+                .ppid = p.ppid,
+                .cpu_pct = p.cpu_pct,
+                .mem_bytes = p.mem_bytes,
+                .name = name.ptr,
+                .user = user.ptr,
+                .cmd = cmd.ptr,
+            };
+            filled = i + 1;
+        }
+        if (filled != procs.items.len) {
+            for (arr[0..filled]) |r| {
+                a.free(std.mem.sliceTo(r.name, 0));
+                a.free(std.mem.sliceTo(r.user, 0));
+                a.free(std.mem.sliceTo(r.cmd, 0));
+            }
+            a.free(arr);
+            return empty;
+        }
+
+        return .{
+            .ok = true,
+            .truncated = truncated,
+            .host = .{
+                .cpu_pct = host.cpu_pct,
+                .mem_used = host.mem_used,
+                .mem_total = host.mem_total,
+                .ncpu = host.ncpu,
+                .uptime_s = host.uptime_s orelse 0,
+                .load1 = host.load1 orelse -1,
+            },
+            .procs = arr.ptr,
+            .procs_len = arr.len,
+            .agent_pid = self_pid,
+        };
+    }
+
+    /// Free a `ghostty_proc_list_s` returned by `ghostty_local_proc_list`. Unlike
+    /// `ghostty_remote_connection_proc_list_free` (which uses the handle's
+    /// allocator), this frees via the app/global allocator — local lists carry no
+    /// handle. Always safe (a failed/empty list has `procs_len == 0`).
+    export fn ghostty_local_proc_list_free(list: ghostty_proc_list_s) void {
+        if (list.procs_len == 0) return;
+        const a = global.alloc;
+        const rows = list.procs[0..list.procs_len];
+        for (rows) |r| {
+            a.free(std.mem.sliceTo(r.name, 0));
+            a.free(std.mem.sliceTo(r.user, 0));
+            a.free(std.mem.sliceTo(r.cmd, 0));
+        }
+        a.free(rows);
+    }
+
+    /// Kill a process on THIS machine by pid (§9.3, the "Local" machine). `signal`
+    /// is a NUL-terminated C string; empty ⇒ default terminate ("TERM"). Returns
+    /// true iff the kill succeeded. In-process (no RPC), guarded by `local_mutex`
+    /// only for symmetry — `killProc` itself is a stateless OS call.
+    export fn ghostty_local_proc_kill(pid: i64, signal: [*:0]const u8) bool {
+        const sig_slice = std.mem.sliceTo(signal, 0);
+        const sig: ?[]const u8 = if (sig_slice.len == 0) null else sig_slice;
+        const out = remote_proc_control.killProc(pid, sig);
+        return out.ok;
+    }
+
+    /// Spawn a DETACHED process on THIS machine (§9.3, the "Local" machine). `cmd`
+    /// is run through the local platform shell. `cwd` is a NUL-terminated C string;
+    /// empty ⇒ the current working directory. Returns the spawned pid (> 0), or -1
+    /// on failure. In-process (no RPC).
+    export fn ghostty_local_proc_spawn(cmd: [*:0]const u8, cwd: [*:0]const u8) i64 {
+        const a = global.alloc;
+        const cmd_slice = std.mem.sliceTo(cmd, 0);
+        if (cmd_slice.len == 0) return -1;
+        const cwd_slice = std.mem.sliceTo(cwd, 0);
+        const cwd_opt: ?[]const u8 = if (cwd_slice.len == 0) null else cwd_slice;
+        const out = remote_proc_spawn.spawnDetached(a, cmd_slice, cwd_opt);
+        // The Windows path may return an allocated diagnostic note we don't surface
+        // through this i64-only C API — free it so it doesn't leak.
+        if (out.free_error) {
+            if (out.@"error") |m| a.free(@constCast(m));
+        }
+        if (!out.ok) return -1;
+        return out.pid orelse -1;
+    }
+
+    /// The LIVE remote agent session id for `surface`, or an empty String if it
+    /// is a local surface or its remote pane is not yet resolved. Returns a
+    /// caller-owned UTF-8 `String` (free with `ghostty_string_free`). (§WP4)
+    export fn ghostty_surface_remote_session_id(surface: *Surface) String {
+        const sid = surface.core_surface.remoteSessionId() orelse return .empty;
+        if (sid.len == 0) return .empty;
+        const copy = surface.app.core_app.alloc.dupeZ(u8, sid) catch return .empty;
+        return .fromSlice(copy);
+    }
+
+    /// The command `surface`'s remote pane was OPENed with, or an empty String if
+    /// it is a local surface or its remote pane uses the agent's default shell.
+    /// Returns a caller-owned UTF-8 `String` (free with `ghostty_string_free`).
+    /// Used by the Swift new-window/tab/split path so a new remote frame inherits
+    /// the parent frame's command (§WP4). The result is a snapshot; it does not
+    /// borrow the backend.
+    export fn ghostty_surface_remote_command(surface: *Surface) String {
+        const cmd = surface.core_surface.remoteCommand() orelse return .empty;
+        if (cmd.len == 0) return .empty;
+        const copy = surface.app.core_app.alloc.dupeZ(u8, cmd) catch return .empty;
+        return .fromSlice(copy);
     }
 
     /// Tell the surface that it needs to schedule a render

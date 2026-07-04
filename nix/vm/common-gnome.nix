@@ -86,8 +86,8 @@
       {
         settings = with lib.gvariant; {
           "org/gnome/desktop/background" = {
-            picture-uri = "file://${pkgs.ghostty}/share/icons/hicolor/512x512/apps/com.mitchellh.ghostty.png";
-            picture-uri-dark = "file://${pkgs.ghostty}/share/icons/hicolor/512x512/apps/com.mitchellh.ghostty.png";
+            picture-uri = "file://${pkgs.ghostty}/share/icons/hicolor/512x512/apps/com.dzearing.ghoztty.png";
+            picture-uri-dark = "file://${pkgs.ghostty}/share/icons/hicolor/512x512/apps/com.dzearing.ghoztty.png";
             picture-options = "centered";
             primary-color = "#000000000000";
             secondary-color = "#000000000000";
@@ -100,7 +100,7 @@
           };
           "org/gnome/desktop/screensaver" = {
             lock-enabled = false;
-            picture-uri = "file://${pkgs.ghostty}/share/icons/hicolor/512x512/apps/com.mitchellh.ghostty.png";
+            picture-uri = "file://${pkgs.ghostty}/share/icons/hicolor/512x512/apps/com.dzearing.ghoztty.png";
             picture-options = "centered";
             primary-color = "#000000000000";
             secondary-color = "#000000000000";
@@ -134,7 +134,7 @@
       text = ''
         mkdir -p /var/lib/AccountsService/{icons,users}
 
-        cp ${pkgs.ghostty}/share/icons/hicolor/1024x1024/apps/com.mitchellh.ghostty.png /var/lib/AccountsService/icons/ghostty
+        cp ${pkgs.ghostty}/share/icons/hicolor/1024x1024/apps/com.dzearing.ghoztty.png /var/lib/AccountsService/icons/ghostty
 
         echo -e "[User]\nIcon=/var/lib/AccountsService/icons/ghostty\n" > /var/lib/AccountsService/users/ghostty
 

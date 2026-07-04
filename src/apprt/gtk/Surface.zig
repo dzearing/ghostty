@@ -98,6 +98,14 @@ pub fn defaultTermioEnv(self: *Self) !std.process.EnvMap {
     return try self.surface.defaultTermioEnv();
 }
 
+/// Remote-machine backend (remote-machines design §3.2). The GTK apprt does
+/// not (yet) support remote surfaces, so this always returns null and surfaces
+/// use the local exec/pty backend.
+pub fn remoteBackend(self: *Self) ?CoreSurface.RemoteBackend {
+    _ = self;
+    return null;
+}
+
 /// Redraw the inspector for our surface.
 pub fn redrawInspector(self: *Self) void {
     self.surface.redrawInspector();

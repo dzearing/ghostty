@@ -65,7 +65,7 @@ pub fn run(alloc: Allocator) !u8 {
     defer iter.deinit();
 
     var buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buffer);
+    var stderr_writer = std.fs.File.stderr().writerStreaming(&buffer);
     const stderr = &stderr_writer.interface;
 
     const result = runArgs(alloc, &iter, stderr);
@@ -109,6 +109,7 @@ fn runArgs(
         },
     }) return 0;
 
-    try stderr.print("+close is not supported on this platform.\n", .{});
+    // sendIpc already printed the server's error text (if any) to stderr.
+    try stderr.print("+close failed.\n", .{});
     return 1;
 }

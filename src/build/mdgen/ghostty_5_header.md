@@ -12,7 +12,7 @@ at `$XDG_CONFIG_HOME/ghostty/config.ghostty`, which defaults to `~/.config/ghost
 if the [XDG environment is not set](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html).
 
 **If you are using macOS, the configuration file can also be placed at
-`$HOME/Library/Application Support/com.mitchellh.ghostty/config.ghostty`.** This is the
+`$HOME/Library/Application Support/com.dzearing.ghoztty/config.ghostty`.** This is the
 default configuration location for macOS. It will be searched before any of the
 XDG environment locations listed above.
 
@@ -98,11 +98,11 @@ logs sent to `stderr` may be stored by the system and made available for later
 retrieval.
 
 On Linux if Ghostty is launched by the default `systemd` user service, you can use
-`journald` to see Ghostty's logs: `journalctl --user --unit app-com.mitchellh.ghostty.service`.
+`journald` to see Ghostty's logs: `journalctl --user --unit app-com.dzearing.ghoztty.service`.
 
 On macOS logging to the macOS unified log is available and enabled by default.
 --Use the system `log` CLI to view Ghostty's logs: `sudo log stream --level debug
---predicate 'subsystem=="com.mitchellh.ghostty"'`.
+--predicate 'subsystem=="com.dzearing.ghoztty"'`.
 
 Ghostty's logging can be configured in two ways. The first is by what
 optimization level Ghostty is compiled with. If Ghostty is compiled with `Debug`

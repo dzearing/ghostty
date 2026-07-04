@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ghoztty-agent.wxs — per-user MSI for the Ghoztty Remote Agent (Windows).
+
+  Compiled on macOS with wixl (GNOME msitools); stick to the WiX-v3 subset
+  wixl understands. Build via relay/deploy/msi/build-msi.sh, which defines:
+
+    Version    numeric ProductVersion  (yy.m.dNN, e.g. 26.7.401)
+    AgentStamp agent build stamp       (YYYYMMDD-<hash>, shown in ARP Comments)
+    RelayUrl   relay base URL baked into the Run key + Start Menu shortcut
+    SourceExe  path to the built ghoztty-agent.exe
+
+  Design notes:
+  - Per-user, no admin: InstallScope="perUser" (ALLUSERS stays unset) plus
+    MSIINSTALLPERUSER=1. Everything lands under the user's profile/HKCU.
+  - Installs to %LOCALAPPDATA%\Programs\Ghoztty Agent\ — REQUIRED: the agent
+    self-updates by swapping its own exe, so the install dir must be
+    user-writable without elevation.
+  - The UpgradeCode GUID below is PERMANENT. Never change it, or upgrades
+    stop replacing older installs. Product Id is regenerated per build ("*").
+  - Component GUIDs are stable per component identity (MSI reference rules).
+  - KillAgent custom action (taskkill, exit code ignored) runs before
+    InstallValidate on install/upgrade/uninstall so the running tray exe
+    doesn't trip the files-in-use dialog or a reboot-scheduled delete.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Ghoztty Remote Agent"
+           Manufacturer="dzearing"
+           Version="$(var.Version)"
+           UpgradeCode="7143BA66-FD7B-4D45-8555-E946D2141912"
+           Language="1033">
+
+    <Package InstallerVersion="500"
+             InstallScope="perUser"
+             Compressed="yes"
+             Description="Ghoztty Remote Agent"
+             Comments="Agent build $(var.AgentStamp)"/>
+
+    <Media Id="1" Cabinet="agent.cab" EmbedCab="yes"/>
+
+    <!-- Per-user install semantics (Windows 7+ dual-mode marker). -->
+    <Property Id="MSIINSTALLPERUSER" Value="1"/>
+    <!-- ARP metadata: numeric ProductVersion is what DisplayVersion shows;
+         surface the human agent stamp via Comments. -->
+    <Property Id="ARPCOMMENTS" Value="Agent build $(var.AgentStamp)"/>
+    <Property Id="ARPNOMODIFY" Value="1"/>
+
+    <!-- Major-upgrade behavior: any older (or equal, other-build) product
+         with our UpgradeCode is removed when this one installs. -->
+    <Upgrade Id="7143BA66-FD7B-4D45-8555-E946D2141912">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes"
+                      Maximum="$(var.Version)" IncludeMaximum="no"
+                      Property="OLDERVERSIONFOUND" MigrateFeatures="yes"/>
+      <UpgradeVersion Minimum="$(var.Version)" IncludeMinimum="yes"
+                      OnlyDetect="yes"
+                      Property="NEWERVERSIONFOUND"/>
+    </Upgrade>
+
+    <!-- Block downgrades: the detect-only Upgrade row above sets
+         NEWERVERSIONFOUND when a newer build is already installed. -->
+    <Condition Message="A newer version of Ghoztty Remote Agent is already installed.">NOT NEWERVERSIONFOUND</Condition>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsDir" Name="Programs">
+          <Directory Id="INSTALLDIR" Name="Ghoztty Agent">
+
+            <!-- The agent binary. Per-user component: HKCU registry value is
+                 the keypath (user-profile file keypaths are unreliable across
+                 users, and the self-updater rewrites the exe anyway — a file
+                 keypath would invite MSI repair loops). -->
+            <Component Id="AgentExe" Guid="0604C8BB-B0FD-4236-861F-6B18983AE6AA">
+              <RegistryValue Root="HKCU"
+                             Key="Software\dzearing\GhozttyAgent"
+                             Name="InstallDir" Value="[INSTALLDIR]"
+                             Type="string" KeyPath="yes"/>
+              <File Id="AgentExeFile" Name="ghoztty-agent.exe"
+                    Source="$(var.SourceExe)"/>
+              <!-- wixl limitation: no Directory attribute on RemoveFolder
+                   (it targets the component's directory) and no RemoveFile
+                   element at all. So untracked self-update leftovers
+                   (e.g. a staged/renamed old exe) can keep INSTALLDIR from
+                   being deleted on uninstall; the tracked exe and all
+                   registry values are still removed cleanly. -->
+              <RemoveFolder Id="RemoveInstallDir" On="uninstall"/>
+            </Component>
+
+            <!-- Autostart at logon, pointed at the relay. -->
+            <Component Id="AgentRunKey" Guid="A98EEBA9-5D7A-4147-A0B9-571CE1BB1C47">
+              <RegistryValue Root="HKCU"
+                             Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                             Name="GhozttyAgent"
+                             Value="&quot;[INSTALLDIR]ghoztty-agent.exe&quot; --relay=$(var.RelayUrl)"
+                             Type="string" KeyPath="yes"/>
+            </Component>
+
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <!-- Start Menu shortcut so the agent can be launched right after
+           install (the Run key only fires at next logon). Non-advertised:
+           explicit Target/Arguments; HKCU keypath per per-user rules. -->
+      <Directory Id="ProgramMenuFolder">
+        <Component Id="AgentShortcut" Guid="53C2F210-3C13-4BE6-91FA-0F5550CDE7BE">
+          <RegistryValue Root="HKCU"
+                         Key="Software\dzearing\GhozttyAgent"
+                         Name="Shortcut" Value="1"
+                         Type="integer" KeyPath="yes"/>
+          <Shortcut Id="AgentStartMenuShortcut"
+                    Name="Ghoztty Agent"
+                    Target="[INSTALLDIR]ghoztty-agent.exe"
+                    Arguments="--relay=$(var.RelayUrl)"
+                    WorkingDirectory="INSTALLDIR"
+                    Description="Connect this machine to your Ghoztty terminal"/>
+        </Component>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Agent" Level="1" Title="Ghoztty Remote Agent">
+      <ComponentRef Id="AgentExe"/>
+      <ComponentRef Id="AgentRunKey"/>
+      <ComponentRef Id="AgentShortcut"/>
+    </Feature>
+
+    <!-- Stop a running agent so its exe isn't locked during install,
+         upgrade, or uninstall. taskkill exits nonzero when no process
+         matches — Return="ignore" makes that a no-op.
+         wixl limitation: no Directory attribute on CustomAction (type 34),
+         so use type 51 (set property to the formatted taskkill path) +
+         type 50 (run the exe named by that property). -->
+    <CustomAction Id="SetKillAgentCmd"
+                  Property="KILLAGENTCMD"
+                  Value="[SystemFolder]taskkill.exe"/>
+    <CustomAction Id="KillAgent"
+                  Property="KILLAGENTCMD"
+                  ExeCommand="/F /IM ghoztty-agent.exe"
+                  Execute="immediate"
+                  Return="ignore"/>
+
+    <InstallExecuteSequence>
+      <Custom Action="SetKillAgentCmd" Before="KillAgent"/>
+      <Custom Action="KillAgent" Before="InstallValidate"/>
+      <RemoveExistingProducts After="InstallValidate"/>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>

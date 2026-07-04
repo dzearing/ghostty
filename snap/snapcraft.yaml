@@ -22,7 +22,7 @@ apps:
     command: bin/ghostty
     command-chain: [app/launcher]
     completer: share/bash-completion/completions/ghostty.bash
-    desktop: share/applications/com.mitchellh.ghostty.desktop
+    desktop: share/applications/com.dzearing.ghoztty.desktop
     #refresh-mode: ignore-running # Store rejects this, needs fix in review-tools
     environment:
       PATH: /snap/ghostty/current/bin:/snap/ghostty/current/usr/bin:$PATH
@@ -86,7 +86,7 @@ parts:
         -Dcpu=baseline \
         -fno-sys=gtk4-layer-shell
       cp -rp zig-out/* $CRAFT_PART_INSTALL/
-      sed -i 's|Icon=com.mitchellh.ghostty|Icon=${SNAP}/share/icons/hicolor/512x512/apps/com.mitchellh.ghostty.png|g' $CRAFT_PART_INSTALL/share/applications/com.mitchellh.ghostty.desktop
+      sed -i 's|Icon=com.dzearing.ghoztty|Icon=${SNAP}/share/icons/hicolor/512x512/apps/com.dzearing.ghoztty.png|g' $CRAFT_PART_INSTALL/share/applications/com.dzearing.ghoztty.desktop
 
   libs:
     plugin: nil

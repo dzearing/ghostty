@@ -9,7 +9,7 @@ pub const application_id = switch (builtin.mode) {
     .ReleaseFast, .ReleaseSmall => base_application_id,
 };
 
-pub const resource_path = "/com/mitchellh/ghostty";
+pub const resource_path = "/com/dzearing/ghoztty";
 
 /// GTK object path
 pub const object_path = switch (builtin.mode) {

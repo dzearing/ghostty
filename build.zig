@@ -64,6 +64,12 @@ pub fn build(b: *std.Build) !void {
         "Run the app under valgrind",
     );
     const test_step = b.step("test", "Run tests");
+    const agent_step = b.step("agent", "Build the ghoztty-agent (remote-machines daemon)");
+    const test_agent_step = b.step("test-agent", "Run the ghoztty-agent tests (incl. real-pty)");
+    const conpty_smoke_step = b.step("conpty-smoke", "Build the ConPTY runtime smoke exe (Windows, cross-compile)");
+    const remote_test_client_step = b.step("remote-test-client", "Build the remote-test-client (drives a TCP ghoztty-agent)");
+    const wp4_e2e_step = b.step("wp4-e2e", "Build the WP4 headless e2e harness (Connection.openChannel over TCP vs the real agent)");
+    const remote_backend_e2e_step = b.step("remote-backend-e2e", "Build the WP4 headless RENDER harness (real Termio/.remote backend grid render vs the real agent)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -83,6 +89,89 @@ pub fn build(b: *std.Build) !void {
 
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
+
+    // Ghoztty remote-machines agent (WP2). A standalone, GUI-free daemon exe
+    // built on demand via `zig build agent`. It is not part of the default
+    // install graph this increment (daemonization/packaging is deferred).
+    {
+        const agent = try buildpkg.GhosttyAgent.init(b, &config, &deps);
+        agent_step.dependOn(&agent.install_step.step);
+
+        // `zig build test-agent` runs the agent's tests, including the real-pty
+        // child end-to-end tests (which need pty-c + os deps, so they can't run
+        // under the pure `agent_test.zig` standalone command).
+        const agent_test = b.addTest(.{
+            .name = "ghoztty-agent-test",
+            .filters = test_filters,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/agent_main.zig"),
+                .target = config.target,
+                .optimize = .Debug,
+            }),
+            .use_llvm = true,
+        });
+        // The agent test roots at `src/agent_main.zig` too, so it reaches
+        // main.zig's `@import("agent_build_options")` — reuse the exe's module.
+        agent_test.root_module.addImport("agent_build_options", agent.version_module);
+        if (!config.emit_lib_vt) _ = try deps.add(agent_test);
+        const agent_test_run = b.addRunArtifact(agent_test);
+        test_agent_step.dependOn(&agent_test_run.step);
+
+        // The agent-core aggregator (`src/remote/agent_test.zig`: server,
+        // session store, metrics, keepalive, socket stream). Previously only
+        // runnable by hand via `zig test -Mroot=src/remote/agent_test.zig`,
+        // so its ~140 tests ran in NO build step; wire it into `test-agent`.
+        const agent_core_test = b.addTest(.{
+            .name = "ghoztty-agent-core-test",
+            .filters = test_filters,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/remote/agent_test.zig"),
+                .target = config.target,
+                .optimize = .Debug,
+            }),
+            .use_llvm = true,
+        });
+        const agent_core_test_run = b.addRunArtifact(agent_core_test);
+        test_agent_step.dependOn(&agent_core_test_run.step);
+    }
+
+    // Ghoztty remote-machines test client (WP: TCP transport). A headless native
+    // CLI that dials a TCP-listening ghoztty-agent and relays a shell session —
+    // the orchestrator's tool for cross-machine end-to-end tests. Built on demand
+    // via `zig build remote-test-client`.
+    {
+        const client = try buildpkg.GhosttyRemoteTestClient.init(b, &config);
+        remote_test_client_step.dependOn(&client.install_step.step);
+    }
+
+    // Ghoztty WP4 Phase-1 headless e2e de-risk harness. Spawns the real
+    // ghoztty-agent on a localhost TCP port and drives the high-level
+    // `Connection.openChannel` (the same call termio/Remote.zig makes) to prove the
+    // client/agent channel rendezvous round-trips against the real,
+    // channel-authoritative agent. Built on demand via `zig build wp4-e2e`.
+    {
+        const harness = try buildpkg.GhosttyWp4E2e.init(b, &config);
+        wp4_e2e_step.dependOn(&harness.install_step.step);
+    }
+
+    // Ghoztty WP4 headless RENDER de-risk harness. Stands up a REAL Termio with a
+    // `.remote` backend on a REAL IO thread (the exact GUI lifecycle) against the
+    // real agent over TCP, and asserts the terminal GRID renders remote output —
+    // the render assertion the GUI lacks. Reproduces the "blank window" bug
+    // headlessly. Built on demand via `zig build remote-backend-e2e`.
+    {
+        const harness = try buildpkg.GhosttyRemoteBackendE2e.init(b, &config, &deps);
+        remote_backend_e2e_step.dependOn(&harness.install_step.step);
+    }
+
+    // Ghoztty ConPTY runtime smoke exe (WP2, §13). A tiny standalone Windows .exe
+    // that proves the in-tree ConPTY machinery works on real hardware. Built on
+    // demand via `zig build conpty-smoke -Dtarget=<arch>-windows`. The artifact is
+    // named per-arch (ghoztty-conpty-smoke-<arch>.exe) so both arches coexist.
+    {
+        const smoke = try buildpkg.GhosttyConptySmoke.init(b, &config, &deps);
+        conpty_smoke_step.dependOn(&smoke.install_step.step);
+    }
 
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);

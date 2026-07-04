@@ -643,6 +643,39 @@ extension Ghostty {
         var backgroundTintNSColor: NSColor?
         #endif
 
+        // MARK: Remote machine (remote-machines design WP4)
+
+        /// The remote machine this surface (and its window/splits) runs on, if any.
+        /// Used for window title and inheritance; the live connection is carried
+        /// separately in `remoteConnection`.
+        var remoteMachine: Machine?
+
+        /// A live, handshake-complete remote connection handle. When non-nil the
+        /// surface is constructed with the `.remote` termio backend riding on this
+        /// connection. The handle is owned by a `RemoteConnection` held strongly by
+        /// the window's `TerminalController`; it is NOT freed when the surface is
+        /// freed. All surfaces/splits in the same remote window share one handle.
+        var remoteConnection: ghostty_remote_connection_t?
+
+        /// Strong owner of the remote connection (the `RemoteConnection` class), held
+        /// only so the new `Ghostty.Surface` can retain it and keep the connection
+        /// alive across its DEFERRED `ghostty_surface_free` (which detaches this
+        /// pane's channel on the connection). Without this the connection can be
+        /// freed before the async surface free runs → channel-table use-after-free.
+        /// Set alongside `remoteConnection` at every remote-surface creation site.
+        /// Typed `AnyObject` to avoid a Ghostty→Features module dependency.
+        var connectionKeepAlive: AnyObject?
+
+        /// The agent session to ATTACH to, or nil to OPEN a brand-new session.
+        var remoteSessionId: String?
+
+        /// Explicit REMOTE working directory for an OPEN-new remote session
+        /// (§WP4): the cwd ON THE REMOTE MACHINE the new pane should start in.
+        /// Set by the split/tab path from an on-demand cwd query of the parent
+        /// remote pane. DISTINCT from `workingDirectory` (a local path) — it is
+        /// forwarded to the agent's OPEN and never confused with a local path.
+        var remoteWorkingDirectory: String?
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -731,6 +764,25 @@ extension Ghostty {
                                 return try envVars.withUnsafeMutableBufferPointer { buffer in
                                     config.env_vars = buffer.baseAddress
                                     config.env_var_count = environmentVariables.count
+
+                                    // Remote machine backend: when we have a live
+                                    // connection, point the C config at it. A non-NULL
+                                    // connection makes libghostty use the `.remote`
+                                    // backend. session_id == NULL ⇒ new session.
+                                    if let remoteConnection {
+                                        config.connection = remoteConnection
+                                        return try remoteSessionId.withCString { cSessionId in
+                                            config.session_id = cSessionId
+                                            // Explicit REMOTE cwd (split/tab
+                                            // inheritance, §WP4). nil ⇒ NULL ⇒ the
+                                            // agent uses its own default cwd.
+                                            return try remoteWorkingDirectory.withCString { cRemoteWd in
+                                                config.remote_working_directory = cRemoteWd
+                                                return try body(&config)
+                                            }
+                                        }
+                                    }
+
                                     return try body(&config)
                                 }
                             }

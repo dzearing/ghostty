@@ -12,15 +12,29 @@ extension Ghostty {
     final class Surface: Sendable {
         private let surface: ghostty_surface_t
 
+        /// An opaque object whose lifetime must extend until AFTER this surface is
+        /// freed. For a REMOTE surface this is the `RemoteConnection` strong owner:
+        /// `ghostty_surface_free` joins the surface's IO thread, which runs the
+        /// remote backend's `threadExit` → `detachChannel` on the shared connection.
+        /// Because the free below is DEFERRED to a detached task (deinit is not on
+        /// the main actor), the connection could otherwise be freed first — a
+        /// use-after-free on the connection's channel table. Capturing this token in
+        /// the same task keeps the connection alive across the free. Nil for local
+        /// surfaces. Typed `AnyObject` to avoid a Ghostty→Features module dependency.
+        private let connectionKeepAlive: AnyObject?
+
         /// Read the underlying C value for this surface. This is unsafe because the value will be
         /// freed when the Surface class is deinitialized.
         var unsafeCValue: ghostty_surface_t {
             surface
         }
 
-        /// Initialize from the C structure.
-        init(cSurface: ghostty_surface_t) {
+        /// Initialize from the C structure. `connectionKeepAlive` is retained until
+        /// after the surface is freed (see the property doc) — pass the owning
+        /// `RemoteConnection` for remote surfaces, nil for local.
+        init(cSurface: ghostty_surface_t, connectionKeepAlive: AnyObject? = nil) {
             self.surface = cSurface
+            self.connectionKeepAlive = connectionKeepAlive
         }
 
         deinit {
@@ -29,9 +43,19 @@ extension Ghostty {
             // value so we don't capture `self` and then we detach it in a task.
             // We can't wait for the task to succeed so this will happen sometime
             // but that's okay.
+            //
+            // We ALSO capture `connectionKeepAlive` so the shared remote connection
+            // (if any) is guaranteed to outlive `ghostty_surface_free` — that call
+            // joins the IO thread, which detaches this pane's channel ON the
+            // connection. Releasing it only after the free closes the teardown
+            // use-after-free.
             let surface = self.surface
+            let keepAlive = self.connectionKeepAlive
             Task.detached { @MainActor in
                 ghostty_surface_free(surface)
+                // Keep the connection owner alive until the free above completes,
+                // then drop it (this is the last reference for the final surface).
+                _ = keepAlive
             }
         }
 

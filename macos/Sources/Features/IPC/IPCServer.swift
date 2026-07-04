@@ -319,6 +319,8 @@ class IPCServer {
             return handleSendKeys(request)
         case "set-state":
             return handleSetState(request)
+        case "new-remote-window":
+            return handleNewRemoteWindow(request)
         default:
             return IPCResponse(success: false, error: "unknown action: \(request.action)")
         }
@@ -340,6 +342,11 @@ class IPCServer {
         var shell: String?
         var state: String?
         var noActivate: Bool = false
+        // When true, `+new-window` mirrors the keyboard/menu "New Window" action:
+        // it resolves the focused/preferred window as the parent and inherits its
+        // REMOTE host + command + cwd (§WP4). Lets the inheriting path be driven
+        // headlessly (the normal IPC path has no parent and never inherits).
+        var fromFocused: Bool = false
     }
 
     private func handleNewWindow(_ request: IPCRequest) -> IPCResponse {
@@ -399,6 +406,22 @@ class IPCServer {
                 config.backgroundTint = Color(nsColor)
                 config.backgroundTintNSColor = nsColor
             }
+        }
+
+        // `--from-focused`: mirror the keyboard/menu "New Window" action so the
+        // new window inherits the focused window's REMOTE host + command + cwd
+        // (§WP4). This is the only IPC path that resolves a parent; it builds the
+        // window asynchronously (off-main cwd query) so we can't return its
+        // controller for naming/registry — `--from-focused` is for the inheriting
+        // case, not for `--target`/`--name` registration.
+        if parsed.fromFocused {
+            DispatchQueue.main.async { [ghostty = self.ghostty] in
+                TerminalController.newWindowInheritingRemote(
+                    ghostty,
+                    withBaseConfig: config,
+                    from: TerminalController.preferredParent?.window)
+            }
+            return .ok
         }
 
         let windowTint: Color? = config.backgroundTint
@@ -525,6 +548,42 @@ class IPCServer {
             ratio = min(0.9, max(0.1, Double(100 - percent) / 100.0))
         } else {
             ratio = 0.5
+        }
+
+        // `--from-focused`: mirror the keyboard/menu split exactly. Resolve the
+        // app's focused window + its focused surface and call the REAL
+        // `newSplit(at: focusedSurface, ...)` — the same path a Cmd-D split takes.
+        // This is the faithful REMOTE-inheriting split: `newSplit` injects the
+        // window's shared remote connection + parent command/cwd (BaseTerminal
+        // Controller §WP4). Unlike `--target`/`--pane` we pass NO command/cwd of
+        // our own, so inheritance is never suppressed. Used to drive rapid remote
+        // splits (each opens a fresh session on the same machine/connection).
+        if parsed.fromFocused {
+            let directionStr = parsed.splitDirection ?? "right"
+            guard let direction = Self.parseSplitDirection(directionStr) else {
+                return IPCResponse(success: false, error: "invalid direction: \(directionStr)")
+            }
+            DispatchQueue.main.async {
+                guard let controller = TerminalController.preferredParent else {
+                    Self.logger.warning("IPC: +split --from-focused: no focused window")
+                    return
+                }
+                guard let surfaceView = controller.focusedSurface else {
+                    Self.logger.warning("IPC: +split --from-focused: no focused surface")
+                    return
+                }
+                // Empty config so `newSplit` performs full remote inheritance
+                // (connection + parent command + cwd). The tint/name plumbing is
+                // intentionally omitted here — this trigger is the inheriting case.
+                let splitConfig = Ghostty.SurfaceConfiguration()
+                _ = controller.newSplit(
+                    at: surfaceView,
+                    direction: direction,
+                    baseConfig: splitConfig,
+                    ratio: ratio
+                )
+            }
+            return .ok
         }
 
         // Resolve --pane targeting: find the named pane's surface and controller
@@ -786,6 +845,131 @@ class IPCServer {
 
         Self.logger.info("IPC: set activity state for '\(target)' to '\(stateStr)'")
 
+        return .ok
+    }
+
+    /// Open a remote-machine window, dialing the agent at `--host=<h> --port=<p>`.
+    ///
+    /// This drives the EXACT same code path as the Cmd-Shift-N "New Remote
+    /// Window" menu action (`AppDelegate.openRemoteWindow`): the dial + window
+    /// open run on the MAIN thread, just like the menu. It exists so the remote
+    /// window GUI flow can be triggered headlessly from the shell (macOS blocks
+    /// synthesized keystrokes), making it scriptable and test-reproducible.
+    ///
+    /// We dispatch to main and block this IPC worker on a semaphore so the
+    /// reply reflects whether the dial+open succeeded. Note: the dial itself is
+    /// synchronous (it completes the handshake) and runs on the main thread —
+    /// exactly as the menu does — so this faithfully reproduces any main-thread
+    /// stall the menu path would hit.
+    private func handleNewRemoteWindow(_ request: IPCRequest) -> IPCResponse {
+        guard let arguments = request.arguments else {
+            return IPCResponse(success: false, error: "--host and --port are required for +new-remote-window")
+        }
+
+        var host: String?
+        var port: UInt16?
+        var relay: String?
+        var device: String?
+        var token: String?
+        var name: String?
+        for arg in arguments {
+            if let value = arg.dropPrefix("--host=") {
+                host = String(value)
+            } else if let value = arg.dropPrefix("--port=") {
+                port = UInt16(value)
+            } else if let value = arg.dropPrefix("--relay=") {
+                relay = String(value)
+            } else if let value = arg.dropPrefix("--device=") {
+                device = String(value)
+            } else if let value = arg.dropPrefix("--token=") {
+                token = String(value)
+            } else if let value = arg.dropPrefix("--name=") {
+                name = String(value)
+            }
+        }
+
+        // Relay path: --relay + --device dial through a rendezvous relay. Takes
+        // precedence over the direct host:port path when both are present.
+        let useRelay = (relay?.isEmpty == false) && (device?.isEmpty == false)
+        if !useRelay {
+            guard host?.isEmpty == false else {
+                return IPCResponse(success: false, error: "--host is required (or use --relay + --device) for +new-remote-window")
+            }
+            guard let port, port != 0 else {
+                return IPCResponse(success: false, error: "--port is required (or use --relay + --device) for +new-remote-window")
+            }
+            _ = port
+        }
+
+        var errorMessage: String?
+        let semaphore = DispatchSemaphore(value: 0)
+        Task { @MainActor in
+            defer { semaphore.signal() }
+            guard let appDelegate = NSApp.delegate as? AppDelegate else {
+                errorMessage = "app delegate unavailable"
+                return
+            }
+            if useRelay {
+                // An explicit --token wins; otherwise resolve through the
+                // WP-B2 seam (signed-in Google account's ID token, dev env
+                // token fallback) — same sourcing as the Cmd-Shift-N dial.
+                var resolvedToken = token ?? ""
+                if resolvedToken.isEmpty {
+                    resolvedToken = await RelayAccount.resolveToken() ?? ""
+                }
+                // Signed out (and no dev token, no explicit --token): refuse
+                // BEFORE dialing — a tokenless relay dial is a guaranteed
+                // 401. The CLI gets this as the command's error output; no
+                // GUI alert from the IPC path.
+                guard !resolvedToken.isEmpty else {
+                    errorMessage = "not signed in: sign in via New Remote Window (Cmd-Shift-N) or pass --token= to open relay windows"
+                    return
+                }
+                errorMessage = appDelegate.openRemoteWindow(
+                    relay: relay!,
+                    device: device!,
+                    token: resolvedToken,
+                    name: name,
+                    // An explicit --name is a caller-supplied label: pin it so
+                    // account renames don't overwrite it (Machine.namePinned).
+                    namePinned: name != nil,
+                    // Persist the registry name in the manifest entry so a
+                    // restored window is re-registered under it (the restore
+                    // path calls registerRestoredRemoteWindow).
+                    ipcName: name,
+                    onOpen: { [weak self] controller in
+                        // Register the window under its friendly name so
+                        // +send-keys / +read / +close can target it (mirrors the
+                        // +new-window --target path). The pill shows the
+                        // machine's display name (the caller-supplied --name
+                        // here, falling back to the agent-reported hostname);
+                        // the registry key stays the --name for scriptability.
+                        if let target = name {
+                            self?.targetRegistry[target] = .window(WeakRef(controller))
+                            Self.logger.info("IPC: registered remote window target '\(target)'")
+                        }
+                    })
+            } else {
+                errorMessage = appDelegate.openRemoteWindow(
+                    host: host!,
+                    port: port!,
+                    name: name,
+                    onOpen: { [weak self] controller in
+                        // Same registration as the relay path above: expose
+                        // the window under its friendly name so +send-keys /
+                        // +read / +close can target TCP remote windows too.
+                        if let target = name {
+                            self?.targetRegistry[target] = .window(WeakRef(controller))
+                            Self.logger.info("IPC: registered remote window target '\(target)'")
+                        }
+                    })
+            }
+        }
+        semaphore.wait()
+
+        if let errorMessage {
+            return IPCResponse(success: false, error: errorMessage)
+        }
         return .ok
     }
 
@@ -1197,6 +1381,24 @@ class IPCServer {
         return IPCResponse(success: true, data: data)
     }
 
+    /// Re-register a RESTORED remote window under the IPC target name
+    /// persisted in its `RemoteSessionManifest` entry, so `+read` /
+    /// `+send-keys` / `+close --target=<name>` keep working across a
+    /// quit/relaunch. If the name is already taken by a live target (the
+    /// user opened a new window under the same name meanwhile), the existing
+    /// registration wins — consistent with the CLI's idempotent named-target
+    /// semantics — and the restored window is simply not re-registered.
+    @MainActor
+    func registerRestoredRemoteWindow(name: String, controller: TerminalController) {
+        pruneStaleTargets()
+        guard targetRegistry[name] == nil else {
+            Self.logger.info("IPC: restored remote window not re-registered — target '\(name)' already in use")
+            return
+        }
+        targetRegistry[name] = .window(WeakRef(controller))
+        Self.logger.info("IPC: re-registered restored remote window target '\(name)'")
+    }
+
     @MainActor
     private func ensureWindowRegistered(name: String, controller: BaseTerminalController) {
         if targetRegistry[name] == nil, let tc = controller as? TerminalController {
@@ -1439,6 +1641,11 @@ class IPCServer {
 
             if arg == "--no-activate" {
                 result.noActivate = true
+                continue
+            }
+
+            if arg == "--from-focused" {
+                result.fromFocused = true
                 continue
             }
         }

@@ -12,6 +12,7 @@ const XCFramework = @import("GhosttyXCFramework.zig");
 build: *std.Build.Step.Run,
 open: *std.Build.Step.Run,
 copy: *std.Build.Step.Run,
+sign: *std.Build.Step.Run,
 xctest: *std.Build.Step.Run,
 
 pub const Deps = struct {
@@ -190,17 +191,55 @@ pub fn init(
         break :copy step;
     };
 
+    // Re-sign the copied bundle. `cp -R` above breaks the code-signature
+    // seal (the on-disk pages no longer match the sealed hashes), which makes
+    // the hardened-runtime binary fail page validation and get SIGKILL'd with
+    // "Code Signature Invalid" when the inner Mach-O is exec'd directly (e.g.
+    // running `.../MacOS/ghostty +new-window` as a CLI). A fresh sign of
+    // the installed copy re-seals it so it launches cleanly.
+    //
+    // Identity: `GHOSTTY_CODESIGN_IDENTITY` if set, else a stable local
+    // self-signed identity when present, else ad-hoc ("-"). A STABLE identity
+    // (vs ad-hoc) keeps the Keychain ACL's designated requirement constant
+    // across rebuilds, so "Always Allow" on the relay-account Keychain item
+    // survives — ad-hoc signatures read as a brand-new app every build and
+    // re-prompt for the login-keychain password after each rebuild.
+    const sign = sign: {
+        const identity = std.process.getEnvVarOwned(
+            b.allocator,
+            "GHOSTTY_CODESIGN_IDENTITY",
+        ) catch identity: {
+            const probe = std.process.Child.run(.{
+                .allocator = b.allocator,
+                .argv = &.{ "security", "find-identity", "-v", "-p", "codesigning" },
+            }) catch break :identity b.dupe("-");
+            if (std.mem.indexOf(u8, probe.stdout, "Ztabby Debug Signing") != null)
+                break :identity b.dupe("Ztabby Debug Signing");
+            break :identity b.dupe("-");
+        };
+        const step = RunStep.create(b, "codesign app bundle");
+        step.has_side_effects = true;
+        step.addArgs(&.{ "codesign", "--force", "--deep", "--sign", identity });
+        step.addArg(b.fmt("{s}/{s}.app", .{ b.install_path, app_name }));
+        step.expectExitCode(0);
+        step.step.dependOn(&copy.step);
+        break :sign step;
+    };
+
     return .{
         .build = build,
         .open = open,
         .copy = copy,
+        .sign = sign,
         .xctest = xctest,
     };
 }
 
 pub fn install(self: *const Ghostty) void {
     const b = self.copy.step.owner;
-    b.getInstallStep().dependOn(&self.copy.step);
+    // Depend on the re-sign step, which itself depends on the copy — so the
+    // installed bundle is always re-sealed after the signature-breaking cp -R.
+    b.getInstallStep().dependOn(&self.sign.step);
 }
 
 pub fn installXcframework(self: *const Ghostty) void {
