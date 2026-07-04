@@ -374,8 +374,14 @@ only the Swift reconnect narrative (info+private), now fixed.
     last-known list, footer error only after 3 consecutive misses; selection
     anchored by UUID). GUI eyeball of live dot-flips still worthwhile once
     signed in.
-11. WP-E1 productionization: move relay to the home NUC behind a Cloudflare
-    Tunnel, audit logging, rate limits, credential rotation. Last roadmap phase.
+11. WP-E1 productionization. **DECISION 2026-07-04 (user): STAY ON AZURE — the
+    NUC-behind-Cloudflare-Tunnel move is DROPPED (no benefit).** The relay
+    lives on the Azure VM `ghoztty-relay-dz17575.westus2.cloudapp.azure.com`
+    for the foreseeable future; do NOT propose the NUC migration again.
+    Any remaining hardening (audit logging, rate limits, credential rotation)
+    would happen ON the Azure host if/when wanted — not currently requested.
+    (Caveat unchanged: the VM runs on the user's personal MSDN credits, which
+    are licensed dev/test-only — fine for dogfooding.)
 
 ## Gotchas that will bite again (also in memories)
 - Debug rebuilds re-sign ad-hoc → Keychain permission prompt ("Always Allow")
