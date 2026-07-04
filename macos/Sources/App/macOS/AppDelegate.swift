@@ -181,6 +181,18 @@ class AppDelegate: NSObject,
         ghostty.delegate = self
     }
 
+    /// True when this process is the HOST APP for a unit-test run
+    /// (`xcodebuild test` injects the XCTest bundle into a fresh app
+    /// instance). Used to skip launch side effects that fight the user's
+    /// real running app over shared machine state (IPC socket, remote
+    /// session manifest).
+    private static var isTestHost: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["XCTestConfigurationFilePath"] != nil
+            || env["XCTestBundlePath"] != nil
+            || env["XCTestSessionIdentifier"] != nil
+    }
+
     // MARK: - NSApplicationDelegate
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -236,18 +248,28 @@ class AppDelegate: NSObject,
         // This registers the Ghostty => Services menu to exist.
         NSApp.servicesMenu = menuServices
 
-        ipcServer.start()
+        // Unit tests use this app as their TEST HOST (xcodebuild test spawns a
+        // second app instance). That instance must not touch shared machine
+        // state the REAL running app owns: starting the IPC server would
+        // unlink+steal the live app's socket, and the remote-window restore
+        // would dial/ATTACH the live manifest's sessions (evicting the real
+        // windows) and can block on a Keychain prompt (RelayAccount token),
+        // hanging the test runner. Tests exercise these paths directly with
+        // injected state instead.
+        if !Self.isTestHost {
+            ipcServer.start()
 
-        if let jsonPtr = ghostty_pending_ipc_json() {
-            let json = String(cString: jsonPtr)
-            ghostty_consume_pending_ipc_json()
-            hasPendingIpc = true
-            ipcServer.dispatchPendingJson(json)
+            if let jsonPtr = ghostty_pending_ipc_json() {
+                let json = String(cString: jsonPtr)
+                ghostty_consume_pending_ipc_json()
+                hasPendingIpc = true
+                ipcServer.dispatchPendingJson(json)
+            }
+
+            // WP-D2: re-attach any relay remote windows that were open when
+            // the app last quit (background dials; failures never alert).
+            restoreRemoteWindows()
         }
-
-        // WP-D2: re-attach any relay remote windows that were open when the
-        // app last quit (background dials; failures never alert).
-        restoreRemoteWindows()
 
         // Setup a local event monitor for app-level keyboard shortcuts. See
         // localEventHandler for more info why.
@@ -1172,7 +1194,9 @@ class AppDelegate: NSObject,
     /// connection. Shared by the interactive dial path (`sessionID` nil ⇒ OPEN
     /// a fresh agent session) and the WP-D2 restore path (`sessionID` set ⇒
     /// re-`ATTACH` to the persisted session). Registers the window in the
-    /// `RemoteSessionManifest` so it can be restored after a quit.
+    /// `RemoteSessionManifest` so it can be restored after a quit; on the
+    /// restore path `replacingManifestEntry` carries the OLD entry's id so
+    /// the registration atomically supersedes it (mark-don't-drain).
     @MainActor
     @discardableResult
     private func presentRemoteWindow(
@@ -1182,7 +1206,8 @@ class AppDelegate: NSObject,
         fallbackName: String?,
         namePinned: Bool = false,
         sessionID: String?,
-        windowTitle: String? = nil
+        windowTitle: String? = nil,
+        replacingManifestEntry: UUID? = nil
     ) -> TerminalController {
         // The relay path has no TCP port. The DISPLAY NAME wins: prefer the
         // account's friendly name for the device (`fallbackName` — the chooser
@@ -1234,7 +1259,8 @@ class AppDelegate: NSObject,
             name: machine.name,
             sessionID: sessionID,
             windowTitle: windowTitle,
-            namePinned: machine.namePinned)
+            namePinned: machine.namePinned,
+            replacing: replacingManifestEntry)
         controller.remoteManifestEntryID = entryID
         RemoteSessionManifest.captureSessionID(of: controller, entryID: entryID)
 
@@ -1266,12 +1292,21 @@ class AppDelegate: NSObject,
     ///
     /// `matching` scopes WHICH entries are replayed: the default (all) is the
     /// launch/sign-in behavior; the machine chooser's contextual "Restore"
-    /// passes a per-machine filter. Entries outside the filter are put back
-    /// untouched (reinstated), exactly like entries bound to open windows.
+    /// passes a per-machine filter. Entries outside the filter are released
+    /// untouched (they never left the manifest), exactly like entries bound
+    /// to open windows.
+    ///
+    /// Crash safety (mark-don't-drain): the snapshot below only MARKS entries
+    /// restore-in-flight — nothing is removed from the persisted manifest
+    /// until each entry's fate is decided (success ⇒ superseded by the fresh
+    /// window's entry; session gone ⇒ removed; anything else ⇒ released for a
+    /// later retry). `RelayAccount.resolveToken()` can block indefinitely on
+    /// a Keychain prompt; a kill/crash anywhere in this flow must not lose
+    /// restorable windows.
     private func restoreRemoteWindows(
         matching filter: @escaping (RemoteSessionManifest.Entry) -> Bool = { _ in true }
     ) {
-        let entries = RemoteSessionManifest.shared.takeAll()
+        let entries = RemoteSessionManifest.shared.snapshotForRestore()
         guard !entries.isEmpty else { return }
 
         Task { @MainActor [weak self] in
@@ -1280,29 +1315,29 @@ class AppDelegate: NSObject,
             // ONCE up front (may await a token refresh), then the blocking
             // dials run on a background queue as before.
             //
-            // Signed out with no dev token ⇒ NO dial at all: put every entry
-            // back untouched and skip silently (the restore path never
+            // Signed out with no dev token ⇒ NO dial at all: release every
+            // entry untouched and skip silently (the restore path never
             // alerts). A later sign-in replays them via
             // `relayAccountDidSignIn()`; a later launch retries the same way.
-            guard let token = await RelayAccount.resolveToken() else {
-                for entry in entries { RemoteSessionManifest.shared.reinstate(entry) }
+            guard let self, let token = await RelayAccount.resolveToken() else {
+                RemoteSessionManifest.shared.releaseRestore(entries.map(\.id))
                 return
             }
 
             // Double-restore guard: an entry still bound to an OPEN window
             // (its controller carries the entry id) must not be re-attached —
             // a second ATTACH to the same session would evict the live window
-            // (spec §5.3). Put those straight back; restore only the rest.
+            // (spec §5.3). Release those untouched; restore only the rest.
             let openEntryIDs = Set(TerminalController.all.compactMap(\.remoteManifestEntryID))
-            let (candidates, reinstate) = RemoteSessionManifest.partitionForRestore(
+            let (candidates, skipOpen) = RemoteSessionManifest.partitionForRestore(
                 entries, openEntryIDs: openEntryIDs)
             // Entries outside the requested scope (per-machine Restore from
-            // the chooser) also go straight back, untouched.
+            // the chooser) are also released, untouched.
             let restore = candidates.filter(filter)
             let skipped = candidates.filter { !filter($0) }
-            for entry in reinstate + skipped { RemoteSessionManifest.shared.reinstate(entry) }
+            RemoteSessionManifest.shared.releaseRestore((skipOpen + skipped).map(\.id))
             guard !restore.isEmpty else { return }
-            self?.restoreRemoteWindows(entries: restore, token: token)
+            self.restoreRemoteWindows(entries: restore, token: token)
         }
     }
 
@@ -1387,7 +1422,9 @@ class AppDelegate: NSObject,
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             for entry in entries {
                 guard let sessionID = entry.sessionID, !sessionID.isEmpty else {
+                    // Nothing to attach to — this entry can never restore.
                     Self.logger.info("remote restore: dropping \(entry.deviceID, privacy: .public) — no session id was captured")
+                    RemoteSessionManifest.shared.remove(entry.id)
                     continue
                 }
 
@@ -1396,10 +1433,11 @@ class AppDelegate: NSObject,
                     device: entry.deviceID,
                     token: token
                 ) else {
-                    // Relay or agent unreachable: keep the entry so the next
-                    // launch retries; never alert from the restore path.
+                    // Relay or agent unreachable: release the entry untouched
+                    // (it never left the manifest) so the next launch retries;
+                    // never alert from the restore path.
                     Self.logger.warning("remote restore: relay dial failed for \(entry.deviceID, privacy: .public); keeping entry for next launch")
-                    RemoteSessionManifest.shared.reinstate(entry)
+                    RemoteSessionManifest.shared.releaseRestore([entry.id])
                     continue
                 }
 
@@ -1414,14 +1452,18 @@ class AppDelegate: NSObject,
                 guard !cwd.isEmpty else {
                     Self.logger.info("remote restore: session \(sessionID, privacy: .public) on \(entry.deviceID, privacy: .public) is gone; dropping entry")
                     ghostty_remote_connection_free(handle)
+                    RemoteSessionManifest.shared.remove(entry.id)
                     continue
                 }
 
                 DispatchQueue.main.async { [weak self] in
                     guard let self else {
                         ghostty_remote_connection_free(handle)
+                        RemoteSessionManifest.shared.releaseRestore([entry.id])
                         return
                     }
+                    // Success: the fresh window's registration atomically
+                    // supersedes the old entry (register(..., replacing:)).
                     self.presentRemoteWindow(
                         handle: handle,
                         relay: entry.relayBase,
@@ -1429,7 +1471,8 @@ class AppDelegate: NSObject,
                         fallbackName: entry.name,
                         namePinned: entry.namePinned == true,
                         sessionID: sessionID,
-                        windowTitle: entry.windowTitle)
+                        windowTitle: entry.windowTitle,
+                        replacingManifestEntry: entry.id)
                 }
             }
         }

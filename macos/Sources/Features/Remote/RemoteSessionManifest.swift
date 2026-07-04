@@ -64,6 +64,15 @@ final class RemoteSessionManifest {
     private let lock = NSLock()
     private var entries: [Entry]
 
+    /// Ids of entries currently being restored (`snapshotForRestore()` was
+    /// called and their fate is not yet decided). Transient — NEVER persisted:
+    /// if the app dies mid-restore the set evaporates and the still-persisted
+    /// entries are retried on the next launch. Guarded by `lock`. This is what
+    /// keeps the launch restore and the sign-in replay from double-restoring
+    /// the same entry (a second ATTACH would evict the first window, spec
+    /// §5.3) now that snapshotting no longer drains.
+    private var restoresInFlight: Set<UUID> = []
+
     init(defaults: UserDefaults = .ghostty) {
         self.defaults = defaults
         if let data = defaults.data(forKey: Self.defaultsKey),
@@ -77,6 +86,13 @@ final class RemoteSessionManifest {
     /// Register a newly-opened relay remote window. Returns the entry id the
     /// window's controller should carry (`remoteManifestEntryID`) so a clean
     /// close can remove it.
+    ///
+    /// `replacing`: the id of the OLD manifest entry this window supersedes
+    /// (restore path — the new window re-ATTACHes the old entry's session).
+    /// The old entry is removed and the fresh one appended under one lock and
+    /// ONE defaults write, so there is no on-disk window where the session is
+    /// recorded zero times (kill ⇒ lost window) — at worst a crash straddling
+    /// the write leaves the old entry, which the next launch retries.
     @discardableResult
     func register(
         relayBase: String,
@@ -84,7 +100,8 @@ final class RemoteSessionManifest {
         name: String?,
         sessionID: String? = nil,
         windowTitle: String? = nil,
-        namePinned: Bool = false
+        namePinned: Bool = false,
+        replacing replacedID: UUID? = nil
     ) -> UUID {
         let entry = Entry(
             id: UUID(),
@@ -96,6 +113,10 @@ final class RemoteSessionManifest {
             namePinned: namePinned ? true : nil)
         lock.lock()
         defer { lock.unlock() }
+        if let replacedID {
+            entries.removeAll { $0.id == replacedID }
+            restoresInFlight.remove(replacedID)
+        }
         entries.append(entry)
         saveLocked()
         return entry.id
@@ -153,39 +174,62 @@ final class RemoteSessionManifest {
     }
 
     /// Remove an entry (clean close: user closed the window or the remote
-    /// child exited). Removing an unknown id is a no-op.
+    /// child exited; or a restore decided the entry's session is gone).
+    /// Also releases any restore-in-flight mark for the id. Removing an
+    /// unknown id is a no-op.
     func remove(_ id: UUID) {
         lock.lock()
         defer { lock.unlock() }
+        restoresInFlight.remove(id)
         guard entries.contains(where: { $0.id == id }) else { return }
         entries.removeAll { $0.id == id }
         saveLocked()
     }
 
-    /// Atomically take every persisted entry for restore-at-launch. Successful
-    /// restores re-register (a fresh entry bound to the new window); entries
-    /// whose relay/agent was unreachable are put back via `reinstate` so the
-    /// NEXT launch retries; entries whose session is gone are simply dropped.
-    func takeAll() -> [Entry] {
+    /// Snapshot every entry not already being restored, marking the returned
+    /// ids restore-in-flight. **Mark, don't drain**: nothing is removed from
+    /// memory or disk — the persisted manifest is only mutated when each
+    /// entry's fate is actually decided, so a crash/kill at ANY point during
+    /// the (async, possibly Keychain-blocked) restore leaves every undecided
+    /// entry intact for the next launch. Per returned entry the caller MUST
+    /// eventually do exactly one of:
+    /// - restore succeeded → `register(..., replacing: entry.id)` (the fresh
+    ///   window entry atomically supersedes the old one)
+    /// - session gone / nothing to attach to → `remove(entry.id)`
+    /// - could not attempt (unreachable, no token, out of scope, bound to an
+    ///   open window) → `releaseRestore([entry.id])` — the entry stays put
+    ///   and a later launch/sign-in retries.
+    /// A concurrent snapshot (launch restore racing the sign-in replay) sees
+    /// only entries the first snapshot didn't claim.
+    func snapshotForRestore() -> [Entry] {
         lock.lock()
         defer { lock.unlock() }
-        let taken = entries
-        entries = []
-        saveLocked()
-        return taken
+        let available = entries.filter { !restoresInFlight.contains($0.id) }
+        restoresInFlight.formUnion(available.map(\.id))
+        return available
     }
 
-    /// Put back an entry taken by `takeAll` whose restore could not be
-    /// attempted (relay unreachable / no token) so a later launch retries.
-    func reinstate(_ entry: Entry) {
+    /// Release the restore-in-flight mark for entries whose restore could not
+    /// be attempted (relay unreachable / no token / filtered out / bound to an
+    /// open window). The entries themselves were never removed — they remain
+    /// persisted for the next launch or sign-in replay to retry.
+    func releaseRestore(_ ids: [UUID]) {
+        guard !ids.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
-        entries.append(entry)
-        saveLocked()
+        restoresInFlight.subtract(ids)
     }
 
-    /// Split entries drained by `takeAll()` into those safe to restore and
-    /// those that must go straight back via `reinstate(_:)` because they are
+    /// Read-only snapshot of every entry (tests/diagnostics). Marks nothing
+    /// in flight and mutates nothing.
+    func allEntries() -> [Entry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+
+    /// Split snapshotted entries into those safe to restore and those that
+    /// must be released via `releaseRestore(_:)` untouched because they are
     /// still bound to an OPEN window (a live controller carries the entry id
     /// as its `remoteManifestEntryID`). Re-attaching a session that already
     /// has a live window would EVICT that window's client (spec §5.3); the
@@ -195,17 +239,17 @@ final class RemoteSessionManifest {
     static func partitionForRestore(
         _ entries: [Entry],
         openEntryIDs: Set<UUID>
-    ) -> (restore: [Entry], reinstate: [Entry]) {
+    ) -> (restore: [Entry], skipOpen: [Entry]) {
         var restore: [Entry] = []
-        var reinstate: [Entry] = []
+        var skipOpen: [Entry] = []
         for entry in entries {
             if openEntryIDs.contains(entry.id) {
-                reinstate.append(entry)
+                skipOpen.append(entry)
             } else {
                 restore.append(entry)
             }
         }
-        return (restore, reinstate)
+        return (restore, skipOpen)
     }
 
     /// The entries for ONE machine that could actually be restored right now:
@@ -231,8 +275,10 @@ final class RemoteSessionManifest {
     }
 
     /// Instance wrapper for `restorableEntries(_:relayBase:deviceID:openEntryIDs:)`
-    /// that snapshots the live entry list under the lock. Read-only: nothing
-    /// is drained (unlike `takeAll()`), so the chooser can query freely.
+    /// that snapshots the live entry list under the lock. Read-only, so the
+    /// chooser can query freely. Entries with a restore already in flight are
+    /// excluded — they are being handled and offering them as "restorable"
+    /// would just double-attach.
     func restorableEntries(
         relayBase: String,
         deviceID: String,
@@ -241,7 +287,7 @@ final class RemoteSessionManifest {
         lock.lock()
         defer { lock.unlock() }
         return Self.restorableEntries(
-            entries,
+            entries.filter { !restoresInFlight.contains($0.id) },
             relayBase: relayBase,
             deviceID: deviceID,
             openEntryIDs: openEntryIDs)
