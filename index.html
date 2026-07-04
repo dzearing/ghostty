@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ghoztty — A Programmable Terminal for AI Agents</title>
+  <title>Ghoztty: A Programmable Terminal for AI Agents</title>
   <meta name="description" content="A fork of Ghostty with CLI-driven window management. Let Claude Code create, split, and manage terminal windows programmatically." />
   <link rel="stylesheet" href="landing/styles.css" />
 </head>
@@ -128,7 +128,7 @@
             </svg>
           </div>
           <h3>+close</h3>
-          <p>Close a named pane or window by target. Closing a nonexistent target succeeds silently &mdash; safe for teardown scripts.</p>
+          <p>Close a named pane or window by target. Closing a nonexistent target succeeds silently, so teardown scripts are safe.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon accent-purple">
@@ -161,7 +161,7 @@
             </svg>
           </div>
           <h3>Full Ghostty</h3>
-          <p>GPU-accelerated rendering, native macOS integration, ligatures, sixel graphics &mdash; everything from Ghostty, plus IPC.</p>
+          <p>GPU-accelerated rendering, native macOS integration, ligatures, sixel graphics. Everything from Ghostty, plus IPC.</p>
         </div>
       </div>
     </div>
@@ -172,21 +172,12 @@
     <div class="section-inner">
       <div class="section-header">
         <h2>Works with<br /><span class="gradient-text">Claude Code.</span></h2>
-        <p>Install the Ghoztty skill and Claude manages terminal windows for you.</p>
+        <p>With the Ghoztty plugin installed, Claude manages terminal windows for you.</p>
       </div>
       <div class="skill-demo">
         <div class="skill-example">
           <div class="skill-step">
             <div class="step-number">1</div>
-            <div class="step-content">
-              <h3>Install the skill plugin</h3>
-              <div class="code-block">
-                <code>claude plugin marketplace add dzearing/ghoztty-claude-plugin<br />claude plugin install ghoztty@ghoztty-claude-plugin</code>
-              </div>
-            </div>
-          </div>
-          <div class="skill-step">
-            <div class="step-number">2</div>
             <div class="step-content">
               <h3>Ask Claude to set up a workspace</h3>
               <div class="code-block">
@@ -195,7 +186,7 @@
             </div>
           </div>
           <div class="skill-step">
-            <div class="step-number">3</div>
+            <div class="step-number">2</div>
             <div class="step-content">
               <h3>Claude creates the layout</h3>
               <div class="code-block"><pre><code><span class="hl-dim"># Claude runs these automatically:</span>
@@ -224,14 +215,8 @@ ghoztty +split --target=ide --name=logs \
             <span class="install-badge">Step 1</span>
             <h3>Install Ghoztty</h3>
           </div>
-          <p>Download the latest DMG and drag to Applications. The <code>ghoztty</code> CLI is bundled inside the app.</p>
-          <div class="code-block">
-            <code># After installing, set up the CLI in your PATH:<br />sudo ln -sf /Applications/Ghoztty.app/Contents/MacOS/ghoztty /usr/local/bin/ghoztty</code>
-          </div>
-          <p class="install-alt">Or build from source:</p>
-          <div class="code-block">
-            <code>git clone https://github.com/dzearing/ghoztty.git<br />cd ghoztty && zig build -Doptimize=ReleaseFast</code>
-          </div>
+          <p>Download the DMG, drag Ghoztty to Applications, and launch it. Ghoztty sets up the <code>ghoztty</code> CLI for you and keeps it working after updates. No terminal commands, no admin password.</p>
+          <a href="#download" class="btn btn-primary">Download for macOS</a>
         </div>
         <div class="install-card">
           <div class="install-card-header">
@@ -242,7 +227,7 @@ ghoztty +split --target=ide --name=logs \
           <div class="code-block">
             <code>claude plugin marketplace add dzearing/ghoztty-claude-plugin<br />claude plugin install ghoztty@ghoztty-claude-plugin</code>
           </div>
-          <p>That's it. Ask Claude to open windows, create splits, or tear down layouts &mdash; it handles the IPC commands automatically.</p>
+          <p>That's it. Ask Claude to open windows, create splits, or tear down layouts. It handles the IPC commands automatically.</p>
         </div>
       </div>
     </div>
@@ -286,7 +271,7 @@ ghoztty +split --target=ide --name=logs \
     <div class="section-inner">
       <div class="section-header">
         <h2>Remote Agent<br /><span class="gradient-text">for Windows.</span></h2>
-        <p>Lets Ghoztty on your Mac open terminals on a Windows machine &mdash; from anywhere. The agent connects outbound over WSS and keeps itself up to date.</p>
+        <p>Lets Ghoztty on your Mac open terminals on a Windows machine, from anywhere. The agent connects outbound over WSS and keeps itself up to date.</p>
       </div>
       <div class="remote-card">
         <div class="install-card-header">
@@ -295,7 +280,7 @@ ghoztty +split --target=ide --name=logs \
         </div>
         <a class="dl-btn" href="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.msi"><span aria-hidden="true">&#8595;</span> Download the installer (.msi)</a>
         <ol class="remote-steps">
-          <li>Run the downloaded <code>ghoztty-agent.msi</code> &mdash; per-user install, no admin required.</li>
+          <li>Run the downloaded <code>ghoztty-agent.msi</code>. Per-user install, no admin required.</li>
           <li>Click <b>Ghoztty Agent</b> in the Start Menu.</li>
           <li>Sign in with Google in the browser that opens to link the machine to your account.</li>
         </ol>
