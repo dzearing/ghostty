@@ -95,10 +95,41 @@ final class RelayAccount: ObservableObject {
         self.keychain = keychain
         self.openURL = openURL
         // Restore the signed-in identity across launches (the refresh token
-        // outlives the app; the first relay call mints a fresh ID token).
-        let stored = keychain.load()
-        self.email = stored?.email
-        self.pictureURL = stored?.picture.flatMap(URL.init(string:))
+        // outlives the app; the first relay call mints a fresh ID token) — but
+        // NEVER on the main thread. `SecItemCopyMatching` can stall for a long
+        // time (ACL prompt after a re-sign, locked keychain, securityd
+        // contention); doing it here synchronously froze the ENTIRE app at
+        // launch with zero windows (observed: 790/790 samples parked in
+        // SecItemCopyMatching under RelayAccount.init). Defer it off-main and
+        // publish the identity when it arrives; until then we read as signed
+        // out (`email == nil`), which degrades gracefully — a relay call that
+        // races the load resolves its own token via `currentIDToken()` (also
+        // off-main), and the UI updates via `@Published` when it lands.
+        Task { [weak self] in
+            guard let self else { return }
+            let stored = await Self.loadStoredOffMain(self.keychain)
+            self.email = stored?.email
+            self.pictureURL = stored?.picture.flatMap(URL.init(string:))
+        }
+    }
+
+    /// Load the persisted account OFF the main thread. Keychain reads block
+    /// (see `init`); the whole purpose of this hop is to keep the main actor
+    /// responsive. A slow read (> 0.5s) is logged and persists so a launch that
+    /// felt sluggish leaves a breadcrumb.
+    nonisolated static func loadStoredOffMain(
+        _ keychain: RelayAccountKeychain
+    ) async -> RelayAccountKeychain.Stored? {
+        await Task.detached(priority: .userInitiated) {
+            let start = Date()
+            let stored = keychain.load()
+            let elapsed = Date().timeIntervalSince(start)
+            if elapsed > 0.5 {
+                Ghostty.logger.warning(
+                    "relay account: Keychain load took \(elapsed, format: .fixed(precision: 2), privacy: .public)s (off main thread; UI was not blocked)")
+            }
+            return stored
+        }.value
     }
 
     // MARK: - OAuth client configuration
@@ -244,7 +275,11 @@ final class RelayAccount: ObservableObject {
             return idToken
         }
 
-        guard let stored = keychain.load() else { throw AccountError.signedOut }
+        // Off-main (see `init`): this runs on the main actor, so a synchronous
+        // `keychain.load()` here would block the UI exactly like launch did.
+        guard let stored = await Self.loadStoredOffMain(keychain) else {
+            throw AccountError.signedOut
+        }
         guard let config = Self.clientConfig() else { throw AccountError.notConfigured }
 
         let client = GoogleOAuth.TokenClient(

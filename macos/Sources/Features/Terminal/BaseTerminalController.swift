@@ -167,6 +167,13 @@ class BaseTerminalController: NSWindowController,
     /// (session gone, evicted, signed out): those never self-heal.
     private var remoteDisconnectMaySelfHeal: Bool = false
 
+    /// Debug-only: true while a forced reconnect swap (the
+    /// `/tmp/ghoztty-debug-force-reconnect-swap` hook) is in flight, so the
+    /// abandoned original connection's self-recovery is ignored until the
+    /// replacement dial resolves. Never set in release builds. See
+    /// `debugShouldForceReconnectSwap`.
+    private var debugForcingReconnectSwap: Bool = false
+
     /// WP-D2: this window's entry in the `RemoteSessionManifest`, when it is a
     /// relay-backed remote window tracked for restore-on-relaunch. A clean
     /// close removes the entry (see `windowWillClose`); app quit leaves it so
@@ -1809,10 +1816,35 @@ class BaseTerminalController: NSWindowController,
     ///                                    └─ session gone/evicted ─► disconnected
     private func remoteLinkStateDidChange(_ connection: RemoteConnection) {
         guard connection === remoteConnection else { return }
-        Ghostty.logger.info(
-            "remote reconnect: link=\(String(describing: connection.linkState)) window-state=\(String(describing: self.remoteConnectionState)) selfHealable=\(self.remoteDisconnectMaySelfHeal)")
+        // This is the FIRST line read when tracing a reconnect: it must persist
+        // (.warning maps to OSLog error level) and be readable — os_log redacts
+        // string interpolation by default, so every field is tagged .public
+        // (link/window state, self-healable, machine name, session id are not
+        // secrets and must be greppable in `log show`).
+        Ghostty.logger.warning(
+            "remote reconnect: link=\(String(describing: connection.linkState), privacy: .public) window-state=\(String(describing: self.remoteConnectionState), privacy: .public) selfHealable=\(self.remoteDisconnectMaySelfHeal, privacy: .public) machine=\(connection.machine.name, privacy: .public) session=\(self.currentRemoteSessionID() ?? "-", privacy: .public)")
+
+        // Debug-only: force a real reconnect SWAP on the next transport wobble
+        // (see debug hook docs on `debugShouldFailReconnectSwap`). A loopback
+        // agent's ORIGINAL connection self-recovers before any replacement dial
+        // completes, so a plain freeze/thaw never exercises the swap path; this
+        // abandons the original and dials a replacement immediately.
+        if Self.debugShouldForceReconnectSwap(),
+           !debugForcingReconnectSwap,
+           case .connected = remoteConnectionState,
+           connection.linkState != .connected {
+            debugForcingReconnectSwap = true
+            Ghostty.logger.warning(
+                "remote reconnect: debug force-swap hook armed; abandoning original connection machine=\(connection.machine.name, privacy: .public) session=\(self.currentRemoteSessionID() ?? "-", privacy: .public)")
+            beginRemoteReconnect()
+            return
+        }
+
         switch connection.linkState {
         case .connected, .degraded:
+            // A forced swap is in flight (debug hook): ignore the abandoned
+            // original's self-recovery so it can't cancel the replacement dial.
+            if debugForcingReconnectSwap { break }
             // The link recovered on its own (a heartbeat blip, or a frozen
             // agent thawing after we exhausted retries — possible only while
             // the transport is still alive). Cancel any retry loop. A
@@ -2033,6 +2065,10 @@ class BaseTerminalController: NSWindowController,
                 machine: machine,
                 sessionID: sessionID
             ) { controller, outcome in
+                // A forced swap (debug hook) has reached its dial outcome; the
+                // replacement is now committing or retrying, so drop the
+                // original-recovery suppression regardless of branch.
+                controller.debugForcingReconnectSwap = false
                 switch outcome {
                 case .sessionAlive(let handle):
                     if controller.completeRemoteReconnect(
@@ -2049,14 +2085,14 @@ class BaseTerminalController: NSWindowController,
                     // restarted / TTL expired): retrying won't bring it back.
                     // Keep the window, mark it. Terminal.
                     Ghostty.logger.error(
-                        "remote reconnect: session gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt); disconnected (terminal)")
+                        "remote reconnect: session gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt, privacy: .public); disconnected (terminal)")
                     controller.remoteDisconnectMaySelfHeal = false
                     controller.remoteConnectionState = .disconnected
                 case .signedOut:
                     // Signed out: terminal until sign-in restores the window
                     // (reconnect never alerts; the manifest entry is kept).
                     Ghostty.logger.error(
-                        "remote reconnect: signed out machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt); disconnected (terminal until sign-in)")
+                        "remote reconnect: signed out machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt, privacy: .public); disconnected (terminal until sign-in)")
                     controller.remoteDisconnectMaySelfHeal = false
                     controller.remoteConnectionState = .disconnected
                 case .unreachable:
@@ -2084,7 +2120,7 @@ class BaseTerminalController: NSWindowController,
     ) {
         guard attempt < Self.remoteReconnectDelays.count else {
             Ghostty.logger.error(
-                "remote reconnect: retries exhausted machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt); disconnected (self-healable, background re-dial armed)")
+                "remote reconnect: retries exhausted machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt, privacy: .public); disconnected (self-healable, background re-dial armed)")
             remoteDisconnectMaySelfHeal = true
             remoteConnectionState = .disconnected
             scheduleRemoteRedialProbe(
@@ -2257,23 +2293,51 @@ class BaseTerminalController: NSWindowController,
         return true
     }
 
-    /// Path of the debug-only reconnect-swap failure hook file. When it exists
-    /// at swap time (debug/release-safe builds ONLY), `completeRemoteReconnect`
-    /// behaves as if `ghostty_surface_new` failed — the deterministic stand-in
-    /// for the dark-wake OOM that can't be forced in a test.
+    // MARK: Debug reconnect-swap hooks
+    //
+    // Two debug-only (never release) hook files let the orchestrator drive the
+    // reconnect swap path deterministically on a loopback agent:
+    //
+    //   /tmp/ghoztty-debug-force-reconnect-swap — when present, the next
+    //     transport wobble (.degraded/.reconnecting) ABANDONS the original
+    //     connection and dials a REPLACEMENT + re-ATTACH swap immediately, even
+    //     though the original would self-recover. This is what a plain agent
+    //     freeze/thaw otherwise fails to exercise (the original TCP link
+    //     recovers before any replacement dial completes).
+    //
+    //   /tmp/ghoztty-debug-fail-reconnect-swap — when present, that swap's
+    //     surface creation is treated as FAILED (the deterministic stand-in for
+    //     the dark-wake `ghostty_surface_new` OOM), so the abort/guard path
+    //     runs: the old grid is kept and the pill stays reconnecting/red.
+    //
+    // Both are gated on the libghostty build mode (the exact condition behind
+    // the "debug build" warning banner in `TerminalView`), so they cannot
+    // trigger in release (ReleaseFast) builds regardless of the files.
     private static let debugFailReconnectSwapHookPath =
         "/tmp/ghoztty-debug-fail-reconnect-swap"
+    private static let debugForceReconnectSwapHookPath =
+        "/tmp/ghoztty-debug-force-reconnect-swap"
 
-    /// Whether the reconnect swap should be forced to fail (debug hook). Gated
-    /// on the libghostty build mode — the exact condition behind the "debug
-    /// build" warning banner (`TerminalView`) — so it cannot trigger in
-    /// release (ReleaseFast) builds regardless of the hook file.
+    /// Whether debug reconnect-swap hooks are honored at all (debug /
+    /// release-safe builds ONLY). Mirrors the `TerminalView` debug banner gate.
+    private static var debugReconnectHooksEnabled: Bool {
+        Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG
+            || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE
+    }
+
+    /// Whether the reconnect swap should be forced to fail (debug hook).
     private static func debugShouldFailReconnectSwap() -> Bool {
-        guard Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG
-                || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE
-        else { return false }
+        guard debugReconnectHooksEnabled else { return false }
         return FileManager.default.fileExists(
             atPath: debugFailReconnectSwapHookPath)
+    }
+
+    /// Whether a reconnect swap should be forced on the next transport wobble
+    /// (debug hook).
+    private static func debugShouldForceReconnectSwap() -> Bool {
+        guard debugReconnectHooksEnabled else { return false }
+        return FileManager.default.fileExists(
+            atPath: debugForceReconnectSwapHookPath)
     }
 
     /// The agent session UUID of this window's first live remote pane, read
