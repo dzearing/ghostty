@@ -293,14 +293,27 @@ ghoztty +split --target=ide --name=logs \
           <span class="install-badge">Windows</span>
           <h3>Install the agent</h3>
         </div>
-        <p>Paste into PowerShell on the Windows machine. A browser window opens once &mdash; sign in with Google to link the machine to your account.</p>
-        <div class="code-block code-block-copy">
-          <code id="agent-install-cmd">irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code>
-          <button class="copy-btn" type="button" data-copy-target="agent-install-cmd" aria-label="Copy install command">Copy</button>
-        </div>
+        <a class="dl-btn" href="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.msi"><span aria-hidden="true">&#8595;</span> Download the installer (.msi)</a>
+        <ol class="remote-steps">
+          <li>Run the downloaded <code>ghoztty-agent.msi</code> &mdash; per-user install, no admin required.</li>
+          <li>Click <b>Ghoztty Agent</b> in the Start Menu.</li>
+          <li>Sign in with Google in the browser that opens to link the machine to your account.</li>
+        </ol>
         <p class="install-alt">
-          Or <a href="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.exe">download ghoztty-agent.exe</a> directly.<span id="agent-version"></span>
+          The agent keeps itself up to date automatically and starts at logon.
+          Uninstall any time from Settings &rarr; Apps.<span id="agent-version"></span>
         </p>
+        <details class="remote-advanced">
+          <summary>Advanced: headless install (PowerShell)</summary>
+          <p>Paste into PowerShell on the Windows machine to install and enroll without the MSI.</p>
+          <div class="code-block code-block-copy">
+            <code id="agent-install-cmd">irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code>
+            <button class="copy-btn" type="button" data-copy-target="agent-install-cmd" aria-label="Copy install command">Copy</button>
+          </div>
+          <p class="install-alt">
+            Or <a href="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.exe">download ghoztty-agent.exe</a> directly.
+          </p>
+        </details>
       </div>
     </div>
   </section>

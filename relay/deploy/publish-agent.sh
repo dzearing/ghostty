@@ -3,6 +3,7 @@
 #
 # Uploads (idempotent; safe to re-run):
 #   ghoztty-agent.exe  -> /var/www/ghoztty-dl/ghoztty-agent.exe
+#   ghoztty-agent.msi  -> /var/www/ghoztty-dl/ghoztty-agent.msi  (built here via msi/build-msi.sh)
 #   version.json       -> /var/www/ghoztty-dl/version.json   (generated here)
 #   install.ps1        -> /var/www/ghoztty-dl/install.ps1
 #   www/index.html     -> /var/www/ghoztty-www/index.html
@@ -12,7 +13,8 @@
 #
 # Usage:
 #   relay/deploy/publish-agent.sh [path/to/ghoztty-agent.exe]
-#                                 [--version <string>] [--host <ssh-host>] [--dry-run]
+#                                 [--version <string>] [--host <ssh-host>]
+#                                 [--build-num <N>] [--skip-msi] [--dry-run]
 #
 # Defaults:
 #   exe      zig-out/bin/ghoztty-agent.exe (relative to the repo root)
@@ -35,9 +37,11 @@ WWW_DIR="/var/www/ghoztty-www"
 
 EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
 VERSION=""
+BUILD_NUM=1
+SKIP_MSI=0
 DRY_RUN=0
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,28p' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,6 +49,9 @@ while [[ $# -gt 0 ]]; do
     --version=*) VERSION="${1#*=}"; shift ;;
     --host)     HOST="${2:?--host needs a value}"; shift 2 ;;
     --host=*)   HOST="${1#*=}"; shift ;;
+    --build-num) BUILD_NUM="${2:?--build-num needs a value}"; shift 2 ;;
+    --build-num=*) BUILD_NUM="${1#*=}"; shift ;;
+    --skip-msi) SKIP_MSI=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     -*)         echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
@@ -67,12 +74,25 @@ SHA256="$(shasum -a 256 "$EXE" | awk '{print $1}')"
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ghoztty-publish.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
+
+# Build (and validate) the per-user MSI alongside the raw exe.
+MSI="$STAGE/ghoztty-agent.msi"
+if [[ "$SKIP_MSI" -eq 0 ]]; then
+  "$SCRIPT_DIR/msi/build-msi.sh" "$EXE" \
+    --version "$VERSION" --build-num "$BUILD_NUM" --out "$MSI"
+fi
+
 VERSION_JSON="$STAGE/version.json"
 printf '{"windows-x86_64": {"version": "%s", "sha256": "%s", "path": "/dl/ghoztty-agent.exe"}}\n' \
   "$VERSION" "$SHA256" > "$VERSION_JSON"
 
 echo "== publish-agent =="
 echo "   exe      : $EXE ($(du -h "$EXE" | awk '{print $1}'))"
+if [[ "$SKIP_MSI" -eq 0 ]]; then
+  echo "   msi      : $MSI ($(du -h "$MSI" | awk '{print $1}'))"
+else
+  echo "   msi      : skipped (--skip-msi)"
+fi
 echo "   version  : $VERSION"
 echo "   sha256   : $SHA256"
 echo "   host     : $HOST"
@@ -90,12 +110,19 @@ run() {
 # Stage on the VM under a unique dir, then sudo-install into place (atomic
 # enough for our purposes: `install` replaces each file in one step).
 REMOTE_STAGE="ghoztty-publish.$$"
+UPLOADS=("$EXE" "$VERSION_JSON" "$INSTALL_PS1" "$INDEX_HTML")
+MSI_INSTALL=""
+if [[ "$SKIP_MSI" -eq 0 ]]; then
+  UPLOADS+=("$MSI")
+  MSI_INSTALL="sudo install -m 644 $REMOTE_STAGE/ghoztty-agent.msi  $DL_DIR/ghoztty-agent.msi"
+fi
 run ssh "$HOST" "mkdir -p $REMOTE_STAGE"
-run scp "$EXE" "$VERSION_JSON" "$INSTALL_PS1" "$INDEX_HTML" "$HOST:$REMOTE_STAGE/"
+run scp "${UPLOADS[@]}" "$HOST:$REMOTE_STAGE/"
 run ssh "$HOST" "
   set -eu
   sudo install -d -m 755 $DL_DIR $WWW_DIR
   sudo install -m 644 $REMOTE_STAGE/$(basename "$EXE") $DL_DIR/ghoztty-agent.exe
+  $MSI_INSTALL
   sudo install -m 644 $REMOTE_STAGE/version.json       $DL_DIR/version.json
   sudo install -m 644 $REMOTE_STAGE/install.ps1        $DL_DIR/install.ps1
   sudo install -m 644 $REMOTE_STAGE/index.html         $WWW_DIR/index.html
@@ -108,5 +135,8 @@ else
   echo "OK: published agent $VERSION."
   echo "   verify: curl -fsS https://${HOST#*@}/dl/version.json"
   echo "           curl -fsSI https://${HOST#*@}/dl/ghoztty-agent.exe | head -5"
+  if [[ "$SKIP_MSI" -eq 0 ]]; then
+    echo "           curl -fsSI https://${HOST#*@}/dl/ghoztty-agent.msi | head -5"
+  fi
   echo "           curl -fsS https://${HOST#*@}/ | head -5"
 fi

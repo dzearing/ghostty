@@ -129,6 +129,62 @@
     font-size: 14px;
     color: var(--text-dim);
   }
+  .dl-body { padding: 20px 18px; }
+  .dl-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--accent);
+    color: #0c0e12;
+    font-weight: 650;
+    font-size: 16px;
+    border-radius: 10px;
+    padding: 13px 22px;
+    text-decoration: none;
+    transition: filter .15s;
+  }
+  .dl-btn:hover { filter: brightness(1.1); text-decoration: none; }
+  .dl-btn .arrow { font-size: 18px; line-height: 1; }
+  ol.steps {
+    margin: 18px 0 0 0;
+    padding-left: 22px;
+    display: grid;
+    gap: 8px;
+    font-size: 15px;
+  }
+  ol.steps li::marker { color: var(--accent); font-weight: 600; }
+  ol.steps code { font: 13px/1.4 var(--mono); color: var(--green); }
+  .note {
+    margin-top: 16px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  details.advanced {
+    margin-top: 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--bg-panel);
+    overflow: hidden;
+  }
+  details.advanced summary {
+    cursor: pointer;
+    padding: 12px 16px;
+    font-size: 14px;
+    color: var(--text-dim);
+    list-style: none;
+  }
+  details.advanced summary::-webkit-details-marker { display: none; }
+  details.advanced summary::before { content: "▸ "; color: var(--accent); }
+  details.advanced[open] summary::before { content: "▾ "; }
+  details.advanced summary:hover { color: var(--text); }
+  details.advanced .inner {
+    border-top: 1px solid var(--border);
+  }
+  details.advanced p.hint {
+    padding: 12px 16px 0;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   ul.features {
@@ -173,16 +229,34 @@
   <h2>Install on Windows</h2>
   <div class="install-card">
     <div class="bar">
-      <span><span class="os">Windows</span> &middot; paste into PowerShell</span>
+      <span><span class="os">Windows</span> &middot; per-user install, no admin required</span>
     </div>
-    <div class="codewrap">
-      <pre><code id="install-cmd"><span class="p">PS&gt;</span> irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code></pre>
-      <button class="copy-btn" id="copy-btn" type="button" aria-label="Copy install command">Copy</button>
+    <div class="dl-body">
+      <a class="dl-btn" href="/dl/ghoztty-agent.msi"><span class="arrow" aria-hidden="true">&#8595;</span> Download the installer (.msi)</a>
+      <ol class="steps">
+        <li>Run the downloaded <code>ghoztty-agent.msi</code>.</li>
+        <li>Click <b>Ghoztty Agent</b> in the Start Menu.</li>
+        <li>Sign in with Google in the browser that opens to link this machine to your account.</li>
+      </ol>
+      <p class="note">
+        The agent keeps itself up to date automatically and starts at logon.
+        To remove it, use Settings &rarr; Apps &rarr; Ghoztty Remote Agent &rarr; Uninstall.
+      </p>
     </div>
   </div>
+
+  <details class="advanced">
+    <summary>Advanced: headless install (PowerShell)</summary>
+    <div class="inner">
+      <p class="hint">Installs and enrolls without the MSI &mdash; useful for scripted setups.</p>
+      <div class="codewrap">
+        <pre><code id="install-cmd"><span class="p">PS&gt;</span> irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code></pre>
+        <button class="copy-btn" id="copy-btn" type="button" aria-label="Copy install command">Copy</button>
+      </div>
+    </div>
+  </details>
   <p class="alt">
-    Prefer the binary? <a href="/dl/ghoztty-agent.exe">Download ghoztty-agent.exe</a> directly.
-    Signing in with your Google account during install links the machine to you.
+    Prefer the raw binary? <a href="/dl/ghoztty-agent.exe">Download ghoztty-agent.exe</a> directly.
   </p>
 
   <h2>What it does</h2>
