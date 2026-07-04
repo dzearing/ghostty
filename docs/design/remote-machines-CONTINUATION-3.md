@@ -117,6 +117,49 @@ rollout (~18 onlines/min → silence at 23:35Z); since then one reconnect at
 Keychain stable-signing carry-over held again this session (rebuild →
 relaunch → manifest restore dialed MaximusHome with NO prompt).
 
+## 2026-07-03 NIGHT SESSION — website + agent SELF-UPDATE (both LIVE)
+
+User request: "installer on the website + easy auto-updating." Landed
+(worktree subagents, cherry-picked; tip `6bf6d7f2a`):
+- `d04dfd789` website + publish tooling: gh-pages "Remote Agent for Windows"
+  section (the REAL product site is **https://dzearing.github.io/ghoztty/**,
+  gh-pages branch of this repo, also hosts the Mac Sparkle appcast — see the
+  `ghoztty-website-gh-pages` memory; pushed as gh-pages `717454733`, verified
+  live in Chrome incl. the cross-origin version badge), relay-root landing
+  page, `relay/deploy/publish-agent.sh` (builds version.json + uploads exe/
+  installer/site to the VM), `Caddyfile.example`; install.ps1 prints the
+  installed version.
+- `6bf6d7f2a` agent SELF-UPDATE (`src/remote/agent/self_update.zig`): version
+  stamped `YYYYMMDD-<short hash>` (`--version` flag; `-Dagent-version=`
+  override; "dev" fallback never updates), relay-mode background thread
+  checks `<relay>/dl/version.json` 90s after start + every 6h, sha256-verified
+  download, crash-safe staging, IDLE-GATED apply (zero attached OR
+  detached-retained sessions), rename-swap + respawn same argv +
+  `--force-replace`. Env: `GHOSTTY_AGENT_NO_SELFUPDATE=1`,
+  `GHOSTTY_AGENT_UPDATE_INTERVAL_MS`, `GHOSTTY_AGENT_UPDATE_BASE`.
+  413/413 agent tests. **PROVEN on the PRODUCTION channel**: published a
+  temporary macos-aarch64 manifest entry, ran the older build → found →
+  downloaded → sha verified → staged → idle → swapped → respawned; the
+  replacement served a real relay dial round trip. Manifest restored to
+  windows-only afterward.
+- DEPLOYED: exe `20260703-6bf6d7f2a` + version.json + install.ps1 + landing
+  page on the VM; Caddy now adds CORS on `/dl/*` and serves `/` statically
+  (backup: `/etc/caddy/Caddyfile.bak`); all relay routes re-verified
+  (healthz, enroll, dl).
+
+**New gotchas:**
+- STAMPED (non-"dev") agent builds CHASE the manifest — a dev Mac running a
+  stamped zig-out build would DOWNGRADE itself if a macos-aarch64 entry ever
+  ships in version.json. Keep the manifest windows-only, or run dev agents
+  with `GHOSTTY_AGENT_NO_SELFUPDATE=1`.
+- version.json MUST carry the exe's EXACT baked stamp or agents update-loop
+  forever — publish-agent.sh derives it, but pass `--version $(zig-out
+  agent --version)` when in doubt.
+- MaximusHome still runs the SMB-watcher supervisor: self-update and the
+  watcher will fight over the binary. Before relying on auto-update there,
+  migrate the box to installer-only (kill the watcher, keep the scheduled
+  task — the REVERSE of the earlier advice).
+
 ## Standing items (the queue)
 
 **Needs the USER:**
