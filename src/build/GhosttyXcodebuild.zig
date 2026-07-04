@@ -191,17 +191,35 @@ pub fn init(
         break :copy step;
     };
 
-    // Re-sign the copied bundle ad-hoc. `cp -R` above breaks the code-signature
+    // Re-sign the copied bundle. `cp -R` above breaks the code-signature
     // seal (the on-disk pages no longer match the sealed hashes), which makes
     // the hardened-runtime binary fail page validation and get SIGKILL'd with
     // "Code Signature Invalid" when the inner Mach-O is exec'd directly (e.g.
-    // running `.../MacOS/ghostty +new-window` as a CLI). A fresh ad-hoc sign of
-    // the installed copy re-seals it so it launches cleanly. Ad-hoc is correct
-    // here because local builds are only ever ad-hoc signed anyway.
+    // running `.../MacOS/ghostty +new-window` as a CLI). A fresh sign of
+    // the installed copy re-seals it so it launches cleanly.
+    //
+    // Identity: `GHOSTTY_CODESIGN_IDENTITY` if set, else a stable local
+    // self-signed identity when present, else ad-hoc ("-"). A STABLE identity
+    // (vs ad-hoc) keeps the Keychain ACL's designated requirement constant
+    // across rebuilds, so "Always Allow" on the relay-account Keychain item
+    // survives — ad-hoc signatures read as a brand-new app every build and
+    // re-prompt for the login-keychain password after each rebuild.
     const sign = sign: {
-        const step = RunStep.create(b, "codesign app bundle (ad-hoc)");
+        const identity = std.process.getEnvVarOwned(
+            b.allocator,
+            "GHOSTTY_CODESIGN_IDENTITY",
+        ) catch identity: {
+            const probe = std.process.Child.run(.{
+                .allocator = b.allocator,
+                .argv = &.{ "security", "find-identity", "-v", "-p", "codesigning" },
+            }) catch break :identity b.dupe("-");
+            if (std.mem.indexOf(u8, probe.stdout, "Ztabby Debug Signing") != null)
+                break :identity b.dupe("Ztabby Debug Signing");
+            break :identity b.dupe("-");
+        };
+        const step = RunStep.create(b, "codesign app bundle");
         step.has_side_effects = true;
-        step.addArgs(&.{ "codesign", "--force", "--deep", "--sign", "-" });
+        step.addArgs(&.{ "codesign", "--force", "--deep", "--sign", identity });
         step.addArg(b.fmt("{s}/{s}.app", .{ b.install_path, app_name }));
         step.expectExitCode(0);
         step.step.dependOn(&copy.step);
