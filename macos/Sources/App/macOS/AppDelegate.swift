@@ -1136,6 +1136,7 @@ class AppDelegate: NSObject,
         token: String,
         name: String? = nil,
         namePinned: Bool = false,
+        ipcName: String? = nil,
         onOpen: ((TerminalController) -> Void)? = nil
     ) -> String? {
         // Defense in depth for the signed-out case: every caller resolves the
@@ -1165,7 +1166,8 @@ class AppDelegate: NSObject,
             device: device,
             fallbackName: name,
             namePinned: namePinned,
-            sessionID: nil)
+            sessionID: nil,
+            ipcName: ipcName)
         onOpen?(controller)
         return nil
     }
@@ -1207,6 +1209,7 @@ class AppDelegate: NSObject,
         namePinned: Bool = false,
         sessionID: String?,
         windowTitle: String? = nil,
+        ipcName: String? = nil,
         replacingManifestEntry: UUID? = nil
     ) -> TerminalController {
         // The relay path has no TCP port. The DISPLAY NAME wins: prefer the
@@ -1260,9 +1263,19 @@ class AppDelegate: NSObject,
             sessionID: sessionID,
             windowTitle: windowTitle,
             namePinned: machine.namePinned,
+            ipcName: ipcName,
             replacing: replacingManifestEntry)
         controller.remoteManifestEntryID = entryID
         RemoteSessionManifest.captureSessionID(of: controller, entryID: entryID)
+
+        // Restore path: put the window back in the IPC target registry under
+        // its persisted name so `+read`/`+send-keys`/`+close --target=` keep
+        // working across a quit/relaunch. (The fresh IPC dial path registers
+        // via its onOpen callback instead; if the name was re-taken meanwhile
+        // the existing registration wins — see registerRestoredRemoteWindow.)
+        if replacingManifestEntry != nil, let ipcName, !ipcName.isEmpty {
+            ipcServer.registerRestoredRemoteWindow(name: ipcName, controller: controller)
+        }
 
         // Re-apply the user-set window title preserved in the manifest entry
         // (restore path). Applied through `titleOverride` — the same property
@@ -1472,6 +1485,7 @@ class AppDelegate: NSObject,
                         namePinned: entry.namePinned == true,
                         sessionID: sessionID,
                         windowTitle: entry.windowTitle,
+                        ipcName: entry.ipcName,
                         replacingManifestEntry: entry.id)
                 }
             }

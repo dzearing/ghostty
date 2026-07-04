@@ -58,6 +58,13 @@ final class RemoteSessionManifest {
         /// brings the window back under its caller-supplied label. Optional
         /// so older manifests decode fine (missing ⇒ nil ⇒ not pinned).
         var namePinned: Bool? = nil
+        /// The IPC target-registry name this window was registered under
+        /// (`+new-remote-window --name=...`), persisted so a restored window
+        /// is re-registered and stays addressable by `+read` / `+send-keys` /
+        /// `+close --target=` across a quit/relaunch. Nil for windows not
+        /// opened through the named IPC path. Optional so older manifests
+        /// decode fine (missing key ⇒ nil).
+        var ipcName: String? = nil
     }
 
     private let defaults: UserDefaults
@@ -101,6 +108,7 @@ final class RemoteSessionManifest {
         sessionID: String? = nil,
         windowTitle: String? = nil,
         namePinned: Bool = false,
+        ipcName: String? = nil,
         replacing replacedID: UUID? = nil
     ) -> UUID {
         let entry = Entry(
@@ -110,7 +118,8 @@ final class RemoteSessionManifest {
             sessionID: sessionID,
             name: name,
             windowTitle: windowTitle,
-            namePinned: namePinned ? true : nil)
+            namePinned: namePinned ? true : nil,
+            ipcName: ipcName)
         lock.lock()
         defer { lock.unlock() }
         if let replacedID {

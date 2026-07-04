@@ -326,6 +326,60 @@ struct RemoteSessionManifestTests {
         #expect(entries[0].name == "new box")
     }
 
+    /// The IPC target-registry name (`+new-remote-window --name=mx`) rides
+    /// the manifest entry: it round-trips through persistence (so a restored
+    /// window can be re-registered under it) and survives the restore's
+    /// `register(..., replacing:)` supersede — otherwise the name would be
+    /// lost after the SECOND quit/relaunch.
+    @Test func ipcNameRoundTripsAndSurvivesReplacing() {
+        let defaults = makeDefaults()
+        let manifest = RemoteSessionManifest(defaults: defaults)
+
+        let old = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "mx",
+            sessionID: "sess-1", namePinned: true, ipcName: "mx")
+
+        // Round-trip: a fresh instance (relaunch) sees the registry name.
+        #expect(persisted(defaults).first { $0.id == old }?.ipcName == "mx")
+
+        // Restore success: the fresh window's entry carries the name forward
+        // (the restore path passes entry.ipcName back into register).
+        let fresh = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "mx",
+            sessionID: "sess-1", namePinned: true, ipcName: "mx",
+            replacing: old)
+
+        let onDisk = persisted(defaults)
+        #expect(onDisk.map(\.id) == [fresh])
+        #expect(onDisk[0].ipcName == "mx")
+
+        // Windows opened outside the named IPC path carry no registry name.
+        let unnamed = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-2", name: "box",
+            sessionID: "sess-2")
+        #expect(persisted(defaults).first { $0.id == unnamed }?.ipcName == nil)
+    }
+
+    /// A manifest persisted BEFORE the `ipcName` field existed decodes with
+    /// the name absent (nil ⇒ nothing to re-register).
+    @Test func decodesLegacyEntryWithoutIPCName() {
+        let defaults = makeDefaults()
+        let legacyJSON = """
+        [{"id":"00000000-0000-0000-0000-000000000003",\
+        "relayBase":"https://relay.test",\
+        "deviceID":"dev-legacy",\
+        "sessionID":"sess-legacy",\
+        "name":"old box"}]
+        """
+        defaults.set(Data(legacyJSON.utf8), forKey: RemoteSessionManifest.defaultsKey)
+
+        let manifest = RemoteSessionManifest(defaults: defaults)
+        let entries = manifest.allEntries()
+        #expect(entries.count == 1)
+        #expect(entries[0].deviceID == "dev-legacy")
+        #expect(entries[0].ipcName == nil)
+    }
+
     /// An account/machine rename (`updateName`) must not clobber the user-set
     /// WINDOW title — they are independent: the machine name feeds the pill
     /// and default naming, the window title is the user's manual rename.

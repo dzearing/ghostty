@@ -933,6 +933,10 @@ class IPCServer {
                     // An explicit --name is a caller-supplied label: pin it so
                     // account renames don't overwrite it (Machine.namePinned).
                     namePinned: name != nil,
+                    // Persist the registry name in the manifest entry so a
+                    // restored window is re-registered under it (the restore
+                    // path calls registerRestoredRemoteWindow).
+                    ipcName: name,
                     onOpen: { [weak self] controller in
                         // Register the window under its friendly name so
                         // +send-keys / +read / +close can target it (mirrors the
@@ -1375,6 +1379,24 @@ class IPCServer {
 
         let data = IPCData.listState(IPCData.ListStateData(windows: windowsData))
         return IPCResponse(success: true, data: data)
+    }
+
+    /// Re-register a RESTORED remote window under the IPC target name
+    /// persisted in its `RemoteSessionManifest` entry, so `+read` /
+    /// `+send-keys` / `+close --target=<name>` keep working across a
+    /// quit/relaunch. If the name is already taken by a live target (the
+    /// user opened a new window under the same name meanwhile), the existing
+    /// registration wins — consistent with the CLI's idempotent named-target
+    /// semantics — and the restored window is simply not re-registered.
+    @MainActor
+    func registerRestoredRemoteWindow(name: String, controller: TerminalController) {
+        pruneStaleTargets()
+        guard targetRegistry[name] == nil else {
+            Self.logger.info("IPC: restored remote window not re-registered — target '\(name)' already in use")
+            return
+        }
+        targetRegistry[name] = .window(WeakRef(controller))
+        Self.logger.info("IPC: re-registered restored remote window target '\(name)'")
     }
 
     @MainActor
