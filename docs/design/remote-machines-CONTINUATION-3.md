@@ -126,14 +126,28 @@ delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
    auto-restored an old MaximusHome window). Follow-up noted: IPC registry
    names (`--name=mx`) do NOT survive restore — `+read --name=mx` →
    "not found" after relaunch; persist the name in the manifest someday.
-6. PARTIAL 07-03 evening: machine rename "MaximusHome"→"Home PC" via the
-   chooser ⋯ menu worked (relay PATCH + `device renamed` log) and the OPEN
-   chooser row updated LIVE (name + "(MaximusHome)" subtext — the 27e639ae6
-   polling). BUT a manifest-RESTORED window kept stale pill/`AXGhosttyMachine`
-   ("MaximusHome") — rename propagation misses restored windows (a00550f84
-   works for chooser-opened ones). Fix delegated (worktree agent, in flight
-   at session end). Explicit `--name` windows keep their label (intentional).
-   Renamed back to "MaximusHome" afterwards.
+6. ~~Rename→open-window propagation~~ DONE (fix `37f81c4a7` cherry-picked,
+   rebuilt, VERIFIED live): device rename via chooser ⋯ now flips a
+   manifest-RESTORED window's pill/`AXGhosttyMachine` within ~1s (verified
+   "MaximusHome"→"Home PC"→back, twice). Root causes fixed: rename
+   propagation was gated on a registry-row lookup that could silently fail
+   after the PATCH; poll-path renames (other Macs/processes) updated chooser
+   rows only; explicit `--name` windows now PIN their label (`namePinned` in
+   Machine + manifest — intentional, survives renames/restores). NOTE from
+   that investigation: running TWO debug instances (zig-out + the
+   macos/build/Debug xcodebuild product share the bundle id — LaunchServices
+   can launch either on `open -b`) breaks process-local notification paths;
+   kill the duplicate before GUI verification.
+   ALSO FIXED tonight: Keychain "Always Allow" now SURVIVES rebuilds — the
+   debug bundle is signed with the stable local "Ztabby Debug Signing" cert
+   instead of ad-hoc (`GHOSTTY_CODESIGN_IDENTITY` overrides; falls back to
+   ad-hoc when no cert). Verified: rebuild → relaunch → restore dialed with
+   NO password prompt.
+   OPEN (fix delegated, in flight at session end): `takeAll()` persists the
+   drained manifest BEFORE restores complete — a kill/crash while restore is
+   blocked (e.g. on the Keychain prompt) permanently loses all restorable
+   windows (happened live tonight; two orphaned MaximusHome sessions remain
+   on the box). Fix = mark-don't-drain snapshot + remove-on-success.
 7. ~~WP-D1 pill walkthrough~~ DONE (loopback TCP agent, screenshots): yellow
    "reconnecting… (N)" on freeze/kill with local-suppression correctly lifted;
    green re-attach after short outage (grid + I/O intact); red "disconnected"
