@@ -143,11 +143,20 @@ delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
    instead of ad-hoc (`GHOSTTY_CODESIGN_IDENTITY` overrides; falls back to
    ad-hoc when no cert). Verified: rebuild → relaunch → restore dialed with
    NO password prompt.
-   OPEN (fix delegated, in flight at session end): `takeAll()` persists the
-   drained manifest BEFORE restores complete — a kill/crash while restore is
-   blocked (e.g. on the Keychain prompt) permanently loses all restorable
-   windows (happened live tonight; two orphaned MaximusHome sessions remain
-   on the box). Fix = mark-don't-drain snapshot + remove-on-success.
+   ~~takeAll() crash-safety~~ FIXED + VERIFIED (`564c54d6f` cherry-picked):
+   `snapshotForRestore()` marks entries in-flight WITHOUT draining disk;
+   success does an atomic `register(replacing:)` swap; unreachable/no-token
+   → `releaseRestore` (entry stays for next launch); gone → explicit remove;
+   `reinstate()` deleted. 16/16 manifest tests. Live kill-test: kill -9
+   during a Keychain-blocked restore → manifest intact → next launch
+   restored the window. Also: the unit-test HOST app now skips IPC start +
+   restore under XCTest (it used to steal the live app's IPC socket and
+   drain its manifest). Historical loss from before the fix: two orphaned
+   sessions remain on MaximusHome (idle cmd.exe — harmless).
+   Keychain carry-over CONFIRMED for the stable-signed lineage: quit →
+   relaunch restores with NO prompt ("Always Allow" bound to the stable
+   designated requirement `identifier + certificate leaf`; the one repeat
+   prompt tonight was the earlier grant landing on the last AD-HOC build).
 7. ~~WP-D1 pill walkthrough~~ DONE (loopback TCP agent, screenshots): yellow
    "reconnecting… (N)" on freeze/kill with local-suppression correctly lifted;
    green re-attach after short outage (grid + I/O intact); red "disconnected"
