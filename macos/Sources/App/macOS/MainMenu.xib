@@ -117,6 +117,18 @@
                                     <action selector="setAsDefaultTerminal:" target="bbz-4X-AYv" id="QHh-CA-Qho"/>
                                 </connections>
                             </menuItem>
+                            <menuItem title="Install Command-Line Tool" id="gz1-CL-mn1">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="installCommandLineTool:" target="bbz-4X-AYv" id="gz1-CL-ac1"/>
+                                </connections>
+                            </menuItem>
+                            <menuItem title="Set Up Claude Code Integration" id="gz2-CC-mn2">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="setupClaudeCodeIntegration:" target="bbz-4X-AYv" id="gz2-CC-ac2"/>
+                                </connections>
+                            </menuItem>
                             <menuItem isSeparatorItem="YES" id="4je-JR-u6R"/>
                             <menuItem title="Services" id="rJe-5J-bwL">
                                 <modifierMask key="keyEquivalentModifierMask"/>

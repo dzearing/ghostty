@@ -67,7 +67,7 @@ struct TerminalCommandPaletteView: View {
             sections.append(CommandPaletteSection(title: nil, options: updates))
         }
 
-        let rest = jumpOptions + terminalOptions
+        let rest = jumpOptions + terminalOptions + setupOptions
 
         let defaultSorted = rest.sorted { a, b in
             let aNormalized = a.title.replacingOccurrences(of: ":", with: "\t")
@@ -153,6 +153,26 @@ struct TerminalCommandPaletteView: View {
                     onAction(c.action)
                 }
             }
+    }
+
+    /// App setup commands, such as installing the command-line tool.
+    private var setupOptions: [CommandOption] {
+        [
+            CommandOption(
+                title: "Install Command-Line Tool",
+                description: "Add the ghoztty command for terminals and tools",
+                leadingIcon: "terminal"
+            ) {
+                (NSApp.delegate as? AppDelegate)?.installCommandLineTool(nil)
+            },
+            CommandOption(
+                title: "Set Up Claude Code Integration",
+                description: "Install the Ghoztty plugin for Claude Code",
+                leadingIcon: "puzzlepiece.extension"
+            ) {
+                (NSApp.delegate as? AppDelegate)?.setupClaudeCodeIntegration(nil)
+            },
+        ]
     }
 
     /// Commands for jumping to other terminal surfaces.

@@ -321,6 +321,11 @@ class AppDelegate: NSObject,
         // Setup signal handlers
         setupSignals()
 
+        // Make sure the ghoztty command-line tool stays set up. This runs in
+        // the background, self-heals silently once accepted, and prompts at
+        // most once ever.
+        checkCommandLineToolOnLaunch()
+
         switch Ghostty.launchSource {
         case .app:
             // Don't have to do anything.
