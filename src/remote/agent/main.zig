@@ -23,6 +23,11 @@
 //!      `GHOSTTY_DEVICE_TOKEN`, falling back to the agent's persisted
 //!      `relay.env` (see `enroll.zig`); relay.env is then WATCHED so a
 //!      re-enroll's new token is adopted without a restart (`relay_creds.zig`).
+//!      With NO credential anywhere, an interactive (non-`--headless`) launch
+//!      runs the browser enrollment INLINE on first run and then continues into
+//!      the connect loop — the MSI Start-Menu / Run-key launch is exactly
+//!      `ghoztty-agent --relay=<base>` (see `decideRelayCred`); `--headless`
+//!      keeps the explicit "run --enroll first" error.
 //!      Reconnects with backoff on a control
 //!      drop (sessions survive). Coexists with — does not replace — `--listen`.
 //!
@@ -125,30 +130,44 @@ pub fn main() !void {
             try runListen(alloc, encoding, l.addr, l.headless);
         },
         .relay => |r| {
-            // DAEMON mode: single-instance first (before the token lookup and
-            // long before the tray could flash an icon).
+            // DAEMON mode: single-instance first (before the token lookup, long
+            // before the tray could flash an icon — and before a first-run
+            // auto-enroll could pop a browser from a doomed duplicate).
             var lock = acquireDaemonLockOrExit(alloc, r.force_replace);
             defer lock.release();
             // The device token authenticates the relay WebSockets. Required.
             // Precedence: the GHOSTTY_DEVICE_TOKEN env var wins; otherwise fall
             // back to the agent's own relay.env (written by `--enroll` and by
             // the Windows installer), so enroll → run needs no env plumbing.
+            // With NO credential anywhere the policy is `decideRelayCred`'s:
+            // interactive launches self-enroll inline, `--headless` errors.
             // The SOURCE travels along: a relay.env sourced token may be hot-
             // reloaded on a re-enroll, an env-sourced one never is (see
             // `relay_creds.zig`).
             const TokenInit = struct { token: []u8, source: relay_creds.Source };
-            const ti: TokenInit = blk: {
-                if (std.process.getEnvVarOwned(alloc, "GHOSTTY_DEVICE_TOKEN")) |t| break :blk .{ .token = t, .source = .env } else |_| {}
-                if (enroll.loadDeviceToken(alloc)) |t| break :blk .{ .token = t, .source = .relay_env };
-                std.debug.print(
-                    "ghoztty-agent: --relay needs a device token: set GHOSTTY_DEVICE_TOKEN " ++
-                        "or enroll this machine first with `ghoztty-agent --enroll --relay=<base>`\n",
-                    .{},
-                );
-                // This is the only relay-mode path that returns (runRelay loops
-                // forever), so free the duped URL to keep the GPA exit clean.
-                alloc.free(r.base_url);
-                return error.MissingDeviceToken;
+            const env_token: ?[]u8 = std.process.getEnvVarOwned(alloc, "GHOSTTY_DEVICE_TOKEN") catch null;
+            const file_token: ?[]u8 = if (env_token == null) enroll.loadDeviceToken(alloc) else null;
+            const ti: TokenInit = switch (decideRelayCred(env_token != null, file_token != null, r.headless)) {
+                .use_env => .{ .token = env_token.?, .source = .env },
+                .use_relay_env => .{ .token = file_token.?, .source = .relay_env },
+                .fail => {
+                    std.debug.print(
+                        "ghoztty-agent: --relay needs a device token: set GHOSTTY_DEVICE_TOKEN " ++
+                            "or enroll this machine first with `ghoztty-agent --enroll --relay=<base>`\n",
+                        .{},
+                    );
+                    // This relay-mode path returns (runRelay loops forever),
+                    // so free the duped URL to keep the GPA exit clean.
+                    alloc.free(r.base_url);
+                    return error.MissingDeviceToken;
+                },
+                .auto_enroll => blk: {
+                    const t = autoEnrollForRelay(alloc, r.base_url) catch |err| {
+                        alloc.free(r.base_url); // keep the GPA exit clean, as above
+                        return err;
+                    };
+                    break :blk .{ .token = t, .source = .relay_env };
+                },
             };
             // Token ownership moves into runRelay's `Creds` (it must stay
             // alive as long as any connection borrows a snapshot of it).
@@ -214,6 +233,64 @@ fn acquireDaemonLockOrExit(alloc: Allocator, force_replace: bool) DaemonLock {
     // We are THE daemon: announce liveness. A heartbeat failure only costs
     // challenger-side takeover diagnostics, never the daemon.
     return .{ .guard = guard, .heartbeat = single_instance.Heartbeat.start(alloc) };
+}
+
+/// How relay-daemon startup obtains its device credential — a PURE decision
+/// seam so the policy is unit-testable without env vars or files. Precedence:
+/// `GHOSTTY_DEVICE_TOKEN` > relay.env. With NO credential anywhere an
+/// INTERACTIVE launch self-enrolls inline (the MSI Start-Menu / Run-key launch
+/// is exactly `ghoztty-agent --relay=<base>`, so the first run must bootstrap
+/// itself), while `--headless` keeps the explicit error — a headless box has
+/// no browser to pop; enroll it deliberately with `--enroll --no-browser`.
+const RelayCredDecision = enum { use_env, use_relay_env, auto_enroll, fail };
+
+fn decideRelayCred(has_env_token: bool, has_relay_env_token: bool, headless: bool) RelayCredDecision {
+    if (has_env_token) return .use_env;
+    if (has_relay_env_token) return .use_relay_env;
+    return if (headless) .fail else .auto_enroll;
+}
+
+/// FIRST-RUN self-enrollment for interactive relay mode: no credential exists,
+/// so run the normal `--enroll` flow inline (browser-first with device-code
+/// fallback — `enroll.run`, reused unchanged) and return the freshly persisted
+/// relay.env token; the caller then continues straight into the connect loop
+/// (no re-exec). On failure (denied / expired / relay unreachable) this logs,
+/// surfaces a Windows message box (see `surfaceEnrollFailure`), and errors out
+/// so the daemon exits NONZERO: the installer's Run key retries at the next
+/// logon — we never loop re-opening browsers.
+fn autoEnrollForRelay(alloc: Allocator, base_url: []const u8) ![]u8 {
+    std.debug.print("ghoztty-agent: no device credential; starting first-run browser enrollment with {s}\n", .{base_url});
+    var host_buf: [256]u8 = undefined;
+    const name = hostName(&host_buf) orelse "unknown-host";
+    enroll.run(alloc, base_url, name, .{}) catch |err| {
+        std.debug.print("ghoztty-agent: first-run enrollment failed ({s}); not starting the relay daemon\n", .{@errorName(err)});
+        surfaceEnrollFailure(err);
+        return err;
+    };
+    return enroll.loadDeviceToken(alloc) orelse {
+        // Enroll claimed success but relay.env holds no token (racing delete,
+        // unwritable dir surfaced late, ...): treat exactly like a failure.
+        std.debug.print("ghoztty-agent: enrollment finished but relay.env holds no device token\n", .{});
+        surfaceEnrollFailure(error.MissingDeviceToken);
+        return error.MissingDeviceToken;
+    };
+}
+
+/// Windows-only user-visible surface for a first-run enrollment failure: a
+/// plain error message box. At this point NO tray icon exists yet (the tray
+/// starts with the connect loop, which we never reach) and the GUI-subsystem
+/// exe launched from the Start Menu / Run key has no console for stderr, so a
+/// box is the only thing the user can see. No-op elsewhere; headless never
+/// reaches here (`decideRelayCred` fails headless launches without enrolling).
+fn surfaceEnrollFailure(err: anyerror) void {
+    if (builtin.os.tag != .windows) return;
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "First-run enrollment failed ({s}).\n\nThe agent will retry at the next launch, or enroll manually with:\nghoztty-agent --enroll --relay=<base>",
+        .{@errorName(err)},
+    ) catch "First-run enrollment failed.";
+    tray.showStartupError(msg);
 }
 
 fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
@@ -682,6 +759,9 @@ fn runRelay(
     // the life of the daemon.
     const ws_base = try wssBase(alloc, base_url);
     defer alloc.free(ws_base);
+    // Host part (scheme stripped): the tray tooltip label and the
+    // self-updater's HTTPS host. wssBase guarantees a scheme prefix.
+    const ws_host = ws_base[(std.mem.indexOf(u8, ws_base, "://") orelse unreachable) + "://".len ..];
 
     // DAEMON-SCOPED shared session store + spawner (§7.1 survival) — identical to
     // `runListen`. These OUTLIVE every data connection AND every control
@@ -717,12 +797,12 @@ fn runRelay(
     // /dl/version.json and swap+respawns ONLY when `store` has zero live
     // sessions. No-op for dev builds or under GHOSTTY_AGENT_NO_SELFUPDATE=1.
     self_update.cleanupLeftovers(alloc);
-    self_update.maybeStart(alloc, ws_base["wss://".len..], agent_version, &store);
+    self_update.maybeStart(alloc, ws_host, agent_version, &store);
 
     // User-controlled relay link state (tray Disconnect/Reconnect). The tray
     // toggles it from its message-pump thread; the control loop obeys it.
     // `host` (scheme stripped) is what the tooltip shows: "Connected to <host>".
-    var link = link_control.LinkControl{ .host = ws_base["wss://".len..] };
+    var link = link_control.LinkControl{ .host = ws_host };
 
     // LIVE relay credentials: every control dial snapshots the current token,
     // so a re-enroll's rotation lands on the next dial. Owns `token` from
@@ -779,18 +859,25 @@ fn runRelay(
 }
 
 /// Convert an `https://host[:port]` / `wss://host[:port]` base to a normalized
-/// `wss://host[:port]` (trailing slashes trimmed). Owned by the caller.
+/// `wss://host[:port]` (trailing slashes trimmed). `http://`/`ws://` bases map
+/// to a PLAINTEXT `ws://` — loopback test relays only, the same rule as
+/// `ws_client.zig` / `http_client.zig` (production relays are always TLS).
+/// Owned by the caller.
 fn wssBase(alloc: Allocator, base: []const u8) ![]u8 {
-    const host_part = if (std.mem.startsWith(u8, base, "https://"))
-        base["https://".len..]
-    else if (std.mem.startsWith(u8, base, "wss://"))
-        base["wss://".len..]
-    else {
-        std.debug.print("ghoztty-agent: --relay url must start with https:// or wss://\n", .{});
-        return error.InvalidArgs;
+    const schemes = [_]struct { prefix: []const u8, out: []const u8 }{
+        .{ .prefix = "https://", .out = "wss" },
+        .{ .prefix = "wss://", .out = "wss" },
+        .{ .prefix = "http://", .out = "ws" },
+        .{ .prefix = "ws://", .out = "ws" },
     };
-    const trimmed = std.mem.trimRight(u8, host_part, "/");
-    return std.fmt.allocPrint(alloc, "wss://{s}", .{trimmed});
+    for (schemes) |s| {
+        if (std.mem.startsWith(u8, base, s.prefix)) {
+            const trimmed = std.mem.trimRight(u8, base[s.prefix.len..], "/");
+            return std.fmt.allocPrint(alloc, "{s}://{s}", .{ s.out, trimmed });
+        }
+    }
+    std.debug.print("ghoztty-agent: --relay url must start with https:// or wss:// (http:// / ws:// are loopback-test only)\n", .{});
+    return error.InvalidArgs;
 }
 
 /// Bundles the relay-loop parameters so they can ride a single `std.Thread.spawn`
@@ -1086,4 +1173,38 @@ test {
     _ = @import("relay_creds.zig");
     _ = @import("self_update.zig");
     _ = @import("single_instance.zig");
+}
+
+test "decideRelayCred: env token wins over relay.env" {
+    try std.testing.expectEqual(RelayCredDecision.use_env, decideRelayCred(true, true, false));
+    try std.testing.expectEqual(RelayCredDecision.use_env, decideRelayCred(true, false, true));
+}
+
+test "decideRelayCred: relay.env token when no env token" {
+    try std.testing.expectEqual(RelayCredDecision.use_relay_env, decideRelayCred(false, true, false));
+    try std.testing.expectEqual(RelayCredDecision.use_relay_env, decideRelayCred(false, true, true));
+}
+
+test "decideRelayCred: no cred + headless errors (no surprise browser on servers)" {
+    try std.testing.expectEqual(RelayCredDecision.fail, decideRelayCred(false, false, true));
+}
+
+test "decideRelayCred: no cred + interactive auto-enrolls (MSI first launch)" {
+    try std.testing.expectEqual(RelayCredDecision.auto_enroll, decideRelayCred(false, false, false));
+}
+
+test "wssBase: https/wss normalize to wss; http/ws stay plaintext; others refused" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "https://relay.example.com/", .want = "wss://relay.example.com" },
+        .{ .in = "wss://relay.example.com", .want = "wss://relay.example.com" },
+        .{ .in = "http://127.0.0.1:8080/", .want = "ws://127.0.0.1:8080" },
+        .{ .in = "ws://127.0.0.1:8080", .want = "ws://127.0.0.1:8080" },
+    };
+    for (cases) |c| {
+        const got = try wssBase(alloc, c.in);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+    try std.testing.expectError(error.InvalidArgs, wssBase(alloc, "relay.example.com"));
 }

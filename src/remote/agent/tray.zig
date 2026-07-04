@@ -70,6 +70,17 @@ pub fn run(
     return win.run(store, build_hash, link);
 }
 
+/// One-shot PRE-TRAY error surface: a plain error message box on Windows,
+/// a no-op elsewhere. For daemon-startup failures that happen before the tray
+/// icon exists (first-run enrollment, see `main.zig`'s `autoEnrollForRelay`) —
+/// there is no tooltip to carry the status yet, and the GUI-subsystem exe
+/// launched from the Start Menu / Run key has no console for stderr. Blocks
+/// until dismissed; callers exit right after, so nothing else is stalled.
+pub fn showStartupError(text: []const u8) void {
+    if (builtin.os.tag != .windows) return;
+    win.showStartupError(text);
+}
+
 // =============================================================================
 // Windows implementation (compiled only on Windows)
 // =============================================================================
@@ -127,6 +138,7 @@ const win = if (builtin.os.tag == .windows) struct {
 
     // MessageBoxW flags.
     const MB_OK: UINT = 0x0000;
+    const MB_ICONERROR: UINT = 0x0010;
     const MB_ICONINFORMATION: UINT = 0x0040;
 
     // Shell_NotifyIcon messages + flags.
@@ -545,6 +557,14 @@ const win = if (builtin.os.tag == .windows) struct {
     /// Format `a ++ b ++ c` (UTF-8 inputs) into `dst` as a NUL-terminated UTF-16LE
     /// string, truncating to fit. Returns a `[*:0]const u16` for the Win32 calls.
     /// Used for the small, dynamic menu/dialog strings.
+    /// Pre-tray startup-error box (see the public `showStartupError`). Owner
+    /// HWND is null — no window exists yet at the failures this serves.
+    fn showStartupError(text: []const u8) void {
+        var buf: [512]u16 = undefined;
+        const wtext = fmtUtf16(&buf, text, "", "");
+        _ = MessageBoxW(null, wtext, lit("Ghoztty Agent"), MB_OK | MB_ICONERROR);
+    }
+
     fn fmtUtf16(dst: []u16, a: []const u8, b: []const u8, c: []const u8) [*:0]const u16 {
         var i: usize = 0;
         for ([_][]const u8{ a, b, c }) |part| {

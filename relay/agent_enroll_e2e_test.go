@@ -145,6 +145,122 @@ done:
 
 var enrollURLRe = regexp.MustCompile(`visit: (\S+)`)
 
+// environWithout returns os.Environ() minus any `key=` entries, so a dev
+// shell's real credential can't leak into a subprocess under test.
+func environWithout(key string) []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, key+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// TestAgentRelayAutoEnrollE2E: the real agent binary in RELAY DAEMON mode with
+// NO credential anywhere (no GHOSTTY_DEVICE_TOKEN, empty relay.env dir) must
+// self-enroll inline — the MSI Start-Menu / Run-key launch is exactly
+// `ghoztty-agent --relay=<base>` — and then continue into the connect loop
+// with the freshly issued token: the device comes ONLINE on this relay without
+// the process ever restarting. The test plays the owner's browser exactly as
+// in TestAgentEnrollWebE2E.
+func TestAgentRelayAutoEnrollE2E(t *testing.T) {
+	bin := os.Getenv("GHOZTTY_AGENT_BIN")
+	if bin == "" {
+		t.Skip("set GHOZTTY_AGENT_BIN=<path to ghoztty-agent> to run the live agent auto-enroll e2e")
+	}
+
+	f := newFakeIssuer(t)
+	g := newFakeGoogleWebFlow(f)
+	ts, store, h := newEnrollTestServer(t, f, withWebClient)
+
+	tmp := t.TempDir()
+	envFile := filepath.Join(tmp, "relay.env")
+	cmd := exec.Command(bin, "--relay="+ts.URL)
+	// Hermetic daemon run: isolated relay.env, isolated single-instance guard
+	// (never fight the machine's real agent), no self-update, no real browser,
+	// and NO inherited device token (that would skip the auto-enroll under test).
+	cmd.Env = append(environWithout("GHOSTTY_DEVICE_TOKEN"),
+		"GHOSTTY_RELAY_ENV="+envFile,
+		"GHOSTTY_AGENT_LOCK="+filepath.Join(tmp, "agent.lock"),
+		"GHOSTTY_AGENT_HEARTBEAT="+filepath.Join(tmp, "agent.heartbeat"),
+		"GHOSTTY_AGENT_NO_SELFUPDATE=1",
+		"GHOZTTY_ENROLL_NO_OPEN=1",
+	)
+	cmd.Stderr = os.Stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start agent: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck // the daemon never exits on its own
+
+	lines := make(chan string, 64)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+
+	var all []string
+	browsed, enrolled := false, false
+	deadline := time.After(60 * time.Second)
+	for !enrolled {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("agent exited before enrolling; output:\n%s", strings.Join(all, "\n"))
+			}
+			t.Logf("agent: %s", line)
+			all = append(all, line)
+			if m := enrollURLRe.FindStringSubmatch(line); m != nil && !browsed {
+				// Play the browser: entry link -> Google redirect -> callback.
+				state := authRedirect(t, ts, f, m[1])
+				claims := f.validClaims()
+				claims["aud"] = testWebClientID
+				code := g.newCode(mint(t, f.key, claims))
+				if status, _, page := browsePath(t, ts, callbackPath(code, state)); status != 200 {
+					t.Errorf("callback status = %d, page:\n%s", status, page)
+				}
+				browsed = true
+			}
+			if strings.Contains(line, "Enrolled as device ") {
+				enrolled = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for the auto-enroll; output:\n%s", strings.Join(all, "\n"))
+		}
+	}
+
+	// The credential was persisted like any --enroll run…
+	if _, err := os.ReadFile(envFile); err != nil {
+		t.Fatalf("agent did not write relay.env: %v", err)
+	}
+
+	// …and the SAME process continued into the connect loop: the device must
+	// come online on this relay's directory (control WS authenticated with
+	// the fresh token).
+	waitOnline := time.After(30 * time.Second)
+	for {
+		devs := store.ListByOwner(allowedEmail)
+		if len(devs) == 1 && h.dir.IsOnline(devs[0].ID) {
+			return
+		}
+		select {
+		case <-waitOnline:
+			t.Fatalf("device never came online after auto-enroll (devices: %d); output:\n%s",
+				len(store.ListByOwner(allowedEmail)), strings.Join(all, "\n"))
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // TestAgentEnrollWebE2E: the real agent binary against a web-enroll-enabled
 // relay. The agent asks for the web flow, prints the enroll link (auto-open
 // suppressed), and the test plays the owner's browser: follow the link, get
