@@ -102,7 +102,11 @@ delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
    paste id+secret → orchestrator sets `GOOGLE_WEB_CLIENT_ID/_SECRET` in
    `/etc/ghoztty-relay.env`, restarts relay (log shows `web_enroll=true`),
    then live-verify one-click browser enrollment. This secret IS confidential.
-2. **Re-sign-in once** after the namespace purge (Keychain service renamed).
+2. ~~Re-sign-in once~~ DONE 07-03 evening (user). Keychain item exists under
+   `com.dzearing.ghoztty.relay-account`; account dials work (MaximusHome
+   relay window round-tripped `hostname`). NOTE: the post-rebuild relaunch
+   popped the password-form Keychain prompt (ad-hoc re-sign = "new app");
+   user clicked through — expect an occasional repeat after rebuilds.
 3. ~~MaximusHome installer re-run / pick one supervisor~~ MOSTLY DONE via the
    evening-session rollout (see above): new exe live, single agent, loop dead.
    STILL PENDING on-box: tray Disconnect/Reconnect + tooltip eyeball, and the
@@ -114,11 +118,22 @@ delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
    there someday re-enrolls it.
 
 **GUI verifications not yet done:**
-5. Title-restore round trip (rename windows → sign out/in or Restore (N) →
-   titles kept; then `printf '\e]0;x\a'` must NOT clobber the user title).
-6. Rename→open-window propagation (pill + `AXGhosttyMachine` update live;
-   ztabby consumes the AX attribute — check via
-   `osascript … attribute "AXGhosttyMachine" of every window`).
+5. ~~Title-restore round trip~~ DONE 07-03 evening: `+rename --target=mx
+   --title="My MaximusHome"` → remote `title ClobberAttempt` (cmd.exe OSC)
+   did NOT clobber it, while an un-titled sibling window correctly FOLLOWED
+   OSC titles; quit → relaunch → manifest replayed and the user title
+   SURVIVED. Bonus verified: sign-in manifest replay (user's re-sign-in
+   auto-restored an old MaximusHome window). Follow-up noted: IPC registry
+   names (`--name=mx`) do NOT survive restore — `+read --name=mx` →
+   "not found" after relaunch; persist the name in the manifest someday.
+6. PARTIAL 07-03 evening: machine rename "MaximusHome"→"Home PC" via the
+   chooser ⋯ menu worked (relay PATCH + `device renamed` log) and the OPEN
+   chooser row updated LIVE (name + "(MaximusHome)" subtext — the 27e639ae6
+   polling). BUT a manifest-RESTORED window kept stale pill/`AXGhosttyMachine`
+   ("MaximusHome") — rename propagation misses restored windows (a00550f84
+   works for chooser-opened ones). Fix delegated (worktree agent, in flight
+   at session end). Explicit `--name` windows keep their label (intentional).
+   Renamed back to "MaximusHome" afterwards.
 7. ~~WP-D1 pill walkthrough~~ DONE (loopback TCP agent, screenshots): yellow
    "reconnecting… (N)" on freeze/kill with local-suppression correctly lifted;
    green re-attach after short outage (grid + I/O intact); red "disconnected"
