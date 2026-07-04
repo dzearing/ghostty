@@ -142,6 +142,31 @@ STILL OPEN: see `remote-machines-CONTINUATION-3.md` (the standing-items queue �
 web OAuth client, MaximusHome installer re-run + on-box tray/single-instance
 verification, title/rename/D1 GUI passes, relay.env re-read follow-up, WP-E1).
 
+**2026-07-03 evening — dup-agent incident + WP-D1 long-outage overhaul (tip
+`03ca52586`; agent exe redeployed to SMB share + `/dl`; full detail in
+`remote-machines-CONTINUATION-3.md` §"EVENING SESSION"):**
+- LIVE INCIDENT RESOLVED: MaximusHome ran TWO agents (scheduled-task + SMB
+  watcher supervisors; `Local\` mutex is per-LOGON-SESSION so they never
+  collided) dup-kicking each other ~1100×/hr on the relay. Fixes:
+  `1b6b873e0` (`Global\GhozttyAgentDaemon-<SID>` mutex + fast-drop backoff
+  3s→120s jittered) and `05ccc9051` (takeover protocol: `agent.heartbeat`
+  liveness ping — stale holder is image-verified then killed and replaced;
+  `--force-replace`). Verified on the box: relay events 33/2min → 0, one
+  stable conn, user confirmed single process.
+- WP-D1 pill walkthrough DONE (yellow/green/red all screenshot-verified,
+  loopback TCP) and its long-outage wedge ROOT-CAUSED + FIXED (`38ff0c0e3`,
+  `03ca52586`): dial-handshake deadline (frozen listener TCP-accepts →
+  attempt hung forever), re-attach replay no longer discarded (blank grid;
+  WP-D2 restores now replay retained scrollback as a side benefit), stale-
+  DETACH ownership guards, and the killer — agent PANIC at SIGCONT
+  (`setsockopt(SO_NOSIGPIPE)` EINVAL hit an `unreachable` in zig std; now raw
+  libc). Post-exhaustion the client background-redials forever (45s+jitter).
+  Independent verify: 130s freeze → red → thaw → self-healed in 6s.
+- `14515562c` relay.env hot-reload (5s watcher + atomic write), `27e639ae6`
+  chooser live polling, `4a55acef1` `--name` on TCP windows + CLI surfaces
+  real IPC server errors. `test-agent` now runs the formerly-orphaned
+  agent-core suite (375 tests); wp4-e2e gained the SIGSTOP/SIGCONT Phase 4.
+
 **2026-07-03 morning — user-driven chooser polish + the SLEEP BUG (tip `a4e8e57c1`,
 relay + `/dl` exe redeployed):**
 - `9ce38cdaa`/`68d7baa8a` — signed-out chooser shows NO account machines (bug the

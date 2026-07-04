@@ -40,6 +40,59 @@
   `windows-remote` (corp PC, OLD binary), `Davids-Personal-Macbook-Pro.local`
   (this Mac; hidden from chooser as "this Mac" == Local).
 
+## 2026-07-03 EVENING SESSION (tip `03ca52586`) — dup-agent + reconnect overhaul
+
+Eight commits landed (all worktree-subagent work, cherry-picked, rebuilt, and
+live-verified in the GUI; agent exe deployed to the SMB share AND `/dl/`):
+
+- `27e639ae6` chooser live polling (5s while open; item 10 DONE).
+- `14515562c` relay.env hot-reload after re-enroll (item 9 DONE).
+- `4a55acef1` `+new-remote-window --name` now registers TCP windows in the IPC
+  registry (was relay-only — `+send-keys`/`+read`/`+close` now work on TCP
+  windows); CLI prints the server's real error instead of the misleading
+  "not supported on this platform" (sendIpc parses the `error` field).
+- `1b6b873e0` dup-daemon holes closed: Windows mutex was `Local\` (per LOGON
+  SESSION — a scheduled-task supervisor lives in a different session than an
+  interactive one, so two same-user daemons never collided) → now
+  `Global\GhozttyAgentDaemon-<user-SID>` (fallback: username, then legacy
+  Local\). Plus fast-drop backoff: control conn that dies <30s after connect
+  escalates 3s→…→120s cap ±20% jitter (dup-token fights converge to ~2min
+  knocks, not 3s pegging); cred-bounce and dial-failures exempt.
+- `05ccc9051` "THERE SHOULD BE ONLY ONE" takeover protocol: holder writes
+  `agent.heartbeat` (PID, touched every 10s; next to relay.env / agent.lock);
+  a challenger finding the guard held reads it — fresh (<45s) → yield (exit
+  183), stale → image-verify the PID (must be ghoztty-agent — no PID-reuse
+  friendly fire) → kill → re-acquire (5×200ms) → take over; still held → die.
+  `--force-replace` (alias `--replace`) skips the ping. No heartbeat file =
+  old-binary holder → yield (upgrade rule).
+- `38ff0c0e3` + `03ca52586` WP-D1 long-outage overhaul (see item 7).
+
+**MaximusHome pegging incident — RESOLVED + VERIFIED.** The relay was taking
+~1100 "agent online"/hr from the box (two agents sharing one device token,
+dup-control-kicking each other every ~3s; user confirmed 2 ghoztty-agent.exe).
+Cause: two supervisors (scheduled task `GhozttyAgent` from install.ps1 + the
+user's SMB watcher script) × the Local\ mutex hole × old binary. Fix rollout:
+new exe dropped on the SMB share (temp+rename; watcher hot-swaps within ~3s)
+— relay went from 33 onlines/2min to ZERO, single stable conn, user confirmed
+1 process. Both supervisors now launch the SAME new exe so the loser exits 183;
+`Unregister-ScheduledTask -TaskName 'GhozttyAgent' -Confirm:$false` is optional
+cosmetics now. The watcher script still embeds a DEAD fallback DEVICE_TOKEN —
+delete someday. `/dl/ghoztty-agent.exe` refreshed to the same build.
+
+**New gotchas (bit us today):**
+- The pill text is NOT in the AX window `title` and `AXGhosttyMachine` doesn't
+  carry link state — automation must screenshot to read pill state. (Follow-up
+  idea: expose link state as an AX attribute.)
+- A `kill -STOP`'d process started by a Bash tool call gets pending teardown
+  signals DELIVERED AT SIGCONT (nohup doesn't cover it) — run whole
+  freeze/thaw cycles in ONE tool call, and verify the exact PID is alive
+  before drawing conclusions ("agent alive" once matched the *other* agent).
+- AppleScript can't match a window by emoji title (`"👻"`); index via the
+  `AXGhosttyMachine` values-list instead. AX-clicking sheets: button 1 may be
+  Cancel — click by name ("Close").
+- Loopback TCP windows report `AXGhosttyMachine="127.0.0.1"`, not "Local" —
+  undecided whether that's right for ztabby.
+
 ## Standing items (the queue)
 
 **Needs the USER:**
@@ -50,13 +103,15 @@
    `/etc/ghoztty-relay.env`, restarts relay (log shows `web_enroll=true`),
    then live-verify one-click browser enrollment. This secret IS confidential.
 2. **Re-sign-in once** after the namespace purge (Keychain service renamed).
-3. **MaximusHome: re-run the installer one-liner** (`irm https://<fqdn>/dl/install.ps1 | iex`)
-   to pick up the new exe; then on-box verify: single tray icon even when
-   double-supervised (second launch exits 183), tray Disconnect/Reconnect +
-   status tooltip, relay-mode-only menu items. Pick ONE supervisor
-   (recommended: installer autostart; retire the SMB watcher there).
-4. `windows-remote` (corp Cloud PC) still runs the OLD agent — installer
-   re-run there someday brings hostname/keepalive/single-instance.
+3. ~~MaximusHome installer re-run / pick one supervisor~~ MOSTLY DONE via the
+   evening-session rollout (see above): new exe live, single agent, loop dead.
+   STILL PENDING on-box: tray Disconnect/Reconnect + tooltip eyeball, and the
+   optional `Unregister-ScheduledTask GhozttyAgent` + watcher fallback-token
+   removal.
+4. `windows-remote` (corp Cloud PC): its DEVICE WAS REMOVED from the relay
+   store (only 2 devices remain: this Mac + MaximusHome); its old agent still
+   knocks with a revoked token from an Azure IP (harmless). Installer re-run
+   there someday re-enrolls it.
 
 **GUI verifications not yet done:**
 5. Title-restore round trip (rename windows → sign out/in or Restore (N) →
@@ -64,10 +119,29 @@
 6. Rename→open-window propagation (pill + `AXGhosttyMachine` update live;
    ztabby consumes the AX attribute — check via
    `osascript … attribute "AXGhosttyMachine" of every window`).
-7. WP-D1 pill walkthrough: freeze/kill local agent → yellow "reconnecting" →
-   green re-attach (kill -STOP/-CONT) or red "disconnected" (agent killed).
+7. ~~WP-D1 pill walkthrough~~ DONE (loopback TCP agent, screenshots): yellow
+   "reconnecting… (N)" on freeze/kill with local-suppression correctly lifted;
+   green re-attach after short outage (grid + I/O intact); red "disconnected"
+   after the 10-attempt budget, window kept. FOUND + FIXED two deep bugs on
+   the long-outage path (`38ff0c0e3`, `03ca52586`): (a) dial handshake had no
+   deadline — a frozen listener still TCP-accepts, so attempt (1) hung forever
+   (now 10s `HandshakeTimeout`); re-attach REPLAY was discarded client-side
+   (blank grid — the §7.3 resync filter dropped the agent's gap-fill; restored
+   windows now replay retained scrollback too); stale DETACH from the replaced
+   connection silenced the re-attached session (ownership guards in agent
+   handleDetach/handleFlow); (b) the REAL wedge: the agent PANICKED at
+   SIGCONT — backlog sockets made `setsockopt(SO_NOSIGPIPE)` return EINVAL,
+   declared `unreachable` in zig std (now raw libc, best-effort). Client also
+   gained a forever background re-dial after exhaustion (45s+jitter; pill
+   stays red until a probe truly succeeds; session-gone stays terminal).
+   Final independent verify: 130s freeze → red → thaw → SELF-HEALED in 6s,
+   agent survived, I/O round-trips. wp4-e2e gained Phase 4 (SIGSTOP/SIGCONT
+   regression; 175s soak behind `GHOZTTY_E2E_LONG_FREEZE=1`); `test-agent`
+   now runs the formerly-orphaned agent-core suite (375 tests).
 8. Real sleep/wake keepalive confirmation (happens organically overnight —
-   check the device stays/returns Online after the Mac sleeps).
+   check the device stays/returns Online after the Mac sleeps). Partial
+   organic evidence 07-03: this Mac's agent re-onlined cleanly 3× in an hour
+   and held a stable conn all day.
 
 **Engineering follow-ups (small, noted by subagents):**
 9. ~~Agent daemon doesn't re-read `relay.env` after a re-enroll (needs restart);
@@ -78,8 +152,11 @@
    credential. `GHOSTTY_DEVICE_TOKEN` still wins (change logged + ignored);
    tray Disconnect stays parked. Verified live (rotate relay.env under a
    running `--relay` daemon → "reconnecting with the new credential").
-10. Chooser list is fetch-on-open only — live online/offline updates while the
-    chooser is open would be nice.
+10. ~~Chooser list is fetch-on-open only~~ DONE (`27e639ae6`): 5s poll while
+    open (skips when signed out; in-flight guard; quiet failures keep the
+    last-known list, footer error only after 3 consecutive misses; selection
+    anchored by UUID). GUI eyeball of live dot-flips still worthwhile once
+    signed in.
 11. WP-E1 productionization: move relay to the home NUC behind a Cloudflare
     Tunnel, audit logging, rate limits, credential rotation. Last roadmap phase.
 
