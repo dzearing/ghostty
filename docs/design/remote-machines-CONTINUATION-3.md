@@ -160,6 +160,48 @@ User request: "installer on the website + easy auto-updating." Landed
   migrate the box to installer-only (kill the watcher, keep the scheduled
   task — the REVERSE of the earlier advice).
 
+## 2026-07-04 MORNING — MSI INSTALLER (user rejected the ps1 one-liner)
+
+User: "download a binary MSI, install it, uninstall it — scripts are a sec
+risk and no uninstall is broken." Landed (tip `64eacaf71`; all deployed):
+- `d044fed9a` MSI packaging: `relay/deploy/msi/ghoztty-agent.wxs` +
+  `build-msi.sh`, built ON MACOS with wixl/msitools (brew). Per-user
+  (MSIINSTALLPERUSER=1, no UAC), installs to `%LOCALAPPDATA%\Programs\
+  Ghoztty Agent` (user-writable so exe SELF-UPDATE still works), HKCU Run
+  autostart + Start Menu shortcut (both `--relay=<base>`), taskkill CA
+  (type 51+50, seq 1-2) solves the locked-exe problem on
+  install/upgrade/uninstall, Upgrade table + downgrade guard.
+  **UpgradeCode {7143BA66-FD7B-4D45-8555-E946D2141912} — NEVER change.**
+  ProductVersion = `yy.m.dNN` (26.7.401); agent stamp in ARPCOMMENTS.
+  publish-agent.sh now builds+uploads the MSI (`--skip-msi`, `--build-num`).
+- `64eacaf71` FIRST-RUN AUTO-ENROLL: interactive relay mode with no
+  credential runs the browser enrollment inline then connects (Start Menu
+  click = full onboarding); headless keeps the explicit error; enroll
+  failure → MessageBox + exit nonzero (Run key retries at logon); dup
+  guard still exits 183 BEFORE any browser. 418/418 agent tests + new Go
+  e2e (auto-enroll against fake issuer).
+- Websites updated (gh-pages `bff0b0269` + relay root): **primary CTA =
+  Download .msi**; ps1 one-liner demoted to a collapsed "Advanced:
+  headless install" details block.
+- **LIVE-VERIFIED ON MaximusHome via remote window** (drove cmd.exe over
+  the relay): silent per-user install (no UAC) → exe + Run key + full ARP
+  record (`Installer\UserData\<SID>\Products\...\InstallProperties` w/
+  UninstallString — Settings→Apps reads THIS for per-user MSIs; the bare
+  HKCU\Uninstall key is legitimately absent), Get-Package sees it;
+  dup-launch exited 183 with no browser; `msiexec /x /qn` removed
+  everything (exe, Run key, product). MSI payload exe verified
+  byte-identical to /dl/ exe (sha256).
+- NOT yet verified: MSI-over-MSI upgrade path live (tables verified
+  offline); first-run browser enroll on a REAL fresh box (MaximusHome's
+  watcher agent holds the guard → 183 by design); SmartScreen behavior
+  (MSI is unsigned — expect "keep anyway" friction).
+- Gotchas: the taskkill CA kills ANY running ghoztty-agent.exe at
+  install/uninstall — on MaximusHome that killed the watcher agent (and
+  my driving session!) twice; watcher auto-recovered. `+send-keys`
+  interprets `\0` escapes — double the backslashes when sending Windows
+  registry paths (`\\01757...` — `\01` became a NUL and corrupted the
+  command).
+
 ## Standing items (the queue)
 
 **Needs the USER:**
