@@ -86,15 +86,19 @@ const enroll = @import("enroll.zig");
 const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
 const relay_creds = @import("relay_creds.zig");
+const self_update = @import("self_update.zig");
 const single_instance = @import("single_instance.zig");
 
 const default_listen = "0.0.0.0:7777";
 
-/// Short build identifier shown in the Windows tray About line. No build/version
-/// constant is wired into the agent's standalone module graph (it roots at `src/`
-/// without `build_config`), so a literal placeholder is used; `// TODO(version)`
-/// thread the real version through if/when the agent module gains build_config.
-const build_hash = "dev";
+/// The agent's baked build version: `YYYYMMDD-<git short hash>` (commit date),
+/// or `"dev"` when git was unavailable at build time. Stamped by
+/// `src/build/GhosttyAgent.zig` through the `agent_build_options` module
+/// (`-Dagent-version=` overrides). Shown by `--version`, the startup banners,
+/// and the tray About line, and compared against the relay's
+/// `/dl/version.json` by the self-updater (`self_update.zig`) — dev builds
+/// never self-update.
+const agent_version: []const u8 = @import("agent_build_options").agent_version;
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -107,6 +111,11 @@ pub fn main() !void {
 
     const mode = try parseArgs(alloc);
     switch (mode) {
+        .version => {
+            var buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "ghoztty-agent {s}\n", .{agent_version}) catch "ghoztty-agent\n";
+            std.fs.File.stdout().writeAll(line) catch {};
+        },
         .stdio => try runStdio(alloc, encoding),
         .listen => |l| {
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
@@ -216,6 +225,8 @@ fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
 }
 
 const Mode = union(enum) {
+    /// `--version`: print the baked build version and exit.
+    version,
     stdio,
     listen: Listen,
     relay: Relay,
@@ -250,7 +261,7 @@ const Listen = struct {
     force_replace: bool = false,
 };
 
-/// Parse `--stdio` | `--listen <addr:port>` | `--relay <url>` |
+/// Parse `--version` | `--stdio` | `--listen <addr:port>` | `--relay <url>` |
 /// `--enroll --relay <url>` | (no args ⇒ default TCP listen).
 /// `--headless` (anywhere on the line) suppresses the tray for listen mode; the
 /// stdio path is ALWAYS headless (an ssh-piped agent has no desktop to draw on).
@@ -287,6 +298,8 @@ fn parseArgs(alloc: Allocator) !Mode {
             std.mem.eql(u8, a, "--force-replace") or std.mem.eql(u8, a, "--replace"))
         {
             continue; // handled in the pre-scan above
+        } else if (std.mem.eql(u8, a, "--version")) {
+            return .version;
         } else if (std.mem.eql(u8, a, "--stdio")) {
             return .stdio;
         } else if (std.mem.eql(u8, a, "--listen")) {
@@ -422,7 +435,7 @@ fn runListen(
     // built as the GUI subsystem so no console pops up, the deploy watcher
     // redirects stdout to a log file — an inherited handle — so this banner is
     // still captured and the readiness poll still works.)
-    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent: listening on {f}\n", .{addr}) catch "ghoztty-agent: listening\n") catch {};
+    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on {f}\n", .{ agent_version, addr }) catch "ghoztty-agent: listening\n") catch {};
 
     // The accept loop is the whole daemon. WHERE it runs depends on the tray:
     //
@@ -448,7 +461,7 @@ fn runListen(
             // the tray actually showed and the user picked Exit; FALSE if any tray
             // setup step failed (RegisterClass / CreateWindow / Shell_NotifyIcon).
             // No relay link in listen mode → null (no Disconnect/Reconnect items).
-            if (tray.run(&store, build_hash, null)) {
+            if (tray.run(&store, agent_version, null)) {
                 // User chose Exit: a clean process exit tears down the (still-running)
                 // accept loop + reaper daemon threads.
                 std.process.exit(0);
@@ -695,7 +708,16 @@ fn runRelay(
     try store.startReaper();
 
     const stdout = std.fs.File.stdout();
-    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent: relay mode, control={s}/v1/agent/control\n", .{ws_base}) catch "ghoztty-agent: relay mode\n") catch {};
+    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: relay mode, control={s}/v1/agent/control\n", .{ agent_version, ws_base }) catch "ghoztty-agent: relay mode\n") catch {};
+
+    // SELF-UPDATE (relay mode only): clear a previous swap's leftovers
+    // (`.old`/stale `.new` next to the exe — best-effort; Windows may still
+    // hold the `.old` of the process we just replaced), then start the
+    // background updater. It stages new binaries from the relay's
+    // /dl/version.json and swap+respawns ONLY when `store` has zero live
+    // sessions. No-op for dev builds or under GHOSTTY_AGENT_NO_SELFUPDATE=1.
+    self_update.cleanupLeftovers(alloc);
+    self_update.maybeStart(alloc, ws_base["wss://".len..], agent_version, &store);
 
     // User-controlled relay link state (tray Disconnect/Reconnect). The tray
     // toggles it from its message-pump thread; the control loop obeys it.
@@ -740,7 +762,7 @@ fn runRelay(
             .link = &link,
         };
         if (std.Thread.spawn(.{}, relayLoopThread, .{args})) |t| {
-            if (tray.run(&store, build_hash, &link)) {
+            if (tray.run(&store, agent_version, &link)) {
                 std.process.exit(0); // user chose Exit (from any link state)
             }
             // Tray setup failed: park the main thread on the (already-serving)
@@ -1062,5 +1084,6 @@ test {
     // Not reachable via pub decls, so reference explicitly for test discovery.
     _ = @import("link_control.zig");
     _ = @import("relay_creds.zig");
+    _ = @import("self_update.zig");
     _ = @import("single_instance.zig");
 }

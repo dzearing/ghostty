@@ -110,6 +110,9 @@ pub fn build(b: *std.Build) !void {
             }),
             .use_llvm = true,
         });
+        // The agent test roots at `src/agent_main.zig` too, so it reaches
+        // main.zig's `@import("agent_build_options")` — reuse the exe's module.
+        agent_test.root_module.addImport("agent_build_options", agent.version_module);
         if (!config.emit_lib_vt) _ = try deps.add(agent_test);
         const agent_test_run = b.addRunArtifact(agent_test);
         test_agent_step.dependOn(&agent_test_run.step);

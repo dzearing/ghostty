@@ -7,10 +7,11 @@
 //!
 //! This exists for the agent's device-code self-enroll flow (WP-B3):
 //! `POST /v1/enroll/start` and `POST /v1/enroll/poll` are ordinary JSON
-//! request/response calls, not WebSockets. Scope is intentionally tiny:
-//! one POST per connection (`Connection: close`), JSON in/out, and the three
-//! body framings a Go/Caddy stack actually produces (Content-Length, chunked,
-//! close-delimited). It is NOT a general HTTP client.
+//! request/response calls, not WebSockets — plus the agent self-updater's
+//! `GET /dl/version.json` manifest fetch and binary download (`get`). Scope is
+//! intentionally tiny: one request per connection (`Connection: close`), and
+//! the three body framings a Go/Caddy stack actually produces (Content-Length,
+//! chunked, close-delimited). It is NOT a general HTTP client.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -82,6 +83,25 @@ pub const Response = struct {
 /// `https://` the certificate is verified against the system roots with host
 /// verification ON; `http://` is plaintext (use only for loopback test relays).
 pub fn postJson(alloc: Allocator, url: []const u8, json_body: []const u8) !Response {
+    return request(alloc, url, "POST", json_body, max_body_len);
+}
+
+/// GET the absolute `url` into memory, returning the status + owned body
+/// (rejected past `max_len` — the caller knows whether it expects a small JSON
+/// manifest or a multi-megabyte binary). Same connection-per-call semantics
+/// and TLS/plaintext scheme split as `postJson`. Added for the agent
+/// self-updater (version manifest + binary download).
+pub fn get(alloc: Allocator, url: []const u8, max_len: usize) !Response {
+    return request(alloc, url, "GET", null, max_len);
+}
+
+fn request(
+    alloc: Allocator,
+    url: []const u8,
+    method: []const u8,
+    json_body: ?[]const u8,
+    max_len: usize,
+) !Response {
     const u = try parseUrl(url);
 
     const socket = try std.net.tcpConnectToHost(alloc, u.host, u.port);
@@ -97,9 +117,9 @@ pub fn postJson(alloc: Allocator, url: []const u8, json_body: []const u8) !Respo
 
     switch (u.scheme) {
         .http => {
-            try writeRequest(&tcp_writer.interface, u, json_body);
+            try writeRequest(&tcp_writer.interface, method, u, json_body);
             try tcp_writer.interface.flush();
-            return readResponse(alloc, tcp_reader.interface());
+            return readResponse(alloc, tcp_reader.interface(), max_len);
         },
         .https => {
             var ca_bundle: Certificate.Bundle = .{};
@@ -117,35 +137,34 @@ pub fn postJson(alloc: Allocator, url: []const u8, json_body: []const u8) !Respo
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
             });
-            try writeRequest(&tls_client.writer, u, json_body);
+            try writeRequest(&tls_client.writer, method, u, json_body);
             // The TLS flush only stages ciphertext; the socket isn't written
             // until the TCP writer flushes too (same dance as ws_client).
             try tls_client.writer.flush();
             try tcp_writer.interface.flush();
-            return readResponse(alloc, &tls_client.reader);
+            return readResponse(alloc, &tls_client.reader, max_len);
         },
     }
 }
 
-/// Emit the full POST request (headers + body) into `w`. Caller flushes.
-fn writeRequest(w: *std.Io.Writer, u: Url, json_body: []const u8) !void {
-    try w.print(
-        "POST {s} HTTP/1.1\r\n" ++
-            "Host: {s}\r\n" ++
-            "Content-Type: application/json\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n",
-        .{ u.path, u.host, json_body.len },
+/// Emit the full request (headers + optional JSON body) into `w`. Caller
+/// flushes. A null `json_body` is a body-less request (GET).
+fn writeRequest(w: *std.Io.Writer, method: []const u8, u: Url, json_body: ?[]const u8) !void {
+    try w.print("{s} {s} HTTP/1.1\r\nHost: {s}\r\n", .{ method, u.path, u.host });
+    if (json_body) |body| try w.print(
+        "Content-Type: application/json\r\nContent-Length: {d}\r\n",
+        .{body.len},
     );
-    try w.writeAll(json_body);
+    try w.writeAll("Connection: close\r\n\r\n");
+    if (json_body) |body| try w.writeAll(body);
 }
 
 /// Parse a full HTTP/1.1 response from `r`: status line, headers (we only care
 /// about the body framing), then the body via Content-Length, chunked
-/// transfer-encoding, or read-to-EOF (we sent `Connection: close`). Factored
-/// over `*std.Io.Reader` so it unit-tests against fixed buffers.
-fn readResponse(alloc: Allocator, r: *std.Io.Reader) !Response {
+/// transfer-encoding, or read-to-EOF (we sent `Connection: close`). The body
+/// is rejected past `max_len`. Factored over `*std.Io.Reader` so it unit-tests
+/// against fixed buffers.
+fn readResponse(alloc: Allocator, r: *std.Io.Reader, max_len: usize) !Response {
     const status_line = try r.takeDelimiterInclusive('\n');
     const status = parseStatusLine(status_line) orelse return error.BadHttpResponse;
 
@@ -169,13 +188,13 @@ fn readResponse(alloc: Allocator, r: *std.Io.Reader) !Response {
     errdefer body.deinit(alloc);
 
     if (chunked) {
-        try readChunkedBody(alloc, r, &body);
+        try readChunkedBody(alloc, r, &body, max_len);
     } else if (content_length) |len| {
-        if (len > max_body_len) return error.BodyTooLarge;
+        if (len > max_len) return error.BodyTooLarge;
         try body.resize(alloc, len);
         try readExact(r, body.items);
     } else {
-        try readToEof(alloc, r, &body);
+        try readToEof(alloc, r, &body, max_len);
     }
 
     return .{ .status = status, .body = try body.toOwnedSlice(alloc) };
@@ -202,7 +221,7 @@ fn readExact(r: *std.Io.Reader, dst: []u8) !void {
 }
 
 /// Decode a chunked body (`<hex-size>\r\n<data>\r\n ... 0\r\n[trailers]\r\n`).
-fn readChunkedBody(alloc: Allocator, r: *std.Io.Reader, body: *std.ArrayList(u8)) !void {
+fn readChunkedBody(alloc: Allocator, r: *std.Io.Reader, body: *std.ArrayList(u8), max_len: usize) !void {
     while (true) {
         const size_line = try r.takeDelimiterInclusive('\n');
         const size_str = std.mem.trimRight(u8, size_line, "\r\n");
@@ -218,7 +237,7 @@ fn readChunkedBody(alloc: Allocator, r: *std.Io.Reader, body: *std.ArrayList(u8)
             }
             return;
         }
-        if (body.items.len + size > max_body_len) return error.BodyTooLarge;
+        if (body.items.len + size > max_len) return error.BodyTooLarge;
         const start = body.items.len;
         try body.resize(alloc, start + size);
         try readExact(r, body.items[start..]);
@@ -227,9 +246,9 @@ fn readChunkedBody(alloc: Allocator, r: *std.Io.Reader, body: *std.ArrayList(u8)
     }
 }
 
-/// Read until EOF (bounded by `max_body_len`). A TLS truncation / reset at the
+/// Read until EOF (bounded by `max_len`). A TLS truncation / reset at the
 /// end of a `Connection: close` body is treated as EOF, not an error.
-fn readToEof(alloc: Allocator, r: *std.Io.Reader, body: *std.ArrayList(u8)) !void {
+fn readToEof(alloc: Allocator, r: *std.Io.Reader, body: *std.ArrayList(u8), max_len: usize) !void {
     var chunk: [4096]u8 = undefined;
     while (true) {
         // `readSliceShort` reports EOF as a short/zero count; a TLS truncation
@@ -238,7 +257,7 @@ fn readToEof(alloc: Allocator, r: *std.Io.Reader, body: *std.ArrayList(u8)) !voi
             error.ReadFailed => return,
         };
         if (n == 0) return;
-        if (body.items.len + n > max_body_len) return error.BodyTooLarge;
+        if (body.items.len + n > max_len) return error.BodyTooLarge;
         try body.appendSlice(alloc, chunk[0..n]);
     }
 }
@@ -279,7 +298,7 @@ test "readResponse: content-length body" {
         "\r\n" ++
         "{\"status\":\"okay\"}";
     var r: std.Io.Reader = .fixed(raw);
-    var resp = try readResponse(testing.allocator, &r);
+    var resp = try readResponse(testing.allocator, &r, max_body_len);
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expectEqualStrings("{\"status\":\"okay\"}", resp.body);
@@ -293,7 +312,7 @@ test "readResponse: chunked body" {
         "b\r\nslow_down\"}\r\n" ++
         "0\r\n\r\n";
     var r: std.Io.Reader = .fixed(raw);
-    var resp = try readResponse(testing.allocator, &r);
+    var resp = try readResponse(testing.allocator, &r, max_body_len);
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 429), resp.status);
     try testing.expectEqualStrings("{\"status\":\"slow_down\"}", resp.body);
@@ -305,7 +324,7 @@ test "readResponse: close-delimited body (no framing headers)" {
         "\r\n" ++
         "enrollment unavailable";
     var r: std.Io.Reader = .fixed(raw);
-    var resp = try readResponse(testing.allocator, &r);
+    var resp = try readResponse(testing.allocator, &r, max_body_len);
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 503), resp.status);
     try testing.expectEqualStrings("enrollment unavailable", resp.body);
@@ -313,13 +332,13 @@ test "readResponse: close-delimited body (no framing headers)" {
 
 test "readResponse: malformed status line rejected" {
     var r: std.Io.Reader = .fixed("garbage\r\n\r\n");
-    try testing.expectError(error.BadHttpResponse, readResponse(testing.allocator, &r));
+    try testing.expectError(error.BadHttpResponse, readResponse(testing.allocator, &r, max_body_len));
 }
 
 test "readResponse: truncated content-length body errors" {
     const raw = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
     var r: std.Io.Reader = .fixed(raw);
-    try testing.expectError(error.EndOfStream, readResponse(testing.allocator, &r));
+    try testing.expectError(error.EndOfStream, readResponse(testing.allocator, &r, max_body_len));
 }
 
 test {
