@@ -52,6 +52,12 @@ final class RemoteSessionManifest {
         /// so manifests persisted before this field decode fine (missing key
         /// ⇒ nil, same as `Machine.hostname`).
         var windowTitle: String? = nil
+        /// True when `name` was explicitly supplied by the caller (IPC
+        /// `+new-remote-window --name=...`, see `Machine.namePinned`).
+        /// Account renames (`updateName`) skip pinned entries so a restore
+        /// brings the window back under its caller-supplied label. Optional
+        /// so older manifests decode fine (missing ⇒ nil ⇒ not pinned).
+        var namePinned: Bool? = nil
     }
 
     private let defaults: UserDefaults
@@ -77,7 +83,8 @@ final class RemoteSessionManifest {
         deviceID: String,
         name: String?,
         sessionID: String? = nil,
-        windowTitle: String? = nil
+        windowTitle: String? = nil,
+        namePinned: Bool = false
     ) -> UUID {
         let entry = Entry(
             id: UUID(),
@@ -85,7 +92,8 @@ final class RemoteSessionManifest {
             deviceID: deviceID,
             sessionID: sessionID,
             name: name,
-            windowTitle: windowTitle)
+            windowTitle: windowTitle,
+            namePinned: namePinned ? true : nil)
         lock.lock()
         defer { lock.unlock() }
         entries.append(entry)
@@ -128,12 +136,15 @@ final class RemoteSessionManifest {
     /// Update the display name of EVERY entry for a device (account rename,
     /// WP-C2): windows restored after a quit must come back under the
     /// machine's current name, whether their entry is bound to an open window
-    /// or waiting for a later launch. Unknown device ids are a no-op.
+    /// or waiting for a later launch. Entries whose name is PINNED (explicit
+    /// IPC `--name=`) keep their caller-supplied label — that override is
+    /// intentional and survives renames. Unknown device ids are a no-op.
     func updateName(deviceID: String, name: String) {
         lock.lock()
         defer { lock.unlock() }
         var changed = false
         for idx in entries.indices where entries[idx].deviceID == deviceID {
+            guard entries[idx].namePinned != true else { continue }
             guard entries[idx].name != name else { continue }
             entries[idx].name = name
             changed = true

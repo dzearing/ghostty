@@ -180,6 +180,53 @@ struct RemoteSessionManifestTests {
         #expect(entries[0].windowTitle == nil)
     }
 
+    /// An explicit caller-supplied name (IPC `+new-remote-window --name=mx`)
+    /// is PINNED: an account rename must not overwrite it — the window (and
+    /// its restore) keeps the caller's label while unpinned entries for the
+    /// same device adopt the new name. The pin round-trips through
+    /// persistence so a restored window re-pins.
+    @Test func updateNameSkipsPinnedEntries() {
+        let defaults = makeDefaults()
+        let manifest = RemoteSessionManifest(defaults: defaults)
+
+        let pinned = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "mx",
+            sessionID: "sess-1", namePinned: true)
+        let unpinned = manifest.register(
+            relayBase: "https://relay.test", deviceID: "dev-1", name: "MaximusHome",
+            sessionID: "sess-2")
+
+        manifest.updateName(deviceID: "dev-1", name: "Home PC")
+
+        let entries = RemoteSessionManifest(defaults: defaults).takeAll()
+        #expect(entries.count == 2)
+        let pinnedEntry = entries.first { $0.id == pinned }
+        #expect(pinnedEntry?.name == "mx")
+        #expect(pinnedEntry?.namePinned == true)
+        #expect(entries.first { $0.id == unpinned }?.name == "Home PC")
+    }
+
+    /// A manifest persisted BEFORE the `namePinned` field existed decodes
+    /// with the pin absent (nil ⇒ not pinned), so renames apply normally.
+    @Test func decodesLegacyEntryWithoutNamePinned() {
+        let defaults = makeDefaults()
+        let legacyJSON = """
+        [{"id":"00000000-0000-0000-0000-000000000002",\
+        "relayBase":"https://relay.test",\
+        "deviceID":"dev-legacy",\
+        "sessionID":"sess-legacy",\
+        "name":"old box"}]
+        """
+        defaults.set(Data(legacyJSON.utf8), forKey: RemoteSessionManifest.defaultsKey)
+
+        let manifest = RemoteSessionManifest(defaults: defaults)
+        manifest.updateName(deviceID: "dev-legacy", name: "new box")
+        let entries = manifest.takeAll()
+        #expect(entries.count == 1)
+        #expect(entries[0].namePinned == nil)
+        #expect(entries[0].name == "new box")
+    }
+
     /// An account/machine rename (`updateName`) must not clobber the user-set
     /// WINDOW title — they are independent: the machine name feeds the pill
     /// and default naming, the window title is the user's manual rename.

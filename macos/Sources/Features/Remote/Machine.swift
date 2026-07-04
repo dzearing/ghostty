@@ -33,6 +33,13 @@ struct Machine: Identifiable, Hashable {
     /// changes while the hostname stays put). Nil when the relay doesn't know
     /// it yet and for non-relay machines.
     var hostname: String?
+    /// True when `name` was explicitly supplied by the caller (IPC
+    /// `+new-remote-window --name=...`). A pinned name is INTENTIONAL and wins
+    /// over account renames (WP-C2): the window keeps its caller-supplied
+    /// label; only `hostname` refreshes on a rename. New tabs/splits inherit
+    /// the pin through the shared connection's machine snapshot, and restored
+    /// windows re-pin via `RemoteSessionManifest.Entry.namePinned`.
+    var namePinned: Bool = false
 
     init(
         id: UUID = UUID(),
@@ -42,7 +49,8 @@ struct Machine: Identifiable, Hashable {
         relayBase: String? = nil,
         deviceID: String? = nil,
         online: Bool? = nil,
-        hostname: String? = nil
+        hostname: String? = nil,
+        namePinned: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -52,6 +60,7 @@ struct Machine: Identifiable, Hashable {
         self.deviceID = deviceID
         self.online = online
         self.hostname = hostname
+        self.namePinned = namePinned
     }
 
     /// True when this machine is reached through a rendezvous relay.
@@ -284,16 +293,43 @@ final class MachineRegistry: ObservableObject {
             throw RelayDirectoryClient.DirectoryError.noAccount
         }
         let dev = try await client.rename(deviceID: deviceID, to: name)
+        // Update the chooser row when it's still present — but the propagation
+        // below deliberately does NOT depend on finding it. The registry list
+        // can be rebuilt or cleared while the PATCH is in flight (quiet poll,
+        // 401 sweep); the relay rename still SUCCEEDED, so open windows and
+        // the restore manifest must hear about it either way.
+        var renamed = Machine(
+            name: dev.name,
+            host: RelayDirectoryClient.defaultBase,
+            port: 0,
+            relayBase: RelayDirectoryClient.defaultBase,
+            deviceID: deviceID,
+            online: dev.online,
+            hostname: dev.hostname)
         if let idx = machines.firstIndex(where: { $0.deviceID == deviceID }) {
             machines[idx].name = dev.name
             machines[idx].online = dev.online
             machines[idx].hostname = dev.hostname
-            RemoteSessionManifest.shared.updateName(deviceID: deviceID, name: dev.name)
-            NotificationCenter.default.post(
-                name: .ghosttyMachineDidRename,
-                object: self,
-                userInfo: [Self.renamedMachineKey: machines[idx]])
+            renamed = machines[idx]
         }
+        propagateRename(renamed)
+    }
+
+    /// Push a device rename to everything that carries the old name:
+    /// - the WP-D2 restore manifest (`updateName` — skips entries whose name
+    ///   is pinned by an explicit `--name`), so future restores use the new
+    ///   name, and
+    /// - every open window on that device, via `.ghosttyMachineDidRename`
+    ///   (observed by `BaseTerminalController`: pill, title suffix,
+    ///   `AXGhosttyMachine`) — INCLUDING manifest-restored windows, which
+    ///   match on the same device id.
+    private func propagateRename(_ machine: Machine) {
+        guard let deviceID = machine.deviceID else { return }
+        RemoteSessionManifest.shared.updateName(deviceID: deviceID, name: machine.name)
+        NotificationCenter.default.post(
+            name: .ghosttyMachineDidRename,
+            object: self,
+            userInfo: [Self.renamedMachineKey: machine])
     }
 
     /// Rebuild `machines` from a fetched device list: authoritative relay
@@ -301,6 +337,14 @@ final class MachineRegistry: ObservableObject {
     /// after any direct-TCP entries. Publishes only when something actually
     /// changed, so a steady-state background poll doesn't churn observers
     /// every tick.
+    ///
+    /// A display-name change observed HERE also propagates like an in-app
+    /// rename (`propagateRename`): the directory is the authoritative source,
+    /// and a rename can originate outside this process (another Mac, the web,
+    /// another app instance — whose NotificationCenter post this process can
+    /// never receive). Without this, such a rename would update the chooser
+    /// rows but leave every open window's pill/`AXGhosttyMachine` and the
+    /// restore manifest stale.
     private func apply(devices: [RelayDirectoryClient.Device]) {
         let relayBase = RelayDirectoryClient.defaultBase
         let relayMachines = devices.map { dev -> Machine in
@@ -322,8 +366,22 @@ final class MachineRegistry: ObservableObject {
                 hostname: dev.hostname
             )
         }
+        // Pre-refresh names, so renames can be detected after the swap. Only
+        // devices KNOWN before the refresh count — a device seen for the
+        // first time isn't a rename.
+        let previousNames: [String: String] = Dictionary(
+            machines.compactMap { m in m.deviceID.map { ($0, m.name) } },
+            uniquingKeysWith: { first, _ in first })
         let updated = machines.filter { !$0.isRelay } + relayMachines
-        if updated != machines { machines = updated }
+        if updated != machines {
+            machines = updated
+            for machine in relayMachines {
+                guard let deviceID = machine.deviceID,
+                      let old = previousNames[deviceID],
+                      old != machine.name else { continue }
+                propagateRename(machine)
+            }
+        }
     }
 }
 

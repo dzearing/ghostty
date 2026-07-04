@@ -930,6 +930,9 @@ class IPCServer {
                     device: device!,
                     token: resolvedToken,
                     name: name,
+                    // An explicit --name is a caller-supplied label: pin it so
+                    // account renames don't overwrite it (Machine.namePinned).
+                    namePinned: name != nil,
                     onOpen: { [weak self] controller in
                         // Register the window under its friendly name so
                         // +send-keys / +read / +close can target it (mirrors the

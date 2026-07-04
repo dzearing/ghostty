@@ -1095,7 +1095,8 @@ class AppDelegate: NSObject,
         let machine = Machine(
             name: name ?? known?.name ?? host,
             host: host,
-            port: port)
+            port: port,
+            namePinned: name != nil)
         return openRemoteWindow(on: machine, onOpen: onOpen)
     }
 
@@ -1112,6 +1113,7 @@ class AppDelegate: NSObject,
         device: String,
         token: String,
         name: String? = nil,
+        namePinned: Bool = false,
         onOpen: ((TerminalController) -> Void)? = nil
     ) -> String? {
         // Defense in depth for the signed-out case: every caller resolves the
@@ -1140,6 +1142,7 @@ class AppDelegate: NSObject,
             relay: relay,
             device: device,
             fallbackName: name,
+            namePinned: namePinned,
             sessionID: nil)
         onOpen?(controller)
         return nil
@@ -1177,6 +1180,7 @@ class AppDelegate: NSObject,
         relay: String,
         device: String,
         fallbackName: String?,
+        namePinned: Bool = false,
         sessionID: String?,
         windowTitle: String? = nil
     ) -> TerminalController {
@@ -1188,6 +1192,8 @@ class AppDelegate: NSObject,
         // hostname is carried separately in `hostname` so local-machine pill
         // suppression still recognizes a renamed local device. Carry the relay
         // base + device id so the Machine is a proper relay machine.
+        // `namePinned` marks an EXPLICIT caller-supplied name (IPC `--name=`):
+        // account renames must not overwrite it (see Machine.namePinned).
         let reportedHostname: String? = ghostty_remote_connection_hostname(handle)
             .flatMap { String(cString: $0) }
             .flatMap { $0.isEmpty ? nil : $0 }
@@ -1197,7 +1203,8 @@ class AppDelegate: NSObject,
             port: 0,
             relayBase: relay,
             deviceID: device,
-            hostname: reportedHostname)
+            hostname: reportedHostname,
+            namePinned: namePinned && fallbackName != nil)
 
         // Wrap the handle in a strong owner; the controller below holds the only
         // strong reference and frees it (once) when the window is deallocated.
@@ -1226,7 +1233,8 @@ class AppDelegate: NSObject,
             deviceID: device,
             name: machine.name,
             sessionID: sessionID,
-            windowTitle: windowTitle)
+            windowTitle: windowTitle,
+            namePinned: machine.namePinned)
         controller.remoteManifestEntryID = entryID
         RemoteSessionManifest.captureSessionID(of: controller, entryID: entryID)
 
@@ -1419,6 +1427,7 @@ class AppDelegate: NSObject,
                         relay: entry.relayBase,
                         device: entry.deviceID,
                         fallbackName: entry.name,
+                        namePinned: entry.namePinned == true,
                         sessionID: sessionID,
                         windowTitle: entry.windowTitle)
                 }

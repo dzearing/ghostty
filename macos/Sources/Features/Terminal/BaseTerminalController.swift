@@ -1848,13 +1848,18 @@ class BaseTerminalController: NSWindowController,
         if let connection = remoteConnection,
            connection.machine.deviceID == deviceID {
             var updated = connection.machine
-            updated.name = renamed.name
+            if !updated.namePinned { updated.name = renamed.name }
             updated.hostname = renamed.hostname ?? updated.hostname
             connection.updateMachine(updated)
         }
 
         guard var machine = remoteMachine, machine.deviceID == deviceID else { return }
-        machine.name = renamed.name
+        // An explicit caller-supplied label (IPC `+new-remote-window
+        // --name=mx`) is INTENTIONAL and wins over account renames: the
+        // window keeps "mx" while only the agent-reported hostname refreshes
+        // (it feeds local-machine pill suppression). Chooser-opened and
+        // manifest-restored windows are not pinned and adopt the new name.
+        if !machine.namePinned { machine.name = renamed.name }
         machine.hostname = renamed.hostname ?? machine.hostname
         // didSet publishes to the TerminalWindow (pill + AXGhosttyMachine +
         // AX valueChanged post) and re-applies the window title.
