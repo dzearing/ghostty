@@ -269,6 +269,14 @@ class BaseTerminalController: NSWindowController,
             selector: #selector(ghosttyMachineDidRename(_:)),
             name: .ghosttyMachineDidRename,
             object: nil)
+        // WP-D1: a reconnect that ran (and failed) during a DARK wake —
+        // display off, surface allocation can fail — must self-heal promptly
+        // at REAL wake: reset the backoff and kick a fresh attempt.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil)
 
         // Splits
         center.addObserver(
@@ -338,6 +346,7 @@ class BaseTerminalController: NSWindowController,
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
@@ -1896,6 +1905,35 @@ class BaseTerminalController: NSWindowController,
             sessionID: sessionID)
     }
 
+    /// The system finished a FULL wake (`NSWorkspace.didWakeNotification` —
+    /// dark wakes don't post it). A reconnect that ran during sleep or a dark
+    /// wake may have burned its retry budget (agent unreachable mid-sleep) or
+    /// aborted its swap (surface alloc fails with the display off); with power
+    /// back, don't wait out backoff timers or the slow re-dial cadence — reset
+    /// and kick a fresh attempt immediately.
+    @objc private func workspaceDidWake(_ notification: Notification) {
+        switch remoteConnectionState {
+        case .reconnecting:
+            break
+        case .disconnected where remoteDisconnectMaySelfHeal:
+            break
+        default:
+            return
+        }
+        guard let connection = remoteConnection, window != nil else { return }
+        guard let sessionID = currentRemoteSessionID() ?? manifestSessionID() else { return }
+        Ghostty.logger.warning(
+            "remote reconnect: full wake; resetting backoff, kicking attempt machine=\(connection.machine.name, privacy: .public) session=\(sessionID, privacy: .public)")
+        // Bump cancels any pending backoff attempt / background re-dial probe.
+        remoteReconnectGeneration += 1
+        remoteConnectionState = .reconnecting(attempt: 1)
+        scheduleRemoteReconnectAttempt(
+            1,
+            generation: remoteReconnectGeneration,
+            machine: connection.machine,
+            sessionID: sessionID)
+    }
+
     /// The outcome of one dial+probe cycle (`dialAndProbeRemote`), delivered on
     /// the main thread with the generation already validated.
     private enum RemoteProbeOutcome {
@@ -1997,48 +2035,69 @@ class BaseTerminalController: NSWindowController,
             ) { controller, outcome in
                 switch outcome {
                 case .sessionAlive(let handle):
-                    controller.completeRemoteReconnect(
-                        handle: handle, machine: machine, sessionID: sessionID)
+                    if controller.completeRemoteReconnect(
+                        handle: handle, machine: machine, sessionID: sessionID) { return }
+                    // Swap-create failed (surface init — e.g. dark-wake OOM):
+                    // the old grid is kept; treat exactly like `.unreachable`.
+                    controller.remoteReconnectAttemptFailed(
+                        attempt,
+                        generation: generation,
+                        machine: machine,
+                        sessionID: sessionID)
                 case .sessionGone:
                     // The agent is reachable but the session is gone (agent
                     // restarted / TTL expired): retrying won't bring it back.
                     // Keep the window, mark it. Terminal.
-                    Ghostty.logger.info(
-                        "remote reconnect: session gone on attempt \(attempt); disconnected (terminal)")
+                    Ghostty.logger.error(
+                        "remote reconnect: session gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt); disconnected (terminal)")
                     controller.remoteDisconnectMaySelfHeal = false
                     controller.remoteConnectionState = .disconnected
                 case .signedOut:
                     // Signed out: terminal until sign-in restores the window
                     // (reconnect never alerts; the manifest entry is kept).
+                    Ghostty.logger.error(
+                        "remote reconnect: signed out machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt); disconnected (terminal until sign-in)")
                     controller.remoteDisconnectMaySelfHeal = false
                     controller.remoteConnectionState = .disconnected
                 case .unreachable:
-                    guard attempt < Self.remoteReconnectDelays.count else {
-                        // Retries exhausted with the agent UNREACHABLE. Show
-                        // the truthful red pill, but DON'T give up for good:
-                        // the window's own connection keeps heartbeating (its
-                        // transport may self-heal, e.g. a frozen agent thaws
-                        // — see remoteLinkStateDidChange), AND a slow
-                        // background re-dial keeps probing so recovery works
-                        // even when the old transport is gone for good.
-                        Ghostty.logger.info(
-                            "remote reconnect: retries exhausted; disconnected (self-healable, background re-dial armed)")
-                        controller.remoteDisconnectMaySelfHeal = true
-                        controller.remoteConnectionState = .disconnected
-                        controller.scheduleRemoteRedialProbe(
-                            generation: generation,
-                            machine: machine,
-                            sessionID: sessionID)
-                        return
-                    }
-                    controller.scheduleRemoteReconnectAttempt(
-                        attempt + 1,
+                    controller.remoteReconnectAttemptFailed(
+                        attempt,
                         generation: generation,
                         machine: machine,
                         sessionID: sessionID)
                 }
             }
         }
+    }
+
+    /// Attempt `attempt` failed without a terminal verdict (agent unreachable,
+    /// or the reconnect swap couldn't build its replacement surface): schedule
+    /// the next backoff attempt, or — budget exhausted — drop to the truthful
+    /// red pill and arm the slow background re-dial. The window's own
+    /// connection keeps heartbeating underneath (its transport may self-heal,
+    /// e.g. a frozen agent thaws — see remoteLinkStateDidChange).
+    private func remoteReconnectAttemptFailed(
+        _ attempt: Int,
+        generation: Int,
+        machine: Machine,
+        sessionID: String
+    ) {
+        guard attempt < Self.remoteReconnectDelays.count else {
+            Ghostty.logger.error(
+                "remote reconnect: retries exhausted machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public) attempt=\(attempt); disconnected (self-healable, background re-dial armed)")
+            remoteDisconnectMaySelfHeal = true
+            remoteConnectionState = .disconnected
+            scheduleRemoteRedialProbe(
+                generation: generation,
+                machine: machine,
+                sessionID: sessionID)
+            return
+        }
+        scheduleRemoteReconnectAttempt(
+            attempt + 1,
+            generation: generation,
+            machine: machine,
+            sessionID: sessionID)
     }
 
     /// Cadence for the slow background re-dial that keeps running after the
@@ -2072,17 +2131,25 @@ class BaseTerminalController: NSWindowController,
             ) { controller, outcome in
                 switch outcome {
                 case .sessionAlive(let handle):
-                    Ghostty.logger.info(
-                        "remote reconnect: background re-dial probe succeeded; swapping")
-                    controller.completeRemoteReconnect(
-                        handle: handle, machine: machine, sessionID: sessionID)
+                    Ghostty.logger.warning(
+                        "remote reconnect: background re-dial probe succeeded machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); swapping")
+                    if controller.completeRemoteReconnect(
+                        handle: handle, machine: machine, sessionID: sessionID) { return }
+                    // Swap-create failed (surface init): the old grid and the
+                    // red pill are kept; probe again later like `.unreachable`.
+                    controller.scheduleRemoteRedialProbe(
+                        generation: generation,
+                        machine: machine,
+                        sessionID: sessionID)
                 case .sessionGone:
                     // Agent came back without the session: now it IS terminal.
-                    Ghostty.logger.info(
-                        "remote reconnect: background re-dial found agent but session gone; terminal")
+                    Ghostty.logger.error(
+                        "remote reconnect: background re-dial found agent but session gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); disconnected (terminal)")
                     controller.remoteDisconnectMaySelfHeal = false
                     controller.remoteConnectionState = .disconnected
                 case .signedOut:
+                    Ghostty.logger.error(
+                        "remote reconnect: background re-dial signed out machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); disconnected (terminal until sign-in)")
                     controller.remoteDisconnectMaySelfHeal = false
                     controller.remoteConnectionState = .disconnected
                 case .unreachable:
@@ -2105,15 +2172,21 @@ class BaseTerminalController: NSWindowController,
     ///
     /// Scope (matches WP-D2): the window is re-attached as a single root pane.
     /// Split panes' sessions stay detached-alive on the agent.
+    /// Returns false when the replacement surface could not be created (the
+    /// swap is ABORTED and the old tree kept — see below); the caller must
+    /// then treat the attempt like `.unreachable` (retry ladder / background
+    /// re-dial). The dialed `handle` is consumed either way (owned by the new
+    /// `RemoteConnection`, which frees it if the swap aborts).
     private func completeRemoteReconnect(
         handle: ghostty_remote_connection_t,
         machine: Machine,
         sessionID: String
-    ) {
+    ) -> Bool {
         guard let ghosttyApp = ghostty.app else {
             ghostty_remote_connection_free(handle)
-            remoteConnectionState = .disconnected
-            return
+            Ghostty.logger.error(
+                "remote reconnect: swap aborted, ghostty app gone machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public)")
+            return false
         }
 
         let newConnection = RemoteConnection(handle: handle, machine: machine)
@@ -2125,13 +2198,38 @@ class BaseTerminalController: NSWindowController,
         cfg.remoteSessionId = sessionID
         cfg.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
 
-        let newView = Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg)
+        // Debug-build-only deterministic failure hook: skips creating the
+        // real view so the guard below takes the failure path (the orchestrator
+        // can't force a real surface-alloc OOM). See debugShouldFailReconnectSwap.
+        let newView: Ghostty.SurfaceView? = Self.debugShouldFailReconnectSwap()
+            ? nil
+            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg)
+
+        guard let newView, newView.error == nil else {
+            // `ghostty_surface_new` FAILED (seen in production: OutOfMemory
+            // allocating Metal/IOSurface during a dark wake). Do NOT swap:
+            // the old grid — dead transport but intact contents — beats a
+            // SurfaceErrorView. Keep `surfaceTree`/`remoteConnection` as they
+            // are; the caller retries like an unreachable attempt.
+            //
+            // Ownership: `newConnection` is the sole strong owner of `handle`
+            // (a failed SurfaceView never constructed its `surfaceModel`, so
+            // nothing retains the keep-alive); dropping it here frees the
+            // dialed handle exactly once via RemoteConnection.deinit.
+            Ghostty.logger.error(
+                "remote reconnect: swap-create FAILED (surface init) machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); keeping old grid, will retry")
+            return false
+        }
 
         // The replacement becomes this window's shared connection (new
         // splits/tabs ride it); rebinds the link observer via didSet.
         remoteConnection = newConnection
         surfaceTree = SplitTree(view: newView)
         remoteConnectionState = .connected
+        // .warning maps to OSLog .error level, so this persists too — one
+        // breadcrumb pairing every failure trail with its recovery.
+        Ghostty.logger.warning(
+            "remote reconnect: swap complete machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public)")
         DispatchQueue.main.async {
             Ghostty.moveFocus(to: newView)
         }
@@ -2150,10 +2248,32 @@ class BaseTerminalController: NSWindowController,
             if self.currentRemoteSessionID() == nil {
                 // The re-ATTACH never yielded a live pane. Terminal tier:
                 // keep the window, mark it truthfully.
+                Ghostty.logger.error(
+                    "remote reconnect: post-swap verify FAILED, re-ATTACH published no session id machine=\(machine.name, privacy: .public) session=\(sessionID, privacy: .public); disconnected (terminal)")
                 self.remoteDisconnectMaySelfHeal = false
                 self.remoteConnectionState = .disconnected
             }
         }
+        return true
+    }
+
+    /// Path of the debug-only reconnect-swap failure hook file. When it exists
+    /// at swap time (debug/release-safe builds ONLY), `completeRemoteReconnect`
+    /// behaves as if `ghostty_surface_new` failed — the deterministic stand-in
+    /// for the dark-wake OOM that can't be forced in a test.
+    private static let debugFailReconnectSwapHookPath =
+        "/tmp/ghoztty-debug-fail-reconnect-swap"
+
+    /// Whether the reconnect swap should be forced to fail (debug hook). Gated
+    /// on the libghostty build mode — the exact condition behind the "debug
+    /// build" warning banner (`TerminalView`) — so it cannot trigger in
+    /// release (ReleaseFast) builds regardless of the hook file.
+    private static func debugShouldFailReconnectSwap() -> Bool {
+        guard Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG
+                || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE
+        else { return false }
+        return FileManager.default.fileExists(
+            atPath: debugFailReconnectSwapHookPath)
     }
 
     /// The agent session UUID of this window's first live remote pane, read
