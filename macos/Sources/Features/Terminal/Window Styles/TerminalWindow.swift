@@ -95,6 +95,10 @@ class TerminalWindow: NSWindow {
         didSet {
             guard remoteConnectionState != oldValue else { return }
             updateMachinePill()
+            // Notify assistive tech / external tools that the window's
+            // `AXGhosttyLinkState` attribute changed (same trigger that
+            // recolors the pill dot), so observers see updates live.
+            NSAccessibility.post(element: self, notification: .valueChanged)
         }
     }
 
@@ -1002,10 +1006,30 @@ extension TerminalWindow {
     /// "Local" when this is not a remote window.
     static let axLocalMachineValue = "Local"
 
+    /// Cross-tool accessibility contract (consumed by GUI automation to read a
+    /// remote window's link health without screenshotting the pill dot):
+    ///
+    ///   Attribute: `AXGhosttyLinkState`
+    ///   Value:     "connected", "reconnecting:<attempt>" (attempt is the
+    ///              1-based retry counter shown in the pill), or
+    ///              "disconnected" for a remote window — see
+    ///              `RemoteWindowConnectionState.axValue` — or the literal
+    ///              string "local" for a local window. Always a non-nil
+    ///              String. A state change posts an AX value-changed
+    ///              notification on the window (see
+    ///              `remoteConnectionState.didSet`), so observers see updates
+    ///              live.
+    static let axGhosttyLinkState = NSAccessibility.Attribute(rawValue: "AXGhosttyLinkState")
+
+    /// The value published for `AXGhosttyLinkState` when this is not a remote
+    /// window.
+    static let axLocalLinkStateValue = "local"
+
     override func accessibilityAttributeNames() -> [NSAccessibility.Attribute] {
         var names = super.accessibilityAttributeNames()
         names.append(Self.axActivityState)
         names.append(Self.axGhosttyMachine)
+        names.append(Self.axGhosttyLinkState)
         return names
     }
 
@@ -1015,6 +1039,10 @@ extension TerminalWindow {
         }
         if attribute == Self.axGhosttyMachine {
             return remoteMachine?.name ?? Self.axLocalMachineValue
+        }
+        if attribute == Self.axGhosttyLinkState {
+            guard remoteMachine != nil else { return Self.axLocalLinkStateValue }
+            return remoteConnectionState.axValue
         }
         return super.accessibilityAttributeValue(attribute)
     }

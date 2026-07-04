@@ -399,6 +399,17 @@ enum RemoteWindowConnectionState: Equatable {
     /// Retries exhausted (or the session is gone / we were evicted). The
     /// window is kept, clearly marked; no further retries.
     case disconnected
+
+    /// Stable machine-readable string published as the window's
+    /// `AXGhosttyLinkState` accessibility attribute (see `TerminalWindow`):
+    /// `connected`, `reconnecting:<attempt>` (1-based), or `disconnected`.
+    var axValue: String {
+        switch self {
+        case .connected: return "connected"
+        case .reconnecting(let attempt): return "reconnecting:\(attempt)"
+        case .disconnected: return "disconnected"
+        }
+    }
 }
 
 extension Notification.Name {
