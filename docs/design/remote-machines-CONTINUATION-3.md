@@ -120,12 +120,21 @@ relaunch → manifest restore dialed MaximusHome with NO prompt).
 ## Standing items (the queue)
 
 **Needs the USER:**
-1. Register the **`ghoztty-web`** OAuth client (Google Console → Credentials →
-   OAuth client ID → **Web application**; authorized redirect URI EXACTLY
-   `https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/enroll/callback`),
-   paste id+secret → orchestrator sets `GOOGLE_WEB_CLIENT_ID/_SECRET` in
-   `/etc/ghoztty-relay.env`, restarts relay (log shows `web_enroll=true`),
-   then live-verify one-click browser enrollment. This secret IS confidential.
+1. ~~Register the **`ghoztty-web`** OAuth client~~ DONE 07-03 late (user
+   registered it; no JS origins — server-side code flow only).
+   `GOOGLE_WEB_CLIENT_ID/_SECRET` set in `/etc/ghoztty-relay.env`, relay
+   restarted, log shows `web_enroll=true`. LIVE-VERIFIED end to end:
+   `ghoztty-agent --enroll --relay=…` opened the browser → Google → relay
+   `/enroll/callback` → "device web-enrolled … owner=dzearing@gmail.com",
+   idempotent upsert (same device id 2ac80d32 for this Mac), token ROTATED
+   + saved; then a relay dial to this Mac round-tripped a command.
+   GOTCHA HIT: the Mac's live agent was an OLD pre-hot-reload binary
+   (started 6:11AM, predates 14515562c) — it never saw the rotated token
+   and would have 401-looped on next reconnect. Restarted on the current
+   binary (writes heartbeat, watches relay.env; log at
+   `~/.config/ghoztty/agent.log`). Lesson: after deploying agent fixes,
+   check RUNNING agents are on the new binary (`ps lstart` vs binary
+   mtime), same trap as the stale debug app.
 2. ~~Re-sign-in once~~ DONE 07-03 evening (user). Keychain item exists under
    `com.dzearing.ghoztty.relay-account`; account dials work (MaximusHome
    relay window round-tripped `hostname`). NOTE: the post-rebuild relaunch
