@@ -202,6 +202,54 @@ risk and no uninstall is broken." Landed (tip `64eacaf71`; all deployed):
   registry paths (`\\01757...` — `\01` became a NUL and corrupted the
   command).
 
+## 2026-07-04 — "Oh no 😭" DEAD REMOTE WINDOW: root-caused + fixed + verified
+
+User hit a remote window showing SurfaceErrorView ("terminal failed to
+initialize") + red disconnected pill. NOT the MSI work. Root cause (from the
+PERSISTED unified-log fault, not a guess): idle sleep 00:50 → DARK WAKE 01:07
+(display off) → per-window reconnect dialed OK, probe OK, then
+`ghostty_surface_new` FAILED `error.OutOfMemory` (Metal/IOSurface alloc during
+dark wake) → the swap replaced the healthy grid with the errored surface →
++5s verify flipped to disconnected terminal. Log proof:
+`embedded_window: error initializing surface err=error.OutOfMemory` @01:07:14.
+
+Fixes (all cherry-picked, tip `4c5ae0e1a`, rebuilt + LIVE-VERIFIED):
+- `b421cfac3` **never swap a failed surface over a healthy grid** — if the
+  replacement surface's `.error != nil`, abort the swap (grid + connection
+  untouched), treat as a failed attempt, continue the ladder. Handle-ownership
+  proven leak/double-free-free (connection is caller-owned; failed view never
+  builds `Ghostty.Surface` so no keepalive; `RemoteConnection.deinit` frees
+  once). Plus NSWorkspace.didWakeNotification KICK (full wake → immediate
+  retry for reconnecting/self-healable windows).
+- `4c5ae0e1a` observability + robustness + testability:
+  (1) reconnect narrator was `.info` + `<private>`-redacted → now `.warning`
+  (persists) with `privacy: .public` machine/session/state; audited every
+  reconnect/surface log line public.
+  (2) **launch-freeze fix**: restore→`RelayAccount.resolveToken()` did a
+  SYNCHRONOUS `SecItemCopyMatching` on the MAIN THREAD during `.shared` lazy
+  init → a Keychain stall (ACL prompt after re-sign, locked kc, securityd
+  contention) FROZE the app at launch, 0 windows (I hit this hard;
+  `sample` = 790/790 in SecItemCopyMatching). Now the Keychain load runs in
+  `Task.detached` off-main; main actor suspends at `await`, never blocks;
+  slow load (>0.5s) logs a persisted breadcrumb. Cold launch w/ restore entry
+  now = first window in 1s, 0 main-thread Keychain frames.
+  (3) debug-gated `/tmp/ghoztty-debug-force-reconnect-swap` +
+  `/tmp/ghoztty-debug-fail-reconnect-swap` hooks to deterministically drive a
+  swap (freeze/thaw alone can't — the original loopback TCP self-recovers
+  before a replacement completes).
+
+LIVE PROOF (loopback, both hooks): forced swap failed repeatedly
+(`swap-create FAILED … keeping old grid, will retry`, persisted, public
+machine=vg session=…), pill stayed reconnecting, **CANARY grid survived**;
+remove fail hook → swap succeeds → green + I/O. Fix 2 proof: cold launch
+restored the `mxheal` MaximusHome window (ipcName intact), connected, hostname
+round-tripped, no freeze.
+
+**Logging was NOT broken** (user's question): the OOM fault persisted and was
+findable — my initial "no logs" was the zsh `log`-builtin trap (use
+`/usr/bin/log`; see the `macos-log-cli-zsh-builtin-trap` memory). The gap was
+only the Swift reconnect narrative (info+private), now fixed.
+
 ## Standing items (the queue)
 
 **Needs the USER:**
