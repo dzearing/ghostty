@@ -19,6 +19,7 @@
         <a href="#features">Features</a>
         <a href="#skill">Claude Skill</a>
         <a href="#install">Install</a>
+        <a href="#remote">Remote Agent</a>
         <a href="https://github.com/dzearing/ghoztty" target="_blank" rel="noopener">GitHub</a>
         <a href="#download" class="nav-cta">Download</a>
       </div>
@@ -277,6 +278,30 @@ ghoztty +split --target=ide --name=logs \
         v1.7.3 &middot; macOS 13+ &middot;
         <a href="https://github.com/dzearing/ghoztty/releases">All releases</a>
       </p>
+    </div>
+  </section>
+
+  <!-- Remote Agent -->
+  <section class="remote" id="remote">
+    <div class="section-inner">
+      <div class="section-header">
+        <h2>Remote Agent<br /><span class="gradient-text">for Windows.</span></h2>
+        <p>Lets Ghoztty on your Mac open terminals on a Windows machine &mdash; from anywhere. The agent connects outbound over WSS and keeps itself up to date.</p>
+      </div>
+      <div class="remote-card">
+        <div class="install-card-header">
+          <span class="install-badge">Windows</span>
+          <h3>Install the agent</h3>
+        </div>
+        <p>Paste into PowerShell on the Windows machine. A browser window opens once &mdash; sign in with Google to link the machine to your account.</p>
+        <div class="code-block code-block-copy">
+          <code id="agent-install-cmd">irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code>
+          <button class="copy-btn" type="button" data-copy-target="agent-install-cmd" aria-label="Copy install command">Copy</button>
+        </div>
+        <p class="install-alt">
+          Or <a href="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.exe">download ghoztty-agent.exe</a> directly.<span id="agent-version"></span>
+        </p>
+      </div>
     </div>
   </section>
 
