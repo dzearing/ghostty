@@ -33,7 +33,15 @@ type Account struct {
 	CreatedAt     time.Time
 	BlockedAt     *time.Time
 	BlockedReason string
+	// IsAdmin is the managed-in-DB admin flag (M2). Bootstrap admins from
+	// ADMIN_SUBS are admins regardless of this bit (they may have no account
+	// row at all); see Handler.isAdmin.
+	IsAdmin bool
 }
+
+// accountCols is the shared SELECT column list for scanAccount.
+const accountCols = `id, google_sub, email, status, COALESCE(invited_by_code,''),
+	        created_at, blocked_at, COALESCE(blocked_reason,''), is_admin`
 
 // InviteOutcome is the typed result of validating/consuming an invite code. It
 // maps 1:1 onto the signin_attempts.outcome enum so the caller can log the
@@ -71,9 +79,7 @@ func (s *Store) GetAccountBySub(sub string) (*Account, error) {
 		return nil, nil
 	}
 	return s.scanAccount(s.db.QueryRow(
-		`SELECT id, google_sub, email, status, COALESCE(invited_by_code,''),
-		        created_at, blocked_at, COALESCE(blocked_reason,'')
-		 FROM accounts WHERE google_sub = ?`, sub,
+		`SELECT `+accountCols+` FROM accounts WHERE google_sub = ?`, sub,
 	))
 }
 
@@ -86,9 +92,7 @@ func (s *Store) GetAccountByEmail(email string) (*Account, error) {
 		return nil, nil
 	}
 	return s.scanAccount(s.db.QueryRow(
-		`SELECT id, google_sub, email, status, COALESCE(invited_by_code,''),
-		        created_at, blocked_at, COALESCE(blocked_reason,'')
-		 FROM accounts WHERE email = ? LIMIT 1`, email,
+		`SELECT `+accountCols+` FROM accounts WHERE email = ? LIMIT 1`, email,
 	))
 }
 
@@ -97,8 +101,9 @@ func (s *Store) scanAccount(sc interface{ Scan(...any) error }) (*Account, error
 	var a Account
 	var created time.Time
 	var blockedAt sql.NullTime
+	var isAdmin int
 	if err := sc.Scan(&a.ID, &a.GoogleSub, &a.Email, &a.Status, &a.InvitedByCode,
-		&created, &blockedAt, &a.BlockedReason); err != nil {
+		&created, &blockedAt, &a.BlockedReason, &isAdmin); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -109,6 +114,7 @@ func (s *Store) scanAccount(sc interface{ Scan(...any) error }) (*Account, error
 		t := blockedAt.Time.UTC()
 		a.BlockedAt = &t
 	}
+	a.IsAdmin = isAdmin != 0
 	return &a, nil
 }
 

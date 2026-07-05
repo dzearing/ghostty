@@ -32,17 +32,25 @@ type Handler struct {
 	dir    *Directory
 	enroll *EnrollManager
 	logger *slog.Logger
+
+	// adminSubs is the ADMIN_SUBS bootstrap allowlist as a set (admin.go).
+	adminSubs map[string]bool
 }
 
 // NewHandler constructs a Handler.
 func NewHandler(cfg *Config, auth *Authenticator, store *Store, dir *Directory, logger *slog.Logger) *Handler {
+	adminSubs := make(map[string]bool, len(cfg.AdminSubs))
+	for _, s := range cfg.AdminSubs {
+		adminSubs[s] = true
+	}
 	return &Handler{
-		cfg:    cfg,
-		auth:   auth,
-		store:  store,
-		dir:    dir,
-		enroll: NewEnrollManager(cfg, auth, store, logger),
-		logger: logger,
+		cfg:       cfg,
+		auth:      auth,
+		store:     store,
+		dir:       dir,
+		enroll:    NewEnrollManager(cfg, auth, store, logger),
+		logger:    logger,
+		adminSubs: adminSubs,
 	}
 }
 
@@ -63,6 +71,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// the {nonce} wildcard per ServeMux precedence, so both can coexist.
 	mux.HandleFunc("GET /enroll/callback", h.handleEnrollCallback)
 	mux.HandleFunc("GET /enroll/{nonce}", h.handleEnrollWeb)
+	// Admin surface (M2): a distinct, separately authorized set of routes —
+	// never satisfiable with a normal user token (admin.go).
+	h.registerAdmin(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
