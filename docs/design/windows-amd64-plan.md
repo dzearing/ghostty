@@ -180,6 +180,40 @@ Artifact: `\\share\ghoztty-windows\Ghoztty-26.7.501-x64.msi`
    `-Dwindows-console=true` for a console-visible release build, or use a
    Debug build (always Console) for stderr.
 
+## Install-failure postmortem (2026-07-05, build 26.7.501)
+
+First staged MSI failed on the box: a console window flashed and nothing
+installed (no Start Menu entry). Diagnosed from MSI forensics (`msidump`),
+since the box could not be reached live (SSH port closed, agent TCP port
+listen-hardened, relay GUI dial hung).
+
+**Two defects, both from deriving MSI identifiers from the full install
+path** in `build-msi.sh`:
+1. **s72 overflow (fatal).** `share/ghostty/shell-integration/fish/
+   vendor_conf.d/ghostty-shell-integration.fish` produced an 83-char
+   Component/File identifier; MSI limits those key columns to `s72`
+   (72 chars). Windows Installer rejects the package at validation and
+   silently rolls back a per-user install → nothing lands.
+2. **Identifier collisions.** Non-alphanumerics were mapped to `_`, so
+   `conf.d` and a hypothetical `conf_d` collapsed to the same id — merging
+   distinct directories/files. The old MSI shipped only 527 of 561 files.
+
+The blank console window was the `taskkill` custom action (type-50 EXE)
+running before validation aborted.
+
+**Fix:** identifiers are now `c`/`f`/`d` + a 20-hex SHA-1 of the install
+path — always ≤21 chars, collision-free, stable across builds (GUIDs still
+`uuid5(path)`). Verified post-fix: every key column ≤24 chars, 561/561
+files present, tree extracts faithfully. Also **dropped the taskkill custom
+action** for the beta (source of the alarming console flash; a fresh install
+never needs it — document "close Ghoztty before upgrading" instead).
+
+Re-staged as **`Ghoztty-26.7.502-x64.msi`** plus `INSTALL-ghoztty.cmd`
+(runs msiexec with `/l*v` verbose logging to `ghoztty-install.log` on the
+share). If it still fails, that log is the ground truth to read next.
+**Not yet reproduced as a successful install on the box** — the fix is
+forensically confirmed but awaits the next on-box run.
+
 ## Decision log
 
 - 2026-07-05: Chose win32-apprt vendoring (see Strategy). Chose wixl MSI

@@ -84,7 +84,7 @@ WXS="$WORK/ghoztty.wxs"
 # GUIDs derived deterministically from the install path (uuid5) so component
 # identity is stable across builds (MSI component rules).
 python3 - "$EXE" "$SHARE" "$WXS" <<'PYEOF'
-import os, sys, uuid
+import os, sys, uuid, hashlib
 from xml.sax.saxutils import escape
 
 exe, share, out = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -96,10 +96,17 @@ NS = uuid.UUID("a934c3a7-a4fa-426d-8aab-2d260aa7563b")
 def guid(install_path: str) -> str:
     return str(uuid.uuid5(NS, install_path)).upper()
 
-def ident(s: str) -> str:
-    # MSI identifiers: alnum/underscore/dot, must not start with a digit.
-    out = "".join(c if (c.isalnum() or c in "._") else "_" for c in s)
-    return ("_" + out) if out[:1].isdigit() else out
+# MSI Component/File/Directory key columns are s72 — max 72 chars. Deriving
+# an identifier from the full install path blows past that for deeply nested
+# files (e.g. share/ghostty/shell-integration/fish/vendor_conf.d/...), and
+# Windows Installer then REJECTS the package at validation and silently rolls
+# back the install. So identifiers are a short prefix + a hash of the install
+# path: always well under 72 chars, unique, and stable across builds (the
+# path is the identity). The human-readable path lives in File.Name /
+# Directory.Name, which are l255/l255 and have no such limit.
+def ident(prefix: str, install_path: str) -> str:
+    h = hashlib.sha1(install_path.encode("utf-8")).hexdigest()[:20]
+    return f"{prefix}{h}"  # e.g. c1a2b3... — <=21 chars, starts with a letter
 
 lines = []
 comp_refs = []
@@ -108,8 +115,8 @@ def emit_file_component(rel_install_dir, src_path, indent):
     """One component per file, file is the keypath (fine for per-user)."""
     name = os.path.basename(src_path)
     install_path = (rel_install_dir + "\\" + name) if rel_install_dir else name
-    cid = ident("C_" + install_path)
-    fid = ident("F_" + install_path)
+    cid = ident("c", install_path)
+    fid = ident("f", install_path)
     pad = " " * indent
     lines.append(f'{pad}<Component Id="{cid}" Guid="{guid(install_path)}">')
     lines.append(f'{pad}  <File Id="{fid}" Name="{escape(name)}" KeyPath="yes" Source="{escape(src_path)}"/>')
@@ -127,16 +134,17 @@ def emit_dir(fs_dir, rel_install_dir, indent):
             # file is what resourcesDir needs).
             continue
         if os.path.isdir(p):
-            did = ident("D_" + (rel_install_dir + "\\" + e if rel_install_dir else e))
+            rel = (rel_install_dir + "\\" + e) if rel_install_dir else e
+            did = ident("d", rel)
             lines.append(f'{pad}<Directory Id="{did}" Name="{escape(e)}">')
-            emit_dir(p, (rel_install_dir + "\\" + e) if rel_install_dir else e, indent + 2)
+            emit_dir(p, rel, indent + 2)
             lines.append(f'{pad}</Directory>')
         else:
             emit_file_component(rel_install_dir, p, indent)
 
 # INSTALLDIR contents: ghoztty.exe + share tree.
 emit_file_component("", exe, 12)
-lines.append('            <Directory Id="D_share" Name="share">')
+lines.append(f'            <Directory Id="{ident("d", "share")}" Name="share">')
 emit_dir(share, "share", 14)
 lines.append('            </Directory>')
 
@@ -222,21 +230,13 @@ template = """<?xml version="1.0" encoding="utf-8"?>
       <ComponentRef Id="C_StartMenuShortcut"/>
     </Feature>
 
-    <!-- Stop a running Ghoztty so its exe isn't locked during install,
-         upgrade, or uninstall. taskkill exits nonzero when no process
-         matches; Return="ignore" makes that a no-op. -->
-    <CustomAction Id="SetKillGhozttyCmd"
-                  Property="KILLGHOZTTYCMD"
-                  Value="[SystemFolder]taskkill.exe"/>
-    <CustomAction Id="KillGhoztty"
-                  Property="KILLGHOZTTYCMD"
-                  ExeCommand="/F /IM ghoztty.exe"
-                  Execute="immediate"
-                  Return="ignore"/>
-
+    <!-- The beta deliberately omits a taskkill custom action. A type-50 EXE
+         custom action running taskkill.exe pops a console window during
+         install (alarming for a first-time install) and buys nothing on a
+         fresh install. If a future upgrade needs to replace a running exe,
+         the user is told to close Ghoztty first. Keep the install a pure
+         file-copy + shortcut + registry write for maximum robustness. -->
     <InstallExecuteSequence>
-      <Custom Action="SetKillGhozttyCmd" Before="KillGhoztty"/>
-      <Custom Action="KillGhoztty" Before="InstallValidate"/>
       <RemoveExistingProducts After="InstallValidate"/>
     </InstallExecuteSequence>
   </Product>
