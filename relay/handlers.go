@@ -258,9 +258,9 @@ func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	email := ident.Email
-
-	devices := h.store.ListByOwner(email)
+	// Ownership is keyed on the caller's stable google_sub, with a legacy
+	// email fallback for devices enrolled before sub existed (store.go).
+	devices := h.store.ListByOwnerIdent(ident)
 	out := make([]deviceView, 0, len(devices))
 	for _, d := range devices {
 		out = append(out, h.viewOf(d))
@@ -288,7 +288,7 @@ func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dev, rawToken, err := h.store.CreateDevice(email, body.Name)
+	dev, rawToken, err := h.store.CreateDevice(email, ident.Sub, body.Name)
 	if err != nil {
 		h.logger.Error("enroll failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -326,7 +326,7 @@ func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dev, err := h.store.RenameDevice(id, email, body.Name)
+	dev, err := h.store.RenameDeviceByOwner(id, ident, body.Name)
 	if err != nil {
 		h.logger.Error("rename failed", "device", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -359,7 +359,7 @@ func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 
 	id := r.PathValue("id")
 
-	deleted, err := h.store.DeleteDevice(id, email)
+	deleted, err := h.store.DeleteDeviceByOwner(id, ident)
 	if err != nil {
 		h.logger.Error("delete failed", "device", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -396,9 +396,10 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dev := h.store.Get(deviceID)
-	if dev == nil || dev.OwnerEmail != email {
+	if dev == nil || !dev.OwnedBy(ident) {
 		// Do not distinguish "not found" from "not yours": both are 404 to the
-		// caller so device IDs of other owners are not enumerable.
+		// caller so device IDs of other owners are not enumerable. Ownership is
+		// sub-keyed with a legacy email fallback (store.go OwnedBy).
 		http.Error(w, "device not found", http.StatusNotFound)
 		return
 	}
@@ -453,8 +454,8 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 // --- Self-enroll endpoints (WP-B3) -----------------------------------------
 
 // handleEnrollStart: POST /v1/enroll/start (JSON, UNAUTHENTICATED).
-// Body {"name":"<machine name>", "flow":"device"|"web"} (flow defaults to
-// "device" for back-compat).
+// Body {"name":"<machine name>", "flow":"device"|"web", "invite_code":"..."}
+// (flow defaults to "device" for back-compat; invite_code is optional).
 //
 //   - device: starts a Google device-code sign-in and returns
 //     {verification_url, user_code, device_code_handle, interval, expires_in}.
@@ -464,10 +465,16 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 //     the owner opens enroll_url in a browser and the agent polls the same
 //     /v1/enroll/poll. 503 when no Web OAuth client is configured — the
 //     agent falls back to the device flow.
+//
+// invite_code (when INVITE_SIGNUP is ON) is parked on the enrollment and
+// consumed at the success path to create a brand-new account. A returning
+// owner never needs it (existing-account/legacy-owner paths authorize without
+// a code), so the headless device flow keeps working unchanged for them.
 func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
-		Flow string `json:"flow"`
+		Name       string `json:"name"`
+		Flow       string `json:"flow"`
+		InviteCode string `json:"invite_code"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
@@ -478,10 +485,11 @@ func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
 		return
 	}
+	inviteCode := strings.TrimSpace(body.InviteCode)
 
 	switch body.Flow {
 	case "", flowDevice:
-		resp, err := h.enroll.Start(r.Context(), name)
+		resp, err := h.enroll.Start(r.Context(), name, inviteCode)
 		switch {
 		case errors.Is(err, errEnrollUnavailable):
 			http.Error(w, "enrollment unavailable: relay has no OIDC device flow configured", http.StatusServiceUnavailable)
@@ -496,7 +504,7 @@ func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, resp)
 	case flowWeb:
-		resp, err := h.enroll.StartWeb(name, h.relayBase(r))
+		resp, err := h.enroll.StartWeb(name, inviteCode, h.relayBase(r))
 		switch {
 		case errors.Is(err, errEnrollUnavailable):
 			http.Error(w, "web enrollment unavailable: relay has no web OAuth client configured", http.StatusServiceUnavailable)
@@ -568,7 +576,7 @@ func (h *Handler) handleEnrollCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name, err := h.enroll.Callback(r.Context(), code, state)
+	name, err := h.enroll.Callback(r.Context(), code, state, clientIP(r))
 	switch {
 	case errors.Is(err, errWebStateUnknown):
 		writeEnrollPage(w, http.StatusBadRequest, false, "Link invalid or expired",
@@ -606,7 +614,7 @@ func (h *Handler) handleEnrollPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := h.enroll.Poll(r.Context(), body.Handle, h.relayBase(r))
+	out := h.enroll.Poll(r.Context(), body.Handle, h.relayBase(r), clientIP(r))
 	writeJSON(w, out.status, out.body)
 }
 

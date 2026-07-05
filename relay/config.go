@@ -62,8 +62,18 @@ type Config struct {
 	IssuerURL string
 
 	// AllowedEmails is the authorization allowlist. A verified Google identity
-	// is necessary but NOT sufficient: the email must also appear here.
+	// is necessary but NOT sufficient: the email must also appear here. This is
+	// the sign-in gate when InviteSignup is OFF (the default).
 	AllowedEmails []string
+
+	// InviteSignup switches the sign-in authorization model (plan §4). When
+	// FALSE (the default) the AllowedEmails allowlist gates sign-in exactly as
+	// before — merging/deploying M1 must NOT change live auth. When TRUE the
+	// invite-code account model governs: an active account for the caller's
+	// google_sub is allowed; a blocked account is refused; no account requires a
+	// valid invite code that is then consumed to create the account. Sourced
+	// from INVITE_SIGNUP; flipping it live is the human cutover checkpoint.
+	InviteSignup bool
 
 	// StateDir holds persisted relay state: the SQLite database
 	// (ghoztty-relay.db) and, on legacy installs, the old devices.json.
@@ -95,6 +105,7 @@ func LoadConfig() *Config {
 		GoogleWebClientSecret:    os.Getenv("GOOGLE_WEB_CLIENT_SECRET"),
 		RelayBaseURL:             strings.TrimRight(os.Getenv("RELAY_BASE_URL"), "/"),
 		StateDir:                 getenv("STATE_DIR", "./state"),
+		InviteSignup:             strings.EqualFold(os.Getenv("INVITE_SIGNUP"), "true"),
 		DevAuth:                  strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),
 		DevClientToken:           os.Getenv("DEV_CLIENT_TOKEN"),
 		DevEmail:                 os.Getenv("DEV_EMAIL"),

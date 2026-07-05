@@ -116,6 +116,13 @@ type enrollment struct {
 	name string // requested machine name
 	flow string // flowDevice or flowWeb
 
+	// inviteCode is the signup code supplied at Start (device flow) or on the
+	// browser entry (web flow). It is consumed by the SigninGate at the success
+	// path when INVITE_SIGNUP is ON to create a brand-new account. Empty for an
+	// existing/returning owner (who never needs a code) and ignored entirely
+	// when the flag is OFF.
+	inviteCode string
+
 	// Device flow only.
 	deviceCode string // Google device_code — NEVER sent to the caller
 
@@ -163,6 +170,27 @@ func NewEnrollManager(cfg *Config, auth *Authenticator, store *Store, logger *sl
 	}
 }
 
+// authorizeEnroll verifies an enrollment ID token and authorizes it under the
+// active model. Flag OFF: exactly the legacy path (VerifyIDToken = verify +
+// ALLOWED_EMAILS). Flag ON: verify identity (unchanged OIDC strictness), then
+// the invite-code gate decides — an existing/returning owner needs no code, a
+// brand-new account consumes inviteCode. Returns the authorized identity or an
+// error (ErrUnauthorized / ErrInviteRequired). ip feeds the attempt audit.
+func (m *EnrollManager) authorizeEnroll(ctx context.Context, idToken, inviteCode, ip string) (Identity, error) {
+	gate := m.auth.gate
+	if gate == nil || !gate.Enabled() {
+		return m.auth.VerifyIDToken(ctx, idToken)
+	}
+	ident, err := m.auth.VerifyIdentity(ctx, idToken)
+	if err != nil {
+		return Identity{}, err
+	}
+	if err := gate.Authorize(ident, inviteCode, ip); err != nil {
+		return Identity{}, err
+	}
+	return ident, nil
+}
+
 // available reports whether the issuer advertises a device flow and OIDC
 // client auth is configured (the success path needs the verifier).
 func (m *EnrollManager) available() bool {
@@ -186,8 +214,10 @@ type enrollStartResponse struct {
 }
 
 // Start begins an enrollment: asks Google for a device/user code pair and
-// files it under a fresh opaque handle.
-func (m *EnrollManager) Start(ctx context.Context, name string) (*enrollStartResponse, error) {
+// files it under a fresh opaque handle. inviteCode (may be empty) is parked on
+// the enrollment for the invite-code gate to consume on the success path when
+// INVITE_SIGNUP is ON.
+func (m *EnrollManager) Start(ctx context.Context, name, inviteCode string) (*enrollStartResponse, error) {
 	if !m.available() {
 		return nil, errEnrollUnavailable
 	}
@@ -265,6 +295,7 @@ func (m *EnrollManager) Start(ctx context.Context, name string) (*enrollStartRes
 	m.pending[handle] = &enrollment{
 		name:       name,
 		flow:       flowDevice,
+		inviteCode: inviteCode,
 		deviceCode: out.DeviceCode,
 		interval:   interval,
 		expiresAt:  now.Add(time.Duration(out.ExpiresIn) * time.Second),
@@ -298,7 +329,7 @@ type webStartResponse struct {
 // fresh opaque poll handle plus a distinct single-use browser nonce, and
 // returns the relay-hosted URL the owner should open. No upstream request is
 // made — Google is first contacted when the browser hits the callback.
-func (m *EnrollManager) StartWeb(name, relayBase string) (*webStartResponse, error) {
+func (m *EnrollManager) StartWeb(name, inviteCode, relayBase string) (*webStartResponse, error) {
 	if !m.webAvailable() {
 		return nil, errEnrollUnavailable
 	}
@@ -322,6 +353,7 @@ func (m *EnrollManager) StartWeb(name, relayBase string) (*webStartResponse, err
 	m.pending[handle] = &enrollment{
 		name:       name,
 		flow:       flowWeb,
+		inviteCode: inviteCode,
 		webNonce:   nonce,
 		interval:   webPollInterval,
 		expiresAt:  now.Add(webEnrollExpiry),
@@ -386,7 +418,7 @@ func (m *EnrollManager) AuthRedirectURL(nonce, relayBase string) (string, error)
 // verifies the identity through the shared VerifyIDToken gate, and upserts
 // the device. The outcome is parked on the enrollment for the agent's next
 // poll to deliver; the returned machine name feeds the success page.
-func (m *EnrollManager) Callback(ctx context.Context, code, state string) (string, error) {
+func (m *EnrollManager) Callback(ctx context.Context, code, state, ip string) (string, error) {
 	m.mu.Lock()
 	m.purgeExpiredLocked(time.Now())
 	handle, ok := m.states[state]
@@ -397,7 +429,7 @@ func (m *EnrollManager) Callback(ctx context.Context, code, state string) (strin
 	e := m.pending[handle]
 	delete(m.states, state) // single-use: a replayed callback gets an error page
 	e.webState = ""
-	name, redirectURI := e.name, e.webRedirectURI
+	name, redirectURI, inviteCode := e.name, e.webRedirectURI, e.inviteCode
 	m.mu.Unlock()
 
 	idToken, oauthErr, err := m.exchangeAuthCode(ctx, code, redirectURI)
@@ -416,11 +448,13 @@ func (m *EnrollManager) Callback(ctx context.Context, code, state string) (strin
 		return "", errWebExchange
 	}
 
-	ident, verr := m.auth.VerifyIDToken(ctx, idToken)
+	ident, verr := m.authorizeEnroll(ctx, idToken, inviteCode, ip)
 	if verr != nil {
-		// A real Google login that fails verification/allowlist is terminal.
+		// A real Google login that fails verification/authorization (allowlist
+		// when flag OFF, or blocked-account / missing-or-bad invite when ON) is
+		// terminal for this enrollment.
 		m.finishWeb(handle, http.StatusForbidden, map[string]any{"status": "rejected"})
-		m.logger.Warn("web enrollment identity rejected", "name", name)
+		m.logger.Warn("web enrollment identity rejected", "name", name, "err", verr)
 		return "", errWebRejected
 	}
 
@@ -499,8 +533,9 @@ type pollOutcome struct {
 }
 
 // Poll advances one enrollment. relayBase is echoed to the agent on success
-// so it knows where to dial back.
-func (m *EnrollManager) Poll(ctx context.Context, handle, relayBase string) pollOutcome {
+// so it knows where to dial back. ip feeds the sign-in attempt audit on the
+// success path when INVITE_SIGNUP is ON.
+func (m *EnrollManager) Poll(ctx context.Context, handle, relayBase, ip string) pollOutcome {
 	now := time.Now()
 	m.mu.Lock()
 	m.purgeExpiredLocked(now)
@@ -546,7 +581,7 @@ func (m *EnrollManager) Poll(ctx context.Context, handle, relayBase string) poll
 	}
 	e.inFlight = true
 	e.nextPollAt = now.Add(e.interval)
-	deviceCode, name := e.deviceCode, e.name
+	deviceCode, name, inviteCode := e.deviceCode, e.name, e.inviteCode
 	m.mu.Unlock()
 
 	// Talk to Google outside the lock.
@@ -592,16 +627,18 @@ func (m *EnrollManager) Poll(ctx context.Context, handle, relayBase string) poll
 	}
 	m.mu.Unlock()
 
-	// The owner approved. Verify the ID token EXACTLY like client auth:
-	// signature/issuer/aud/exp + email_verified + ALLOWED_EMAILS.
-	ident, verr := m.auth.VerifyIDToken(ctx, idToken)
+	// The owner approved. Verify the ID token EXACTLY like client auth
+	// (signature/issuer/aud/exp + email_verified) and authorize it: ALLOWED_EMAILS
+	// when INVITE_SIGNUP is OFF, or the invite-code account model when ON (a
+	// returning owner needs no code; a brand-new account consumes inviteCode).
+	ident, verr := m.authorizeEnroll(ctx, idToken, inviteCode, ip)
 	if verr != nil {
-		// A real Google login that fails our verification/allowlist is
-		// terminal: retrying the same grant cannot change the identity.
+		// A real Google login that fails verification/authorization is terminal:
+		// retrying the same grant cannot change the identity or the invite.
 		m.mu.Lock()
 		delete(m.pending, handle)
 		m.mu.Unlock()
-		m.logger.Warn("enrollment identity rejected", "name", name)
+		m.logger.Warn("enrollment identity rejected", "name", name, "err", verr)
 		return pollOutcome{http.StatusForbidden, map[string]any{"status": "rejected"}}
 	}
 

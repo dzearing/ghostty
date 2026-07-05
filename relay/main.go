@@ -44,6 +44,14 @@ func main() {
 	}
 	defer store.Close()
 
+	// Wire the invite-code authorization gate. It is consulted only when
+	// INVITE_SIGNUP is ON; when OFF, ALLOWED_EMAILS still gates and live auth is
+	// unchanged. The gate needs the Store, hence this late bind after LoadStore.
+	auth.SetGate(NewSigninGate(cfg, store, logger))
+	if cfg.InviteSignup {
+		logger.Warn("INVITE_SIGNUP enabled — invite-code account model governs sign-in (ALLOWED_EMAILS bypassed)")
+	}
+
 	dir := NewDirectory(logger)
 	h := NewHandler(cfg, auth, store, dir, logger)
 
