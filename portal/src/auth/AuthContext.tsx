@@ -146,6 +146,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           callback: onGoogleCredential,
           auto_select: true,
         });
+        // Silent re-sign-in on load: with auto_select, a returning admin who
+        // previously consented gets a credential without a click, so the
+        // memory-only token survives refreshes UX-wise. After an explicit
+        // sign-out, disableAutoSelect() makes this a visible (non-auto)
+        // prompt instead — sign-out stays signed out.
+        gis.prompt();
       }
     })();
     return () => {
