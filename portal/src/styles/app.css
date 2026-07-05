@@ -137,6 +137,9 @@
   font-size: var(--fs-overline);
   font-weight: 650;
   text-transform: uppercase;
+  /* Google profile photo variant (img.avatar) */
+  object-fit: cover;
+  overflow: hidden;
 }
 
 .content {

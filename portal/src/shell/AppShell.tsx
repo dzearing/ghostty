@@ -131,7 +131,16 @@ export function AppShell({ children }: { children: ReactNode }) {
               )}
             </button>
             <div className="whoami" title={identity ? `sub: ${identity.sub}` : undefined}>
-              <span className="avatar">{initial}</span>
+              {identity?.picture ? (
+                <img
+                  className="avatar"
+                  src={identity.picture}
+                  alt=""
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <span className="avatar">{initial}</span>
+              )}
               <span>{identity?.email}</span>
               {identity?.isDev && <span className="badge warn">dev</span>}
             </div>

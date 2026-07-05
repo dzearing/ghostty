@@ -8,6 +8,7 @@ export interface TokenClaims {
   email?: string;
   sub?: string;
   name?: string;
+  picture?: string; // Google profile photo URL (header avatar)
   exp?: number; // seconds since epoch
 }
 

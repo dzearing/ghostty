@@ -2,11 +2,16 @@
  * Auth state machine + token custody.
  *
  * The bearer token (a Google ID token, or the relay's DEV_CLIENT_TOKEN in
- * dev) is held ONLY in memory (a ref), never in localStorage/sessionStorage:
- * an XSS anywhere on the origin could exfiltrate persisted tokens at leisure,
- * while a memory-only token confines the blast radius to the live session.
- * The cost is a re-prompt on refresh — GIS auto_select makes that a silent
- * one-tap for a returning admin.
+ * dev) lives in memory plus sessionStorage — NOT localStorage. Rationale:
+ * memory-only forced a Google round-trip on every refresh, and Chrome's
+ * FedCM auto-reauthn cooldown degrades that to a visible chip per F5 (user
+ * hit exactly this). sessionStorage survives refresh in the same tab,
+ * evaporates when the tab closes, and holds a token that self-expires in
+ * ~1h; an XSS on this origin could equally hook the in-memory path, so the
+ * marginal exposure is the persistence window of an already-short-lived
+ * token. localStorage (indefinite, cross-tab) remains off the table.
+ * On boot a saved, unexpired token is adopted directly (no Google
+ * round-trip); GIS one-tap remains the fallback for expiry/new sessions.
  *
  * Flow: signed-out → (GIS credential | dev token) → probe the admin API
  * (GET /v1/admin/signin-attempts?limit=1 as a cheap "am I an admin?") →
@@ -42,6 +47,8 @@ export interface AuthIdentity {
   email: string;
   sub: string;
   isDev: boolean;
+  /** Google profile photo URL from the ID token's picture claim, if any. */
+  picture?: string;
 }
 
 interface AuthContextValue {
@@ -59,6 +66,45 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+/** sessionStorage key for the bearer token (see header comment for custody). */
+const TOKEN_KEY = "ghoztty-admin-token";
+
+function saveToken(token: string) {
+  try {
+    sessionStorage.setItem(TOKEN_KEY, token);
+  } catch {
+    /* storage unavailable (private mode etc.) — memory-only fallback */
+  }
+}
+
+function clearToken() {
+  try {
+    sessionStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * A saved token worth adopting on boot: present and, when it carries an exp
+ * claim, not within 30s of expiry. Dev tokens (not JWTs) have no exp and are
+ * adoptable as-is.
+ */
+function loadSavedToken(): string | null {
+  try {
+    const t = sessionStorage.getItem(TOKEN_KEY);
+    if (!t) return null;
+    const claims = decodeJwtClaims(t);
+    if (claims?.exp && claims.exp * 1000 < Date.now() + 30_000) {
+      sessionStorage.removeItem(TOKEN_KEY);
+      return null;
+    }
+    return t;
+  } catch {
+    return null;
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const tokenRef = useRef<string | null>(null);
   const [status, setStatus] = useState<AuthStatus>("loading");
@@ -71,6 +117,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const handleUnauthorized = useCallback(() => {
     if (statusRef.current === "checking") return; // probe handles its own 401
     tokenRef.current = null;
+    clearToken();
     setIdentity(null);
     setNotice("Your session expired — sign in again.");
     setStatus("signed-out");
@@ -91,6 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const adopt = useCallback(
     async (token: string, ident: AuthIdentity) => {
       tokenRef.current = token;
+      saveToken(token);
       setIdentity(ident);
       setNotice(null);
       setStatus("checking");
@@ -102,6 +150,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setStatus("not-admin");
         } else if (isApiError(e) && e.status === 401) {
           tokenRef.current = null;
+          clearToken();
           setIdentity(null);
           setNotice("The relay rejected that token (401). Sign in again.");
           setStatus("signed-out");
@@ -125,19 +174,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         email: claims?.email ?? "(unknown)",
         sub: claims?.sub ?? "(unknown)",
         isDev: false,
+        picture: claims?.picture,
       });
     },
     [adopt],
   );
 
-  // Boot: load runtime config, then initialize GIS if a client ID exists.
+  // Boot: load runtime config, adopt a saved (unexpired) session token if one
+  // survives in sessionStorage — F5 stays signed in with zero Google round
+  // trips — else initialize GIS and try a silent one-tap.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       const cfg = await loadPortalConfig();
       if (cancelled) return;
       setGoogleClientId(cfg.googleClientId);
-      setStatus("signed-out");
+
+      const saved = loadSavedToken();
+      if (saved) {
+        const claims = decodeJwtClaims(saved);
+        void adopt(saved, {
+          email: claims?.email ?? "dev",
+          sub: claims?.sub ?? "dev",
+          isDev: claims === null,
+          picture: claims?.picture,
+        });
+      } else {
+        setStatus("signed-out");
+      }
+
       if (cfg.googleClientId) {
         const gis = await loadGis();
         if (cancelled || !gis) return;
@@ -146,18 +211,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           callback: onGoogleCredential,
           auto_select: true,
         });
-        // Silent re-sign-in on load: with auto_select, a returning admin who
-        // previously consented gets a credential without a click, so the
-        // memory-only token survives refreshes UX-wise. After an explicit
-        // sign-out, disableAutoSelect() makes this a visible (non-auto)
-        // prompt instead — sign-out stays signed out.
-        gis.prompt();
+        // No saved token: attempt the silent one-tap for a returning admin.
+        // (Chrome FedCM may render a small chip; the sessionStorage path
+        // above is what makes plain refreshes seamless.) After an explicit
+        // sign-out, disableAutoSelect() keeps this non-automatic.
+        if (!saved) gis.prompt();
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [onGoogleCredential]);
+  }, [onGoogleCredential, adopt]);
 
   const renderGoogleButton = useCallback(
     (el: HTMLElement) => {
@@ -193,6 +257,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(() => {
     tokenRef.current = null;
+    clearToken();
     setIdentity(null);
     setNotice(null);
     setStatus("signed-out");
