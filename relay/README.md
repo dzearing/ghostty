@@ -201,6 +201,12 @@ Design notes:
 | `RELAY_BASE_URL`   | *(unset)*          | Public https base URL returned to freshly enrolled agents (`relay_base`) and used to build web-enroll URLs (`enroll_url`, the OAuth `redirect_uri`). When unset it is derived from the request `Host` header, which is correct behind Caddy. |
 | `ALLOWED_EMAILS`   | *(empty)*          | Comma-separated authorization allowlist of verified Google emails. A valid login by anyone not listed is rejected — including at self-enrollment. |
 | `STATE_DIR`        | `./state`          | Directory holding the SQLite database `ghoztty-relay.db` (WAL mode; persisted device hashes). A legacy `devices.json` here is imported once on first boot and then kept as a backup. |
+| `QUOTA_MAX_DEVICES` | `10`              | Default per-account cap on enrolled devices, enforced at every device-creating path (manual POST + both enroll flows; credential rotation is exempt). `0` = unlimited. Per-account overrides live on `accounts.max_devices` (NULL = this default). Exceeded → `409` `{"error":"device quota exceeded","limit":N}`. |
+| `QUOTA_MAX_SESSIONS` | `8`              | Default per-account cap on concurrent relay sessions (a session = one admitted client connect, setup through bridge end), enforced at `/v1/client/connect`. `0` = unlimited; override on `accounts.max_sessions`. Exceeded → `409` `{"error":"session quota exceeded","limit":N}`. |
+| `RATELIMIT_SIGNIN_PER_MIN` | `10`       | Per-IP budget of **failed** client sign-ins per minute (successes are never charged). Exhausted → `429` + `Retry-After`. `0` disables. In-memory; resets on restart. |
+| `RATELIMIT_ENROLL_PER_MIN` | `6`        | Per-IP budget of `/v1/enroll/start` requests per minute (unauthenticated, mints upstream Google traffic). Exhausted → `429` + `Retry-After`. `0` disables. |
+| `RATELIMIT_ENROLL_POLL_PER_MIN` | `120` | Per-IP backstop on `/v1/enroll/poll` behind the per-handle interval throttle. Exhausted → `429` `{"status":"slow_down"}`. `0` disables. |
+| `RATELIMIT_CONNECT_PER_MIN` | `60`      | Per-identity budget of `/v1/client/connect` attempts per minute. Exhausted → `429` + `Retry-After`. `0` disables. |
 | `DEV_AUTH`         | `false`            | **Testing only.** Accept a static bearer as a stand-in for OIDC. Logs a loud warning at startup. |
 | `DEV_CLIENT_TOKEN` | *(unset)*          | The static bearer accepted when `DEV_AUTH=true`. |
 | `DEV_EMAIL`        | *(unset)*          | Identity that a successful dev-auth maps to (becomes the device owner). |
