@@ -16,6 +16,7 @@ import {
   YAxis,
 } from "recharts";
 import { useAccounts, useAttempts, useInvites } from "../api/hooks";
+import { isAllowedOutcome } from "../api/types";
 import type { InviteCode, SigninAttempt } from "../api/types";
 import {
   EmptyState,
@@ -58,7 +59,7 @@ function bucketByHour(attempts: SigninAttempt[], now: number): HourBucket[] {
     const idx = Math.floor((t - (start - HOUR / 2)) / HOUR);
     const b = buckets[Math.min(23, Math.max(0, idx))];
     if (t >= start - HOUR && b) {
-      if (a.outcome === "allowed") b.allowed++;
+      if (isAllowedOutcome(a.outcome)) b.allowed++;
       else b.refused++;
     }
   }
@@ -81,7 +82,7 @@ export default function DashboardPage() {
     const blocked = acc.length - active;
     const devices = acc.reduce((n, a) => n + a.device_count, 0);
     const usable = inv.filter((i) => inviteUsable(i, now)).length;
-    const allowed = att.filter((a) => a.outcome === "allowed").length;
+    const allowed = att.filter((a) => isAllowedOutcome(a.outcome)).length;
     return {
       accounts: acc.length,
       active,

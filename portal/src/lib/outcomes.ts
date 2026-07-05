@@ -36,6 +36,18 @@ export const OUTCOME_META: Record<Outcome, OutcomeMeta> = {
     tone: "neutral",
     cssVar: "var(--text-3)",
   },
+  // Legacy allowlist model (relay INVITE_SIGNUP off): same semantics as
+  // allowed/blocked, labeled so the feed shows which model decided.
+  allowlist_allowed: {
+    label: "Allowed (allowlist)",
+    tone: "ok",
+    cssVar: "var(--ok)",
+  },
+  allowlist_rejected: {
+    label: "Rejected (allowlist)",
+    tone: "danger",
+    cssVar: "var(--danger)",
+  },
 };
 
 export function outcomeMeta(outcome: string): OutcomeMeta {

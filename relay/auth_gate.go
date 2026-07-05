@@ -28,6 +28,9 @@ package main
 import (
 	"errors"
 	"log/slog"
+	"strings"
+	"sync"
+	"time"
 )
 
 // ErrInviteRequired is returned when a verified identity has no account and
@@ -35,11 +38,91 @@ import (
 // can surface a "you need an invite code" message rather than a bare 401.
 var ErrInviteRequired = errors.New("invite code required")
 
+// allowedLogInterval throttles repeat "allowed" audit rows per identity: the
+// client authenticates on EVERY API request (device list polls included), so
+// unthrottled logging floods signin_attempts with the same caller within
+// hours. One row per identity per interval keeps the feed meaning "this
+// person signed in", while failures/blocks are always recorded (each one is
+// signal). In-memory: resets on restart (an extra row per identity per
+// restart — harmless).
+const allowedLogInterval = time.Hour
+
 // SigninGate authorizes verified identities under the invite-code model.
 type SigninGate struct {
 	cfg    *Config
 	store  *Store
 	logger *slog.Logger
+
+	// mu guards lastAllowed, the per-identity throttle clock for "allowed"
+	// audit rows (see allowedLogInterval).
+	mu          sync.Mutex
+	lastAllowed map[string]time.Time
+}
+
+// throttleKey identifies a caller for the allowed-row throttle: the stable
+// sub when present, else the lowercased email (legacy identities).
+func throttleKey(ident Identity) string {
+	if ident.Sub != "" {
+		return ident.Sub
+	}
+	return strings.ToLower(ident.Email)
+}
+
+// shouldRecordAllowed reports whether an "allowed" row for this identity is
+// due (none recorded within allowedLogInterval), and marks it recorded.
+func (g *SigninGate) shouldRecordAllowed(key string) bool {
+	now := time.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.lastAllowed == nil {
+		g.lastAllowed = make(map[string]time.Time)
+	}
+	if last, ok := g.lastAllowed[key]; ok && now.Sub(last) < allowedLogInterval {
+		return false
+	}
+	// Opportunistic sweep so the map cannot grow without bound.
+	if len(g.lastAllowed) > 8192 {
+		for k, t := range g.lastAllowed {
+			if now.Sub(t) >= allowedLogInterval {
+				delete(g.lastAllowed, k)
+			}
+		}
+	}
+	g.lastAllowed[key] = now
+	return true
+}
+
+// RecordLegacy writes the audit row for an ALLOWLIST-path decision
+// (INVITE_SIGNUP off): outcome allowlist_allowed / allowlist_rejected. It is
+// logging only — the accept/reject decision was already made by the caller
+// and is unchanged. Allowed rows are throttled like the gate's own; verified-
+// but-rejected rows are always recorded. Nil-safe: a gate-less Authenticator
+// (some tests) simply doesn't log.
+func (g *SigninGate) RecordLegacy(ident Identity, ip string, allowed bool) {
+	if g == nil || g.store == nil {
+		return
+	}
+	if allowed {
+		if !g.shouldRecordAllowed(throttleKey(ident)) {
+			// Metrics still count every decision; only the DB row is throttled.
+			mSigninAttempts.WithLabelValues(outcomeAllowlistAllowed).Inc()
+			return
+		}
+		g.record(ident, ip, outcomeAllowlistAllowed, "")
+		return
+	}
+	g.record(ident, ip, outcomeAllowlistRejected, "")
+}
+
+// recordAllowedThrottled is the throttled variant of record() for the gate's
+// own (INVITE_SIGNUP on) "allowed" decisions — same rationale as
+// allowedLogInterval: authenticated API traffic must not flood the feed.
+func (g *SigninGate) recordAllowedThrottled(ident Identity, ip, accountID string) {
+	if !g.shouldRecordAllowed(throttleKey(ident)) {
+		mSigninAttempts.WithLabelValues(outcomeAllowed).Inc()
+		return
+	}
+	g.record(ident, ip, outcomeAllowed, accountID)
 }
 
 // NewSigninGate builds the gate.
@@ -70,7 +153,7 @@ func (g *SigninGate) Authorize(ident Identity, inviteCode, ip string) error {
 			g.logger.Warn("sign-in refused: account blocked", "sub", ident.Sub, "email", ident.Email)
 			return ErrUnauthorized
 		}
-		g.record(ident, ip, outcomeAllowed, acct.ID)
+		g.recordAllowedThrottled(ident, ip, acct.ID)
 		return nil
 	}
 

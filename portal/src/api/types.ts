@@ -28,7 +28,11 @@ export type Outcome =
   | "expired_invite"
   | "revoked_invite"
   | "exhausted_invite"
-  | "not_verified";
+  | "not_verified"
+  // Legacy allowlist-path decisions (relay INVITE_SIGNUP off). Distinct
+  // names so the feed shows which auth model decided.
+  | "allowlist_allowed"
+  | "allowlist_rejected";
 
 export const ALL_OUTCOMES: Outcome[] = [
   "allowed",
@@ -39,7 +43,14 @@ export const ALL_OUTCOMES: Outcome[] = [
   "revoked_invite",
   "exhausted_invite",
   "not_verified",
+  "allowlist_allowed",
+  "allowlist_rejected",
 ];
+
+/** Sign-in succeeded, under either auth model (dashboard bucketing). */
+export function isAllowedOutcome(o: Outcome | string): boolean {
+  return o === "allowed" || o === "allowlist_allowed";
+}
 
 export interface SigninAttempt {
   id: number;

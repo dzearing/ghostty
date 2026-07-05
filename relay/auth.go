@@ -205,9 +205,10 @@ func (a *Authenticator) authenticateClient(ctx context.Context, r *http.Request)
 		// Not the dev token — fall through to real OIDC if configured.
 	}
 
-	// Flag OFF: exact legacy behavior (verify + ALLOWED_EMAILS).
+	// Flag OFF: exact legacy accept/reject behavior (verify + ALLOWED_EMAILS);
+	// the client IP rides along for the (logging-only) attempt audit.
 	if a.gate == nil || !a.gate.Enabled() {
-		return a.VerifyIDToken(ctx, token)
+		return a.verifyIDTokenIP(ctx, token, clientIP(r))
 	}
 
 	// Flag ON: verify identity (unchanged OIDC strictness), then authorize via
@@ -293,6 +294,15 @@ func (a *Authenticator) VerifyIdentity(ctx context.Context, token string) (Ident
 // allowlist membership test. When INVITE_SIGNUP is ON the enroll flows call
 // VerifyIdentity + the SigninGate instead (see enroll.go).
 func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identity, error) {
+	return a.verifyIDTokenIP(ctx, token, "")
+}
+
+// verifyIDTokenIP is VerifyIDToken with the client IP plumbed through for the
+// signin_attempts audit row. Logging only — accept/reject decisions are
+// byte-for-byte unchanged. SigninGate.RecordLegacy owns both the Prometheus
+// counter and the (throttled-for-allowed) DB row; a nil gate (gate-less unit
+// tests) records nothing.
+func (a *Authenticator) verifyIDTokenIP(ctx context.Context, token, ip string) (Identity, error) {
 	ident, err := a.VerifyIdentity(ctx, token)
 	if err != nil {
 		return Identity{}, err
@@ -300,11 +310,11 @@ func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identi
 	if !a.allowed[ident.Email] {
 		// Authorization gate: a valid Google login by anyone not on the
 		// allowlist is rejected.
-		mSigninAttempts.WithLabelValues(outcomeAllowlistRejected).Inc() // metrics.go; counting only
+		a.gate.RecordLegacy(ident, ip, false)
 		a.logger.Warn("client email not on allowlist", "email", ident.Email)
 		return Identity{}, ErrUnauthorized
 	}
-	mSigninAttempts.WithLabelValues(outcomeAllowlistAllowed).Inc() // metrics.go; counting only
+	a.gate.RecordLegacy(ident, ip, true)
 	return ident, nil
 }
 

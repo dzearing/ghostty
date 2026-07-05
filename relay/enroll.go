@@ -179,7 +179,7 @@ func NewEnrollManager(cfg *Config, auth *Authenticator, store *Store, logger *sl
 func (m *EnrollManager) authorizeEnroll(ctx context.Context, idToken, inviteCode, ip string) (Identity, error) {
 	gate := m.auth.gate
 	if gate == nil || !gate.Enabled() {
-		return m.auth.VerifyIDToken(ctx, idToken)
+		return m.auth.verifyIDTokenIP(ctx, idToken, ip)
 	}
 	ident, err := m.auth.VerifyIdentity(ctx, idToken)
 	if err != nil {

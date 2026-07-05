@@ -287,3 +287,75 @@ func TestBindLegacyDevicesToSub(t *testing.T) {
 		t.Fatalf("bind must not touch other owners' legacy devices")
 	}
 }
+
+// TestSigninAttemptThrottle covers the allowed-row throttle (one DB row per
+// identity per allowedLogInterval; failures always recorded) and the
+// allowlist-path RecordLegacy audit rows, including nil-gate safety.
+func TestSigninAttemptThrottle(t *testing.T) {
+	s := newStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := NewSigninGate(&Config{InviteSignup: true}, s, logger)
+	ident := Identity{Email: "user@example.com", Sub: "sub-1"}
+
+	// Repeat "allowed" decisions within the interval -> exactly one row.
+	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1")
+	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1")
+	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1")
+	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 1 {
+		t.Fatalf("allowed rows = %d, want 1 (throttled)", n)
+	}
+
+	// A different identity gets its own row.
+	g.recordAllowedThrottled(Identity{Email: "other@example.com", Sub: "sub-2"}, "1.2.3.4", "acct-2")
+	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 2 {
+		t.Fatalf("allowed rows = %d, want 2 (per identity)", n)
+	}
+
+	// Failures are never throttled.
+	g.record(ident, "1.2.3.4", outcomeBlocked, "acct-1")
+	g.record(ident, "1.2.3.4", outcomeBlocked, "acct-1")
+	if n, _ := s.CountSigninAttempts(outcomeBlocked); n != 2 {
+		t.Fatalf("blocked rows = %d, want 2 (unthrottled)", n)
+	}
+
+	// Allowlist path: allowed throttled (shares the same per-identity clock),
+	// rejected always recorded.
+	g.RecordLegacy(ident, "1.2.3.4", true) // same identity, within interval -> no row
+	if n, _ := s.CountSigninAttempts(outcomeAllowlistAllowed); n != 0 {
+		t.Fatalf("allowlist_allowed rows = %d, want 0 (throttle shared)", n)
+	}
+	fresh := Identity{Email: "legacy@example.com"} // no sub -> email key
+	g.RecordLegacy(fresh, "5.6.7.8", true)
+	g.RecordLegacy(fresh, "5.6.7.8", true)
+	if n, _ := s.CountSigninAttempts(outcomeAllowlistAllowed); n != 1 {
+		t.Fatalf("allowlist_allowed rows = %d, want 1", n)
+	}
+	g.RecordLegacy(fresh, "5.6.7.8", false)
+	g.RecordLegacy(fresh, "5.6.7.8", false)
+	if n, _ := s.CountSigninAttempts(outcomeAllowlistRejected); n != 2 {
+		t.Fatalf("allowlist_rejected rows = %d, want 2 (unthrottled)", n)
+	}
+
+	// Nil gate: never panics, never records (gate-less unit-test Authenticators).
+	var nilGate *SigninGate
+	nilGate.RecordLegacy(ident, "1.2.3.4", true)
+	nilGate.RecordLegacy(ident, "1.2.3.4", false)
+}
+
+// TestSigninAttemptThrottleExpiry proves the clock actually expires: back-date
+// the identity's last-allowed mark and a new row is due.
+func TestSigninAttemptThrottleExpiry(t *testing.T) {
+	s := newStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := NewSigninGate(&Config{InviteSignup: true}, s, logger)
+	ident := Identity{Email: "user@example.com", Sub: "sub-1"}
+
+	g.recordAllowedThrottled(ident, "", "a")
+	g.mu.Lock()
+	g.lastAllowed[throttleKey(ident)] = time.Now().Add(-allowedLogInterval - time.Minute)
+	g.mu.Unlock()
+	g.recordAllowedThrottled(ident, "", "a")
+	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 2 {
+		t.Fatalf("allowed rows = %d, want 2 after interval expiry", n)
+	}
+}
