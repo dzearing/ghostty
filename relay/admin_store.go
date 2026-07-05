@@ -198,7 +198,7 @@ func (s *Store) DeleteAccount(id string) (bool, []string, error) {
 	defer tx.Rollback()
 
 	acct, err := s.scanAccount(tx.QueryRow(
-		`SELECT ` + accountCols + ` FROM accounts WHERE id = ?`, id,
+		`SELECT `+accountCols+` FROM accounts WHERE id = ?`, id,
 	))
 	if err != nil {
 		return false, nil, fmt.Errorf("lookup account: %w", err)

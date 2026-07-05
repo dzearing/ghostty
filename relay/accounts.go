@@ -49,11 +49,11 @@ const accountCols = `id, google_sub, email, status, COALESCE(invited_by_code,'')
 type InviteOutcome int
 
 const (
-	InviteOK InviteOutcome = iota
-	InviteBad              // code does not exist
-	InviteRevoked          // revoked_at set
-	InviteExpired          // past expires_at
-	InviteExhausted        // uses >= max_uses
+	InviteOK        InviteOutcome = iota
+	InviteBad                     // code does not exist
+	InviteRevoked                 // revoked_at set
+	InviteExpired                 // past expires_at
+	InviteExhausted               // uses >= max_uses
 )
 
 // signinOutcome returns the signin_attempts.outcome string for a failed

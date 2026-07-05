@@ -96,6 +96,26 @@ type Config struct {
 	// (ghoztty-relay.db) and, on legacy installs, the old devices.json.
 	StateDir string
 
+	// --- M4 quotas + rate limits (quotas.go / ratelimit.go) ---
+
+	// QuotaMaxDevices / QuotaMaxSessions are the DEFAULT per-account limits on
+	// enrolled devices and concurrent relay sessions. 0 = unlimited. Accounts
+	// may carry per-account overrides (accounts.max_devices / max_sessions,
+	// migration 0004; NULL = use these defaults, 0 = unlimited for that
+	// account). Sourced from QUOTA_MAX_DEVICES / QUOTA_MAX_SESSIONS
+	// (defaults 10 / 8). Zero-valued Configs built directly (tests) therefore
+	// get unlimited unless they opt in.
+	QuotaMaxDevices  int
+	QuotaMaxSessions int
+
+	// In-memory abuse-control rate limits, requests per minute; 0 disables a
+	// limiter. Buckets reset on restart (accepted for the single-VM beta).
+	// See ratelimit.go for where each one bites.
+	RateSigninPerMin     int // failed sign-ins per IP (RATELIMIT_SIGNIN_PER_MIN, default 10)
+	RateEnrollPerMin     int // enroll starts per IP (RATELIMIT_ENROLL_PER_MIN, default 6)
+	RateEnrollPollPerMin int // enroll polls per IP, backstop (RATELIMIT_ENROLL_POLL_PER_MIN, default 120)
+	RateConnectPerMin    int // client connects per identity (RATELIMIT_CONNECT_PER_MIN, default 60)
+
 	// --- Dev/test auth (MUST be off in production) ---
 
 	// DevAuth, when true, accepts a static bearer token (DevClientToken) as a
@@ -128,6 +148,14 @@ func LoadConfig() *Config {
 		DevClientToken:           os.Getenv("DEV_CLIENT_TOKEN"),
 		DevEmail:                 os.Getenv("DEV_EMAIL"),
 	}
+
+	// M4 quotas + rate limits (getenvInt lives in quotas.go).
+	cfg.QuotaMaxDevices = getenvInt("QUOTA_MAX_DEVICES", 10)
+	cfg.QuotaMaxSessions = getenvInt("QUOTA_MAX_SESSIONS", 8)
+	cfg.RateSigninPerMin = getenvInt("RATELIMIT_SIGNIN_PER_MIN", 10)
+	cfg.RateEnrollPerMin = getenvInt("RATELIMIT_ENROLL_PER_MIN", 6)
+	cfg.RateEnrollPollPerMin = getenvInt("RATELIMIT_ENROLL_POLL_PER_MIN", 120)
+	cfg.RateConnectPerMin = getenvInt("RATELIMIT_CONNECT_PER_MIN", 60)
 
 	for _, e := range strings.Split(os.Getenv("ALLOWED_EMAILS"), ",") {
 		e = strings.ToLower(strings.TrimSpace(e))

@@ -852,9 +852,10 @@ func TestMigration0003RoundTrip(t *testing.T) {
 		t.Fatalf("seed account: %v", err)
 	}
 
-	// Down one step: 0003 reverted, 0002 intact.
-	if err := goose.Down(db, "."); err != nil {
-		t.Fatalf("goose down: %v", err)
+	// Down to 0002: 0003 reverted (and any later migrations — M4 added 0004,
+	// so a single relative Down would only revert THAT), 0002 intact.
+	if err := goose.DownTo(db, ".", 2); err != nil {
+		t.Fatalf("goose down to 0002: %v", err)
 	}
 	if hasIsAdmin() || hasAuditTable() {
 		t.Fatalf("after down: is_admin=%v admin_audit=%v, want neither", hasIsAdmin(), hasAuditTable())

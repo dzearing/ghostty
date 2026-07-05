@@ -458,12 +458,15 @@ func (m *EnrollManager) Callback(ctx context.Context, code, state, ip string) (s
 		return "", errWebRejected
 	}
 
-	dev, rawToken, uerr := m.store.UpsertDevice(ident.Email, ident.Sub, name)
+	// M4: quota-aware upsert (device quota; rotation of an existing device is
+	// never counted — quotas.go).
+	dev, rawToken, uerr := m.upsertEnrolled(ident, name)
 	if uerr != nil {
-		m.finishWeb(handle, http.StatusInternalServerError, map[string]any{
-			"status": "error", "error": "internal error",
-		})
-		m.logger.Error("web enroll upsert failed", "err", uerr)
+		out := m.enrollUpsertFailed(name, uerr)
+		m.finishWeb(handle, out.status, out.body)
+		if isQuotaExceeded(uerr) {
+			return "", errWebQuota
+		}
 		return "", errWebInternal
 	}
 
@@ -642,7 +645,9 @@ func (m *EnrollManager) Poll(ctx context.Context, handle, relayBase, ip string) 
 		return pollOutcome{http.StatusForbidden, map[string]any{"status": "rejected"}}
 	}
 
-	dev, rawToken, uerr := m.store.UpsertDevice(ident.Email, ident.Sub, name)
+	// M4: quota-aware upsert (device quota; rotation of an existing device is
+	// never counted — quotas.go).
+	dev, rawToken, uerr := m.upsertEnrolled(ident, name)
 
 	// The grant is single-use at Google either way; drop the handle now.
 	m.mu.Lock()
@@ -650,11 +655,7 @@ func (m *EnrollManager) Poll(ctx context.Context, handle, relayBase, ip string) 
 	m.mu.Unlock()
 
 	if uerr != nil {
-		m.logger.Error("enroll upsert failed", "err", uerr)
-		return pollOutcome{http.StatusInternalServerError, map[string]any{
-			"status": "error",
-			"error":  "internal error",
-		}}
+		return m.enrollUpsertFailed(name, uerr)
 	}
 
 	m.logger.Info("device self-enrolled", "device", dev.ID, "owner", ident.Email, "name", dev.Name)

@@ -263,71 +263,9 @@ func (s *Store) CreateDevice(ownerEmail, ownerSub, name string) (*Device, string
 // read-modify-write is done in a single transaction so it cannot race a
 // concurrent mutation.
 func (s *Store) UpsertDevice(ownerEmail, ownerSub, name string) (*Device, string, error) {
-	rawToken, hash, err := newDeviceToken()
-	if err != nil {
-		return nil, "", err
-	}
-	ownerEmail = strings.ToLower(ownerEmail)
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, "", err
-	}
-	defer tx.Rollback()
-
-	// Oldest (owner, name) row wins deterministically; ties broken by id.
-	existing, err := scanDevice(tx.QueryRow(
-		`SELECT `+deviceCols+` FROM devices
-		 WHERE owner_email = ? AND name = ?
-		 ORDER BY created_at ASC, id ASC
-		 LIMIT 1`,
-		ownerEmail, name,
-	))
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, "", fmt.Errorf("lookup upsert target: %w", err)
-	}
-
-	if existing != nil {
-		existing.TokenHash = hash
-		if ownerSub != "" {
-			existing.OwnerSub = ownerSub
-		}
-		if _, err := tx.Exec(
-			`UPDATE devices SET token_hash = ?, owner_sub = ? WHERE id = ?`,
-			existing.TokenHash, existing.OwnerSub, existing.ID,
-		); err != nil {
-			return nil, "", fmt.Errorf("persist upsert: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, "", fmt.Errorf("persist upsert: %w", err)
-		}
-		return existing, rawToken, nil
-	}
-
-	dev := &Device{
-		ID:   uuid.NewString(),
-		Name: name,
-		// Device-code enrollment names the device after the machine's
-		// hostname, so at creation the two coincide. They diverge when the
-		// owner renames the device (rename never touches Hostname) and the
-		// hostname is thereafter refreshed by the agent's control connects.
-		Hostname:   name,
-		OwnerEmail: ownerEmail,
-		OwnerSub:   ownerSub,
-		TokenHash:  hash,
-		CreatedAt:  time.Now().UTC(),
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO devices (`+deviceCols+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		dev.ID, dev.Name, dev.Hostname, dev.OwnerEmail, dev.OwnerSub, dev.TokenHash, dev.CreatedAt,
-	); err != nil {
-		return nil, "", fmt.Errorf("persist device: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, "", fmt.Errorf("persist device: %w", err)
-	}
-	cp := *dev
-	return &cp, rawToken, nil
+	// M4: the full logic lives in UpsertDeviceLimited (quotas.go); maxDevices 0
+	// = no quota check, preserving this method's historical contract.
+	return s.UpsertDeviceLimited(ownerEmail, ownerSub, name, 0)
 }
 
 // SetHostname records the device's OS-reported hostname (from the agent's

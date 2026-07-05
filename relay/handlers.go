@@ -31,6 +31,8 @@ type Handler struct {
 	store  *Store
 	dir    *Directory
 	enroll *EnrollManager
+	quotas *Quotas       // M4 per-account limits (quotas.go)
+	rl     *RateLimiters // M4 abuse-control rate limits (ratelimit.go)
 	logger *slog.Logger
 
 	// adminSubs is the ADMIN_SUBS bootstrap allowlist as a set (admin.go).
@@ -43,15 +45,22 @@ func NewHandler(cfg *Config, auth *Authenticator, store *Store, dir *Directory, 
 	for _, s := range cfg.AdminSubs {
 		adminSubs[s] = true
 	}
-	return &Handler{
+	h := &Handler{
 		cfg:       cfg,
 		auth:      auth,
 		store:     store,
 		dir:       dir,
 		enroll:    NewEnrollManager(cfg, auth, store, logger),
+		quotas:    NewQuotas(cfg, store, dir, logger),
+		rl:        NewRateLimiters(cfg),
 		logger:    logger,
 		adminSubs: adminSubs,
 	}
+	// M4: bind the failed-sign-in limiter into the Authenticator (late bind,
+	// mirroring SetGate) so production and every test wiring get it through
+	// this one path with no main.go changes.
+	auth.SetRateLimits(h.rl)
+	return h
 }
 
 // Register attaches all routes to mux. Method+path patterns require Go 1.22+.
@@ -266,7 +275,7 @@ func (h *Handler) viewOf(d *Device) deviceView {
 func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	// Ownership is keyed on the caller's stable google_sub, with a legacy
@@ -286,7 +295,7 @@ func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
@@ -299,8 +308,13 @@ func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dev, rawToken, err := h.store.CreateDevice(email, ident.Sub, body.Name)
+	// M4: quota-aware create — the caller's device quota is enforced inside
+	// the create transaction (quotas.go).
+	dev, rawToken, err := h.createDeviceQuota(ident, body.Name)
 	if err != nil {
+		if h.writeQuotaExceeded(w, err) { // 409 + {"error","limit"}
+			return
+		}
 		h.logger.Error("enroll failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -322,7 +336,7 @@ func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
@@ -363,7 +377,7 @@ func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
@@ -395,10 +409,15 @@ func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
+
+	// M4: per-identity connect rate limit (429 + Retry-After).
+	if h.limitConnect(w, ident) {
+		return
+	}
 
 	deviceID := r.URL.Query().Get("device")
 	if deviceID == "" {
@@ -419,6 +438,12 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// M4: concurrent-session quota, checked pre-upgrade for a clean HTTP 409
+	// body; newOwnedSession re-enforces it atomically after the upgrade.
+	if h.writeSessionQuotaExceeded(w, ident) {
+		return
+	}
+
 	// All authz checks passed; upgrade to WebSocket.
 	c, err := websocket.Accept(w, r, acceptOptions)
 	if err != nil {
@@ -426,9 +451,8 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.CloseNow()
 
-	ps, err := h.dir.CreatePending(deviceID)
-	if err != nil {
-		c.Close(websocket.StatusTryAgainLater, "relay busy")
+	ps, ok := h.newOwnedSession(c, deviceID, ident)
+	if !ok {
 		return
 	}
 	// Always release the agent data handler (which blocks on ps.done) and drop
@@ -482,6 +506,12 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 // owner never needs it (existing-account/legacy-owner paths authorize without
 // a code), so the headless device flow keeps working unchanged for them.
 func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
+	// M4: per-IP rate limit — this endpoint is unauthenticated and mints
+	// upstream traffic + relay state, making it the most abusable one.
+	if h.limitEnrollStart(w, r) {
+		return
+	}
+
 	var body struct {
 		Name       string `json:"name"`
 		Flow       string `json:"flow"`
@@ -600,6 +630,11 @@ func (h *Handler) handleEnrollCallback(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, errWebExchange):
 		writeEnrollPage(w, http.StatusBadGateway, false, "Sign-in could not be completed",
 			"The code exchange with Google failed. Run the enrollment on the machine again.")
+	case errors.Is(err, errWebQuota):
+		// M4: device quota — same 409 the API paths use for quota refusals.
+		writeEnrollPage(w, http.StatusConflict, false, "Device limit reached",
+			"Your account already has its maximum number of machines. "+
+				"Remove one, then run the enrollment again.")
 	case err != nil:
 		writeEnrollPage(w, http.StatusInternalServerError, false, "Something went wrong",
 			"Run the enrollment on the machine again.")
@@ -617,6 +652,12 @@ func (h *Handler) handleEnrollCallback(w http.ResponseWriter, r *http.Request) {
 // device_token, relay_base} exactly once; denied/expired/rejected are
 // terminal.
 func (h *Handler) handleEnrollPoll(w http.ResponseWriter, r *http.Request) {
+	// M4: per-IP backstop behind the per-handle interval throttle below —
+	// that throttle is per enrollment, so handle-rotating callers need this.
+	if h.limitEnrollPoll(w, r) {
+		return
+	}
+
 	var body struct {
 		Handle string `json:"device_code_handle"`
 	}
