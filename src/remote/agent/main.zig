@@ -87,6 +87,7 @@ const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
 const ws_client = @import("../ws_client.zig");
 const tray = @import("tray.zig");
+const tray_account = @import("tray_account.zig");
 const enroll = @import("enroll.zig");
 const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
@@ -537,8 +538,9 @@ fn runListen(
             // Hand the MAIN thread to the tray message loop. It returns TRUE only if
             // the tray actually showed and the user picked Exit; FALSE if any tray
             // setup step failed (RegisterClass / CreateWindow / Shell_NotifyIcon).
-            // No relay link in listen mode → null (no Disconnect/Reconnect items).
-            if (tray.run(&store, agent_version, null)) {
+            // No relay link/account in listen mode → null (no Disconnect/Reconnect
+            // and no Sign in/out items).
+            if (tray.run(&store, agent_version, null, null)) {
                 // User chose Exit: a clean process exit tears down the (still-running)
                 // accept loop + reaper daemon threads.
                 std.process.exit(0);
@@ -829,6 +831,16 @@ fn runRelay(
         std.debug.print("ghoztty-agent: relay.env path unavailable ({s}); a re-enroll needs an agent restart\n", .{@errorName(err)});
     }
 
+    // Tray account controller (Sign in / Sign out + "Signed in as <email>").
+    // Reads the live creds + drives the link; borrows `base_url` (http(s) relay
+    // base) for whoami/deEnroll/enroll. Lives on this frame (outlives the tray).
+    var acct_host_buf: [256]u8 = undefined;
+    const acct_name = hostName(&acct_host_buf) orelse "unknown-host";
+    var account = tray_account.TrayAccount.init(alloc, base_url, acct_name, &creds, &link);
+    // Populate "Signed in as <email>" in the background so the first menu open
+    // shows it (best-effort; a menu opened before it lands just shows "Signed in").
+    account.requestRefresh();
+
     // The relay control loop is the whole daemon. WHERE it runs depends on the
     // tray, exactly mirroring `runListen`'s accept-loop placement.
     if (builtin.os.tag == .windows and !headless) {
@@ -842,7 +854,7 @@ fn runRelay(
             .link = &link,
         };
         if (std.Thread.spawn(.{}, relayLoopThread, .{args})) |t| {
-            if (tray.run(&store, agent_version, &link)) {
+            if (tray.run(&store, agent_version, &link, &account)) {
                 std.process.exit(0); // user chose Exit (from any link state)
             }
             // Tray setup failed: park the main thread on the (already-serving)

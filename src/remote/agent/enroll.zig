@@ -368,6 +368,97 @@ pub fn loadDeviceToken(alloc: Allocator) ?[]u8 {
     return null;
 }
 
+/// Delete the agent's relay.env (and any leftover `.tmp` sibling). Best-effort:
+/// a missing file is success. Used by "Sign out" to drop the local credential
+/// so a restart won't silently reconnect.
+pub fn clearLocalCredential(alloc: Allocator) void {
+    const path = relayEnvPath(alloc) catch return;
+    defer alloc.free(path);
+    std.fs.cwd().deleteFile(path) catch {};
+    const tmp = std.fmt.allocPrint(alloc, "{s}.tmp", .{path}) catch return;
+    defer alloc.free(tmp);
+    std.fs.cwd().deleteFile(tmp) catch {};
+}
+
+/// The account a device token is bound to, as reported by `/v1/agent/whoami`.
+/// All fields are owned by the caller (free via `deinit`).
+pub const WhoamiResult = struct {
+    email: []u8,
+    device_id: []u8,
+    name: []u8,
+
+    pub fn deinit(self: *WhoamiResult, alloc: Allocator) void {
+        alloc.free(self.email);
+        alloc.free(self.device_id);
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+/// Ask the relay which account this device token is bound to — the data the
+/// tray shows as "Signed in as <email>". `GET <base>/v1/agent/whoami` with the
+/// bearer token. Returns null on ANY failure (network, non-200, parse, OOM): the
+/// caller falls back to a neutral "Signed in" rather than surfacing an error.
+pub fn whoami(alloc: Allocator, relay_base: []const u8, token: []const u8) ?WhoamiResult {
+    const base = std.mem.trimRight(u8, relay_base, "/");
+    const url = std.fmt.allocPrint(alloc, "{s}/v1/agent/whoami", .{base}) catch return null;
+    defer alloc.free(url);
+
+    var resp = http_client.getAuth(alloc, url, token, 64 * 1024) catch return null;
+    defer resp.deinit(alloc);
+    if (resp.status != 200) return null;
+
+    const Wire = struct {
+        email: []const u8 = "",
+        device_id: []const u8 = "",
+        name: []const u8 = "",
+    };
+    const parsed = std.json.parseFromSlice(Wire, alloc, resp.body, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    // Dupe all three out of the arena; free what we have on a mid-way OOM so we
+    // never leak a partial result.
+    const email = alloc.dupe(u8, parsed.value.email) catch return null;
+    const device_id = alloc.dupe(u8, parsed.value.device_id) catch {
+        alloc.free(email);
+        return null;
+    };
+    const name = alloc.dupe(u8, parsed.value.name) catch {
+        alloc.free(email);
+        alloc.free(device_id);
+        return null;
+    };
+    return .{ .email = email, .device_id = device_id, .name = name };
+}
+
+/// Revoke this device on the relay AND delete the local credential — the
+/// "Sign out" action. `POST <base>/v1/agent/deenroll` with the bearer token
+/// deletes the device server-side (its token hash is gone, so it can never
+/// reconnect), then relay.env is cleared locally. A 204 (revoked) or a 401
+/// (token already dead — a prior de-enroll) both count as signed out; anything
+/// else is a hard failure the caller can surface. The local file is cleared
+/// regardless, best-effort.
+pub fn deEnroll(alloc: Allocator, relay_base: []const u8, token: []const u8) !void {
+    const base = std.mem.trimRight(u8, relay_base, "/");
+    const url = try std.fmt.allocPrint(alloc, "{s}/v1/agent/deenroll", .{base});
+    defer alloc.free(url);
+
+    const status: u16 = blk: {
+        var resp = http_client.postAuth(alloc, url, token, null) catch |err| {
+            // Couldn't reach the relay: leave the local credential in place so a
+            // retry can still revoke it, and report the failure.
+            return err;
+        };
+        defer resp.deinit(alloc);
+        break :blk resp.status;
+    };
+    if (status != 204 and status != 401) return error.DeenrollFailed;
+
+    clearLocalCredential(alloc);
+}
+
 // -----------------------------------------------------------------------------
 // The enroll driver
 // -----------------------------------------------------------------------------

@@ -50,6 +50,8 @@ func NewHandler(cfg *Config, auth *Authenticator, store *Store, dir *Directory, 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/agent/control", h.handleAgentControl)
 	mux.HandleFunc("GET /v1/agent/data", h.handleAgentData)
+	mux.HandleFunc("GET /v1/agent/whoami", h.handleAgentWhoami)
+	mux.HandleFunc("POST /v1/agent/deenroll", h.handleAgentDeenroll)
 	mux.HandleFunc("GET /v1/client/devices", h.handleListDevices)
 	mux.HandleFunc("POST /v1/client/devices", h.handleEnrollDevice)
 	mux.HandleFunc("PATCH /v1/client/devices/{id}", h.handleRenameDevice)
@@ -176,6 +178,52 @@ func (h *Handler) handleAgentData(w http.ResponseWriter, r *http.Request) {
 	// until it signals completion so this HTTP handler (and its hijacked socket)
 	// stays alive for the lifetime of the bridge.
 	<-ps.done
+}
+
+// handleAgentWhoami: GET /v1/agent/whoami (JSON).
+// Device-authenticated. Returns the account the device token is bound to, so
+// the agent's tray can show "Signed in as <email>". The agent only persists the
+// opaque token locally (never the email), so it asks the relay who it is.
+func (h *Handler) handleAgentWhoami(w http.ResponseWriter, r *http.Request) {
+	dev, err := h.auth.AuthenticateDevice(r, h.store)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"email":     dev.OwnerEmail,
+		"device_id": dev.ID,
+		"name":      dev.Name,
+		"hostname":  dev.Hostname,
+	})
+}
+
+// handleAgentDeenroll: POST /v1/agent/deenroll (no body).
+// Device-authenticated SELF de-enroll: the agent revokes its own registration.
+// Deletes the device the token belongs to (revoking the token hash) and severs
+// any live connection. This is the relay side of the tray's "Sign out". The
+// agent clears its local relay.env after this succeeds. Idempotent from the
+// caller's view: a token that no longer maps to a device just 401s.
+func (h *Handler) handleAgentDeenroll(w http.ResponseWriter, r *http.Request) {
+	dev, err := h.auth.AuthenticateDevice(r, h.store)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Reuse the owner-scoped delete (the device's own owner always matches).
+	deleted, err := h.store.DeleteDevice(dev.ID, dev.OwnerEmail)
+	if err != nil {
+		h.logger.Error("self de-enroll failed", "device", dev.ID, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if deleted {
+		// Credential revoked (hash gone) — now sever anything still live.
+		h.dir.KickDevice(dev.ID)
+		h.logger.Info("device self de-enrolled", "device", dev.ID, "owner", dev.OwnerEmail)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Client endpoints ------------------------------------------------------
