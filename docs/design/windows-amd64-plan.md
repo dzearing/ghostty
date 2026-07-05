@@ -223,3 +223,31 @@ forensically confirmed but awaits the next on-box run.
   Windows today); font = `.freetype_windows` (in-tree default for Windows).
 - 2026-07-05: Default shell on Windows = existing core behavior (`cmd.exe`,
   per `termio/Exec.zig`); revisit pwsh detection post-beta.
+
+## Second install-failure (build 26.7.502): self-upgrade deleted the exe
+
+Symptom: install "succeeded" (status 0), Start Menu entry created, but the
+shortcut can't find the exe. Verbose log (`ghoztty-install.log`) showed:
+
+    Disallowing installation of component {B646...ghoztty.exe} since the same
+    component with higher versioned keyfile exists
+    Component: C_ghoztty.exe; Installed: Local; Request: Absent; Action: Absent
+    FileRemove(FileName=ghoztty.exe, ...)
+    ShortcutCreate(... FileName=...\Ghoztty\ghoztty.exe)
+
+Cause: re-running the MSI (after the earlier attempts left state) triggered
+the major-upgrade path. `RemoveExistingProducts` removed the prior product's
+`ghoztty.exe`, but the file-copy for the new product was *skipped*
+("disallowing installation … same component with higher versioned keyfile"),
+so the net result was: exe removed, shortcut created pointing at nothing.
+Classic MSI RemoveExistingProducts-vs-file-versioning footgun, made worse by
+every file carrying the exe-less versioning and a self-referential
+UpgradeCode range.
+
+Decision: **ship a portable ZIP for the beta** (`Ghoztty-portable-x64.zip` =
+`Ghoztty\ghoztty.exe` + `share\`), no installer. Double-click the exe, the
+terminal opens. This is the reliable path to "see it run"; the MSI upgrade
+logic needs a proper fix (sequence RExP early / use per-file real versions /
+distinct component GUIDs per build) before it's trustworthy — deferred.
+Users with the broken MSI install should uninstall "Ghoztty" from Apps &
+Features first.
