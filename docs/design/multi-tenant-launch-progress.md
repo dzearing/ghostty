@@ -30,7 +30,7 @@ SQLite (WAL) + Litestream · React (Vite) SPA + Recharts · Prometheus · single
 | M | Name | Branch | State | Depends on |
 |---|------|--------|-------|-----------|
 | M0 | SQLite foundation | `mt/m0-sqlite` | **merged** → main `8a328e120` (re-verified: build/vet/race-tests/static-build). NOT yet deployed to prod. | — |
-| M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **next — launch this** | M0 ✓ |
+| M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **in worktree** — agent launched 2026-07-05, staged behind `INVITE_SIGNUP` flag (default OFF); awaiting agent + review; STOP before live cutover | M0 ✓ |
 | M2 | Admin API + admin auth | `mt/m2-admin-api` | pending | M1 |
 | M3 | Admin portal UI (React) | `mt/m3-admin-portal` | pending | M2 |
 | M4 | Quotas + rate limits | `mt/m4-quotas` | pending | M1 (parallel w/ M2/M3) |
