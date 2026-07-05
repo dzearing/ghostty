@@ -5,9 +5,18 @@ FRESH context (after `/clear`) can resume with zero prior memory. The detailed
 plan is `docs/design/multi-tenant-launch-plan.md`; this file tracks *where we are*
 and *what to do next*.
 
-Last updated: 2026-07-05 (M0+M1+M2+M4+M5a ALL merged; M3 portal in worktree;
-production cutover of M1 auth is PENDING — human checkpoint; nothing deployed
-to prod yet).
+Last updated: 2026-07-05 evening. M0–M4+M5a ALL merged. **DEPLOYED TO PROD**
+(user-approved restart 23:09 UTC): SQLite live (2 devices imported), admin API
+live (`ADMIN_SUBS=113035548042046169952` = dzearing's real sub), portal live at
+https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/admin (Caddy
+`handle_path /admin*` → /var/www/ghoztty-admin-portal; PORTAL_BASE=/admin/
+build; portal-config.json has the web client ID), metrics on VM-loopback :9091,
+both agents auto-reconnected. **INVITE_SIGNUP still OFF — the M1 auth cutover
+remains the pending human checkpoint.** Rollback binary:
+/usr/local/bin/ghoztty-relay.bak-pre-m0 on the VM.
+Possible snag: browser Google sign-in needs the relay host as an Authorized
+JavaScript origin on the ghoztty-web OAuth client (Cloud Console, user-only) —
+unverified until the user's first real portal sign-in.
 
 ## Merge-composition notes (M2∥M4∥M5a, resolved 2026-07-05)
 - `mSessionsTotal.Inc()` (M5a) lives in `CreatePendingOwned` (quotas.go) — the
@@ -59,7 +68,7 @@ SQLite (WAL) + Litestream · React (Vite) SPA + Recharts · Prometheus · single
 | M0 | SQLite foundation | `mt/m0-sqlite` | **merged** → main `8a328e120` (re-verified: build/vet/race-tests/static-build). NOT yet deployed to prod. | — |
 | M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **merged** → main `40066364e` (re-verified: build/vet/race-tests/static-build). Staged behind `INVITE_SIGNUP` (default OFF) — **live cutover NOT done** (human checkpoint; see M1 handoff below). | M0 ✓ |
 | M2 | Admin API + admin auth | `mt/m2-admin-api` | **merged** → main `18e4c1fb5` (re-verified: build/vet/race/static). `/v1/admin/*` REST; `ADMIN_SUBS` env bootstrap + `accounts.is_admin`; `admin_audit` (0003). NOT deployed. | M1 ✓ |
-| M3 | Admin portal UI (React) | `mt/m3-admin-portal` | **in worktree** — agent launched 2026-07-05. **Design bar (user): clean, intuitive, well designed; very powerful but also elegant** — visual quality reviewed on screenshots (committed to docs/design/m3-portal-screenshots/) BEFORE merge. `portal/` at repo root, GIS browser sign-in (web client aud already accepted), zero relay changes. | M2 ✓ |
+| M3 | Admin portal UI (React) | `mt/m3-admin-portal` | **merged** `d7ae7001d` + **deployed** at /admin (user design-approved after live try-out). Follow-ups noted: quota screen (M4 seams), attempts pagination cursor, /v1/admin/stats, accounts-row density nit. | M2 ✓ |
 | M4 | Quotas + rate limits | `mt/m4-quotas` | **merged** → main `1a63d034e` (composed with M2+M5a; re-verified). Quotas: `QUOTA_MAX_DEVICES=10`/`QUOTA_MAX_SESSIONS=8`, per-account overrides (0004, NULL=default 0=unlimited), 409 JSON. Rate limits: per-IP signin(10/min, charged on failure only)/enroll(6/min)/poll(120/min), per-identity connect(60/min), 429+Retry-After; in-memory, reset-on-restart. Rotation never quota-checked. Admin surfacing seams: `Quotas.LimitsFor/UsageFor`, `Store.Get/SetQuotaOverrides` — wire into /v1/admin later (small follow-up). NOT deployed. | M1 ✓ |
 | M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | **merged** → main (after M2; clean, re-verified). `/metrics` on internal listener `METRICS_ADDR` (default 127.0.0.1:9091, `off` disables); `ghoztty_relay_*` families. Prometheus standup on the VM = human checkpoint (scrape target 127.0.0.1:9091; do NOT expose in NSG/Caddy). NOT deployed. | M0 ✓ |
 | M5b | Portal availability + usage charts | `mt/m5b-portal-charts` | pending | M3, M5a |
