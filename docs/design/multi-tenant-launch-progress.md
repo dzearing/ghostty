@@ -5,9 +5,19 @@ FRESH context (after `/clear`) can resume with zero prior memory. The detailed
 plan is `docs/design/multi-tenant-launch-plan.md`; this file tracks *where we are*
 and *what to do next*.
 
-Last updated: 2026-07-05 (M0+M1+M2+M5a merged; M4 in worktree; M3 unblocked —
-launch next with the design bar below; production cutover of M1 auth is PENDING —
-human checkpoint; nothing deployed to prod yet).
+Last updated: 2026-07-05 (M0+M1+M2+M4+M5a ALL merged; M3 portal in worktree;
+production cutover of M1 auth is PENDING — human checkpoint; nothing deployed
+to prod yet).
+
+## Merge-composition notes (M2∥M4∥M5a, resolved 2026-07-05)
+- `mSessionsTotal.Inc()` (M5a) lives in `CreatePendingOwned` (quotas.go) — the
+  single session-creation choke point after M4's delegation. Don't re-add to
+  `CreatePending`.
+- `TestMigration0003RoundTrip` uses `goose.DownTo(2)` (a relative Down would
+  revert 0004, not 0003). Future migration tests: pin versions, never relative.
+- Known follow-up (small): admin API endpoints for quota overrides/usage via
+  M4's seams (`Quotas.UsageFor`, `Store.SetQuotaOverrides`) + portal screen —
+  fold into M3 review or a follow-up patch.
 
 ## M2 handoff facts (for M3, the portal UI)
 - Admin auth: Bearer token, verified via full OIDC; admin = sub ∈ `ADMIN_SUBS`
@@ -50,7 +60,7 @@ SQLite (WAL) + Litestream · React (Vite) SPA + Recharts · Prometheus · single
 | M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **merged** → main `40066364e` (re-verified: build/vet/race-tests/static-build). Staged behind `INVITE_SIGNUP` (default OFF) — **live cutover NOT done** (human checkpoint; see M1 handoff below). | M0 ✓ |
 | M2 | Admin API + admin auth | `mt/m2-admin-api` | **merged** → main `18e4c1fb5` (re-verified: build/vet/race/static). `/v1/admin/*` REST; `ADMIN_SUBS` env bootstrap + `accounts.is_admin`; `admin_audit` (0003). NOT deployed. | M1 ✓ |
 | M3 | Admin portal UI (React) | `mt/m3-admin-portal` | **in worktree** — agent launched 2026-07-05. **Design bar (user): clean, intuitive, well designed; very powerful but also elegant** — visual quality reviewed on screenshots (committed to docs/design/m3-portal-screenshots/) BEFORE merge. `portal/` at repo root, GIS browser sign-in (web client aud already accepted), zero relay changes. | M2 ✓ |
-| M4 | Quotas + rate limits | `mt/m4-quotas` | **in worktree** — agent launched 2026-07-05 (migration 0004 assigned; env defaults + DB overrides; store seams only, no admin HTTP) | M1 ✓ (parallel w/ M2/M3) |
+| M4 | Quotas + rate limits | `mt/m4-quotas` | **merged** → main `1a63d034e` (composed with M2+M5a; re-verified). Quotas: `QUOTA_MAX_DEVICES=10`/`QUOTA_MAX_SESSIONS=8`, per-account overrides (0004, NULL=default 0=unlimited), 409 JSON. Rate limits: per-IP signin(10/min, charged on failure only)/enroll(6/min)/poll(120/min), per-identity connect(60/min), 429+Retry-After; in-memory, reset-on-restart. Rotation never quota-checked. Admin surfacing seams: `Quotas.LimitsFor/UsageFor`, `Store.Get/SetQuotaOverrides` — wire into /v1/admin later (small follow-up). NOT deployed. | M1 ✓ |
 | M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | **merged** → main (after M2; clean, re-verified). `/metrics` on internal listener `METRICS_ADDR` (default 127.0.0.1:9091, `off` disables); `ghoztty_relay_*` families. Prometheus standup on the VM = human checkpoint (scrape target 127.0.0.1:9091; do NOT expose in NSG/Caddy). NOT deployed. | M0 ✓ |
 | M5b | Portal availability + usage charts | `mt/m5b-portal-charts` | pending | M3, M5a |
 | M6 | Launch hardening / ops | `mt/m6-ops` | pending | M3, M4, M5 |
