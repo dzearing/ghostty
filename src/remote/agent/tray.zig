@@ -44,6 +44,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("session.zig");
 const link_control = @import("link_control.zig");
+const tray_account = @import("tray_account.zig");
 
 /// Show the agent tray icon and run the Win32 message loop until the user picks
 /// Exit. BLOCKS the calling thread (must be the main thread — see the module doc).
@@ -61,13 +62,17 @@ const link_control = @import("link_control.zig");
 /// mode, where there is no relay link): non-null adds a status line plus a
 /// Disconnect/Reconnect item to the menu and a live-status tooltip. Its methods
 /// are thread-safe, so the message-pump thread may call them directly.
+/// `account` is the sign in/out controller (relay mode only; null in `--listen`):
+/// non-null adds the "Signed in as <email>" line and the Sign in/out item. Its
+/// `view`/`request*` methods are thread-safe (workers run off the pump thread).
 pub fn run(
     store: *session.SessionStore,
     build_hash: []const u8,
     link: ?*link_control.LinkControl,
+    account: ?*tray_account.TrayAccount,
 ) bool {
     if (builtin.os.tag != .windows) return false;
-    return win.run(store, build_hash, link);
+    return win.run(store, build_hash, link, account);
 }
 
 /// One-shot PRE-TRAY error surface: a plain error message box on Windows,
@@ -122,19 +127,34 @@ const win = if (builtin.os.tag == .windows) struct {
     const ID_EXIT: UINT = 1003;
     const ID_DISCONNECT: UINT = 1004;
     const ID_RECONNECT: UINT = 1005;
+    const ID_SIGNOUT: UINT = 1006;
+    const ID_SIGNIN: UINT = 1007;
 
     // AppendMenuW flags.
     const MF_STRING: UINT = 0x0000;
     const MF_GRAYED: UINT = 0x0001;
     const MF_DISABLED: UINT = 0x0002;
+    const MF_POPUP: UINT = 0x0010;
     const MF_SEPARATOR: UINT = 0x0800;
 
     // TrackPopupMenu flags.
     const TPM_RIGHTBUTTON: UINT = 0x0002;
     const TPM_BOTTOMALIGN: UINT = 0x0020;
 
-    // LoadIconW well-known icon (IDI_APPLICATION).
+    // LoadIconW well-known icon (IDI_APPLICATION) — last-resort fallback only.
     const IDI_APPLICATION: usize = 32512;
+
+    // Our embedded icon's resource id (see dist/windows/ghoztty-agent.rc). As a
+    // MAKEINTRESOURCE value it is just the integer id.
+    const ICON_RES_ID: usize = 1;
+
+    // LoadImageW image type + load flags.
+    const IMAGE_ICON: UINT = 1;
+    const LR_DEFAULTCOLOR: UINT = 0x0000;
+
+    // GetSystemMetrics indices for the small-icon dimensions (tray size).
+    const SM_CXSMICON: i32 = 49;
+    const SM_CYSMICON: i32 = 50;
 
     // MessageBoxW flags.
     const MB_OK: UINT = 0x0000;
@@ -220,6 +240,8 @@ const win = if (builtin.os.tag == .windows) struct {
     extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
     extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.winapi) void;
     extern "user32" fn LoadIconW(hInstance: ?HINSTANCE, lpIconName: usize) callconv(.winapi) ?HICON;
+    extern "user32" fn LoadImageW(hInst: ?HINSTANCE, name: usize, imageType: UINT, cx: i32, cy: i32, fuLoad: UINT) callconv(.winapi) ?HICON;
+    extern "user32" fn GetSystemMetrics(nIndex: i32) callconv(.winapi) i32;
     extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
     extern "user32" fn DestroyMenu(hMenu: HMENU) callconv(.winapi) BOOL;
     extern "user32" fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: ?[*:0]const u16) callconv(.winapi) BOOL;
@@ -241,6 +263,10 @@ const win = if (builtin.os.tag == .windows) struct {
     /// Disconnect/Reconnect UI). Thread-safe by contract; the message-pump
     /// thread calls disconnect/reconnect/display on it directly.
     var g_link: ?*link_control.LinkControl = null;
+    /// Sign in/out controller, or null in `--listen` mode (no account section).
+    /// Thread-safe: the message-pump thread reads `view` and calls `request*`
+    /// (which spawn workers), never blocking on network/browser work.
+    var g_account: ?*tray_account.TrayAccount = null;
     var g_nid: NOTIFYICONDATAW = undefined; // retained so Exit can NIM_DELETE it.
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyAgentTrayWnd");
@@ -255,18 +281,25 @@ const win = if (builtin.os.tag == .windows) struct {
         store: *session.SessionStore,
         build_hash: []const u8,
         link: ?*link_control.LinkControl,
+        account: ?*tray_account.TrayAccount,
     ) bool {
         g_store = store;
         g_build_hash = build_hash;
         g_link = link;
+        g_account = account;
 
         const hinst = GetModuleHandleW(null) orelse return false;
+
+        // Our embedded ghost icon, reused for the window class and the tray.
+        const app_icon = loadAppIcon(hinst);
 
         var wc: WNDCLASSEXW = .{
             .cbSize = @sizeOf(WNDCLASSEXW),
             .style = 0,
             .lpfnWndProc = wndProc,
             .hInstance = hinst,
+            .hIcon = app_icon,
+            .hIconSm = app_icon,
             .lpszClassName = class_name,
         };
         // RegisterClassExW returns 0 on failure. A duplicate-class error (if the
@@ -299,7 +332,7 @@ const win = if (builtin.os.tag == .windows) struct {
             .uID = 1,
             .uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
             .uCallbackMessage = WM_TRAY,
-            .hIcon = LoadIconW(null, IDI_APPLICATION),
+            .hIcon = app_icon,
         };
         copyTip(&g_nid.szTip, tray_tip);
         setTipText(); // relay mode: reflect the link state from the start
@@ -345,6 +378,21 @@ const win = if (builtin.os.tag == .windows) struct {
         _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     }
 
+    /// Load the embedded ghost icon (resource id 1) from our own module. Prefers
+    /// a crisp small icon sized for the tray (LoadImageW at the system small-icon
+    /// size), then a default-size LoadIconW, and only as a last resort the generic
+    /// IDI_APPLICATION — so a resource/link mishap degrades instead of showing no
+    /// icon at all.
+    fn loadAppIcon(hinst: HINSTANCE) ?HICON {
+        var cx = GetSystemMetrics(SM_CXSMICON);
+        var cy = GetSystemMetrics(SM_CYSMICON);
+        if (cx <= 0) cx = 16;
+        if (cy <= 0) cy = 16;
+        if (LoadImageW(hinst, ICON_RES_ID, IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR)) |h| return h;
+        if (LoadIconW(hinst, ICON_RES_ID)) |h| return h;
+        return LoadIconW(null, IDI_APPLICATION);
+    }
+
     /// Copy a NUL-terminated UTF-16 literal into a fixed szTip buffer (truncating).
     fn copyTip(dst: []u16, src: [*:0]const u16) void {
         var i: usize = 0;
@@ -385,6 +433,17 @@ const win = if (builtin.os.tag == .windows) struct {
                         if (g_link) |lk| lk.reconnect();
                         updateTip();
                     },
+                    ID_SIGNOUT => {
+                        // Full de-enroll: revoke on the relay + clear the local
+                        // credential + park the link. Runs on a worker thread so
+                        // the pump never blocks; the menu reflects it next open.
+                        if (g_account) |ac| ac.requestSignOut();
+                    },
+                    ID_SIGNIN => {
+                        // Interactive re-enroll (opens the browser) on a worker
+                        // thread, then adopts the new token + un-parks the link.
+                        if (g_account) |ac| ac.requestSignIn();
+                    },
                     ID_EXIT => onExit(),
                     else => {},
                 }
@@ -403,19 +462,41 @@ const win = if (builtin.os.tag == .windows) struct {
     /// Win32 quirk), hence the SetForegroundWindow + trailing null PostMessage.
     fn showMenu(hwnd: HWND) void {
         const menu = CreatePopupMenu() orelse return;
-        defer _ = DestroyMenu(menu);
+        defer _ = DestroyMenu(menu); // frees attached submenus too
+
+        // Snapshot the account state ONCE (email copied into a stack buffer so we
+        // never hold the account lock across a UI call). Null in `--listen` mode.
+        var email_buf: [320]u8 = undefined;
+        const acct: ?tray_account.TrayAccount.View =
+            if (g_account) |ac| ac.view(&email_buf) else null;
 
         // Header (disabled): "Ghoztty Agent <hash>".
         var hdr_buf: [128]u16 = undefined;
         const hdr = fmtUtf16(&hdr_buf, "Ghoztty Agent ", g_build_hash, "");
         _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, hdr);
+
+        // Account status line (relay mode): the account this machine is bound to.
+        if (acct) |av| {
+            var acc_buf: [384]u16 = undefined;
+            const line = switch (av.status) {
+                .signed_in => if (av.email.len > 0)
+                    fmtUtf16(&acc_buf, "Signed in as ", av.email, "")
+                else
+                    lit("Signed in"),
+                .signed_out => lit("Not signed in"),
+                .working => lit("Working\u{2026}"),
+            };
+            _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, line);
+        }
         _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
-        // Relay-link section (relay mode only): a status line + ONE item that
-        // retitles by state — "Disconnect" while connected/reconnecting,
-        // "Reconnect" while disconnected-by-user. `--listen` mode (g_link null)
-        // shows none of this.
-        if (g_link) |lk| {
+        // Relay-link section: a status line + ONE item that retitles by state
+        // ("Disconnect from relay" while connected/reconnecting, "Reconnect to
+        // relay" while disconnected-by-user). Hidden when signed out (there is no
+        // credential to dial) and in `--listen` mode (g_link null).
+        const show_link = g_link != null and (acct == null or acct.?.status != .signed_out);
+        if (show_link) {
+            const lk = g_link.?;
             var st_buf: [160]u16 = undefined;
             const d = lk.display();
             const st = switch (d) {
@@ -425,21 +506,31 @@ const win = if (builtin.os.tag == .windows) struct {
             };
             _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, st);
             if (d == .offline) {
-                _ = AppendMenuW(menu, MF_STRING, ID_RECONNECT, lit("Reconnect"));
+                _ = AppendMenuW(menu, MF_STRING, ID_RECONNECT, lit("Reconnect to relay"));
             } else {
-                _ = AppendMenuW(menu, MF_STRING, ID_DISCONNECT, lit("Disconnect"));
+                _ = AppendMenuW(menu, MF_STRING, ID_DISCONNECT, lit("Disconnect from relay"));
             }
             _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
         }
 
-        _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, lit("About"));
-
-        // Sessions section, snapshotted fresh under the store lock.
-        appendSessions(menu);
+        // Sessions as a SUBMENU (rows live inside it, not as top-level siblings).
+        appendSessionsSubmenu(menu);
+        _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
         _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, lit("Check for updates"));
-        _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
-        _ = AppendMenuW(menu, MF_STRING, ID_EXIT, lit("Exit"));
+
+        // Sign in / out (relay mode). Grayed while an op is in flight.
+        if (acct) |av| {
+            switch (av.status) {
+                .signed_in => _ = AppendMenuW(menu, MF_STRING, ID_SIGNOUT, lit("Sign out")),
+                .signed_out => _ = AppendMenuW(menu, MF_STRING, ID_SIGNIN, lit("Sign in\u{2026}")),
+                .working => _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, lit("Working\u{2026}")),
+            }
+        }
+
+        // About directly above Exit (grouped at the bottom, standard convention).
+        _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, lit("About"));
+        _ = AppendMenuW(menu, MF_STRING, ID_EXIT, lit("Quit Ghoztty Agent"));
 
         var pt: POINT = undefined;
         _ = GetCursorPos(&pt);
@@ -462,12 +553,33 @@ const win = if (builtin.os.tag == .windows) struct {
         }
     };
 
+    /// Append a "Sessions (N)" SUBMENU to `parent`, with one disabled row per
+    /// live session INSIDE the submenu (not as siblings of the top-level items).
+    /// The submenu is attached with MF_POPUP, so `DestroyMenu(parent)` frees it.
+    fn appendSessionsSubmenu(parent: HMENU) void {
+        const sub = CreatePopupMenu() orelse {
+            // Can't build a submenu — degrade to a single disabled inline label
+            // rather than dropping the section entirely.
+            _ = AppendMenuW(parent, MF_STRING | MF_GRAYED | MF_DISABLED, 0, lit("Sessions"));
+            return;
+        };
+
+        const total = appendSessionRows(sub);
+
+        var hdr_buf: [64]u16 = undefined;
+        var num_buf: [20]u8 = undefined;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{total}) catch "?";
+        const hdr = fmtUtf16(&hdr_buf, "Sessions (", num, ")");
+        // MF_POPUP: uIDNewItem carries the submenu handle, not a command id.
+        _ = AppendMenuW(parent, MF_STRING | MF_POPUP, @intFromPtr(sub), hdr);
+    }
+
     /// Snapshot up to N live sessions UNDER the store lock (copying out pid + a
-    /// label into stack memory), then append them to `menu` as disabled rows —
+    /// label into stack memory), then append them to `target` as disabled rows —
     /// releasing the lock BEFORE any AppendMenuW call (never hold the store lock
-    /// across a UI call; the `session.zig` discipline).
-    fn appendSessions(menu: HMENU) void {
-        const store = g_store orelse return;
+    /// across a UI call; the `session.zig` discipline). Returns the live count.
+    fn appendSessionRows(target: HMENU) usize {
+        const store = g_store orelse return 0;
 
         const max_rows = 32;
         var rows: [max_rows]SessionRow = undefined;
@@ -499,16 +611,9 @@ const win = if (builtin.os.tag == .windows) struct {
         }
         store.mutex.unlock();
 
-        // Header line: "Sessions (N)".
-        var hdr_buf: [64]u16 = undefined;
-        var num_buf: [20]u8 = undefined;
-        const num = std.fmt.bufPrint(&num_buf, "{d}", .{total}) catch "?";
-        const hdr = fmtUtf16(&hdr_buf, "Sessions (", num, ")");
-        _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, hdr);
-
         if (total == 0) {
-            _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, lit("  (no active sessions)"));
-            return;
+            _ = AppendMenuW(target, MF_STRING | MF_GRAYED | MF_DISABLED, 0, lit("(no active sessions)"));
+            return 0;
         }
 
         var i: usize = 0;
@@ -516,10 +621,11 @@ const win = if (builtin.os.tag == .windows) struct {
             const row = &rows[i];
             var line_buf: [160]u16 = undefined;
             var pid_buf: [24]u8 = undefined;
-            const pid_str = std.fmt.bufPrint(&pid_buf, "  {d}  ", .{row.pid}) catch "  ?  ";
+            const pid_str = std.fmt.bufPrint(&pid_buf, "{d}  ", .{row.pid}) catch "?  ";
             const line = fmtUtf16(&line_buf, pid_str, row.label(), "");
-            _ = AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, line);
+            _ = AppendMenuW(target, MF_STRING | MF_GRAYED | MF_DISABLED, 0, line);
         }
+        return total;
     }
 
     fn onAbout(hwnd: HWND) void {

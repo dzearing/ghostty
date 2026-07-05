@@ -1,0 +1,25 @@
+// Windows resources for ghoztty-agent.exe (the remote-machines daemon).
+// LANG_NEUTRAL(0), SUBLANG_NEUTRAL(0)
+LANGUAGE 0, 0
+
+// Icon id 1 is the lowest-numbered ICON, so Explorer uses it as the exe's icon
+// AND the tray loads it by this id (see tray.zig `LoadImageW`/`LoadIconW`).
+#define ID_ICON_AGENT 1
+ID_ICON_AGENT ICON "ghostty.ico"
+
+VS_VERSION_INFO VERSIONINFO
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+        VALUE "OriginalFilename", "ghoztty-agent.exe"
+        VALUE "ProductName",      "Ghoztty Agent"
+        VALUE "FileDescription",  "Ghoztty remote-machines agent"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409,1200
+    END
+END
