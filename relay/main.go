@@ -52,6 +52,11 @@ func main() {
 		logger.Warn("INVITE_SIGNUP enabled — invite-code account model governs sign-in (ALLOWED_EMAILS bypassed)")
 	}
 
+	// Admin surface (M2): bootstrap admins come from ADMIN_SUBS; with none
+	// configured, only accounts.is_admin rows grant access (fail closed —
+	// neither means every /v1/admin/ request 403s).
+	logger.Info("admin bootstrap allowlist", "subs", len(cfg.AdminSubs))
+
 	dir := NewDirectory(logger)
 	h := NewHandler(cfg, auth, store, dir, logger)
 
