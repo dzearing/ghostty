@@ -1,6 +1,9 @@
 # Ghoztty on Windows amd64 — port plan
 
-Status: **in progress** (this doc is updated as milestones land)
+Status: **beta staged** — `Ghoztty-26.7.501-x64.msi` is on
+`/Volumes/share/ghoztty-windows/`, awaiting manual verification on the
+Windows box (checklist at the bottom). All milestones except manual
+on-box verification are complete.
 Branch: `users/dzearing/windows-amd64`
 Date started: 2026-07-05
 
@@ -82,35 +85,48 @@ work; writing 10k lines fresh is strictly slower and riskier.
 - **M0 — recon + baseline** ✅
   Cross-compile of core with `-Dapp-runtime=none` for `x86_64-windows-gnu`
   verified on this Mac. Recon complete (this doc).
-- **M1 — win32 apprt compiles: exe skeleton**
-  Vendor `src/apprt/win32/` + `dist/windows` resources (rebrand to Ghoztty),
-  add `.win32` to `src/apprt/runtime.zig` + `src/apprt.zig`, build wiring
-  (SharedDeps win32 libs, GhosttyExe subsystem + .rc), OpenGL.zig WGL arms,
-  small shared hunks (action/structs/surface/os.windows/Binding/mouse/modes/
-  face). Adapt to our fork's apprt action set. Exit: `zig build
-  -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu` emits `ghoztty.exe`.
-- **M2 — smoke artifact on the share**
-  Debug-console build staged to `/Volumes/share/ghoztty-windows/` for a first
-  manual launch check (window + shell + typing). Iterate on crash reports from
-  the box if needed.
-- **M3 — beta hardening**
-  Windows console subsystem off for release, icon/version resources, config
-  paths (%APPDATA%), default shell decision (cmd.exe default; pwsh if
-  detected), clipboard, resize, scrollback sanity. Cut lines below apply.
-- **M4 — installer**
-  Per-user **MSI built with wixl (GNOME msitools)** — the repo already has a
-  proven macOS-built MSI pipeline for the agent
-  (`relay/deploy/msi/build-msi.sh` + `.wxs`); model
-  `dist/windows-installer/ghoztty.wxs` on it: per-user (no elevation),
-  Start Menu shortcut, Apps & Features entry, stable UpgradeCode so newer
-  ProductVersions auto-upgrade (`yy.m.dNN` scheme). Upgrade path: same MSI
-  major-upgrade mechanism; future: winget manifest and/or in-app updater.
-  Fallback if MSI hits a wall: zip + README.
-  Exit: exactly ONE artifact on the share, stale builds deleted.
-- **M5 — regression + docs**
-  Native macOS `zig build -Doptimize=Debug` still green. This doc updated
-  with outcomes, cut lines, manual-verification checklist. Incremental
-  commits throughout (already the practice).
+- **M1 — win32 apprt compiles: exe skeleton** ✅ (commit `e0118f682`)
+  Vendored `src/apprt/win32/` (~10.2k lines, 6 files), rebranded to Ghoztty,
+  auto-update check disabled. Wiring: `.win32` runtime enum member (default
+  for Windows targets), apprt dispatch, 11 `app_runtime` switch sites,
+  OpenGL.zig WGL arms, SharedDeps win32 system libs, GhosttyExe subsystem
+  logic, `-Dwindows-console` option, win32_input mode 9001 + core encoder
+  gate, `.rc` version resources + UTF-8/PerMonitorV2/long-path manifest.
+  Fork adaptations: Windows `Exit` union gained `Signal`/`Stopped`/`Unknown`
+  + `init()`; win32 Surface `remoteBackend()` stub; win32 App arms for
+  `swap_split`/`toggle_hero_mode`/`activity_state` (report unimplemented);
+  `+list`/`+read`/`+rearrange`/`+new-remote-window` CLI guarded off on
+  Windows (Unix-socket IPC). Total: 5 targeted fixes after vendoring —
+  the vendored runtime compiled against our core almost cleanly.
+  `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu` emits
+  `ghoztty.exe` (PE32+ console, Debug).
+- **M2 — release build** ✅
+  ReleaseFast build → 27MB PE32+ **GUI**-subsystem exe. Added
+  `%LOCALAPPDATA%\ghoztty\ghoztty.log` file logging for release builds
+  (GUI subsystem has no stderr; without it a beta crash is silent).
+- **M3 — input/ConPTY/rendering** ✅ (via the vendored runtime)
+  Keyboard (incl. Win32 Input Mode 9001), mouse, clipboard, WGL/OpenGL
+  rendering, ConPTY shell (`cmd.exe` default) all come from the proven
+  vendored runtime + upstream's Windows-branched termio. Compile-verified
+  only on this Mac — interactive behavior needs the on-box checklist below.
+- **M4 — installer** ✅ (`dist/windows-installer/build-msi.sh`)
+  Per-user MSI via wixl (GNOME msitools), modeled on the agent MSI:
+  `%LOCALAPPDATA%\Programs\Ghoztty\`, Start Menu shortcut, Apps & Features
+  entry with build stamp, taskkill custom action, permanent UpgradeCode
+  `5EB02044-7F06-498B-B7A9-7EFD65486CFB`, ProductVersion `yy.m.dNN` so
+  newer builds always major-upgrade older ones. Packages the exe + `share/`
+  tree (terminfo sentinel for `resourcesDir()`, 503 themes,
+  shell-integration) as 527 components with deterministic uuid5 GUIDs.
+  Layout verified by `msiextract`. Upgrade path: install newer MSI
+  (auto-removes old); future: winget manifest and/or in-app updater.
+  **Staged: `Ghoztty-26.7.501-x64.msi` on `/Volumes/share/ghoztty-windows/`**
+  (sha256 verified after copy). The agent files in that folder
+  (`ghoztty-agent.exe`, watcher, logs) are the live remote-agent deployment,
+  not stale builds — left in place.
+- **M5 — regression + docs** ✅
+  Native macOS `zig build -Doptimize=Debug` still green after all changes.
+  All Windows-specific code is comptime-gated (`builtin.os.tag == .windows`
+  / `.win32` runtime arms), so other platforms are structurally unaffected.
 
 ## Cut lines (explicitly out of scope for the beta)
 
@@ -141,12 +157,28 @@ work; writing 10k lines fresh is strictly slower and riskier.
 
 ## Manual verification checklist (Windows box)
 
-Filled in at M4 staging time; expected items:
-1. MSI installs per-user without elevation; Ghoztty appears in Start Menu.
-2. Launch → window opens, shell prompt renders, typing works.
-3. Resize, scrollback (wheel), copy/paste round-trip.
-4. `exit` closes the surface/window cleanly.
-5. Uninstall from Apps & Features removes it.
+Artifact: `\\share\ghoztty-windows\Ghoztty-26.7.501-x64.msi`
+(sha256 `598abb0d2e183f9f7fefce81bd82d297fe95fc0c86abc37a4aaf7a8e10387e1a`)
+
+1. Double-click the MSI. Expect **no elevation prompt** (per-user install)
+   and possibly a SmartScreen warning (unsigned beta — "More info → Run
+   anyway"). Installs to `%LOCALAPPDATA%\Programs\Ghoztty\`.
+2. Start Menu → "Ghoztty" → window opens with a `cmd.exe` prompt rendering
+   in JetBrains Mono.
+3. Type commands; verify echo, colors (`dir`, `type` a file), Enter/Backspace/
+   arrows/Tab behave. Try `powershell` inside it.
+4. Resize the window (grid reflows), mouse-wheel scrollback, select text +
+   Ctrl+Shift+C / Ctrl+Shift+V round-trip.
+5. Tabs/splits: Ctrl+Shift+T (new tab), Ctrl+Shift+O / Ctrl+Shift+E (splits).
+6. `exit` closes the pane/tab/window cleanly; last window quits the app.
+7. Re-run the MSI → repair/no-op without errors. Apps & Features shows
+   "Ghoztty" with build stamp in Comments; uninstall removes Start Menu
+   entry and install dir.
+8. If anything crashes or the window is black: check
+   `%LOCALAPPDATA%\ghoztty\ghoztty.log` and report its tail. A black window
+   most likely means WGL/driver issues — rebuild with
+   `-Dwindows-console=true` for a console-visible release build, or use a
+   Debug build (always Console) for stderr.
 
 ## Decision log
 
