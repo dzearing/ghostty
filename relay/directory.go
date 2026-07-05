@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/google/uuid"
 )
 
 // maxPendingSessions bounds the number of in-flight session setups to limit
@@ -57,6 +56,10 @@ func (ac *agentConn) send(m controlMsg) error {
 type pendingSession struct {
 	id       string
 	deviceID string
+	// ownerKey attributes the session to the connecting CLIENT's identity
+	// (quotaKey: sub, email fallback) for the M4 per-account concurrent-session
+	// quota. Empty for sessions created via the unattributed CreatePending.
+	ownerKey string
 	dataCh   chan *websocket.Conn // agent's data conn is delivered here (buffered 1)
 	done     chan struct{}        // closed by the client handler when bridging ends
 	// agentData is the claimed data conn (set under Directory.mu by ClaimData).
@@ -116,20 +119,10 @@ func (d *Directory) IsOnline(deviceID string) bool {
 }
 
 // CreatePending registers a new pending session for deviceID and returns it.
+// M4: unattributed and quota-free; the owner-attributed, quota-enforcing
+// variant is CreatePendingOwned (quotas.go), which handleClientConnect uses.
 func (d *Directory) CreatePending(deviceID string) (*pendingSession, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(d.sessions) >= maxPendingSessions {
-		return nil, ErrTooManyPending
-	}
-	ps := &pendingSession{
-		id:       uuid.NewString(),
-		deviceID: deviceID,
-		dataCh:   make(chan *websocket.Conn, 1),
-		done:     make(chan struct{}),
-	}
-	d.sessions[ps.id] = ps
-	return ps, nil
+	return d.CreatePendingOwned(deviceID, "", 0)
 }
 
 // RemovePending deletes a pending session (called by the client handler when it

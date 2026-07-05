@@ -52,6 +52,11 @@ type Authenticator struct {
 	// the Store, which the Authenticator is built before, hence the late bind.
 	gate *SigninGate
 
+	// limits is the M4 rate-limiter set (ratelimit.go); only the failed
+	// sign-in limiter is consulted here. Late-bound by NewHandler
+	// (SetRateLimits, mirroring SetGate); nil-safe when never bound.
+	limits *RateLimiters
+
 	// allowedAuds is the `aud` allowlist for ID tokens: GOOGLE_CLIENT_ID (the
 	// Desktop client the Mac app signs in with) plus GOOGLE_DEVICE_CLIENT_ID
 	// (the TV/limited-input client the device-code enroll flow uses) plus
@@ -158,7 +163,24 @@ func (a *Authenticator) SetGate(g *SigninGate) { a.gate = g }
 //     must instead sign up through the enroll flow).
 //
 // Presence of a token is never sufficient.
+//
+// M4 abuse control: failed sign-ins are rate limited per client IP. The
+// budget is CHECKED before any verification work (a brute-forcer gets 429s
+// without costing a JWKS/signature check) and CHARGED only on failure, so
+// successful authenticated traffic never consumes it (see ratelimit.go).
 func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request) (Identity, error) {
+	if err := a.limits.checkSigninBudget(clientIP(r)); err != nil {
+		return Identity{}, err
+	}
+	ident, err := a.authenticateClient(ctx, r)
+	if err != nil {
+		a.limits.chargeSigninFailure(clientIP(r))
+	}
+	return ident, err
+}
+
+// authenticateClient is the unthrottled body of AuthenticateClient.
+func (a *Authenticator) authenticateClient(ctx context.Context, r *http.Request) (Identity, error) {
 	token := bearerToken(r)
 	if token == "" {
 		return Identity{}, ErrUnauthorized
