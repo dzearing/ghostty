@@ -6,7 +6,9 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const build_config = @import("build_config.zig");
-const macos = @import("macos");
+// The macos module is only present in the build graph on Darwin targets;
+// the logging block below comptime-breaks before touching it elsewhere.
+const macos = if (builtin.target.os.tag.isDarwin()) @import("macos") else undefined;
 const cli = @import("cli.zig");
 const renderer = @import("renderer.zig");
 const apprt = @import("apprt.zig");

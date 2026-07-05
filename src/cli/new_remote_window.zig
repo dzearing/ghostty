@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
@@ -89,6 +90,15 @@ fn runArgs(
     argsIter: anytype,
     stderr: *std.Io.Writer,
 ) !u8 {
+    // These commands drive a running Ghoztty instance over a Unix-domain
+    // socket, which the Windows beta does not have (see
+    // docs/design/windows-amd64-plan.md cut lines). Guarding here keeps the
+    // posix-only socket helpers below out of Windows semantic analysis.
+    if (comptime builtin.os.tag == .windows) {
+        try stderr.print("This command is not supported on Windows.\n", .{});
+        return 1;
+    }
+
     var opts: Options = .{};
     defer opts.deinit();
 
@@ -127,10 +137,12 @@ fn runArgs(
     // GHOSTTY_RELAY_TOKEN) must be forwarded explicitly. If the user did not pass
     // --token=, read it from this CLI's env and forward it through the IPC
     // arguments so the running app receives it.
-    if (have_relay and opts.token == null) {
-        if (std.posix.getenv("GHOSTTY_RELAY_TOKEN")) |tok| {
-            const forwarded = try std.fmt.allocPrintSentinel(alloc, "--token={s}", .{tok}, 0);
-            try opts._arguments.append(alloc_gpa, forwarded);
+    if (comptime builtin.os.tag != .windows) {
+        if (have_relay and opts.token == null) {
+            if (std.posix.getenv("GHOSTTY_RELAY_TOKEN")) |tok| {
+                const forwarded = try std.fmt.allocPrintSentinel(alloc, "--token={s}", .{tok}, 0);
+                try opts._arguments.append(alloc_gpa, forwarded);
+            }
         }
     }
 
@@ -154,6 +166,10 @@ fn sendOpen(
     arguments: [][:0]const u8,
     stderr: *std.Io.Writer,
 ) !void {
+    // Unix-socket IPC does not exist on Windows; the Windows beta has no
+    // CLI window-management (see docs/design/windows-amd64-plan.md).
+    if (comptime builtin.os.tag == .windows) return error.IPCFailed;
+
     const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
     const uid = std.c.getuid();
     const build_config = @import("../build_config.zig");

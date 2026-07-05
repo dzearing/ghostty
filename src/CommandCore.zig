@@ -69,6 +69,17 @@ pub const PostForkError = error{PostForkError};
 /// type, so it lives here and is re-exported by `Command.zig`.
 pub const Exit = if (builtin.os.tag == .windows) union(enum) {
     Exited: u32,
+
+    /// Never produced on Windows (there are no POSIX signals); these
+    /// members exist so shared exit-logging switch prongs compile without
+    /// os-branching at every use site.
+    Signal: u32,
+    Stopped: u32,
+    Unknown: u32,
+
+    pub fn init(status: u32) Exit {
+        return .{ .Exited = status };
+    }
 } else union(enum) {
     /// Exited by normal exit call, value is exit status
     Exited: u8,

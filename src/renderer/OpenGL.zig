@@ -33,6 +33,23 @@ pub const swap_chain_count = 1;
 
 const log = std.log.scoped(.opengl);
 
+/// WGL declarations for Win32 OpenGL context management.
+/// Only defined when building for the win32 apprt.
+const wgl = if (apprt.runtime == apprt.win32) struct {
+    extern "opengl32" fn wglMakeCurrent(
+        hdc: ?*anyopaque,
+        hglrc: ?*anyopaque,
+    ) callconv(.c) i32;
+    extern "opengl32" fn wglGetCurrentDC() callconv(.c) ?*anyopaque;
+    extern "gdi32" fn SwapBuffers(hdc: ?*anyopaque) callconv(.c) i32;
+    extern "user32" fn WindowFromDC(hdc: ?*anyopaque) callconv(.c) ?std.os.windows.HWND;
+    const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+    extern "user32" fn GetClientRect(
+        hwnd: std.os.windows.HWND,
+        rect: *RECT,
+    ) callconv(.c) i32;
+} else struct {};
+
 /// We require at least OpenGL 4.3
 pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
@@ -160,8 +177,6 @@ fn prepareContext(getProcAddress: anytype) !void {
 
 /// This is called early right after surface creation.
 pub fn surfaceInit(surface: *apprt.Surface) !void {
-    _ = surface;
-
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
@@ -173,6 +188,28 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
             // broken for rendering on this platforms.
+        },
+
+        apprt.win32 => {
+            // For Win32/WGL, make the context current on the main thread.
+            // It stays current through Renderer.init() and finalizeSurfaceInit()
+            // so OpenGL resources (shaders, textures, buffers) can be created.
+            // It will be released in finalizeSurfaceInit (displayRealized)
+            // right before the renderer thread is spawned.
+            const hdc = surface.hdc orelse return error.InvalidSurface;
+            const hglrc = surface.hglrc orelse return error.InvalidSurface;
+
+            if (wgl.wglMakeCurrent(hdc, hglrc) == 0)
+                return error.WGLMakeCurrentFailed;
+
+            // Load GL functions. Passing null tells GLAD to use its
+            // built-in loader which on Windows uses opengl32.dll +
+            // wglGetProcAddress.
+            try prepareContext(null);
+
+            // NOTE: We intentionally do NOT release the context here.
+            // Renderer.init() needs a current GL context to create resources.
+            // The context is released in finalizeSurfaceInit/displayRealized.
         },
     }
 
@@ -191,12 +228,19 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
     _ = surface;
+
+    // On Win32, release the WGL context from the main thread so the
+    // renderer thread can make it current in threadEnter. The context
+    // was kept current since surfaceInit to allow Renderer.init() to
+    // create GL resources.
+    if (comptime apprt.runtime == apprt.win32) {
+        _ = wgl.wglMakeCurrent(null, null);
+    }
 }
 
 /// Callback called by renderer.Thread when it begins.
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
 
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
@@ -212,6 +256,19 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
             // broken for rendering on this platforms.
+        },
+
+        apprt.win32 => {
+            // Make the WGL context current on the renderer thread.
+            const hdc = surface.hdc orelse return error.InvalidSurface;
+            const hglrc = surface.hglrc orelse return error.InvalidSurface;
+
+            if (wgl.wglMakeCurrent(hdc, hglrc) == 0)
+                return error.WGLMakeCurrentFailed;
+
+            // Reload GL functions on this thread since OpenGL is
+            // thread-local state.
+            try prepareContext(null);
         },
     }
 }
@@ -231,6 +288,11 @@ pub fn threadExit(self: *const OpenGL) void {
         apprt.embedded => {
             // TODO: see threadEnter
         },
+
+        apprt.win32 => {
+            // Release the WGL context from the renderer thread.
+            _ = wgl.wglMakeCurrent(null, null);
+        },
     }
 }
 
@@ -243,6 +305,14 @@ pub fn displayRealized(self: *const OpenGL) void {
                 "Error preparing GL context in displayRealized, err={}",
                 .{err},
             );
+        },
+
+        apprt.win32 => {
+            // Release the WGL context from the main thread so the
+            // renderer thread can make it current in threadEnter.
+            // The context was kept current since surfaceInit to allow
+            // Renderer.init() to create GL resources.
+            _ = wgl.wglMakeCurrent(null, null);
         },
 
         else => @compileError("only GTK should be calling displayRealized"),
@@ -258,9 +328,14 @@ pub fn drawFrameStart(self: *OpenGL) void {
 
 /// Actions taken after `drawFrame` is done.
 ///
-/// Right now there's nothing we need to do for OpenGL.
+/// On Win32 with double-buffered WGL, swap the front/back buffers
+/// so the rendered frame appears on screen.
 pub fn drawFrameEnd(self: *OpenGL) void {
     _ = self;
+    if (comptime apprt.runtime == apprt.win32) {
+        const hdc = wgl.wglGetCurrentDC();
+        if (hdc != null) _ = wgl.SwapBuffers(hdc);
+    }
 }
 
 pub fn initShaders(
@@ -278,6 +353,29 @@ pub fn initShaders(
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     _ = self;
+
+    // On Win32, query the actual window client rect instead of
+    // GL_VIEWPORT. GL_VIEWPORT is only updated when we call
+    // glViewport explicitly (no framework does it for us), creating
+    // a chicken-and-egg problem during resize. The Win32 Surface
+    // caches the client dimensions from WM_SIZE.
+    if (comptime apprt.runtime == apprt.win32) {
+        // Use the thread-local WGL DC to find our HWND, then query
+        // the actual window client rect for the current size.
+        const hdc = wgl.wglGetCurrentDC() orelse return error.NoCurrentContext;
+        const hwnd = wgl.WindowFromDC(hdc) orelse return error.NoWindow;
+        var rect: wgl.RECT = undefined;
+        if (wgl.GetClientRect(hwnd, &rect) != 0) {
+            const w: u32 = @intCast(rect.right - rect.left);
+            const h: u32 = @intCast(rect.bottom - rect.top);
+            if (w > 0 and h > 0) {
+                // Update glViewport to match
+                gl.glad.context.Viewport.?(0, 0, @intCast(w), @intCast(h));
+                return .{ .width = w, .height = h };
+            }
+        }
+    }
+
     var viewport: [4]gl.c.GLint = undefined;
     gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
     return .{
@@ -307,6 +405,11 @@ pub fn present(self: *OpenGL, target: Target) !void {
     defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
         log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
     };
+
+    // Update the viewport to match the target dimensions. On Win32
+    // there's no framework (like GTK's GLArea) that automatically
+    // updates glViewport when the window resizes.
+    gl.glad.context.Viewport.?(0, 0, @intCast(target.width), @intCast(target.height));
 
     // Bind the target for reading.
     const fbobind = try target.framebuffer.bind(.read);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const builtin = @import("builtin");
 const Command = @import("Command.zig");
 
 const log_path_suffix = "/ghoztty-exit.log";
@@ -33,6 +34,10 @@ pub fn logEvent(context: []const u8) void {
 }
 
 fn appendToLog(msg: []const u8) void {
+    // This is a $TMPDIR-based debugging aid for the macOS/Linux builds;
+    // skip it on Windows rather than porting the path handling.
+    if (comptime builtin.os.tag == .windows) return;
+
     const tmpdir = posix.getenv("TMPDIR") orelse "/tmp";
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ tmpdir, log_path_suffix }) catch return;

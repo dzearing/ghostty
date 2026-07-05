@@ -4650,7 +4650,7 @@ pub fn finalize(self: *Config) !void {
 
     // Apprt-specific defaults
     switch (build_config.app_runtime) {
-        .none => {},
+        .none, .win32 => {},
         .gtk => {
             switch (self.@"gtk-single-instance") {
                 .true, .false => {},
@@ -9165,7 +9165,7 @@ pub const GtkTitlebarStyle = enum(c_int) {
             .{ .name = "GhosttyGtkTitlebarStyle" },
         ),
 
-        .none => void,
+        .none, .win32 => void,
     };
 };
 
@@ -9880,7 +9880,7 @@ pub const WindowDecoration = enum(c_int) {
             .{ .name = "GhosttyConfigWindowDecoration" },
         ),
 
-        .none => void,
+        .none, .win32 => void,
     };
 
     pub fn parseCLI(input_: ?[]const u8) !WindowDecoration {

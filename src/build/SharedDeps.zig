@@ -605,6 +605,19 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtkNg(step),
+            .win32 => {
+                // Link Windows system libraries for the Win32 runtime.
+                if (step.rootModuleTarget().os.tag == .windows) {
+                    step.linkSystemLibrary2("opengl32", .{});
+                    step.linkSystemLibrary2("gdi32", .{});
+                    step.linkSystemLibrary2("user32", .{});
+                    step.linkSystemLibrary2("dwrite", .{});
+                    step.linkSystemLibrary2("dwmapi", .{});
+                    step.linkSystemLibrary2("imm32", .{});
+                    step.linkSystemLibrary2("shell32", .{});
+                    step.linkSystemLibrary2("wininet", .{});
+                }
+            },
         }
     }
 
