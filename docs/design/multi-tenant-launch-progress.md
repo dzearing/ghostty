@@ -5,7 +5,8 @@ FRESH context (after `/clear`) can resume with zero prior memory. The detailed
 plan is `docs/design/multi-tenant-launch-plan.md`; this file tracks *where we are*
 and *what to do next*.
 
-Last updated: 2026-07-05 (M0 merged; M1 is next).
+Last updated: 2026-07-05 (M1 merged; M2 + M4 + M5a are now unblocked; production
+cutover of M1 auth is PENDING — human checkpoint).
 
 ## ON RESUME ("go") — do this, in order
 1. Read this file, then `docs/design/multi-tenant-launch-plan.md`.
@@ -30,7 +31,7 @@ SQLite (WAL) + Litestream · React (Vite) SPA + Recharts · Prometheus · single
 | M | Name | Branch | State | Depends on |
 |---|------|--------|-------|-----------|
 | M0 | SQLite foundation | `mt/m0-sqlite` | **merged** → main `8a328e120` (re-verified: build/vet/race-tests/static-build). NOT yet deployed to prod. | — |
-| M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **in worktree** — agent launched 2026-07-05, staged behind `INVITE_SIGNUP` flag (default OFF); awaiting agent + review; STOP before live cutover | M0 ✓ |
+| M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **merged** → main `40066364e` (re-verified: build/vet/race-tests/static-build). Staged behind `INVITE_SIGNUP` (default OFF) — **live cutover NOT done** (human checkpoint; see M1 handoff below). | M0 ✓ |
 | M2 | Admin API + admin auth | `mt/m2-admin-api` | pending | M1 |
 | M3 | Admin portal UI (React) | `mt/m3-admin-portal` | pending | M2 |
 | M4 | Quotas + rate limits | `mt/m4-quotas` | pending | M1 (parallel w/ M2/M3) |
@@ -68,6 +69,43 @@ The conductor context bloats across milestones; reset it at each merge boundary.
      boundary fire a detached `sleep 2; ghoztty +send-keys --target=conductor "/clear" Enter; sleep 1; ghoztty +send-keys --target=conductor "go" Enter`
      before ending the turn. A registered target CAN be driven; the background
      send fires after the turn ends. (Not yet set up.)
+
+## M1 handoff facts (from the merged work — M2/M4 must honor these)
+- **`INVITE_SIGNUP` env flag (bool, default OFF).** OFF = pre-M1 behavior
+  byte-for-byte (`ALLOWED_EMAILS` gates, no attempt logging). ON = invite-code
+  account model governs sign-in. Flipping it live is the pending human checkpoint.
+- Migration `0002_accounts.sql`: `accounts` (google_sub UNIQUE, status
+  active|blocked), `invite_codes` (code pk, max_uses NULL=unlimited, uses,
+  expires_at/revoked_at), `signin_attempts` (append-only audit, indexed on ts).
+- **`devices.account_id` deferred to M2** (documented in the migration header).
+  Ownership is keyed on `devices.owner_sub` with a lowercased-email fallback for
+  legacy empty-sub rows (`ownsClause` in store.go, `Device.OwnedBy`). M2 adds the
+  physical FK once live devices have bound subs.
+- Authz surface: `Authenticator.VerifyIdentity` (verification only) vs
+  `VerifyIDToken` (verification + ALLOWED_EMAILS, the flag-OFF path);
+  `SigninGate.Authorize` (auth_gate.go) is the flag-ON decision and needs the
+  Store. Wired via `auth.SetGate(...)` in main.go — test servers must mirror this.
+- Invite code enters at `POST /v1/enroll/start` JSON body field `invite_code`
+  (both device + web flows), parked on the pending enrollment, consumed at the
+  success path. Returning/legacy owners never need one (headless flow unchanged).
+- Legacy owner migration is **lazy**: first verified sign-in with flag ON matches
+  a legacy device by email, creates the account (no code), and backfills the sub
+  onto their devices (`BindLegacyDevicesToSub`). Reads SQLite, never devices.json.
+- Store seams for M2 admin API: `CreateInviteCode`, `RevokeInviteCode`,
+  `GetAccountBySub/ByEmail`, `RecordSigninAttempt`, `CountSigninAttempts`.
+- DSN gained `_txlock=immediate` (BEGIN IMMEDIATE) so read-then-write txs wait on
+  busy_timeout instead of failing with SQLITE_BUSY_SNAPSHOT under concurrency.
+
+### M1 production cutover runbook (the pending human checkpoint)
+1. Deploy the new binary (brings SQLite from M0 + flag-OFF M1; restart drops live
+   relay links briefly — itself a checkpoint). Live auth unchanged.
+2. Seed ≥1 invite code (`Store.CreateInviteCode`; M2 admin API will wrap this).
+3. Set `INVITE_SIGNUP=true` in `/etc/ghoztty-relay.env`, restart. Keep
+   `ALLOWED_EMAILS` populated for one release as the instant rollback
+   (`INVITE_SIGNUP=false` + restart reverts fully; no data migration).
+4. Verify dzearing@gmail.com signs in with NO code → an `accounts` row appears
+   with the real Google sub, status=active; devices get sub-stamped.
+5. Watch `signin_attempts` outcome distribution for anomalies.
 
 ## M0 handoff facts (from the merged work — M1 must honor these)
 - `devices` table exists (SQLite, WAL, `STATE_DIR/ghoztty-relay.db`); migrations
