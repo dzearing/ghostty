@@ -64,7 +64,11 @@ export default function App() {
       <AuthProvider>
         <ToastProvider>
           <BrowserRouter
-            basename={import.meta.env.BASE_URL}
+            // BASE_URL has a trailing slash ("/admin/"); React Router treats a
+            // trailing-slash basename as NOT matching the bare "/admin"
+            // location and silently renders nothing (prod strips the warning).
+            // Strip it: "/" -> "" (root), "/admin/" -> "/admin".
+            basename={import.meta.env.BASE_URL.replace(/\/$/, "")}
             future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
           >
             <Gate />
