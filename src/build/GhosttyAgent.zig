@@ -54,12 +54,12 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
     const version_module = version_opts.createModule();
     exe.root_module.addImport("agent_build_options", version_module);
 
-    // On Windows the agent shows a system-tray icon in listen-daemon mode (the
-    // deploy watcher launches it as the always-on daemon). Build it as the GUI
-    // subsystem so Windows never allocates a console window for it — no stray
-    // black box pops up next to the tray. Logging is unaffected: the watcher
-    // redirects stdout/stderr to log files (inherited handles work regardless of
-    // subsystem), so the readiness banner is still captured. This is windows-only;
+    // On Windows the agent shows a system-tray icon in its daemon modes (the
+    // MSI/installer autostart it as the always-on `--relay` daemon). Build it as
+    // the GUI subsystem so Windows never allocates a console window for it — no
+    // stray black box pops up next to the tray. Logging is unaffected: stdout/
+    // stderr go to log files via inherited handles regardless of subsystem, so
+    // the readiness banner is still captured. This is windows-only;
     // the macOS host + the `test-agent` build are left untouched.
     if (cfg.target.result.os.tag == .windows) {
         exe.subsystem = .Windows;

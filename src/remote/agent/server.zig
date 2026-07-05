@@ -27,12 +27,14 @@
 //!
 //!   - **Transport** (`Stream`): abstract vtable; tests drive it over an in-memory
 //!     loopback. Real impl wraps the two ssh-channel pipe fds — out of scope.
-//!   - **Child**: abstract (`session.Child`); only a fake, pipe/buffer-backed child
-//!     is provided (tests feed its output). Real pty via `src/pty.zig` is a later
-//!     increment (`// TODO(pty)`).
+//!   - **Child**: abstract (`session.Child`); the real pty/ConPTY impl is
+//!     `pty_child.zig` (wired in `main.zig`), while tests inject a fake,
+//!     pipe/buffer-backed child.
 //!   - **Snapshot**: `ATTACHED.snapshot_at_offset` is the session's current
-//!     outbound offset `S`; a real grid snapshot (§7.3) is `// TODO(snapshot)`.
-//!   - Daemonization, idle-TTL GC, RPC, tunnels, Windows: out of scope.
+//!     outbound offset `S`; reconnect replays the ring forward from there. A true
+//!     grid-model snapshot at `S` (§7.3), so ring eviction is invisible, is
+//!     future work.
+//!   - RPC, tunnels: out of scope.
 //!
 //! ## Driving it (test harness pattern)
 //!
@@ -138,10 +140,10 @@ pub const Clock = struct {
 // Spawner — how the agent turns an OPEN into a Child (injectable)
 // -----------------------------------------------------------------------------
 
-/// Spawns a child for an `OPEN` request. The real spawner forks a process on a pty
-/// (`src/pty.zig`) and returns a pid + a `Child` whose output-reader thread calls
-/// the session's sink. For this increment a test injects a fake spawner that hands
-/// back a buffer-backed `FakeChild`. `// TODO(pty)`.
+/// Spawns a child for an `OPEN` request. The real spawner (`pty_child.zig`) forks
+/// a process on a pty/ConPTY and returns a pid + a `Child` whose output-reader
+/// thread calls the session's sink; tests inject a fake spawner that hands back a
+/// buffer-backed `FakeChild`.
 ///
 /// The returned `Result.child` must remain valid until the session's child is
 /// `terminate()`d. The spawner owns any backing storage and frees it on terminate.

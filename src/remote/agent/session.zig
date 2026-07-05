@@ -12,22 +12,23 @@
 //!
 //! ## Child abstraction
 //!
-//! A `Child` is an interface (vtable) over "a process attached to a pty". For this
-//! increment we ship only a **fake, buffer-backed child** for tests; the real
-//! POSIX implementation (wiring `src/pty.zig` + a forked process) is a later
-//! increment — see the `// TODO(pty)` notes. Keeping the seam here means the
-//! `Server` never has to change when the real pty lands.
+//! A `Child` is an interface (vtable) over "a process attached to a pty". The
+//! real implementation is `pty_child.zig` (POSIX pty via `src/pty.zig`, Windows
+//! ConPTY), wired into every production serve path in `main.zig`; a fake,
+//! buffer-backed child is used only by the tests. The vtable seam means the
+//! `Server` is identical for both.
 //!
-//! ## What is real vs stubbed in increment 1
+//! ## Real vs. a known limitation
 //!
 //!   - Session table, ids, caps, tombstones, ring, byte-offset: **real**.
-//!   - Child process: **fake** (a write-sink + an output-feed used by tests).
-//!   - Grid snapshot for resync: **stubbed** — `snapshotOffset()` returns the
-//!     current outbound offset `S` (§7.3 captures a real grid snapshot at `S`;
-//!     here we only anchor the offset and stream forward). `// TODO(snapshot)`.
-//!   - Idle-TTL / ring-memory GC: **stubbed** — the tombstone is modeled (an
-//!     exited session retains its exit code + final state) but the timed reaper
-//!     is `// TODO(gc)`.
+//!   - Child process: **real** (`pty_child.zig`); tests inject a fake.
+//!   - Idle-TTL / ring-memory GC: **real** — the background reaper
+//!     (`startReaper`) evicts orphaned sessions past `default_idle_ttl_ms`.
+//!   - Grid snapshot for resync: **known limitation** — `snapshotOffset()`
+//!     anchors the current outbound offset `S` and reconnect replays the ring
+//!     forward from the client's last offset (byte-exact within the ~2 MB ring;
+//!     deeper scrollback is dropped with a visible marker). A true grid-model
+//!     snapshot at `S` (§7.3), so eviction is invisible, is future work.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -71,10 +72,9 @@ pub const ActivityState = enum { idle, busy, needs_input };
 /// when bytes are available.
 ///
 /// Threading: for the fake child everything is synchronous and single-threaded
-/// (tests pump output explicitly). The real pty child will own a reader thread
-/// that calls the sink; the `Server`'s session lock serializes sink delivery with
-/// frame handling. `// TODO(pty)`: a real impl forks via `src/pty.zig` and runs a
-/// read loop feeding `sink`.
+/// (tests pump output explicitly). The real pty child (`pty_child.zig`) owns a
+/// reader thread that calls the sink; the `Server`'s session lock serializes sink
+/// delivery with frame handling.
 pub const Child = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -331,7 +331,7 @@ pub const Session = struct {
     /// lifetime/locking rules as `bridge_data`.
     bridge_exit: ?*const fn (ctx: *anyopaque, channel: u128, code: i64, runtime_ms: u64) void = null,
 
-    /// Timestamps (ms). `last_activity_ms` drives the idle-TTL reaper (`// TODO(gc)`).
+    /// Timestamps (ms). `last_activity_ms` drives the idle-TTL reaper (`startReaper`).
     created_ms: i64,
     last_activity_ms: i64,
 
@@ -584,11 +584,10 @@ pub const SessionTable = struct {
 // -----------------------------------------------------------------------------
 
 /// Default idle-TTL before an orphaned (no live connection bound) session is
-/// reaped (§7.1 "Resource caps & TTL"). A generous 10 minutes: long enough to
-/// close a laptop, ride an elevator, and reconnect without losing the shell, but
-/// bounded so abandoned sessions don't leak forever. `last_activity_ms` is bumped
-/// on every output chunk and on (re)attach, so an actively-running session never
-/// idles out.
+/// reaped (§7.1 "Resource caps & TTL"). 5 minutes: long enough to close a laptop,
+/// ride an elevator, and reconnect without losing the shell, but bounded so
+/// abandoned sessions don't leak forever. `last_activity_ms` is bumped on every
+/// output chunk and on (re)attach, so an actively-running session never idles out.
 pub const default_idle_ttl_ms: i64 = 5 * 60 * 1000;
 
 /// The agent's DAEMON-scoped session store: a `SessionTable` plus the single mutex

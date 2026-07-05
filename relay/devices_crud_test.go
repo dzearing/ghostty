@@ -317,3 +317,33 @@ func TestCrudOwnerScoping(t *testing.T) {
 		t.Fatalf("cross-owner delete removed the device")
 	}
 }
+
+// TestConnectOwnerScoping proves the SESSION-OPEN path — the one that actually
+// reaches a shell — is owner-scoped: a caller cannot open a connection to a
+// device owned by a different account even if it knows the device ID. The
+// ownership check (handlers.go, dev.OwnerEmail != email) returns a
+// non-enumerable 404 before any WebSocket upgrade or online check. This is the
+// highest-value authorization gate, so it gets a direct regression test.
+func TestConnectOwnerScoping(t *testing.T) {
+	ts, clientToken, store := newTestServer(t)
+
+	// A device owned by a DIFFERENT identity than the dev caller.
+	other, _, err := store.CreateDevice("other@example.com", "otherbox")
+	if err != nil {
+		t.Fatalf("seed other-owner device: %v", err)
+	}
+
+	// The dev identity (dev@example.com) tries to open a session to it. A plain
+	// GET reaches the ownership gate before the WS upgrade, so we can assert on
+	// the status code directly.
+	resp := doJSON(t, http.MethodGet, ts.URL+"/v1/client/connect?device="+other.ID, clientToken, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-account connect status = %d, want 404", resp.StatusCode)
+	}
+
+	// The device is untouched — the 404 hid it, it was not removed.
+	if store.Get(other.ID) == nil {
+		t.Fatalf("cross-account connect mutated/removed the device")
+	}
+}
