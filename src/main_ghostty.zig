@@ -153,6 +153,44 @@ fn logFn(
         logger.log(std.heap.c_allocator, mac_level, prefix ++ format, args);
     }
 
+    // On Windows release builds the exe uses the GUI subsystem, so stderr
+    // goes nowhere. Append to %LOCALAPPDATA%\ghoztty\ghoztty.log instead so
+    // beta crashes/failures are diagnosable. (Debug builds use the Console
+    // subsystem and log to stderr like every other platform.)
+    windows_file: {
+        if (comptime !(builtin.os.tag == .windows and builtin.mode != .Debug)) break :windows_file;
+        if (level == .debug) break :windows_file;
+
+        const localappdata_w = std.process.getenvW(
+            std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA"),
+        ) orelse break :windows_file;
+
+        var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = std.unicode.wtf16LeToWtf8(&base_buf, localappdata_w);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_path = std.fmt.bufPrint(
+            &path_buf,
+            "{s}\\ghoztty",
+            .{base_buf[0..n]},
+        ) catch break :windows_file;
+
+        var dir = std.fs.cwd().makeOpenPath(dir_path, .{}) catch break :windows_file;
+        defer dir.close();
+        const file = dir.createFile("ghoztty.log", .{ .truncate = false }) catch break :windows_file;
+        defer file.close();
+        file.seekFromEnd(0) catch break :windows_file;
+
+        var msg_buf: [2048]u8 = undefined;
+        const level_txt = comptime level.asText();
+        const prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+        const msg = std.fmt.bufPrint(
+            &msg_buf,
+            level_txt ++ prefix ++ format ++ "\n",
+            args,
+        ) catch break :windows_file;
+        _ = file.write(msg) catch {};
+    }
+
     stderr: {
         // don't log debug messages to stderr unless we are a debug build
         if (comptime builtin.mode != .Debug and level == .debug) break :stderr;
