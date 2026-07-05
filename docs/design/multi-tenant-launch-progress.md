@@ -33,13 +33,22 @@ SQLite (WAL) + Litestream · React (Vite) SPA + Recharts · Prometheus · single
 | M0 | SQLite foundation | `mt/m0-sqlite` | **merged** → main `8a328e120` (re-verified: build/vet/race-tests/static-build). NOT yet deployed to prod. | — |
 | M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **merged** → main `40066364e` (re-verified: build/vet/race-tests/static-build). Staged behind `INVITE_SIGNUP` (default OFF) — **live cutover NOT done** (human checkpoint; see M1 handoff below). | M0 ✓ |
 | M2 | Admin API + admin auth | `mt/m2-admin-api` | **in worktree** — agent launched 2026-07-05 (`ADMIN_SUBS` bootstrap + is_admin in DB, /v1/admin/* REST, admin_audit via migration 0003; no devices.account_id) | M1 ✓ |
-| M3 | Admin portal UI (React) | `mt/m3-admin-portal` | pending | M2 |
-| M4 | Quotas + rate limits | `mt/m4-quotas` | pending | M1 (parallel w/ M2/M3) |
-| M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | pending | M0 (parallel) |
+| M3 | Admin portal UI (React) | `mt/m3-admin-portal` | pending — **design bar (user, 2026-07-05): clean, intuitive, well designed; very powerful but also elegant.** Bake this into the M3 launch spec (visual polish is in scope, not deferred). | M2 |
+| M4 | Quotas + rate limits | `mt/m4-quotas` | **in worktree** — agent launched 2026-07-05 (migration 0004 assigned; env defaults + DB overrides; store seams only, no admin HTTP) | M1 ✓ (parallel w/ M2/M3) |
+| M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | **in worktree** — agent launched 2026-07-05 (separate internal listener `METRICS_ADDR` default 127.0.0.1:9091; no DB migration; Prometheus standup itself stays human) | M0 ✓ (parallel) |
 | M5b | Portal availability + usage charts | `mt/m5b-portal-charts` | pending | M3, M5a |
 | M6 | Launch hardening / ops | `mt/m6-ops` | pending | M3, M4, M5 |
 
 State values: `pending` → `in worktree` → `awaiting review` → `merged`.
+
+## Parallel-merge coordination (M2 ∥ M4 ∥ M5a, launched 2026-07-05)
+Three worktrees are in flight off the same main. Conductor merge plan:
+- Migration numbers assigned: M2=0003_admin.sql, M4=0004_quotas.sql, M5a=none.
+- Each agent was told to keep shared-file edits (handlers/config/main/enroll/
+  auth_gate/store) surgical and put logic in new files.
+- Merge sequentially in completion order; re-run full acceptance on main after
+  EACH merge (conflicts in shared files are expected to be small; resolve by
+  composing hooks, never dropping one milestone's hook for another's).
 
 ## Human checkpoints (STOP and ask)
 - **M1 production auth cutover** — flipping live sign-in from `ALLOWED_EMAILS` to
