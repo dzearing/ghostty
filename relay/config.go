@@ -75,6 +75,17 @@ type Config struct {
 	// from INVITE_SIGNUP; flipping it live is the human cutover checkpoint.
 	InviteSignup bool
 
+	// AdminSubs is the bootstrap admin allowlist: comma-separated Google `sub`
+	// values (NOT emails — the sub is the stable authz key, plan §2/§4.4) whose
+	// verified holders may call the /v1/admin/ surface. It is the
+	// bootstrap/recovery path; day-to-day admin-ness is managed in the DB via
+	// accounts.is_admin (admin = sub ∈ AdminSubs OR is_admin=1). Empty means no
+	// bootstrap admins — with no is_admin accounts either, every admin endpoint
+	// 403s (fail closed). Under DEV_AUTH the dev identity's sub is "dev", so
+	// including "dev" here makes the dev token an admin (tests only). Sourced
+	// from ADMIN_SUBS.
+	AdminSubs []string
+
 	// StateDir holds persisted relay state: the SQLite database
 	// (ghoztty-relay.db) and, on legacy installs, the old devices.json.
 	StateDir string
@@ -115,6 +126,14 @@ func LoadConfig() *Config {
 		e = strings.ToLower(strings.TrimSpace(e))
 		if e != "" {
 			cfg.AllowedEmails = append(cfg.AllowedEmails, e)
+		}
+	}
+
+	// Subs are opaque case-sensitive identifiers — trimmed, never lowercased.
+	for _, s := range strings.Split(os.Getenv("ADMIN_SUBS"), ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			cfg.AdminSubs = append(cfg.AdminSubs, s)
 		}
 	}
 
