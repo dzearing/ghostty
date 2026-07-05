@@ -154,6 +154,7 @@ func (g *SigninGate) legacyOwnerAccount(ident Identity) (*Account, error) {
 // record writes a best-effort signin_attempts row; a failure is logged, never
 // propagated (it must not block a legitimate sign-in).
 func (g *SigninGate) record(ident Identity, ip, outcome, accountID string) {
+	mSigninAttempts.WithLabelValues(outcome).Inc() // metrics.go
 	if err := g.store.RecordSigninAttempt(ident.Email, ident.Sub, ip, outcome, accountID); err != nil {
 		g.logger.Warn("record signin attempt failed", "err", err)
 	}

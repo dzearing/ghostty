@@ -278,9 +278,11 @@ func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identi
 	if !a.allowed[ident.Email] {
 		// Authorization gate: a valid Google login by anyone not on the
 		// allowlist is rejected.
+		mSigninAttempts.WithLabelValues(outcomeAllowlistRejected).Inc() // metrics.go; counting only
 		a.logger.Warn("client email not on allowlist", "email", ident.Email)
 		return Identity{}, ErrUnauthorized
 	}
+	mSigninAttempts.WithLabelValues(outcomeAllowlistAllowed).Inc() // metrics.go; counting only
 	return ident, nil
 }
 
