@@ -1,9 +1,10 @@
 # Ghoztty on Windows amd64 — port plan
 
-Status: **beta staged** — `Ghoztty-26.7.501-x64.msi` is on
-`/Volumes/share/ghoztty-windows/`, awaiting manual verification on the
-Windows box (checklist at the bottom). All milestones except manual
-on-box verification are complete.
+Status: **beta staged as a portable ZIP** — `Ghoztty-portable-x64.zip` is on
+`/Volumes/share/ghoztty-windows/` (extract, run `Ghoztty\ghoztty.exe`). The
+MSI installer is deferred: its major-upgrade path deletes the exe on
+re-install (see postmortems below). Awaiting on-box confirmation that the
+terminal window opens.
 Branch: `users/dzearing/windows-amd64`
 Date started: 2026-07-05
 
