@@ -38,6 +38,8 @@ func newTestServer(t *testing.T) (*httptest.Server, string, *Store) {
 	if err != nil {
 		t.Fatalf("LoadStore: %v", err)
 	}
+	// Mirror main.go: bind the invite-code gate (no-op unless INVITE_SIGNUP).
+	auth.SetGate(NewSigninGate(cfg, store, logger))
 	dir := NewDirectory(logger)
 	h := NewHandler(cfg, auth, store, dir, logger)
 

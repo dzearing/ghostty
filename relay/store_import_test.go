@@ -154,7 +154,7 @@ func TestLoadStoreNoLegacyFile(t *testing.T) {
 		t.Fatalf("expected empty store, got %d devices", n)
 	}
 	// And it is a functioning store.
-	dev, raw, err := store.CreateDevice("x@example.com", "box")
+	dev, raw, err := store.CreateDevice("x@example.com", "sub-x", "box")
 	if err != nil {
 		t.Fatalf("CreateDevice: %v", err)
 	}
