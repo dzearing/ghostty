@@ -382,7 +382,7 @@ func TestOIDCEndToEndHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
-	store, err := LoadStore(cfg.DevicesPath(), logger)
+	store, err := LoadStore(cfg.DBPath(), cfg.DevicesPath(), logger)
 	if err != nil {
 		t.Fatalf("LoadStore: %v", err)
 	}

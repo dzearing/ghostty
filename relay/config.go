@@ -65,7 +65,8 @@ type Config struct {
 	// is necessary but NOT sufficient: the email must also appear here.
 	AllowedEmails []string
 
-	// StateDir holds persisted relay state (currently devices.json).
+	// StateDir holds persisted relay state: the SQLite database
+	// (ghoztty-relay.db) and, on legacy installs, the old devices.json.
 	StateDir string
 
 	// --- Dev/test auth (MUST be off in production) ---
@@ -129,7 +130,14 @@ func (c *Config) EnrollClientSecret() string {
 	return c.GoogleClientSecret
 }
 
-// DevicesPath returns the path to the persisted device directory.
+// DBPath returns the path to the SQLite database file under StateDir.
+func (c *Config) DBPath() string {
+	return filepath.Join(c.StateDir, "ghoztty-relay.db")
+}
+
+// DevicesPath returns the path to the legacy flat-file device directory. It is
+// no longer written; it is read once by LoadStore's one-time importer and then
+// left in place as a backup.
 func (c *Config) DevicesPath() string {
 	return filepath.Join(c.StateDir, "devices.json")
 }
