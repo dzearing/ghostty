@@ -200,7 +200,7 @@ Design notes:
 | `GOOGLE_WEB_CLIENT_SECRET` | *(unset)*  | The Web client's secret, used server-side for the `/enroll/callback` code exchange. **Confidential** — keep it in the relay env only. |
 | `RELAY_BASE_URL`   | *(unset)*          | Public https base URL returned to freshly enrolled agents (`relay_base`) and used to build web-enroll URLs (`enroll_url`, the OAuth `redirect_uri`). When unset it is derived from the request `Host` header, which is correct behind Caddy. |
 | `ALLOWED_EMAILS`   | *(empty)*          | Comma-separated authorization allowlist of verified Google emails. A valid login by anyone not listed is rejected — including at self-enrollment. |
-| `STATE_DIR`        | `./state`          | Directory holding `devices.json` (persisted device hashes). |
+| `STATE_DIR`        | `./state`          | Directory holding the SQLite database `ghoztty-relay.db` (WAL mode; persisted device hashes). A legacy `devices.json` here is imported once on first boot and then kept as a backup. |
 | `DEV_AUTH`         | `false`            | **Testing only.** Accept a static bearer as a stand-in for OIDC. Logs a loud warning at startup. |
 | `DEV_CLIENT_TOKEN` | *(unset)*          | The static bearer accepted when `DEV_AUTH=true`. |
 | `DEV_EMAIL`        | *(unset)*          | Identity that a successful dev-auth maps to (becomes the device owner). |
@@ -225,9 +225,10 @@ both accepted until `DEV_AUTH` is turned off.
   local issuer (self-minted RS256 tokens): valid accepted; wrong aud/iss,
   expired, forged signature, unverified/missing email, and non-allowlisted
   logins all rejected.
-- **Agents:** the presented device token is SHA-256'd and compared
-  constant-time against the stored hash. **Raw tokens are never stored or
-  logged** — only their SHA-256 hash is persisted to `devices.json`.
+- **Agents:** the presented device token is SHA-256'd and looked up by its
+  digest against the stored hash (an indexed equality match on the digest, not
+  the raw token). **Raw tokens are never stored or logged** — only their
+  SHA-256 hash is persisted in the SQLite `devices` table.
 - **Authorization:** a client may only list/connect/rename/delete devices whose
   `owner_email` matches its verified email. Unknown / unowned device IDs return
   `404` (not enumerable).
@@ -386,7 +387,7 @@ rename preserves it, the control-connect header updates it).
 | `config.go`                   | Environment-variable configuration. |
 | `auth.go`                     | OIDC client verification, device-token verification, dev mode. |
 | `enroll.go`                   | OAuth device-code self-enrollment (start/poll state machine). |
-| `store.go`                    | Device persistence (`devices.json`), token hashing, idempotent upsert. |
+| `store.go`                    | Device persistence (SQLite via `modernc.org/sqlite`, goose migrations in `migrations/`), token hashing, idempotent upsert, one-time `devices.json` import. |
 | `directory.go`                | Online-agent registry, control connections, pending sessions. |
 | `bridge.go`                   | The bidirectional `io.Copy` splice. |
 | `handlers.go`                 | HTTP/WebSocket endpoint handlers. |

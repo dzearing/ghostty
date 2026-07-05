@@ -37,11 +37,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	store, err := LoadStore(cfg.DevicesPath(), logger)
+	store, err := LoadStore(cfg.DBPath(), cfg.DevicesPath(), logger)
 	if err != nil {
 		logger.Error("failed to load device store", "err", err)
 		os.Exit(1)
 	}
+	defer store.Close()
 
 	dir := NewDirectory(logger)
 	h := NewHandler(cfg, auth, store, dir, logger)
