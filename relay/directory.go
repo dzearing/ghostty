@@ -129,6 +129,7 @@ func (d *Directory) CreatePending(deviceID string) (*pendingSession, error) {
 		done:     make(chan struct{}),
 	}
 	d.sessions[ps.id] = ps
+	mSessionsTotal.Inc() // metrics.go
 	return ps, nil
 }
 

@@ -14,6 +14,12 @@ type Config struct {
 	// in front, so we deliberately default to loopback only.
 	ListenAddr string
 
+	// MetricsAddr is the SEPARATE Prometheus /metrics listen address (default
+	// loopback 127.0.0.1:9091 — never on the Caddy-proxied public mux, so
+	// metrics are unreachable from the internet by construction). Set
+	// METRICS_ADDR=off to disable the listener. See metrics.go.
+	MetricsAddr string
+
 	// GoogleClientID is the OAuth 2.0 / OIDC client ID that Google-issued ID
 	// tokens must be addressed to (the `aud` claim). Required for real OIDC.
 	GoogleClientID string
@@ -97,6 +103,7 @@ type Config struct {
 func LoadConfig() *Config {
 	cfg := &Config{
 		ListenAddr:               getenv("LISTEN_ADDR", "127.0.0.1:8080"),
+		MetricsAddr:              getenv("METRICS_ADDR", "127.0.0.1:9091"),
 		GoogleClientID:           os.Getenv("GOOGLE_CLIENT_ID"),
 		GoogleClientSecret:       os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleDeviceClientID:     os.Getenv("GOOGLE_DEVICE_CLIENT_ID"),

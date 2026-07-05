@@ -58,9 +58,19 @@ func main() {
 	mux := http.NewServeMux()
 	h.Register(mux)
 
+	// Prometheus /metrics on its own (loopback by default) listener — never on
+	// the public mux. Bind failure is fatal: it is a config error (metrics.go).
+	metricsSrv, err := StartMetricsServer(cfg, dir, store, logger)
+	if err != nil {
+		logger.Error("failed to start metrics listener", "err", err)
+		os.Exit(1)
+	}
+
 	srv := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: mux,
+		Addr: cfg.ListenAddr,
+		// InstrumentHTTP wraps the mux for request/error-rate counters
+		// (metrics.go); it preserves Hijacker for the WebSocket routes.
+		Handler: InstrumentHTTP(mux),
 		// No global write/read timeouts: WebSocket bridges are long-lived.
 		// Per-operation timeouts (heartbeat, session setup) bound the risky paths.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -85,5 +95,8 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "err", err)
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}
 }

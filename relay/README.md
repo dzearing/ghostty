@@ -192,6 +192,7 @@ Design notes:
 | Variable           | Default            | Purpose |
 |--------------------|--------------------|---------|
 | `LISTEN_ADDR`      | `127.0.0.1:8080`   | Plain-HTTP listen address (TLS handled by Caddy). |
+| `METRICS_ADDR`     | `127.0.0.1:9091`   | **Separate** Prometheus `/metrics` listener — deliberately never on the Caddy-proxied public mux, so metrics stay unreachable from the internet (Prometheus on the same VM scrapes localhost). Set to `off` to disable; a bind failure at startup is fatal (config error). |
 | `GOOGLE_CLIENT_ID` | *(unset)*          | OAuth/OIDC client ID of the **Desktop** client the Mac app signs in with; ID tokens must carry this (or `GOOGLE_DEVICE_CLIENT_ID`) as `aud`. Required for real client auth and for self-enrollment. |
 | `GOOGLE_CLIENT_SECRET` | *(unset)*      | The Desktop client's secret. Used for Google's token endpoint during self-enrollment **only when** `GOOGLE_DEVICE_CLIENT_ID` is unset (single-client fallback). Not confidential for this client type. |
 | `GOOGLE_DEVICE_CLIENT_ID` | *(unset)*   | OAuth client ID of the **"TVs and Limited Input devices"** client used for device-code self-enrollment — Google only allows the device-code grant for that client type. When set, enroll start/poll present this client to Google, and ID tokens with this `aud` are accepted alongside `GOOGLE_CLIENT_ID`. When unset, enroll falls back to `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`. |
