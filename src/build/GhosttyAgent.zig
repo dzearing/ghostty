@@ -67,6 +67,8 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
         // are not, so request them explicitly (windows-target only).
         exe.linkSystemLibrary("user32");
         exe.linkSystemLibrary("shell32");
+        // relay.env DACL hardening (enroll.zig) uses the token/security APIs.
+        exe.linkSystemLibrary("advapi32");
         // Embed the ghost icon (id 1) so the exe and its tray icon aren't the
         // generic Windows application icon. `tray.zig` loads it by id from this
         // module's own instance handle.
