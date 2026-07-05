@@ -145,6 +145,20 @@ pub fn updateAvailable(local: []const u8, remote: []const u8) bool {
     return !std.mem.eql(u8, local, remote);
 }
 
+/// Result of a single check (`checkNow`), for the tray "Check for updates" UI.
+pub const CheckOutcome = enum {
+    /// Manifest says this build is current — nothing to do.
+    up_to_date,
+    /// A newer build was downloaded + sha-verified + staged; it applies on the
+    /// next idle moment (zero live sessions).
+    update_staged,
+    /// The check couldn't complete (network / manifest / download / hash). The
+    /// loop retries automatically.
+    check_failed,
+    /// Another check is already running (single-flight).
+    busy,
+};
+
 /// The background updater. Production wiring is `maybeStart` (env knobs, real
 /// exe path/argv, store-backed idleness, detached thread); tests build one
 /// directly with short intervals and hooked spawn/exit seams.
@@ -175,10 +189,16 @@ pub const Updater = struct {
     spawnFn: *const fn (?*anyopaque, *Updater, []const []const u8) anyerror!void = spawnReal,
     exitFn: *const fn (*Updater) void = exitReal,
 
-    // Stop plumbing (tests; production never stops it).
+    // Stop plumbing (tests; production never stops it) + manual-check state.
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     stop_flag: bool = false,
+    /// Single-flight guard: true while a check (loop or manual) is running, so a
+    /// tray "Check for updates" and the background loop never stage concurrently.
+    checking: bool = false,
+    /// A verified update is staged and waiting only on idleness to apply. Set by
+    /// a manual check so the loop applies it without re-downloading.
+    pending_apply: bool = false,
 
     /// THE LOOP: initial delay → check (+stage) → idle-gate → apply → respawn
     /// → exit. Runs until `exitFn` (production: never returns from it) or
@@ -190,7 +210,9 @@ pub const Updater = struct {
         );
         if (self.sleepOrStop(self.initial_delay_ms)) return;
         while (true) {
-            if (self.checkAndStage()) {
+            // A manual check may have already staged an update (pending_apply);
+            // otherwise check now. Both share the single-flight guard in checkNow.
+            if (self.stagedOrCheck()) {
                 // Staged: gate the apply on ZERO live sessions.
                 var logged_wait = false;
                 while (true) {
@@ -207,12 +229,27 @@ pub const Updater = struct {
                     self.exitFn(self);
                     return; // test exit hooks return; production never gets here
                 } else |err| {
-                    // Swap failed and was rolled back; retry a full cycle later.
+                    // Swap failed and was rolled back; retry a full cycle later
+                    // (re-download), so clear the staged flag.
                     std.debug.print("ghoztty-agent: self-update: apply failed ({s}); will retry next cycle\n", .{@errorName(err)});
+                    self.mutex.lock();
+                    self.pending_apply = false;
+                    self.mutex.unlock();
                 }
             }
             if (self.sleepOrStop(self.check_interval_ms)) return;
         }
+    }
+
+    /// Loop helper: true if an update is staged and ready to apply — either a
+    /// manual check already staged one (`pending_apply`), or a fresh check does
+    /// so now.
+    fn stagedOrCheck(self: *Updater) bool {
+        self.mutex.lock();
+        const pending = self.pending_apply;
+        self.mutex.unlock();
+        if (pending) return true;
+        return self.checkNow() == .update_staged;
     }
 
     /// Unblock + stop the loop (tests).
@@ -233,50 +270,92 @@ pub const Updater = struct {
         return self.stop_flag;
     }
 
-    /// One manifest check; on a version difference, download + verify + stage.
-    /// Returns true when `<exe>.new` is staged and ready to apply. ALL failure
-    /// modes log-and-return-false (the loop just retries next cycle). The
-    /// quiet no-update paths log only in debug builds.
+    /// Back-compat thin wrapper: true iff a fresh update was staged. Used by the
+    /// tests; the loop and tray use `checkNow`/`doCheck` for the richer outcome.
     pub fn checkAndStage(self: *Updater) bool {
+        return self.doCheck() == .update_staged;
+    }
+
+    /// Manual, user-initiated check (the tray "Check for updates"). Single-flight
+    /// with the background loop via `checking`, so the two never stage at once.
+    /// On a staged update it sets `pending_apply` (the loop then applies it when
+    /// idle, without re-downloading) — pair with `wake` to apply promptly.
+    pub fn checkNow(self: *Updater) CheckOutcome {
+        self.mutex.lock();
+        if (self.checking) {
+            self.mutex.unlock();
+            return .busy;
+        }
+        self.checking = true;
+        self.mutex.unlock();
+        defer {
+            self.mutex.lock();
+            self.checking = false;
+            self.mutex.unlock();
+        }
+
+        const outcome = self.doCheck();
+        if (outcome == .update_staged) {
+            self.mutex.lock();
+            self.pending_apply = true;
+            self.mutex.unlock();
+        }
+        return outcome;
+    }
+
+    /// Wake the loop out of its sleep so a just-staged update applies now (once
+    /// idle) instead of at the next 6h check. A spurious wake is harmless — the
+    /// loop simply re-evaluates and sleeps again.
+    pub fn wake(self: *Updater) void {
+        self.mutex.lock();
+        self.cond.broadcast();
+        self.mutex.unlock();
+    }
+
+    /// One manifest check; on a version difference, download + verify + stage.
+    /// Returns `.update_staged` when `<exe>.new` is ready to apply, `.up_to_date`
+    /// when current, `.check_failed` on any error (the loop retries next cycle).
+    /// The quiet no-update paths log only in debug builds.
+    fn doCheck(self: *Updater) CheckOutcome {
         const alloc = self.alloc;
 
         // 1. Fetch + parse the manifest, select this platform's entry.
-        const url = std.fmt.allocPrint(alloc, "{s}{s}", .{ self.base_url, manifest_path }) catch return false;
+        const url = std.fmt.allocPrint(alloc, "{s}{s}", .{ self.base_url, manifest_path }) catch return .check_failed;
         defer alloc.free(url);
         var resp = http_client.get(alloc, url, max_manifest_len) catch |err| {
             debugLog("manifest fetch failed ({s})", .{@errorName(err)});
-            return false;
+            return .check_failed;
         };
         defer resp.deinit(alloc);
         if (resp.status != 200) {
             debugLog("manifest fetch: HTTP {d}", .{resp.status});
-            return false;
+            return .check_failed;
         }
         var entry = parseManifest(alloc, resp.body, platform_key) orelse {
             debugLog("manifest invalid or no entry for {s}", .{platform_key});
-            return false;
+            return .check_failed;
         };
         defer entry.deinit(alloc);
 
         // 2. Version gate.
         if (!updateAvailable(self.local_version, entry.version)) {
             debugLog("up to date ({s})", .{self.local_version});
-            return false;
+            return .up_to_date;
         }
         std.debug.print("ghoztty-agent: self-update: update found: {s} -> {s}\n", .{ self.local_version, entry.version });
 
         // 3. Download the binary (to memory — verified BEFORE anything is
         //    written next to the exe).
-        const bin_url = std.fmt.allocPrint(alloc, "{s}{s}", .{ self.base_url, entry.path }) catch return false;
+        const bin_url = std.fmt.allocPrint(alloc, "{s}{s}", .{ self.base_url, entry.path }) catch return .check_failed;
         defer alloc.free(bin_url);
         var bin = http_client.get(alloc, bin_url, max_binary_len) catch |err| {
             std.debug.print("ghoztty-agent: self-update: download failed ({s}); will retry next cycle\n", .{@errorName(err)});
-            return false;
+            return .check_failed;
         };
         defer bin.deinit(alloc);
         if (bin.status != 200 or bin.body.len == 0) {
             std.debug.print("ghoztty-agent: self-update: download failed (HTTP {d}); will retry next cycle\n", .{bin.status});
-            return false;
+            return .check_failed;
         }
         std.debug.print("ghoztty-agent: self-update: downloaded {d} bytes\n", .{bin.body.len});
 
@@ -284,23 +363,23 @@ pub const Updater = struct {
         var expected: [32]u8 = undefined;
         _ = std.fmt.hexToBytes(&expected, entry.sha256) catch {
             std.debug.print("ghoztty-agent: self-update: manifest sha256 is not hex; discarding download\n", .{});
-            return false;
+            return .check_failed;
         };
         var actual: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bin.body, &actual, .{});
         if (!std.mem.eql(u8, &expected, &actual)) {
             std.debug.print("ghoztty-agent: self-update: sha256 MISMATCH (want {s}); discarding download, will retry next cycle\n", .{entry.sha256});
-            return false;
+            return .check_failed;
         }
         std.debug.print("ghoztty-agent: self-update: sha256 verified\n", .{});
 
         // 5. Stage crash-safely: write `<exe>.new.tmp`, rename → `<exe>.new`.
         self.stageBytes(bin.body) catch |err| {
             std.debug.print("ghoztty-agent: self-update: staging failed ({s}); will retry next cycle\n", .{@errorName(err)});
-            return false;
+            return .check_failed;
         };
         std.debug.print("ghoztty-agent: self-update: staged {s} at {s}.new\n", .{ entry.version, self.exe_path });
-        return true;
+        return .update_staged;
     }
 
     /// Write the verified bytes to `<exe>.new.tmp` (exec bit set on POSIX),
@@ -407,25 +486,28 @@ fn storeLiveSessions(ctx: ?*anyopaque) usize {
 /// override), capture the running exe path + argv for the respawn, apply the
 /// test-interval override, and run the updater on a detached daemon-lifetime
 /// thread. Failures only cost the feature, never the daemon.
+/// Returns the live `Updater` (for the tray "Check for updates") or null when
+/// self-update is disabled (kill switch / dev build) or failed to start.
 pub fn maybeStart(
     alloc: Allocator,
     relay_host: []const u8,
     local_version: []const u8,
     store: *session.SessionStore,
-) void {
+) ?*Updater {
     if (std.process.getEnvVarOwned(alloc, env_disable)) |v| {
         defer alloc.free(v);
         if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
             std.debug.print("ghoztty-agent: self-update: disabled ({s}={s})\n", .{ env_disable, v });
-            return;
+            return null;
         }
     } else |_| {}
     if (std.mem.eql(u8, local_version, "dev")) {
         std.debug.print("ghoztty-agent: self-update: disabled (dev build has no baked version)\n", .{});
-        return;
+        return null;
     }
-    start(alloc, relay_host, local_version, store) catch |err| {
+    return start(alloc, relay_host, local_version, store) catch |err| {
         std.debug.print("ghoztty-agent: self-update: failed to start ({s}); continuing without it\n", .{@errorName(err)});
+        return null;
     };
 }
 
@@ -434,7 +516,7 @@ fn start(
     relay_host: []const u8,
     local_version: []const u8,
     store: *session.SessionStore,
-) !void {
+) !*Updater {
     // Everything below is daemon-lifetime (the thread never joins); nothing
     // here is freed on the success path.
     const base_url: []const u8 = blk: {
@@ -476,6 +558,7 @@ fn start(
 
     const t = try std.Thread.spawn(.{}, Updater.runLoop, .{updater});
     t.detach(); // daemon-lifetime thread; nothing ever joins it
+    return updater;
 }
 
 /// Best-effort startup cleanup of a previous update's artifacts next to the

@@ -1,8 +1,9 @@
 //! Windows system-tray UI for the `ghoztty-agent` listen daemon.
 //!
-//! When the agent runs in TCP listen-daemon or relay mode on Windows (the
-//! default — the deploy watcher launches it as `ghoztty-agent --listen ...`), it
-//! shows a tray icon so the human running the Windows box has a visible,
+//! When the agent runs in relay mode (the customer default — the MSI/installer
+//! autostart it as `ghoztty-agent --relay=<url>`) or the local `--listen` dev
+//! daemon on Windows, it shows a tray icon so the human running the box has a
+//! visible,
 //! dismissable handle on the daemon: confirm it's alive, see the live session
 //! count, and Quit it cleanly. `--headless` suppresses this (CI / ssh-piped /
 //! stdio paths), keeping the previous behavior exactly.
@@ -45,6 +46,7 @@ const builtin = @import("builtin");
 const session = @import("session.zig");
 const link_control = @import("link_control.zig");
 const tray_account = @import("tray_account.zig");
+const self_update = @import("self_update.zig");
 
 /// Show the agent tray icon and run the Win32 message loop until the user picks
 /// Exit. BLOCKS the calling thread (must be the main thread — see the module doc).
@@ -70,9 +72,10 @@ pub fn run(
     build_hash: []const u8,
     link: ?*link_control.LinkControl,
     account: ?*tray_account.TrayAccount,
+    updater: ?*self_update.Updater,
 ) bool {
     if (builtin.os.tag != .windows) return false;
-    return win.run(store, build_hash, link, account);
+    return win.run(store, build_hash, link, account, updater);
 }
 
 /// One-shot PRE-TRAY error surface: a plain error message box on Windows,
@@ -267,6 +270,9 @@ const win = if (builtin.os.tag == .windows) struct {
     /// Thread-safe: the message-pump thread reads `view` and calls `request*`
     /// (which spawn workers), never blocking on network/browser work.
     var g_account: ?*tray_account.TrayAccount = null;
+    /// Self-updater handle, or null in `--listen` / dev / disabled. The tray's
+    /// "Check for updates" triggers an immediate check through it (off-thread).
+    var g_updater: ?*self_update.Updater = null;
     var g_nid: NOTIFYICONDATAW = undefined; // retained so Exit can NIM_DELETE it.
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyAgentTrayWnd");
@@ -282,11 +288,13 @@ const win = if (builtin.os.tag == .windows) struct {
         build_hash: []const u8,
         link: ?*link_control.LinkControl,
         account: ?*tray_account.TrayAccount,
+        updater: ?*self_update.Updater,
     ) bool {
         g_store = store;
         g_build_hash = build_hash;
         g_link = link;
         g_account = account;
+        g_updater = updater;
 
         const hinst = GetModuleHandleW(null) orelse return false;
 
@@ -639,18 +647,42 @@ const win = if (builtin.os.tag == .windows) struct {
         _ = MessageBoxW(hwnd, text, lit("About Ghoztty Agent"), MB_OK | MB_ICONINFORMATION);
     }
 
-    fn onUpdate(hwnd: HWND) void {
-        // TODO(update): real update check. The deploy watcher currently hot-swaps a
-        // new ghoztty-agent.exe dropped on the share, so updates are automatic; a
-        // manual "check now" / version-compare path is a later increment.
-        var buf: [256]u16 = undefined;
-        const text = fmtUtf16(
-            &buf,
-            "Current build ",
-            g_build_hash,
-            ".\nAuto-update is handled by the deploy watcher.",
-        );
-        _ = MessageBoxW(hwnd, text, lit("Check for updates"), MB_OK | MB_ICONINFORMATION);
+    fn onUpdate(_: HWND) void {
+        // The check fetches a manifest and may download the binary (seconds), so
+        // run it OFF the message-pump thread; the result is shown in an
+        // owner-less message box (safe to call from any thread). Spawn failure
+        // falls back to a synchronous check (briefly blocks the menu — rare).
+        (std.Thread.spawn(.{}, updateWorker, .{}) catch {
+            updateWorker();
+            return;
+        }).detach();
+    }
+
+    /// Runs a real self-update check and reports the outcome. See `onUpdate`.
+    fn updateWorker() void {
+        const up = g_updater orelse {
+            _ = MessageBoxW(null, lit("Ghoztty Agent updates itself automatically. A manual check isn't available in this mode."), lit("Check for Updates"), MB_OK | MB_ICONINFORMATION);
+            return;
+        };
+        switch (up.checkNow()) {
+            .up_to_date => {
+                var buf: [256]u16 = undefined;
+                const text = fmtUtf16(&buf, "Ghoztty Agent is up to date (", g_build_hash, ").");
+                _ = MessageBoxW(null, text, lit("Check for Updates"), MB_OK | MB_ICONINFORMATION);
+            },
+            .update_staged => {
+                // Wake the background loop so it applies as soon as the machine
+                // is idle, rather than waiting for the next scheduled check.
+                up.wake();
+                _ = MessageBoxW(null, lit("An update was downloaded and verified.\n\nIt installs automatically the next time this machine has no active sessions — no interruption to your work."), lit("Check for Updates"), MB_OK | MB_ICONINFORMATION);
+            },
+            .check_failed => {
+                _ = MessageBoxW(null, lit("Couldn't check for updates right now.\n\nGhoztty keeps trying automatically in the background."), lit("Check for Updates"), MB_OK | MB_ICONINFORMATION);
+            },
+            .busy => {
+                _ = MessageBoxW(null, lit("An update check is already in progress\u{2026}"), lit("Check for Updates"), MB_OK | MB_ICONINFORMATION);
+            },
+        }
     }
 
     /// Exit: remove the tray icon, then post WM_QUIT so the message loop returns
@@ -699,6 +731,9 @@ const win = if (builtin.os.tag == .windows) struct {
 
     /// Shorthand for a compile-time UTF-16 literal.
     inline fn lit(comptime s: []const u8) [*:0]const u16 {
+        // The longer message-box strings exceed the default 1000-branch comptime
+        // quota during UTF-16 conversion; raise it.
+        @setEvalBranchQuota(10_000);
         return std.unicode.utf8ToUtf16LeStringLiteral(s);
     }
 } else struct {};

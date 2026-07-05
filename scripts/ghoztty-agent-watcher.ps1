@@ -86,7 +86,11 @@ while ($true) {
       # icon in listen mode (no console window pops up), so do NOT pass --headless
       # (that would suppress the tray). stdout/stderr still go to the log files via
       # inherited handles, so the readiness banner below is captured as before.
-      $proc = Start-Process -FilePath $Local -ArgumentList @('--listen', $Listen) `
+      # $Listen is 0.0.0.0 (dev box reachable from the Mac driver over the LAN),
+      # which is a non-loopback bind of the UNAUTHENTICATED listener, so the
+      # agent requires the explicit --insecure-allow-public opt-in. This is a
+      # DEV-ONLY tool on a trusted network; production uses --relay.
+      $proc = Start-Process -FilePath $Local -ArgumentList @('--listen', $Listen, '--insecure-allow-public') `
                 -PassThru -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr
       $deployed = $srcHash
       Start-Sleep -Milliseconds 400

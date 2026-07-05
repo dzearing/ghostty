@@ -272,7 +272,9 @@ func (m *EnrollManager) Start(ctx context.Context, name string) (*enrollStartRes
 	}
 	m.mu.Unlock()
 
-	m.logger.Info("enrollment started", "name", name, "user_code", out.UserCode)
+	// The user_code is a live (short-lived) enrollment credential shown to the
+	// human — deliberately NOT logged.
+	m.logger.Info("enrollment started", "name", name)
 
 	return &enrollStartResponse{
 		VerificationURL:  verificationURL,

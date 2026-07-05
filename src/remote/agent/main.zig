@@ -8,12 +8,12 @@
 //!      `ssh host -- ghoztty-agent` path (§4.1). One stdin/stdout pipe pair, both
 //!      logical lanes muxed onto it. Shuts down on stdin EOF (client hung up).
 //!
-//!   2. **TCP listen daemon** (`--listen <addr:port>`, default `0.0.0.0:7777` when
-//!      run with NO args): bind, listen, then loop — accept a connection and serve
-//!      it on its OWN thread (a `Mux` + `Server` over the socket, sharing the
-//!      daemon-scoped session store), so the accept loop NEVER blocks on one
-//!      connection's lifecycle. The real-network backbone for cross-machine tests
-//!      (Mac ↔ Windows over Tailscale).
+//!   2. **TCP listen daemon** (`--listen <addr:port>`, loopback by default;
+//!      non-loopback needs `--insecure-allow-public`): bind, listen, then loop —
+//!      accept a connection and serve it on its OWN thread (a `Mux` + `Server`
+//!      over the socket, sharing the daemon-scoped session store), so the accept
+//!      loop NEVER blocks on one connection's lifecycle. UNAUTHENTICATED — a
+//!      local/dev harness only (the authenticated path is `--relay`).
 //!
 //!   3. **Relay daemon** (`--relay <url>`): the single-binary rendezvous path (no
 //!      Go sidecar, no inbound port). Hold an authenticated `wss://` control
@@ -47,13 +47,21 @@
 //! and the agent replays the ring gap `(last_byte_offset, S]` — catching the client
 //! up to everything the remote produced while it was gone — then resumes live
 //! streaming. Orphaned sessions are reaped by a background idle-TTL thread
-//! (`session.default_idle_ttl_ms`, 10 min) so abandoned shells don't leak.
+//! (`session.default_idle_ttl_ms`, 5 min) so abandoned shells don't leak.
 //!
-//! ### SECURITY (this increment)
-//! The TCP listener is **unauthenticated**: any host that can reach the port can
-//! open a shell session on this machine. It relies entirely on network trust
-//! (Tailscale / a trusted LAN / `127.0.0.1`). Do NOT expose it on an untrusted
-//! network. Auth (a shared token / mTLS) is a later increment.
+//! ### SECURITY
+//! The `--relay` path is authenticated end to end (per-device bearer token, and
+//! the relay enforces account ownership). The `--relay` mode is the ONLY way a
+//! customer install brings a machine online (the MSI/installer autostart it with
+//! `--relay=<url>`).
+//!
+//! The TCP `--listen` path is **unauthenticated**: any host that can reach the
+//! port can open a shell. It exists for local/dev use only and is guarded:
+//!   - a bare invocation (no args) does NOT listen — it prints usage and exits;
+//!   - `--listen` may bind loopback (`127.0.0.1`/`::1`) freely;
+//!   - binding a NON-loopback interface requires the explicit
+//!     `--insecure-allow-public` opt-in and prints a loud warning.
+//! So an unauthenticated shell can never be exposed to the network by accident.
 //!
 //! ## Transport over a single byte channel
 //! The wire design (§4.3) uses two logical lanes — control + data, each a
@@ -95,8 +103,6 @@ const relay_creds = @import("relay_creds.zig");
 const self_update = @import("self_update.zig");
 const single_instance = @import("single_instance.zig");
 
-const default_listen = "0.0.0.0:7777";
-
 /// The agent's baked build version: `YYYYMMDD-<git short hash>` (commit date),
 /// or `"dev"` when git was unavailable at build time. Stamped by
 /// `src/build/GhosttyAgent.zig` through the `agent_build_options` module
@@ -122,13 +128,14 @@ pub fn main() !void {
             const line = std.fmt.bufPrint(&buf, "ghoztty-agent {s}\n", .{agent_version}) catch "ghoztty-agent\n";
             std.fs.File.stdout().writeAll(line) catch {};
         },
+        .usage => printUsage(),
         .stdio => try runStdio(alloc, encoding),
         .listen => |l| {
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
             // (bind, banner, tray icon). Exits the process on conflict.
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
             defer lock.release();
-            try runListen(alloc, encoding, l.addr, l.headless);
+            try runListen(alloc, encoding, l.addr, l.headless, l.public);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
@@ -305,6 +312,9 @@ fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
 const Mode = union(enum) {
     /// `--version`: print the baked build version and exit.
     version,
+    /// No recognized mode (bare invocation): print usage and exit cleanly —
+    /// deliberately NOT an unauthenticated listener (see the SECURITY note).
+    usage,
     stdio,
     listen: Listen,
     relay: Relay,
@@ -337,7 +347,16 @@ const Listen = struct {
     addr: std.net.Address,
     headless: bool = false,
     force_replace: bool = false,
+    /// True when `addr` is a non-loopback interface (only reachable via the
+    /// explicit `--insecure-allow-public` opt-in) — drives a runtime warning.
+    public: bool = false,
 };
+
+/// Opt-in required to bind `--listen` to a NON-loopback interface. The TCP
+/// listener is unauthenticated (see the SECURITY note), so binding it to a
+/// routable address exposes a shell to the network; we refuse to do that
+/// unless the operator explicitly accepts the risk with this flag.
+const allow_public_flag = "--insecure-allow-public";
 
 /// Parse `--version` | `--stdio` | `--listen <addr:port>` | `--relay <url>` |
 /// `--enroll --relay <url>` | (no args ⇒ default TCP listen).
@@ -359,6 +378,7 @@ fn parseArgs(alloc: Allocator) !Mode {
     var want_enroll = false;
     var no_browser = false;
     var force_replace = false;
+    var allow_public = false;
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--headless")) headless = true;
         if (std.mem.eql(u8, a, "--enroll")) want_enroll = true;
@@ -366,6 +386,7 @@ fn parseArgs(alloc: Allocator) !Mode {
             std.mem.eql(u8, a, "--headless-enroll")) no_browser = true;
         if (std.mem.eql(u8, a, "--force-replace") or
             std.mem.eql(u8, a, "--replace")) force_replace = true;
+        if (std.mem.eql(u8, a, allow_public_flag)) allow_public = true;
     }
 
     var i: usize = 1;
@@ -373,11 +394,14 @@ fn parseArgs(alloc: Allocator) !Mode {
         const a = args[i];
         if (std.mem.eql(u8, a, "--headless") or std.mem.eql(u8, a, "--enroll") or
             std.mem.eql(u8, a, "--no-browser") or std.mem.eql(u8, a, "--headless-enroll") or
-            std.mem.eql(u8, a, "--force-replace") or std.mem.eql(u8, a, "--replace"))
+            std.mem.eql(u8, a, "--force-replace") or std.mem.eql(u8, a, "--replace") or
+            std.mem.eql(u8, a, allow_public_flag))
         {
             continue; // handled in the pre-scan above
         } else if (std.mem.eql(u8, a, "--version")) {
             return .version;
+        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            return .usage;
         } else if (std.mem.eql(u8, a, "--stdio")) {
             return .stdio;
         } else if (std.mem.eql(u8, a, "--listen")) {
@@ -386,9 +410,9 @@ fn parseArgs(alloc: Allocator) !Mode {
                 std.debug.print("ghoztty-agent: --listen requires <addr:port>\n", .{});
                 return error.InvalidArgs;
             }
-            return .{ .listen = .{ .addr = try parseAddr(args[i]), .headless = headless, .force_replace = force_replace } };
+            return listenMode(try parseAddr(args[i]), headless, force_replace, allow_public);
         } else if (std.mem.startsWith(u8, a, "--listen=")) {
-            return .{ .listen = .{ .addr = try parseAddr(a["--listen=".len..]), .headless = headless, .force_replace = force_replace } };
+            return listenMode(try parseAddr(a["--listen=".len..]), headless, force_replace, allow_public);
         } else if (std.mem.eql(u8, a, "--relay")) {
             i += 1;
             if (i >= args.len) {
@@ -413,8 +437,70 @@ fn parseArgs(alloc: Allocator) !Mode {
         std.debug.print("ghoztty-agent: --enroll requires --relay=<base url>\n", .{});
         return error.InvalidArgs;
     }
-    // No args: default to the TCP listen daemon so a bare invocation "just works".
-    return .{ .listen = .{ .addr = try parseAddr(default_listen), .headless = headless, .force_replace = force_replace } };
+    // No recognized mode: print usage and exit. A bare invocation deliberately
+    // does NOT open a listener — the TCP path is unauthenticated, so defaulting
+    // to it would expose a shell to the network (see the SECURITY note).
+    return .usage;
+}
+
+/// Build a `.listen` mode, enforcing the loopback/public policy: an
+/// unauthenticated TCP shell may bind loopback freely (tests, local dev), but a
+/// NON-loopback interface requires the explicit `--insecure-allow-public`
+/// opt-in. Without it we refuse rather than silently expose a shell.
+fn listenMode(addr: std.net.Address, headless: bool, force_replace: bool, allow_public: bool) !Mode {
+    const public = !isLoopbackAddr(addr);
+    if (public and !allow_public) {
+        std.debug.print(
+            "ghoztty-agent: refusing to bind an UNAUTHENTICATED shell listener to a public\n" ++
+                "  interface. The --listen TCP path has no authentication.\n" ++
+                "  • For secure remote access use: ghoztty-agent --relay=<url>\n" ++
+                "  • To bind loopback only: --listen=127.0.0.1:<port>\n" ++
+                "  • To accept the risk on a trusted network: add " ++ allow_public_flag ++ "\n",
+            .{},
+        );
+        return error.InsecureListen;
+    }
+    return .{ .listen = .{ .addr = addr, .headless = headless, .force_replace = force_replace, .public = public } };
+}
+
+/// Whether `addr` is a loopback address (127.0.0.0/8 or ::1) — the only binds
+/// that don't expose the unauthenticated listener beyond this machine.
+fn isLoopbackAddr(addr: std.net.Address) bool {
+    return switch (addr.any.family) {
+        posix.AF.INET => std.mem.asBytes(&addr.in.sa.addr)[0] == 127,
+        posix.AF.INET6 => blk: {
+            const v6 = [_]u8{0} ** 15 ++ [_]u8{1}; // ::1
+            break :blk std.mem.eql(u8, &addr.in6.sa.addr, &v6);
+        },
+        else => false,
+    };
+}
+
+/// Print usage to stdout (bare invocation / `--help`). Steers users to the
+/// authenticated relay path — never to the unauthenticated listener.
+fn printUsage() void {
+    const text =
+        \\ghoztty-agent — Ghoztty remote-machines daemon
+        \\
+        \\Usage:
+        \\  ghoztty-agent --relay=<url>     Connect to your account's relay (authenticated;
+        \\                                  the normal way to bring a machine online).
+        \\  ghoztty-agent --enroll --relay=<url>
+        \\                                  Enroll this machine to your account (browser sign-in).
+        \\  ghoztty-agent --version         Print the build version.
+        \\
+        \\Advanced / development:
+        \\  ghoztty-agent --listen=127.0.0.1:<port>
+        \\                                  UNAUTHENTICATED TCP shell, loopback only.
+        \\  ghoztty-agent --listen=<addr:port> --insecure-allow-public
+        \\                                  UNAUTHENTICATED TCP shell on a routable interface
+        \\                                  (trusted networks only — anyone who reaches it gets a shell).
+        \\
+        \\For secure remote access, use --relay. A bare invocation intentionally does
+        \\nothing (it will not open an unauthenticated listener).
+        \\
+    ;
+    std.fs.File.stdout().writeAll(text) catch {};
 }
 
 /// Parse "host:port" into a `std.net.Address`. Host may be an IPv4/IPv6 literal.
@@ -475,7 +561,20 @@ fn runListen(
     encoding: protocol.TransferEncoding,
     addr: std.net.Address,
     headless: bool,
+    public: bool,
 ) !void {
+    // Loud, unmissable warning when bound to a routable interface: this listener
+    // has no authentication, so anyone who can reach the port gets a shell. Only
+    // reachable via the explicit --insecure-allow-public opt-in.
+    if (public) {
+        std.debug.print(
+            "ghoztty-agent: WARNING — UNAUTHENTICATED shell listener bound to a PUBLIC\n" ++
+                "  interface ({f}). Anyone who can reach this port can run commands on this\n" ++
+                "  machine. Use --relay=<url> for authenticated remote access instead.\n",
+            .{addr},
+        );
+    }
+
     var listener = addr.listen(.{ .reuse_address = true }) catch |err| {
         std.debug.print("ghoztty-agent: failed to bind {f}: {s}\n", .{ addr, @errorName(err) });
         return err;
@@ -538,9 +637,9 @@ fn runListen(
             // Hand the MAIN thread to the tray message loop. It returns TRUE only if
             // the tray actually showed and the user picked Exit; FALSE if any tray
             // setup step failed (RegisterClass / CreateWindow / Shell_NotifyIcon).
-            // No relay link/account in listen mode → null (no Disconnect/Reconnect
-            // and no Sign in/out items).
-            if (tray.run(&store, agent_version, null, null)) {
+            // No relay link/account/updater in listen mode → null (no
+            // Disconnect/Reconnect, Sign in/out, or self-update items).
+            if (tray.run(&store, agent_version, null, null, null)) {
                 // User chose Exit: a clean process exit tears down the (still-running)
                 // accept loop + reaper daemon threads.
                 std.process.exit(0);
@@ -799,7 +898,9 @@ fn runRelay(
     // /dl/version.json and swap+respawns ONLY when `store` has zero live
     // sessions. No-op for dev builds or under GHOSTTY_AGENT_NO_SELFUPDATE=1.
     self_update.cleanupLeftovers(alloc);
-    self_update.maybeStart(alloc, ws_host, agent_version, &store);
+    // The returned handle (null if disabled/dev) lets the tray "Check for
+    // updates" trigger an immediate check.
+    const updater = self_update.maybeStart(alloc, ws_host, agent_version, &store);
 
     // Tighten the existing relay.env DACL to owner-only (Windows). Freshly
     // written credentials are hardened in saveRelayEnv; this catches installs
@@ -859,7 +960,7 @@ fn runRelay(
             .link = &link,
         };
         if (std.Thread.spawn(.{}, relayLoopThread, .{args})) |t| {
-            if (tray.run(&store, agent_version, &link, &account)) {
+            if (tray.run(&store, agent_version, &link, &account, updater)) {
                 std.process.exit(0); // user chose Exit (from any link state)
             }
             // Tray setup failed: park the main thread on the (already-serving)
