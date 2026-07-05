@@ -69,7 +69,13 @@ func LoadStore(dbPath, legacyJSONPath string, logger *slog.Logger) (*Store, erro
 
 	// WAL for concurrent readers + a writer; foreign_keys on for future FKs;
 	// busy_timeout so brief writer contention retries rather than erroring.
-	dsn := "file:" + dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+	// _txlock=immediate makes every db.Begin() acquire the write lock up front
+	// (BEGIN IMMEDIATE) instead of lazily on first write — so busy_timeout
+	// governs the wait and a deferred read-then-write tx can never hit the
+	// non-waiting SQLITE_BUSY_SNAPSHOT (517) it otherwise would under concurrent
+	// writers (e.g. the invite consume race). Reads still run outside a tx and
+	// are unaffected.
+	dsn := "file:" + dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -209,11 +215,13 @@ func scanDevice(sc interface{ Scan(...any) error }) (*Device, error) {
 
 const deviceCols = `id, name, hostname, owner_email, owner_sub, token_hash, created_at`
 
-// CreateDevice enrolls a new device owned by ownerEmail. It generates a
-// 32-byte high-entropy token, stores only its SHA-256 hash, persists the row,
-// and returns the device plus the RAW token (shown to the caller once and
-// never recoverable thereafter).
-func (s *Store) CreateDevice(ownerEmail, name string) (*Device, string, error) {
+// CreateDevice enrolls a new device owned by (ownerEmail, ownerSub). It
+// generates a 32-byte high-entropy token, stores only its SHA-256 hash,
+// persists the row, and returns the device plus the RAW token (shown to the
+// caller once and never recoverable thereafter). ownerSub is always stamped so
+// the row is sub-owned from birth (authz keys on sub); it is only ever empty
+// under dev auth (Identity.Sub == "dev") or a test that passes "".
+func (s *Store) CreateDevice(ownerEmail, ownerSub, name string) (*Device, string, error) {
 	rawToken, hash, err := newDeviceToken()
 	if err != nil {
 		return nil, "", err
@@ -222,6 +230,7 @@ func (s *Store) CreateDevice(ownerEmail, name string) (*Device, string, error) {
 		ID:         uuid.NewString(),
 		Name:       name,
 		OwnerEmail: strings.ToLower(ownerEmail),
+		OwnerSub:   ownerSub,
 		TokenHash:  hash,
 		CreatedAt:  time.Now().UTC(),
 	}
@@ -395,6 +404,167 @@ func (s *Store) ListByOwner(ownerEmail string) []*Device {
 		return nil
 	}
 	return out
+}
+
+// --- Ownership scoping: google_sub with an email fallback (plan §4.4) --------
+//
+// The authz key is the caller's stable Google `sub`. A device is the caller's
+// when its owner_sub is non-empty AND equals the caller's sub. Devices enrolled
+// before owner_sub existed (or via dev auth) have an empty owner_sub — for
+// those the caller's lowercased email is the fallback key. The predicate below
+// encodes exactly that: sub-match for sub-stamped rows, email-match for legacy
+// rows. It never mixes the two (a row with a sub can only be reached by that
+// sub), so two accounts sharing no sub can never see each other's devices.
+//
+// ownsClause is the shared WHERE fragment; ownsArgs supplies its (?,?) params.
+const ownsClause = `((owner_sub != '' AND owner_sub = ?) OR (owner_sub = '' AND owner_email = ?))`
+
+// ownsArgs returns the (sub, email) parameter pair for ownsClause. Email is
+// lowercased to match how it is stored.
+func ownsArgs(id Identity) (string, string) {
+	return id.Sub, strings.ToLower(id.Email)
+}
+
+// ListByOwnerIdent returns all devices owned by the caller (sub-keyed, with the
+// legacy email fallback), sorted by name. This is the sub-aware replacement for
+// ListByOwner; the older email-only method is retained for the legacy importer
+// test and internal callers that only have an email.
+func (s *Store) ListByOwnerIdent(id Identity) []*Device {
+	sub, email := ownsArgs(id)
+	rows, err := s.db.Query(
+		`SELECT `+deviceCols+` FROM devices WHERE `+ownsClause+` ORDER BY name ASC`,
+		sub, email,
+	)
+	if err != nil {
+		s.logger.Error("list by owner failed", "sub", sub, "err", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var out []*Device
+	for rows.Next() {
+		d, err := scanDevice(rows)
+		if err != nil {
+			s.logger.Error("scan device failed", "err", err)
+			return nil
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		s.logger.Error("list by owner iter failed", "sub", sub, "err", err)
+		return nil
+	}
+	return out
+}
+
+// RenameDeviceByOwner is the sub-aware rename: it renames iff the device exists
+// AND is owned by the caller (sub-match or legacy email fallback), in one
+// owner-scoped UPDATE. Returns nil for "no such owned device" (callers must not
+// distinguish not-found from not-yours).
+func (s *Store) RenameDeviceByOwner(id string, owner Identity, newName string) (*Device, error) {
+	sub, email := ownsArgs(owner)
+	res, err := s.db.Exec(
+		`UPDATE devices SET name = ? WHERE id = ? AND `+ownsClause,
+		newName, id, sub, email,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("persist rename: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("persist rename: %w", err)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	d := s.Get(id)
+	if d == nil {
+		return nil, nil // raced with a delete
+	}
+	return d, nil
+}
+
+// DeleteDeviceByOwner is the sub-aware delete: it removes the device iff it
+// exists AND is owned by the caller (sub-match or legacy email fallback),
+// revoking the token hash. Returns whether a device was deleted.
+func (s *Store) DeleteDeviceByOwner(id string, owner Identity) (bool, error) {
+	sub, email := ownsArgs(owner)
+	res, err := s.db.Exec(
+		`DELETE FROM devices WHERE id = ? AND `+ownsClause,
+		id, sub, email,
+	)
+	if err != nil {
+		return false, fmt.Errorf("persist delete: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("persist delete: %w", err)
+	}
+	return n > 0, nil
+}
+
+// OwnedBy reports whether the device is owned by the caller under the same
+// sub-with-email-fallback rule. Used by the connect ownership gate in place of
+// the old dev.OwnerEmail != email check.
+func (d *Device) OwnedBy(id Identity) bool {
+	if d.OwnerSub != "" {
+		return d.OwnerSub == id.Sub
+	}
+	return d.OwnerEmail == strings.ToLower(id.Email)
+}
+
+// DistinctOwners returns the distinct (owner_sub, owner_email) pairs across all
+// devices — the source of truth for migrating existing owners into accounts
+// (plan §4.1), read from SQLite rather than devices.json.
+func (s *Store) DistinctOwners() ([]struct{ Sub, Email string }, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT owner_sub, owner_email FROM devices`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []struct{ Sub, Email string }
+	for rows.Next() {
+		var o struct{ Sub, Email string }
+		if err := rows.Scan(&o.Sub, &o.Email); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// HasLegacyDeviceForEmail reports whether any device with an EMPTY owner_sub is
+// owned by ownerEmail — i.e. a device enrolled before sub existed / via dev
+// auth. This is the "existing owner from before accounts" signal the sign-in
+// gate uses to migrate that owner without an invite code (plan §4.1).
+func (s *Store) HasLegacyDeviceForEmail(ownerEmail string) bool {
+	ownerEmail = strings.ToLower(ownerEmail)
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM devices WHERE owner_sub = '' AND owner_email = ?`, ownerEmail,
+	).Scan(&n)
+	if err != nil {
+		s.logger.Error("legacy device check failed", "err", err)
+		return false
+	}
+	return n > 0
+}
+
+// BindLegacyDevicesToSub stamps ownerSub onto every legacy (empty-sub) device
+// owned by ownerEmail, so their ownership becomes sub-keyed going forward. Run
+// once, when a legacy owner first signs in and their account is created.
+func (s *Store) BindLegacyDevicesToSub(ownerEmail, ownerSub string) error {
+	if ownerSub == "" {
+		return fmt.Errorf("bind legacy devices: empty sub")
+	}
+	_, err := s.db.Exec(
+		`UPDATE devices SET owner_sub = ? WHERE owner_sub = '' AND owner_email = ?`,
+		ownerSub, strings.ToLower(ownerEmail),
+	)
+	if err != nil {
+		return fmt.Errorf("bind legacy devices: %w", err)
+	}
+	return nil
 }
 
 // RenameDevice updates the display name of the device iff it exists AND is
