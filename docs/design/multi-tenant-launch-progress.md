@@ -5,8 +5,24 @@ FRESH context (after `/clear`) can resume with zero prior memory. The detailed
 plan is `docs/design/multi-tenant-launch-plan.md`; this file tracks *where we are*
 and *what to do next*.
 
-Last updated: 2026-07-05 (M1 merged; M2 + M4 + M5a are now unblocked; production
-cutover of M1 auth is PENDING — human checkpoint).
+Last updated: 2026-07-05 (M0+M1+M2+M5a merged; M4 in worktree; M3 unblocked —
+launch next with the design bar below; production cutover of M1 auth is PENDING —
+human checkpoint; nothing deployed to prod yet).
+
+## M2 handoff facts (for M3, the portal UI)
+- Admin auth: Bearer token, verified via full OIDC; admin = sub ∈ `ADMIN_SUBS`
+  (env bootstrap) OR `accounts.is_admin=1`. 401 unverified, 403 verified
+  non-admin. Flag-independent; user gates not consulted; admin ≠ user surface.
+- API (all `/v1/admin/*`, JSON):
+  - `GET /signin-attempts?outcome=&email=&since=RFC3339&limit=` (def 100, cap 1000) → `{"attempts":[{id,ts,email,google_sub,ip,outcome,account_id?}]}` newest-first
+  - `GET /accounts?q=<email substr>&status=active|blocked` → `{"accounts":[{id,google_sub,email,status,invited_by_code?,created_at,blocked_at?,blocked_reason?,is_admin,device_count}]}`
+  - `POST /accounts/{id}/block` `{"reason"}` / `POST /accounts/{id}/unblock` → `{"account":{...}}` (idempotent, 404 unknown)
+  - `DELETE /accounts/{id}` → `{"deleted":bool,"devices_deleted":N}` (revokes device tokens, kicks live conns)
+  - `GET /accounts/{id}/usage` → `{"account","devices":[{id,name,hostname?,online,created_at}],"device_count","signin_attempts":{outcome:count}}`
+  - `POST /invites` `{"code"?,"max_uses":N|null,"expires_at":RFC3339|null,"note"}` → 201 (409 dup); `GET /invites`; `DELETE /invites/{code}` → 204. Generated codes: XXXX-XXXX, unambiguous alphabet.
+  - Every mutation → `admin_audit` (admin_sub-keyed; bootstrap admins may lack account rows).
+- Metrics for M5b charts: Prometheus HTTP API against the VM-local Prometheus
+  (once stood up), families `ghoztty_relay_{agents_online,sessions_active,sessions_total,bridge_bytes_total,http_requests_total,signin_attempts_total,db_up,devices_total,build_info}`.
 
 ## ON RESUME ("go") — do this, in order
 1. Read this file, then `docs/design/multi-tenant-launch-plan.md`.
@@ -32,10 +48,10 @@ SQLite (WAL) + Litestream · React (Vite) SPA + Recharts · Prometheus · single
 |---|------|--------|-------|-----------|
 | M0 | SQLite foundation | `mt/m0-sqlite` | **merged** → main `8a328e120` (re-verified: build/vet/race-tests/static-build). NOT yet deployed to prod. | — |
 | M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **merged** → main `40066364e` (re-verified: build/vet/race-tests/static-build). Staged behind `INVITE_SIGNUP` (default OFF) — **live cutover NOT done** (human checkpoint; see M1 handoff below). | M0 ✓ |
-| M2 | Admin API + admin auth | `mt/m2-admin-api` | **in worktree** — agent launched 2026-07-05 (`ADMIN_SUBS` bootstrap + is_admin in DB, /v1/admin/* REST, admin_audit via migration 0003; no devices.account_id) | M1 ✓ |
+| M2 | Admin API + admin auth | `mt/m2-admin-api` | **merged** → main `18e4c1fb5` (re-verified: build/vet/race/static). `/v1/admin/*` REST; `ADMIN_SUBS` env bootstrap + `accounts.is_admin`; `admin_audit` (0003). NOT deployed. | M1 ✓ |
 | M3 | Admin portal UI (React) | `mt/m3-admin-portal` | pending — **design bar (user, 2026-07-05): clean, intuitive, well designed; very powerful but also elegant.** Bake this into the M3 launch spec (visual polish is in scope, not deferred). | M2 |
 | M4 | Quotas + rate limits | `mt/m4-quotas` | **in worktree** — agent launched 2026-07-05 (migration 0004 assigned; env defaults + DB overrides; store seams only, no admin HTTP) | M1 ✓ (parallel w/ M2/M3) |
-| M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | **in worktree** — agent launched 2026-07-05 (separate internal listener `METRICS_ADDR` default 127.0.0.1:9091; no DB migration; Prometheus standup itself stays human) | M0 ✓ (parallel) |
+| M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | **merged** → main (after M2; clean, re-verified). `/metrics` on internal listener `METRICS_ADDR` (default 127.0.0.1:9091, `off` disables); `ghoztty_relay_*` families. Prometheus standup on the VM = human checkpoint (scrape target 127.0.0.1:9091; do NOT expose in NSG/Caddy). NOT deployed. | M0 ✓ |
 | M5b | Portal availability + usage charts | `mt/m5b-portal-charts` | pending | M3, M5a |
 | M6 | Launch hardening / ops | `mt/m6-ops` | pending | M3, M4, M5 |
 
