@@ -340,7 +340,94 @@ pub fn saveRelayEnv(alloc: Allocator, path: []const u8, relay_base: []const u8, 
     }
     errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
     try std.fs.cwd().rename(tmp_path, path);
+
+    // On Windows the create-flags `mode` is ignored, so the file inherits its
+    // parent's ACL (`%LOCALAPPDATA%` — user-scoped, but SYSTEM/Administrators
+    // typically inherit read). Tighten it to an owner-only, non-inherited DACL
+    // now that it holds a bearer credential. Best-effort: failure never breaks
+    // enrollment (POSIX already got 0600 above). No-op on non-Windows.
+    win_acl.harden(alloc, path);
 }
+
+/// Best-effort: tighten the DACL of the agent's EXISTING relay.env to owner-only
+/// (Windows). For installs whose credential was written before ACL hardening —
+/// called once at relay-mode startup so a self-update fixes them with no
+/// re-enroll. No-op on non-Windows or when the file is absent.
+pub fn hardenLocalCredential(alloc: Allocator) void {
+    const path = relayEnvPath(alloc) catch return;
+    defer alloc.free(path);
+    std.fs.cwd().access(path, .{}) catch return; // only touch a file that exists
+    win_acl.harden(alloc, path);
+}
+
+/// Windows DACL hardening for the credential file (no-op elsewhere). Replaces
+/// the file's DACL with a single, non-inherited ACE granting only the current
+/// user — dropping the inherited SYSTEM/Administrators access the file would
+/// otherwise carry from `%LOCALAPPDATA%`.
+const win_acl = if (builtin.os.tag == .windows) struct {
+    const W = std.os.windows;
+    const DWORD = W.DWORD;
+    const BOOL = W.BOOL;
+    const HANDLE = W.HANDLE;
+
+    const TOKEN_QUERY: DWORD = 0x0008;
+    const TokenUser: c_int = 1; // TOKEN_INFORMATION_CLASS
+    const SE_FILE_OBJECT: c_int = 1;
+    const DACL_SECURITY_INFORMATION: DWORD = 0x00000004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: DWORD = 0x80000000;
+    const ACL_REVISION: DWORD = 2;
+    // FILE_ALL_ACCESS: full control for the owning user.
+    const FILE_ALL_ACCESS: DWORD = 0x001F01FF;
+
+    const SID_AND_ATTRIBUTES = extern struct { Sid: ?*anyopaque, Attributes: DWORD };
+    const TOKEN_USER = extern struct { User: SID_AND_ATTRIBUTES };
+
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+    extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
+    extern "advapi32" fn OpenProcessToken(ProcessHandle: HANDLE, DesiredAccess: DWORD, TokenHandle: *HANDLE) callconv(.winapi) BOOL;
+    extern "advapi32" fn GetTokenInformation(TokenHandle: HANDLE, TokenInformationClass: c_int, TokenInformation: ?*anyopaque, TokenInformationLength: DWORD, ReturnLength: *DWORD) callconv(.winapi) BOOL;
+    extern "advapi32" fn GetLengthSid(pSid: *anyopaque) callconv(.winapi) DWORD;
+    extern "advapi32" fn InitializeAcl(pAcl: *anyopaque, nAclLength: DWORD, dwAclRevision: DWORD) callconv(.winapi) BOOL;
+    extern "advapi32" fn AddAccessAllowedAce(pAcl: *anyopaque, dwAceRevision: DWORD, AccessMask: DWORD, pSid: *anyopaque) callconv(.winapi) BOOL;
+    extern "advapi32" fn SetNamedSecurityInfoW(pObjectName: [*:0]const u16, ObjectType: c_int, SecurityInfo: DWORD, psidOwner: ?*anyopaque, psidGroup: ?*anyopaque, pDacl: ?*anyopaque, pSacl: ?*anyopaque) callconv(.winapi) DWORD;
+
+    fn harden(alloc: Allocator, path: []const u8) void {
+        var token: HANDLE = undefined;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0) return;
+        defer _ = CloseHandle(token);
+
+        // Current user's SID: TOKEN_USER header + inline SID. A SID is at most
+        // 68 bytes, so 256 is ample; a short buffer just skips hardening.
+        var info: [256]u8 align(8) = undefined;
+        var need: DWORD = 0;
+        if (GetTokenInformation(token, TokenUser, &info, info.len, &need) == 0) return;
+        const tu: *const TOKEN_USER = @ptrCast(@alignCast(&info));
+        const sid = tu.User.Sid orelse return;
+
+        // One-ACE DACL granting the user full control. 1 KiB dwarfs
+        // sizeof(ACL)+sizeof(ACE)+sizeof(SID); align(4) as ACLs require.
+        var acl_buf: [1024]u8 align(4) = undefined;
+        if (InitializeAcl(&acl_buf, acl_buf.len, ACL_REVISION) == 0) return;
+        if (AddAccessAllowedAce(&acl_buf, ACL_REVISION, FILE_ALL_ACCESS, sid) == 0) return;
+
+        // Round-trip the WTF-8 path (as Zig hands out on Windows) back to WTF-16.
+        const path_w = std.unicode.wtf8ToWtf16LeAllocZ(alloc, path) catch return;
+        defer alloc.free(path_w);
+
+        // PROTECTED_DACL_* strips inheritance, so ONLY our explicit ACE remains.
+        _ = SetNamedSecurityInfoW(
+            path_w,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null,
+            null,
+            &acl_buf,
+            null,
+        );
+    }
+} else struct {
+    fn harden(_: Allocator, _: []const u8) void {}
+};
 
 /// Load + parse relay.env at `path`. A missing file is an empty env, not an
 /// error (the caller decides whether that's fatal).

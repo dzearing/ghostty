@@ -801,6 +801,11 @@ fn runRelay(
     self_update.cleanupLeftovers(alloc);
     self_update.maybeStart(alloc, ws_host, agent_version, &store);
 
+    // Tighten the existing relay.env DACL to owner-only (Windows). Freshly
+    // written credentials are hardened in saveRelayEnv; this catches installs
+    // whose credential predates that, so a self-update fixes them in place.
+    enroll.hardenLocalCredential(alloc);
+
     // User-controlled relay link state (tray Disconnect/Reconnect). The tray
     // toggles it from its message-pump thread; the control loop obeys it.
     // `host` (scheme stripped) is what the tooltip shows: "Connected to <host>".
