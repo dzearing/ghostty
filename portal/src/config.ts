@@ -18,7 +18,11 @@ export interface PortalConfig {
 
 export async function loadPortalConfig(): Promise<PortalConfig> {
   try {
-    const res = await fetch("/portal-config.json", { cache: "no-store" });
+    // BASE_URL-relative so the same code works at "/" (dev) and "/admin/"
+    // (prod path-routed deploy).
+    const res = await fetch(`${import.meta.env.BASE_URL}portal-config.json`, {
+      cache: "no-store",
+    });
     if (!res.ok) return { googleClientId: "" };
     const raw: unknown = await res.json();
     const obj = (raw ?? {}) as Record<string, unknown>;
