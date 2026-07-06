@@ -450,9 +450,15 @@ struct MachineChooserView: View {
     /// The leading status column for a device row. For relay machines the
     /// status is SHAPE-coded, not just color-coded (colorblind-safe): online
     /// is a filled circle with an inner ring mark (`circle.inset.filled`,
-    /// green), offline a HOLLOW circle (`circle`, gray), unknown (pre-fetch) a
-    /// dotted outline (`circle.dotted`). Non-relay rows get an equally sized
-    /// empty slot so all rows share one column grid.
+    /// green), offline a HOLLOW circle (`circle`, gray), and checking — a
+    /// cache-seeded row at launch whose live status hasn't arrived yet — a
+    /// dimmed dotted outline (`circle.dotted`). Non-relay rows get an equally
+    /// sized empty slot so all rows share one column grid.
+    ///
+    /// Checking/offline rows stay SELECTABLE, matching the long-standing
+    /// offline policy: the chooser never blocks a connect attempt on
+    /// directory presence (which can be stale in either direction); a machine
+    /// that really is unreachable fails at dial time with a clear error.
     @ViewBuilder
     private func statusIndicator(for machine: Machine) -> some View {
         if machine.isRelay {
@@ -486,7 +492,7 @@ struct MachineChooserView: View {
         switch machine.online {
         case true: return "Online"
         case false: return "Offline"
-        default: return "Status unknown"
+        default: return "Checking status"
         }
     }
 

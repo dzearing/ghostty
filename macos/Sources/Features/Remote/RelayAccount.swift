@@ -83,6 +83,14 @@ final class RelayAccount: ObservableObject {
     /// coalesce onto one token-endpoint request.
     private var refreshTask: Task<GoogleOAuth.TokenResponse, Error>?
 
+    /// The deferred Keychain load kicked off in `init` (see there for why it
+    /// is off-main). Until it completes, `isSignedIn`/`hasCredentials` read as
+    /// signed OUT even when a persisted account exists — anything that gates
+    /// on those at launch (e.g. the machine registry's refresh, which CLEARS
+    /// account state when credentials are absent) must `waitForInitialLoad()`
+    /// first or it races to a false "signed out".
+    private var initialLoadTask: Task<Void, Never>?
+
     /// `endpoints`/`keychain`/`openURL` are injectable for tests ONLY (the
     /// relay's `IssuerURL` pattern — no environment override in production).
     init(
@@ -105,12 +113,19 @@ final class RelayAccount: ObservableObject {
         // out (`email == nil`), which degrades gracefully — a relay call that
         // races the load resolves its own token via `currentIDToken()` (also
         // off-main), and the UI updates via `@Published` when it lands.
-        Task { [weak self] in
+        initialLoadTask = Task { [weak self] in
             guard let self else { return }
             let stored = await Self.loadStoredOffMain(self.keychain)
             self.email = stored?.email
             self.pictureURL = stored?.picture.flatMap(URL.init(string:))
         }
+    }
+
+    /// Suspend until the persisted account (if any) has been loaded from the
+    /// Keychain and published. After this, `isSignedIn`/`hasCredentials`
+    /// reflect reality instead of the pre-load "signed out" default.
+    func waitForInitialLoad() async {
+        await initialLoadTask?.value
     }
 
     /// Load the persisted account OFF the main thread. Keychain reads block
