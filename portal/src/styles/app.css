@@ -1150,3 +1150,87 @@
   height: 10px;
   border-radius: 3px;
 }
+
+/* ---------- Settings: sign-up policy picker ---------- */
+
+.mode-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  max-width: 620px;
+}
+
+.mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  text-align: left;
+  font: inherit;
+  color: var(--text-1);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.mode-option:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.mode-option:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.mode-option.on {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  cursor: default;
+}
+
+.mode-option.skeleton {
+  height: 58px;
+  border: 1px solid var(--border);
+}
+
+.mode-radio {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  background: var(--bg-panel);
+}
+
+.mode-option.on .mode-radio {
+  border-color: var(--accent);
+  background: radial-gradient(
+    circle,
+    var(--accent) 0 4px,
+    var(--bg-panel) 4.5px
+  );
+}
+
+.mode-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mode-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-weight: 600;
+  font-size: var(--fs-body);
+}
+
+.mode-desc {
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+}

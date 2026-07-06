@@ -14,6 +14,7 @@ const AttemptsPage = lazy(() => import("./pages/AttemptsPage"));
 const AccountsPage = lazy(() => import("./pages/AccountsPage"));
 const AccountDetailPage = lazy(() => import("./pages/AccountDetailPage"));
 const InvitesPage = lazy(() => import("./pages/InvitesPage"));
+const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -50,6 +51,7 @@ function Gate() {
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/accounts/:id" element={<AccountDetailPage />} />
               <Route path="/invites" element={<InvitesPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>

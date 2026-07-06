@@ -36,6 +36,13 @@ export const OUTCOME_META: Record<Outcome, OutcomeMeta> = {
     tone: "neutral",
     cssVar: "var(--text-3)",
   },
+  // A verified fresh identity refused because signups are closed
+  // (signup_mode=closed): policy, not misbehavior — warm, not red.
+  signup_closed: {
+    label: "Signups closed",
+    tone: "orange",
+    cssVar: "var(--orange)",
+  },
   // Legacy allowlist model (relay INVITE_SIGNUP off): same semantics as
   // allowed/blocked, labeled so the feed shows which model decided.
   allowlist_allowed: {

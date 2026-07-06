@@ -140,6 +140,8 @@ func (h *Handler) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/admin/invites", h.adminOnly(h.handleAdminCreateInvite))
 	mux.HandleFunc("GET /v1/admin/invites", h.adminOnly(h.handleAdminListInvites))
 	mux.HandleFunc("DELETE /v1/admin/invites/{code}", h.adminOnly(h.handleAdminRevokeInvite))
+	mux.HandleFunc("GET /v1/admin/settings", h.adminOnly(h.handleAdminGetSettings))
+	mux.HandleFunc("PUT /v1/admin/settings", h.adminOnly(h.handleAdminPutSettings))
 }
 
 // --- Views -------------------------------------------------------------------
@@ -499,6 +501,67 @@ func (h *Handler) handleAdminListInvites(w http.ResponseWriter, r *http.Request,
 		invites = []InviteCode{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"invites": invites})
+}
+
+// --- Service settings --------------------------------------------------------------
+
+// settingsView renders the settings payload for both GET and PUT responses.
+func settingsView(mode SignupMode, source string) map[string]any {
+	return map[string]any{"signup_mode": string(mode), "source": source}
+}
+
+// handleAdminGetSettings: GET /v1/admin/settings (JSON).
+// Returns the EFFECTIVE runtime settings: the resolved signup mode plus its
+// source ("db" when a settings row governs, "env-default" when still seeded
+// from SIGNUP_MODE / INVITE_SIGNUP — see settings.go).
+func (h *Handler) handleAdminGetSettings(w http.ResponseWriter, r *http.Request, _ Identity) {
+	gate := h.auth.gate
+	if gate == nil {
+		// Only reachable in a mis-wired test server: production always SetGates.
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	mode, source := gate.SignupModeWithSource()
+	writeJSON(w, http.StatusOK, settingsView(mode, source))
+}
+
+// handleAdminPutSettings: PUT /v1/admin/settings (JSON).
+// Body {"signup_mode":"open|invite|closed|allowlist"}. Validates, persists
+// (settings.signup_mode), busts the in-process cache — the change governs the
+// very next sign-in decision, no restart — writes a settings.update audit row
+// (old -> new), and returns the new effective state.
+func (h *Handler) handleAdminPutSettings(w http.ResponseWriter, r *http.Request, admin Identity) {
+	gate := h.auth.gate
+	if gate == nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	var body struct {
+		SignupMode string `json:"signup_mode"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		http.Error(w, "invalid body: expected {\"signup_mode\":\"open|invite|closed|allowlist\"}", http.StatusBadRequest)
+		return
+	}
+	mode, ok := parseSignupMode(strings.ToLower(strings.TrimSpace(body.SignupMode)))
+	if !ok {
+		http.Error(w, "invalid signup_mode: expected open, invite, closed, or allowlist", http.StatusBadRequest)
+		return
+	}
+
+	oldMode, _ := gate.SignupModeWithSource()
+	if err := gate.SetSignupMode(mode); err != nil {
+		h.logger.Error("admin set signup mode failed", "mode", mode, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	h.audit(admin, "settings.update", settingSignupMode, map[string]any{
+		"old": string(oldMode),
+		"new": string(mode),
+	})
+	writeJSON(w, http.StatusOK, settingsView(mode, settingSourceDB))
 }
 
 // handleAdminRevokeInvite: DELETE /v1/admin/invites/{code}.

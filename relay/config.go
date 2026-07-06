@@ -72,13 +72,21 @@ type Config struct {
 	// the sign-in gate when InviteSignup is OFF (the default).
 	AllowedEmails []string
 
-	// InviteSignup switches the sign-in authorization model (plan §4). When
-	// FALSE (the default) the AllowedEmails allowlist gates sign-in exactly as
-	// before — merging/deploying M1 must NOT change live auth. When TRUE the
-	// invite-code account model governs: an active account for the caller's
-	// google_sub is allowed; a blocked account is refused; no account requires a
-	// valid invite code that is then consumed to create the account. Sourced
-	// from INVITE_SIGNUP; flipping it live is the human cutover checkpoint.
+	// SignupMode seeds the runtime sign-up policy when the DB has no
+	// settings.signup_mode row yet: one of open|invite|closed|allowlist
+	// (settings.go). The DB value — set live from the admin portal — ALWAYS
+	// wins; this env var (then InviteSignup, then allowlist) is only the
+	// fallback default for deployments that predate the settings table.
+	// Sourced from SIGNUP_MODE (lowercased); invalid values fail safe to
+	// allowlist with an error log.
+	SignupMode string
+
+	// InviteSignup is retained for BACK-COMPAT SEEDING ONLY (see SignupMode):
+	// when neither a settings.signup_mode row nor SIGNUP_MODE exists,
+	// INVITE_SIGNUP=true seeds mode `invite` (the M1 invite-code account
+	// model) and anything else seeds `allowlist` (the legacy AllowedEmails
+	// gate) — so pre-settings deployments keep their exact behavior. It is no
+	// longer consulted anywhere else; the runtime mode governs.
 	InviteSignup bool
 
 	// AdminSubs is the bootstrap admin allowlist: comma-separated Google `sub`
@@ -143,6 +151,7 @@ func LoadConfig() *Config {
 		GoogleWebClientSecret:    os.Getenv("GOOGLE_WEB_CLIENT_SECRET"),
 		RelayBaseURL:             strings.TrimRight(os.Getenv("RELAY_BASE_URL"), "/"),
 		StateDir:                 getenv("STATE_DIR", "./state"),
+		SignupMode:               strings.ToLower(strings.TrimSpace(os.Getenv("SIGNUP_MODE"))),
 		InviteSignup:             strings.EqualFold(os.Getenv("INVITE_SIGNUP"), "true"),
 		DevAuth:                  strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),
 		DevClientToken:           os.Getenv("DEV_CLIENT_TOKEN"),

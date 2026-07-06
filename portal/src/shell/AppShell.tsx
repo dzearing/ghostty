@@ -47,6 +47,17 @@ const NAV = [
       </svg>
     ),
   },
+  {
+    to: "/settings",
+    label: "Settings",
+    icon: (
+      <svg className="nav-icon" viewBox="0 0 16 16" fill="none">
+        <path d="M1.75 4.75h6M12 4.75h2.25M1.75 11.25h2.25M8 11.25h6.25" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        <circle cx="9.9" cy="4.75" r="1.9" stroke="currentColor" strokeWidth="1.3" />
+        <circle cx="6.1" cy="11.25" r="1.9" stroke="currentColor" strokeWidth="1.3" />
+      </svg>
+    ),
+  },
 ];
 
 const TITLES: Record<string, string> = {
@@ -54,6 +65,7 @@ const TITLES: Record<string, string> = {
   "/attempts": "Sign-in attempts",
   "/accounts": "Accounts",
   "/invites": "Invite codes",
+  "/settings": "Settings",
 };
 
 function pageTitle(pathname: string): string {

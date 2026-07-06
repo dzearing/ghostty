@@ -123,6 +123,8 @@ var adminRoutes = []struct {
 	{http.MethodPost, "/v1/admin/invites", `{}`},
 	{http.MethodGet, "/v1/admin/invites", ""},
 	{http.MethodDelete, "/v1/admin/invites/SOME-CODE", ""},
+	{http.MethodGet, "/v1/admin/settings", ""},
+	{http.MethodPut, "/v1/admin/settings", `{"signup_mode":"open"}`},
 }
 
 // TestAdminAuthSweep: on every admin route, a missing token and a garbage

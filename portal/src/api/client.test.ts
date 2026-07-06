@@ -88,6 +88,49 @@ describe("ApiClient", () => {
     await expect(client.revokeInvite("ABCD-EFGH")).resolves.toBeUndefined();
   });
 
+  it("gets service settings with the bearer token", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        jsonResponse(200, { signup_mode: "invite", source: "env-default" }),
+      );
+    const client = new ApiClient({ getToken: () => "tok-123" });
+
+    const settings = await client.getSettings();
+    expect(settings).toEqual({ signup_mode: "invite", source: "env-default" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("/v1/admin/settings");
+    expect(init?.method).toBeUndefined(); // GET
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer tok-123");
+  });
+
+  it("PUTs the signup mode and returns the new state", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse(200, { signup_mode: "open", source: "db" }));
+    const client = new ApiClient({ getToken: () => "tok-123" });
+
+    const settings = await client.putSettings("open");
+    expect(settings).toEqual({ signup_mode: "open", source: "db" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("/v1/admin/settings");
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(String(init?.body))).toEqual({ signup_mode: "open" });
+    expect(new Headers(init?.headers).get("Content-Type")).toBe("application/json");
+  });
+
+  it("maps a rejected settings PUT (400) to ApiError with the relay's message", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      textResponse(400, "invalid signup_mode: expected open, invite, closed, or allowlist"),
+    );
+    const client = new ApiClient({ getToken: () => "valid" });
+
+    const err = await client.putSettings("open").catch((e: unknown) => e);
+    expect(isApiError(err)).toBe(true);
+    expect((err as ApiError).status).toBe(400);
+    expect((err as ApiError).message).toContain("invalid signup_mode");
+  });
+
   it("omits the Authorization header when signed out", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")

@@ -44,12 +44,18 @@ func main() {
 	}
 	defer store.Close()
 
-	// Wire the invite-code authorization gate. It is consulted only when
-	// INVITE_SIGNUP is ON; when OFF, ALLOWED_EMAILS still gates and live auth is
-	// unchanged. The gate needs the Store, hence this late bind after LoadStore.
-	auth.SetGate(NewSigninGate(cfg, store, logger))
-	if cfg.InviteSignup {
-		logger.Warn("INVITE_SIGNUP enabled — invite-code account model governs sign-in (ALLOWED_EMAILS bypassed)")
+	// Wire the account-model authorization gate. The runtime signup mode
+	// (settings.go: DB settings.signup_mode, seeded from SIGNUP_MODE /
+	// INVITE_SIGNUP) decides per-request whether it governs — `allowlist`
+	// keeps the legacy ALLOWED_EMAILS path. The gate needs the Store, hence
+	// this late bind after LoadStore. The log below is a startup SNAPSHOT
+	// only; the mode is changeable live via PUT /v1/admin/settings.
+	gate := NewSigninGate(cfg, store, logger)
+	auth.SetGate(gate)
+	mode, modeSource := gate.SignupModeWithSource()
+	logger.Info("signup mode resolved", "mode", mode, "source", modeSource)
+	if mode != SignupAllowlist {
+		logger.Warn("account model governs sign-in (ALLOWED_EMAILS bypassed)", "mode", mode)
 	}
 
 	// Admin surface (M2): bootstrap admins come from ADMIN_SUBS; with none

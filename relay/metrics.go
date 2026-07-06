@@ -123,7 +123,8 @@ func init() {
 	for _, o := range []string{
 		outcomeAllowed, outcomeBlocked, outcomeNoAccount, outcomeBadInvite,
 		outcomeExpiredInvite, outcomeRevokedInvite, outcomeExhaustedInvite,
-		outcomeNotVerified, outcomeAllowlistAllowed, outcomeAllowlistRejected,
+		outcomeNotVerified, outcomeSignupClosed,
+		outcomeAllowlistAllowed, outcomeAllowlistRejected,
 	} {
 		mSigninAttempts.WithLabelValues(o)
 	}
