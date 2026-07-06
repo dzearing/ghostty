@@ -421,7 +421,10 @@ func TestQuotaMigrationRoundTrip(t *testing.T) {
 	if n := quotaCols(); n != 2 {
 		t.Fatalf("after up: %d quota columns, want 2", n)
 	}
-	if err := goose.Down(db, "."); err != nil { // rolls back 0004 (the latest)
+	// Pinned target (never relative Down): later migrations exist (0005), and
+	// a relative Down would revert THAT instead of 0004 (merge-composition
+	// note in docs/design/multi-tenant-launch-progress.md).
+	if err := goose.DownTo(db, ".", 3); err != nil { // rolls back 0005 + 0004, keeps 0003
 		t.Fatalf("down: %v", err)
 	}
 	if n := quotaCols(); n != 0 {

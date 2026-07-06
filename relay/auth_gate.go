@@ -7,15 +7,19 @@ package main
 // and (for new accounts) the invite code from the request — neither of which
 // auth.go's verifier has.
 //
-// It is only consulted when Config.InviteSignup is TRUE. When FALSE, callers
-// keep using Authenticator.VerifyIDToken (ALLOWED_EMAILS) unchanged, so the
-// live sign-in path is byte-for-byte identical to pre-M1.
+// It is only consulted when the runtime signup mode (settings.go) is NOT
+// `allowlist`. In allowlist mode, callers keep using
+// Authenticator.VerifyIDToken (ALLOWED_EMAILS) unchanged, so that sign-in
+// path is byte-for-byte identical to pre-M1.
 //
 // Decision, given a VERIFIED identity (email_verified, sub present):
 //   - active account for this google_sub            -> allow
-//   - blocked account                               -> reject (blocked)
-//   - no account, valid+consumable invite code       -> create active account, allow
-//   - no account, missing/invalid code               -> reject (no_account/bad_invite/…)
+//   - blocked account                               -> reject (blocked), in EVERY mode
+//   - no account:
+//       open   -> create active account (no code), allow
+//       invite -> valid+consumable code creates the account; otherwise
+//                 reject (no_account/bad_invite/…)
+//       closed -> reject (signup_closed)
 //
 // A legacy owner (a device owner who predates accounts, matched by email with
 // no sub yet) is allowed WITHOUT a code and lazily gets an account bound to
@@ -23,7 +27,8 @@ package main
 //
 // Every consulted attempt is recorded in signin_attempts (best-effort — a
 // logging failure never blocks a legitimate sign-in). Recording only happens
-// on the invite path (flag ON); the OFF path is untouched.
+// on the account-model path (gate enabled); the allowlist path only logs via
+// RecordLegacy and its accept/reject decision is untouched.
 
 import (
 	"crypto/sha256"
@@ -69,6 +74,13 @@ type SigninGate struct {
 	// audit rows (see allowedLogInterval).
 	mu          sync.Mutex
 	lastAllowed map[string]allowedMark
+
+	// modeMu guards the short-TTL signup-mode cache (settings.go): the
+	// resolved mode, its source ("db"/"env-default"), and the cache deadline.
+	modeMu     sync.Mutex
+	modeVal    SignupMode
+	modeSource string
+	modeExp    time.Time
 }
 
 // throttleKey identifies a caller for the allowed-row throttle: the stable
@@ -116,8 +128,8 @@ func (g *SigninGate) shouldRecordAllowed(key, fp string) bool {
 	return true
 }
 
-// RecordLegacy writes the audit row for an ALLOWLIST-path decision
-// (INVITE_SIGNUP off): outcome allowlist_allowed / allowlist_rejected. It is
+// RecordLegacy writes the audit row for an ALLOWLIST-path decision (signup
+// mode `allowlist`): outcome allowlist_allowed / allowlist_rejected. It is
 // logging only — the accept/reject decision was already made by the caller
 // and is unchanged. Allowed rows are throttled like the gate's own; verified-
 // but-rejected rows are always recorded. Nil-safe: a gate-less Authenticator
@@ -139,7 +151,7 @@ func (g *SigninGate) RecordLegacy(ident Identity, ip string, allowed bool, token
 }
 
 // recordAllowedThrottled is the throttled variant of record() for the gate's
-// own (INVITE_SIGNUP on) "allowed" decisions — same rationale as
+// own (account-model) "allowed" decisions — same rationale as
 // allowedLogInterval: authenticated API traffic must not flood the feed, but
 // a fresh credential (real login) records immediately.
 func (g *SigninGate) recordAllowedThrottled(ident Identity, ip, accountID, tokenFP string) {
@@ -155,14 +167,18 @@ func NewSigninGate(cfg *Config, store *Store, logger *slog.Logger) *SigninGate {
 	return &SigninGate{cfg: cfg, store: store, logger: logger}
 }
 
-// Enabled reports whether the invite-code model governs sign-in (flag ON).
+// Enabled reports whether the account model governs sign-in — every signup
+// mode except the legacy `allowlist` (settings.go). Resolved per call (with a
+// short-TTL cache) so an admin flipping the mode takes effect live, without a
+// restart.
 func (g *SigninGate) Enabled() bool {
-	return g.cfg.InviteSignup
+	return g.SignupMode() != SignupAllowlist
 }
 
-// Authorize applies the invite-code account model to an already-VERIFIED
-// identity and returns nil to allow or an error to reject. inviteCode is the
-// code supplied in the request (may be empty — only new accounts need one). ip
+// Authorize applies the account model — under the runtime signup mode
+// (settings.go) — to an already-VERIFIED identity and returns nil to allow or
+// an error to reject. inviteCode is the code supplied in the request (may be
+// empty — only new accounts in invite mode need one). ip
 // is the client IP for the audit row; tokenFP is the presented credential's
 // fingerprint for the allowed-row throttle (see shouldRecordAllowed). Callers
 // MUST have verified the identity (VerifyIdentity) before calling; this
@@ -197,7 +213,29 @@ func (g *SigninGate) Authorize(ident Identity, inviteCode, ip, tokenFP string) e
 		return nil
 	}
 
-	// Genuinely new: require and consume an invite code.
+	// Genuinely new identity: the signup mode decides. Resolved here (not at
+	// startup) so an admin's live mode change governs the next request.
+	switch g.SignupMode() {
+	case SignupOpen:
+		// Open signups: create the account immediately, no code involved.
+		acct, err = g.store.CreateAccount(ident.Sub, ident.Email, "")
+		if err != nil {
+			g.logger.Error("account creation failed", "err", err)
+			return ErrUnauthorized
+		}
+		g.record(ident, ip, outcomeAllowed, acct.ID)
+		g.logger.Info("account created (open signup)", "sub", ident.Sub, "email", ident.Email)
+		return nil
+	case SignupClosed:
+		// Signups closed: existing accounts (handled above) keep working; a
+		// fresh identity is refused regardless of any invite code.
+		g.record(ident, ip, outcomeSignupClosed, "")
+		g.logger.Warn("sign-in refused: signups closed", "sub", ident.Sub, "email", ident.Email)
+		return ErrUnauthorized
+	}
+
+	// Invite mode (and, defensively, any other value — the gate is only
+	// consulted when enabled): require and consume an invite code.
 	if inviteCode == "" {
 		g.record(ident, ip, outcomeNoAccount, "")
 		return ErrInviteRequired

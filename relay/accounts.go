@@ -290,6 +290,10 @@ const (
 	outcomeRevokedInvite   = "revoked_invite"
 	outcomeExhaustedInvite = "exhausted_invite"
 	outcomeNotVerified     = "not_verified"
+	// outcomeSignupClosed: a verified fresh identity refused because the
+	// signup mode is `closed` (settings.go / migration 0005). Existing
+	// accounts are unaffected in closed mode.
+	outcomeSignupClosed = "signup_closed"
 )
 
 // RecordSigninAttempt appends one audit row. It is best-effort: the caller
