@@ -910,6 +910,13 @@ pub fn deinit(self: *Surface) void {
 
     // Stop our IO thread
     {
+        // Abort any blocking backend work FIRST (e.g. a remote OPEN/ATTACH
+        // RPC parked on a dead transport that will never reply) so the join
+        // below cannot block this (GUI) thread for the RPC timeout — or, under
+        // reconnect churn, effectively forever. Mirrors Exec's quit-pipe
+        // signal-before-join, but from the joining side.
+        self.io.shutdown();
+
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();

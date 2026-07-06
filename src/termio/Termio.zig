@@ -383,6 +383,14 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
+/// Signal the IO backend to abort any blocking work so the IO thread can be
+/// joined promptly. Safe to call from another thread (the GUI thread calls it
+/// from `Surface.deinit` right before joining the IO thread). See
+/// `termio.Backend.shutdown`.
+pub fn shutdown(self: *Termio) void {
+    self.backend.shutdown();
+}
+
 /// Send a message to the mailbox. Depending on the mailbox type in use
 /// this may process now or it may just enqueue and process later.
 ///

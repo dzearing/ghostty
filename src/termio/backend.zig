@@ -36,6 +36,22 @@ pub const Backend = union(Kind) {
         }
     }
 
+    /// Signal the backend to abort any blocking work its IO thread may be
+    /// parked in, so that thread can be joined promptly. Called on the GUI
+    /// thread by `Surface.deinit` BEFORE the IO thread join; must be safe to
+    /// call concurrently with the IO thread running.
+    pub fn shutdown(self: *Backend) void {
+        switch (self.*) {
+            // Exec's read thread is signaled by its quit pipe in `threadExit`,
+            // which runs on the IO thread itself; nothing on the IO thread
+            // blocks indefinitely before that, so no pre-join signal needed.
+            .exec => {},
+            // Remote may be parked in an OPEN/ATTACH RPC on a dead transport
+            // (`threadEnter`); cancel it so the join can't wedge on it.
+            .remote => |*remote| remote.shutdown(),
+        }
+    }
+
     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
         switch (self.*) {
             .exec => |*exec| exec.initTerminal(t),
