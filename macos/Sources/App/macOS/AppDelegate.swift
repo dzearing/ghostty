@@ -269,6 +269,20 @@ class AppDelegate: NSObject,
             // WP-D2: re-attach any relay remote windows that were open when
             // the app last quit (background dials; failures never alert).
             restoreRemoteWindows()
+
+            // Warm the machine chooser: touching `MachineRegistry.shared`
+            // seeds it from the persisted device cache, and the quiet refresh
+            // starts resolving live online status NOW — the first fetch can
+            // take seconds (OAuth refresh-token grant + network), so doing it
+            // at launch means the chooser (Cmd-Shift-N) usually opens with
+            // fresh presence instead of "checking" rows. Quiet: a launch-time
+            // blip must not stage error UI the chooser would then show; the
+            // chooser's own on-open refresh still runs regardless. The
+            // refresh internally waits for the account's deferred Keychain
+            // load, so this cannot race it into a false "signed out" purge.
+            Task { @MainActor in
+                await MachineRegistry.shared.refreshFromRelay(quiet: true)
+            }
         }
 
         // Setup a local event monitor for app-level keyboard shortcuts. See
