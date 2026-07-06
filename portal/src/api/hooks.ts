@@ -15,6 +15,7 @@ import type {
   AccountsQuery,
   AttemptsQuery,
   CreateInviteRequest,
+  SignupMode,
 } from "./types";
 
 const LIVE = { refetchInterval: 20_000, refetchOnWindowFocus: true } as const;
@@ -53,6 +54,15 @@ export function useInvites() {
   return useQuery({
     queryKey: ["invites"],
     queryFn: () => api.listInvites(),
+    ...LIVE,
+  });
+}
+
+export function useSettings() {
+  const { api } = useAuth();
+  return useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api.getSettings(),
     ...LIVE,
   });
 }
@@ -109,5 +119,14 @@ export function useRevokeInvite() {
   return useMutation({
     mutationFn: (code: string) => api.revokeInvite(code),
     onSuccess: () => invalidate("invites"),
+  });
+}
+
+export function useUpdateSettings() {
+  const { api } = useAuth();
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: (mode: SignupMode) => api.putSettings(mode),
+    onSuccess: () => invalidate("settings"),
   });
 }

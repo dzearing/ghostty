@@ -17,7 +17,9 @@ import type {
   CreateInviteRequest,
   DeleteAccountResponse,
   InviteCode,
+  ServiceSettings,
   SigninAttempt,
+  SignupMode,
 } from "./types";
 
 export class ApiError extends Error {
@@ -149,5 +151,18 @@ export class ApiClient {
       `/v1/admin/invites/${encodeURIComponent(code)}`,
       { method: "DELETE" },
     );
+  }
+
+  // --- Service settings ---
+
+  async getSettings(): Promise<ServiceSettings> {
+    return this.request<ServiceSettings>("/v1/admin/settings");
+  }
+
+  async putSettings(mode: SignupMode): Promise<ServiceSettings> {
+    return this.request<ServiceSettings>("/v1/admin/settings", {
+      method: "PUT",
+      body: JSON.stringify({ signup_mode: mode }),
+    });
   }
 }

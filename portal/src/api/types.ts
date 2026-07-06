@@ -29,7 +29,10 @@ export type Outcome =
   | "revoked_invite"
   | "exhausted_invite"
   | "not_verified"
-  // Legacy allowlist-path decisions (relay INVITE_SIGNUP off). Distinct
+  // A verified fresh identity refused because the signup mode is `closed`
+  // (relay/settings.go); existing accounts are unaffected.
+  | "signup_closed"
+  // Legacy allowlist-path decisions (signup mode `allowlist`). Distinct
   // names so the feed shows which auth model decided.
   | "allowlist_allowed"
   | "allowlist_rejected";
@@ -43,6 +46,7 @@ export const ALL_OUTCOMES: Outcome[] = [
   "revoked_invite",
   "exhausted_invite",
   "not_verified",
+  "signup_closed",
   "allowlist_allowed",
   "allowlist_rejected",
 ];
@@ -110,4 +114,24 @@ export interface CreateInviteRequest {
 export interface DeleteAccountResponse {
   deleted: boolean;
   devices_deleted: number;
+}
+
+/** Sign-up policy (relay settings.signup_mode; relay/settings.go). */
+export type SignupMode = "open" | "invite" | "closed" | "allowlist";
+
+export const ALL_SIGNUP_MODES: SignupMode[] = [
+  "open",
+  "invite",
+  "closed",
+  "allowlist",
+];
+
+/** GET/PUT /v1/admin/settings response. */
+export interface ServiceSettings {
+  signup_mode: SignupMode;
+  /**
+   * "db" when a portal-set settings row governs; "env-default" when the mode
+   * is still seeded from the server environment (SIGNUP_MODE / INVITE_SIGNUP).
+   */
+  source: "db" | "env-default";
 }
