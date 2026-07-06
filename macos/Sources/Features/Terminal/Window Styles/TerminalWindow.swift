@@ -215,14 +215,14 @@ class TerminalWindow: NSWindow {
             // center that window's title. translatesAutoresizingMaskIntoConstraints is
             // disabled AFTER the add so the titlebar installs the sizing constraints.
             machinePillAccessory.layoutAttribute = .left
-            let pillHost = NonDraggableHostingView(
+            // NOTE: do NOT set sizingOptions = [.intrinsicContentSize] here —
+            // combined with the Spacer inside MachineTitlePillView it creates a
+            // non-converging AutoLayout feedback loop (100% main-thread layout
+            // spin, live-sampled 2026-07-05). The truncation issue is instead
+            // solved the UpdatePill way: measure the text and set an explicit
+            // width constraint in updateMachinePill().
+            machinePillAccessory.view = NonDraggableHostingView(
                 rootView: MachineTitlePillView(model: machinePillModel))
-            // Track the SwiftUI content's width via intrinsicContentSize so the
-            // accessory GROWS when the title/machine name changes after install.
-            // Without this the titlebar keeps the width measured at add time and
-            // clips the pill (e.g. "MaximusH…" in a titlebar full of free space).
-            pillHost.sizingOptions = [.intrinsicContentSize]
-            machinePillAccessory.view = pillHost
             updateMachinePill()
         }
 
