@@ -44,7 +44,13 @@ type Authenticator struct {
 	cfg      *Config
 	logger   *slog.Logger
 	verifier *oidc.IDTokenVerifier // nil if GOOGLE_CLIENT_ID is unset
-	allowed  map[string]bool       // lowercased allowlist
+
+	// envAllowed is the ALLOWED_EMAILS env allowlist (lowercased). Since the
+	// DB-backed allowlist (allowlist.go, migration 0006) it is the BOOTSTRAP/
+	// RECOVERY half of the effective allowlist: always honored, never written
+	// to the DB — same pattern as ADMIN_SUBS. Day-to-day entries live in the
+	// allowed_emails table, managed from the portal. See emailAllowed.
+	envAllowed map[string]bool
 
 	// gate is the invite-code authorization layer, consulted only when
 	// Config.InviteSignup is ON. It is wired after the Store exists (SetGate),
@@ -91,12 +97,12 @@ type Authenticator struct {
 // can authenticate clients.
 func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*Authenticator, error) {
 	a := &Authenticator{
-		cfg:     cfg,
-		logger:  logger,
-		allowed: make(map[string]bool, len(cfg.AllowedEmails)),
+		cfg:        cfg,
+		logger:     logger,
+		envAllowed: make(map[string]bool, len(cfg.AllowedEmails)),
 	}
 	for _, e := range cfg.AllowedEmails {
-		a.allowed[strings.ToLower(e)] = true
+		a.envAllowed[strings.ToLower(e)] = true
 	}
 
 	if cfg.GoogleClientID != "" {
@@ -285,36 +291,55 @@ func (a *Authenticator) VerifyIdentity(ctx context.Context, token string) (Ident
 	return Identity{Email: strings.ToLower(claims.Email), Sub: idToken.Subject}, nil
 }
 
-// VerifyIDToken runs the full OIDC verification + ALLOWED_EMAILS authorization
-// on a raw ID token and returns the verified, authorized identity. It is the
-// legacy (INVITE_SIGNUP=off) gate for interactive client auth
+// VerifyIDToken runs the full OIDC verification + allowlist authorization on
+// a raw ID token and returns the verified, authorized identity. It is the
+// `allowlist` signup-mode gate for interactive client auth
 // (AuthenticateClient), device-code self-enrollment (the /v1/enroll/poll
-// success path), and web enrollment (the /enroll/callback code exchange). Its
-// behavior is byte-for-byte what it was before M1: VerifyIdentity plus the
-// allowlist membership test. When INVITE_SIGNUP is ON the enroll flows call
-// VerifyIdentity + the SigninGate instead (see enroll.go).
+// success path), and web enrollment (the /enroll/callback code exchange):
+// VerifyIdentity plus the effective-allowlist membership test (env ∪ DB, see
+// emailAllowed) plus the allowlist-path account layer (blocked refusal +
+// account ensure, see SigninGate.AuthorizeAllowlisted). In every other signup
+// mode the callers use VerifyIdentity + the SigninGate instead (enroll.go).
 func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identity, error) {
 	return a.verifyIDTokenIP(ctx, token, "")
 }
 
+// emailAllowed is the EFFECTIVE allowlist membership test: the ALLOWED_EMAILS
+// env set (bootstrap/recovery — always honored, so a wedged DB or a portal
+// mishap can never lock out the operator) UNION the allowed_emails table
+// (portal-managed, behind the gate's short-TTL cache). email must already be
+// lowercased (VerifyIdentity lowercases). Nil-gate safe: env-only, which is
+// exactly the pre-0006 behavior for gate-less unit tests.
+func (a *Authenticator) emailAllowed(email string) bool {
+	if a.envAllowed[email] {
+		return true
+	}
+	return a.gate.AllowlistedInDB(email)
+}
+
 // verifyIDTokenIP is VerifyIDToken with the client IP plumbed through for the
-// signin_attempts audit row. Logging only — accept/reject decisions are
-// byte-for-byte unchanged. SigninGate.RecordLegacy owns both the Prometheus
+// signin_attempts audit row. The membership test is env ∪ DB (emailAllowed);
+// a member is then run through the allowlist-path account layer
+// (AuthorizeAllowlisted): a blocked account is refused even when allowlisted,
+// and an allowed sign-in ensures an account row exists so the portal shows
+// the owner in every mode. SigninGate.RecordLegacy owns both the Prometheus
 // counter and the (throttled-for-allowed) DB row; a nil gate (gate-less unit
-// tests) records nothing.
+// tests) records nothing and allows any member.
 func (a *Authenticator) verifyIDTokenIP(ctx context.Context, token, ip string) (Identity, error) {
 	ident, err := a.VerifyIdentity(ctx, token)
 	if err != nil {
 		return Identity{}, err
 	}
-	if !a.allowed[ident.Email] {
+	if !a.emailAllowed(ident.Email) {
 		// Authorization gate: a valid Google login by anyone not on the
 		// allowlist is rejected.
 		a.gate.RecordLegacy(ident, ip, false, "")
 		a.logger.Warn("client email not on allowlist", "email", ident.Email)
 		return Identity{}, ErrUnauthorized
 	}
-	a.gate.RecordLegacy(ident, ip, true, tokenFingerprint(token))
+	if err := a.gate.AuthorizeAllowlisted(ident, ip, tokenFingerprint(token)); err != nil {
+		return Identity{}, err
+	}
 	return ident, nil
 }
 

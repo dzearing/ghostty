@@ -142,6 +142,9 @@ func (h *Handler) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /v1/admin/invites/{code}", h.adminOnly(h.handleAdminRevokeInvite))
 	mux.HandleFunc("GET /v1/admin/settings", h.adminOnly(h.handleAdminGetSettings))
 	mux.HandleFunc("PUT /v1/admin/settings", h.adminOnly(h.handleAdminPutSettings))
+	mux.HandleFunc("GET /v1/admin/allowlist", h.adminOnly(h.handleAdminListAllowlist))
+	mux.HandleFunc("POST /v1/admin/allowlist", h.adminOnly(h.handleAdminAddAllowlist))
+	mux.HandleFunc("DELETE /v1/admin/allowlist/{email}", h.adminOnly(h.handleAdminRemoveAllowlist))
 }
 
 // --- Views -------------------------------------------------------------------
