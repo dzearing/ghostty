@@ -282,7 +282,7 @@ func TestMetricsSigninOutcomes(t *testing.T) {
 	allowedBefore := testutil.ToFloat64(mSigninAttempts.WithLabelValues(outcomeAllowed))
 
 	// Fresh identity, no code -> rejected, counted as no_account.
-	if err := gate.Authorize(Identity{Email: "fresh@example.com", Sub: "sub-m5a"}, "", "127.0.0.1"); err == nil {
+	if err := gate.Authorize(Identity{Email: "fresh@example.com", Sub: "sub-m5a"}, "", "127.0.0.1", tokenFingerprint("m5a-tok-1")); err == nil {
 		t.Fatalf("fresh identity without code should be rejected")
 	}
 	if got := testutil.ToFloat64(mSigninAttempts.WithLabelValues(outcomeNoAccount)); got != noAcctBefore+1 {
@@ -293,7 +293,7 @@ func TestMetricsSigninOutcomes(t *testing.T) {
 	if err := store.CreateInviteCode("M5ACODE", nil, nil, "test"); err != nil {
 		t.Fatalf("create invite: %v", err)
 	}
-	if err := gate.Authorize(Identity{Email: "fresh@example.com", Sub: "sub-m5a"}, "M5ACODE", "127.0.0.1"); err != nil {
+	if err := gate.Authorize(Identity{Email: "fresh@example.com", Sub: "sub-m5a"}, "M5ACODE", "127.0.0.1", tokenFingerprint("m5a-tok-2")); err != nil {
 		t.Fatalf("coded sign-in should be allowed: %v", err)
 	}
 	if got := testutil.ToFloat64(mSigninAttempts.WithLabelValues(outcomeAllowed)); got != allowedBefore+1 {

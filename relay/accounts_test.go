@@ -288,27 +288,35 @@ func TestBindLegacyDevicesToSub(t *testing.T) {
 	}
 }
 
-// TestSigninAttemptThrottle covers the allowed-row throttle (one DB row per
-// identity per allowedLogInterval; failures always recorded) and the
-// allowlist-path RecordLegacy audit rows, including nil-gate safety.
+// TestSigninAttemptThrottle covers the credential-keyed allowed-row throttle
+// (same token re-presented within the interval -> one DB row; a FRESH token
+// records immediately; failures always recorded) and the allowlist-path
+// RecordLegacy audit rows, including nil-gate safety.
 func TestSigninAttemptThrottle(t *testing.T) {
 	s := newStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	g := NewSigninGate(&Config{InviteSignup: true}, s, logger)
 	ident := Identity{Email: "user@example.com", Sub: "sub-1"}
+	fpA := tokenFingerprint("token-A")
 
-	// Repeat "allowed" decisions within the interval -> exactly one row.
-	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1")
-	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1")
-	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1")
+	// Same credential re-presented (API polling) -> exactly one row.
+	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1", fpA)
+	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1", fpA)
+	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1", fpA)
 	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 1 {
-		t.Fatalf("allowed rows = %d, want 1 (throttled)", n)
+		t.Fatalf("allowed rows = %d, want 1 (same-token throttled)", n)
+	}
+
+	// A FRESH credential (real login) records immediately, no interval wait.
+	g.recordAllowedThrottled(ident, "1.2.3.4", "acct-1", tokenFingerprint("token-B"))
+	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 2 {
+		t.Fatalf("allowed rows = %d, want 2 (fresh token records immediately)", n)
 	}
 
 	// A different identity gets its own row.
-	g.recordAllowedThrottled(Identity{Email: "other@example.com", Sub: "sub-2"}, "1.2.3.4", "acct-2")
-	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 2 {
-		t.Fatalf("allowed rows = %d, want 2 (per identity)", n)
+	g.recordAllowedThrottled(Identity{Email: "other@example.com", Sub: "sub-2"}, "1.2.3.4", "acct-2", fpA)
+	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 3 {
+		t.Fatalf("allowed rows = %d, want 3 (per identity)", n)
 	}
 
 	// Failures are never throttled.
@@ -318,43 +326,45 @@ func TestSigninAttemptThrottle(t *testing.T) {
 		t.Fatalf("blocked rows = %d, want 2 (unthrottled)", n)
 	}
 
-	// Allowlist path: allowed throttled (shares the same per-identity clock),
-	// rejected always recorded.
-	g.RecordLegacy(ident, "1.2.3.4", true) // same identity, within interval -> no row
+	// Allowlist path: shares the same per-identity throttle state — the same
+	// credential last marked above is suppressed, a fresh one records.
+	g.RecordLegacy(ident, "1.2.3.4", true, tokenFingerprint("token-B"))
 	if n, _ := s.CountSigninAttempts(outcomeAllowlistAllowed); n != 0 {
-		t.Fatalf("allowlist_allowed rows = %d, want 0 (throttle shared)", n)
+		t.Fatalf("allowlist_allowed rows = %d, want 0 (same token suppressed)", n)
 	}
 	fresh := Identity{Email: "legacy@example.com"} // no sub -> email key
-	g.RecordLegacy(fresh, "5.6.7.8", true)
-	g.RecordLegacy(fresh, "5.6.7.8", true)
+	fpL := tokenFingerprint("legacy-token")
+	g.RecordLegacy(fresh, "5.6.7.8", true, fpL)
+	g.RecordLegacy(fresh, "5.6.7.8", true, fpL)
 	if n, _ := s.CountSigninAttempts(outcomeAllowlistAllowed); n != 1 {
 		t.Fatalf("allowlist_allowed rows = %d, want 1", n)
 	}
-	g.RecordLegacy(fresh, "5.6.7.8", false)
-	g.RecordLegacy(fresh, "5.6.7.8", false)
+	g.RecordLegacy(fresh, "5.6.7.8", false, "")
+	g.RecordLegacy(fresh, "5.6.7.8", false, "")
 	if n, _ := s.CountSigninAttempts(outcomeAllowlistRejected); n != 2 {
 		t.Fatalf("allowlist_rejected rows = %d, want 2 (unthrottled)", n)
 	}
 
 	// Nil gate: never panics, never records (gate-less unit-test Authenticators).
 	var nilGate *SigninGate
-	nilGate.RecordLegacy(ident, "1.2.3.4", true)
-	nilGate.RecordLegacy(ident, "1.2.3.4", false)
+	nilGate.RecordLegacy(ident, "1.2.3.4", true, fpA)
+	nilGate.RecordLegacy(ident, "1.2.3.4", false, "")
 }
 
-// TestSigninAttemptThrottleExpiry proves the clock actually expires: back-date
-// the identity's last-allowed mark and a new row is due.
+// TestSigninAttemptThrottleExpiry proves the clock expires even for the SAME
+// credential: back-date the mark and a new row is due on re-presentation.
 func TestSigninAttemptThrottleExpiry(t *testing.T) {
 	s := newStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	g := NewSigninGate(&Config{InviteSignup: true}, s, logger)
 	ident := Identity{Email: "user@example.com", Sub: "sub-1"}
+	fp := tokenFingerprint("token-A")
 
-	g.recordAllowedThrottled(ident, "", "a")
+	g.recordAllowedThrottled(ident, "", "a", fp)
 	g.mu.Lock()
-	g.lastAllowed[throttleKey(ident)] = time.Now().Add(-allowedLogInterval - time.Minute)
+	g.lastAllowed[throttleKey(ident)] = allowedMark{fp: fp, t: time.Now().Add(-allowedLogInterval - time.Minute)}
 	g.mu.Unlock()
-	g.recordAllowedThrottled(ident, "", "a")
+	g.recordAllowedThrottled(ident, "", "a", fp)
 	if n, _ := s.CountSigninAttempts(outcomeAllowed); n != 2 {
 		t.Fatalf("allowed rows = %d, want 2 after interval expiry", n)
 	}

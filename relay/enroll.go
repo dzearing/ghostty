@@ -185,7 +185,7 @@ func (m *EnrollManager) authorizeEnroll(ctx context.Context, idToken, inviteCode
 	if err != nil {
 		return Identity{}, err
 	}
-	if err := gate.Authorize(ident, inviteCode, ip); err != nil {
+	if err := gate.Authorize(ident, inviteCode, ip, tokenFingerprint(idToken)); err != nil {
 		return Identity{}, err
 	}
 	return ident, nil

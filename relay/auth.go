@@ -196,7 +196,7 @@ func (a *Authenticator) authenticateClient(ctx context.Context, r *http.Request)
 				// the account model governs uniformly. No invite code on a
 				// client API request; an existing account (or legacy owner) is
 				// what allows it.
-				if err := a.gate.Authorize(ident, "", clientIP(r)); err != nil {
+				if err := a.gate.Authorize(ident, "", clientIP(r), tokenFingerprint(token)); err != nil {
 					return Identity{}, err
 				}
 			}
@@ -217,7 +217,7 @@ func (a *Authenticator) authenticateClient(ctx context.Context, r *http.Request)
 	if err != nil {
 		return Identity{}, err
 	}
-	if err := a.gate.Authorize(ident, "", clientIP(r)); err != nil {
+	if err := a.gate.Authorize(ident, "", clientIP(r), tokenFingerprint(token)); err != nil {
 		return Identity{}, err
 	}
 	return ident, nil
@@ -310,11 +310,11 @@ func (a *Authenticator) verifyIDTokenIP(ctx context.Context, token, ip string) (
 	if !a.allowed[ident.Email] {
 		// Authorization gate: a valid Google login by anyone not on the
 		// allowlist is rejected.
-		a.gate.RecordLegacy(ident, ip, false)
+		a.gate.RecordLegacy(ident, ip, false, "")
 		a.logger.Warn("client email not on allowlist", "email", ident.Email)
 		return Identity{}, ErrUnauthorized
 	}
-	a.gate.RecordLegacy(ident, ip, true)
+	a.gate.RecordLegacy(ident, ip, true, tokenFingerprint(token))
 	return ident, nil
 }
 

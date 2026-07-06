@@ -26,6 +26,8 @@ package main
 // on the invite path (flag ON); the OFF path is untouched.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"strings"
@@ -38,14 +40,24 @@ import (
 // can surface a "you need an invite code" message rather than a bare 401.
 var ErrInviteRequired = errors.New("invite code required")
 
-// allowedLogInterval throttles repeat "allowed" audit rows per identity: the
-// client authenticates on EVERY API request (device list polls included), so
-// unthrottled logging floods signin_attempts with the same caller within
-// hours. One row per identity per interval keeps the feed meaning "this
-// person signed in", while failures/blocks are always recorded (each one is
-// signal). In-memory: resets on restart (an extra row per identity per
-// restart — harmless).
+// allowedLogInterval bounds repeat "allowed" audit rows for the SAME
+// credential: the client authenticates on EVERY API request (device list
+// polls included), so unthrottled logging floods signin_attempts with the
+// same caller within hours. The throttle is credential-keyed, not just
+// time-keyed: a FRESH token (a real login minting a new ID token) records
+// immediately — "I signed in, show me" — while re-presentations of the same
+// token are suppressed within the interval. Silent hourly token refresh thus
+// costs at most one row per refresh. Failures/blocks are always recorded
+// (each one is signal). In-memory: resets on restart (an extra row per
+// identity per restart — harmless).
 const allowedLogInterval = time.Hour
+
+// allowedMark is the throttle state per identity: which credential was last
+// logged, and when.
+type allowedMark struct {
+	fp string // token fingerprint
+	t  time.Time
+}
 
 // SigninGate authorizes verified identities under the invite-code model.
 type SigninGate struct {
@@ -53,10 +65,10 @@ type SigninGate struct {
 	store  *Store
 	logger *slog.Logger
 
-	// mu guards lastAllowed, the per-identity throttle clock for "allowed"
+	// mu guards lastAllowed, the per-identity throttle state for "allowed"
 	// audit rows (see allowedLogInterval).
 	mu          sync.Mutex
-	lastAllowed map[string]time.Time
+	lastAllowed map[string]allowedMark
 }
 
 // throttleKey identifies a caller for the allowed-row throttle: the stable
@@ -68,27 +80,39 @@ func throttleKey(ident Identity) string {
 	return strings.ToLower(ident.Email)
 }
 
-// shouldRecordAllowed reports whether an "allowed" row for this identity is
-// due (none recorded within allowedLogInterval), and marks it recorded.
-func (g *SigninGate) shouldRecordAllowed(key string) bool {
+// tokenFingerprint is a compact, non-reversible identifier for a presented
+// credential, used ONLY as the throttle key (never stored, never compared for
+// auth). A fresh login mints a fresh token -> fresh fingerprint -> immediate
+// audit row.
+func tokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:8])
+}
+
+// shouldRecordAllowed reports whether an "allowed" row is due for this
+// identity + credential: YES for a credential not seen before (fresh login),
+// YES when the interval elapsed, NO for the same credential re-presented
+// within the interval (API polling). Marks it recorded when returning true.
+func (g *SigninGate) shouldRecordAllowed(key, fp string) bool {
 	now := time.Now()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.lastAllowed == nil {
-		g.lastAllowed = make(map[string]time.Time)
+		g.lastAllowed = make(map[string]allowedMark)
 	}
-	if last, ok := g.lastAllowed[key]; ok && now.Sub(last) < allowedLogInterval {
+	if last, ok := g.lastAllowed[key]; ok &&
+		last.fp == fp && now.Sub(last.t) < allowedLogInterval {
 		return false
 	}
 	// Opportunistic sweep so the map cannot grow without bound.
 	if len(g.lastAllowed) > 8192 {
-		for k, t := range g.lastAllowed {
-			if now.Sub(t) >= allowedLogInterval {
+		for k, m := range g.lastAllowed {
+			if now.Sub(m.t) >= allowedLogInterval {
 				delete(g.lastAllowed, k)
 			}
 		}
 	}
-	g.lastAllowed[key] = now
+	g.lastAllowed[key] = allowedMark{fp: fp, t: now}
 	return true
 }
 
@@ -98,12 +122,12 @@ func (g *SigninGate) shouldRecordAllowed(key string) bool {
 // and is unchanged. Allowed rows are throttled like the gate's own; verified-
 // but-rejected rows are always recorded. Nil-safe: a gate-less Authenticator
 // (some tests) simply doesn't log.
-func (g *SigninGate) RecordLegacy(ident Identity, ip string, allowed bool) {
+func (g *SigninGate) RecordLegacy(ident Identity, ip string, allowed bool, tokenFP string) {
 	if g == nil || g.store == nil {
 		return
 	}
 	if allowed {
-		if !g.shouldRecordAllowed(throttleKey(ident)) {
+		if !g.shouldRecordAllowed(throttleKey(ident), tokenFP) {
 			// Metrics still count every decision; only the DB row is throttled.
 			mSigninAttempts.WithLabelValues(outcomeAllowlistAllowed).Inc()
 			return
@@ -116,9 +140,10 @@ func (g *SigninGate) RecordLegacy(ident Identity, ip string, allowed bool) {
 
 // recordAllowedThrottled is the throttled variant of record() for the gate's
 // own (INVITE_SIGNUP on) "allowed" decisions — same rationale as
-// allowedLogInterval: authenticated API traffic must not flood the feed.
-func (g *SigninGate) recordAllowedThrottled(ident Identity, ip, accountID string) {
-	if !g.shouldRecordAllowed(throttleKey(ident)) {
+// allowedLogInterval: authenticated API traffic must not flood the feed, but
+// a fresh credential (real login) records immediately.
+func (g *SigninGate) recordAllowedThrottled(ident Identity, ip, accountID, tokenFP string) {
+	if !g.shouldRecordAllowed(throttleKey(ident), tokenFP) {
 		mSigninAttempts.WithLabelValues(outcomeAllowed).Inc()
 		return
 	}
@@ -138,9 +163,11 @@ func (g *SigninGate) Enabled() bool {
 // Authorize applies the invite-code account model to an already-VERIFIED
 // identity and returns nil to allow or an error to reject. inviteCode is the
 // code supplied in the request (may be empty — only new accounts need one). ip
-// is the client IP for the audit row. Callers MUST have verified the identity
-// (VerifyIdentity) before calling; this method makes no OIDC checks.
-func (g *SigninGate) Authorize(ident Identity, inviteCode, ip string) error {
+// is the client IP for the audit row; tokenFP is the presented credential's
+// fingerprint for the allowed-row throttle (see shouldRecordAllowed). Callers
+// MUST have verified the identity (VerifyIdentity) before calling; this
+// method makes no OIDC checks.
+func (g *SigninGate) Authorize(ident Identity, inviteCode, ip, tokenFP string) error {
 	// Existing account by stable sub.
 	acct, err := g.store.GetAccountBySub(ident.Sub)
 	if err != nil {
@@ -153,7 +180,7 @@ func (g *SigninGate) Authorize(ident Identity, inviteCode, ip string) error {
 			g.logger.Warn("sign-in refused: account blocked", "sub", ident.Sub, "email", ident.Email)
 			return ErrUnauthorized
 		}
-		g.recordAllowedThrottled(ident, ip, acct.ID)
+		g.recordAllowedThrottled(ident, ip, acct.ID, tokenFP)
 		return nil
 	}
 
