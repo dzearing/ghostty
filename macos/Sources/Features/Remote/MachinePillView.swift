@@ -49,16 +49,15 @@ struct MachinePillCapsule: View {
         }
     }
 
-    /// Connection-state text for the SEPARATE state pill; nil when connected
-    /// (no second pill). Never uses an em dash (user style rule).
-    private var stateText: String? {
+    private var label: String {
+        guard let machineName else { return "" }
         switch connectionState {
         case .connected:
-            return nil
+            return machineName
         case .reconnecting(let attempt):
-            return "Reconnecting (\(attempt))"
+            return "\(machineName) — reconnecting… (\(attempt))"
         case .disconnected:
-            return "Disconnected"
+            return "\(machineName) — disconnected"
         }
     }
 
@@ -68,46 +67,29 @@ struct MachinePillCapsule: View {
         case .connected:
             return "Terminal runs on \(machineName)"
         case .reconnecting(let attempt):
-            return "Connection to \(machineName) lost. Reconnecting (attempt \(attempt))."
+            return "Connection to \(machineName) lost — reconnecting (attempt \(attempt))"
         case .disconnected:
-            return "Connection to \(machineName) lost. Could not reconnect."
+            return "Connection to \(machineName) lost — could not reconnect"
         }
     }
 
     var body: some View {
-        if let machineName {
-            // The machine name and the connection state are SEPARATE pills:
-            // the name stays stable while the state pill appears/disappears
-            // beside it, so reconnect churn never reflows or truncates the name.
-            HStack(spacing: 6) {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(dotColor)
-                        .frame(width: 6, height: 6)
-                    Text(machineName)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    Capsule()
-                        .fill(.quaternary)
-                )
-                if let stateText {
-                    Text(stateText)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(dotColor)
-                        .lineLimit(1)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(
-                            Capsule()
-                                .fill(.quaternary)
-                        )
-                }
+        if machineName != nil {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 6, height: 6)
+                Text(label)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                Capsule()
+                    .fill(.quaternary)
+            )
             .help(helpText)
             .accessibilityLabel(helpText)
         }
