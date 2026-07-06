@@ -131,6 +131,106 @@ describe("ApiClient", () => {
     expect((err as ApiError).message).toContain("invalid signup_mode");
   });
 
+  it("lists the allowlist with the bearer token and unwraps entries", async () => {
+    const entries = [
+      { email: "owner@example.com", source: "env" },
+      { email: "friend@example.com", source: "db", note: "college friend", created_at: "2026-07-01T00:00:00Z" },
+    ];
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse(200, { emails: entries }));
+    const client = new ApiClient({ getToken: () => "tok-123" });
+
+    const got = await client.listAllowlist();
+    expect(got).toEqual(entries);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("/v1/admin/allowlist");
+    expect(init?.method).toBeUndefined(); // GET
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer tok-123");
+  });
+
+  it("POSTs an allowlist add and unwraps the created entry", async () => {
+    const entry = {
+      email: "friend@example.com",
+      source: "db",
+      note: "college friend",
+      created_at: "2026-07-05T00:00:00Z",
+    };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse(201, { email: entry }));
+    const client = new ApiClient({ getToken: () => "tok-123" });
+
+    const got = await client.addAllowlistEmail({
+      email: "friend@example.com",
+      note: "college friend",
+    });
+    expect(got).toEqual(entry);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("/v1/admin/allowlist");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      email: "friend@example.com",
+      note: "college friend",
+    });
+  });
+
+  it("maps an invalid allowlist add (400) to ApiError with the relay's message", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      textResponse(400, "invalid email"),
+    );
+    const client = new ApiClient({ getToken: () => "valid" });
+
+    const err = await client
+      .addAllowlistEmail({ email: "not-an-email" })
+      .catch((e: unknown) => e);
+    expect(isApiError(err)).toBe(true);
+    expect((err as ApiError).status).toBe(400);
+    expect((err as ApiError).message).toBe("invalid email");
+  });
+
+  it("maps a duplicate allowlist add (409) to ApiError with the relay's message", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      textResponse(409, "email already on the allowlist"),
+    );
+    const client = new ApiClient({ getToken: () => "valid" });
+
+    const err = await client
+      .addAllowlistEmail({ email: "dupe@example.com" })
+      .catch((e: unknown) => e);
+    expect((err as ApiError).status).toBe(409);
+    expect((err as ApiError).message).toBe("email already on the allowlist");
+  });
+
+  it("DELETEs an allowlist email URL-encoded and returns removed", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse(200, { removed: true }));
+    const client = new ApiClient({ getToken: () => "valid" });
+
+    const got = await client.removeAllowlistEmail("friend@example.com");
+    expect(got).toEqual({ removed: true });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("/v1/admin/allowlist/friend%40example.com");
+    expect(init?.method).toBe("DELETE");
+  });
+
+  it("maps an env-entry allowlist delete (409) to ApiError with the env-managed message", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      textResponse(
+        409,
+        "email is managed by the ALLOWED_EMAILS environment variable and cannot be removed from the portal",
+      ),
+    );
+    const client = new ApiClient({ getToken: () => "valid" });
+
+    const err = await client
+      .removeAllowlistEmail("owner@example.com")
+      .catch((e: unknown) => e);
+    expect((err as ApiError).status).toBe(409);
+    expect((err as ApiError).message).toContain("ALLOWED_EMAILS");
+  });
+
   it("omits the Authorization header when signed out", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")

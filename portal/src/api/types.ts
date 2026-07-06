@@ -135,3 +135,26 @@ export interface ServiceSettings {
    */
   source: "db" | "env-default";
 }
+
+/**
+ * One effective-allowlist entry (GET /v1/admin/allowlist). The effective
+ * list is the union of portal-managed allowed_emails rows (source "db") and
+ * the ALLOWED_EMAILS env var (source "env" — bootstrap/recovery: always
+ * honored, immutable from the portal, so no note/created_at).
+ */
+export interface AllowlistEntry {
+  email: string;
+  source: "db" | "env";
+  note?: string;
+  created_at?: string;
+}
+
+export interface AddAllowlistRequest {
+  email: string;
+  note?: string;
+}
+
+/** DELETE /v1/admin/allowlist/{email} response. */
+export interface RemoveAllowlistResponse {
+  removed: boolean;
+}

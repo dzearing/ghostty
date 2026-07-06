@@ -13,6 +13,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import type {
   AccountsQuery,
+  AddAllowlistRequest,
   AttemptsQuery,
   CreateInviteRequest,
   SignupMode,
@@ -63,6 +64,15 @@ export function useSettings() {
   return useQuery({
     queryKey: ["settings"],
     queryFn: () => api.getSettings(),
+    ...LIVE,
+  });
+}
+
+export function useAllowlist() {
+  const { api } = useAuth();
+  return useQuery({
+    queryKey: ["allowlist"],
+    queryFn: () => api.listAllowlist(),
     ...LIVE,
   });
 }
@@ -128,5 +138,23 @@ export function useUpdateSettings() {
   return useMutation({
     mutationFn: (mode: SignupMode) => api.putSettings(mode),
     onSuccess: () => invalidate("settings"),
+  });
+}
+
+export function useAddAllowlistEmail() {
+  const { api } = useAuth();
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: (req: AddAllowlistRequest) => api.addAllowlistEmail(req),
+    onSuccess: () => invalidate("allowlist"),
+  });
+}
+
+export function useRemoveAllowlistEmail() {
+  const { api } = useAuth();
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: (email: string) => api.removeAllowlistEmail(email),
+    onSuccess: () => invalidate("allowlist"),
   });
 }

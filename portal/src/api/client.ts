@@ -13,10 +13,13 @@ import type {
   Account,
   AccountsQuery,
   AccountUsage,
+  AddAllowlistRequest,
+  AllowlistEntry,
   AttemptsQuery,
   CreateInviteRequest,
   DeleteAccountResponse,
   InviteCode,
+  RemoveAllowlistResponse,
   ServiceSettings,
   SigninAttempt,
   SignupMode,
@@ -164,5 +167,29 @@ export class ApiClient {
       method: "PUT",
       body: JSON.stringify({ signup_mode: mode }),
     });
+  }
+
+  // --- Allowlist ---
+
+  async listAllowlist(): Promise<AllowlistEntry[]> {
+    const body = await this.request<{ emails: AllowlistEntry[] }>(
+      "/v1/admin/allowlist",
+    );
+    return body.emails;
+  }
+
+  async addAllowlistEmail(req: AddAllowlistRequest): Promise<AllowlistEntry> {
+    const body = await this.request<{ email: AllowlistEntry }>(
+      "/v1/admin/allowlist",
+      { method: "POST", body: JSON.stringify(req) },
+    );
+    return body.email;
+  }
+
+  async removeAllowlistEmail(email: string): Promise<RemoveAllowlistResponse> {
+    return this.request<RemoveAllowlistResponse>(
+      `/v1/admin/allowlist/${encodeURIComponent(email)}`,
+      { method: "DELETE" },
+    );
   }
 }
