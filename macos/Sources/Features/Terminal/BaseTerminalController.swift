@@ -447,6 +447,13 @@ class BaseTerminalController: NSWindowController,
                 // shell and dropped). Matches the explicit `-e`/`--command` path.
                 effectiveConfig.waitAfterCommand = true
             }
+            // The split OPENs a fresh session on the same machine, so the
+            // per-host default SHELL applies (the working directory instead
+            // inherits from the parent pane below — a per-host default cwd
+            // must not yank a split away from where its parent is).
+            if effectiveConfig.remoteShell == nil {
+                effectiveConfig.remoteShell = remoteConnection.machine.settings.shell
+            }
 
             let alreadyHasCwd = effectiveConfig.remoteWorkingDirectory != nil
             Self.resolveRemoteInheritance(

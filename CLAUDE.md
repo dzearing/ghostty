@@ -94,19 +94,33 @@ action (dial the agent, build a remote surface, open the window), so the remote
 path is scriptable/testable from the shell.
 
 ```
-ghoztty +new-remote-window --host=<host> --port=<port>
+ghoztty +new-remote-window --host=<host> --port=<port> --working-directory=<path> --shell=<path> --command=<cmd>
 ```
 
 - `--host`: Agent host (DNS name or literal IP). Required.
 - `--port`: Agent TCP port. Required.
+- `--working-directory`: Working directory ON THE REMOTE MACHINE for the new
+  session. Overrides the machine's per-host default.
+- `--shell`: Shell ON THE REMOTE MACHINE to run (e.g. `wsl.exe`,
+  `powershell.exe`, `/bin/zsh`). Overrides the machine's per-host default.
+- `--command`: Command to run in the remote session instead of an interactive
+  shell. Runs through the resolved shell using its native convention (POSIX
+  `-lic`, cmd `/c`, powershell/pwsh `-Command`, wsl `--`).
 
 ```bash
 ghoztty +new-remote-window --host=127.0.0.1 --port=7777
+ghoztty +new-remote-window --host=winbox --port=7777 --shell=wsl.exe --working-directory='C:\dev'
 ```
 
 The remote session uses the remote machine's own default shell and working
 directory (the local shell/pwd are NOT forwarded — they would not exist on a
-different OS such as a Windows ConPTY agent).
+different OS such as a Windows ConPTY agent) unless a **per-host default** or
+an explicit flag says otherwise. Per-host defaults (default working directory
++ default shell per machine) are edited in the machine chooser (Cmd-Shift-N →
+row `⋯` menu → "Host Settings…") and persist in UserDefaults keyed by relay
+device id or `host:port`; explicit `--working-directory`/`--shell` flags
+override them per window. New tabs/splits on a remote window use the per-host
+default shell too (their cwd inherits from the parent pane).
 
 ### Naming
 

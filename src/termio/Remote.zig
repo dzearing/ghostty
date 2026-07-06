@@ -65,6 +65,12 @@ command: ?[]const u8,
 /// pwd. Duped into `arena`.
 working_directory: ?[]const u8,
 
+/// The shell to run for an open-new session (null ⇒ the remote's own default:
+/// POSIX `$SHELL`/`/bin/sh`, Windows `%COMSPEC%`/cmd.exe). A path ON THE REMOTE
+/// MACHINE, sourced from the per-host settings (never the local config). Sent
+/// verbatim in the `OPEN` payload (§4.2). Duped into `arena`.
+shell: ?[]const u8,
+
 /// The TERM value advertised in `OPEN` (§4.2). Duped into `arena`.
 term: []const u8,
 
@@ -122,6 +128,11 @@ pub const Config = struct {
     /// Working directory hint + the terminal's initial pwd.
     working_directory: ?[]const u8 = null,
 
+    /// Shell for an open-new session (null ⇒ the agent resolves its own
+    /// default). A remote-native path (per-host setting), NEVER the local
+    /// shell — a local path does not exist on a different remote OS.
+    shell: ?[]const u8 = null,
+
     /// TERM value advertised to the agent. Deliberately NOT `xterm-ghostty`:
     /// the remote machine almost never has ghostty's terminfo installed, and an
     /// unknown TERM breaks curses apps and pagers there (git's less prints
@@ -141,6 +152,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
     const session_id = if (cfg.session_id) |s| try aa.dupe(u8, s) else null;
     const command = if (cfg.command) |c| try aa.dupe(u8, c) else null;
     const working_directory = if (cfg.working_directory) |w| try aa.dupe(u8, w) else null;
+    const shell = if (cfg.shell) |s| try aa.dupe(u8, s) else null;
     const term = try aa.dupe(u8, cfg.term);
 
     return .{
@@ -148,6 +160,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .session_id = session_id,
         .command = command,
         .working_directory = working_directory,
+        .shell = shell,
         .term = term,
         .arena = arena,
     };
@@ -282,6 +295,7 @@ pub fn threadEnter(
         const open: protocol.Open = .{
             .command = self.command,
             .cwd = self.working_directory,
+            .shell = self.shell,
             .term = self.term,
             .rows = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
             .cols = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),

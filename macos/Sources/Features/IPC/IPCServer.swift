@@ -872,6 +872,9 @@ class IPCServer {
         var device: String?
         var token: String?
         var name: String?
+        var workingDirectory: String?
+        var shell: String?
+        var command: String?
         for arg in arguments {
             if let value = arg.dropPrefix("--host=") {
                 host = String(value)
@@ -885,6 +888,16 @@ class IPCServer {
                 token = String(value)
             } else if let value = arg.dropPrefix("--name=") {
                 name = String(value)
+            } else if let value = arg.dropPrefix("--working-directory=") {
+                // REMOTE-native cwd/shell/command: forwarded into the agent
+                // OPEN. Explicit flags override the machine's per-host
+                // defaults (Machine.applyOpenDefaults). Empty values are
+                // treated as absent so `--shell=` can't forward "".
+                workingDirectory = value.isEmpty ? nil : String(value)
+            } else if let value = arg.dropPrefix("--shell=") {
+                shell = value.isEmpty ? nil : String(value)
+            } else if let value = arg.dropPrefix("--command=") {
+                command = value.isEmpty ? nil : String(value)
             }
         }
 
@@ -937,6 +950,9 @@ class IPCServer {
                     // restored window is re-registered under it (the restore
                     // path calls registerRestoredRemoteWindow).
                     ipcName: name,
+                    workingDirectory: workingDirectory,
+                    shell: shell,
+                    command: command,
                     onOpen: { [weak self] controller in
                         // Register the window under its friendly name so
                         // +send-keys / +read / +close can target it (mirrors the
@@ -954,6 +970,9 @@ class IPCServer {
                     host: host!,
                     port: port!,
                     name: name,
+                    workingDirectory: workingDirectory,
+                    shell: shell,
+                    command: command,
                     onOpen: { [weak self] controller in
                         // Same registration as the relay path above: expose
                         // the window under its friendly name so +send-keys /

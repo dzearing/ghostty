@@ -506,6 +506,14 @@ typedef struct {
   // agent). NULL means "no remote cwd hint" — the agent uses its own default.
   // Ignored when `connection` is NULL.
   const char* remote_working_directory;
+
+  // The shell to run for an OPEN-new remote session: a path ON THE REMOTE
+  // MACHINE (e.g. `powershell.exe`, `wsl.exe`, `/bin/zsh`), sourced from the
+  // per-host machine settings or an explicit `--shell`. Forwarded verbatim in
+  // the agent's OPEN. NULL means the agent resolves its own default shell
+  // (POSIX $SHELL / /bin/sh, Windows %COMSPEC% / cmd.exe). Ignored when
+  // `connection` is NULL.
+  const char* remote_shell;
 } ghostty_surface_config_s;
 
 typedef struct {

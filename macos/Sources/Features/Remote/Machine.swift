@@ -124,6 +124,121 @@ struct Machine: Identifiable, Hashable {
         if s.hasSuffix(".local") { s.removeLast(".local".count) }
         return s
     }
+
+    // MARK: Per-host settings
+
+    /// The stable identity key for this machine's persisted per-host settings:
+    /// the relay device id when this is a relay machine (stable across renames
+    /// and directory refreshes), else `host:port` for direct-TCP machines
+    /// (their only durable identity — TCP rows are rebuilt per dial). NOT the
+    /// registry UUID, which is regenerated across launches.
+    var settingsKey: String { deviceID ?? "\(host):\(port)" }
+
+    /// This machine's persisted per-host settings (default cwd/shell for new
+    /// remote sessions). Read-through to the store; empty settings when none
+    /// were ever saved.
+    var settings: MachineSettings { MachineSettingsStore.get(settingsKey) }
+}
+
+extension Machine {
+    /// Seed an OPEN-new remote surface config with this machine's per-host
+    /// defaults, letting explicit caller values (CLI `--working-directory` /
+    /// `--shell` / `--command` flags) override them. Only meaningful for a
+    /// config that OPENs a new session (`remoteSessionId == nil`) — an ATTACH
+    /// ignores OPEN fields.
+    ///
+    /// The command has no per-host default (a default command re-run on every
+    /// new window would be surprising); it is applied here only so the CLI
+    /// override path has one seeding site. `waitAfterCommand` makes libghostty
+    /// forward it as an EXPLICIT remote command in the OPEN (otherwise it is
+    /// treated as a local default and deliberately dropped — see Surface.zig's
+    /// remote branch).
+    func applyOpenDefaults(
+        to cfg: inout Ghostty.SurfaceConfiguration,
+        workingDirectory: String? = nil,
+        shell: String? = nil,
+        command: String? = nil
+    ) {
+        let settings = self.settings
+        if cfg.remoteWorkingDirectory == nil {
+            cfg.remoteWorkingDirectory = workingDirectory ?? settings.workingDirectory
+        }
+        if cfg.remoteShell == nil {
+            cfg.remoteShell = shell ?? settings.shell
+        }
+        if cfg.command == nil, let command, !command.isEmpty {
+            cfg.command = command
+            cfg.waitAfterCommand = true
+        }
+    }
+}
+
+/// Per-host defaults for NEW remote sessions on a machine: the working
+/// directory and shell the session starts with when the caller doesn't pass
+/// explicit `--working-directory`/`--shell` flags. Both are REMOTE-native
+/// values (e.g. `C:\dev` + `wsl.exe` on a Windows host, `/home/me` +
+/// `/bin/zsh` on Linux); nil means "use the remote's own default" (unchanged
+/// current behavior). Forwarded in the agent OPEN's existing optional
+/// `cwd`/`shell` fields, so old agents ignore nothing they don't understand.
+struct MachineSettings: Codable, Equatable {
+    var workingDirectory: String?
+    var shell: String?
+
+    var isEmpty: Bool { workingDirectory == nil && shell == nil }
+}
+
+/// Persistence for `MachineSettings`, keyed by `Machine.settingsKey`.
+///
+/// Store choice (the Machine.swift `[machines]`-file TODO): the same
+/// UserDefaults-JSON pattern as the relay device cache, NOT a machines.toml.
+/// A config file buys hand-editability but needs a parser, file watching, and
+/// a write path the app doesn't have today; these settings are written from
+/// the app's own UI/CLI, so the app-owned store the codebase already uses is
+/// the right weight. Unlike the device cache this is NEVER purged on
+/// sign-out/401: per-host defaults are local user preferences (no secrets, no
+/// account resources — keys are device ids / host:port strings), and a user's
+/// shell choice must survive an auth blip. UserDefaults is thread-safe, so
+/// reads (dial time) and writes (settings UI) need no isolation.
+enum MachineSettingsStore {
+    private static let defaultsKey = "MachineSettingsByHost"
+
+    /// The persisted settings for a machine key, or empty settings when none
+    /// (or the blob fails to decode — schema drift degrades to defaults).
+    static func get(_ machineKey: String) -> MachineSettings {
+        loadAll()[machineKey] ?? MachineSettings()
+    }
+
+    /// Persist `settings` for a machine key. Whitespace-only fields are
+    /// normalized to nil ("use the remote default"); fully-empty settings
+    /// remove the entry so the store doesn't accumulate blanks.
+    static func set(_ settings: MachineSettings, for machineKey: String) {
+        var normalized = settings
+        normalized.workingDirectory = normalize(settings.workingDirectory)
+        normalized.shell = normalize(settings.shell)
+
+        var all = loadAll()
+        if normalized.isEmpty {
+            all.removeValue(forKey: machineKey)
+        } else {
+            all[machineKey] = normalized
+        }
+        guard let data = try? JSONEncoder().encode(all) else { return }
+        UserDefaults.ghostty.set(data, forKey: defaultsKey)
+    }
+
+    private static func normalize(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed
+    }
+
+    private static func loadAll() -> [String: MachineSettings] {
+        guard let data = UserDefaults.ghostty.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode([String: MachineSettings].self, from: data)
+        else { return [:] }
+        return decoded
+    }
 }
 
 /// In-memory registry of known remote machines.

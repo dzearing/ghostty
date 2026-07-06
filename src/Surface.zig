@@ -81,6 +81,13 @@ pub const RemoteBackend = struct {
     /// Null ⇒ no remote cwd hint (the agent uses its own default). Borrowed for
     /// the construction call only.
     working_directory: ?[]const u8 = null,
+
+    /// The shell to run for an OPEN-new session (per-host default or an explicit
+    /// `--shell`): a path ON THE REMOTE MACHINE (e.g. `powershell.exe`,
+    /// `wsl.exe`, `/bin/zsh`). Same invariant as `working_directory`: the LOCAL
+    /// shell config must never reach a remote agent. Null ⇒ the agent resolves
+    /// its own default shell. Borrowed for the construction call only.
+    shell: ?[]const u8 = null,
 };
 
 /// Unique ID used to identify this surface for IPC purposes. It is
@@ -742,6 +749,7 @@ pub fn init(
                     .session_id = rb.session_id,
                     .command = remote_command,
                     .working_directory = rb.working_directory,
+                    .shell = rb.shell,
                     .term = config.term,
                 });
                 break :backend .{ .remote = io_remote };

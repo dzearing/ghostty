@@ -17,6 +17,10 @@ pub const Options = struct {
     device: ?[:0]const u8 = null,
     token: ?[:0]const u8 = null,
 
+    @"working-directory": ?[:0]const u8 = null,
+    shell: ?[:0]const u8 = null,
+    command: ?[:0]const u8 = null,
+
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
 
@@ -37,6 +41,12 @@ pub const Options = struct {
             self.device = try alloc.dupeZ(u8, arg["--device=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--token=")) {
             self.token = try alloc.dupeZ(u8, arg["--token=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--working-directory=")) {
+            self.@"working-directory" = try alloc.dupeZ(u8, arg["--working-directory=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--shell=")) {
+            self.shell = try alloc.dupeZ(u8, arg["--shell=".len..]);
+        } else if (std.mem.startsWith(u8, arg, "--command=")) {
+            self.command = try alloc.dupeZ(u8, arg["--command=".len..]);
         }
         try self._arguments.append(alloc, try alloc.dupeZ(u8, arg));
     }
@@ -69,6 +79,16 @@ pub const Options = struct {
 ///   * `--name=<name>`: Register the new window under a name so it can be
 ///     targeted later by `+send-keys`, `+read`, `+split`, and `+close`.
 ///     Also used as the window's display name.
+///   * `--working-directory=<path>`: Working directory ON THE REMOTE MACHINE
+///     for the new session. Overrides the machine's per-host default. The
+///     local pwd is never forwarded (it would not exist on a remote OS).
+///   * `--shell=<path>`: Shell ON THE REMOTE MACHINE to run (e.g. `wsl.exe`,
+///     `powershell.exe`, `/bin/zsh`). Overrides the machine's per-host
+///     default; when neither is set the agent uses the remote's own default
+///     shell ($SHELL / %COMSPEC%).
+///   * `--command=<cmd>`: Command to run in the remote session instead of an
+///     interactive shell. Runs THROUGH the resolved shell using its native
+///     convention (POSIX `-lic`, cmd `/c`, powershell `-Command`, wsl `--`).
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {

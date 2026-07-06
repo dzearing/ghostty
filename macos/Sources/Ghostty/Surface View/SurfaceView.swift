@@ -676,6 +676,15 @@ extension Ghostty {
         /// forwarded to the agent's OPEN and never confused with a local path.
         var remoteWorkingDirectory: String?
 
+        /// The shell to run for an OPEN-new remote session: a path ON THE
+        /// REMOTE MACHINE (e.g. `powershell.exe`, `wsl.exe`, `/bin/zsh`),
+        /// sourced from the machine's per-host settings or an explicit
+        /// `--shell`. Forwarded verbatim in the agent's OPEN. nil ⇒ the agent
+        /// resolves its own default shell (current behavior). Never sourced
+        /// from the LOCAL shell config — a local shell path does not exist on
+        /// a different remote OS (the stall-fix invariant).
+        var remoteShell: String?
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -778,7 +787,12 @@ extension Ghostty {
                                             // agent uses its own default cwd.
                                             return try remoteWorkingDirectory.withCString { cRemoteWd in
                                                 config.remote_working_directory = cRemoteWd
-                                                return try body(&config)
+                                                // Per-host shell (nil ⇒ NULL ⇒ the
+                                                // agent's own default shell).
+                                                return try remoteShell.withCString { cRemoteShell in
+                                                    config.remote_shell = cRemoteShell
+                                                    return try body(&config)
+                                                }
                                             }
                                         }
                                     }
