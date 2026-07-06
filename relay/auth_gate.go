@@ -81,6 +81,12 @@ type SigninGate struct {
 	modeVal    SignupMode
 	modeSource string
 	modeExp    time.Time
+
+	// alMu guards the short-TTL DB-allowlist cache (allowlist.go): the
+	// lowercased allowed_emails set and its cache deadline. nil set = cold.
+	alMu  sync.Mutex
+	alSet map[string]bool
+	alExp time.Time
 }
 
 // throttleKey identifies a caller for the allowed-row throttle: the stable
