@@ -5,7 +5,17 @@ FRESH context (after `/clear`) can resume with zero prior memory. The detailed
 plan is `docs/design/multi-tenant-launch-plan.md`; this file tracks *where we are*
 and *what to do next*.
 
-Last updated: 2026-07-05 evening. M0–M4+M5a ALL merged. **DEPLOYED TO PROD**
+Last updated: 2026-07-06. signup_mode service flag SHIPPED+DEPLOYED (merge
+a76e62829): runtime settings table (0005), GET/PUT /v1/admin/settings, portal
+Settings page. Modes: open|invite|closed|allowlist; DB row > SIGNUP_MODE env >
+INVITE_SIGNUP seed > allowlist default; user flips mode LIVE from the portal
+(no restart). This SUPERSEDES the "INVITE_SIGNUP cutover" checkpoint — the
+cutover is now a portal click; user intends OPEN mode. Also shipped 2026-07-05
+late: allowlist attempt logging + credential-keyed allowed-row throttle
+(fresh token records immediately); portal sessionStorage token custody +
+avatar; basename fix.
+
+Earlier (2026-07-05 evening): M0–M4+M5a ALL merged. **DEPLOYED TO PROD**
 (user-approved restart 23:09 UTC): SQLite live (2 devices imported), admin API
 live (`ADMIN_SUBS=113035548042046169952` = dzearing's real sub), portal live at
 https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/admin (Caddy
