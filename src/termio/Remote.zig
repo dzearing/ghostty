@@ -80,6 +80,15 @@ exit_code: ?u32 = null,
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
 
+/// Cancellation token for this pane's session-establishing RPCs (OPEN/ATTACH).
+/// `shutdown` (GUI thread, called by `Surface.deinit` BEFORE joining the IO
+/// thread) cancels it so a doomed OPEN/ATTACH parked on a dead link wakes
+/// immediately instead of waiting out its full timeout under the join — the
+/// remote analogue of Exec signaling its quit pipe before joining its reader.
+/// Stable for the backend's lifetime (lives in `Termio.backend`, which is
+/// deinitialized only after the IO thread has joined).
+canceller: connection.RpcCanceller = .{},
+
 /// The LIVE agent session id, published once `threadEnter` resolves the pane
 /// (OPEN-new learns it from the agent's OPENED; ATTACH already knows it). Stored
 /// here on the STABLE backend (`Termio.backend.remote`) so the GUI thread can
@@ -149,6 +158,28 @@ pub fn deinit(self: *Remote) void {
     self.* = undefined;
 }
 
+/// Abort any blocking work this backend may be doing on its IO thread so that
+/// thread can be joined promptly. Called by `Surface.deinit` on the GUI thread
+/// BEFORE it joins the IO thread (mirroring how Exec signals its read thread's
+/// quit pipe before the join).
+///
+/// The one blocking wait a remote pane's IO thread can be parked in is a
+/// session-establishing RPC (`threadEnter`'s OPEN/ATTACH). On a link that died
+/// silently (e.g. a WSS transport that will never deliver another byte — the
+/// readers see no error, so nothing fails the parked slot) that wait runs the
+/// full RPC timeout; joining through it beachballs the GUI thread, and during
+/// reconnect churn (a fresh doomed ATTACH every cycle) it looks permanent.
+/// Cancelling is always safe: the surface is being torn down, so the RPC's
+/// result could never be used anyway.
+///
+/// Thread-safe: only touches the atomic canceller and the connection's
+/// rpc-slot table (under its own lock). The connection outlives the surface
+/// (the GUI retains it until after `ghostty_surface_free` returns).
+pub fn shutdown(self: *Remote) void {
+    self.canceller.cancel();
+    self.conn.cancelRpcsFor(&self.canceller);
+}
+
 /// The LIVE agent session id for this backend, or null if no pane is currently
 /// resolved (pre-`threadEnter` or post-`threadExit`). Lock-free; safe to call
 /// from any thread. The returned slice borrows the pane's `session_id` and is
@@ -209,7 +240,7 @@ pub fn threadEnter(
         // ATTACH: re-attach to an existing agent session (§3.3 / §7.3).
         const rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
         const cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
-        var outcome = try self.conn.attachChannel(
+        var outcome = try self.conn.attachChannelCancellable(
             sid,
             rows,
             cols,
@@ -217,6 +248,7 @@ pub fn threadEnter(
             // GUI process); the agent replays its retained ring from 0 (§7.3).
             0,
             false,
+            &self.canceller,
         );
         // `attached_elsewhere` without force (§5.3): the session's bridge still
         // belongs to another connection — for THIS surface that is our own
@@ -231,7 +263,7 @@ pub fn threadEnter(
         {
             outcome.deinit();
             log.info("attach: session attached elsewhere; reclaiming with force=true", .{});
-            outcome = try self.conn.attachChannel(sid, rows, cols, 0, true);
+            outcome = try self.conn.attachChannelCancellable(sid, rows, cols, 0, true, &self.canceller);
         }
         defer outcome.deinit();
         const p = outcome.pane orelse {
@@ -256,7 +288,7 @@ pub fn threadEnter(
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
             .px_h = @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
         };
-        break :pane try self.conn.openChannel(open);
+        break :pane try self.conn.openChannelCancellable(open, &self.canceller);
     };
     // On any failure after this point we DETACH the pane (keep-alive teardown,
     // §3.3) so the remote session survives for a later re-attach.

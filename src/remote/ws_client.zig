@@ -713,17 +713,29 @@ pub const WsClient = struct {
         return bytes.len;
     }
 
-    /// Idempotent. Best-effort masked close frame, then `shutdown(.both)` (unblocks
-    /// a blocked reader thread inside TLS) + `close` the socket fd.
+    /// Idempotent. `shutdown(.both)` FIRST (unblocks any thread parked in a
+    /// socket recv/send), then a best-effort masked close frame, then `close`
+    /// the socket fd.
+    ///
+    /// Order matters: on a silently-dead link the kernel send buffer can be
+    /// full, so a writer thread may be blocked inside `send` while HOLDING
+    /// `write_mtx`. Sending the close frame first would (a) block on that
+    /// mutex and (b) block in `send` itself — wedging teardown forever (the
+    /// reconnect-churn hang). `shutdown(.both)` errors out both the blocked
+    /// send and any blocked recv immediately, after which the close-frame
+    /// attempt fails fast and harmlessly. On a healthy link this trades the
+    /// WS close frame for a plain TCP FIN — acceptable: the frame was always
+    /// best-effort, and every peer (relay, agent) must treat raw EOF as a
+    /// disconnect anyway.
     fn closeImpl(self: *WsClient) void {
         if (self.closed.swap(true, .acq_rel)) return;
-        // Best-effort close frame (under the write mutex). Ignore errors — the
-        // socket may already be gone. We set `closed=true` above first, so
-        // `sendFrame`'s own guard would bail; do the frame write directly here
-        // instead, bypassing that guard, before tearing the socket down.
-        self.sendCloseDuringShutdown();
-        // shutdown wakes a blocked recv with EOF; then close the fd.
+        // shutdown wakes a blocked recv with EOF and fails a blocked send.
         posix.shutdown(self.socket.handle, .both) catch {};
+        // Best-effort close frame (under the write mutex, released promptly by
+        // any writer the shutdown just unblocked). Ignore errors — the socket
+        // is going away. We set `closed=true` above first, so `sendFrame`'s own
+        // guard would bail; do the frame write directly here instead.
+        self.sendCloseDuringShutdown();
         self.socket.close();
     }
 
