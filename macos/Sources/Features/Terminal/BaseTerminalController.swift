@@ -174,6 +174,31 @@ class BaseTerminalController: NSWindowController,
     /// `debugShouldForceReconnectSwap`.
     private var debugForcingReconnectSwap: Bool = false
 
+    /// Poisoned-session circuit breaker: when the most recent reconnect swap
+    /// completed (`completeRemoteReconnect` succeeded). Nil when no swap is
+    /// pending judgment. Used with `remoteQuickSwapDeaths` to detect a session
+    /// that probes ALIVE but kills the link every time we ATTACH to it (seen
+    /// live: a stale session created by an older client build; every swap
+    /// "succeeded" and then the link died within ~300ms, looping forever).
+    private var remoteSwapCompletedAt: Date?
+
+    /// Consecutive swaps that completed and then had their link die within
+    /// `remoteSwapPoisonWindow`. Reset by a swap that stays up longer than the
+    /// window or by any genuine link recovery. At `remoteSwapPoisonLimit` the
+    /// fast reconnect ladder STOPS (the session is treated as poisoned) instead
+    /// of dial/probe/swap-looping every couple of seconds forever.
+    private var remoteQuickSwapDeaths: Int = 0
+
+    /// A post-swap link death within this many seconds counts as a
+    /// quick-death cycle for the poisoned-session circuit breaker. Chosen well
+    /// above the observed ~300ms death and above the 5s post-swap verify, but
+    /// short enough that a genuinely working session (interactive use easily
+    /// exceeds it) always resets the counter.
+    private static let remoteSwapPoisonWindow: TimeInterval = 10
+
+    /// Consecutive quick-death cycles before the session is declared poisoned.
+    private static let remoteSwapPoisonLimit = 3
+
     /// WP-D2: this window's entry in the `RemoteSessionManifest`, when it is a
     /// relay-backed remote window tracked for restore-on-relaunch. A clean
     /// close removes the entry (see `windowWillClose`); app quit leaves it so
@@ -1855,9 +1880,16 @@ class BaseTerminalController: NSWindowController,
             case .reconnecting:
                 remoteReconnectGeneration += 1
                 remoteConnectionState = .connected
+                // A genuine link recovery (no swap involved): clear the
+                // poisoned-session circuit breaker so unrelated future wobbles
+                // start counting from a clean slate.
+                remoteQuickSwapDeaths = 0
+                remoteSwapCompletedAt = nil
             case .disconnected where remoteDisconnectMaySelfHeal:
                 remoteReconnectGeneration += 1
                 remoteConnectionState = .connected
+                remoteQuickSwapDeaths = 0
+                remoteSwapCompletedAt = nil
             default:
                 break
             }
@@ -1926,6 +1958,33 @@ class BaseTerminalController: NSWindowController,
             remoteDisconnectMaySelfHeal = false
             remoteConnectionState = .disconnected
             return
+        }
+
+        // Poisoned-session circuit breaker. If we get here shortly after a
+        // reconnect swap completed, that swap's link just died: the dial and
+        // the liveness probe keep "succeeding" but every ATTACH onto the
+        // session kills the connection (seen live with a stale session from an
+        // older client build). Without this, the ladder loops dial, probe,
+        // swap, die every ~2.4s forever. Count consecutive quick deaths; at
+        // the limit, stop the fast ladder and go terminal (red pill, user
+        // action to recover). A swap whose link survived past the window is a
+        // genuine recovery and resets the count.
+        if let swapAt = remoteSwapCompletedAt {
+            remoteSwapCompletedAt = nil // judge each swap at most once
+            if Date().timeIntervalSince(swapAt) < Self.remoteSwapPoisonWindow {
+                remoteQuickSwapDeaths += 1
+            } else {
+                remoteQuickSwapDeaths = 0
+            }
+            if remoteQuickSwapDeaths >= Self.remoteSwapPoisonLimit {
+                Ghostty.logger.error(
+                    "remote reconnect: session poisoned, \(self.remoteQuickSwapDeaths, privacy: .public) consecutive swaps died within \(Int(Self.remoteSwapPoisonWindow), privacy: .public)s of completing; stopping fast reconnect, disconnected (terminal) machine=\(connection.machine.name, privacy: .public) session=\(sessionID, privacy: .public)")
+                remoteQuickSwapDeaths = 0
+                remoteReconnectGeneration += 1
+                remoteDisconnectMaySelfHeal = false
+                remoteConnectionState = .disconnected
+                return
+            }
         }
 
         remoteReconnectGeneration += 1
@@ -2262,6 +2321,10 @@ class BaseTerminalController: NSWindowController,
         remoteConnection = newConnection
         surfaceTree = SplitTree(view: newView)
         remoteConnectionState = .connected
+        // Stamp the swap for the poisoned-session circuit breaker: if this
+        // link dies again within the poison window, `beginRemoteReconnect`
+        // counts it as a quick-death cycle (see remoteSwapCompletedAt).
+        remoteSwapCompletedAt = Date()
         // .warning maps to OSLog .error level, so this persists too — one
         // breadcrumb pairing every failure trail with its recovery.
         Ghostty.logger.warning(
