@@ -13,6 +13,9 @@ pub const Options = struct {
 
     _diagnostics: diagnostics.DiagnosticList = .{},
 
+    when_idle: bool = false,
+    idle_timeout: u32 = 30,
+
     pub fn parseManuallyHook(self: *Options, alloc: Allocator, arg: []const u8, iter: anytype) (error{InvalidValue} || Allocator.Error)!bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
 
@@ -26,7 +29,14 @@ pub const Options = struct {
     }
 
     fn checkArg(self: *Options, alloc: Allocator, arg: []const u8) (error{InvalidValue} || Allocator.Error)!?[:0]const u8 {
-        _ = self;
+        if (std.mem.eql(u8, arg, "--when-idle")) {
+            self.when_idle = true;
+            return null;
+        }
+        if (std.mem.startsWith(u8, arg, "--idle-timeout=")) {
+            self.idle_timeout = std.fmt.parseInt(u32, arg["--idle-timeout=".len..], 10) catch return error.InvalidValue;
+            return null;
+        }
         return try alloc.dupeZ(u8, arg);
     }
 
@@ -52,6 +62,15 @@ pub const Options = struct {
 ///   * `--target=<name>`: The named pane or window to send input to.
 ///     Required. The target must have been created with
 ///     `+new-window --target=<name>` or `+split --name=<name>`.
+///
+///   * `--when-idle`: Before sending, poll the target pane's recent
+///     output every 500ms until it no longer looks busy (no
+///     "esc to interrupt" in the last lines — the marker Claude Code
+///     shows while working). Sends anyway once `--idle-timeout` elapses
+///     or if the pane's output cannot be read.
+///
+///   * `--idle-timeout=<seconds>`: Max time to wait with `--when-idle`.
+///     Default: 30.
 ///
 /// Positional arguments are the text to send. Each argument is
 /// checked for key notation first, then processed for escape
@@ -143,6 +162,15 @@ fn runArgs(
     var ipc_args_buf: [2][:0]const u8 = .{ target_arg.?, keys_arg };
     const ipc_args: [][:0]const u8 = &ipc_args_buf;
 
+    if (opts.when_idle) {
+        waitForIdle(
+            alloc,
+            target_arg.?["--target=".len..],
+            opts.idle_timeout,
+            stderr,
+        );
+    }
+
     if (apprt.App.performIpc(
         alloc,
         .detect,
@@ -165,6 +193,21 @@ fn runArgs(
     // sendIpc already printed the server's error text (if any) to stderr.
     try stderr.print("+send-keys failed.\n", .{});
     return 1;
+}
+
+/// Poll the target pane's recent output until it no longer contains
+/// "esc to interrupt" (shown by Claude Code and similar TUIs while
+/// busy), then return. Returns early — allowing the send to proceed —
+/// after `timeout_secs`, or immediately if the pane's output cannot be
+/// read (e.g. the target is a window name rather than a pane).
+fn waitForIdle(alloc: Allocator, name: []const u8, timeout_secs: u32, stderr: *std.Io.Writer) void {
+    const read_cli = @import("read.zig");
+    var remaining_polls: u64 = @as(u64, timeout_secs) * 2;
+    while (remaining_polls > 0) : (remaining_polls -= 1) {
+        const text = read_cli.queryPaneText(alloc, name, 10, stderr) catch return;
+        if (std.mem.indexOf(u8, text, "esc to interrupt") == null) return;
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+    }
 }
 
 /// Resolve a single argument: if it matches a key name, append its byte(s);

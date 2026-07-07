@@ -47,6 +47,16 @@ ghoztty +read --name=<pane> --lines=<N>
 - `--name`: Named pane to read from (required).
 - `--lines`: Number of lines from the end of scrollback (default: 50).
 
+### `ghoztty +list`
+
+List open windows, tabs, and panes (human-readable tree, or `--json`). Listing auto-registers every pane it discovers, so returned names are immediately usable as targets.
+
+```
+ghoztty +list [--json] [--tty=<tty>]
+```
+
+- `--tty`: Print only the registered name of the pane whose terminal matches the given tty (`ttys014` or `/dev/ttys014`; raw padded `ps -o tty=` output is accepted), then exit. Exits 1 if no match. Lets a process find its own pane: `ghoztty +list --tty="$(ps -o tty= -p $PPID)"`.
+
 ### `ghoztty +send-keys`
 
 Send text input to a named pane's terminal PTY.
@@ -56,6 +66,7 @@ ghoztty +send-keys --target=<name> <text|key>...
 ```
 
 - `--target`: Named pane or window to send input to. Required.
+- `--when-idle`: Poll the target pane's recent output every 500ms until it no longer contains `esc to interrupt` (Claude Code's busy marker) before sending; sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
 - Positional arguments are text or key names, concatenated and written to the PTY.
 - Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
 - Named keys: `Enter`, `Tab`, `Escape`, `Space`, `Backspace`

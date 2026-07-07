@@ -11,6 +11,8 @@ pub const Options = struct {
 
     json: bool = false,
 
+    tty: ?[:0]const u8 = null,
+
     pub fn deinit(self: *Options) void {
         if (self._arena) |arena| arena.deinit();
         self.* = undefined;
@@ -30,6 +32,12 @@ pub const Options = struct {
 /// Flags:
 ///
 ///   * `--json`: Output as JSON instead of human-readable tree view.
+///
+///   * `--tty=<tty>`: Print only the registered name of the pane whose
+///     terminal matches the given tty (`ttys014` or `/dev/ttys014`),
+///     then exit. Exits 1 if no pane matches. Listing auto-registers
+///     every pane, so the printed name is immediately usable as a
+///     `--target`/`--name` for other commands.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -80,6 +88,20 @@ fn runArgs(
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
+
+    if (opts.tty) |tty| {
+        const name = findPaneNameByTty(alloc, resp_body, tty) catch {
+            try stderr.print("Failed to parse list response\n", .{});
+            return 1;
+        } orelse {
+            try stderr.print("No pane found for tty {s}\n", .{tty});
+            return 1;
+        };
+        stdout.writeAll(name) catch return 1;
+        stdout.writeAll("\n") catch return 1;
+        stdout.flush() catch return 1;
+        return 0;
+    }
 
     if (opts.json) {
         stdout.writeAll(resp_body) catch return 1;
@@ -169,6 +191,40 @@ fn sendListQuery(
     }
 
     return resp_buf;
+}
+
+/// Find the registered name of the pane whose terminal tty matches
+/// `tty` (compared with the `/dev/` prefix stripped from both sides).
+/// Returns null if no pane matches or the matching pane has no name.
+fn findPaneNameByTty(alloc: Allocator, resp_body: []const u8, tty_raw: []const u8) !?[]const u8 {
+    // Trim so raw `ps -o tty=` output (padded) works as-is.
+    const tty = std.mem.trim(u8, tty_raw, " \t\r\n");
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp_body, .{});
+    // Leaks into the arena intentionally: the returned name slice points
+    // into the parsed JSON, so it must outlive this function.
+
+    const data_val = parsed.value.object.get("data") orelse return null;
+    const windows = (data_val.object.get("windows") orelse return null).array;
+    for (windows.items) |window| {
+        const tabs = (window.object.get("tabs") orelse continue).array;
+        for (tabs.items) |tab| {
+            const splits = tab.object.get("splits") orelse continue;
+            const leaves = try collectLeaves(alloc, splits);
+            for (leaves) |leaf| {
+                if (leaf != .object) continue;
+                const term_tty = jsonStr(leaf.object.get("tty"));
+                if (!std.mem.eql(u8, stripDev(term_tty), stripDev(tty))) continue;
+                const name = jsonStr(leaf.object.get("name"));
+                return if (name.len > 0) name else null;
+            }
+        }
+    }
+    return null;
+}
+
+fn stripDev(tty: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, tty, "/dev/")) return tty["/dev/".len..];
+    return tty;
 }
 
 fn formatHumanReadable(alloc: Allocator, resp_body: []const u8, stdout: *std.Io.Writer) !void {
