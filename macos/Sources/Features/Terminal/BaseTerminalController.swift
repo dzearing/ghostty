@@ -2124,6 +2124,21 @@ class BaseTerminalController: NSWindowController,
             min(attempt, Self.remoteReconnectDelays.count) - 1]
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, generation == self.remoteReconnectGeneration else { return }
+
+            // Display asleep (system sleep / dark wake): don't dial — the
+            // swap can't build its surface anyway (see displayIsAsleep).
+            // Re-park this same attempt; a real wake kicks a fresh ladder.
+            if Self.displayIsAsleep {
+                Ghostty.logger.info(
+                    "remote reconnect: display asleep; deferring attempt \(attempt, privacy: .public) machine=\(machine.name, privacy: .public)")
+                self.scheduleRemoteReconnectAttempt(
+                    attempt,
+                    generation: generation,
+                    machine: machine,
+                    sessionID: sessionID)
+                return
+            }
+
             self.remoteConnectionState = .reconnecting(attempt: attempt)
 
             self.dialAndProbeRemote(
@@ -2208,6 +2223,18 @@ class BaseTerminalController: NSWindowController,
     /// a probe succeeds / the session is confirmed gone.
     private static let remoteRedialInterval: TimeInterval = 45
 
+    /// True while the display is asleep (system sleep or a dark wake).
+    /// Reconnect dials are pointless then and actively harmful: the swap's
+    /// `ghostty_surface_new` needs Metal/IOSurface allocations that fail with
+    /// the display off (observed live: OutOfMemory → an all-night
+    /// dial/probe/swap-fail loop, each cycle also tearing down a connection —
+    /// thread joins — on the main thread). Attempts are deferred while this
+    /// is true; the full-wake kick (`workspaceDidWake`) restarts them
+    /// immediately on a real wake.
+    private static var displayIsAsleep: Bool {
+        CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
     /// Schedule the next background re-dial probe. Unlike the fast attempts,
     /// this NEVER touches the pill on failure — the window stays truthfully
     /// red "disconnected" until a probe actually finds the agent AND the
@@ -2225,6 +2252,19 @@ class BaseTerminalController: NSWindowController,
             // Only while still in the self-healable disconnected tier.
             guard case .disconnected = self.remoteConnectionState,
                   self.remoteDisconnectMaySelfHeal else { return }
+
+            // Display asleep (system sleep / dark wake): skip this probe —
+            // the swap can't build its surface anyway (see displayIsAsleep).
+            // Keep the cadence; a real wake kicks an immediate attempt.
+            if Self.displayIsAsleep {
+                Ghostty.logger.info(
+                    "remote reconnect: display asleep; deferring background re-dial machine=\(machine.name, privacy: .public)")
+                self.scheduleRemoteRedialProbe(
+                    generation: generation,
+                    machine: machine,
+                    sessionID: sessionID)
+                return
+            }
 
             self.dialAndProbeRemote(
                 generation: generation,

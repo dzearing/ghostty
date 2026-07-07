@@ -906,6 +906,15 @@ pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
+    // Abort any blocking IO backend work FIRST, before joining ANY thread:
+    // cancel parked RPCs (e.g. a remote OPEN/ATTACH on a dead transport),
+    // poison the termio mailbox, and set the closing flag that unblocks
+    // pushers on the shared app mailbox. The IO thread must be guaranteed
+    // unable to park forever before this (GUI) thread blocks in a join —
+    // a wedged join here beachballs the entire app permanently (observed:
+    // post-wake remote reconnect swaps freezing the GUI).
+    self.io.shutdown();
+
     // Stop rendering thread
     {
         self.renderer_thread.stop.notify() catch |err|
@@ -914,17 +923,18 @@ pub fn deinit(self: *Surface) void {
 
         // We need to become the active rendering thread again
         self.renderer.threadEnter(self.rt_surface) catch unreachable;
+
+        // The renderer thread is gone, so nothing drains its mailbox from
+        // here on. Close it so a producer (the IO thread handling e.g. a
+        // resize message, or this thread in changeConfig) that tries a
+        // blocking push wakes immediately and drops instead of parking on
+        // a queue with no consumer — which would wedge the IO-thread join
+        // below.
+        self.renderer_thread.mailbox.close();
     }
 
     // Stop our IO thread
     {
-        // Abort any blocking backend work FIRST (e.g. a remote OPEN/ATTACH
-        // RPC parked on a dead transport that will never reply) so the join
-        // below cannot block this (GUI) thread for the RPC timeout — or, under
-        // reconnect churn, effectively forever. Mirrors Exec's quit-pipe
-        // signal-before-join, but from the joining side.
-        self.io.shutdown();
-
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();

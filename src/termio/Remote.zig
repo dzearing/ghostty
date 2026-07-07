@@ -37,6 +37,7 @@ const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const xev = @import("../global.zig").xev;
+const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
@@ -544,8 +545,20 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
     const rd = &td.backend.remote;
     const ch = rd.pane.ring;
 
+    // Cap the work per wake instead of draining until empty. processOutput
+    // runs ON this IO thread (unlike Exec, whose ReadThread parses while the
+    // IO thread drains the termio mailbox), so replies it generates (CPR,
+    // DA1, color queries, ...) pile into our own 64-slot mailbox and nothing
+    // drains it until we return to the xev loop. An unbounded drain of a big
+    // burst (e.g. a re-attach ring replay) can fill it and previously parked
+    // this thread on its own queue — producer == consumer, a self-deadlock
+    // that also wedged the GUI thread when Surface.deinit joined us. Bail
+    // after a bounded number of chunks and re-notify so the loop runs our
+    // mailbox drain between bursts.
     var buf: [16 * 1024]u8 = undefined;
-    while (true) {
+    var chunks: usize = 0;
+    const max_chunks_per_wake = 32;
+    while (chunks < max_chunks_per_wake) : (chunks += 1) {
         const res = ch.pop(&buf);
         if (res.read == 0) break;
 
@@ -553,6 +566,14 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
 
         if (res.send_resume) rd.conn.sendFlowResume(ch.id) catch |err|
             log.warn("error sending FLOW resume err={}", .{err});
+    } else {
+        // Hit the cap with the ring possibly non-empty: schedule another
+        // wake and return to the loop. EXIT handling below is deferred to
+        // the wake that finds the ring empty, preserving "final bytes
+        // render before close".
+        rd.ring_async.notify() catch |err|
+            log.warn("error re-notifying ring async err={}", .{err});
+        return;
     }
 
     // EXIT handling, mirroring local Exec (`Exec.zig` `processExit` →
@@ -576,10 +597,17 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
             std.math.maxInt(u32)
         else
             @intCast(ch.exit_code);
-        _ = td.surface_mailbox.push(.{ .child_exited = .{
+        // Timed retries on the SHARED app mailbox — never a forever park
+        // (the GUI thread is the only consumer; if it's busy or joining us
+        // in Surface.deinit, a forever wait here deadlocks the app). If the
+        // surface is closing, the exit notification is moot: drop it.
+        const msg: apprt.surface.Message = .{ .child_exited = .{
             .exit_code = code,
             .runtime_ms = ch.runtime_ms,
-        } }, .{ .forever = {} });
+        } };
+        while (td.surface_mailbox.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) == 0) {
+            if (rd.io.closing.load(.acquire)) break;
+        }
     }
 }
 

@@ -71,6 +71,15 @@ last_cursor_reset: ?std.time.Instant = null,
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
 
+/// Set by `shutdown` (GUI thread, right before it joins the IO thread).
+/// Producers that push to the SHARED app/surface mailbox check this in
+/// their retry loops: that queue can't be closed (other surfaces still
+/// use it), so a pusher that can't make progress needs this flag to know
+/// the surface is dying and the message should be dropped instead of
+/// waiting forever (a forever wait there deadlocks the joining GUI
+/// thread if it's the only consumer).
+closing: std.atomic.Value(bool) = .init(false),
+
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
 const ThreadEnterState = struct {
@@ -276,6 +285,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     // isn't safe to use until self.* is set.
     const handler: StreamHandler = .{
         .alloc = alloc,
+        .closing = &self.closing,
         .termio_mailbox = &self.mailbox,
         .surface_mailbox = opts.surface_mailbox,
         .renderer_state = opts.renderer_state,
@@ -387,7 +397,17 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
 /// joined promptly. Safe to call from another thread (the GUI thread calls it
 /// from `Surface.deinit` right before joining the IO thread). See
 /// `termio.Backend.shutdown`.
+///
+/// Beyond the backend's own cancellation (e.g. Remote's RPC canceller),
+/// this poisons every blocking-queue wait the IO thread could be parked
+/// in, because after this call nothing will ever drain those queues
+/// again: the closing flag unblocks pushes to the shared app/surface
+/// mailbox, and closing our own mailbox wakes a producer parked in
+/// `Mailbox.send`. Without this, joining the IO thread can deadlock the
+/// GUI thread permanently (observed: post-wake remote reconnect swaps).
 pub fn shutdown(self: *Termio) void {
+    self.closing.store(true, .release);
+    self.mailbox.close();
     self.backend.shutdown();
 }
 
