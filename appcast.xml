@@ -89,5 +89,12 @@
             <pubDate>Mon, 06 Jul 2026 17:43:49 +0000</pubDate>
             <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.9.0/Ghoztty-1.9.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="5In1adcRwCDA6RxpCnN4bQyB4lEca1ItJEjk7evT5vqPzd3JZoq/i3CeNV+7xgtVondSq8bt8uxnkhSmn4UwAA==" length="23494332" />
         </item>
+        <item>
+            <title>Version 1.10.0</title>
+            <sparkle:version>1.10.0</sparkle:version>
+            <sparkle:shortVersionString>1.10.0</sparkle:shortVersionString>
+            <pubDate>Tue, 07 Jul 2026 00:22:16 +0000</pubDate>
+            <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.10.0/Ghoztty-1.10.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="GdfiNMgq47PUpIj5bHyp6gCQ1o9EebxFEno1DeyMYVqcD1e+/2ScmrE7Fw/IRzsIzmmSSpHn/TIcZZ9PVKp7Dg==" length="23509791" />
+        </item>
     </channel>
 </rss>
