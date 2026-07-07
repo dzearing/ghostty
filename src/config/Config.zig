@@ -6872,6 +6872,138 @@ pub const Keybinds = struct {
                 .{ .paste_from_selection = {} },
             );
         }
+
+        // Windows: mirror the macOS super-based bindings onto plain ctrl so
+        // cmd-on-mac muscle memory translates (ctrl+n new window, ctrl+d
+        // split, ctrl+t new tab, ...). The ctrl+shift set above still works.
+        //
+        // Deliberately NOT mirrored because plain-ctrl would steal a key
+        // every shell/TUI user needs: ctrl+[ and ctrl+] (ctrl+[ IS Escape),
+        // ctrl+z (EOF/suspend), ctrl+a (line start), ctrl+k (kill line),
+        // ctrl+f (readline), ctrl+arrows (word movement),
+        // ctrl+home/end handled below (harmless — matches Windows Terminal).
+        //
+        // These are added AFTER the ctrl+shift set so menus/palette display
+        // the ctrl+<key> form as the primary shortcut (last added wins).
+        if (comptime builtin.target.os.tag == .windows) {
+            // Clipboard, Windows Terminal-style: ctrl+c copies ONLY when a
+            // selection exists (performable), otherwise falls through to the
+            // shell as SIGINT. ctrl+v pastes (quoted-insert is rare enough).
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'c' }, .mods = .{ .ctrl = true } },
+                .{ .copy_to_clipboard = .mixed },
+                .{ .performable = true },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'v' }, .mods = .{ .ctrl = true } },
+                .paste_from_clipboard,
+            );
+
+            // Windowing (mac: cmd+n / cmd+t / cmd+w / cmd+q)
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'n' }, .mods = .{ .ctrl = true } },
+                .{ .new_window = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true } },
+                .{ .new_tab = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .ctrl = true } },
+                .{ .close_surface = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .close_tab = .this },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .ctrl = true, .shift = true, .alt = true } },
+                .{ .close_all_windows = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'q' }, .mods = .{ .ctrl = true } },
+                .{ .quit = {} },
+            );
+
+            // Splits (mac: cmd+d / cmd+shift+d)
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'd' }, .mods = .{ .ctrl = true } },
+                .{ .new_split = .right },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'd' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .new_split = .down },
+            );
+
+            // Tab cycling (mac: cmd+shift+[ / cmd+shift+])
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = '[' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .previous_tab = {} },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = ']' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .next_tab = {} },
+                .{ .performable = true },
+            );
+
+            // Scrollback (matches Windows Terminal ctrl+home/end)
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .home }, .mods = .{ .ctrl = true } },
+                .{ .scroll_to_top = {} },
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .end }, .mods = .{ .ctrl = true } },
+                .{ .scroll_to_bottom = {} },
+            );
+
+            // Tab selection by number, browser-style (mac: cmd+1..9).
+            // Registered on both physical digit keys and unicode digits,
+            // same rationale as the alt+N block below (AZERTY et al).
+            const start: u21 = '1';
+            const end: u21 = '8';
+            comptime var i: u21 = start;
+            inline while (i <= end) : (i += 1) {
+                try self.set.putFlags(
+                    alloc,
+                    .{
+                        .key = .{ .physical = @field(
+                            inputpkg.Key,
+                            std.fmt.comptimePrint("digit_{u}", .{i}),
+                        ) },
+                        .mods = .{ .ctrl = true },
+                    },
+                    .{ .goto_tab = (i - start) + 1 },
+                    .{ .performable = true },
+                );
+                try self.set.putFlags(
+                    alloc,
+                    .{ .key = .{ .unicode = i }, .mods = .{ .ctrl = true } },
+                    .{ .goto_tab = (i - start) + 1 },
+                    .{ .performable = true },
+                );
+            }
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = '9' }, .mods = .{ .ctrl = true } },
+                .{ .last_tab = {} },
+                .{ .performable = true },
+            );
+        }
         {
             // On macOS we default to super but everywhere else
             // is alt.
