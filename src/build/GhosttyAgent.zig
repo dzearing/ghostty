@@ -49,8 +49,9 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
     // "dev" when git is unavailable) into the binary via a tiny dedicated
     // options module. Deliberately NOT part of the shared `build_options`
     // (that would rebuild the whole app graph on every commit-hash change).
+    const stamp = try versionString(b);
     const version_opts = b.addOptions();
-    version_opts.addOption([]const u8, "agent_version", try versionString(b));
+    version_opts.addOption([]const u8, "agent_version", stamp);
     const version_module = version_opts.createModule();
     exe.root_module.addImport("agent_build_options", version_module);
 
@@ -71,9 +72,20 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
         exe.linkSystemLibrary("advapi32");
         // Embed the ghost icon (id 1) so the exe and its tray icon aren't the
         // generic Windows application icon. `tray.zig` loads it by id from this
-        // module's own instance handle.
+        // module's own instance handle. The /d defines stamp VERSIONINFO so
+        // Explorer's Details tab shows the release semver (matching the DMG
+        // tag) and the date-hash self-update stamp; see ghoztty-agent.rc.
+        const semver = semverString(b);
+        const sv = parseSemver(semver);
         exe.addWin32ResourceFile(.{
             .file = b.path("dist/windows/ghoztty-agent.rc"),
+            .flags = &.{
+                "/d", b.fmt("AGENT_VER_MAJOR={d}", .{sv.major}),
+                "/d", b.fmt("AGENT_VER_MINOR={d}", .{sv.minor}),
+                "/d", b.fmt("AGENT_VER_PATCH={d}", .{sv.patch}),
+                "/d", b.fmt("AGENT_VERSION_STR=\"{s}\"", .{semver}),
+                "/d", b.fmt("AGENT_STAMP_STR=\"{s}\"", .{stamp}),
+            },
         });
     }
 
@@ -121,6 +133,46 @@ fn versionString(b: *std.Build) ![]const u8 {
     const date = std.mem.trim(u8, date_raw, "\r\n ");
     if (date.len < 10) return "dev";
     return b.fmt("{s}{s}{s}-{s}", .{ date[0..4], date[5..7], date[8..10], git.short_hash });
+}
+
+/// The release semver the agent ships under — the app's git tag, so the
+/// Windows artifacts carry the SAME version as the DMG of the same release
+/// (e.g. tag v1.11.0 → DMG Ghoztty-1.11.0-arm64.dmg + MSI
+/// Ghoztty-Agent-1.11.0-x64.msi). Stamped into the exe's VERSIONINFO; the
+/// MSI's ProductVersion is derived from it in relay/deploy/msi/build-msi.sh.
+/// Precedence:
+///   1. `-Dagent-semver=<X.Y.Z>` (explicit override — publisher builds),
+///   2. latest reachable git tag (`git describe --tags --abbrev=0`, `v` strip),
+///   3. `"0.0.0"` (git unavailable / no tags).
+fn semverString(b: *std.Build) []const u8 {
+    if (b.option(
+        []const u8,
+        "agent-semver",
+        "Release semver baked into ghoztty-agent's VERSIONINFO. " ++
+            "Defaults to the latest git tag, or \"0.0.0\" without git.",
+    )) |v| return v;
+
+    var code: u8 = 0;
+    const raw = b.runAllowFail(
+        &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "describe", "--tags", "--abbrev=0" },
+        &code,
+        .Ignore,
+    ) catch return "0.0.0";
+    const tag = std.mem.trim(u8, raw, "\r\n ");
+    if (tag.len == 0) return "0.0.0";
+    return if (tag[0] == 'v') tag[1..] else tag;
+}
+
+const Semver = struct { major: u32, minor: u32, patch: u32 };
+
+/// Best-effort X.Y.Z split for the numeric FILEVERSION fields; malformed
+/// pieces become 0 (VERSIONINFO strings still carry the raw text).
+fn parseSemver(s: []const u8) Semver {
+    var it = std.mem.splitScalar(u8, s, '.');
+    const major = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
+    const minor = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
+    const patch = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
+    return .{ .major = major, .minor = minor, .patch = patch };
 }
 
 /// Add the agent exe to the install target.

@@ -81,7 +81,18 @@ document.querySelectorAll(".copy-btn[data-copy-target]").forEach((btn) => {
     .then((r) => (r.ok ? r.json() : null))
     .then((v) => {
       const win = v && v["windows-x86_64"];
-      if (win && win.version) el.textContent = " Current version: " + win.version + ".";
+      if (win && win.version) {
+        el.textContent = win.semver
+          ? ` Current version: ${win.semver} (build ${win.version}).`
+          : " Current version: " + win.version + ".";
+      }
+      // Point the download button at the versioned installer filename
+      // (Ghoztty-Agent-X.Y.Z-x64.msi); the static href stays a working
+      // stable-URL fallback when version.json is unavailable.
+      const link = document.getElementById("agent-msi-link");
+      if (link && win && win.msi) {
+        link.setAttribute("href", "https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com" + win.msi);
+      }
     })
     .catch(() => { /* version info unavailable */ });
 })();

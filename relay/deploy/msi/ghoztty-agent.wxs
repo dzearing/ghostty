@@ -5,7 +5,8 @@
   Compiled on macOS with wixl (GNOME msitools); stick to the WiX-v3 subset
   wixl understands. Build via relay/deploy/msi/build-msi.sh, which defines:
 
-    Version    numeric ProductVersion  (yy.m.dNN, e.g. 26.7.401)
+    Version    numeric ProductVersion derived from the release semver:
+               X.Y.(Z*100+NN), e.g. v1.11.0 build 1 → 1.11.1 (ARP shows this)
     AgentStamp agent build stamp       (YYYYMMDD-<hash>, shown in ARP Comments)
     RelayUrl   relay base URL baked into the Run key + Start Menu shortcut
     SourceExe  path to the built ghoztty-agent.exe
@@ -22,6 +23,11 @@
   - KillAgent custom action (taskkill, exit code ignored) runs before
     InstallValidate on install/upgrade/uninstall so the running tray exe
     doesn't trip the files-in-use dialog or a reboot-scheduled delete.
+  - LegacyCleanup retires the pre-MSI install.ps1 layout (watchdog scheduled
+    task + %LOCALAPPDATA%\ghoztty\ exe) so the old build can't respawn and
+    hold the single-instance lock against the MSI-installed agent.
+  - LaunchAgent starts the installed agent right after install/upgrade
+    (asyncNoWait); the HKCU Run key covers subsequent logons.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
@@ -46,20 +52,21 @@
     <Property Id="ARPCOMMENTS" Value="Agent build $(var.AgentStamp)"/>
     <Property Id="ARPNOMODIFY" Value="1"/>
 
-    <!-- Major-upgrade behavior: any older (or equal, other-build) product
-         with our UpgradeCode is removed when this one installs. -->
+    <!-- Major-upgrade behavior: ANY installed product with our UpgradeCode is
+         removed when this one installs — deliberately including equal and
+         "newer" versions. Whatever MSI the user runs wins. Two reasons:
+         1. ProductVersion switched schemes (date-derived yy.m.dNN, e.g.
+            26.7.601, → semver-derived, e.g. 1.11.1). Every semver compares
+            "older" than every date version, so a downgrade block would
+            permanently reject the new MSIs on already-installed boxes.
+         2. There is a single download URL that always serves the latest
+            build, and installed agents self-update — downgrade protection
+            defends nothing here, while last-writer-wins gives free rollback. -->
     <Upgrade Id="7143BA66-FD7B-4D45-8555-E946D2141912">
       <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes"
-                      Maximum="$(var.Version)" IncludeMaximum="no"
-                      Property="OLDERVERSIONFOUND" MigrateFeatures="yes"/>
-      <UpgradeVersion Minimum="$(var.Version)" IncludeMinimum="yes"
-                      OnlyDetect="yes"
-                      Property="NEWERVERSIONFOUND"/>
+                      Maximum="255.255.65535" IncludeMaximum="yes"
+                      Property="EXISTINGVERSIONFOUND" MigrateFeatures="yes"/>
     </Upgrade>
-
-    <!-- Block downgrades: the detect-only Upgrade row above sets
-         NEWERVERSIONFOUND when a newer build is already installed. -->
-    <Condition Message="A newer version of Ghoztty Remote Agent is already installed.">NOT NEWERVERSIONFOUND</Condition>
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="LocalAppDataFolder">
@@ -124,12 +131,34 @@
       <ComponentRef Id="AgentShortcut"/>
     </Feature>
 
+    <!-- Retire the legacy install.ps1 layout (%LOCALAPPDATA%\ghoztty\ exe + a
+         run-agent.ps1 watchdog kept alive by a 'GhozttyAgent' scheduled task /
+         Startup shortcut). The watchdog is a powershell.exe, so KillAgent's
+         taskkill of ghoztty-agent.exe does NOT stop it — it would respawn the
+         OLD exe within 3 seconds of the kill, win the single-instance lock,
+         and the freshly installed agent would silently exit forever after
+         (exit 183). Order matters: kill the watchdog FIRST (tree-kill takes
+         its agent child with it), then unhook its logon triggers, then remove
+         the old binaries. relay.env and logs in the same dir are shared state
+         and deliberately kept. Runs on install/upgrade, not uninstall.
+         wixl limitation: no Directory attribute on CustomAction (type 34),
+         so use type 51 (set property to the formatted exe path) + type 50
+         (run the exe named by that property) — same pattern as KillAgent. -->
+    <CustomAction Id="SetLegacyCleanupCmd"
+                  Property="LEGACYCLEANUPCMD"
+                  Value="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe"/>
+    <CustomAction Id="LegacyCleanup"
+                  Property="LEGACYCLEANUPCMD"
+                  ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command &quot;$$d=Join-Path $$env:LOCALAPPDATA 'ghoztty'; $$pf=Join-Path $$d 'launcher.pid'; if(Test-Path $$pf){$$w=Get-Content $$pf -ErrorAction SilentlyContinue; if($$w){taskkill /F /T /PID $$w 2&gt;$$null}; Remove-Item $$pf -ErrorAction SilentlyContinue}; schtasks /Delete /TN GhozttyAgent /F 2&gt;$$null; Remove-Item -ErrorAction SilentlyContinue (Join-Path $$env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\ghoztty-agent.cmd'); taskkill /F /IM ghoztty-agent.exe 2&gt;$$null; Start-Sleep -Milliseconds 400; Remove-Item -ErrorAction SilentlyContinue (Join-Path $$d 'ghoztty-agent.exe'),(Join-Path $$d 'run-agent.ps1')&quot;"
+                  Execute="immediate"
+                  Return="ignore"/>
+
     <!-- Stop a running agent so its exe isn't locked during install,
          upgrade, or uninstall. taskkill exits nonzero when no process
-         matches — Return="ignore" makes that a no-op.
-         wixl limitation: no Directory attribute on CustomAction (type 34),
-         so use type 51 (set property to the formatted taskkill path) +
-         type 50 (run the exe named by that property). -->
+         matches — Return="ignore" makes that a no-op. Kept as a backstop
+         even though LegacyCleanup also taskkills: LegacyCleanup is
+         conditioned out on uninstall, and powershell could be blocked by
+         policy on some box. -->
     <CustomAction Id="SetKillAgentCmd"
                   Property="KILLAGENTCMD"
                   Value="[SystemFolder]taskkill.exe"/>
@@ -139,10 +168,29 @@
                   Execute="immediate"
                   Return="ignore"/>
 
+    <!-- Start the freshly installed agent as the last install step, so the
+         tray icon appears immediately instead of at next logon (the Run key
+         handles logons from then on). asyncNoWait: the agent is a daemon —
+         the installer must not wait for it to exit. Skipped on uninstall
+         (Installed is set once THIS product is registered; a fresh install
+         or a major upgrade's new package sees it empty). -->
+    <CustomAction Id="SetLaunchAgentCmd"
+                  Property="LAUNCHAGENTCMD"
+                  Value="[INSTALLDIR]ghoztty-agent.exe"/>
+    <CustomAction Id="LaunchAgent"
+                  Property="LAUNCHAGENTCMD"
+                  ExeCommand="--relay=$(var.RelayUrl)"
+                  Execute="immediate"
+                  Return="asyncNoWait"/>
+
     <InstallExecuteSequence>
+      <Custom Action="SetLegacyCleanupCmd" Before="LegacyCleanup"/>
+      <Custom Action="LegacyCleanup" Before="SetKillAgentCmd">NOT REMOVE</Custom>
       <Custom Action="SetKillAgentCmd" Before="KillAgent"/>
       <Custom Action="KillAgent" Before="InstallValidate"/>
       <RemoveExistingProducts After="InstallValidate"/>
+      <Custom Action="SetLaunchAgentCmd" Before="LaunchAgent"/>
+      <Custom Action="LaunchAgent" After="InstallFinalize">NOT Installed</Custom>
     </InstallExecuteSequence>
   </Product>
 </Wix>
