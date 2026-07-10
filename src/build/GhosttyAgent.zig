@@ -21,6 +21,12 @@ exe: *std.Build.Step.Compile,
 /// The install step for the executable.
 install_step: *std.Build.Step.InstallArtifact,
 
+/// Windows targets only (null otherwise): ghoztty-agent-ca.dll, the MSI
+/// custom-action DLL (src/remote/agent/msi_ca.zig). Runs in-process inside
+/// msiexec so the installer never pops console windows for its kill/cleanup
+/// steps; packaged into the MSI by relay/deploy/msi/build-msi.sh.
+ca_dll_install_step: ?*std.Build.Step.InstallArtifact,
+
 /// The `agent_build_options` module (currently just `agent_version`). Exposed
 /// so build.zig can wire the SAME options onto the agent test build (which
 /// roots at `src/agent_main.zig` too and therefore reaches `main.zig`'s
@@ -62,8 +68,23 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
     // stderr go to log files via inherited handles regardless of subsystem, so
     // the readiness banner is still captured. This is windows-only;
     // the macOS host + the `test-agent` build are left untouched.
+    var ca_dll_install_step: ?*std.Build.Step.InstallArtifact = null;
     if (cfg.target.result.os.tag == .windows) {
         exe.subsystem = .Windows;
+        // The MSI custom-action DLL ships alongside the agent exe. Pure Win32,
+        // no shared deps — keep it that way so msiexec loads it instantly.
+        const ca_dll = b.addLibrary(.{
+            .name = "ghoztty-agent-ca",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/remote/agent/msi_ca.zig"),
+                .target = cfg.target,
+                .optimize = cfg.optimize,
+                .strip = cfg.strip,
+            }),
+            .use_llvm = true,
+        });
+        ca_dll_install_step = b.addInstallArtifact(ca_dll, .{});
         // The tray pulls in user32/shell32. kernel32 is auto-linked, but these
         // are not, so request them explicitly (windows-target only).
         exe.linkSystemLibrary("user32");
@@ -102,6 +123,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
     return .{
         .exe = exe,
         .install_step = install_step,
+        .ca_dll_install_step = ca_dll_install_step,
         .version_module = version_module,
     };
 }

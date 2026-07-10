@@ -10,6 +10,8 @@
     AgentStamp agent build stamp       (YYYYMMDD-<hash>, shown in ARP Comments)
     RelayUrl   relay base URL baked into the Run key + Start Menu shortcut
     SourceExe  path to the built ghoztty-agent.exe
+    CaDll      path to the built ghoztty-agent-ca.dll (in-process custom
+               actions — no console windows during install)
 
   Design notes:
   - Per-user, no admin: InstallScope="perUser" (ALLUSERS stays unset) plus
@@ -131,40 +133,37 @@
       <ComponentRef Id="AgentShortcut"/>
     </Feature>
 
+    <!-- In-process custom-action DLL (src/remote/agent/msi_ca.zig, built as
+         ghoztty-agent-ca.dll by `zig build agent`). Type-50 exe actions
+         (taskkill/powershell) each popped a console window over the installer
+         — this is a tray app, so all kill/cleanup work runs inside msiexec
+         instead. wixl supports Binary-table DLL actions but not inline
+         script actions, hence a DLL rather than JScript. -->
+    <Binary Id="AgentCA" SourceFile="$(var.CaDll)"/>
+
     <!-- Retire the legacy install.ps1 layout (%LOCALAPPDATA%\ghoztty\ exe + a
          run-agent.ps1 watchdog kept alive by a 'GhozttyAgent' scheduled task /
-         Startup shortcut). The watchdog is a powershell.exe, so KillAgent's
-         taskkill of ghoztty-agent.exe does NOT stop it — it would respawn the
-         OLD exe within 3 seconds of the kill, win the single-instance lock,
-         and the freshly installed agent would silently exit forever after
-         (exit 183). Order matters: kill the watchdog FIRST (tree-kill takes
-         its agent child with it), then unhook its logon triggers, then remove
-         the old binaries. relay.env and logs in the same dir are shared state
-         and deliberately kept. Runs on install/upgrade, not uninstall.
-         wixl limitation: no Directory attribute on CustomAction (type 34),
-         so use type 51 (set property to the formatted exe path) + type 50
-         (run the exe named by that property) — same pattern as KillAgent. -->
-    <CustomAction Id="SetLegacyCleanupCmd"
-                  Property="LEGACYCLEANUPCMD"
-                  Value="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe"/>
+         Startup shortcut). The watchdog is a powershell.exe, so killing
+         ghoztty-agent.exe alone does NOT stop it — it would respawn the OLD
+         exe within 3 seconds, win the single-instance lock, and the freshly
+         installed agent would silently exit forever after (exit 183). The DLL
+         kills the watchdog FIRST, then unhooks its logon triggers, then kills
+         the agent and removes the old binaries. relay.env and logs in the
+         same dir are shared state and deliberately kept. Runs on
+         install/upgrade, not uninstall. -->
     <CustomAction Id="LegacyCleanup"
-                  Property="LEGACYCLEANUPCMD"
-                  ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command &quot;$$d=Join-Path $$env:LOCALAPPDATA 'ghoztty'; $$pf=Join-Path $$d 'launcher.pid'; if(Test-Path $$pf){$$w=Get-Content $$pf -ErrorAction SilentlyContinue; if($$w){taskkill /F /T /PID $$w 2&gt;$$null}; Remove-Item $$pf -ErrorAction SilentlyContinue}; schtasks /Delete /TN GhozttyAgent /F 2&gt;$$null; Remove-Item -ErrorAction SilentlyContinue (Join-Path $$env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\ghoztty-agent.cmd'); taskkill /F /IM ghoztty-agent.exe 2&gt;$$null; Start-Sleep -Milliseconds 400; Remove-Item -ErrorAction SilentlyContinue (Join-Path $$d 'ghoztty-agent.exe'),(Join-Path $$d 'run-agent.ps1')&quot;"
+                  BinaryKey="AgentCA"
+                  DllEntry="LegacyCleanupCA"
                   Execute="immediate"
                   Return="ignore"/>
 
     <!-- Stop a running agent so its exe isn't locked during install,
-         upgrade, or uninstall. taskkill exits nonzero when no process
-         matches — Return="ignore" makes that a no-op. Kept as a backstop
-         even though LegacyCleanup also taskkills: LegacyCleanup is
-         conditioned out on uninstall, and powershell could be blocked by
-         policy on some box. -->
-    <CustomAction Id="SetKillAgentCmd"
-                  Property="KILLAGENTCMD"
-                  Value="[SystemFolder]taskkill.exe"/>
+         upgrade, or uninstall. Kept as a backstop even though LegacyCleanup
+         also kills the agent: LegacyCleanup is conditioned out on
+         uninstall. -->
     <CustomAction Id="KillAgent"
-                  Property="KILLAGENTCMD"
-                  ExeCommand="/F /IM ghoztty-agent.exe"
+                  BinaryKey="AgentCA"
+                  DllEntry="KillAgentCA"
                   Execute="immediate"
                   Return="ignore"/>
 
@@ -184,9 +183,7 @@
                   Return="asyncNoWait"/>
 
     <InstallExecuteSequence>
-      <Custom Action="SetLegacyCleanupCmd" Before="LegacyCleanup"/>
-      <Custom Action="LegacyCleanup" Before="SetKillAgentCmd">NOT REMOVE</Custom>
-      <Custom Action="SetKillAgentCmd" Before="KillAgent"/>
+      <Custom Action="LegacyCleanup" Before="KillAgent">NOT REMOVE</Custom>
       <Custom Action="KillAgent" Before="InstallValidate"/>
       <RemoveExistingProducts After="InstallValidate"/>
       <Custom Action="SetLaunchAgentCmd" Before="LaunchAgent"/>

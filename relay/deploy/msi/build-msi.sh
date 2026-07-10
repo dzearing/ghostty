@@ -8,10 +8,14 @@
 #   relay/deploy/msi/build-msi.sh [path/to/ghoztty-agent.exe]
 #                                 [--semver <X.Y.Z>] [--version <stamp>]
 #                                 [--build-num <N>] [--relay <url>]
-#                                 [--out <path>]
+#                                 [--ca-dll <path>] [--out <path>]
 #
 # Defaults:
 #   exe        zig-out/bin/ghoztty-agent.exe (relative to the repo root)
+#   ca-dll     zig-out/bin/ghoztty-agent-ca.dll — the in-process custom-action
+#              DLL (built by `zig build agent` alongside the exe); replaces
+#              taskkill/powershell exe actions so no console window ever
+#              appears during install
 #   semver     latest git tag (v stripped) — the release version, SAME as the
 #              DMG of that release. Drives the output filename
 #              (Ghoztty-Agent-<semver>-x64.msi) and ProductVersion.
@@ -39,13 +43,14 @@ REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 WXS="$SCRIPT_DIR/ghoztty-agent.wxs"
 
 EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
+CA_DLL="$REPO_ROOT/zig-out/bin/ghoztty-agent-ca.dll"
 OUT=""
 VERSION=""
 SEMVER=""
 BUILD_NUM=1
 RELAY_URL="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com"
 
-usage() { sed -n '2,34p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,38p' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,6 +62,8 @@ while [[ $# -gt 0 ]]; do
     --build-num=*) BUILD_NUM="${1#*=}"; shift ;;
     --relay)       RELAY_URL="${2:?--relay needs a value}"; shift 2 ;;
     --relay=*)     RELAY_URL="${1#*=}"; shift ;;
+    --ca-dll)      CA_DLL="${2:?--ca-dll needs a value}"; shift 2 ;;
+    --ca-dll=*)    CA_DLL="${1#*=}"; shift ;;
     --out)         OUT="${2:?--out needs a value}"; shift 2 ;;
     --out=*)       OUT="${1#*=}"; shift ;;
     -h|--help)     usage; exit 0 ;;
@@ -69,6 +76,7 @@ for tool in wixl msiinfo msiextract; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found (brew install msitools)" >&2; exit 1; }
 done
 [[ -f "$EXE" && -s "$EXE" ]] || { echo "error: agent exe not found or empty: $EXE" >&2; exit 1; }
+[[ -f "$CA_DLL" && -s "$CA_DLL" ]] || { echo "error: custom-action dll not found or empty (zig build agent -Dtarget=x86_64-windows-gnu): $CA_DLL" >&2; exit 1; }
 [[ -f "$WXS" ]] || { echo "error: missing $WXS" >&2; exit 1; }
 [[ "$BUILD_NUM" =~ ^[0-9]{1,2}$ && "$BUILD_NUM" -ge 1 ]] \
   || { echo "error: --build-num must be 1..99, got: $BUILD_NUM" >&2; exit 1; }
@@ -111,6 +119,7 @@ wixl -a x64 \
   -D "AgentStamp=$VERSION" \
   -D "RelayUrl=$RELAY_URL" \
   -D "SourceExe=$EXE" \
+  -D "CaDll=$CA_DLL" \
   -o "$OUT" "$WXS"
 [[ -s "$OUT" ]] || { echo "error: wixl produced no output" >&2; exit 1; }
 
@@ -144,28 +153,24 @@ grep -q $'\t1\tSoftware\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\tGhoztt
 grep -q $'^AgentStartMenuShortcut\tProgramMenuFolder\tGhoztty Agent\t.*\t\[INSTALLDIR\]ghoztty-agent.exe\t--relay='"$RELAY_URL"'\t' < <(table Shortcut) \
   || fail "Start Menu shortcut row missing or wrong"
 
-# taskkill custom action (type 51 sets the path, type 50+ignore runs it)
-# sequenced before InstallValidate.
+# Kill/cleanup custom actions: in-process DLL (type 1 + continue = 65), NOT
+# exe actions — type-50 console tools (taskkill/powershell) each pop a console
+# window over the installer, and this is a tray app. The DLL rides the Binary
+# table; prove the stream actually carries our DLL's exports.
 CA="$(table CustomAction)"
-grep -q $'^SetKillAgentCmd\t51\tKILLAGENTCMD\t\[SystemFolder\]taskkill.exe' <<<"$CA" || fail "SetKillAgentCmd CA missing"
-grep -q $'^KillAgent\t114\tKILLAGENTCMD\t/F /IM ghoztty-agent.exe' <<<"$CA" || fail "KillAgent CA missing"
+grep -q $'^KillAgent\t65\tAgentCA\tKillAgentCA' <<<"$CA" || fail "KillAgent CA missing or not an in-process DLL action (want type 65)"
+grep -q $'^LegacyCleanup\t65\tAgentCA\tLegacyCleanupCA' <<<"$CA" || fail "LegacyCleanup CA missing or not an in-process DLL action (want type 65)"
+grep -qi "taskkill\|powershell\|cmd.exe" <<<"$CA" && fail "console-subsystem tool in CustomAction table — would pop a console window"
+grep -q $'^AgentCA\t' < <(table Binary) || fail "Binary table lacks the AgentCA DLL row"
+
 SEQ="$(table InstallExecuteSequence)"
 KILL_SEQ="$(awk -F'\t' '$1=="KillAgent"{print $3}' <<<"$SEQ")"
 VALIDATE_SEQ="$(awk -F'\t' '$1=="InstallValidate"{print $3}' <<<"$SEQ")"
 [[ -n "$KILL_SEQ" && -n "$VALIDATE_SEQ" && "$KILL_SEQ" -lt "$VALIDATE_SEQ" ]] \
   || fail "KillAgent ($KILL_SEQ) not sequenced before InstallValidate ($VALIDATE_SEQ)"
 
-# Legacy install.ps1 cleanup (powershell, type 50+ignore) BEFORE KillAgent —
-# the watchdog must die before the agent kill or it respawns the old exe.
-grep -q $'^SetLegacyCleanupCmd\t51\tLEGACYCLEANUPCMD\t\[SystemFolder\]WindowsPowerShell' <<<"$CA" || fail "SetLegacyCleanupCmd CA missing"
-grep -q $'^LegacyCleanup\t114\tLEGACYCLEANUPCMD\t' <<<"$CA" || fail "LegacyCleanup CA missing or wrong type (want 114 = exe-by-property + continue)"
-grep -q "schtasks /Delete /TN GhozttyAgent /F" <<<"$CA" || fail "LegacyCleanup does not delete the legacy scheduled task"
-grep -q "launcher.pid" <<<"$CA" || fail "LegacyCleanup does not kill the legacy watchdog"
-# wixl's preprocessor eats bare '$' ('$$' escapes it); a mangled command would
-# still "run" and silently do nothing. Prove the PowerShell survived intact.
-grep -qF '$d=Join-Path $env:LOCALAPPDATA' <<<"$CA" || fail "LegacyCleanup PowerShell mangled (\$ stripped by wixl preprocessor?)"
-awk -F'\t' '$1=="LegacyCleanup"{print $4}' <<<"$CA" | grep -q '\[' \
-  && fail "LegacyCleanup command contains '[' — MSI Formatted would substitute it as a property"
+# LegacyCleanup BEFORE KillAgent — the watchdog must die before the agent
+# kill or it respawns the old exe mid-install.
 LEGACY_SEQ="$(awk -F'\t' '$1=="LegacyCleanup"{print $3}' <<<"$SEQ")"
 LEGACY_COND="$(awk -F'\t' '$1=="LegacyCleanup"{print $2}' <<<"$SEQ")"
 [[ -n "$LEGACY_SEQ" && "$LEGACY_SEQ" -lt "$KILL_SEQ" ]] \
@@ -191,6 +196,14 @@ EXPECT="$XT/Programs/Ghoztty Agent/ghoztty-agent.exe"
 [[ -f "$EXPECT" ]] || fail "extracted exe not at Programs/Ghoztty Agent/ghoztty-agent.exe"
 cmp -s "$EXE" "$EXPECT" || fail "extracted exe differs from input exe"
 
+# The embedded CA DLL must be OUR dll with both entry points exported.
+msiinfo extract "$OUT" Binary.AgentCA > "$XT/ca.dll" 2>/dev/null \
+  || fail "cannot extract Binary.AgentCA stream"
+cmp -s "$CA_DLL" "$XT/ca.dll" || fail "embedded CA DLL differs from input dll"
+for entry in KillAgentCA LegacyCleanupCA; do
+  grep -q "$entry" "$XT/ca.dll" || fail "CA DLL does not export $entry"
+done
+
 echo "OK: $OUT ($(du -h "$OUT" | awk '{print $1}'))"
 echo "   release semver : $SEMVER (filename + ARP DisplayVersion base)"
 echo "   ProductVersion : $MSI_VERSION"
@@ -199,4 +212,5 @@ echo "   per-user       : ALLUSERS unset, MSIINSTALLPERUSER=1, no UAC"
 echo "   installs to    : %LOCALAPPDATA%\\Programs\\Ghoztty Agent\\"
 echo "   autostart      : HKCU Run \"GhozttyAgent\" --relay=$RELAY_URL"
 echo "   post-install   : launches the agent (asyncNoWait); legacy install.ps1 layout retired"
+echo "   no consoles    : kill/cleanup run in-process via ghoztty-agent-ca.dll"
 echo "   validated      : Property/Upgrade/Registry/Shortcut/CustomAction tables + payload extraction"
