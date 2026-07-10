@@ -962,6 +962,12 @@ extension TerminalWindow {
                 machine: connection.machine
             )
         }
+        // The status pill's "Reconnect" button (shown once the window is
+        // disconnected): reset the breakers and dial now; falls back to a
+        // fresh shell when the old session is gone (WP-D1 manual reconnect).
+        machinePillModel.onReconnectTap = { [weak self] in
+            self?.terminalController?.manualRemoteReconnect()
+        }
         // Remote ⇒ inline leading title+pill (system title hidden). Local ⇒ system
         // title, no accessory (a leading accessory would center the local title).
         setInlineTitleEnabled(name != nil)

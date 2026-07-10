@@ -9,9 +9,10 @@ final class MachinePillModel: ObservableObject {
     /// The machine display name, or nil when the window is local (pill hidden).
     @Published var machineName: String?
 
-    /// WP-D1: the window's connection status. Drives the pill dot color
-    /// (green = connected, yellow = reconnecting, red = disconnected) and a
-    /// status suffix while not connected.
+    /// WP-D1: the window's connection status. Drives the machine pill dot color
+    /// (green = connected, yellow = reconnecting, red = disconnected) and the
+    /// separate connection-status pill rendered to its right ("Connecting…"
+    /// while retrying, a "Reconnect" button once retries are exhausted).
     @Published var connectionState: RemoteWindowConnectionState = .connected
 
     /// The window title, rendered inline before the pill on the leading edge (so the
@@ -26,17 +27,24 @@ final class MachinePillModel: ObservableObject {
     /// reset-zoom / update accessories' `accessoryTopPadding` convention.
     @Published var topPadding: CGFloat = 4
 
-    /// Invoked when the pill capsule is clicked. Set by `TerminalWindow` (which
-    /// knows its `remoteMachine` + `RemoteConnection`) to open the Remote Activity
-    /// Monitor on the window's existing connection. Not `@Published` (it doesn't
-    /// affect layout; it's read at tap time).
+    /// Invoked when the machine pill capsule is clicked. Set by `TerminalWindow`
+    /// (which knows its `remoteMachine` + `RemoteConnection`) to open the Remote
+    /// Activity Monitor on the window's existing connection. Not `@Published`
+    /// (it doesn't affect layout; it's read at tap time).
     var onTap: (() -> Void)?
+
+    /// Invoked when the status pill's "Reconnect" button is clicked. Set by
+    /// `TerminalWindow` to the controller's `manualRemoteReconnect()`. Not
+    /// `@Published` for the same reason as `onTap`.
+    var onReconnectTap: (() -> Void)?
 }
 
 /// The rounded "● name" capsule identifying which machine a window's terminals run
 /// on. Renders nothing when `machineName` is nil. The dot reflects the window's
 /// connection status (WP-D1): green = connected, yellow = reconnecting,
-/// red = disconnected; a short status suffix is shown while not connected.
+/// red = disconnected. The textual status lives in the separate
+/// `ConnectionStatusPill` so the machine's name stays stable while the status
+/// beside it changes.
 struct MachinePillCapsule: View {
     let machineName: String?
     var connectionState: RemoteWindowConnectionState = .connected
@@ -46,18 +54,6 @@ struct MachinePillCapsule: View {
         case .connected: return .green
         case .reconnecting: return .yellow
         case .disconnected: return .red
-        }
-    }
-
-    private var label: String {
-        guard let machineName else { return "" }
-        switch connectionState {
-        case .connected:
-            return machineName
-        case .reconnecting(let attempt):
-            return "\(machineName) — reconnecting… (\(attempt))"
-        case .disconnected:
-            return "\(machineName) — disconnected"
         }
     }
 
@@ -74,12 +70,12 @@ struct MachinePillCapsule: View {
     }
 
     var body: some View {
-        if machineName != nil {
+        if let machineName {
             HStack(spacing: 5) {
                 Circle()
                     .fill(dotColor)
                     .frame(width: 6, height: 6)
-                Text(label)
+                Text(machineName)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
@@ -96,9 +92,62 @@ struct MachinePillCapsule: View {
     }
 }
 
+/// The connection-status capsule rendered to the RIGHT of the machine pill while
+/// the window is not connected (WP-D1): a spinner + "Connecting…" during the
+/// reconnect ladder, and a prominent "Reconnect" button once retries are
+/// exhausted (the manual way back — it re-attaches when the session survived,
+/// or opens a fresh shell on the machine when it didn't). Renders nothing while
+/// connected.
+struct ConnectionStatusPill: View {
+    let machineName: String?
+    let connectionState: RemoteWindowConnectionState
+    var onReconnect: (() -> Void)?
+
+    var body: some View {
+        switch connectionState {
+        case .connected:
+            EmptyView()
+        case .reconnecting(let attempt):
+            HStack(spacing: 5) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("Connecting…")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(.quaternary))
+            .help("Reconnecting to \(machineName ?? "machine") (attempt \(attempt))")
+            .accessibilityLabel("Reconnecting, attempt \(attempt)")
+        case .disconnected:
+            Button {
+                onReconnect?()
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 9, weight: .bold))
+                    Text("Reconnect")
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.accentColor))
+            }
+            .buttonStyle(.plain)
+            .help("Connection to \(machineName ?? "machine") lost — click to reconnect")
+            .accessibilityLabel("Reconnect to \(machineName ?? "machine")")
+        }
+    }
+}
+
 /// The leading titlebar view for a REMOTE window: the window title followed inline by
-/// the machine pill. Used in place of the (hidden) system title so the machine reads
-/// as "<title>  ● <machine>" left-aligned, vertically centered in the titlebar.
+/// the machine pill, then the connection-status pill (hidden while connected). Used
+/// in place of the (hidden) system title so the machine reads as
+/// "<title>  ● <machine>  <status>" left-aligned, vertically centered in the titlebar.
 struct MachineTitlePillView: View {
     @ObservedObject var model: MachinePillModel
 
@@ -127,6 +176,12 @@ struct MachineTitlePillView: View {
                 }
                 .buttonStyle(.plain)
                 .help(model.machineName.map { "Open Activity Monitor for \($0)" } ?? "")
+                if model.machineName != nil {
+                    ConnectionStatusPill(
+                        machineName: model.machineName,
+                        connectionState: model.connectionState,
+                        onReconnect: model.onReconnectTap)
+                }
                 Spacer(minLength: 0)
             }
             Spacer(minLength: 0)

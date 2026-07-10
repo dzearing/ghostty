@@ -47,7 +47,8 @@
 //! and the agent replays the ring gap `(last_byte_offset, S]` — catching the client
 //! up to everything the remote produced while it was gone — then resumes live
 //! streaming. Orphaned sessions are reaped by a background idle-TTL thread
-//! (`session.default_idle_ttl_ms`, 5 min) so abandoned shells don't leak.
+//! (`session.default_idle_ttl_ms`, 24 h — long enough to survive a closed
+//! laptop lid overnight) so abandoned shells don't leak forever.
 //!
 //! ### SECURITY
 //! The `--relay` path is authenticated end to end (per-device bearer token, and
