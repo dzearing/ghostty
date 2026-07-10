@@ -261,6 +261,21 @@ test "ghostty_config_trigger: default keybind" {
         try testing.expectEqual(.unicode, trigger.tag);
         try testing.expectEqual(@as(u32, ','), trigger.key.unicode);
     }
+    {
+        const trigger = try config_trigger_(&cfg, "prompt_surface_title");
+        try testing.expectEqual(.unicode, trigger.tag);
+        try testing.expectEqual(@as(u32, 'r'), trigger.key.unicode);
+        try testing.expect(trigger.mods.shift);
+    }
+    // The macOS app clones the config before menu-shortcut lookups,
+    // so the reverse map must survive a clone.
+    {
+        var cloned = try cfg.clone(testing.allocator);
+        defer cloned.deinit();
+        const trigger = try config_trigger_(&cloned, "prompt_surface_title");
+        try testing.expectEqual(.unicode, trigger.tag);
+        try testing.expectEqual(@as(u32, 'r'), trigger.key.unicode);
+    }
     // Performable bindings are not tracked in the reverse map,
     // so config_trigger_ should return a default (empty) trigger.
     if (comptime builtin.target.os.tag.isDarwin()) {

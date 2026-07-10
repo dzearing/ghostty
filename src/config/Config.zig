@@ -6981,6 +6981,13 @@ pub const Keybinds = struct {
             .toggle_command_palette,
         );
 
+        // Rename window (prompt for surface title)
+        try self.set.put(
+            alloc,
+            .{ .key = .{ .unicode = 'r' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .prompt_surface_title = {} },
+        );
+
         // Mac-specific keyboard bindings.
         if (comptime builtin.target.os.tag.isDarwin()) {
             try self.set.put(
