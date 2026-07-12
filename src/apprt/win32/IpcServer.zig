@@ -18,6 +18,8 @@ const windows = std.os.windows;
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
+const termio = @import("../../termio.zig");
+const terminal = @import("../../terminal/main.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
 const w32 = @import("win32.zig");
 const apprt = @import("../../apprt.zig");
@@ -364,13 +366,16 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
         return try self.handleClose(request);
     } else if (std.mem.eql(u8, request.action, "split")) {
         return try self.handleSplit(request);
+    } else if (std.mem.eql(u8, request.action, "rename")) {
+        return try self.handleRename(request);
+    } else if (std.mem.eql(u8, request.action, "send-keys")) {
+        return try self.handleSendKeys(request);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
     // (each is its own task in the parity tracker).
     const known = [_][]const u8{
-        "rename",    "rearrange", "read",
-        "send-keys", "set-state", "new-remote-window",
+        "rearrange", "read", "set-state", "new-remote-window",
     };
     for (known) |k| {
         if (std.mem.eql(u8, request.action, k)) {
@@ -397,6 +402,7 @@ const VerbArgs = struct {
     state: ?[]const u8 = null,
     pane: ?[]const u8 = null,
     percent: ?i64 = null,
+    lines: ?i64 = null,
     no_activate: bool = false,
     env: []const Surface.Overrides.EnvVar = &.{},
     /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
@@ -445,6 +451,8 @@ fn parseVerbArgs(
             result.state = v;
         } else if (dropPrefix(arg, "--pane=")) |v| {
             result.pane = v;
+        } else if (dropPrefix(arg, "--lines=")) |v| {
+            result.lines = std.fmt.parseInt(i64, v, 10) catch null;
         } else if (dropPrefix(arg, "--percent=")) |v| {
             result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
         } else if (dropPrefix(arg, "--split-percent=")) |v| {
@@ -717,6 +725,96 @@ fn handleSplit(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
     if (args.name) |name| {
         app.ipcRegister(name, .{ .pane = new_surface }) catch {};
     }
+
+    return try self.alloc.dupe(u8, "{\"success\":true}");
+}
+
+fn handleRename(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+    const target = args.target orelse
+        return try self.errorResponse("--target is required for +rename", .{});
+    const title = args.title orelse
+        return try self.errorResponse("--title is required for +rename", .{});
+
+    const entry = self.app.ipcLookup(target) orelse
+        return try self.errorResponse("target '{s}' not found in registry", .{target});
+    const window = switch (entry) {
+        .window => |w| w,
+        .pane => |surface| surface.parent_window,
+    };
+
+    // titleOverride semantics: the override wins over terminal-reported
+    // titles until cleared (Mac BaseTerminalController.titleOverride).
+    window.setTitleOverride(title);
+    return try self.alloc.dupe(u8, "{\"success\":true}");
+}
+
+fn handleSendKeys(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
+    // The CLI resolves all key notation (C-x, Enter, \n escapes) before
+    // sending; the server receives `--target=` and raw `--keys=` bytes and
+    // just writes them to the pane's PTY (Mac writePtyRaw semantics).
+    var target: ?[]const u8 = null;
+    var text: ?[]const u8 = null;
+    if (request.arguments) |arguments| {
+        for (arguments) |arg| {
+            if (dropPrefix(arg, "--target=")) |v| {
+                target = v;
+            } else if (dropPrefix(arg, "--keys=")) |v| {
+                text = v;
+            }
+        }
+    }
+    const target_name = target orelse
+        return try self.errorResponse("--target is required for +send-keys", .{});
+    const bytes = text orelse
+        return try self.errorResponse("text is required for +send-keys", .{});
+    if (bytes.len == 0)
+        return try self.errorResponse("text is required for +send-keys", .{});
+
+    const entry = self.app.ipcLookup(target_name) orelse
+        return try self.errorResponse("target '{s}' not found", .{target_name});
+    const surface: *Surface = switch (entry) {
+        .pane => |s| s,
+        .window => |w| surface: {
+            if (w.tab_count == 0)
+                return try self.errorResponse("target '{s}' is no longer alive", .{target_name});
+            break :surface w.tab_active_surface[w.active_tab];
+        },
+    };
+    if (!surface.core_surface_ready)
+        return try self.errorResponse("target '{s}' is no longer alive", .{target_name});
+
+    // ConPTY input convention: Enter is CR. A bare LF never comes from a
+    // real keyboard and cmd/pwsh don't execute on it, but the CLI's `\n`
+    // notation means "Enter" to the user — normalize LF and CRLF to CR.
+    const normalized = try self.alloc.alloc(u8, bytes.len);
+    defer self.alloc.free(normalized);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        const b = bytes[i];
+        if (b == '\n') {
+            normalized[n] = '\r';
+        } else if (b == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') {
+            normalized[n] = '\r';
+            i += 1;
+        } else {
+            normalized[n] = b;
+        }
+        n += 1;
+    }
+
+    const write_req = termio.Message.WriteReq.init(self.alloc, normalized[0..n]) catch
+        return try self.errorResponse("failed to queue input", .{});
+    surface.core_surface.io.queueMessage(switch (write_req) {
+        .small => |v| .{ .write_small = v },
+        .stable => |v| .{ .write_stable = v },
+        .alloc => |v| .{ .write_alloc = v },
+    }, .unlocked);
 
     return try self.alloc.dupe(u8, "{\"success\":true}");
 }

@@ -124,10 +124,10 @@ still authoritative for staging/ZIP layout and merge rules.
 | T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | done | e80e32d39 | on-box 2026-07-12: cold auto-launch (detached CreateProcessW) + create with --target/--title/--command; repeat --target focused (no dup); --split=down + --split-command + --name registered pane; --working-directory honored; -e exec window created; `[target: <name>]` canonical (Mac windowName semantics) |
 | T07 | `+close` | B | T06 | done | e80e32d39 | on-box 2026-07-12: close named pane (window survives), close window, close missing → all exit 0; registry pruned via ipcForget in destroy paths |
 | T08 | P1 acceptance script `test/win32/ipc-p1.ps1` green | B | T05,T06,T07 | done | e80e32d39 | on-box 2026-07-12: ALL PASS (22 assertions — auto-launch, create/focus/close, idempotency, close-missing, inline split, -e, json shape, 2nd-instance forward) from fresh start |
-| T09 | `+split` (window/pane targets, registry) | C | T08 | todo | — | — |
-| T10 | `+rename` / titleOverride precedence | C | T08 | todo | — | — |
-| T11 | `+send-keys` full notation | C | T08 | todo | — | — |
-| T12 | P2 acceptance script green | C | T09,T10,T11 | todo | — | — |
+| T09 | `+split` (window/pane targets, registry) | C | T08 | done | 72943724a | on-box 2026-07-12: three-pane CLAUDE.md layout by name; idempotent --name; --pane exact-surface split with --percent (ratio 0.70); missing-target error; teardown — ALL PASS (15) |
+| T10 | `+rename` / titleOverride precedence | C | T08 | done | (this commit) | on-box 2026-07-12: rename sets window title; shell `title` changes update the TAB label but the window title keeps the override; missing target errors |
+| T11 | `+send-keys` full notation | C | T08 | done | (this commit) | on-box 2026-07-12: `"title X" Enter` executed (observable via +list tab title), `\n` escape executes after LF→CR ConPTY normalization, C-c accepted, window-target routes to active pane, missing target errors |
+| T12 | P2 acceptance script green | C | T09,T10,T11 | done | (this commit) | on-box 2026-07-12: `test/win32/ipc-p2.ps1` ALL PASS (21 assertions) from fresh start |
 | T13 | `+read` | D | T08 | todo | — | — |
 | T14 | `+set-state` + OSC 7777 + title suffix | D | T08 | todo | — | — |
 | T15 | `+rearrange` | D | T09 | todo | — | — |
@@ -483,6 +483,19 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, night) — T09–T12 done, Phase C (P2) complete —
+  `+split`: Window.newSplitAt (arbitrary surface, explicit ratio,
+  background-tab panes stay hidden), --pane/--target/foreground-default
+  resolution, --percent→ratio. `+rename`: window titleOverride (window
+  title shows override; tab labels keep tracking the shell). `+send-keys`:
+  server writes raw --keys bytes to the pane PTY via
+  termio.Message.WriteReq/queueMessage; KEY FINDING — ConPTY shells do not
+  execute on LF, only CR, so the server normalizes LF/CRLF→CR (the CLI's
+  `\n` notation means Enter; validated `title X\n` runs in cmd).
+  Validation trick worth keeping: use the shell `title` command +
+  `+list`'s tab title to prove send-keys executed without needing +read.
+  `test/win32/ipc-p2.ps1` ALL PASS (21). Next: T13 (+read — dumpTextLocked
+  full-screen selection; parse fields already staged), then T14/T15.
 - 2026-07-12 (on-box, evening) — T06+T07 done — `+new-window` full flags:
   parseVerbArgs ports the Mac prefix table; per-surface config overrides
   (command/cwd/env) flow via a Window `pending_surface_overrides` baton into
