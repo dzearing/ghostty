@@ -592,6 +592,20 @@ fn ipcPrune(self: *App) void {
     }
 }
 
+/// Create, track, and populate a new Window (with its first tab). Shared by
+/// the .new_window action and the IPC server.
+pub fn createWindow(self: *App, opts: Window.InitOptions) !*Window {
+    const alloc = self.core_app.alloc;
+    const window = try alloc.create(Window);
+    errdefer alloc.destroy(window);
+    try window.init(self, opts);
+    errdefer window.deinit();
+    try self.windows.append(alloc, window);
+    errdefer _ = self.windows.pop();
+    _ = try window.addTab();
+    return window;
+}
+
 /// The next auto-generated window name (`window-N`). Caller owns the slice.
 pub fn ipcNextWindowName(self: *App) Allocator.Error![]u8 {
     self.ipc_window_counter += 1;
@@ -605,6 +619,10 @@ pub fn ipcNextWindowName(self: *App) Allocator.Error![]u8 {
 /// IPC client: runs in a CLI process (`ghoztty +new-window`, `+split`, ...)
 /// and sends the action to the running instance's named pipe. The server
 /// side lives in the pipe listener owned by this App.
+///
+/// `+new-window` with no running instance auto-launches one: spawn our own
+/// exe detached and retry the send with backoff until the new instance's
+/// pipe server answers (parity with the Mac flow).
 pub fn performIpc(
     alloc: Allocator,
     _: apprt.ipc.Target,
@@ -615,7 +633,73 @@ pub fn performIpc(
         alloc,
         comptime action.wireName(),
         value.arguments,
-    );
+    ) catch |err| switch (err) {
+        error.NoRunningInstance => switch (comptime action) {
+            .new_window => {
+                try autoLaunchInstance(alloc);
+                // The new instance needs to create its window and bind the
+                // pipe; a cold debug start on a busy box can take a while.
+                var attempt: usize = 0;
+                while (true) : (attempt += 1) {
+                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    return internal_os.ipc_client.sendAction(
+                        alloc,
+                        comptime action.wireName(),
+                        value.arguments,
+                    ) catch |retry_err| switch (retry_err) {
+                        error.NoRunningInstance => {
+                            if (attempt < 20) continue;
+                            return error.NoRunningInstance;
+                        },
+                        else => return retry_err,
+                    };
+                }
+            },
+            else => return err,
+        },
+        else => return err,
+    };
+}
+
+/// Spawn a detached GUI instance of our own executable. Raw CreateProcessW
+/// with bInheritHandles=FALSE: std.process.Child inherits handles, and a
+/// GUI that inherits the CLI's redirected stdout/stderr keeps the caller's
+/// pipes open — any script capturing `ghoztty +new-window` output would
+/// block until the GUI exits.
+fn autoLaunchInstance(alloc: Allocator) apprt.ipc.Errors!void {
+    _ = alloc;
+    const windows = std.os.windows;
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = std.fs.selfExePath(&exe_buf) catch return error.IPCFailed;
+
+    // Quoted, mutable (CreateProcessW may rewrite lpCommandLine), NUL-
+    // terminated wide command line.
+    var cmd_utf8_buf: [std.fs.max_path_bytes + 2]u8 = undefined;
+    const cmd_utf8 = std.fmt.bufPrint(&cmd_utf8_buf, "\"{s}\"", .{exe}) catch
+        return error.IPCFailed;
+    var cmd_w: [std.fs.max_path_bytes + 3]u16 = undefined;
+    const cmd_len = std.unicode.utf8ToUtf16Le(cmd_w[0 .. cmd_w.len - 1], cmd_utf8) catch
+        return error.IPCFailed;
+    cmd_w[cmd_len] = 0;
+
+    var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
+    si.cb = @sizeOf(windows.STARTUPINFOW);
+    var pi: windows.PROCESS_INFORMATION = undefined;
+    if (windows.kernel32.CreateProcessW(
+        null,
+        @ptrCast(&cmd_w),
+        null,
+        null,
+        windows.FALSE, // no handle inheritance (see above)
+        .{ .detached_process = true, .create_new_process_group = true },
+        null,
+        null,
+        &si,
+        &pi,
+    ) == 0) return error.IPCFailed;
+    windows.CloseHandle(pi.hProcess);
+    windows.CloseHandle(pi.hThread);
 }
 
 pub fn performAction(
@@ -646,25 +730,8 @@ pub fn performAction(
                 },
             };
 
-            const alloc = self.core_app.alloc;
-            const window = alloc.create(Window) catch |err| {
-                log.err("failed to allocate new window err={}", .{err});
-                return true;
-            };
-            window.init(self, .{ .force_opaque = force_opaque }) catch |err| {
-                log.err("failed to init new window err={}", .{err});
-                alloc.destroy(window);
-                return true;
-            };
-            self.windows.append(alloc, window) catch |err| {
-                log.err("failed to track new window err={}", .{err});
-                window.deinit();
-                alloc.destroy(window);
-                return true;
-            };
-            _ = window.addTab() catch |err| {
-                log.err("failed to add tab to new window err={}", .{err});
-                return true;
+            _ = self.createWindow(.{ .force_opaque = force_opaque }) catch |err| {
+                log.err("failed to create new window err={}", .{err});
             };
             return true;
         },
@@ -1462,8 +1529,9 @@ pub fn performAction(
                         .up => .up,
                         .down => .down,
                     };
-                    core_surface.rt_surface.parent_window.newSplit(dir) catch |err| {
+                    _ = core_surface.rt_surface.parent_window.newSplit(dir) catch |err| blk: {
                         log.err("failed to create split: {}", .{err});
+                        break :blk null;
                     };
                 },
             }

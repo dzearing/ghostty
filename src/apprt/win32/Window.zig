@@ -124,12 +124,34 @@ resize_overlay_hwnd: ?w32.HWND = null,
 /// after-first suppresses the overlay for that first layout pass.
 resize_seen_first: bool = false,
 
+/// IPC surface-config overrides consumed by the NEXT Surface.init in this
+/// window (see Surface.Overrides). Set immediately before addTab/newSplit
+/// by the IPC server; creation is synchronous so borrowed strings are fine.
+pending_surface_overrides: ?*const Surface.Overrides = null,
+
+/// When set, the title bar shows this instead of terminal-reported titles
+/// (`+new-window --title`, `+rename`) — mirrors the Mac titleOverride
+/// precedence. Owned. Tab labels still track terminal titles.
+title_override: ?[:0]u8 = null,
+
+/// This window's canonical IPC name: `+new-window --target` when given,
+/// else auto-generated `window-N` (Mac windowName semantics). Owned; also
+/// the key it is registered under in App.ipc_targets. Null only for quick
+/// terminals (not IPC-addressable) or if registration failed.
+ipc_name: ?[]u8 = null,
+
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
     /// If true, start fully opaque regardless of `background-opacity`. Set
     /// when `new_window` inherits from a parent window the user had
     /// toggled to opaque via `toggle_background_opacity`.
     force_opaque: bool = false,
+    /// Config overrides for the first surface (IPC `+new-window` flags).
+    /// Borrowed; only read during the synchronous first addTab.
+    surface_overrides: ?*const Surface.Overrides = null,
+    /// Canonical IPC name for this window (`+new-window --target`).
+    /// Borrowed; duped at registration. Null → auto-generated `window-N`.
+    ipc_name: ?[]const u8 = null,
 };
 
 /// Read HKCU\...\Themes\Personalize\AppsUseLightTheme. Returns true when the
@@ -228,6 +250,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     self.* = .{
         .app = app,
         .is_quick_terminal = options.is_quick_terminal,
+        .pending_surface_overrides = options.surface_overrides,
     };
 
     const style: u32 = if (options.is_quick_terminal)
@@ -358,18 +381,21 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // Showing the parent before the terminal is ready can cause
     // timing issues with ConPTY.
 
-    // Every regular window is IPC-addressable under an auto-generated name
-    // (`window-N`, matching the Mac); `+new-window --target` re-registers
-    // the user's name. Quick terminals are not listable targets.
-    if (!options.is_quick_terminal) {
-        if (app.ipcNextWindowName()) |name| {
-            defer app.core_app.alloc.free(name);
-            app.ipcRegister(name, .{ .window = self }) catch |err| {
-                log.warn("IPC window registration failed err={}", .{err});
-            };
-        } else |err| {
+    // Every regular window is IPC-addressable under one canonical name:
+    // `+new-window --target` when given, else auto-generated `window-N`
+    // (Mac windowName semantics). Quick terminals are not listable targets.
+    if (!options.is_quick_terminal) register: {
+        const gpa = app.core_app.alloc;
+        const name: []u8 = if (options.ipc_name) |n|
+            gpa.dupe(u8, n) catch break :register
+        else
+            app.ipcNextWindowName() catch break :register;
+        app.ipcRegister(name, .{ .window = self }) catch |err| {
             log.warn("IPC window registration failed err={}", .{err});
-        }
+            gpa.free(name);
+            break :register;
+        };
+        self.ipc_name = name;
     }
 }
 
@@ -378,6 +404,15 @@ pub fn deinit(self: *Window) void {
     // Drop IPC names pointing at this window before the memory can be
     // recycled.
     self.app.ipcForget(.{ .window = self });
+    if (self.ipc_name) |n| {
+        self.app.core_app.alloc.free(n);
+        self.ipc_name = null;
+    }
+
+    if (self.title_override) |t| {
+        self.app.core_app.alloc.free(t);
+        self.title_override = null;
+    }
 
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
@@ -866,13 +901,13 @@ fn endDividerDrag(self: *Window) void {
 }
 
 /// Create a new split in the active tab.
-pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !void {
-    if (self.tab_count == 0) return;
+pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !?*Surface {
+    if (self.tab_count == 0) return null;
     const alloc = self.app.core_app.alloc;
     const tab = self.active_tab;
 
     const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
+    const handle = self.findHandle(tab, active_surface) orelse return null;
 
     // Create new surface.
     const new_surface = try alloc.create(Surface);
@@ -905,6 +940,7 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
 
     self.layoutSplits();
     if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
+    return new_surface;
 }
 
 /// Navigate to a split in the given direction.
@@ -1047,12 +1083,32 @@ pub fn moveTab(self: *Window, amount: isize) void {
 /// Update the top-level window title to match the active tab's title.
 fn updateWindowTitle(self: *Window) void {
     const hwnd = self.hwnd orelse return;
+    if (self.title_override) |override| {
+        var wbuf: [257]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(wbuf[0..256], override) catch 0;
+        wbuf[wlen] = 0;
+        _ = w32.SetWindowTextW(hwnd, @ptrCast(&wbuf));
+        return;
+    }
     if (self.tab_count == 0) return;
     const len = self.tab_title_lens[self.active_tab];
     var buf: [257]u16 = undefined;
     @memcpy(buf[0..len], self.tab_titles[self.active_tab][0..len]);
     buf[len] = 0;
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
+}
+
+/// Set (or clear, with null) the title override. Owned copy; wins over
+/// terminal-reported titles until cleared, like the Mac titleOverride.
+pub fn setTitleOverride(self: *Window, title: ?[]const u8) void {
+    const alloc = self.app.core_app.alloc;
+    const copy: ?[:0]u8 = if (title) |t|
+        alloc.dupeZ(u8, t) catch return
+    else
+        null;
+    if (self.title_override) |old| alloc.free(old);
+    self.title_override = copy;
+    self.updateWindowTitle();
 }
 
 /// Called when a tab's title changes. Updates the stored title
@@ -1911,6 +1967,18 @@ fn onDestroy(self: *Window) void {
             _ = app.windows.orderedRemove(i);
             break;
         }
+    }
+
+    // Drop IPC names before the allocation is freed below (deinit() is not
+    // called on this path).
+    app.ipcForget(.{ .window = self });
+    if (self.ipc_name) |n| {
+        app.core_app.alloc.free(n);
+        self.ipc_name = null;
+    }
+    if (self.title_override) |t| {
+        app.core_app.alloc.free(t);
+        self.title_override = null;
     }
 
     // Clean up Window-level resources.

@@ -186,6 +186,21 @@ pub fn eql(self: *const Surface, other: *const Surface) bool {
     return self == other;
 }
 
+/// Per-surface config overrides for IPC-driven creation (`+new-window
+/// --command/--working-directory/--env`, `+split ...`). Consumed by the
+/// next Surface.init through the parent Window's pending_surface_overrides
+/// baton; the strings only need to outlive that (synchronous) init.
+pub const Overrides = struct {
+    /// argv to spawn, in the config `Command.direct` form. Direct (not
+    /// `.shell`) because the Windows `.shell` path whitespace-splits with
+    /// no quoting rules — a shell-wrapped command would be mangled.
+    command_argv: ?[]const [:0]const u8 = null,
+    working_directory: ?[]const u8 = null,
+    env: []const EnvVar = &.{},
+
+    pub const EnvVar = struct { key: []const u8, value: []const u8 };
+};
+
 /// Initialize a new Surface by creating a Win32 window and WGL context,
 /// then initialize the core terminal surface (fonts, renderer, PTY, IO).
 pub fn init(
@@ -298,6 +313,32 @@ pub fn init(
     // Create a config copy for this surface.
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
+
+    // Apply IPC overrides (command/cwd/env) queued on the parent window by
+    // the IPC server. One-shot: cleared here so a later plain tab/split
+    // doesn't inherit them.
+    if (parent.pending_surface_overrides) |ov| {
+        parent.pending_surface_overrides = null;
+        const carena = config._arena.?.allocator();
+        if (ov.command_argv) |argv| {
+            const copy = try carena.alloc([:0]const u8, argv.len);
+            for (argv, 0..) |arg, i| copy[i] = try carena.dupeZ(u8, arg);
+            config.command = .{ .direct = copy };
+        }
+        if (ov.working_directory) |wd| {
+            config.@"working-directory" = .{ .path = try carena.dupe(u8, wd) };
+        }
+        for (ov.env) |env_var| {
+            const kv = try std.fmt.allocPrint(
+                carena,
+                "{s}={s}",
+                .{ env_var.key, env_var.value },
+            );
+            config.env.parseCLI(carena, kv) catch |err| {
+                log.warn("IPC env override rejected key={s} err={}", .{ env_var.key, err });
+            };
+        }
+    }
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
     // and spawns the renderer + IO threads.

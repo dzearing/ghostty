@@ -359,13 +359,16 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
         return try self.handleNewWindow(request);
     } else if (std.mem.eql(u8, request.action, "list")) {
         return try self.handleList(request);
+    } else if (std.mem.eql(u8, request.action, "close")) {
+        return try self.handleClose(request);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
     // (each is its own task in the parity tracker).
     const known = [_][]const u8{
-        "split",         "close",     "rename",           "rearrange",
-        "read",          "send-keys", "set-state",        "new-remote-window",
+        "split",             "rename",    "rearrange",
+        "read",              "send-keys", "set-state",
+        "new-remote-window",
     };
     for (known) |k| {
         if (std.mem.eql(u8, request.action, k)) {
@@ -378,17 +381,261 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
     return try self.errorResponse("unknown action: {s}", .{request.action});
 }
 
+/// Flags shared by the window/pane verbs, parsed with the same prefix table
+/// as the Mac server (unknown flags are ignored there too).
+const VerbArgs = struct {
+    target: ?[]const u8 = null,
+    working_directory: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    shell: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    split_direction: ?[]const u8 = null,
+    split_command: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    no_activate: bool = false,
+    env: []const Surface.Overrides.EnvVar = &.{},
+    /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
+    e_args: []const [:0]const u8 = &.{},
+};
+
+fn parseVerbArgs(
+    arena: Allocator,
+    arguments: ?[]const []const u8,
+) Allocator.Error!VerbArgs {
+    var result: VerbArgs = .{};
+    const args = arguments orelse return result;
+
+    var env: std.ArrayList(Surface.Overrides.EnvVar) = .empty;
+    var e_args: std.ArrayList([:0]const u8) = .empty;
+    var e_flag = false;
+
+    for (args) |arg| {
+        if (e_flag) {
+            try e_args.append(arena, try arena.dupeZ(u8, arg));
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-e")) {
+            e_flag = true;
+        } else if (std.mem.eql(u8, arg, "--no-activate")) {
+            result.no_activate = true;
+        } else if (dropPrefix(arg, "--working-directory=")) |v| {
+            result.working_directory = v;
+        } else if (dropPrefix(arg, "--command=")) |v| {
+            result.command = v;
+        } else if (dropPrefix(arg, "--shell=")) |v| {
+            result.shell = v;
+        } else if (dropPrefix(arg, "--title=")) |v| {
+            result.title = v;
+        } else if (dropPrefix(arg, "--split=")) |v| {
+            result.split_direction = v;
+        } else if (dropPrefix(arg, "--direction=")) |v| {
+            result.split_direction = v;
+        } else if (dropPrefix(arg, "--split-command=")) |v| {
+            result.split_command = v;
+        } else if (dropPrefix(arg, "--target=")) |v| {
+            result.target = v;
+        } else if (dropPrefix(arg, "--name=")) |v| {
+            result.name = v;
+        } else if (dropPrefix(arg, "--state=")) |v| {
+            result.state = v;
+        } else if (dropPrefix(arg, "--env=")) |v| {
+            if (std.mem.indexOfScalar(u8, v, '=')) |eq| {
+                try env.append(arena, .{
+                    .key = v[0..eq],
+                    .value = v[eq + 1 ..],
+                });
+            }
+        }
+        // Remaining Mac flags (--color, --percent, --pane, --from-focused)
+        // are accepted-and-ignored until their features land.
+    }
+
+    result.env = env.items;
+    result.e_args = e_args.items;
+    return result;
+}
+
+fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
+    return null;
+}
+
+/// Build the argv that runs `command` inside a shell, per the pinned
+/// Windows table: pwsh/powershell → `-NoExit -Command`, cmd → `/K`,
+/// anything else (git-bash etc.) → `-lic` (Mac behavior). Shell resolution:
+/// `--shell` flag → `command-shell` config → cmd.exe.
+fn wrapCommandArgv(
+    self: *IpcServer,
+    arena: Allocator,
+    shell_flag: ?[]const u8,
+    command: []const u8,
+) Allocator.Error![]const [:0]const u8 {
+    const shell = shell_flag orelse
+        (self.app.config.@"command-shell" orelse "cmd.exe");
+
+    var base = std.fs.path.basename(shell);
+    if (std.ascii.endsWithIgnoreCase(base, ".exe")) base = base[0 .. base.len - 4];
+
+    var argv: std.ArrayList([:0]const u8) = .empty;
+    try argv.append(arena, try arena.dupeZ(u8, shell));
+    if (std.ascii.eqlIgnoreCase(base, "pwsh") or
+        std.ascii.eqlIgnoreCase(base, "powershell"))
+    {
+        try argv.append(arena, "-NoExit");
+        try argv.append(arena, "-Command");
+    } else if (std.ascii.eqlIgnoreCase(base, "cmd")) {
+        try argv.append(arena, "/K");
+    } else {
+        try argv.append(arena, "-lic");
+    }
+    try argv.append(arena, try arena.dupeZ(u8, command));
+    return argv.items;
+}
+
+extern "user32" fn IsIconic(hWnd: w32.HWND) callconv(.winapi) windows.BOOL;
+
+/// Raise and focus the window that owns `entry` (and the pane itself for
+/// pane targets).
+fn focusTarget(entry: App.IpcTarget) void {
+    const window = switch (entry) {
+        .window => |w| w,
+        .pane => |s| s.parent_window,
+    };
+    if (window.hwnd) |hwnd| {
+        if (IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+        _ = w32.SetForegroundWindow(hwnd);
+    }
+    switch (entry) {
+        .window => {},
+        .pane => |s| if (s.hwnd) |h| {
+            _ = w32.SetFocus(h);
+        },
+    }
+}
+
 fn handleNewWindow(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
-    // Flag handling (--target, --command, ...) lands with T06; for now every
-    // request opens a plain window, which is what second-instance forwarding
-    // needs.
-    _ = request;
-    const ok = self.app.performAction(.app, .new_window, {}) catch |err| {
+    const app = self.app;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+
+    // Idempotent: an existing live target is focused, not recreated.
+    if (args.target) |target| {
+        if (app.ipcLookup(target)) |entry| {
+            if (!args.no_activate) focusTarget(entry);
+            return try self.alloc.dupe(u8, "{\"success\":true}");
+        }
+    }
+
+    // Environment for the first surface: --env flags plus the window/pane
+    // name vars the Mac injects for named windows.
+    var env: std.ArrayList(Surface.Overrides.EnvVar) = .empty;
+    try env.appendSlice(arena, args.env);
+    if (args.target) |t| {
+        try env.append(arena, .{ .key = "GHOZTTY_WINDOW_NAME", .value = t });
+        try env.append(arena, .{ .key = "GHOZTTY_PANE_NAME", .value = t });
+    }
+
+    const overrides: Surface.Overrides = .{
+        .command_argv = if (args.e_args.len > 0)
+            args.e_args
+        else if (args.command) |cmd|
+            try self.wrapCommandArgv(arena, args.shell, cmd)
+        else
+            null,
+        .working_directory = args.working_directory,
+        .env = env.items,
+    };
+
+    const window = app.createWindow(.{
+        .surface_overrides = &overrides,
+        .ipc_name = args.target,
+    }) catch |err| {
         log.warn("IPC new-window failed err={}", .{err});
         return try self.errorResponse("failed to create window", .{});
     };
-    if (!ok) return try self.errorResponse("failed to create window", .{});
+
+    if (args.title) |title| window.setTitleOverride(title);
+    if (args.no_activate) {
+        // Window creation focused it within our app; at least don't keep it
+        // raised over the previously-active window.
+        if (window.hwnd) |hwnd| {
+            _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+        }
+    } else if (window.hwnd) |hwnd| {
+        _ = w32.SetForegroundWindow(hwnd);
+    }
+
+    // Inline split (`--split=<dir>`, `--split-command`, `--name`).
+    if (args.split_direction) |dir_str| {
+        const dir = parseSplitDirection(dir_str) orelse
+            return try self.errorResponse("invalid split direction: {s}", .{dir_str});
+
+        var split_env: std.ArrayList(Surface.Overrides.EnvVar) = .empty;
+        if (args.target) |t| {
+            try split_env.append(arena, .{ .key = "GHOZTTY_WINDOW_NAME", .value = t });
+        }
+        if (args.name) |n| {
+            try split_env.append(arena, .{ .key = "GHOZTTY_PANE_NAME", .value = n });
+        }
+        const split_overrides: Surface.Overrides = .{
+            .command_argv = if (args.split_command) |cmd|
+                try self.wrapCommandArgv(arena, args.shell, cmd)
+            else
+                null,
+            .env = split_env.items,
+        };
+        window.pending_surface_overrides = &split_overrides;
+        defer window.pending_surface_overrides = null;
+        const new_surface = window.newSplit(dir) catch |err| blk: {
+            log.warn("IPC inline split failed err={}", .{err});
+            break :blk null;
+        };
+        if (new_surface) |s| {
+            if (args.name) |n| app.ipcRegister(n, .{ .pane = s }) catch {};
+        }
+    }
+
     return try self.alloc.dupe(u8, "{\"success\":true}");
+}
+
+fn handleClose(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
+    const app = self.app;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+    const target = args.target orelse
+        return try self.errorResponse("--target is required for +close", .{});
+
+    // Idempotent: closing a target that's already gone succeeds silently.
+    const entry = app.ipcLookup(target) orelse
+        return try self.alloc.dupe(u8, "{\"success\":true}");
+
+    switch (entry) {
+        // Both paths close without confirmation (the CLI drives teardown;
+        // matching the Mac server's withConfirmation:false /
+        // closeWindowImmediately). Registry entries drop via ipcForget in
+        // the destroy paths.
+        .pane => |surface| surface.parent_window.closeSplitSurface(surface),
+        .window => |window| window.close(),
+    }
+
+    return try self.alloc.dupe(u8, "{\"success\":true}");
+}
+
+fn parseSplitDirection(s: []const u8) ?SplitTree.Split.Direction {
+    if (std.mem.eql(u8, s, "right")) return .right;
+    if (std.mem.eql(u8, s, "down")) return .down;
+    if (std.mem.eql(u8, s, "left")) return .left;
+    if (std.mem.eql(u8, s, "up")) return .up;
+    return null;
 }
 
 fn handleList(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
@@ -438,7 +685,7 @@ fn handleList(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
         try window_list.append(arena, .{
             .id = try std.fmt.allocPrint(arena, "{d}", .{@intFromPtr(hwnd)}),
             .title = win_title,
-            .target = app.ipcNameOf(.{ .window = window }),
+            .target = window.ipc_name,
             .focused = foreground != null and foreground.? == hwnd,
             .tabs = tabs.items,
         });
@@ -478,18 +725,20 @@ fn buildNode(
                 const copy = surface.core_surface.pwd(arena) catch break :pwd "";
                 break :pwd copy orelse "";
             };
-            node.* = .{ .leaf = .{
-                .id = id,
-                .title = surface.getTitle() orelse "",
-                .working_directory = pwd,
-                // Foreground pid / tty name are not surfaced by the ConPTY
-                // backend yet; the Mac fills these from the surface model.
-                .pid = 0,
-                .tty = "",
-                .name = name,
-                .focused = surface == active_surface,
-                .exit_code = null,
-            } };
+            node.* = .{
+                .leaf = .{
+                    .id = id,
+                    .title = surface.getTitle() orelse "",
+                    .working_directory = pwd,
+                    // Foreground pid / tty name are not surfaced by the ConPTY
+                    // backend yet; the Mac fills these from the surface model.
+                    .pid = 0,
+                    .tty = "",
+                    .name = name,
+                    .focused = surface == active_surface,
+                    .exit_code = null,
+                },
+            };
         },
         .split => |split| {
             node.* = .{ .split = .{
