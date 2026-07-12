@@ -132,7 +132,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T14 | `+set-state` + OSC 7777 + title suffix | D | T08 | done | fee87d441 | on-box 2026-07-12: all 3 states via CLI, aggregation needs_input>busy>idle across 2 panes, suffix set/cleared; OSC 7777 busy/idle round-trip from inside the pane (pwsh `[console]::Write`); invalid state errors |
 | T15 | `+rearrange` | D | T09 | done | (this commit) | on-box 2026-07-12: 4-pane tab rearranged to horizontal(pa\|vertical(pb,pc)) ratio 0.3 — unnamed pane closed, tree+human list agree; duplicate/unknown-pane/bad-JSON error paths — ALL PASS (15) |
 | T16 | P3 acceptance script green | D | T13,T14,T15 | done | (this commit) | on-box 2026-07-12: `test/win32/ipc-p3.ps1` ALL PASS (17 assertions — read byte-accurate, state aggregation + suffix, OSC 7777 round-trip, rearrange + error paths) from fresh start |
-| T17 | Skill conformance on the box | E | T12,T16 | todo | — | — |
+| T17 | Skill conformance on the box | E | T12,T16 | done | (doc only) | on-box 2026-07-12: full skill-driven session from Claude Code with ZERO skill modifications — three-pane CLAUDE.md example verbatim (auto-launch from cold; `tail -f` genuinely ran via git-bash PATH), +read, +send-keys (echo round-trip read back), C-c, set-state loop, +rename, +rearrange (70/30 + pane removal), auto-name targeting (`window-1`), idempotent re-close/teardown. Env note: `jq` not installed on box, that discover pattern untestable as-is |
 | T18 | `swap_split` on win32 | F | — | todo | — | — |
 | T19 | Hero mode on win32 | F | T18 | todo | — | — |
 | T20 | `+new-remote-window --host/--port` (direct TCP) | G | T08 | todo | — | — |
@@ -483,6 +483,18 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night, later) — T17 done — **PHASE E / P4 COMPLETE:
+  THE ORIGINAL ASK IS CLOSED.** Ran the ghoztty skill from this on-box
+  Claude Code session against the debug exe (PATH prepended; zero skill
+  edits): three-pane example verbatim (incl. cold auto-launch), +read,
+  +send-keys round-trip verified via +read, C-c, set-state loop, +rename,
+  +rearrange with pane removal, auto-name (`window-1`) targeting,
+  idempotent teardown. Zero functional divergences. Env note: box lacks
+  `jq` (skill's jq discover pattern untested; PS ConvertFrom-Json is the
+  local equivalent). Phases B–E all green: P1 (22), P2 (21), P3 (17)
+  acceptance scripts checked in and passing from fresh starts. Remaining
+  on-box work: T01/T02 (Phase A keybinds), T18/T19 (GUI parity),
+  T20–T22 (remote), T23/T24 (distribution), T26–T28 (audit gaps).
 - 2026-07-12 (on-box, late night) — T13–T15 done — `+read`: dumpTextLocked
   under the renderer mutex with a full-SCREEN selection
   (pages.getTopLeft/BottomRight(.screen)), trailing N lines in data.text;
