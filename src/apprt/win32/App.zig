@@ -1623,13 +1623,23 @@ pub fn performAction(
             return true;
         },
 
+        // OSC 7777 / `+set-state`: per-pane activity state, surfaced as a
+        // window-title suffix aggregated across panes (T14).
+        .activity_state => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                const surface = core_surface.rt_surface;
+                surface.activity_state = value;
+                surface.parent_window.updateWindowTitle();
+                return true;
+            },
+        },
+
         // Ghoztty fork actions, not yet implemented by the Win32 apprt:
-        // split swapping, hero-mode view, and the activity-state title
-        // suffix (driven by `+set-state` IPC / OSC 7777, and IPC does not
-        // exist on Windows). Returning false reports them as unimplemented.
+        // split swapping and the hero-mode view. Returning false reports
+        // them as unimplemented.
         .swap_split,
         .toggle_hero_mode,
-        .activity_state,
         => return false,
     }
 }

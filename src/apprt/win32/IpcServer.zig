@@ -372,12 +372,14 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
         return try self.handleSendKeys(request);
     } else if (std.mem.eql(u8, request.action, "read")) {
         return try self.handleRead(request);
+    } else if (std.mem.eql(u8, request.action, "set-state")) {
+        return try self.handleSetState(request);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
     // (each is its own task in the parity tracker).
     const known = [_][]const u8{
-        "rearrange", "set-state", "new-remote-window",
+        "rearrange", "new-remote-window",
     };
     for (known) |k| {
         if (std.mem.eql(u8, request.action, k)) {
@@ -810,6 +812,51 @@ fn handleRead(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
         return try out.toOwnedSlice();
     }
     return error.OutOfMemory;
+}
+
+fn handleSetState(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+    const target = args.target orelse
+        return try self.errorResponse("--target is required for +set-state", .{});
+    const state_str = args.state orelse
+        return try self.errorResponse("--state is required for +set-state", .{});
+
+    const state: terminal.osc.Command.ActivityState = state: {
+        if (std.mem.eql(u8, state_str, "idle")) break :state .idle;
+        if (std.mem.eql(u8, state_str, "busy")) break :state .busy;
+        if (std.mem.eql(u8, state_str, "needs_input")) break :state .needs_input;
+        return try self.errorResponse(
+            "invalid state '{s}': must be idle, busy, or needs_input",
+            .{state_str},
+        );
+    };
+
+    const entry = self.app.ipcLookup(target) orelse
+        return try self.errorResponse("target '{s}' not found in registry", .{target});
+
+    // Pane targets set just that pane; window targets set every pane in
+    // the window (Mac handleSetState semantics).
+    switch (entry) {
+        .pane => |surface| {
+            surface.activity_state = state;
+            surface.parent_window.updateWindowTitle();
+        },
+        .window => |window| {
+            for (0..window.tab_count) |i| {
+                var it = window.tab_trees[i].iterator();
+                while (it.next()) |view_entry| {
+                    view_entry.view.activity_state = state;
+                }
+            }
+            window.updateWindowTitle();
+        },
+    }
+
+    return try self.alloc.dupe(u8, "{\"success\":true}");
 }
 
 fn handleRename(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {

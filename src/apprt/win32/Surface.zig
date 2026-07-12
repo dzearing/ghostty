@@ -103,6 +103,10 @@ current_cursor: ?w32.HCURSOR = null,
 /// `+list` tree can report a per-pane title. Null until the first set.
 title: ?[:0]u8 = null,
 
+/// Activity state of this pane (`+set-state` IPC / OSC 7777). Aggregated
+/// per-window (needs_input > busy > idle) into a title suffix.
+activity_state: terminal.osc.Command.ActivityState = .idle,
+
 /// When false, WM_SETCURSOR sets the cursor to null (invisible). The
 /// core surface toggles this for typing-while-mouse-still etc.
 mouse_visible: bool = true,

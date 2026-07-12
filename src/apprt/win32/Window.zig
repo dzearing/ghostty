@@ -12,6 +12,7 @@ const apprt = @import("../../apprt.zig");
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
+const terminal = @import("../../terminal/main.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -1098,19 +1099,49 @@ pub fn moveTab(self: *Window, amount: isize) void {
 }
 
 /// Update the top-level window title to match the active tab's title.
-fn updateWindowTitle(self: *Window) void {
-    const hwnd = self.hwnd orelse return;
-    if (self.title_override) |override| {
-        var wbuf: [257]u16 = undefined;
-        const wlen = std.unicode.utf8ToUtf16Le(wbuf[0..256], override) catch 0;
-        wbuf[wlen] = 0;
-        _ = w32.SetWindowTextW(hwnd, @ptrCast(&wbuf));
-        return;
+/// Highest-priority activity state across every pane in every tab
+/// (needs_input > busy > idle).
+pub fn activityAggregate(self: *Window) terminal.osc.Command.ActivityState {
+    var aggregate: terminal.osc.Command.ActivityState = .idle;
+    for (0..self.tab_count) |i| {
+        var it = self.tab_trees[i].iterator();
+        while (it.next()) |entry| {
+            switch (entry.view.activity_state) {
+                .needs_input => return .needs_input,
+                .busy => aggregate = .busy,
+                .idle => {},
+            }
+        }
     }
-    if (self.tab_count == 0) return;
-    const len = self.tab_title_lens[self.active_tab];
-    var buf: [257]u16 = undefined;
-    @memcpy(buf[0..len], self.tab_titles[self.active_tab][0..len]);
+    return aggregate;
+}
+
+pub fn updateWindowTitle(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+
+    // Base title: the override if set, else the active tab's title.
+    var buf: [280]u16 = undefined;
+    var len: usize = 0;
+    if (self.title_override) |override| {
+        len = std.unicode.utf8ToUtf16Le(buf[0..256], override) catch 0;
+    } else {
+        if (self.tab_count == 0) return;
+        len = self.tab_title_lens[self.active_tab];
+        @memcpy(buf[0..len], self.tab_titles[self.active_tab][0..len]);
+    }
+
+    // Activity suffix (`+set-state` / OSC 7777), matching the Mac's
+    // " (busy)" / " (needs_input)" title decoration.
+    const suffix: ?[]const u16 = switch (self.activityAggregate()) {
+        .idle => null,
+        .busy => std.unicode.utf8ToUtf16LeStringLiteral(" (busy)"),
+        .needs_input => std.unicode.utf8ToUtf16LeStringLiteral(" (needs_input)"),
+    };
+    if (suffix) |s| {
+        @memcpy(buf[len..][0..s.len], s);
+        len += s.len;
+    }
+
     buf[len] = 0;
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
 }
