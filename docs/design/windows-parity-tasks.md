@@ -120,10 +120,10 @@ still authoritative for staging/ZIP layout and merge rules.
 | T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | todo | — | — |
 | T03 | Named-pipe client helper + CLI un-guard | B | — | done | 353d70abf, 4f52e8877, 64f5b6984 | box round-trip 2026-07-12: fake server logged `{"action":"list"}` (17 B framed), CLI printed `No windows open.` exit 0; native win32 Debug build green; native `zig build test -Dapp-runtime=none` green (after 2 fork compile fixes, see log) |
 | T04 | Pipe server in win32 App + marshal + DACL | B | T03 | done | 1a44125de | on-box 2026-07-12: `+list` answered by in-app server (`No windows open.`, exit 0); 2nd GUI launch forwarded new-window (master windows 1→2, second exited 0); pipe DACL = single ACE `MAXIMUSHOME\David` FullControl; clean app exit after IPC use (no join deadlock) |
-| T05 | `+list` | B | T04 | done | (this commit) | golden shape tests in apprt/ipc.zig green; on-box 2026-07-12: 2-tab + h-split layout (built via ctrl+t/ctrl+d SendInput) rendered correctly in human + `--json` forms — `[target: window-1]`, per-pane `[name: <id>]`, focus/selected markers, pwd populated |
-| T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | todo | — | — |
-| T07 | `+close` | B | T06 | todo | — | — |
-| T08 | P1 acceptance script `test/win32/ipc-p1.ps1` green | B | T05,T06,T07 | todo | — | — |
+| T05 | `+list` | B | T04 | done | da9d56d0d | golden shape tests in apprt/ipc.zig green; on-box 2026-07-12: 2-tab + h-split layout (built via ctrl+t/ctrl+d SendInput) rendered correctly in human + `--json` forms — `[target: window-1]`, per-pane `[name: <id>]`, focus/selected markers, pwd populated |
+| T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | done | e80e32d39 | on-box 2026-07-12: cold auto-launch (detached CreateProcessW) + create with --target/--title/--command; repeat --target focused (no dup); --split=down + --split-command + --name registered pane; --working-directory honored; -e exec window created; `[target: <name>]` canonical (Mac windowName semantics) |
+| T07 | `+close` | B | T06 | done | e80e32d39 | on-box 2026-07-12: close named pane (window survives), close window, close missing → all exit 0; registry pruned via ipcForget in destroy paths |
+| T08 | P1 acceptance script `test/win32/ipc-p1.ps1` green | B | T05,T06,T07 | done | e80e32d39 | on-box 2026-07-12: ALL PASS (22 assertions — auto-launch, create/focus/close, idempotency, close-missing, inline split, -e, json shape, 2nd-instance forward) from fresh start |
 | T09 | `+split` (window/pane targets, registry) | C | T08 | todo | — | — |
 | T10 | `+rename` / titleOverride precedence | C | T08 | todo | — | — |
 | T11 | `+send-keys` full notation | C | T08 | todo | — | — |
@@ -483,6 +483,26 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, evening) — T06+T07 done — `+new-window` full flags:
+  parseVerbArgs ports the Mac prefix table; per-surface config overrides
+  (command/cwd/env) flow via a Window `pending_surface_overrides` baton into
+  the Surface.init config copy, using the config Command `.direct` argv form
+  (the Windows `.shell` path whitespace-splits with NO quoting — never wrap
+  commands as one string). Shell table per spec (pwsh `-NoExit -Command` /
+  cmd `/K` / else `-lic`); GHOZTTY_WINDOW_NAME/PANE_NAME env injected;
+  window titleOverride (`--title`, reused by T10); canonical window
+  ipc_name = --target else `window-N` (Mac windowName semantics — reverse
+  hash lookup showed arbitrary names first). Auto-launch: raw CreateProcessW
+  with bInheritHandles=FALSE + DETACHED_PROCESS — std.process.Child inherits
+  the CLI's redirected stdout/stderr, which kept callers' pipes open and
+  HUNG any script capturing `+new-window` output (first validation run
+  deadlocked on this). `+close`: pane→closeSplitSurface, window→close(),
+  missing→success; found+fixed a dangling-registry bug: Window.onDestroy
+  frees the Window WITHOUT deinit(), so ipcForget/name frees had to be added
+  there too. T08 `test/win32/ipc-p1.ps1`: ALL PASS (22 assertions) from a
+  fresh start — Phase B (P1) complete. Known cosmetic gaps: --no-activate is
+  best-effort (window still created focused within the app);
+  --color/--percent accepted-and-ignored.
 - 2026-07-12 (on-box, later still) — T05 done — `+list` is real: shared
   list-JSON data model + serializer in `src/apprt/ipc.zig` (golden tests pin
   the Mac wire shape — keep in sync with IPCMessage.swift), win32 registry
