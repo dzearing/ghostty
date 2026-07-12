@@ -199,7 +199,17 @@ pub const ChildStream = struct {
 /// per (user, host, port) so the data subprocess reuses the control master's
 /// socket. Caller owns the returned slice.
 pub fn controlPath(alloc: Allocator, cfg: DialConfig) ![]u8 {
-    const tmp = posix.getenv("TMPDIR") orelse "/tmp";
+    // posix.getenv is a compile error on Windows (and this file imports only
+    // std, so the shared os.getenv helper is off-limits): branch per-OS here.
+    const tmp_owned: ?[]u8 = if (comptime builtin.os.tag == .windows)
+        std.process.getEnvVarOwned(alloc, "TEMP") catch null
+    else
+        null;
+    defer if (tmp_owned) |t| alloc.free(t);
+    const tmp: []const u8 = if (comptime builtin.os.tag == .windows)
+        tmp_owned orelse "."
+    else
+        posix.getenv("TMPDIR") orelse "/tmp";
     // A short, collision-resistant tag from the key. ssh has a ~104-byte
     // sun_path limit, so we hash rather than embed the raw host/user.
     var hasher = std.hash.Wyhash.init(0);

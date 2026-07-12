@@ -3355,7 +3355,10 @@ const LifecycleAgent = struct {
     spawn_pid: i64 = 99001,
 
     // Observations (atomics / events so the test thread can read them safely).
-    seen_channel: std.atomic.Value(u128) = .{ .raw = 0 },
+    // The channel id is u128 and x86_64 has no 128-bit atomics, so it is
+    // mutex-guarded instead (setSeenChannel/seenChannel).
+    seen_channel_mtx: std.Thread.Mutex = .{},
+    seen_channel: u128 = 0,
     saw_request: std.Thread.ResetEvent = .{},
     saw_close: std.atomic.Value(bool) = .{ .raw = false },
     saw_detach: std.atomic.Value(bool) = .{ .raw = false },
@@ -3369,13 +3372,25 @@ const LifecycleAgent = struct {
         };
     }
 
+    fn setSeenChannel(self: *LifecycleAgent, ch: u128) void {
+        self.seen_channel_mtx.lock();
+        defer self.seen_channel_mtx.unlock();
+        self.seen_channel = ch;
+    }
+
+    fn seenChannel(self: *LifecycleAgent) u128 {
+        self.seen_channel_mtx.lock();
+        defer self.seen_channel_mtx.unlock();
+        return self.seen_channel;
+    }
+
     fn body(self: *LifecycleAgent) !void {
         _ = try self.ctrl.handshake();
         while (true) {
             const frame = (try self.ctrl.nextFrame()) orelse return; // EOF: done
             switch (frame.type) {
                 .open => {
-                    self.seen_channel.store(frame.channel, .monotonic);
+                    self.setSeenChannel(frame.channel);
                     self.saw_request.set();
                     // Model a remote session that fails to spawn (bad command/cwd):
                     // the agent never sends OPENED. The client's OPEN RPC must time
@@ -3395,7 +3410,7 @@ const LifecycleAgent = struct {
                 },
                 .attach => {
                     const n = self.attach_count.fetchAdd(1, .monotonic);
-                    self.seen_channel.store(frame.channel, .monotonic);
+                    self.setSeenChannel(frame.channel);
                     self.saw_request.set();
                     // If configured, the FIRST attach reports attached_elsewhere; a
                     // retry (which carries force=true) succeeds.
@@ -3595,7 +3610,7 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
 
     // The agent received a well-formed OPEN on the pane's channel id.
     a.saw_request.wait();
-    try testing.expectEqual(pane.id, a.seen_channel.load(.monotonic));
+    try testing.expectEqual(pane.id, a.seenChannel());
     // The pane carries the agent-assigned identity.
     try testing.expectEqualStrings("session-abc", pane.session_id);
     try testing.expectEqual(@as(i64, 9001), pane.pid);
