@@ -449,14 +449,20 @@ pub fn wakeup(self: *App) void {
     }
 }
 
-/// IPC from external processes. Not yet implemented for Win32.
+/// IPC client: runs in a CLI process (`ghoztty +new-window`, `+split`, ...)
+/// and sends the action to the running instance's named pipe. The server
+/// side lives in the pipe listener owned by this App.
 pub fn performIpc(
-    _: Allocator,
+    alloc: Allocator,
     _: apprt.ipc.Target,
     comptime action: apprt.ipc.Action.Key,
-    _: apprt.ipc.Action.Value(action),
-) !bool {
-    return false;
+    value: apprt.ipc.Action.Value(action),
+) (Allocator.Error || apprt.ipc.Errors)!bool {
+    return internal_os.ipc_client.sendAction(
+        alloc,
+        comptime action.wireName(),
+        value.arguments,
+    );
 }
 
 pub fn performAction(

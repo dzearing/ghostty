@@ -1,10 +1,10 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
+const ipc_client = @import("../os/ipc_client.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
@@ -90,15 +90,6 @@ fn runArgs(
     argsIter: anytype,
     stderr: *std.Io.Writer,
 ) !u8 {
-    // These commands drive a running Ghoztty instance over a Unix-domain
-    // socket, which the Windows beta does not have (see
-    // docs/design/windows-amd64-plan.md cut lines). Guarding here keeps the
-    // posix-only socket helpers below out of Windows semantic analysis.
-    if (comptime builtin.os.tag == .windows) {
-        try stderr.print("This command is not supported on Windows.\n", .{});
-        return 1;
-    }
-
     var opts: Options = .{};
     defer opts.deinit();
 
@@ -137,12 +128,13 @@ fn runArgs(
     // GHOSTTY_RELAY_TOKEN) must be forwarded explicitly. If the user did not pass
     // --token=, read it from this CLI's env and forward it through the IPC
     // arguments so the running app receives it.
-    if (comptime builtin.os.tag != .windows) {
-        if (have_relay and opts.token == null) {
-            if (std.posix.getenv("GHOSTTY_RELAY_TOKEN")) |tok| {
-                const forwarded = try std.fmt.allocPrintSentinel(alloc, "--token={s}", .{tok}, 0);
-                try opts._arguments.append(alloc_gpa, forwarded);
-            }
+    if (have_relay and opts.token == null) {
+        if (std.process.getEnvVarOwned(alloc, "GHOSTTY_RELAY_TOKEN")) |tok| {
+            const forwarded = try std.fmt.allocPrintSentinel(alloc, "--token={s}", .{tok}, 0);
+            try opts._arguments.append(alloc_gpa, forwarded);
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
         }
     }
 
@@ -166,69 +158,18 @@ fn sendOpen(
     arguments: [][:0]const u8,
     stderr: *std.Io.Writer,
 ) !void {
-    // Unix-socket IPC does not exist on Windows; the Windows beta has no
-    // CLI window-management (see docs/design/windows-amd64-plan.md).
-    if (comptime builtin.os.tag == .windows) return error.IPCFailed;
-
-    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-    const uid = std.c.getuid();
-    const build_config = @import("../build_config.zig");
-    const suffix = if (build_config.is_debug) "-debug" else "";
-    const sock_path = try std.fmt.allocPrintSentinel(alloc, "{s}ghostty{s}-{d}.sock", .{
-        tmpdir, suffix, uid,
-    }, 0);
-    defer alloc.free(sock_path);
-
-    const fd = connectUnixSocket(sock_path) catch {
-        return error.NoRunningInstance;
+    const conn = ipc_client.connect(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.NoRunningInstance,
     };
-    defer std.posix.close(fd);
+    defer conn.close();
 
-    // Build JSON payload: {"action":"new-remote-window","arguments":[...]}
-    var json_buf: std.Io.Writer.Allocating = .init(alloc);
-    defer json_buf.deinit();
-    var jws: std.json.Stringify = .{ .writer = &json_buf.writer };
+    // {"action":"new-remote-window","arguments":[...]} — the arguments
+    // field is always present for this verb, even when empty.
+    const json_payload = try ipc_client.buildRequest(alloc, "new-remote-window", arguments);
+    defer alloc.free(json_payload);
 
-    jws.beginObject() catch return error.IPCFailed;
-    jws.objectField("action") catch return error.IPCFailed;
-    jws.write("new-remote-window") catch return error.IPCFailed;
-    jws.objectField("arguments") catch return error.IPCFailed;
-    jws.beginArray() catch return error.IPCFailed;
-    for (arguments) |arg| jws.write(arg) catch return error.IPCFailed;
-    jws.endArray() catch return error.IPCFailed;
-    jws.endObject() catch return error.IPCFailed;
-
-    const json_bytes = json_buf.written();
-
-    const len: u32 = @intCast(json_bytes.len);
-    const len_bytes = std.mem.toBytes(std.mem.nativeToBig(u32, len));
-    _ = std.posix.write(fd, &len_bytes) catch |err| {
-        stderr.print("Failed to send IPC message: {}\n", .{err}) catch {};
-        return error.IPCFailed;
-    };
-    _ = std.posix.write(fd, json_bytes) catch |err| {
-        stderr.print("Failed to send IPC message: {}\n", .{err}) catch {};
-        return error.IPCFailed;
-    };
-
-    // Read response: 4-byte big-endian length + JSON {success, error?}.
-    var resp_len_bytes: [4]u8 = undefined;
-    readFull(fd, &resp_len_bytes) catch {
-        stderr.print("Failed to read IPC response length\n", .{}) catch {};
-        return error.IPCFailed;
-    };
-
-    const resp_len = std.mem.bigToNative(u32, std.mem.bytesAsValue(u32, &resp_len_bytes).*);
-    if (resp_len == 0 or resp_len > 1_048_576) {
-        stderr.print("IPC response has invalid length: {d}\n", .{resp_len}) catch {};
-        return error.IPCFailed;
-    }
-
-    const resp_buf = try alloc.alloc(u8, resp_len);
-    readFull(fd, resp_buf) catch {
-        stderr.print("Failed to read IPC response\n", .{}) catch {};
-        return error.IPCFailed;
-    };
+    const resp_buf = try ipc_client.exchange(alloc, conn, json_payload, .{}, stderr);
 
     const parsed = std.json.parseFromSlice(
         struct { success: bool = false, @"error": ?[]const u8 = null },
@@ -249,28 +190,3 @@ fn sendOpen(
     }
 }
 
-fn connectUnixSocket(path: [:0]const u8) !std.posix.fd_t {
-    const fd = try std.posix.socket(
-        std.posix.AF.UNIX,
-        std.posix.SOCK.STREAM,
-        0,
-    );
-    errdefer std.posix.close(fd);
-
-    var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
-    if (path.len >= addr.path.len) return error.NameTooLong;
-    @memcpy(addr.path[0..path.len], path);
-    addr.path[path.len] = 0;
-
-    try std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-    return fd;
-}
-
-fn readFull(fd: std.posix.fd_t, buffer: []u8) !void {
-    var total: usize = 0;
-    while (total < buffer.len) {
-        const n = std.posix.read(fd, buffer[total..]) catch |err| return err;
-        if (n == 0) return error.EndOfStream;
-        total += n;
-    }
-}

@@ -79,7 +79,7 @@ become tasks here, not loose threads). Never delete a task — mark
 |----|------|-------|------|--------|---------|---------------------|
 | T01 | Verify fresh ZIP keybinds on box | A | — | todo | — | — |
 | T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | todo | — | — |
-| T03 | Named-pipe client helper + CLI un-guard | B | — | todo | — | — |
+| T03 | Named-pipe client helper + CLI un-guard | B | — | in-progress | — | — |
 | T04 | Pipe server in win32 App + marshal + DACL | B | T03 | todo | — | — |
 | T05 | `+list` | B | T04 | todo | — | — |
 | T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | todo | — | — |

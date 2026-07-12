@@ -396,6 +396,20 @@ pub const Action = union(enum) {
         send_keys,
         set_state,
 
+        /// The wire name of this action: the `action` field of the IPC JSON
+        /// request (and the CLI `+<verb>` spelling).
+        pub fn wireName(self: Key) [:0]const u8 {
+            return switch (self) {
+                .new_window => "new-window",
+                .split => "split",
+                .close => "close",
+                .rename => "rename",
+                .rearrange => "rearrange",
+                .send_keys => "send-keys",
+                .set_state => "set-state",
+            };
+        }
+
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_IPC_ACTION_");
         }

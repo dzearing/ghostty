@@ -23,6 +23,7 @@ pub const args = @import("args.zig");
 pub const cgroup = @import("cgroup.zig");
 pub const hostname = @import("hostname.zig");
 pub const i18n = @import("i18n.zig");
+pub const ipc_client = @import("ipc_client.zig");
 pub const mach = @import("mach.zig");
 pub const path = @import("path.zig");
 pub const passwd = @import("passwd.zig");
@@ -70,6 +71,7 @@ pub const getKernelInfo = kernel_info.getKernelInfo;
 test {
     _ = file;
     _ = i18n;
+    _ = ipc_client;
     _ = path;
     _ = uri;
     _ = shell;
