@@ -24,6 +24,45 @@ New tasks: add rows/sections as discovered (bugs found during validation
 become tasks here, not loose threads). Never delete a task — mark
 `skipped(<reason>)` instead so decisions stay visible.
 
+## On-box session bootstrap (Windows / MaximusHome)
+
+Development moved to the Windows box 2026-07-12 — an on-box Claude Code
+session owns Phases B–E; Mac sessions own Mac-side tasks (T29, T30) and the
+pre-merge macOS regression build. Both sync via
+`origin/users/dzearing/windows-amd64`; pull before starting, push at every
+task boundary.
+
+One-time setup (PowerShell, admin where needed):
+
+```powershell
+winget install Git.Git
+winget install zig.zig --version 0.15.2   # exact version; repo requireZig's it
+winget install Anthropic.ClaudeCode       # or: irm https://claude.ai/install.ps1 | iex
+git clone https://github.com/dzearing/ghoztty
+cd ghoztty
+git checkout users/dzearing/windows-amd64
+```
+
+First actions for a fresh on-box session (this is P0's acceptance, then the
+T03 leftover, then onward):
+
+1. `zig build -Dapp-runtime=win32 -Doptimize=Debug` (native; Console
+   subsystem → stderr visible). Launch `zig-out\bin\ghoztty.exe`, type in it.
+2. `zig build test -Dapp-runtime=none` — upstream keeps this green on
+   Windows; deviations are our bugs.
+3. T03 round-trip: run `test\win32\ipc-fake-server.ps1 -DebugPipe` in one
+   shell, `zig-out\bin\ghoztty.exe +list` in another (a Debug exe speaks
+   the `ghoztty-debug-<username>` pipe). Expect the server to print the
+   `{"action":"list"}` request and the CLI to print `No windows open.`
+   Record the evidence in the T03 row, flip it to `done`.
+4. Resume protocol below (next task: T04).
+
+On-box notes: config file lives at `%LOCALAPPDATA%\ghostty\config.ghostty`
+(note the `ghostty` spelling); app log at `%LOCALAPPDATA%\ghoztty\ghoztty.log`;
+the share is `\\homeassistant\share\ghoztty-windows` for staging artifacts
+back to the Mac side. The "Environment facts" below are the MAC seat's —
+still authoritative for staging/ZIP layout and merge rules.
+
 ## Environment facts (verified 2026-07-12)
 
 - Worktree: `~/git/ghoztty-windows-amd64`, branch `users/dzearing/windows-amd64`.
