@@ -903,11 +903,22 @@ fn endDividerDrag(self: *Window) void {
 /// Create a new split in the active tab.
 pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !?*Surface {
     if (self.tab_count == 0) return null;
-    const alloc = self.app.core_app.alloc;
-    const tab = self.active_tab;
+    return self.newSplitAt(self.tab_active_surface[self.active_tab], direction, 0.5);
+}
 
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return null;
+/// Split at a specific surface (IPC `+split --pane`), with an explicit
+/// ratio. The surface may live in a background tab; layout/focus side
+/// effects only apply when its tab is active.
+pub fn newSplitAt(
+    self: *Window,
+    at: *Surface,
+    direction: SplitTree(Surface).Split.Direction,
+    ratio: f16,
+) !?*Surface {
+    if (self.tab_count == 0) return null;
+    const alloc = self.app.core_app.alloc;
+    const tab = self.findTabIndex(at) orelse return null;
+    const handle = self.findHandle(tab, at) orelse return null;
 
     // Create new surface.
     const new_surface = try alloc.create(Surface);
@@ -921,12 +932,12 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !?
     var insert_tree = try SplitTree(Surface).init(alloc, new_surface);
     defer insert_tree.deinit();
 
-    // Split the current tree at the active surface.
+    // Split the current tree at the target surface.
     const new_tree = try self.tab_trees[tab].split(
         alloc,
         handle,
         direction,
-        @as(f16, 0.5),
+        ratio,
         &insert_tree,
     );
 
@@ -938,8 +949,14 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !?
     // Focus the new surface.
     self.tab_active_surface[tab] = new_surface;
 
-    self.layoutSplits();
-    if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
+    if (tab == self.active_tab) {
+        self.layoutSplits();
+        if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
+    } else {
+        // Surface.init shows its child hwnd; this pane belongs to a
+        // background tab, so hide it until its tab is selected.
+        if (new_surface.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+    }
     return new_surface;
 }
 

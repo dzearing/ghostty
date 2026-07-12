@@ -17,6 +17,7 @@ const windows = std.os.windows;
 
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
+const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
 const w32 = @import("win32.zig");
 const apprt = @import("../../apprt.zig");
@@ -361,14 +362,15 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
         return try self.handleList(request);
     } else if (std.mem.eql(u8, request.action, "close")) {
         return try self.handleClose(request);
+    } else if (std.mem.eql(u8, request.action, "split")) {
+        return try self.handleSplit(request);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
     // (each is its own task in the parity tracker).
     const known = [_][]const u8{
-        "split",             "rename",    "rearrange",
-        "read",              "send-keys", "set-state",
-        "new-remote-window",
+        "rename",    "rearrange", "read",
+        "send-keys", "set-state", "new-remote-window",
     };
     for (known) |k| {
         if (std.mem.eql(u8, request.action, k)) {
@@ -393,6 +395,8 @@ const VerbArgs = struct {
     split_command: ?[]const u8 = null,
     name: ?[]const u8 = null,
     state: ?[]const u8 = null,
+    pane: ?[]const u8 = null,
+    percent: ?i64 = null,
     no_activate: bool = false,
     env: []const Surface.Overrides.EnvVar = &.{},
     /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
@@ -439,6 +443,12 @@ fn parseVerbArgs(
             result.name = v;
         } else if (dropPrefix(arg, "--state=")) |v| {
             result.state = v;
+        } else if (dropPrefix(arg, "--pane=")) |v| {
+            result.pane = v;
+        } else if (dropPrefix(arg, "--percent=")) |v| {
+            result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
+        } else if (dropPrefix(arg, "--split-percent=")) |v| {
+            result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
         } else if (dropPrefix(arg, "--env=")) |v| {
             if (std.mem.indexOfScalar(u8, v, '=')) |eq| {
                 try env.append(arena, .{
@@ -601,6 +611,132 @@ fn handleNewWindow(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
     }
 
     return try self.alloc.dupe(u8, "{\"success\":true}");
+}
+
+fn handleSplit(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
+    const app = self.app;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+
+    // Idempotent: an existing live pane under --name is focused, not
+    // recreated.
+    if (args.name) |name| {
+        if (app.ipcLookup(name)) |entry| {
+            switch (entry) {
+                .pane => {
+                    focusTarget(entry);
+                    return try self.alloc.dupe(u8, "{\"success\":true}");
+                },
+                // A window under this name: fall through and let the later
+                // registration no-op (existing registration wins).
+                .window => {},
+            }
+        }
+    }
+
+    const ratio: f16 = if (args.percent) |percent| ratio: {
+        if (percent < 1 or percent > 99) {
+            return try self.errorResponse(
+                "percent must be between 1 and 99, got {d}",
+                .{percent},
+            );
+        }
+        const r = @as(f16, @floatFromInt(100 - percent)) / 100.0;
+        break :ratio @min(0.9, @max(0.1, r));
+    } else 0.5;
+
+    const dir_str = args.split_direction orelse "right";
+    const direction = parseSplitDirection(dir_str) orelse
+        return try self.errorResponse("invalid direction: {s}", .{dir_str});
+
+    // Resolve where to split: --pane names the exact surface; --target
+    // names a window (or a pane, whose window is used) and splits at its
+    // active surface; neither → the foreground (else most recent) window.
+    var window: *Window = undefined;
+    var at: *Surface = undefined;
+    if (args.pane) |pane_name| {
+        const entry = app.ipcLookup(pane_name) orelse
+            return try self.errorResponse("pane '{s}' not found", .{pane_name});
+        switch (entry) {
+            .pane => |surface| {
+                at = surface;
+                window = surface.parent_window;
+            },
+            .window => return try self.errorResponse("pane '{s}' not found", .{pane_name}),
+        }
+    } else if (args.target) |target| {
+        const entry = app.ipcLookup(target) orelse
+            return try self.errorResponse("target '{s}' not found in registry", .{target});
+        window = switch (entry) {
+            .window => |w| w,
+            .pane => |surface| surface.parent_window,
+        };
+        if (window.tab_count == 0)
+            return try self.errorResponse("target '{s}' has no surface to split", .{target});
+        at = window.tab_active_surface[window.active_tab];
+    } else {
+        window = frontWindow(app) orelse
+            return try self.errorResponse("no window found for split", .{});
+        if (window.tab_count == 0)
+            return try self.errorResponse("no surface to split", .{});
+        at = window.tab_active_surface[window.active_tab];
+    }
+
+    // Surface overrides for the new pane.
+    var env: std.ArrayList(Surface.Overrides.EnvVar) = .empty;
+    try env.appendSlice(arena, args.env);
+    if (window.ipc_name) |wn| {
+        try env.append(arena, .{ .key = "GHOZTTY_WINDOW_NAME", .value = wn });
+    }
+    if (args.name) |n| {
+        try env.append(arena, .{ .key = "GHOZTTY_PANE_NAME", .value = n });
+    }
+    const command = args.split_command orelse args.command;
+    const overrides: Surface.Overrides = .{
+        .command_argv = if (args.e_args.len > 0)
+            args.e_args
+        else if (command) |cmd|
+            try self.wrapCommandArgv(arena, args.shell, cmd)
+        else
+            null,
+        .working_directory = args.working_directory,
+        .env = env.items,
+    };
+
+    window.pending_surface_overrides = &overrides;
+    defer window.pending_surface_overrides = null;
+    const new_surface = window.newSplitAt(at, direction, ratio) catch |err| {
+        log.warn("IPC split failed err={}", .{err});
+        return try self.errorResponse("failed to create split", .{});
+    } orelse return try self.errorResponse("failed to create split", .{});
+
+    if (args.name) |name| {
+        app.ipcRegister(name, .{ .pane = new_surface }) catch {};
+    }
+
+    return try self.alloc.dupe(u8, "{\"success\":true}");
+}
+
+/// The window the user is most plausibly working in: the foreground window
+/// if it is one of ours, else the most recently created one.
+fn frontWindow(app: *App) ?*Window {
+    const foreground = w32.GetForegroundWindow();
+    for (app.windows.items) |window| {
+        if (window.is_quick_terminal) continue;
+        if (window.hwnd != null and foreground != null and window.hwnd.? == foreground.?)
+            return window;
+    }
+    var i = app.windows.items.len;
+    while (i > 0) {
+        i -= 1;
+        const window = app.windows.items[i];
+        if (!window.is_quick_terminal) return window;
+    }
+    return null;
 }
 
 fn handleClose(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
