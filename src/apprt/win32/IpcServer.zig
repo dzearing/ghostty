@@ -16,6 +16,8 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 
 const App = @import("App.zig");
+const Surface = @import("Surface.zig");
+const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
 const w32 = @import("win32.zig");
 const apprt = @import("../../apprt.zig");
 const internal_os = @import("../../os/main.zig");
@@ -390,10 +392,125 @@ fn handleNewWindow(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
 }
 
 fn handleList(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
-    // Registry + Mac-format tree rendering is T05; an empty tree is the
-    // valid minimal response until then.
     _ = request;
-    return try self.alloc.dupe(u8, "{\"success\":true,\"data\":{\"windows\":[]}}");
+    const app = self.app;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const foreground = w32.GetForegroundWindow();
+
+    var window_list: std.ArrayList(apprt.ipc.List.Window) = .empty;
+    for (app.windows.items) |window| {
+        // Quick terminals are not listable/addressable targets.
+        if (window.is_quick_terminal) continue;
+        const hwnd = window.hwnd orelse continue;
+
+        var tabs: std.ArrayList(apprt.ipc.List.Tab) = .empty;
+        for (0..window.tab_count) |i| {
+            const tab_title = try utf16ToUtf8Arena(
+                arena,
+                window.tab_titles[i][0..window.tab_title_lens[i]],
+            );
+            const node = try self.buildNode(
+                arena,
+                &window.tab_trees[i],
+                .root,
+                window.tab_active_surface[i],
+            );
+            try tabs.append(arena, .{
+                .id = try std.fmt.allocPrint(arena, "{d}", .{i}),
+                .title = tab_title,
+                .index = @intCast(i),
+                .selected = i == window.active_tab,
+                .splits = node,
+            });
+        }
+
+        var title_buf: [512]u16 = undefined;
+        const title_len = w32.GetWindowTextW(hwnd, &title_buf, title_buf.len);
+        const win_title = try utf16ToUtf8Arena(
+            arena,
+            title_buf[0..@intCast(@max(title_len, 0))],
+        );
+
+        try window_list.append(arena, .{
+            .id = try std.fmt.allocPrint(arena, "{d}", .{@intFromPtr(hwnd)}),
+            .title = win_title,
+            .target = app.ipcNameOf(.{ .window = window }),
+            .focused = foreground != null and foreground.? == hwnd,
+            .tabs = tabs.items,
+        });
+    }
+
+    const json = (apprt.ipc.List{ .windows = window_list.items }).serializeResponse(arena) catch
+        return error.OutOfMemory;
+    return try self.alloc.dupe(u8, json);
+}
+
+/// Recursively build the split-node model for one tree node. Every leaf is
+/// auto-registered under its fallback name (the surface id), matching the
+/// Mac server.
+fn buildNode(
+    self: *IpcServer,
+    arena: Allocator,
+    tree: *const SplitTree,
+    handle: SplitTree.Node.Handle,
+    active_surface: *Surface,
+) Allocator.Error!*const apprt.ipc.List.Node {
+    const node = try arena.create(apprt.ipc.List.Node);
+
+    // An empty tree renders as the Mac server's placeholder leaf.
+    if (tree.isEmpty()) {
+        node.* = .{ .leaf = apprt.ipc.List.empty_terminal };
+        return node;
+    }
+
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |surface| {
+            const id = try std.fmt.allocPrint(arena, "{d}", .{surface.core_surface.id});
+            const name = self.app.ipcNameOf(.{ .pane = surface }) orelse name: {
+                self.app.ipcRegister(id, .{ .pane = surface }) catch {};
+                break :name id;
+            };
+            const pwd: []const u8 = pwd: {
+                const copy = surface.core_surface.pwd(arena) catch break :pwd "";
+                break :pwd copy orelse "";
+            };
+            node.* = .{ .leaf = .{
+                .id = id,
+                .title = surface.getTitle() orelse "",
+                .working_directory = pwd,
+                // Foreground pid / tty name are not surfaced by the ConPTY
+                // backend yet; the Mac fills these from the surface model.
+                .pid = 0,
+                .tty = "",
+                .name = name,
+                .focused = surface == active_surface,
+                .exit_code = null,
+            } };
+        },
+        .split => |split| {
+            node.* = .{ .split = .{
+                .direction = switch (split.layout) {
+                    .horizontal => "horizontal",
+                    .vertical => "vertical",
+                },
+                .ratio = @floatCast(split.ratio),
+                .left = try self.buildNode(arena, tree, split.left, active_surface),
+                .right = try self.buildNode(arena, tree, split.right, active_surface),
+            } };
+        },
+    }
+    return node;
+}
+
+fn utf16ToUtf8Arena(arena: Allocator, utf16: []const u16) Allocator.Error![]const u8 {
+    return std.unicode.utf16LeToUtf8Alloc(arena, utf16) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => "",
+    };
 }
 
 fn errorResponse(

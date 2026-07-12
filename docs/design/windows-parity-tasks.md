@@ -119,8 +119,8 @@ still authoritative for staging/ZIP layout and merge rules.
 | T01 | Verify fresh ZIP keybinds on box | A | — | todo | — | — |
 | T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | todo | — | — |
 | T03 | Named-pipe client helper + CLI un-guard | B | — | done | 353d70abf, 4f52e8877, 64f5b6984 | box round-trip 2026-07-12: fake server logged `{"action":"list"}` (17 B framed), CLI printed `No windows open.` exit 0; native win32 Debug build green; native `zig build test -Dapp-runtime=none` green (after 2 fork compile fixes, see log) |
-| T04 | Pipe server in win32 App + marshal + DACL | B | T03 | done | (this commit) | on-box 2026-07-12: `+list` answered by in-app server (`No windows open.`, exit 0); 2nd GUI launch forwarded new-window (master windows 1→2, second exited 0); pipe DACL = single ACE `MAXIMUSHOME\David` FullControl; clean app exit after IPC use (no join deadlock) |
-| T05 | `+list` | B | T04 | todo | — | — |
+| T04 | Pipe server in win32 App + marshal + DACL | B | T03 | done | 1a44125de | on-box 2026-07-12: `+list` answered by in-app server (`No windows open.`, exit 0); 2nd GUI launch forwarded new-window (master windows 1→2, second exited 0); pipe DACL = single ACE `MAXIMUSHOME\David` FullControl; clean app exit after IPC use (no join deadlock) |
+| T05 | `+list` | B | T04 | done | (this commit) | golden shape tests in apprt/ipc.zig green; on-box 2026-07-12: 2-tab + h-split layout (built via ctrl+t/ctrl+d SendInput) rendered correctly in human + `--json` forms — `[target: window-1]`, per-pane `[name: <id>]`, focus/selected markers, pwd populated |
 | T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | todo | — | — |
 | T07 | `+close` | B | T06 | todo | — | — |
 | T08 | P1 acceptance script `test/win32/ipc-p1.ps1` green | B | T05,T06,T07 | todo | — | — |
@@ -483,6 +483,22 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, later still) — T05 done — `+list` is real: shared
+  list-JSON data model + serializer in `src/apprt/ipc.zig` (golden tests pin
+  the Mac wire shape — keep in sync with IPCMessage.swift), win32 registry
+  (`App.ipc_targets`: StringHashMap of window/pane unions, eager ipcForget
+  from Window/Surface deinit + prune-on-register so stale pointers are
+  unreachable), auto window names `window-N` (Mac parity), pane fallback
+  names = core surface id (Mac uses uuid), per-pane title storage on win32
+  Surface (fixes the getTitle TODO; leaf titles now real). Known gaps left
+  in the leaf data, all cosmetic for the skill: pid=0, tty="",
+  exit_code=null (ConPTY backend doesn't surface them yet) — carried as
+  notes, not tasks. Validation: keybind-driven 2-tab + split layout listed
+  correctly (human + json); SendKeys only after VERIFYING foreground window
+  (first attempt silently missed focus — don't trust AppActivate).
+  PowerShell tool note: interleaved native stdout can swallow lines — pipe
+  CLI output to files via `cmd /c ... >` when asserting. Next: T06
+  (+new-window flags + auto-launch).
 - 2026-07-12 (on-box, later) — T04 done — New `src/apprt/win32/IpcServer.zig`:
   named-pipe listener thread (single instance, byte mode,
   PIPE_REJECT_REMOTE_CLIENTS), owner-only DACL via SDDL

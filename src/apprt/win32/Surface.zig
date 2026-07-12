@@ -99,6 +99,10 @@ scrollbar: ?*Scrollbar = null,
 /// WM_SETCURSOR, so we must override it ourselves).
 current_cursor: ?w32.HCURSOR = null,
 
+/// The last title set via setTitle (owned copy), so getTitle and the IPC
+/// `+list` tree can report a per-pane title. Null until the first set.
+title: ?[:0]u8 = null,
+
 /// When false, WM_SETCURSOR sets the cursor to null (invisible). The
 /// core surface toggles this for typing-while-mouse-still etc.
 mouse_visible: bool = true,
@@ -314,6 +318,15 @@ pub fn init(
 pub fn deinit(self: *Surface) void {
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
 
+    // Drop IPC names pointing at this pane before the memory can be
+    // recycled.
+    self.app.ipcForget(.{ .pane = self });
+
+    if (self.title) |t| {
+        self.app.core_app.alloc.free(t);
+        self.title = null;
+    }
+
     if (self.core_surface_initialized) {
         log.debug("surface deinit: core_surface.deinit start", .{});
         self.core_surface.deinit();
@@ -491,9 +504,7 @@ pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
 }
 
 pub fn getTitle(self: *const Surface) ?[:0]const u8 {
-    _ = self;
-    // TODO: Store and return the title set via setTitle.
-    return null;
+    return self.title;
 }
 
 /// Notify the core whether this surface is currently visible. When a surface
@@ -747,6 +758,11 @@ pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
 
 /// Set the window title. Called from performAction(.set_title).
 pub fn setTitle(self: *Surface, title: [:0]const u8) void {
+    const alloc = self.app.core_app.alloc;
+    if (alloc.dupeZ(u8, title)) |copy| {
+        if (self.title) |old| alloc.free(old);
+        self.title = copy;
+    } else |_| {}
     self.parent_window.onTabTitleChanged(self, title);
 }
 

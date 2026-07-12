@@ -357,10 +357,28 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // surface which triggers ShowWindow on the parent as needed.
     // Showing the parent before the terminal is ready can cause
     // timing issues with ConPTY.
+
+    // Every regular window is IPC-addressable under an auto-generated name
+    // (`window-N`, matching the Mac); `+new-window --target` re-registers
+    // the user's name. Quick terminals are not listable targets.
+    if (!options.is_quick_terminal) {
+        if (app.ipcNextWindowName()) |name| {
+            defer app.core_app.alloc.free(name);
+            app.ipcRegister(name, .{ .window = self }) catch |err| {
+                log.warn("IPC window registration failed err={}", .{err});
+            };
+        } else |err| {
+            log.warn("IPC window registration failed err={}", .{err});
+        }
+    }
 }
 
 /// Deinitialize the Window: close all tabs, delete font, destroy HWND.
 pub fn deinit(self: *Window) void {
+    // Drop IPC names pointing at this window before the memory can be
+    // recycled.
+    self.app.ipcForget(.{ .window = self });
+
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
 

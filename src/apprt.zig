@@ -58,4 +58,5 @@ test {
     _ = runtime;
     _ = action;
     _ = structs;
+    _ = ipc;
 }
