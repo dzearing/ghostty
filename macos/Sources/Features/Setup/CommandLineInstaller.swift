@@ -7,7 +7,7 @@ import OSLog
 /// updates.
 enum CommandLineInstaller {
     private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier!,
+        subsystem: Bundle.loggerSubsystem,
         category: "CommandLineInstaller"
     )
 

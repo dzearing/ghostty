@@ -6,7 +6,7 @@ import SwiftUI
 
 class IPCServer {
     private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier!,
+        subsystem: Bundle.loggerSubsystem,
         category: String(describing: IPCServer.self)
     )
 
