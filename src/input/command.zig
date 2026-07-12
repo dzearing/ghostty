@@ -450,6 +450,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Prompt for a new title for the current tab.",
         }},
 
+        .prompt_surface_banner => comptime &.{.{
+            .action = .prompt_surface_banner,
+            .title = "Set Pane Banner…",
+            .description = "Prompt for a sticky banner shown above the current terminal.",
+        }},
+
         .new_split => comptime &.{
             .{
                 .action = .{ .new_split = .left },

@@ -683,6 +683,10 @@ extension Ghostty {
                 return copyTitleToClipboard(app, target: target)
             case GHOSTTY_ACTION_ACTIVITY_STATE:
                 activityState(app, target: target, v: action.action.activity_state)
+            case GHOSTTY_ACTION_PANE_BANNER:
+                paneBanner(app, target: target, v: action.action.pane_banner)
+            case GHOSTTY_ACTION_PROMPT_BANNER:
+                return promptBanner(app, target: target)
             default:
                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue)")
                 return false
@@ -2129,6 +2133,46 @@ extension Ghostty {
                 }
 
             default: return
+            }
+        }
+
+        private static func paneBanner(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_pane_banner_s
+        ) {
+            switch target.tag {
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                let text = String(cString: v.text)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                DispatchQueue.main.async {
+                    surfaceView.paneBanner = text.isEmpty ? nil : text
+                }
+
+            default: return
+            }
+        }
+
+        private static func promptBanner(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s
+        ) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("prompt banner does nothing with an app target")
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                surfaceView.promptBanner()
+                return true
+
+            default:
+                assertionFailure()
+                return false
             }
         }
 

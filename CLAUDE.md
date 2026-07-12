@@ -97,6 +97,27 @@ ghoztty +set-state --target=dev --state=idle
 
 Processes can also set state via OSC escape sequence: `\033]7777;<state>\007`
 
+### `ghoztty +set-banner`
+
+Set or clear the sticky banner of a named pane or window. The banner is a native overlay rendered above the terminal content of a pane — it persists (survives scrolling, screen clears, and content updates) until changed or cleared. Setting a banner on a window target applies it to that window's focused pane (banners are per-pane).
+
+```
+ghoztty +set-banner --target=<name> [--clear] [text...]
+```
+
+- `--target`: Named pane or window. Required.
+- `--clear`: Remove the banner (empty text does the same).
+- All other arguments are treated as the banner text (multiple are joined with spaces).
+
+Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic_`, `__underline__`, `` `code` ``, and `[text](url)` clickable links (URL must include a scheme, e.g. `https://`). Note `__underline__` intentionally differs from CommonMark (where `__` is bold). `\` escapes the next character. Unterminated delimiters render literally. A literal `\n` in CLI banner text becomes a line break — banners can span multiple lines (display is capped at 6 lines).
+
+```bash
+ghoztty +set-banner --target=dev "**PR #123** — _3 files_, +120/−45 — [view](https://github.com/org/repo/pull/123)"
+ghoztty +set-banner --target=dev --clear
+```
+
+Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels).
+
 ### `ghoztty +new-remote-window`
 
 Open a terminal window whose shell runs on a remote machine via a `ghoztty-agent`

@@ -1286,6 +1286,22 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .pane_banner => |w| {
+            defer w.deinit();
+
+            // We always allocate for this because we need to null-terminate.
+            const str = try self.alloc.dupeZ(u8, w.slice());
+            defer self.alloc.free(str);
+
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .pane_banner,
+                .{ .text = str },
+            ) catch |err| {
+                log.warn("apprt failed to set pane banner err={}", .{err});
+            };
+        },
+
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();
@@ -5545,6 +5561,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .{ .surface = self },
             .prompt_title,
             .tab,
+        ),
+
+        .prompt_surface_banner => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_banner,
+            {},
         ),
 
         .set_surface_title => |v| {

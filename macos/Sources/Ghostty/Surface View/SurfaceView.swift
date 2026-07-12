@@ -112,6 +112,19 @@ extension Ghostty {
                         .allowsHitTesting(false)
                 }
 
+                // Sticky pane banner (IPC +set-banner / OSC 7778). Rendered
+                // as a native overlay pinned to the top so it survives
+                // scrolling and screen clears. Hit-testable so links are
+                // clickable.
+                if let banner = surfaceView.paneBanner {
+                    VStack(spacing: 0) {
+                        SurfacePaneBanner(text: banner)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .zIndex(1)
+                }
+
                 // Progress report
                 if let progressReport = surfaceView.progressReport, progressReport.state != .remove {
                     VStack(spacing: 0) {

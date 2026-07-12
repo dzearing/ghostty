@@ -7007,6 +7007,14 @@ pub const Keybinds = struct {
                 .{ .select_all = {} },
             );
 
+            // Set/edit the pane banner (prompt). Mac-only: plain ctrl+r
+            // would clobber the shell's reverse history search elsewhere.
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'r' }, .mods = .{ .super = true } },
+                .{ .prompt_surface_banner = {} },
+            );
+
             // Undo/redo
             try self.set.putFlags(
                 alloc,

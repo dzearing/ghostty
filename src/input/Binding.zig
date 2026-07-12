@@ -602,6 +602,12 @@ pub const Action = union(enum) {
     /// and persists across focus changes within the tab.
     prompt_tab_title,
 
+    /// Set or edit the sticky banner of the current focused surface via
+    /// a pop-up prompt. The banner is rendered above the terminal content
+    /// and supports a small markdown subset (bold, italic, underline,
+    /// links). Leave the prompt empty to clear the banner.
+    prompt_surface_banner,
+
     /// Set the title for the current focused surface.
     ///
     /// If the title is empty, the surface title is reset to an empty title.
@@ -1381,6 +1387,7 @@ pub const Action = union(enum) {
             .set_font_size,
             .prompt_surface_title,
             .prompt_tab_title,
+            .prompt_surface_banner,
             .set_surface_title,
             .set_tab_title,
             .clear_screen,

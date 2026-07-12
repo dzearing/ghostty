@@ -711,6 +711,11 @@ typedef enum {
   GHOSTTY_PROMPT_TITLE_TAB,
 } ghostty_action_prompt_title_e;
 
+// apprt.action.PaneBanner.C
+typedef struct {
+  const char* text;
+} ghostty_action_pane_banner_s;
+
 // apprt.action.Pwd.C
 typedef struct {
   const char* pwd;
@@ -995,6 +1000,8 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_ACTIVITY_STATE,
+  GHOSTTY_ACTION_PANE_BANNER,
+  GHOSTTY_ACTION_PROMPT_BANNER,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1038,6 +1045,7 @@ typedef union {
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
   ghostty_activity_state_e activity_state;
+  ghostty_action_pane_banner_s pane_banner;
 } ghostty_action_u;
 
 typedef struct {
@@ -1131,6 +1139,12 @@ typedef struct {
   const char **arguments;
 } ghostty_ipc_action_set_state_s;
 
+typedef struct {
+  // null terminated list of arguments, it will be null itself if there are
+  // no arguments
+  const char** arguments;
+} ghostty_ipc_action_set_banner_s;
+
 typedef union {
   ghostty_ipc_action_new_window_s new_window;
   ghostty_ipc_action_split_s split;
@@ -1139,6 +1153,7 @@ typedef union {
   ghostty_ipc_action_rearrange_s rearrange;
   ghostty_ipc_action_send_keys_s send_keys;
   ghostty_ipc_action_set_state_s set_state;
+  ghostty_ipc_action_set_banner_s set_banner;
 } ghostty_ipc_action_u;
 
 // apprt.ipc.Action.Key
@@ -1150,6 +1165,7 @@ typedef enum {
   GHOSTTY_IPC_ACTION_REARRANGE,
   GHOSTTY_IPC_ACTION_SEND_KEYS,
   GHOSTTY_IPC_ACTION_SET_STATE,
+  GHOSTTY_IPC_ACTION_SET_BANNER,
 } ghostty_ipc_action_tag_e;
 
 //-------------------------------------------------------------------

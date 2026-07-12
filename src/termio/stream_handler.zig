@@ -345,6 +345,7 @@ pub const StreamHandler = struct {
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
             .activity_state => self.activityState(value),
+            .pane_banner => self.paneBanner(value.text),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
@@ -1573,5 +1574,14 @@ pub const StreamHandler = struct {
 
     fn activityState(self: *StreamHandler, state: terminal.osc.Command.ActivityState) void {
         self.surfaceMessageWriter(.{ .activity_state = state });
+    }
+
+    /// Set (or clear, when empty) the sticky pane banner.
+    fn paneBanner(self: *StreamHandler, text: []const u8) void {
+        if (apprt.surface.Message.WriteReq.init(self.alloc, text)) |req| {
+            self.surfaceMessageWriter(.{ .pane_banner = req });
+        } else |err| {
+            log.warn("error notifying surface of pane banner err={}", .{err});
+        }
     }
 };

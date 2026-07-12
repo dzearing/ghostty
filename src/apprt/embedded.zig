@@ -352,6 +352,7 @@ pub const App = struct {
             .rearrange => "rearrange",
             .send_keys => "send-keys",
             .set_state => "set-state",
+            .set_banner => "set-banner",
         };
 
         return sendIpc(alloc, action_name, value.arguments);

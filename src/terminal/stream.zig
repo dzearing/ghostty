@@ -126,6 +126,7 @@ pub const Action = union(Key) {
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
     activity_state: osc.Command.ActivityState,
+    pane_banner: PaneBanner,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -224,6 +225,7 @@ pub const Action = union(Key) {
             "color_operation",
             "semantic_prompt",
             "activity_state",
+            "pane_banner",
         },
     );
 
@@ -320,6 +322,16 @@ pub const Action = union(Key) {
 
         pub fn cval(self: WindowTitle) WindowTitle.C {
             return .init(self.title);
+        }
+    };
+
+    pub const PaneBanner = struct {
+        text: []const u8,
+
+        pub const C = lib.String;
+
+        pub fn cval(self: PaneBanner) PaneBanner.C {
+            return .init(self.text);
         }
     };
 
@@ -2051,6 +2063,10 @@ pub fn Stream(comptime H: type) type {
 
                 .activity_state => |v| {
                     self.handler.vt(.activity_state, v);
+                },
+
+                .pane_banner => |v| {
+                    self.handler.vt(.pane_banner, .{ .text = v });
                 },
 
                 .conemu_sleep,
