@@ -319,6 +319,8 @@ class IPCServer {
             return handleSendKeys(request)
         case "set-state":
             return handleSetState(request)
+        case "set-banner":
+            return handleSetBanner(request)
         case "new-remote-window":
             return handleNewRemoteWindow(request)
         default:
@@ -844,6 +846,65 @@ class IPCServer {
         }
 
         Self.logger.info("IPC: set activity state for '\(target)' to '\(stateStr)'")
+
+        return .ok
+    }
+
+    /// Set or clear the sticky banner of a named pane or window. Banner text
+    /// is any non-flag argument (multiple are joined with spaces); `--clear`
+    /// or an empty text removes the banner. For a window target the banner
+    /// applies to its focused pane (banners are per-pane).
+    private func handleSetBanner(_ request: IPCRequest) -> IPCResponse {
+        var target: String?
+        var clear = false
+        var textParts: [String] = []
+
+        for arg in request.arguments ?? [] {
+            if let value = arg.dropPrefix("--target=") {
+                target = String(value)
+            } else if arg == "--clear" {
+                clear = true
+            } else {
+                textParts.append(arg)
+            }
+        }
+
+        guard let target else {
+            return IPCResponse(success: false, error: "--target is required for +set-banner")
+        }
+
+        // A literal `\n` in the text becomes a line break so multi-line
+        // banners can be set from a single shell argument. Trim so a stray
+        // trailing newline doesn't render as a blank line.
+        let text = textParts.joined(separator: " ")
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { clear = true }
+
+        pruneStaleTargets()
+
+        guard let entry = targetRegistry[target] else {
+            return IPCResponse(success: false, error: "target '\(target)' not found in registry")
+        }
+
+        var setError: String?
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            defer { semaphore.signal() }
+
+            guard let surface = entry.surfaceView else {
+                setError = "target '\(target)' is no longer alive"
+                return
+            }
+            surface.paneBanner = clear ? nil : text
+        }
+        semaphore.wait()
+
+        if let setError {
+            return IPCResponse(success: false, error: setError)
+        }
+
+        Self.logger.info("IPC: \(clear ? "cleared" : "set") banner for '\(target)'")
 
         return .ok
     }

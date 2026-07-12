@@ -562,8 +562,10 @@ extension Ghostty {
             alert.informativeText = "Leave blank to restore the default."
             alert.alertStyle = .informational
 
-            // Add a text field to the alert
-            let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
+            // Add a text field to the alert. PromptTextField handles ⌘V
+            // etc. itself because our Edit menu has no key equivalents
+            // for copy/paste (see PromptTextControls.swift).
+            let textField = PromptTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
             textField.stringValue = title
             alert.accessoryView = textField
 
@@ -603,6 +605,43 @@ extension Ghostty {
                 // On macOS 26 RC, this codepath results in the "OK" button not being
                 // visible. The above codepath should be taken most times but I'm just
                 // noting this as something I noticed consistently.
+                completionHandler(alert.runModal())
+            }
+        }
+
+        /// Set or clear the sticky pane banner by prompting the user.
+        func promptBanner() {
+            let alert = NSAlert()
+            alert.messageText = "Set Pane Banner"
+            alert.informativeText = "Supports **bold**, *italic*, __underline__, `code`, " +
+                "and [text](url) links. Return inserts a new line; press ⌘Return to save. " +
+                "Leave empty to remove the banner."
+            alert.alertStyle = .informational
+
+            let (scroll, textView) = PromptTextView.scrollablePrompt(width: 360, height: 72)
+            textView.string = paneBanner ?? ""
+            alert.accessoryView = scroll
+
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Cancel")
+
+            // Return must insert a newline in the editor, so move the OK
+            // button's key equivalent to ⌘Return. (Escape still cancels.)
+            alert.buttons[0].keyEquivalent = "\r"
+            alert.buttons[0].keyEquivalentModifierMask = [.command]
+
+            alert.window.initialFirstResponder = textView
+
+            let completionHandler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+                guard let self else { return }
+                guard response == .alertFirstButtonReturn else { return }
+                let text = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.paneBanner = text.isEmpty ? nil : text
+            }
+
+            if let window {
+                alert.beginSheetModal(for: window, completionHandler: completionHandler)
+            } else {
                 completionHandler(alert.runModal())
             }
         }
