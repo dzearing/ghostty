@@ -128,10 +128,10 @@ still authoritative for staging/ZIP layout and merge rules.
 | T10 | `+rename` / titleOverride precedence | C | T08 | done | (this commit) | on-box 2026-07-12: rename sets window title; shell `title` changes update the TAB label but the window title keeps the override; missing target errors |
 | T11 | `+send-keys` full notation | C | T08 | done | (this commit) | on-box 2026-07-12: `"title X" Enter` executed (observable via +list tab title), `\n` escape executes after LF→CR ConPTY normalization, C-c accepted, window-target routes to active pane, missing target errors |
 | T12 | P2 acceptance script green | C | T09,T10,T11 | done | (this commit) | on-box 2026-07-12: `test/win32/ipc-p2.ps1` ALL PASS (21 assertions) from fresh start |
-| T13 | `+read` | D | T08 | todo | — | — |
-| T14 | `+set-state` + OSC 7777 + title suffix | D | T08 | todo | — | — |
-| T15 | `+rearrange` | D | T09 | todo | — | — |
-| T16 | P3 acceptance script green | D | T13,T14,T15 | todo | — | — |
+| T13 | `+read` | D | T08 | done | 1aac69e91 | on-box 2026-07-12: echoed marker read back byte-accurate (--lines=5 + default 50); window target reads active pane; missing pane errors |
+| T14 | `+set-state` + OSC 7777 + title suffix | D | T08 | done | fee87d441 | on-box 2026-07-12: all 3 states via CLI, aggregation needs_input>busy>idle across 2 panes, suffix set/cleared; OSC 7777 busy/idle round-trip from inside the pane (pwsh `[console]::Write`); invalid state errors |
+| T15 | `+rearrange` | D | T09 | done | (this commit) | on-box 2026-07-12: 4-pane tab rearranged to horizontal(pa\|vertical(pb,pc)) ratio 0.3 — unnamed pane closed, tree+human list agree; duplicate/unknown-pane/bad-JSON error paths — ALL PASS (15) |
+| T16 | P3 acceptance script green | D | T13,T14,T15 | done | (this commit) | on-box 2026-07-12: `test/win32/ipc-p3.ps1` ALL PASS (17 assertions — read byte-accurate, state aggregation + suffix, OSC 7777 round-trip, rearrange + error paths) from fresh start |
 | T17 | Skill conformance on the box | E | T12,T16 | todo | — | — |
 | T18 | `swap_split` on win32 | F | — | todo | — | — |
 | T19 | Hero mode on win32 | F | T18 | todo | — | — |
@@ -483,6 +483,21 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night) — T13–T15 done — `+read`: dumpTextLocked
+  under the renderer mutex with a full-SCREEN selection
+  (pages.getTopLeft/BottomRight(.screen)), trailing N lines in data.text;
+  byte-accurate on the box. `+set-state`/OSC 7777: per-pane activity_state
+  on win32 Surface, window aggregation → " (busy)"/" (needs_input)" title
+  suffix; the activity_state action arm replaces the stub so the OSC path
+  (validated with a pwsh `[console]::Write(ESC ]7777;busy BEL)` from inside
+  the pane) and the verb share one code path. `+rearrange`: builds a
+  replacement SplitTree directly (preorder nodes array, root=0, own arena),
+  refs kept surfaces before dropping the old tree (unref destroys panes not
+  in the layout), ratio arrives as percent clamped 0.1–0.9, Mac error
+  strings. PowerShell gotchas recorded: PS 5.1 reads .ps1 as ANSI — keep
+  test scripts pure ASCII (an em-dash broke parsing); PS native-arg passing
+  eats embedded quotes — escape as `\"` when passing JSON (`--layout`).
+  T16 ipc-p3.ps1: ALL PASS (17) — Phase D (P3) complete. Next: T17 (skill conformance).
 - 2026-07-12 (on-box, night) — T09–T12 done, Phase C (P2) complete —
   `+split`: Window.newSplitAt (arbitrary surface, explicit ratio,
   background-tab panes stay hidden), --pane/--target/foreground-default

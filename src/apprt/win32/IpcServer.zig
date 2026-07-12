@@ -374,12 +374,14 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
         return try self.handleRead(request);
     } else if (std.mem.eql(u8, request.action, "set-state")) {
         return try self.handleSetState(request);
+    } else if (std.mem.eql(u8, request.action, "rearrange")) {
+        return try self.handleRearrange(request);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
     // (each is its own task in the parity tracker).
     const known = [_][]const u8{
-        "rearrange", "new-remote-window",
+        "new-remote-window",
     };
     for (known) |k| {
         if (std.mem.eql(u8, request.action, k)) {
@@ -407,6 +409,7 @@ const VerbArgs = struct {
     pane: ?[]const u8 = null,
     percent: ?i64 = null,
     lines: ?i64 = null,
+    layout: ?[]const u8 = null,
     no_activate: bool = false,
     env: []const Surface.Overrides.EnvVar = &.{},
     /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
@@ -457,6 +460,8 @@ fn parseVerbArgs(
             result.pane = v;
         } else if (dropPrefix(arg, "--lines=")) |v| {
             result.lines = std.fmt.parseInt(i64, v, 10) catch null;
+        } else if (dropPrefix(arg, "--layout=")) |v| {
+            result.layout = v;
         } else if (dropPrefix(arg, "--percent=")) |v| {
             result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
         } else if (dropPrefix(arg, "--split-percent=")) |v| {
@@ -812,6 +817,201 @@ fn handleRead(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
         return try out.toOwnedSlice();
     }
     return error.OutOfMemory;
+}
+
+fn handleRearrange(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
+    const app = self.app;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+    const layout_json = args.layout orelse
+        return try self.errorResponse("--layout is required for +rearrange", .{});
+
+    const layout = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        layout_json,
+        .{},
+    ) catch return try self.errorResponse("invalid layout JSON", .{});
+
+    // Validate shape + collect pane names (Mac collectPaneNames semantics).
+    var names: std.ArrayList([]const u8) = .empty;
+    if (try self.validateLayout(arena, layout, &names)) |err_response| return err_response;
+    if (names.items.len == 0)
+        return try self.errorResponse("layout must contain at least one pane", .{});
+    for (names.items, 0..) |a, i| {
+        for (names.items[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a, b))
+                return try self.errorResponse("duplicate pane name in layout: '{s}'", .{a});
+        }
+    }
+
+    // Resolve the window, then every pane against its ACTIVE tab's tree.
+    const window: *Window = if (args.target) |target| window: {
+        const entry = app.ipcLookup(target) orelse
+            return try self.errorResponse("target window '{s}' not found", .{target});
+        break :window switch (entry) {
+            .window => |w| w,
+            .pane => |surface| surface.parent_window,
+        };
+    } else frontWindow(app) orelse
+        return try self.errorResponse("no focused window found", .{});
+    if (window.tab_count == 0)
+        return try self.errorResponse("no focused window found", .{});
+    const tab = window.active_tab;
+    const tree = &window.tab_trees[tab];
+
+    var surfaces: std.StringHashMapUnmanaged(*Surface) = .empty;
+    for (names.items) |name| {
+        const entry = app.ipcLookup(name) orelse
+            return try self.errorResponse("pane '{s}' not found in registry", .{name});
+        const surface = switch (entry) {
+            .pane => |s| s,
+            .window => return try self.errorResponse("pane '{s}' not found in registry", .{name}),
+        };
+        const in_tree = in_tree: {
+            var it = tree.iterator();
+            while (it.next()) |view_entry| {
+                if (view_entry.view == surface) break :in_tree true;
+            }
+            break :in_tree false;
+        };
+        if (!in_tree)
+            return try self.errorResponse("pane '{s}' is not in the target window", .{name});
+        try surfaces.put(arena, name, surface);
+    }
+
+    // Build the replacement tree in its own arena (SplitTree owns it).
+    const gpa = self.alloc;
+    var tree_arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer tree_arena.deinit();
+    var nodes: std.ArrayList(SplitTree.Node) = .empty;
+    _ = try buildLayoutNode(tree_arena.allocator(), &nodes, layout, &surfaces);
+    const final_nodes = try tree_arena.allocator().dupe(SplitTree.Node, nodes.items);
+
+    // Allocate the success response up front: past this point the swap
+    // must not hit a fallible path while errdefer would free the arena the
+    // new tree now owns.
+    const response = try self.alloc.dupe(u8, "{\"success\":true}");
+
+    // Take ownership references on the kept surfaces BEFORE dropping the
+    // old tree, so they can't hit refcount 0 during the swap.
+    var kept_it = surfaces.valueIterator();
+    while (kept_it.next()) |surface_ptr| {
+        _ = surface_ptr.*.ref(gpa) catch {};
+    }
+
+    // Swap trees. Old-tree deinit unrefs every old view: panes not in the
+    // new layout reach refcount 0 and are destroyed (their registry names
+    // drop via ipcForget in Surface.deinit).
+    const current_focus = window.tab_active_surface[tab];
+    var old_tree = window.tab_trees[tab];
+    window.tab_trees[tab] = .{
+        .arena = tree_arena,
+        .nodes = final_nodes,
+        .zoomed = null,
+    };
+    old_tree.deinit();
+
+    // Focus: keep the focused surface if it survived, else the first leaf.
+    const focus: *Surface = focus: {
+        var it = window.tab_trees[tab].iterator();
+        var first: ?*Surface = null;
+        while (it.next()) |view_entry| {
+            if (first == null) first = view_entry.view;
+            if (view_entry.view == current_focus) break :focus current_focus;
+        }
+        break :focus first.?; // validated non-empty layout above
+    };
+    window.tab_active_surface[tab] = focus;
+    window.layoutSplits();
+    if (focus.hwnd) |h| _ = w32.SetFocus(h);
+    window.updateWindowTitle();
+
+    return response;
+}
+
+/// Validate one layout node (shape, direction) and collect its pane names.
+/// Returns an error response to send, or null if valid.
+fn validateLayout(
+    self: *IpcServer,
+    arena: Allocator,
+    node: std.json.Value,
+    names: *std.ArrayList([]const u8),
+) Allocator.Error!?[]u8 {
+    if (node != .object)
+        return try self.errorResponse("layout node must have either 'pane' or 'direction'", .{});
+    const obj = node.object;
+
+    if (obj.get("pane")) |pane| {
+        if (pane != .string)
+            return try self.errorResponse("layout node must have either 'pane' or 'direction'", .{});
+        try names.append(arena, pane.string);
+        return null;
+    }
+
+    const direction = obj.get("direction") orelse
+        return try self.errorResponse("layout node must have either 'pane' or 'direction'", .{});
+    if (direction != .string or
+        (!std.ascii.eqlIgnoreCase(direction.string, "horizontal") and
+            !std.ascii.eqlIgnoreCase(direction.string, "vertical")))
+    {
+        return try self.errorResponse(
+            "invalid direction '{s}' (expected 'horizontal' or 'vertical')",
+            .{if (direction == .string) direction.string else "?"},
+        );
+    }
+    const left = obj.get("left") orelse
+        return try self.errorResponse("split node must have 'left' child", .{});
+    const right = obj.get("right") orelse
+        return try self.errorResponse("split node must have 'right' child", .{});
+
+    if (try self.validateLayout(arena, left, names)) |err| return err;
+    if (try self.validateLayout(arena, right, names)) |err| return err;
+    return null;
+}
+
+/// Append the nodes for `layout` (validated by validateLayout) preorder, so
+/// the root lands at index 0. Returns the node's handle.
+fn buildLayoutNode(
+    arena: Allocator,
+    nodes: *std.ArrayList(SplitTree.Node),
+    node: std.json.Value,
+    surfaces: *const std.StringHashMapUnmanaged(*Surface),
+) Allocator.Error!SplitTree.Node.Handle {
+    const handle: SplitTree.Node.Handle = @enumFromInt(nodes.items.len);
+    try nodes.append(arena, undefined);
+    const obj = node.object;
+
+    if (obj.get("pane")) |pane| {
+        nodes.items[handle.idx()] = .{ .leaf = surfaces.get(pane.string).? };
+        return handle;
+    }
+
+    // Ratio arrives as a percent (default 50), clamped like the Mac.
+    const ratio_percent: f64 = switch (obj.get("ratio") orelse std.json.Value{ .float = 50 }) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => 50,
+    };
+    const ratio: f16 = @floatCast(@min(0.9, @max(0.1, ratio_percent / 100.0)));
+    const layout: SplitTree.Split.Layout = if (std.ascii.eqlIgnoreCase(
+        obj.get("direction").?.string,
+        "horizontal",
+    )) .horizontal else .vertical;
+
+    const left = try buildLayoutNode(arena, nodes, obj.get("left").?, surfaces);
+    const right = try buildLayoutNode(arena, nodes, obj.get("right").?, surfaces);
+    nodes.items[handle.idx()] = .{ .split = .{
+        .layout = layout,
+        .ratio = ratio,
+        .left = left,
+        .right = right,
+    } };
+    return handle;
 }
 
 fn handleSetState(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {

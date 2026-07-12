@@ -1,4 +1,4 @@
-# P1 acceptance (spec §Phases P1 / tracker T08): +new-window, +list, +close
+# P1 acceptance (spec Phases P1 / tracker T08): +new-window, +list, +close
 # against a debug build. Non-interactive; asserts and exits nonzero on any
 # failure. Only ever touches ghoztty processes running from the repo zig-out.
 #

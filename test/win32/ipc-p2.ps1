@@ -1,4 +1,4 @@
-# P2 acceptance (spec §Phases P2 / tracker T12): +split, +rename, +send-keys
+# P2 acceptance (spec Phases P2 / tracker T12): +split, +rename, +send-keys
 # against a debug build. Non-interactive; exits nonzero on any failure.
 # Only ever touches ghoztty processes running from the repo zig-out.
 #
