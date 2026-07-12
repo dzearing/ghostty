@@ -79,7 +79,7 @@ become tasks here, not loose threads). Never delete a task — mark
 |----|------|-------|------|--------|---------|---------------------|
 | T01 | Verify fresh ZIP keybinds on box | A | — | todo | — | — |
 | T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | todo | — | — |
-| T03 | Named-pipe client helper + CLI un-guard | B | — | in-progress | — | — |
+| T03 | Named-pipe client helper + CLI un-guard | B | — | in-progress (code done; box round-trip pending) | 353d70abf, 4f52e8877, 64f5b6984 | tests+cross-compiles green; +list/+set-state/+close live vs Mac debug instance; box kit staged (share t03/) |
 | T04 | Pipe server in win32 App + marshal + DACL | B | T03 | todo | — | — |
 | T05 | `+list` | B | T04 | todo | — | — |
 | T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | todo | — | — |
@@ -106,6 +106,7 @@ become tasks here, not loose threads). Never delete a task — mark
 | T27 | PowerShell shell integration | I | — | todo | — | — |
 | T28 | Minor action no-ops cleanup | I | — | todo | — | — |
 | T29 | Mac-side: fix action fallthroughs to showChildExited | I | — | todo | — | — |
+| T30 | Mac-side: IPC dial must not modal-block the app/IPC server | I | — | todo | — | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.
@@ -342,6 +343,21 @@ unaffected (it implements these properly).
 `quit-after-last-window-closed` delay still honored. Run the Mac
 regression build.
 
+**T30 — Mac-side: IPC dial must not modal-block the app/IPC server.**
+Found live 2026-07-12: `ghoztty +new-remote-window --relay --device` against
+the release app, dial failed (box agent presumed down), and
+`AppDelegate.openRemoteWindow` popped `NSAlert runModal` ON THE MAIN THREAD
+from the IPC path (`IPCServer.handleNewRemoteWindow` waits on a semaphore →
+serial IPC queue wedged). With the screen locked nobody can dismiss → ALL
+CLI IPC to the app is dead until the user unlocks and clicks the alert.
+The handler already routes the signed-out case through the IPC response
+("no GUI alert from the IPC path") — dial-failure must do the same: when
+the dial was IPC-initiated, return the error in the IPC response and never
+`runModal`. Menu-initiated dials may keep the alert.
+*Validation:* Mac regression build; `+new-remote-window` to a dead device
+returns a CLI error promptly (no alert, no wedge); a second `+list` during
+and after the failed dial responds normally.
+
 ### Final gate
 
 **T25 — Conformance checklist.** Run spec §8 items 1–10 end-to-end on the
@@ -428,6 +444,24 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (later) — T03 code COMPLETE (353d70abf): new shared
+  `src/os/ipc_client.zig` (posix socket + Windows named pipe, framed
+  exchange, sendAction), all five client copies collapsed onto it, Windows
+  guards removed, win32 `performIpc` is a real pipe client,
+  `Action.Key.wireName()` added. Bonus fix 64f5b6984: xtversion test had
+  been red since the ghoztty rename. Validated on Mac: core tests green,
+  win32 Debug+ReleaseFast cross-compiles green, native macOS build green,
+  `+list`/`+set-state`/`+close` live against the debug instance. Box
+  round-trip NOT yet run: kit staged at share `ghoztty-windows/t03/`
+  (`ghoztty-t03-debug.exe` = Debug build → debug pipe, `ipc-fake-server.ps1`,
+  `run-t03.ps1` writes `t03-result.txt`) — run `run-t03.ps1` on the box, or
+  fold into T04/T08 validation. Attempted remote-window validation wedged
+  the RELEASE app: dial failure → modal alert on locked screen → IPC dead
+  until user dismisses (→ new task T30; user must click the alert away).
+  Note: `zig build -Dapp-runtime=none -Dtarget=x86_64-windows-gnu` was
+  already broken pre-T03 (ssh_transport posix calls, hit via main_c/lib) —
+  untouched, tracked nowhere yet; only matters if we ever ship a Windows
+  none-runtime lib.
 - 2026-07-12 — doc created + full three-way audit run (action matrix, GUI
   features, config coverage — see appendix). Audit added T26–T29 and the
   backlog section; win32 baseline is stronger than assumed (search,
