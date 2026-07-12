@@ -6945,6 +6945,22 @@ pub const Keybinds = struct {
                 .{ .new_split = .down },
             );
 
+            // Command palette (mac cmd+p muscle memory). Deliberately
+            // shadows readline previous-history — accepted trade-off,
+            // parity tracker T02. ctrl+shift+p still works too.
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'p' }, .mods = .{ .ctrl = true } },
+                .toggle_command_palette,
+            );
+
+            // Windows convention: ctrl+f4 closes the current tab.
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .f4 }, .mods = .{ .ctrl = true } },
+                .{ .close_tab = .this },
+            );
+
             // Tab cycling (mac: cmd+shift+[ / cmd+shift+])
             try self.set.putFlags(
                 alloc,

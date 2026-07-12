@@ -117,7 +117,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | ID | Task | Phase | Deps | Status | Commits | Validation evidence |
 |----|------|-------|------|--------|---------|---------------------|
 | T01 | Verify fresh ZIP keybinds on box | A | — | todo | — | — |
-| T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | todo | — | — |
+| T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | done | (this commit) | on-box 2026-07-12: ctrl+p opens palette (popup window appears, verified twice; Esc closes), ctrl+f4 closes tab (2→1 via +list), ctrl+t sanity green; core tests green. ctrl+, already worked (audit). Nuance: ctrl+p from INSIDE the palette edit doesn't toggle-close (pre-existing popup-edit bubbling behavior) |
 | T03 | Named-pipe client helper + CLI un-guard | B | — | done | 353d70abf, 4f52e8877, 64f5b6984 | box round-trip 2026-07-12: fake server logged `{"action":"list"}` (17 B framed), CLI printed `No windows open.` exit 0; native win32 Debug build green; native `zig build test -Dapp-runtime=none` green (after 2 fork compile fixes, see log) |
 | T04 | Pipe server in win32 App + marshal + DACL | B | T03 | done | 1a44125de | on-box 2026-07-12: `+list` answered by in-app server (`No windows open.`, exit 0); 2nd GUI launch forwarded new-window (master windows 1→2, second exited 0); pipe DACL = single ACE `MAXIMUSHOME\David` FullControl; clean app exit after IPC use (no join deadlock) |
 | T05 | `+list` | B | T04 | done | da9d56d0d | golden shape tests in apprt/ipc.zig green; on-box 2026-07-12: 2-tab + h-split layout (built via ctrl+t/ctrl+d SendInput) rendered correctly in human + `--json` forms — `[target: window-1]`, per-pane `[name: <id>]`, focus/selected markers, pwd populated |
@@ -483,6 +483,15 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night, +1) — T02 done — ctrl+p →
+  toggle_command_palette and ctrl+f4 → close_tab added to the Windows
+  mirror block (Config.zig). Validated with verified-focus SendKeys:
+  palette popup appears on ctrl+p, tab count 2→1 on ctrl+f4 (+list as the
+  oracle). Testing note: window-COUNT assertions are noisy — the themed
+  scrollbar overlay is a transient top-level popup that auto-hides; assert
+  deltas on the specific window, not absolute counts. T01 left for the
+  user: it verifies the STAGED RELEASE ZIP artifact, and a release exe
+  here would collide with the user's three live release instances.
 - 2026-07-12 (on-box, late night, later) — T17 done — **PHASE E / P4 COMPLETE:
   THE ORIGINAL ASK IS CLOSED.** Ran the ghoztty skill from this on-box
   Claude Code session against the debug exe (PATH prepended; zero skill
