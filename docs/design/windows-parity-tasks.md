@@ -119,7 +119,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T01 | Verify fresh ZIP keybinds on box | A | — | todo | — | — |
 | T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | todo | — | — |
 | T03 | Named-pipe client helper + CLI un-guard | B | — | done | 353d70abf, 4f52e8877, 64f5b6984 | box round-trip 2026-07-12: fake server logged `{"action":"list"}` (17 B framed), CLI printed `No windows open.` exit 0; native win32 Debug build green; native `zig build test -Dapp-runtime=none` green (after 2 fork compile fixes, see log) |
-| T04 | Pipe server in win32 App + marshal + DACL | B | T03 | in-progress | — | — |
+| T04 | Pipe server in win32 App + marshal + DACL | B | T03 | done | (this commit) | on-box 2026-07-12: `+list` answered by in-app server (`No windows open.`, exit 0); 2nd GUI launch forwarded new-window (master windows 1→2, second exited 0); pipe DACL = single ACE `MAXIMUSHOME\David` FullControl; clean app exit after IPC use (no join deadlock) |
 | T05 | `+list` | B | T04 | todo | — | — |
 | T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | todo | — | — |
 | T07 | `+close` | B | T06 | todo | — | — |
@@ -483,6 +483,22 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, later) — T04 done — New `src/apprt/win32/IpcServer.zig`:
+  named-pipe listener thread (single instance, byte mode,
+  PIPE_REJECT_REMOTE_CLIENTS), owner-only DACL via SDDL
+  `D:P(A;;GA;;;<user-sid>)`, requests marshaled to the GUI thread via
+  message-only window (`WM_APP_IPC` + ResetEvent), framing/error strings
+  byte-match the Mac server. FILE_FLAG_FIRST_PIPE_INSTANCE doubles as the
+  single-instance lock: second GUI launch gets AlreadyRunning → forwards
+  `new-window` as a client → exits. Shutdown drains in-flight WM_APP_IPC
+  from deinit (GUI no longer pumping) before joining the listener — verified
+  no deadlock via clean exit after IPC use. Dispatch implements `new-window`
+  (plain, flags land with T06) and `list` (empty tree, real rendering is
+  T05); other verbs answer `unimplemented action on Windows: <verb>`.
+  Found while testing: the box had 3 windowless RELEASE ghoztty leftovers
+  running (quit-after-last-window-closed=false default keeps the process
+  alive headless — macOS parity, maybe surprising on Windows; noting for the
+  user, left them running). Next: T05 (+list registry + Mac-format render).
 - 2026-07-12 (on-box) — bootstrap + T03 done — First on-box session
   (MaximusHome, D:\git\ghoztty). Toolchain verified (zig 0.15.2 via winget,
   `ZIG_GLOBAL_CACHE_DIR=D:\zig-global-cache` required — cross-drive cache

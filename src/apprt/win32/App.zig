@@ -13,6 +13,7 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
+const IpcServer = @import("IpcServer.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
@@ -34,6 +35,11 @@ pub const must_draw_from_app_thread = false;
 /// Custom window message used to wake up the message loop so that
 /// core_app.tick() is called.
 const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
+
+/// Posted by the IPC listener thread to marshal a request to the GUI
+/// thread. wparam = *IpcServer.Pending. (WM_APP+2/+3 are defined below:
+/// WM_APP_UPDATE_AVAILABLE, WM_APP_TRAY.)
+pub const WM_APP_IPC: u32 = w32.WM_APP + 4;
 
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
@@ -102,6 +108,10 @@ taskbar: ?*w32.ITaskbarList3 = null,
 notif_desktop_surface_id: u64 = 0,
 /// Whether CoInitializeEx has been called on the main thread.
 com_initialized: bool = false,
+
+/// The IPC named-pipe server (null if binding failed non-fatally). Owning
+/// the pipe name is also the single-instance lock; see IpcServer.zig.
+ipc_server: ?IpcServer = null,
 
 pub fn init(
     self: *App,
@@ -233,6 +243,21 @@ pub fn init(
 
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+
+    // Bind the IPC pipe and become the master instance. If another process
+    // already owns the pipe, forward a `new-window` request to it and exit
+    // (Mac single-app behavior).
+    self.ipc_server = @as(IpcServer, undefined);
+    self.ipc_server.?.init(self) catch |err| switch (err) {
+        error.AlreadyRunning => {
+            log.info("another instance owns the IPC pipe; forwarding new-window", .{});
+            const ok = internal_os.ipc_client.sendAction(alloc, "new-window", null) catch false;
+            std.process.exit(if (ok) 0 else 1);
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+        // Run without an IPC server rather than refusing to start.
+        error.BindFailed => self.ipc_server = null,
+    };
 
     // Register global hotkey for quick terminal (if configured).
     self.registerGlobalHotkey();
@@ -401,6 +426,13 @@ pub fn terminate(self: *App) void {
     if (self.quick_terminal) |qt| {
         qt.deinit();
         self.quick_terminal = null;
+    }
+
+    // Stop the IPC listener while msg_hwnd is still alive (a request could
+    // be mid-marshal; deinit joins the listener thread).
+    if (self.ipc_server) |*server| {
+        server.deinit();
+        self.ipc_server = null;
     }
 
     if (self.msg_hwnd) |hwnd| {
@@ -2321,6 +2353,16 @@ fn msgWndProc(
 
     if (msg == WM_APP_WAKEUP) {
         app.tick();
+        return 0;
+    }
+
+    if (msg == WM_APP_IPC) {
+        // wparam = *IpcServer.Pending, owned by the listener thread which is
+        // blocked waiting for the response.
+        if (wparam != 0) {
+            const pending: *IpcServer.Pending = @ptrFromInt(wparam);
+            IpcServer.serveOnGuiThread(pending);
+        }
         return 0;
     }
 

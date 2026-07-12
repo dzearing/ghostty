@@ -390,6 +390,16 @@ pub extern "user32" fn GetMessageW(
     wMsgFilterMax: u32,
 ) callconv(.winapi) i32;
 
+pub const PM_REMOVE: u32 = 0x0001;
+
+pub extern "user32" fn PeekMessageW(
+    lpMsg: *MSG,
+    hWnd: ?HWND,
+    wMsgFilterMin: u32,
+    wMsgFilterMax: u32,
+    wRemoveMsg: u32,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn TranslateMessage(
     lpMsg: *const MSG,
 ) callconv(.winapi) i32;

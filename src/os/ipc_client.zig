@@ -47,7 +47,7 @@ pub const Conn = struct {
         }
     }
 
-    fn writeAll(self: Conn, bytes: []const u8) !void {
+    pub fn writeAll(self: Conn, bytes: []const u8) !void {
         var total: usize = 0;
         while (total < bytes.len) {
             const n = if (comptime is_windows)
@@ -59,7 +59,7 @@ pub const Conn = struct {
         }
     }
 
-    fn readFull(self: Conn, buffer: []u8) !void {
+    pub fn readFull(self: Conn, buffer: []u8) !void {
         var total: usize = 0;
         while (total < buffer.len) {
             // On Windows, std's ReadFile maps BROKEN_PIPE/EOF to 0 already.
