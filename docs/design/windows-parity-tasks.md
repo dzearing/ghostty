@@ -118,8 +118,8 @@ still authoritative for staging/ZIP layout and merge rules.
 |----|------|-------|------|--------|---------|---------------------|
 | T01 | Verify fresh ZIP keybinds on box | A | — | todo | — | — |
 | T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | todo | — | — |
-| T03 | Named-pipe client helper + CLI un-guard | B | — | in-progress (code done; box round-trip pending) | 353d70abf, 4f52e8877, 64f5b6984 | tests+cross-compiles green; +list/+set-state/+close live vs Mac debug instance; box kit staged (share t03/) |
-| T04 | Pipe server in win32 App + marshal + DACL | B | T03 | todo | — | — |
+| T03 | Named-pipe client helper + CLI un-guard | B | — | done | 353d70abf, 4f52e8877, 64f5b6984 | box round-trip 2026-07-12: fake server logged `{"action":"list"}` (17 B framed), CLI printed `No windows open.` exit 0; native win32 Debug build green; native `zig build test -Dapp-runtime=none` green (after 2 fork compile fixes, see log) |
+| T04 | Pipe server in win32 App + marshal + DACL | B | T03 | in-progress | — | — |
 | T05 | `+list` | B | T04 | todo | — | — |
 | T06 | `+new-window` full flags + auto-launch + 2nd-instance forward | B | T04 | todo | — | — |
 | T07 | `+close` | B | T06 | todo | — | — |
@@ -482,6 +482,21 @@ auto-update disabled (→ T24). Config file on Windows:
 
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
+
+- 2026-07-12 (on-box) — bootstrap + T03 done — First on-box session
+  (MaximusHome, D:\git\ghoztty). Toolchain verified (zig 0.15.2 via winget,
+  `ZIG_GLOBAL_CACHE_DIR=D:\zig-global-cache` required — cross-drive cache
+  panics the build runner). Native win32 Debug build green; exe launches and
+  stays up (cmd.exe shell window). T03 round-trip green: `ipc-fake-server.ps1
+  -DebugPipe` logged the framed `{"action":"list"}` request, CLI printed
+  `No windows open.` exit 0. `zig build test -Dapp-runtime=none` was RED
+  natively with 3 fork compile errors, fixed this session: (1)+(2)
+  `connection.zig` LifecycleAgent used `std.atomic.Value(u128)` for
+  `seen_channel` — x86_64 has no 128-bit atomics (worked on aarch64 Mac);
+  now mutex-guarded. (3) `ssh_transport.zig controlPath` called
+  `posix.getenv` (comptime error on Windows); now branches per-OS
+  (`TEMP` via getEnvVarOwned on Windows). After fixes: full suite green
+  natively. Next: T04 (pipe server in win32 App).
 
 - 2026-07-12 (later) — T03 code COMPLETE (353d70abf): new shared
   `src/os/ipc_client.zig` (posix socket + Windows named pipe, framed
