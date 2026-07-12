@@ -370,12 +370,14 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
         return try self.handleRename(request);
     } else if (std.mem.eql(u8, request.action, "send-keys")) {
         return try self.handleSendKeys(request);
+    } else if (std.mem.eql(u8, request.action, "read")) {
+        return try self.handleRead(request);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
     // (each is its own task in the parity tracker).
     const known = [_][]const u8{
-        "rearrange", "read", "set-state", "new-remote-window",
+        "rearrange", "set-state", "new-remote-window",
     };
     for (known) |k| {
         if (std.mem.eql(u8, request.action, k)) {
@@ -727,6 +729,87 @@ fn handleSplit(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
     }
 
     return try self.alloc.dupe(u8, "{\"success\":true}");
+}
+
+fn handleRead(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+    const name = args.name orelse
+        return try self.errorResponse("--name is required for +read", .{});
+    const line_count: usize = if (args.lines) |l|
+        (if (l > 0) @intCast(l) else 50)
+    else
+        50;
+
+    const entry = self.app.ipcLookup(name) orelse
+        return try self.errorResponse("pane '{s}' not found in registry", .{name});
+    const surface: *Surface = switch (entry) {
+        .pane => |s| s,
+        .window => |w| surface: {
+            if (w.tab_count == 0)
+                return try self.errorResponse("pane '{s}' is no longer alive", .{name});
+            break :surface w.tab_active_surface[w.active_tab];
+        },
+    };
+    if (!surface.core_surface_ready)
+        return try self.errorResponse("pane '{s}' is no longer alive", .{name});
+
+    // Dump the whole screen (scrollback + active) as plain text, matching
+    // the Mac's full-SCREEN ghostty_surface_read_text selection.
+    const core = &surface.core_surface;
+    const dump: ?[]const u8 = dump: {
+        core.renderer_state.mutex.lock();
+        defer core.renderer_state.mutex.unlock();
+        const pages = &core.io.terminal.screens.active.pages;
+        const tl = pages.getTopLeft(.screen);
+        const br = pages.getBottomRight(.screen) orelse break :dump null;
+        const sel = terminal.Selection.init(tl, br, false);
+        const text = core.dumpTextLocked(arena, sel) catch break :dump null;
+        break :dump text.text;
+    };
+    var full = dump orelse
+        return try self.errorResponse("failed to read terminal content from '{s}'", .{name});
+
+    // Last N lines: strip one trailing newline (the Mac drops the trailing
+    // empty split element), then walk back N newlines.
+    if (full.len > 0 and full[full.len - 1] == '\n') full = full[0 .. full.len - 1];
+    var start: usize = 0;
+    var newlines: usize = 0;
+    var i: usize = full.len;
+    while (i > 0) {
+        i -= 1;
+        if (full[i] == '\n') {
+            newlines += 1;
+            if (newlines == line_count) {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+    const result = full[start..];
+    if (result.len == 0)
+        return try self.errorResponse("failed to read terminal content from '{s}'", .{name});
+
+    // {"success":true,"data":{"text":<result>}}
+    var out: std.Io.Writer.Allocating = .init(self.alloc);
+    errdefer out.deinit();
+    var jws: std.json.Stringify = .{ .writer = &out.writer };
+    write: {
+        jws.beginObject() catch break :write;
+        jws.objectField("success") catch break :write;
+        jws.write(true) catch break :write;
+        jws.objectField("data") catch break :write;
+        jws.beginObject() catch break :write;
+        jws.objectField("text") catch break :write;
+        jws.write(result) catch break :write;
+        jws.endObject() catch break :write;
+        jws.endObject() catch break :write;
+        return try out.toOwnedSlice();
+    }
+    return error.OutOfMemory;
 }
 
 fn handleRename(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
