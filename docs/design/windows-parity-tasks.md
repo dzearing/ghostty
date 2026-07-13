@@ -99,10 +99,11 @@ still authoritative for staging/ZIP layout and merge rules.
 
 ## Key code landmarks
 
-- `src/apprt/win32/App.zig` — `performIpc` returns `false` (all CLI verbs
-  dead); action stubs `swap_split`/`toggle_hero_mode`/`activity_state`
-  return `false` near the end of the action switch; `startUpdateCheck` is
-  hard-disabled with `if (true) return;`.
+- `src/apprt/win32/` IPC (as of 2026-07-12): IpcServer.zig (pipe
+  transport), IpcHandlers.zig (verbs), IpcRegistry.zig (named targets),
+  ProcessTree.zig (`--pid` ancestry); pure logic in `src/apprt/ipc/`
+  (args.zig, list.zig — unit tested in both lanes). Last action stub:
+  `toggle_hero_mode` (T19). `startUpdateCheck` still hard-disabled (T24).
 - `src/apprt/none.zig` `sendIpc` — Mac client wire protocol (4-byte BE length
   + JSON), reuse `src/apprt/ipc.zig` `parseResponse`.
 - `macos/Sources/Features/IPC/IPCServer.swift` — reference server semantics
@@ -119,7 +120,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | ID | Task | Phase | Deps | Status | Commits | Validation evidence |
 |----|------|-------|------|--------|---------|---------------------|
 | T01 | Verify fresh ZIP keybinds on box | A | — | todo | — | — |
-| T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | done | (this commit) | on-box 2026-07-12: ctrl+p opens palette (popup window appears, verified twice; Esc closes), ctrl+f4 closes tab (2→1 via +list), ctrl+t sanity green; core tests green. ctrl+, already worked (audit). Nuance: ctrl+p from INSIDE the palette edit doesn't toggle-close (pre-existing popup-edit bubbling behavior) |
+| T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | done | 82e096f4b | on-box 2026-07-12: ctrl+p opens palette (popup window appears, verified twice; Esc closes), ctrl+f4 closes tab (2→1 via +list), ctrl+t sanity green; core tests green. ctrl+, already worked (audit). Nuance: ctrl+p from INSIDE the palette edit doesn't toggle-close (pre-existing popup-edit bubbling behavior) |
 | T03 | Named-pipe client helper + CLI un-guard | B | — | done | 353d70abf, 4f52e8877, 64f5b6984 | box round-trip 2026-07-12: fake server logged `{"action":"list"}` (17 B framed), CLI printed `No windows open.` exit 0; native win32 Debug build green; native `zig build test -Dapp-runtime=none` green (after 2 fork compile fixes, see log) |
 | T04 | Pipe server in win32 App + marshal + DACL | B | T03 | done | 1a44125de | on-box 2026-07-12: `+list` answered by in-app server (`No windows open.`, exit 0); 2nd GUI launch forwarded new-window (master windows 1→2, second exited 0); pipe DACL = single ACE `MAXIMUSHOME\David` FullControl; clean app exit after IPC use (no join deadlock) |
 | T05 | `+list` | B | T04 | done | da9d56d0d | golden shape tests in apprt/ipc.zig green; on-box 2026-07-12: 2-tab + h-split layout (built via ctrl+t/ctrl+d SendInput) rendered correctly in human + `--json` forms — `[target: window-1]`, per-pane `[name: <id>]`, focus/selected markers, pwd populated |
