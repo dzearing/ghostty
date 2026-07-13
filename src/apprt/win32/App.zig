@@ -13,6 +13,7 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
+const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
@@ -114,32 +115,11 @@ com_initialized: bool = false,
 ipc_server: ?IpcServer = null,
 
 /// IPC target registry: named windows and panes (`+new-window --target`,
-/// `+split --name`). Keys are owned (duped) strings. Entries are removed
-/// eagerly from Window/Surface deinit and pruned on use, so a recycled
-/// allocation can never be reached through a stale name.
-ipc_targets: std.StringHashMapUnmanaged(IpcTarget) = .empty,
+/// `+split --name`). See IpcRegistry.zig; the App methods below adapt it
+/// to the live window list and app allocator.
+ipc_registry: IpcRegistry = .{},
 
-/// Counter for auto-generated window names (`window-1`, ...), mirroring the
-/// Mac's BaseTerminalController.nextWindowId.
-ipc_window_counter: u64 = 0,
-
-pub const IpcTarget = union(enum) {
-    window: *Window,
-    pane: *Surface,
-
-    fn eql(self: IpcTarget, other: IpcTarget) bool {
-        return switch (self) {
-            .window => |w| switch (other) {
-                .window => |ow| w == ow,
-                .pane => false,
-            },
-            .pane => |p| switch (other) {
-                .window => false,
-                .pane => |op| p == op,
-            },
-        };
-    }
-};
+pub const IpcTarget = IpcRegistry.Target;
 
 pub fn init(
     self: *App,
@@ -481,11 +461,7 @@ pub fn terminate(self: *App) void {
     self.windows.deinit(alloc);
 
     // Free the IPC target registry (keys are owned).
-    {
-        var it = self.ipc_targets.keyIterator();
-        while (it.next()) |key| alloc.free(key.*);
-        self.ipc_targets.deinit(alloc);
-    }
+    self.ipc_registry.deinit(alloc);
 
     if (self.bg_brush) |brush| {
         _ = w32.DeleteObject(@ptrCast(brush));
@@ -516,80 +492,24 @@ pub fn wakeup(self: *App) void {
     }
 }
 
-/// Register `target` under `name` (key is duped). If the name is already
-/// registered to a live target, the existing registration wins — consistent
-/// with the CLI's idempotent named-target semantics; callers that need
-/// focus-if-exists behavior look the name up first.
+/// Register `target` under `name`. See IpcRegistry.register.
 pub fn ipcRegister(self: *App, name: []const u8, target: IpcTarget) Allocator.Error!void {
-    const alloc = self.core_app.alloc;
-    self.ipcPrune();
-    const gop = try self.ipc_targets.getOrPut(alloc, name);
-    if (gop.found_existing) return;
-    gop.key_ptr.* = try alloc.dupe(u8, name);
-    gop.value_ptr.* = target;
+    return self.ipc_registry.register(self.core_app.alloc, self.windows.items, name, target);
 }
 
-/// Look up a live target by name (stale entries are pruned first).
+/// Look up a live target by name. See IpcRegistry.lookup.
 pub fn ipcLookup(self: *App, name: []const u8) ?IpcTarget {
-    self.ipcPrune();
-    return self.ipc_targets.get(name);
+    return self.ipc_registry.lookup(self.core_app.alloc, self.windows.items, name);
 }
 
 /// Reverse lookup: the registered name of a target, if any.
 pub fn ipcNameOf(self: *App, target: IpcTarget) ?[]const u8 {
-    var it = self.ipc_targets.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.eql(target)) return entry.key_ptr.*;
-    }
-    return null;
+    return self.ipc_registry.nameOf(target);
 }
 
-/// Drop every registration pointing at `target`. Called from Window and
-/// Surface deinit so names can never reach a recycled allocation.
+/// Drop every registration pointing at `target`. See IpcRegistry.forget.
 pub fn ipcForget(self: *App, target: IpcTarget) void {
-    const alloc = self.core_app.alloc;
-    var it = self.ipc_targets.iterator();
-    while (it.next()) |entry| {
-        if (!entry.value_ptr.eql(target)) continue;
-        const key = entry.key_ptr.*;
-        self.ipc_targets.removeByPtr(entry.key_ptr);
-        alloc.free(key);
-        // Hash map iterators are invalidated by removal; restart. The map
-        // is tiny (named targets), so the rescan is negligible.
-        it = self.ipc_targets.iterator();
-    }
-}
-
-/// Remove registry entries whose target is no longer alive.
-fn ipcPrune(self: *App) void {
-    const alloc = self.core_app.alloc;
-    var it = self.ipc_targets.iterator();
-    while (it.next()) |entry| {
-        const alive = switch (entry.value_ptr.*) {
-            .window => |w| alive: {
-                for (self.windows.items) |live| {
-                    if (live == w) break :alive true;
-                }
-                break :alive false;
-            },
-            .pane => |s| alive: {
-                for (self.windows.items) |win| {
-                    for (0..win.tab_count) |i| {
-                        var surfaces = win.tab_trees[i].iterator();
-                        while (surfaces.next()) |v| {
-                            if (v.view == s) break :alive true;
-                        }
-                    }
-                }
-                break :alive false;
-            },
-        };
-        if (alive) continue;
-        const key = entry.key_ptr.*;
-        self.ipc_targets.removeByPtr(entry.key_ptr);
-        alloc.free(key);
-        it = self.ipc_targets.iterator();
-    }
+    self.ipc_registry.forget(self.core_app.alloc, target);
 }
 
 /// Create, track, and populate a new Window (with its first tab). Shared by
@@ -608,12 +528,7 @@ pub fn createWindow(self: *App, opts: Window.InitOptions) !*Window {
 
 /// The next auto-generated window name (`window-N`). Caller owns the slice.
 pub fn ipcNextWindowName(self: *App) Allocator.Error![]u8 {
-    self.ipc_window_counter += 1;
-    return std.fmt.allocPrint(
-        self.core_app.alloc,
-        "window-{d}",
-        .{self.ipc_window_counter},
-    );
+    return self.ipc_registry.nextWindowName(self.core_app.alloc);
 }
 
 /// IPC client: runs in a CLI process (`ghoztty +new-window`, `+split`, ...)
