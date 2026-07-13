@@ -136,7 +136,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T16 | P3 acceptance script green | D | T13,T14,T15 | done | (this commit) | on-box 2026-07-12: `test/win32/ipc-p3.ps1` ALL PASS (17 assertions — read byte-accurate, state aggregation + suffix, OSC 7777 round-trip, rearrange + error paths) from fresh start |
 | T17 | Skill conformance on the box | E | T12,T16 | done | (doc only) | on-box 2026-07-12: full skill-driven session from Claude Code with ZERO skill modifications — three-pane CLAUDE.md example verbatim (auto-launch from cold; `tail -f` genuinely ran via git-bash PATH), +read, +send-keys (echo round-trip read back), C-c, set-state loop, +rename, +rearrange (70/30 + pane removal), auto-name targeting (`window-1`), idempotent re-close/teardown. Env note: `jq` not installed on box, that discover pattern untestable as-is |
 | T18 | `swap_split` on win32 | F | — | done | (this commit) | on-box 2026-07-12: ctrl+shift+up swapped stacked panes (JSON tree order flipped, focus followed), ctrl+shift+down restored; screenshot archived (temp t18-swap-after.png); IPC-driven swap covered by the +rearrange swap pattern (T15). Fixed two binding shadows that had made ctrl+shift+arrows dead for swap on Windows (see log) |
-| T19a | Hero mode design (win32) | F | T18 | todo | — | — |
+| T19a | Hero mode design (win32) | F | T18 | done | (this commit) | design decided and recorded in the T19a section: per-tab state, 0.25 carousel, layoutSplits branch, goto interception, focus-follows, tree-change clamping, +list unaffected |
 | T19 | Hero mode on win32 (implement per T19a) | F | T19a | todo | — | — |
 | T20 | `+new-remote-window --host/--port` (direct TCP) | G | T08 | todo | — | — |
 | T21 | Relay dial + browser sign-in + DPAPI creds | G | T20 | todo | — | — |
@@ -324,9 +324,36 @@ this doc or a sibling doc) before implementing. Scouting notes from
   confirm).
 *Validation:* design section reviewed/committed; open questions resolved.
 
-**T19 — Hero mode implementation.** Per T19a. Pure `Window.zig` layout
-work plus the `toggle_hero_mode` action arm (the last `return false`
-stub in win32 `performAction`).
+**T19a — DESIGN (decided 2026-07-12, on-box session):**
+
+- **State is per-tab** (Mac = per-controller = per-tab): parallel arrays on
+  Window beside `tab_trees`: `tab_hero_active: [MAX_TABS]bool`,
+  `tab_hero_index: [MAX_TABS]u16`. Carousel ratio fixed at 0.25 for v1
+  (Mac default; clamp 0.1–0.6 constants kept for the future drag).
+- **Layout**: new branch at the TOP of `layoutSplits` (before the
+  `tree.zoomed` branch): leaves in tree-iteration order; leaf[index] gets
+  the left `(1-ratio)·w` full height; the remaining leaves stack equally
+  in the right column. `paintDividers` early-returns while active.
+- **Toggle** (`toggle_hero_mode` action, ctrl+shift+space on Windows):
+  requires >1 leaf; activation seeds index from the focused leaf and
+  clears `tree.zoomed` (zoom and hero are mutually exclusive; toggling
+  zoom while hero active deactivates hero first).
+- **Navigation while active**: intercept in `Window.gotoSplit` —
+  previous/next AND spatial up/down move the selection (clamped, Mac
+  clamps too); selection change = SetFocus(selected) + relayout. Spatial
+  left/right pass through (hero pane vs carousel is horizontal).
+- **Focus-follows**: clicking any carousel pane focuses it; the
+  WM_SETFOCUS path that updates `tab_active_surface` also sets
+  `tab_hero_index` to that leaf while active.
+- **Tree changes** (split/close/rearrange) while active: clamp index;
+  deactivate when leaves ≤ 1. One `heroOnTreeChanged(tab)` helper called
+  from newSplitAt/closeSplitSurface/closeTab/rearrange swap sites.
+- **+list is unaffected** — hero is pure presentation; the tree does not
+  change (matches Mac).
+
+**T19 — Hero mode implementation.** Per T19a above. Pure `Window.zig`
+layout work plus the `toggle_hero_mode` action arm (the last
+`return false` stub in win32 `performAction`).
 *Validation:* toggle on/off on a 3-pane layout; focus-follows behavior
 matches Mac; screenshot archived.
 
