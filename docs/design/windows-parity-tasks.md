@@ -102,8 +102,8 @@ still authoritative for staging/ZIP layout and merge rules.
 - `src/apprt/win32/` IPC (as of 2026-07-12): IpcServer.zig (pipe
   transport), IpcHandlers.zig (verbs), IpcRegistry.zig (named targets),
   ProcessTree.zig (`--pid` ancestry); pure logic in `src/apprt/ipc/`
-  (args.zig, list.zig — unit tested in both lanes). Last action stub:
-  `toggle_hero_mode` (T19). `startUpdateCheck` still hard-disabled (T24).
+  (args.zig, list.zig — unit tested in both lanes). No action stubs remain
+  (T19 landed the last one). `startUpdateCheck` still hard-disabled (T24).
 - `src/apprt/none.zig` `sendIpc` — Mac client wire protocol (4-byte BE length
   + JSON), reuse `src/apprt/ipc.zig` `parseResponse`.
 - `macos/Sources/Features/IPC/IPCServer.swift` — reference server semantics
@@ -138,7 +138,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T17 | Skill conformance on the box | E | T12,T16 | done | (doc only) | on-box 2026-07-12: full skill-driven session from Claude Code with ZERO skill modifications — three-pane CLAUDE.md example verbatim (auto-launch from cold; `tail -f` genuinely ran via git-bash PATH), +read, +send-keys (echo round-trip read back), C-c, set-state loop, +rename, +rearrange (70/30 + pane removal), auto-name targeting (`window-1`), idempotent re-close/teardown. Env note: `jq` not installed on box, that discover pattern untestable as-is |
 | T18 | `swap_split` on win32 | F | — | done | (this commit) | on-box 2026-07-12: ctrl+shift+up swapped stacked panes (JSON tree order flipped, focus followed), ctrl+shift+down restored; screenshot archived (temp t18-swap-after.png); IPC-driven swap covered by the +rearrange swap pattern (T15). Fixed two binding shadows that had made ctrl+shift+arrows dead for swap on Windows (see log) |
 | T19a | Hero mode design (win32) | F | T18 | done | (this commit) | design decided and recorded in the T19a section: per-tab state, 0.25 carousel, layoutSplits branch, goto interception, focus-follows, tree-change clamping, +list unaffected |
-| T19 | Hero mode on win32 (implement per T19a) | F | T19a | done | (this commit) | on-box 2026-07-12: geometry oracle on a 3-pane layout — tree (3x310px) → hero (465x442 left + two 156px stacked right at x=502) → ctrl+alt+down moves the hero → toggle-off restores the exact tree layout; screenshot archived; both test lanes + P1–P3 acceptance green. LAST `return false` action stub is gone |
+| T19 | Hero mode on win32 (implement per T19a) | F | T19a | done | f37bd1e3c | on-box 2026-07-12: geometry oracle on a 3-pane layout — tree (3x310px) → hero (465x442 left + two 156px stacked right at x=502) → ctrl+alt+down moves the hero → toggle-off restores the exact tree layout; screenshot archived; both test lanes + P1–P3 acceptance green. LAST `return false` action stub is gone |
 | T20 | `+new-remote-window --host/--port` (direct TCP) | G | T08 | todo | — | — |
 | T21 | Relay dial + browser sign-in + DPAPI creds | G | T20 | todo | — | — |
 | T22 | Remote GUI: menu item + machine chooser | G | T21 | todo | — | — |
@@ -605,6 +605,22 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night, +4) — T31, T19a, T19 done — `+list --pid`
+  lands the Windows answer to the Mac's tty-based pane identity: leaves now
+  carry the shell's real pid (GetProcessId on the ConPTY child handle) and
+  `--pid=<any descendant>` resolves the owning pane via a Toolhelp32
+  ancestry walk (unit-tested with cycle/self-parent guards). This unblocks
+  pane-aware workflow skills on Windows (/reset-context's probe becomes
+  `ghoztty +list --pid=<winpid>`; the SKILL itself still needs its Step 1
+  updated — it's a user plugin, not in this repo). Then hero mode (T19a
+  design → T19 implementation): per-tab state, layout branch above zoom,
+  goto interception, focus-follows, tree-change clamping. **Every apprt
+  action on win32 is now implemented or a deliberate no-op — no
+  `return false` stubs remain.** Validation lesson worth keeping: for
+  keybind-driven GUI tests, build the layout in the AUTO-LAUNCHED window
+  (its MainWindowHandle owns keyboard focus) — cross-process
+  SetForegroundWindow does NOT move focus into another window's child
+  pane, which silently sent my first hero runs to the wrong window.
 - 2026-07-12 (on-box, late night, +3) — T32 done, T34 done — Phase J
   underway per the standing directive. IPC code restructured into five
   focused modules with the pure logic (arg parsing, shell wrap table,
