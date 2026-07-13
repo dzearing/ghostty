@@ -145,7 +145,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T23 | MSI fix → uninstall entry works | H | — | todo | — | — |
 | T24 | Windows release channel + enable update check | H | T23 | todo | — | — |
 | T25 | Full conformance checklist (spec §8) end-to-end | — | T17,T19,T21 | todo | — | — |
-| T26 | OS color-scheme sync (colorSchemeCallback) | I | — | todo | — | — |
+| T26 | OS color-scheme sync (colorSchemeCallback) | I | — | done | (this commit) | on-box 2026-07-12: `theme = light:Adwaita,dark:GitHub Dark` config + screenshot pixel oracle — pane renders #101216 when the OS is dark, flips LIVE to #ffffff on a light flip, and back, no restart. Found+fixed the real bug the task implies: WM_SETTINGCHANGE broadcasts reach TOP-LEVEL windows only, so the handler had to live in Window.windowWndProc, not the surface proc |
 | T27 | PowerShell shell integration | I | — | todo | — | — |
 | T28 | Minor action no-ops cleanup | I | — | todo | — | — |
 | T29 | Mac-side: fix action fallthroughs to showChildExited | I | — | todo | — | — |
@@ -605,6 +605,17 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night, +5) — T26 done — OS light/dark now
+  reaches the TERMINAL side (not just the DWM chrome): initial
+  colorSchemeCallback at surface init + re-report on WM_SETTINGCHANGE.
+  The interesting bug: WM_SETTINGCHANGE broadcasts are delivered to
+  TOP-LEVEL windows only, so a handler in the surface (child) wndproc
+  never fires — the report lives in Window.windowWndProc, which also
+  re-applies the DWM chrome for `window-theme = system`. Validated with a
+  `theme = light:Adwaita,dark:GitHub Dark` config and a screenshot-pixel
+  oracle across dark→light→dark flips (the OSC 11 response goes to the
+  shell's stdin, so `+read` is NOT a usable oracle for it — pixels are).
+  Test restores the user's theme + config.
 - 2026-07-12 (on-box, late night, +4) — T31, T19a, T19 done — `+list --pid`
   lands the Windows answer to the Mac's tty-based pane identity: leaves now
   carry the shell's real pid (GetProcessId on the ConPTY child handle) and

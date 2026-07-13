@@ -2133,6 +2133,10 @@ fn surfaceWndProc(
                     _ = w32.PostMessageW(hwnd, w32.WM_SIZE, 0, lp_size);
                 }
             }
+
+            // Note: OS light/dark flips do NOT arrive here — a
+            // WM_SETTINGCHANGE broadcast only reaches top-level windows.
+            // The color-scheme report lives in Window.windowWndProc (T26).
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 

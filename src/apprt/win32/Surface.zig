@@ -358,6 +358,13 @@ pub fn init(
     // (triggered by ShowWindow, wglCreateContext, etc.) must be ignored.
     self.core_surface_ready = true;
     self.core_surface_initialized = true;
+
+    // Report the OS color scheme so OSC 10/11 queries and `light:`/`dark:`
+    // conditional config start out correct (T26). WM_SETTINGCHANGE keeps
+    // it current afterwards.
+    self.core_surface.colorSchemeCallback(Window.systemColorScheme()) catch |err| {
+        log.warn("initial color scheme report failed err={}", .{err});
+    };
 }
 
 pub fn deinit(self: *Surface) void {

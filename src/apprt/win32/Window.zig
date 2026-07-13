@@ -164,7 +164,7 @@ pub const InitOptions = struct {
 /// Read HKCU\...\Themes\Personalize\AppsUseLightTheme. Returns true when the
 /// system apps theme is light. A missing/erroring value is treated as light,
 /// which is how the Personalize key reads before it is ever written.
-fn systemUsesLightTheme() bool {
+pub fn systemUsesLightTheme() bool {
     const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
         "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
     );
@@ -1304,6 +1304,28 @@ pub fn moveTab(self: *Window, amount: isize) void {
 }
 
 /// Update the top-level window title to match the active tab's title.
+/// The OS apps color scheme, as the core's `apprt.ColorScheme`.
+pub fn systemColorScheme() apprt.ColorScheme {
+    return if (systemUsesLightTheme()) .light else .dark;
+}
+
+/// Report the OS color scheme to every pane in this window (T26). Drives
+/// OSC 10/11 light/dark queries and `light:`/`dark:` conditional config —
+/// the terminal-side signal, distinct from the DWM chrome theme.
+pub fn reportColorScheme(self: *Window) void {
+    const scheme = systemColorScheme();
+    for (0..self.tab_count) |i| {
+        var it = self.tab_trees[i].iterator();
+        while (it.next()) |entry| {
+            const surface = entry.view;
+            if (!surface.core_surface_ready) continue;
+            surface.core_surface.colorSchemeCallback(scheme) catch |err| {
+                log.warn("color scheme callback failed err={}", .{err});
+            };
+        }
+    }
+}
+
 /// Highest-priority activity state across every pane in every tab
 /// (needs_input > busy > idle).
 pub fn activityAggregate(self: *Window) terminal.osc.Command.ActivityState {
@@ -2299,6 +2321,22 @@ pub fn windowWndProc(
     };
 
     switch (msg) {
+        w32.WM_SETTINGCHANGE => {
+            // An OS light/dark flip arrives here (a WM_SETTINGCHANGE
+            // broadcast reaches TOP-LEVEL windows only — never the child
+            // surface procs). Re-report the scheme to every pane so OSC
+            // 10/11 queries and `light:`/`dark:` conditional config react
+            // live (T26), and re-apply the DWM chrome theme for
+            // `window-theme = system`. The core no-ops when the scheme is
+            // unchanged, so reacting to every setting change is safe.
+            window.reportColorScheme();
+            applyChromeTheme(
+                hwnd,
+                window.app.config.@"window-theme",
+                window.app.config.background,
+            );
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_GETOBJECT => {
             // Opt out of MSAA accessibility for OBJID_CLIENT on the
             // top-level window too. See the matching handler in
