@@ -49,7 +49,9 @@ T03 leftover, then onward):
 1. `zig build -Dapp-runtime=win32 -Doptimize=Debug` (native; Console
    subsystem → stderr visible). Launch `zig-out\bin\ghoztty.exe`, type in it.
 2. `zig build test -Dapp-runtime=none` — upstream keeps this green on
-   Windows; deviations are our bugs.
+   Windows; deviations are our bugs. `zig build test -Dapp-runtime=win32`
+   also runs natively and covers win32-tagged units (T33); run both
+   before pushing code that touches win32 files.
 3. T03 round-trip: run `test\win32\ipc-fake-server.ps1 -DebugPipe` in one
    shell, `zig-out\bin\ghoztty.exe +list` in another (a Debug exe speaks
    the `ghoztty-debug-<username>` pipe). Expect the server to print the
@@ -148,7 +150,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T29 | Mac-side: fix action fallthroughs to showChildExited | I | — | todo | — | — |
 | T31 | `+list --tty` filter + pid/tty/exit_code leaf data on Windows | I | T05 | todo | — | — |
 | T32 | Refactor: split IpcServer.zig into modules; extract pure logic + unit tests | J | — | done | 640457b0d, cb53bb728, 31393ce38, 4cbc3d3e3 | IPC now 5 focused modules (transport 385 lines / handlers / registry / pure args / list model); 8 unit-test blocks in the none-runtime suite; P1–P3 ALL PASS after every step. App.zig −330 lines (rest is the vendored action switch — assessed, deferred) |
-| T33 | Native win32 test lane (`zig build test` on the box covers win32 units) | J | T32 | in-progress | — | pure logic covered by none-runtime lane; native win32 lane attempt recorded below |
+| T33 | Native win32 test lane (`zig build test` on the box covers win32 units) | J | T32 | done | (this commit) | `zig build test -Dapp-runtime=win32` runs green natively on the box (verified 2026-07-12); pure IPC logic also covered by the cross-platform none-runtime lane; both documented in the bootstrap section |
 | T34 | Windows shell types: first-class pwsh/powershell/cmd/git-bash/WSL/nushell support | J | — | done | (this commit) | wrap table extended (wsl `--`, nu `-e`) + Mac-parity keep-alive for posix flavors (`; exec "shell" -li` — git-bash panes used to die after the command); every branch unit-tested; on-box: cmd/powershell/git-bash markers read back + panes alive; wsl created but box only has the locked-down docker-desktop distro (`/bin/sh: Permission denied` — informational); pwsh7/nu not installed. CLAUDE.md documents the Windows flavors |
 | T30 | Mac-side: IPC dial must not modal-block the app/IPC server | I | — | todo | — | — |
 
