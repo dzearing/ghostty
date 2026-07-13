@@ -141,6 +141,12 @@ title_override: ?[:0]u8 = null,
 /// terminals (not IPC-addressable) or if registration failed.
 ipc_name: ?[]u8 = null,
 
+/// Hero mode (fork feature, T19): per-tab presentation state. The split
+/// tree is untouched — the selected leaf renders full height on the left
+/// and every other leaf stacks in a right-hand carousel column.
+tab_hero_active: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
+tab_hero_index: [MAX_TABS]u16 = [_]u16{0} ** MAX_TABS,
+
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
     /// If true, start fully opaque regardless of `background-opacity`. Set
@@ -513,9 +519,13 @@ pub fn addTab(self: *Window) !*Surface {
         self.tab_active_surface[i] = self.tab_active_surface[i - 1];
         self.tab_titles[i] = self.tab_titles[i - 1];
         self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+        self.tab_hero_active[i] = self.tab_hero_active[i - 1];
+        self.tab_hero_index[i] = self.tab_hero_index[i - 1];
     }
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
+    self.tab_hero_active[pos] = false;
+    self.tab_hero_index[pos] = 0;
     self.tab_count += 1;
 
     // Set default title.
@@ -565,6 +575,8 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_active_surface[i] = self.tab_active_surface[i + 1];
         self.tab_titles[i] = self.tab_titles[i + 1];
         self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+        self.tab_hero_active[i] = self.tab_hero_active[i + 1];
+        self.tab_hero_index[i] = self.tab_hero_index[i + 1];
     }
     self.tab_count -= 1;
     if (self.tab_count == 0) {
@@ -655,6 +667,7 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     if (next_surface) |ns| {
         log.debug("closeSplitSurface: focusing next surface", .{});
         self.tab_active_surface[tab] = ns;
+        self.heroOnTreeChanged(tab);
         self.layoutSplits();
         if (ns.hwnd) |h| _ = w32.SetFocus(h);
     } else {
@@ -697,10 +710,144 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
 }
 
 /// Layout split panes for the active tab.
+/// Carousel share of the window width in hero mode (Mac default; the Mac
+/// clamps user resizes to 0.1–0.6, which applies when drag lands here).
+const HERO_CAROUSEL_RATIO: f32 = 0.25;
+
+/// Number of leaves in a tab's tree.
+fn leafCount(self: *Window, tab: usize) usize {
+    var n: usize = 0;
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+/// The tree-iteration-order index of `surface` in a tab, if present.
+fn leafIndexOf(self: *Window, tab: usize, surface: *Surface) ?usize {
+    var i: usize = 0;
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |entry| : (i += 1) {
+        if (entry.view == surface) return i;
+    }
+    return null;
+}
+
+/// The leaf at a tree-iteration-order index, if in range.
+fn leafAt(self: *Window, tab: usize, index: usize) ?*Surface {
+    var i: usize = 0;
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |entry| : (i += 1) {
+        if (i == index) return entry.view;
+    }
+    return null;
+}
+
+/// Toggle hero mode for the active tab (fork feature, T19). Activation
+/// needs more than one pane, seeds the selection from the focused pane,
+/// and clears any zoom (zoom and hero are mutually exclusive).
+pub fn toggleHeroMode(self: *Window) void {
+    if (self.tab_count == 0) return;
+    const tab = self.active_tab;
+    if (self.tab_hero_active[tab]) {
+        self.tab_hero_active[tab] = false;
+    } else {
+        if (self.leafCount(tab) <= 1) return;
+        const focused = self.tab_active_surface[tab];
+        self.tab_hero_index[tab] = @intCast(self.leafIndexOf(tab, focused) orelse 0);
+        self.tab_trees[tab].zoom(null);
+        self.tab_hero_active[tab] = true;
+    }
+    self.layoutSplits();
+    if (self.tab_active_surface[tab].hwnd) |h| _ = w32.SetFocus(h);
+}
+
+/// Move the hero selection (clamped), focus it, and re-layout.
+fn heroSelect(self: *Window, index: isize) void {
+    const tab = self.active_tab;
+    const n = self.leafCount(tab);
+    if (n == 0) return;
+    const clamped: usize = @intCast(@max(0, @min(index, @as(isize, @intCast(n - 1)))));
+    if (clamped == self.tab_hero_index[tab]) return;
+    self.tab_hero_index[tab] = @intCast(clamped);
+    const view = self.leafAt(tab, clamped) orelse return;
+    self.tab_active_surface[tab] = view;
+    self.layoutSplits();
+    if (view.hwnd) |h| _ = w32.SetFocus(h);
+}
+
+/// Clamp/deactivate hero state after the tab's tree changed (split
+/// created, pane closed, layout rearranged).
+pub fn heroOnTreeChanged(self: *Window, tab: usize) void {
+    if (!self.tab_hero_active[tab]) return;
+    const n = self.leafCount(tab);
+    if (n <= 1) {
+        self.tab_hero_active[tab] = false;
+        return;
+    }
+    if (self.tab_hero_index[tab] >= n) self.tab_hero_index[tab] = @intCast(n - 1);
+}
+
+/// Focus-follows: clicking (or otherwise focusing) a carousel pane makes
+/// it the hero. Called from the WM_SETFOCUS path.
+pub fn heroOnSurfaceFocused(self: *Window, surface: *Surface) void {
+    const tab = self.active_tab;
+    if (!self.tab_hero_active[tab]) return;
+    const index = self.leafIndexOf(tab, surface) orelse return;
+    if (index == self.tab_hero_index[tab]) return;
+    self.tab_hero_index[tab] = @intCast(index);
+    self.layoutSplits();
+}
+
+/// Hero layout: selected leaf full-height left, every other leaf stacked
+/// equally in the right-hand carousel column.
+fn layoutHero(self: *Window, rect: w32.RECT) void {
+    const tab = self.active_tab;
+    const n = self.leafCount(tab);
+    if (self.tab_hero_index[tab] >= n) self.tab_hero_index[tab] = @intCast(n - 1);
+    const hero_index: usize = self.tab_hero_index[tab];
+
+    const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
+    const total_w = rect.right - rect.left;
+    const total_h = rect.bottom - rect.top;
+    const carousel_w: i32 = @intFromFloat(HERO_CAROUSEL_RATIO * @as(f32, @floatFromInt(total_w)));
+    const hero_right = rect.right - carousel_w - gap;
+    const carousel_count: i32 = @intCast(n - 1);
+
+    var it = self.tab_trees[tab].iterator();
+    var leaf_i: usize = 0;
+    var carousel_i: i32 = 0;
+    while (it.next()) |entry| : (leaf_i += 1) {
+        var r: w32.RECT = undefined;
+        if (leaf_i == hero_index) {
+            r = .{ .left = rect.left, .top = rect.top, .right = hero_right, .bottom = rect.bottom };
+        } else {
+            const top = rect.top + @divTrunc(total_h * carousel_i, carousel_count);
+            var bottom = rect.top + @divTrunc(total_h * (carousel_i + 1), carousel_count);
+            if (carousel_i + 1 < carousel_count) bottom -= gap;
+            r = .{ .left = hero_right + gap, .top = top, .right = rect.right, .bottom = bottom };
+            carousel_i += 1;
+        }
+        entry.view.setVisible(true);
+        if (entry.view.hwnd) |h| {
+            const w = @max(r.right - r.left, 1);
+            const ht = @max(r.bottom - r.top, 1);
+            _ = w32.MoveWindow(h, r.left, r.top, @intCast(w), @intCast(ht), 1);
+            _ = w32.ShowWindow(h, w32.SW_SHOW);
+        }
+    }
+}
+
 pub fn layoutSplits(self: *Window) void {
     if (self.tab_count == 0) return;
     const tree = self.tab_trees[self.active_tab];
     const rect = self.surfaceRect();
+    if (self.tab_hero_active[self.active_tab]) {
+        if (self.leafCount(self.active_tab) > 1) {
+            self.layoutHero(rect);
+            return;
+        }
+        self.tab_hero_active[self.active_tab] = false;
+    }
     if (tree.zoomed) |zoomed_handle| {
         var it = tree.iterator();
         while (it.next()) |entry| {
@@ -768,6 +915,7 @@ fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface
 /// Paint divider lines between split panes in the active tab.
 fn paintDividers(self: *Window, hdc: w32.HDC) void {
     if (self.tab_count == 0) return;
+    if (self.tab_hero_active[self.active_tab]) return;
     const tree = self.tab_trees[self.active_tab];
     if (!tree.isSplit()) return;
     if (tree.zoomed != null) return;
@@ -949,6 +1097,12 @@ pub fn newSplitAt(
 
     // Focus the new surface.
     self.tab_active_surface[tab] = new_surface;
+    self.heroOnTreeChanged(tab);
+    if (self.tab_hero_active[tab]) {
+        if (self.leafIndexOf(tab, new_surface)) |index| {
+            self.tab_hero_index[tab] = @intCast(index);
+        }
+    }
 
     if (tab == self.active_tab) {
         self.layoutSplits();
@@ -966,6 +1120,18 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     if (self.tab_count == 0) return;
     const alloc = self.app.core_app.alloc;
     const tab = self.active_tab;
+
+    // Hero mode intercepts prev/next and vertical navigation to move the
+    // carousel selection (Mac behavior); horizontal spatial navigation
+    // still walks the real tree.
+    if (self.tab_hero_active[tab]) {
+        switch (goto_target) {
+            .previous, .up => return self.heroSelect(@as(isize, self.tab_hero_index[tab]) - 1),
+            .next, .down => return self.heroSelect(@as(isize, self.tab_hero_index[tab]) + 1),
+            .left, .right => {},
+        }
+    }
+
     const tree = &self.tab_trees[tab];
 
     const active_surface = self.tab_active_surface[tab];
@@ -1664,6 +1830,8 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     const saved_surface = self.tab_active_surface[from];
     const saved_title = self.tab_titles[from];
     const saved_title_len = self.tab_title_lens[from];
+    const saved_hero_active = self.tab_hero_active[from];
+    const saved_hero_index = self.tab_hero_index[from];
 
     if (from < to) {
         // Shift left: move [from+1..to+1] to [from..to]
@@ -1673,6 +1841,8 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i + 1];
             self.tab_titles[i] = self.tab_titles[i + 1];
             self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+            self.tab_hero_active[i] = self.tab_hero_active[i + 1];
+            self.tab_hero_index[i] = self.tab_hero_index[i + 1];
         }
     } else {
         // Shift right: move [to..from] to [to+1..from+1]
@@ -1682,6 +1852,8 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i - 1];
             self.tab_titles[i] = self.tab_titles[i - 1];
             self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+            self.tab_hero_active[i] = self.tab_hero_active[i - 1];
+            self.tab_hero_index[i] = self.tab_hero_index[i - 1];
         }
     }
 
@@ -1690,6 +1862,8 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_active_surface[to] = saved_surface;
     self.tab_titles[to] = saved_title;
     self.tab_title_lens[to] = saved_title_len;
+    self.tab_hero_active[to] = saved_hero_active;
+    self.tab_hero_index[to] = saved_hero_index;
 
     self.active_tab = to;
     self.invalidateTabBar();

@@ -1559,10 +1559,15 @@ pub fn performAction(
             },
         },
 
-        // Ghoztty fork action not yet implemented by the Win32 apprt:
-        // the hero-mode view (T19). Returning false reports it as
-        // unimplemented.
-        .toggle_hero_mode => return false,
+        // Hero mode: focused pane full-size left, carousel right (fork
+        // feature, T19).
+        .toggle_hero_mode => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                core_surface.rt_surface.parent_window.toggleHeroMode();
+                return true;
+            },
+        },
     }
 }
 
@@ -2448,6 +2453,7 @@ fn surfaceWndProc(
             // Update the active surface for this tab when a split pane gains focus.
             const tab = surface.parent_window.active_tab;
             surface.parent_window.tab_active_surface[tab] = surface;
+            surface.parent_window.heroOnSurfaceFocused(surface);
             surface.handleFocus(true);
             return 0;
         },

@@ -511,6 +511,7 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         break :focus first.?; // validated non-empty layout above
     };
     window.tab_active_surface[tab] = focus;
+    window.heroOnTreeChanged(tab);
     window.layoutSplits();
     if (focus.hwnd) |h| _ = w32.SetFocus(h);
     window.updateWindowTitle();
