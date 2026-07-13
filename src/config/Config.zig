@@ -6763,32 +6763,6 @@ pub const Keybinds = struct {
                 .{ .performable = true },
             );
 
-            // Swapping splits
-            try self.set.putFlags(
-                alloc,
-                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .ctrl = true, .shift = true } },
-                .{ .swap_split = .up },
-                .{ .performable = true },
-            );
-            try self.set.putFlags(
-                alloc,
-                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .ctrl = true, .shift = true } },
-                .{ .swap_split = .down },
-                .{ .performable = true },
-            );
-            try self.set.putFlags(
-                alloc,
-                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .ctrl = true, .shift = true } },
-                .{ .swap_split = .left },
-                .{ .performable = true },
-            );
-            try self.set.putFlags(
-                alloc,
-                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .ctrl = true, .shift = true } },
-                .{ .swap_split = .right },
-                .{ .performable = true },
-            );
-
             // Viewport scrolling
             try self.set.put(
                 alloc,
@@ -6821,6 +6795,37 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .physical = .arrow_down }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .jump_to_prompt = 1 },
+            );
+
+            // Swapping splits (fork feature). Bound AFTER jump_to_prompt:
+            // both want ctrl+shift+up/down and the fork gives the arrows
+            // to swap on every platform (the Mac section does the same;
+            // jump_to_prompt keeps super+shift there). Prompt jumping
+            // needs shell integration, which non-posix shells don't have
+            // yet anyway (tracker T27).
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .swap_split = .up },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .swap_split = .down },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .swap_split = .left },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .swap_split = .right },
+                .{ .performable = true },
             );
 
             // Move tab
@@ -7103,15 +7108,19 @@ pub const Keybinds = struct {
             .{ .toggle_split_zoom = {} },
         );
 
-        // Hero mode navigation (previous/next split, intercepted by hero mode)
+        // Hero mode navigation (previous/next split, intercepted by hero
+        // mode). Explicitly super (NOT ctrlOrSuper): on Windows the ctrl
+        // mirror would collide with the swap_split ctrl+shift+arrow
+        // bindings — cmd+shift+arrows is the Mac shape, unchanged; hero
+        // navigation gets Windows bindings with hero mode itself (T19).
         try self.set.put(
             alloc,
-            .{ .key = .{ .physical = .arrow_up }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .key = .{ .physical = .arrow_up }, .mods = .{ .super = true, .shift = true } },
             .{ .goto_split = .previous },
         );
         try self.set.put(
             alloc,
-            .{ .key = .{ .physical = .arrow_down }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .key = .{ .physical = .arrow_down }, .mods = .{ .super = true, .shift = true } },
             .{ .goto_split = .next },
         );
 

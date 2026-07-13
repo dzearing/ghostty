@@ -133,7 +133,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T15 | `+rearrange` | D | T09 | done | (this commit) | on-box 2026-07-12: 4-pane tab rearranged to horizontal(pa\|vertical(pb,pc)) ratio 0.3 — unnamed pane closed, tree+human list agree; duplicate/unknown-pane/bad-JSON error paths — ALL PASS (15) |
 | T16 | P3 acceptance script green | D | T13,T14,T15 | done | (this commit) | on-box 2026-07-12: `test/win32/ipc-p3.ps1` ALL PASS (17 assertions — read byte-accurate, state aggregation + suffix, OSC 7777 round-trip, rearrange + error paths) from fresh start |
 | T17 | Skill conformance on the box | E | T12,T16 | done | (doc only) | on-box 2026-07-12: full skill-driven session from Claude Code with ZERO skill modifications — three-pane CLAUDE.md example verbatim (auto-launch from cold; `tail -f` genuinely ran via git-bash PATH), +read, +send-keys (echo round-trip read back), C-c, set-state loop, +rename, +rearrange (70/30 + pane removal), auto-name targeting (`window-1`), idempotent re-close/teardown. Env note: `jq` not installed on box, that discover pattern untestable as-is |
-| T18 | `swap_split` on win32 | F | — | todo | — | — |
+| T18 | `swap_split` on win32 | F | — | done | (this commit) | on-box 2026-07-12: ctrl+shift+up swapped stacked panes (JSON tree order flipped, focus followed), ctrl+shift+down restored; screenshot archived (temp t18-swap-after.png); IPC-driven swap covered by the +rearrange swap pattern (T15). Fixed two binding shadows that had made ctrl+shift+arrows dead for swap on Windows (see log) |
 | T19 | Hero mode on win32 | F | T18 | todo | — | — |
 | T20 | `+new-remote-window --host/--port` (direct TCP) | G | T08 | todo | — | — |
 | T21 | Relay dial + browser sign-in + DPAPI creds | G | T20 | todo | — | — |
@@ -483,6 +483,20 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night, +2) — T18 done — win32 swap_split:
+  Window.swapSplit (goto to resolve the neighbor, SplitTree.swap for the
+  tree, focus follows the moved pane) + action arm replacing the stub.
+  TWO keybind shadows found while validating (the fork's ctrl+shift+arrow
+  swap bindings were dead on Windows all along): (1) hero-mode nav bound
+  goto_split prev/next at ctrlOrSuper+shift+up/down — now explicitly
+  super+shift (Mac unchanged, Windows freed); (2) upstream's
+  jump_to_prompt ctrl+shift+up/down came AFTER the fork's swap block in
+  the non-Mac defaults — swap block moved after it so the fork binding
+  wins (prompt jumping needs shell integration, dead on Windows until
+  T27). Validated: swap up/down via keybind with JSON tree order + focus
+  as oracle, screenshot archived. Debugging tip that cracked it: launch
+  the debug exe with stderr to a file and grep 'key event binding' to see
+  exactly which action a chord resolves to.
 - 2026-07-12 (on-box, late night, +1) — T02 done — ctrl+p →
   toggle_command_palette and ctrl+f4 → close_tab added to the Windows
   mirror block (Config.zig). Validated with verified-focus SendKeys:

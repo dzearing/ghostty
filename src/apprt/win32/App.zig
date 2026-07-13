@@ -1635,12 +1635,19 @@ pub fn performAction(
             },
         },
 
-        // Ghoztty fork actions, not yet implemented by the Win32 apprt:
-        // split swapping and the hero-mode view. Returning false reports
-        // them as unimplemented.
-        .swap_split,
-        .toggle_hero_mode,
-        => return false,
+        // Swap the focused pane with a neighbor (fork feature, T18).
+        .swap_split => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                core_surface.rt_surface.parent_window.swapSplit(value);
+                return true;
+            },
+        },
+
+        // Ghoztty fork action not yet implemented by the Win32 apprt:
+        // the hero-mode view (T19). Returning false reports it as
+        // unimplemented.
+        .toggle_hero_mode => return false,
     }
 }
 

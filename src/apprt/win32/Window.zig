@@ -991,6 +991,45 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     }
 }
 
+/// Swap the active pane with the pane in the given direction (fork
+/// feature; core SplitTree.swap does the tree work). Focus follows the
+/// active surface to its new position.
+pub fn swapSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
+    if (self.tab_count == 0) return;
+    const alloc = self.app.core_app.alloc;
+    const tab = self.active_tab;
+    const tree = &self.tab_trees[tab];
+
+    const active_surface = self.tab_active_surface[tab];
+    const handle = self.findHandle(tab, active_surface) orelse return;
+
+    const target: SplitTree(Surface).Goto = switch (goto_target) {
+        .previous => .previous,
+        .next => .next,
+        .up => .{ .spatial = .up },
+        .down => .{ .spatial = .down },
+        .left => .{ .spatial = .left },
+        .right => .{ .spatial = .right },
+    };
+    const dest = (tree.goto(alloc, handle, target) catch return) orelse return;
+    if (dest == handle) return;
+    switch (tree.nodes[dest.idx()]) {
+        .leaf => {},
+        .split => return,
+    }
+
+    const new_tree = tree.swap(alloc, handle, dest) catch |err| {
+        log.err("failed to swap splits: {}", .{err});
+        return;
+    };
+    var old_tree = self.tab_trees[tab];
+    self.tab_trees[tab] = new_tree;
+    old_tree.deinit();
+
+    self.layoutSplits();
+    if (active_surface.hwnd) |h| _ = w32.SetFocus(h);
+}
+
 /// Resize the nearest split in the given direction by the given pixel amount.
 pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
     if (self.tab_count == 0) return;
