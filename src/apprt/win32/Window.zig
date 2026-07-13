@@ -6,6 +6,7 @@
 const Window = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 
@@ -315,7 +316,10 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     const hwnd = w32.CreateWindowExW(
         ex_style,
         App.WINDOW_CLASS_NAME,
-        std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
+        if (comptime builtin.mode == .Debug)
+            std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty [DEBUG]")
+        else
+            std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
         style,
         cx,
         cy,
@@ -1369,6 +1373,15 @@ pub fn updateWindowTitle(self: *Window) void {
         len += s.len;
     }
 
+    // Debug builds mark themselves in the title (and thus the taskbar) so
+    // a dev instance is never mistaken for the installed release — the
+    // Windows equivalent of the Mac debug banner.
+    if (comptime builtin.mode == .Debug) {
+        const dbg = std.unicode.utf8ToUtf16LeStringLiteral(" [DEBUG]");
+        @memcpy(buf[len..][0..dbg.len], dbg);
+        len += dbg.len;
+    }
+
     buf[len] = 0;
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
 }
@@ -2043,7 +2056,21 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
     self.cancelTabRename();
 
     const hwnd = self.hwnd orelse return;
-    const rect = self.tab_rects[tab_idx];
+
+    // With the tab bar hidden (e.g. a single tab under the default
+    // window-show-tab-bar = auto) there is no tab rect to anchor to —
+    // tab_rects is zeroed/stale and the editor would be created invisible
+    // while still stealing keyboard focus (an un-dismissable "mystery
+    // box"). Anchor a visible strip at the top of the client area instead.
+    const rect: w32.RECT = if (self.tab_bar_visible) self.tab_rects[tab_idx] else blk: {
+        var client: w32.RECT = undefined;
+        if (w32.GetClientRect(hwnd, &client) == 0) return;
+        const h: i32 = @intFromFloat(@round(32.0 * self.scale));
+        const max_w: i32 = @intFromFloat(@round(400.0 * self.scale));
+        const w: i32 = @min(client.right - client.left - 8, max_w);
+        if (w <= 8) return;
+        break :blk .{ .left = 4, .top = 4, .right = 4 + w, .bottom = 4 + h };
+    };
 
     // tab_titles stores only `tab_title_lens` valid u16s; the rest is
     // uninitialized. CreateWindowExW reads a NUL-terminated wide string,

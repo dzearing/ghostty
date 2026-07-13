@@ -32,8 +32,9 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 On Windows, `ghoztty +list --pid=<pid>` prints just the name of the pane
 whose shell is an ancestor of the given process id — the tty-less way for a
 process inside a pane to discover its own pane (e.g. `ghoztty +list
---pid=$(cat /proc/self/winpid)` from git-bash, or `--pid=$PID` from
-PowerShell).
+--pid=$(cat /proc/$$/winpid)` from git-bash — `$$`, not `self`: the pid must
+still be alive when the server walks ancestry, and `/proc/self` read via
+`cat` names the already-exited `cat` — or `--pid=$PID` from PowerShell).
 
 ### `ghoztty +close`
 

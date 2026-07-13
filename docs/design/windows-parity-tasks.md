@@ -166,6 +166,11 @@ still authoritative for staging/ZIP layout and merge rules.
 | T35 | Sticky pane banner on win32 (set-banner IPC verb, OSC 7778, banner UI, prompt_banner editor) | I | — | todo | — | — |
 | T36 | On-box release install refresh flow (rebuild + reinstall to %LOCALAPPDATA%\Programs\Ghoztty) | H | — | in-progress | ae71b19b4, (this commit) | 2026-07-13: merged origin/main (62 commits); both test lanes + P1–P3 ALL PASS post-merge; ReleaseFast gnu exe installed + user PATH; verified: cold auto-launch, +list, in-pane `+list --pid=$PID` → pane name, exit 0; teardown clean. REMAINING: live skill-driven /reset-context from a session inside the installed release (needs user to launch the new terminal and start a session there) |
 | T37 | CLAUDE.md: Windows+Mac symmetry mandate + start/debug instructions for both architectures | — | — | todo | — | — |
+| T40 | Investigate slow/jerky scrolling on Windows (reported in Claude Code TUI, release build) | I | — | todo | — | — |
+| T41 | Close-tab confirmation: skip when shell is idle (no child processes) | I | — | todo | — | — |
+| T42 | Remote sessions: user PATH/env not available in remote Windows shells | G | — | todo | — | — |
+| T43 | Proper visual debug banner on win32 (parity with the Mac's banner; title suffix is interim) | I | — | todo (lower priority) | — | — |
+| T44 | FIX CRASH: ctrl+shift+r (rename overlay) crashes the app in a single-tab window | I | — | todo (NEXT — blocks release refresh) | — | — |
 | T38 | Release process includes the Windows build (build/stage/publish alongside Mac) | H | T23,T24 | todo | — | — |
 | T39 | Website: Windows installer download link (arch+version filename convention) | H | T38 | todo | — | — |
 
@@ -534,6 +539,88 @@ implementing). The site lives in the gh-pages branch (see the relay
 artifacts to link to.
 *Validation:* website shows a working Windows download whose filename
 carries arch + version, alongside the existing platform links.
+
+**T40 — Slow scrolling investigation (user report 2026-07-13).**
+Scrolling "extremely slow, not smooth at all" in the release build while
+Claude Code (TUI, alt-screen) is running. Suspects: mouse-wheel event
+granularity/accumulation in the win32 path (`WM_MOUSEWHEEL` → scroll
+lines), alt-screen wheel-to-arrow-key translation rate, renderer frame
+pacing on scroll. Compare against Windows Terminal on the same box and the
+Mac build for the expected feel; instrument events-per-notch and
+lines-per-event first.
+*Validation:* smooth scrolling in Claude Code scrollback and in a full
+`less`/vim buffer; regular terminal scrollback unaffected.
+
+**T41 — Skip close confirmation when the shell is idle (user report
+2026-07-13).**
+Closing a tab that is just cmd.exe sitting at a prompt shows the
+"Processes are still running" confirmation. The Mac asks only when
+something beyond the shell is running (`needsConfirmQuit` /
+config `confirm-close-surface`). On Windows the shell itself is always a
+live child over ConPTY, so the naive check always says "running".
+Investigate: enumerate the shell's child processes (ProcessTree.zig from
+T31 already walks Toolhelp32 ancestry — reuse) and confirm only when the
+shell has descendants (or the foreground process differs from the shell).
+*Validation:* close an idle cmd/pwsh tab → no dialog; close a tab running
+a child (e.g. `ping -t`) → dialog appears.
+
+**T42 — Remote sessions drop the user's env/PATH (user report 2026-07-13).**
+A remote Windows session opened from the Mac had none of the user's PATH
+entries. Likely cause: `ghoztty-agent` runs as a service/background
+process whose environment block lacks the interactive user's registry env
+(HKCU Environment), and the ConPTY shell inherits the agent's env.
+Investigate: agent should build the user token environment
+(CreateEnvironmentBlock / reading HKCU+HKLM Environment and merging, as
+Windows logon does) for spawned sessions.
+*Validation:* remote session's `echo %PATH%` matches an interactive local
+shell's PATH (including user-scope entries like the Ghoztty install dir).
+
+**T43 — Proper visual debug banner (lower priority).**
+The Mac debug build shows a real banner; the win32 build only marks the
+title (" [DEBUG]" suffix, added 2026-07-13 as an interim). Build a real
+visual marker — e.g. a colored strip across the window top (the T35
+banner infrastructure, once built, is the natural vehicle: a permanent
+debug-styled banner row) or a tinted tab bar.
+*Validation:* debug build visually unmistakable at a glance; release
+build unaffected.
+
+**T44 — CRASH: rename overlay in a single-tab window (2026-07-13).**
+Pressing ctrl+shift+r in a single-tab DEBUG window crashed the whole app
+(window vanished; user-observed, twice removed by cleanup). State of play:
+
+- Background (this commit): `startTabRename` used to anchor the rename
+  Edit to `tab_rects[tab_idx]`, which is zeroed when the tab bar is hidden
+  (single tab, `window-show-tab-bar=auto`) → INVISIBLE edit that steals
+  focus ("mystery box", user-reported on the release build; Escape
+  dismisses it there). This commit adds a fallback anchor (top-left strip
+  of the client area) — and with real user input, THAT is when the app
+  crashes, so the crash is most likely IN the new fallback block in
+  `Window.zig startTabRename` (or something it triggers). Prime suspects:
+  the `@intFromFloat` rounding on `self.scale`, the RECT arithmetic, or a
+  message-loop re-entry (WM_COMMAND/EN_* during CreateWindowExW inside the
+  key handler's stack).
+- **Repro on the box:** `zig-out\bin\ghoztty.exe` started FROM a console
+  (Debug is Console-subsystem — panic trace prints to that console; run
+  with `2> crash.log`), open (it makes a single-tab window), press
+  ctrl+shift+r. The panic/stack goes to the console/redirect.
+- **Synthetic input does NOT reproduce it**: keybd_event chords with
+  correct scan codes + verified focus on `GhozttyTerminal` never fire the
+  binding (5 attempts; root cause of THAT is unknown — modifier state via
+  GetKeyState vs injected input is the leading theory). Real keystrokes
+  fire it fine. Investigating that gap would also unlock autonomous GUI
+  keybind testing (nice-to-have; scratchpad script:
+  `rename-fix-test.ps1`, reusable — it has focus-verify + scan-code
+  helpers).
+- The rename fallback code is COMMITTED but UNVALIDATED (crashes).
+  **Do not run a release refresh (T36) until this is fixed** — the
+  currently installed release predates it and only has the milder
+  invisible-box bug.
+- The `[DEBUG]` title-suffix marker (same commit) is validated working
+  (`+list` showed `cmd.exe [DEBUG]` titles); T43 tracks the real banner.
+*Validation:* console-attached repro shows the panic; after the fix,
+ctrl+shift+r in a single-tab window shows a visible top-left edit box,
+Enter commits (title changes in `+list`), Escape cancels, no crash; also
+still correct with the tab bar visible (2+ tabs).
 
 ### Phase J — reliability, structure, tests (standing user directive 2026-07-12)
 

@@ -9,6 +9,15 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-13 (on-box, +1) — T40–T44 filed from live user reports on the
+  installed release; rename-anchor fix + [DEBUG] title marker committed
+  but the rename fix CRASHES on real input (T44, marked NEXT). User is
+  AFK and wants autonomous progress: pick tasks per go.md, validate
+  everything without user interaction (debug exe run from a console gives
+  panic traces; synthetic keybd_event chords do NOT fire keybinds — see
+  T44 notes before attempting GUI key injection). Session ended via
+  /reset-context — its first successful use on Windows would close out
+  T36's remaining checkbox (this very reset is the test).
 - 2026-07-13 (on-box) — T36 (new, user-directed) — Frontloaded a locally
   installed RELEASE build so ghoztty IPC (and `/reset-context`) powers
   on-box sessions. Merged origin/main (62 commits: `+list --tty`,
