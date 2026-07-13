@@ -146,6 +146,10 @@ still authoritative for staging/ZIP layout and merge rules.
 | T27 | PowerShell shell integration | I | — | todo | — | — |
 | T28 | Minor action no-ops cleanup | I | — | todo | — | — |
 | T29 | Mac-side: fix action fallthroughs to showChildExited | I | — | todo | — | — |
+| T31 | `+list --tty` filter + pid/tty/exit_code leaf data on Windows | I | T05 | todo | — | — |
+| T32 | Refactor: split IpcServer.zig into modules; extract pure logic + unit tests | J | — | todo | — | — |
+| T33 | Native win32 test lane (`zig build test` on the box covers win32 units) | J | T32 | todo | — | — |
+| T34 | Windows shell types: first-class pwsh/powershell/cmd/git-bash/WSL/nushell support | J | — | todo | — | — |
 | T30 | Mac-side: IPC dial must not modal-block the app/IPC server | I | — | todo | — | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
@@ -426,6 +430,64 @@ the dial was IPC-initiated, return the error in the IPC response and never
 *Validation:* Mac regression build; `+new-remote-window` to a dead device
 returns a CLI error promptly (no alert, no wedge); a second `+list` during
 and after the failed dial responds normally.
+
+### Phase J — reliability, structure, tests (standing user directive 2026-07-12)
+
+Standing directive from the user (applies to ALL future on-box work):
+keep going autonomously; reach parity with every feature that translates;
+build Windows-native equivalents where the Mac concept doesn't translate
+(e.g. shell types); keep the code well structured — **no mega files**;
+**everything gets tests**.
+
+**T32 — Refactor IpcServer.zig + testable pure logic.**
+IpcServer.zig has grown past 1100 lines (transport + marshal + 9 verb
+handlers + arg parsing + SDDL). Split: `ipc/Server.zig` (pipe transport,
+marshal, shutdown), `ipc/verbs.zig` or per-verb files (handlers),
+`ipc/args.zig` (parseVerbArgs/dropPrefix/wrapCommandArgv — PURE, no
+win32 imports, so it compiles in the none-runtime test build like
+apprt/ipc.zig does), plus unit tests for: verb arg parsing, shell argv
+wrapping (pwsh/-Command vs cmd//K vs -lic), send-keys LF/CRLF→CR
+normalization, rearrange layout validation (shape/direction/dupes), and
+the List golden tests (already exist). App.zig (2600+) and Window.zig
+(2000+): move the IPC registry into its own file; assess further splits.
+*Validation:* `zig build test -Dapp-runtime=none` runs the new units;
+win32 build green; P1–P3 acceptance scripts still ALL PASS.
+
+**T33 — Native win32 test lane.**
+Pure-logic tests land in none-runtime files (T32) and run everywhere.
+For win32-tagged units, add/verify a `zig build test -Dapp-runtime=win32`
+lane on the box and fold it into the acceptance flow docs.
+*Validation:* the lane runs green on the box and is documented in this
+file's bootstrap section.
+
+**T34 — Windows shell types, first-class.**
+The Mac wraps commands in `$SHELL -lic`. The Windows translation is a
+shell-flavor table (today: pwsh/powershell → `-NoExit -Command`, cmd →
+`/K`, else `-lic`). Make it first-class: add `wsl`/`wsl.exe`
+(`wsl.exe -- <cmd>`, and bare `--shell=wsl` opens the default distro),
+`nu`/`nushell` (`-e <cmd>`? verify), `bash`/git-bash (works via `-lic`
+today — verify login-shell profile loads), and document `command-shell`
+values for Windows in CLAUDE.md/README. Unit-test the wrap table (T32
+makes it pure). Consider `+list` showing the shell flavor per pane.
+*Validation:* on box — `--command` runs correctly under pwsh, cmd,
+git-bash, and WSL (if installed); unit tests cover every flavor branch.
+
+**T31 — `+list --tty` + pid/tty leaf data on Windows.**
+Found 2026-07-12 trying to run the user's `/reset-context` skill on the
+box: it identifies the calling session's pane via
+`ghoztty +list --tty="$(ps -o tty= -p $PPID)"`, but on Windows (a) the
+CLI ignores `--tty` (prints the full list), (b) every leaf reports
+`tty:""`/`pid:0` (ConPTY backend doesn't surface them — T05 note), and
+(c) MSYS `ps` lacks `-o`, so the skill's tty probe itself needs a
+Windows-appropriate identity (e.g. match by pane's shell PID ancestry or
+an env var like GHOZTTY_SURFACE_ID, which IS already injected). Design
+the Windows equivalent (likely: `+list --pid=<pid>` walking the ConPTY
+child process tree, or match on GHOZTTY_SURFACE_ID) and implement the
+filter + real pid data. This blocks `/reset-context`, `/wt`, and other
+pane-aware workflow skills on Windows.
+*Validation:* from a Claude Code session inside a debug-ghoztty pane, the
+skill's Step-1 probe (or its documented Windows replacement) returns
+exactly that pane's name.
 
 ### Final gate
 
