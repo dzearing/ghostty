@@ -147,9 +147,9 @@ still authoritative for staging/ZIP layout and merge rules.
 | T28 | Minor action no-ops cleanup | I | — | todo | — | — |
 | T29 | Mac-side: fix action fallthroughs to showChildExited | I | — | todo | — | — |
 | T31 | `+list --tty` filter + pid/tty/exit_code leaf data on Windows | I | T05 | todo | — | — |
-| T32 | Refactor: split IpcServer.zig into modules; extract pure logic + unit tests | J | — | todo | — | — |
-| T33 | Native win32 test lane (`zig build test` on the box covers win32 units) | J | T32 | todo | — | — |
-| T34 | Windows shell types: first-class pwsh/powershell/cmd/git-bash/WSL/nushell support | J | — | todo | — | — |
+| T32 | Refactor: split IpcServer.zig into modules; extract pure logic + unit tests | J | — | done | 640457b0d, cb53bb728, 31393ce38, 4cbc3d3e3 | IPC now 5 focused modules (transport 385 lines / handlers / registry / pure args / list model); 8 unit-test blocks in the none-runtime suite; P1–P3 ALL PASS after every step. App.zig −330 lines (rest is the vendored action switch — assessed, deferred) |
+| T33 | Native win32 test lane (`zig build test` on the box covers win32 units) | J | T32 | in-progress | — | pure logic covered by none-runtime lane; native win32 lane attempt recorded below |
+| T34 | Windows shell types: first-class pwsh/powershell/cmd/git-bash/WSL/nushell support | J | — | done | (this commit) | wrap table extended (wsl `--`, nu `-e`) + Mac-parity keep-alive for posix flavors (`; exec "shell" -li` — git-bash panes used to die after the command); every branch unit-tested; on-box: cmd/powershell/git-bash markers read back + panes alive; wsl created but box only has the locked-down docker-desktop distro (`/bin/sh: Permission denied` — informational); pwsh7/nu not installed. CLAUDE.md documents the Windows flavors |
 | T30 | Mac-side: IPC dial must not modal-block the app/IPC server | I | — | todo | — | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
@@ -575,6 +575,16 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night, +3) — T32 done, T34 done — Phase J
+  underway per the standing directive. IPC code restructured into five
+  focused modules with the pure logic (arg parsing, shell wrap table,
+  LF→CR, layout validation) unit-tested in the none-runtime suite; P1–P3
+  acceptance re-run green after EVERY step. Shell-flavor work found a
+  real parity bug: posix-flavor `--command` panes (git-bash) exited with
+  the command because the Mac's `; exec shell -li` keep-alive wasn't
+  ported — fixed, all flavors keep the shell alive now. On-box flavor
+  validation: cmd/powershell/git-bash green via +read markers; wsl
+  blocked by the box having only the docker-desktop utility distro.
 - 2026-07-12 (on-box, late night, +2) — T18 done — win32 swap_split:
   Window.swapSplit (goto to resolve the neighbor, SplitTree.swap for the
   tree, focus follows the moved pane) + action arm replacing the stub.

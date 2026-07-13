@@ -107,11 +107,16 @@ pub fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
 /// `.direct` argv form is required on Windows — the `.shell` path
 /// whitespace-splits with no quoting rules.
 ///
+/// Every flavor keeps the shell ALIVE after the command (Mac behavior:
+/// `shell -lic '<cmd>; exec shell -li'`).
+///
 ///   pwsh / powershell  -> shell -NoExit -Command <cmd>
 ///   cmd                -> shell /K <cmd>
-///   wsl                -> shell -- <cmd>   (runs in the default distro)
+///   wsl                -> shell -- <cmd>   (runs in the default distro;
+///                         exits with the command — no login shell there)
 ///   nu / nushell       -> shell -e <cmd>
-///   anything else      -> shell -lic <cmd> (posix shells, e.g. git-bash)
+///   anything else      -> shell -lic "<cmd>; exec \"shell\" -li"
+///                         (posix shells, e.g. git-bash)
 pub fn wrapShellCommandArgv(
     arena: Allocator,
     shell: []const u8,
@@ -127,18 +132,30 @@ pub fn wrapShellCommandArgv(
     {
         try argv.append(arena, "-NoExit");
         try argv.append(arena, "-Command");
+        try argv.append(arena, try arena.dupeZ(u8, command));
     } else if (std.ascii.eqlIgnoreCase(base, "cmd")) {
         try argv.append(arena, "/K");
+        try argv.append(arena, try arena.dupeZ(u8, command));
     } else if (std.ascii.eqlIgnoreCase(base, "wsl")) {
         try argv.append(arena, "--");
+        try argv.append(arena, try arena.dupeZ(u8, command));
     } else if (std.ascii.eqlIgnoreCase(base, "nu") or
         std.ascii.eqlIgnoreCase(base, "nushell"))
     {
         try argv.append(arena, "-e");
+        try argv.append(arena, try arena.dupeZ(u8, command));
     } else {
+        // Mac parity: run the command, then exec a login shell so the pane
+        // survives with the profile loaded. The exec target is quoted for
+        // spaced Windows paths (C:\Program Files\Git\bin\bash.exe).
         try argv.append(arena, "-lic");
+        try argv.append(arena, try std.fmt.allocPrintSentinel(
+            arena,
+            "{s}; exec \"{s}\" -li",
+            .{ command, shell },
+            0,
+        ));
     }
-    try argv.append(arena, try arena.dupeZ(u8, command));
     return argv.items;
 }
 
@@ -292,8 +309,8 @@ test "wrapShellCommandArgv: every flavor branch" {
         .{ .shell = "wsl.exe", .expect = &.{ "wsl.exe", "--", "echo hi" } },
         .{ .shell = "nu", .expect = &.{ "nu", "-e", "echo hi" } },
         .{ .shell = "nushell.exe", .expect = &.{ "nushell.exe", "-e", "echo hi" } },
-        .{ .shell = "C:\\Program Files\\Git\\bin\\bash.exe", .expect = &.{ "C:\\Program Files\\Git\\bin\\bash.exe", "-lic", "echo hi" } },
-        .{ .shell = "zsh", .expect = &.{ "zsh", "-lic", "echo hi" } },
+        .{ .shell = "C:\\Program Files\\Git\\bin\\bash.exe", .expect = &.{ "C:\\Program Files\\Git\\bin\\bash.exe", "-lic", "echo hi; exec \"C:\\Program Files\\Git\\bin\\bash.exe\" -li" } },
+        .{ .shell = "zsh", .expect = &.{ "zsh", "-lic", "echo hi; exec \"zsh\" -li" } },
     };
     for (cases) |case| {
         const argv = try wrapShellCommandArgv(alloc, case.shell, "echo hi");

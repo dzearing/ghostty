@@ -15,6 +15,7 @@ ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> -
 ```
 
 - `--shell`: Shell to use for `--command`/`--split-command`, invoked with `-lic` so profile is loaded. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`.
+  On Windows the fallback is `command-shell` then `cmd.exe`, and the invocation is per-flavor (the shell stays alive after the command in every case): `pwsh`/`powershell` → `-NoExit -Command`, `cmd` → `/K`, `wsl` → `-- <cmd>` in the default distro, `nu` → `-e`, anything else (e.g. git-bash) → `-lic "<cmd>; exec shell -li"`.
 
 ### `ghoztty +split`
 
