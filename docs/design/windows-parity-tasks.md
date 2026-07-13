@@ -8,6 +8,10 @@ Architecture decisions, reference implementations, and phase rationale live in
 
 ## Resume protocol (fresh session starts here)
 
+**ONE TASK PER CONTEXT, then reset.** (A session that chained tasks hit a
+716k context on 2026-07-12. Everything needed to resume lives in git + this
+doc, so there is nothing worth carrying across tasks.) See `go.md`.
+
 1. Read this doc top to bottom. The **state table** below is ground truth.
 2. Pick the first task that is `todo` whose dependencies are `done`.
 3. Set it `in-progress` (edit the table, commit the doc change or fold it
@@ -17,8 +21,13 @@ Architecture decisions, reference implementations, and phase rationale live in
    build alone — validation must actually pass, on the box when it says so.
 6. Update the state table: status, commit hash(es), one-line validation
    evidence. Append a dated entry to the **Session log** at the bottom.
-7. Push. If context is nearly spent, stop at a task boundary — the next
-   session resumes at step 1.
+7. Push, then **reset context** (`/reset-context read go.md and go`) and end
+   the turn. Do not start the next task in the same context.
+
+Task sizing: if a task looks like it will exceed ~250k context, split it in
+this table first (e.g. `T19a` design + `T19` implement) and commit the split.
+Keep tool output small — grep build logs for `error`, take only the last line
+of acceptance scripts.
 
 New tasks: add rows/sections as discovered (bugs found during validation
 become tasks here, not loose threads). Never delete a task — mark
@@ -147,7 +156,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T25 | Full conformance checklist (spec §8) end-to-end | — | T17,T19,T21 | todo | — | — |
 | T26 | OS color-scheme sync (colorSchemeCallback) | I | — | done | (this commit) | on-box 2026-07-12: `theme = light:Adwaita,dark:GitHub Dark` config + screenshot pixel oracle — pane renders #101216 when the OS is dark, flips LIVE to #ffffff on a light flip, and back, no restart. Found+fixed the real bug the task implies: WM_SETTINGCHANGE broadcasts reach TOP-LEVEL windows only, so the handler had to live in Window.windowWndProc, not the surface proc |
 | T27 | PowerShell shell integration | I | — | done | (this commit) | on-box 2026-07-12: new `src/shell-integration/powershell/ghostty.ps1` (OSC 133 marks, OSC 7 cwd, OSC 2 title) dot-sourced via `-NoExit -Command . '<script>'`; detection for pwsh/powershell(.exe); unit tests for detection + injection + non-interactive bail-out. **Found the real blocker: `reportPwd` was hard-disabled on Windows in the CORE** (`log.warn("reportPwd unimplemented on windows"); return;`) — no shell could EVER report cwd. Implemented it + native path normalization (`/D:/x` → `D:\x`). Validated: pane cwd tracks `cd` live (D:\git\ghoztty → C:\Windows → C:\Users) |
-| T28 | Minor action no-ops cleanup | I | — | todo | — | — |
+| T28 | Minor action no-ops cleanup | I | — | in-progress | (this commit) | DONE so far: close_all_windows now closes each window honoring confirm (was: quit the whole app - a real bug); color_change now retints the scrollbar on foreground/cursor (was: background only). NOT yet done (each is a small next chunk): readonly indicator, key_sequence/key_table pending indicator, pwd action (now that OSC 7 works on Windows via T27), notification click-to-focus round-trip verification |
 | T29 | Mac-side: fix action fallthroughs to showChildExited | I | — | todo | — | — |
 | T31 | `+list --pid` filter + real pid leaf data on Windows | I | T05 | done | (this commit) | on-box 2026-07-12: +list leaves report the real shell pid (verified live cmd.exe); `+list --pid=<any descendant>` resolves the owning pane by Toolhelp32 ancestry (self + grandchild + unknown-pid-error all green); ProcessTree walk unit-tested (cycle/self-parent guards) in the win32 lane. tty stays "" (no ConPTY tty name) and exit_code stays null (note). /reset-context's Windows probe: `ghoztty +list --pid=<winpid>` — the skill (user plugin) needs its Step 1 updated to use it |
 | T32 | Refactor: split IpcServer.zig into modules; extract pure logic + unit tests | J | — | done | 640457b0d, cb53bb728, 31393ce38, 4cbc3d3e3 | IPC now 5 focused modules (transport 385 lines / handlers / registry / pure args / list model); 8 unit-test blocks in the none-runtime suite; P1–P3 ALL PASS after every step. App.zig −330 lines (rest is the vendored action switch — assessed, deferred) |

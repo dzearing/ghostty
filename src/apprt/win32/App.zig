@@ -23,6 +23,7 @@ const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
 const input = @import("../../input.zig");
+const terminal = @import("../../terminal/main.zig");
 
 /// A registered global system hotkey: the RegisterHotKey id and the binding
 /// action to perform when WM_HOTKEY delivers that id.
@@ -1057,10 +1058,22 @@ pub fn performAction(
         },
 
         .close_all_windows => {
-            // Close all surfaces by posting WM_CLOSE to each.
-            // The core tracks surfaces; iterate via quit.
-            self.quit_requested = true;
-            w32.PostQuitMessage(0);
+            // Close every window (honoring confirm-close-surface), which is
+            // distinct from `quit`: if a window's confirmation is declined,
+            // the app stays up with that window. The quit timer starts on
+            // its own once the last window is gone.
+            //
+            // Iterate over a snapshot: Window.close destroys the HWND, whose
+            // WM_DESTROY handler removes it from self.windows.
+            const alloc = self.core_app.alloc;
+            const snapshot = alloc.dupe(*Window, self.windows.items) catch |err| {
+                log.err("close_all_windows: allocation failed err={}", .{err});
+                return true;
+            };
+            defer alloc.free(snapshot);
+            for (snapshot) |window| {
+                if (window.confirmCloseIfNeeded()) window.close();
+            }
             return true;
         },
 
@@ -1236,15 +1249,50 @@ pub fn performAction(
         },
 
         .color_change => {
-            // Track terminal background color changes (OSC 10/11) so the
-            // class background brush matches. The renderer paints the
-            // client area via OpenGL — the brush only affects the brief
-            // flash on resize before the renderer catches up.
-            if (value.kind != .background) return true;
+            // Foreground/cursor changes (OSC 10/12) retint the themed
+            // scrollbar overlay, which is drawn by us rather than the
+            // renderer (T28). Palette entries need no chrome update.
+            switch (value.kind) {
+                .foreground => {
+                    const fg: terminal.color.RGB = .{ .r = value.r, .g = value.g, .b = value.b };
+                    for (self.windows.items) |w| {
+                        for (0..w.tab_count) |i| {
+                            var it = w.tab_trees[i].iterator();
+                            while (it.next()) |entry| {
+                                if (entry.view.scrollbar) |sb| {
+                                    sb.setTheme(self.config.background.toTerminalRGB(), fg);
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                },
+                .cursor => return true,
+                .background => {},
+                else => return true,
+            }
+
+            // Background: keep the class brush in sync so the resize flash
+            // matches the terminal. The renderer paints the client area via
+            // OpenGL; the brush only shows during resize before it catches
+            // up. The scrollbar tracks the new background too.
             if (self.bg_brush) |old_brush| {
                 _ = w32.DeleteObject(@ptrCast(old_brush));
             }
             self.bg_brush = w32.CreateSolidBrush(w32.RGB(value.r, value.g, value.b));
+            {
+                const bg: terminal.color.RGB = .{ .r = value.r, .g = value.g, .b = value.b };
+                for (self.windows.items) |w| {
+                    for (0..w.tab_count) |i| {
+                        var it = w.tab_trees[i].iterator();
+                        while (it.next()) |entry| {
+                            if (entry.view.scrollbar) |sb| {
+                                sb.setTheme(bg, self.config.foreground.toTerminalRGB());
+                            }
+                        }
+                    }
+                }
+            }
             // SetClassLongPtrW propagates the new brush to all existing
             // windows of the class, not just future ones.
             for (self.windows.items) |w| {
