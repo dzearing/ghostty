@@ -297,6 +297,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             if cfg.remoteWorkingDirectory == nil, let cwd {
                 cfg.remoteWorkingDirectory = cwd
             }
+            // Fresh session on the same machine ⇒ the per-host default shell
+            // applies (the cwd already inherited from the parent pane above).
+            if cfg.remoteShell == nil {
+                cfg.remoteShell = parentRemote.machine.settings.shell
+            }
             let controller = newWindow(ghostty, withBaseConfig: cfg, withParent: parent)
             // Carry the strong connection owner onto the new window so the shared
             // handle outlives every surface/split and its splits/tabs keep
@@ -520,6 +525,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 }
                 if cfg.remoteWorkingDirectory == nil, let cwd {
                     cfg.remoteWorkingDirectory = cwd
+                }
+                // Fresh session on the same machine ⇒ the per-host default
+                // shell applies (the cwd already inherited above).
+                if cfg.remoteShell == nil {
+                    cfg.remoteShell = parentRemote.machine.settings.shell
                 }
                 _ = buildTab(
                     ghostty,

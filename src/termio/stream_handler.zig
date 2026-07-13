@@ -24,6 +24,13 @@ pub const StreamHandler = struct {
     size: *renderer.Size,
     terminal: *terminal.Terminal,
 
+    /// True once the surface began tearing down (set by `Termio.shutdown`
+    /// on the GUI thread before it joins the IO thread). Checked by push
+    /// retry loops on the SHARED app mailbox, which cannot be closed:
+    /// when set, drop the message instead of waiting for a drain that may
+    /// never come. Points at the owning Termio's flag.
+    closing: *const std.atomic.Value(bool),
+
     /// Mailbox for data to the termio thread.
     termio_mailbox: *termio.Mailbox,
 
@@ -131,7 +138,16 @@ pub const StreamHandler = struct {
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
             self.renderer_state.mutex.unlock();
             defer self.renderer_state.mutex.lock();
-            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+
+            // The app mailbox is SHARED across surfaces and drained only by
+            // the GUI thread, so we must never park forever here: if the GUI
+            // thread is currently in Surface.deinit joining THIS thread (or
+            // just busy while our surface dies), a forever wait deadlocks
+            // the whole app. Timed retries until it lands — unless our
+            // surface is closing, in which case nobody cares, drop it.
+            while (self.surface_mailbox.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) == 0) {
+                if (self.closing.load(.acquire)) return;
+            }
         }
     }
 
@@ -329,6 +345,7 @@ pub const StreamHandler = struct {
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
             .activity_state => self.activityState(value),
+            .pane_banner => self.paneBanner(value.text),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
@@ -1572,5 +1589,14 @@ pub const StreamHandler = struct {
 
     fn activityState(self: *StreamHandler, state: terminal.osc.Command.ActivityState) void {
         self.surfaceMessageWriter(.{ .activity_state = state });
+    }
+
+    /// Set (or clear, when empty) the sticky pane banner.
+    fn paneBanner(self: *StreamHandler, text: []const u8) void {
+        if (apprt.surface.Message.WriteReq.init(self.alloc, text)) |req| {
+            self.surfaceMessageWriter(.{ .pane_banner = req });
+        } else |err| {
+            log.warn("error notifying surface of pane banner err={}", .{err});
+        }
     }
 };

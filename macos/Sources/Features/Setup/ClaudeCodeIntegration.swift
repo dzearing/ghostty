@@ -5,7 +5,7 @@ import OSLog
 /// again when everything is installed reports success.
 enum ClaudeCodeIntegration {
     private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier!,
+        subsystem: Bundle.loggerSubsystem,
         category: "ClaudeCodeIntegration"
     )
 

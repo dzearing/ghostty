@@ -52,6 +52,18 @@ pub const Mailbox = union(enum) {
         }
     }
 
+    /// Close the mailbox: all future (and currently blocked) sends drop
+    /// their message instead of waiting for space. Called at surface
+    /// teardown BEFORE joining the IO thread, because after the IO thread
+    /// is asked to stop nobody will ever drain this queue again — a
+    /// producer parked in `send`'s slow path would otherwise deadlock the
+    /// joining (GUI) thread forever.
+    pub fn close(self: *Mailbox) void {
+        switch (self.*) {
+            .spsc => |*v| v.queue.close(),
+        }
+    }
+
     /// Sends the given message without notifying there are messages.
     ///
     /// If the optional mutex is given, it must already be LOCKED. If the
@@ -89,7 +101,24 @@ pub const Mailbox = union(enum) {
                 // here.
                 if (mutex) |m| m.unlock();
                 defer if (mutex) |m| m.lock();
-                _ = mb.queue.push(msg, .{ .forever = {} });
+
+                // Bounded timed retries, NEVER a forever wait. Two callers
+                // can reach this with a full queue and no hope of a drain:
+                // (1) the IO thread itself, when stream processing generates
+                // replies (remote backends parse output ON the IO thread, so
+                // producer == consumer and waiting can never succeed), and
+                // (2) any producer during teardown, after the IO thread has
+                // stopped draining. A forever wait wedges that thread — and
+                // wedges the GUI thread when Surface.deinit later joins it.
+                // Dropping a message after ~50ms of a full queue is strictly
+                // better than deadlocking the app; it's also loud so we can
+                // find pathological floods.
+                var attempts: usize = 0;
+                while (attempts < 5) : (attempts += 1) {
+                    if (mb.queue.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) > 0) return;
+                    if (mb.queue.isClosed()) return;
+                }
+                log.warn("termio mailbox full for 50ms, dropping message={s}", .{@tagName(msg)});
             },
         }
     }

@@ -54,6 +54,16 @@ ghoztty +read --name=<pane> --lines=<N>
 - `--name`: Named pane to read from (required).
 - `--lines`: Number of lines from the end of scrollback (default: 50).
 
+### `ghoztty +list`
+
+List open windows, tabs, and panes (human-readable tree, or `--json`). Listing auto-registers every pane it discovers, so returned names are immediately usable as targets.
+
+```
+ghoztty +list [--json] [--tty=<tty>]
+```
+
+- `--tty`: Print only the registered name of the pane whose terminal matches the given tty (`ttys014` or `/dev/ttys014`; raw padded `ps -o tty=` output is accepted), then exit. Exits 1 if no match. Lets a process find its own pane: `ghoztty +list --tty="$(ps -o tty= -p $PPID)"`.
+
 ### `ghoztty +send-keys`
 
 Send text input to a named pane's terminal PTY.
@@ -63,6 +73,7 @@ ghoztty +send-keys --target=<name> <text|key>...
 ```
 
 - `--target`: Named pane or window to send input to. Required.
+- `--when-idle`: Poll the target pane's recent output every 500ms until it no longer contains `esc to interrupt` (Claude Code's busy marker) before sending; sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
 - Positional arguments are text or key names, concatenated and written to the PTY.
 - Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
 - Named keys: `Enter`, `Tab`, `Escape`, `Space`, `Backspace`
@@ -93,6 +104,27 @@ ghoztty +set-state --target=dev --state=idle
 
 Processes can also set state via OSC escape sequence: `\033]7777;<state>\007`
 
+### `ghoztty +set-banner`
+
+Set or clear the sticky banner of a named pane or window. The banner is a native overlay rendered above the terminal content of a pane — it persists (survives scrolling, screen clears, and content updates) until changed or cleared. Setting a banner on a window target applies it to that window's focused pane (banners are per-pane).
+
+```
+ghoztty +set-banner --target=<name> [--clear] [text...]
+```
+
+- `--target`: Named pane or window. Required.
+- `--clear`: Remove the banner (empty text does the same).
+- All other arguments are treated as the banner text (multiple are joined with spaces).
+
+Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic_`, `__underline__`, `` `code` ``, and `[text](url)` clickable links (URL must include a scheme, e.g. `https://`). Note `__underline__` intentionally differs from CommonMark (where `__` is bold). `\` escapes the next character. Unterminated delimiters render literally. A literal `\n` in CLI banner text becomes a line break — banners can span multiple lines (display is capped at 6 lines).
+
+```bash
+ghoztty +set-banner --target=dev "**PR #123** — _3 files_, +120/−45 — [view](https://github.com/org/repo/pull/123)"
+ghoztty +set-banner --target=dev --clear
+```
+
+Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels).
+
 ### `ghoztty +new-remote-window`
 
 Open a terminal window whose shell runs on a remote machine via a `ghoztty-agent`
@@ -101,19 +133,33 @@ action (dial the agent, build a remote surface, open the window), so the remote
 path is scriptable/testable from the shell.
 
 ```
-ghoztty +new-remote-window --host=<host> --port=<port>
+ghoztty +new-remote-window --host=<host> --port=<port> --working-directory=<path> --shell=<path> --command=<cmd>
 ```
 
 - `--host`: Agent host (DNS name or literal IP). Required.
 - `--port`: Agent TCP port. Required.
+- `--working-directory`: Working directory ON THE REMOTE MACHINE for the new
+  session. Overrides the machine's per-host default.
+- `--shell`: Shell ON THE REMOTE MACHINE to run (e.g. `wsl.exe`,
+  `powershell.exe`, `/bin/zsh`). Overrides the machine's per-host default.
+- `--command`: Command to run in the remote session instead of an interactive
+  shell. Runs through the resolved shell using its native convention (POSIX
+  `-lic`, cmd `/c`, powershell/pwsh `-Command`, wsl `--`).
 
 ```bash
 ghoztty +new-remote-window --host=127.0.0.1 --port=7777
+ghoztty +new-remote-window --host=winbox --port=7777 --shell=wsl.exe --working-directory='C:\dev'
 ```
 
 The remote session uses the remote machine's own default shell and working
 directory (the local shell/pwd are NOT forwarded — they would not exist on a
-different OS such as a Windows ConPTY agent).
+different OS such as a Windows ConPTY agent) unless a **per-host default** or
+an explicit flag says otherwise. Per-host defaults (default working directory
++ default shell per machine) are edited in the machine chooser (Cmd-Shift-N →
+row `⋯` menu → "Host Settings…") and persist in UserDefaults keyed by relay
+device id or `host:port`; explicit `--working-directory`/`--shell` flags
+override them per window. New tabs/splits on a remote window use the per-host
+default shell too (their cwd inherits from the parent pane).
 
 ### Naming
 

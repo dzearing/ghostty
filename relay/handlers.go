@@ -31,19 +31,36 @@ type Handler struct {
 	store  *Store
 	dir    *Directory
 	enroll *EnrollManager
+	quotas *Quotas       // M4 per-account limits (quotas.go)
+	rl     *RateLimiters // M4 abuse-control rate limits (ratelimit.go)
 	logger *slog.Logger
+
+	// adminSubs is the ADMIN_SUBS bootstrap allowlist as a set (admin.go).
+	adminSubs map[string]bool
 }
 
 // NewHandler constructs a Handler.
 func NewHandler(cfg *Config, auth *Authenticator, store *Store, dir *Directory, logger *slog.Logger) *Handler {
-	return &Handler{
-		cfg:    cfg,
-		auth:   auth,
-		store:  store,
-		dir:    dir,
-		enroll: NewEnrollManager(cfg, auth, store, logger),
-		logger: logger,
+	adminSubs := make(map[string]bool, len(cfg.AdminSubs))
+	for _, s := range cfg.AdminSubs {
+		adminSubs[s] = true
 	}
+	h := &Handler{
+		cfg:       cfg,
+		auth:      auth,
+		store:     store,
+		dir:       dir,
+		enroll:    NewEnrollManager(cfg, auth, store, logger),
+		quotas:    NewQuotas(cfg, store, dir, logger),
+		rl:        NewRateLimiters(cfg),
+		logger:    logger,
+		adminSubs: adminSubs,
+	}
+	// M4: bind the failed-sign-in limiter into the Authenticator (late bind,
+	// mirroring SetGate) so production and every test wiring get it through
+	// this one path with no main.go changes.
+	auth.SetRateLimits(h.rl)
+	return h
 }
 
 // Register attaches all routes to mux. Method+path patterns require Go 1.22+.
@@ -63,6 +80,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// the {nonce} wildcard per ServeMux precedence, so both can coexist.
 	mux.HandleFunc("GET /enroll/callback", h.handleEnrollCallback)
 	mux.HandleFunc("GET /enroll/{nonce}", h.handleEnrollWeb)
+	// Admin surface (M2): a distinct, separately authorized set of routes —
+	// never satisfiable with a normal user token (admin.go).
+	h.registerAdmin(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -255,12 +275,12 @@ func (h *Handler) viewOf(d *Device) deviceView {
 func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
-	email := ident.Email
-
-	devices := h.store.ListByOwner(email)
+	// Ownership is keyed on the caller's stable google_sub, with a legacy
+	// email fallback for devices enrolled before sub existed (store.go).
+	devices := h.store.ListByOwnerIdent(ident)
 	out := make([]deviceView, 0, len(devices))
 	for _, d := range devices {
 		out = append(out, h.viewOf(d))
@@ -275,7 +295,7 @@ func (h *Handler) handleListDevices(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
@@ -288,8 +308,13 @@ func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dev, rawToken, err := h.store.CreateDevice(email, body.Name)
+	// M4: quota-aware create — the caller's device quota is enforced inside
+	// the create transaction (quotas.go).
+	dev, rawToken, err := h.createDeviceQuota(ident, body.Name)
 	if err != nil {
+		if h.writeQuotaExceeded(w, err) { // 409 + {"error","limit"}
+			return
+		}
 		h.logger.Error("enroll failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -311,7 +336,7 @@ func (h *Handler) handleEnrollDevice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
@@ -326,7 +351,7 @@ func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dev, err := h.store.RenameDevice(id, email, body.Name)
+	dev, err := h.store.RenameDeviceByOwner(id, ident, body.Name)
 	if err != nil {
 		h.logger.Error("rename failed", "device", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -352,14 +377,14 @@ func (h *Handler) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
 
 	id := r.PathValue("id")
 
-	deleted, err := h.store.DeleteDevice(id, email)
+	deleted, err := h.store.DeleteDeviceByOwner(id, ident)
 	if err != nil {
 		h.logger.Error("delete failed", "device", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -384,10 +409,15 @@ func (h *Handler) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.auth.AuthenticateClient(r.Context(), r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.writeAuthErr(w, err) // 401, or 429 when rate limited (ratelimit.go)
 		return
 	}
 	email := ident.Email
+
+	// M4: per-identity connect rate limit (429 + Retry-After).
+	if h.limitConnect(w, ident) {
+		return
+	}
 
 	deviceID := r.URL.Query().Get("device")
 	if deviceID == "" {
@@ -396,14 +426,21 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dev := h.store.Get(deviceID)
-	if dev == nil || dev.OwnerEmail != email {
+	if dev == nil || !dev.OwnedBy(ident) {
 		// Do not distinguish "not found" from "not yours": both are 404 to the
-		// caller so device IDs of other owners are not enumerable.
+		// caller so device IDs of other owners are not enumerable. Ownership is
+		// sub-keyed with a legacy email fallback (store.go OwnedBy).
 		http.Error(w, "device not found", http.StatusNotFound)
 		return
 	}
 	if !h.dir.IsOnline(deviceID) {
 		http.Error(w, "device offline", http.StatusConflict)
+		return
+	}
+
+	// M4: concurrent-session quota, checked pre-upgrade for a clean HTTP 409
+	// body; newOwnedSession re-enforces it atomically after the upgrade.
+	if h.writeSessionQuotaExceeded(w, ident) {
 		return
 	}
 
@@ -414,9 +451,8 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.CloseNow()
 
-	ps, err := h.dir.CreatePending(deviceID)
-	if err != nil {
-		c.Close(websocket.StatusTryAgainLater, "relay busy")
+	ps, ok := h.newOwnedSession(c, deviceID, ident)
+	if !ok {
 		return
 	}
 	// Always release the agent data handler (which blocks on ps.done) and drop
@@ -453,8 +489,8 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 // --- Self-enroll endpoints (WP-B3) -----------------------------------------
 
 // handleEnrollStart: POST /v1/enroll/start (JSON, UNAUTHENTICATED).
-// Body {"name":"<machine name>", "flow":"device"|"web"} (flow defaults to
-// "device" for back-compat).
+// Body {"name":"<machine name>", "flow":"device"|"web", "invite_code":"..."}
+// (flow defaults to "device" for back-compat; invite_code is optional).
 //
 //   - device: starts a Google device-code sign-in and returns
 //     {verification_url, user_code, device_code_handle, interval, expires_in}.
@@ -464,10 +500,22 @@ func (h *Handler) handleClientConnect(w http.ResponseWriter, r *http.Request) {
 //     the owner opens enroll_url in a browser and the agent polls the same
 //     /v1/enroll/poll. 503 when no Web OAuth client is configured — the
 //     agent falls back to the device flow.
+//
+// invite_code (when INVITE_SIGNUP is ON) is parked on the enrollment and
+// consumed at the success path to create a brand-new account. A returning
+// owner never needs it (existing-account/legacy-owner paths authorize without
+// a code), so the headless device flow keeps working unchanged for them.
 func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
+	// M4: per-IP rate limit — this endpoint is unauthenticated and mints
+	// upstream traffic + relay state, making it the most abusable one.
+	if h.limitEnrollStart(w, r) {
+		return
+	}
+
 	var body struct {
-		Name string `json:"name"`
-		Flow string `json:"flow"`
+		Name       string `json:"name"`
+		Flow       string `json:"flow"`
+		InviteCode string `json:"invite_code"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
@@ -478,10 +526,11 @@ func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid body: expected {\"name\":\"...\"}", http.StatusBadRequest)
 		return
 	}
+	inviteCode := strings.TrimSpace(body.InviteCode)
 
 	switch body.Flow {
 	case "", flowDevice:
-		resp, err := h.enroll.Start(r.Context(), name)
+		resp, err := h.enroll.Start(r.Context(), name, inviteCode)
 		switch {
 		case errors.Is(err, errEnrollUnavailable):
 			http.Error(w, "enrollment unavailable: relay has no OIDC device flow configured", http.StatusServiceUnavailable)
@@ -496,7 +545,7 @@ func (h *Handler) handleEnrollStart(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, resp)
 	case flowWeb:
-		resp, err := h.enroll.StartWeb(name, h.relayBase(r))
+		resp, err := h.enroll.StartWeb(name, inviteCode, h.relayBase(r))
 		switch {
 		case errors.Is(err, errEnrollUnavailable):
 			http.Error(w, "web enrollment unavailable: relay has no web OAuth client configured", http.StatusServiceUnavailable)
@@ -568,7 +617,7 @@ func (h *Handler) handleEnrollCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name, err := h.enroll.Callback(r.Context(), code, state)
+	name, err := h.enroll.Callback(r.Context(), code, state, clientIP(r))
 	switch {
 	case errors.Is(err, errWebStateUnknown):
 		writeEnrollPage(w, http.StatusBadRequest, false, "Link invalid or expired",
@@ -581,6 +630,11 @@ func (h *Handler) handleEnrollCallback(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, errWebExchange):
 		writeEnrollPage(w, http.StatusBadGateway, false, "Sign-in could not be completed",
 			"The code exchange with Google failed. Run the enrollment on the machine again.")
+	case errors.Is(err, errWebQuota):
+		// M4: device quota — same 409 the API paths use for quota refusals.
+		writeEnrollPage(w, http.StatusConflict, false, "Device limit reached",
+			"Your account already has its maximum number of machines. "+
+				"Remove one, then run the enrollment again.")
 	case err != nil:
 		writeEnrollPage(w, http.StatusInternalServerError, false, "Something went wrong",
 			"Run the enrollment on the machine again.")
@@ -598,6 +652,12 @@ func (h *Handler) handleEnrollCallback(w http.ResponseWriter, r *http.Request) {
 // device_token, relay_base} exactly once; denied/expired/rejected are
 // terminal.
 func (h *Handler) handleEnrollPoll(w http.ResponseWriter, r *http.Request) {
+	// M4: per-IP backstop behind the per-handle interval throttle below —
+	// that throttle is per enrollment, so handle-rotating callers need this.
+	if h.limitEnrollPoll(w, r) {
+		return
+	}
+
 	var body struct {
 		Handle string `json:"device_code_handle"`
 	}
@@ -606,7 +666,7 @@ func (h *Handler) handleEnrollPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := h.enroll.Poll(r.Context(), body.Handle, h.relayBase(r))
+	out := h.enroll.Poll(r.Context(), body.Handle, h.relayBase(r), clientIP(r))
 	writeJSON(w, out.status, out.body)
 }
 

@@ -44,15 +44,44 @@ func main() {
 	}
 	defer store.Close()
 
+	// Wire the account-model authorization gate. The runtime signup mode
+	// (settings.go: DB settings.signup_mode, seeded from SIGNUP_MODE /
+	// INVITE_SIGNUP) decides per-request whether it governs — `allowlist`
+	// keeps the legacy ALLOWED_EMAILS path. The gate needs the Store, hence
+	// this late bind after LoadStore. The log below is a startup SNAPSHOT
+	// only; the mode is changeable live via PUT /v1/admin/settings.
+	gate := NewSigninGate(cfg, store, logger)
+	auth.SetGate(gate)
+	mode, modeSource := gate.SignupModeWithSource()
+	logger.Info("signup mode resolved", "mode", mode, "source", modeSource)
+	if mode != SignupAllowlist {
+		logger.Warn("account model governs sign-in (ALLOWED_EMAILS bypassed)", "mode", mode)
+	}
+
+	// Admin surface (M2): bootstrap admins come from ADMIN_SUBS; with none
+	// configured, only accounts.is_admin rows grant access (fail closed —
+	// neither means every /v1/admin/ request 403s).
+	logger.Info("admin bootstrap allowlist", "subs", len(cfg.AdminSubs))
+
 	dir := NewDirectory(logger)
 	h := NewHandler(cfg, auth, store, dir, logger)
 
 	mux := http.NewServeMux()
 	h.Register(mux)
 
+	// Prometheus /metrics on its own (loopback by default) listener — never on
+	// the public mux. Bind failure is fatal: it is a config error (metrics.go).
+	metricsSrv, err := StartMetricsServer(cfg, dir, store, logger)
+	if err != nil {
+		logger.Error("failed to start metrics listener", "err", err)
+		os.Exit(1)
+	}
+
 	srv := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: mux,
+		Addr: cfg.ListenAddr,
+		// InstrumentHTTP wraps the mux for request/error-rate counters
+		// (metrics.go); it preserves Hijacker for the WebSocket routes.
+		Handler: InstrumentHTTP(mux),
 		// No global write/read timeouts: WebSocket bridges are long-lived.
 		// Per-operation timeouts (heartbeat, session setup) bound the risky paths.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -77,5 +106,8 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "err", err)
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}
 }

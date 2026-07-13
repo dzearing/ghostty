@@ -7,7 +7,30 @@ LANGUAGE 0, 0
 #define ID_ICON_AGENT 1
 ID_ICON_AGENT ICON "ghostty.ico"
 
+// Version identity is injected by the build (src/build/GhosttyAgent.zig) via
+// /d defines: the release semver (matches the app tag / DMG) as both the
+// numeric FILEVERSION and the FileVersion/ProductVersion strings, and the
+// agent's date-hash self-update stamp as Comments. The #ifndef defaults keep
+// bare `rc` compiles (and dev builds without git) working.
+#ifndef AGENT_VER_MAJOR
+#define AGENT_VER_MAJOR 0
+#endif
+#ifndef AGENT_VER_MINOR
+#define AGENT_VER_MINOR 0
+#endif
+#ifndef AGENT_VER_PATCH
+#define AGENT_VER_PATCH 0
+#endif
+#ifndef AGENT_VERSION_STR
+#define AGENT_VERSION_STR "0.0.0"
+#endif
+#ifndef AGENT_STAMP_STR
+#define AGENT_STAMP_STR "dev"
+#endif
+
 VS_VERSION_INFO VERSIONINFO
+FILEVERSION    AGENT_VER_MAJOR,AGENT_VER_MINOR,AGENT_VER_PATCH,0
+PRODUCTVERSION AGENT_VER_MAJOR,AGENT_VER_MINOR,AGENT_VER_PATCH,0
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
@@ -16,6 +39,9 @@ BEGIN
         VALUE "OriginalFilename", "ghoztty-agent.exe"
         VALUE "ProductName",      "Ghoztty Agent"
         VALUE "FileDescription",  "Ghoztty remote-machines agent"
+        VALUE "FileVersion",      AGENT_VERSION_STR
+        VALUE "ProductVersion",   AGENT_VERSION_STR
+        VALUE "Comments",         "Agent build " AGENT_STAMP_STR
         END
     END
     BLOCK "VarFileInfo"

@@ -173,6 +173,9 @@ pub const Action = union(enum) {
     /// Set the activity state of a named pane or window.
     set_state: SetState,
 
+    /// Set or clear the sticky banner of a named pane or window.
+    set_banner: SetBanner,
+
     pub const NewWindow = struct {
         /// A list of command arguments to launch in the new window. If this is
         /// `null` the command configured in the config or the user's default
@@ -399,6 +402,35 @@ pub const Action = union(enum) {
         }
     };
 
+    pub const SetBanner = struct {
+        arguments: ?[][:0]const u8,
+
+        pub const C = extern struct {
+            arguments: ?[*]?[*:0]const u8,
+
+            pub fn deinit(self: *SetBanner.C, alloc: Allocator) void {
+                if (self.arguments) |arguments| alloc.free(arguments);
+            }
+        };
+
+        pub fn cval(self: *SetBanner, alloc: Allocator) Allocator.Error!SetBanner.C {
+            var result: SetBanner.C = undefined;
+
+            if (self.arguments) |arguments| {
+                result.arguments = try alloc.alloc([*:0]const u8, arguments.len + 1);
+
+                for (arguments, 0..) |argument, i|
+                    result.arguments[i] = argument.ptr;
+
+                result.arguments[arguments.len] = null;
+            } else {
+                result.arguments = null;
+            }
+
+            return result;
+        }
+    };
+
     /// Sync with: ghostty_ipc_action_tag_e
     pub const Key = enum(c_int) {
         new_window,
@@ -408,6 +440,7 @@ pub const Action = union(enum) {
         rearrange,
         send_keys,
         set_state,
+        set_banner,
 
         /// The wire name of this action: the `action` field of the IPC JSON
         /// request (and the CLI `+<verb>` spelling).
@@ -420,6 +453,7 @@ pub const Action = union(enum) {
                 .rearrange => "rearrange",
                 .send_keys => "send-keys",
                 .set_state => "set-state",
+                .set_banner => "set-banner",
             };
         }
 

@@ -163,6 +163,10 @@ pub const Command = union(Key) {
     /// OSC 7777. Activity state reporting (Ghoztty extension).
     activity_state: ActivityState,
 
+    /// OSC 7778. Sticky pane banner (Ghoztty extension). The payload is
+    /// the banner text; an empty payload clears the banner.
+    pane_banner: [:0]const u8,
+
     pub const ActivityState = enum(c_int) {
         idle = 0,
         busy = 1,
@@ -203,6 +207,7 @@ pub const Command = union(Key) {
             "kitty_clipboard_protocol",
             "context_signal",
             "activity_state",
+            "pane_banner",
         },
     );
 
@@ -370,6 +375,7 @@ pub const Parser = struct {
         @"552",
         @"777",
         @"7777",
+        @"7778",
         @"1337",
         @"5522",
     };
@@ -434,6 +440,7 @@ pub const Parser = struct {
             .kitty_clipboard_protocol,
             .context_signal,
             .activity_state,
+            .pane_banner,
             => {},
         }
 
@@ -748,10 +755,16 @@ pub const Parser = struct {
             .@"777" => switch (c) {
                 ';' => self.captureTrailing(.fixed),
                 '7' => self.state = .@"7777",
+                '8' => self.state = .@"7778",
                 else => self.state = .invalid,
             },
 
             .@"7777" => switch (c) {
+                ';' => self.captureTrailing(.fixed),
+                else => self.state = .invalid,
+            },
+
+            .@"7778" => switch (c) {
                 ';' => self.captureTrailing(.fixed),
                 else => self.state = .invalid,
             },
@@ -836,6 +849,8 @@ pub const Parser = struct {
             .@"777" => parsers.rxvt_extension.parse(self, terminator_ch),
 
             .@"7777" => parsers.activity_state.parse(self, terminator_ch),
+
+            .@"7778" => parsers.pane_banner.parse(self, terminator_ch),
 
             .@"1337" => parsers.iterm2.parse(self, terminator_ch),
 

@@ -153,6 +153,31 @@ fn runArgs(
     return 0;
 }
 
+/// Query the last `lines` lines of a named pane and return the plain
+/// text. For use by other CLI actions (e.g. `+send-keys --when-idle`).
+/// The returned slice points into JSON parsed with `alloc`, so callers
+/// must pass an arena (as the CLI actions do).
+pub fn queryPaneText(
+    alloc: Allocator,
+    name: []const u8,
+    lines: u32,
+    stderr: *std.Io.Writer,
+) ![]const u8 {
+    const name_arg = try std.fmt.allocPrintSentinel(alloc, "--name={s}", .{name}, 0);
+    const lines_arg = try std.fmt.allocPrintSentinel(alloc, "--lines={d}", .{lines}, 0);
+    var ipc_args = [_][:0]const u8{ name_arg, lines_arg };
+    const resp_body = try sendReadQuery(alloc, &ipc_args, stderr);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp_body, .{});
+    const data_val = parsed.value.object.get("data") orelse return "";
+    if (data_val != .object) return "";
+    const text = data_val.object.get("text") orelse return "";
+    return switch (text) {
+        .string => |s| s,
+        else => "",
+    };
+}
+
 fn sendReadQuery(
     alloc: Allocator,
     arguments: [][:0]const u8,

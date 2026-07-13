@@ -13,7 +13,7 @@ class AppDelegate: NSObject,
     // The application logger. We should probably move this at some point to a dedicated
     // class/struct but for now it lives here! 🤷‍♂️
     static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier!,
+        subsystem: Bundle.loggerSubsystem,
         category: String(describing: AppDelegate.self)
     )
 
@@ -269,6 +269,20 @@ class AppDelegate: NSObject,
             // WP-D2: re-attach any relay remote windows that were open when
             // the app last quit (background dials; failures never alert).
             restoreRemoteWindows()
+
+            // Warm the machine chooser: touching `MachineRegistry.shared`
+            // seeds it from the persisted device cache, and the quiet refresh
+            // starts resolving live online status NOW — the first fetch can
+            // take seconds (OAuth refresh-token grant + network), so doing it
+            // at launch means the chooser (Cmd-Shift-N) usually opens with
+            // fresh presence instead of "checking" rows. Quiet: a launch-time
+            // blip must not stage error UI the chooser would then show; the
+            // chooser's own on-open refresh still runs regardless. The
+            // refresh internally waits for the account's deferred Keychain
+            // load, so this cannot race it into a false "signed out" purge.
+            Task { @MainActor in
+                await MachineRegistry.shared.refreshFromRelay(quiet: true)
+            }
         }
 
         // Setup a local event monitor for app-level keyboard shortcuts. See
@@ -1109,6 +1123,9 @@ class AppDelegate: NSObject,
         host: String,
         port: UInt16,
         name: String? = nil,
+        workingDirectory: String? = nil,
+        shell: String? = nil,
+        command: String? = nil,
         onOpen: ((TerminalController) -> Void)? = nil
     ) -> String? {
         // Resolve a friendly NAME from the registry so an IPC-opened window's
@@ -1124,7 +1141,12 @@ class AppDelegate: NSObject,
             host: host,
             port: port,
             namePinned: name != nil)
-        return openRemoteWindow(on: machine, onOpen: onOpen)
+        return openRemoteWindow(
+            on: machine,
+            workingDirectory: workingDirectory,
+            shell: shell,
+            command: command,
+            onOpen: onOpen)
     }
 
     /// Opens a remote window by dialing a remote agent THROUGH a rendezvous
@@ -1142,6 +1164,9 @@ class AppDelegate: NSObject,
         name: String? = nil,
         namePinned: Bool = false,
         ipcName: String? = nil,
+        workingDirectory: String? = nil,
+        shell: String? = nil,
+        command: String? = nil,
         onOpen: ((TerminalController) -> Void)? = nil
     ) -> String? {
         // Defense in depth for the signed-out case: every caller resolves the
@@ -1172,7 +1197,10 @@ class AppDelegate: NSObject,
             fallbackName: name,
             namePinned: namePinned,
             sessionID: nil,
-            ipcName: ipcName)
+            ipcName: ipcName,
+            workingDirectory: workingDirectory,
+            shell: shell,
+            command: command)
         onOpen?(controller)
         return nil
     }
@@ -1215,6 +1243,9 @@ class AppDelegate: NSObject,
         sessionID: String?,
         windowTitle: String? = nil,
         ipcName: String? = nil,
+        workingDirectory: String? = nil,
+        shell: String? = nil,
+        command: String? = nil,
         replacingManifestEntry: UUID? = nil
     ) -> TerminalController {
         // The relay path has no TCP port. The DISPLAY NAME wins: prefer the
@@ -1252,6 +1283,16 @@ class AppDelegate: NSObject,
         // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
         cfg.connectionKeepAlive = connection
         cfg.remoteSessionId = sessionID
+        // Per-host defaults (cwd/shell) + explicit CLI overrides apply only to
+        // an OPEN-new window; a restore re-ATTACHes an existing session, whose
+        // shell/cwd were fixed when it was first opened.
+        if sessionID == nil {
+            machine.applyOpenDefaults(
+                to: &cfg,
+                workingDirectory: workingDirectory,
+                shell: shell,
+                command: command)
+        }
 
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
         controller.remoteMachine = machine
@@ -1505,6 +1546,9 @@ class AppDelegate: NSObject,
     @discardableResult
     private func openRemoteWindow(
         on machine: Machine,
+        workingDirectory: String? = nil,
+        shell: String? = nil,
+        command: String? = nil,
         onOpen: ((TerminalController) -> Void)? = nil
     ) -> String? {
         // Dial the agent over TCP. This blocks through the handshake and returns
@@ -1536,6 +1580,13 @@ class AppDelegate: NSObject,
         // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
         cfg.connectionKeepAlive = connection
         cfg.remoteSessionId = nil
+        // Per-host defaults (cwd/shell), overridden by explicit CLI flags. This
+        // is an OPEN-new (session_id nil), so the OPEN fields apply.
+        machine.applyOpenDefaults(
+            to: &cfg,
+            workingDirectory: workingDirectory,
+            shell: shell,
+            command: command)
 
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
         controller.remoteMachine = machine

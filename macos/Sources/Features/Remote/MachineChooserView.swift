@@ -190,20 +190,19 @@ struct MachineChooserView: View {
                                 .help("Open Activity Monitor for \(machine.name)")
                                 .padding(.trailing, 6)
 
-                                // Account-resource management (relay devices
-                                // only, WP-C2): rename or remove the host.
-                                if machine.isRelay {
-                                    Menu {
-                                        managementActions(for: machine)
-                                    } label: {
-                                        Image(systemName: "ellipsis.circle")
-                                    }
-                                    .menuStyle(.borderlessButton)
-                                    .menuIndicator(.hidden)
-                                    .fixedSize()
-                                    .help("Manage \(machine.name)")
-                                    .padding(.trailing, 6)
+                                // Management menu: per-host settings for EVERY
+                                // remote machine; account-resource actions
+                                // (rename/remove, WP-C2) for relay devices only.
+                                Menu {
+                                    managementActions(for: machine)
+                                } label: {
+                                    Image(systemName: "ellipsis.circle")
                                 }
+                                .menuStyle(.borderlessButton)
+                                .menuIndicator(.hidden)
+                                .fixedSize()
+                                .help("Manage \(machine.name)")
+                                .padding(.trailing, 6)
                             }
                         }
                         .padding(.horizontal, 8)
@@ -212,7 +211,7 @@ struct MachineChooserView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .onHover { hovering in hoveredIndex = hovering ? idx : nil }
                         .contextMenu {
-                            if case .remote(let machine) = target, machine.isRelay {
+                            if case .remote(let machine) = target {
                                 managementActions(for: machine)
                             }
                         }
@@ -450,9 +449,15 @@ struct MachineChooserView: View {
     /// The leading status column for a device row. For relay machines the
     /// status is SHAPE-coded, not just color-coded (colorblind-safe): online
     /// is a filled circle with an inner ring mark (`circle.inset.filled`,
-    /// green), offline a HOLLOW circle (`circle`, gray), unknown (pre-fetch) a
-    /// dotted outline (`circle.dotted`). Non-relay rows get an equally sized
-    /// empty slot so all rows share one column grid.
+    /// green), offline a HOLLOW circle (`circle`, gray), and checking — a
+    /// cache-seeded row at launch whose live status hasn't arrived yet — a
+    /// dimmed dotted outline (`circle.dotted`). Non-relay rows get an equally
+    /// sized empty slot so all rows share one column grid.
+    ///
+    /// Checking/offline rows stay SELECTABLE, matching the long-standing
+    /// offline policy: the chooser never blocks a connect attempt on
+    /// directory presence (which can be stale in either direction); a machine
+    /// that really is unreachable fails at dial time with a clear error.
     @ViewBuilder
     private func statusIndicator(for machine: Machine) -> some View {
         if machine.isRelay {
@@ -486,17 +491,85 @@ struct MachineChooserView: View {
         switch machine.online {
         case true: return "Online"
         case false: return "Offline"
-        default: return "Status unknown"
+        default: return "Checking status"
         }
     }
 
-    /// The rename/remove actions for an account (relay) device, shared by the
-    /// per-row ellipsis menu and the row's context menu (WP-C2).
+    /// The management actions for a remote machine, shared by the per-row
+    /// ellipsis menu and the row's context menu. Per-host settings apply to
+    /// every remote machine (TCP or relay); rename/remove are account-resource
+    /// actions and stay relay-only (WP-C2).
     @ViewBuilder
     private func managementActions(for machine: Machine) -> some View {
-        Button("Rename…") { promptRename(machine) }
-        Divider()
-        Button("Remove from Account…", role: .destructive) { confirmRemove(machine) }
+        Button("Host Settings…") { promptHostSettings(machine) }
+        if machine.isRelay {
+            Divider()
+            Button("Rename…") { promptRename(machine) }
+            Divider()
+            Button("Remove from Account…", role: .destructive) { confirmRemove(machine) }
+        }
+    }
+
+    /// Shell presets offered in the host-settings combo box: the Windows
+    /// shells the agent has per-shell argv conventions for (cmd `/c`,
+    /// powershell/pwsh `-Command`, wsl `--` — see pty_child.zig), plus common
+    /// POSIX shells. The combo box is editable, so any other path can be
+    /// typed as free text.
+    private static let shellPresets: [String] = [
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "wsl.exe",
+        "/bin/bash",
+        "/bin/zsh",
+    ]
+
+    /// Edit the per-host defaults (working directory + shell) for new remote
+    /// sessions on `machine`. NSAlert-based like `promptRename` (the chooser
+    /// panel runs an AppKit modal session). Empty fields mean "use the
+    /// remote's own default" — saving them clears the stored setting.
+    private func promptHostSettings(_ machine: Machine) {
+        let current = machine.settings
+
+        let alert = NSAlert()
+        alert.messageText = "Host Settings for “\(machine.name)”"
+        alert.informativeText = "Defaults for new terminals on this machine. Both are values on the remote machine (e.g. wsl.exe or C:\\dev on a Windows host). Leave a field empty to use the remote's own default."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let labelWidth: CGFloat = 120
+        let fieldWidth: CGFloat = 240
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: labelWidth + 8 + fieldWidth, height: 62))
+
+        let wdLabel = NSTextField(labelWithString: "Working directory:")
+        wdLabel.alignment = .right
+        wdLabel.frame = NSRect(x: 0, y: 38, width: labelWidth, height: 18)
+        let wdField = NSTextField(frame: NSRect(x: labelWidth + 8, y: 34, width: fieldWidth, height: 24))
+        wdField.placeholderString = "Remote default"
+        wdField.stringValue = current.workingDirectory ?? ""
+
+        let shellLabel = NSTextField(labelWithString: "Shell:")
+        shellLabel.alignment = .right
+        shellLabel.frame = NSRect(x: 0, y: 6, width: labelWidth, height: 18)
+        let shellCombo = NSComboBox(frame: NSRect(x: labelWidth + 8, y: 0, width: fieldWidth, height: 26))
+        shellCombo.addItems(withObjectValues: Self.shellPresets)
+        shellCombo.placeholderString = "Remote default"
+        shellCombo.stringValue = current.shell ?? ""
+        shellCombo.completes = true
+
+        container.addSubview(wdLabel)
+        container.addSubview(wdField)
+        container.addSubview(shellLabel)
+        container.addSubview(shellCombo)
+        alert.accessoryView = container
+        alert.window.initialFirstResponder = wdField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        MachineSettingsStore.set(
+            MachineSettings(
+                workingDirectory: wdField.stringValue,
+                shell: shellCombo.stringValue),
+            for: machine.settingsKey)
     }
 
     /// Ask for confirmation, then delete the device from the relay account

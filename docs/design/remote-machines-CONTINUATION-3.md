@@ -398,3 +398,36 @@ only the Swift reconnect narrative (info+private), now fixed.
   scp + `sudo install` + `systemctl restart ghoztty-relay`; agents auto-reconnect.
   Windows agent: `zig build agent -Dtarget=x86_64-windows-gnu` → scp exe to
   `/var/www/ghoztty-dl/`.
+
+## Per-host settings: default cwd + shell (2026-07-06)
+
+Per-machine defaults for NEW remote sessions — **default working directory**
+and **default shell** (Windows hosts: cmd / PowerShell / pwsh / WSL) — plus
+CLI overrides. The wire protocol needed NO change: `OPEN.cwd`/`OPEN.shell`
+were already optional fields the agent honored; this fills the client-side
+gaps (proto version unchanged, old agents/clients interop).
+
+- **Store:** `MachineSettings` / `MachineSettingsStore` (`Machine.swift`) —
+  UserDefaults-JSON keyed by relay `deviceID` or `host:port` (`settingsKey`).
+  Deliberately NOT purged on sign-out/401 (local prefs, no secrets), unlike
+  the device cache. Chose the existing UserDefaults pattern over a
+  machines.toml: app-owned writes, no parser/watcher needed.
+- **Plumbing:** `SurfaceConfiguration.remoteShell` → `ghostty_surface_config_s
+  .remote_shell` → `embedded.zig remote_shell` → `RemoteBackend.shell` →
+  `termio/Remote.zig Config.shell` → `OPEN.shell`. Mirrors
+  `remote_working_directory` exactly. The invariant stands: local
+  shell/pwd are NEVER forwarded; only per-host settings / explicit flags.
+- **Apply sites:** `Machine.applyOpenDefaults(to:)` — AppDelegate TCP +
+  relay dial (OPEN-new only; ATTACH/restore skips), and tab/split
+  inheritance applies the per-host SHELL only (cwd keeps inheriting the
+  parent pane's).
+- **Agent fix:** Windows argv convention is per-shell now
+  (`windowsCommandArg` in `pty_child.zig`): cmd `/c`, powershell/pwsh
+  `-Command`, wsl `--`. POSIX `-lic`/`-li` unchanged.
+- **UI:** chooser row `⋯` → "Host Settings…" (all remote machines, TCP
+  included) — cwd field + editable shell combo with presets.
+- **CLI:** `+new-remote-window --working-directory= --shell= --command=`
+  (explicit flags override per-host defaults; parsed app-side in
+  `IPCServer.handleNewRemoteWindow`).
+- **Not done (optional):** agent advertising available shells for a
+  live-populated picker; per-host settings UI outside the chooser.

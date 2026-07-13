@@ -94,6 +94,10 @@ pub const Message = union(enum) {
     /// The activity state reported by the terminal process.
     activity_state: terminal.osc.Command.ActivityState,
 
+    /// The sticky pane banner reported by the terminal process (OSC 7778).
+    /// An empty string clears the banner.
+    pane_banner: WriteReq,
+
     /// A command has started in the shell, start a timer.
     start_command,
 

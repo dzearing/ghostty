@@ -54,6 +54,10 @@ extension Ghostty {
         /// The activity state reported by the terminal process via OSC 7777.
         @Published var activityState: Ghostty.ActivityState = .idle
 
+        /// The sticky pane banner (raw markdown-subset source text), set via
+        /// IPC (+set-banner) or OSC 7778. Nil when no banner is shown.
+        @Published var paneBanner: String?
+
         /// The exit code from the child process, or nil if still running.
         @Published private(set) var exitCode: UInt32?
 

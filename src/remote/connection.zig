@@ -438,8 +438,41 @@ const PendingRpc = struct {
     /// pane's data-channel id. For a same-channel reply it simply equals the request
     /// channel.
     reply_channel: u128 = 0,
+    /// The cancellation token this RPC was issued with (or null). Lets
+    /// `cancelRpcsFor` wake exactly the callers owned by one tearing-down pane
+    /// without touching other panes' in-flight RPCs on the shared connection.
+    canceller: ?*const RpcCanceller = null,
 
-    const PendingError = error{ ConnectionClosed, MalformedReply, WrongReply, Timeout };
+    const PendingError = error{ ConnectionClosed, MalformedReply, WrongReply, Timeout, Cancelled };
+};
+
+/// A cancellation token for session-establishing RPCs (OPEN/ATTACH). One lives
+/// on each `termio.Remote` backend so the GUI thread can abort that pane's
+/// blocking RPC BEFORE joining the pane's IO thread (`Surface.deinit`).
+///
+/// Why: an ATTACH/OPEN sent onto a link that silently died (a WSS transport
+/// that will never deliver another byte does NOT error the readers, so nothing
+/// fails the parked slot) waits out the full `rpc_open_timeout_ns`. Freeing
+/// such a surface joins its IO thread, which is parked inside that wait — the
+/// GUI thread beachballed for the whole timeout, and during reconnect churn
+/// (a new doomed ATTACH every cycle) that is effectively a permanent hang.
+/// This token is the remote analogue of local Exec's quit pipe: signal first,
+/// then join.
+///
+/// Usage: the canceller thread calls `cancel()` then `Connection.cancelRpcsFor`.
+/// `rpcCall` checks the flag after registering its slot, so the pair is
+/// race-free: a slot registered before the cancel walk is woken by the walk; a
+/// slot registered after it observes the flag and fails fast.
+pub const RpcCanceller = struct {
+    cancelled: std.atomic.Value(bool) = .init(false),
+
+    pub fn cancel(self: *RpcCanceller) void {
+        self.cancelled.store(true, .release);
+    }
+
+    pub fn isCancelled(self: *const RpcCanceller) bool {
+        return self.cancelled.load(.acquire);
+    }
 };
 
 /// Default timeout for a session-establishing RPC (OPEN / ATTACH). If the agent
@@ -1199,6 +1232,18 @@ pub const Connection = struct {
     /// `open` is the §4.2 payload (cwd/command/shell/term/env/rows/cols/...). The
     /// caller need not set a channel — this method owns channel-id minting.
     pub fn openChannel(self: *Connection, open: protocol.Open) !*Pane {
+        return self.openChannelCancellable(open, null);
+    }
+
+    /// `openChannel` with an optional cancellation token (see `RpcCanceller`):
+    /// `cancelRpcsFor(canceller)` from another thread aborts the parked OPEN with
+    /// `error.Cancelled`. Used by the remote termio backend so surface teardown
+    /// can wake a pane's IO thread out of a doomed OPEN before joining it.
+    pub fn openChannelCancellable(
+        self: *Connection,
+        open: protocol.Open,
+        canceller: ?*const RpcCanceller,
+    ) !*Pane {
         // Mint a fresh channel id for the OUTBOUND OPEN frame (§7.1). The agent is
         // **channel-authoritative**: it mints its OWN session channel and replies
         // OPENED on it (see `deliverRpcReply`/`rpcCall`). So we send OPEN on our
@@ -1214,7 +1259,7 @@ pub const Connection = struct {
         // matches the proven frame-level path in `test_client.zig`).
         const open_json = try protocol.encodeJson(self.alloc, open);
         defer self.alloc.free(open_json);
-        const rpc = try self.rpcCall(req_channel, .open, .opened, open_json, self.rpc_open_timeout_ns);
+        const rpc = try self.rpcCall(req_channel, .open, .opened, open_json, self.rpc_open_timeout_ns, canceller);
         defer self.alloc.free(rpc.payload);
         const id = rpc.channel; // agent-authoritative data channel
 
@@ -1270,7 +1315,7 @@ pub const Connection = struct {
         const json = try protocol.encodeJson(self.alloc, get);
         defer self.alloc.free(json);
 
-        const rpc = try self.rpcCall(req_channel, .get_cwd, .cwd, json, timeout_ns);
+        const rpc = try self.rpcCall(req_channel, .get_cwd, .cwd, json, timeout_ns, null);
         defer self.alloc.free(rpc.payload);
 
         var parsed = protocol.parseJson(protocol.Cwd, self.alloc, rpc.payload) catch
@@ -1309,7 +1354,7 @@ pub const Connection = struct {
         const json = try protocol.encodeJson(self.alloc, req);
         defer self.alloc.free(json);
 
-        const rpc = try self.rpcCall(req_channel, .proc_list, .proc_snapshot, json, timeout_ns);
+        const rpc = try self.rpcCall(req_channel, .proc_list, .proc_snapshot, json, timeout_ns, null);
         defer self.alloc.free(rpc.payload);
 
         var parsed = protocol.parseJson(protocol.ProcSnapshot, self.alloc, rpc.payload) catch
@@ -1376,7 +1421,7 @@ pub const Connection = struct {
         const json = try protocol.encodeJson(self.alloc, req);
         defer self.alloc.free(json);
 
-        const rpc = try self.rpcCall(req_channel, .proc_kill, .proc_kill_result, json, timeout_ns);
+        const rpc = try self.rpcCall(req_channel, .proc_kill, .proc_kill_result, json, timeout_ns, null);
         defer self.alloc.free(rpc.payload);
 
         var parsed = protocol.parseJson(protocol.ProcKillResult, self.alloc, rpc.payload) catch
@@ -1412,7 +1457,7 @@ pub const Connection = struct {
         const json = try protocol.encodeJson(self.alloc, req);
         defer self.alloc.free(json);
 
-        const rpc = try self.rpcCall(req_channel, .proc_spawn, .proc_spawn_result, json, timeout_ns);
+        const rpc = try self.rpcCall(req_channel, .proc_spawn, .proc_spawn_result, json, timeout_ns, null);
         defer self.alloc.free(rpc.payload);
 
         var parsed = protocol.parseJson(protocol.ProcSpawnResult, self.alloc, rpc.payload) catch
@@ -1451,6 +1496,23 @@ pub const Connection = struct {
         last_byte_offset: u64,
         force: bool,
     ) !AttachOutcome {
+        return self.attachChannelCancellable(session_id, rows, cols, last_byte_offset, force, null);
+    }
+
+    /// `attachChannel` with an optional cancellation token (see `RpcCanceller`):
+    /// `cancelRpcsFor(canceller)` from another thread aborts the parked ATTACH
+    /// with `error.Cancelled`. Used by the remote termio backend so surface
+    /// teardown can wake a pane's IO thread out of a doomed ATTACH (e.g. sent
+    /// onto a silently-dead link during reconnect churn) before joining it.
+    pub fn attachChannelCancellable(
+        self: *Connection,
+        session_id: []const u8,
+        rows: u16,
+        cols: u16,
+        last_byte_offset: u64,
+        force: bool,
+        canceller: ?*const RpcCanceller,
+    ) !AttachOutcome {
         // Mint a fresh channel id for the OUTBOUND ATTACH frame (§7.1). As with
         // OPEN, the agent is **channel-authoritative**: it replies ATTACHED on the
         // session's own channel (or on `control_channel` for `not_found`), so we
@@ -1476,7 +1538,7 @@ pub const Connection = struct {
         };
         const attach_json = try protocol.encodeJson(self.alloc, attach);
         defer self.alloc.free(attach_json);
-        const rpc = try self.rpcCall(req_channel, .attach, .attached, attach_json, self.rpc_open_timeout_ns);
+        const rpc = try self.rpcCall(req_channel, .attach, .attached, attach_json, self.rpc_open_timeout_ns, canceller);
         defer self.alloc.free(rpc.payload);
         const id = rpc.channel; // agent-authoritative session channel
 
@@ -1659,6 +1721,9 @@ pub const Connection = struct {
     /// `timeout_ns` bounds how long we park on the reply (null ⇒ wait forever).
     /// A timeout returns `error.Timeout`; the slot is removed by the trailing
     /// `defer` exactly as on the success path, so a late reply is safely dropped.
+    /// `canceller` (optional) lets another thread abort this call early via
+    /// `cancelRpcsFor` — `error.Cancelled` — used by surface teardown so a
+    /// parked OPEN/ATTACH never wedges the join of the pane's IO thread.
     fn rpcCall(
         self: *Connection,
         channel: u128,
@@ -1666,8 +1731,18 @@ pub const Connection = struct {
         want: protocol.FrameType,
         payload: []const u8,
         timeout_ns: ?u64,
+        canceller: ?*const RpcCanceller,
     ) !RpcResult {
-        var slot: PendingRpc = .{ .want = want, .reply_channel = channel };
+        var slot: PendingRpc = .{
+            .want = want,
+            .reply_channel = channel,
+            .canceller = canceller,
+        };
+
+        // Fail fast if our owner was already cancelled (the surface is being
+        // freed) so we don't queue behind another pane's in-flight by-type RPC
+        // on `open_rpc_mutex` below just to be cancelled afterward.
+        if (canceller) |c| if (c.isCancelled()) return error.Cancelled;
 
         // OPEN/ATTACH correlate by reply type (the agent picks the reply channel);
         // all other RPCs correlate by the request channel.
@@ -1719,6 +1794,14 @@ pub const Connection = struct {
             }
             self.rpc_mutex.unlock();
         }
+
+        // Re-check cancellation now that the slot is registered. This closes the
+        // register-vs-cancel race: `cancelRpcsFor` walks the slots under
+        // `rpc_mutex`, so either it ran BEFORE our registration (then the flag —
+        // stored before the walk — is visible here and we bail) or it runs after
+        // (then it finds our slot and sets `done`). Either way we never park
+        // uncancellably. The trailing `defer` removes the slot.
+        if (canceller) |c| if (c.isCancelled()) return error.Cancelled;
 
         try self.writeControl(req, channel, payload);
         if (timeout_ns) |ns| {
@@ -1779,6 +1862,31 @@ pub const Connection = struct {
         self.rpc_mutex.unlock();
         done.set();
         return true;
+    }
+
+    /// Fail every still-parked RPC caller registered with `canceller` with
+    /// `error.Cancelled`, leaving all other panes' in-flight RPCs on this shared
+    /// connection untouched. Safe to call from any thread (typically the GUI
+    /// thread tearing down one surface). The canceller must call
+    /// `canceller.cancel()` FIRST so an RPC racing its registration observes the
+    /// flag (see `rpcCall`); we only set the result + event here — the parked
+    /// caller removes its own slot.
+    pub fn cancelRpcsFor(self: *Connection, canceller: *const RpcCanceller) void {
+        self.rpc_mutex.lock();
+        defer self.rpc_mutex.unlock();
+        var it = self.pending.valueIterator();
+        while (it.next()) |slot_ptr| cancelSlot(slot_ptr.*, canceller);
+        if (self.pending_opened) |slot| cancelSlot(slot, canceller);
+        if (self.pending_attached) |slot| cancelSlot(slot, canceller);
+    }
+
+    /// Cancel one parked slot if it belongs to `canceller`. Must be called under
+    /// `rpc_mutex` (same publish discipline as `failPendingRpcs`).
+    fn cancelSlot(slot: *PendingRpc, canceller: *const RpcCanceller) void {
+        if (slot.canceller != canceller) return;
+        if (slot.done.isSet()) return;
+        slot.result = error.Cancelled;
+        slot.done.set();
     }
 
     /// Fail every still-parked RPC caller with `ConnectionClosed` (called by
@@ -1870,6 +1978,15 @@ pub const Connection = struct {
     /// HELLO arrives, parse + negotiate it, store the result, and signal
     /// `handshake_done`. Then loops, dispatching each control frame to the handler.
     fn controlReaderLoop(self: *Connection) void {
+        // Once this thread exits — for ANY reason (EOF, transport error, protocol
+        // error, shutdown) — no RPC reply can ever be delivered again: replies
+        // only arrive through this loop and it never restarts on a Connection
+        // (reconnect dials a NEW Connection). So on the way out, fail every
+        // parked RPC caller and latch `rpc_closed` so future callers fail fast
+        // instead of waiting out their full timeout on a dead link. Idempotent
+        // with the same call in `shutdown`.
+        defer self.failPendingRpcs();
+
         var reader = protocol.Reader.init(self.alloc, self.encoding);
         defer reader.deinit();
         var scratch: [read_buf_size]u8 = undefined;
@@ -3930,6 +4047,118 @@ test "openChannel: a silent agent (no OPENED) times out instead of deadlocking" 
     const pane_count = h.conn.panes.count();
     h.conn.panes_mutex.unlock();
     try testing.expectEqual(@as(usize, 0), pane_count);
+}
+
+test "cancelRpcsFor: wakes a parked OPEN promptly with error.Cancelled" {
+    const alloc = testing.allocator;
+    // LONG timeout: a pass proves the CANCEL woke the caller, not the timeout.
+    // This is the surface-teardown path: the GUI thread must be able to wake a
+    // pane's IO thread out of a doomed OPEN/ATTACH before joining it.
+    const h = try LifecycleHarness.createWithTimeout(alloc, 60 * std.time.ns_per_s);
+    defer h.destroy();
+    h.configure().silent_open = true; // the agent never replies OPENED
+    try h.start();
+
+    var canceller: RpcCanceller = .{};
+    const Worker = struct {
+        conn: *Connection,
+        canceller: *const RpcCanceller,
+        result: ?anyerror = null,
+        fn run(self: *@This()) void {
+            _ = self.conn.openChannelCancellable(
+                .{ .rows = 24, .cols = 80 },
+                self.canceller,
+            ) catch |e| {
+                self.result = e;
+                return;
+            };
+        }
+    };
+    var w: Worker = .{ .conn = h.conn, .canceller = &canceller };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&w});
+
+    // Wait until the OPEN is on the wire (the slot is registered before the
+    // send), then cancel: flag first, then the slot walk (the required order).
+    h.agent.saw_request.wait();
+    const t = std.time.milliTimestamp();
+    canceller.cancel();
+    h.conn.cancelRpcsFor(&canceller);
+    thread.join();
+    const elapsed = std.time.milliTimestamp() - t;
+
+    try testing.expectEqual(@as(anyerror, error.Cancelled), w.result.?);
+    // Woke promptly (well under the 60s RPC timeout). Generous for loaded CI.
+    try testing.expect(elapsed < 5_000);
+    // Nothing was registered for the cancelled OPEN (caller owns nothing).
+    h.conn.panes_mutex.lock();
+    const pane_count = h.conn.panes.count();
+    h.conn.panes_mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), pane_count);
+}
+
+test "rpcCall: an already-cancelled canceller fails fast (register-vs-cancel race)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.createWithTimeout(alloc, 60 * std.time.ns_per_s);
+    defer h.destroy();
+    h.configure().silent_open = true;
+    try h.start();
+
+    // Cancel BEFORE issuing the RPC: models the GUI thread tearing the surface
+    // down just as (or before) the IO thread reaches its OPEN/ATTACH.
+    var canceller: RpcCanceller = .{};
+    canceller.cancel();
+    h.conn.cancelRpcsFor(&canceller);
+
+    const t = std.time.milliTimestamp();
+    try testing.expectError(error.Cancelled, h.conn.openChannelCancellable(
+        .{ .rows = 24, .cols = 80 },
+        &canceller,
+    ));
+    try testing.expect(std.time.milliTimestamp() - t < 5_000);
+}
+
+test "control reader exit fails a parked RPC promptly (no reply can ever arrive)" {
+    const alloc = testing.allocator;
+    // LONG timeout again: the parked OPEN must be failed by the control
+    // reader's exit (link death), NOT by waiting out the timeout.
+    const h = try LifecycleHarness.createWithTimeout(alloc, 60 * std.time.ns_per_s);
+    defer h.destroy();
+    h.configure().silent_open = true;
+    try h.start();
+
+    const Worker = struct {
+        conn: *Connection,
+        result: ?anyerror = null,
+        fn run(self: *@This()) void {
+            _ = self.conn.openChannel(.{ .rows = 24, .cols = 80 }) catch |e| {
+                self.result = e;
+                return;
+            };
+        }
+    };
+    var w: Worker = .{ .conn = h.conn };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&w});
+
+    // Once the OPEN is on the wire, kill the control lane (models the
+    // transport dying mid-RPC). The control reader sees EOF and exits; its
+    // exit must fail the parked caller immediately.
+    h.agent.saw_request.wait();
+    const t = std.time.milliTimestamp();
+    h.ctrl_lb.clientStream().close();
+    thread.join();
+    const elapsed = std.time.milliTimestamp() - t;
+
+    try testing.expectEqual(@as(anyerror, error.ConnectionClosed), w.result.?);
+    try testing.expect(elapsed < 5_000);
+
+    // The connection is latched closed for RPCs: a later call fails fast
+    // instead of parking for its full timeout on the dead link.
+    const t2 = std.time.milliTimestamp();
+    try testing.expectError(
+        error.ConnectionClosed,
+        h.conn.openChannel(.{ .rows = 24, .cols = 80 }),
+    );
+    try testing.expect(std.time.milliTimestamp() - t2 < 5_000);
 }
 
 test "openChannel: N concurrent OPENs on one Connection all succeed (rapid remote splits)" {

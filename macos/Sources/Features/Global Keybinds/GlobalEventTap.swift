@@ -10,7 +10,7 @@ class GlobalEventTap {
     static let shared = GlobalEventTap()
 
     fileprivate static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier!,
+        subsystem: Bundle.loggerSubsystem,
         category: String(describing: GlobalEventTap.self)
     )
 

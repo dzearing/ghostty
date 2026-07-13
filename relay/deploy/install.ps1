@@ -1,144 +1,83 @@
-# ghoztty-agent installer — download, enroll (if needed), autostart. Idempotent.
+# ghoztty-agent installer — thin wrapper over the per-user MSI. Idempotent.
 #
 # HOSTED COPY: this file is served by the relay VM as /dl/install.ps1
-# (Caddy `handle_path /dl/*` → /var/www/ghoztty-dl). After editing it here,
-# upload it to the VM:  scp relay/deploy/install.ps1 <vm>:/var/www/ghoztty-dl/
+# (Caddy `handle_path /dl/*` → /var/www/ghoztty-dl). It is uploaded by
+# relay/deploy/publish-agent.sh alongside the MSI.
 #
 # Usage (paste in a normal PowerShell window on the Windows box):
 #
 #   irm https://<relay>/dl/install.ps1 | iex
 #
-# With NO token set, a fresh box self-enrolls via Google sign-in: a browser
-# window opens on this machine — approve the sign-in there and the credential
-# lands in relay.env automatically. (If the relay has no web sign-in
-# configured, the agent falls back to "visit <url>, enter code XXXX-XXXX".)
+# Downloads the current versioned MSI (Ghoztty-Agent-X.Y.Z-x64.msi) and
+# installs it silently — per-user, no admin/UAC. The MSI does the rest:
+# retires any legacy install.ps1 layout (watchdog scheduled task + old
+# %LOCALAPPDATA%\ghoztty\ exe), installs to %LOCALAPPDATA%\Programs\Ghoztty
+# Agent\, registers the HKCU Run key for start-at-logon, and launches the
+# agent immediately. With no credential the launched agent self-enrolls via
+# Google sign-in: a browser window opens on this machine — approve the
+# sign-in there and the credential lands in relay.env automatically.
 #
 # A pre-minted token still works (skips the interactive sign-in):
 #
 #   $env:DEVICE_TOKEN='<per-box token>'; irm https://<relay>/dl/install.ps1 | iex
 #
 # Re-running with an existing relay.env keeps the credential and just updates
-# the binary. No admin rights required.
+# the binary.
 
 $ErrorActionPreference = 'Stop'
 $RelayBase = if ($env:RELAY_BASE) { $env:RELAY_BASE } else { 'https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com' }
-$RunDir    = Join-Path $env:LOCALAPPDATA 'ghoztty'
-$ExePath   = Join-Path $RunDir 'ghoztty-agent.exe'
-$EnvFile   = Join-Path $RunDir 'relay.env'
-$Launcher  = Join-Path $RunDir 'run-agent.ps1'
-$PidFile   = Join-Path $RunDir 'launcher.pid'
+$StateDir  = Join-Path $env:LOCALAPPDATA 'ghoztty'   # shared agent state (relay.env, logs)
+$EnvFile   = Join-Path $StateDir 'relay.env'
 
-New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
+New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 Write-Host "== ghoztty-agent installer ==" -ForegroundColor Cyan
 Write-Host "   relay : $RelayBase"
-Write-Host "   dir   : $RunDir"
 
-# --- stop anything already running (frees the exe for overwrite) --------------
-if (Test-Path $PidFile) {
-  $oldPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-  if ($oldPid) { try { & taskkill.exe /F /T /PID $oldPid 2>$null | Out-Null } catch {} }
-}
-Get-Process -Name 'ghoztty-agent' -ErrorAction SilentlyContinue |
-  Where-Object { $_.Path -eq $ExePath } |
-  ForEach-Object { try { & taskkill.exe /F /T /PID $_.Id 2>$null | Out-Null } catch {} }
-Start-Sleep -Milliseconds 500
-
-# --- download the agent binary (needed below for --enroll too) ----------------
-$tmp = "$ExePath.new"
-Invoke-WebRequest -Uri "$RelayBase/dl/ghoztty-agent.exe" -OutFile $tmp -UseBasicParsing
-Move-Item -Force $tmp $ExePath
-Write-Host ("   agent : downloaded ({0:N1} MB)" -f ((Get-Item $ExePath).Length / 1MB))
-
-# --- report the installed version ----------------------------------------------
-# GUI-subsystem exe: capture stdout via redirection files. Older binaries don't
-# know --version (and might not exit), so bound the wait and kill on timeout.
-$agentVersion = $null
-try {
-  $verOut = Join-Path $RunDir 'version-check.out'
-  $verErr = Join-Path $RunDir 'version-check.err'
-  $vp = Start-Process -FilePath $ExePath -ArgumentList '--version' -PassThru `
-          -RedirectStandardOutput $verOut -RedirectStandardError $verErr
-  if (-not $vp.WaitForExit(5000)) { try { $vp.Kill() } catch {} }
-  $agentVersion = (Get-Content $verOut -ErrorAction SilentlyContinue |
-                     Where-Object { $_ -match '\S' } | Select-Object -First 1)
-  Remove-Item $verOut, $verErr -ErrorAction SilentlyContinue
-} catch {}
-if ($agentVersion) {
-  Write-Host "   ver   : $agentVersion"
-} else {
-  Write-Host "   ver   : unknown (binary predates --version)"
-}
-
-# --- credential config ---------------------------------------------------------
+# --- credential first: the MSI launches the agent at the end of the install,
+#     and the agent reads relay.env from $StateDir at startup. ------------------
 if ($env:DEVICE_TOKEN) {
-  # Pre-minted token provided: write relay.env directly (legacy/manual path).
   "RELAY_BASE=$RelayBase`nDEVICE_TOKEN=$($env:DEVICE_TOKEN)" | Set-Content -LiteralPath $EnvFile
   Write-Host "   token : written to relay.env (from DEVICE_TOKEN)"
 } elseif (Test-Path $EnvFile) {
   Write-Host "   token : keeping existing relay.env"
 } else {
-  # Fresh box, no token: self-enroll via Google sign-in. The agent opens the
-  # default browser to approve this machine (and prints the URL in case the
-  # browser did not open), polls the relay, and writes relay.env itself on
-  # success. Falls back to the "visit URL, enter code" device flow when the
-  # relay has no web sign-in. NOTE: the agent is a GUI-subsystem exe, so its
-  # stdout only reaches this console through a pipeline — hence ForEach-Object.
-  Write-Host "   token : none - enrolling this machine with your Google account..." -ForegroundColor Yellow
-  Write-Host "           a browser window should open - approve the sign-in there" -ForegroundColor Yellow
-  & $ExePath --enroll --relay=$RelayBase 2>&1 | ForEach-Object { Write-Host "   $_" }
-  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $EnvFile)) {
-    Write-Error "Enrollment failed (exit $LASTEXITCODE). Re-run the installer to try again."
-  }
-  Write-Host "   token : enrolled; credential saved to relay.env" -ForegroundColor Green
+  Write-Host "   token : none - the agent will open a browser to enroll this machine" -ForegroundColor Yellow
+  Write-Host "           after install; approve the Google sign-in there" -ForegroundColor Yellow
 }
 
-# --- write the launcher (reads relay.env, keeps the agent alive) --------------
-@'
-$RunDir  = Join-Path $env:LOCALAPPDATA 'ghoztty'
-$ExePath = Join-Path $RunDir 'ghoztty-agent.exe'
-$EnvFile = Join-Path $RunDir 'relay.env'
-$PID | Set-Content (Join-Path $RunDir 'launcher.pid')
-while ($true) {
-  $base = $null
-  Get-Content $EnvFile | ForEach-Object {
-    if ($_ -match '^\s*RELAY_BASE\s*=\s*(.+)$')   { $base = $Matches[1].Trim() }
-    if ($_ -match '^\s*DEVICE_TOKEN\s*=\s*(.+)$') { $env:GHOSTTY_DEVICE_TOKEN = $Matches[1].Trim() }
-  }
-  # (The agent can now also read relay.env itself; the env var is kept for
-  # back-compat with older binaries.) GUI-subsystem exe: no console pops up.
-  $p = Start-Process -FilePath $ExePath -ArgumentList @('--relay', $base) -PassThru `
-        -RedirectStandardOutput (Join-Path $RunDir 'agent.out.log') `
-        -RedirectStandardError  (Join-Path $RunDir 'agent.err.log')
-  $p.WaitForExit()
-  Start-Sleep -Seconds 3
-}
-'@ | Set-Content -LiteralPath $Launcher
-
-# --- autostart at logon --------------------------------------------------------
-$launchCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`""
+# --- resolve the current versioned MSI from the publish manifest --------------
+$msiUrlPath = '/dl/ghoztty-agent.msi'   # stable-URL fallback
 try {
-  $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
-               -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`""
-  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-  Register-ScheduledTask -TaskName 'GhozttyAgent' -Action $action -Trigger $trigger -Force | Out-Null
-  Write-Host "   start : scheduled task 'GhozttyAgent' (at logon)"
+  $manifest = Invoke-RestMethod -Uri "$RelayBase/dl/version.json" -UseBasicParsing
+  $win = $manifest.'windows-x86_64'
+  if ($win.msi) { $msiUrlPath = $win.msi }
+  if ($win.semver) {
+    Write-Host "   ver   : $($win.semver) (build $($win.version))"
+  } elseif ($win.version) {
+    Write-Host "   ver   : $($win.version)"
+  }
 } catch {
-  # Fall back to a Startup-folder launcher if task registration is denied.
-  $startup = [Environment]::GetFolderPath('Startup')
-  Set-Content -LiteralPath (Join-Path $startup 'ghoztty-agent.cmd') -Value "start `"`" $launchCmd"
-  Write-Host "   start : Startup-folder shortcut (task registration unavailable)"
+  Write-Host "   ver   : unknown (version.json unavailable; using stable MSI URL)"
 }
 
-# --- start it now ---------------------------------------------------------------
-Start-Process powershell.exe -WindowStyle Hidden `
-  -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Launcher`""
-Start-Sleep -Seconds 4
+# --- download + silent per-user install ----------------------------------------
+$msiFile = Join-Path $env:TEMP (Split-Path $msiUrlPath -Leaf)
+Invoke-WebRequest -Uri "$RelayBase$msiUrlPath" -OutFile $msiFile -UseBasicParsing
+Write-Host ("   msi   : downloaded {0} ({1:N1} MB)" -f (Split-Path $msiFile -Leaf), ((Get-Item $msiFile).Length / 1MB))
 
-$proc = Get-Process -Name 'ghoztty-agent' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $ExePath }
+$msiLog = Join-Path $env:TEMP 'ghoztty-agent-msi.log'
+$p = Start-Process msiexec.exe -ArgumentList "/i `"$msiFile`" /qn /l* `"$msiLog`"" -Wait -PassThru
+if ($p.ExitCode -ne 0) {
+  Write-Error "MSI install failed (exit $($p.ExitCode)). See $msiLog"
+}
+Write-Host "   msi   : installed (per-user; starts at logon via HKCU Run key)"
+
+# --- confirm the agent the MSI launched is up ----------------------------------
+Start-Sleep -Seconds 3
+$exePath = Join-Path $env:LOCALAPPDATA 'Programs\Ghoztty Agent\ghoztty-agent.exe'
+$proc = Get-Process -Name 'ghoztty-agent' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath }
 if ($proc) {
   Write-Host "OK: agent running (pid $($proc.Id))." -ForegroundColor Green
 } else {
-  Write-Host "WARNING: agent not detected yet; check logs below." -ForegroundColor Yellow
+  Write-Host "NOTE: agent process not detected yet. If enrollment is pending, check for a browser window; otherwise launch 'Ghoztty Agent' from the Start Menu." -ForegroundColor Yellow
 }
-$errLog = Join-Path $RunDir 'agent.err.log'
-if (Test-Path $errLog) { Write-Host '--- agent.err.log (tail) ---'; Get-Content $errLog -Tail 8 }

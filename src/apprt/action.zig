@@ -352,6 +352,13 @@ pub const Action = union(Key) {
     /// The activity state of the surface has changed.
     activity_state: terminal.osc.Command.ActivityState,
 
+    /// Set (or clear, when the text is empty) the sticky pane banner
+    /// rendered above the surface.
+    pane_banner: PaneBanner,
+
+    /// Prompt the user for the surface's banner text via a pop-up.
+    prompt_banner,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -422,6 +429,8 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         activity_state,
+        pane_banner,
+        prompt_banner,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -724,6 +733,30 @@ pub const SetTitle = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.title });
+    }
+};
+
+pub const PaneBanner = struct {
+    text: [:0]const u8,
+
+    // Sync with: ghostty_action_pane_banner_s
+    pub const C = extern struct {
+        text: [*:0]const u8,
+    };
+
+    pub fn cval(self: PaneBanner) C {
+        return .{
+            .text = self.text.ptr,
+        };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.text });
     }
 };
 

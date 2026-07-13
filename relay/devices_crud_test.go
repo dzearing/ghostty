@@ -98,8 +98,10 @@ func TestDeviceHostname(t *testing.T) {
 
 	ts, clientToken, store := newTestServer(t)
 
-	// Device-code self-enroll path (UpsertDevice) seeds hostname = name.
-	dev, deviceToken, err := store.UpsertDevice("dev@example.com", "sub-123", "windows-home")
+	// Device-code self-enroll path (UpsertDevice) seeds hostname = name. Seed
+	// with the dev caller's own sub ("dev") so the sub-keyed ownership scoping
+	// (ListByOwnerIdent / RenameDeviceByOwner) sees it as the caller's device.
+	dev, deviceToken, err := store.UpsertDevice("dev@example.com", "dev", "windows-home")
 	if err != nil {
 		t.Fatalf("upsert device: %v", err)
 	}
@@ -292,7 +294,7 @@ func TestCrudOwnerScoping(t *testing.T) {
 	ts, clientToken, store := newTestServer(t)
 
 	// Seed a device owned by a DIFFERENT identity, directly in the store.
-	other, _, err := store.CreateDevice("other@example.com", "otherbox")
+	other, _, err := store.CreateDevice("other@example.com", "", "otherbox")
 	if err != nil {
 		t.Fatalf("seed other-owner device: %v", err)
 	}
@@ -328,7 +330,7 @@ func TestConnectOwnerScoping(t *testing.T) {
 	ts, clientToken, store := newTestServer(t)
 
 	// A device owned by a DIFFERENT identity than the dev caller.
-	other, _, err := store.CreateDevice("other@example.com", "otherbox")
+	other, _, err := store.CreateDevice("other@example.com", "", "otherbox")
 	if err != nil {
 		t.Fatalf("seed other-owner device: %v", err)
 	}

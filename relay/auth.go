@@ -44,7 +44,24 @@ type Authenticator struct {
 	cfg      *Config
 	logger   *slog.Logger
 	verifier *oidc.IDTokenVerifier // nil if GOOGLE_CLIENT_ID is unset
-	allowed  map[string]bool       // lowercased allowlist
+
+	// envAllowed is the ALLOWED_EMAILS env allowlist (lowercased). Since the
+	// DB-backed allowlist (allowlist.go, migration 0006) it is the BOOTSTRAP/
+	// RECOVERY half of the effective allowlist: always honored, never written
+	// to the DB — same pattern as ADMIN_SUBS. Day-to-day entries live in the
+	// allowed_emails table, managed from the portal. See emailAllowed.
+	envAllowed map[string]bool
+
+	// gate is the invite-code authorization layer, consulted only when
+	// Config.InviteSignup is ON. It is wired after the Store exists (SetGate),
+	// so it is nil during construction; the OFF path never touches it. It needs
+	// the Store, which the Authenticator is built before, hence the late bind.
+	gate *SigninGate
+
+	// limits is the M4 rate-limiter set (ratelimit.go); only the failed
+	// sign-in limiter is consulted here. Late-bound by NewHandler
+	// (SetRateLimits, mirroring SetGate); nil-safe when never bound.
+	limits *RateLimiters
 
 	// allowedAuds is the `aud` allowlist for ID tokens: GOOGLE_CLIENT_ID (the
 	// Desktop client the Mac app signs in with) plus GOOGLE_DEVICE_CLIENT_ID
@@ -80,12 +97,12 @@ type Authenticator struct {
 // can authenticate clients.
 func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*Authenticator, error) {
 	a := &Authenticator{
-		cfg:     cfg,
-		logger:  logger,
-		allowed: make(map[string]bool, len(cfg.AllowedEmails)),
+		cfg:        cfg,
+		logger:     logger,
+		envAllowed: make(map[string]bool, len(cfg.AllowedEmails)),
 	}
 	for _, e := range cfg.AllowedEmails {
-		a.allowed[strings.ToLower(e)] = true
+		a.envAllowed[strings.ToLower(e)] = true
 	}
 
 	if cfg.GoogleClientID != "" {
@@ -136,15 +153,40 @@ func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*A
 	return a, nil
 }
 
+// SetGate binds the invite-code authorization gate. Called once at startup
+// after the Store exists. When nil (or Config.InviteSignup off) the legacy
+// ALLOWED_EMAILS path is used and live auth is unchanged.
+func (a *Authenticator) SetGate(g *SigninGate) { a.gate = g }
+
 // AuthenticateClient verifies a human client request and returns the caller's
 // verified, authorized identity (email + Google sub). Order of checks:
 //  1. (dev only) static DEV_CLIENT_TOKEN match -> DEV_EMAIL.
 //  2. Full Google ID-token verification: signature/issuer/aud/exp.
 //  3. email_verified == true, email and sub present.
-//  4. email present in the allowlist.
+//  4. Authorization: ALLOWED_EMAILS (flag OFF) or the invite-code account
+//     model (flag ON — active account required; the client API carries no
+//     invite code, so a brand-new account without a code is rejected here and
+//     must instead sign up through the enroll flow).
 //
 // Presence of a token is never sufficient.
+//
+// M4 abuse control: failed sign-ins are rate limited per client IP. The
+// budget is CHECKED before any verification work (a brute-forcer gets 429s
+// without costing a JWKS/signature check) and CHARGED only on failure, so
+// successful authenticated traffic never consumes it (see ratelimit.go).
 func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request) (Identity, error) {
+	if err := a.limits.checkSigninBudget(clientIP(r)); err != nil {
+		return Identity{}, err
+	}
+	ident, err := a.authenticateClient(ctx, r)
+	if err != nil {
+		a.limits.chargeSigninFailure(clientIP(r))
+	}
+	return ident, err
+}
+
+// authenticateClient is the unthrottled body of AuthenticateClient.
+func (a *Authenticator) authenticateClient(ctx context.Context, r *http.Request) (Identity, error) {
 	token := bearerToken(r)
 	if token == "" {
 		return Identity{}, ErrUnauthorized
@@ -154,23 +196,64 @@ func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request)
 	// an explicit, opt-in credential and maps directly to DEV_EMAIL.
 	if a.cfg.DevAuth && a.cfg.DevClientToken != "" {
 		if subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.DevClientToken)) == 1 {
-			return Identity{Email: strings.ToLower(a.cfg.DevEmail), Sub: "dev"}, nil
+			ident := Identity{Email: strings.ToLower(a.cfg.DevEmail), Sub: "dev"}
+			if a.gate != nil && a.gate.Enabled() {
+				// Dev auth still flows through the invite-code gate when ON, so
+				// the account model governs uniformly. No invite code on a
+				// client API request; an existing account (or legacy owner) is
+				// what allows it.
+				if err := a.gate.Authorize(ident, "", clientIP(r), tokenFingerprint(token)); err != nil {
+					return Identity{}, err
+				}
+			}
+			return ident, nil
 		}
 		// Not the dev token — fall through to real OIDC if configured.
 	}
 
-	return a.VerifyIDToken(ctx, token)
+	// Flag OFF: exact legacy accept/reject behavior (verify + ALLOWED_EMAILS);
+	// the client IP rides along for the (logging-only) attempt audit.
+	if a.gate == nil || !a.gate.Enabled() {
+		return a.verifyIDTokenIP(ctx, token, clientIP(r))
+	}
+
+	// Flag ON: verify identity (unchanged OIDC strictness), then authorize via
+	// the account model. The client API supplies no invite code.
+	ident, err := a.VerifyIdentity(ctx, token)
+	if err != nil {
+		return Identity{}, err
+	}
+	if err := a.gate.Authorize(ident, "", clientIP(r), tokenFingerprint(token)); err != nil {
+		return Identity{}, err
+	}
+	return ident, nil
 }
 
-// VerifyIDToken runs the full OIDC verification + allowlist authorization on a
-// raw ID token and returns the verified identity. It is the single shared
-// gate for interactive client auth (AuthenticateClient), device-code
-// self-enrollment (the /v1/enroll/poll success path), and web enrollment (the
-// /enroll/callback code exchange): signature against the issuer's JWKS,
-// issuer, audience (∈ {GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID,
-// GOOGLE_WEB_CLIENT_ID}), expiry, `sub` present, `email_verified`, and
-// membership in ALLOWED_EMAILS.
-func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identity, error) {
+// clientIP extracts a best-effort client IP for the audit log. Behind Caddy the
+// X-Forwarded-For head is the real client; fall back to RemoteAddr's host.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host := r.RemoteAddr
+	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return host
+}
+
+// VerifyIdentity runs the OIDC IDENTITY VERIFICATION on a raw ID token and
+// returns the verified identity WITHOUT applying any authorization decision:
+// signature against the issuer's JWKS, issuer, audience (∈ {GOOGLE_CLIENT_ID,
+// GOOGLE_DEVICE_CLIENT_ID, GOOGLE_WEB_CLIENT_ID}), expiry, `sub` present, and
+// `email_verified`. These checks are exactly as strict as they have always
+// been; the ONLY thing factored out is the ALLOWED_EMAILS membership test,
+// which is an authorization decision (see VerifyIDToken and the SigninGate).
+// Fail-closed: any verification failure returns ErrUnauthorized.
+func (a *Authenticator) VerifyIdentity(ctx context.Context, token string) (Identity, error) {
 	if token == "" || a.verifier == nil {
 		return Identity{}, ErrUnauthorized
 	}
@@ -205,15 +288,59 @@ func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identi
 		return Identity{}, ErrUnauthorized
 	}
 
-	email := strings.ToLower(claims.Email)
-	if !a.allowed[email] {
+	return Identity{Email: strings.ToLower(claims.Email), Sub: idToken.Subject}, nil
+}
+
+// VerifyIDToken runs the full OIDC verification + allowlist authorization on
+// a raw ID token and returns the verified, authorized identity. It is the
+// `allowlist` signup-mode gate for interactive client auth
+// (AuthenticateClient), device-code self-enrollment (the /v1/enroll/poll
+// success path), and web enrollment (the /enroll/callback code exchange):
+// VerifyIdentity plus the effective-allowlist membership test (env ∪ DB, see
+// emailAllowed) plus the allowlist-path account layer (blocked refusal +
+// account ensure, see SigninGate.AuthorizeAllowlisted). In every other signup
+// mode the callers use VerifyIdentity + the SigninGate instead (enroll.go).
+func (a *Authenticator) VerifyIDToken(ctx context.Context, token string) (Identity, error) {
+	return a.verifyIDTokenIP(ctx, token, "")
+}
+
+// emailAllowed is the EFFECTIVE allowlist membership test: the ALLOWED_EMAILS
+// env set (bootstrap/recovery — always honored, so a wedged DB or a portal
+// mishap can never lock out the operator) UNION the allowed_emails table
+// (portal-managed, behind the gate's short-TTL cache). email must already be
+// lowercased (VerifyIdentity lowercases). Nil-gate safe: env-only, which is
+// exactly the pre-0006 behavior for gate-less unit tests.
+func (a *Authenticator) emailAllowed(email string) bool {
+	if a.envAllowed[email] {
+		return true
+	}
+	return a.gate.AllowlistedInDB(email)
+}
+
+// verifyIDTokenIP is VerifyIDToken with the client IP plumbed through for the
+// signin_attempts audit row. The membership test is env ∪ DB (emailAllowed);
+// a member is then run through the allowlist-path account layer
+// (AuthorizeAllowlisted): a blocked account is refused even when allowlisted,
+// and an allowed sign-in ensures an account row exists so the portal shows
+// the owner in every mode. SigninGate.RecordLegacy owns both the Prometheus
+// counter and the (throttled-for-allowed) DB row; a nil gate (gate-less unit
+// tests) records nothing and allows any member.
+func (a *Authenticator) verifyIDTokenIP(ctx context.Context, token, ip string) (Identity, error) {
+	ident, err := a.VerifyIdentity(ctx, token)
+	if err != nil {
+		return Identity{}, err
+	}
+	if !a.emailAllowed(ident.Email) {
 		// Authorization gate: a valid Google login by anyone not on the
 		// allowlist is rejected.
-		a.logger.Warn("client email not on allowlist", "email", email)
+		a.gate.RecordLegacy(ident, ip, false, "")
+		a.logger.Warn("client email not on allowlist", "email", ident.Email)
 		return Identity{}, ErrUnauthorized
 	}
-
-	return Identity{Email: email, Sub: idToken.Subject}, nil
+	if err := a.gate.AuthorizeAllowlisted(ident, ip, tokenFingerprint(token)); err != nil {
+		return Identity{}, err
+	}
+	return ident, nil
 }
 
 // AuthenticateDevice verifies an agent request via its device token and returns

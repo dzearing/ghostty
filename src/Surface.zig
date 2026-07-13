@@ -81,6 +81,13 @@ pub const RemoteBackend = struct {
     /// Null ⇒ no remote cwd hint (the agent uses its own default). Borrowed for
     /// the construction call only.
     working_directory: ?[]const u8 = null,
+
+    /// The shell to run for an OPEN-new session (per-host default or an explicit
+    /// `--shell`): a path ON THE REMOTE MACHINE (e.g. `powershell.exe`,
+    /// `wsl.exe`, `/bin/zsh`). Same invariant as `working_directory`: the LOCAL
+    /// shell config must never reach a remote agent. Null ⇒ the agent resolves
+    /// its own default shell. Borrowed for the construction call only.
+    shell: ?[]const u8 = null,
 };
 
 /// Unique ID used to identify this surface for IPC purposes. It is
@@ -742,6 +749,7 @@ pub fn init(
                     .session_id = rb.session_id,
                     .command = remote_command,
                     .working_directory = rb.working_directory,
+                    .shell = rb.shell,
                     .term = config.term,
                 });
                 break :backend .{ .remote = io_remote };
@@ -898,6 +906,15 @@ pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
+    // Abort any blocking IO backend work FIRST, before joining ANY thread:
+    // cancel parked RPCs (e.g. a remote OPEN/ATTACH on a dead transport),
+    // poison the termio mailbox, and set the closing flag that unblocks
+    // pushers on the shared app mailbox. The IO thread must be guaranteed
+    // unable to park forever before this (GUI) thread blocks in a join —
+    // a wedged join here beachballs the entire app permanently (observed:
+    // post-wake remote reconnect swaps freezing the GUI).
+    self.io.shutdown();
+
     // Stop rendering thread
     {
         self.renderer_thread.stop.notify() catch |err|
@@ -906,6 +923,14 @@ pub fn deinit(self: *Surface) void {
 
         // We need to become the active rendering thread again
         self.renderer.threadEnter(self.rt_surface) catch unreachable;
+
+        // The renderer thread is gone, so nothing drains its mailbox from
+        // here on. Close it so a producer (the IO thread handling e.g. a
+        // resize message, or this thread in changeConfig) that tries a
+        // blocking push wakes immediately and drops instead of parking on
+        // a queue with no consumer — which would wedge the IO-thread join
+        // below.
+        self.renderer_thread.mailbox.close();
     }
 
     // Stop our IO thread
@@ -1258,6 +1283,22 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 state,
             ) catch |err| {
                 log.warn("apprt failed to set activity state err={}", .{err});
+            };
+        },
+
+        .pane_banner => |w| {
+            defer w.deinit();
+
+            // We always allocate for this because we need to null-terminate.
+            const str = try self.alloc.dupeZ(u8, w.slice());
+            defer self.alloc.free(str);
+
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .pane_banner,
+                .{ .text = str },
+            ) catch |err| {
+                log.warn("apprt failed to set pane banner err={}", .{err});
             };
         },
 
@@ -5538,6 +5579,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .{ .surface = self },
             .prompt_title,
             .tab,
+        ),
+
+        .prompt_surface_banner => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_banner,
+            {},
         ),
 
         .set_surface_title => |v| {

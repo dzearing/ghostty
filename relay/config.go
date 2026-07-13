@@ -14,6 +14,12 @@ type Config struct {
 	// in front, so we deliberately default to loopback only.
 	ListenAddr string
 
+	// MetricsAddr is the SEPARATE Prometheus /metrics listen address (default
+	// loopback 127.0.0.1:9091 — never on the Caddy-proxied public mux, so
+	// metrics are unreachable from the internet by construction). Set
+	// METRICS_ADDR=off to disable the listener. See metrics.go.
+	MetricsAddr string
+
 	// GoogleClientID is the OAuth 2.0 / OIDC client ID that Google-issued ID
 	// tokens must be addressed to (the `aud` claim). Required for real OIDC.
 	GoogleClientID string
@@ -62,12 +68,61 @@ type Config struct {
 	IssuerURL string
 
 	// AllowedEmails is the authorization allowlist. A verified Google identity
-	// is necessary but NOT sufficient: the email must also appear here.
+	// is necessary but NOT sufficient: the email must also appear here. This is
+	// the sign-in gate when InviteSignup is OFF (the default).
 	AllowedEmails []string
+
+	// SignupMode seeds the runtime sign-up policy when the DB has no
+	// settings.signup_mode row yet: one of open|invite|closed|allowlist
+	// (settings.go). The DB value — set live from the admin portal — ALWAYS
+	// wins; this env var (then InviteSignup, then allowlist) is only the
+	// fallback default for deployments that predate the settings table.
+	// Sourced from SIGNUP_MODE (lowercased); invalid values fail safe to
+	// allowlist with an error log.
+	SignupMode string
+
+	// InviteSignup is retained for BACK-COMPAT SEEDING ONLY (see SignupMode):
+	// when neither a settings.signup_mode row nor SIGNUP_MODE exists,
+	// INVITE_SIGNUP=true seeds mode `invite` (the M1 invite-code account
+	// model) and anything else seeds `allowlist` (the legacy AllowedEmails
+	// gate) — so pre-settings deployments keep their exact behavior. It is no
+	// longer consulted anywhere else; the runtime mode governs.
+	InviteSignup bool
+
+	// AdminSubs is the bootstrap admin allowlist: comma-separated Google `sub`
+	// values (NOT emails — the sub is the stable authz key, plan §2/§4.4) whose
+	// verified holders may call the /v1/admin/ surface. It is the
+	// bootstrap/recovery path; day-to-day admin-ness is managed in the DB via
+	// accounts.is_admin (admin = sub ∈ AdminSubs OR is_admin=1). Empty means no
+	// bootstrap admins — with no is_admin accounts either, every admin endpoint
+	// 403s (fail closed). Under DEV_AUTH the dev identity's sub is "dev", so
+	// including "dev" here makes the dev token an admin (tests only). Sourced
+	// from ADMIN_SUBS.
+	AdminSubs []string
 
 	// StateDir holds persisted relay state: the SQLite database
 	// (ghoztty-relay.db) and, on legacy installs, the old devices.json.
 	StateDir string
+
+	// --- M4 quotas + rate limits (quotas.go / ratelimit.go) ---
+
+	// QuotaMaxDevices / QuotaMaxSessions are the DEFAULT per-account limits on
+	// enrolled devices and concurrent relay sessions. 0 = unlimited. Accounts
+	// may carry per-account overrides (accounts.max_devices / max_sessions,
+	// migration 0004; NULL = use these defaults, 0 = unlimited for that
+	// account). Sourced from QUOTA_MAX_DEVICES / QUOTA_MAX_SESSIONS
+	// (defaults 10 / 8). Zero-valued Configs built directly (tests) therefore
+	// get unlimited unless they opt in.
+	QuotaMaxDevices  int
+	QuotaMaxSessions int
+
+	// In-memory abuse-control rate limits, requests per minute; 0 disables a
+	// limiter. Buckets reset on restart (accepted for the single-VM beta).
+	// See ratelimit.go for where each one bites.
+	RateSigninPerMin     int // failed sign-ins per IP (RATELIMIT_SIGNIN_PER_MIN, default 10)
+	RateEnrollPerMin     int // enroll starts per IP (RATELIMIT_ENROLL_PER_MIN, default 6)
+	RateEnrollPollPerMin int // enroll polls per IP, backstop (RATELIMIT_ENROLL_POLL_PER_MIN, default 120)
+	RateConnectPerMin    int // client connects per identity (RATELIMIT_CONNECT_PER_MIN, default 60)
 
 	// --- Dev/test auth (MUST be off in production) ---
 
@@ -87,6 +142,7 @@ type Config struct {
 func LoadConfig() *Config {
 	cfg := &Config{
 		ListenAddr:               getenv("LISTEN_ADDR", "127.0.0.1:8080"),
+		MetricsAddr:              getenv("METRICS_ADDR", "127.0.0.1:9091"),
 		GoogleClientID:           os.Getenv("GOOGLE_CLIENT_ID"),
 		GoogleClientSecret:       os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleDeviceClientID:     os.Getenv("GOOGLE_DEVICE_CLIENT_ID"),
@@ -95,15 +151,33 @@ func LoadConfig() *Config {
 		GoogleWebClientSecret:    os.Getenv("GOOGLE_WEB_CLIENT_SECRET"),
 		RelayBaseURL:             strings.TrimRight(os.Getenv("RELAY_BASE_URL"), "/"),
 		StateDir:                 getenv("STATE_DIR", "./state"),
+		SignupMode:               strings.ToLower(strings.TrimSpace(os.Getenv("SIGNUP_MODE"))),
+		InviteSignup:             strings.EqualFold(os.Getenv("INVITE_SIGNUP"), "true"),
 		DevAuth:                  strings.EqualFold(os.Getenv("DEV_AUTH"), "true"),
 		DevClientToken:           os.Getenv("DEV_CLIENT_TOKEN"),
 		DevEmail:                 os.Getenv("DEV_EMAIL"),
 	}
 
+	// M4 quotas + rate limits (getenvInt lives in quotas.go).
+	cfg.QuotaMaxDevices = getenvInt("QUOTA_MAX_DEVICES", 10)
+	cfg.QuotaMaxSessions = getenvInt("QUOTA_MAX_SESSIONS", 8)
+	cfg.RateSigninPerMin = getenvInt("RATELIMIT_SIGNIN_PER_MIN", 10)
+	cfg.RateEnrollPerMin = getenvInt("RATELIMIT_ENROLL_PER_MIN", 6)
+	cfg.RateEnrollPollPerMin = getenvInt("RATELIMIT_ENROLL_POLL_PER_MIN", 120)
+	cfg.RateConnectPerMin = getenvInt("RATELIMIT_CONNECT_PER_MIN", 60)
+
 	for _, e := range strings.Split(os.Getenv("ALLOWED_EMAILS"), ",") {
 		e = strings.ToLower(strings.TrimSpace(e))
 		if e != "" {
 			cfg.AllowedEmails = append(cfg.AllowedEmails, e)
+		}
+	}
+
+	// Subs are opaque case-sensitive identifiers — trimmed, never lowercased.
+	for _, s := range strings.Split(os.Getenv("ADMIN_SUBS"), ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			cfg.AdminSubs = append(cfg.AdminSubs, s)
 		}
 	}
 

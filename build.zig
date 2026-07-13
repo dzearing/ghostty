@@ -96,6 +96,7 @@ pub fn build(b: *std.Build) !void {
     {
         const agent = try buildpkg.GhosttyAgent.init(b, &config, &deps);
         agent_step.dependOn(&agent.install_step.step);
+        if (agent.ca_dll_install_step) |ca| agent_step.dependOn(&ca.step);
 
         // `zig build test-agent` runs the agent's tests, including the real-pty
         // child end-to-end tests (which need pty-c + os deps, so they can't run

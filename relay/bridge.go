@@ -24,11 +24,12 @@ func bridge(client, agent *websocket.Conn) {
 
 	errc := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(agentConn, clientConn) // client -> agent
+		// countingWriter (metrics.go) feeds the per-direction throughput counter.
+		_, err := io.Copy(countingWriter{agentConn, mBridgeBytes.WithLabelValues(dirClientToAgent)}, clientConn) // client -> agent
 		errc <- err
 	}()
 	go func() {
-		_, err := io.Copy(clientConn, agentConn) // agent -> client
+		_, err := io.Copy(countingWriter{clientConn, mBridgeBytes.WithLabelValues(dirAgentToClient)}, agentConn) // agent -> client
 		errc <- err
 	}()
 

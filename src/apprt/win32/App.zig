@@ -1198,6 +1198,8 @@ pub fn performAction(
         .show_on_screen_keyboard, // GTK/mobile
         .inspector, // Not yet implemented (debug overlay)
         .render_inspector, // Not yet implemented (debug overlay)
+        .pane_banner, // Not yet implemented on Windows (tracker T35)
+        .prompt_banner, // Not yet implemented on Windows (tracker T35)
         => return true,
 
         .renderer_health => {

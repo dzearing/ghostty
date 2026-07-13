@@ -37,6 +37,7 @@ const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const xev = @import("../global.zig").xev;
+const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
@@ -65,6 +66,12 @@ command: ?[]const u8,
 /// pwd. Duped into `arena`.
 working_directory: ?[]const u8,
 
+/// The shell to run for an open-new session (null ⇒ the remote's own default:
+/// POSIX `$SHELL`/`/bin/sh`, Windows `%COMSPEC%`/cmd.exe). A path ON THE REMOTE
+/// MACHINE, sourced from the per-host settings (never the local config). Sent
+/// verbatim in the `OPEN` payload (§4.2). Duped into `arena`.
+shell: ?[]const u8,
+
 /// The TERM value advertised in `OPEN` (§4.2). Duped into `arena`.
 term: []const u8,
 
@@ -79,6 +86,15 @@ exit_code: ?u32 = null,
 
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
+
+/// Cancellation token for this pane's session-establishing RPCs (OPEN/ATTACH).
+/// `shutdown` (GUI thread, called by `Surface.deinit` BEFORE joining the IO
+/// thread) cancels it so a doomed OPEN/ATTACH parked on a dead link wakes
+/// immediately instead of waiting out its full timeout under the join — the
+/// remote analogue of Exec signaling its quit pipe before joining its reader.
+/// Stable for the backend's lifetime (lives in `Termio.backend`, which is
+/// deinitialized only after the IO thread has joined).
+canceller: connection.RpcCanceller = .{},
 
 /// The LIVE agent session id, published once `threadEnter` resolves the pane
 /// (OPEN-new learns it from the agent's OPENED; ATTACH already knows it). Stored
@@ -113,6 +129,11 @@ pub const Config = struct {
     /// Working directory hint + the terminal's initial pwd.
     working_directory: ?[]const u8 = null,
 
+    /// Shell for an open-new session (null ⇒ the agent resolves its own
+    /// default). A remote-native path (per-host setting), NEVER the local
+    /// shell — a local path does not exist on a different remote OS.
+    shell: ?[]const u8 = null,
+
     /// TERM value advertised to the agent. Deliberately NOT `xterm-ghostty`:
     /// the remote machine almost never has ghostty's terminfo installed, and an
     /// unknown TERM breaks curses apps and pagers there (git's less prints
@@ -132,6 +153,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
     const session_id = if (cfg.session_id) |s| try aa.dupe(u8, s) else null;
     const command = if (cfg.command) |c| try aa.dupe(u8, c) else null;
     const working_directory = if (cfg.working_directory) |w| try aa.dupe(u8, w) else null;
+    const shell = if (cfg.shell) |s| try aa.dupe(u8, s) else null;
     const term = try aa.dupe(u8, cfg.term);
 
     return .{
@@ -139,6 +161,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .session_id = session_id,
         .command = command,
         .working_directory = working_directory,
+        .shell = shell,
         .term = term,
         .arena = arena,
     };
@@ -147,6 +170,28 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
 pub fn deinit(self: *Remote) void {
     self.arena.deinit();
     self.* = undefined;
+}
+
+/// Abort any blocking work this backend may be doing on its IO thread so that
+/// thread can be joined promptly. Called by `Surface.deinit` on the GUI thread
+/// BEFORE it joins the IO thread (mirroring how Exec signals its read thread's
+/// quit pipe before the join).
+///
+/// The one blocking wait a remote pane's IO thread can be parked in is a
+/// session-establishing RPC (`threadEnter`'s OPEN/ATTACH). On a link that died
+/// silently (e.g. a WSS transport that will never deliver another byte — the
+/// readers see no error, so nothing fails the parked slot) that wait runs the
+/// full RPC timeout; joining through it beachballs the GUI thread, and during
+/// reconnect churn (a fresh doomed ATTACH every cycle) it looks permanent.
+/// Cancelling is always safe: the surface is being torn down, so the RPC's
+/// result could never be used anyway.
+///
+/// Thread-safe: only touches the atomic canceller and the connection's
+/// rpc-slot table (under its own lock). The connection outlives the surface
+/// (the GUI retains it until after `ghostty_surface_free` returns).
+pub fn shutdown(self: *Remote) void {
+    self.canceller.cancel();
+    self.conn.cancelRpcsFor(&self.canceller);
 }
 
 /// The LIVE agent session id for this backend, or null if no pane is currently
@@ -209,7 +254,7 @@ pub fn threadEnter(
         // ATTACH: re-attach to an existing agent session (§3.3 / §7.3).
         const rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
         const cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
-        var outcome = try self.conn.attachChannel(
+        var outcome = try self.conn.attachChannelCancellable(
             sid,
             rows,
             cols,
@@ -217,6 +262,7 @@ pub fn threadEnter(
             // GUI process); the agent replays its retained ring from 0 (§7.3).
             0,
             false,
+            &self.canceller,
         );
         // `attached_elsewhere` without force (§5.3): the session's bridge still
         // belongs to another connection — for THIS surface that is our own
@@ -231,7 +277,7 @@ pub fn threadEnter(
         {
             outcome.deinit();
             log.info("attach: session attached elsewhere; reclaiming with force=true", .{});
-            outcome = try self.conn.attachChannel(sid, rows, cols, 0, true);
+            outcome = try self.conn.attachChannelCancellable(sid, rows, cols, 0, true, &self.canceller);
         }
         defer outcome.deinit();
         const p = outcome.pane orelse {
@@ -250,13 +296,14 @@ pub fn threadEnter(
         const open: protocol.Open = .{
             .command = self.command,
             .cwd = self.working_directory,
+            .shell = self.shell,
             .term = self.term,
             .rows = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
             .cols = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
             .px_h = @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
         };
-        break :pane try self.conn.openChannel(open);
+        break :pane try self.conn.openChannelCancellable(open, &self.canceller);
     };
     // On any failure after this point we DETACH the pane (keep-alive teardown,
     // §3.3) so the remote session survives for a later re-attach.
@@ -498,8 +545,20 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
     const rd = &td.backend.remote;
     const ch = rd.pane.ring;
 
+    // Cap the work per wake instead of draining until empty. processOutput
+    // runs ON this IO thread (unlike Exec, whose ReadThread parses while the
+    // IO thread drains the termio mailbox), so replies it generates (CPR,
+    // DA1, color queries, ...) pile into our own 64-slot mailbox and nothing
+    // drains it until we return to the xev loop. An unbounded drain of a big
+    // burst (e.g. a re-attach ring replay) can fill it and previously parked
+    // this thread on its own queue — producer == consumer, a self-deadlock
+    // that also wedged the GUI thread when Surface.deinit joined us. Bail
+    // after a bounded number of chunks and re-notify so the loop runs our
+    // mailbox drain between bursts.
     var buf: [16 * 1024]u8 = undefined;
-    while (true) {
+    var chunks: usize = 0;
+    const max_chunks_per_wake = 32;
+    while (chunks < max_chunks_per_wake) : (chunks += 1) {
         const res = ch.pop(&buf);
         if (res.read == 0) break;
 
@@ -507,6 +566,14 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
 
         if (res.send_resume) rd.conn.sendFlowResume(ch.id) catch |err|
             log.warn("error sending FLOW resume err={}", .{err});
+    } else {
+        // Hit the cap with the ring possibly non-empty: schedule another
+        // wake and return to the loop. EXIT handling below is deferred to
+        // the wake that finds the ring empty, preserving "final bytes
+        // render before close".
+        rd.ring_async.notify() catch |err|
+            log.warn("error re-notifying ring async err={}", .{err});
+        return;
     }
 
     // EXIT handling, mirroring local Exec (`Exec.zig` `processExit` →
@@ -530,10 +597,17 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
             std.math.maxInt(u32)
         else
             @intCast(ch.exit_code);
-        _ = td.surface_mailbox.push(.{ .child_exited = .{
+        // Timed retries on the SHARED app mailbox — never a forever park
+        // (the GUI thread is the only consumer; if it's busy or joining us
+        // in Surface.deinit, a forever wait here deadlocks the app). If the
+        // surface is closing, the exit notification is moot: drop it.
+        const msg: apprt.surface.Message = .{ .child_exited = .{
             .exit_code = code,
             .runtime_ms = ch.runtime_ms,
-        } }, .{ .forever = {} });
+        } };
+        while (td.surface_mailbox.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) == 0) {
+            if (rd.io.closing.load(.acquire)) break;
+        }
     }
 }
 

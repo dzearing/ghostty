@@ -584,11 +584,15 @@ pub const SessionTable = struct {
 // -----------------------------------------------------------------------------
 
 /// Default idle-TTL before an orphaned (no live connection bound) session is
-/// reaped (§7.1 "Resource caps & TTL"). 5 minutes: long enough to close a laptop,
-/// ride an elevator, and reconnect without losing the shell, but bounded so
-/// abandoned sessions don't leak forever. `last_activity_ms` is bumped on every
-/// output chunk and on (re)attach, so an actively-running session never idles out.
-pub const default_idle_ttl_ms: i64 = 5 * 60 * 1000;
+/// reaped (§7.1 "Resource caps & TTL"). 24 hours: a closed laptop lid must
+/// survive overnight — the whole point of daemon-scoped sessions is that the
+/// client reconnects and catches up, and a 5-minute TTL (the original value)
+/// meant any real sleep reaped the session before the GUI could re-ATTACH.
+/// Still bounded so truly abandoned sessions don't leak forever; an orphan
+/// costs its pty child plus a ~2MB output ring. `last_activity_ms` is bumped
+/// on every output chunk and on (re)attach, so an actively-running session
+/// never idles out.
+pub const default_idle_ttl_ms: i64 = 24 * 60 * 60 * 1000;
 
 /// The agent's DAEMON-scoped session store: a `SessionTable` plus the single mutex
 /// that guards ALL access to it, a clock, and a background idle-TTL reaper. It

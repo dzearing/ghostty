@@ -215,6 +215,12 @@ class TerminalWindow: NSWindow {
             // center that window's title. translatesAutoresizingMaskIntoConstraints is
             // disabled AFTER the add so the titlebar installs the sizing constraints.
             machinePillAccessory.layoutAttribute = .left
+            // NOTE: do NOT set sizingOptions = [.intrinsicContentSize] here —
+            // combined with the Spacer inside MachineTitlePillView it creates a
+            // non-converging AutoLayout feedback loop (100% main-thread layout
+            // spin, live-sampled 2026-07-05). The truncation issue is instead
+            // solved the UpdatePill way: measure the text and set an explicit
+            // width constraint in updateMachinePill().
             machinePillAccessory.view = NonDraggableHostingView(
                 rootView: MachineTitlePillView(model: machinePillModel))
             updateMachinePill()
@@ -955,6 +961,12 @@ extension TerminalWindow {
                 connection: connection.handle,
                 machine: connection.machine
             )
+        }
+        // The status pill's "Reconnect" button (shown once the window is
+        // disconnected): reset the breakers and dial now; falls back to a
+        // fresh shell when the old session is gone (WP-D1 manual reconnect).
+        machinePillModel.onReconnectTap = { [weak self] in
+            self?.terminalController?.manualRemoteReconnect()
         }
         // Remote ⇒ inline leading title+pill (system title hidden). Local ⇒ system
         // title, no accessory (a leading accessory would center the local title).

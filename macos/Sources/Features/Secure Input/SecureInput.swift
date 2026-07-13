@@ -16,7 +16,7 @@ class SecureInput: ObservableObject {
     static let shared = SecureInput()
 
     private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier!,
+        subsystem: Bundle.loggerSubsystem,
         category: String(describing: SecureInput.self)
     )
 

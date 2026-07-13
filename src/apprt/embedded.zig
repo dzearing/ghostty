@@ -352,6 +352,7 @@ pub const App = struct {
             .rearrange => "rearrange",
             .send_keys => "send-keys",
             .set_state => "set-state",
+            .set_banner => "set-banner",
         };
 
         return sendIpc(alloc, action_name, value.arguments);
@@ -852,6 +853,13 @@ pub const Surface = struct {
     /// a fresh remote window (no parent, no explicit remote cwd) forwards NO cwd.
     remote_working_directory: ?[*:0]const u8 = null,
 
+    /// The REMOTE shell for an OPEN-new remote session, copied from
+    /// `Options.remote_shell`. Borrowed for the duration of `CoreSurface.init`
+    /// only (the remote backend dupes it). A remote-native path (per-host
+    /// setting or explicit `--shell`), NEVER the local shell config — same
+    /// invariant as `remote_working_directory`.
+    remote_shell: ?[*:0]const u8 = null,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -919,6 +927,15 @@ pub const Surface = struct {
         ///
         /// C type: `const char*`.
         remote_working_directory: ?[*:0]const u8 = null,
+
+        /// The shell to run for an OPEN-new remote session (per-host default
+        /// or an explicit `--shell`): a path ON THE REMOTE MACHINE (e.g.
+        /// `powershell.exe`, `wsl.exe`, `/bin/zsh`), forwarded verbatim in the
+        /// agent's OPEN. Null ⇒ the agent resolves its own default shell.
+        /// Ignored when `connection` is null.
+        ///
+        /// C type: `const char*`.
+        remote_shell: ?[*:0]const u8 = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -939,6 +956,7 @@ pub const Surface = struct {
             .remote_connection = opts.connection,
             .remote_session_id = opts.session_id,
             .remote_working_directory = opts.remote_working_directory,
+            .remote_shell = opts.remote_shell,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1466,6 +1484,12 @@ pub const Surface = struct {
             .working_directory = if (self.remote_working_directory) |w| wd: {
                 const s = std.mem.sliceTo(w, 0);
                 break :wd if (s.len > 0) s else null;
+            } else null,
+            // The REMOTE shell (per-host default / explicit --shell). Empty ⇒
+            // null so a stray empty string never forwards a shell.
+            .shell = if (self.remote_shell) |sh| sh: {
+                const s = std.mem.sliceTo(sh, 0);
+                break :sh if (s.len > 0) s else null;
             } else null,
         };
     }

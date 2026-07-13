@@ -70,6 +70,15 @@ pub fn BlockingQueue(
         cond_not_full: std.Thread.Condition = .{},
         not_full_waiters: usize = 0,
 
+        /// Set by `close`. Once closed, every push fails immediately (returns
+        /// 0) and any pusher parked waiting for space is woken up. This exists
+        /// for teardown: a consumer that is about to stop draining forever
+        /// closes the queue so no producer can park on `cond_not_full` waiting
+        /// for a pop that will never come (which would deadlock any thread
+        /// that later joins the producer). Pops still work after close so the
+        /// consumer can drain remaining items.
+        closed: bool = false,
+
         /// Allocate the blocking queue on the heap.
         pub fn create(alloc: Allocator) Allocator.Error!*Self {
             const ptr = try alloc.create(Self);
@@ -102,6 +111,8 @@ pub fn BlockingQueue(
             self.mutex.lock();
             defer self.mutex.unlock();
 
+            if (self.closed) return 0;
+
             // The
             if (self.full()) {
                 switch (timeout) {
@@ -121,6 +132,9 @@ pub fn BlockingQueue(
                     },
                 }
 
+                // The consumer may have closed the queue while we waited.
+                if (self.closed) return 0;
+
                 // If we're still full, then we failed to write. This can
                 // happen in situations where we are interrupted.
                 if (self.full()) return 0;
@@ -133,6 +147,26 @@ pub fn BlockingQueue(
             self.len += 1;
 
             return self.len;
+        }
+
+        /// Close the queue: all future pushes fail immediately and any
+        /// pusher currently parked waiting for space is woken (its push
+        /// returns 0). Call this from the consumer side when it will never
+        /// drain again (teardown), BEFORE joining producer threads. Pop and
+        /// drain still work so remaining items can be consumed.
+        pub fn close(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.closed = true;
+            self.cond_not_full.broadcast();
+        }
+
+        /// Returns true if `close` was called. Producers can use this to
+        /// distinguish "queue full, retry" from "consumer is gone, drop".
+        pub fn isClosed(self: *Self) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.closed;
         }
 
         /// Pop a value from the queue without blocking.
@@ -229,6 +263,38 @@ test "basic push and pop" {
 
     // Verify we can still push
     try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+}
+
+test "close wakes a blocked pusher and fails future pushes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64, 1);
+    const q = try Q.create(alloc);
+    defer q.destroy(alloc);
+
+    // Fill the queue.
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+
+    // Park a producer in a forever push, then close from this thread.
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(queue: *Q) void {
+            // Blocks until close() wakes it; must return 0 (dropped).
+            std.debug.assert(queue.push(2, .{ .forever = {} }) == 0);
+        }
+    }.run, .{q});
+    // Give the producer time to park (best-effort; close is correct even
+    // if it wins the race and the push fails on the closed check instead).
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    q.close();
+    t.join();
+
+    // Closed queue: pushes fail instantly, pops still drain.
+    try testing.expectEqual(@as(Q.Size, 0), q.push(3, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 0), q.push(3, .{ .forever = {} }));
+    try testing.expect(q.pop().? == 1);
+    try testing.expect(q.pop() == null);
+    try testing.expect(q.isClosed());
 }
 
 test "timed push" {

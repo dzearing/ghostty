@@ -232,9 +232,9 @@
       <span><span class="os">Windows</span> &middot; per-user install, no admin required</span>
     </div>
     <div class="dl-body">
-      <a class="dl-btn" href="/dl/ghoztty-agent.msi"><span class="arrow" aria-hidden="true">&#8595;</span> Download the installer (.msi)</a>
+      <a class="dl-btn" id="msi-link" href="/dl/ghoztty-agent.msi"><span class="arrow" aria-hidden="true">&#8595;</span> Download the installer (.msi)</a>
       <ol class="steps">
-        <li>Run the downloaded <code>ghoztty-agent.msi</code>.</li>
+        <li>Run the downloaded <code id="msi-name">ghoztty-agent.msi</code>.</li>
         <li>Click <b>Ghoztty Agent</b> in the Start Menu.</li>
         <li>Sign in with Google in the browser that opens to link this machine to your account.</li>
       </ol>
@@ -320,8 +320,18 @@
       var win = v && v["windows-x86_64"];
       if (win && win.version) {
         var badge = document.getElementById("version-badge");
-        badge.textContent = "v" + win.version;
+        badge.textContent = win.semver ? "v" + win.semver : "v" + win.version;
+        badge.title = "build " + win.version;
         badge.style.display = "inline-block";
+      }
+      // Point the download button at the versioned installer filename
+      // (Ghoztty-Agent-X.Y.Z-x64.msi); the static href stays a working
+      // stable-URL fallback when version.json is unavailable.
+      if (win && win.msi) {
+        document.getElementById("msi-link").setAttribute("href", win.msi);
+        var name = win.msi.split("/").pop();
+        var el = document.getElementById("msi-name");
+        if (el) el.textContent = name;
       }
     })
     .catch(function () { /* no version info available */ });

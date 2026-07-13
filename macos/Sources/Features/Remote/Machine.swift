@@ -26,7 +26,9 @@ struct Machine: Identifiable, Hashable {
     var deviceID: String?
     /// Live online status from the relay's device directory (WP-C2). Nil for
     /// non-relay machines and for relay machines that haven't been refreshed
-    /// from the account list yet.
+    /// from the account list yet — including rows seeded from the persisted
+    /// device cache at launch, which the chooser renders as "checking" until
+    /// the first fetch confirms.
     var online: Bool?
     /// The machine's OS-reported hostname from the relay's device directory.
     /// Distinct from `name` (the user-facing display name, which a rename
@@ -122,6 +124,121 @@ struct Machine: Identifiable, Hashable {
         if s.hasSuffix(".local") { s.removeLast(".local".count) }
         return s
     }
+
+    // MARK: Per-host settings
+
+    /// The stable identity key for this machine's persisted per-host settings:
+    /// the relay device id when this is a relay machine (stable across renames
+    /// and directory refreshes), else `host:port` for direct-TCP machines
+    /// (their only durable identity — TCP rows are rebuilt per dial). NOT the
+    /// registry UUID, which is regenerated across launches.
+    var settingsKey: String { deviceID ?? "\(host):\(port)" }
+
+    /// This machine's persisted per-host settings (default cwd/shell for new
+    /// remote sessions). Read-through to the store; empty settings when none
+    /// were ever saved.
+    var settings: MachineSettings { MachineSettingsStore.get(settingsKey) }
+}
+
+extension Machine {
+    /// Seed an OPEN-new remote surface config with this machine's per-host
+    /// defaults, letting explicit caller values (CLI `--working-directory` /
+    /// `--shell` / `--command` flags) override them. Only meaningful for a
+    /// config that OPENs a new session (`remoteSessionId == nil`) — an ATTACH
+    /// ignores OPEN fields.
+    ///
+    /// The command has no per-host default (a default command re-run on every
+    /// new window would be surprising); it is applied here only so the CLI
+    /// override path has one seeding site. `waitAfterCommand` makes libghostty
+    /// forward it as an EXPLICIT remote command in the OPEN (otherwise it is
+    /// treated as a local default and deliberately dropped — see Surface.zig's
+    /// remote branch).
+    func applyOpenDefaults(
+        to cfg: inout Ghostty.SurfaceConfiguration,
+        workingDirectory: String? = nil,
+        shell: String? = nil,
+        command: String? = nil
+    ) {
+        let settings = self.settings
+        if cfg.remoteWorkingDirectory == nil {
+            cfg.remoteWorkingDirectory = workingDirectory ?? settings.workingDirectory
+        }
+        if cfg.remoteShell == nil {
+            cfg.remoteShell = shell ?? settings.shell
+        }
+        if cfg.command == nil, let command, !command.isEmpty {
+            cfg.command = command
+            cfg.waitAfterCommand = true
+        }
+    }
+}
+
+/// Per-host defaults for NEW remote sessions on a machine: the working
+/// directory and shell the session starts with when the caller doesn't pass
+/// explicit `--working-directory`/`--shell` flags. Both are REMOTE-native
+/// values (e.g. `C:\dev` + `wsl.exe` on a Windows host, `/home/me` +
+/// `/bin/zsh` on Linux); nil means "use the remote's own default" (unchanged
+/// current behavior). Forwarded in the agent OPEN's existing optional
+/// `cwd`/`shell` fields, so old agents ignore nothing they don't understand.
+struct MachineSettings: Codable, Equatable {
+    var workingDirectory: String?
+    var shell: String?
+
+    var isEmpty: Bool { workingDirectory == nil && shell == nil }
+}
+
+/// Persistence for `MachineSettings`, keyed by `Machine.settingsKey`.
+///
+/// Store choice (the Machine.swift `[machines]`-file TODO): the same
+/// UserDefaults-JSON pattern as the relay device cache, NOT a machines.toml.
+/// A config file buys hand-editability but needs a parser, file watching, and
+/// a write path the app doesn't have today; these settings are written from
+/// the app's own UI/CLI, so the app-owned store the codebase already uses is
+/// the right weight. Unlike the device cache this is NEVER purged on
+/// sign-out/401: per-host defaults are local user preferences (no secrets, no
+/// account resources — keys are device ids / host:port strings), and a user's
+/// shell choice must survive an auth blip. UserDefaults is thread-safe, so
+/// reads (dial time) and writes (settings UI) need no isolation.
+enum MachineSettingsStore {
+    private static let defaultsKey = "MachineSettingsByHost"
+
+    /// The persisted settings for a machine key, or empty settings when none
+    /// (or the blob fails to decode — schema drift degrades to defaults).
+    static func get(_ machineKey: String) -> MachineSettings {
+        loadAll()[machineKey] ?? MachineSettings()
+    }
+
+    /// Persist `settings` for a machine key. Whitespace-only fields are
+    /// normalized to nil ("use the remote default"); fully-empty settings
+    /// remove the entry so the store doesn't accumulate blanks.
+    static func set(_ settings: MachineSettings, for machineKey: String) {
+        var normalized = settings
+        normalized.workingDirectory = normalize(settings.workingDirectory)
+        normalized.shell = normalize(settings.shell)
+
+        var all = loadAll()
+        if normalized.isEmpty {
+            all.removeValue(forKey: machineKey)
+        } else {
+            all[machineKey] = normalized
+        }
+        guard let data = try? JSONEncoder().encode(all) else { return }
+        UserDefaults.ghostty.set(data, forKey: defaultsKey)
+    }
+
+    private static func normalize(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed
+    }
+
+    private static func loadAll() -> [String: MachineSettings] {
+        guard let data = UserDefaults.ghostty.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode([String: MachineSettings].self, from: data)
+        else { return [:] }
+        return decoded
+    }
 }
 
 /// In-memory registry of known remote machines.
@@ -135,6 +252,12 @@ struct Machine: Identifiable, Hashable {
 /// — machines are per-account, so a signed-out chooser must never show a
 /// previous account's devices. Non-relay (direct TCP) entries are never
 /// touched by the fetch or by sign-out.
+///
+/// The last successful device list is also PERSISTED (names/hostnames only —
+/// see `CachedRelayDevice`) so the next launch can seed the list instantly
+/// instead of showing nothing until the first fetch lands; the persisted
+/// cache follows the same account-scoping rule (purged by
+/// `clearRelayMachines`).
 ///
 /// TODO(wp4): load TCP machines from ~/.config/ghostty (e.g. a `[machines]`
 /// section or a dedicated machines.toml) in addition to the account list.
@@ -176,11 +299,45 @@ final class MachineRegistry: ObservableObject {
     var hasRelayAccount: Bool { RelayAccount.hasCredentials }
 
     init() {
-        // Relay machines are account resources and only ever come from the
-        // directory fetch — there is deliberately no pre-auth seed (a
-        // signed-out chooser must show no account devices). TCP machines can
+        // Seed relay machines from the persisted device cache so a cold
+        // launch shows the account's machines INSTANTLY (with presence
+        // "checking", `online == nil`) instead of an empty list until the
+        // first directory fetch lands — that fetch can take seconds (OAuth
+        // refresh-token grant + network), which is exactly the "machine
+        // didn't appear for 5-10s" complaint this cache fixes.
+        //
+        // The seed is deliberately gated on the cache alone, NOT on
+        // `RelayAccount.hasCredentials`: the account's Keychain load is
+        // deferred off-main (see `RelayAccount.init`) and has almost never
+        // published by the time this runs at startup, so a credential check
+        // here would race to "signed out" and skip the seed for every
+        // signed-in user. The cache's existence IS the credential signal —
+        // every auth-driven clear (sign-out, credential-less refresh, 401)
+        // purges it via `clearRelayMachines`, so it cannot outlive the
+        // account; and the first refresh reconciles it against the live
+        // directory either way (removing devices that are gone, or clearing
+        // everything when authorization is really absent). TCP machines can
         // still be `add`ed at runtime.
-        self.machines = []
+        var uuids: [String: UUID] = [:]
+        let relayBase = RelayDirectoryClient.defaultBase
+        self.machines = Self.loadCachedDevices().map { cached in
+            let uuid = UUID()
+            uuids[cached.id] = uuid
+            return Machine(
+                id: uuid,
+                name: cached.name,
+                host: relayBase,
+                port: 0,
+                relayBase: relayBase,
+                deviceID: cached.id,
+                online: nil,
+                hostname: cached.hostname
+            )
+        }
+        // Pre-register the seeded UUIDs so the first fetch rebuilds these
+        // rows under the SAME identity (selection/highlight in an already
+        // open chooser survives the cache-to-live handoff).
+        self.deviceUUIDs = uuids
     }
 
     func add(_ machine: Machine) {
@@ -191,9 +348,16 @@ final class MachineRegistry: ObservableObject {
     /// Called on sign-out and on credential-less/401 refreshes: the relay
     /// list belongs to an account, so without a valid account it must not be
     /// shown. Publishes immediately, so an open chooser re-renders live.
+    ///
+    /// Also purges the PERSISTED device cache: every caller of this clear is
+    /// an authorization boundary, and a cache that survived it would re-seed
+    /// the previous account's devices on the next launch — account devices
+    /// must never outlive their authorization, on disk any more than in
+    /// memory.
     func clearRelayMachines() {
         machines.removeAll { $0.isRelay }
         deviceUUIDs.removeAll()
+        UserDefaults.ghostty.removeObject(forKey: Self.deviceCacheKey)
     }
 
     /// Refresh the relay account's device list (WP-C2). On success, relay
@@ -213,17 +377,26 @@ final class MachineRegistry: ObservableObject {
     /// outlive their authorization).
     func refreshFromRelay(quiet: Bool = false) async {
         guard !refreshInFlight else { return }
+        refreshInFlight = true
+        defer { refreshInFlight = false }
+        // `hasCredentials` reads as signed OUT until the account's deferred
+        // Keychain load has published (see `RelayAccount.init`). A refresh
+        // that races it — the launch-time warm refresh, or a chooser opened
+        // immediately after launch — would take the no-credentials branch and
+        // wrongly CLEAR the cache-seeded list (and purge the on-disk cache)
+        // for a signed-in user. Wait for the load so the guard below decides
+        // on real state. The in-flight flag is set BEFORE this suspension so
+        // overlapping callers still coalesce.
+        await RelayAccount.shared.waitForInitialLoad()
         guard RelayAccount.hasCredentials else {
             clearRelayMachines()
             return
         }
-        refreshInFlight = true
         if !quiet {
             isRefreshing = true
             lastRefreshError = nil
         }
         defer {
-            refreshInFlight = false
             if !quiet { isRefreshing = false }
         }
         // Token via the WP-B2 seam (account ID token, dev-token fallback);
@@ -346,6 +519,10 @@ final class MachineRegistry: ObservableObject {
     /// rows but leave every open window's pill/`AXGhosttyMachine` and the
     /// restore manifest stale.
     private func apply(devices: [RelayDirectoryClient.Device]) {
+        // Every successful fetch refreshes the persisted seed for the next
+        // launch (no-op write when nothing changed — this runs on the
+        // chooser's 5s poll).
+        saveDeviceCache(devices)
         let relayBase = RelayDirectoryClient.defaultBase
         let relayMachines = devices.map { dev -> Machine in
             let uuid: UUID
@@ -382,6 +559,45 @@ final class MachineRegistry: ObservableObject {
                 propagateRename(machine)
             }
         }
+    }
+
+    // MARK: Persisted device cache
+
+    /// One cached account device: the minimal directory metadata needed to
+    /// seed a useful chooser row at launch. Deliberately EXCLUDES `online`
+    /// (presence is live-only; a persisted "online" would be a lie by the
+    /// next launch — seeded rows show "checking" until a fetch confirms) and
+    /// carries no secrets of any kind (never tokens).
+    private struct CachedRelayDevice: Codable {
+        var id: String
+        var name: String
+        var hostname: String?
+    }
+
+    /// UserDefaults key for the persisted device cache (a JSON-encoded
+    /// `[CachedRelayDevice]` blob on the app's suite).
+    private static let deviceCacheKey = "MachineRegistryRelayDeviceCache"
+
+    /// The persisted device list from the last successful fetch, or empty.
+    /// A blob that fails to decode (schema drift) is treated as absent — the
+    /// launch just falls back to today's empty-until-fetch behavior.
+    private static func loadCachedDevices() -> [CachedRelayDevice] {
+        guard let data = UserDefaults.ghostty.data(forKey: deviceCacheKey),
+              let cached = try? JSONDecoder().decode([CachedRelayDevice].self, from: data)
+        else { return [] }
+        return cached
+    }
+
+    /// Persist the fetched device list for the next launch's seed. Skips the
+    /// write when the encoded payload is unchanged, so the chooser's
+    /// steady-state poll doesn't churn UserDefaults every tick.
+    private func saveDeviceCache(_ devices: [RelayDirectoryClient.Device]) {
+        let cached = devices.map {
+            CachedRelayDevice(id: $0.id, name: $0.name, hostname: $0.hostname)
+        }
+        guard let data = try? JSONEncoder().encode(cached) else { return }
+        guard data != UserDefaults.ghostty.data(forKey: Self.deviceCacheKey) else { return }
+        UserDefaults.ghostty.set(data, forKey: Self.deviceCacheKey)
     }
 }
 

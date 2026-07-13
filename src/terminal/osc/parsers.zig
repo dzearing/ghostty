@@ -13,6 +13,7 @@ pub const kitty_color = @import("parsers/kitty_color.zig");
 pub const kitty_text_sizing = @import("parsers/kitty_text_sizing.zig");
 pub const mouse_shape = @import("parsers/mouse_shape.zig");
 pub const osc9 = @import("parsers/osc9.zig");
+pub const pane_banner = @import("parsers/pane_banner.zig");
 pub const report_pwd = @import("parsers/report_pwd.zig");
 pub const rxvt_extension = @import("parsers/rxvt_extension.zig");
 pub const semantic_prompt = @import("parsers/semantic_prompt.zig");

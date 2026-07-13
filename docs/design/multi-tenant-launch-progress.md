@@ -5,7 +5,53 @@ FRESH context (after `/clear`) can resume with zero prior memory. The detailed
 plan is `docs/design/multi-tenant-launch-plan.md`; this file tracks *where we are*
 and *what to do next*.
 
-Last updated: 2026-07-05 (M0 merged; M1 is next).
+Last updated: 2026-07-06. signup_mode service flag SHIPPED+DEPLOYED (merge
+a76e62829): runtime settings table (0005), GET/PUT /v1/admin/settings, portal
+Settings page. Modes: open|invite|closed|allowlist; DB row > SIGNUP_MODE env >
+INVITE_SIGNUP seed > allowlist default; user flips mode LIVE from the portal
+(no restart). This SUPERSEDES the "INVITE_SIGNUP cutover" checkpoint — the
+cutover is now a portal click; user intends OPEN mode. Also shipped 2026-07-05
+late: allowlist attempt logging + credential-keyed allowed-row throttle
+(fresh token records immediately); portal sessionStorage token custody +
+avatar; basename fix.
+
+Earlier (2026-07-05 evening): M0–M4+M5a ALL merged. **DEPLOYED TO PROD**
+(user-approved restart 23:09 UTC): SQLite live (2 devices imported), admin API
+live (`ADMIN_SUBS=113035548042046169952` = dzearing's real sub), portal live at
+https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/admin (Caddy
+`handle_path /admin*` → /var/www/ghoztty-admin-portal; PORTAL_BASE=/admin/
+build; portal-config.json has the web client ID), metrics on VM-loopback :9091,
+both agents auto-reconnected. **INVITE_SIGNUP still OFF — the M1 auth cutover
+remains the pending human checkpoint.** Rollback binary:
+/usr/local/bin/ghoztty-relay.bak-pre-m0 on the VM.
+Possible snag: browser Google sign-in needs the relay host as an Authorized
+JavaScript origin on the ghoztty-web OAuth client (Cloud Console, user-only) —
+unverified until the user's first real portal sign-in.
+
+## Merge-composition notes (M2∥M4∥M5a, resolved 2026-07-05)
+- `mSessionsTotal.Inc()` (M5a) lives in `CreatePendingOwned` (quotas.go) — the
+  single session-creation choke point after M4's delegation. Don't re-add to
+  `CreatePending`.
+- `TestMigration0003RoundTrip` uses `goose.DownTo(2)` (a relative Down would
+  revert 0004, not 0003). Future migration tests: pin versions, never relative.
+- Known follow-up (small): admin API endpoints for quota overrides/usage via
+  M4's seams (`Quotas.UsageFor`, `Store.SetQuotaOverrides`) + portal screen —
+  fold into M3 review or a follow-up patch.
+
+## M2 handoff facts (for M3, the portal UI)
+- Admin auth: Bearer token, verified via full OIDC; admin = sub ∈ `ADMIN_SUBS`
+  (env bootstrap) OR `accounts.is_admin=1`. 401 unverified, 403 verified
+  non-admin. Flag-independent; user gates not consulted; admin ≠ user surface.
+- API (all `/v1/admin/*`, JSON):
+  - `GET /signin-attempts?outcome=&email=&since=RFC3339&limit=` (def 100, cap 1000) → `{"attempts":[{id,ts,email,google_sub,ip,outcome,account_id?}]}` newest-first
+  - `GET /accounts?q=<email substr>&status=active|blocked` → `{"accounts":[{id,google_sub,email,status,invited_by_code?,created_at,blocked_at?,blocked_reason?,is_admin,device_count}]}`
+  - `POST /accounts/{id}/block` `{"reason"}` / `POST /accounts/{id}/unblock` → `{"account":{...}}` (idempotent, 404 unknown)
+  - `DELETE /accounts/{id}` → `{"deleted":bool,"devices_deleted":N}` (revokes device tokens, kicks live conns)
+  - `GET /accounts/{id}/usage` → `{"account","devices":[{id,name,hostname?,online,created_at}],"device_count","signin_attempts":{outcome:count}}`
+  - `POST /invites` `{"code"?,"max_uses":N|null,"expires_at":RFC3339|null,"note"}` → 201 (409 dup); `GET /invites`; `DELETE /invites/{code}` → 204. Generated codes: XXXX-XXXX, unambiguous alphabet.
+  - Every mutation → `admin_audit` (admin_sub-keyed; bootstrap admins may lack account rows).
+- Metrics for M5b charts: Prometheus HTTP API against the VM-local Prometheus
+  (once stood up), families `ghoztty_relay_{agents_online,sessions_active,sessions_total,bridge_bytes_total,http_requests_total,signin_attempts_total,db_up,devices_total,build_info}`.
 
 ## ON RESUME ("go") — do this, in order
 1. Read this file, then `docs/design/multi-tenant-launch-plan.md`.
@@ -30,15 +76,24 @@ SQLite (WAL) + Litestream · React (Vite) SPA + Recharts · Prometheus · single
 | M | Name | Branch | State | Depends on |
 |---|------|--------|-------|-----------|
 | M0 | SQLite foundation | `mt/m0-sqlite` | **merged** → main `8a328e120` (re-verified: build/vet/race-tests/static-build). NOT yet deployed to prod. | — |
-| M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **next — launch this** | M0 ✓ |
-| M2 | Admin API + admin auth | `mt/m2-admin-api` | pending | M1 |
-| M3 | Admin portal UI (React) | `mt/m3-admin-portal` | pending | M2 |
-| M4 | Quotas + rate limits | `mt/m4-quotas` | pending | M1 (parallel w/ M2/M3) |
-| M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | pending | M0 (parallel) |
+| M1 | Invite-code sign-up (retire ALLOWED_EMAILS, authz→sub) | `mt/m1-invite-signup` | **merged** → main `40066364e` (re-verified: build/vet/race-tests/static-build). Staged behind `INVITE_SIGNUP` (default OFF) — **live cutover NOT done** (human checkpoint; see M1 handoff below). | M0 ✓ |
+| M2 | Admin API + admin auth | `mt/m2-admin-api` | **merged** → main `18e4c1fb5` (re-verified: build/vet/race/static). `/v1/admin/*` REST; `ADMIN_SUBS` env bootstrap + `accounts.is_admin`; `admin_audit` (0003). NOT deployed. | M1 ✓ |
+| M3 | Admin portal UI (React) | `mt/m3-admin-portal` | **merged** `d7ae7001d` + **deployed** at /admin (user design-approved after live try-out). Follow-ups noted: quota screen (M4 seams), attempts pagination cursor, /v1/admin/stats, accounts-row density nit. | M2 ✓ |
+| M4 | Quotas + rate limits | `mt/m4-quotas` | **merged** → main `1a63d034e` (composed with M2+M5a; re-verified). Quotas: `QUOTA_MAX_DEVICES=10`/`QUOTA_MAX_SESSIONS=8`, per-account overrides (0004, NULL=default 0=unlimited), 409 JSON. Rate limits: per-IP signin(10/min, charged on failure only)/enroll(6/min)/poll(120/min), per-identity connect(60/min), 429+Retry-After; in-memory, reset-on-restart. Rotation never quota-checked. Admin surfacing seams: `Quotas.LimitsFor/UsageFor`, `Store.Get/SetQuotaOverrides` — wire into /v1/admin later (small follow-up). NOT deployed. | M1 ✓ |
+| M5a | Prometheus /metrics backbone | `mt/m5a-metrics` | **merged** → main (after M2; clean, re-verified). `/metrics` on internal listener `METRICS_ADDR` (default 127.0.0.1:9091, `off` disables); `ghoztty_relay_*` families. Prometheus standup on the VM = human checkpoint (scrape target 127.0.0.1:9091; do NOT expose in NSG/Caddy). NOT deployed. | M0 ✓ |
 | M5b | Portal availability + usage charts | `mt/m5b-portal-charts` | pending | M3, M5a |
 | M6 | Launch hardening / ops | `mt/m6-ops` | pending | M3, M4, M5 |
 
 State values: `pending` → `in worktree` → `awaiting review` → `merged`.
+
+## Parallel-merge coordination (M2 ∥ M4 ∥ M5a, launched 2026-07-05)
+Three worktrees are in flight off the same main. Conductor merge plan:
+- Migration numbers assigned: M2=0003_admin.sql, M4=0004_quotas.sql, M5a=none.
+- Each agent was told to keep shared-file edits (handlers/config/main/enroll/
+  auth_gate/store) surgical and put logic in new files.
+- Merge sequentially in completion order; re-run full acceptance on main after
+  EACH merge (conflicts in shared files are expected to be small; resolve by
+  composing hooks, never dropping one milestone's hook for another's).
 
 ## Human checkpoints (STOP and ask)
 - **M1 production auth cutover** — flipping live sign-in from `ALLOWED_EMAILS` to
@@ -68,6 +123,43 @@ The conductor context bloats across milestones; reset it at each merge boundary.
      boundary fire a detached `sleep 2; ghoztty +send-keys --target=conductor "/clear" Enter; sleep 1; ghoztty +send-keys --target=conductor "go" Enter`
      before ending the turn. A registered target CAN be driven; the background
      send fires after the turn ends. (Not yet set up.)
+
+## M1 handoff facts (from the merged work — M2/M4 must honor these)
+- **`INVITE_SIGNUP` env flag (bool, default OFF).** OFF = pre-M1 behavior
+  byte-for-byte (`ALLOWED_EMAILS` gates, no attempt logging). ON = invite-code
+  account model governs sign-in. Flipping it live is the pending human checkpoint.
+- Migration `0002_accounts.sql`: `accounts` (google_sub UNIQUE, status
+  active|blocked), `invite_codes` (code pk, max_uses NULL=unlimited, uses,
+  expires_at/revoked_at), `signin_attempts` (append-only audit, indexed on ts).
+- **`devices.account_id` deferred to M2** (documented in the migration header).
+  Ownership is keyed on `devices.owner_sub` with a lowercased-email fallback for
+  legacy empty-sub rows (`ownsClause` in store.go, `Device.OwnedBy`). M2 adds the
+  physical FK once live devices have bound subs.
+- Authz surface: `Authenticator.VerifyIdentity` (verification only) vs
+  `VerifyIDToken` (verification + ALLOWED_EMAILS, the flag-OFF path);
+  `SigninGate.Authorize` (auth_gate.go) is the flag-ON decision and needs the
+  Store. Wired via `auth.SetGate(...)` in main.go — test servers must mirror this.
+- Invite code enters at `POST /v1/enroll/start` JSON body field `invite_code`
+  (both device + web flows), parked on the pending enrollment, consumed at the
+  success path. Returning/legacy owners never need one (headless flow unchanged).
+- Legacy owner migration is **lazy**: first verified sign-in with flag ON matches
+  a legacy device by email, creates the account (no code), and backfills the sub
+  onto their devices (`BindLegacyDevicesToSub`). Reads SQLite, never devices.json.
+- Store seams for M2 admin API: `CreateInviteCode`, `RevokeInviteCode`,
+  `GetAccountBySub/ByEmail`, `RecordSigninAttempt`, `CountSigninAttempts`.
+- DSN gained `_txlock=immediate` (BEGIN IMMEDIATE) so read-then-write txs wait on
+  busy_timeout instead of failing with SQLITE_BUSY_SNAPSHOT under concurrency.
+
+### M1 production cutover runbook (the pending human checkpoint)
+1. Deploy the new binary (brings SQLite from M0 + flag-OFF M1; restart drops live
+   relay links briefly — itself a checkpoint). Live auth unchanged.
+2. Seed ≥1 invite code (`Store.CreateInviteCode`; M2 admin API will wrap this).
+3. Set `INVITE_SIGNUP=true` in `/etc/ghoztty-relay.env`, restart. Keep
+   `ALLOWED_EMAILS` populated for one release as the instant rollback
+   (`INVITE_SIGNUP=false` + restart reverts fully; no data migration).
+4. Verify dzearing@gmail.com signs in with NO code → an `accounts` row appears
+   with the real Google sub, status=active; devices get sub-stamped.
+5. Watch `signin_attempts` outcome distribution for anomalies.
 
 ## M0 handoff facts (from the merged work — M1 must honor these)
 - `devices` table exists (SQLite, WAL, `STATE_DIR/ghoztty-relay.db`); migrations
