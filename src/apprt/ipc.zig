@@ -5,6 +5,14 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const lib = @import("../lib/main.zig");
 
+/// Pure verb-argument logic (flag parsing, shell wrap table, ConPTY input
+/// normalization, layout validation) shared by IPC servers.
+pub const args = @import("ipc/args.zig");
+
+test {
+    _ = args;
+}
+
 pub const Errors = error{
     /// The IPC failed. If a function returns this error, it's expected that
     /// an a more specific error message will have been written to stderr (or

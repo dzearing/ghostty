@@ -202,7 +202,7 @@ pub const Overrides = struct {
     working_directory: ?[]const u8 = null,
     env: []const EnvVar = &.{},
 
-    pub const EnvVar = struct { key: []const u8, value: []const u8 };
+    pub const EnvVar = apprt.ipc.args.EnvVar;
 };
 
 /// Initialize a new Surface by creating a Win32 window and WGL context,

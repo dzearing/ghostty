@@ -394,104 +394,16 @@ fn dispatch(self: *IpcServer, request_json: []const u8) Allocator.Error!?[]u8 {
     return try self.errorResponse("unknown action: {s}", .{request.action});
 }
 
-/// Flags shared by the window/pane verbs, parsed with the same prefix table
-/// as the Mac server (unknown flags are ignored there too).
-const VerbArgs = struct {
-    target: ?[]const u8 = null,
-    working_directory: ?[]const u8 = null,
-    command: ?[]const u8 = null,
-    shell: ?[]const u8 = null,
-    title: ?[]const u8 = null,
-    split_direction: ?[]const u8 = null,
-    split_command: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    state: ?[]const u8 = null,
-    pane: ?[]const u8 = null,
-    percent: ?i64 = null,
-    lines: ?i64 = null,
-    layout: ?[]const u8 = null,
-    no_activate: bool = false,
-    env: []const Surface.Overrides.EnvVar = &.{},
-    /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
-    e_args: []const [:0]const u8 = &.{},
-};
+// Pure verb-argument logic (flag parsing, shell wrap table, ConPTY input
+// normalization, layout validation) lives in apprt/ipc/args.zig where it
+// is unit tested in the none-runtime build.
+const verb_args = apprt.ipc.args;
+const VerbArgs = verb_args.VerbArgs;
+const parseVerbArgs = verb_args.parseVerbArgs;
+const dropPrefix = verb_args.dropPrefix;
 
-fn parseVerbArgs(
-    arena: Allocator,
-    arguments: ?[]const []const u8,
-) Allocator.Error!VerbArgs {
-    var result: VerbArgs = .{};
-    const args = arguments orelse return result;
-
-    var env: std.ArrayList(Surface.Overrides.EnvVar) = .empty;
-    var e_args: std.ArrayList([:0]const u8) = .empty;
-    var e_flag = false;
-
-    for (args) |arg| {
-        if (e_flag) {
-            try e_args.append(arena, try arena.dupeZ(u8, arg));
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-e")) {
-            e_flag = true;
-        } else if (std.mem.eql(u8, arg, "--no-activate")) {
-            result.no_activate = true;
-        } else if (dropPrefix(arg, "--working-directory=")) |v| {
-            result.working_directory = v;
-        } else if (dropPrefix(arg, "--command=")) |v| {
-            result.command = v;
-        } else if (dropPrefix(arg, "--shell=")) |v| {
-            result.shell = v;
-        } else if (dropPrefix(arg, "--title=")) |v| {
-            result.title = v;
-        } else if (dropPrefix(arg, "--split=")) |v| {
-            result.split_direction = v;
-        } else if (dropPrefix(arg, "--direction=")) |v| {
-            result.split_direction = v;
-        } else if (dropPrefix(arg, "--split-command=")) |v| {
-            result.split_command = v;
-        } else if (dropPrefix(arg, "--target=")) |v| {
-            result.target = v;
-        } else if (dropPrefix(arg, "--name=")) |v| {
-            result.name = v;
-        } else if (dropPrefix(arg, "--state=")) |v| {
-            result.state = v;
-        } else if (dropPrefix(arg, "--pane=")) |v| {
-            result.pane = v;
-        } else if (dropPrefix(arg, "--lines=")) |v| {
-            result.lines = std.fmt.parseInt(i64, v, 10) catch null;
-        } else if (dropPrefix(arg, "--layout=")) |v| {
-            result.layout = v;
-        } else if (dropPrefix(arg, "--percent=")) |v| {
-            result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
-        } else if (dropPrefix(arg, "--split-percent=")) |v| {
-            result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
-        } else if (dropPrefix(arg, "--env=")) |v| {
-            if (std.mem.indexOfScalar(u8, v, '=')) |eq| {
-                try env.append(arena, .{
-                    .key = v[0..eq],
-                    .value = v[eq + 1 ..],
-                });
-            }
-        }
-        // Remaining Mac flags (--color, --percent, --pane, --from-focused)
-        // are accepted-and-ignored until their features land.
-    }
-
-    result.env = env.items;
-    result.e_args = e_args.items;
-    return result;
-}
-
-fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
-    if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
-    return null;
-}
-
-/// Build the argv that runs `command` inside a shell, per the pinned
-/// Windows table: pwsh/powershell → `-NoExit -Command`, cmd → `/K`,
-/// anything else (git-bash etc.) → `-lic` (Mac behavior). Shell resolution:
-/// `--shell` flag → `command-shell` config → cmd.exe.
+/// Shell resolution (`--shell` flag → `command-shell` config → cmd.exe),
+/// then the pure per-flavor wrap table.
 fn wrapCommandArgv(
     self: *IpcServer,
     arena: Allocator,
@@ -500,24 +412,7 @@ fn wrapCommandArgv(
 ) Allocator.Error![]const [:0]const u8 {
     const shell = shell_flag orelse
         (self.app.config.@"command-shell" orelse "cmd.exe");
-
-    var base = std.fs.path.basename(shell);
-    if (std.ascii.endsWithIgnoreCase(base, ".exe")) base = base[0 .. base.len - 4];
-
-    var argv: std.ArrayList([:0]const u8) = .empty;
-    try argv.append(arena, try arena.dupeZ(u8, shell));
-    if (std.ascii.eqlIgnoreCase(base, "pwsh") or
-        std.ascii.eqlIgnoreCase(base, "powershell"))
-    {
-        try argv.append(arena, "-NoExit");
-        try argv.append(arena, "-Command");
-    } else if (std.ascii.eqlIgnoreCase(base, "cmd")) {
-        try argv.append(arena, "/K");
-    } else {
-        try argv.append(arena, "-lic");
-    }
-    try argv.append(arena, try arena.dupeZ(u8, command));
-    return argv.items;
+    return verb_args.wrapShellCommandArgv(arena, shell, command);
 }
 
 extern "user32" fn IsIconic(hWnd: w32.HWND) callconv(.winapi) windows.BOOL;
@@ -839,15 +734,12 @@ fn handleRearrange(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
 
     // Validate shape + collect pane names (Mac collectPaneNames semantics).
     var names: std.ArrayList([]const u8) = .empty;
-    if (try self.validateLayout(arena, layout, &names)) |err_response| return err_response;
+    if (try verb_args.validateLayout(arena, layout, &names)) |msg|
+        return try self.errorResponse("{s}", .{msg});
     if (names.items.len == 0)
         return try self.errorResponse("layout must contain at least one pane", .{});
-    for (names.items, 0..) |a, i| {
-        for (names.items[i + 1 ..]) |b| {
-            if (std.mem.eql(u8, a, b))
-                return try self.errorResponse("duplicate pane name in layout: '{s}'", .{a});
-        }
-    }
+    if (verb_args.firstDuplicate(names.items)) |dupe|
+        return try self.errorResponse("duplicate pane name in layout: '{s}'", .{dupe});
 
     // Resolve the window, then every pane against its ACTIVE tab's tree.
     const window: *Window = if (args.target) |target| window: {
@@ -934,48 +826,8 @@ fn handleRearrange(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
     return response;
 }
 
-/// Validate one layout node (shape, direction) and collect its pane names.
-/// Returns an error response to send, or null if valid.
-fn validateLayout(
-    self: *IpcServer,
-    arena: Allocator,
-    node: std.json.Value,
-    names: *std.ArrayList([]const u8),
-) Allocator.Error!?[]u8 {
-    if (node != .object)
-        return try self.errorResponse("layout node must have either 'pane' or 'direction'", .{});
-    const obj = node.object;
-
-    if (obj.get("pane")) |pane| {
-        if (pane != .string)
-            return try self.errorResponse("layout node must have either 'pane' or 'direction'", .{});
-        try names.append(arena, pane.string);
-        return null;
-    }
-
-    const direction = obj.get("direction") orelse
-        return try self.errorResponse("layout node must have either 'pane' or 'direction'", .{});
-    if (direction != .string or
-        (!std.ascii.eqlIgnoreCase(direction.string, "horizontal") and
-            !std.ascii.eqlIgnoreCase(direction.string, "vertical")))
-    {
-        return try self.errorResponse(
-            "invalid direction '{s}' (expected 'horizontal' or 'vertical')",
-            .{if (direction == .string) direction.string else "?"},
-        );
-    }
-    const left = obj.get("left") orelse
-        return try self.errorResponse("split node must have 'left' child", .{});
-    const right = obj.get("right") orelse
-        return try self.errorResponse("split node must have 'right' child", .{});
-
-    if (try self.validateLayout(arena, left, names)) |err| return err;
-    if (try self.validateLayout(arena, right, names)) |err| return err;
-    return null;
-}
-
-/// Append the nodes for `layout` (validated by validateLayout) preorder, so
-/// the root lands at index 0. Returns the node's handle.
+/// Append the nodes for `layout` (validated by verb_args.validateLayout)
+/// preorder, so the root lands at index 0. Returns the node's handle.
 fn buildLayoutNode(
     arena: Allocator,
     nodes: *std.ArrayList(SplitTree.Node),
@@ -1118,27 +970,10 @@ fn handleSendKeys(self: *IpcServer, request: Request) Allocator.Error!?[]u8 {
     if (!surface.core_surface_ready)
         return try self.errorResponse("target '{s}' is no longer alive", .{target_name});
 
-    // ConPTY input convention: Enter is CR. A bare LF never comes from a
-    // real keyboard and cmd/pwsh don't execute on it, but the CLI's `\n`
-    // notation means "Enter" to the user — normalize LF and CRLF to CR.
-    const normalized = try self.alloc.alloc(u8, bytes.len);
+    const normalized = try verb_args.normalizeConptyInput(self.alloc, bytes);
     defer self.alloc.free(normalized);
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < bytes.len) : (i += 1) {
-        const b = bytes[i];
-        if (b == '\n') {
-            normalized[n] = '\r';
-        } else if (b == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') {
-            normalized[n] = '\r';
-            i += 1;
-        } else {
-            normalized[n] = b;
-        }
-        n += 1;
-    }
 
-    const write_req = termio.Message.WriteReq.init(self.alloc, normalized[0..n]) catch
+    const write_req = termio.Message.WriteReq.init(self.alloc, normalized) catch
         return try self.errorResponse("failed to queue input", .{});
     surface.core_surface.io.queueMessage(switch (write_req) {
         .small => |v| .{ .write_small = v },
