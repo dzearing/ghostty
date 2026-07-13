@@ -134,7 +134,8 @@ still authoritative for staging/ZIP layout and merge rules.
 | T16 | P3 acceptance script green | D | T13,T14,T15 | done | (this commit) | on-box 2026-07-12: `test/win32/ipc-p3.ps1` ALL PASS (17 assertions — read byte-accurate, state aggregation + suffix, OSC 7777 round-trip, rearrange + error paths) from fresh start |
 | T17 | Skill conformance on the box | E | T12,T16 | done | (doc only) | on-box 2026-07-12: full skill-driven session from Claude Code with ZERO skill modifications — three-pane CLAUDE.md example verbatim (auto-launch from cold; `tail -f` genuinely ran via git-bash PATH), +read, +send-keys (echo round-trip read back), C-c, set-state loop, +rename, +rearrange (70/30 + pane removal), auto-name targeting (`window-1`), idempotent re-close/teardown. Env note: `jq` not installed on box, that discover pattern untestable as-is |
 | T18 | `swap_split` on win32 | F | — | done | (this commit) | on-box 2026-07-12: ctrl+shift+up swapped stacked panes (JSON tree order flipped, focus followed), ctrl+shift+down restored; screenshot archived (temp t18-swap-after.png); IPC-driven swap covered by the +rearrange swap pattern (T15). Fixed two binding shadows that had made ctrl+shift+arrows dead for swap on Windows (see log) |
-| T19 | Hero mode on win32 | F | T18 | todo | — | — |
+| T19a | Hero mode design (win32) | F | T18 | todo | — | — |
+| T19 | Hero mode on win32 (implement per T19a) | F | T19a | todo | — | — |
 | T20 | `+new-remote-window --host/--port` (direct TCP) | G | T08 | todo | — | — |
 | T21 | Relay dial + browser sign-in + DPAPI creds | G | T20 | todo | — | — |
 | T22 | Remote GUI: menu item + machine chooser | G | T21 | todo | — | — |
@@ -288,9 +289,38 @@ arm + re-layout.
 *Validation:* keybind- and IPC-driven swap on a 3-pane layout; screenshot
 archived.
 
-**T19 — Hero mode.** Focused pane full-size left, carousel right
-(reference the Mac implementation in
-`macos/Sources/Features/Terminal/`). Pure `Window.zig` layout work.
+**T19a — Hero mode design.** Write the win32 design (a short section in
+this doc or a sibling doc) before implementing. Scouting notes from
+2026-07-12 (reference sources already located):
+
+- Mac model lives in `macos/Sources/Features/HeroMode/` —
+  `HeroModeState.swift` is tiny: `isActive`, `selectedIndex`,
+  `carouselRatio` (default 0.25, clamped 0.1–0.6), `scrollOffset`;
+  activate requires >1 leaf and seeds selection from the focused leaf;
+  select/prev/next clamp to leaf count. Views: `HeroModeView` (hero pane
+  fills `1-ratio` of width, carousel column right), `HeroCarouselView`,
+  `HeroPaneView`.
+- Interception points on Mac (`BaseTerminalController.swift`): goto_split
+  prev/next while active moves the carousel selection (~line 989); tree
+  changes clamp/deactivate (~line 635); hero nav keybinds are
+  super+shift+up/down (now explicitly super — see T18 log — so Windows
+  needs its own nav story, e.g. intercept goto_split up/down =
+  ctrl+alt+arrows, or all goto variants → prev/next while active).
+- win32 integration point: `Window.layoutSplits` (Window.zig ~700) —
+  the `tree.zoomed` branch is the precedent for a non-tree layout mode
+  (position/show/hide each leaf directly). Hero layout = leaves[i]
+  full-height left at `(1-ratio)·w`; remaining leaves stacked in the
+  right column. `layoutNode`/`paintDividers` stay untouched.
+- Design decisions to settle: per-TAB hero state (parallel arrays like
+  `tab_trees`) vs per-window; interaction with `tree.zoomed`; carousel
+  click-to-select and divider drag (stretch); deactivate on leaf count
+  dropping to 1; +list representation (Mac +list ignores hero mode —
+  confirm).
+*Validation:* design section reviewed/committed; open questions resolved.
+
+**T19 — Hero mode implementation.** Per T19a. Pure `Window.zig` layout
+work plus the `toggle_hero_mode` action arm (the last `return false`
+stub in win32 `performAction`).
 *Validation:* toggle on/off on a 3-pane layout; focus-follows behavior
 matches Mac; screenshot archived.
 
