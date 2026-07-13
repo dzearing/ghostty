@@ -29,6 +29,12 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 - `--target`: Named window to split in (default: most recently focused).
 - `--name`: Register the new pane with a name for later targeting.
 
+On Windows, `ghoztty +list --pid=<pid>` prints just the name of the pane
+whose shell is an ancestor of the given process id — the tty-less way for a
+process inside a pane to discover its own pane (e.g. `ghoztty +list
+--pid=$(cat /proc/self/winpid)` from git-bash, or `--pid=$PID` from
+PowerShell).
+
 ### `ghoztty +close`
 
 Close a named pane or window. Closing a nonexistent target succeeds silently.

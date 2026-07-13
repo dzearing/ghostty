@@ -12,6 +12,11 @@ pub const Options = struct {
 
     json: bool = false,
 
+    /// Resolve the pane that owns this process id: prints just the pane's
+    /// name (Windows; the tty-less equivalent of `--tty`). The pid may be
+    /// any process running inside the pane — the server walks ancestry.
+    pid: ?u32 = null,
+
     pub fn deinit(self: *Options) void {
         if (self._arena) |arena| arena.deinit();
         self.* = undefined;
@@ -31,6 +36,11 @@ pub const Options = struct {
 /// Flags:
 ///
 ///   * `--json`: Output as JSON instead of human-readable tree view.
+///
+///   * `--pid=<pid>`: Print only the name of the pane whose shell is an
+///     ancestor of the given process id (Windows). Lets a process inside a
+///     pane discover its own pane name, e.g.
+///     `ghoztty +list --pid=$(cat /proc/self/winpid)` from git-bash.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -66,7 +76,7 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const resp_body = sendListQuery(alloc, stderr) catch |err| switch (err) {
+    const resp_body = sendListQuery(alloc, opts.pid, stderr) catch |err| switch (err) {
         error.NoRunningInstance => {
             try stderr.print("No running Ghoztty instance found.\n", .{});
             return 1;
@@ -81,6 +91,24 @@ fn runArgs(
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
+
+    if (opts.pid != null) {
+        // --pid answers with data.match: just the pane name.
+        const parsed = std.json.parseFromSlice(
+            struct { data: struct { match: []const u8 } },
+            alloc,
+            resp_body,
+            .{ .ignore_unknown_fields = true },
+        ) catch {
+            try stderr.print("IPC response missing match\n", .{});
+            return 1;
+        };
+        defer parsed.deinit();
+        stdout.writeAll(parsed.value.data.match) catch return 1;
+        stdout.writeAll("\n") catch return 1;
+        stdout.flush() catch return 1;
+        return 0;
+    }
 
     if (opts.json) {
         stdout.writeAll(resp_body) catch return 1;
@@ -98,6 +126,7 @@ fn runArgs(
 
 fn sendListQuery(
     alloc: Allocator,
+    pid: ?u32,
     stderr: *std.Io.Writer,
 ) ![]const u8 {
     const conn = ipc_client.connect(alloc) catch |err| switch (err) {
@@ -106,7 +135,16 @@ fn sendListQuery(
     };
     defer conn.close();
 
-    const json_payload = try ipc_client.buildRequest(alloc, "list", null);
+    var pid_arg_buf: [24]u8 = undefined;
+    var pid_args: [1][:0]const u8 = undefined;
+    const arguments: ?[]const [:0]const u8 = if (pid) |p| args: {
+        const written = std.fmt.bufPrintZ(&pid_arg_buf, "--pid={d}", .{p}) catch
+            return error.IPCFailed;
+        pid_args[0] = written;
+        break :args &pid_args;
+    } else null;
+
+    const json_payload = try ipc_client.buildRequest(alloc, "list", arguments);
     defer alloc.free(json_payload);
 
     const resp_buf = try ipc_client.exchange(alloc, conn, json_payload, .{
@@ -293,4 +331,3 @@ fn jsonInt(val: ?std.json.Value) i64 {
         else => 0,
     };
 }
-

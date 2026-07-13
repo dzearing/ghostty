@@ -24,6 +24,9 @@ pub const VerbArgs = struct {
     percent: ?i64 = null,
     lines: ?i64 = null,
     layout: ?[]const u8 = null,
+    /// `+list --pid=<pid>`: resolve the pane whose shell is an ancestor
+    /// of this process id (Windows; the tty-less equivalent of --tty).
+    pid: ?u32 = null,
     no_activate: bool = false,
     env: []const EnvVar = &.{},
     /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
@@ -76,6 +79,8 @@ pub fn parseVerbArgs(
             result.lines = std.fmt.parseInt(i64, v, 10) catch null;
         } else if (dropPrefix(arg, "--layout=")) |v| {
             result.layout = v;
+        } else if (dropPrefix(arg, "--pid=")) |v| {
+            result.pid = std.fmt.parseInt(u32, v, 10) catch null;
         } else if (dropPrefix(arg, "--percent=")) |v| {
             result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
         } else if (dropPrefix(arg, "--split-percent=")) |v| {
@@ -251,7 +256,7 @@ test "parseVerbArgs: full flag set" {
         "--split-command=htop",      "--name=term",                 "--state=busy",
         "--pane=logs",               "--percent=30",                "--lines=10",
         "--no-activate",             "--env=A=1",                   "--env=B=x=y",
-        "--layout={\"pane\":\"a\"}",
+        "--layout={\"pane\":\"a\"}", "--pid=4242",
     };
     const parsed = try parseVerbArgs(arena.allocator(), &args);
     try testing.expectEqualStrings("dev", parsed.target.?);
@@ -274,6 +279,7 @@ test "parseVerbArgs: full flag set" {
     try testing.expectEqualStrings("B", parsed.env[1].key);
     try testing.expectEqualStrings("x=y", parsed.env[1].value);
     try testing.expectEqualStrings("{\"pane\":\"a\"}", parsed.layout.?);
+    try testing.expectEqual(@as(?u32, 4242), parsed.pid);
 }
 
 test "parseVerbArgs: -e captures everything after, no flag parsing" {

@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 
 const App = @import("App.zig");
+const ProcessTree = @import("ProcessTree.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
@@ -730,12 +731,50 @@ fn parseSplitDirection(s: []const u8) ?SplitTree.Split.Direction {
 }
 
 fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
-    _ = request;
     const app = ctx.app;
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+
+    // `--pid=<pid>`: resolve the pane whose shell is an ancestor of the
+    // given process (the Windows equivalent of the Mac's `--tty` — panes
+    // have no tty here). Answers with data.match = the pane's name.
+    if (args.pid) |query_pid| {
+        var pid_map = try ProcessTree.snapshot(arena);
+        for (app.windows.items) |window| {
+            if (window.is_quick_terminal) continue;
+            for (0..window.tab_count) |i| {
+                var it = window.tab_trees[i].iterator();
+                while (it.next()) |entry| {
+                    const shell_pid = surfaceShellPid(entry.view);
+                    if (shell_pid == 0) continue;
+                    if (!ProcessTree.isAncestor(&pid_map, shell_pid, query_pid)) continue;
+                    const name = app.ipcNameOf(.{ .pane = entry.view }) orelse
+                        try std.fmt.allocPrint(arena, "{d}", .{entry.view.core_surface.id});
+                    var out: std.Io.Writer.Allocating = .init(ctx.alloc);
+                    errdefer out.deinit();
+                    var jws: std.json.Stringify = .{ .writer = &out.writer };
+                    write: {
+                        jws.beginObject() catch break :write;
+                        jws.objectField("success") catch break :write;
+                        jws.write(true) catch break :write;
+                        jws.objectField("data") catch break :write;
+                        jws.beginObject() catch break :write;
+                        jws.objectField("match") catch break :write;
+                        jws.write(name) catch break :write;
+                        jws.endObject() catch break :write;
+                        jws.endObject() catch break :write;
+                        return try out.toOwnedSlice();
+                    }
+                    return error.OutOfMemory;
+                }
+            }
+        }
+        return try errorResponse(ctx.alloc, "no pane found for pid {d}", .{query_pid});
+    }
 
     const foreground = w32.GetForegroundWindow();
 
@@ -822,9 +861,9 @@ fn buildNode(
                     .id = id,
                     .title = surface.getTitle() orelse "",
                     .working_directory = pwd,
-                    // Foreground pid / tty name are not surfaced by the ConPTY
-                    // backend yet; the Mac fills these from the surface model.
-                    .pid = 0,
+                    // The shell's process id. There is no tty name on
+                    // Windows (ConPTY); the Mac reports /dev/ttysNNN here.
+                    .pid = @intCast(surfaceShellPid(surface)),
                     .tty = "",
                     .name = name,
                     .focused = surface == active_surface,
@@ -845,6 +884,28 @@ fn buildNode(
         },
     }
     return node;
+}
+
+extern "kernel32" fn GetProcessId(Process: windows.HANDLE) callconv(.winapi) windows.DWORD;
+
+/// The pane's shell process id, or 0 when unavailable (remote panes, spawn
+/// still in flight). On Windows Command.pid holds the process HANDLE.
+fn surfaceShellPid(surface: *Surface) u32 {
+    if (!surface.core_surface_ready) return 0;
+    switch (surface.core_surface.io.backend) {
+        .exec => |*exec| {
+            const process = exec.subprocess.process orelse return 0;
+            return switch (process) {
+                .fork_exec => |cmd| if (cmd.pid) |handle| GetProcessId(handle) else 0,
+                .flatpak => 0,
+            };
+        },
+        .remote => return 0,
+    }
+}
+
+test {
+    _ = ProcessTree;
 }
 
 fn utf16ToUtf8Arena(arena: Allocator, utf16: []const u16) Allocator.Error![]const u8 {
