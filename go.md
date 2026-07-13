@@ -16,10 +16,16 @@ Concretely:
 1. Pick exactly **one** task (the first `todo` whose deps are `done`).
 2. Do it: implement → validate on the box → update the tracker row + session
    log → commit → push.
-3. **STOP and reset context.** Run `/reset-context read go.md and go`, reply
-   with one short line, and end the turn. Do NOT keep working after invoking
-   it — the clear only fires when your turn ends, so continuing silently
-   cancels the reset (this is exactly how the 716k session happened).
+3. **STOP and reset context.** Do NOT keep working after invoking a reset —
+   the clear only fires when your turn ends, so continuing silently cancels
+   it (this is exactly how the 716k session happened).
+   - `/reset-context` does NOT work on this box yet: it drives the terminal
+     over `ghoztty` IPC, but the installed release Ghoztty here predates IPC
+     (that is the very thing this effort is building) and `ghoztty` is not on
+     PATH. So: **ask the user to run `/clear`**, and stop.
+   - Once a Windows release build with IPC ships (T23/T24), the probe becomes
+     `ghoztty +list --pid=<winpid>` (T31) rather than the skill's posix
+     `--tty` — the skill itself is a user plugin and needs that one-line fix.
 4. The fresh session re-reads this file and the tracker, and picks up the
    next task with a clean context.
 
@@ -35,9 +41,15 @@ only the parts of files you need.
 
 ## What to do
 
-1. Read `docs/design/windows-parity-tasks.md` top to bottom. It is the
-   canonical state/task doc; the state table is ground truth.
+1. Read `docs/design/windows-parity-tasks.md`. It is the canonical
+   state/task doc; the state table is ground truth. **Read only that file.**
+   The session log (`windows-parity-log.md`), the audit appendix
+   (`windows-parity-audit.md`), and the spec (`windows-parity-spec.md`) are
+   split out on purpose — open at most the one section you actually need for
+   your task, never all of them "for background".
 2. Follow its resume protocol for **one** task, per the context rule above.
+   At the boundary, append ONE short entry to `windows-parity-log.md` (no
+   build output, no diffs).
 3. The repo CLAUDE.md is written from the Mac seat (app bundles, unix
    sockets, /Applications paths). Where it conflicts with the tracker doc,
    the tracker doc wins on Windows. The "never touch /Applications/
