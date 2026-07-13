@@ -15,6 +15,9 @@ pub const Shell = enum {
     elvish,
     fish,
     nushell,
+    /// pwsh / powershell (Windows default shells; T27). cmd.exe cannot
+    /// support integration at all — it has no prompt hook.
+    powershell,
     zsh,
 };
 
@@ -59,6 +62,13 @@ pub fn setup(
         ),
 
         .nushell => try setupNushell(
+            alloc_arena,
+            command,
+            resource_dir,
+            env,
+        ),
+
+        .powershell => try setupPowershell(
             alloc_arena,
             command,
             resource_dir,
@@ -161,6 +171,22 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     if (std.mem.eql(u8, "fish", exe)) return .fish;
     if (std.mem.eql(u8, "nu", exe)) return .nushell;
     if (std.mem.eql(u8, "zsh", exe)) return .zsh;
+
+    // Windows: pwsh.exe / powershell.exe (with or without the extension;
+    // the basename is what we see). cmd.exe has no prompt hook and cannot
+    // be integrated.
+    {
+        var buf: [16]u8 = undefined;
+        const base = if (std.ascii.endsWithIgnoreCase(exe, ".exe"))
+            exe[0 .. exe.len - 4]
+        else
+            exe;
+        if (base.len <= buf.len) {
+            const lower = std.ascii.lowerString(buf[0..base.len], base);
+            if (std.mem.eql(u8, "pwsh", lower)) return .powershell;
+            if (std.mem.eql(u8, "powershell", lower)) return .powershell;
+        }
+    }
 
     return null;
 }
@@ -818,6 +844,128 @@ fn setupNushell(
     return .{ .shell = try alloc.dupeZ(u8, try cmd.toOwnedSlice()) };
 }
 
+/// Set up PowerShell (pwsh 7 / Windows PowerShell 5.1) integration (T27).
+///
+/// PowerShell has no ENV/rcfile hook we can inject from the outside, so the
+/// integration is dot-sourced with `-NoExit -Command . '<script>'` before
+/// the interactive session starts. `.direct` argv form is required on
+/// Windows (the `.shell` string form whitespace-splits with no quoting).
+///
+/// Bails out (no integration, unmodified command) when the user's command
+/// already carries `-Command`/`-c` or `-File`/`-f`: those are
+/// non-interactive and injecting would change their semantics.
+fn setupPowershell(
+    alloc: Allocator,
+    command: config.Command,
+    resource_dir: []const u8,
+    env: *EnvMap,
+) !?config.Command {
+    const script = try std.fs.path.join(alloc, &.{
+        resource_dir,
+        "shell-integration",
+        "powershell",
+        "ghostty.ps1",
+    });
+
+    // The script must exist; otherwise the shell would error on startup.
+    std.fs.accessAbsolute(script, .{}) catch return null;
+
+    var args: std.ArrayList([:0]const u8) = .empty;
+
+    var iter = try command.argIterator(alloc);
+    defer iter.deinit();
+
+    const exe = iter.next() orelse return null;
+    try args.append(alloc, try alloc.dupeZ(u8, exe));
+
+    while (iter.next()) |arg| {
+        // Non-interactive invocations: leave them alone entirely.
+        if (std.ascii.eqlIgnoreCase(arg, "-Command") or
+            std.ascii.eqlIgnoreCase(arg, "-c") or
+            std.ascii.eqlIgnoreCase(arg, "-File") or
+            std.ascii.eqlIgnoreCase(arg, "-f") or
+            std.ascii.eqlIgnoreCase(arg, "-EncodedCommand"))
+        {
+            return null;
+        }
+        try args.append(alloc, try alloc.dupeZ(u8, arg));
+    }
+
+    // Dot-source the integration, then drop into the interactive shell.
+    try args.append(alloc, "-NoExit");
+    try args.append(alloc, "-Command");
+    try args.append(alloc, try std.fmt.allocPrintSentinel(
+        alloc,
+        ". '{s}'",
+        .{script},
+        0,
+    ));
+
+    // The script reads this to know where the resources live (parity with
+    // the other integrations).
+    try env.put("GHOSTTY_POWERSHELL", script);
+
+    return .{ .direct = try args.toOwnedSlice(alloc) };
+}
+
+test "powershell" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(alloc, .powershell);
+    defer res.deinit();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+
+    const result = (try setup(
+        alloc,
+        res.path,
+        .{ .shell = "pwsh" },
+        &env,
+        null,
+    )).?;
+    try testing.expectEqual(.powershell, result.shell);
+
+    // Dot-sources the integration and keeps the session interactive.
+    const argv = result.command.direct;
+    try testing.expectEqualStrings("pwsh", argv[0]);
+    try testing.expectEqualStrings("-NoExit", argv[argv.len - 3]);
+    try testing.expectEqualStrings("-Command", argv[argv.len - 2]);
+    try testing.expect(std.mem.startsWith(u8, argv[argv.len - 1], ". '"));
+    try testing.expect(std.mem.indexOf(u8, argv[argv.len - 1], "ghostty.ps1") != null);
+    try testing.expect(env.get("GHOSTTY_POWERSHELL") != null);
+}
+
+test "powershell: non-interactive invocations are left alone" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(alloc, .powershell);
+    defer res.deinit();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+
+    for ([_][:0]const u8{
+        "pwsh -Command echo hi",
+        "pwsh -File script.ps1",
+        "powershell.exe -c whoami",
+    }) |cmd| {
+        try testing.expect(try setup(
+            alloc,
+            res.path,
+            .{ .shell = cmd },
+            &env,
+            null,
+        ) == null);
+    }
+}
+
 test "nushell" {
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -1011,6 +1159,10 @@ const TmpResourcesDir = struct {
         switch (shell) {
             .bash => try tmp_dir.dir.writeFile(.{
                 .sub_path = "shell-integration/bash/ghostty.bash",
+                .data = "",
+            }),
+            .powershell => try tmp_dir.dir.writeFile(.{
+                .sub_path = "shell-integration/powershell/ghostty.ps1",
                 .data = "",
             }),
             else => {},

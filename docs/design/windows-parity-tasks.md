@@ -146,7 +146,7 @@ still authoritative for staging/ZIP layout and merge rules.
 | T24 | Windows release channel + enable update check | H | T23 | todo | — | — |
 | T25 | Full conformance checklist (spec §8) end-to-end | — | T17,T19,T21 | todo | — | — |
 | T26 | OS color-scheme sync (colorSchemeCallback) | I | — | done | (this commit) | on-box 2026-07-12: `theme = light:Adwaita,dark:GitHub Dark` config + screenshot pixel oracle — pane renders #101216 when the OS is dark, flips LIVE to #ffffff on a light flip, and back, no restart. Found+fixed the real bug the task implies: WM_SETTINGCHANGE broadcasts reach TOP-LEVEL windows only, so the handler had to live in Window.windowWndProc, not the surface proc |
-| T27 | PowerShell shell integration | I | — | todo | — | — |
+| T27 | PowerShell shell integration | I | — | done | (this commit) | on-box 2026-07-12: new `src/shell-integration/powershell/ghostty.ps1` (OSC 133 marks, OSC 7 cwd, OSC 2 title) dot-sourced via `-NoExit -Command . '<script>'`; detection for pwsh/powershell(.exe); unit tests for detection + injection + non-interactive bail-out. **Found the real blocker: `reportPwd` was hard-disabled on Windows in the CORE** (`log.warn("reportPwd unimplemented on windows"); return;`) — no shell could EVER report cwd. Implemented it + native path normalization (`/D:/x` → `D:\x`). Validated: pane cwd tracks `cd` live (D:\git\ghoztty → C:\Windows → C:\Users) |
 | T28 | Minor action no-ops cleanup | I | — | todo | — | — |
 | T29 | Mac-side: fix action fallthroughs to showChildExited | I | — | todo | — | — |
 | T31 | `+list --pid` filter + real pid leaf data on Windows | I | T05 | done | (this commit) | on-box 2026-07-12: +list leaves report the real shell pid (verified live cmd.exe); `+list --pid=<any descendant>` resolves the owning pane by Toolhelp32 ancestry (self + grandchild + unknown-pid-error all green); ProcessTree walk unit-tested (cycle/self-parent guards) in the win32 lane. tty stays "" (no ConPTY tty name) and exit_code stays null (note). /reset-context's Windows probe: `ghoztty +list --pid=<winpid>` — the skill (user plugin) needs its Step 1 updated to use it |
@@ -605,6 +605,22 @@ auto-update disabled (→ T24). Config file on Windows:
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-12 (on-box, late night, +6) — T27 done — PowerShell shell
+  integration (pwsh 7 + Windows PowerShell 5.1): a new
+  `src/shell-integration/powershell/ghostty.ps1` chains onto the user's
+  prompt (never replaces it) and emits OSC 133 A/B/C/D marks, OSC 7 cwd,
+  OSC 2 title, all feature-gated and wrapped so it can never break the
+  user's shell. Injected as `-NoExit -Command . '<script>'` (PowerShell has
+  no ENV/rcfile hook); non-interactive invocations (-Command/-File/-c/
+  -EncodedCommand) bail out untouched. **The task's premise understated the
+  problem: OSC 7 was dead on Windows in the CORE** — `reportPwd` began with
+  `if (windows) { log.warn("unimplemented"); return; }`, so NO shell could
+  report cwd on Windows, ever. Implemented it, including URI→native path
+  normalization (`/D:/git/x` → `D:\git\x`). Bug caught in my own fix:
+  `stackFallback.get()` must be called exactly once — calling it twice
+  panics (reached unreachable code). Validated live: a PowerShell pane's
+  reported cwd now tracks `cd` (D:\git\ghoztty → C:\Windows → C:\Users).
+  cmd.exe still cannot be integrated (no prompt hook) — inherent.
 - 2026-07-12 (on-box, late night, +5) — T26 done — OS light/dark now
   reaches the TERMINAL side (not just the DWM chrome): initial
   colorSchemeCallback at surface init + re-report on WM_SETTINGCHANGE.

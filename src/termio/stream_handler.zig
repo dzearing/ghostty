@@ -1131,11 +1131,6 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
-            return;
-        }
-
         // Attempt to parse this file-style URI using options appropriate
         // for this OSC 7 context (e.g. kitty-shell-cwd expects the full,
         // unencoded path).
@@ -1185,9 +1180,29 @@ pub const StreamHandler = struct {
         // We need the raw path, which might require unescaping. We try to
         // avoid making any heap allocations by using the stack first.
         var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
-        var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
         defer arena_alloc.deinit();
-        const path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
+        var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
+        // NOTE: stackFallback.get() must be called exactly once — the
+        // returned allocator captures the fallback state.
+        const scratch = stack_alloc.get();
+        const raw_path = try uri.path.toRawMaybeAlloc(scratch);
+
+        // Windows: a URI path is posix-shaped ("/D:/git/x"), but consumers
+        // (window-inherit-working-directory, +list, the shell-integration
+        // cwd) want a native path. Drop the leading slash that precedes a
+        // drive letter and flip the separators.
+        const path = if (comptime builtin.os.tag == .windows) win: {
+            const trimmed = if (raw_path.len >= 3 and
+                raw_path[0] == '/' and
+                std.ascii.isAlphabetic(raw_path[1]) and
+                raw_path[2] == ':')
+                raw_path[1..]
+            else
+                raw_path;
+            const native = try arena_alloc.allocator().dupe(u8, trimmed);
+            std.mem.replaceScalar(u8, native, '/', '\\');
+            break :win native;
+        } else raw_path;
 
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
