@@ -9,7 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
-- 2026-07-12 (on-box, late night, +6) — T27 done — PowerShell shell
+- 2026-07-13 (on-box) — T36 (new, user-directed) — Frontloaded a locally
+  installed RELEASE build so ghoztty IPC (and `/reset-context`) powers
+  on-box sessions. Merged origin/main (62 commits: `+list --tty`,
+  `+send-keys`/`+read --when-idle`, sticky pane banner, remote/relay
+  fixes). Conflicts: none.zig (kept our unified ipc_client helper; main's
+  set_banner case moved into `wireName()`, which auto-merge had left
+  non-exhaustive) and list.zig (kept BOTH `--pid` and `--tty`). New
+  `pane_banner`/`prompt_banner` actions ack'd as no-ops → T35 tracks the
+  real win32 banner. Gotcha for release builds: native msvc + GUI
+  subsystem fails to link (`undefined symbol: WinMain`) — release must be
+  `-Dtarget=x86_64-windows-gnu`. Install: `%LOCALAPPDATA%\Programs\
+  Ghoztty\{ghoztty.exe, share\}` + user PATH (that dir previously held a
+  share\ with NO exe — the T23 MSI upgrade bug's droppings, live
+  evidence). reset-context skill Step 1 now branches on
+  `/proc/self/winpid` → `+list --pid` (fixed in marketplace repo + plugin
+  cache). Both test lanes + P1–P3 ALL PASS post-merge. T28 remains
+  in-progress (readonly/key_sequence/pwd/notification chunks untouched
+  this session).
   integration (pwsh 7 + Windows PowerShell 5.1): a new
   `src/shell-integration/powershell/ghostty.ps1` chains onto the user's
   prompt (never replaces it) and emits OSC 133 A/B/C/D marks, OSC 7 cwd,

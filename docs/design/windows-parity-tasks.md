@@ -163,6 +163,11 @@ still authoritative for staging/ZIP layout and merge rules.
 | T33 | Native win32 test lane (`zig build test` on the box covers win32 units) | J | T32 | done | (this commit) | `zig build test -Dapp-runtime=win32` runs green natively on the box (verified 2026-07-12); pure IPC logic also covered by the cross-platform none-runtime lane; both documented in the bootstrap section |
 | T34 | Windows shell types: first-class pwsh/powershell/cmd/git-bash/WSL/nushell support | J | — | done | (this commit) | wrap table extended (wsl `--`, nu `-e`) + Mac-parity keep-alive for posix flavors (`; exec "shell" -li` — git-bash panes used to die after the command); every branch unit-tested; on-box: cmd/powershell/git-bash markers read back + panes alive; wsl created but box only has the locked-down docker-desktop distro (`/bin/sh: Permission denied` — informational); pwsh7/nu not installed. CLAUDE.md documents the Windows flavors |
 | T30 | Mac-side: IPC dial must not modal-block the app/IPC server | I | — | todo | — | — |
+| T35 | Sticky pane banner on win32 (set-banner IPC verb, OSC 7778, banner UI, prompt_banner editor) | I | — | todo | — | — |
+| T36 | On-box release install refresh flow (rebuild + reinstall to %LOCALAPPDATA%\Programs\Ghoztty) | H | — | in-progress | ae71b19b4, (this commit) | 2026-07-13: merged origin/main (62 commits); both test lanes + P1–P3 ALL PASS post-merge; ReleaseFast gnu exe installed + user PATH; verified: cold auto-launch, +list, in-pane `+list --pid=$PID` → pane name, exit 0; teardown clean. REMAINING: live skill-driven /reset-context from a session inside the installed release (needs user to launch the new terminal and start a session there) |
+| T37 | CLAUDE.md: Windows+Mac symmetry mandate + start/debug instructions for both architectures | — | — | todo | — | — |
+| T38 | Release process includes the Windows build (build/stage/publish alongside Mac) | H | T23,T24 | todo | — | — |
+| T39 | Website: Windows installer download link (arch+version filename convention) | H | T38 | todo | — | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.
@@ -469,6 +474,66 @@ the dial was IPC-initiated, return the error in the IPC response and never
 *Validation:* Mac regression build; `+new-remote-window` to a dead device
 returns a CLI error promptly (no alert, no wedge); a second `+list` during
 and after the failed dial responds normally.
+
+**T35 — Sticky pane banner on win32.**
+Main's pane-banner feature (merged 2026-07-13): `+set-banner` CLI, OSC 7778,
+`pane_banner`/`prompt_banner` apprt actions, cmd+R editor on Mac
+(`SurfacePaneBanner.swift` is the reference, ~162 lines). Win32 currently
+acks both actions as no-ops (App.zig ack list) and the IpcHandlers lack the
+`set-banner` verb (CLI errors gracefully). Implement: banner strip above the
+surface, the IPC verb, OSC routing, and a rename-style edit popup for
+`prompt_banner` (ctrl+r is taken? check; Mac added cmd+shift+r for rename).
+*Validation:* `+set-banner` sets/clears a visible banner; OSC 7778
+round-trip from inside the pane; prompt_banner editor works.
+
+**T36 — Release install refresh flow.**
+A locally-installed release build powers daily use so `/reset-context` and
+other ghoztty-IPC workflows work from on-box sessions (user directive
+2026-07-13). Install: `%LOCALAPPDATA%\Programs\Ghoztty\{ghoztty.exe, share\}`
+(exe+share side-by-side, same layout as the portable ZIP; resourcesDir
+climbs from the exe), dir on user PATH. **Release builds must use
+`-Dtarget=x86_64-windows-gnu`** — native msvc + GUI subsystem fails with
+`undefined symbol: WinMain` (GhosttyExe.zig sets .Windows subsystem for
+non-Debug; zig's msvc CRT expects WinMain). Refresh = rebuild ReleaseFast
+gnu, re-run the copy + PATH script. Release exe speaks the
+`ghoztty-<username>` pipe; Debug exes keep `ghoztty-debug-<username>`, so
+both run side by side.
+*Validation:* `ghoztty +list` from a fresh shell answers via the installed
+release instance; `+list --pid` resolves a pane from inside it; skill-driven
+`/reset-context` clears a session (the original blocked workflow).
+
+**T37 — CLAUDE.md symmetry mandate + dual-arch dev instructions.**
+User directive 2026-07-13: **all new features must land in BOTH the
+Windows and Mac builds — the two are to be kept symmetric.** Update the
+repo CLAUDE.md to state this as a standing rule, and add clear
+instructions for starting and debugging each architecture: Mac (zig build
++ Ghoztty-Debug.app, debug socket) and Windows (native Debug build with
+`ZIG_GLOBAL_CACHE_DIR` on the repo drive, Console-subsystem stderr, debug
+pipe, release builds via `-Dtarget=x86_64-windows-gnu`, installed-release
+layout under `%LOCALAPPDATA%\Programs\Ghoztty`). Fold in the test lanes
+(none/win32) and the P1–P3 acceptance scripts so either seat can validate.
+*Validation:* CLAUDE.md review — a fresh session on either OS can build,
+run, and debug from CLAUDE.md alone.
+
+**T38 — Windows build in the release process.**
+User directive 2026-07-13: when we release, the Windows build ships too.
+Extend the release flow (currently Mac-centric; see `dist/` and the T24
+release-channel work) to build/stage/publish the Windows artifacts (MSI
+once T23 lands, portable ZIP meanwhile) alongside the Mac release —
+same version, same tag, one process.
+*Validation:* a release run produces and publishes both platforms'
+artifacts with matching versions.
+
+**T39 — Website installer link for Windows.**
+User directive 2026-07-13: the website must offer the Windows installer
+with the same filename conventions as the other platforms — arch and
+version in the filename (e.g. `Ghoztty-<version>-windows-x86_64.msi` /
+`...-portable-x86_64.zip`; match the exact existing pattern when
+implementing). The site lives in the gh-pages branch (see the relay
+"ghpages mirror" commits on main). Depends on T38 publishing versioned
+artifacts to link to.
+*Validation:* website shows a working Windows download whose filename
+carries arch + version, alongside the existing platform links.
 
 ### Phase J — reliability, structure, tests (standing user directive 2026-07-12)
 

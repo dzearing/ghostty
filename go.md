@@ -19,13 +19,15 @@ Concretely:
 3. **STOP and reset context.** Do NOT keep working after invoking a reset —
    the clear only fires when your turn ends, so continuing silently cancels
    it (this is exactly how the 716k session happened).
-   - `/reset-context` does NOT work on this box yet: it drives the terminal
-     over `ghoztty` IPC, but the installed release Ghoztty here predates IPC
-     (that is the very thing this effort is building) and `ghoztty` is not on
-     PATH. So: **ask the user to run `/clear`**, and stop.
-   - Once a Windows release build with IPC ships (T23/T24), the probe becomes
-     `ghoztty +list --pid=<winpid>` (T31) rather than the skill's posix
-     `--tty` — the skill itself is a user plugin and needs that one-line fix.
+   - `/reset-context` works on this box as of 2026-07-13 IF this session
+     runs inside the installed release Ghoztty
+     (`%LOCALAPPDATA%\Programs\Ghoztty\ghoztty.exe`, on the user PATH,
+     IPC-capable, refreshed via T36). The skill's Step 1 branches on
+     `/proc/self/winpid` → `ghoztty +list --pid=…` (fixed in the
+     dzearing-claude-marketplace repo + the plugin cache).
+   - If the session is NOT in a Ghoztty pane (e.g. Windows Terminal, or the
+     old pre-IPC portable build), the probe returns nothing — then **ask
+     the user to run `/clear`** and stop, as before.
 4. The fresh session re-reads this file and the tracker, and picks up the
    next task with a clean context.
 
