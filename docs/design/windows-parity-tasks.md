@@ -171,6 +171,8 @@ still authoritative for staging/ZIP layout and merge rules.
 | T42 | Remote sessions: user PATH/env not available in remote Windows shells | G | — | todo | — | — |
 | T43 | Proper visual debug banner on win32 (parity with the Mac's banner; title suffix is interim) | I | — | todo (lower priority) | — | — |
 | T44 | FIX CRASH: ctrl+shift+r (rename overlay) crashes the app in a single-tab window | I | — | todo (NEXT — blocks release refresh) | — | — |
+| T45 | `+send-keys --when-idle` acceptance test `test/win32/ipc-when-idle.ps1` | I | T11 | done | (this commit) | on-box 2026-07-13: ALL PASS (14 assertions — idle pane sends <0.2s; busy marker holds send (job still polling at +4s, no delivery), releases when marker scrolls out of the 10-line window; --idle-timeout=3 releases after 3.1s). Mechanism verified correct on win32 — the reset-context incident was marker drift, not a ghoztty bug (see T46) |
+| T46 | `--when-idle` busy marker drift: Claude Code v2.1.207 no longer renders "esc to interrupt" (spinner shows `(4m 49s · ↓ 14.9k tokens)`), so panes running current Claude Code always look idle and sends fire mid-turn (keystrokes get queued into the busy session and can be dropped by /clear). Consider configurable/extra markers (spinner glyphs ✻/✽, `--idle-marker=`) | I | T45 | todo | — | live-verified 2026-07-13 by reading this session's own busy pane twice via +read: no marker present while turn active |
 | T38 | Release process includes the Windows build (build/stage/publish alongside Mac) | H | T23,T24 | todo | — | — |
 | T39 | Website: Windows installer download link (arch+version filename convention) | H | T38 | todo | — | — |
 

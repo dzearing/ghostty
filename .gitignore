@@ -10,6 +10,7 @@
 zig-cache/
 .zig-cache/
 zig-out/
+zig-out-release/
 build-cmake/
 CMakeCache.txt
 CMakeFiles/
