@@ -9,6 +9,19 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-14 (on-box) — T45/T46 — The 2026-07-13 reset-context failed:
+  helper #1's `/clear` was MSYS-mangled into a user message; helper #2
+  fired mid-turn because `--when-idle` scrapes for "esc to interrupt",
+  which Claude Code v2.1.207 no longer renders — queued keys died with
+  the /clear. Mechanism itself proven correct (new ipc-when-idle.ps1,
+  T45). Fix (T46): busy = marker OR tail changing between 500ms polls;
+  idle = neither across 3 polls. Skill cache gotcha: the 0.6.0 MSYS fix
+  was dead on arrival — plugin cache had moved to 0.8.1; patch source
+  repo + ACTIVE cache version. New scripts/upgrade-ghoztty-windows.ps1
+  does detached kill/swap/relaunch/`claude --continue`; first live run
+  upgraded ae71b19b4→7510d2cd2 and resumed the session cleanly (wart:
+  cold relaunch also opens a stray default window). Release refreshed
+  again with the T46 fix via the same script.
 - 2026-07-13 (on-box, +1) — T40–T44 filed from live user reports on the
   installed release; rename-anchor fix + [DEBUG] title marker committed
   but the rename fix CRASHES on real input (T44, marked NEXT). User is

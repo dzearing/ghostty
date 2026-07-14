@@ -2,10 +2,13 @@
 # build. Non-interactive; exits nonzero on any failure. Only touches
 # ghoztty processes from zig-out.
 #
-# The contract under test (src/cli/send_keys.zig waitForIdle):
-#   1. no "esc to interrupt" in the pane's last 10 lines -> send at once
-#   2. marker present -> hold, poll every 500ms, send when it scrolls away
+# The contract under test (src/cli/send_keys.zig waitForIdle) — busy is
+# marker OR motion; idle needs neither for 3 consecutive 500ms polls:
+#   1. static pane, no "esc to interrupt" in the last 10 lines -> send
+#      after the ~1s stability window
+#   2. marker present -> hold, send when it scrolls away
 #   3. marker never clears -> send anyway after --idle-timeout seconds
+#   4. no marker but output still streaming -> hold until quiescent
 #
 #   powershell -NoProfile -File test\win32\ipc-when-idle.ps1
 param(
@@ -76,7 +79,22 @@ Remove-Job $job -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 Assert "text executed after release" (Pane-HasOutput 'WI-DELAYED')
 
-"== 3: marker never clears -> --idle-timeout releases the send"
+"== 3: no marker, streaming output -> held until quiescent"
+# Printer script avoids shell-specific quoting in the typed line: ~14
+# distinct lines over ~7s, then the pane goes static.
+Set-Content "$tmp\printer.ps1" '1..14 | ForEach-Object { "tick-$_"; Start-Sleep -Milliseconds 500 }'
+& $Exe +send-keys --target=wia "powershell -NoProfile -File $tmp\printer.ps1" Enter 2>&1 | Out-Null
+Start-Sleep -Seconds 2
+$t0 = Get-Date
+& $Exe +send-keys --target=wia --when-idle --idle-timeout=30 "echo WI-QUIET" Enter 2>&1 | Out-Null
+$elapsed = ((Get-Date) - $t0).TotalSeconds
+Assert "exit 0" ($LASTEXITCODE -eq 0)
+Assert "held while streaming (>=3s, took $([math]::Round($elapsed,1))s)" ($elapsed -ge 3)
+Assert "released after quiescent (<20s)" ($elapsed -lt 20)
+Start-Sleep -Seconds 2
+Assert "text executed after quiescent" (Pane-HasOutput 'WI-QUIET')
+
+"== 4: marker never clears -> --idle-timeout releases the send"
 & $Exe +send-keys --target=wia "echo WI-BUSY2 esc to interrupt" Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 2
 Assert "marker visible again" ((Read-Pane 10) -match 'esc to interrupt')

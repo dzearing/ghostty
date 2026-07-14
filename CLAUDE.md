@@ -74,7 +74,7 @@ ghoztty +send-keys --target=<name> <text|key>...
 ```
 
 - `--target`: Named pane or window to send input to. Required.
-- `--when-idle`: Poll the target pane's recent output every 500ms until it no longer contains `esc to interrupt` (Claude Code's busy marker) before sending; sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
+- `--when-idle`: Poll the target pane's recent output every 500ms until it looks idle before sending: no `esc to interrupt` in the tail (older Claude Code's busy marker) AND the tail unchanged across ~1s (busy TUIs animate spinners/timers every second; an idle prompt is static — this catches Claude Code ≥ 2.1.207, which dropped the marker). Sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
 - Positional arguments are text or key names, concatenated and written to the PTY.
 - Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
 - Named keys: `Enter`, `Tab`, `Escape`, `Space`, `Backspace`

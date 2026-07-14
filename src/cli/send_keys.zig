@@ -64,10 +64,12 @@ pub const Options = struct {
 ///     `+new-window --target=<name>` or `+split --name=<name>`.
 ///
 ///   * `--when-idle`: Before sending, poll the target pane's recent
-///     output every 500ms until it no longer looks busy (no
-///     "esc to interrupt" in the last lines — the marker Claude Code
-///     shows while working). Sends anyway once `--idle-timeout` elapses
-///     or if the pane's output cannot be read.
+///     output every 500ms until it no longer looks busy: no
+///     "esc to interrupt" in the last lines (the marker older Claude
+///     Code shows while working) AND the tail unchanged across ~1s
+///     (busy TUIs animate spinners/timers; an idle prompt is static).
+///     Sends anyway once `--idle-timeout` elapses or if the pane's
+///     output cannot be read.
 ///
 ///   * `--idle-timeout=<seconds>`: Max time to wait with `--when-idle`.
 ///     Default: 30.
@@ -195,17 +197,41 @@ fn runArgs(
     return 1;
 }
 
-/// Poll the target pane's recent output until it no longer contains
-/// "esc to interrupt" (shown by Claude Code and similar TUIs while
-/// busy), then return. Returns early — allowing the send to proceed —
-/// after `timeout_secs`, or immediately if the pane's output cannot be
-/// read (e.g. the target is a window name rather than a pane).
+/// Poll the target pane's recent output until it looks idle, then
+/// return. Busy is either signal:
+///
+///   * the literal "esc to interrupt" in the last lines (the marker
+///     Claude Code < 2.1.207 shows while working), or
+///   * the tail CHANGING between polls — busy TUIs animate a spinner
+///     and a per-second timer, so their tail never holds still for a
+///     full second, while an idle prompt is static. This catches
+///     Claude Code versions that no longer render the marker.
+///
+/// Idle therefore requires no marker AND an identical tail across
+/// three consecutive polls (spanning ~1s, so a ticking seconds timer
+/// can never look stable). Returns early — allowing the send to
+/// proceed — after `timeout_secs`, or immediately if the pane's output
+/// cannot be read (e.g. the target is a window name rather than a
+/// pane).
 fn waitForIdle(alloc: Allocator, name: []const u8, timeout_secs: u32, stderr: *std.Io.Writer) void {
     const read_cli = @import("read.zig");
+    var prev_hash: u64 = 0;
+    var have_prev = false;
+    var stable: u32 = 0;
     var remaining_polls: u64 = @as(u64, timeout_secs) * 2;
     while (remaining_polls > 0) : (remaining_polls -= 1) {
         const text = read_cli.queryPaneText(alloc, name, 10, stderr) catch return;
-        if (std.mem.indexOf(u8, text, "esc to interrupt") == null) return;
+        const marker = std.mem.indexOf(u8, text, "esc to interrupt") != null;
+        const hash = std.hash.Wyhash.hash(0, text);
+        const changed = !have_prev or hash != prev_hash;
+        prev_hash = hash;
+        have_prev = true;
+        if (!marker and !changed) {
+            stable += 1;
+            if (stable >= 2) return;
+        } else {
+            stable = 0;
+        }
         std.Thread.sleep(500 * std.time.ns_per_ms);
     }
 }
