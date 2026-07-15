@@ -153,6 +153,30 @@ pub fn init(
     const bg = config.background;
     const bg_brush = w32.CreateSolidBrush(w32.RGB(bg.r, bg.g, bg.b));
 
+    // Seed the app-level conditional state (light/dark) from the OS BEFORE
+    // any surface exists — the macOS apprt does the equivalent at startup.
+    // Every new core surface inherits this state, so its init-time
+    // color-scheme report (T26) is a no-op instead of a `reload_config`
+    // that re-derives the just-created surface's config from the app
+    // config — a wipe that destroyed per-surface IPC overrides
+    // (`+new-remote-window --command`'s `wait-after-command` in
+    // particular) within milliseconds of creation.
+    core_app.config_conditional_state.theme =
+        if (Window.systemUsesLightTheme()) .light else .dark;
+
+    // Keep the app config's own conditional state consistent with what we
+    // just seeded: replay `light:`/`dark:` conditionals now so surface
+    // clones start from a config whose recorded state MATCHES the app
+    // state (`changeConditionalState` then returns null at surface init,
+    // preserving runtime overrides on the clone). Configs with no theme
+    // conditionals return null here — nothing to do.
+    if (config.changeConditionalState(
+        core_app.config_conditional_state,
+    ) catch null) |applied| {
+        config.deinit();
+        config = applied;
+    }
+
     self.* = .{
         .core_app = core_app,
         .config = config,
@@ -999,13 +1023,27 @@ pub fn performAction(
 
         .reload_config => {
             // Reload config and push to the core, which triggers
-            // config_change actions on all surfaces.
+            // config_change actions on the target surface(s).
+            //
+            // The target matters (GTK apprt semantics): a SURFACE-scoped
+            // soft reload (e.g. one surface's color-scheme conditional
+            // state changed) must re-derive ONLY that surface. Re-deriving
+            // every surface from the app config would wipe per-surface
+            // config overrides (`+new-remote-window --command` sets
+            // `wait-after-command` on its surface only — a wipe made the
+            // window close underneath the user when the command exited).
             const alloc = self.core_app.alloc;
             if (value.soft) {
-                // Soft reload: re-apply existing config (for conditional state changes)
-                self.core_app.updateConfig(self, &self.config) catch |err| {
-                    log.err("soft config reload error: {}", .{err});
-                };
+                // Soft reload: re-apply existing config (for conditional
+                // state changes).
+                switch (target) {
+                    .app => self.core_app.updateConfig(self, &self.config) catch |err| {
+                        log.err("soft config reload error: {}", .{err});
+                    },
+                    .surface => |core_surface| core_surface.updateConfig(&self.config) catch |err| {
+                        log.err("soft surface config reload error: {}", .{err});
+                    },
+                }
             } else {
                 // Hard reload: read config from disk
                 var new_config = Config.load(alloc) catch |err| {

@@ -15,6 +15,7 @@ const RenameDialog = @import("RenameDialog.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
+const tcp_dial = @import("../../remote/tcp_dial.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -136,6 +137,13 @@ resize_seen_first: bool = false,
 /// window (see Surface.Overrides). Set immediately before addTab/newSplit
 /// by the IPC server; creation is synchronous so borrowed strings are fine.
 pending_surface_overrides: ?*const Surface.Overrides = null,
+
+/// The dialed remote-agent connection this window rides on
+/// (`+new-remote-window`), or null for a local window. OWNED: torn down in
+/// deinit strictly AFTER every surface (each `termio.Remote` borrows
+/// `remote_dialed.conn`; core surface deinit joins the IO thread first).
+/// Attached by the IPC handler right after createWindow succeeds.
+remote_dialed: ?*tcp_dial.Dialed = null,
 
 /// When set, the title bar shows this instead of terminal-reported titles
 /// (`+new-window --title`, `+rename`) — mirrors the Mac titleOverride
@@ -437,6 +445,15 @@ pub fn deinit(self: *Window) void {
 
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
+
+    // Tear down the remote-agent connection AFTER every surface is gone:
+    // each remote surface's termio backend borrows `remote_dialed.conn`,
+    // and its IO thread (joined by core surface deinit above) uses it.
+    if (self.remote_dialed) |d| {
+        d.deinit();
+        self.app.core_app.alloc.destroy(d);
+        self.remote_dialed = null;
+    }
 
     // Delete the tab bar font.
     if (self.tab_font) |font| {

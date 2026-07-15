@@ -24,6 +24,15 @@ pub const VerbArgs = struct {
     percent: ?i64 = null,
     lines: ?i64 = null,
     layout: ?[]const u8 = null,
+    /// `+new-remote-window --host/--port`: direct TCP dial to a listening
+    /// ghoztty-agent. Port 0 ⇒ absent/invalid (0 is not a dialable port).
+    host: ?[]const u8 = null,
+    port: u16 = 0,
+    /// `+new-remote-window --relay/--device/--token`: rendezvous-relay dial
+    /// (T21). Parsed now so the T20 handler can refuse them explicitly.
+    relay: ?[]const u8 = null,
+    device: ?[]const u8 = null,
+    token: ?[]const u8 = null,
     /// `+list --pid=<pid>`: resolve the pane whose shell is an ancestor
     /// of this process id (Windows; the tty-less equivalent of --tty).
     pid: ?u32 = null,
@@ -79,6 +88,16 @@ pub fn parseVerbArgs(
             result.lines = std.fmt.parseInt(i64, v, 10) catch null;
         } else if (dropPrefix(arg, "--layout=")) |v| {
             result.layout = v;
+        } else if (dropPrefix(arg, "--host=")) |v| {
+            result.host = v;
+        } else if (dropPrefix(arg, "--port=")) |v| {
+            result.port = std.fmt.parseInt(u16, v, 10) catch 0;
+        } else if (dropPrefix(arg, "--relay=")) |v| {
+            result.relay = v;
+        } else if (dropPrefix(arg, "--device=")) |v| {
+            result.device = v;
+        } else if (dropPrefix(arg, "--token=")) |v| {
+            result.token = v;
         } else if (dropPrefix(arg, "--pid=")) |v| {
             result.pid = std.fmt.parseInt(u32, v, 10) catch null;
         } else if (dropPrefix(arg, "--percent=")) |v| {
@@ -290,6 +309,31 @@ test "parseVerbArgs: -e captures everything after, no flag parsing" {
     try testing.expectEqualStrings("x", parsed.target.?);
     try testing.expectEqual(@as(usize, 3), parsed.e_args.len);
     try testing.expectEqualStrings("--target=not-a-flag", parsed.e_args[2]);
+}
+
+test "parseVerbArgs: remote-window flags (--host/--port/--relay/--device/--token)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const args = [_][]const u8{
+        "--host=winbox", "--port=7777",     "--relay=https://r.example",
+        "--device=dev1", "--token=abc.def",
+    };
+    const parsed = try parseVerbArgs(arena.allocator(), &args);
+    try testing.expectEqualStrings("winbox", parsed.host.?);
+    try testing.expectEqual(@as(u16, 7777), parsed.port);
+    try testing.expectEqualStrings("https://r.example", parsed.relay.?);
+    try testing.expectEqualStrings("dev1", parsed.device.?);
+    try testing.expectEqualStrings("abc.def", parsed.token.?);
+}
+
+test "parseVerbArgs: bad or out-of-range --port parses as 0 (absent)" {
+    var arena = testArena();
+    defer arena.deinit();
+    for ([_][]const u8{ "--port=abc", "--port=70000", "--port=-1", "--port=" }) |bad| {
+        const args = [_][]const u8{bad};
+        const parsed = try parseVerbArgs(arena.allocator(), &args);
+        try testing.expectEqual(@as(u16, 0), parsed.port);
+    }
 }
 
 test "parseVerbArgs: --direction aliases --split" {

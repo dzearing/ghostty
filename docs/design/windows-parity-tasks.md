@@ -101,7 +101,7 @@ One line per row. Full spec + validation + evidence per task:
 | T18 | `swap_split` on win32 | F | — | done | see details |
 | T19a | Hero mode design (win32) | F | T18 | done | see details |
 | T19 | Hero mode on win32 (implement) | F | T19a | done | f37bd1e3c |
-| T20 | `+new-remote-window` direct TCP | G | T08 | todo | — |
+| T20 | `+new-remote-window` direct TCP | G | T08 | in-progress | — |
 | T21 | Relay dial + browser sign-in + DPAPI creds | G | T20 | todo | — |
 | T22 | Remote GUI: menu item + machine chooser | G | T21 | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |

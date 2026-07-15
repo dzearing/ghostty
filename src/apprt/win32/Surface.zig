@@ -13,6 +13,7 @@ const terminal = @import("../../terminal/main.zig");
 const termio = @import("../../termio.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
+const remote_connection = @import("../../remote/connection.zig");
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
@@ -164,6 +165,21 @@ palette_count: u16 = 0,
 /// Indices into palette_entries for the current filter.
 palette_filtered: [palette_entries.len + MAX_USER_PALETTE_ENTRIES]u16 = undefined,
 
+/// Remote-machine backend for this surface (remote-machines design §3.2),
+/// or null for a local ConPTY surface. Set from `Overrides.remote` BEFORE
+/// `core_surface.init` runs so `remoteBackend()` can branch the termio
+/// backend construction. The connection is BORROWED — it is owned by the
+/// parent Window (`Window.remote_dialed`), which tears it down only after
+/// every surface riding on it has been deinitialized.
+remote_conn: ?*remote_connection.Connection = null,
+
+/// The REMOTE working directory / shell for the OPEN-new session, borrowed
+/// from the IPC request arena for the duration of `core_surface.init` ONLY
+/// (`termio.Remote.init` dupes them). Cleared right after init returns so
+/// no dangling arena pointers outlive the request.
+remote_working_directory: ?[]const u8 = null,
+remote_shell: ?[]const u8 = null,
+
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// SplitTree.init() calls ref() to take initial ownership.
 ref_count: u32 = 0,
@@ -202,7 +218,26 @@ pub const Overrides = struct {
     working_directory: ?[]const u8 = null,
     env: []const EnvVar = &.{},
 
+    /// Remote-machine session (`+new-remote-window`): the surface is built
+    /// with the `.remote` termio backend riding on this connection instead
+    /// of a local ConPTY. All strings are REMOTE-native values forwarded
+    /// verbatim in the agent OPEN (never wrapped by the local shell table —
+    /// the agent applies its own shell's convention).
+    remote: ?Remote = null,
+
     pub const EnvVar = apprt.ipc.args.EnvVar;
+
+    pub const Remote = struct {
+        /// Already dialed + handshake-complete. Owned by the parent Window.
+        connection: *remote_connection.Connection,
+        /// cwd ON THE REMOTE MACHINE, or null for the agent's default.
+        working_directory: ?[]const u8 = null,
+        /// Shell ON THE REMOTE MACHINE, or null for the agent's default.
+        shell: ?[]const u8 = null,
+        /// Command to run instead of an interactive shell (runs through the
+        /// resolved remote shell, agent-side). Null ⇒ interactive shell.
+        command: ?[]const u8 = null,
+    };
 };
 
 /// Initialize a new Surface by creating a Win32 window and WGL context,
@@ -342,6 +377,24 @@ pub fn init(
                 log.warn("IPC env override rejected key={s} err={}", .{ env_var.key, err });
             };
         }
+        if (ov.remote) |r| {
+            // Recorded BEFORE core_surface.init so remoteBackend() branches
+            // the termio backend to `.remote` (remote-machines design §3.2).
+            self.remote_conn = r.connection;
+            self.remote_working_directory = r.working_directory;
+            self.remote_shell = r.shell;
+            // An explicit remote command travels through the same surface
+            // config seam Exec uses; the core only forwards it into the
+            // agent OPEN when `wait-after-command` marks it as explicitly
+            // requested (the stall-fix invariant — a local default command
+            // like the login shell must never reach a remote agent). It is
+            // NOT wrapped by the local shell table: the agent applies its
+            // own shell's native convention.
+            if (r.command) |cmd| {
+                config.command = .{ .shell = try carena.dupeZ(u8, cmd) };
+                config.@"wait-after-command" = true;
+            }
+        }
     }
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
@@ -353,6 +406,13 @@ pub fn init(
         app,
         self,
     );
+
+    // The remote cwd/shell strings were borrowed from the IPC request arena
+    // for the duration of core_surface.init only (termio.Remote duped them).
+    // Clear them so nothing dangles past the request. `remote_conn` stays:
+    // it is owned by the parent Window and outlives this surface.
+    self.remote_working_directory = null;
+    self.remote_shell = null;
 
     // Mark the surface as ready. Before this point, Win32 messages
     // (triggered by ShowWindow, wglCreateContext, etc.) must be ignored.
@@ -2913,12 +2973,29 @@ pub fn core(self: *Surface) *CoreSurface {
     return &self.core_surface;
 }
 
-/// Remote-machine sessions are not supported by the Win32 apprt; every
-/// surface runs a local ConPTY shell. (Ghoztty fork addition — the core
-/// termio setup asks the apprt surface for an optional remote backend.)
+/// Returns the remote-machine backend for this surface, or null for a local
+/// ConPTY surface (remote-machines design §3.2). `CoreSurface.init` calls
+/// this at the single backend-construction site to decide between the
+/// `.remote` and `.exec` backends. The connection is borrowed (owned by the
+/// parent Window); the cwd/shell slices are borrowed for the duration of
+/// the construction call only (`termio.Remote.init` dupes them).
 pub fn remoteBackend(self: *Surface) ?CoreSurface.RemoteBackend {
-    _ = self;
-    return null;
+    const conn = self.remote_conn orelse return null;
+    return .{
+        .connection = conn,
+        // T20 always OPENs a new agent session; ATTACH (session restore)
+        // is a later Phase G increment.
+        .session_id = null,
+        // Empty ⇒ null so a stray empty string never forwards a cwd/shell.
+        .working_directory = if (self.remote_working_directory) |w|
+            (if (w.len > 0) w else null)
+        else
+            null,
+        .shell = if (self.remote_shell) |s|
+            (if (s.len > 0) s else null)
+        else
+            null,
+    };
 }
 
 /// Return a reference to the App for use by core code.

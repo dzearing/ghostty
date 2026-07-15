@@ -9,6 +9,7 @@ const windows = std.os.windows;
 
 const App = @import("App.zig");
 const ProcessTree = @import("ProcessTree.zig");
+const tcp_dial = @import("../../remote/tcp_dial.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
@@ -66,12 +67,14 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         return try handleSetState(ctx, request);
     } else if (std.mem.eql(u8, request.action, "rearrange")) {
         return try handleRearrange(ctx, request);
+    } else if (std.mem.eql(u8, request.action, "new-remote-window")) {
+        return try handleNewRemoteWindow(ctx, request);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
     // (each is its own task in the parity tracker).
     const known = [_][]const u8{
-        "new-remote-window",
+        "set-banner", // T35
     };
     for (known) |k| {
         if (std.mem.eql(u8, request.action, k)) {
@@ -214,6 +217,107 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     }
 
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
+}
+
+/// Open a remote-machine window, dialing the agent at `--host=<h> --port=<p>`
+/// over TCP (T20 / Phase G). Semantics mirror the Mac server's
+/// handleNewRemoteWindow: validation error strings byte-match; the dial is
+/// synchronous ON THE GUI THREAD (bounded by the 10s HELLO handshake
+/// deadline), exactly like the Mac menu/IPC path; `--name` registers the
+/// window for later targeting. The relay path (`--relay`/`--device`) is T21.
+///
+/// `--working-directory`/`--shell`/`--command` are REMOTE-native values
+/// forwarded verbatim in the agent OPEN (empty ⇒ absent, like the Mac);
+/// they are never wrapped by the local shell table — the agent applies its
+/// own shell's convention.
+fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
+    const app = ctx.app;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseVerbArgs(arena, request.arguments);
+
+    // Relay dial lands with T21 (browser sign-in + DPAPI creds). Refuse it
+    // explicitly so the CLI reports something actionable, not a hang.
+    if (args.relay != null or args.device != null) {
+        return try errorResponse(
+            ctx.alloc,
+            "relay dial is not yet supported on Windows; use --host/--port",
+            .{},
+        );
+    }
+    const host = args.host orelse "";
+    if (host.len == 0) {
+        return try errorResponse(
+            ctx.alloc,
+            "--host is required (or use --relay + --device) for +new-remote-window",
+            .{},
+        );
+    }
+    if (args.port == 0) {
+        return try errorResponse(
+            ctx.alloc,
+            "--port is required (or use --relay + --device) for +new-remote-window",
+            .{},
+        );
+    }
+
+    // Dial the agent: TCP connect + mux + Connection + HELLO handshake,
+    // blocking until connected (≤10s). The Dialed is heap-owned so the
+    // window can take ownership for its lifetime.
+    const alloc = app.core_app.alloc;
+    const dialed = try alloc.create(tcp_dial.Dialed);
+    dialed.* = tcp_dial.dial(alloc, host, args.port, .raw) catch |err| {
+        log.warn(
+            "IPC new-remote-window: dial failed host={s} port={d} err={}",
+            .{ host, args.port, err },
+        );
+        alloc.destroy(dialed);
+        return try errorResponse(
+            ctx.alloc,
+            "failed to reach {s}:{d}: the agent is not running or not reachable",
+            .{ host, args.port },
+        );
+    };
+
+    // Empty string ⇒ absent (the Mac treats `--shell=` as nil so an empty
+    // value can never forward "").
+    const overrides: Surface.Overrides = .{
+        .remote = .{
+            .connection = dialed.conn,
+            .working_directory = nonEmpty(args.working_directory),
+            .shell = nonEmpty(args.shell),
+            .command = nonEmpty(args.command),
+        },
+    };
+
+    const window = app.createWindow(.{
+        .surface_overrides = &overrides,
+        .ipc_name = args.name,
+    }) catch |err| {
+        log.warn("IPC new-remote-window: create window failed err={}", .{err});
+        dialed.deinit();
+        alloc.destroy(dialed);
+        return try errorResponse(ctx.alloc, "failed to create window", .{});
+    };
+    window.remote_dialed = dialed;
+
+    if (args.title) |title| window.setTitleOverride(title);
+    if (args.no_activate) {
+        if (window.hwnd) |hwnd| _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+    } else if (window.hwnd) |hwnd| {
+        _ = w32.SetForegroundWindow(hwnd);
+    }
+
+    return try ctx.alloc.dupe(u8, "{\"success\":true}");
+}
+
+/// Empty ⇒ null, so blank flag values are treated as absent.
+fn nonEmpty(v: ?[]const u8) ?[]const u8 {
+    const s = v orelse return null;
+    return if (s.len > 0) s else null;
 }
 
 fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
