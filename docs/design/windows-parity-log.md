@@ -9,6 +9,25 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-14 (on-box, late night) — T49 investigated, NO repro on HEAD;
+  release refresh launched. New `test/win32/hero-mode.ps1` (geometry oracle,
+  real chords, reuses the kb-actions recipe + a positive-control chord):
+  ALL PASS on Debug AND on a fresh ReleaseFast gnu build — toggle, focus
+  seeding, ctrl+alt+down nav, exact tree restore. No shadow anywhere
+  (binding dispatch log-verified; user config has no keybinds). Theory for
+  the user report: installed 2bb4c802d has T19 but not the T40 wakeup fix,
+  so live TUI panes render frozen → hero looks broken. Surprises: (1) an
+  old zig-out-release exe (pre-suffix-hook) IGNORED GHOZTTY_PIPE_SUFFIX and
+  my first two test launches forwarded new-window INTO the installed
+  instance (strays closed) — always verify the staging exe is fresh before
+  suffix-isolated runs; (2) `zig build` in git-bash without
+  ZIG_GLOBAL_CACHE_DIR=D:\zig-global-cache fails ("configure phase"
+  FileNotFound) — the memory note applies to Bash too, and a grep pipe can
+  eat the nonzero exit; (3) in a multi-pane window the rename EDIT dies to
+  focus churn too fast for out-of-process polling — assert on the Debug
+  stderr binding-dispatch line instead (hero-mode.ps1 does). T49 is now
+  blocked(user re-test); upgrade script launched detached at turn end with
+  staging = this HEAD (exe+pdb+share), resuming via claude --continue.
 - 2026-07-14 (on-box, night) — T40 DONE: renderer wakeups were 100% lost on
   Windows — termio held a by-value COPY of the renderer thread's xev.Async,
   and the IOCP Async is pure userspace state (waiter=null forever on the
