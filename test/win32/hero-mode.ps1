@@ -1,4 +1,4 @@
-# Hero-mode geometry oracle (T19 acceptance, T49 regression guard).
+# Hero-mode geometry + pixel oracle (T19 acceptance, T49 regression guard).
 #
 # Drives REAL key chords into the debug build and asserts pane geometry:
 #   1. 3-pane layout renders as a tree (3 visible terminal children).
@@ -6,6 +6,13 @@
 #      full height on the left, the other two stack in the right column.
 #   3. ctrl+alt+down moves the hero selection (big-left HWND changes).
 #   4. ctrl+shift+space again restores the exact tree geometry.
+#
+# Pixel layer (user directive 2026-07-15: "look at its pixels"): each pane
+# is filled with a marker line before the toggle; after the toggle every
+# pane region is sampled from the actual screen and must show rendered
+# content (>= the distinct-color floor — a blank/frozen pane shows only
+# background + cursor). Full-window PNGs land in %TEMP% for human review:
+#   ghoztty-hero-tree.png / ghoztty-hero-on.png / ghoztty-hero-nav.png
 #
 # A positive control (ctrl+shift+r, proven by kb-actions.ps1 / T44) runs
 # first so an injection failure is distinguishable from a hero regression;
@@ -58,6 +65,7 @@ public class HeroDrv {
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern int MapWindowPoints(IntPtr from, IntPtr to, ref RECT r, uint points);
     [StructLayout(LayoutKind.Sequential)]
@@ -136,6 +144,57 @@ public class HeroDrv {
 }
 '@
 
+Add-Type -AssemblyName System.Drawing
+
+# Capture a window's OWN content via PrintWindow(PW_RENDERFULLCONTENT) —
+# immune to occlusion by other windows, which polluted the first
+# CopyFromScreen version of this harness (2026-07-15).
+function Get-WindowBitmap([IntPtr]$hwnd) {
+    $r = New-Object HeroDrv+RECT
+    [HeroDrv]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+    $w = $r.right - $r.left; $h = $r.bottom - $r.top
+    if ($w -le 0 -or $h -le 0) { return $null }
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $g.GetHdc()
+    [HeroDrv]::PrintWindow($hwnd, $hdc, 2) | Out-Null   # 2 = PW_RENDERFULLCONTENT
+    $g.ReleaseHdc($hdc)
+    $g.Dispose()
+    return $bmp
+}
+
+function Save-WindowShot([IntPtr]$top, [string]$path) {
+    $bmp = Get-WindowBitmap $top
+    if ($null -eq $bmp) { return }
+    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
+
+# Distinct-color count of a pane's own rendered content (sampled grid).
+# Rendered text gives dozens of colors (antialiasing); a blank or
+# never-painted pane gives a handful (bg + cursor). Retries up to
+# $settleMs so slow repaints after a relayout don't read as blank.
+function Get-PaneColorCount([long]$hwnd, [int]$floor = 8, [int]$settleMs = 3000) {
+    $best = 0
+    $deadline = [DateTime]::Now.AddMilliseconds($settleMs)
+    do {
+        $bmp = Get-WindowBitmap ([IntPtr]$hwnd)
+        if ($null -ne $bmp) {
+            $colors = New-Object 'System.Collections.Generic.HashSet[int]'
+            for ($y = 0; $y -lt $bmp.Height; $y += 3) {
+                for ($x = 0; $x -lt $bmp.Width; $x += 3) {
+                    [void]$colors.Add($bmp.GetPixel($x, $y).ToArgb())
+                }
+            }
+            $bmp.Dispose()
+            if ($colors.Count -gt $best) { $best = $colors.Count }
+            if ($best -ge $floor) { return $best }
+        }
+        Start-Sleep -Milliseconds 400
+    } while ([DateTime]::Now -lt $deadline)
+    return $best
+}
+
 # Rect parsing helpers ---------------------------------------------------------
 function Parse-Panes([string[]]$lines) {
     $lines | ForEach-Object {
@@ -172,9 +231,16 @@ if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
 $top = [HeroDrv]::FindTop([uint32]$proc.Id)
 if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
 
+# Fill each pane with a distinct marker (pixel layer needs rendered text).
+$listJson = & $exe +list --json | ConvertFrom-Json
+$win = $listJson.data.windows[0].target
+& $exe +send-keys --target=$win "echo HERO_PANE_A_MARKER" Enter | Out-Null
 & $exe +split --direction=down --name=herob | Out-Null
 Start-Sleep -Milliseconds 800
+& $exe +send-keys --target=herob "echo HERO_PANE_B_MARKER" Enter | Out-Null
 & $exe +split --direction=down --name=heroc | Out-Null
+Start-Sleep -Milliseconds 800
+& $exe +send-keys --target=heroc "echo HERO_PANE_C_MARKER" Enter | Out-Null
 Start-Sleep -Milliseconds 800
 
 $tree = Parse-Panes ([HeroDrv]::Panes($top))
@@ -185,6 +251,7 @@ if ($tree.Count -ne 3) { Stop-Process -Id $proc.Id -Force; exit 1 }
 # Focus target for the toggle: the topmost-leftmost pane (leaf 0).
 $leaf0 = ($tree | Sort-Object Top, Left | Select-Object -First 1)
 $leaf0Hwnd = [IntPtr]$leaf0.Hwnd
+Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-tree.png')
 
 # --- Positive control: ctrl+shift+r reaches binding dispatch (T44-proven) ----
 # Debug builds prove it via the stderr binding-dispatch log; release builds
@@ -226,6 +293,25 @@ $heroOn = ($big.Width -ge [int](0.6 * $client[0])) -and
           ([Math]::Abs($rest[0].Top - $rest[1].Top) -gt 10)
 Assert $heroOn 'hero geometry: big full-height left pane + two stacked right-column panes'
 Assert ($big.Hwnd -eq $leaf0.Hwnd) 'hero seeds from the focused pane (leaf 0 is the hero)'
+Write-Host ("INFO  client={0}x{1} hero=({2},{3})-({4},{5}) carousel0=({6},{7})-({8},{9}) carousel1=({10},{11})-({12},{13})" -f `
+    $client[0], $client[1], $big.Left, $big.Top, $big.Right, $big.Bottom, `
+    $rest[0].Left, $rest[0].Top, $rest[0].Right, $rest[0].Bottom, `
+    $rest[1].Left, $rest[1].Top, $rest[1].Right, $rest[1].Bottom)
+# The Mac carousel ratio is 0.25: the hero pane must NOT eat the carousel
+# column (caught by pixels 2026-07-15 — floor-only geometry passed while
+# the carousel was a sliver).
+$ratio = ($client[0] - $rest[0].Left) / [double]$client[0]
+Assert ([Math]::Abs($ratio - 0.25) -lt 0.05) ("carousel column is ~25% of client width (got {0:P1})" -f $ratio)
+
+# Pixel layer: every pane must show rendered content in hero layout.
+Start-Sleep -Milliseconds 700
+Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-on.png')
+$heroColors = Get-PaneColorCount $big.Hwnd
+Assert ($heroColors -ge 8) "hero pane renders content ($heroColors distinct colors, floor 8)"
+foreach ($i in 0, 1) {
+    $cc = Get-PaneColorCount $rest[$i].Hwnd
+    Assert ($cc -ge 8) "carousel pane $i renders content ($cc distinct colors, floor 8)"
+}
 
 # --- Navigate: ctrl+alt+down moves the hero selection ------------------------
 $r = [HeroDrv]::Chord($top, [IntPtr]$big.Hwnd, [uint16[]]@(0x11, 0x12), 0x28)
@@ -234,6 +320,10 @@ Start-Sleep -Milliseconds 500
 $hero2 = Parse-Panes ([HeroDrv]::Panes($top))
 $big2 = $hero2 | Sort-Object Width -Descending | Select-Object -First 1
 Assert ($big2.Hwnd -ne $big.Hwnd) 'ctrl+alt+down moved the hero (big-left pane changed)'
+Start-Sleep -Milliseconds 500
+Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-nav.png')
+$hero2Colors = Get-PaneColorCount $big2.Hwnd
+Assert ($hero2Colors -ge 8) "new hero pane renders content after nav ($hero2Colors distinct colors)"
 
 # --- Toggle hero mode off: exact tree geometry restored -----------------------
 $r = [HeroDrv]::Chord($top, [IntPtr]$big2.Hwnd, [uint16[]]@(0x11, 0x10), 0x20)

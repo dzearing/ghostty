@@ -9,6 +9,16 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box, midday) — T49 pixel verification (user: "look at its
+  pixels, get a screenshot"). hero-mode.ps1 grew a pixel layer: PrintWindow
+  full-window PNGs + per-pane distinct-color floors + carousel-ratio~25%
+  assert; 16 asserts ALL PASS 3/3 on the release build; screenshots
+  human-reviewed (hero content, carousel reflow, nav promotion correct).
+  HARNESS TRAP for future pixel oracles: CopyFromScreen captures occluding
+  windows — first runs produced convincing-but-false "carousel blank /
+  misrendered strip" evidence; PrintWindow(PW_RENDERFULLCONTENT) on the
+  target HWND is occlusion-immune and deterministic. Filed T54 (resume-doc
+  diet, user-sanctioned). NEXT: T50.
 - 2026-07-15 (on-box, morning) — T49 RESOLVED (stale binaries) + user
   reset of goals/priorities. User reported hero mode missing (no palette
   entry, no ctrl+shift+space) — root cause: they were typing in a JULY 5
