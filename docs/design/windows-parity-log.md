@@ -9,6 +9,16 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box, night 2) — T21 split (sizing rule) into T21a
+  (sign-in + DPAPI creds + `+relay-login`) / T21b (relay dial in the
+  GUI); T21b DONE (89e31b7fb): `--relay/--device/--token` dial via the
+  shared relay_dial (which now maps `http://`→plaintext `ws://` for
+  loopback test relays, agent/ws_client rule); Window.remote_dialed is a
+  tcp|relay union; token tiers --token → GHOSTTY_RELAY_TOKEN (account
+  tier = T21a). New `ipc-relay.ps1` runs a REAL local relay (go build,
+  DEV_AUTH) + relay-mode agent: full loop ALL PASS first run, incl.
+  agent-kill-under-live-window (no GUI hang). No surprises. Next: T21a.
+
 - 2026-07-15 (on-box, night) — T20 DONE: `+new-remote-window` direct TCP
   (2ed989866); new `test/win32/ipc-remote.ps1` ALL PASS vs a loopback
   agent. Surprises, both fixed in-flight: (1) Winsock — src/remote's

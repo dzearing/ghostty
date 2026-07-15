@@ -56,12 +56,12 @@ Work these first, in order, before falling back to first-todo-in-table:
 1. ~~T50~~ — DONE 2026-07-15 (real "Rename Window" dialog).
 2. ~~T54~~ — DONE 2026-07-15 (this doc restructure; resume read is now
    small).
-3. **~~T20~~ → T21b → T21a → T22** — remote windows on Windows: T20
-   (direct TCP) DONE 2026-07-15; T21 split 2026-07-15 (sizing rule) into
-   T21b (relay dial path in the GUI, validated against a local relay) then
-   T21a (browser sign-in + DPAPI creds + `+relay-login`), then T22 (menu
-   item + machine chooser). User explicitly needs ctrl+shift+n and
-   auth/sign-in.
+3. **~~T20~~ → ~~T21b~~ → T21a → T22** — remote windows on Windows: T20
+   (direct TCP) DONE 2026-07-15; T21 split 2026-07-15 (sizing rule);
+   T21b (relay dial in the GUI) DONE 2026-07-15, validated full-loop
+   against a local relay (`ipc-relay.ps1` ALL PASS). Next: T21a (browser
+   sign-in + DPAPI creds + `+relay-login`), then T22 (menu item +
+   machine chooser). User explicitly needs ctrl+shift+n and auth/sign-in.
 4. **T48** — deadlock root-cause. The refreshed install has a matching
    pdb, so the next watchdog dump WILL be symbolizable. Adversarial
    investigation applies (three ranked candidates in the details section).
@@ -106,7 +106,7 @@ One line per row. Full spec + validation + evidence per task:
 | T19 | Hero mode on win32 (implement) | F | T19a | done | f37bd1e3c |
 | T20 | `+new-remote-window` direct TCP | G | T08 | done | 2ed989866 |
 | T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | todo | — |
-| T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | in-progress | — |
+| T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
 | T22 | Remote GUI: menu item + machine chooser | G | T21a | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |
 | T24 | Windows release channel + update check | H | T23 | todo | — |

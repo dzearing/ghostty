@@ -467,6 +467,17 @@ clean error, tokenless ⇒ "not signed in", agent killed under a live
 window ⇒ no GUI hang (`+list` still answers). Update `ipc-remote.ps1` §5
 (relay-refusal is gone). Both unit lanes green.
 
+*Evidence (done, 89e31b7fb):* on-box 2026-07-15: `ipc-relay.ps1` ALL PASS
+on the FIRST full run — relay dial, agent OPEN, echo round-trip via
++send-keys/+read, --command through the remote shell, tokenless refusal,
+bad-token clean error, agent killed under a live window (GUI kept
+answering `+list` and `+close` completed within timeout, no hang/crash).
+`ipc-remote.ps1`, `ipc-p1/p2/p3.ps1` ALL PASS; both unit lanes green.
+The E2E runs every CLI call through a hard-timeout runner so a hung GUI
+fails the script instead of hanging it. Note: `zig build` needs
+`ZIG_GLOBAL_CACHE_DIR=D:\zig-global-cache` on this box (cross-drive
+Run-step assert in zig 0.15.2 otherwise).
+
 ## T22 — Remote GUI: menu item + machine chooser (Phase G)
 
 Menu item + machine chooser dialog. Reconnect/restore manifests = stretch.
