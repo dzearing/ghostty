@@ -26,7 +26,11 @@
       "Stale-instance trap: after rebuilding, verify the debug app process start time > binary mtime before trusting live behavior. Kill any debug instance launched from other/deleted worktrees first (the user's real terminal is the RELEASE app; killing DEBUG instances is safe unless this effort created live test windows).",
       "Agent test seam: GHOSTTY_AGENT_LOCK=<path> GHOSTTY_AGENT_HEARTBEAT=<path> lets a test agent run beside any real one. Agent flag is --listen=127.0.0.1:<port> (there is no --port flag).",
       "+split --name= on remote/agent-backed windows registers the pane ASYNCHRONOUSLY since T04 (onCreate callback after the cwd RPC; loopback ≈ ms, real remote = latency-bound) — poll briefly before using the name, or use +list to discover panes.",
-      "If the user interrupts with new instructions, encode them as tasks in this file instead of drifting."
+      "If the user interrupts with new instructions, encode them as tasks in this file instead of drifting.",
+      "NEVER 'tell process \"ghoztty\"' by NAME in System Events — the RELEASE app has the same process name and it WILL be targeted (this created a tab in the user's real terminal once). Scope by pid ('first process whose unix id is N') or better: use the app's own AppleScript interface via 'tell application id \"com.dzearing.ghoztty.debug\"'.",
+      "Driving tabs headlessly: the scripting interface (new tab / close tab / select tab / windows / tabs) works even while the SCREEN IS LOCKED; AX menu-bar clicks do NOT (zero AX windows exposed, action silently no-ops). 'new tab in (first window whose id is \"tab-group-…\")' — ids match +list. Known wart: 'new tab' errors -10000 even on success (T06d); re-discover the pane via +list.",
+      "Screen locked also means the KEYCHAIN is locked — relay-account loads can block for minutes (observed 185s, off-main).",
+      "Do not kill -9 + relaunch the app with <2s gap until T06b is fixed: the restore probe races the agent's dead-peer detection and DESTROYS manifest entries for live sessions."
     ],
     "environment": {
       "toolchain": "export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH; export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer",
@@ -155,18 +159,58 @@
     {
       "id": "T06a",
       "title": "Verify tab-group restore path live (GUI-driven)",
-      "status": "pending",
+      "status": "done",
       "dependsOn": ["T06"],
       "goal": "The tabGroupID/tabIndex restore path (entries → native tabs of one window) is implemented but never executed live: no CLI command creates tabs, so it needs GUI driving (Cmd-T into a persistent window), then quit + relaunch and assert one window with N tabs, correct order, each tab's tree re-attached.",
       "steps": ["GUI-drive Cmd-T on a flag-on window (memory: ghoztty-gui-driving-now-possible; screen must be unlocked), sync manifest (2 entries sharing tabGroupID), quit, relaunch, verify grouping + selection + per-tab session re-attach."],
       "acceptance": "Restored tab group matches pre-quit: same window count, tab order, per-tab topology, sessions re-attached.",
-      "notes": "Not blocking T07/T08 (their scenarios are window+split based). Can ride alongside T08's graceful path."
+      "notes": "2026-07-14: done, incl. TWO REAL BUGS FIXED (found by this verify): (1) adding a tab synced only the NEW controller's entry — siblings kept tabGroupID nil, so restore would NOT have grouped them; fix = sync() now refreshes every sibling entry in the tab group (private syncEntry does one controller, depth-1 no recursion). (2) closing a tab left the survivor's stale tabGroupID; windowWillClose's group is ALREADY solo (AppKit detaches the closing window from the shared group BEFORE windowWillClose — proven via log: groupWindows=1 there), so the close path refreshes ALL other persistent controllers via NSApp.windows; also syncEntry counts only isVisible||isMiniaturized group members (closed tabs linger in tabGroup.windows until dealloc). VERIFIED LIVE x2 (graceful quit + relaunch): 1 window, 2 tabs, order+selection preserved, tab-1 split topology exact, ticker monotonic across gap (f-tick-19→25 no reset), +read/+send-keys by name post-restore OK, agent pid 18770 unchanged; create→manifest shows shared tabGroupID idx 0/1 with ids captured; close→survivor's group cleared. HOW TO DRIVE TABS HEADLESSLY: the app's AppleScript interface works even with the SCREEN LOCKED — osascript 'tell application id \"com.dzearing.ghoztty.debug\" to new tab in (first window whose id is \"tab-group-…\")' / 'close tab (tab 2 of …)'; window/tab ids match +list. AX menu clicks do NOT work locked (app exposes zero AX windows; click 'succeeds', action no-ops). WARNING: NEVER 'tell process \"ghoztty\"' by NAME in System Events — it resolved to the RELEASE app and created a tab in the user's real terminal (removed it; verified fresh idle shell before closing). Manifest unit tests (12) pass. Discovered 3 new bugs → T06b/T06c/T06d. Also: old 3-window fixture's manifest entries were DESTROYED by the T06b bug during this work (sessions orphaned; ticker orphans killed); current fixture = 1 window/2 tabs (tab2 ticker f-tick) restored + live, agent 18770."
+    },
+    {
+      "id": "T06b",
+      "title": "Restore drop-policy is destructive on probe failure (+ fast-relaunch poisoned connection)",
+      "status": "pending",
+      "dependsOn": ["T06a"],
+      "goal": "SEEN LIVE: kill -9 the app and relaunch ~1s later → LocalAgentManager dial reports ready, but ALL query_cwd probes return empty within ~2ms (agent still had the dead app's bridges bound) → restore treated every session as gone and REMOVED all manifest entries (layout permanently lost) even though every shell was alive under agent 18770. Worse, that instance's shared connection stayed poisoned: EVERY subsequent ghostty_surface_new failed ('surface error view will render', session=-) until the app was restarted. Make the drop policy conservative and the connection resilient.",
+      "steps": [
+        "SessionLayoutRestore.probeSessions: distinguish 'agent says dead/not_found' from 'probe failed/empty' (query_cwd empty ≠ dead — needs an RPC that returns session status; T10's LIST_SESSIONS is the natural fix, or probe retry with backoff).",
+        "Drop policy: only remove a manifest entry on POSITIVE dead; on inconclusive probes keep the entry and skip (or retry) — losing layout on a race is worse than a stale entry.",
+        "Investigate the poisoned shared connection: after the failed probe pass, all surface_new calls failed for the process lifetime (repro was one-off; log evidence at 2026-07-14 20:39:56, pid 29256). Suspect agent-side single-bridge state after abrupt viewer death + instant redial; possibly interacts with locked-keychain relay-account load (185s hang observed).",
+        "E2E guard: T07's harness should use >=2s gap OR the fix should make 0s gaps safe (agent must detect dead TCP peer promptly — RST arrives immediately on kill -9)."
+      ],
+      "acceptance": "kill -9 → instant relaunch (no sleep) restores every window reliably 3x in a row; no manifest entry is ever removed while its agent session is alive; test-agent still passes.",
+      "notes": ""
+    },
+    {
+      "id": "T06c",
+      "title": "Scrollback replay on re-attach is inconsistent (blocks headline '+read shows pre-kill lines')",
+      "status": "pending",
+      "dependsOn": ["T06a"],
+      "goal": "SEEN LIVE: restored panes often show NO pre-quit/pre-kill scrollback despite the client sending last_byte_offset=0 (src/termio/Remote.zig:263) and the agent's ATTACH gap-fill (src/remote/agent/server.zig:784-816) supposedly replaying the whole retained ring. Graceful-quit relaunch: NO pane replayed pre-quit content (t06b showed post-attach ticks only). kill -9 relaunch: t06b replayed 300+ pre-kill lines fine, but the new tab's pane replayed NOTHING (2 lines: post-attach ticks only; ticks produced during the down-gap also missing). Same agent, same cycle, different panes.",
+      "steps": [
+        "Instrument/read agent ATTACH path: log snapshot_at, ring.base_offset, replay_from, bytes replayed per attach; reproduce both quit paths.",
+        "Suspects: session ring/offset state reset on clean DETACH or on force=true reclaim (attached_elsewhere retry in Remote.zig:280); snapshotOffset()==0 skipping the gap-fill; ring writes gated while a (dead) bridge is still bound.",
+        "Fix + add agent test: attach with last_byte_offset=0 after (a) clean detach, (b) abrupt disconnect, (c) force reclaim — all must replay the retained ring.",
+        "Re-verify live with the T07 harness assertions (pre-kill lines present after restore)."
+      ],
+      "acceptance": "After both graceful-quit and kill -9 relaunch, +read on every restored pane shows pre-gap scrollback AND the output produced during the gap; test-agent passes with new coverage.",
+      "notes": ""
+    },
+    {
+      "id": "T06d",
+      "title": "AppleScript 'new tab' returns error -10000 despite creating the tab",
+      "status": "pending",
+      "dependsOn": ["T06a"],
+      "goal": "handleNewTabScriptCommand (AppDelegate+AppleScript.swift:230) reliably errors 'Failed to create tab.' (errAEEventFailed) while the tab IS created — TerminalController.newTab apparently returns nil though the controller comes up fine. Scripts can't get the returned tab object (harness must re-discover via +list). Low priority; fix the return path (likely async window creation racing the synchronous script reply).",
+      "steps": [],
+      "acceptance": "osascript 'new tab in window …' returns the ScriptTab object with no error; existing AppleScript tests (if any) pass.",
+      "notes": ""
     },
     {
       "id": "T07",
       "title": "E2E harness: scripted kill -9 survival test",
       "status": "pending",
-      "dependsOn": ["T06"],
+      "dependsOn": ["T06", "T06b", "T06c"],
       "goal": "A repeatable script (e.g. scripts/e2e/session-persistence.sh or .py) that builds the full headlineAcceptance scenario via CLI, SIGKILLs the app, relaunches, and ASSERTS every criterion mechanically (exit nonzero on any failure).",
       "steps": [
         "Drive via debug CLI: +new-window/+split with --command markers (see headlineAcceptance), capture +list --json, capture marker PIDs via +read.",

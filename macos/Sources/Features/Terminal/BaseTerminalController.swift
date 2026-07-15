@@ -1826,6 +1826,23 @@ class BaseTerminalController: NSWindowController,
         if let entryID = sessionLayoutEntryID {
             if (NSApp.delegate as? AppDelegate)?.isQuitting != true {
                 SessionLayoutManifest.shared.remove(entryID)
+
+                // Surviving tabs of this window's group have a changed
+                // membership (`tabGroupID`/`tabIndex`) but get no sync
+                // trigger of their own — and by now AppKit has already
+                // detached this window from the shared group (seen live:
+                // `window.tabGroup` here is a solo group of just the closing
+                // window), so the siblings can't be found through it.
+                // Refresh every other persistent window instead; the sync
+                // is a no-op for entries whose snapshot didn't change.
+                for other in NSApp.windows {
+                    if let otherController =
+                        other.windowController as? BaseTerminalController,
+                        otherController !== self,
+                        otherController.sessionLayoutEntryID != nil {
+                        SessionLayoutManifest.shared.scheduleSync(otherController)
+                    }
+                }
             } else {
                 SessionLayoutManifest.shared.updateWindowTitle(
                     entryID, windowTitle: titleOverride)

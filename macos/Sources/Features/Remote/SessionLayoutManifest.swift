@@ -376,11 +376,31 @@ final class SessionLayoutManifest {
         }
     }
 
-    /// Snapshot the controller's live state into its entry: frame, tab-group
-    /// membership, IPC names, title override, and the full split tree with
-    /// per-leaf session ids read straight from libghostty.
+    /// Snapshot the controller's live state into its entry, then refresh
+    /// every sibling entry in the same native tab group. The sibling pass is
+    /// what keeps group membership consistent: when a new tab joins (or a
+    /// tab is torn off / reordered), only the changed controller gets a sync
+    /// trigger, but `tabGroupID`/`tabIndex` changed for ALL members — without
+    /// the refresh, restore would see the old members as ungrouped.
     @MainActor
     func sync(_ controller: BaseTerminalController) {
+        syncEntry(controller)
+        guard let group = controller.window?.tabGroup else { return }
+        for sibling in group.windows {
+            guard let siblingController = sibling.windowController as? BaseTerminalController,
+                  siblingController !== controller,
+                  siblingController.sessionLayoutEntryID != nil
+            else { continue }
+            syncEntry(siblingController)
+        }
+    }
+
+    /// Snapshot ONE controller's live state into its entry: frame, tab-group
+    /// membership, IPC names, title override, and the full split tree with
+    /// per-leaf session ids read straight from libghostty. No sibling
+    /// refresh — `sync(_:)` layers that on top (depth 1, no recursion).
+    @MainActor
+    private func syncEntry(_ controller: BaseTerminalController) {
         guard let entryID = controller.sessionLayoutEntryID else { return }
         let ipc = (NSApp.delegate as? AppDelegate)?.ipcServer
 
@@ -398,9 +418,17 @@ final class SessionLayoutManifest {
         var tabIndex = 0
         if let window = controller.window {
             frame = Frame(window.frame)
-            if let group = window.tabGroup, group.windows.count > 1 {
-                tabGroupID = self.tabGroupID(for: group)
-                tabIndex = group.windows.firstIndex(of: window) ?? 0
+            // A closed tab can linger in `tabGroup.windows` until AppKit
+            // releases it (seen live: the close-path sibling refresh ran
+            // 250ms after `windowWillClose` and still counted the closed
+            // window, leaving a stale group id). Count only windows that
+            // are actually on screen (or minimized).
+            if let group = window.tabGroup {
+                let members = group.windows.filter { $0.isVisible || $0.isMiniaturized }
+                if members.count > 1 {
+                    tabGroupID = self.tabGroupID(for: group)
+                    tabIndex = members.firstIndex(of: window) ?? 0
+                }
             }
         }
 
