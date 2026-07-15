@@ -9,6 +9,19 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box, morning) — T49 RESOLVED (stale binaries) + user
+  reset of goals/priorities. User reported hero mode missing (no palette
+  entry, no ctrl+shift+space) — root cause: they were typing in a JULY 5
+  portable exe; the box ran FOUR coexisting builds (installed release,
+  Desktop portable Jul 5, second portable instance, \\homeassistant\share
+  Jul 12). All refreshed to HEAD (dated .baks); windows opened pre-refresh
+  still run old code until relaunched. Fixed upgrade-script resume idling
+  (--continue now gets the "read go.md and go" prompt — this is why the
+  resumed session "stopped working" overnight). Filed T51 (re-audit, at
+  end), T52 (build provenance in-app), T53 (long-context soak/tuning);
+  reprioritized: T50 → T20/T21/T22 (remote + auth, user needs
+  ctrl+shift+n) → T48 → T53 → T52 → T51. Goal + autonomy directives
+  recorded in go.md quality bar and the tracker header. NEXT: T50.
 - 2026-07-14 (on-box, late night) — T49 investigated, NO repro on HEAD;
   release refresh launched. New `test/win32/hero-mode.ps1` (geometry oracle,
   real chords, reuses the kb-actions recipe + a positive-control chord):

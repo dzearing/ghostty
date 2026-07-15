@@ -61,7 +61,7 @@ only the parts of files you need.
 4. Sync discipline: `git pull` before starting, push at the task boundary —
    the Mac seat works Mac-side tasks on the same branch.
 
-## Standing quality bar (from the user, 2026-07-12)
+## Standing quality bar (from the user, 2026-07-12; expanded 2026-07-15)
 
 - Full parity with every Mac feature that translates; build Windows-native
   equivalents where the concept doesn't (e.g. shell flavors, `+list --pid`
@@ -72,3 +72,17 @@ only the parts of files you need.
   lane; behavior → an on-box validation script. Both test lanes
   (`-Dapp-runtime=none` and `-Dapp-runtime=win32`) must be green, and the
   P1–P3 acceptance scripts in `test/win32/` must stay ALL PASS.
+- **Reliable and fast under long-context use** (2026-07-15): no crashes,
+  no slowdowns, tuned for hours-long Claude Code sessions (T53 tracks the
+  soak/tuning pass). Windows UI affordances should look Windows-native,
+  not like bare controls (T50 is the pattern-setter).
+- **Fully autonomous** (2026-07-15): the user steps away — never stop to
+  ask clarifying questions mid-process; audit your own trail; use
+  adversarial investigation for hard problems and recommended approaches
+  where they exist. After a task: verify, mark the doc, audit the task
+  list for gaps, commit/push, `/reset-context read go.md and go`, repeat.
+- **Deliver to every install location** when a fix matters to the user:
+  installed release (`%LOCALAPPDATA%\Programs\Ghoztty`), Desktop portable
+  (`D:\Users\David\Desktop\Ghoztty-portable-x64`), and the share copy
+  (`\\homeassistant\share\ghoztty-windows`). A fix that only lives in
+  zig-out does not exist as far as the user can tell (the T49 lesson).

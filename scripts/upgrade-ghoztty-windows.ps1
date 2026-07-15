@@ -23,7 +23,11 @@ param(
     # --continue restores the conversation, NOT the dead process's CLI
     # flags, so launch-mode flags like --dangerously-skip-permissions must
     # be repeated here or the resumed session drops back to prompting.
-    [string]$ResumeCommand = 'claude --dangerously-skip-permissions --continue',
+    # The trailing prompt is REQUIRED: --continue alone restores the
+    # conversation and then sits idle waiting for input (observed
+    # 2026-07-14 -> "you stopped working"); the starter prompt re-enters
+    # the go.md task loop immediately.
+    [string]$ResumeCommand = 'claude --dangerously-skip-permissions --continue "read go.md and go"',
     [int]$DelaySeconds = 3,
     [switch]$NoResume
 )
