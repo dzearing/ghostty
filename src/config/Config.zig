@@ -6884,7 +6884,7 @@ pub const Keybinds = struct {
         //
         // Deliberately NOT mirrored because plain-ctrl would steal a key
         // every shell/TUI user needs: ctrl+[ and ctrl+] (ctrl+[ IS Escape),
-        // ctrl+z (EOF/suspend), ctrl+a (line start), ctrl+k (kill line),
+        // ctrl+z (EOF/suspend), ctrl+a (line start),
         // ctrl+f (readline), ctrl+arrows (word movement),
         // ctrl+home/end handled below (harmless — matches Windows Terminal).
         //
@@ -6904,6 +6904,17 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .unicode = 'v' }, .mods = .{ .ctrl = true } },
                 .paste_from_clipboard,
+            );
+
+            // Clear screen + scrollback (mac: cmd+k). Performable: on the
+            // alternate screen the action reports unconsumed, so ctrl+k
+            // falls through to full-screen TUIs; a primary-screen shell
+            // loses readline kill-line, which Windows shells rarely use.
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'k' }, .mods = .{ .ctrl = true } },
+                .{ .clear_screen = {} },
+                .{ .performable = true },
             );
 
             // Windowing (mac: cmd+n / cmd+t / cmd+w / cmd+q)
