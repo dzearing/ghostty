@@ -107,7 +107,9 @@ class AppDelegate: NSObject,
     /// This is the current configuration from the Ghostty configuration that we need.
     private var derivedConfig: DerivedConfig = DerivedConfig()
 
-    private lazy var ipcServer = IPCServer(ghostty: ghostty)
+    /// Internal (not private) so the session layout manifest can look up a
+    /// window/pane's registered IPC target name when persisting layouts.
+    private(set) lazy var ipcServer = IPCServer(ghostty: ghostty)
     private var hasPendingIpc = false
 
     /// The ghostty global state. Only one per process.
@@ -451,6 +453,12 @@ class AppDelegate: NSObject,
         // keep their restore-manifest entries. Reset on the (single) cancel
         // path below.
         isQuitting = true
+
+        // Session persistence (T05): run any debounced layout syncs while
+        // every window is still fully alive — windowWillClose during quit
+        // sees sibling tabs already closing, too late for a faithful
+        // tab-group snapshot. Harmless if the quit is cancelled below.
+        SessionLayoutManifest.shared.flushPendingSyncs()
 
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }

@@ -1572,6 +1572,28 @@ class IPCServer {
         return nil
     }
 
+    /// The registered window-target name for a controller, if any (session
+    /// layout manifest: a restored window must stay addressable under the
+    /// name `+new-window --target=` registered). Main-thread, like every
+    /// registry write.
+    @MainActor
+    func registeredWindowName(forController controller: TerminalController) -> String? {
+        windowName(for: controller)
+    }
+
+    /// The registered pane-target name for a surface, if any — nil when the
+    /// pane was never named (unlike `paneNameForSurface`, which falls back
+    /// to the surface UUID for `+list` display).
+    @MainActor
+    func registeredPaneName(forSurface view: Ghostty.SurfaceView) -> String? {
+        for (name, entry) in targetRegistry {
+            if case .pane(_, let surfaceRef) = entry, surfaceRef.value === view {
+                return name
+            }
+        }
+        return nil
+    }
+
     private static func randomDarkColor() -> NSColor {
         let hue = CGFloat.random(in: 0...1)
         let saturation = CGFloat.random(in: 0.2...0.3)

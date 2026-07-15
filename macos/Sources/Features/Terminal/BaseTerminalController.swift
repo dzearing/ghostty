@@ -113,6 +113,13 @@ class BaseTerminalController: NSWindowController,
                 RemoteSessionManifest.shared.updateWindowTitle(
                     remoteManifestEntryID, windowTitle: titleOverride)
             }
+
+            // Session persistence (T05): same contract for local
+            // agent-backed windows in the layout manifest.
+            if let sessionLayoutEntryID {
+                SessionLayoutManifest.shared.updateWindowTitle(
+                    sessionLayoutEntryID, windowTitle: titleOverride)
+            }
         }
     }
 
@@ -137,7 +144,10 @@ class BaseTerminalController: NSWindowController,
     /// A successful WP-D1 reconnect REPLACES this with a freshly-dialed
     /// connection (the old one is released once its last surface deallocates).
     var remoteConnection: RemoteConnection? {
-        didSet { bindRemoteConnectionStateObserver() }
+        didSet {
+            bindRemoteConnectionStateObserver()
+            registerSessionLayoutIfNeeded()
+        }
     }
 
     /// WP-D1: this window's connection status (reconnect state machine output).
@@ -204,6 +214,14 @@ class BaseTerminalController: NSWindowController,
     /// close removes the entry (see `windowWillClose`); app quit leaves it so
     /// the window is restored (re-`ATTACH`ed) on the next launch.
     var remoteManifestEntryID: UUID?
+
+    /// Session persistence (T05): this window's entry in the
+    /// `SessionLayoutManifest`, when it is a LOCAL-agent-backed persistent
+    /// window tracked for restore-on-relaunch. Registered in
+    /// `remoteConnection`'s didSet (the one choke point every persistent
+    /// window/tab passes through); a clean close removes the entry (see
+    /// `windowWillClose`); app quit leaves it so T06 can rebuild the window.
+    var sessionLayoutEntryID: UUID?
 
     private static var _nextWindowId: Int = 0
     private static func nextWindowId() -> Int {
@@ -678,6 +696,14 @@ class BaseTerminalController: NSWindowController,
             focusedSurface = nil
         }
 
+        // Session persistence (T05): the split topology is the heart of the
+        // layout manifest — re-sync on every tree change (new split, close,
+        // resize-equalize, ...). Debounced; each sync also restarts the
+        // per-leaf session-id capture for freshly-opened panes.
+        if sessionLayoutEntryID != nil {
+            SessionLayoutManifest.shared.scheduleSync(self)
+        }
+
         if heroModeState.isActive {
             let oldLeaves = from.root?.leaves() ?? []
             let newLeaves = to.root?.leaves() ?? []
@@ -714,8 +740,35 @@ class BaseTerminalController: NSWindowController,
         // We need to update our saved frame information in case of monitor
         // changes (see didChangeScreenParameters notification).
         savedFrame = nil
+
+        // Session persistence (T05): a persistent window's frame is part of
+        // its restore manifest (debounced — drags fire this continuously).
+        if sessionLayoutEntryID != nil {
+            SessionLayoutManifest.shared.scheduleSync(self)
+        }
+
         guard let window, let screen = window.screen else { return }
         savedFrame = .init(window: window.frame, screen: screen.visibleFrame)
+    }
+
+    /// Session persistence (T05): start tracking this window in the
+    /// `SessionLayoutManifest` the moment it binds to the LOCAL agent's
+    /// connection — the one choke point every persistent window passes
+    /// through (fresh window in `TerminalController.init`, tab and
+    /// new-window-from-parent inheritance). Gated on the config flag so
+    /// flag-off behavior is untouched (a manual loopback remote window must
+    /// not suddenly persist), and on the machine being local so relay/remote
+    /// windows keep using `RemoteSessionManifest`. A reconnect replaces
+    /// `remoteConnection` on an already-tracked window: entry stays.
+    private func registerSessionLayoutIfNeeded() {
+        guard sessionLayoutEntryID == nil,
+              self is TerminalController,
+              let remoteConnection,
+              remoteConnection.machine.isLocalMachine,
+              ghostty.config.sessionPersistence
+        else { return }
+        sessionLayoutEntryID = SessionLayoutManifest.shared.register()
+        SessionLayoutManifest.shared.scheduleSync(self)
     }
 
     func confirmClose(
@@ -1739,6 +1792,22 @@ class BaseTerminalController: NSWindowController,
                 // already keeps this in sync on every rename, so this is a
                 // last-moment belt-and-braces sync at the preservation point.
                 RemoteSessionManifest.shared.updateWindowTitle(
+                    entryID, windowTitle: titleOverride)
+            }
+        }
+
+        // Session persistence (T05): same contract for local agent-backed
+        // windows — a clean close removes the layout entry, an app quit
+        // preserves it for the T06 launch restore. (Sign-out doesn't apply:
+        // local-agent windows aren't account-backed.) No full re-sync here:
+        // during a quit, sibling tabs are already closing, so live tab-group
+        // state is unreliable — `flushPendingSyncs` at quit-begin captured
+        // the faithful snapshot; only the title is belt-and-braces synced.
+        if let entryID = sessionLayoutEntryID {
+            if (NSApp.delegate as? AppDelegate)?.isQuitting != true {
+                SessionLayoutManifest.shared.remove(entryID)
+            } else {
+                SessionLayoutManifest.shared.updateWindowTitle(
                     entryID, windowTitle: titleOverride)
             }
         }

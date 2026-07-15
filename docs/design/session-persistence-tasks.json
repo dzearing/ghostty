@@ -126,7 +126,7 @@
     {
       "id": "T05",
       "title": "Manifest v2: persist layout + session ids on change/quit",
-      "status": "pending",
+      "status": "done",
       "dependsOn": ["T04"],
       "goal": "SessionLayoutManifest: for every persistent window, durably record {windowFrame, tabColor?, titleOverride, ipcName, tabs:[{splitTree with per-leaf {sessionID, title, ipcName}}]}. SplitTree is already Codable; add a parallel codable that captures sessionID per leaf.",
       "steps": [
@@ -136,7 +136,7 @@
         "Do NOT wire restore yet — that is T06."
       ],
       "acceptance": "Manifest JSON on disk matches live layout after making windows/splits/resizes; survives app quit; entries removed on explicit window close; unit tests for codable round-trip.",
-      "notes": ""
+      "notes": "2026-07-14: done, commit <T05-SHA>. FILE store (not UserDefaults): ~/Library/Application Support/<bundle-id>/session-layout.json, atomic tmp+rename, file deleted when last entry removed. Shape: ONE ENTRY PER TerminalController (an AppKit tab is its own window+controller) with {frame, titleOverride, ipcName, tabGroupID+tabIndex (grouped only when tabGroup.windows.count>1; groupID transient per-run), tree}; tree = parallel codable of SplitTree with per-leaf {sessionID,title,ipcName}; JSON uses synthesized enum coding ({\"split\":{\"_0\":{...}}}) — T07 parser beware. Registration choke point = remoteConnection.didSet in BaseTerminalController (fires for fresh window, tab, new-window-from-parent) gated on: entry nil + is TerminalController + machine.isLocalMachine + sessionPersistence flag. Sync triggers: surfaceTreeDidChange + windowFrameDidChange (debounced 250ms per entry) + titleOverride didSet; per-leaf session ids polled 0.5s×60 after each sync (syncAndCaptureSessionIDs). windowWillClose: remove unless isQuitting (title-only belt-and-braces update when quitting — NO full re-sync there, tab groups are mid-teardown); AppDelegate.applicationShouldTerminate calls flushPendingSyncs() while windows are alive. IPCServer gained registeredWindowName(forController:)/registeredPaneName(forSurface:) (nil when unnamed); AppDelegate.ipcServer now private(set). 10 new Swift Testing tests + full GhosttyTests bundle pass. LIVE VERIFIED: entry captures nested tree (vertical root ratio .5 + horizontal subtree), both leaf sessionIDs, ipc names, frame, titleOverride; +close removed entry; SIGKILL preserved entries; graceful quit (launched --confirm-close-surface=false) preserved entries; agent pid 18770 survived both. LEFTOVER STATE FOR T06: manifest has 2 entries (t05win 3-pane, t05quit 1-pane) whose agent sessions are STILL LIVE under agent 18770 — a ready-made restore fixture. Gotchas: (1) quit-confirm alert wedges ALL CLI IPC and CANNOT be GUI-driven when the screen is locked — E2E harness (T07/T08 graceful path) MUST launch with --confirm-close-surface=false; (2) AppKit state restoration ALSO recreates flag-on windows as exec-backed duplicates at relaunch (saw two from an old run) — T06's restorable-gating step is REQUIRED, not optional; (3) leaf titles in the manifest are last-sync snapshots (transient OSC titles), only titleOverride is authoritative."
     },
     {
       "id": "T06",
