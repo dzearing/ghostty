@@ -112,8 +112,51 @@ pub const SocketStream = struct {
     /// `posix.recv` but with the close-race `EBADF`/`ENOTSOCK` mapped to a catchable
     /// `error.Closed` instead of std's `unreachable` (which would panic when our own
     /// `close` races a blocked read on another thread).
-    fn posixRecv(fd: posix.socket_t, buf: []u8) !usize {
-        while (true) {
+    ///
+    /// Windows needs its own branch: Winsock reports failure as
+    /// `SOCKET_ERROR` + `WSAGetLastError()`, NOT via errno — `posix.errno(-1)`
+    /// reads a stale libc errno there, classifying every failure as
+    /// `.SUCCESS` and feeding -1 into `@intCast` (an instant panic on the
+    /// pump thread the first time the peer closes).
+    const RecvError = error{
+        Closed,
+        ConnectionResetByPeer,
+        SocketNotConnected,
+        ConnectionTimedOut,
+        SystemResources,
+        Unexpected,
+    };
+
+    const SendError = error{
+        Closed,
+        BrokenPipe,
+        ConnectionResetByPeer,
+        SystemResources,
+        AccessDenied,
+        Unexpected,
+    };
+
+    fn posixRecv(fd: posix.socket_t, buf: []u8) RecvError!usize {
+        if (builtin.os.tag == .windows) {
+            const w = std.os.windows;
+            while (true) {
+                const len: i32 = @intCast(@min(buf.len, std.math.maxInt(i32)));
+                const rc = w.ws2_32.recv(fd, buf.ptr, len, 0);
+                if (rc != w.ws2_32.SOCKET_ERROR) return @intCast(rc);
+                switch (w.ws2_32.WSAGetLastError()) {
+                    .WSAEINTR => continue,
+                    .WSAEBADF, .WSAENOTSOCK => return error.Closed,
+                    // WSAESHUTDOWN: our own `close` did shutdown(.both) while
+                    // this read raced it — same close-race class as EBADF.
+                    .WSAESHUTDOWN => return error.Closed,
+                    .WSAECONNRESET, .WSAECONNABORTED, .WSAENETRESET, .WSAECONNREFUSED => return error.ConnectionResetByPeer,
+                    .WSAENOTCONN => return error.SocketNotConnected,
+                    .WSAETIMEDOUT => return error.ConnectionTimedOut,
+                    .WSAENOBUFS => return error.SystemResources,
+                    else => |e| return w.unexpectedWSAError(e),
+                }
+            }
+        } else while (true) {
             const rc = posix.system.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
             switch (posix.errno(rc)) {
                 .SUCCESS => return @intCast(rc),
@@ -144,8 +187,26 @@ pub const SocketStream = struct {
 
     /// `posix.send` with the close-race `EBADF`/`ENOTSOCK` mapped to `error.Closed`
     /// (std marks them `unreachable`), for the same reason as `posixRecv`.
-    fn posixSend(fd: posix.socket_t, bytes: []const u8) !usize {
-        while (true) {
+    /// Windows branch for the same reason as `posixRecv` (SOCKET_ERROR +
+    /// WSAGetLastError, not errno). There is no SIGPIPE on Windows.
+    fn posixSend(fd: posix.socket_t, bytes: []const u8) SendError!usize {
+        if (builtin.os.tag == .windows) {
+            const w = std.os.windows;
+            while (true) {
+                const len: i32 = @intCast(@min(bytes.len, std.math.maxInt(i32)));
+                const rc = w.ws2_32.send(fd, bytes.ptr, len, 0);
+                if (rc != w.ws2_32.SOCKET_ERROR) return @intCast(rc);
+                switch (w.ws2_32.WSAGetLastError()) {
+                    .WSAEINTR => continue,
+                    // A send on a not-/no-longer-connected socket is a dead
+                    // lane (writeImpl maps Closed → 0 → WriteZero upstream).
+                    .WSAEBADF, .WSAENOTSOCK, .WSAESHUTDOWN, .WSAENOTCONN => return error.Closed,
+                    .WSAECONNRESET, .WSAECONNABORTED, .WSAENETRESET => return error.ConnectionResetByPeer,
+                    .WSAENOBUFS => return error.SystemResources,
+                    else => |e| return w.unexpectedWSAError(e),
+                }
+            }
+        } else while (true) {
             const rc = posix.system.sendto(fd, bytes.ptr, bytes.len, send_flags, null, 0);
             switch (posix.errno(rc)) {
                 .SUCCESS => return @intCast(rc),
@@ -168,7 +229,13 @@ pub const SocketStream = struct {
         // shutdown first so a blocked reader on another thread wakes with EOF; the
         // socket may already be half-closed, so ignore errors.
         posix.shutdown(self.fd, .both) catch {};
-        posix.close(self.fd);
+        // A Windows SOCKET must go through closesocket(); posix.close would
+        // CloseHandle it (wrong object manager path for Winsock sockets).
+        if (builtin.os.tag == .windows) {
+            std.os.windows.closesocket(self.fd) catch {};
+        } else {
+            posix.close(self.fd);
+        }
     }
 
     // --- server.Stream adapter (agent side) ----------------------------------
