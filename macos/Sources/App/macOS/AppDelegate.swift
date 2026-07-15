@@ -112,6 +112,15 @@ class AppDelegate: NSObject,
     private(set) lazy var ipcServer = IPCServer(ghostty: ghostty)
     private var hasPendingIpc = false
 
+    /// Session persistence (T06): true while the launch-time layout restore
+    /// is in flight (or has restored windows), so `applicationDidBecomeActive`
+    /// does not ALSO open the initial window on top of the restored layout.
+    /// Set synchronously in `restoreSessionLayoutWindows()` before the agent
+    /// dial; cleared only if the restore ends with nothing on screen (see
+    /// `sessionLayoutRestoreFinished`). Internal so the restore extension
+    /// (SessionLayoutRestore.swift) can manage it.
+    var hasPendingSessionRestore = false
+
     /// The ghostty global state. Only one per process.
     let ghostty: Ghostty.App
 
@@ -271,6 +280,12 @@ class AppDelegate: NSObject,
             // WP-D2: re-attach any relay remote windows that were open when
             // the app last quit (background dials; failures never alert).
             restoreRemoteWindows()
+
+            // Session persistence (T06): rebuild the local-agent-backed
+            // windows recorded in the layout manifest, re-ATTACHing every
+            // pane to its still-running agent session (background dial +
+            // probes; failures never alert).
+            restoreSessionLayoutWindows()
 
             // Warm the machine chooser: touching `MachineRegistry.shared`
             // seeds it from the persisted device cache, and the quiet refresh
@@ -436,7 +451,8 @@ class AppDelegate: NSObject,
             // is possible to have other windows in a few scenarios:
             //   - if we're opening a URL since `application(_:openFile:)` is called before this.
             //   - if we're restoring from persisted state
-            if TerminalController.all.isEmpty && derivedConfig.initialWindow && !hasPendingIpc {
+            if TerminalController.all.isEmpty && derivedConfig.initialWindow
+                && !hasPendingIpc && !hasPendingSessionRestore {
                 undoManager.disableUndoRegistration()
                 _ = TerminalController.newWindow(ghostty)
                 undoManager.enableUndoRegistration()

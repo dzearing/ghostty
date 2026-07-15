@@ -1479,6 +1479,22 @@ class IPCServer {
         Self.logger.info("IPC: re-registered restored remote window target '\(name)'")
     }
 
+    /// Re-register a RESTORED pane under the IPC target name persisted in
+    /// its `SessionLayoutManifest` leaf (T06), so `+read` / `+send-keys` /
+    /// `+close --target=<name>` keep working across a quit/relaunch. Same
+    /// idempotent semantics as `registerRestoredRemoteWindow`: a live target
+    /// already holding the name wins and the restored pane is skipped.
+    @MainActor
+    func registerRestoredPane(name: String, controller: TerminalController, surface: Ghostty.SurfaceView) {
+        pruneStaleTargets()
+        guard targetRegistry[name] == nil else {
+            Self.logger.info("IPC: restored pane not re-registered — target '\(name)' already in use")
+            return
+        }
+        targetRegistry[name] = .pane(controller: WeakRef(controller), surface: WeakRef(surface))
+        Self.logger.info("IPC: re-registered restored pane target '\(name)'")
+    }
+
     @MainActor
     private func ensureWindowRegistered(name: String, controller: BaseTerminalController) {
         if targetRegistry[name] == nil, let tc = controller as? TerminalController {

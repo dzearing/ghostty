@@ -115,6 +115,56 @@ struct SessionLayoutManifestTests {
         #expect(encoded == expected)
     }
 
+    // MARK: Tree decoding (restore)
+
+    @Test func makeTreeNodeRebuildsTopologyExactly() {
+        // Codable → live → codable must be lossless for directions, ratios,
+        // and leaf order — the T06 restore contract.
+        let tree = sampleTree()
+        let live: SplitTree<DummyView>.Node = SessionLayoutManifest.makeTreeNode(tree) { leaf in
+            DummyView(leaf.sessionID ?? "uncaptured")
+        }
+        let reencoded = SessionLayoutManifest.encodeNode(live) { view in
+            .init(
+                sessionID: view.tag2 == "uncaptured" ? nil : view.tag2,
+                title: nil,
+                ipcName: nil)
+        }
+
+        let expected: SessionLayoutManifest.Node = .split(.init(
+            direction: .horizontal,
+            ratio: 0.3,
+            left: .leaf(.init(sessionID: "s-left", title: nil, ipcName: nil)),
+            right: .split(.init(
+                direction: .vertical,
+                ratio: 0.62,
+                left: .leaf(.init(sessionID: "s-top", title: nil, ipcName: nil)),
+                right: .leaf(.init(sessionID: nil, title: nil, ipcName: nil))))))
+        #expect(reencoded == expected)
+    }
+
+    @Test func makeTreeNodeLeafFactoryOrderMatchesLeavesHelper() {
+        // Restored views pair with manifest leaves by position: the factory
+        // invocation order must equal `leaves(of:)` order (and both must be
+        // depth-first left-to-right, like `SplitTree.Node.leaves()`).
+        let tree = sampleTree()
+        var factoryOrder: [String?] = []
+        let live: SplitTree<DummyView>.Node = SessionLayoutManifest.makeTreeNode(tree) { leaf in
+            factoryOrder.append(leaf.sessionID)
+            return DummyView(leaf.sessionID ?? "-")
+        }
+        let helperOrder = SessionLayoutManifest.leaves(of: tree).map(\.sessionID)
+        #expect(factoryOrder == helperOrder)
+        #expect(helperOrder == ["s-left", "s-top", nil])
+        #expect(live.leaves().map(\.tag2) == ["s-left", "s-top", "-"])
+    }
+
+    @Test func leavesReturnsEveryLeafInTreeOrder() {
+        let leaves = SessionLayoutManifest.leaves(of: sampleTree())
+        #expect(leaves.map(\.ipcName) == ["ide", nil, "logs"])
+        #expect(SessionLayoutManifest.leaves(of: .leaf(.init(sessionID: "x", title: nil, ipcName: nil))).count == 1)
+    }
+
     // MARK: Missing-session-id detection
 
     @Test func hasMissingSessionIDsFindsTheGapAnywhereInTheTree() {

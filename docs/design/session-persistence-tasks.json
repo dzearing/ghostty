@@ -141,7 +141,7 @@
     {
       "id": "T06",
       "title": "Restore at launch: rebuild windows + splits, re-attach every leaf",
-      "status": "pending",
+      "status": "in_progress",
       "dependsOn": ["T05"],
       "goal": "At app launch (flag on), replay the manifest: recreate each window at its frame, rebuild the SplitTree with exact directions/ratios, each leaf a .remote surface with its recorded sessionID (agent replays ring → scrollback restored), restore titles/ipc names.",
       "steps": [

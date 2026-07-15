@@ -277,6 +277,42 @@ final class SessionLayoutManifest {
         }
     }
 
+    // MARK: Tree decoding (restore)
+
+    /// Inverse of `encodeNode` (T06): build a live `SplitTree` node from the
+    /// codable parallel, preserving directions and ratios exactly, calling
+    /// `leafView` to construct each pane's view. Generic and pure like
+    /// `encodeNode` so the restore-path tree rebuild is unit-testable
+    /// without real terminal surfaces.
+    static func makeTreeNode<V: NSView & Codable & Identifiable>(
+        _ node: Node,
+        leaf leafView: (Leaf) -> V
+    ) -> SplitTree<V>.Node {
+        switch node {
+        case .leaf(let leaf):
+            return .leaf(view: leafView(leaf))
+        case .split(let split):
+            return .split(.init(
+                direction: split.direction == .horizontal ? .horizontal : .vertical,
+                ratio: split.ratio,
+                left: makeTreeNode(split.left, leaf: leafView),
+                right: makeTreeNode(split.right, leaf: leafView)))
+        }
+    }
+
+    /// The leaves of a codable tree in tree order (depth-first,
+    /// left-before-right) — the same order `makeTreeNode` invokes its leaf
+    /// factory and `SplitTree.Node.leaves()` returns views, so restored
+    /// views pair with their manifest leaves by position.
+    static func leaves(of node: Node) -> [Leaf] {
+        switch node {
+        case .leaf(let leaf):
+            return [leaf]
+        case .split(let split):
+            return leaves(of: split.left) + leaves(of: split.right)
+        }
+    }
+
     // MARK: Live sync
 
     /// Debounced sync work, keyed by entry id. Main-thread only.

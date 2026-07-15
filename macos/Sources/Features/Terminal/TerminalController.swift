@@ -1234,6 +1234,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // use whatever the latest app-level config is.
         let config = ghostty.config
 
+        // Session persistence: agent-backed windows must NOT also be saved
+        // by AppKit state restoration — the SessionLayoutManifest restores
+        // them re-ATTACHed to their live sessions (T06); AppKit would
+        // recreate them as fresh exec-backed duplicates. The entry id is
+        // always set before the window loads (fresh window: init; tab:
+        // buildTab; restore: presentRestoredSessionWindow — all assign
+        // `remoteConnection` before first touching `window`).
+        if sessionLayoutEntryID != nil { restorable = false }
+
         // Setting all three of these is required for restoration to work.
         window.isRestorable = restorable
         if restorable {
@@ -1430,6 +1439,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     // Called when the window will be encoded. We handle the data encoding here in the
     // window controller.
     func window(_ window: NSWindow, willEncodeRestorableState state: NSCoder) {
+        // Session persistence: never encode a manifest-tracked window even
+        // if AppKit asks (final backstop behind the isRestorable gates) —
+        // decoding it would duplicate the window as exec-backed surfaces.
+        guard sessionLayoutEntryID == nil else { return }
         let data = TerminalRestorableState(from: self)
         data.encode(with: state)
     }

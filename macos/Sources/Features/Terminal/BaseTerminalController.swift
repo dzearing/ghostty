@@ -769,6 +769,26 @@ class BaseTerminalController: NSWindowController,
         else { return }
         sessionLayoutEntryID = SessionLayoutManifest.shared.register()
         SessionLayoutManifest.shared.scheduleSync(self)
+        disableAppKitRestorationForSessionLayout()
+    }
+
+    /// Session persistence: a manifest-tracked window must NOT also be saved
+    /// by AppKit state restoration — after a crash/kill relaunch AppKit would
+    /// recreate it as a fresh exec-backed DUPLICATE alongside the manifest
+    /// restore's re-attached window. The window frequently loads DURING
+    /// `TerminalController.init` (the surface-tree observer touches
+    /// `self.window`), i.e. before the entry id binds, so the gate is applied
+    /// from BOTH directions: here when the entry binds (window may already be
+    /// loaded) and in `TerminalController.windowDidLoad` (entry may already
+    /// be bound). Verified live: with only the windowDidLoad gate, restored
+    /// windows were re-encoded by AppKit and duplicated on every relaunch.
+    func disableAppKitRestorationForSessionLayout() {
+        guard sessionLayoutEntryID != nil else { return }
+        // isWindowLoaded first: the `window` getter would force-load the nib
+        // (this can run inside init); the not-yet-loaded case is covered by
+        // the windowDidLoad-side gate.
+        guard isWindowLoaded, let window else { return }
+        window.isRestorable = false
     }
 
     func confirmClose(

@@ -133,18 +133,32 @@ final class LocalAgentManager {
     /// finds a warm cached connection instead of blocking the main thread on
     /// the agent spawn. Safe to call repeatedly (e.g. on config reload).
     func warmUp() {
+        sharedConnectionAsync { _ in }
+    }
+
+    /// Resolve the shared connection WITHOUT blocking the caller: find-or-
+    /// spawn + dial on a background queue, cache on main, deliver on main.
+    /// Used by the launch warm-up and the T06 layout restore (which must not
+    /// beachball launch on an agent spawn). Completion receives nil when no
+    /// agent could be reached; it is delivered on the main actor.
+    func sharedConnectionAsync(_ completion: @escaping @MainActor (RemoteConnection?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            guard let conn = connect() else { return }
+            let conn = connect()
             DispatchQueue.main.async {
                 // A racing main-thread caller may have cached one already:
                 // keep the established one, discard ours.
                 if let existing = self.sharedOwner, existing.linkState != .dead,
                    self.sharedAgentPid > 0,
                    kill(self.sharedAgentPid, 0) == 0 || errno == EPERM {
-                    ghostty_remote_connection_free(conn.handle)
+                    if let conn { ghostty_remote_connection_free(conn.handle) }
+                    completion(existing)
                     return
                 }
-                _ = self.cacheShared(conn)
+                guard let conn else {
+                    completion(nil)
+                    return
+                }
+                completion(self.cacheShared(conn))
             }
         }
     }
