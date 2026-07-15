@@ -20,7 +20,10 @@ param(
     [string]$WorkingDirectory = 'D:\git\ghoztty',
     # Runs in the relaunched window; --continue resumes the most recent
     # Claude session in WorkingDirectory (i.e. the one this kill orphaned).
-    [string]$ResumeCommand = 'claude --continue',
+    # --continue restores the conversation, NOT the dead process's CLI
+    # flags, so launch-mode flags like --dangerously-skip-permissions must
+    # be repeated here or the resumed session drops back to prompting.
+    [string]$ResumeCommand = 'claude --dangerously-skip-permissions --continue',
     [int]$DelaySeconds = 3,
     [switch]$NoResume
 )

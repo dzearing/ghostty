@@ -753,8 +753,13 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                     const shell_pid = surfaceShellPid(entry.view);
                     if (shell_pid == 0) continue;
                     if (!ProcessTree.isAncestor(&pid_map, shell_pid, query_pid)) continue;
-                    const name = app.ipcNameOf(.{ .pane = entry.view }) orelse
-                        try std.fmt.allocPrint(arena, "{d}", .{entry.view.core_surface.id});
+                    const name = app.ipcNameOf(.{ .pane = entry.view }) orelse name: {
+                        // Register the fallback name so the returned value is
+                        // immediately usable as a target, matching buildNode.
+                        const id = try std.fmt.allocPrint(arena, "{d}", .{entry.view.core_surface.id});
+                        app.ipcRegister(id, .{ .pane = entry.view }) catch {};
+                        break :name id;
+                    };
                     var out: std.Io.Writer.Allocating = .init(ctx.alloc);
                     errdefer out.deinit();
                     var jws: std.json.Stringify = .{ .writer = &out.writer };
