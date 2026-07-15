@@ -141,6 +141,7 @@ One line per row. Full spec + validation + evidence per task:
 | T53 | Long-context reliability + perf soak/tuning | I | T40 | todo | — |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
 | T55 | FIX: hero-mode.ps1 fails on HEAD (chords not dispatched) | F | T19 | todo | — |
+| T56 | Remote reconnect on win32 (WP-D1 parity) | G | T21b | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.

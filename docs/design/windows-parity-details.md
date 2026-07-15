@@ -1087,7 +1087,23 @@ log entry) whether the script was ever green on-box after that commit.
 
 *Validation:* `test/win32/hero-mode.ps1` ALL PASS on the box.
 
-## Backlog (tracked, deliberately not in the parity pass)
+## T56 — Remote reconnect on win32 (WP-D1 parity) (Phase G)
+
+Filed 2026-07-15 during T21b validation. When the agent dies under a live
+remote window, win32 today degrades to a clean dead pane (no hang, no
+crash — `ipc-relay.ps1` §6/§7 prove it), but the Mac has the full WP-D1
+reconnect state machine: CONNECTED → RECONNECTING on transport EOF,
+bounded redial with backoff (`tcp_dial`/`relay_dial` + handshake
+deadline), re-ATTACH by session UUID (agent keeps detached sessions
+alive), yellow-pill status UI. The Zig core primitives are shared and
+already proven headlessly (`wp4_e2e.zig` phases 2–4); the work is the
+win32 driver: state observer on the connection, redial loop off the GUI
+thread, ATTACH-then-DETACH swap ordering (see the Phase-4 notes), and a
+Windows-native status affordance.
+
+*Validation:* extend `ipc-relay.ps1`: kill + restart the agent under a
+live window → the pane comes back (reattach) or reports a clear
+disconnected state; no hang, no crash, no orphan connection threads.
 
 Promote to a task row when prioritized; don't work these ad hoc.
 
