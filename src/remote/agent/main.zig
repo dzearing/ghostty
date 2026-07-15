@@ -132,11 +132,13 @@ pub fn main() !void {
         .usage => printUsage(),
         .stdio => try runStdio(alloc, encoding),
         .listen => |l| {
+            // Keep the GPA exit clean on the (error) paths where runListen returns.
+            defer if (l.port_file) |pf| alloc.free(pf);
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
             // (bind, banner, tray icon). Exits the process on conflict.
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
             defer lock.release();
-            try runListen(alloc, encoding, l.addr, l.headless, l.public);
+            try runListen(alloc, encoding, l.addr, l.headless, l.public, l.port_file);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
@@ -351,6 +353,11 @@ const Listen = struct {
     /// True when `addr` is a non-loopback interface (only reachable via the
     /// explicit `--insecure-allow-public` opt-in) — drives a runtime warning.
     public: bool = false,
+    /// `--port-file=<path>`: after the listener binds, atomically write a JSON
+    /// file `{"port":N,"pid":P,"startedAt":MS}` so a supervisor that spawned us
+    /// with `--listen=127.0.0.1:0` (ephemeral port) can discover the bound
+    /// port. Owned (duped from argv).
+    port_file: ?[]const u8 = null,
 };
 
 /// Opt-in required to bind `--listen` to a NON-loopback interface. The TCP
@@ -380,14 +387,29 @@ fn parseArgs(alloc: Allocator) !Mode {
     var no_browser = false;
     var force_replace = false;
     var allow_public = false;
-    for (args[1..]) |a| {
-        if (std.mem.eql(u8, a, "--headless")) headless = true;
-        if (std.mem.eql(u8, a, "--enroll")) want_enroll = true;
-        if (std.mem.eql(u8, a, "--no-browser") or
-            std.mem.eql(u8, a, "--headless-enroll")) no_browser = true;
-        if (std.mem.eql(u8, a, "--force-replace") or
-            std.mem.eql(u8, a, "--replace")) force_replace = true;
-        if (std.mem.eql(u8, a, allow_public_flag)) allow_public = true;
+    var port_file_arg: ?[]const u8 = null;
+    {
+        var j: usize = 1;
+        while (j < args.len) : (j += 1) {
+            const a = args[j];
+            if (std.mem.eql(u8, a, "--headless")) headless = true;
+            if (std.mem.eql(u8, a, "--enroll")) want_enroll = true;
+            if (std.mem.eql(u8, a, "--no-browser") or
+                std.mem.eql(u8, a, "--headless-enroll")) no_browser = true;
+            if (std.mem.eql(u8, a, "--force-replace") or
+                std.mem.eql(u8, a, "--replace")) force_replace = true;
+            if (std.mem.eql(u8, a, allow_public_flag)) allow_public = true;
+            if (std.mem.eql(u8, a, "--port-file")) {
+                j += 1;
+                if (j >= args.len) {
+                    std.debug.print("ghoztty-agent: --port-file requires <path>\n", .{});
+                    return error.InvalidArgs;
+                }
+                port_file_arg = args[j];
+            } else if (std.mem.startsWith(u8, a, "--port-file=")) {
+                port_file_arg = a["--port-file=".len..];
+            }
+        }
     }
 
     var i: usize = 1;
@@ -396,9 +418,13 @@ fn parseArgs(alloc: Allocator) !Mode {
         if (std.mem.eql(u8, a, "--headless") or std.mem.eql(u8, a, "--enroll") or
             std.mem.eql(u8, a, "--no-browser") or std.mem.eql(u8, a, "--headless-enroll") or
             std.mem.eql(u8, a, "--force-replace") or std.mem.eql(u8, a, "--replace") or
-            std.mem.eql(u8, a, allow_public_flag))
+            std.mem.eql(u8, a, allow_public_flag) or
+            std.mem.startsWith(u8, a, "--port-file="))
         {
             continue; // handled in the pre-scan above
+        } else if (std.mem.eql(u8, a, "--port-file")) {
+            i += 1; // value consumed in the pre-scan above
+            continue;
         } else if (std.mem.eql(u8, a, "--version")) {
             return .version;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -411,9 +437,9 @@ fn parseArgs(alloc: Allocator) !Mode {
                 std.debug.print("ghoztty-agent: --listen requires <addr:port>\n", .{});
                 return error.InvalidArgs;
             }
-            return listenMode(try parseAddr(args[i]), headless, force_replace, allow_public);
+            return listenMode(alloc, try parseAddr(args[i]), headless, force_replace, allow_public, port_file_arg);
         } else if (std.mem.startsWith(u8, a, "--listen=")) {
-            return listenMode(try parseAddr(a["--listen=".len..]), headless, force_replace, allow_public);
+            return listenMode(alloc, try parseAddr(a["--listen=".len..]), headless, force_replace, allow_public, port_file_arg);
         } else if (std.mem.eql(u8, a, "--relay")) {
             i += 1;
             if (i >= args.len) {
@@ -448,7 +474,8 @@ fn parseArgs(alloc: Allocator) !Mode {
 /// unauthenticated TCP shell may bind loopback freely (tests, local dev), but a
 /// NON-loopback interface requires the explicit `--insecure-allow-public`
 /// opt-in. Without it we refuse rather than silently expose a shell.
-fn listenMode(addr: std.net.Address, headless: bool, force_replace: bool, allow_public: bool) !Mode {
+/// `port_file` is duped here (argv is freed when parseArgs returns).
+fn listenMode(alloc: Allocator, addr: std.net.Address, headless: bool, force_replace: bool, allow_public: bool, port_file: ?[]const u8) !Mode {
     const public = !isLoopbackAddr(addr);
     if (public and !allow_public) {
         std.debug.print(
@@ -461,7 +488,12 @@ fn listenMode(addr: std.net.Address, headless: bool, force_replace: bool, allow_
         );
         return error.InsecureListen;
     }
-    return .{ .listen = .{ .addr = addr, .headless = headless, .force_replace = force_replace, .public = public } };
+    if (port_file) |pf| if (pf.len == 0) {
+        std.debug.print("ghoztty-agent: --port-file requires a non-empty <path>\n", .{});
+        return error.InvalidArgs;
+    };
+    const pf_owned: ?[]const u8 = if (port_file) |pf| try alloc.dupe(u8, pf) else null;
+    return .{ .listen = .{ .addr = addr, .headless = headless, .force_replace = force_replace, .public = public, .port_file = pf_owned } };
 }
 
 /// Whether `addr` is a loopback address (127.0.0.0/8 or ::1) — the only binds
@@ -493,6 +525,9 @@ fn printUsage() void {
         \\Advanced / development:
         \\  ghoztty-agent --listen=127.0.0.1:<port>
         \\                                  UNAUTHENTICATED TCP shell, loopback only.
+        \\                                  Port 0 binds an ephemeral port; add
+        \\                                  --port-file=<path> to publish the bound port
+        \\                                  as {"port":N,"pid":P,"startedAt":MS} (atomic).
         \\  ghoztty-agent --listen=<addr:port> --insecure-allow-public
         \\                                  UNAUTHENTICATED TCP shell on a routable interface
         \\                                  (trusted networks only — anyone who reaches it gets a shell).
@@ -563,6 +598,7 @@ fn runListen(
     addr: std.net.Address,
     headless: bool,
     public: bool,
+    port_file: ?[]const u8,
 ) !void {
     // Loud, unmissable warning when bound to a routable interface: this listener
     // has no authentication, so anyone who can reach the port gets a shell. Only
@@ -581,6 +617,23 @@ fn runListen(
         return err;
     };
     defer listener.deinit();
+
+    // The ADDRESS ACTUALLY BOUND (getsockname). Differs from `addr` when the
+    // caller asked for port 0 (ephemeral): this one carries the real port —
+    // use it for the banner and the port file below.
+    const bound_addr = listener.listen_address;
+
+    // Publish the bound port for the supervisor that spawned us (the whole
+    // point of `--listen=127.0.0.1:0 --port-file=...`). Written AFTER the bind
+    // succeeds, atomically (tmp+rename), so a reader never sees a torn file or
+    // a port we don't actually hold. Failure is fatal: a supervisor waiting on
+    // this file would otherwise hang against a silently portless agent.
+    if (port_file) |pf| {
+        writePortFile(alloc, pf, bound_addr.getPort()) catch |err| {
+            std.debug.print("ghoztty-agent: failed to write --port-file {s}: {s}\n", .{ pf, @errorName(err) });
+            return err;
+        };
+    }
 
     // DAEMON-SCOPED shared session store + spawner (§7.1 survival). These OUTLIVE
     // every connection: a client disconnect tears down its per-connection Server but
@@ -613,7 +666,7 @@ fn runListen(
     // built as the GUI subsystem so no console pops up, the deploy watcher
     // redirects stdout to a log file — an inherited handle — so this banner is
     // still captured and the readiness poll still works.)
-    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on {f}\n", .{ agent_version, addr }) catch "ghoztty-agent: listening\n") catch {};
+    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on {f}\n", .{ agent_version, bound_addr }) catch "ghoztty-agent: listening\n") catch {};
 
     // The accept loop is the whole daemon. WHERE it runs depends on the tray:
     //
@@ -659,6 +712,50 @@ fn runListen(
 
     // Headless / non-windows / tray-fallback: run the accept loop right here.
     try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener);
+}
+
+/// Atomically publish the listener's bound port for a supervisor: write
+/// `{"port":N,"pid":P,"startedAt":MS}` to `path` via the same-directory
+/// tmp+rename pattern (see `enroll.saveRelayEnv`), creating parent directories
+/// as needed. `pid` lets the reader liveness-check the writer; `startedAt`
+/// (unix ms) lets it spot a stale file from a previous boot.
+fn writePortFile(alloc: Allocator, path: []const u8, port: u16) !void {
+    if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
+    const content = try formatPortFile(alloc, port, currentPid(), std.time.milliTimestamp());
+    defer alloc.free(content);
+
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(tmp_path);
+    {
+        // Declared before the create/close pair so on error (LIFO) the file
+        // closes BEFORE the delete — Windows can't delete an open file.
+        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+        const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(content);
+        // Durable before the rename publishes it: a reader must never parse a
+        // partially-flushed port.
+        try file.sync();
+    }
+    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try std.fs.cwd().rename(tmp_path, path);
+}
+
+/// The port-file JSON body (pure — separated from the I/O for tests).
+fn formatPortFile(alloc: Allocator, port: u16, pid: i64, started_at_ms: i64) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "{{\"port\":{d},\"pid\":{d},\"startedAt\":{d}}}\n",
+        .{ port, pid, started_at_ms },
+    );
+}
+
+fn currentPid() i64 {
+    return switch (builtin.os.tag) {
+        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        .linux => @intCast(std.os.linux.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
 }
 
 /// Bundles the accept-loop parameters so they can ride a single `std.Thread.spawn`
@@ -1310,6 +1407,63 @@ test "decideRelayCred: no cred + headless errors (no surprise browser on servers
 
 test "decideRelayCred: no cred + interactive auto-enrolls (MSI first launch)" {
     try std.testing.expectEqual(RelayCredDecision.auto_enroll, decideRelayCred(false, false, false));
+}
+
+test "port file: JSON body carries port/pid/startedAt" {
+    const alloc = std.testing.allocator;
+    const body = try formatPortFile(alloc, 54321, 987, 1770000000000);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 54321), parsed.value.object.get("port").?.integer);
+    try std.testing.expectEqual(@as(i64, 987), parsed.value.object.get("pid").?.integer);
+    try std.testing.expectEqual(@as(i64, 1770000000000), parsed.value.object.get("startedAt").?.integer);
+}
+
+test "port file: bind port 0 → write file → read back live port → dial it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Exactly what runListen does for `--listen=127.0.0.1:0 --port-file=...`:
+    // bind ephemeral, resolve the real port from listen_address, publish it.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const bound_port = listener.listen_address.getPort();
+    try std.testing.expect(bound_port != 0);
+
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    // Nested path proves parent-directory creation (the supervisor's config
+    // dir may not exist yet on first spawn).
+    const path = try std.fs.path.join(alloc, &.{ dir_path, "nested", "port.json" });
+    defer alloc.free(path);
+
+    try writePortFile(alloc, path, bound_port);
+
+    // A supervisor's read: parse the file, dial the advertised port.
+    const body = try std.fs.cwd().readFileAlloc(alloc, path, 4096);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const file_port: u16 = @intCast(parsed.value.object.get("port").?.integer);
+    try std.testing.expectEqual(bound_port, file_port);
+    try std.testing.expectEqual(currentPid(), parsed.value.object.get("pid").?.integer);
+    try std.testing.expect(parsed.value.object.get("startedAt").?.integer > 0);
+
+    const dial_addr = try std.net.Address.parseIp("127.0.0.1", file_port);
+    const conn = try std.net.tcpConnectToAddress(dial_addr);
+    conn.close();
+
+    // The staging file is consumed by the rename, never left behind.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(tmp_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
+
+    // Rewrite (agent restart reusing the same path) must replace the file.
+    try writePortFile(alloc, path, bound_port);
 }
 
 test "wssBase: https/wss normalize to wss; http/ws stay plaintext; others refused" {

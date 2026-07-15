@@ -73,7 +73,7 @@
     {
       "id": "T02",
       "title": "Agent: --port-file for ephemeral loopback listen",
-      "status": "pending",
+      "status": "done",
       "dependsOn": ["T01"],
       "goal": "Let a supervisor spawn `ghoztty-agent --listen=127.0.0.1:0 --port-file=<path>` and discover the bound port from an atomically-written file (tmp+rename). Needed so the app can spawn/find its local agent without a fixed port.",
       "steps": [
@@ -81,7 +81,7 @@
         "Reuse/extend listen-mode tests; add a test spawning with port 0 + reading the file."
       ],
       "acceptance": "zig build test-agent passes incl. new test; manual: run agent with --listen=127.0.0.1:0 --port-file=/tmp/x.json, file appears with live port, nc connects.",
-      "notes": ""
+      "notes": "2026-07-14: done, commit 382ca6ef7, in src/remote/agent/main.zig only. --port-file=<path> (and two-token form) pre-scanned order-independently; port 0 already parsed fine, real port comes from listener.listen_address (getsockname) — banner now prints the BOUND addr. File written atomically (tmp+rename, enroll.saveRelayEnv pattern) AFTER bind, fatal on failure. Body: {\"port\":N,\"pid\":P,\"startedAt\":MS}\\n. 2 new tests (pure format + bind-0/write/read-back/dial); test-agent exit 0. Manual verified: file showed live port 59246 matching banner, pid matched, nc connected, no .tmp leftover. For T03: poll for the file AND liveness-check the pid in it; file is NOT cleaned up on agent exit (stale-file detection is the reader's job)."
     },
     {
       "id": "T03",
