@@ -1,0 +1,240 @@
+{
+  "project": "Ghoztty session persistence — build + thorough E2E test",
+  "createdAt": "2026-07-13",
+  "designDoc": "docs/design/session-persistence.md",
+  "branch": "users/dzearing/session-persistence",
+  "worktree": "/Users/dzearing/git/ghoztty-session-persistence",
+  "userIntent": "Build the hybrid local-agent session persistence (design doc §5) and prove it: simulate a binary upgrade where every window reloads intact — correct positions/splits, same screen buffers, processes still running (re-attached, NOT restarted). Test thoroughly, not just build.",
+
+  "protocol": {
+    "loop": [
+      "1. On session start: read THIS file fully, then the design-doc sections referenced by the task you pick. Do not re-explore the codebase for facts already in keyFacts below.",
+      "2. Pick the first task with status=pending whose dependsOn are all done. Set it to in_progress (edit this file) before starting work.",
+      "3. Do the task. Keep it small; if it balloons, split it into sub-tasks in this file and finish only the first.",
+      "4. Verify per the task's acceptance. Build must pass; run the named tests. For user-facing changes, kill + relaunch the DEBUG app from this worktree and verify live (never while the user has live debug windows you did not create).",
+      "5. Commit on this branch: git add -A && git commit with a descriptive message ending in the Claude Co-Authored-By trailer. Record the SHA + outcome + surprises in the task's notes, set status=done (or blocked with reason).",
+      "6. Add any newly-discovered follow-up tasks to the tasks array (small, ordered).",
+      "7. If tasks remain: invoke the Skill tool with skill='dzearing-skills:reset-context' and args='Read /Users/dzearing/git/ghoztty-session-persistence/docs/design/session-persistence-tasks.json and follow its protocol: execute the next pending task, then reset context again.' — this clears context and re-seeds the next session.",
+      "8. If ALL tasks are done (or only blocked ones remain): do NOT reset. Write a final summary for the user: what shipped, E2E results, what is blocked and why."
+    ],
+    "rules": [
+      "NEVER touch /Applications/Ghoztty.app in any way — it is the user's primary terminal. Debug app only: zig-out/Ghoztty-Debug.app (bundle id com.dzearing.ghoztty.debug, socket ghostty-debug-<uid>.sock).",
+      "All bundle identifiers stay in com.dzearing.ghoztty.* — NEVER com.mitchellh.*.",
+      "NEVER run +new-remote-window unattended against a possibly-unreachable host: a failed dial pops a modal alert that wedges ALL CLI IPC. Loopback dials to an agent you just health-checked are OK.",
+      "Use /usr/bin/log (never bare `log` — zsh builtin shadows it).",
+      "A `kill -STOP`ed process gets pending teardown signals delivered at SIGCONT — run freeze/thaw cycles in one tool call.",
+      "Stale-instance trap: after rebuilding, verify the debug app process start time > binary mtime before trusting live behavior. Kill any debug instance launched from other/deleted worktrees first (the user's real terminal is the RELEASE app; killing DEBUG instances is safe unless this effort created live test windows).",
+      "Agent test seam: GHOSTTY_AGENT_LOCK=<path> GHOSTTY_AGENT_HEARTBEAT=<path> lets a test agent run beside any real one. Agent flag is --listen=127.0.0.1:<port> (there is no --port flag).",
+      "Remote +split --name= never registers the pane (async) — target the WINDOW and use its focused pane, or use +list to discover pane uuids.",
+      "If the user interrupts with new instructions, encode them as tasks in this file instead of drifting."
+    ],
+    "environment": {
+      "toolchain": "export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH; export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer",
+      "buildApp": "zig build -Doptimize=Debug   # → zig-out/Ghoztty-Debug.app",
+      "buildAgent": "zig build agent -Doptimize=Debug   # → zig-out/bin/ghoztty-agent",
+      "agentTests": "zig build test-agent   # ~418 tests",
+      "cli": "zig-out/Ghoztty-Debug.app/Contents/MacOS/ghoztty +<action> … (or the ghoztty binary inside the debug bundle); debug socket is separate from release",
+      "notes": "Official zig 0.15.2 binary cannot link on this macOS 26.4 box; the brew zig@0.15 bottle works (see memory ghoztty-macos26-zig-toolchain)."
+    }
+  },
+
+  "decisions": [
+    "Direction: design doc §5 hybrid — local ghoztty-agent owns PTYs; viewer keeps a layout+sessionId manifest; agent later gains disk metadata for reboot floor. User approved 2026-07-13 ('let's try it').",
+    "v0 local transport = loopback TCP (both ends already exist: agent --listen, ghostty_remote_connection_new_tcp). Unix-socket + peercred is a hardening task AFTER the headline E2E works (T09).",
+    "session-persistence is an opt-in config flag initially (default off) so the debug app stays usable throughout.",
+    "Ring stays 2 MB default for the demo; configurable size + 16 MB default comes with T11.",
+    "Reboot recovery (agent disk persistence, RELAUNCH) comes after the upgrade demo (T12/T13) — the upgrade scenario keeps the agent alive, so it does not need disk persistence."
+  ],
+
+  "headlineAcceptance": {
+    "scenario": "Simulated binary upgrade (what the user asked to prove)",
+    "criteria": [
+      "Setup: >=2 windows, >=4 panes total with nontrivial split topology and distinct ratios, each pane running `echo PANE=<n> PID=$$; i=0; while true; do echo tick-<n>-$((i++)); sleep 1; done` (unique markers).",
+      "Action: capture +list --json snapshot; quit/SIGKILL the app; REPLACE the debug app bundle with a freshly-built one (simulating Sparkle swap); launch the new binary.",
+      "Pass: every pane's shell/child PID unchanged and process never exited (tick counter continued monotonically across the gap — no reset to 0); split tree (directions, ratios ±0.01), window count, titles match the snapshot; +read on each pane shows pre-kill scrollback lines (replayed) AND post-gap ticks; time from kill to all panes interactive < 10 s."
+    ]
+  },
+
+  "tasks": [
+    {
+      "id": "T01",
+      "title": "Baseline: build app + agent, run agent tests, sanity-launch debug app",
+      "status": "done",
+      "dependsOn": [],
+      "goal": "Prove the toolchain + worktree build cleanly before changing anything; commit the design doc + this task file.",
+      "steps": [
+        "Toolchain exports; zig build -Doptimize=Debug; zig build agent -Doptimize=Debug; zig build test-agent.",
+        "Launch zig-out/Ghoztty-Debug.app, verify +list works over the debug socket, quit it.",
+        "Commit docs/design/session-persistence.md + this file."
+      ],
+      "acceptance": "App bundle + agent binary exist; agent tests pass; debug app answers +list; commit exists.",
+      "notes": "2026-07-14: build OK (app + agent), test-agent exit 0, debug app launched from this worktree and answered +list, then quit cleanly. Killed a stale Sunday debug instance from the ghoztty-pane-banner worktree (had one idle ~ shell) that held the debug socket — expect to have to do this again if other worktrees launch debug apps. Committed with docs."
+    },
+    {
+      "id": "T02",
+      "title": "Agent: --port-file for ephemeral loopback listen",
+      "status": "pending",
+      "dependsOn": ["T01"],
+      "goal": "Let a supervisor spawn `ghoztty-agent --listen=127.0.0.1:0 --port-file=<path>` and discover the bound port from an atomically-written file (tmp+rename). Needed so the app can spawn/find its local agent without a fixed port.",
+      "steps": [
+        "src/remote/agent/main.zig: support port 0 in --listen (report bound port), new --port-file flag; write `{\"port\":N,\"pid\":P,\"startedAt\":...}` atomically after listen succeeds.",
+        "Reuse/extend listen-mode tests; add a test spawning with port 0 + reading the file."
+      ],
+      "acceptance": "zig build test-agent passes incl. new test; manual: run agent with --listen=127.0.0.1:0 --port-file=/tmp/x.json, file appears with live port, nc connects.",
+      "notes": ""
+    },
+    {
+      "id": "T03",
+      "title": "App: LocalAgentManager — find-or-spawn the local agent",
+      "status": "pending",
+      "dependsOn": ["T02"],
+      "goal": "Swift manager that (a) locates a healthy local agent via its port file + HELLO probe, (b) else spawns the BUNDLED agent binary (ship ghoztty-agent inside Ghoztty-Debug.app/Contents/MacOS or Resources via the zig build) with debug-separated paths, (c) returns a dialed RemoteConnection handle.",
+      "steps": [
+        "Build: package ghoztty-agent into the app bundle (src/build/GhosttyXcodebuild or the zig install step).",
+        "Swift: LocalAgentManager (new file under macos/Sources/Features/Remote/): paths keyed by bundle id (~/.config/ghoztty/local-agent-debug/{port.json,agent.lock,agent.heartbeat}); spawn with GHOSTTY_AGENT_LOCK/HEARTBEAT env overrides + GHOSTTY_AGENT_NO_SELFUPDATE=1; probe via existing ghostty_remote_connection_new_tcp (it completes HELLO before returning — that IS the health check).",
+        "Reuse Machine.isLocalMachine/isLoopback so no remote pill shows.",
+        "Idempotency: agent single-instance guard (per-lock-path) makes double-spawn safe (loser exits 183)."
+      ],
+      "acceptance": "Unit-testable path resolution; live: first call spawns agent (visible in ps, port file written), second call reuses it; connection handle dials and HELLO completes.",
+      "notes": "Agent lifecycle: leave launchd packaging to T12; for now spawn-on-demand orphaned (daemon outlives app because it is NOT a child in the same process group — use posix_spawn with setsid or Process with detached semantics; verify app quit does NOT kill it)."
+    },
+    {
+      "id": "T04",
+      "title": "Config flag: route local windows through the local agent",
+      "status": "pending",
+      "dependsOn": ["T03"],
+      "goal": "New config `session-persistence = off|on` (default off). When on, NEW local windows/tabs/splits create their surface as a .remote backend attached to the local agent (fresh session per pane) instead of .exec.",
+      "steps": [
+        "Zig: add config key (src/config/Config.zig pattern), expose to Swift like other keys.",
+        "Swift: at surface-creation sites that today produce local surfaces (TerminalController/BaseTerminalController newSurface paths), when flag on and no explicit remote target: obtain LocalAgentManager connection, inject remoteConnection/connectionKeepAlive (mirror BaseTerminalController.swift:428-475 remote-inheritance path), sessionId nil (fresh).",
+        "Working directory & command: pass through OPEN.cwd/OPEN.command (already supported by agent; per-host-defaults plumbing shows the path: SurfaceConfiguration.remoteShell → embedded.zig → termio/Remote.zig → OPEN).",
+        "Keep: pill hidden for local (isLocalMachine), title/OSC behavior unchanged (emulation is client-side)."
+      ],
+      "acceptance": "With flag off: zero behavior change (default). With flag on: new window's shell runs under ghoztty-agent (ps PPID chain proves it); typing/scrolling feels normal; +list shows the pane; kill -9 the APP → shell process survives (ps) — the core survival primitive, verified manually before any restore work.",
+      "notes": "This is the highest-risk integration task. If Surface.zig/embedded config plumbing fights back, note findings here and split."
+    },
+    {
+      "id": "T05",
+      "title": "Manifest v2: persist layout + session ids on change/quit",
+      "status": "pending",
+      "dependsOn": ["T04"],
+      "goal": "SessionLayoutManifest: for every persistent window, durably record {windowFrame, tabColor?, titleOverride, ipcName, tabs:[{splitTree with per-leaf {sessionID, title, ipcName}}]}. SplitTree is already Codable; add a parallel codable that captures sessionID per leaf.",
+      "steps": [
+        "New Swift store (UserDefaults JSON or file under ~/Library/Application Support/com.dzearing.ghoztty.debug/), modeled on RemoteSessionManifest.swift incl. its mark-don't-drain crash safety and isQuitting preservation.",
+        "Capture session ids asynchronously like captureSessionID does (poll ghostty_surface_remote_session_id ~30s).",
+        "Update triggers: window close (remove unless isQuitting), split tree change, title change, frame move (debounced).",
+        "Do NOT wire restore yet — that is T06."
+      ],
+      "acceptance": "Manifest JSON on disk matches live layout after making windows/splits/resizes; survives app quit; entries removed on explicit window close; unit tests for codable round-trip.",
+      "notes": ""
+    },
+    {
+      "id": "T06",
+      "title": "Restore at launch: rebuild windows + splits, re-attach every leaf",
+      "status": "pending",
+      "dependsOn": ["T05"],
+      "goal": "At app launch (flag on), replay the manifest: recreate each window at its frame, rebuild the SplitTree with exact directions/ratios, each leaf a .remote surface with its recorded sessionID (agent replays ring → scrollback restored), restore titles/ipc names.",
+      "steps": [
+        "Model on restoreRemoteWindows() (AppDelegate.swift:1365) + presentRemoteWindow(sessionID:), extended to multi-leaf trees: construct SplitTree nodes directly (native, exact ratios — do NOT shell out to +split/+rearrange).",
+        "Dead/not_found sessions: leaf shows exited state (reuse childExited overlay or a banner); do not crash the tree build.",
+        "Interplay: persistent windows must NOT also be restored by AppKit TerminalRestorable (avoid double windows) — gate restorable off for agent-backed windows like explicit-command windows already do (TerminalController.swift:69-74)."
+      ],
+      "acceptance": "Manual: 2 windows / 4 panes, quit app, relaunch → identical layout+titles, scrollback present, processes SAME PIDs still running. IPC names still targetable (+send-keys works post-restore).",
+      "notes": ""
+    },
+    {
+      "id": "T07",
+      "title": "E2E harness: scripted kill -9 survival test",
+      "status": "pending",
+      "dependsOn": ["T06"],
+      "goal": "A repeatable script (e.g. scripts/e2e/session-persistence.sh or .py) that builds the full headlineAcceptance scenario via CLI, SIGKILLs the app, relaunches, and ASSERTS every criterion mechanically (exit nonzero on any failure).",
+      "steps": [
+        "Drive via debug CLI: +new-window/+split with --command markers (see headlineAcceptance), capture +list --json, capture marker PIDs via +read.",
+        "kill -9 the app process; relaunch via open -b com.dzearing.ghoztty.debug (or direct binary); poll +list until restored.",
+        "Assertions: PID sets equal & alive; tick counters monotonic across gap (grep last pre-kill tick N, first post-restore read must show ticks > N with no restart marker PANE=… reprinted); split tree deep-equal (directions, ratios ±0.01); titles; +read contains pre-kill lines; wall-clock gap < 10s.",
+        "Teardown: +close everything, kill test agent (its lock path is the T03 debug path — never kill a NON-test agent)."
+      ],
+      "acceptance": "Script passes 3 consecutive runs; failure modes print actionable diffs. Committed with a README note.",
+      "notes": ""
+    },
+    {
+      "id": "T08",
+      "title": "E2E: simulated binary UPGRADE (the user's headline ask)",
+      "status": "pending",
+      "dependsOn": ["T07"],
+      "goal": "Extend the harness with an upgrade mode: between kill and relaunch, REPLACE the app bundle with a newly-built one (new mtime + bumped build marker), like Sparkle does. Everything must re-attach intact per headlineAcceptance.",
+      "steps": [
+        "Build a second copy of the bundle (or rebuild after touching a version string); rsync --delete over zig-out staged copy in a scratch dir — NEVER /Applications.",
+        "Also test the graceful path: normal quit (isQuitting) instead of SIGKILL, then swap+relaunch — both must pass.",
+        "Verify the agent process was untouched across the swap (same agent PID before/after).",
+        "Record results (timings, any scrollback truncation) in this file's notes and the design doc's acceptance table."
+      ],
+      "acceptance": "Upgrade-mode script passes 3 consecutive runs for BOTH kill -9 and graceful-quit variants; agent PID unchanged; report written.",
+      "notes": ""
+    },
+    {
+      "id": "T09",
+      "title": "Hardening: Unix-socket transport (agent listen + client dial + ABI), make it the default local transport",
+      "status": "pending",
+      "dependsOn": ["T08"],
+      "goal": "Replace loopback TCP with a 0600 unix socket + LOCAL_PEERCRED same-uid check (design §5.2 security rationale: any local user can connect to 127.0.0.1 ports).",
+      "steps": [
+        "Agent: --listen-unix=<path> (socket_stream.zig is the Stream template); unlink-stale-with-livecheck; peercred check.",
+        "Client: ghostty_remote_connection_new_unix(path) through embedded.zig; LocalAgentManager switches; port-file becomes socket-path file.",
+        "Keep --listen TCP for dev/tests."
+      ],
+      "acceptance": "E2E suite (T07+T08) passes over UDS; another-uid connect is refused (test with a root-owned probe or skip with documented manual check); tests added.",
+      "notes": ""
+    },
+    {
+      "id": "T10",
+      "title": "Agent: LIST_SESSIONS + `+sessions` CLI",
+      "status": "pending",
+      "dependsOn": ["T08"],
+      "goal": "Wire session enumeration: new LIST_SESSIONS/SESSIONS frames (store already internally enumerable — tray.zig:33 pattern), and `ghoztty +sessions [--json]` against the local agent. Foundation for cross-machine attach later.",
+      "steps": ["protocol.zig frames + server.zig handler + tests; src/cli/sessions.zig modeled on list.zig but dialing the agent directly (not the app socket)."],
+      "acceptance": "test-agent passes; +sessions lists live sessions with id/state/attached/cwd/argv; documented in CLAUDE.md CLI section.",
+      "notes": ""
+    },
+    {
+      "id": "T11",
+      "title": "Agent policy: pinned sessions (no TTL), session cap 256, configurable ring size",
+      "status": "pending",
+      "dependsOn": ["T08"],
+      "goal": "Persistent local sessions must never be TTL-reaped while a manifest references them; raise max_sessions 64→256; ring size via flag/env (default stays 2MB until measured; design target 16MB).",
+      "steps": ["OPEN gains pinned flag (additive, HELLO-compatible); reapIdle skips pinned; caps + --ring-bytes flag; tests incl. reaper behavior."],
+      "acceptance": "test-agent passes; pinned session survives a fake-TTL fast-forward test; unpinned still reaped.",
+      "notes": ""
+    },
+    {
+      "id": "T12",
+      "title": "Reboot floor: agent disk metadata + RELAUNCH + launchd packaging",
+      "status": "pending",
+      "dependsOn": ["T11"],
+      "goal": "sessions.json (atomic) with {id, argv, cwd, title, pinned, createdAt}; on agent start, load as dead-relaunchable; RELAUNCH frame restarts the command under the recorded metadata; install per-user LaunchAgent (com.dzearing.ghoztty.debug.agent for the debug lineage) RunAtLoad+KeepAlive.",
+      "steps": ["Persist on open/close/meta-change; tombstone on load; RELAUNCH handler; viewer: dead-session leaf offers/auto relaunch with '--- restarted ---' banner (config session-relaunch=auto|prompt, default auto); LaunchAgent plist written by LocalAgentManager."],
+      "acceptance": "Kill -9 the AGENT → launchd restarts it → app reconnect ladder re-attaches → panes show relaunched processes with banner; reboot-equivalent simulated by full agent restart; E2E script variant added.",
+      "notes": ""
+    },
+    {
+      "id": "T13",
+      "title": "Reboot scrollback: ring disk snapshots",
+      "status": "pending",
+      "dependsOn": ["T12"],
+      "goal": "Agent snapshots dirty rings every 30s + on SIGTERM; after restart, replay snapshot then a divider then live output (design §5.4).",
+      "steps": ["Snapshot format (offset+bytes), atomic write, load on start attaching to relaunched session; tests."],
+      "acceptance": "Agent-restart E2E shows pre-restart scrollback + divider + fresh output.",
+      "notes": ""
+    },
+    {
+      "id": "T14",
+      "title": "Wrap-up: docs, design-doc status update, memory, final report",
+      "status": "pending",
+      "dependsOn": ["T08"],
+      "goal": "Update CLAUDE.md (new CLI/config), design doc status + measured acceptance numbers, memory files; write the final user-facing summary (do NOT reset context after this — report instead).",
+      "steps": [],
+      "acceptance": "Docs consistent with shipped behavior; final report delivered.",
+      "notes": "T09–T13 may still be pending when the user wants a checkpoint; the report should state exactly which ACs are proven."
+    }
+  ]
+}
