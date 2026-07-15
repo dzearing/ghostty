@@ -9,6 +9,16 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box, evening) — T54 DONE: resume-doc diet. The tracker's
+  state table shrank to one-line rows (status + commit); all per-task
+  spec/validation/evidence narrative moved to new
+  `windows-parity-details.md` (`## T<id>` sections, plus Bootstrap &
+  environment and the backlog). Resume protocol now reads only go.md + the
+  hot doc + the one task's details section (Grep `^## T<id> ` for the
+  slice). Hot doc 65KB → 10KB; resume read ≈6–8k tokens (target <15k).
+  All 55 table IDs cross-checked against details sections (55/55). go.md
+  updated to name the details doc. Next priority: T20.
+
 - 2026-07-15 (on-box, afternoon) — T50 DONE: real "Rename Window" dialog.
   New `src/apprt/win32/RenameDialog.zig` — owner-centered WS_POPUP+WS_CAPTION
   dialog (dark title bar/controls), "Window title:" label, prefilled edit,

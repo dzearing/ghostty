@@ -45,10 +45,12 @@ only the parts of files you need.
 
 1. Read `docs/design/windows-parity-tasks.md`. It is the canonical
    state/task doc; the state table is ground truth. **Read only that file.**
-   The session log (`windows-parity-log.md`), the audit appendix
+   The per-task details (`windows-parity-details.md`), the session log
+   (`windows-parity-log.md`), the audit appendix
    (`windows-parity-audit.md`), and the spec (`windows-parity-spec.md`) are
    split out on purpose — open at most the one section you actually need for
-   your task, never all of them "for background".
+   your task (for details, Grep `^## T<id> ` and Read that slice), never
+   all of them "for background".
 2. Follow its resume protocol for **one** task, per the context rule above.
    At the boundary, append ONE short entry to `windows-parity-log.md` (no
    build output, no diffs).
