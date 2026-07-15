@@ -135,7 +135,7 @@ One line per row. Full spec + validation + evidence per task:
 | T51 | Full parity RE-AUDIT | — | T50,T22,T48,T53 | todo | — |
 | T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
 | T53 | Long-context reliability + perf soak/tuning | I | T40 | todo | — |
-| T54 | Resume-doc diet (this restructure) | — | — | done | (this commit) |
+| T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.
