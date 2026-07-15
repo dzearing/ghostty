@@ -66,6 +66,16 @@ foreach ($try in 1..20) {
 if (-not $swapped) { Log 'ABORT: could not replace exe after 20 tries'; exit 1 }
 Log 'exe swapped'
 
+# Keep the matching PDB next to the installed exe so freeze/crash dumps are
+# symbolizable (T48). Release builds must use -Dstrip=false to produce one.
+$newPdb = Join-Path $Staging 'bin\ghoztty.pdb'
+if (Test-Path $newPdb) {
+    Copy-Item $newPdb (Join-Path $InstallDir 'ghoztty.pdb') -Force
+    Log 'pdb copied alongside exe'
+} else {
+    Log 'WARNING: no ghoztty.pdb in staging (built with strip?); dumps from this build will be unsymbolized'
+}
+
 $stagingShare = Join-Path $Staging 'share'
 if (Test-Path $stagingShare) {
     robocopy $stagingShare (Join-Path $InstallDir 'share') /MIR /NFL /NDL /NJH /NJS | Out-Null

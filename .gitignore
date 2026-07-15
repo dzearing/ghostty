@@ -36,3 +36,4 @@ macos/macos/
 
 # Ephemeral git worktrees created by Claude Code subagents
 .claude/worktrees/
+.dumps/

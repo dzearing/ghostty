@@ -9,6 +9,21 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-14 (on-box, evening) — T48 recurrence + safeguards; T49/T50 filed —
+  Release GUI froze white again 21:05 (WER AppHangB1; Windows closed it, no
+  dump). The 18:35 T48 dump is unsymbolizable: ReleaseFast defaults
+  strip=true (src/build/Config.zig:345) — release builds MUST use
+  `-Dstrip=false` from now on. Safeguards: new
+  scripts/watchdog-ghoztty-windows.ps1 (3s poll, 15s hang → full minidump
+  to .dumps\ + kill + relaunch/--continue; MiniDumpWriteDump P/Invoke
+  test-verified), staging rebuilt with pdb, upgrade script copies pdb
+  beside the exe. Static candidate causes ranked in the T48 row (top:
+  GUI-thread reentrant win32k self-block, same class as the fixed
+  WM_GETOBJECT hang at App.zig:2294). Gotcha: Store WinDbgX cannot be
+  scripted headlessly (-c ignored); get console cdb before attempting dump
+  analysis. User directive: priority order now T40 (Claude Code scrolling
+  perf) → T49 (hero mode broken) → T50 (rename dialog) → T48 root-cause;
+  goal = highly reliable, highly performant client.
 - 2026-07-14 (on-box) — T45/T46 — The 2026-07-13 reset-context failed:
   helper #1's `/clear` was MSYS-mangled into a user message; helper #2
   fired mid-turn because `--when-idle` scrapes for "esc to interrupt",
