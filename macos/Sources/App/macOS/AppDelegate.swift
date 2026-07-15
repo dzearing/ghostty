@@ -283,6 +283,21 @@ class AppDelegate: NSObject,
             Task { @MainActor in
                 await MachineRegistry.shared.refreshFromRelay(quiet: true)
             }
+
+            // Test seam: exercise the local-agent find-or-spawn path without
+            // any window plumbing (session persistence is not wired to
+            // surfaces yet). Logs the outcome; the orchestrator asserts via
+            // the unified log + the agent port file + ps.
+            if ProcessInfo.processInfo.environment["GHOSTTY_TEST_LOCAL_AGENT"] == "1" {
+                DispatchQueue.global(qos: .utility).async {
+                    if let conn = LocalAgentManager.shared.connect() {
+                        Self.logger.info("local-agent test seam: connected, agent pid \(conn.pid) port \(conn.port)")
+                        ghostty_remote_connection_free(conn.handle)
+                    } else {
+                        Self.logger.error("local-agent test seam: connect() failed")
+                    }
+                }
+            }
         }
 
         // Setup a local event monitor for app-level keyboard shortcuts. See

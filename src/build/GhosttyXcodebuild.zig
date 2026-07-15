@@ -3,6 +3,7 @@ const Ghostty = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 const RunStep = std.Build.Step.Run;
+const Agent = @import("GhosttyAgent.zig");
 const Config = @import("Config.zig");
 const Docs = @import("GhosttyDocs.zig");
 const I18n = @import("GhosttyI18n.zig");
@@ -20,6 +21,12 @@ pub const Deps = struct {
     docs: *const Docs,
     i18n: ?*const I18n,
     resources: *const Resources,
+
+    /// When set, the ghoztty-agent daemon is embedded into the installed
+    /// bundle at Contents/MacOS/ghoztty-agent so the app can spawn its local
+    /// session-persistence agent (LocalAgentManager) without a separate
+    /// install.
+    agent: ?*const Agent = null,
 };
 
 pub fn init(
@@ -191,6 +198,24 @@ pub fn init(
         break :copy step;
     };
 
+    // Embed the ghoztty-agent daemon into the installed bundle. Only the
+    // zig-out copy gets it (not the xcodebuild output under macos/build), so
+    // it must land after the cp -R and before the re-sign so the nested
+    // binary is covered by the bundle seal (`codesign --deep` below).
+    const embed_agent: ?*RunStep = if (deps.agent) |agent| embed: {
+        const step = RunStep.create(b, "embed ghoztty-agent");
+        step.has_side_effects = true;
+        step.addArgs(&.{ "cp", "-f" });
+        step.addFileArg(agent.exe.getEmittedBin());
+        step.addArg(b.fmt(
+            "{s}/{s}.app/Contents/MacOS/ghoztty-agent",
+            .{ b.install_path, app_name },
+        ));
+        step.expectExitCode(0);
+        step.step.dependOn(&copy.step);
+        break :embed step;
+    } else null;
+
     // Re-sign the copied bundle. `cp -R` above breaks the code-signature
     // seal (the on-disk pages no longer match the sealed hashes), which makes
     // the hardened-runtime binary fail page validation and get SIGKILL'd with
@@ -223,6 +248,7 @@ pub fn init(
         step.addArg(b.fmt("{s}/{s}.app", .{ b.install_path, app_name }));
         step.expectExitCode(0);
         step.step.dependOn(&copy.step);
+        if (embed_agent) |embed| step.step.dependOn(&embed.step);
         break :sign step;
     };
 

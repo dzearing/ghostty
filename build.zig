@@ -91,10 +91,11 @@ pub fn build(b: *std.Build) !void {
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
 
     // Ghoztty remote-machines agent (WP2). A standalone, GUI-free daemon exe
-    // built on demand via `zig build agent`. It is not part of the default
-    // install graph this increment (daemonization/packaging is deferred).
+    // built via `zig build agent`, and embedded into the macOS app bundle
+    // (Contents/MacOS/ghoztty-agent) so the app can spawn its local
+    // session-persistence agent.
+    const agent = try buildpkg.GhosttyAgent.init(b, &config, &deps);
     {
-        const agent = try buildpkg.GhosttyAgent.init(b, &config, &deps);
         agent_step.dependOn(&agent.install_step.step);
         if (agent.ca_dll_install_step) |ca| agent_step.dependOn(&ca.step);
 
@@ -323,6 +324,7 @@ pub fn build(b: *std.Build) !void {
                 .docs = &docs,
                 .i18n = if (i18n) |v| &v else null,
                 .resources = &resources,
+                .agent = &agent,
             },
         );
         if (config.emit_macos_app) {
@@ -370,6 +372,7 @@ pub fn build(b: *std.Build) !void {
                     .docs = &docs,
                     .i18n = if (i18n) |v| &v else null,
                     .resources = &resources,
+                    .agent = &agent,
                 },
             );
 

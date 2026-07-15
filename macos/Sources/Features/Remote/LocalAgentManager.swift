@@ -1,0 +1,226 @@
+import Foundation
+import GhosttyKit
+import os
+
+/// Finds or spawns the local `ghoztty-agent` and hands back dialed connection
+/// handles to it — the local end of session persistence: panes backed by this
+/// agent survive the app process, so the app can be killed/upgraded and
+/// re-attach to the same PTYs.
+///
+/// Discovery order:
+///
+///  1. **Find**: read the agent's port file (written atomically by
+///     `--port-file` after its listener binds), liveness-check the recorded
+///     pid, and dial `127.0.0.1:<port>`. The dial blocks through the HELLO
+///     handshake before returning, so a non-nil handle IS the health check.
+///  2. **Spawn**: launch the agent bundled next to the app executable
+///     (`Contents/MacOS/ghoztty-agent`) in its own session (`setsid`) so it
+///     outlives the app, then poll the port file until a dial succeeds.
+///
+/// All agent state lives in a per-lineage directory keyed by bundle id
+/// (`~/.config/ghoztty/local-agent[-debug]/`) so the debug app never shares an
+/// agent — or its sessions — with the release app. The lock/heartbeat paths
+/// are forced there via the agent's `GHOSTTY_AGENT_LOCK`/`GHOSTTY_AGENT_HEARTBEAT`
+/// overrides; its single-instance guard (loser exits 183) makes concurrent
+/// spawns safe.
+final class LocalAgentManager {
+    static let shared = LocalAgentManager()
+
+    private static let logger = Logger(
+        subsystem: Bundle.loggerSubsystem,
+        category: String(describing: LocalAgentManager.self)
+    )
+
+    /// Serializes connect() so racing callers can't double-spawn from within
+    /// this process (cross-process races are the agent guard's job).
+    private let lock = NSLock()
+
+    /// Everything path-shaped, resolved purely from (bundleID, home) so tests
+    /// can assert the layout without touching the filesystem or the real bundle.
+    struct Paths: Equatable {
+        let directory: URL
+
+        var portFile: URL { directory.appendingPathComponent("port.json") }
+        var lockFile: URL { directory.appendingPathComponent("agent.lock") }
+        var heartbeatFile: URL { directory.appendingPathComponent("agent.heartbeat") }
+        var logFile: URL { directory.appendingPathComponent("agent.log") }
+
+        init(bundleID: String?, home: URL) {
+            // The debug lineage (com.dzearing.ghoztty.debug) gets its own
+            // directory; anything else — including a nil bundle id when
+            // running bare — is the release lineage.
+            let name = bundleID?.hasSuffix(".debug") == true
+                ? "local-agent-debug" : "local-agent"
+            self.directory = home
+                .appendingPathComponent(".config/ghoztty/\(name)", isDirectory: true)
+        }
+
+        static var current: Paths {
+            .init(
+                bundleID: Bundle.main.bundleIdentifier,
+                home: FileManager.default.homeDirectoryForCurrentUser)
+        }
+    }
+
+    /// The agent's `--port-file` body: `{"port":N,"pid":P,"startedAt":MS}`.
+    /// `startedAt` is ignored — the pid liveness check supersedes it.
+    struct PortFile: Codable, Equatable {
+        let port: UInt16
+        let pid: pid_t
+    }
+
+    /// A successfully dialed local-agent connection. The caller owns the
+    /// handle (free with `ghostty_remote_connection_free`, or hand it to a
+    /// `RemoteConnection` owner).
+    struct Connection {
+        let handle: ghostty_remote_connection_t
+        let port: UInt16
+        let pid: pid_t
+    }
+
+    /// Find-or-spawn the local agent and dial it. Blocking (dial + spawn
+    /// polling, worst case ~5s) — call off the main thread.
+    func connect() -> Connection? {
+        lock.lock()
+        defer { lock.unlock() }
+        let paths = Paths.current
+        if let conn = Self.dialExisting(paths: paths) { return conn }
+        return Self.spawnAndDial(paths: paths)
+    }
+
+    /// Strict parse of the port file body. Static + pure for tests.
+    static func parsePortFile(_ data: Data) -> PortFile? {
+        guard let parsed = try? JSONDecoder().decode(PortFile.self, from: data),
+              parsed.port > 0, parsed.pid > 0
+        else { return nil }
+        return parsed
+    }
+
+    /// The bundled agent binary: a sibling of the app executable inside
+    /// Contents/MacOS. `GHOSTTY_LOCAL_AGENT_BIN` overrides for tests/dev
+    /// (e.g. driving a zig-out binary without rebuilding the bundle).
+    static func agentBinaryURL() -> URL? {
+        if let override = ProcessInfo.processInfo.environment["GHOSTTY_LOCAL_AGENT_BIN"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        guard let exe = Bundle.main.executableURL else { return nil }
+        return exe.deletingLastPathComponent().appendingPathComponent("ghoztty-agent")
+    }
+
+    // MARK: - Find
+
+    /// Dial the agent recorded in the port file, if it looks alive. The port
+    /// file is never cleaned up on agent exit, so stale entries are expected:
+    /// dead pid or failed HELLO both mean "no healthy agent" (nil).
+    private static func dialExisting(paths: Paths) -> Connection? {
+        guard let data = try? Data(contentsOf: paths.portFile),
+              let record = parsePortFile(data)
+        else { return nil }
+
+        // Liveness: signal 0 probes existence without touching the process.
+        // EPERM still means "exists" (not expected same-uid, but harmless).
+        guard kill(record.pid, 0) == 0 || errno == EPERM else { return nil }
+
+        guard let handle = "127.0.0.1".withCString({
+            ghostty_remote_connection_new_tcp($0, record.port)
+        }) else { return nil }
+        return Connection(handle: handle, port: record.port, pid: record.pid)
+    }
+
+    // MARK: - Spawn
+
+    /// Spawn the bundled agent detached (own session, stdio to the log file)
+    /// and poll until its freshly-written port file dials. The agent is
+    /// deliberately NOT our child in the same session: it must outlive the
+    /// app across quit/upgrade/kill -9.
+    private static func spawnAndDial(paths: Paths) -> Connection? {
+        guard let bin = agentBinaryURL(),
+              FileManager.default.isExecutableFile(atPath: bin.path)
+        else {
+            logger.error("local agent binary not found or not executable at \(Self.agentBinaryURL()?.path ?? "<nil>", privacy: .public)")
+            return nil
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: paths.directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+        } catch {
+            logger.error("failed to create \(paths.directory.path, privacy: .public): \(error)")
+            return nil
+        }
+
+        // Pre-spawn snapshot of the port file so polling can tell a fresh
+        // write from the stale record that just failed dialExisting. (If a
+        // healthy agent existed we would not be here.)
+        let staleData = try? Data(contentsOf: paths.portFile)
+
+        guard spawnDetached(binary: bin, paths: paths) else { return nil }
+
+        // Poll for a healthy dial. The winner of the agent's single-instance
+        // guard (ours, or a concurrent spawner's) rewrites the port file after
+        // its bind; the loser exits 183 without touching it.
+        let deadline = Date().addingTimeInterval(5.0)
+        while Date() < deadline {
+            usleep(100_000)
+            let data = try? Data(contentsOf: paths.portFile)
+            if data == staleData, staleData != nil { continue }
+            if let conn = dialExisting(paths: paths) { return conn }
+        }
+        logger.error("local agent did not become dialable within 5s; see \(paths.logFile.path, privacy: .public)")
+        return nil
+    }
+
+    /// posix_spawn the agent in a NEW session (POSIX_SPAWN_SETSID): no
+    /// controlling terminal, not in the app's process group, reparented to
+    /// launchd — app exit (or SIGKILL) cannot take it down. stdin is
+    /// /dev/null; stdout/stderr append to agent.log for diagnosis.
+    private static func spawnDetached(binary: URL, paths: Paths) -> Bool {
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addopen(
+            &actions, 1, paths.logFile.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+        posix_spawn_file_actions_adddup2(&actions, 1, 2)
+
+        let argv: [String] = [
+            binary.path,
+            "--listen=127.0.0.1:0",
+            "--port-file=\(paths.portFile.path)",
+        ]
+
+        // Inherit the app's environment, forcing the per-lineage guard paths
+        // and disabling self-update (the bundle owns the binary's lifecycle;
+        // Sparkle replaces it with the app).
+        var env = ProcessInfo.processInfo.environment
+        env["GHOSTTY_AGENT_LOCK"] = paths.lockFile.path
+        env["GHOSTTY_AGENT_HEARTBEAT"] = paths.heartbeatFile.path
+        env["GHOSTTY_AGENT_NO_SELFUPDATE"] = "1"
+
+        var cArgv = argv.map { strdup($0) }
+        cArgv.append(nil)
+        var cEnv = env.map { strdup("\($0.key)=\($0.value)") }
+        cEnv.append(nil)
+        defer {
+            cArgv.forEach { free($0) }
+            cEnv.forEach { free($0) }
+        }
+
+        var pid: pid_t = 0
+        let rc = posix_spawn(&pid, binary.path, &actions, &attr, cArgv, cEnv)
+        guard rc == 0 else {
+            logger.error("posix_spawn(\(binary.path, privacy: .public)) failed: \(String(cString: strerror(rc)), privacy: .public)")
+            return false
+        }
+        logger.info("spawned local agent pid \(pid) (log: \(paths.logFile.path, privacy: .public))")
+        return true
+    }
+}
