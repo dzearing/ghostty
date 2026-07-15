@@ -141,7 +141,7 @@
     {
       "id": "T06",
       "title": "Restore at launch: rebuild windows + splits, re-attach every leaf",
-      "status": "in_progress",
+      "status": "done",
       "dependsOn": ["T05"],
       "goal": "At app launch (flag on), replay the manifest: recreate each window at its frame, rebuild the SplitTree with exact directions/ratios, each leaf a .remote surface with its recorded sessionID (agent replays ring → scrollback restored), restore titles/ipc names.",
       "steps": [
@@ -150,7 +150,17 @@
         "Interplay: persistent windows must NOT also be restored by AppKit TerminalRestorable (avoid double windows) — gate restorable off for agent-backed windows like explicit-command windows already do (TerminalController.swift:69-74)."
       ],
       "acceptance": "Manual: 2 windows / 4 panes, quit app, relaunch → identical layout+titles, scrollback present, processes SAME PIDs still running. IPC names still targetable (+send-keys works post-restore).",
-      "notes": ""
+      "notes": "2026-07-14: done, commit 6c6e32b64. Entry point AppDelegate.restoreSessionLayoutWindows (new SessionLayoutRestore.swift), called from applicationDidFinishLaunching !isTestHost, gated on flag. Flow: set hasPendingSessionRestore (suppresses initial launch window; cleared + fallback initial window if restore ends empty) → LocalAgentManager.sharedConnectionAsync (new non-blocking API, warmUp now wraps it) → bg thread probes every leaf session (query_cwd_timeout 5s) → main thread groups entries by tabGroupID/tabIndex → per entry SplitTree via SessionLayoutManifest.makeTreeNode (new pure inverse of encodeNode; +leaves(of:) pairs views/manifest leaves by tree order) with per-leaf ATTACH cfg → controller ADOPTS entry.id (set BEFORE remoteConnection so didSet skips duplicate registration; entry never drained — crash-safe) → frame setFrame AFTER showWindow (showWindow re-applies defaults) → titleOverride → registerRestoredRemoteWindow + new IPCServer.registerRestoredPane → syncAndCaptureSessionIDs. Drop policy: nil tree dropped; ALL leaves dead/uncaptured dropped; agent unreachable keeps everything; partial death restores (dead leaves attach-fail to exited overlay). LIVE VERIFIED: 3 windows/6 panes across 5 kill -9 cycles + 1 graceful quit + 1 binary-swap relaunch (rebuild → kill → new binary re-attached = upgrade primitive); nested vert+horiz topology exact; +rearrange'd ratio 0.31 restored exactly; titles, ipc names (+send-keys/+read post-restore) OK; ticker PID 96130 monotonic to 841 across every gap; scrollback replayed. HARD-WON GOTCHA (AppKit dupes): windowDidLoad-only isRestorable gate FAILS — the window loads DURING TerminalController.init (surface-tree observer touches self.window) before any entry id binds; unified log proved layoutEntry=nil at every windowDidLoad. Fix = 3 gates: windowDidLoad check + BaseTerminalController.disableAppKitRestorationForSessionLayout (called from registerSessionLayoutIfNeeded AND restore path; guards isWindowLoaded to avoid forcing nib load) + willEncodeRestorableState guard (backstop). macOS 26: ~/Library/'Saved Application State' does NOT exist (unknown location); stale PRE-fix snapshots multiplied on every kill-9 relaunch (11 dupes at peak) because kill-9 replays whatever snapshot exists; purge = +close dupes then GRACEFUL quit (rewrites state) then relaunch. Discovered +rearrange --layout JSON (ratio 10-90 %) — T07 can use it for distinct ratios. UNTESTED: tab-group restore path (no CLI creates tabs → T06a). Fixture left: app RUNNING (current build, launched --session-persistence=true --confirm-close-surface=false) with 3 restored windows; agent 18770 owns the sessions."
+    },
+    {
+      "id": "T06a",
+      "title": "Verify tab-group restore path live (GUI-driven)",
+      "status": "pending",
+      "dependsOn": ["T06"],
+      "goal": "The tabGroupID/tabIndex restore path (entries → native tabs of one window) is implemented but never executed live: no CLI command creates tabs, so it needs GUI driving (Cmd-T into a persistent window), then quit + relaunch and assert one window with N tabs, correct order, each tab's tree re-attached.",
+      "steps": ["GUI-drive Cmd-T on a flag-on window (memory: ghoztty-gui-driving-now-possible; screen must be unlocked), sync manifest (2 entries sharing tabGroupID), quit, relaunch, verify grouping + selection + per-tab session re-attach."],
+      "acceptance": "Restored tab group matches pre-quit: same window count, tab order, per-tab topology, sessions re-attached.",
+      "notes": "Not blocking T07/T08 (their scenarios are window+split based). Can ride alongside T08's graceful path."
     },
     {
       "id": "T07",
