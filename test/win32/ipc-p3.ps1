@@ -56,13 +56,15 @@ Assert "nonzero exit" ($LASTEXITCODE -ne 0)
 "== 3: +set-state states + aggregation + title suffix"
 & $Exe +set-state --target=p3 --state=busy 2>&1 | Out-Null
 Start-Sleep -Seconds 1
-Assert "window busy suffix" ((Get-P3Title) -match '\(busy\)$')
+# NOTE: debug builds append a " [DEBUG]" title marker after the activity
+# suffix (added 2026-07-13), so these anchors allow it.
+Assert "window busy suffix" ((Get-P3Title) -match '\(busy\)( \[DEBUG\])?$')
 & $Exe +set-state --target=p3a --state=needs_input 2>&1 | Out-Null
 Start-Sleep -Seconds 1
-Assert "needs_input outranks busy" ((Get-P3Title) -match '\(needs_input\)$')
+Assert "needs_input outranks busy" ((Get-P3Title) -match '\(needs_input\)( \[DEBUG\])?$')
 & $Exe +set-state --target=p3a --state=idle 2>&1 | Out-Null
 Start-Sleep -Seconds 1
-Assert "back to busy" ((Get-P3Title) -match '\(busy\)$')
+Assert "back to busy" ((Get-P3Title) -match '\(busy\)( \[DEBUG\])?$')
 & $Exe +set-state --target=p3 --state=idle 2>&1 | Out-Null
 Start-Sleep -Seconds 1
 Assert "suffix cleared" (-not ((Get-P3Title) -match '\(busy\)|\(needs_input\)'))
@@ -73,7 +75,7 @@ Assert "invalid state errors" ($LASTEXITCODE -ne 0)
 $oscBusy = "powershell -NoProfile -Command `"[console]::Write([char]27+']7777;busy'+[char]7)`""
 & $Exe +send-keys --target=p3a $oscBusy Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 6
-Assert "OSC busy set" ((Get-P3Title) -match '\(busy\)$')
+Assert "OSC busy set" ((Get-P3Title) -match '\(busy\)( \[DEBUG\])?$')
 $oscIdle = "powershell -NoProfile -Command `"[console]::Write([char]27+']7777;idle'+[char]7)`""
 & $Exe +send-keys --target=p3a $oscIdle Enter 2>&1 | Out-Null
 Start-Sleep -Seconds 6

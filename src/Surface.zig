@@ -787,7 +787,10 @@ pub fn init(
             .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
+            // Pointer into self (NOT the local render_thread copy): the
+            // renderer thread registers its waiter on self.renderer_thread's
+            // Async, and IOCP Async copies lose notifications (Options.zig).
+            .renderer_wakeup = &self.renderer_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });

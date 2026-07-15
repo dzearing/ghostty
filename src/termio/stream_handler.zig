@@ -44,8 +44,9 @@ pub const StreamHandler = struct {
     renderer_mailbox: *renderer.Thread.Mailbox,
 
     /// A handle to wake up the renderer. This hints to the renderer that
-    /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    /// a repaint should happen. Must remain a pointer — see Options.zig
+    /// (IOCP xev.Async copies lose notifications).
+    renderer_wakeup: *xev.Async,
 
     /// The default cursor state. This is used with CSI q. This is
     /// set to true when we're currently in the default cursor state.
@@ -105,10 +106,44 @@ pub const StreamHandler = struct {
         }
     }
 
+    /// Env-gated telemetry (GHOZTTY_PERF): rate of queueRender calls and
+    /// the Async instance they target (to correlate with the renderer
+    /// thread's own instance when debugging lost wakeups).
+    const queue_render_telemetry = struct {
+        threadlocal var enabled: ?bool = null;
+        threadlocal var window_start: ?std.time.Instant = null;
+        threadlocal var count: u32 = 0;
+
+        fn hit(target: *anyopaque) void {
+            const on = enabled orelse on: {
+                const on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+                enabled = on;
+                break :on on;
+            };
+            if (!on) return;
+            count += 1;
+            const now = std.time.Instant.now() catch return;
+            const start = window_start orelse {
+                window_start = now;
+                return;
+            };
+            const elapsed = now.since(start);
+            if (elapsed >= std.time.ns_per_s) {
+                log.info("perf queue_render_per_s={d} target={*}", .{
+                    @as(u64, count) * std.time.ns_per_s / @max(elapsed, 1),
+                    target,
+                });
+                window_start = now;
+                count = 0;
+            }
+        }
+    };
+
     /// This queues a render operation with the renderer thread. The render
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.
     pub inline fn queueRender(self: *StreamHandler) !void {
+        queue_render_telemetry.hit(self.renderer_wakeup);
         try self.renderer_wakeup.notify();
     }
 

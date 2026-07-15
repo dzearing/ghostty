@@ -32,7 +32,15 @@ renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
 /// a repaint should happen.
-renderer_wakeup: xev.Async,
+///
+/// This MUST be a pointer to the renderer thread's own Async (not a
+/// copy): with the IOCP backend (Windows) xev.Async is plain userspace
+/// state, so a copy is permanently severed from the instance the
+/// renderer thread waits on and every notify() is silently lost
+/// (T40: output-driven repaints degraded to cursor-blink cadence).
+/// Kqueue/eventfd backends tolerate copies because they share a kernel
+/// handle, which is how this went unnoticed on macOS/Linux.
+renderer_wakeup: *xev.Async,
 
 /// The mailbox for renderer messages.
 renderer_mailbox: *renderer.Thread.Mailbox,

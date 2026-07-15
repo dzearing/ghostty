@@ -335,8 +335,56 @@ pub fn drawFrameEnd(self: *OpenGL) void {
     if (comptime apprt.runtime == apprt.win32) {
         const hdc = wgl.wglGetCurrentDC();
         if (hdc != null) _ = wgl.SwapBuffers(hdc);
+        perf.frame();
     }
 }
+
+/// Win32 frame-pacing telemetry (T40/T48): when GHOZTTY_PERF is set in
+/// the environment, log frames-per-second, the longest inter-frame gap,
+/// and the max SwapBuffers-to-SwapBuffers stall once per second. Costs
+/// one branch per frame when disabled. Renderer-thread only (each
+/// surface has its own renderer thread; state is threadlocal so panes
+/// don't interleave).
+const perf = struct {
+    threadlocal var enabled: ?bool = null;
+    threadlocal var window_start: ?std.time.Instant = null;
+    threadlocal var last_frame: ?std.time.Instant = null;
+    threadlocal var frames: u32 = 0;
+    threadlocal var max_gap_ns: u64 = 0;
+
+    fn frame() void {
+        const on = enabled orelse on: {
+            const on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+            enabled = on;
+            break :on on;
+        };
+        if (!on) return;
+
+        const now = std.time.Instant.now() catch return;
+        if (last_frame) |last| {
+            const gap = now.since(last);
+            if (gap > max_gap_ns) max_gap_ns = gap;
+        }
+        last_frame = now;
+        frames += 1;
+
+        const start = window_start orelse {
+            window_start = now;
+            return;
+        };
+        const elapsed = now.since(start);
+        if (elapsed >= std.time.ns_per_s) {
+            const fps = @as(u64, frames) * std.time.ns_per_s / @max(elapsed, 1);
+            log.info(
+                "perf fps={d} max_gap_ms={d}",
+                .{ fps, max_gap_ns / std.time.ns_per_ms },
+            );
+            window_start = now;
+            frames = 0;
+            max_gap_ns = 0;
+        }
+    }
+};
 
 pub fn initShaders(
     self: *const OpenGL,

@@ -2334,6 +2334,11 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
 pub fn handleMouseWheel(self: *Surface, wparam: usize, axis: enum { vertical, horizontal }) void {
     if (!self.core_surface_ready) return;
     // The high word of wparam contains the wheel delta (signed).
+    // One detent (WHEEL_DELTA) is one discrete "tick"; the core then
+    // applies mouse-scroll-multiplier (discrete default 3), which
+    // matches the Windows 3-lines-per-notch convention. Do NOT also
+    // apply SPI_GETWHEELSCROLLLINES here — that double-multiplies
+    // (verified 9 lines/notch, test/win32/wheel-scroll.ps1).
     const raw_delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
     const delta: f64 = @as(f64, @floatFromInt(raw_delta)) / @as(f64, @floatFromInt(w32.WHEEL_DELTA));
 

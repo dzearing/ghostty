@@ -1390,6 +1390,12 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
+        // Env-gated telemetry (GHOZTTY_PERF): reads/sec + bytes/sec.
+        const perf_on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+        var perf_start: ?std.time.Instant = null;
+        var perf_reads: u64 = 0;
+        var perf_bytes: u64 = 0;
+
         var buf: [1024]u8 = undefined;
         while (true) {
             while (true) {
@@ -1404,6 +1410,26 @@ pub const ReadThread = struct {
                             log.err("io reader error err={}", .{err});
                             unreachable;
                         },
+                    }
+                }
+
+                if (perf_on) perf: {
+                    const now = std.time.Instant.now() catch break :perf;
+                    perf_reads += 1;
+                    perf_bytes += n;
+                    const start = perf_start orelse {
+                        perf_start = now;
+                        break :perf;
+                    };
+                    const elapsed = now.since(start);
+                    if (elapsed >= std.time.ns_per_s) {
+                        log.info("perf pty reads_per_s={d} kb_per_s={d}", .{
+                            perf_reads * std.time.ns_per_s / @max(elapsed, 1),
+                            (perf_bytes * std.time.ns_per_s / @max(elapsed, 1)) / 1024,
+                        });
+                        perf_start = now;
+                        perf_reads = 0;
+                        perf_bytes = 0;
                     }
                 }
 

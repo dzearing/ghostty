@@ -1120,6 +1120,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Update the frame data.
+        /// Env-gated perf telemetry (see also OpenGL.drawFrameEnd).
+        const perf_telemetry = struct {
+            threadlocal var cached: ?bool = null;
+            fn enabled() bool {
+                return cached orelse on: {
+                    const on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+                    cached = on;
+                    break :on on;
+                };
+            }
+        };
+
         pub fn updateFrame(
             self: *Self,
             state: *renderer.State,
@@ -1170,8 +1182,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //     std.log.err("[updateFrame critical time] start={}\tduration={} us", .{ start_micro, end.since(start) / std.time.ns_per_us });
                 // }
 
+                // Telemetry (GHOZTTY_PERF): how long the renderer waits to
+                // acquire the shared terminal state mutex. Under heavy PTY
+                // output the IO thread can starve us here (win32 T40/T48).
+                const lock_start: ?std.time.Instant = if (perf_telemetry.enabled())
+                    std.time.Instant.now() catch null
+                else
+                    null;
+
                 state.mutex.lock();
                 defer state.mutex.unlock();
+
+                if (lock_start) |start| {
+                    if (std.time.Instant.now() catch null) |end| {
+                        const wait_ms = end.since(start) / std.time.ns_per_ms;
+                        if (wait_ms >= 50) log.warn(
+                            "perf slow state mutex acquire ms={d}",
+                            .{wait_ms},
+                        );
+                    }
+                }
 
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {

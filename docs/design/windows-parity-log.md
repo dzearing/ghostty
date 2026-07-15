@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-14 (on-box, night) — T40 DONE: renderer wakeups were 100% lost on
+  Windows — termio held a by-value COPY of the renderer thread's xev.Async,
+  and the IOCP Async is pure userspace state (waiter=null forever on the
+  copy), so heavy output repainted only on the 600ms blink timer (~1.6fps).
+  Fix = renderer_wakeup as *xev.Async everywhere. Release build measured
+  before/after: fps 1→120, max frame gap 610ms→10ms during an 80MB visible
+  stream. Surprises worth knowing: (1) `Measure-Command { cmd /c type … }`
+  CAPTURES the output — first perf runs measured an idle screen; (2) wheel
+  scrolling was NOT the bug — config discrete default already = 3
+  lines/notch (Windows convention); stacking SPI_GETWHEELSCROLLLINES gives
+  9/notch (wheel-scroll.ps1 now guards 3); (3) P2/P3 had been silently red
+  since the " [DEBUG]" title marker landed — assertions now tolerate it;
+  (4) new tooling: GHOZTTY_PERF=1 telemetry (fps/wakeups/pty-reads/slow-
+  mutex), GHOZTTY_PIPE_SUFFIX for side-by-side release testing. Debug-lane
+  note for T48: under Debug parse load the renderer waited up to ~1s on
+  renderer_state.mutex (candidate-2 starvation is real but Debug-amplified;
+  release shows none at 3MB/s). NEXT: release refresh (T36, -Dstrip=false)
+  to actually deliver the fix to the installed app.
 - 2026-07-14 (on-box, evening) — T48 recurrence + safeguards; T49/T50 filed —
   Release GUI froze white again 21:05 (WER AppHangB1; Windows closed it, no
   dump). The 18:35 T48 dump is unsymbolizable: ReleaseFast defaults

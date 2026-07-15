@@ -85,11 +85,12 @@ Assert "nonzero exit" ($LASTEXITCODE -ne 0)
 & $Exe +rename --target=p2ide --title=P2-OVERRIDE 2>&1 | Out-Null
 Assert "rename exit 0" ($LASTEXITCODE -eq 0)
 Start-Sleep -Seconds 1
-Assert "window title is override" ((Get-List) -match 'Window: "P2-OVERRIDE"')
+# Debug builds append a " [DEBUG]" marker inside the quoted title.
+Assert "window title is override" ((Get-List) -match 'Window: "P2-OVERRIDE( \[DEBUG\])?"')
 & $Exe +send-keys --target=p2term "title P2-SHELL-FIGHTS\n" 2>&1 | Out-Null
 Start-Sleep -Seconds 2
 $list = Get-List
-Assert "override still wins" ($list -match 'Window: "P2-OVERRIDE"')
+Assert "override still wins" ($list -match 'Window: "P2-OVERRIDE( \[DEBUG\])?"')
 Assert "tab title tracks shell" ($list -match 'P2-SHELL-FIGHTS')
 
 "== 8: +rename missing target errors"

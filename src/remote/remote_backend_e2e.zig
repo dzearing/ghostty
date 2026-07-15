@@ -199,7 +199,7 @@ fn runProof(alloc: Allocator, port: u16) !bool {
         .backend = backend,
         .mailbox = io_mailbox,
         .renderer_state = &renderer_state,
-        .renderer_wakeup = renderer_wakeup,
+        .renderer_wakeup = &renderer_wakeup,
         .renderer_mailbox = renderer_mailbox,
         .surface_mailbox = surface_mailbox,
     });

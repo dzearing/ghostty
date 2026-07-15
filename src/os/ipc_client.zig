@@ -79,7 +79,20 @@ pub const Conn = struct {
 /// the upstream `ghostty` name, while the Windows pipe uses the fork's
 /// `ghoztty` name (pinned in the parity spec).
 pub fn endpointPath(alloc: Allocator) Allocator.Error![:0]u8 {
-    const suffix = if (build_config.is_debug) "-debug" else "";
+    // Test hook: GHOZTTY_PIPE_SUFFIX overrides the debug/release endpoint
+    // suffix so an instrumented release build (and its CLI invocations,
+    // which inherit the env) can run beside the installed instance.
+    // Used by the perf/acceptance harnesses in test/win32/.
+    const env_suffix: ?[]u8 = std.process.getEnvVarOwned(
+        alloc,
+        "GHOZTTY_PIPE_SUFFIX",
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    defer if (env_suffix) |s| alloc.free(s);
+
+    const suffix: []const u8 = if (env_suffix) |s| s else if (build_config.is_debug) "-debug" else "";
     if (comptime is_windows) {
         // USERNAME is set for every interactive session; the fallback only
         // matters for exotic service contexts.

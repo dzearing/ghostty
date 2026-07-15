@@ -237,6 +237,9 @@ fn threadMain_(self: *Thread) !void {
 
     // Start the async handlers
     self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
+    if (std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF")) {
+        log.info("perf wakeup waiter registered instance={*}", .{&self.wakeup});
+    }
     self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
     self.draw_now.wait(&self.loop, &self.draw_now_c, Thread, self, drawNowCallback);
 
@@ -510,6 +513,38 @@ fn drawFrame(self: *Thread, now: bool) void {
     }
 }
 
+/// Env-gated telemetry (GHOZTTY_PERF): count wakeupCallback firings per
+/// second so wakeup delivery problems (e.g. the win32 T40 lost-notify
+/// bug) are visible next to the fps counter in OpenGL.drawFrameEnd.
+const wakeup_telemetry = struct {
+    threadlocal var enabled: ?bool = null;
+    threadlocal var window_start: ?std.time.Instant = null;
+    threadlocal var count: u32 = 0;
+
+    fn hit() void {
+        const on = enabled orelse on: {
+            const on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+            enabled = on;
+            break :on on;
+        };
+        if (!on) return;
+        count += 1;
+        const now = std.time.Instant.now() catch return;
+        const start = window_start orelse {
+            window_start = now;
+            return;
+        };
+        const elapsed = now.since(start);
+        if (elapsed >= std.time.ns_per_s) {
+            log.info("perf wakeups_per_s={d}", .{
+                @as(u64, count) * std.time.ns_per_s / @max(elapsed, 1),
+            });
+            window_start = now;
+            count = 0;
+        }
+    }
+};
+
 fn wakeupCallback(
     self_: ?*Thread,
     _: *xev.Loop,
@@ -522,6 +557,7 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    wakeup_telemetry.hit();
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.

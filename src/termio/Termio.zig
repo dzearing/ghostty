@@ -44,8 +44,9 @@ terminal: terminalpkg.Terminal,
 renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// a repaint should happen. Must remain a pointer — see Options.zig
+/// (IOCP xev.Async copies lose notifications).
+renderer_wakeup: *xev.Async,
 
 /// The mailbox for notifying the renderer of things.
 renderer_mailbox: *renderer.Thread.Mailbox,
