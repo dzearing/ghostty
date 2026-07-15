@@ -15,6 +15,7 @@ const internal_os = @import("../../os/main.zig");
 
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
+const RenameDialog = @import("RenameDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
@@ -319,74 +320,84 @@ pub fn run(self: *App) !void {
         if (msg.message == w32.WM_KEYDOWN and msg.hwnd != null) {
             const vk: u16 = @intCast(msg.wParam & 0xFFFF);
 
-            // Check if this edit is a tab rename edit
-            if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
-                for (self.windows.items) |win| {
-                    if (win.rename_edit != null and win.rename_edit.? == msg.hwnd) {
-                        if (vk == w32.VK_RETURN) {
-                            win.finishTabRename();
-                        } else {
-                            win.cancelTabRename();
-                        }
-                        continue :loop;
-                    }
-                }
-            }
-
-            // Find the parent surface of this edit control
-            const parent = w32.GetParent(msg.hwnd.?);
-            if (parent) |p| {
-                const userdata = w32.GetWindowLongPtrW(p, w32.GWLP_USERDATA);
-                if (userdata != 0) {
-                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
-                    if (surface.search_active and surface.search_edit == msg.hwnd) {
-                        if (surface.handleSearchKey(vk)) continue;
-                    }
-                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
-                        if (surface.handlePaletteKey(vk)) continue;
-                    }
-                }
-            }
-
-            // Bubble global keybindings from popup edit controls (tab
-            // rename, command palette, search) up to the surface so that
-            // e.g. `Ctrl+Shift+P` while renaming actually toggles the
-            // palette instead of being eaten by the Edit. Excludes
-            // Ctrl-only A/C/V/X/Y/Z so standard text-edit shortcuts keep
-            // working inside the popup.
-            const ctrl_held = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
-            const shift_held = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
-            const route_key = ctrl_held and (shift_held or !isEditShortcutVk(vk));
-            if (route_key) {
-                const target_surface: ?*Surface = blk: {
-                    // Tab rename edit lives on the Window, not a surface.
-                    // Commit (not cancel) — matches standard Win32 inline
-                    // rename convention (Explorer, Edge): any action that
-                    // takes focus away saves the typed title.
+            // Modal "Rename Window" dialog: Enter/Escape/Tab are handled
+            // by our code; every other key reaches the native controls
+            // via Translate/Dispatch below. Checked first and exclusive —
+            // the Surface-cast intercepts below must never run for dialog
+            // children (their parent's GWLP_USERDATA is not a Surface),
+            // and no global keybind bubbles out of a modal dialog.
+            if (self.renameDialogOwning(msg.hwnd.?)) |dlg| {
+                if (dlg.handleKey(vk)) continue :loop;
+            } else {
+                // Check if this edit is a tab rename edit
+                if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
                     for (self.windows.items) |win| {
                         if (win.rename_edit != null and win.rename_edit.? == msg.hwnd) {
-                            win.finishTabRename();
-                            break :blk win.getActiveSurface();
+                            if (vk == w32.VK_RETURN) {
+                                win.finishTabRename();
+                            } else {
+                                win.cancelTabRename();
+                            }
+                            continue :loop;
                         }
                     }
-                    // Palette/search edits are children of a surface HWND.
-                    const pp = w32.GetParent(msg.hwnd.?) orelse break :blk null;
-                    const ud = w32.GetWindowLongPtrW(pp, w32.GWLP_USERDATA);
-                    if (ud == 0) break :blk null;
-                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(ud)));
-                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
-                        surface.setCommandPaletteActive(false);
-                        break :blk surface;
+                }
+
+                // Find the parent surface of this edit control
+                const parent = w32.GetParent(msg.hwnd.?);
+                if (parent) |p| {
+                    const userdata = w32.GetWindowLongPtrW(p, w32.GWLP_USERDATA);
+                    if (userdata != 0) {
+                        const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
+                        if (surface.search_active and surface.search_edit == msg.hwnd) {
+                            if (surface.handleSearchKey(vk)) continue;
+                        }
+                        if (surface.palette_active and surface.palette_edit == msg.hwnd) {
+                            if (surface.handlePaletteKey(vk)) continue;
+                        }
                     }
-                    if (surface.search_active and surface.search_edit == msg.hwnd) {
-                        surface.setSearchActive(false, &[_:0]u8{});
-                        break :blk surface;
+                }
+
+                // Bubble global keybindings from popup edit controls (tab
+                // rename, command palette, search) up to the surface so that
+                // e.g. `Ctrl+Shift+P` while renaming actually toggles the
+                // palette instead of being eaten by the Edit. Excludes
+                // Ctrl-only A/C/V/X/Y/Z so standard text-edit shortcuts keep
+                // working inside the popup.
+                const ctrl_held = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
+                const shift_held = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+                const route_key = ctrl_held and (shift_held or !isEditShortcutVk(vk));
+                if (route_key) {
+                    const target_surface: ?*Surface = blk: {
+                        // Tab rename edit lives on the Window, not a surface.
+                        // Commit (not cancel) — matches standard Win32 inline
+                        // rename convention (Explorer, Edge): any action that
+                        // takes focus away saves the typed title.
+                        for (self.windows.items) |win| {
+                            if (win.rename_edit != null and win.rename_edit.? == msg.hwnd) {
+                                win.finishTabRename();
+                                break :blk win.getActiveSurface();
+                            }
+                        }
+                        // Palette/search edits are children of a surface HWND.
+                        const pp = w32.GetParent(msg.hwnd.?) orelse break :blk null;
+                        const ud = w32.GetWindowLongPtrW(pp, w32.GWLP_USERDATA);
+                        if (ud == 0) break :blk null;
+                        const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(ud)));
+                        if (surface.palette_active and surface.palette_edit == msg.hwnd) {
+                            surface.setCommandPaletteActive(false);
+                            break :blk surface;
+                        }
+                        if (surface.search_active and surface.search_edit == msg.hwnd) {
+                            surface.setSearchActive(false, &[_:0]u8{});
+                            break :blk surface;
+                        }
+                        break :blk null;
+                    };
+                    if (target_surface) |s| {
+                        s.handleKeyEvent(msg.wParam, msg.lParam, .press);
+                        continue :loop;
                     }
-                    break :blk null;
-                };
-                if (target_surface) |s| {
-                    s.handleKeyEvent(msg.wParam, msg.lParam, .press);
-                    continue :loop;
                 }
             }
         }
@@ -1547,12 +1558,10 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    // Both .tab and .surface trigger inline rename on the
-                    // current tab. On Win32 there's no separate surface title
-                    // UI — the tab title IS the surface identity.
-                    core_surface.rt_surface.parent_window.startTabRename(
-                        core_surface.rt_surface.parent_window.active_tab,
-                    );
+                    // Keybind rename opens the real "Rename Window" dialog
+                    // (T50); commits via titleOverride, the +rename path.
+                    // Inline tab rename stays on tab double-click.
+                    core_surface.rt_surface.parent_window.promptRenameWindow();
                 },
             }
             return true;
@@ -1619,6 +1628,19 @@ pub fn performAction(
             },
         },
     }
+}
+
+/// Returns the open "Rename Window" dialog owning the given HWND (the
+/// dialog itself or one of its controls), if any. Used by the message
+/// loop to route dialog keys and to keep dialog children away from the
+/// Surface-cast popup-edit intercepts.
+fn renameDialogOwning(self: *App, hwnd: w32.HWND) ?*RenameDialog {
+    for (self.windows.items) |win| {
+        if (win.rename_dialog) |dlg| {
+            if (dlg.ownsHwnd(hwnd)) return dlg;
+        }
+    }
+    return null;
 }
 
 /// Ctrl-modified VKs that should remain with the focused Edit control

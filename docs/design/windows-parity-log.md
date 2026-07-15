@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box, afternoon) — T50 DONE: real "Rename Window" dialog.
+  New `src/apprt/win32/RenameDialog.zig` — owner-centered WS_POPUP+WS_CAPTION
+  dialog (dark title bar/controls), "Window title:" label, prefilled edit,
+  OK/Cancel. Owner disabled while open (modal) but the app msg loop keeps
+  turning, so renderer + IPC stay live — no NSAlert-style wedge. Tab cycles
+  focus, Enter commits (default = OK), Escape cancels; all three are routed
+  from App.run's WM_KEYDOWN intercept (new `renameDialogOwning` — checked
+  first + exclusive so dialog children never hit the Surface-cast popup
+  intercepts). Commit path = `setTitleOverride` (the +rename/T10 path);
+  empty text clears the override → reverts to the shell title. `prompt_title`
+  (ctrl+shift+r) now opens this; tab double-click keeps the inline edit.
+  Pure `layout()`/`nextFocus()` unit-tested in the win32 lane. kb-actions.ps1
+  gained 20 T50 asserts; ALL PASS (25 total w/ T47), P1–P3 ALL PASS, both
+  lanes green. HARNESS TRAP: FindWindowExW(dlg,_,'EDIT',$null) from
+  PowerShell fails — $null title marshals to "" and only matches
+  empty-titled windows, but the edit is prefilled; C# `null` (old T44 path)
+  is a true null. Added a class-only ChildByClass(GW_CHILD/GW_HWNDNEXT
+  walk) helper. NEXT: T54 (resume-doc diet).
 - 2026-07-15 (on-box, midday) — T49 pixel verification (user: "look at its
   pixels, get a screenshot"). hero-mode.ps1 grew a pixel layer: PrintWindow
   full-window PNGs + per-pane distinct-color floors + carousel-ratio~25%

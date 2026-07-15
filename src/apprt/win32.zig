@@ -8,3 +8,7 @@ pub const Surface = @import("win32/Surface.zig");
 
 const internal_os = @import("../os/main.zig");
 pub const resourcesDir = internal_os.resourcesDir;
+
+test {
+    _ = @import("win32/RenameDialog.zig");
+}

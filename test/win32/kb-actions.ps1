@@ -1,9 +1,11 @@
 # Keyboard-action acceptance: drives REAL key chords into the debug build's
 # surface HWND and asserts GUI-side behavior.
 #
-#   T44: ctrl+shift+r in a single-tab window (hidden tab bar) opens the
-#        rename edit (no crash, no invisible "mystery box"); committing
-#        with Enter changes the window title.
+#   T50: ctrl+shift+r opens the real "Rename Window" dialog (caption, edit
+#        prefilled, OK/Cancel, owner-centered, owner disabled); Enter
+#        commits via titleOverride (wins over shell titles, T10), Escape
+#        cancels, empty text clears the override. Supersedes the T44
+#        rename-edit assertions (no crash in a single-tab window).
 #   T47: ctrl+k clears the primary screen (+ scrollback); on the alternate
 #        screen the performable binding is unconsumed and falls through.
 #
@@ -45,7 +47,12 @@ public class KbDrv {
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int L; public int T; public int R; public int B; }
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [StructLayout(LayoutKind.Sequential)]
     public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
     [StructLayout(LayoutKind.Sequential)]
@@ -96,22 +103,67 @@ public class KbDrv {
         } finally { AttachThreadInput(cur, tid, false); }
     }
 
-    // Chord, then immediately grab the rename EDIT, set its text, and post
-    // Enter — all in one burst so a foreground steal can't outrun us (the
-    // EN_KILLFOCUS commit keeps the text we set anyway).
-    public static string RenameChord(IntPtr top, IntPtr surface, string title) {
+    // The "Rename Window" dialog is a top-level popup of its own class.
+    public static IntPtr FindDialog() {
+        return FindWindowExW(IntPtr.Zero, IntPtr.Zero, "GhozttyRenameDialog", null);
+    }
+
+    // Send ctrl+shift+r and wait for the rename dialog to appear.
+    public static string OpenRenameDialog(IntPtr top, IntPtr surface) {
         string r = Chord(top, surface, new ushort[] { 0x11, 0x10 }, 0x52); // ctrl+shift+r
         if (r != "SENT") return r;
-        IntPtr edit = IntPtr.Zero;
-        for (int t = 0; t < 100 && edit == IntPtr.Zero; t++) {
+        for (int t = 0; t < 100; t++) {
             Thread.Sleep(10);
-            edit = FindWindowExW(top, IntPtr.Zero, "EDIT", null);
+            if (FindDialog() != IntPtr.Zero) return "OPEN";
         }
-        if (edit == IntPtr.Zero) return "NO EDIT within 1s";
-        SendMessageW(edit, 0x000C, IntPtr.Zero, title);                  // WM_SETTEXT
-        PostMessageW(edit, 0x0100, (IntPtr)0x0D, (IntPtr)0x001C0001);    // Enter
-        Thread.Sleep(150);
-        return "RENAMED";
+        return "NO DIALOG within 1s";
+    }
+
+    public static string WindowText(IntPtr h) {
+        var sb = new StringBuilder(512);
+        GetWindowTextW(h, sb, 512);
+        return sb.ToString();
+    }
+
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+
+    // Deterministic direct-child lookup by class name (case-insensitive).
+    // Avoids FindWindowExW's title-matching ambiguity when the title arg is
+    // a PowerShell $null (which marshals to "" and only matches empty
+    // titles) — the dialog's edit is prefilled, so it has a non-empty title.
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    public static IntPtr ChildByClass(IntPtr parent, string cls) {
+        IntPtr c = GetWindow(parent, 5); // GW_CHILD
+        while (c != IntPtr.Zero) {
+            var sb = new StringBuilder(64);
+            GetClassNameW(c, sb, 64);
+            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase))
+                return c;
+            c = GetWindow(c, 2); // GW_HWNDNEXT
+        }
+        return IntPtr.Zero;
+    }
+
+    public static string DumpChildren(IntPtr parent) {
+        var outp = new StringBuilder();
+        EnumChildWindows(parent, (h, l) => {
+            var cls = new StringBuilder(64); GetClassNameW(h, cls, 64);
+            var txt = new StringBuilder(128); GetWindowTextW(h, txt, 128);
+            outp.AppendLine("  " + h.ToString("X") + "  class=[" + cls + "]  text=[" + txt + "]");
+            return true;
+        }, IntPtr.Zero);
+        return outp.ToString();
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, StringBuilder sb);
+
+    // GetWindowTextW cannot read another process's edit control - WM_GETTEXT
+    // is marshaled cross-process for standard controls.
+    public static string ControlText(IntPtr h) {
+        var sb = new StringBuilder(512);
+        SendMessageW(h, 0x000D, (IntPtr)512, sb); // WM_GETTEXT
+        return sb.ToString();
     }
 }
 '@
@@ -133,15 +185,81 @@ $listJson = & $exe +list --json | ConvertFrom-Json
 $pane = $listJson.data.windows[0].tabs[0].splits.terminal.name
 $win = $listJson.data.windows[0].target
 
-# --- T44: rename overlay in a single-tab window -----------------------------
-$r = [KbDrv]::RenameChord($top, $surface, 'KBTEST_TITLE')
-if ($r -like 'ABORT*') { Write-Host "SKIP T44: $r"; }
+# --- T50: "Rename Window" dialog (supersedes the T44 rename-edit path) ------
+$r = [KbDrv]::OpenRenameDialog($top, $surface)
+if ($r -like 'ABORT*') { Write-Host "SKIP T50: $r"; }
 else {
-    Assert ($r -eq 'RENAMED') "T44 rename edit opened and committed ($r)"
-    Start-Sleep -Milliseconds 500
-    Assert (-not $proc.HasExited) 'T44 no crash after ctrl+shift+r'
-    $list = & $exe +list --json | Out-String
-    Assert ($list -match 'KBTEST_TITLE') 'T44 title changed via rename edit'
+    Assert ($r -eq 'OPEN') "T50 dialog opened on ctrl+shift+r ($r)"
+    Assert (-not $proc.HasExited) 'T50 no crash after ctrl+shift+r (single tab)'
+    $dlg = [KbDrv]::FindDialog()
+    if ($dlg -ne [IntPtr]::Zero) {
+        Assert ([KbDrv]::WindowText($dlg) -eq 'Rename Window') 'T50 dialog caption is "Rename Window"'
+        $edit = [KbDrv]::ChildByClass($dlg, 'Edit')
+        $okBtn = [KbDrv]::FindWindowExW($dlg, [IntPtr]::Zero, 'BUTTON', 'OK')
+        $cancelBtn = [KbDrv]::FindWindowExW($dlg, [IntPtr]::Zero, 'BUTTON', 'Cancel')
+        Assert ($edit -ne [IntPtr]::Zero) 'T50 dialog has an edit box'
+        Assert ($okBtn -ne [IntPtr]::Zero) 'T50 dialog has an OK button'
+        Assert ($cancelBtn -ne [IntPtr]::Zero) 'T50 dialog has a Cancel button'
+        Assert (-not [KbDrv]::IsWindowEnabled($top)) 'T50 owner window disabled while dialog open (modal)'
+        $dr = New-Object KbDrv+RECT; $tr = New-Object KbDrv+RECT
+        [KbDrv]::GetWindowRect($dlg, [ref]$dr) | Out-Null
+        [KbDrv]::GetWindowRect($top, [ref]$tr) | Out-Null
+        $dcx = ($dr.L + $dr.R) / 2; $tcx = ($tr.L + $tr.R) / 2
+        $dcy = ($dr.T + $dr.B) / 2; $tcy = ($tr.T + $tr.B) / 2
+        Assert (([Math]::Abs($dcx - $tcx) -le 3) -and ([Math]::Abs($dcy - $tcy) -le 3)) 'T50 dialog centered on owner'
+
+        # Enter commits via titleOverride.
+        [KbDrv]::SendMessageW($edit, 0x000C, [IntPtr]::Zero, 'KBTEST_TITLE') | Out-Null  # WM_SETTEXT
+        [KbDrv]::PostMessageW($edit, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001) | Out-Null # Enter
+        Start-Sleep -Milliseconds 500
+        Assert ([KbDrv]::FindDialog() -eq [IntPtr]::Zero) 'T50 dialog closed on Enter'
+        Assert (-not $proc.HasExited) 'T50 no crash after commit'
+        Assert ([KbDrv]::IsWindowEnabled($top)) 'T50 owner re-enabled after close'
+        $list = & $exe +list --json | Out-String
+        Assert ($list -match 'KBTEST_TITLE') 'T50 window title committed (visible in +list)'
+
+        # titleOverride precedence (T10): a shell-set title updates the TAB
+        # label but the window caption keeps the override.
+        & $exe +send-keys --target=$win "title SHELLSET_TITLE" Enter | Out-Null
+        Start-Sleep -Seconds 2
+        $listJson2 = & $exe +list --json | ConvertFrom-Json
+        $tabTitle = $listJson2.data.windows[0].tabs[0].title
+        if ($tabTitle -notmatch 'SHELLSET_TITLE') { Write-Host 'SKIP T50-precedence: shell title did not land' }
+        else {
+            Assert ([KbDrv]::WindowText($top) -match 'KBTEST_TITLE') 'T50 override beats shell title (T10 precedence)'
+        }
+
+        # Reopen: edit prefilled with the current override; Escape cancels
+        # without applying.
+        $r2 = [KbDrv]::OpenRenameDialog($top, $surface)
+        if ($r2 -like 'ABORT*') { Write-Host "SKIP T50-cancel: $r2" }
+        else {
+            Assert ($r2 -eq 'OPEN') "T50 dialog reopened ($r2)"
+            $dlg2 = [KbDrv]::FindDialog()
+            $edit2 = [KbDrv]::ChildByClass($dlg2, 'Edit')
+            Assert ([KbDrv]::ControlText($edit2) -eq 'KBTEST_TITLE') 'T50 edit prefilled with current title'
+            [KbDrv]::SendMessageW($edit2, 0x000C, [IntPtr]::Zero, 'SHOULD_NOT_APPLY') | Out-Null
+            [KbDrv]::PostMessageW($edit2, 0x0100, [IntPtr]0x1B, [IntPtr]0x00010001) | Out-Null # Escape
+            Start-Sleep -Milliseconds 500
+            Assert ([KbDrv]::FindDialog() -eq [IntPtr]::Zero) 'T50 dialog closed on Escape'
+            $list3 = & $exe +list --json | Out-String
+            Assert (($list3 -match 'KBTEST_TITLE') -and ($list3 -notmatch 'SHOULD_NOT_APPLY')) 'T50 Escape discarded the edit'
+            Assert ([KbDrv]::IsWindowEnabled($top)) 'T50 owner re-enabled after cancel'
+        }
+
+        # Reopen: empty text clears the override (reverts to shell title).
+        $r3 = [KbDrv]::OpenRenameDialog($top, $surface)
+        if ($r3 -like 'ABORT*') { Write-Host "SKIP T50-clear: $r3" }
+        else {
+            $dlg3 = [KbDrv]::FindDialog()
+            $edit3 = [KbDrv]::ChildByClass($dlg3, 'Edit')
+            [KbDrv]::SendMessageW($edit3, 0x000C, [IntPtr]::Zero, '') | Out-Null
+            [KbDrv]::PostMessageW($edit3, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001) | Out-Null # Enter
+            Start-Sleep -Milliseconds 500
+            Assert ([KbDrv]::FindDialog() -eq [IntPtr]::Zero) 'T50 dialog closed on empty commit'
+            Assert ([KbDrv]::WindowText($top) -notmatch 'KBTEST_TITLE') 'T50 empty text cleared the override'
+        }
+    }
 }
 
 # --- T47: ctrl+k clears primary screen ---------------------------------------

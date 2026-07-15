@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 
 const App = @import("App.zig");
+const RenameDialog = @import("RenameDialog.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
@@ -72,6 +73,11 @@ drag_active: bool = false,
 rename_edit: ?w32.HWND = null,
 rename_font: ?*anyopaque = null,
 rename_tab: usize = 0,
+
+/// The "Rename Window" dialog (ctrl+shift+r), when open. Owned by
+/// RenameDialog itself; this is a backreference for key routing and
+/// teardown.
+rename_dialog: ?*RenameDialog = null,
 
 /// UTF-16 title buffers for each tab (for painting the tab bar).
 tab_titles: [64][256]u16 = undefined,
@@ -412,6 +418,10 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
 
 /// Deinitialize the Window: close all tabs, delete font, destroy HWND.
 pub fn deinit(self: *Window) void {
+    // Close the rename dialog first (it re-enables and refocuses this
+    // window's HWND, which must still be alive).
+    if (self.rename_dialog) |dlg| dlg.cancel();
+
     // Drop IPC names pointing at this window before the memory can be
     // recycled.
     self.app.ipcForget(.{ .window = self });
@@ -2048,6 +2058,13 @@ fn handleTabBarMouseLeave(self: *Window) void {
 
 /// Rename edit control child ID.
 const RENAME_EDIT_ID: u16 = 300;
+
+/// Open the "Rename Window" dialog (ctrl+shift+r / prompt_title). The
+/// inline tab-rename Edit remains the double-click affordance on visible
+/// tabs; the keybind path gets a real dialog (T50).
+pub fn promptRenameWindow(self: *Window) void {
+    RenameDialog.open(self);
+}
 
 /// Start inline editing of a tab title. Creates a small Edit control
 /// overlay on the tab and pre-fills it with the current title.

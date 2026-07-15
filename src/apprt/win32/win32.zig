@@ -91,10 +91,12 @@ pub const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 pub const WS_POPUP: u32 = 0x80000000;
 pub const WS_CAPTION: u32 = 0x00C00000;
 pub const WS_THICKFRAME: u32 = 0x00040000;
+pub const WS_SYSMENU: u32 = 0x00080000;
 
 // Extended window styles
 pub const WS_EX_LAYERED: u32 = 0x00080000;
 pub const WS_EX_TOOLWINDOW: u32 = 0x00000080;
+pub const WS_EX_DLGMODALFRAME: u32 = 0x00000001;
 
 // Layered window flags
 pub const LWA_ALPHA: u32 = 0x00000002;
@@ -809,6 +811,11 @@ pub extern "kernel32" fn GlobalFree(
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
+pub const WM_CTLCOLORBTN: u32 = 0x0135;
+
+// Button control styles / notifications
+pub const BS_DEFPUSHBUTTON: u32 = 0x00000001;
+pub const BN_CLICKED: u16 = 0;
 // STATIC control styles.
 pub const SS_CENTER: u32 = 0x0001;
 pub const SS_RIGHT: u32 = 0x0002;
@@ -829,6 +836,15 @@ pub const WS_BORDER: u32 = 0x00800000;
 pub extern "user32" fn SetFocus(
     hWnd: ?HWND,
 ) callconv(.winapi) ?HWND;
+
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+
+/// Enables or disables mouse and keyboard input to the window. Used for
+/// modal-ish dialogs: disable the owner while the dialog is open.
+pub extern "user32" fn EnableWindow(
+    hWnd: HWND,
+    bEnable: i32,
+) callconv(.winapi) i32;
 
 pub extern "user32" fn GetWindowTextW(
     hWnd: HWND,
