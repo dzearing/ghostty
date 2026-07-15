@@ -56,9 +56,10 @@ Work these first, in order, before falling back to first-todo-in-table:
 1. ~~T50~~ — DONE 2026-07-15 (real "Rename Window" dialog).
 2. ~~T54~~ — DONE 2026-07-15 (this doc restructure; resume read is now
    small).
-3. **T20 → T21 → T22** — remote windows on Windows: user explicitly needs
-   ctrl+shift+n (remote window chooser) and auth/sign-in; none of Phase G
-   exists on Windows yet. This is the largest missing parity surface.
+3. **~~T20~~ → T21 → T22** — remote windows on Windows: T20 (direct TCP)
+   DONE 2026-07-15; next is T21 (relay dial + browser sign-in + DPAPI
+   creds), then T22 (menu item + machine chooser). User explicitly needs
+   ctrl+shift+n and auth/sign-in.
 4. **T48** — deadlock root-cause. The refreshed install has a matching
    pdb, so the next watchdog dump WILL be symbolizable. Adversarial
    investigation applies (three ranked candidates in the details section).
@@ -101,7 +102,7 @@ One line per row. Full spec + validation + evidence per task:
 | T18 | `swap_split` on win32 | F | — | done | see details |
 | T19a | Hero mode design (win32) | F | T18 | done | see details |
 | T19 | Hero mode on win32 (implement) | F | T19a | done | f37bd1e3c |
-| T20 | `+new-remote-window` direct TCP | G | T08 | in-progress | — |
+| T20 | `+new-remote-window` direct TCP | G | T08 | done | 2ed989866 |
 | T21 | Relay dial + browser sign-in + DPAPI creds | G | T20 | todo | — |
 | T22 | Remote GUI: menu item + machine chooser | G | T21 | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |
@@ -136,6 +137,7 @@ One line per row. Full spec + validation + evidence per task:
 | T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
 | T53 | Long-context reliability + perf soak/tuning | I | T40 | todo | — |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
+| T55 | FIX: hero-mode.ps1 fails on HEAD (chords not dispatched) | F | T19 | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.

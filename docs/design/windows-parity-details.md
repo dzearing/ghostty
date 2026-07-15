@@ -393,6 +393,29 @@ Un-guard the CLI; dial with `src/remote` (tcp_dial/connection) + termio
 *Validation:* from the box, connect to a test agent (`--listen`, use
 `GHOSTTY_AGENT_LOCK` override per memory) — type/read works.
 
+*Evidence (done 2026-07-15, 2ed989866 + a27cb90a1):* new
+`test/win32/ipc-remote.ps1` ALL PASS on the box vs a loopback
+`ghoztty-agent --listen` (agent needs `-Dtarget=x86_64-windows-gnu`):
+dial+open, send-keys→read round-trip THROUGH the agent, `--command`
+output visible, dial-failure error byte-matches the Mac
+("failed to reach h:p: the agent is not running or not reachable"),
+relay args refused (T21), `+close` teardown clean. Both test lanes +
+P1–P3 + when-idle stayed ALL PASS. Design: handler dials on the GUI
+thread (Mac parity), `Window.remote_dialed` owns the `tcp_dial.Dialed`
+(torn down after `cleanupAllSurfaces`), `Surface.Overrides.remote`
+carries conn + REMOTE-native cwd/shell/command into `remoteBackend()`.
+Found+fixed two latent bugs: (1) Winsock — `posixRecv/Send` checked
+`posix.errno`, which Winsock never sets → `@intCast(-1)` panic on the
+pump thread at first peer close; now SOCKET_ERROR/WSAGetLastError +
+`closesocket` (a27cb90a1). (2) config wipe — surface-scoped soft
+`reload_config` re-derived EVERY surface from the app config, wiping
+per-surface overrides (`wait-after-command` → remote `--command`
+window closed itself); handler now honors the surface target and App
+seeds `config_conditional_state` from the OS theme at startup so
+surface-birth color reports are no-ops (2ed989866). Splits/tabs in a
+remote window still spawn LOCAL shells (remote split inheritance is
+part of T22-era work). Session restore (ATTACH) not in scope.
+
 ## T21 — Relay dial + browser sign-in + DPAPI creds (Phase G)
 
 `--relay/--device` via relay_dial; browser OAuth (open default browser,
@@ -991,6 +1014,27 @@ rewritten as the slim hot doc (one-line table rows, protocol reads
 goal+priorities+table+one section); go.md updated to name this file among
 the split-out docs. Hot doc shrank from ~65KB (~30k+ tokens) to well under
 the 15k-token resume budget.
+
+## T55 — FIX: hero-mode.ps1 fails on HEAD (chords not dispatched)
+
+Filed 2026-07-15 during T20 validation. `test/win32/hero-mode.ps1` fails
+5/17 (4/17 with `-ExePath`, which skips the log assertion) — and it fails
+IDENTICALLY on a clean HEAD build (94dea4642, verified in a throwaway
+worktree), so it is NOT a T20 regression; it predates this session.
+
+Symptom: the positive control dispatches (ctrl+shift+r →
+`prompt_surface_title` appears in the debug log), but ctrl+shift+space
+never dispatches `toggle_hero_mode` and ctrl+alt+down never moves the
+hero — geometry stays the plain tree (carousel assertion reports 100%
+width). So key INJECTION works; the hero bindings specifically don't
+fire. The default binding is `physical:space` + ctrl+shift
+(`src/config/Config.zig` ~7139). Leads: physical-key (VK_SPACE) matching
+in `handleKeyEvent` vs the unicode-key rename binding that DOES match;
+or space's WM_CHAR suppression path eating the keydown. T54's session
+landed the pixel layer in 911cae47e — first establish (git log / T54
+log entry) whether the script was ever green on-box after that commit.
+
+*Validation:* `test/win32/hero-mode.ps1` ALL PASS on the box.
 
 ## Backlog (tracked, deliberately not in the parity pass)
 

@@ -9,6 +9,19 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box, night) — T20 DONE: `+new-remote-window` direct TCP
+  (2ed989866); new `test/win32/ipc-remote.ps1` ALL PASS vs a loopback
+  agent. Surprises, both fixed in-flight: (1) Winsock — src/remote's
+  SocketStream error-checked recv/send via posix.errno (never set on
+  Windows) → intCast panic at first peer close (a27cb90a1); (2) a
+  surface-scoped soft reload_config re-derived ALL surfaces from the app
+  config, wiping per-surface overrides — remote `--command` windows
+  closed on command exit; fixed by honoring the surface target + seeding
+  app conditional state from the OS theme at startup. Filed T55:
+  hero-mode.ps1 fails on a CLEAN HEAD too (hero chords don't dispatch;
+  injection control passes) — predates T20, evidence in its section.
+  Next: T21 (relay dial + sign-in + DPAPI creds).
+
 - 2026-07-15 (on-box, evening) — T54 DONE: resume-doc diet. The tracker's
   state table shrank to one-line rows (status + commit); all per-task
   spec/validation/evidence narrative moved to new
