@@ -856,6 +856,14 @@ class AppDelegate: NSObject,
         // Update the config we need to store
         self.derivedConfig = DerivedConfig(config)
 
+        // Session persistence: warm the local-agent connection in the
+        // background so the first persistent window doesn't block the main
+        // thread on the agent spawn/dial. Never from a test host — spawning
+        // agents is real shared machine state.
+        if config.sessionPersistence && !Self.isTestHost {
+            LocalAgentManager.shared.warmUp()
+        }
+
         // Depending on the "window-save-state" setting we have to set the NSQuitAlwaysKeepsWindows
         // configuration. This is the only way to carefully control whether macOS invokes the
         // state restoration system.

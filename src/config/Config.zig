@@ -1206,6 +1206,15 @@ command: ?Command = null,
 /// `/bin/sh` on other platforms.
 @"command-shell": ?[:0]const u8 = null,
 
+/// Session persistence (macOS): when `true`, new local windows, tabs, and
+/// splits run their shells under the local `ghoztty-agent` (found or spawned
+/// on demand) instead of directly under the app process. The processes then
+/// survive the app exiting — including crashes and binary upgrades — and can
+/// be re-attached.
+///
+/// Defaults to `false`.
+@"session-persistence": bool = false,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///

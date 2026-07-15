@@ -76,7 +76,45 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Setup our initial derived config based on the current app config
         self.derivedConfig = DerivedConfig(ghostty.config)
 
+        // Session persistence: route the initial surface of a fresh, non-remote
+        // window through the LOCAL agent so its process survives this app
+        // process (quit, crash, upgrade) and can be re-attached. Tabs and
+        // splits then inherit the shared connection through `remoteConnection`
+        // exactly like a remote window's. An existing tree carries
+        // already-built surfaces, so there is nothing to route.
+        var base = base
+        var localAgent: RemoteConnection?
+        if tree == nil,
+           base?.remoteConnection == nil,
+           ghostty.config.sessionPersistence,
+           let agent = LocalAgentManager.shared.sharedRemoteConnection() {
+            var cfg = base ?? Ghostty.SurfaceConfiguration()
+            cfg.remoteMachine = agent.machine
+            cfg.remoteConnection = agent.handle
+            cfg.connectionKeepAlive = agent
+            // An explicit command is only forwarded to the agent's OPEN when
+            // marked explicit via wait-after-command (Surface.zig's remote
+            // backend drops an unmarked command as a local default shell).
+            if cfg.command != nil { cfg.waitAfterCommand = true }
+            // The agent runs on THIS machine, so a local working directory is
+            // valid there — forward it (the remote backend ignores the local
+            // `workingDirectory` field).
+            if cfg.remoteWorkingDirectory == nil {
+                cfg.remoteWorkingDirectory = cfg.workingDirectory
+            }
+            base = cfg
+            localAgent = agent
+        }
+
         super.init(ghostty, baseConfig: base, surfaceTree: tree)
+
+        // Carry the strong connection owner + machine so tabs/splits inherit
+        // the agent connection and the reconnect ladder watches it. The
+        // loopback machine is "local", so no remote pill shows.
+        if let localAgent {
+            self.remoteConnection = localAgent
+            self.remoteMachine = localAgent.machine
+        }
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default

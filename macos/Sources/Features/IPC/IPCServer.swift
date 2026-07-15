@@ -627,23 +627,23 @@ class IPCServer {
                     splitConfig.environmentVariables["GHOZTTY_PANE_NAME"] = name
                 }
 
-                let newView = controller.newSplit(
+                // Registration happens in `onCreate` (not on the return value)
+                // because a remote/agent-backed split is created ASYNCHRONOUSLY
+                // (off-main cwd inheritance) and returns nil here.
+                _ = controller.newSplit(
                     at: surface,
                     direction: direction,
                     baseConfig: splitConfig,
                     ratio: ratio
-                )
-
-                if let newView {
+                ) { newView in
                     Self.applyColorScheme(for: tintColor, to: newView)
-                }
-
-                if let name = parsed.name, let newView {
-                    self?.targetRegistry[name] = .pane(
-                        controller: WeakRef(controller),
-                        surface: WeakRef(newView)
-                    )
-                    Self.logger.info("IPC: registered pane target '\(name)'")
+                    if let name = parsed.name {
+                        self?.targetRegistry[name] = .pane(
+                            controller: WeakRef(controller),
+                            surface: WeakRef(newView)
+                        )
+                        Self.logger.info("IPC: registered pane target '\(name)'")
+                    }
                 }
             }
 
@@ -701,23 +701,23 @@ class IPCServer {
                 splitConfig.environmentVariables["GHOZTTY_PANE_NAME"] = name
             }
 
-            let newView = controller.newSplit(
+            // Registration happens in `onCreate` (not on the return value)
+            // because a remote/agent-backed split is created ASYNCHRONOUSLY
+            // (off-main cwd inheritance) and returns nil here.
+            _ = controller.newSplit(
                 at: surfaceView,
                 direction: direction,
                 baseConfig: splitConfig,
                 ratio: ratio
-            )
-
-            if let newView {
+            ) { newView in
                 Self.applyColorScheme(for: tintColor, to: newView)
-            }
-
-            if let name = parsed.name, let newView {
-                self?.targetRegistry[name] = .pane(
-                    controller: WeakRef(controller),
-                    surface: WeakRef(newView)
-                )
-                Self.logger.info("IPC: registered pane target '\(name)'")
+                if let name = parsed.name {
+                    self?.targetRegistry[name] = .pane(
+                        controller: WeakRef(controller),
+                        surface: WeakRef(newView)
+                    )
+                    Self.logger.info("IPC: registered pane target '\(name)'")
+                }
             }
         }
 

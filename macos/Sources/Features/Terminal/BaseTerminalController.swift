@@ -402,7 +402,8 @@ class BaseTerminalController: NSWindowController,
         at oldView: Ghostty.SurfaceView,
         direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
         baseConfig config: Ghostty.SurfaceConfiguration? = nil,
-        ratio: Double = 0.5
+        ratio: Double = 0.5,
+        onCreate: ((Ghostty.SurfaceView) -> Void)? = nil
     ) -> Ghostty.SurfaceView? {
         // We can only create new splits for surfaces in our tree.
         guard surfaceTree.root?.node(view: oldView) != nil else { return nil }
@@ -472,22 +473,26 @@ class BaseTerminalController: NSWindowController,
                 guard let self else { return }
                 var cfg = effectiveConfig
                 if !alreadyHasCwd, let cwd { cfg.remoteWorkingDirectory = cwd }
-                _ = self.finishSplit(
+                if let newView = self.finishSplit(
                     config: cfg,
                     at: oldView,
                     direction: direction,
                     ratio: ratio,
-                    hasExplicitTint: hasExplicitTint)
+                    hasExplicitTint: hasExplicitTint) {
+                    onCreate?(newView)
+                }
             }
             return nil
         }
 
-        return finishSplit(
+        let newView = finishSplit(
             config: effectiveConfig,
             at: oldView,
             direction: direction,
             ratio: ratio,
             hasExplicitTint: hasExplicitTint)
+        if let newView { onCreate?(newView) }
+        return newView
     }
 
     /// Build the new surface, insert it into the tree, and finalize focus/undo.

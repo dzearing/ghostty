@@ -88,6 +88,79 @@ final class LocalAgentManager {
         return Self.spawnAndDial(paths: paths)
     }
 
+    // MARK: - Shared connection (session persistence)
+
+    /// Cached shared connection for session-persistent surfaces. Every
+    /// persistent window/tab/split rides this ONE connection, exactly like the
+    /// tabs/splits of a remote window share theirs. This manager's reference
+    /// keeps it alive for the app's lifetime; windows retain it additionally
+    /// via `connectionKeepAlive`. Main-thread only.
+    private var sharedOwner: RemoteConnection?
+
+    /// The pid of the agent behind `sharedOwner`, for cheap liveness checks.
+    private var sharedAgentPid: pid_t = 0
+
+    /// The Machine value describing the local agent endpoint. A loopback
+    /// host/name makes `Machine.isLocalMachine` true, so remote-only UI (the
+    /// titlebar machine pill) stays hidden for persistent local windows.
+    static func localMachine(port: UInt16) -> Machine {
+        Machine(name: "127.0.0.1", host: "127.0.0.1", port: port)
+    }
+
+    /// The shared local-agent connection, creating it (find-or-spawn + dial)
+    /// if there is no healthy cached one. Blocking on a cache miss:
+    /// milliseconds against a live agent, ~300ms when the agent must be
+    /// spawned (call `warmUp()` at launch to hide this), ~5s worst case
+    /// against a wedged agent. Main-thread only.
+    func sharedRemoteConnection() -> RemoteConnection? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let existing = sharedOwner,
+           existing.linkState != .dead,
+           sharedAgentPid > 0,
+           kill(sharedAgentPid, 0) == 0 || errno == EPERM {
+            return existing
+        }
+        // Dead link or dead agent: drop our reference (windows still using the
+        // old connection keep it alive; their reconnect ladder handles it) and
+        // dial fresh.
+        sharedOwner = nil
+        sharedAgentPid = 0
+        guard let conn = connect() else { return nil }
+        return cacheShared(conn)
+    }
+
+    /// Find-or-spawn + dial in the background so the first persistent window
+    /// finds a warm cached connection instead of blocking the main thread on
+    /// the agent spawn. Safe to call repeatedly (e.g. on config reload).
+    func warmUp() {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            guard let conn = connect() else { return }
+            DispatchQueue.main.async {
+                // A racing main-thread caller may have cached one already:
+                // keep the established one, discard ours.
+                if let existing = self.sharedOwner, existing.linkState != .dead,
+                   self.sharedAgentPid > 0,
+                   kill(self.sharedAgentPid, 0) == 0 || errno == EPERM {
+                    ghostty_remote_connection_free(conn.handle)
+                    return
+                }
+                _ = self.cacheShared(conn)
+            }
+        }
+    }
+
+    /// Wrap a dialed connection in a strong `RemoteConnection` owner and cache
+    /// it as the shared one. Main-thread only.
+    private func cacheShared(_ conn: Connection) -> RemoteConnection {
+        let owner = RemoteConnection(
+            handle: conn.handle,
+            machine: Self.localMachine(port: conn.port))
+        sharedOwner = owner
+        sharedAgentPid = conn.pid
+        Self.logger.info("shared local-agent connection ready (agent pid \(conn.pid), port \(conn.port))")
+        return owner
+    }
+
     /// Strict parse of the port file body. Static + pure for tests.
     static func parsePortFile(_ data: Data) -> PortFile? {
         guard let parsed = try? JSONDecoder().decode(PortFile.self, from: data),
@@ -190,6 +263,11 @@ final class LocalAgentManager {
         posix_spawn_file_actions_addopen(
             &actions, 1, paths.logFile.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
         posix_spawn_file_actions_adddup2(&actions, 1, 2)
+        // The agent's cwd is the default cwd of every session it OPENs without
+        // an explicit one. The app's own cwd is "/" when launched from Finder —
+        // start the agent in the user's home instead.
+        posix_spawn_file_actions_addchdir_np(
+            &actions, FileManager.default.homeDirectoryForCurrentUser.path)
 
         let argv: [String] = [
             binary.path,
