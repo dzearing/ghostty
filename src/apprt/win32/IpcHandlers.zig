@@ -10,6 +10,7 @@ const windows = std.os.windows;
 const App = @import("App.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
+const relay_dial = @import("../../remote/relay_dial.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
@@ -220,11 +221,18 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 }
 
 /// Open a remote-machine window, dialing the agent at `--host=<h> --port=<p>`
-/// over TCP (T20 / Phase G). Semantics mirror the Mac server's
-/// handleNewRemoteWindow: validation error strings byte-match; the dial is
-/// synchronous ON THE GUI THREAD (bounded by the 10s HELLO handshake
+/// over TCP (T20 / Phase G) or through a rendezvous relay at
+/// `--relay=<base> --device=<id> [--token=<tok>]` (T21b). Semantics mirror
+/// the Mac server's handleNewRemoteWindow: validation error strings
+/// byte-match; the relay path takes precedence when both are present; the
+/// dial is synchronous ON THE GUI THREAD (bounded by the 10s HELLO handshake
 /// deadline), exactly like the Mac menu/IPC path; `--name` registers the
-/// window for later targeting. The relay path (`--relay`/`--device`) is T21.
+/// window for later targeting.
+///
+/// Relay token tiers (T21b): explicit `--token` wins (the CLI already
+/// forwards its own GHOSTTY_RELAY_TOKEN env as `--token`), then this GUI
+/// process's GHOSTTY_RELAY_TOKEN. The signed-in-account tier (Mac
+/// `RelayAccount.resolveToken()` parity) lands with T21a.
 ///
 /// `--working-directory`/`--shell`/`--command` are REMOTE-native values
 /// forwarded verbatim in the agent OPEN (empty ⇒ absent, like the Mac);
@@ -239,54 +247,89 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 
     const args = try parseVerbArgs(arena, request.arguments);
 
-    // Relay dial lands with T21 (browser sign-in + DPAPI creds). Refuse it
-    // explicitly so the CLI reports something actionable, not a hang.
-    if (args.relay != null or args.device != null) {
-        return try errorResponse(
-            ctx.alloc,
-            "relay dial is not yet supported on Windows; use --host/--port",
-            .{},
-        );
-    }
-    const host = args.host orelse "";
-    if (host.len == 0) {
-        return try errorResponse(
-            ctx.alloc,
-            "--host is required (or use --relay + --device) for +new-remote-window",
-            .{},
-        );
-    }
-    if (args.port == 0) {
-        return try errorResponse(
-            ctx.alloc,
-            "--port is required (or use --relay + --device) for +new-remote-window",
-            .{},
-        );
+    // Relay path: --relay + --device dial through a rendezvous relay. Takes
+    // precedence over the direct host:port path when both are present (Mac
+    // rule; empty values are absent).
+    const relay = nonEmpty(args.relay);
+    const device = nonEmpty(args.device);
+    const use_relay = relay != null and device != null;
+    if (!use_relay) {
+        const host = args.host orelse "";
+        if (host.len == 0) {
+            return try errorResponse(
+                ctx.alloc,
+                "--host is required (or use --relay + --device) for +new-remote-window",
+                .{},
+            );
+        }
+        if (args.port == 0) {
+            return try errorResponse(
+                ctx.alloc,
+                "--port is required (or use --relay + --device) for +new-remote-window",
+                .{},
+            );
+        }
     }
 
-    // Dial the agent: TCP connect + mux + Connection + HELLO handshake,
-    // blocking until connected (≤10s). The Dialed is heap-owned so the
-    // window can take ownership for its lifetime.
+    // Dial the agent (TCP or relay): connect + mux + Connection + HELLO
+    // handshake, blocking until connected (≤10s). The Dialed is heap-owned
+    // so the window can take ownership for its lifetime.
     const alloc = app.core_app.alloc;
-    const dialed = try alloc.create(tcp_dial.Dialed);
-    dialed.* = tcp_dial.dial(alloc, host, args.port, .raw) catch |err| {
-        log.warn(
-            "IPC new-remote-window: dial failed host={s} port={d} err={}",
-            .{ host, args.port, err },
-        );
-        alloc.destroy(dialed);
-        return try errorResponse(
-            ctx.alloc,
-            "failed to reach {s}:{d}: the agent is not running or not reachable",
-            .{ host, args.port },
-        );
+    const dialed: Window.RemoteDialed = if (use_relay) relay_blk: {
+        // Token tiers: explicit --token, then the GUI's env. A tokenless
+        // relay dial is a guaranteed 401 — refuse BEFORE dialing (Mac rule).
+        const env_token: ?[]const u8 = std.process.getEnvVarOwned(
+            arena,
+            "GHOSTTY_RELAY_TOKEN",
+        ) catch null;
+        const token = nonEmpty(args.token) orelse nonEmpty(env_token) orelse {
+            return try errorResponse(
+                ctx.alloc,
+                "not signed in: pass --token= (or set GHOSTTY_RELAY_TOKEN) to open relay windows",
+                .{},
+            );
+        };
+
+        const dialed = try alloc.create(relay_dial.Dialed);
+        dialed.* = relay_dial.dial(alloc, relay.?, device.?, token, .raw) catch |err| {
+            log.warn(
+                "IPC new-remote-window: relay dial failed relay={s} device={s} err={}",
+                .{ relay.?, device.?, err },
+            );
+            alloc.destroy(dialed);
+            return try errorResponse(
+                ctx.alloc,
+                "failed to reach {s} via relay {s}: the agent is not running or not reachable",
+                .{ device.?, relay.? },
+            );
+        };
+        break :relay_blk .{ .relay = dialed };
+    } else tcp_blk: {
+        const host = args.host.?;
+        const dialed = try alloc.create(tcp_dial.Dialed);
+        dialed.* = tcp_dial.dial(alloc, host, args.port, .raw) catch |err| {
+            log.warn(
+                "IPC new-remote-window: dial failed host={s} port={d} err={}",
+                .{ host, args.port, err },
+            );
+            alloc.destroy(dialed);
+            return try errorResponse(
+                ctx.alloc,
+                "failed to reach {s}:{d}: the agent is not running or not reachable",
+                .{ host, args.port },
+            );
+        };
+        break :tcp_blk .{ .tcp = dialed };
+    };
+    const conn = switch (dialed) {
+        inline else => |d| d.conn,
     };
 
     // Empty string ⇒ absent (the Mac treats `--shell=` as nil so an empty
     // value can never forward "").
     const overrides: Surface.Overrides = .{
         .remote = .{
-            .connection = dialed.conn,
+            .connection = conn,
             .working_directory = nonEmpty(args.working_directory),
             .shell = nonEmpty(args.shell),
             .command = nonEmpty(args.command),
@@ -298,8 +341,7 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         .ipc_name = args.name,
     }) catch |err| {
         log.warn("IPC new-remote-window: create window failed err={}", .{err});
-        dialed.deinit();
-        alloc.destroy(dialed);
+        dialed.deinitDestroy(alloc);
         return try errorResponse(ctx.alloc, "failed to create window", .{});
     };
     window.remote_dialed = dialed;

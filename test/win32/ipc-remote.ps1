@@ -7,8 +7,9 @@
 #
 # Covers: dial + open window (happy path), terminal round-trip through the
 # agent (send-keys -> read), --command forwarded into the agent OPEN,
-# dial-failure error (no listener), relay-args refusal (T21 pending),
-# +close teardown without wedging the app.
+# dial-failure error (no listener), tokenless relay-args refusal (T21b;
+# the full relay path is covered by ipc-relay.ps1), +close teardown
+# without wedging the app.
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
@@ -86,11 +87,14 @@ Assert "exit nonzero" ($LASTEXITCODE -ne 0)
 $err = Get-Content "$tmp\dead.txt" -Raw
 Assert "error names the endpoint" ($err -match "failed to reach 127.0.0.1:$deadPort")
 
-"== 5: relay args are refused explicitly (T21 pending)"
+"== 5: tokenless relay args are refused with sign-in guidance (T21b)"
+$savedTok = $env:GHOSTTY_RELAY_TOKEN
+$env:GHOSTTY_RELAY_TOKEN = $null
 cmd /c "`"$Exe`" +new-remote-window --relay=https://relay.example --device=dev1 > `"$tmp\relay.txt`" 2>&1"
+$env:GHOSTTY_RELAY_TOKEN = $savedTok
 Assert "exit nonzero" ($LASTEXITCODE -ne 0)
 $err = Get-Content "$tmp\relay.txt" -Raw
-Assert "refusal mentions relay" ($err -match 'relay dial is not yet supported on Windows')
+Assert "refusal says not signed in" ($err -match 'not signed in')
 
 "== 6: +close tears the remote window down cleanly"
 & $Exe +close --target=remcmd 2>&1 | Out-Null

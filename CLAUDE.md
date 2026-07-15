@@ -134,11 +134,17 @@ action (dial the agent, build a remote surface, open the window), so the remote
 path is scriptable/testable from the shell.
 
 ```
-ghoztty +new-remote-window --host=<host> --port=<port> --working-directory=<path> --shell=<path> --command=<cmd>
+ghoztty +new-remote-window --host=<host> --port=<port> --relay=<base> --device=<id> --token=<tok> --working-directory=<path> --shell=<path> --command=<cmd>
 ```
 
-- `--host`: Agent host (DNS name or literal IP). Required.
-- `--port`: Agent TCP port. Required.
+- `--host`: Agent host (DNS name or literal IP). Required unless dialing via `--relay` + `--device`.
+- `--port`: Agent TCP port. Required unless dialing via `--relay` + `--device`.
+- `--relay` + `--device`: Dial the enrolled agent `--device=<id>` through the
+  rendezvous relay at `--relay=<https-base>` instead of direct TCP (takes
+  precedence over `--host`/`--port` when both are given). Auth bearer:
+  explicit `--token=`, else the signed-in account (macOS), else the
+  `GHOSTTY_RELAY_TOKEN` env var — with no source the command fails with
+  "not signed in".
 - `--working-directory`: Working directory ON THE REMOTE MACHINE for the new
   session. Overrides the machine's per-host default.
 - `--shell`: Shell ON THE REMOTE MACHINE to run (e.g. `wsl.exe`,

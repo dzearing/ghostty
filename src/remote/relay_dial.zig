@@ -71,8 +71,11 @@ pub const HandshakeFailed = error{HandshakeFailed};
 /// cleaned up (including the WebSocket) and the error is returned.
 ///
 /// `relay_base` is the relay HTTPS base (e.g. `https://relay.example.com`); it is
-/// converted to `wss://` and the client-connect path is appended. `token` is the
-/// device bearer token sent as `Authorization: Bearer <token>`.
+/// converted to `wss://` and the client-connect path is appended. An `http://` or
+/// `ws://` base maps to a PLAINTEXT `ws://` connection — loopback test relays
+/// only, the same rule as `ws_client.connectUrl` and the agent's `--relay`
+/// normalization. `token` is the device bearer token sent as
+/// `Authorization: Bearer <token>`.
 ///
 /// The error set is inferred (it spans the WebSocket dial/upgrade, allocation,
 /// thread spawn, and `error.HandshakeFailed`).
@@ -86,21 +89,28 @@ pub fn dial(
     token: []const u8,
     encoding: protocol.TransferEncoding,
 ) !Dialed {
-    // 1. Build the wss URL: convert the https base to wss and append the
+    // 1. Build the ws(s) URL: convert the base scheme and append the
     //    client-connect path with the device query. Both strings are scratch and
-    //    freed before we return.
-    const host_part = if (std.mem.startsWith(u8, relay_base, "https://"))
-        relay_base["https://".len..]
-    else if (std.mem.startsWith(u8, relay_base, "wss://"))
-        relay_base["wss://".len..]
-    else
+    //    freed before we return. `http`/`ws` bases stay PLAINTEXT (loopback test
+    //    relays only — see the fn doc).
+    const scheme: []const u8, const host_part: []const u8 = blk: {
+        inline for (.{
+            .{ "https://", "wss" },
+            .{ "wss://", "wss" },
+            .{ "http://", "ws" },
+            .{ "ws://", "ws" },
+        }) |m| {
+            if (std.mem.startsWith(u8, relay_base, m[0]))
+                break :blk .{ m[1], relay_base[m[0].len..] };
+        }
         return error.InvalidRelayBase;
+    };
     const host_trimmed = std.mem.trimRight(u8, host_part, "/");
 
     const url = try std.fmt.allocPrint(
         alloc,
-        "wss://{s}/v1/client/connect?device={s}",
-        .{ host_trimmed, device_id },
+        "{s}://{s}/v1/client/connect?device={s}",
+        .{ scheme, host_trimmed, device_id },
     );
     defer alloc.free(url);
 
@@ -190,15 +200,35 @@ test "dial: unreachable relay cleanly returns an error (no leak)" {
     }
 }
 
-test "dial: non-TLS relay base is rejected" {
+test "dial: unknown-scheme relay base is rejected" {
     const alloc = testing.allocator;
     try testing.expectError(error.InvalidRelayBase, dial(
         alloc,
-        "http://relay.example",
+        "ftp://relay.example",
         "device-1",
         "tok",
         .raw,
     ));
+}
+
+test "dial: plaintext loopback base is accepted (fails at connect, no leak)" {
+    const alloc = testing.allocator;
+    // `http://` maps to plaintext `ws://` (loopback test relays). Nothing
+    // listens on port 1, so the dial must fail at the TCP connect — NOT with
+    // `error.InvalidRelayBase` — and free every partial resource.
+    if (dial(
+        alloc,
+        "http://127.0.0.1:1",
+        "device-1",
+        "tok",
+        .raw,
+    )) |d| {
+        var dialed = d;
+        dialed.deinit();
+        return error.UnexpectedSuccess;
+    } else |err| {
+        try testing.expect(err != error.InvalidRelayBase);
+    }
 }
 
 test {

@@ -416,16 +416,56 @@ surface-birth color reports are no-ops (2ed989866). Splits/tabs in a
 remote window still spawn LOCAL shells (remote split inheritance is
 part of T22-era work). Session restore (ATTACH) not in scope.
 
-## T21 — Relay dial + browser sign-in + DPAPI creds (Phase G)
+## T21a — Browser sign-in + DPAPI creds + `+relay-login` CLI (Phase G)
 
-`--relay/--device` via relay_dial; browser OAuth (open default browser,
-loopback redirect listener — `src/remote/agent/enroll.zig` web-enroll is
-the reference); creds under `%LOCALAPPDATA%\ghoztty\` with DPAPI or
-owner-DACL file.
+Split from T21 2026-07-15 (sizing rule; T21b is the other half). The
+sign-in machinery, Mac `RelayAccount`/`GoogleOAuth` parity in Zig:
 
-*Validation:* from the box, open a remote window to the Mac (or second
-agent) via the production relay with Google sign-in; survive an agent
-restart with reconnect or clean error (no hang/crash).
+- `src/remote/google_oauth.zig`: PKCE (S256), authorization URL, loopback
+  code receiver, token exchange/refresh (needs a form-POST helper in
+  `http_client.zig`), ID-token claims parse (email/exp/picture). The Mac
+  reference is `macos/Sources/Features/Remote/GoogleOAuth.swift`; the
+  agent's `enroll.zig` browser-open helper is reusable.
+- Client account store: `{client_id, client_secret?, refresh_token,
+  email}` DPAPI-encrypted (CryptProtectData, per-user) at
+  `%LOCALAPPDATA%\ghoztty\account.dat`, atomic write (tmp+rename, like
+  `saveRelayEnv`). Client id/secret come from
+  `GHOSTTY_GOOGLE_CLIENT_ID`/`GHOSTTY_GOOGLE_CLIENT_SECRET` env or
+  `--client-id=`/`--client-secret=` flags at login and are PERSISTED with
+  the creds so GUI-side refreshes need no env.
+- CLI verbs `+relay-login` / `+relay-logout` (run fully in the CLI
+  process — no IPC; the GUI only READS the store). Login: PKCE + open
+  default browser + loopback redirect + code exchange → save.
+- Token-resolution seam in the win32 GUI grows the account tier:
+  explicit `--token` → account ID token (refresh grant) →
+  `GHOSTTY_RELAY_TOKEN` env (T21b shipped the two outer tiers).
+
+*Validation:* unit tests (PKCE/URL/claims/store round-trip) in both
+lanes; on-box fake-issuer E2E driving `+relay-login --no-browser` end to
+end (PowerShell HttpListener as Google); then a relay window opened with
+NO --token (account tier). Production Google sign-in needs the user's
+Desktop OAuth client id (password manager) — leave the exact command in
+the log for the user if not available on the box.
+
+## T21b — Relay dial path in win32 GUI (Phase G)
+
+Split from T21 2026-07-15. `+new-remote-window --relay=<base>
+--device=<id> [--token=<tok>]` dials through the rendezvous relay via the
+shared `src/remote/relay_dial.zig` (same call shape as the Mac
+`ghostty_remote_connection_new_relay`), synchronous on the GUI thread like
+T20. Token tiers for now: explicit `--token` → `GHOSTTY_RELAY_TOKEN` (the
+CLI already forwards its env as `--token`); account tier lands with T21a.
+`relay_dial` gains the `http://`/`ws://` → plaintext-`ws://`
+loopback-test-only mapping (same rule as agent `--relay` + `ws_client`).
+Window owns the dialed transport as a union (tcp | relay).
+
+*Validation:* `test/win32/ipc-relay.ps1` — build+run a LOCAL relay
+(`go build ./relay`, DEV_AUTH=true), enroll a device via
+`POST /v1/client/devices`, run a loopback agent `--relay=http://…`, then:
+open (happy path), round-trip (send-keys→read), --command, bad token ⇒
+clean error, tokenless ⇒ "not signed in", agent killed under a live
+window ⇒ no GUI hang (`+list` still answers). Update `ipc-remote.ps1` §5
+(relay-refusal is gone). Both unit lanes green.
 
 ## T22 — Remote GUI: menu item + machine chooser (Phase G)
 
