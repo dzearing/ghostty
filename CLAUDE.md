@@ -189,6 +189,37 @@ ghoztty +close --target=term
 ghoztty +close --target=ide
 ```
 
+## Session Persistence
+
+Terminal processes can be made independent of the GUI app so they survive app
+crashes, quits, and binary upgrades (and relaunch across reboots / agent
+crashes). It is **opt-in** via config and **off by default**.
+
+- `session-persistence = off|on` (macOS, default `off`). When `on`, new local
+  windows/tabs/splits run their shell under the local `ghoztty-agent` (found or
+  spawned on demand) instead of directly under the app process, so the child
+  processes outlive the app. On next launch the app re-attaches: layout, split
+  ratios, titles, working dirs, and gap-filled scrollback come back with the
+  **same PIDs** (no restart) as long as the agent stayed alive.
+- `session-relaunch = auto|prompt` (default `auto`). Only matters across an
+  **agent** restart (reboot / agent upgrade), where the child is gone but its
+  metadata was materialized from disk as a relaunchable tombstone. `auto`
+  respawns the recorded command in-place with a `--- session restarted ---`
+  divider; `prompt` leaves the pane in its exited state for the user to decide.
+
+The agent owns the PTYs, keeps a per-session output ring (2 MB default;
+snapshotted to disk for reboot scrollback), persists session metadata to
+`sessions.json`, and is packaged as a per-user LaunchAgent so it comes back
+after a crash/reboot. The app dials it over a 0600 AF_UNIX socket
+(`~/.config/ghoztty/local-agent[-debug]/agent.sock`) with a same-uid peercred
+check. Use `+sessions` (above) to enumerate live sessions directly from the
+agent, even when the app is not running. Design + measured E2E results:
+`docs/design/session-persistence.md`; E2E harness: `scripts/e2e/session-persistence.py`.
+
+Cross-machine session *move* (browse another machine's live sessions from the
+Cmd-Shift-N chooser and resume them locally over the relay) is **scoped but not
+yet built** — see tasks T16–T18 in `docs/design/session-persistence-tasks.json`.
+
 ## Build & Test
 
 ```bash

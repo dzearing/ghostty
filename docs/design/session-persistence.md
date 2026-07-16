@@ -1,6 +1,13 @@
 # Session Persistence
 
-> Status: design draft v1 (research-complete; not yet implemented).
+> Status: **implemented** (local single-machine persistence shipped on
+> `users/dzearing/session-persistence`, 2026-07-16). AC1/AC2 (upgrade + crash
+> survival), AC3/AC4 (reboot & agent-crash relaunch floor, both app-relaunch
+> and in-place), and AC7 (CLI parity) are built and E2E-verified — see §2
+> *Measured results*. AC5 (latency micro-benchmark) is not yet measured; AC6
+> (cross-machine session move) is scoped but not built (tasks T16–T18). The
+> opt-in `session-persistence` config flag defaults `off`.
+>
 > Deliverable of the 2026-07-13 design task: terminal processes must survive
 > Ghoztty app updates and crashes, recover as much as possible across reboots,
 > and any machine's Ghoztty UX must be able to attach to, detach from, and
@@ -57,7 +64,7 @@ per mode, 0 s relaunch gap. Debug build on macOS 26.4.
 |----|------|--------|-------------|-------|
 | AC2 | `kill -9`, relaunch same binary (T07) | ✅ 3/3 | ~6–8 s | all 5 PIDs unchanged & alive; ticks monotonic across gap; topology exact (±0.01); pre-gap scrollback replayed; agent PID unchanged |
 | AC1 | `kill -9` + **bundle swapped on disk**, relaunch (T08) | ✅ 3/3 | ~8 s | as above; main-exec inode replaced each cycle (proof of on-disk swap); agent PID unchanged across the swap |
-| AC1 | **graceful quit** + bundle swap, relaunch (T08) | ✅ 3/3 | ~3 s | as above; `isQuitting` manifest path exercised; ⚠️ graceful *quit* itself wedges ~45 s in AppKit window teardown with many agent-backed panes (task T08a) — persistence + recovery unaffected |
+| AC1 | **graceful quit** + bundle swap, relaunch (T08) | ✅ 3/3 | ~3 s | as above; `isQuitting` manifest path exercised. (An earlier ~45 s "graceful-quit hang" reported against T08 was a **misdiagnosis** — a test-harness zombie-reaping artifact, not an app hang; there is no graceful-quit regression. Fixed harness-side in T08a.) |
 | AC3 / AC4 | **reboot-equivalent**: `kill -9` app **and** agent; launchd restarts the agent; relaunch app (T12d, `--agent-restart`) | ✅ 3/3 | ~1.9–3.9 s | launchd (`RunAtLoad`+`KeepAlive`) restarts the agent in **≤ 2 s** (0.0–2.0 s measured); the new agent materializes sessions from `sessions.json` as relaunchable tombstones; app relaunch re-attaches → auto-RELAUNCH spawns each pane fresh (**new child PID, marker re-ran, `--- session restarted ---` banner**); topology rebuilt from the manifest. Honest contract: children die + ring RAM is lost (POSIX), so scrollback restarts — no pre-kill replay until the ring disk snapshot (T13). |
 | AC4 (in-place) | **agent crash, app stays up**: `kill -9` agent ONLY (T12e, `--agent-only`) | ✅ 2/2 | ~2.5–3.7 s | the **app process is never relaunched** (asserted); launchd restarts the agent (≤ 2 s), the live app detects the dropped shared connection, re-dials, and rebuilds each open window in place → auto-RELAUNCH (**new child PID, marker re-ran, restart banner**); topology rebuilt from the manifest; local machine pill never shown. Same honest contract as AC3/AC4 (children + ring RAM lost). |
 
@@ -495,6 +502,15 @@ in device list.
 ## 8. Phased plan
 
 Each phase is independently shippable and useful.
+
+> **Status (2026-07-16):** Phases 1–3 are **complete and E2E-verified**
+> (Phase 1 groundwork: T09/T09b/T09c UDS + peercred, T10 `+sessions`, T11
+> pinning/caps, T12d launchd; Phase 2 headline: T04/T05/T06/T07/T08; Phase 3
+> reboot floor: T12/T12b/T12c/T12e relaunch + T13/T13b ring snapshots). Phase 0
+> was folded into the T04–T08 build (AC5's latency micro-benchmark was **not**
+> separately measured — the loopback path proved fast enough in practice but
+> has no recorded p50). **Phase 4 (cross-machine move, AC6) is not built** —
+> tracked as T16–T18. Phase 5 is future work.
 
 - **Phase 0 — Spike & gate (≈1 day).** Wire a debug-app local window through
   a loopback `--listen` agent by hand (no new code beyond a config hack).
