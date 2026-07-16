@@ -11,6 +11,12 @@ enum WindowTarget: Hashable {
     /// of opening a new one. Produced by the chooser's contextual "Restore"
     /// primary action; never shown as a list row.
     case restoreRemote(Machine)
+    /// Resume ONE browsed session (cross-machine resume, T17): open a local
+    /// viewer window that re-`ATTACH`es to `session` over its host machine's
+    /// transport. `machine == nil` means the local agent ("this Mac"). Produced
+    /// by clicking / keyboard-selecting a row in a machine's expanded session
+    /// list; never a top-level `targets` row.
+    case resumeSession(machine: Machine?, session: BrowsedSession)
 }
 
 /// A native, filterable chooser for picking where to open a new window: the
@@ -57,6 +63,12 @@ struct MachineChooserView: View {
     @State private var selectedMachineID: UUID?
     /// Index of the row currently under the pointer (for hover feedback).
     @State private var hoveredIndex: Int?
+    /// Keyboard sub-cursor INTO the highlighted row's expanded session list
+    /// (cross-machine resume, T17). `nil` ⇒ the machine row itself is
+    /// highlighted; a value ⇒ that index within the highlighted row's loaded
+    /// sessions is highlighted, and Return resumes it. Cleared whenever the
+    /// machine-row highlight moves or its list collapses.
+    @State private var browseCursor: Int?
     @FocusState private var isFilterFocused: Bool
 
     /// The background for row `idx`: accent when selected, a faint wash on hover,
@@ -80,7 +92,7 @@ struct MachineChooserView: View {
         switch target {
         case .local: return SessionBrowserProbe.localKey
         case .remote(let m): return m.id.uuidString
-        case .restoreRemote: return nil
+        case .restoreRemote, .resumeSession: return nil
         }
     }
 
@@ -89,8 +101,36 @@ struct MachineChooserView: View {
         switch target {
         case .local: browser.toggleLocal()
         case .remote(let m): browser.toggle(machine: m)
-        case .restoreRemote: break
+        case .restoreRemote, .resumeSession: break
         }
+    }
+
+    /// The loaded session roster of the currently-highlighted machine row when
+    /// it is expanded, else `[]`. Drives the keyboard session sub-cursor (T17).
+    private var highlightedSessions: [BrowsedSession] {
+        guard let target = resolvedSelection, let key = browseKey(for: target),
+              browser.isExpanded(key), case .loaded(let sessions) = browser.states[key]
+        else { return [] }
+        return sessions
+    }
+
+    /// Build the `resumeSession` target for `session` under its parent row
+    /// (`.local` ⇒ local agent, `.remote` ⇒ that machine). `nil` for rows that
+    /// never browse.
+    private func resumeTarget(_ session: BrowsedSession, parent: WindowTarget) -> WindowTarget? {
+        switch parent {
+        case .local: return .resumeSession(machine: nil, session: session)
+        case .remote(let m): return .resumeSession(machine: m, session: session)
+        case .restoreRemote, .resumeSession: return nil
+        }
+    }
+
+    /// Resume `session` under `parent`: dismiss the chooser and hand the
+    /// selection to the app. Only ALIVE sessions are resumable (a dead session
+    /// has no live pane to attach; its row is rendered disabled).
+    private func resume(_ session: BrowsedSession, parent: WindowTarget) {
+        guard session.alive, let target = resumeTarget(session, parent: parent) else { return }
+        onSelect(target)
     }
 
     /// Right-arrow: expand the highlighted row's session list if not already open.
@@ -104,6 +144,7 @@ struct MachineChooserView: View {
     private func collapseSelection() {
         guard let target = resolvedSelection, let key = browseKey(for: target),
               browser.isExpanded(key) else { return }
+        browseCursor = nil
         toggleBrowse(target)
     }
 
@@ -157,8 +198,11 @@ struct MachineChooserView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(sessions) { session in
-                        sessionBrowseRow(session)
+                    ForEach(Array(sessions.enumerated()), id: \.element) { idx, session in
+                        sessionBrowseRow(
+                            session,
+                            parent: target,
+                            highlighted: isSessionCursor(key: key, index: idx))
                     }
                 }
             case .some(.failed):
@@ -184,11 +228,29 @@ struct MachineChooserView: View {
         .padding(.bottom, 4)
     }
 
-    /// One read-only session row: liveness dot, label (title/cwd/command),
-    /// working directory, and an "attached" marker when a viewer holds it.
+    /// Whether the keyboard session sub-cursor (T17) currently points at
+    /// session `index` under the row keyed `key` — i.e. that row is the
+    /// highlighted machine row AND its list is where the cursor lives.
+    private func isSessionCursor(key: String, index: Int) -> Bool {
+        guard browseCursor == index,
+              let target = resolvedSelection,
+              browseKey(for: target) == key
+        else { return false }
+        return true
+    }
+
+    /// One session row: liveness dot, label (title/cwd/command), working
+    /// directory, and an "attached" / "exited" marker. An ALIVE session is a
+    /// clickable Button that resumes it (cross-machine resume, T17) — a local
+    /// viewer window that re-`ATTACH`es to the session over its machine's
+    /// transport; a dead session is non-interactive (nothing to attach).
     @ViewBuilder
-    private func sessionBrowseRow(_ session: BrowsedSession) -> some View {
-        HStack(spacing: 8) {
+    private func sessionBrowseRow(
+        _ session: BrowsedSession,
+        parent: WindowTarget,
+        highlighted: Bool
+    ) -> some View {
+        let content = HStack(spacing: 8) {
             Image(systemName: "circle.fill")
                 .font(.system(size: 6))
                 .foregroundStyle(session.alive ? Color.green : Color.secondary)
@@ -215,7 +277,20 @@ struct MachineChooserView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, 1)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(highlighted ? Color.accentColor.opacity(0.25) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .contentShape(Rectangle())
+
+        if session.alive {
+            Button { resume(session, parent: parent) } label: { content }
+                .buttonStyle(.plain)
+                .help("Resume this session in a new window")
+        } else {
+            content
+        }
     }
 
     /// The current machine list (live from the registry), minus any relay
@@ -615,8 +690,8 @@ struct MachineChooserView: View {
                 // button in the row wrapper, NOT here, so it doesn't nest inside the
                 // row's selection button.)
             }
-        case .restoreRemote:
-            // Never appears in `targets`; it's an action result, not a row.
+        case .restoreRemote, .resumeSession:
+            // Never appears in `targets`; they're action results, not rows.
             EmptyView()
         }
     }
@@ -865,14 +940,37 @@ struct MachineChooserView: View {
     }
 
     /// Move the highlighted selection by `delta` rows, clamped to the list.
+    /// When the highlighted row is expanded with a loaded session list, Down/Up
+    /// first traverse that list (the `browseCursor` sub-cursor, T17) before
+    /// stepping to the next/previous machine row, so the whole chooser —
+    /// machines and their sessions — is keyboard-navigable.
     private func move(_ delta: Int) {
         guard !targets.isEmpty else { return }
-        select(min(max(selectedIndex + delta, 0), targets.count - 1))
+        let sessions = highlightedSessions
+
+        if delta > 0 {
+            if !sessions.isEmpty {
+                let next = (browseCursor ?? -1) + 1
+                if next < sessions.count { browseCursor = next; return }
+                // Past the last session: fall through to the next machine row.
+            }
+            browseCursor = nil
+            select(min(selectedIndex + 1, targets.count - 1))
+        } else {
+            if let cur = browseCursor {
+                // Up within the list; stepping above the first returns to the
+                // machine row itself (cursor cleared).
+                browseCursor = cur > 0 ? cur - 1 : nil
+                return
+            }
+            select(max(selectedIndex - 1, 0))
+        }
     }
 
     /// Highlight row `idx` and remember the machine identity under it, so a
     /// later list change can re-anchor the highlight to the same machine.
     private func select(_ idx: Int) {
+        if idx != selectedIndex { browseCursor = nil }
         selectedIndex = idx
         selectedMachineID = machineID(at: idx)
     }
@@ -891,6 +989,9 @@ struct MachineChooserView: View {
     /// machine to its new row when it still exists, otherwise fall back to
     /// clamping the index and re-anchoring on whatever row that lands on.
     private func reanchorSelection() {
+        // The list changed underfoot — drop any session sub-cursor (its roster
+        // may have shifted) so the highlight lands cleanly on a machine row.
+        browseCursor = nil
         if let id = selectedMachineID,
            let idx = targets.firstIndex(where: { target in
                if case .remote(let machine) = target { return machine.id == id }
@@ -910,6 +1011,15 @@ struct MachineChooserView: View {
     }
 
     private func submit() {
+        // A session sub-cursor (T17) resumes that session; otherwise the
+        // highlighted machine row's primary action (New / Restore) fires.
+        if let cur = browseCursor, let target = resolvedSelection {
+            let sessions = highlightedSessions
+            if cur < sessions.count {
+                resume(sessions[cur], parent: target)
+                return
+            }
+        }
         if let target = resolvedSelection {
             activate(target)
         }

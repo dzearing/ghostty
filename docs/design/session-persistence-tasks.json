@@ -565,7 +565,7 @@
     {
       "id": "T17",
       "title": "Cross-machine resume: attach a single remote session on the local machine",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T16"
       ],
@@ -576,7 +576,7 @@
         "Detach-on-close: closing the resumed window detaches (session stays alive on the host), matching current remote-window teardown."
       ],
       "acceptance": "With a live session on machine X, resume it from Y \u2192 a window on Y attaches, scrollback replays, input works; closing the window leaves the session alive on X (re-browsable); attached-elsewhere is handled, not forced.",
-      "notes": ""
+      "notes": "2026-07-16: done, Swift-only (macos/ only; ZERO Zig/agent/protocol changes). Cross-machine resume ATTACH from the T16 session browser. WIRING: (1) WindowTarget gains `.resumeSession(machine: Machine?, session: BrowsedSession)` (machine==nil => local agent); it is an ACTION result, never a top-level `targets` row (like `.restoreRemote`) so the enum switches (browseKey/toggleBrowse/row) just return nil/EmptyView for it. (2) MachineChooserView: each ALIVE session row in a machine's expanded browse list is now a Button -> `resume(session,parent)` -> onSelect(.resumeSession(...)); dead sessions render non-interactive (nothing to attach). Added a keyboard session sub-cursor `browseCursor: Int?`: Down/Up first traverse the highlighted expanded row's loaded sessions before stepping to the next/prev machine row, Return resumes the cursored session (submit() checks browseCursor first, else the machine row's New/Restore). Cursor cleared on collapse / row-change / list reanchor. This is both a11y AND the reliable non-pointer driver (T16 gotcha: synthetic clicks route BEHIND the app-modal panel; keyboard is authoritative). (3) AppDelegate completion `.resumeSession` -> resumeBrowsedSession(machine,session): local-and-already-open => focus that window (no self-steal, no dialog); else if session.attached => NSAlert steal-confirm (Resume Here/Cancel) BEFORE attaching, since the termio ATTACH path force-reclaims (Remote.zig:373) and must not steal silently; then resumeLocalSession or resumeRemoteSession. resumeLocalSession builds a single-leaf .remote SurfaceConfiguration (remoteConnection=shared local agent, remoteSessionId=id) via sharedConnectionAsync + TerminalController.newWindow(withBaseConfig:) \u2014 the injection guard (base.remoteConnection==nil) is skipped so my ATTACH cfg flows through; setting controller.remoteConnection after triggers registerSessionLayoutIfNeeded (machine.isLocalMachine) so the RESUMED window is itself restorable + detaches-on-close like any local-agent window. resumeRemoteSession reuses the existing presentRemoteWindow(sessionID:) for relay (registers in RemoteSessionManifest -> resumed cross-machine window also restorable) with the dial off-main (no beachball) + an alert on dial failure (user-initiated, so a modal is fine); TCP machines go through openRemoteWindow(on:) generalized with attachSessionID+windowTitle. BUILD: zig build -Doptimize=Debug OK. LIVE VERIFIED (flag-on, agent-backed local sessions, 3 independent cycles A/B/gamma on the final build): created a tick session (`echo PANE=X PID=$$; i=0; while true; do echo tick-X-$((i++)); sleep 1; done`), CLOSED its window (session stayed alive+detached, pinned), opened Cmd-Shift-N, Right-arrow expanded Local (count badge), Down onto the session (accent cursor highlight \u2014 screenshot-confirmed), Return. RESULT each time: NO new session created (same session id, same child PID unchanged \u2014 ATTACH not OPEN), the resumed window replayed pre-close scrollback (PANE=X PID + tick-X-0..) AND streamed continuing live ticks (e.g. tick-G-52+, monotonic, never reset to 0). INPUT proven: C-c stopped the tick loop (ticks halted, ^C echoed => keystrokes reach the PTY). DETACH-ON-CLOSE proven: closed the RESUMED window => session stayed alive=True attached=False, same pid, re-browsable. NSLog trace confirmed the exact path (submit browseCursor=N -> resume -> resumeBrowsedSession machine=LOCAL attached=false -> resumeLocalSession attaching remoteSessionId=<id>). Box left CLEAN (app+agent killed, ~/.config/ghoztty/local-agent-debug removed, debug LaunchAgent booted out). NOT LIVE-VERIFIED HERE: the RELAY resume path + the attached-elsewhere steal DIALOG (no reliable relay machine on this box \u2014 Windows agent only; and the steal dialog is effectively relay-only since local sessions attached by our own windows hit focus-instead-first). Code mirrors the proven presentRemoteWindow relay restore path (same as T16's relay-browse: code-complete, not box-verified). REGRESSION: zig build test-agent = 504/505 (1 PRE-EXISTING flake unrelated to this Swift-only change: the Zig test 'RELAUNCH: ATTACH to a materialized session...' in server.zig writes ring/meta snapshots to a temp-dir path that materializes as non-UTF8 garbage bytes -> macOS EILSEQ errno 92; test-agent compiles ONLY src/ which my diff does not touch, so the binary is bit-identical to HEAD -> this fails on HEAD too). Filed as T17a."
     },
     {
       "id": "T18",
@@ -614,6 +614,21 @@
       ],
       "acceptance": "Default config (no flag set) produces agent-backed persistent local windows; with the agent forcibly unavailable, windows still open as exec-backed and are fully usable (no hang/crash/overlay); test-agent + existing E2E still pass; the kill-9/upgrade E2E still passes with the flag now defaulted on (harness can drop its explicit --session-persistence=true).",
       "notes": "Added 2026-07-16 at user request. User never asked for opt-in \u2014 it was a build-hygiene choice during development (keep the debug app usable while the feature was half-built). User wants it default-on eventually; explicitly NOT urgent. Key risk called out: default-on makes the local agent a HARD DEPENDENCY of every local window, so the agent-unavailable fallback-to-exec is the actual deliverable here, not the one-line default flip. Independent of the cross-machine effort (T16-T18); can be done before or after them."
+    },
+    {
+      "id": "T17a",
+      "title": "Fix pre-existing test-agent flake: ring/meta snapshot temp-dir path is non-UTF8 (EILSEQ errno 92)",
+      "status": "pending",
+      "dependsOn": [],
+      "goal": "The agent test 'RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH revives it' (src/remote/agent/server.zig ~2400) fails intermittently on this macOS 26 box: ring_snapshot/session_meta writes go to a temp directory whose path renders as garbage bytes, so the write fails with Unexpected/EILSEQ (errno 92) and one test fails (504/505). Pre-existing before T17 (T17 is Swift-only; test-agent compiles only src/). Root-cause the temp-dir path handling (likely an uninitialized/short-lived tmp path buffer in the Harness or snapshot-dir plumbing added around T13/T13b) and make the test deterministic.",
+      "steps": [
+        "Reproduce: zig build test-agent (fails ~1/1 here). Instrument the snapshot-dir path the Harness/store uses for this test; the leading directory bytes are garbage while the trailing '/abcabc...ring' basename is intact => the DIR path buffer is the problem.",
+        "Check Harness.init + the ring/meta snapshot dir wiring (T13/T13b) for a path built from a stack buffer that outlives its scope or isn't NUL/length-bounded.",
+        "Fix so the snapshot dir is a valid per-test temp dir (std.testing.tmpDir or an explicit fixed path); assert the write succeeds.",
+        "Re-run test-agent -> 505/505 stable across a few seeds."
+      ],
+      "acceptance": "zig build test-agent is 505/505 deterministically; no EILSEQ/Unexpected snapshot-write warnings.",
+      "notes": ""
     }
   ]
 }
