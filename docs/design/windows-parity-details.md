@@ -1549,6 +1549,49 @@ thumbnails visibly update while a busy TUI runs in a non-hero pane
 (spike + timer working); toggle-off restores the exact tree. Rewritten
 `hero-mode.ps1` ALL PASS; both test lanes + P1–P3 green.
 
+*Evidence (DONE 2026-07-16):*
+
+- *Spike outcome (step 1):* better than planned — instead of reading the
+  window back buffer, `OpenGL.captureThumb` blits `last_target` (the
+  OFFSCREEN texture every frame renders into before `present()`) into a
+  lazily-created thumb FBO and does one small `glReadPixels`. Offscreen
+  texture content is always defined regardless of HWND visibility, so
+  hidden panes capture cleanly by construction; the documented
+  visible-but-occluded fallback was never needed. Verified on-box:
+  `hero snap committed` debug lines from all (hidden) panes + carousel
+  pixels of a hidden busy pane visibly changing (screenshot shows live
+  `ping -t` output inside a hidden pane's thumbnail).
+- *Pipeline (step 2):* per-Surface mutex-guarded request/buffer/seq
+  (GUI pre-sizes the buffer; the renderer never allocates; one atomic
+  load per frame when idle), pre-swap defer hook in generic.zig
+  drawFrame (runs even on the `presentLastTarget` no-redraw path, so a
+  GUI `wakeup.notify()` refreshes idle panes' thumbs), WM_APP_HERO_SNAP
+  (WM_APP+6) with tree-validated HWND, per-Surface bottom-up DIB cache
+  (matches GL readback order — no flip), 150ms `HERO_SNAP_TIMER_ID`
+  heartbeat paused while minimized (IsIconic).
+- *Layout (step 3):* non-hero leaves SW_HIDE + `setVisible(true)`;
+  every leaf MoveWindow'd to the hero rect; per-tab `tab_hero_ratio`
+  (default 0.25) carried through addTab/closeTab/moveTabTo;
+  `hitTestDivider` returns null in hero mode.
+- *Carousel (step 4):* `HeroCarousel.zig` (geometry + double-buffered
+  owner paint: darkened column, divider line, rounded-clipped
+  AlphaBlend thumbs — selected 255 / normal 89 alpha, accent-blue
+  selected border; glow shadow skipped per design) + `hero_math.zig`
+  (pure; 8 unit tests wired into BOTH lanes via the apprt.zig test
+  block). Click-to-select on WM_LBUTTONUP. WM_PAINT restructured into
+  `paintWindow` (one BeginPaint for tab bar + carousel).
+- *hero-mode.ps1 (step 5):* rewritten to the T58 oracle in two phases —
+  2-pane snapshot-pipeline phase (both tiles on-screen; log + pixel-diff
+  oracles) then 3-pane layout/nav/click/palette phase. ALL PASS on-box
+  (39 assertions; ran via a wait-for-input-idle runner because
+  SetForegroundWindow is denied while the user actively uses the box).
+  Harness lessons recorded in the script comments: pixel scripts MUST be
+  per-monitor-DPI-aware (PrintWindow silently clips at 125% DPI
+  otherwise), and the carousel strip is in TREE ITERATION ORDER with
+  prev/next clamped at the ends (Mac parity) — the focused pane isn't
+  necessarily first, so the nav step tries down then up.
+- Both unit-test lanes green; P1–P3 ALL PASS.
+
 ## T59b — Hero mode TRUE port: interactions, motion, polish (Phase F)
 
 Second half of the T58 design, on top of T59a:

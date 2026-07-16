@@ -482,6 +482,8 @@ pub extern "user32" fn ClientToScreen(
     lpPoint: *POINT,
 ) callconv(.winapi) i32;
 
+pub extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) i32;
+
 pub extern "user32" fn GetParent(
     hWnd: HWND,
 ) callconv(.winapi) ?HWND;
@@ -1139,6 +1141,19 @@ pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: ?*anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn LineTo(hdc: HDC, x: i32, y: i32) callconv(.winapi) i32;
+
+// Hero-mode carousel painting (T59a): stretch/alpha blits, rounded-rect
+// clipping and borders.
+pub extern "gdi32" fn StretchBlt(hdcDest: HDC, xDest: i32, yDest: i32, wDest: i32, hDest: i32, hdcSrc: HDC, xSrc: i32, ySrc: i32, wSrc: i32, hSrc: i32, rop: u32) callconv(.winapi) i32;
+pub extern "gdi32" fn SetStretchBltMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
+pub extern "gdi32" fn SetBrushOrgEx(hdc: HDC, x: i32, y: i32, lppt: ?*anyopaque) callconv(.winapi) i32;
+pub const HALFTONE: i32 = 4;
+// BLENDFUNCTION is defined below (UpdateLayeredWindow section).
+pub extern "msimg32" fn AlphaBlend(hdcDest: HDC, xoriginDest: i32, yoriginDest: i32, wDest: i32, hDest: i32, hdcSrc: HDC, xoriginSrc: i32, yoriginSrc: i32, wSrc: i32, hSrc: i32, ftn: BLENDFUNCTION) callconv(.winapi) i32;
+pub extern "gdi32" fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) callconv(.winapi) ?*anyopaque;
+pub extern "gdi32" fn SelectClipRgn(hdc: HDC, hrgn: ?*anyopaque) callconv(.winapi) i32;
+pub extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) i32;
+pub const NULL_BRUSH: i32 = 5;
 
 pub extern "user32" fn BeginPaint(hwnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
 pub extern "user32" fn EndPaint(hwnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) i32;

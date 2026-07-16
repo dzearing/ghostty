@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-16 (on-box) — T59a DONE: hero-mode TRUE port first half — renderer
+  snapshot pipeline (captureThumb blits the OFFSCREEN render target, so the
+  T58 hidden-window spike risk evaporated: hidden panes capture cleanly, no
+  fallback needed), SW_HIDE + renderer-awake hero layout with all leaves
+  hero-sized, owner-painted HeroCarousel.zig + unit-tested hero_math.zig,
+  click-a-tile-to-select, 150ms refresh timer (paused while minimized).
+  hero-mode.ps1 rewritten to the T58 oracle. Two HARNESS lessons burned a
+  lot of the session: (1) pixel scripts must be per-monitor-DPI-aware or
+  PrintWindow silently clips at 125% DPI; (2) the carousel strip is in
+  TREE ITERATION ORDER and prev/next clamp at the ends (Mac parity) — the
+  focused pane is not necessarily first, so a nav test pressing only
+  "down" can hit a correct no-op (heroSelect logged req=3 clamped=2
+  cur=2; the test now tries down then up). Also: chord tests can't run
+  while the user is actively using the box (SetForegroundWindow denied) —
+  the final validation ran via a wait-for-input-idle runner. Next: T59b
+  (wheel scroll, divider drag, hover chrome, slide/re-center animations).
+
 - 2026-07-16 (on-box) — T58 DONE (design, doc-only): resolved all five
   win32 design questions from code study (Window/Surface/generic/OpenGL/
   Thread.zig). Headline decisions: thumbnails come from the RENDERER

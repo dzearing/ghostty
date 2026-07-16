@@ -1,32 +1,33 @@
-# Hero-mode geometry + pixel oracle (T19 acceptance, T49 regression guard).
+# Hero-mode TRUE-port oracle (T58 design / T59a acceptance; supersedes the
+# T19 static-stand-in oracle).
 #
-# Drives REAL key chords into the debug build and asserts pane geometry:
-#   1. 3-pane layout renders as a tree (3 visible terminal children).
-#   2. ctrl+shift+space toggles hero mode: one pane fills ~75% width at
-#      full height on the left, the other two stack in the right column.
-#   3. ctrl+alt+down moves the hero selection (big-left HWND changes).
+# Drives REAL key chords into the debug build and asserts the T58 layout.
+# PHASE 1 (2 panes — both tiles fit on-screen): snapshot pipeline oracle:
+#   with a busy loop running in the HIDDEN pane, the debug log shows
+#   "hero snap committed" lines and the owner-painted carousel region's
+#   pixels CHANGE between shots (thumbnails refreshing from hidden-pane
+#   renderer captures).
+# PHASE 2 (3 panes): layout + interaction:
+#   1. ctrl+shift+space: exactly ONE visible pane (the hero) at ~75%
+#      width / full height on the left; every OTHER leaf HIDDEN
+#      (IsWindowVisible false) and sized EXACTLY like the hero rect (T58:
+#      all leaves stay hero-sized so selection swaps need no reflow); the
+#      carousel column contains NO child HWNDs (it is owner-painted).
+#   2. ctrl+alt+down moves the selection: a different leaf becomes the
+#      single visible pane, at the same hero rect.
+#   3. Click a carousel tile: selects that leaf (mouse-up inside tile).
 #   4. ctrl+shift+space again restores the exact tree geometry.
+#   5. Palette path (T57): ctrl+shift+p -> "hero" -> Enter produces the
+#      same hero layout.
+# The harness makes itself per-monitor-DPI-aware; without it PrintWindow
+# captures are CLIPPED on >100% DPI monitors (2026-07-16 lesson).
 #
-# Pixel layer (user directive 2026-07-15: "look at its pixels"): each pane
-# is filled with a marker line before the toggle; after the toggle every
-# pane region is sampled from the actual screen and must show rendered
-# content (>= the distinct-color floor — a blank/frozen pane shows only
-# background + cursor). Full-window PNGs land in %TEMP% for human review:
-#   ghoztty-hero-tree.png / ghoztty-hero-on.png / ghoztty-hero-nav.png
+# A positive control (ctrl+k, T55) runs first so an injection failure is
+# distinguishable from a hero regression. Only touches ghoztty processes
+# running from this repo's zig-out*.
 #
-# A positive control (ctrl+shift+r, proven by kb-actions.ps1 / T44) runs
-# first so an injection failure is distinguishable from a hero regression;
-# it is verified via the Debug build's stderr binding-dispatch log line
-# (the rename EDIT itself is killed by focus churn too fast to poll from
-# PowerShell in a multi-pane window). Control fails -> ABORT (environment),
-# control passes but hero fails -> real bug.
-#
-# Only touches ghoztty processes running from this repo's zig-out*.
-#
-# -ExePath: test a different build (e.g. zig-out-release\bin\ghoztty.exe).
-# A non-default exe gets an isolated pipe (GHOZTTY_PIPE_SUFFIX) so the run
-# never talks to the installed release instance. Release builds emit no
-# debug log, so the log-based assertions auto-skip (geometry is the verdict).
+# -ExePath: test a different build. Release builds emit no debug log, so
+# log-based assertions auto-skip (geometry is the verdict).
 param([string]$ExePath)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -68,6 +69,7 @@ public class HeroDrv {
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern int MapWindowPoints(IntPtr from, IntPtr to, ref RECT r, uint points);
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, UIntPtr w, IntPtr l);
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int left, top, right, bottom; }
     [StructLayout(LayoutKind.Sequential)]
@@ -75,7 +77,18 @@ public class HeroDrv {
     [StructLayout(LayoutKind.Sequential)]
     public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     public delegate bool EnumProc(IntPtr h, IntPtr l);
+
+    // Make this PowerShell process per-monitor-DPI-aware so GetWindowRect/
+    // GetClientRect return PHYSICAL pixels and PrintWindow captures the
+    // full window. Without this, on a >100% DPI monitor the capture
+    // bitmap (sized from virtualized coords) CLIPS the right/bottom of
+    // the physically-rendered window — the carousel column was cut off
+    // and the thumbnail-refresh pixel oracle went blind (found 2026-07-16).
+    public static void BeDpiAware() {
+        SetProcessDpiAwarenessContext((IntPtr)(-4)); // PER_MONITOR_AWARE_V2
+    }
 
     public static IntPtr FindTop(uint pid) {
         IntPtr found = IntPtr.Zero;
@@ -91,17 +104,18 @@ public class HeroDrv {
         return found;
     }
 
-    // Visible GhozttyTerminal children with rects in the top window's
-    // client coordinates, as "hwnd:left,top,right,bottom" lines.
+    // ALL GhozttyTerminal children (visible or not) with rects in the top
+    // window's client coordinates, as "hwnd:vis:left,top,right,bottom".
     public static string[] Panes(IntPtr top) {
         var lines = new List<string>();
         EnumChildWindows(top, (h, l) => {
             var sb = new StringBuilder(64);
             GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) {
+            if (sb.ToString() == "GhozttyTerminal") {
                 RECT r; GetWindowRect(h, out r);
                 MapWindowPoints(IntPtr.Zero, top, ref r, 2);
-                lines.Add(h.ToInt64() + ":" + r.left + "," + r.top + "," + r.right + "," + r.bottom);
+                int vis = IsWindowVisible(h) ? 1 : 0;
+                lines.Add(h.ToInt64() + ":" + vis + ":" + r.left + "," + r.top + "," + r.right + "," + r.bottom);
             }
             return true;
         }, IntPtr.Zero);
@@ -154,11 +168,17 @@ public class HeroDrv {
     }
 
     // Send mods+vk with focus on `surface`. Returns "SENT" or a reason.
+    // Retries the foreground grab a few times: on a busy desktop another
+    // window can win the race right after SetForegroundWindow.
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        SetForegroundWindow(top);
-        Thread.Sleep(150);
+        bool fg = false;
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            SetForegroundWindow(top);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             SetFocus(surface);
@@ -169,7 +189,10 @@ public class HeroDrv {
             Key(vk, false); Thread.Sleep(20); Key(vk, true);
             Thread.Sleep(20);
             for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
+            // Let any focus/layout change the binding caused settle while
+            // still attached (ghoztty defers SetFocus via a posted
+            // message, T48) so callers sample post-binding state.
+            Thread.Sleep(450);
             return "SENT";
         } finally { AttachThreadInput(cur, tid, false); }
     }
@@ -177,10 +200,10 @@ public class HeroDrv {
 '@
 
 Add-Type -AssemblyName System.Drawing
+[HeroDrv]::BeDpiAware()
 
 # Capture a window's OWN content via PrintWindow(PW_RENDERFULLCONTENT) —
-# immune to occlusion by other windows, which polluted the first
-# CopyFromScreen version of this harness (2026-07-15).
+# immune to occlusion by other windows.
 function Get-WindowBitmap([IntPtr]$hwnd) {
     $r = New-Object HeroDrv+RECT
     [HeroDrv]::GetWindowRect($hwnd, [ref]$r) | Out-Null
@@ -203,9 +226,6 @@ function Save-WindowShot([IntPtr]$top, [string]$path) {
 }
 
 # Distinct-color count of a pane's own rendered content (sampled grid).
-# Rendered text gives dozens of colors (antialiasing); a blank or
-# never-painted pane gives a handful (bg + cursor). Retries up to
-# $settleMs so slow repaints after a relayout don't read as blank.
 function Get-PaneColorCount([long]$hwnd, [int]$floor = 8, [int]$settleMs = 3000) {
     $best = 0
     $deadline = [DateTime]::Now.AddMilliseconds($settleMs)
@@ -227,13 +247,30 @@ function Get-PaneColorCount([long]$hwnd, [int]$floor = 8, [int]$settleMs = 3000)
     return $best
 }
 
+# Sampled pixel signature of the top window's region right of $xMin
+# (client coords ~ window-bitmap coords are close enough for a diff oracle;
+# the region only needs to be inside the carousel column).
+function Get-RegionSignature([IntPtr]$top, [int]$xMin) {
+    $bmp = Get-WindowBitmap $top
+    if ($null -eq $bmp) { return $null }
+    $sb = New-Object System.Text.StringBuilder
+    for ($y = 40; $y -lt $bmp.Height - 10; $y += 7) {
+        for ($x = $xMin; $x -lt $bmp.Width - 4; $x += 7) {
+            [void]$sb.Append($bmp.GetPixel($x, $y).ToArgb())
+        }
+    }
+    $bmp.Dispose()
+    return $sb.ToString().GetHashCode()
+}
+
 # Rect parsing helpers ---------------------------------------------------------
 function Parse-Panes([string[]]$lines) {
     $lines | ForEach-Object {
-        $hw, $r = $_ -split ':'
+        $hw, $vis, $r = $_ -split ':'
         $c = $r -split ','
         [pscustomobject]@{
             Hwnd = [int64]$hw
+            Visible = ([int]$vis -eq 1)
             Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
             Width = [int]$c[2] - [int]$c[0]; Height = [int]$c[3] - [int]$c[1]
         }
@@ -241,11 +278,34 @@ function Parse-Panes([string[]]$lines) {
 }
 function Rects-Equal($a, $b) {
     if ($a.Count -ne $b.Count) { return $false }
-    $am = @{}; $a | ForEach-Object { $am[$_.Hwnd] = "$($_.Left),$($_.Top),$($_.Right),$($_.Bottom)" }
+    $am = @{}; $a | ForEach-Object { $am[$_.Hwnd] = "$($_.Left),$($_.Top),$($_.Right),$($_.Bottom),$($_.Visible)" }
     foreach ($p in $b) {
-        if ($am[$p.Hwnd] -ne "$($p.Left),$($p.Top),$($p.Right),$($p.Bottom)") { return $false }
+        if ($am[$p.Hwnd] -ne "$($p.Left),$($p.Top),$($p.Right),$($p.Bottom),$($p.Visible)") { return $false }
     }
     return $true
+}
+function Same-Rect($a, $b) {
+    return ($a.Left -eq $b.Left) -and ($a.Top -eq $b.Top) -and
+           ($a.Right -eq $b.Right) -and ($a.Bottom -eq $b.Bottom)
+}
+
+# Assert the T58 hero layout and return @{Hero=<pane>; Ok=<bool>}.
+function Assert-HeroLayout($panes, $client, [string]$label) {
+    $visible = @($panes | Where-Object Visible)
+    $hidden = @($panes | Where-Object { -not $_.Visible })
+    $ok = ($visible.Count -eq 1)
+    Assert $ok "$label - exactly one visible pane (got $($visible.Count))"
+    if (-not $ok) { return @{ Hero = $null; Ok = $false } }
+    $hero = $visible[0]
+    $geom = ($hero.Width -ge [int](0.6 * $client[0])) -and
+            ($hero.Width -le [int](0.85 * $client[0])) -and
+            ($hero.Height -ge [int](0.9 * $client[1])) -and
+            ($hero.Left -le 2)
+    Assert $geom "$label - hero fills ~75% width / full height on the left (w=$($hero.Width) of $($client[0]))"
+    $allHeroSized = $true
+    foreach ($p in $hidden) { if (-not (Same-Rect $p $hero)) { $allHeroSized = $false } }
+    Assert $allHeroSized "$label - all hidden leaves sized exactly like the hero rect (T58: no reflow on swap)"
+    return @{ Hero = $hero; Ok = ($geom -and $allHeroSized) }
 }
 
 # --- Setup: fresh debug instance with a 3-pane layout ------------------------
@@ -254,8 +314,6 @@ Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 500
 
-# GUI-subsystem (release) exes reject stderr redirection pairing oddly in
-# some hosts; redirect only for the Console-subsystem debug build.
 if ($ExePath) { $proc = Start-Process -FilePath $exe -PassThru }
 else { $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardError $errlog }
 Start-Sleep -Seconds 3
@@ -263,37 +321,28 @@ if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
 $top = [HeroDrv]::FindTop([uint32]$proc.Id)
 if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
 
-# Fill each pane with a distinct marker (pixel layer needs rendered text).
+# Two panes first: pane A (markers) + herob running a BUSY LOOP so its
+# thumbnail keeps changing while the pane is hidden (snapshot oracle runs
+# in this 2-pane phase — with only two tiles both are fully on-screen;
+# with three, the busy tile can land below the window since the strip
+# centers the SELECTED tile, Mac behavior). The 3rd pane is added later
+# for the geometry/nav/click phase.
 $listJson = & $exe +list --json | ConvertFrom-Json
 $win = $listJson.data.windows[0].target
 & $exe +send-keys --target=$win "echo HERO_PANE_A_MARKER" Enter | Out-Null
 & $exe +split --direction=down --name=herob | Out-Null
 Start-Sleep -Milliseconds 800
-& $exe +send-keys --target=herob "echo HERO_PANE_B_MARKER" Enter | Out-Null
-& $exe +split --direction=down --name=heroc | Out-Null
-Start-Sleep -Milliseconds 800
-& $exe +send-keys --target=heroc "echo HERO_PANE_C_MARKER" Enter | Out-Null
-Start-Sleep -Milliseconds 800
+# Busy output that works in cmd AND PowerShell panes: one line per second.
+& $exe +send-keys --target=herob "ping -t 127.0.0.1" Enter | Out-Null
+Start-Sleep -Milliseconds 1200
 
-$tree = Parse-Panes ([HeroDrv]::Panes($top))
+$pair = Parse-Panes ([HeroDrv]::Panes($top))
 $client = [HeroDrv]::ClientSize($top)
-Assert ($tree.Count -eq 3) "setup: 3 visible panes in tree layout (got $($tree.Count))"
-if ($tree.Count -ne 3) { Stop-Process -Id $proc.Id -Force; exit 1 }
-
-# Focus target for the toggle: the topmost-leftmost pane (leaf 0).
-$leaf0 = ($tree | Sort-Object Top, Left | Select-Object -First 1)
+Assert ($pair.Count -eq 2) "setup: 2 panes exist (got $($pair.Count))"
+$leaf0 = ($pair | Sort-Object Top, Left | Select-Object -First 1)
 $leaf0Hwnd = [IntPtr]$leaf0.Hwnd
-Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-tree.png')
 
-# --- Positive control: ctrl+k reaches binding dispatch (T47-proven) ----------
-# Debug builds prove it via the stderr io-mailbox log; release builds have no
-# log, so the control degrades to chord delivery only.
-#
-# Deliberately NOT ctrl+shift+r: since T50 that opens the real Rename dialog,
-# which DISABLES the owner window while open (RenameDialog.zig) — a control
-# that leaves it up silently kills every later chord in this script (that was
-# T55: "chords not dispatched" was the dialog eating them, not a key-path
-# regression). ctrl+k just clears pane 0's primary screen and leaves no UI.
+# --- Positive control: ctrl+k reaches binding dispatch (T55/T47-proven) ------
 $haveLog = (Test-Path $errlog)
 $r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11), 0x4B)
 if ($r -ne 'SENT') { Write-Host "ABORT: control chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
@@ -308,70 +357,138 @@ if ($haveLog) {
     Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
 }
 
-# --- Toggle hero mode on ------------------------------------------------------
+# --- Phase 1 (2 panes): snapshot pipeline oracle ------------------------------
 $r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11, 0x10), 0x20)  # ctrl+shift+space
 Assert ($r -eq 'SENT') "hero toggle chord delivered ($r)"
-Start-Sleep -Milliseconds 500
+Start-Sleep -Milliseconds 800
 Assert (-not $proc.HasExited) 'no crash after hero toggle'
 if ($haveLog) {
     Assert ((Select-String -Path $errlog -Pattern 'toggle_hero_mode' -Quiet)) 'toggle_hero_mode binding dispatched (log)'
 }
+$hero1 = Parse-Panes ([HeroDrv]::Panes($top))
+$res1 = Assert-HeroLayout $hero1 $client 'hero on (2 panes)'
+$big1 = $res1.Hero
+if ($null -eq $big1) { Stop-Process -Id $proc.Id -Force; exit 1 }
 
+if ($haveLog) {
+    $snapDeadline = [DateTime]::Now.AddSeconds(5)
+    $snapSeen = $false
+    while (-not $snapSeen -and [DateTime]::Now -lt $snapDeadline) {
+        $snapSeen = (Select-String -Path $errlog -Pattern 'hero snap committed' -Quiet)
+        if (-not $snapSeen) { Start-Sleep -Milliseconds 300 }
+    }
+    Assert $snapSeen 'renderer committed hero snapshots (debug log)'
+}
+# The busy ping in HIDDEN pane "herob" adds a line every ~1s; with two
+# tiles both are fully on-screen, so the carousel signature must change
+# within a few refresh cycles.
+$sigX = $big1.Right + 10
+$sig1 = Get-RegionSignature $top $sigX
+$sigChanged = $false
+for ($t = 0; $t -lt 5 -and -not $sigChanged; $t++) {
+    Start-Sleep -Milliseconds 1500
+    $sig2 = Get-RegionSignature $top $sigX
+    if (($null -ne $sig1) -and ($null -ne $sig2) -and ($sig1 -ne $sig2)) { $sigChanged = $true }
+}
+Assert $sigChanged 'carousel thumbnails visibly update while a busy TUI runs in a hidden pane'
+Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-snap.png')
+
+# Toggle off and add the third pane for the geometry/nav/click phase.
+$r = [HeroDrv]::Chord($top, [IntPtr]$big1.Hwnd, [uint16[]]@(0x11, 0x10), 0x20)
+Assert ($r -eq 'SENT') 'phase-1 un-toggle delivered'
+Start-Sleep -Milliseconds 600
+& $exe +split --direction=down --name=heroc | Out-Null
+Start-Sleep -Milliseconds 800
+& $exe +send-keys --target=heroc "echo HERO_PANE_C_MARKER" Enter | Out-Null
+Start-Sleep -Milliseconds 800
+
+$tree = Parse-Panes ([HeroDrv]::Panes($top))
+Assert ($tree.Count -eq 3) "setup: 3 panes exist (got $($tree.Count))"
+Assert (@($tree | Where-Object Visible).Count -eq 3) 'setup: all 3 panes visible in tree layout'
+if ($tree.Count -ne 3) { Stop-Process -Id $proc.Id -Force; exit 1 }
+Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-tree.png')
+
+# --- Phase 2 (3 panes): layout, nav, click, restore ---------------------------
+# Focus + toggle from leaf 0 again (the previous hero).
+$r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11, 0x10), 0x20)
+Assert ($r -eq 'SENT') "hero re-toggle chord delivered ($r)"
+Start-Sleep -Milliseconds 800
 $hero = Parse-Panes ([HeroDrv]::Panes($top))
-Assert ($hero.Count -eq 3) "hero: still 3 visible panes (got $($hero.Count))"
-$big = $hero | Sort-Object Width -Descending | Select-Object -First 1
-$rest = @($hero | Where-Object { $_.Hwnd -ne $big.Hwnd })
-$heroOn = ($big.Width -ge [int](0.6 * $client[0])) -and
-          ($big.Height -ge [int](0.9 * $client[1])) -and
-          ($rest.Count -eq 2) -and
-          ($rest[0].Left -gt $big.Right - 5) -and ($rest[1].Left -gt $big.Right - 5) -and
-          ($rest[0].Left -eq $rest[1].Left) -and
-          ([Math]::Abs($rest[0].Top - $rest[1].Top) -gt 10)
-Assert $heroOn 'hero geometry: big full-height left pane + two stacked right-column panes'
+Assert ($hero.Count -eq 3) "hero: still 3 panes (got $($hero.Count))"
+$res = Assert-HeroLayout $hero $client 'hero on (3 panes)'
+$big = $res.Hero
+if ($null -eq $big) { Stop-Process -Id $proc.Id -Force; exit 1 }
 Assert ($big.Hwnd -eq $leaf0.Hwnd) 'hero seeds from the focused pane (leaf 0 is the hero)'
-Write-Host ("INFO  client={0}x{1} hero=({2},{3})-({4},{5}) carousel0=({6},{7})-({8},{9}) carousel1=({10},{11})-({12},{13})" -f `
-    $client[0], $client[1], $big.Left, $big.Top, $big.Right, $big.Bottom, `
-    $rest[0].Left, $rest[0].Top, $rest[0].Right, $rest[0].Bottom, `
-    $rest[1].Left, $rest[1].Top, $rest[1].Right, $rest[1].Bottom)
-# The Mac carousel ratio is 0.25: the hero pane must NOT eat the carousel
-# column (caught by pixels 2026-07-15 — floor-only geometry passed while
-# the carousel was a sliver).
-$ratio = ($client[0] - $rest[0].Left) / [double]$client[0]
-Assert ([Math]::Abs($ratio - 0.25) -lt 0.05) ("carousel column is ~25% of client width (got {0:P1})" -f $ratio)
+$ratio = ($client[0] - $big.Right) / [double]$client[0]
+Assert ([Math]::Abs($ratio - 0.25) -lt 0.06) ("carousel column is ~25% of client width (got {0:P1})" -f $ratio)
 
-# Pixel layer: every pane must show rendered content in hero layout.
+# Pixel layer: the hero pane renders content.
 Start-Sleep -Milliseconds 700
 Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-on.png')
 $heroColors = Get-PaneColorCount $big.Hwnd
 Assert ($heroColors -ge 8) "hero pane renders content ($heroColors distinct colors, floor 8)"
-foreach ($i in 0, 1) {
-    $cc = Get-PaneColorCount $rest[$i].Hwnd
-    Assert ($cc -ge 8) "carousel pane $i renders content ($cc distinct colors, floor 8)"
+
+# --- Navigate: ctrl+alt+down/up moves the hero selection ---------------------
+# The carousel strip is ordered by TREE ITERATION ORDER, and prev/next
+# clamp at the ends (Mac parity) — the focused pane is NOT necessarily
+# first in that order, so pressing "down" from the last tile is a correct
+# no-op (this burned a session on 2026-07-16: heroSelect logged
+# `req=3 clamped=2 cur=2`). Try down first, then up.
+$big2 = $null
+foreach ($vk in 0x28, 0x26) {  # VK_DOWN, then VK_UP
+    $r = [HeroDrv]::Chord($top, [IntPtr]$big.Hwnd, [uint16[]]@(0x11, 0x12), $vk)
+    if ($vk -eq 0x28) { Assert ($r -eq 'SENT') "hero nav chord delivered ($r)" }
+    Start-Sleep -Milliseconds 600
+    $cand = @((Parse-Panes ([HeroDrv]::Panes($top))) | Where-Object Visible)
+    if ($cand.Count -eq 1 -and $cand[0].Hwnd -ne $big.Hwnd) { break }
+}
+$hero2 = Parse-Panes ([HeroDrv]::Panes($top))
+$res2 = Assert-HeroLayout $hero2 $client 'hero nav'
+$big2 = $res2.Hero
+Assert (($null -ne $big2) -and ($big2.Hwnd -ne $big.Hwnd)) 'ctrl+alt+down/up moved the hero (visible pane changed)'
+Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-nav.png')
+if ($null -ne $big2) {
+    $hero2Colors = Get-PaneColorCount $big2.Hwnd
+    Assert ($hero2Colors -ge 8) "new hero pane renders content after nav ($hero2Colors distinct colors)"
 }
 
-# --- Navigate: ctrl+alt+down moves the hero selection ------------------------
-$r = [HeroDrv]::Chord($top, [IntPtr]$big.Hwnd, [uint16[]]@(0x11, 0x12), 0x28)
-Assert ($r -eq 'SENT') "hero nav chord delivered ($r)"
-Start-Sleep -Milliseconds 500
-$hero2 = Parse-Panes ([HeroDrv]::Panes($top))
-$big2 = $hero2 | Sort-Object Width -Descending | Select-Object -First 1
-Assert ($big2.Hwnd -ne $big.Hwnd) 'ctrl+alt+down moved the hero (big-left pane changed)'
-Start-Sleep -Milliseconds 500
-Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-nav.png')
-$hero2Colors = Get-PaneColorCount $big2.Hwnd
-Assert ($hero2Colors -ge 8) "new hero pane renders content after nav ($hero2Colors distinct colors)"
+# --- Click a carousel tile selects it (mouse-up inside the tile) -------------
+# Tile geometry mirror of hero_math.zig: carousel column right of the
+# divider; thumb w = 88% of column, h = w/AR capped at 70% of column
+# height; selected tile centered. Clicking one tile-step ABOVE the center
+# selects the previous leaf.
+if ($null -ne $big2) {
+    $carouselLeft = $big2.Right + 8
+    $carouselW = $client[0] - $carouselLeft
+    $carouselH = $client[1] - $big2.Top
+    $ar = $big2.Width / [double]$big2.Height
+    $thumbW = [int](0.88 * $carouselW)
+    $thumbH = [int]($thumbW / $ar)
+    if ($thumbH -gt [int](0.7 * $carouselH)) { $thumbH = [int](0.7 * $carouselH) }
+    $cx = $carouselLeft + [int]($carouselW / 2)
+    $cy = $big2.Top + [int]($carouselH / 2) - ($thumbH + 8)
+    $lparam = [IntPtr](($cy -shl 16) -bor ($cx -band 0xFFFF))
+    [HeroDrv]::PostMessageW($top, 0x0201, [UIntPtr]::Zero, $lparam) | Out-Null  # WM_LBUTTONDOWN
+    Start-Sleep -Milliseconds 50
+    [HeroDrv]::PostMessageW($top, 0x0202, [UIntPtr]::Zero, $lparam) | Out-Null  # WM_LBUTTONUP
+    Start-Sleep -Milliseconds 600
+    $hero3 = Parse-Panes ([HeroDrv]::Panes($top))
+    $vis3 = @($hero3 | Where-Object Visible)
+    Assert (($vis3.Count -eq 1) -and ($vis3[0].Hwnd -ne $big2.Hwnd)) 'clicking a carousel tile swaps it into the hero'
+}
 
 # --- Toggle hero mode off: exact tree geometry restored -----------------------
-$r = [HeroDrv]::Chord($top, [IntPtr]$big2.Hwnd, [uint16[]]@(0x11, 0x10), 0x20)
+$visNow = @((Parse-Panes ([HeroDrv]::Panes($top))) | Where-Object Visible)
+$curHero = if ($visNow.Count -ge 1) { [IntPtr]$visNow[0].Hwnd } else { $leaf0Hwnd }
+$r = [HeroDrv]::Chord($top, $curHero, [uint16[]]@(0x11, 0x10), 0x20)
 Assert ($r -eq 'SENT') "hero un-toggle chord delivered ($r)"
-Start-Sleep -Milliseconds 500
+Start-Sleep -Milliseconds 600
 Assert (-not $proc.HasExited) 'no crash after hero un-toggle'
 $after = Parse-Panes ([HeroDrv]::Panes($top))
+Assert (@($after | Where-Object Visible).Count -eq 3) 'all 3 panes visible again after toggle-off'
 Assert (Rects-Equal $tree $after) 'tree geometry restored exactly after toggle-off'
 
 # --- Palette path: ctrl+shift+p, type "hero", Enter toggles hero mode --------
-# (T49 real root cause: the win32 palette list was hardcoded and had no
-# "Toggle Hero Mode" entry, so the feature was undiscoverable.)
 $treeNow = Parse-Panes ([HeroDrv]::Panes($top))
 $r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11, 0x10), 0x50)  # ctrl+shift+p
 if ($r -ne 'SENT') { Write-Host "SKIP palette test: $r" }
@@ -389,21 +506,17 @@ else {
             # H E R O then Enter
             $r = [HeroDrv]::TypeKeys($popup, $palEdit, [uint16[]]@(0x48, 0x45, 0x52, 0x4F, 0x0D))
             Assert ($r -eq 'SENT') "palette keys typed ($r)"
-            Start-Sleep -Milliseconds 600
+            Start-Sleep -Milliseconds 800
             Assert (-not $proc.HasExited) 'no crash after palette hero toggle'
             $heroP = Parse-Panes ([HeroDrv]::Panes($top))
-            $bigP = $heroP | Sort-Object Width -Descending | Select-Object -First 1
-            $restP = @($heroP | Where-Object { $_.Hwnd -ne $bigP.Hwnd })
-            $heroOnP = ($heroP.Count -eq 3) -and
-                       ($bigP.Width -ge [int](0.6 * $client[0])) -and
-                       ($restP.Count -eq 2) -and
-                       ($restP[0].Left -eq $restP[1].Left) -and ($restP[0].Left -gt $bigP.Right - 5)
-            Assert $heroOnP 'palette "Toggle Hero Mode" produced hero geometry'
+            $resP = Assert-HeroLayout $heroP $client 'palette hero'
             # Restore via the keybind for symmetric teardown.
-            [HeroDrv]::Chord($top, [IntPtr]$bigP.Hwnd, [uint16[]]@(0x11, 0x10), 0x20) | Out-Null
-            Start-Sleep -Milliseconds 400
-            $afterP = Parse-Panes ([HeroDrv]::Panes($top))
-            Assert (Rects-Equal $treeNow $afterP) 'tree geometry restored after palette round-trip'
+            if ($null -ne $resP.Hero) {
+                [HeroDrv]::Chord($top, [IntPtr]$resP.Hero.Hwnd, [uint16[]]@(0x11, 0x10), 0x20) | Out-Null
+                Start-Sleep -Milliseconds 500
+                $afterP = Parse-Panes ([HeroDrv]::Panes($top))
+                Assert (Rects-Equal $treeNow $afterP) 'tree geometry restored after palette round-trip'
+            }
         }
     }
 }

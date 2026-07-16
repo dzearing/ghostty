@@ -180,6 +180,34 @@ remote_conn: ?*remote_connection.Connection = null,
 remote_working_directory: ?[]const u8 = null,
 remote_shell: ?[]const u8 = null,
 
+/// Hero-mode thumbnail snapshot pipeline (T58 design / T59a). The renderer
+/// thread captures its own presented frame (blit of the offscreen render
+/// target — never an HWND capture, which can't see hidden panes) into
+/// `snap_buffer` when `snap_requested` is set, then posts WM_APP_HERO_SNAP
+/// to `snap_notify_hwnd`. The GUI thread copies the pixels into a DIB for
+/// carousel painting. `snap_requested` is the renderer's one-atomic-load
+/// fast path per frame when hero mode is inactive (T53 bar); everything
+/// else is guarded by `snap_mutex`.
+snap_mutex: std.Thread.Mutex = .{},
+snap_requested: std.atomic.Value(bool) = .init(false),
+/// Requested thumbnail size in px (guarded by snap_mutex). The GUI thread
+/// pre-sizes snap_buffer to w*h*4 so the renderer never allocates.
+snap_req_w: u32 = 0,
+snap_req_h: u32 = 0,
+/// Top-level window to notify with WM_APP_HERO_SNAP (guarded).
+snap_notify_hwnd: ?w32.HWND = null,
+/// BGRA bottom-up pixels, snap_req_w * snap_req_h * 4 (guarded).
+snap_buffer: []u8 = &.{},
+/// Bumped on every completed capture (guarded). The GUI-side DIB cache
+/// syncs only when this differs from snap_dib_seq.
+snap_seq: u32 = 0,
+/// GUI-thread-only DIB cache of the last published snapshot.
+snap_dib: ?w32.HANDLE = null,
+snap_dib_bits: ?[*]u8 = null,
+snap_dib_w: i32 = 0,
+snap_dib_h: i32 = 0,
+snap_dib_seq: u32 = 0,
+
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// SplitTree.init() calls ref() to take initial ownership.
 ref_count: u32 = 0,
@@ -448,6 +476,18 @@ pub fn deinit(self: *Surface) void {
         log.debug("surface deinit: deleteSurface done", .{});
     }
 
+    // Snapshot buffer: freed only after core_surface.deinit so the
+    // renderer thread (the only other toucher) is already joined.
+    if (self.snap_buffer.len > 0) {
+        self.app.core_app.alloc.free(self.snap_buffer);
+        self.snap_buffer = &.{};
+    }
+    if (self.snap_dib) |dib| {
+        _ = w32.DeleteObject(dib);
+        self.snap_dib = null;
+        self.snap_dib_bits = null;
+    }
+
     if (self.frame_event) |event| {
         _ = w32.CloseHandle(event);
         self.frame_event = null;
@@ -634,6 +674,126 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     self.core_surface.occlusionCallback(visible) catch |err| {
         log.warn("occlusionCallback failed err={}", .{err});
     };
+}
+
+// -----------------------------------------------------------------------
+// Hero-mode thumbnail snapshots (T59a). Request/publish run on the GUI
+// thread; wanted/acquire/commit run on the renderer thread.
+// -----------------------------------------------------------------------
+
+pub const SnapReq = struct { w: u32, h: u32 };
+
+/// GUI thread: ask the renderer for a thumbnail capture at (w, h) px.
+/// Pre-sizes the pixel buffer so the renderer thread never allocates,
+/// then wakes the renderer so idle panes still produce a capture (the
+/// re-present of the last frame runs the capture hook).
+pub fn heroSnapRequest(self: *Surface, w: u32, h: u32) void {
+    if (w == 0 or h == 0) return;
+    if (!self.core_surface_ready) return;
+    {
+        self.snap_mutex.lock();
+        defer self.snap_mutex.unlock();
+        const len: usize = @as(usize, w) * @as(usize, h) * 4;
+        if (self.snap_buffer.len != len) {
+            const alloc = self.app.core_app.alloc;
+            if (self.snap_buffer.len > 0) alloc.free(self.snap_buffer);
+            self.snap_buffer = alloc.alloc(u8, len) catch {
+                self.snap_buffer = &.{};
+                return;
+            };
+        }
+        self.snap_req_w = w;
+        self.snap_req_h = h;
+        self.snap_notify_hwnd = self.parent_window.hwnd;
+    }
+    self.snap_requested.store(true, .release);
+    self.core_surface.renderer_thread.wakeup.notify() catch {};
+}
+
+/// Renderer thread: is a snapshot wanted? One atomic load when idle.
+pub fn heroSnapWanted(self: *Surface) ?SnapReq {
+    if (!self.snap_requested.load(.acquire)) return null;
+    self.snap_mutex.lock();
+    defer self.snap_mutex.unlock();
+    if (self.snap_req_w == 0 or self.snap_req_h == 0) return null;
+    return .{ .w = self.snap_req_w, .h = self.snap_req_h };
+}
+
+/// Renderer thread: lock and return the destination pixel buffer for a
+/// capture at (w, h). Returns null (unlocked) if the request changed
+/// since heroSnapWanted. On success the mutex STAYS HELD until
+/// heroSnapCommit.
+pub fn heroSnapAcquire(self: *Surface, w: u32, h: u32) ?[]u8 {
+    self.snap_mutex.lock();
+    const len: usize = @as(usize, w) * @as(usize, h) * 4;
+    if (self.snap_req_w != w or self.snap_req_h != h or
+        self.snap_buffer.len != len)
+    {
+        self.snap_mutex.unlock();
+        return null;
+    }
+    return self.snap_buffer;
+}
+
+/// Renderer thread: complete a capture begun with heroSnapAcquire,
+/// releasing the mutex. On success, bumps the sequence, clears the
+/// request flag, and notifies the GUI thread. On failure the request
+/// stays pending so the next frame retries.
+pub fn heroSnapCommit(self: *Surface, ok: bool) void {
+    const notify: ?w32.HWND = if (ok) self.snap_notify_hwnd else null;
+    var seq: u32 = 0;
+    if (ok) {
+        self.snap_seq +%= 1;
+        seq = self.snap_seq;
+        self.snap_requested.store(false, .release);
+    }
+    self.snap_mutex.unlock();
+    if (ok and (seq <= 4 or seq % 256 == 0)) {
+        // Debug-build oracle for hero-mode.ps1: proves the renderer of a
+        // (possibly hidden) pane produced a thumbnail capture. Rate-limited
+        // so an hours-long hero session doesn't flood the debug log.
+        log.debug("hero snap committed hwnd={?} seq={}", .{ self.hwnd, seq });
+    }
+    if (notify) |h| {
+        _ = w32.PostMessageW(
+            h,
+            Window.WM_APP_HERO_SNAP,
+            @intFromPtr(self.hwnd orelse return),
+            0,
+        );
+    }
+}
+
+/// GUI thread (WM_APP_HERO_SNAP): sync the DIB cache from the snapshot
+/// buffer. Returns true if the DIB changed (tile needs a repaint).
+pub fn heroSnapPublish(self: *Surface) bool {
+    self.snap_mutex.lock();
+    defer self.snap_mutex.unlock();
+    if (self.snap_seq == self.snap_dib_seq) return false;
+    const w: i32 = @intCast(self.snap_req_w);
+    const h: i32 = @intCast(self.snap_req_h);
+    if (self.snap_buffer.len != @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4) return false;
+    if (self.snap_dib == null or self.snap_dib_w != w or self.snap_dib_h != h) {
+        if (self.snap_dib) |dib| _ = w32.DeleteObject(dib);
+        self.snap_dib = null;
+        self.snap_dib_bits = null;
+        var bits: ?*anyopaque = null;
+        // Positive height = bottom-up DIB, matching GL's bottom-up
+        // ReadPixels order — no flip needed (T58 decision 1).
+        const bmi: w32.BITMAPINFO = .{ .bmiHeader = .{ .biWidth = w, .biHeight = h } };
+        const dib = w32.CreateDIBSection(null, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse return false;
+        self.snap_dib = dib;
+        self.snap_dib_bits = @ptrCast(bits orelse {
+            _ = w32.DeleteObject(dib);
+            self.snap_dib = null;
+            return false;
+        });
+        self.snap_dib_w = w;
+        self.snap_dib_h = h;
+    }
+    @memcpy(self.snap_dib_bits.?[0..self.snap_buffer.len], self.snap_buffer);
+    self.snap_dib_seq = self.snap_seq;
+    return true;
 }
 
 pub fn close(self: *Surface, process_active: bool) void {

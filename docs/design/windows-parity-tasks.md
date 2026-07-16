@@ -87,14 +87,16 @@ Work these first, in order, before falling back to first-todo-in-table:
    `t48-deadlock-dump-analysis.md`. **T48 (implement fix) is next**: defer
    SetFocus out of WindowProc so the IME/CTF cascade runs where the thread
    can pump.
-5. **~~T58~~ → T59a → T59b** — hero mode TRUE port (user, 2026-07-16,
+5. **~~T58~~ → ~~T59a~~ → T59b** — hero mode TRUE port (user, 2026-07-16,
    mid-session correction: T19's win32 port is a static live-pane
    stand-in; the Mac hero = maximized pane + animated snapshot-thumbnail
-   carousel). T58 (design) DONE 2026-07-16: decisions + sized two-part
-   plan recorded in the T58 details section — renderer-side snapshots
-   (HWND capture rejected), owner-painted carousel, snapshot-slide
-   animation. Next: T59a (pipeline + static carousel, spike first),
-   then T59b (interactions + motion).
+   carousel). T58 (design) DONE 2026-07-16. **T59a DONE 2026-07-16**:
+   snapshot pipeline (offscreen-target capture — hidden panes capture
+   cleanly, spike risk gone) + hidden/hero-sized pane layout +
+   owner-painted static carousel + click-select; hero-mode.ps1 rewritten
+   to the T58 oracle, ALL PASS on-box; both test lanes + P1–P3 green.
+   Next: T59b (wheel scroll, divider drag, hover chrome, slide +
+   re-center animations, reduced-motion, perf check).
 6. **T53** — long-context reliability + perf soak/tuning pass.
 7. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
    report was a July-5 exe — make "which build is this" answerable at a
@@ -178,7 +180,7 @@ One line per row. Full spec + validation + evidence per task:
 | T57 | FIX: "Toggle Hero Mode" (and other fork actions) missing from the win32 command palette — the REAL cause of the T49 user report ("no hero mode in command palette", 2026-07-16): the palette is a hardcoded static list (Surface.zig palette_entries), never updated with fork actions, so hero mode was undiscoverable even though the keybind worked. Added: Toggle Hero Mode, Swap Split Right/Down/Left/Up, Rename Window (prompt_surface_title). Skipped prompt_surface_banner (win32 no-op until T35). hero-mode.ps1 grew a palette section: ctrl+shift+p → type "hero" → Enter → hero geometry asserted. Consider (T51 audit): generate palette entries from core command.zig defaults instead of a parallel list, so this class of drift can't recur | F | T19 | done | (this commit) |
 | T56 | Remote reconnect on win32 (WP-D1 parity) | G | T21b | todo | — |
 | T58 | Hero mode TRUE port — design (win32): Mac hero = animated hero strip + snapshot thumbnail carousel + drag divider; T19 shipped a static live-pane stand-in (user, 2026-07-16). Decided: renderer-side FBO-downscaled snapshots (pre-swap hook in generic.zig; HWND capture rejected — child GL windows have no DWM surface), non-hero panes SW_HIDE + renderer kept awake + all hero-sized (no reflow on swap), owner-painted carousel in new HeroCarousel.zig, snapshot-slide animation, per-tab ratio + divider drag. T59 split → T59a/T59b | F | T19 | done | (this commit) |
-| T59a | Hero mode TRUE port — snapshot pipeline + static carousel: hidden-pane capture spike FIRST, then plumbing, hero layout rework, HeroCarousel.zig/hero_math.zig static paint + click-select, hero-mode.ps1 rewrite | F | T58 | todo | — |
+| T59a | Hero mode TRUE port — snapshot pipeline + static carousel. Spike outcome: capture reads the OFFSCREEN render target (OpenGL.captureThumb), so hidden panes capture cleanly — no fallback needed. Renderer hook in generic.zig; Surface snap buffer/DIB + WM_APP_HERO_SNAP; SW_HIDE + renderer-awake layout, all leaves hero-sized; owner-painted HeroCarousel.zig + hero_math.zig (unit tests in both lanes); click-select; per-tab ratio field; hero-mode.ps1 rewritten (DPI-aware harness) | F | T58 | done | (this commit) |
 | T59b | Hero mode TRUE port — interactions/motion: wheel scroll, divider drag + per-tab ratio, hover chrome, slide + re-center animations, reduced-motion, GHOZTTY_PERF check, screenshot | F | T59a | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

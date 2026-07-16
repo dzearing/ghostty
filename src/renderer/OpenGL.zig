@@ -62,6 +62,14 @@ blending: configpkg.Config.AlphaBlending,
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
+/// Lazily-created FBO + renderbuffer used to downscale the last target
+/// for hero-mode thumbnails (T59a, win32 only). Sized snap_w x snap_h.
+/// Owned by the GL context (freed with it; renderer-thread only).
+snap_fbo: ?gl.Framebuffer = null,
+snap_rbo: ?gl.Renderbuffer = null,
+snap_w: u32 = 0,
+snap_h: u32 = 0,
+
 /// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
 ///       Metal, since it needs to be fallible so does this, even though it
 ///       can't actually fail.
@@ -484,6 +492,75 @@ pub fn present(self: *OpenGL, target: Target) !void {
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);
+}
+
+/// Capture the last presented render target, downscaled to (w, h), as
+/// bottom-up BGRA pixels into `out` (len must be w*h*4). Renderer thread,
+/// win32 hero-mode thumbnails (T59a). Reads from the OFFSCREEN target
+/// texture — not the window back buffer — so it stays valid for panes
+/// whose HWND is hidden (no DWM redirection / pixel-ownership involved).
+pub fn captureThumb(self: *OpenGL, w: u32, h: u32, out: []u8) !void {
+    const target = self.last_target orelse return error.NoFrameYet;
+    if (out.len != @as(usize, w) * @as(usize, h) * 4) return error.BadBufferSize;
+
+    if (self.snap_fbo == null) self.snap_fbo = try gl.Framebuffer.create();
+    if (self.snap_rbo == null) self.snap_rbo = try gl.Renderbuffer.create();
+    if (self.snap_w != w or self.snap_h != h) {
+        {
+            const rb = try self.snap_rbo.?.bind();
+            defer rb.unbind();
+            try rb.storage(.rgba, @intCast(w), @intCast(h));
+        }
+        {
+            const fb = try self.snap_fbo.?.bind(.framebuffer);
+            defer fb.unbind();
+            try fb.renderbuffer(.color0, self.snap_rbo.?);
+        }
+        self.snap_w = w;
+        self.snap_h = h;
+    }
+
+    // Copy raw values: without this the blit would linearize/encode sRGB
+    // (same reasoning as present()).
+    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
+        log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
+    };
+
+    {
+        const draw = try self.snap_fbo.?.bind(.draw);
+        defer draw.unbind();
+        const read = try target.framebuffer.bind(.read);
+        defer read.unbind();
+        gl.glad.context.BlitFramebuffer.?(
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            0,
+            0,
+            @intCast(w),
+            @intCast(h),
+            gl.c.GL_COLOR_BUFFER_BIT,
+            gl.c.GL_LINEAR,
+        );
+    }
+
+    {
+        const read = try self.snap_fbo.?.bind(.read);
+        defer read.unbind();
+        gl.glad.context.ReadBuffer.?(gl.c.GL_COLOR_ATTACHMENT0);
+        gl.glad.context.PixelStorei.?(gl.c.GL_PACK_ALIGNMENT, 4);
+        gl.glad.context.ReadPixels.?(
+            0,
+            0,
+            @intCast(w),
+            @intCast(h),
+            gl.c.GL_BGRA,
+            gl.c.GL_UNSIGNED_BYTE,
+            out.ptr,
+        );
+    }
 }
 
 /// Returns the options to use when constructing buffers.

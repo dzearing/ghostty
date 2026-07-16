@@ -59,4 +59,8 @@ test {
     _ = action;
     _ = structs;
     _ = ipc;
+
+    // Pure win32 hero-mode geometry: no OS imports, so its unit tests run
+    // in every app-runtime lane (T59a).
+    _ = @import("apprt/win32/hero_math.zig");
 }

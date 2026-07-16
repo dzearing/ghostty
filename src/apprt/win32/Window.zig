@@ -37,8 +37,20 @@ pub const RemoteDialed = union(enum) {
     }
 };
 const w32 = @import("win32.zig");
+const HeroCarousel = @import("HeroCarousel.zig");
+const hero_math = @import("hero_math.zig");
 
 const log = std.log.scoped(.win32);
+
+/// Posted by a Surface's renderer thread when a hero-mode thumbnail
+/// snapshot is ready (wparam = the leaf's HWND; validated against the
+/// active tab's tree before any pointer is touched). WM_APP+1..+5 are
+/// defined in App.zig.
+pub const WM_APP_HERO_SNAP: u32 = w32.WM_APP + 6;
+
+/// Hero-mode carousel thumbnail refresh period (Mac parity: 0.15s).
+const HERO_SNAP_INTERVAL_MS: u32 = 150;
+const HERO_SNAP_TIMER_ID: usize = 0x4853; // 'HS'
 
 /// Maximum number of tabs per window.
 const MAX_TABS: usize = 64;
@@ -180,11 +192,16 @@ title_override: ?[:0]u8 = null,
 /// terminals (not IPC-addressable) or if registration failed.
 ipc_name: ?[]u8 = null,
 
-/// Hero mode (fork feature, T19): per-tab presentation state. The split
-/// tree is untouched — the selected leaf renders full height on the left
-/// and every other leaf stacks in a right-hand carousel column.
+/// Hero mode (fork feature, T19; TRUE port T58/T59a): per-tab presentation
+/// state. The split tree is untouched — the selected leaf fills the hero
+/// region on the left; every other leaf is HIDDEN (renderer kept awake)
+/// and represented by a snapshot thumbnail in the owner-painted carousel
+/// column on the right.
 tab_hero_active: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
 tab_hero_index: [MAX_TABS]u16 = [_]u16{0} ** MAX_TABS,
+/// Carousel share of the window width, per tab (Mac default 0.25,
+/// clamped 0.1–0.6; divider drag lands in T59b).
+tab_hero_ratio: [MAX_TABS]f32 = [_]f32{hero_math.RATIO_DEFAULT} ** MAX_TABS,
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -576,11 +593,13 @@ pub fn addTab(self: *Window) !*Surface {
         self.tab_title_lens[i] = self.tab_title_lens[i - 1];
         self.tab_hero_active[i] = self.tab_hero_active[i - 1];
         self.tab_hero_index[i] = self.tab_hero_index[i - 1];
+        self.tab_hero_ratio[i] = self.tab_hero_ratio[i - 1];
     }
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
     self.tab_hero_active[pos] = false;
     self.tab_hero_index[pos] = 0;
+    self.tab_hero_ratio[pos] = hero_math.RATIO_DEFAULT;
     self.tab_count += 1;
 
     // Set default title.
@@ -632,6 +651,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_title_lens[i] = self.tab_title_lens[i + 1];
         self.tab_hero_active[i] = self.tab_hero_active[i + 1];
         self.tab_hero_index[i] = self.tab_hero_index[i + 1];
+        self.tab_hero_ratio[i] = self.tab_hero_ratio[i + 1];
     }
     self.tab_count -= 1;
     if (self.tab_count == 0) {
@@ -764,11 +784,6 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.updateWindowTitle();
 }
 
-/// Layout split panes for the active tab.
-/// Carousel share of the window width in hero mode (Mac default; the Mac
-/// clamps user resizes to 0.1–0.6, which applies when drag lands here).
-const HERO_CAROUSEL_RATIO: f32 = 0.25;
-
 /// Number of leaves in a tab's tree.
 fn leafCount(self: *Window, tab: usize) usize {
     var n: usize = 0;
@@ -813,6 +828,8 @@ pub fn toggleHeroMode(self: *Window) void {
         self.tab_hero_active[tab] = true;
     }
     self.layoutSplits();
+    // Repaint everything: entering paints the carousel, leaving clears it.
+    if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
     if (self.tab_active_surface[tab].hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
@@ -822,6 +839,7 @@ fn heroSelect(self: *Window, index: isize) void {
     const n = self.leafCount(tab);
     if (n == 0) return;
     const clamped: usize = @intCast(@max(0, @min(index, @as(isize, @intCast(n - 1)))));
+    log.debug("heroSelect req={} clamped={} cur={} n={}", .{ index, clamped, self.tab_hero_index[tab], n });
     if (clamped == self.tab_hero_index[tab]) return;
     self.tab_hero_index[tab] = @intCast(clamped);
     const view = self.leafAt(tab, clamped) orelse return;
@@ -848,47 +866,97 @@ pub fn heroOnSurfaceFocused(self: *Window, surface: *Surface) void {
     const tab = self.active_tab;
     if (!self.tab_hero_active[tab]) return;
     const index = self.leafIndexOf(tab, surface) orelse return;
+    log.debug("heroOnSurfaceFocused hwnd={?} index={} cur={}", .{ surface.hwnd, index, self.tab_hero_index[tab] });
     if (index == self.tab_hero_index[tab]) return;
     self.tab_hero_index[tab] = @intCast(index);
     self.layoutSplits();
 }
 
-/// Hero layout: selected leaf full-height left, every other leaf stacked
-/// equally in the right-hand carousel column.
+/// 150ms heartbeat while hero mode is active: ask every leaf's renderer
+/// for a fresh thumbnail at the current tile size. Idle panes produce no
+/// new frame until their next wakeup re-presents the last target, so the
+/// steady-state cost of an unchanged pane is one atomic load per frame.
+fn heroSnapTick(self: *Window) void {
+    if (self.tab_count == 0 or !self.tab_hero_active[self.active_tab]) {
+        if (self.hwnd) |h| _ = w32.KillTimer(h, HERO_SNAP_TIMER_ID);
+        return;
+    }
+    // Minimized: panes are occluded and produce no frames — don't wake
+    // every renderer thread each tick for nothing (T53 bar).
+    if (self.hwnd) |h| if (w32.IsIconic(h) != 0) return;
+    const geo = HeroCarousel.geometry(self) orelse return;
+    var it = self.tab_trees[self.active_tab].iterator();
+    while (it.next()) |entry| {
+        entry.view.heroSnapRequest(
+            @intCast(@max(geo.layout.thumb_w, 1)),
+            @intCast(@max(geo.layout.thumb_h, 1)),
+        );
+    }
+}
+
+/// WM_APP_HERO_SNAP: a renderer thread finished a thumbnail capture.
+/// wparam carries the leaf HWND; it is validated against the active
+/// tab's tree before any Surface pointer is dereferenced (the pane may
+/// have closed between post and delivery).
+fn heroOnSnapReady(self: *Window, leaf_hwnd_int: usize) void {
+    if (self.tab_count == 0 or !self.tab_hero_active[self.active_tab]) return;
+    var it = self.tab_trees[self.active_tab].iterator();
+    var index: usize = 0;
+    while (it.next()) |entry| : (index += 1) {
+        const h = entry.view.hwnd orelse continue;
+        if (@intFromPtr(h) != leaf_hwnd_int) continue;
+        if (entry.view.heroSnapPublish()) {
+            if (self.hwnd) |wh| {
+                if (HeroCarousel.tileRect(self, index)) |r| {
+                    var inv: w32.RECT = .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
+                    _ = w32.InvalidateRect(wh, &inv, 0);
+                }
+            }
+        }
+        return;
+    }
+}
+
+/// Hero layout (T58 true port): the selected leaf fills the hero region
+/// on the left; every OTHER leaf is hidden (SW_HIDE) but kept renderer-
+/// visible so it keeps producing frames for its carousel thumbnail. ALL
+/// leaves — hidden included — are MoveWindow'd to the hero rect: the
+/// thumbnails inherit the hero aspect ratio for free and a selection swap
+/// needs no grid reflow (the Mac keeps all strip slots hero-sized for
+/// exactly this reason). The carousel column itself has no child HWNDs;
+/// it is owner-painted by HeroCarousel.
 fn layoutHero(self: *Window, rect: w32.RECT) void {
     const tab = self.active_tab;
     const n = self.leafCount(tab);
     if (self.tab_hero_index[tab] >= n) self.tab_hero_index[tab] = @intCast(n - 1);
     const hero_index: usize = self.tab_hero_index[tab];
 
-    const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
-    const total_w = rect.right - rect.left;
-    const total_h = rect.bottom - rect.top;
-    const carousel_w: i32 = @intFromFloat(HERO_CAROUSEL_RATIO * @as(f32, @floatFromInt(total_w)));
-    const hero_right = rect.right - carousel_w - gap;
-    const carousel_count: i32 = @intCast(n - 1);
+    const split = HeroCarousel.splitRects(self, rect);
+    const hero_w = @max(split.hero.width(), 1);
+    const hero_h = @max(split.hero.height(), 1);
 
     var it = self.tab_trees[tab].iterator();
     var leaf_i: usize = 0;
-    var carousel_i: i32 = 0;
     while (it.next()) |entry| : (leaf_i += 1) {
-        var r: w32.RECT = undefined;
-        if (leaf_i == hero_index) {
-            r = .{ .left = rect.left, .top = rect.top, .right = hero_right, .bottom = rect.bottom };
-        } else {
-            const top = rect.top + @divTrunc(total_h * carousel_i, carousel_count);
-            var bottom = rect.top + @divTrunc(total_h * (carousel_i + 1), carousel_count);
-            if (carousel_i + 1 < carousel_count) bottom -= gap;
-            r = .{ .left = hero_right + gap, .top = top, .right = rect.right, .bottom = bottom };
-            carousel_i += 1;
-        }
+        // Renderer stays awake even for hidden leaves (thumbnail source).
         entry.view.setVisible(true);
         if (entry.view.hwnd) |h| {
-            const w = @max(r.right - r.left, 1);
-            const ht = @max(r.bottom - r.top, 1);
-            _ = w32.MoveWindow(h, r.left, r.top, @intCast(w), @intCast(ht), 1);
-            _ = w32.ShowWindow(h, w32.SW_SHOW);
+            _ = w32.MoveWindow(h, split.hero.left, split.hero.top, @intCast(hero_w), @intCast(hero_h), 1);
+            _ = w32.ShowWindow(h, if (leaf_i == hero_index) w32.SW_SHOW else w32.SW_HIDE);
         }
+    }
+
+    if (self.hwnd) |h| {
+        // Repaint the owner-painted divider + carousel column.
+        var inv: w32.RECT = .{
+            .left = split.divider.left,
+            .top = rect.top,
+            .right = rect.right,
+            .bottom = rect.bottom,
+        };
+        _ = w32.InvalidateRect(h, &inv, 0);
+        // Thumbnail refresh heartbeat while hero is active (Mac: 0.15s).
+        _ = w32.SetTimer(h, HERO_SNAP_TIMER_ID, HERO_SNAP_INTERVAL_MS, null);
     }
 }
 
@@ -903,6 +971,9 @@ pub fn layoutSplits(self: *Window) void {
         }
         self.tab_hero_active[self.active_tab] = false;
     }
+    // Not in hero mode: stop the thumbnail heartbeat (harmless if it was
+    // never started) and repaint the area the carousel used to own.
+    if (self.hwnd) |h| _ = w32.KillTimer(h, HERO_SNAP_TIMER_ID);
     if (tree.zoomed) |zoomed_handle| {
         var it = tree.iterator();
         while (it.next()) |entry| {
@@ -1021,6 +1092,9 @@ const DividerHit = struct {
 
 fn hitTestDivider(self: *Window, x: i32, y: i32) ?DividerHit {
     if (self.tab_count == 0) return null;
+    // Hero mode ignores the tree layout, so tree dividers don't exist on
+    // screen (the hero/carousel divider drag lands in T59b).
+    if (self.tab_hero_active[self.active_tab]) return null;
     const tree = self.tab_trees[self.active_tab];
     if (!tree.isSplit()) return null;
     if (tree.zoomed != null) return null;
@@ -1493,16 +1567,27 @@ pub fn invalidateTabBar(self: *Window) void {
     _ = w32.InvalidateRect(hwnd, &rect, 0);
 }
 
-/// Paint the tab bar using double-buffered GDI painting.
-/// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
-fn paintTabBar(self: *Window) void {
+/// WM_PAINT: one BeginPaint/EndPaint cycle covering both the tab bar and
+/// (when hero mode is active) the owner-painted carousel column.
+fn paintWindow(self: *Window) void {
     const hwnd = self.hwnd orelse return;
 
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
 
-    // If the tab bar is not visible, just validate the region and return.
+    self.paintTabBar(hdc_screen);
+    if (self.tab_count > 0 and self.tab_hero_active[self.active_tab]) {
+        HeroCarousel.paint(self, hdc_screen);
+    }
+}
+
+/// Paint the tab bar using double-buffered GDI painting.
+/// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
+fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
+    const hwnd = self.hwnd orelse return;
+
+    // If the tab bar is not visible, there is nothing to paint here.
     if (!self.tab_bar_visible) return;
 
     const bar_h = self.tabBarHeight();
@@ -1918,6 +2003,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     const saved_title_len = self.tab_title_lens[from];
     const saved_hero_active = self.tab_hero_active[from];
     const saved_hero_index = self.tab_hero_index[from];
+    const saved_hero_ratio = self.tab_hero_ratio[from];
 
     if (from < to) {
         // Shift left: move [from+1..to+1] to [from..to]
@@ -1929,6 +2015,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_title_lens[i] = self.tab_title_lens[i + 1];
             self.tab_hero_active[i] = self.tab_hero_active[i + 1];
             self.tab_hero_index[i] = self.tab_hero_index[i + 1];
+            self.tab_hero_ratio[i] = self.tab_hero_ratio[i + 1];
         }
     } else {
         // Shift right: move [to..from] to [to+1..from+1]
@@ -1940,6 +2027,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_title_lens[i] = self.tab_title_lens[i - 1];
             self.tab_hero_active[i] = self.tab_hero_active[i - 1];
             self.tab_hero_index[i] = self.tab_hero_index[i - 1];
+            self.tab_hero_ratio[i] = self.tab_hero_ratio[i - 1];
         }
     }
 
@@ -1950,6 +2038,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_title_lens[to] = saved_title_len;
     self.tab_hero_active[to] = saved_hero_active;
     self.tab_hero_index[to] = saved_hero_index;
+    self.tab_hero_ratio[to] = saved_hero_ratio;
 
     self.active_tab = to;
     self.invalidateTabBar();
@@ -2443,7 +2532,15 @@ pub fn windowWndProc(
                 _ = w32.KillTimer(hwnd, RESIZE_OVERLAY_TIMER_ID);
                 return 0;
             }
+            if (wparam == HERO_SNAP_TIMER_ID) {
+                window.heroSnapTick();
+                return 0;
+            }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        WM_APP_HERO_SNAP => {
+            window.heroOnSnapReady(wparam);
+            return 0;
         },
 
         w32.WM_CTLCOLORSTATIC => {
@@ -2532,7 +2629,7 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_PAINT => {
-            window.paintTabBar();
+            window.paintWindow();
             return 0;
         },
         w32.WM_COMMAND => {
@@ -2580,6 +2677,16 @@ pub fn windowWndProc(
                 window.drag_active = false;
                 _ = w32.ReleaseCapture();
                 return 0;
+            }
+            // Hero carousel: clicking a thumbnail selects it (the Mac
+            // selects on mouse-up inside a tile).
+            if (window.tab_count > 0 and window.tab_hero_active[window.active_tab]) {
+                const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
+                const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+                if (HeroCarousel.hitTest(window, x, y)) |index| {
+                    window.heroSelect(@intCast(index));
+                    return 0;
+                }
             }
             return 0;
         },

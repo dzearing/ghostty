@@ -106,6 +106,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The mailbox for communicating with the window.
         surface_mailbox: apprt.surface.Mailbox,
 
+        /// The apprt surface. Used on win32 for hero-mode thumbnail
+        /// snapshot requests (T59a); the pointer outlives this renderer.
+        rt_surface: *apprt.Surface,
+
         /// Current font metrics defining our grid.
         grid_metrics: font.Metrics,
 
@@ -702,6 +706,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .alloc = alloc,
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
+                .rt_surface = options.rt_surface,
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
@@ -1491,6 +1496,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.api.drawFrameStart();
             defer self.api.drawFrameEnd();
 
+            // Win32 hero mode (T59a): registered after the drawFrameEnd
+            // defer so it runs BEFORE it (LIFO) — i.e. after the frame is
+            // fully presented to the target but before SwapBuffers. Captures
+            // a thumbnail of the last presented target when the GUI thread
+            // requested one. One atomic load when idle.
+            defer if (comptime apprt.runtime == apprt.win32) self.heroSnapshot();
+
             // Retrieve the most up-to-date surface size from the Graphics API
             const surface_size = try self.api.surfaceSize();
 
@@ -1748,6 +1760,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     });
                 }
             }
+        }
+
+        /// Win32 hero mode (T59a): if the GUI thread requested a thumbnail
+        /// of this pane, downscale-capture the last presented target into
+        /// the surface's snapshot buffer and notify the GUI. Runs on the
+        /// renderer thread at the end of drawFrame. Only analyzed on the
+        /// win32 runtime (the call site is comptime-gated).
+        fn heroSnapshot(self: *Self) void {
+            const req = self.rt_surface.heroSnapWanted() orelse return;
+            const buf = self.rt_surface.heroSnapAcquire(req.w, req.h) orelse return;
+            const ok = ok: {
+                self.api.captureThumb(req.w, req.h, buf) catch |err| {
+                    // NoFrameYet is expected until the first frame presents.
+                    if (err != error.NoFrameYet) log.warn(
+                        "hero snapshot capture failed err={}",
+                        .{err},
+                    );
+                    break :ok false;
+                };
+                break :ok true;
+            };
+            self.rt_surface.heroSnapCommit(ok);
         }
 
         // Callback from the graphics API when a frame is completed.
