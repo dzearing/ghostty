@@ -2606,22 +2606,34 @@ test "RELAUNCH: reboot ring snapshot is replayed (scrollback + divider) before l
     var prng = std.Random.DefaultPrng.init(0xD1CE);
 
     var h = try Harness.init(alloc, .raw, &clock, &sp, 1 << 16, prng.random());
-    defer h.deinit();
 
     // Point the store's reboot-floor state at a temp dir and seed BOTH files a real
     // agent restart would find: sessions.json (the roster) + rings/<id>.ring (the
     // pre-restart scrollback snapshot). Then loadPersisted materializes the session
     // AND preloads its ring — exactly the reboot path.
     var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
     const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir_path);
     const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
-    defer alloc.free(meta);
     const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
-    defer alloc.free(rings);
     h.store.meta_path = meta;
     h.store.rings_dir = rings;
+    // Ordered teardown (one defer, not several). The store only BORROWS
+    // meta_path/rings_dir, and the server's reader threads touch them AFTER acking a
+    // frame: handleRelaunch sends .relaunched and THEN calls persistMeta on the control
+    // thread, and shutdown() calls snapshotRings. h.deinit() is what joins those
+    // threads, so the borrowed paths and the temp dir must outlive it. Splitting these
+    // into separate `defer`s frees the paths (LIFO) BEFORE h.deinit() joins the
+    // threads, so a still-running persistMeta/snapshotRings writes through the freed
+    // slices into the deleted dir — a use-after-free that surfaces as a garbage path
+    // and a spurious EILSEQ/Unexpected snapshot-write warning. Deinit-then-free here
+    // guarantees the writers are quiesced first.
+    defer {
+        h.deinit();
+        alloc.free(rings);
+        alloc.free(meta);
+        alloc.free(dir_path);
+        tmp.cleanup();
+    }
 
     const rec_id = "abcabcabcabcabcabcabcabcabcabcab";
     const scrollback = "PANE=3 PID=4242\r\ntick-3-0\r\ntick-3-1\r\n";
