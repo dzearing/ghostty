@@ -52,6 +52,11 @@ final class LocalAgentManager {
         /// The AF_UNIX socket the agent binds and clients dial. 0600, same-uid
         /// gated — the secure local transport (design §5.2).
         var socketFile: URL { directory.appendingPathComponent("agent.sock") }
+        /// The reboot-floor session-metadata store (passed via `--sessions-file`):
+        /// the agent keeps this current with its live-session roster (id/argv/cwd/
+        /// title/pinned) so sessions can be relaunched after an agent/machine
+        /// restart (design §5.4, T12).
+        var sessionsFile: URL { directory.appendingPathComponent("sessions.json") }
         var lockFile: URL { directory.appendingPathComponent("agent.lock") }
         var heartbeatFile: URL { directory.appendingPathComponent("agent.heartbeat") }
         var logFile: URL { directory.appendingPathComponent("agent.log") }
@@ -326,6 +331,10 @@ final class LocalAgentManager {
             binary.path,
             "--listen-unix=\(paths.socketFile.path)",
             "--port-file=\(paths.portFile.path)",
+            // Reboot-floor metadata store (design §5.4, T12): the agent keeps this
+            // current with its live-session roster so sessions can be relaunched
+            // after an agent/machine restart.
+            "--sessions-file=\(paths.sessionsFile.path)",
         ]
 
         // Inherit the app's environment, forcing the per-lineage guard paths

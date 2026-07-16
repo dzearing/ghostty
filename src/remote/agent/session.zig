@@ -38,6 +38,9 @@ const assert = std.debug.assert;
 // root one level up (`src/remote/agent_test.zig`) so this `../` stays inside the
 // module path; see `server.zig`'s "Running the tests" note.
 const protocol = @import("../protocol.zig");
+// Metadata persistence (T12, §5.4 reboot floor). `session_meta` depends on
+// nothing but `std`, so importing it here introduces no cycle.
+const session_meta = @import("session_meta.zig");
 
 // -----------------------------------------------------------------------------
 // Caps (§7.1 "Resource caps & TTL")
@@ -642,6 +645,13 @@ pub const SessionStore = struct {
     nowFn: *const fn (ctx: *anyopaque) i64,
     idle_ttl_ms: i64,
 
+    /// When set, `persistMeta` atomically rewrites this path with the current
+    /// alive-session metadata (§5.4 reboot floor, T12). BORROWED — the caller
+    /// (main.zig) owns the string and keeps it alive for the store's lifetime.
+    /// Null (the default) disables persistence entirely, so tests and any
+    /// non-persistent serve path are byte-for-byte unchanged.
+    meta_path: ?[]const u8 = null,
+
     /// Background reaper: wakes periodically to evict idle orphaned sessions.
     reaper: ?std.Thread = null,
     reaper_mutex: std.Thread.Mutex = .{},
@@ -749,6 +759,9 @@ pub const SessionStore = struct {
         }
         self.mutex.unlock();
         for (unlinked.items) |s| self.table.freeUnlinked(s);
+        // Refresh the on-disk metadata if the alive set actually shrank (§5.4,
+        // T12). No-op when persistence is disabled or nothing was reaped.
+        if (unlinked.items.len > 0) self.persistMeta();
     }
 
     /// Explicit CLOSE: unlink the session on `channel` under the lock and free it
@@ -762,6 +775,56 @@ pub const SessionStore = struct {
         const unlinked = self.table.unlink(s.id);
         self.mutex.unlock();
         if (unlinked) |u| self.table.freeUnlinked(u);
+    }
+
+    /// Persist the current ALIVE session set to `meta_path` (§5.4 reboot floor,
+    /// T12). No-op when `meta_path` is null (persistence disabled — the default).
+    /// Best-effort: any failure is logged and swallowed, never propagated — a
+    /// failed metadata write must never take down a live session.
+    ///
+    /// Snapshot-then-IO discipline (mirrors the server's `handleGetCwd`): the
+    /// alive set is copied into OWNED `session_meta.Record`s UNDER the store
+    /// mutex, the mutex is released, and only THEN is the file serialized +
+    /// atomically written — no OS I/O ever runs under the lock (which serializes
+    /// every child output chunk). The owned dupes mean a session freed between
+    /// the snapshot and the write cannot dangle. Callers invoke this AFTER their
+    /// own unlocks (never while holding `mutex`); it takes the lock itself.
+    ///
+    /// Only ALIVE sessions are recorded: a tombstone (exited child) has nothing
+    /// to relaunch, and the file self-heals on the next open/close trigger, so
+    /// child-exit deliberately does not call this.
+    pub fn persistMeta(self: *SessionStore) void {
+        const path = self.meta_path orelse return;
+        const alloc = self.table.alloc;
+
+        // Phase 1: snapshot alive sessions into owned records under the lock.
+        var recs: std.ArrayList(session_meta.Record) = .empty;
+        defer {
+            for (recs.items) |r| freeMetaRecord(alloc, r);
+            recs.deinit(alloc);
+        }
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive) continue; // tombstones have nothing to relaunch
+            const rec = dupMetaRecord(alloc, s) catch continue; // best-effort per session
+            recs.append(alloc, rec) catch {
+                freeMetaRecord(alloc, rec); // not in the list → free here
+                continue;
+            };
+        }
+        self.mutex.unlock();
+
+        // Phase 2: serialize + atomic write OUTSIDE the lock.
+        const body = session_meta.serialize(alloc, recs.items) catch |err| {
+            std.log.warn("session_meta: serialize failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer alloc.free(body);
+        session_meta.writeAtomic(alloc, path, body) catch |err| {
+            std.log.warn("session_meta: write to {s} failed: {s}", .{ path, @errorName(err) });
+        };
     }
 
     /// Free the whole store: stop the reaper, then tear down every session. Unlinks
@@ -795,6 +858,37 @@ pub const SessionStore = struct {
         self.table = undefined;
     }
 };
+
+/// Copy a live session's relaunch metadata into an OWNED `session_meta.Record`
+/// (every string duped). Used by `persistMeta` under the store lock so the
+/// snapshot survives the unlock + file write. On any allocation failure the
+/// partial dupes are freed (errdefer) and the error propagates to the caller,
+/// which skips that one session (best-effort).
+fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_meta.Record {
+    const id = try alloc.dupe(u8, s.idStr());
+    errdefer alloc.free(id);
+    const argv: ?[]u8 = if (s.argv) |a| try alloc.dupe(u8, a) else null;
+    errdefer if (argv) |a| alloc.free(a);
+    const cwd: ?[]u8 = if (s.cwd) |c| try alloc.dupe(u8, c) else null;
+    errdefer if (cwd) |c| alloc.free(c);
+    const title: ?[]u8 = if (s.title) |t| try alloc.dupe(u8, t) else null;
+    return .{
+        .id = id,
+        .argv = argv,
+        .cwd = cwd,
+        .title = title,
+        .pinned = s.pinned,
+        .created_ms = s.created_ms,
+    };
+}
+
+/// Free every string in an owned metadata record (the inverse of `dupMetaRecord`).
+fn freeMetaRecord(alloc: Allocator, r: session_meta.Record) void {
+    alloc.free(r.id);
+    if (r.argv) |a| alloc.free(a);
+    if (r.cwd) |c| alloc.free(c);
+    if (r.title) |t| alloc.free(t);
+}
 
 // =============================================================================
 // Tests
@@ -997,6 +1091,82 @@ test "SessionStore.reapIdle: pinned survives fast-forward, unpinned is reaped" {
     try testing.expect(fakes[1].terminated); // plain child was terminated on reap
     try testing.expect(!fakes[0].terminated); // pinned child untouched
     _ = plain;
+}
+
+test "SessionStore.persistMeta: writes alive set, excludes tombstones, refreshes on removal" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7E57);
+    var fakes: [3]FakeChild = .{ .{ .alloc = alloc }, .{ .alloc = alloc }, .{ .alloc = alloc } };
+    defer for (&fakes) |*f| f.deinit();
+
+    var clock: MutClock = .{ .ms = 100 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    // A private temp file for the metadata store.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const path = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(path);
+    store.meta_path = path;
+
+    // No-op sanity: persisting an empty store writes an empty roster.
+    store.persistMeta();
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 0), p.value.sessions.len);
+    }
+
+    // Two sessions: one pinned + a command label, one plain.
+    const s0 = try store.table.create(fakes[0].child(), 500, 24, 80, 1024, 100);
+    s0.pinned = true;
+    s0.setArgv("sleep 600");
+    const s1 = try store.table.create(fakes[1].child(), 501, 24, 80, 1024, 100);
+    const s1_channel = s1.channel;
+
+    store.persistMeta();
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 2), p.value.sessions.len);
+        // Find s0's record by id and assert its captured fields survived the trip.
+        var saw_pinned_argv = false;
+        for (p.value.sessions) |r| {
+            if (std.mem.eql(u8, r.id, s0.idStr())) {
+                saw_pinned_argv = true;
+                try testing.expect(r.pinned);
+                try testing.expectEqualStrings("sleep 600", r.argv.?);
+                try testing.expectEqual(@as(i64, 100), r.created_ms);
+            }
+        }
+        try testing.expect(saw_pinned_argv);
+    }
+
+    // A tombstone (exited child) is excluded — nothing to relaunch.
+    s1.markExited(0, 200);
+    store.persistMeta();
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.sessions.len);
+        try testing.expectEqualStrings(s0.idStr(), p.value.sessions[0].id);
+    }
+
+    // Closing the tombstoned session refreshes to the same single record.
+    store.closeByChannel(s1_channel);
+    store.persistMeta();
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.sessions.len);
+    }
+
+    // A null meta_path disables persistence: no crash, file untouched.
+    store.meta_path = null;
+    store.persistMeta();
 }
 
 test "SessionStore.reapIdle: a bound session is never reaped regardless of pin" {

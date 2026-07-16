@@ -725,6 +725,11 @@ pub const Server = struct {
             .session_id = id_copy[0..],
             .pid = pid,
         }) catch {};
+
+        // A new session entered the alive set — durably record the reboot-floor
+        // metadata (§5.4, T12). Runs after our unlock; no-op when persistence is
+        // disabled (meta_path null, e.g. every test + non-persistent serve path).
+        self.store.persistMeta();
     }
 
     /// Bind session `s` to this connection: point its outbound bridge at us, mark it
@@ -902,7 +907,12 @@ pub const Server = struct {
         const s = self.store.table.getByChannel(channel);
         const unlinked = if (s) |sess| self.store.table.unlink(sess.id) else null;
         self.store.mutex.unlock();
-        if (unlinked) |u| self.store.table.freeUnlinked(u);
+        if (unlinked) |u| {
+            self.store.table.freeUnlinked(u);
+            // The alive set shrank — refresh the reboot-floor metadata (§5.4,
+            // T12). No-op when persistence is disabled or the channel was stale.
+            self.store.persistMeta();
+        }
     }
 
     /// `GET_CWD` (§WP4): on-demand "what is this session's child cwd?". Looks the

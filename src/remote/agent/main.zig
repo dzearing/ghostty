@@ -161,20 +161,22 @@ pub fn main() !void {
         .listen => |l| {
             // Keep the GPA exit clean on the (error) paths where runListen returns.
             defer if (l.port_file) |pf| alloc.free(pf);
+            defer if (l.sessions_file) |sf| alloc.free(sf);
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
             // (bind, banner, tray icon). Exits the process on conflict.
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
             defer lock.release();
-            try runListen(alloc, encoding, l.addr, l.headless, l.public, l.port_file);
+            try runListen(alloc, encoding, l.addr, l.headless, l.public, l.port_file, l.sessions_file);
         },
         .listen_unix => |l| {
             defer alloc.free(l.path);
             defer if (l.port_file) |pf| alloc.free(pf);
+            defer if (l.sessions_file) |sf| alloc.free(sf);
             // DAEMON mode: single-instance BEFORE the bind (a losing instance
             // must not clobber the winner's socket node).
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
             defer lock.release();
-            try runListenUnix(alloc, encoding, l.path, l.headless, l.port_file);
+            try runListenUnix(alloc, encoding, l.path, l.headless, l.port_file, l.sessions_file);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
@@ -421,6 +423,11 @@ const Listen = struct {
     /// with `--listen=127.0.0.1:0` (ephemeral port) can discover the bound
     /// port. Owned (duped from argv).
     port_file: ?[]const u8 = null,
+    /// `--sessions-file=<path>`: the reboot-floor metadata store (§5.4, T12).
+    /// When set, the daemon keeps this path up to date with the live-session
+    /// roster (id/argv/cwd/title/pinned) so sessions can be relaunched after an
+    /// agent/machine restart. Owned (duped from argv). Null ⇒ no persistence.
+    sessions_file: ?[]const u8 = null,
 };
 
 /// Unix-domain-socket listen-daemon parameters (`--listen-unix=<path>`). The
@@ -442,6 +449,9 @@ const ListenUnix = struct {
     /// and learn the socket path to dial (a UDS has no ephemeral port to
     /// publish). Owned (duped from argv).
     port_file: ?[]const u8 = null,
+    /// `--sessions-file=<path>`: the reboot-floor metadata store (§5.4, T12) —
+    /// see `Listen.sessions_file`. Owned (duped from argv). Null ⇒ no persistence.
+    sessions_file: ?[]const u8 = null,
 };
 
 /// Opt-in required to bind `--listen` to a NON-loopback interface. The TCP
@@ -472,6 +482,7 @@ fn parseArgs(alloc: Allocator) !Mode {
     var force_replace = false;
     var allow_public = false;
     var port_file_arg: ?[]const u8 = null;
+    var sessions_file_arg: ?[]const u8 = null;
     {
         var j: usize = 1;
         while (j < args.len) : (j += 1) {
@@ -492,6 +503,17 @@ fn parseArgs(alloc: Allocator) !Mode {
                 port_file_arg = args[j];
             } else if (std.mem.startsWith(u8, a, "--port-file=")) {
                 port_file_arg = a["--port-file=".len..];
+            }
+            // Sessions file (T12): order-independent config, like --port-file.
+            if (std.mem.eql(u8, a, "--sessions-file")) {
+                j += 1;
+                if (j >= args.len) {
+                    std.debug.print("ghoztty-agent: --sessions-file requires <path>\n", .{});
+                    return error.InvalidArgs;
+                }
+                sessions_file_arg = args[j];
+            } else if (std.mem.startsWith(u8, a, "--sessions-file=")) {
+                sessions_file_arg = a["--sessions-file=".len..];
             }
             // Ring size (T11): order-independent config, like --port-file.
             if (std.mem.eql(u8, a, "--ring-bytes")) {
@@ -528,10 +550,11 @@ fn parseArgs(alloc: Allocator) !Mode {
             std.mem.eql(u8, a, "--force-replace") or std.mem.eql(u8, a, "--replace") or
             std.mem.eql(u8, a, allow_public_flag) or
             std.mem.startsWith(u8, a, "--port-file=") or
+            std.mem.startsWith(u8, a, "--sessions-file=") or
             std.mem.startsWith(u8, a, "--ring-bytes="))
         {
             continue; // handled in the pre-scan above
-        } else if (std.mem.eql(u8, a, "--port-file") or std.mem.eql(u8, a, "--ring-bytes")) {
+        } else if (std.mem.eql(u8, a, "--port-file") or std.mem.eql(u8, a, "--sessions-file") or std.mem.eql(u8, a, "--ring-bytes")) {
             i += 1; // value consumed in the pre-scan above
             continue;
         } else if (std.mem.eql(u8, a, "--version")) {
@@ -546,18 +569,18 @@ fn parseArgs(alloc: Allocator) !Mode {
                 std.debug.print("ghoztty-agent: --listen requires <addr:port>\n", .{});
                 return error.InvalidArgs;
             }
-            return listenMode(alloc, try parseAddr(args[i]), headless, force_replace, allow_public, port_file_arg);
+            return listenMode(alloc, try parseAddr(args[i]), headless, force_replace, allow_public, port_file_arg, sessions_file_arg);
         } else if (std.mem.startsWith(u8, a, "--listen=")) {
-            return listenMode(alloc, try parseAddr(a["--listen=".len..]), headless, force_replace, allow_public, port_file_arg);
+            return listenMode(alloc, try parseAddr(a["--listen=".len..]), headless, force_replace, allow_public, port_file_arg, sessions_file_arg);
         } else if (std.mem.eql(u8, a, "--listen-unix")) {
             i += 1;
             if (i >= args.len) {
                 std.debug.print("ghoztty-agent: --listen-unix requires <path>\n", .{});
                 return error.InvalidArgs;
             }
-            return listenUnixMode(alloc, args[i], headless, force_replace, port_file_arg);
+            return listenUnixMode(alloc, args[i], headless, force_replace, port_file_arg, sessions_file_arg);
         } else if (std.mem.startsWith(u8, a, "--listen-unix=")) {
-            return listenUnixMode(alloc, a["--listen-unix=".len..], headless, force_replace, port_file_arg);
+            return listenUnixMode(alloc, a["--listen-unix=".len..], headless, force_replace, port_file_arg, sessions_file_arg);
         } else if (std.mem.eql(u8, a, "--relay")) {
             i += 1;
             if (i >= args.len) {
@@ -592,8 +615,8 @@ fn parseArgs(alloc: Allocator) !Mode {
 /// unauthenticated TCP shell may bind loopback freely (tests, local dev), but a
 /// NON-loopback interface requires the explicit `--insecure-allow-public`
 /// opt-in. Without it we refuse rather than silently expose a shell.
-/// `port_file` is duped here (argv is freed when parseArgs returns).
-fn listenMode(alloc: Allocator, addr: std.net.Address, headless: bool, force_replace: bool, allow_public: bool, port_file: ?[]const u8) !Mode {
+/// `port_file`/`sessions_file` are duped here (argv is freed when parseArgs returns).
+fn listenMode(alloc: Allocator, addr: std.net.Address, headless: bool, force_replace: bool, allow_public: bool, port_file: ?[]const u8, sessions_file: ?[]const u8) !Mode {
     const public = !isLoopbackAddr(addr);
     if (public and !allow_public) {
         std.debug.print(
@@ -610,15 +633,21 @@ fn listenMode(alloc: Allocator, addr: std.net.Address, headless: bool, force_rep
         std.debug.print("ghoztty-agent: --port-file requires a non-empty <path>\n", .{});
         return error.InvalidArgs;
     };
+    if (sessions_file) |sf| if (sf.len == 0) {
+        std.debug.print("ghoztty-agent: --sessions-file requires a non-empty <path>\n", .{});
+        return error.InvalidArgs;
+    };
     const pf_owned: ?[]const u8 = if (port_file) |pf| try alloc.dupe(u8, pf) else null;
-    return .{ .listen = .{ .addr = addr, .headless = headless, .force_replace = force_replace, .public = public, .port_file = pf_owned } };
+    errdefer if (pf_owned) |p| alloc.free(p);
+    const sf_owned: ?[]const u8 = if (sessions_file) |sf| try alloc.dupe(u8, sf) else null;
+    return .{ .listen = .{ .addr = addr, .headless = headless, .force_replace = force_replace, .public = public, .port_file = pf_owned, .sessions_file = sf_owned } };
 }
 
 /// Build a `.listen_unix` mode. Validates a non-empty path and rejects it on
 /// Windows (AF_UNIX local persistence is not this fork's Windows story — that is
 /// a named pipe, §5.2). `path` is duped here (argv is freed when parseArgs
 /// returns).
-fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_replace: bool, port_file: ?[]const u8) !Mode {
+fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_replace: bool, port_file: ?[]const u8, sessions_file: ?[]const u8) !Mode {
     if (path.len == 0) {
         std.debug.print("ghoztty-agent: --listen-unix requires a non-empty <path>\n", .{});
         return error.InvalidArgs;
@@ -631,10 +660,16 @@ fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_repl
         std.debug.print("ghoztty-agent: --port-file requires a non-empty <path>\n", .{});
         return error.InvalidArgs;
     };
+    if (sessions_file) |sf| if (sf.len == 0) {
+        std.debug.print("ghoztty-agent: --sessions-file requires a non-empty <path>\n", .{});
+        return error.InvalidArgs;
+    };
     const path_owned = try alloc.dupe(u8, path);
     errdefer alloc.free(path_owned);
     const pf_owned: ?[]const u8 = if (port_file) |pf| try alloc.dupe(u8, pf) else null;
-    return .{ .listen_unix = .{ .path = path_owned, .headless = headless, .force_replace = force_replace, .port_file = pf_owned } };
+    errdefer if (pf_owned) |p| alloc.free(p);
+    const sf_owned: ?[]const u8 = if (sessions_file) |sf| try alloc.dupe(u8, sf) else null;
+    return .{ .listen_unix = .{ .path = path_owned, .headless = headless, .force_replace = force_replace, .port_file = pf_owned, .sessions_file = sf_owned } };
 }
 
 /// Whether `addr` is a loopback address (127.0.0.0/8 or ::1) — the only binds
@@ -682,6 +717,10 @@ fn printUsage() void {
         \\  --ring-bytes=<N>                Per-session output-ring size in bytes (scrollback /
         \\                                  reconnect gap-fill). Default 2097152 (2 MB), min 65536.
         \\                                  Also settable via GHOSTTY_AGENT_RING_BYTES (flag wins).
+        \\  --sessions-file=<path>          Reboot-floor metadata store: keep this file's
+        \\                                  {"version":1,"sessions":[…]} up to date with the live
+        \\                                  session roster (id/argv/cwd/title/pinned) so sessions
+        \\                                  can be relaunched after an agent/machine restart (atomic).
         \\
         \\For secure remote access, use --relay. A bare invocation intentionally does
         \\nothing (it will not open an unauthenticated listener).
@@ -750,6 +789,7 @@ fn runListen(
     headless: bool,
     public: bool,
     port_file: ?[]const u8,
+    sessions_file: ?[]const u8,
 ) !void {
     // Loud, unmissable warning when bound to a routable interface: this listener
     // has no authentication, so anyone who can reach the port gets a shell. Only
@@ -808,6 +848,10 @@ fn runListen(
         realNow,
         session.default_idle_ttl_ms,
     );
+    // Reboot-floor metadata store (§5.4, T12): when a supervisor passed
+    // --sessions-file, the store atomically rewrites it with the live-session
+    // roster on every open/close. Borrowed; `sessions_file` outlives `store`.
+    store.meta_path = sessions_file;
     defer store.deinit();
     try store.startReaper();
 
@@ -881,6 +925,7 @@ fn runListenUnix(
     path: []const u8,
     headless: bool,
     port_file: ?[]const u8,
+    sessions_file: ?[]const u8,
 ) !void {
     _ = headless; // no Windows tray on the unix path; reserved for symmetry.
 
@@ -955,6 +1000,8 @@ fn runListenUnix(
         realNow,
         session.default_idle_ttl_ms,
     );
+    // Reboot-floor metadata store (§5.4, T12) — borrowed; outlives `store`.
+    store.meta_path = sessions_file;
     defer store.deinit();
     try store.startReaper();
 

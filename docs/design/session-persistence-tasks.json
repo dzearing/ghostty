@@ -349,19 +349,70 @@
     },
     {
       "id": "T12",
-      "title": "Reboot floor: agent disk metadata + RELAUNCH + launchd packaging",
-      "status": "pending",
+      "title": "Reboot floor (part 1): agent session metadata persistence to disk (write side)",
+      "status": "done",
       "dependsOn": ["T11"],
-      "goal": "sessions.json (atomic) with {id, argv, cwd, title, pinned, createdAt}; on agent start, load as dead-relaunchable; RELAUNCH frame restarts the command under the recorded metadata; install per-user LaunchAgent (com.dzearing.ghoztty.debug.agent for the debug lineage) RunAtLoad+KeepAlive.",
-      "steps": ["Persist on open/close/meta-change; tombstone on load; RELAUNCH handler; viewer: dead-session leaf offers/auto relaunch with '--- restarted ---' banner (config session-relaunch=auto|prompt, default auto); LaunchAgent plist written by LocalAgentManager."],
-      "acceptance": "Kill -9 the AGENT → launchd restarts it → app reconnect ladder re-attaches → panes show relaunched processes with banner; reboot-equivalent simulated by full agent restart; E2E script variant added.",
+      "goal": "First slice of the reboot floor. Give the agent a durable, atomically-written `sessions.json` recording {id, argv, cwd, title, pinned, created_ms} for every live session, refreshed on the session-set-changing events (open/close/reap). Pure write side + on-disk format + a standalone parse/serialize round-trip; NO load-at-start materialization, NO RELAUNCH, NO viewer UX, NO launchd (those are T12b/T12c/T12d). This unblocks everything else in the reboot floor.",
+      "steps": [
+        "New src/remote/agent/session_meta.zig: on-disk format {version:1, sessions:[{id,argv?,cwd?,title?,pinned,created_ms}]}; pure serialize(alloc,recs) + parse(alloc,bytes) round-trip; writeAtomic(path,bytes) tmp+rename+fsync+makePath; load(alloc,path) -> ?Parsed (null when the file is absent). Add to agent_test.zig aggregator.",
+        "SessionStore gains meta_path: ?[]const u8 + persistMeta(): snapshot the ALIVE session set under the lock into OWNED Record dupes, unlock, serialize + writeAtomic OUTSIDE the lock (no I/O under the store mutex — mirrors handleGetCwd's snapshot-then-IO discipline). Best-effort: never crashes, logs on failure. No-op when meta_path is null so existing tests/paths are byte-for-byte unchanged.",
+        "Server calls store.persistMeta() AFTER its own unlocks in handleOpen and handleClose; reapIdle calls it after freeing victims. (Child-exit tombstone does NOT persist — it self-heals on the next open/close; noted.)",
+        "main.zig: new --sessions-file=<path> flag (thread through Mode.listen/listen_unix exactly like --port-file, order-independent pre-scan); set store.meta_path after store init in runListen + runListenUnix.",
+        "Minimal Swift wiring so it's live-verifiable end-to-end: LocalAgentManager.Paths.sessionsFile (<dir>/sessions.json) + add --sessions-file=<path> to spawnDetached argv.",
+        "Tests (test-agent): serialize/parse round-trip incl. null argv/cwd/title + empty roster; writeAtomic leaves no .tmp and produces parseable bytes; a store with meta_path persists the alive set on open and drops an entry on close (drive via the server open/close path or SessionStore directly)."
+      ],
+      "acceptance": "zig build test-agent passes incl. new session_meta tests; full app build OK; live: launch the debug app --session-persistence=true, open a couple agent-backed panes, and sessions.json under ~/.config/ghoztty/local-agent-debug/ lists them with correct id/argv/pinned and refreshes when a pane closes; no .tmp leftovers.",
+      "notes": "2026-07-16: done, commit <PENDING>. WRITE SIDE ONLY (load/materialize/RELAUNCH = T12b; viewer UX = T12c; launchd = T12d). ZERO protocol changes; the app-facing change is one argv flag.\n\nNEW MODULE src/remote/agent/session_meta.zig (std-only, no store/transport deps → unit-tests standalone, no import cycle): on-disk shape {\"version\":1,\"sessions\":[{id,argv?,cwd?,title?,pinned,created_ms}]}; pure serialize(alloc,recs) (emit_null_optional_fields=false → plain shells stay compact) + parse(alloc,bytes) + writeAtomic (tmp+fsync+rename+makePath, the main.zig writeInfoFile pattern) + load(alloc,path)->?Parsed (null when ABSENT = normal first start). Added to agent_test.zig aggregator. TRAP HIT+FIXED: std.json.parseFromSlice defaults to `alloc_if_needed`, which SLICES strings out of the input buffer; load() frees that buffer → dangling garbage strings (test caught it: expected 'top', got \\xaa…). Fix = `.allocate = .alloc_always` in parse() so the Parsed arena OWNS every string and load can free the file bytes immediately.\n\nSTORE WIRING (session.zig): SessionStore gains meta_path: ?[]const u8 (BORROWED — main.zig owns it) + persistMeta(): snapshot the ALIVE set into OWNED session_meta.Record dupes UNDER the store mutex, unlock, then serialize + writeAtomic OUTSIDE the lock — the same lock→snapshot→unlock→IO discipline as handleGetCwd (no OS I/O under the mutex that serializes every child output chunk; owned dupes can't dangle if a session is freed between snapshot and write). Best-effort: logs + swallows any failure, never crashes a live session. No-op when meta_path==null (the default) → every existing test + non-persistent serve path is byte-for-byte unchanged. Helpers dupMetaRecord (errdefer-clean partial-alloc) / freeMetaRecord. Only ALIVE sessions are recorded (a tombstone has nothing to relaunch); child-exit deliberately does NOT persist (the file self-heals on the next open/close). TRIGGERS: server.handleOpen calls persistMeta after its unlock+sendJson; server.handleClose calls it after a real CLOSE frees a session; reapIdle calls it only when the alive set actually shrank.\n\nFLAG (main.zig): new --sessions-file=<path> threaded EXACTLY parallel to --port-file — added to Listen + ListenUnix structs, the order-independent pre-scan (two-token + = forms), the dispatch skip-list, listenMode/listenUnixMode (dupe + empty-path reject + errdefer-free), the main() free-defers, and runListen/runListenUnix (set store.meta_path = sessions_file after store init). printUsage documents it.\n\nSWIFT (LocalAgentManager.swift, minimal, for live-verifiability): Paths.sessionsFile = <dir>/sessions.json; spawnDetached argv gains --sessions-file=<path>. E2E harness full_reset also rm's sessions.json.\n\nTESTS: zig build test-agent exit 0 (3 new session_meta tests: serialize+parse round-trip incl. null-elision + a plain no-argv record; empty roster = present empty array; writeAtomic+load round-trip with no .tmp leftover + missing-file→null; PLUS a SessionStore.persistMeta integration test: writes the alive set, EXCLUDES a tombstone [markExited], refreshes to fewer on closeByChannel, and null meta_path is a safe no-op). Full app build OK (agent re-embedded).\n\nLIVE VERIFIED (freshly-built debug app --session-persistence=true, agent pid 10115): agent argv carried --sessions-file=…/sessions.json; sessions.json appeared immediately with the initial shell, then grew 1→3 as +new-window --command='sleep 777' and +split --command='sleep 888' opened — each pinned:true, argv = the full '/bin/zsh -lic ...' wrapper, created_ms set, ids EXACTLY matching +sessions. Schema {version:1,sessions:[…]}, no .tmp leftovers. IMPORTANT OBSERVED SEMANTIC: +close on a PERSISTENT pane DETACHes (session stays alive by design — that's persistence), so the entry correctly REMAINS (the file reflects the agent's true alive set, not viewer attachment); the genuine drop-on-CLOSE + tombstone-exclusion paths are proven by the unit test, not reachable live via +close. E2E scripts/e2e/session-persistence.py --cycles=2 --quit=kill = 2/2 PASS (recovery ~1.0s, PIDs stable, topology exact, scrollback replayed, agent untouched) — the persistMeta hot-path calls didn't regress restore. Box left CLEAN (teardown killed app+agent, cleared all state files).\n\nKNOWN GAPS for T12b (deferred, not defects): (a) argv is NULL for a PLAIN shell session (client sends no command/shell; the agent resolves its own default $SHELL in pty_child.spawnChild, not reachable from handleOpen) — T12b's relaunch must resolve the shell the same way, OR capture the resolved argv at spawn. (b) cwd/title are always absent (no SET_META handler yet server-side; T10 noted the same) — recorded when the fields become populated. (c) The file can accumulate pinned local sessions that are alive-but-detached (correct for reboot recovery; they only drop on genuine CLOSE / reap). (d) On child-exit the tombstone lingers in the file until the next open/close self-heals it — acceptable for a best-effort write side."
+    },
+    {
+      "id": "T12b",
+      "title": "Reboot floor (part 2): load-at-start materialization + RELAUNCH frame/handler",
+      "status": "pending",
+      "dependsOn": ["T12"],
+      "goal": "On agent start, load sessions.json (T12) and materialize each record as a DEAD, relaunchable tombstone in the store (no child yet). New RELAUNCH protocol frame + agent handler: respawn the child under the recorded argv/cwd, re-key it into the same session id, transition the tombstone to alive, and stream fresh output. Additive/HELLO-compatible.",
+      "steps": [
+        "session_meta.load() at agent start (runListen/runListenUnix) → for each record insert a tombstone Session (alive=false, no child, exit_code=null-or-a 'relaunchable' marker) carrying argv/cwd/title/pinned so ATTACH replies dead and LIST_SESSIONS shows it.",
+        "protocol.zig: RELAUNCH{session_id} + a reply (reuse OPENED/ATTACHED shape) — additive frame ids after the T10/T11 ones.",
+        "server.zig handleRelaunch: spawn a child from the recorded metadata, bind it to the existing id/channel, flip alive, reply. Persist (T12's persistMeta) after.",
+        "Decide the tombstone's exit_code semantics vs a real exited child (a relaunchable-on-load tombstone is distinct from a child that exited this run).",
+        "test-agent coverage: load materializes tombstones; RELAUNCH respawns + re-keys; ATTACH to a not-yet-relaunched loaded session replies dead."
+      ],
+      "acceptance": "test-agent passes; a store loaded from a sessions.json exposes dead sessions that RELAUNCH turns back into alive children under the recorded argv/cwd.",
+      "notes": ""
+    },
+    {
+      "id": "T12c",
+      "title": "Reboot floor (part 3): viewer relaunch UX + session-relaunch config",
+      "status": "pending",
+      "dependsOn": ["T12b"],
+      "goal": "Viewer side: a restored leaf whose session comes back DEAD-but-relaunchable offers/auto-fires RELAUNCH and shows a '--- restarted ---' divider/banner. New config session-relaunch=auto|prompt (default auto).",
+      "steps": [
+        "Zig config key session-relaunch (enum auto|prompt) exposed to Swift like session-persistence.",
+        "SessionLayoutRestore: when a leaf attaches dead+relaunchable, either auto-send RELAUNCH (auto) or show a prompt/affordance (prompt); on relaunch show the '--- restarted ---' banner atop fresh output.",
+        "Live-verify against a real agent restart (full agent kill+restart with a loaded sessions.json)."
+      ],
+      "acceptance": "After an agent restart, restored panes auto-relaunch (default) with a restarted banner; session-relaunch=prompt shows an affordance instead; config off/on paths verified.",
+      "notes": ""
+    },
+    {
+      "id": "T12d",
+      "title": "Reboot floor (part 4): per-user LaunchAgent packaging + reboot-equivalent E2E",
+      "status": "pending",
+      "dependsOn": ["T12b"],
+      "goal": "Install a per-user LaunchAgent (com.dzearing.ghoztty.debug.agent for the debug lineage) with RunAtLoad+KeepAlive so the agent is restarted by launchd after a kill/reboot; add the reboot-equivalent E2E variant (full agent restart) to the harness.",
+      "steps": [
+        "LocalAgentManager writes/loads the LaunchAgent plist (RunAtLoad+KeepAlive, debug-suffixed label + paths, GHOSTTY_AGENT_* env); decide bootstrap vs the existing find-or-spawn (avoid double-spawn with the single-instance guard).",
+        "scripts/e2e/session-persistence.py --agent-restart variant: kill the AGENT (not the app), assert launchd restarts it, app reconnect ladder re-attaches, panes show relaunched processes + banner.",
+        "Record measured recovery numbers in the design doc acceptance table."
+      ],
+      "acceptance": "Kill -9 the AGENT → launchd restarts it → app reconnect ladder re-attaches → panes show relaunched processes with banner; reboot-equivalent simulated by full agent restart; E2E script variant passes.",
       "notes": ""
     },
     {
       "id": "T13",
       "title": "Reboot scrollback: ring disk snapshots",
       "status": "pending",
-      "dependsOn": ["T12"],
+      "dependsOn": ["T12b"],
       "goal": "Agent snapshots dirty rings every 30s + on SIGTERM; after restart, replay snapshot then a divider then live output (design §5.4).",
       "steps": ["Snapshot format (offset+bytes), atomic write, load on start attaching to relaunched session; tests."],
       "acceptance": "Agent-restart E2E shows pre-restart scrollback + divider + fresh output.",
