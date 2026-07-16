@@ -2392,6 +2392,64 @@ pub const CAPI = struct {
         return handle;
     }
 
+    /// Create a remote connection by dialing a `ghoztty-agent` listening on a
+    /// local AF_UNIX stream socket at `path` (session-persistence hardening
+    /// §5.2 / T09b). The unix analogue of `_new_tcp`: `tcp_dial.dialUnix`
+    /// connects the 0600 socket, folds the two lanes through a `ClientMux`,
+    /// stands up the `Connection`, AND blocks through the HELLO handshake before
+    /// returning — so the returned handle is FULLY ESTABLISHED (a subsequent
+    /// `_start` is a no-op; `_wait_handshake` returns true immediately). The
+    /// established transport is stored in the SAME `handle.tcp` `Dialed` slot
+    /// (it is transport-agnostic — a `Dialed` over an AF_UNIX socket behaves
+    /// identically), so `conn()`/`remoteBackend`/`_wait_handshake`/`_latency_ms`/
+    /// `_free` all read it with no other changes.
+    ///
+    /// The agent enforces a same-uid peercred gate on the unix socket (T09), so
+    /// this only succeeds for the current user's own agent. Returns null on a
+    /// null/empty `path` or any connect/handshake failure. The encoding is
+    /// pinned to `.raw` (a clean local pipe, matching the agent's default).
+    export fn ghostty_remote_connection_new_unix(
+        path: [*:0]const u8,
+    ) ?*RemoteConnectionHandle {
+        const path_slice = std.mem.sliceTo(path, 0);
+        if (path_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_unix: path is empty", .{});
+            return null;
+        }
+
+        const alloc = global.alloc;
+
+        // Record the socket path in the handle's `host` slot (the dial-parameter
+        // string) with port 0 so the handle is uniform with the TCP/SSH ones.
+        // No user/jump for a local unix dial.
+        const handle = RemoteConnectionHandle.create(
+            alloc,
+            path_slice,
+            null,
+            0,
+            null,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new_unix: handle alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer handle.destroy();
+
+        // Dial: connect + mux + Connection + HELLO handshake (blocks). On any
+        // failure the handle is destroyed (no transport was attached).
+        const dialed = alloc.create(tcp_dial.Dialed) catch |err| {
+            log.err("ghostty_remote_connection_new_unix: Dialed alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer alloc.destroy(dialed);
+        dialed.* = tcp_dial.dialUnix(alloc, path_slice, .raw) catch |err| {
+            log.err("ghostty_remote_connection_new_unix: unix dial failed err={}", .{err});
+            return null;
+        };
+
+        handle.tcp = dialed;
+        return handle;
+    }
+
     /// Create a remote connection by dialing a remote `ghoztty-agent` THROUGH a
     /// rendezvous relay. A native `wss://` WebSocket (`relay_dial`/`ws_client`)
     /// opens an authenticated connection to the relay (`base`) for `device`,

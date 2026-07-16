@@ -1324,6 +1324,18 @@ GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new(
 GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_tcp(
     const char* host, uint16_t port);
 
+// Create a remote connection by dialing a ghoztty-agent listening on a local
+// AF_UNIX stream socket at path (session-persistence hardening, T09b). The unix
+// analogue of _new_tcp: connects the 0600 socket and BLOCKS through the HELLO
+// handshake before returning, so the handle is fully established (a subsequent
+// _start is a no-op and _wait_handshake returns true immediately). The agent
+// enforces a same-uid peercred gate, so this only succeeds for the current
+// user's own agent. Returns NULL on a NULL/empty path or any connect/handshake
+// failure. The transport encoding is raw. Free with
+// ghostty_remote_connection_free.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_unix(
+    const char* path);
+
 // Create a remote connection by dialing a remote ghoztty-agent THROUGH a
 // rendezvous relay. The relay-connect byte-pipe helper opens an authenticated
 // WebSocket to the relay (base) for device and splices it to its stdio, giving
