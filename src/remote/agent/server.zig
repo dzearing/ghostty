@@ -656,6 +656,7 @@ pub const Server = struct {
             .close => self.handleClose(frame.channel),
             .get_cwd => self.handleGetCwd(frame.channel, frame.payload),
             .list_sessions => self.handleListSessions(frame.channel),
+            .relaunch => self.handleRelaunch(frame.payload),
             .ping => self.handlePing(frame.payload),
             .flow => self.handleFlow(frame.payload),
             .metrics_sub => self.handleMetricsSub(frame.payload),
@@ -764,10 +765,13 @@ pub const Server = struct {
         };
 
         if (!s.alive) {
-            // Tombstone → dead + exit_code (§7.1/§7.4).
+            // Tombstone → dead + exit_code (§7.1/§7.4). `relaunchable` distinguishes
+            // a session materialized from disk (T12b, no exit_code, RELAUNCH-able)
+            // from a child that genuinely exited this run.
             self.sendJson(.attached, s.channel, protocol.Attached{
                 .status = .dead,
                 .exit_code = s.exit_code,
+                .relaunchable = s.relaunchable,
                 .rows = s.rows,
                 .cols = s.cols,
             }) catch {};
@@ -992,12 +996,155 @@ pub const Server = struct {
                 .created_at = s.created_ms,
                 .last_activity = s.last_activity_ms,
                 .pinned = s.pinned,
+                .relaunchable = s.relaunchable,
             }) catch break;
         }
 
         self.sendJson(.sessions, channel, protocol.Sessions{
             .sessions = infos.items,
         }) catch {};
+    }
+
+    /// `RELAUNCH` (§5.4 reboot floor, T12b): respawn a DEAD, relaunchable session
+    /// (materialized from disk at start) — or idempotently rebind an already-alive
+    /// one — under its recorded `argv`/`cwd`, re-keyed into the SAME session id +
+    /// data channel, then stream fresh output and reply `RELAUNCHED` on that channel.
+    ///
+    /// Locking/spawn discipline mirrors `handleOpen`: validate + snapshot the
+    /// relaunch inputs (argv/cwd copies, channel) UNDER the store lock, drop the
+    /// lock, spawn the child OUTSIDE it (fork+exec must never run under the mutex
+    /// that serializes every output chunk), then re-lock, re-find (the reaper could
+    /// have evicted it during the spawn), install the child, and revive.
+    fn handleRelaunch(self: *Server, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.Relaunch, self.alloc, payload) catch return;
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        // Stable copy of the session id for the reply/re-lookup (the parsed value is
+        // freed by the trailing defer before the reply runs through the writer queue).
+        var id_buf: [64]u8 = undefined;
+        const id_len = @min(req.session_id.len, id_buf.len);
+        @memcpy(id_buf[0..id_len], req.session_id[0..id_len]);
+        const id_copy = id_buf[0..id_len];
+
+        // Phase 1: validate + snapshot under the lock.
+        self.store.mutex.lock();
+        const s0 = self.store.table.getByIdStr(req.session_id);
+        if (s0 == null) {
+            self.store.mutex.unlock();
+            // No such session — the client should fall back to a fresh OPEN.
+            self.sendJson(.relaunched, protocol.control_channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = false,
+            }) catch {};
+            return;
+        }
+        const s = s0.?;
+        const channel = s.channel;
+
+        if (s.alive) {
+            // Already running (double RELAUNCH / a race): rebind to us + reply ok,
+            // no respawn. The child reader is already attached to the store sink.
+            self.bindLocked(s);
+            const pid = s.pid;
+            self.store.mutex.unlock();
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = true,
+                .pid = pid,
+                .found = true,
+            }) catch {};
+            return;
+        }
+
+        if (!s.relaunchable) {
+            // A genuinely-exited tombstone with no relaunch metadata: found but not
+            // relaunchable. The client shows the exited overlay (no auto-relaunch).
+            self.store.mutex.unlock();
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = true,
+            }) catch {};
+            return;
+        }
+
+        // Snapshot the relaunch inputs into owned buffers so the spawn (unlocked)
+        // can't race a concurrent free of the session's strings.
+        const argv_copy: ?[]u8 = if (s.argv) |a| (self.alloc.dupe(u8, a) catch null) else null;
+        defer if (argv_copy) |a| self.alloc.free(a);
+        const cwd_copy: ?[]u8 = if (s.cwd) |c| (self.alloc.dupe(u8, c) catch null) else null;
+        defer if (cwd_copy) |c| self.alloc.free(c);
+        const pinned = s.pinned;
+        self.store.mutex.unlock();
+
+        // Phase 2: spawn the child OUTSIDE the lock. Synthesize an OPEN from the
+        // recorded metadata (the recorded argv is treated as the command to run;
+        // null → a plain login shell, the agent resolves its own default $SHELL).
+        const open: protocol.Open = .{
+            .command = argv_copy,
+            .cwd = cwd_copy,
+            .rows = req.rows,
+            .cols = req.cols,
+            .px_w = req.px_w,
+            .px_h = req.px_h,
+            .pinned = pinned,
+        };
+        const spawned = self.spawner.spawn(open) catch {
+            // Spawn failed — the session stays a relaunchable tombstone; report
+            // found-but-not-ok so the client can retry or show the overlay.
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = true,
+            }) catch {};
+            return;
+        };
+
+        // Phase 3: re-lock, re-find (the reaper could have evicted the tombstone
+        // during the spawn), install the fresh child, and revive the session.
+        self.store.mutex.lock();
+        const s2 = self.store.table.getByIdStr(id_copy);
+        if (s2 == null or s2.?.channel != channel or s2.?.alive) {
+            // Gone, re-keyed, or already revived by a racing RELAUNCH — drop the
+            // fresh child OUTSIDE the lock (terminate joins its reader).
+            self.store.mutex.unlock();
+            spawned.child.terminate();
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = s2 != null,
+            }) catch {};
+            return;
+        }
+        const rs = s2.?;
+        rs.child = spawned.child; // replace the inert deadChild placeholder
+        rs.pid = spawned.pid;
+        rs.alive = true;
+        rs.relaunchable = false;
+        rs.exit_code = null;
+        rs.last_activity_ms = self.clock.now();
+        // Bind to THIS connection so live output frames flow to our writer.
+        self.bindLocked(rs);
+        const pid = rs.pid;
+        const child = rs.child; // value copy of the vtable handle
+        self.store.mutex.unlock();
+
+        // Start the real child's reader routing output to the STORE sink on our
+        // channel (done after unlock — the sink takes the store lock).
+        child.attach(self.store, session.SessionStore.onChildOutputTrampoline, channel);
+
+        self.sendJson(.relaunched, channel, protocol.Relaunched{
+            .session_id = id_copy,
+            .ok = true,
+            .pid = pid,
+            .found = true,
+        }) catch {};
+
+        // The alive set changed (a tombstone became alive) — refresh the on-disk
+        // metadata so a subsequent restart re-materializes it.
+        self.store.persistMeta();
     }
 
     fn handlePing(self: *Server, payload: []const u8) void {
@@ -2212,6 +2359,96 @@ test "child exit emits EXIT after final DATA; reattach → dead+exit_code; CLOSE
     try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
     h.server.store.mutex.unlock();
     try testing.expect(fc.terminated);
+}
+
+test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH revives it" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xB0B);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Materialize a dead, relaunchable session directly in the store (simulating a
+    // load-at-start from sessions.json). Recorded id is fixed so we can target it.
+    const rec_id = "abcabcabcabcabcabcabcabcabcabcab";
+    h.server.store.mutex.lock();
+    _ = (h.server.store.table.materialize(.{
+        .id = rec_id,
+        .argv = "sleep 600",
+        .pinned = true,
+        .created_ms = 50,
+    }, 4096, h.clock.ms) catch unreachable).?;
+    h.server.store.mutex.unlock();
+
+    // ATTACH → dead + relaunchable (no exit_code); reply rides the session channel.
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.dead, ap.value.status);
+    try testing.expect(ap.value.relaunchable);
+    try testing.expect(ap.value.exit_code == null);
+    const channel = af.channel; // the session's data channel
+
+    // RELAUNCH → the agent spawns the child, revives the session, and replies ok.
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    try testing.expectEqual(channel, rf.channel);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    try testing.expect(rp.value.pid != 0);
+
+    // The session is now alive + not relaunchable, and streams fresh output.
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByChannel(channel).?;
+    try testing.expect(s.alive and !s.relaunchable);
+    h.server.store.mutex.unlock();
+
+    h.server.onChildOutput(channel, "back!");
+    const d = try h.client.nextData();
+    const dp = try protocol.DataPayload.decode(d.?.payload);
+    try testing.expectEqual(@as(u64, 0), dp.byte_offset); // fresh stream from 0
+    try testing.expectEqualSlices(u8, "back!", dp.bytes);
+}
+
+test "RELAUNCH: unknown session id → not found (client falls back to OPEN)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(0xF00D);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = "ffffffffffffffffffffffffffffffff",
+        .rows = 24,
+        .cols = 80,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(!rp.value.ok and !rp.value.found);
 }
 
 test "RESIZE and SIGNAL are recorded on the child" {

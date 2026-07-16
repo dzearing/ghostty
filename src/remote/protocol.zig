@@ -90,6 +90,9 @@ pub const FrameType = enum(u8) {
     list_sessions = 0x24, // C→A  {}  enumerate every session this agent owns
     sessions = 0x25, // A→C  {sessions:[SessionInfo]}  reply to LIST_SESSIONS
 
+    relaunch = 0x26, // C→A  {session_id, rows, cols}  respawn a loaded/dead session
+    relaunched = 0x27, // A→C  {session_id, ok, pid, found}  reply to RELAUNCH
+
     rpc = 0x30, // C→A  JSON-RPC 2.0 request (§9.5)
     rpc_result = 0x31, // A→C  JSON-RPC 2.0 response / subscription notification
 
@@ -475,6 +478,14 @@ pub const Attached = struct {
     /// retry with `force = true` to steal.
     attached_elsewhere: bool = false,
 
+    /// Set (with `status == .dead`) when this dead session is a RELAUNCHABLE
+    /// tombstone materialized from the agent's on-disk metadata at start (§5.4
+    /// reboot floor, T12b) — NOT a child that exited this run. The viewer uses it
+    /// to decide whether to auto-fire `RELAUNCH` (T12c) rather than just showing an
+    /// exited overlay. A genuinely-exited child leaves this false (it carries an
+    /// `exit_code` instead). Additive/optional (older agents omit it → false).
+    relaunchable: bool = false,
+
     pub const AttachStatus = enum { alive, dead, not_found };
 };
 
@@ -565,6 +576,12 @@ pub const SessionInfo = struct {
     /// Surfaced so `+sessions` can show which sessions survive indefinitely.
     /// Additive/optional (defaults false; older agents omit it).
     pinned: bool = false,
+    /// True when this is a DEAD session materialized from the agent's on-disk
+    /// metadata at start and not yet relaunched (§5.4 reboot floor, T12b) — i.e.
+    /// `alive == false` but the recorded argv/cwd can bring it back via `RELAUNCH`.
+    /// A genuinely-exited child (`alive == false`, `exit_code` set) leaves this
+    /// false. Additive/optional (defaults false; older agents omit it).
+    relaunchable: bool = false,
 };
 
 /// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty
@@ -572,6 +589,38 @@ pub const SessionInfo = struct {
 /// elided — so the client can distinguish "answered, none" from "no reply".
 pub const Sessions = struct {
     sessions: []const SessionInfo = &.{},
+};
+
+/// `RELAUNCH` (0x26). Ask the agent to respawn a DEAD session — a relaunchable
+/// tombstone materialized from disk at agent start (§5.4 reboot floor, T12b), or
+/// (idempotently) an already-alive one. The agent respawns the child under the
+/// session's recorded argv/cwd, re-keys it into the SAME session id + data channel
+/// (so the viewer's layout manifest reference and the already-known channel stay
+/// valid), flips the tombstone to alive, and streams fresh output. `rows`/`cols`
+/// carry the attaching viewer's current geometry so the respawned pty is sized
+/// correctly. Correlated by `session_id` in the reply (the agent echoes
+/// `RELAUNCHED` on the session's data channel). Additive/HELLO-compatible.
+pub const Relaunch = struct {
+    session_id: []const u8,
+    rows: u16,
+    cols: u16,
+    px_w: u16 = 0,
+    px_h: u16 = 0,
+};
+
+/// `RELAUNCHED` (0x27). Reply to `RELAUNCH`. `ok == true` ⇒ the session is now
+/// alive under `pid` and live output is streaming on the reply frame's channel
+/// (the client resets its applied-offset baseline to 0 — a relaunch is a FRESH
+/// stream, not a resync). `ok == false` distinguishes two failures via `found`:
+/// `found == false` means the agent has no such session id (reaped/closed — the
+/// client should fall back to a fresh `OPEN`); `found == true` means the session
+/// exists but is not relaunchable (a genuinely-exited child with no recorded
+/// metadata) or the respawn itself failed.
+pub const Relaunched = struct {
+    session_id: []const u8,
+    ok: bool = false,
+    pid: i64 = 0,
+    found: bool = false,
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
@@ -1603,6 +1652,54 @@ test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
     const ej = try encodeJson(alloc, empty);
     defer alloc.free(ej);
     try testing.expectEqualStrings("{\"sessions\":[]}", ej);
+
+    // A relaunchable dead tombstone (T12b) round-trips its marker.
+    const reln = [_]SessionInfo{.{
+        .id = "cccccccccccccccccccccccccccccccc",
+        .alive = false,
+        .pinned = true,
+        .relaunchable = true,
+        .argv = "sleep 600",
+    }};
+    const rjs = try encodeJson(alloc, Sessions{ .sessions = &reln });
+    defer alloc.free(rjs);
+    var rsp = try parseJson(Sessions, alloc, rjs);
+    defer rsp.deinit();
+    try testing.expect(!rsp.value.sessions[0].alive);
+    try testing.expect(rsp.value.sessions[0].relaunchable);
+    try testing.expect(rsp.value.sessions[0].exit_code == null);
+}
+
+test "RELAUNCH / RELAUNCHED JSON payloads round-trip (T12b)" {
+    const alloc = testing.allocator;
+
+    // Request carries the session id + the attaching viewer's geometry.
+    const req: Relaunch = .{ .session_id = "0123456789abcdef0123456789abcdef", .rows = 40, .cols = 120 };
+    const rj = try encodeJson(alloc, req);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunch, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", rp.value.session_id);
+    try testing.expectEqual(@as(u16, 40), rp.value.rows);
+    try testing.expectEqual(@as(u16, 120), rp.value.cols);
+
+    // A successful reply carries the fresh pid; found/ok both true.
+    const ok_reply: Relaunched = .{ .session_id = req.session_id, .ok = true, .pid = 7777, .found = true };
+    const oj = try encodeJson(alloc, ok_reply);
+    defer alloc.free(oj);
+    var op = try parseJson(Relaunched, alloc, oj);
+    defer op.deinit();
+    try testing.expect(op.value.ok and op.value.found);
+    try testing.expectEqual(@as(i64, 7777), op.value.pid);
+
+    // A "no such session" reply: ok=false, found=false, pid defaults 0.
+    const gone: Relaunched = .{ .session_id = req.session_id };
+    const gj = try encodeJson(alloc, gone);
+    defer alloc.free(gj);
+    var gp = try parseJson(Relaunched, alloc, gj);
+    defer gp.deinit();
+    try testing.expect(!gp.value.ok and !gp.value.found);
+    try testing.expectEqual(@as(i64, 0), gp.value.pid);
 }
 
 test "JSON-RPC request/response envelope" {

@@ -853,6 +853,12 @@ fn runListen(
     // roster on every open/close. Borrowed; `sessions_file` outlives `store`.
     store.meta_path = sessions_file;
     defer store.deinit();
+    // Reboot-floor materialization (§5.4, T12b): before accepting connections (and
+    // before the reaper starts), load the persisted roster and re-create each record
+    // as a DEAD, relaunchable tombstone so a viewer's ATTACH finds a session it can
+    // RELAUNCH. No-op when --sessions-file was not passed or the file is absent.
+    const materialized = store.loadPersisted(configured_ring_bytes);
+    if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
     try store.startReaper();
 
     const stdout = std.fs.File.stdout();
@@ -1003,6 +1009,10 @@ fn runListenUnix(
     // Reboot-floor metadata store (§5.4, T12) — borrowed; outlives `store`.
     store.meta_path = sessions_file;
     defer store.deinit();
+    // Reboot-floor materialization (§5.4, T12b): re-create the persisted roster as
+    // dead, relaunchable tombstones before accepting connections + starting the reaper.
+    const materialized = store.loadPersisted(configured_ring_bytes);
+    if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
     try store.startReaper();
 
     const stdout = std.fs.File.stdout();

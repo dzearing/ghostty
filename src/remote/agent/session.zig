@@ -168,6 +168,38 @@ pub const Child = struct {
     }
 };
 
+/// A stateless placeholder context for `deadChild` (the vtable ignores its `ctx`).
+var dead_child_ctx: u8 = 0;
+
+/// An inert `Child` for a DEAD session materialized from disk (§5.4 reboot floor,
+/// T12b) before it is relaunched: the session sits in the table so `ATTACH` replies
+/// `dead` and `LIST_SESSIONS` lists it, but there is no process behind it yet. Every
+/// method is a no-op / error: `terminate` does nothing (so table teardown is safe
+/// even if the session is never relaunched), `tryWait` reports "still running" (it is
+/// never polled — a dead session installs no output reader), `write` fails (no stdin).
+/// A successful `RELAUNCH` swaps this out for a real `pty_child`. Backed by a shared
+/// stateless context — no allocation, so nothing to free.
+pub fn deadChild() Child {
+    return .{ .ctx = &dead_child_ctx, .vtable = &dead_child_vtable };
+}
+
+const dead_child_vtable: Child.VTable = .{
+    .write = deadWrite,
+    .resize = deadResize,
+    .signal = deadSignal,
+    .tryWait = deadTryWait,
+    .terminate = deadTerminate,
+};
+fn deadWrite(_: *anyopaque, _: []const u8) anyerror!usize {
+    return error.BrokenPipe;
+}
+fn deadResize(_: *anyopaque, _: u16, _: u16, _: u16, _: u16) anyerror!void {}
+fn deadSignal(_: *anyopaque, _: []const u8) anyerror!void {}
+fn deadTryWait(_: *anyopaque) ?i64 {
+    return null;
+}
+fn deadTerminate(_: *anyopaque) void {}
+
 // -----------------------------------------------------------------------------
 // Raw-output ring — bounded recent-scrollback buffer (§7.1 / §7.3 gap-fill)
 // -----------------------------------------------------------------------------
@@ -337,6 +369,17 @@ pub const Session = struct {
     /// sessions leave this false and keep the plain idle-TTL. Only `CLOSE` or
     /// child exit frees a pinned session.
     pinned: bool = false,
+
+    /// True for a DEAD session MATERIALIZED FROM DISK at agent start (§5.4 reboot
+    /// floor, T12b) that has not been relaunched yet: `alive == false`, no live
+    /// `child` (a `deadChild()` placeholder), but the recorded `argv`/`cwd` are
+    /// present so `RELAUNCH` can respawn the process and revive it. Distinguishes a
+    /// relaunchable tombstone from a child that genuinely EXITED this run
+    /// (`relaunchable == false`, `exit_code` set): the former is offered a relaunch,
+    /// persisted across restarts, and never dropped by `persistMeta`; the latter is
+    /// a plain tombstone. Set true by `SessionTable.materialize`, cleared back to
+    /// false by a successful RELAUNCH (the session is then a normal alive one).
+    relaunchable: bool = false,
 
     /// The currently-bound connection's outbound bridge: where live child→client
     /// DATA frames are enqueued. Null while orphaned (no live connection) — output
@@ -536,6 +579,51 @@ pub const SessionTable = struct {
         errdefer self.alloc.destroy(s);
         s.* = try Session.init(self.alloc, id, channel, child, pid, rows, cols, ring_bytes, now_ms);
         errdefer s.deinit();
+
+        try self.by_id.put(self.alloc, id, s);
+        errdefer _ = self.by_id.remove(id);
+        try self.by_channel.put(self.alloc, channel, s);
+        return s;
+    }
+
+    /// Materialize a DEAD, RELAUNCHABLE session from persisted metadata (§5.4 reboot
+    /// floor, T12b). Re-keys the session to its RECORDED id (`rec.id`, the id the
+    /// viewer's layout manifest references) with a freshly-minted data channel and a
+    /// no-op `deadChild()`. Sets `alive = false` + `relaunchable = true` so `ATTACH`
+    /// replies `dead(relaunchable)` and `RELAUNCH` can respawn under the recorded
+    /// `argv`/`cwd`. Copies `argv`/`cwd`/`title` (owned) and `pinned`; preserves the
+    /// original `created_ms`, but sets `last_activity_ms = now_ms` so a just-loaded
+    /// session isn't instantly idle-reaped. Allocates a full `ring_bytes` output ring
+    /// (used once relaunched). Returns null (skips) on a malformed id or one already
+    /// present — idempotent across a double load. Enforces `max_sessions`.
+    pub fn materialize(
+        self: *SessionTable,
+        rec: session_meta.Record,
+        ring_bytes: usize,
+        now_ms: i64,
+    ) Error!?*Session {
+        if (self.by_id.count() >= max_sessions) return error.TooManySessions;
+        const id = parseId(rec.id) orelse return null; // malformed hex → skip
+        if (self.by_id.contains(id)) return null; // already present → skip
+
+        const channel = self.mintId(&self.by_channel);
+        if (channel == protocol.control_channel) return error.IdCollision;
+
+        const s = try self.alloc.create(Session);
+        errdefer self.alloc.destroy(s);
+        // Dead sessions carry no dimensions until an ATTACH/RELAUNCH sets them; a
+        // sane default (24×80) keeps the ring/pty math well-formed in the interim.
+        s.* = try Session.init(self.alloc, id, channel, deadChild(), 0, 24, 80, ring_bytes, now_ms);
+        errdefer s.deinit();
+
+        s.alive = false;
+        s.relaunchable = true;
+        s.pinned = rec.pinned;
+        s.created_ms = rec.created_ms; // preserve the original creation time
+        if (rec.argv) |a| s.setArgv(a); // relaunch command + LIST_SESSIONS label
+        if (rec.cwd) |c| s.cwd = try self.alloc.dupe(u8, c);
+        errdefer if (s.cwd) |c| self.alloc.free(c);
+        if (rec.title) |t| s.title = try self.alloc.dupe(u8, t);
 
         try self.by_id.put(self.alloc, id, s);
         errdefer _ = self.by_id.remove(id);
@@ -777,8 +865,41 @@ pub const SessionStore = struct {
         if (unlinked) |u| self.table.freeUnlinked(u);
     }
 
-    /// Persist the current ALIVE session set to `meta_path` (§5.4 reboot floor,
-    /// T12). No-op when `meta_path` is null (persistence disabled — the default).
+    /// Load persisted session metadata (T12) and MATERIALIZE each record as a DEAD,
+    /// relaunchable tombstone (§5.4 reboot floor, T12b). Call ONCE at agent start,
+    /// BEFORE accepting connections (so a viewer's `ATTACH` to a persisted id finds a
+    /// `dead(relaunchable)` session it can `RELAUNCH`) and before the reaper starts.
+    /// `ring_bytes` sizes each materialized session's output ring (used once
+    /// relaunched). No-op (and no error) when `meta_path` is null or the file is
+    /// absent (a first start / clean box). Best-effort per record: a malformed / dup /
+    /// oversized entry is skipped and logged; a whole-file read/parse failure is
+    /// logged and swallowed (a corrupt file must not stop the agent from starting).
+    /// Returns the number of sessions materialized.
+    pub fn loadPersisted(self: *SessionStore, ring_bytes: usize) usize {
+        const path = self.meta_path orelse return 0;
+        const alloc = self.table.alloc;
+
+        var parsed = (session_meta.load(alloc, path) catch |err| {
+            std.log.warn("session_meta: load from {s} failed: {s}", .{ path, @errorName(err) });
+            return 0;
+        }) orelse return 0; // absent → nothing to restore
+        defer parsed.deinit();
+
+        var n: usize = 0;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (parsed.value.sessions) |rec| {
+            const s = self.table.materialize(rec, ring_bytes, self.now()) catch |err| {
+                std.log.warn("session_meta: materialize {s} failed: {s}", .{ rec.id, @errorName(err) });
+                continue;
+            };
+            if (s != null) n += 1;
+        }
+        return n;
+    }
+
+    /// Persist the current ALIVE + RELAUNCHABLE session set to `meta_path` (§5.4
+    /// reboot floor, T12/T12b). No-op when `meta_path` is null (disabled — default).
     /// Best-effort: any failure is logged and swallowed, never propagated — a
     /// failed metadata write must never take down a live session.
     ///
@@ -790,14 +911,14 @@ pub const SessionStore = struct {
     /// the snapshot and the write cannot dangle. Callers invoke this AFTER their
     /// own unlocks (never while holding `mutex`); it takes the lock itself.
     ///
-    /// Only ALIVE sessions are recorded: a tombstone (exited child) has nothing
-    /// to relaunch, and the file self-heals on the next open/close trigger, so
-    /// child-exit deliberately does not call this.
+    /// ALIVE sessions and RELAUNCHABLE tombstones (T12b materialized-from-disk) are
+    /// recorded; a genuinely EXITED child has nothing to relaunch and is excluded (the
+    /// file self-heals on the next open/close trigger, so child-exit does not call this).
     pub fn persistMeta(self: *SessionStore) void {
         const path = self.meta_path orelse return;
         const alloc = self.table.alloc;
 
-        // Phase 1: snapshot alive sessions into owned records under the lock.
+        // Phase 1: snapshot the persistable set into owned records under the lock.
         var recs: std.ArrayList(session_meta.Record) = .empty;
         defer {
             for (recs.items) |r| freeMetaRecord(alloc, r);
@@ -807,7 +928,12 @@ pub const SessionStore = struct {
         var it = self.table.by_id.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
-            if (!s.alive) continue; // tombstones have nothing to relaunch
+            // Persist ALIVE sessions and RELAUNCHABLE tombstones (§5.4 reboot floor,
+            // T12b: a session loaded from disk but not yet relaunched must survive a
+            // second restart — dropping it here would lose the intent). A genuinely
+            // EXITED child (`!alive and !relaunchable`) has nothing to relaunch and
+            // is excluded; the file self-heals on the next open/close.
+            if (!s.alive and !s.relaunchable) continue;
             const rec = dupMetaRecord(alloc, s) catch continue; // best-effort per session
             recs.append(alloc, rec) catch {
                 freeMetaRecord(alloc, rec); // not in the list → free here
@@ -1184,4 +1310,98 @@ test "SessionStore.reapIdle: a bound session is never reaped regardless of pin" 
     clock.ms = 1_000_000;
     store.reapIdle();
     try testing.expectEqual(@as(usize, 1), store.table.count());
+}
+
+test "SessionTable.materialize: re-keys a dead relaunchable session from a record" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1234);
+    var table = SessionTable.init(alloc, prng.random());
+    defer table.deinit();
+
+    const rec: session_meta.Record = .{
+        .id = "0123456789abcdef0123456789abcdef",
+        .argv = "sleep 600",
+        .cwd = "/Users/x/work",
+        .title = "work",
+        .pinned = true,
+        .created_ms = 4242,
+    };
+    const s = (try table.materialize(rec, 1024, 9000)).?;
+
+    // Re-keyed to the RECORDED id (viewer manifest reference stays valid).
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", s.idStr());
+    try testing.expect(table.getByIdStr("0123456789abcdef0123456789abcdef") != null);
+    // Dead + relaunchable, no exit code, metadata copied, times set correctly.
+    try testing.expect(!s.alive);
+    try testing.expect(s.relaunchable);
+    try testing.expect(s.exit_code == null);
+    try testing.expect(s.pinned);
+    try testing.expectEqualStrings("sleep 600", s.argv.?);
+    try testing.expectEqualStrings("/Users/x/work", s.cwd.?);
+    try testing.expectEqualStrings("work", s.title.?);
+    try testing.expectEqual(@as(i64, 4242), s.created_ms); // preserved
+    try testing.expectEqual(@as(i64, 9000), s.last_activity_ms); // now, not idle
+    // A distinct data channel was minted and indexed.
+    try testing.expect(s.channel != protocol.control_channel);
+    try testing.expectEqual(s.id, table.getByChannel(s.channel).?.id);
+
+    // A malformed id is skipped (null), not a crash; a duplicate id is skipped too.
+    try testing.expect((try table.materialize(.{ .id = "nope" }, 1024, 9000)) == null);
+    try testing.expect((try table.materialize(rec, 1024, 9000)) == null);
+    try testing.expectEqual(@as(usize, 1), table.count());
+}
+
+test "SessionStore.loadPersisted materializes + persistMeta keeps relaunchable tombstones" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x99);
+    var clock: MutClock = .{ .ms = 500 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const path = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(path);
+    store.meta_path = path;
+
+    // Seed a sessions.json with one pinned command session.
+    const recs = [_]session_meta.Record{.{
+        .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .argv = "sleep 600",
+        .pinned = true,
+        .created_ms = 100,
+    }};
+    const body = try session_meta.serialize(alloc, &recs);
+    defer alloc.free(body);
+    try session_meta.writeAtomic(alloc, path, body);
+
+    // Load → one dead, relaunchable tombstone in the table.
+    try testing.expectEqual(@as(usize, 1), store.loadPersisted(1024));
+    const s = store.table.getByIdStr("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?;
+    try testing.expect(!s.alive and s.relaunchable);
+
+    // persistMeta must NOT drop the not-yet-relaunched tombstone (a second restart
+    // would otherwise lose it). The file still lists it.
+    store.persistMeta();
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.sessions.len);
+        try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", p.value.sessions[0].id);
+        try testing.expect(p.value.sessions[0].pinned);
+    }
+
+    // But a genuinely-exited tombstone (not relaunchable) IS excluded.
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    const dead = try store.table.create(fake.child(), 7, 24, 80, 1024, 100);
+    dead.markExited(0, 200); // alive=false, relaunchable=false
+    store.persistMeta();
+    {
+        var p = (try session_meta.load(alloc, path)).?;
+        defer p.deinit();
+        try testing.expectEqual(@as(usize, 1), p.value.sessions.len); // only the relaunchable one
+    }
 }
