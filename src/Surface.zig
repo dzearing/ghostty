@@ -32,6 +32,8 @@ const Command = @import("Command.zig");
 const exit_diagnostics = @import("exit_diagnostics.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
+const build_config = @import("build_config.zig");
+const shell_integration = @import("termio/shell_integration.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
@@ -88,6 +90,15 @@ pub const RemoteBackend = struct {
     /// shell config must never reach a remote agent. Null ⇒ the agent resolves
     /// its own default shell. Borrowed for the construction call only.
     shell: ?[]const u8 = null,
+
+    /// True ⇒ this remote backend is the LOCAL agent (same machine + same
+    /// Ghostty bundle as this viewer), so it is safe to inject ghostty shell
+    /// integration and the per-pane GHOSTTY_* env an exec pane would set — the
+    /// resources dir, terminfo, ZDOTDIR etc. all resolve on the agent's machine
+    /// because it IS this machine (T04b). NEVER set for a cross-machine window:
+    /// a macOS resources path / ZDOTDIR is meaningless (and breaks the shell) on
+    /// a different-OS agent. Set by the apprt from `Machine.isLocalMachine`.
+    local_shell_integration: bool = false,
 };
 
 /// Unique ID used to identify this surface for IPC purposes. It is
@@ -499,6 +510,152 @@ const DerivedConfig = struct {
     }
 };
 
+/// Build the ghostty shell-integration + GHOSTTY_* environment for a LOCAL
+/// agent-backed pane and append it to `remote_env` (forwarded via `OPEN.env`,
+/// T04b). This mirrors the env half of `Exec.Subprocess.init`: the same
+/// GHOSTTY_RESOURCES_DIR / TERM / TERMINFO / GHOSTTY_BIN_DIR / TERM_PROGRAM /
+/// GHOSTTY_SHELL_FEATURES / ZDOTDIR (etc.) an exec pane sets, so an agent-backed
+/// pane on THIS machine reaches shell-integration parity with an exec pane.
+///
+/// ONLY valid for the LOCAL agent (same OS + same bundle resources as this
+/// viewer); a cross-machine window must never call this (a macOS resources path
+/// / ZDOTDIR is meaningless — and breaks the shell — on a different-OS agent).
+///
+/// `scratch` is a caller-owned, initially-empty `EnvMap` that MUST outlive the
+/// `OPEN` construction: the appended pairs borrow its key/value strings until
+/// `Remote.init` dupes them. Env-only shells (zsh/fish/elvish) get FULL
+/// integration this way. bash/nushell additionally need an argv rewrite the
+/// `OPEN` wire can't carry yet (T04c); for them the agent still spawns a plain
+/// `-li`/`-lic` shell, so their integration won't fully activate — we set the
+/// GHOSTTY_* vars regardless and log the gap. `shell_path` is the shell the
+/// agent will spawn (the caller's `rb.shell` or the inherited `$SHELL`), used to
+/// detect which integration to inject; null falls back to the zsh default.
+fn appendLocalShellIntegrationEnv(
+    alloc: Allocator,
+    scratch: *std.process.EnvMap,
+    remote_env: *std.ArrayListUnmanaged(termio.Remote.EnvPair),
+    config: *const configpkg.Config,
+    surface_id_str: []const u8,
+    shell_path: ?[]const u8,
+) !void {
+    const resources_dir = global_state.resources_dir.host() orelse {
+        log.warn("no resources dir set; local shell integration disabled", .{});
+        return;
+    };
+
+    // Per-pane surface id: an exec pane sets this, but the remote branch dropped
+    // the local env map that carried it (Surface init), so forward it here.
+    try scratch.put("GHOSTTY_SURFACE_ID", surface_id_str);
+
+    // GHOSTTY_* + TERM machinery, mirroring Exec.Subprocess.init's env block.
+    try scratch.put("GHOSTTY_RESOURCES_DIR", resources_dir);
+    try scratch.put("TERM", config.term);
+    try scratch.put("COLORTERM", "truecolor");
+    {
+        // The terminfo db is adjacent to the resources dir (…/terminfo).
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.path.dirname(resources_dir)) |parent| {
+            if (std.fmt.bufPrint(&buf, "{s}/terminfo", .{parent})) |dir| {
+                try scratch.put("TERMINFO", dir);
+            } else |err| log.warn("error building TERMINFO path err={}", .{err});
+        }
+    }
+    try scratch.put("TERM_PROGRAM", "ghostty");
+    try scratch.put("TERM_PROGRAM_VERSION", build_config.version_string);
+
+    // GHOSTTY_BIN_DIR so scripts can find the ghoztty CLI. Our exe dir is the
+    // bundle's MacOS dir — the same dir the agent binary lives in — so the CLI
+    // is reachable there for the agent-spawned shell too.
+    {
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExePath(&exe_buf)) |exe_path| {
+            if (std.fs.path.dirname(exe_path)) |exe_dir| {
+                try scratch.put("GHOSTTY_BIN_DIR", exe_dir);
+            }
+        } else |err| log.warn("failed to get exe path for GHOSTTY_BIN_DIR err={}", .{err});
+    }
+
+    // On macOS, export the bundle's data dir so fish/elvish integration (and man
+    // pages) resolve — mirrors Exec's darwin block (XDG_DATA_DIRS).
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{s}/..", .{resources_dir})) |data_dir| {
+            const base = scratch.get("XDG_DATA_DIRS") orelse "/usr/local/share:/usr/share";
+            const joined = try internal_os.appendEnv(alloc, base, data_dir);
+            defer alloc.free(joined);
+            try scratch.put("XDG_DATA_DIRS", joined);
+        } else |err| log.warn("error building XDG_DATA_DIRS err={}", .{err});
+    }
+
+    // Shell features (GHOSTTY_SHELL_FEATURES), used by both automatic and manual
+    // integrations.
+    try shell_integration.setupFeatures(
+        scratch,
+        config.@"shell-integration-features",
+        config.@"cursor-style-blink" orelse true,
+    );
+
+    // Inject the shell-specific integration (ZDOTDIR for zsh, XDG for
+    // fish/elvish). `break :integrate` on any non-injectable case still forwards
+    // the GHOSTTY_* vars accumulated above.
+    integrate: {
+        const force: ?shell_integration.Shell = switch (config.@"shell-integration") {
+            .none => {
+                log.info("shell integration disabled by configuration", .{});
+                break :integrate;
+            },
+            .detect => null,
+            .bash => .bash,
+            .elvish => .elvish,
+            .fish => .fish,
+            .nushell => .nushell,
+            .zsh => .zsh,
+        };
+
+        // `config.Command.shell` is a sentinel-terminated string; dupe into a
+        // `[:0]u8` (works for both `shell_path` and the literal default).
+        const shell_z = try alloc.dupeZ(u8, shell_path orelse "/bin/zsh");
+        defer alloc.free(shell_z);
+        const integration = (shell_integration.setup(
+            alloc,
+            resources_dir,
+            .{ .shell = shell_z },
+            scratch,
+            force,
+        ) catch |err| {
+            log.warn("local shell integration setup error err={}", .{err});
+            break :integrate;
+        }) orelse {
+            log.warn("shell could not be detected; no local shell integration injected", .{});
+            break :integrate;
+        };
+
+        switch (integration.shell) {
+            // Env-only shells are fully integrated by the env we just built.
+            .zsh, .fish, .elvish => log.info(
+                "local shell integration injected shell={s}",
+                .{@tagName(integration.shell)},
+            ),
+            // These need an argv rewrite the OPEN wire can't carry yet (T04c);
+            // the agent spawns a plain shell so integration won't fully activate.
+            .bash, .nushell => log.warn(
+                "local shell integration for {s} needs an argv rewrite not yet " ++
+                    "forwarded (T04c); pane runs without full integration",
+                .{@tagName(integration.shell)},
+            ),
+        }
+    }
+
+    // Append everything accumulated in `scratch` to the forwarded env list. The
+    // pairs borrow `scratch`'s strings (stable until it is deinited, after
+    // Remote.init dupes them).
+    var it = scratch.iterator();
+    while (it.next()) |entry| try remote_env.append(alloc, .{
+        .key = entry.key_ptr.*,
+        .value = entry.value_ptr.*,
+    });
+}
+
 /// Create a new surface. This must be called from the main thread. The
 /// pointer to the memory for the surface must be provided and must be
 /// stable due to interfacing with various callbacks.
@@ -714,6 +871,18 @@ pub fn init(
                 // borrowed (caller-owned). Env, shell-integration, and the
                 // resources-dir all live on the agent side, so the local env
                 // map is not consumed by this backend — free it here.
+                //
+                // First, for the LOCAL agent, capture the inherited $SHELL before
+                // we free the env: the local agent resolves the SAME $SHELL (same
+                // user/host), so we integrate shell-integration for it (T04b).
+                // Duped because `env` is freed on the next line.
+                const inherited_shell: ?[]const u8 =
+                    if (rb.local_shell_integration)
+                        (if (env.get("SHELL")) |s| try alloc.dupe(u8, s) else null)
+                    else
+                        null;
+                defer if (inherited_shell) |s| alloc.free(s);
+
                 env.deinit();
                 env_owned = false;
 
@@ -746,6 +915,35 @@ pub fn init(
                 // immediately, so this temporary list is freed as the block exits.
                 var remote_env: std.ArrayListUnmanaged(termio.Remote.EnvPair) = .empty;
                 defer remote_env.deinit(alloc);
+
+                // LOCAL agent only (T04b): inject ghostty shell integration +
+                // the per-pane GHOSTTY_* env an exec pane sets (resources dir,
+                // terminfo, ZDOTDIR, GHOSTTY_SURFACE_ID, TERM_PROGRAM, …). This
+                // is appended FIRST so the user/apprt overrides below win on any
+                // key collision, mirroring exec's env_override-applied-last order.
+                // `integ_env` owns the strings the appended pairs borrow, so it
+                // must outlive `Remote.init` (which dupes them) — it is deinited at
+                // block exit, after `break :backend`. Never runs for a
+                // cross-machine window (`local_shell_integration` is false there).
+                var integ_env = std.process.EnvMap.init(alloc);
+                defer integ_env.deinit();
+                if (rb.local_shell_integration) {
+                    const shell_for_integration = rb.shell orelse inherited_shell;
+                    appendLocalShellIntegrationEnv(
+                        alloc,
+                        &integ_env,
+                        &remote_env,
+                        config,
+                        surface_id_str,
+                        shell_for_integration,
+                    ) catch |err| log.warn(
+                        "local shell integration setup failed err={}",
+                        .{err},
+                    );
+                }
+
+                // User/apprt env overrides applied LAST (they win over the
+                // integration env above, mirroring exec's `env_override`).
                 {
                     var env_it = config.env.iterator();
                     while (env_it.next()) |entry| try remote_env.append(alloc, .{

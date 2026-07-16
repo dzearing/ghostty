@@ -793,6 +793,14 @@ extension Ghostty {
                                     // backend. session_id == NULL ⇒ new session.
                                     if let remoteConnection {
                                         config.connection = remoteConnection
+                                        // Only the LOCAL agent (same machine +
+                                        // bundle) gets ghostty shell integration
+                                        // + per-pane GHOSTTY_* env injected (T04b).
+                                        // A cross-machine window must NOT — a macOS
+                                        // resources path / ZDOTDIR is meaningless on
+                                        // a different-OS agent.
+                                        config.remote_local_shell_integration =
+                                            remoteMachine?.isLocalMachine ?? false
                                         return try remoteSessionId.withCString { cSessionId in
                                             config.session_id = cSessionId
                                             // Explicit REMOTE cwd (split/tab

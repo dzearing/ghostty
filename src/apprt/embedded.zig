@@ -860,6 +860,13 @@ pub const Surface = struct {
     /// invariant as `remote_working_directory`.
     remote_shell: ?[*:0]const u8 = null,
 
+    /// True ⇒ the remote connection is the LOCAL agent (same machine + bundle),
+    /// so `remoteBackend()` requests ghostty shell integration + the per-pane
+    /// GHOSTTY_* env for the pane (T04b). Copied from
+    /// `Options.remote_local_shell_integration`. Ignored when `connection` is
+    /// null. NEVER true for a cross-machine window.
+    remote_local_shell_integration: bool = false,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -936,6 +943,16 @@ pub const Surface = struct {
         ///
         /// C type: `const char*`.
         remote_shell: ?[*:0]const u8 = null,
+
+        /// True ⇒ the connection is the LOCAL agent (same machine + same Ghostty
+        /// bundle as this viewer), so it is safe to inject ghostty shell
+        /// integration and the per-pane GHOSTTY_* env for the pane (T04b). The
+        /// apprt sets this from `Machine.isLocalMachine`. Ignored when
+        /// `connection` is null; NEVER set for a cross-machine window (a macOS
+        /// resources path / ZDOTDIR is meaningless on a different-OS agent).
+        ///
+        /// C type: `bool`.
+        remote_local_shell_integration: bool = false,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -957,6 +974,7 @@ pub const Surface = struct {
             .remote_session_id = opts.session_id,
             .remote_working_directory = opts.remote_working_directory,
             .remote_shell = opts.remote_shell,
+            .remote_local_shell_integration = opts.remote_local_shell_integration,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1491,6 +1509,8 @@ pub const Surface = struct {
                 const s = std.mem.sliceTo(sh, 0);
                 break :sh if (s.len > 0) s else null;
             } else null,
+            // Only the LOCAL agent gets ghostty shell integration injected (T04b).
+            .local_shell_integration = self.remote_local_shell_integration,
         };
     }
 

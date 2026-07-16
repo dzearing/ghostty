@@ -514,6 +514,16 @@ typedef struct {
   // (POSIX $SHELL / /bin/sh, Windows %COMSPEC% / cmd.exe). Ignored when
   // `connection` is NULL.
   const char* remote_shell;
+
+  // True when `connection` is the LOCAL agent (same machine + same Ghostty
+  // bundle as this viewer). When set, the pane is constructed with ghostty
+  // shell integration and the per-pane GHOSTTY_* environment an exec pane would
+  // set (resources dir, terminfo, ZDOTDIR, GHOSTTY_SURFACE_ID, TERM_PROGRAM …),
+  // since those all resolve on the agent's machine because it IS this machine.
+  // NEVER set this for a cross-machine window: a macOS resources path / ZDOTDIR
+  // is meaningless (and breaks the shell) on a different-OS agent. Ignored when
+  // `connection` is NULL.
+  bool remote_local_shell_integration;
 } ghostty_surface_config_s;
 
 typedef struct {
