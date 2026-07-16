@@ -46,6 +46,25 @@ phases in §8.
 | AC6 | Move window between machines | From Mac B: chooser lists Mac A's sessions ≤ 2 s; attach steals the session ≤ 3 s with full ring replay; Mac A's viewer (if open) shows "attached elsewhere" and offers re-steal. Round-trip A→B→A preserves the process. |
 | AC7 | CLI parity | `+list` shows agent-backed panes with correct pid/tty/cwd; `+send-keys`/`+read`/`+set-banner`/`+set-state` work unchanged on persistent panes. |
 
+### Measured results (E2E, `scripts/e2e/session-persistence.py`)
+
+Scenario used: 2 windows / 5 panes, nested topology with distinct ratios
+(Window A `P0 | (P1/P2)` ratios 0.30/0.70; Window B `P3 | P4` ratio 0.40), each
+pane running a never-exiting `PANE=n PID=$$` + tick marker. 3 consecutive cycles
+per mode, 0 s relaunch gap. Debug build on macOS 26.4.
+
+| AC | Mode | Result | Recovery gap | Notes |
+|----|------|--------|-------------|-------|
+| AC2 | `kill -9`, relaunch same binary (T07) | ✅ 3/3 | ~6–8 s | all 5 PIDs unchanged & alive; ticks monotonic across gap; topology exact (±0.01); pre-gap scrollback replayed; agent PID unchanged |
+| AC1 | `kill -9` + **bundle swapped on disk**, relaunch (T08) | ✅ 3/3 | ~8 s | as above; main-exec inode replaced each cycle (proof of on-disk swap); agent PID unchanged across the swap |
+| AC1 | **graceful quit** + bundle swap, relaunch (T08) | ✅ 3/3 | ~3 s | as above; `isQuitting` manifest path exercised; ⚠️ graceful *quit* itself wedges ~45 s in AppKit window teardown with many agent-backed panes (task T08a) — persistence + recovery unaffected |
+
+The swapped bundle is byte-identical (ad-hoc signing binds keychain auth to the
+exact code hash; a recompiled binary would prompt on every launch). This is
+immaterial to the AC — the restore path reads the layout manifest + surviving
+agent, never app-bundle bytes; the full FS-swap → relaunch → re-attach path is
+exercised. See `scripts/e2e/README.md`.
+
 ## 3. What exists today (inventory)
 
 The fork already contains ~80% of the machinery, built for remote machines.

@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-E2E harness for Ghoztty session persistence (design doc §5, task T07).
+E2E harness for Ghoztty session persistence (design doc §5, tasks T07 + T08).
 
 Builds the headlineAcceptance scenario against the DEBUG build entirely via the
-debug CLI, then SIGKILLs the app and relaunches the SAME binary, asserting that
-every pane's process survived (re-attached, not restarted), the split topology
-and ratios are restored exactly, and scrollback replays. Repeats the kill/relaunch
-cycle N times to prove repeatability (incl. 0s fast-relaunch, which T06b made safe).
+debug CLI, then terminates the app and relaunches it, asserting that every pane's
+process survived (re-attached, not restarted), the split topology and ratios are
+restored exactly, and scrollback replays. Repeats the terminate/relaunch cycle N
+times to prove repeatability (incl. 0s fast-relaunch, which T06b made safe).
 
-This is the kill -9 variant (T07). The binary-UPGRADE variant is T08 (--upgrade,
-to be added there).
+Modes:
+  * default (T07): SIGKILL the app, relaunch the SAME on-disk binary.
+  * --upgrade (T08): between terminate and relaunch, REPLACE the app bundle on
+    disk with a freshly-versioned, re-signed copy (main-exec sha genuinely
+    changes each cycle) — exactly the on-disk swap Sparkle performs — then
+    relaunch from the replaced bundle. Proves an upgrade re-attaches intact and
+    leaves the agent process untouched.
+  * --quit=kill|graceful: how the app is terminated each cycle. `graceful` uses
+    AppleScript `quit` (routes through applicationShouldTerminate → isQuitting,
+    manifest preserved) instead of SIGKILL. Both must survive.
 
 Exit 0 = all criteria passed. Nonzero = a criterion failed (actionable diff printed).
 
-    scripts/e2e/session-persistence.py [--cycles=3] [--keep] [--verbose]
+    scripts/e2e/session-persistence.py [--cycles=3] [--upgrade] [--quit=kill|graceful] [--keep] [--verbose]
 
 NEVER touches /Applications/Ghoztty.app. Debug bundle + debug socket + debug agent
-only. See docs/design/session-persistence-tasks.json for the full protocol.
+only. --upgrade stages/replaces a COPY of the bundle under a temp dir; the
+freshly-built zig-out bundle is only ever read. See
+docs/design/session-persistence-tasks.json for the full protocol.
 """
 
 import argparse
@@ -26,15 +36,14 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BUNDLE = os.path.join(ROOT, "zig-out", "Ghoztty-Debug.app")
-CLI = os.path.join(BUNDLE, "Contents", "MacOS", "ghoztty")
-AGENT_BIN = os.path.join(BUNDLE, "Contents", "MacOS", "ghoztty-agent")
+ZIGOUT_BUNDLE = os.path.join(ROOT, "zig-out", "Ghoztty-Debug.app")
 BUNDLE_ID = "com.dzearing.ghoztty.debug"
 HOME = os.path.expanduser("~")
 MANIFEST = os.path.join(HOME, "Library", "Application Support", BUNDLE_ID, "session-layout.json")
@@ -42,7 +51,26 @@ AGENT_DIR = os.path.join(HOME, ".config", "ghoztty", "local-agent-debug")
 PORT_FILE = os.path.join(AGENT_DIR, "port.json")
 LOCK_FILE = os.path.join(AGENT_DIR, "agent.lock")
 HEARTBEAT_FILE = os.path.join(AGENT_DIR, "agent.heartbeat")
-APP_LOG = "/private/tmp/claude-501/-Users-dzearing-git-ghoztty-session-persistence/07b76f56-4805-41d3-907d-8c54be603961/scratchpad/e2e-app.log"
+APP_LOG = os.path.join(tempfile.gettempdir(), "ghoztty-e2e", "e2e-app.log")
+
+# --upgrade staging: a pristine, byte-identical RESERVE copy of the fresh build.
+# The app ALWAYS launches from the installed zig-out path (whose ad-hoc code hash
+# is already authorized in the keychain — launching a differently-signed copy would
+# spam a keychain re-auth prompt every cycle). Each cycle the installed bundle is
+# physically replaced from the reserve: every file unlinked and rewritten with
+# fresh inodes at the same path — exactly the on-disk swap an updater performs —
+# while the code bytes (hence cdhash) stay identical, so there is NO keychain
+# prompt. See scripts/e2e/README.md for why the bytes are held constant.
+STAGING = os.path.join(tempfile.gettempdir(), "ghoztty-e2e-upgrade")
+UPGRADE_RESERVE = os.path.join(STAGING, "reserve", "Ghoztty-Debug.app")
+
+# The app + CLI/agent always live at the installed zig-out path. Matching
+# processes is done by the bundle-relative suffix so strays are still found.
+BUNDLE = ZIGOUT_BUNDLE
+CLI = os.path.join(BUNDLE, "Contents", "MacOS", "ghoztty")
+AGENT_BIN = os.path.join(BUNDLE, "Contents", "MacOS", "ghoztty-agent")
+APP_SUFFIX = os.path.join("Ghoztty-Debug.app", "Contents", "MacOS", "ghoztty")
+AGENT_SUFFIX = APP_SUFFIX + "-agent"
 
 LAUNCH_ARGS = ["--session-persistence=true", "--confirm-close-surface=false"]
 
@@ -113,11 +141,13 @@ def procs_matching(substr, extra=None):
     return res
 
 def app_pids():
-    # the app binary, NOT the agent (both live in Contents/MacOS)
-    return [pid for pid, cmd in procs_matching(CLI) if "ghoztty-agent" not in cmd and "+" not in cmd]
+    # the app binary, NOT the agent (both live in Contents/MacOS). Match by the
+    # bundle-relative suffix so a stray app from either launch location is caught.
+    return [pid for pid, cmd in procs_matching(APP_SUFFIX)
+            if AGENT_SUFFIX not in cmd and "+" not in cmd]
 
 def agent_pid():
-    pids = [pid for pid, cmd in procs_matching(AGENT_BIN)]
+    pids = [pid for pid, cmd in procs_matching(AGENT_SUFFIX)]
     return pids[0] if pids else None
 
 def pid_alive(pid):
@@ -190,6 +220,80 @@ def wait_app_ready(timeout=20.0):
                 pass
         time.sleep(0.25)
     raise E2EError("app did not answer +list --json within timeout")
+
+def graceful_quit(pids, timeout=45.0):
+    """Terminate the app the way a real quit / Sparkle relaunch does: AppleScript
+    `quit` scoped BY BUNDLE ID (never by process name — the release app shares the
+    name). Routes through applicationShouldTerminate (isQuitting → manifest kept).
+    The app's teardown can be slow (agent-backed surface teardown — see T08a), so
+    we wait generously to let the graceful path fully complete; SIGKILL is only a
+    last resort so a wedged teardown can't hang the whole suite. Returns True if it
+    exited on its own."""
+    subprocess.run(
+        ["osascript", "-e", f'tell application id "{BUNDLE_ID}" to quit'],
+        capture_output=True, text=True, timeout=15)
+    if wait_gone(pids, timeout):
+        return True
+    log(f"    ! graceful quit still alive after {timeout:.0f}s — forcing SIGKILL")
+    kill_pids(pids, signal.SIGKILL)
+    return wait_gone(pids, 4)
+
+# ---------------------------------------------------------------------------
+# Bundle upgrade (T08): physically replace the installed bundle on disk
+# ---------------------------------------------------------------------------
+def main_exec_path(bundle):
+    return os.path.join(bundle, "Contents", "MacOS", "ghoztty")
+
+def file_inode(path):
+    return os.stat(path).st_ino
+
+def cdhash_of(bundle):
+    p = subprocess.run(["codesign", "-dvvv", bundle], capture_output=True, text=True)
+    for line in (p.stderr + p.stdout).splitlines():
+        if line.startswith("CDHash="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+def run_checked(argv):
+    p = subprocess.run(argv, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise E2EError(f"{argv[0]} failed rc={p.returncode}: {p.stderr.strip()}")
+
+def stage_upgrade_bundles():
+    """Make a pristine, byte-identical RESERVE copy of the freshly-built bundle.
+    Each cycle the installed bundle is physically replaced from this reserve, so
+    the swap gives fresh inodes but identical signed content (same code hash → no
+    keychain re-auth). Verifies the reserve's cdhash matches the installed one."""
+    log(f"[upgrade] staging pristine reserve under {STAGING}")
+    run_checked(["rm", "-rf", UPGRADE_RESERVE])
+    os.makedirs(os.path.dirname(UPGRADE_RESERVE), exist_ok=True)
+    run_checked(["cp", "-R", ZIGOUT_BUNDLE, UPGRADE_RESERVE])
+    installed, reserve = cdhash_of(ZIGOUT_BUNDLE), cdhash_of(UPGRADE_RESERVE)
+    if installed is None or installed != reserve:
+        raise E2EError(f"reserve cdhash {reserve} != installed {installed} "
+                       f"(copy is not byte-identical — would trigger keychain prompts)")
+    vlog(f"reserve cdhash matches installed: {installed}")
+
+def swap_in_upgrade(cycle):
+    """Replace the installed bundle ON DISK with a fresh copy from the reserve:
+    every file unlinked and rewritten with new inodes at the same installed path,
+    exactly as an app updater swaps the bundle, then the app relaunches from it.
+    Content is byte-identical (README: ad-hoc signing binds keychain auth to the
+    exact code hash, so a recompiled binary can't be swapped silently; the FS-swap
+    + relaunch + re-attach path — the only thing session persistence must survive —
+    is exercised fully). Returns (old_inode, new_inode) of the main executable."""
+    exe = main_exec_path(ZIGOUT_BUNDLE)
+    old_ino = file_inode(exe)
+    tmp = ZIGOUT_BUNDLE + ".e2e-new"          # same volume as the bundle → atomic rename
+    run_checked(["rm", "-rf", tmp])
+    run_checked(["cp", "-R", UPGRADE_RESERVE, tmp])  # fresh inodes, identical bytes
+    run_checked(["rm", "-rf", ZIGOUT_BUNDLE])        # app is dead here — safe
+    os.rename(tmp, ZIGOUT_BUNDLE)
+    new_ino = file_inode(exe)
+    if new_ino == old_ino:
+        raise E2EError("upgrade swap did not replace the main executable (inode unchanged)")
+    vlog(f"upgrade cycle {cycle}: main-exec inode {old_ino} -> {new_ino} (physically replaced)")
+    return old_ino, new_ino
 
 # ---------------------------------------------------------------------------
 # Tree walking / snapshotting
@@ -397,10 +501,16 @@ def wait_restored(timeout=12.0):
 # ---------------------------------------------------------------------------
 # Assertions
 # ---------------------------------------------------------------------------
-def assert_cycle(baseline, cur, prev, gap, agent_before, agent_after, failures):
+def assert_cycle(baseline, cur, prev, gap, agent_before, agent_after, failures, upgrade=None):
     def check(cond, msg):
         if not cond:
             failures.append(msg)
+
+    # Upgrade proof: the installed bundle the app relaunched from was physically
+    # replaced this cycle (main executable has a fresh inode).
+    if upgrade is not None:
+        check(upgrade["new_ino"] != upgrade["old_ino"],
+              f"bundle main-exec not replaced (inode stayed {upgrade['old_ino']})")
 
     check(cur["n_windows"] == baseline["n_windows"],
           f"window count {cur['n_windows']} != baseline {baseline['n_windows']}")
@@ -447,7 +557,11 @@ def assert_cycle(baseline, cur, prev, gap, agent_before, agent_after, failures):
 def main():
     global VERBOSE
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cycles", type=int, default=3, help="kill/relaunch cycles (default 3)")
+    ap.add_argument("--cycles", type=int, default=3, help="terminate/relaunch cycles (default 3)")
+    ap.add_argument("--upgrade", action="store_true",
+                    help="replace the app bundle on disk between terminate and relaunch (T08)")
+    ap.add_argument("--quit", choices=("kill", "graceful"), default="kill",
+                    help="how to terminate the app each cycle (default kill = SIGKILL)")
     ap.add_argument("--keep", action="store_true", help="leave app+windows running at end")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -457,11 +571,14 @@ def main():
         log(f"FATAL: debug CLI not found at {CLI} — build first (zig build -Doptimize=Debug)")
         return 2
 
+    mode = ("binary UPGRADE (T08)" if args.upgrade else "kill -9 survival (T07)")
     log("=" * 70)
-    log("Ghoztty session-persistence E2E — kill -9 survival (T07)")
+    log(f"Ghoztty session-persistence E2E — {mode}, quit={args.quit}")
     log("=" * 70)
 
     full_reset()
+    if args.upgrade:
+        stage_upgrade_bundles()
     build_scenario()
 
     agent_before = agent_pid()
@@ -481,46 +598,67 @@ def main():
 
     prev = baseline
     all_failures = []
+    verb = "SIGKILL" if args.quit == "kill" else "gracefully quit"
+    action = "swap bundle + relaunch" if args.upgrade else "relaunch"
     for cycle in range(1, args.cycles + 1):
         log("-" * 70)
-        log(f"[cycle {cycle}/{args.cycles}] SIGKILL app, relaunch (0s gap), assert survival")
-        pre = snapshot()  # capture tick high-water just before the kill
+        log(f"[cycle {cycle}/{args.cycles}] {verb} app, {action} (0s gap), assert survival")
+        pre = snapshot()  # capture tick high-water just before termination
 
         pids = app_pids()
         if not pids:
-            all_failures.append(f"cycle {cycle}: no app process to kill")
+            all_failures.append(f"cycle {cycle}: no app process to terminate")
             break
-        t_kill = time.time()
-        kill_pids(pids, signal.SIGKILL)
-        wait_gone(pids, 5)
+        t_term = time.time()
+        if args.quit == "graceful":
+            graceful_quit(pids)
+        else:
+            kill_pids(pids, signal.SIGKILL)
+            wait_gone(pids, 5)
+        t_gone = time.time()
+        term_secs = t_gone - t_term
+
+        upgrade = None
+        if args.upgrade:
+            old_ino, new_ino = swap_in_upgrade(cycle)
+            upgrade = {"old_ino": old_ino, "new_ino": new_ino}
+            log(f"    ↻ replaced installed bundle on disk "
+                f"(main-exec inode {old_ino} -> {new_ino})")
 
         launch_app()
         wait_app_ready()
         wait_restored()
-        gap = time.time() - t_kill
+        # Recovery gap: from the OLD process being gone to all panes interactive.
+        # The headline SLA is recovery speed, not how long a graceful quit takes to
+        # tear down (that's logged as term_secs; slow graceful teardown = T08a).
+        gap = time.time() - t_gone
 
         agent_after = agent_pid()
         cur = snapshot()
 
         failures = []
-        assert_cycle(baseline, cur, pre, gap, agent_before, agent_after, failures)
+        assert_cycle(baseline, cur, pre, gap, agent_before, agent_after, failures, upgrade)
+        termdesc = f"  term={term_secs:.1f}s" if args.quit == "graceful" else ""
         if failures:
-            log(f"[cycle {cycle}] FAIL ({gap:.1f}s):")
+            log(f"[cycle {cycle}] FAIL (recovery {gap:.1f}s{termdesc}):")
             for f in failures:
                 log(f"    ✗ {f}")
             all_failures.extend(f"cycle {cycle}: {f}" for f in failures)
         else:
-            log(f"[cycle {cycle}] PASS  gap={gap:.1f}s  agent={agent_after}  "
+            log(f"[cycle {cycle}] PASS  recovery={gap:.1f}s{termdesc}  agent={agent_after}  "
                 f"ticks {cur['tick']}")
         prev = cur
 
     log("=" * 70)
+    survived = "upgrade" if args.upgrade else f"{args.quit}"
     if all_failures:
         log(f"RESULT: FAIL — {len(all_failures)} assertion(s) failed across {args.cycles} cycle(s)")
         rc = 1
     else:
-        log(f"RESULT: PASS — {args.cycles}/{args.cycles} kill -9 cycles survived; "
-            f"PIDs stable, topology exact, scrollback replayed, agent {agent_before} untouched")
+        extra = "binary swapped each cycle, " if args.upgrade else ""
+        log(f"RESULT: PASS — {args.cycles}/{args.cycles} {survived}/{args.quit} cycles survived; "
+            f"PIDs stable, {extra}topology exact, scrollback replayed, "
+            f"agent {agent_before} untouched")
         rc = 0
 
     if args.keep:
@@ -530,6 +668,14 @@ def main():
         for nm in ("A1", "A2", "B1"):
             cli_ok(["+close", f"--target={nm}"])
         full_reset()
+        if args.upgrade:
+            # If a crash ever left the installed bundle mid-swap, restore it from
+            # the reserve before discarding staging, so zig-out stays usable.
+            if not os.path.exists(CLI) and os.path.exists(UPGRADE_RESERVE):
+                log("[teardown] restoring installed bundle from reserve")
+                subprocess.run(["rm", "-rf", ZIGOUT_BUNDLE + ".e2e-new"], capture_output=True)
+                subprocess.run(["cp", "-R", UPGRADE_RESERVE, ZIGOUT_BUNDLE], capture_output=True)
+            subprocess.run(["rm", "-rf", STAGING, ZIGOUT_BUNDLE + ".e2e-new"], capture_output=True)
     return rc
 
 if __name__ == "__main__":

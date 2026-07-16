@@ -11,7 +11,7 @@ kill the app, relaunch, and assert mechanically that every pane's process
 ## `session-persistence.py` — kill -9 survival (task T07)
 
 ```
-scripts/e2e/session-persistence.py [--cycles=3] [--keep] [--verbose]
+scripts/e2e/session-persistence.py [--cycles=3] [--upgrade] [--quit=kill|graceful] [--keep] [--verbose]
 ```
 
 What it does:
@@ -56,6 +56,48 @@ By default the harness cleans up (closes windows, resets state) on exit; pass
 
 ## `session-persistence.py --upgrade` — simulated binary upgrade (task T08)
 
-_Planned._ Same flow, but between kill and relaunch the app bundle is replaced
-with a freshly-built copy (new mtime) to simulate a Sparkle swap, exercised for
-both the `SIGKILL` and graceful-quit paths.
+```
+scripts/e2e/session-persistence.py --upgrade [--quit=kill|graceful] [--cycles=3]
+```
+
+Same scenario and assertions as above, but between terminating the app and
+relaunching it, the **installed bundle is physically replaced on disk** — every
+file unlinked and rewritten with fresh inodes at the same installed path — exactly
+the on-disk swap an updater (Sparkle) performs. The app then relaunches from the
+replaced bundle and must re-attach every pane intact, with the **agent process
+untouched** (same PID before and after the swap). Each cycle asserts the main
+executable's inode actually changed (proof the bundle was replaced).
+
+Both termination modes are covered:
+
+- `--quit=kill` (default) — `SIGKILL`, i.e. crash-then-upgrade.
+- `--quit=graceful` — AppleScript `quit` (scoped by bundle id, never by process
+  name — the release app shares the name), routing through
+  `applicationShouldTerminate` (`isQuitting` ⇒ manifest preserved).
+
+The `<10s` SLA is measured as the **recovery** gap (old process gone →
+all panes interactive), reported separately from how long termination itself
+takes (`term=…s`), since recovery speed — not quit speed — is the crash/upgrade
+criterion.
+
+**Why the swapped bundle is byte-identical (not a recompiled binary):** the debug
+build is *ad-hoc* signed (no team), so its keychain authorization for
+`com.dzearing.ghoztty.relay-account` is bound to the app's exact code hash
+(cdhash). A genuinely-recompiled or re-signed bundle has a different cdhash and
+would trigger a keychain re-auth **prompt on every launch**. Real Developer-ID
+upgrades keep a stable designated requirement and don't prompt; we can't
+replicate that ad-hoc. Holding the bytes constant is immaterial to what the test
+proves — the restore path never reads app-bundle bytes; it reads the layout
+manifest + the surviving agent. The test still exercises the full
+FS-swap → relaunch → re-attach path an upgrade takes. The harness verifies the
+reserve copy's cdhash matches the installed one before starting.
+
+### Known caveat: slow graceful quit with many agent-backed panes (task T08a)
+
+With several session-persistence (agent-backed) panes open, a **graceful** quit
+can hang ~45s in AppKit's `-[NSApplication _terminateFromSender:…saveWindows:]`
+window-teardown before the process exits (plain exec-backed windows quit in
+<1s). The `isQuitting` manifest-preservation path runs *before* the hang, so
+persistence is unaffected, and recovery after relaunch is still <4s — but the
+harness waits out the hang (up to 45s) then `SIGKILL`s as a last resort. This is
+a pre-existing app-teardown issue tracked as T08a, not a persistence regression.
