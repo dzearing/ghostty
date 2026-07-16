@@ -82,12 +82,17 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // splits then inherit the shared connection through `remoteConnection`
         // exactly like a remote window's. An existing tree carries
         // already-built surfaces, so there is nothing to route.
+        //
+        // Default-on (T19): the connection resolve is bounded and non-fatal —
+        // when the local agent can't be found/spawned/dialed in time,
+        // `sharedConnectionForNewSurface` returns nil and this window opens as a
+        // plain exec surface instead of hanging or failing.
         var base = base
         var localAgent: RemoteConnection?
         if tree == nil,
            base?.remoteConnection == nil,
            ghostty.config.sessionPersistence,
-           let agent = LocalAgentManager.shared.sharedRemoteConnection() {
+           let agent = LocalAgentManager.shared.sharedConnectionForNewSurface() {
             var cfg = base ?? Ghostty.SurfaceConfiguration()
             cfg.remoteMachine = agent.machine
             cfg.remoteConnection = agent.handle

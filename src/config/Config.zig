@@ -1212,8 +1212,11 @@ command: ?Command = null,
 /// survive the app exiting — including crashes and binary upgrades — and can
 /// be re-attached.
 ///
-/// Defaults to `false`.
-@"session-persistence": bool = false,
+/// Defaults to `true`. When the local agent cannot be found, spawned, or
+/// dialed, new windows/tabs/splits fall back to running their shell directly
+/// under the app (a plain, non-persistent local surface) so terminal creation
+/// never hangs or fails on an unavailable agent.
+@"session-persistence": bool = true,
 
 /// Session relaunch policy (macOS, requires `session-persistence`): controls what
 /// a restored window does when a pane's persisted session comes back from the

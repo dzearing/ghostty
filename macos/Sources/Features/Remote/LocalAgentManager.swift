@@ -117,6 +117,19 @@ final class LocalAgentManager {
         let pid: pid_t
     }
 
+    /// Thread-safe one-shot holder for a `connect()` result handed from a
+    /// background queue to the main thread across a `DispatchSemaphore`, used by
+    /// `sharedConnectionForNewSurface`'s bounded wait. `Connection` is a plain
+    /// value (a C handle + ints); the lock only guards the cross-thread handoff.
+    private final class ConnectResultBox {
+        private let lock = NSLock()
+        private var value: Connection?
+        func set(_ v: Connection?) { lock.lock(); value = v; lock.unlock() }
+        func take() -> Connection? {
+            lock.lock(); defer { value = nil; lock.unlock() }; return value
+        }
+    }
+
     /// Find-or-spawn the local agent and dial it. Blocking (dial + spawn
     /// polling, worst case ~5s) — call off the main thread.
     func connect() -> Connection? {
@@ -176,25 +189,89 @@ final class LocalAgentManager {
         Machine(name: "127.0.0.1", host: "127.0.0.1", port: port)
     }
 
-    /// The shared local-agent connection, creating it (find-or-spawn + dial)
-    /// if there is no healthy cached one. Blocking on a cache miss:
-    /// milliseconds against a live agent, ~300ms when the agent must be
-    /// spawned (call `warmUp()` at launch to hide this), ~5s worst case
-    /// against a wedged agent. Main-thread only.
-    func sharedRemoteConnection() -> RemoteConnection? {
+    /// Timestamp of the last find-or-spawn failure, so `session-persistence`
+    /// default-on never re-beachballs window creation against a broken or
+    /// unspawnable agent: after a failure, new surfaces fall back to exec
+    /// immediately for `connectFailureCooldown` while `warmUp()` keeps retrying
+    /// in the background. Main-thread only.
+    private var lastConnectFailureAt: Date?
+    private let connectFailureCooldown: TimeInterval = 15
+
+    /// Resolve the shared local-agent connection for a NEW persistent surface,
+    /// with a BOUNDED main-thread wait so `session-persistence` (default-on
+    /// since T19) can never hang window creation:
+    ///
+    ///   * a warm, healthy connection returns instantly (the common case after
+    ///     `warmUp()` at launch);
+    ///   * otherwise a find-or-spawn+dial runs on a background queue and we wait
+    ///     at most `timeout` for it — a healthy agent dials in well under a
+    ///     second (spawn ~300ms), so it lands agent-backed; a slow/broken agent
+    ///     exceeds the bound and this returns nil, so the caller opens a plain
+    ///     exec surface for THIS window while the eventual connection is cached
+    ///     (or the failure recorded) for the next one;
+    ///   * a recent find-or-spawn failure short-circuits to nil (no probe, no
+    ///     wait) for a cooldown, so an unspawnable agent doesn't re-block every
+    ///     window.
+    ///
+    /// nil ⇒ the caller must fall back to a non-persistent exec surface.
+    /// Main-thread only.
+    func sharedConnectionForNewSurface(timeout: TimeInterval = 2.0) -> RemoteConnection? {
         dispatchPrecondition(condition: .onQueue(.main))
-        if let existing = sharedOwner,
-           existing.linkState != .dead,
-           sharedAgentPid > 0,
-           kill(sharedAgentPid, 0) == 0 || errno == EPERM {
-            return existing
-        }
+
+        // Fast path: a warm, healthy connection — agent-backed, no wait.
+        if let warm = warmSharedOwner() { return warm }
+
         // Dead link or dead agent: drop our reference (windows still using the
-        // old connection keep it alive; their reconnect ladder handles it) and
-        // dial fresh.
+        // old connection keep it alive; their reconnect ladder handles it).
         sharedOwner = nil
         sharedAgentPid = 0
-        guard let conn = connect() else { return nil }
+
+        // Known-broken recently: fall back to exec now, no probe. `warmUp()`
+        // keeps retrying in the background and will clear this on success.
+        if let last = lastConnectFailureAt,
+           Date().timeIntervalSince(last) < connectFailureCooldown {
+            return nil
+        }
+
+        // No warm connection and no recent failure: bounded find-or-spawn.
+        let box = ConnectResultBox()
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            box.set(connect())
+            sem.signal()
+        }
+
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            // Still dialing — don't hold the main thread. Absorb the eventual
+            // result (cache it, or record the failure) when it lands, and open
+            // an exec surface for this window now.
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                sem.wait()
+                let conn = box.take()
+                DispatchQueue.main.async { self.absorbConnectResult(conn) }
+            }
+            return nil
+        }
+
+        // Completed within the bound.
+        return absorbConnectResult(box.take())
+    }
+
+    /// Cache a freshly-dialed connection as the shared owner (or record the
+    /// failure), returning the resulting owner. Idempotent against a racing
+    /// caller that cached one first: keep theirs, free ours. Main-thread only.
+    @discardableResult
+    private func absorbConnectResult(_ conn: Connection?) -> RemoteConnection? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let conn else {
+            lastConnectFailureAt = Date()
+            return nil
+        }
+        lastConnectFailureAt = nil
+        if let warm = warmSharedOwner() {
+            ghostty_remote_connection_free(conn.handle)
+            return warm
+        }
         return cacheShared(conn)
     }
 
@@ -220,13 +297,18 @@ final class LocalAgentManager {
                    self.sharedAgentPid > 0,
                    kill(self.sharedAgentPid, 0) == 0 || errno == EPERM {
                     if let conn { ghostty_remote_connection_free(conn.handle) }
+                    self.lastConnectFailureAt = nil
                     completion(existing)
                     return
                 }
                 guard let conn else {
+                    // Record the failure so default-on window creation short-
+                    // circuits to exec during the cooldown instead of re-probing.
+                    self.lastConnectFailureAt = Date()
                     completion(nil)
                     return
                 }
+                self.lastConnectFailureAt = nil
                 completion(self.cacheShared(conn))
             }
         }

@@ -22,6 +22,7 @@ Modes:
 Exit 0 = all criteria passed. Nonzero = a criterion failed (actionable diff printed).
 
     scripts/e2e/session-persistence.py [--cycles=3] [--upgrade] [--quit=kill|graceful] [--keep] [--verbose]
+    scripts/e2e/session-persistence.py --fallback   # T19: agent-unavailable exec fallback (default-on)
 
 NEVER touches /Applications/Ghoztty.app. Debug bundle + debug socket + debug agent
 only. --upgrade stages/replaces a COPY of the bundle under a temp dir; the
@@ -84,7 +85,14 @@ AGENT_BIN = os.path.join(BUNDLE, "Contents", "MacOS", "ghoztty-agent")
 APP_SUFFIX = os.path.join("Ghoztty-Debug.app", "Contents", "MacOS", "ghoztty")
 AGENT_SUFFIX = APP_SUFFIX + "-agent"
 
-LAUNCH_ARGS = ["--session-persistence=true", "--confirm-close-surface=false"]
+# session-persistence is DEFAULT-ON since T19, so the harness no longer passes
+# --session-persistence=true: a clean pass here proves the default flip works.
+LAUNCH_ARGS = ["--confirm-close-surface=false"]
+
+# When set (the --fallback mode), point the app's local-agent binary at this
+# path so the agent can NEVER be found/spawned — proving default-on windows fall
+# back to a plain exec surface instead of hanging. None = normal (real agent).
+AGENT_BIN_OVERRIDE = None
 
 # Each pane runs a unique, never-exiting marker: prints PANE=<n> PID=<shell pid>
 # once, then an incrementing tick line every second. Survival == same PID + ticks
@@ -289,6 +297,8 @@ def launch_app():
     # every launch (its code hash changes each rebuild, so the ACL never matches
     # and "Always Allow" can't stick). Session persistence needs no relay account.
     env = dict(os.environ, GHOSTTY_RELAY_DISABLE="1")
+    if AGENT_BIN_OVERRIDE is not None:
+        env["GHOSTTY_LOCAL_AGENT_BIN"] = AGENT_BIN_OVERRIDE
     p = subprocess.Popen([CLI] + LAUNCH_ARGS, stdout=logf, stderr=logf,
                          start_new_session=True, env=env)
     _launched_procs.append(p)
@@ -1041,6 +1051,129 @@ def run_sigterm_check(args, baseline):
     return 0
 
 # ---------------------------------------------------------------------------
+# Agent-unavailable fallback check (T19)
+# ---------------------------------------------------------------------------
+def run_fallback_check(args):
+    """T19: with session-persistence DEFAULT-ON but the local agent forcibly
+    unavailable (GHOSTTY_LOCAL_AGENT_BIN → a nonexistent path, so it can never be
+    found or spawned), new windows/tabs/splits must fall back to a plain exec
+    surface — open promptly, be fully usable — instead of hanging, erroring, or
+    leaving an exited overlay. Proves the default-on safety net.
+
+    Note the app is launched WITHOUT --session-persistence: the flag is default-on
+    now, so the feature is exercised purely from the compiled default."""
+    global AGENT_BIN_OVERRIDE
+    failures = []
+
+    bad_bin = "/nonexistent/ghoztty-agent-does-not-exist"
+    AGENT_BIN_OVERRIDE = bad_bin
+    log(f"[fallback] launching app default-on, agent bin forced to {bad_bin} (unspawnable)")
+
+    t_launch = time.time()
+    launch_app()
+    # The app must answer +list quickly: a hang here would mean window creation
+    # blocked on the (impossible) agent spawn.
+    wait_app_ready(timeout=20.0)
+    dt_ready = time.time() - t_launch
+    log(f"    ✓ app answered +list {dt_ready:.1f}s after launch (no hang at startup)")
+
+    # No agent may ever appear — the whole point is that persistence degraded.
+    time.sleep(1.0)
+    if agent_pid() is not None:
+        failures.append(f"an agent is running (pid {agent_pid()}) — the bad-bin override "
+                        "did not prevent a spawn, so this did not exercise the fallback")
+
+    # Create a window + two splits, each running a marker command. Time-bound each
+    # mutation: retry_cli already fails loudly if a command can't complete, and the
+    # window must come up well within the timeout (no ~5s-per-window agent stall).
+    # (The default-on app already opened one blank exec window at launch — itself a
+    # fallback surface — so the new window brings the count to 2.)
+    log("[fallback] creating an exec-backed window + 2 splits (marker commands)")
+    initial_n = len(all_windows())
+    t0 = time.time()
+    retry_cli(["+new-window", "--target=fbwin", f"--command={marker_cmd(0)}"],
+              "fallback new-window", timeout=15)
+    wait_window_count(initial_n + 1)
+    retry_cli(["+split", "--target=fbwin", "--direction=right", "--name=fb1",
+               f"--command={marker_cmd(1)}"], "fallback split fb1", timeout=15)
+    wait_for_pane("fb1")
+    retry_cli(["+split", "--target=fb1", "--direction=down", "--name=fb2",
+               f"--command={marker_cmd(2)}"], "fallback split fb2", timeout=15)
+    wait_for_pane("fb2")
+    dt_build = time.time() - t0
+    log(f"    ✓ window + 2 splits created in {dt_build:.1f}s (no per-window agent stall)")
+    # A per-window agent stall would be ~5s each; 3 surfaces well under that bound.
+    if dt_build > 12.0:
+        failures.append(f"window+splits took {dt_build:.1f}s — suggests a per-surface "
+                        "agent-spawn stall instead of an instant exec fallback")
+
+    # Every pane must be a working exec surface: its marker + ticks appear, and it
+    # accepts input. Give ticks a moment to accumulate.
+    time.sleep(3.0)
+    names = {0: None, 1: None, 2: None}
+    # map marker index -> pane name via read
+    for nm in all_leaf_names():
+        n, pid = parse_marker(read_pane(nm))
+        if n in names:
+            names[n] = nm
+    for n in (0, 1, 2):
+        nm = names[n]
+        if nm is None:
+            failures.append(f"pane marker {n} never appeared (exec surface did not start?)")
+            continue
+        text = read_pane(nm)
+        n2, pid = parse_marker(text)
+        tick = last_tick(text, n)
+        if pid is None or pid <= 0:
+            failures.append(f"pane {n}: no valid PID in marker (exec child not running)")
+        if tick is None:
+            failures.append(f"pane {n}: no ticks (exec child not producing output)")
+        else:
+            log(f"    ✓ pane {n} ({nm}) exec-backed: PID={pid}, ticks up to {tick}")
+
+    # Input must reach a live shell (proves the fallback surface is a usable,
+    # interactive terminal — not an exited overlay). The marker panes run an
+    # infinite loop, so open one PLAIN shell split and echo into that.
+    retry_cli(["+split", "--target=fb2", "--direction=right", "--name=fbsh"],
+              "fallback plain-shell split", timeout=15)
+    wait_for_pane("fbsh")
+    cli_ok(["+send-keys", "--target=fbsh", "echo FALLBACK-INPUT-OK", "Enter"])
+    deadline = time.time() + 6
+    seen = False
+    while time.time() < deadline:
+        if "FALLBACK-INPUT-OK" in read_pane("fbsh"):
+            seen = True
+            break
+        time.sleep(0.4)
+    if seen:
+        log("    ✓ plain-shell fallback pane accepted input (send-keys echoed back)")
+    else:
+        failures.append("plain-shell pane did not echo injected input (exec surface not interactive)")
+
+    # Teardown: kill the app; assert nothing leaked an agent or a launchd job (the
+    # bad-bin path must NOT install a KeepAlive job around a broken binary).
+    AGENT_BIN_OVERRIDE = None
+    if launchagent_pid() is not None:
+        failures.append("a LaunchAgent job was installed despite the unspawnable binary "
+                        "(would KeepAlive-respawn a broken agent forever)")
+    ap = app_pids()
+    if ap:
+        kill_pids(ap, signal.SIGKILL)
+        wait_gone(ap, 4)
+    launchagent_bootout()
+
+    log("=" * 70)
+    if failures:
+        log(f"RESULT: FAIL — {len(failures)} assertion(s) failed")
+        for f in failures:
+            log(f"    ✗ {f}")
+        return 1
+    log("RESULT: PASS — session-persistence default-on with the agent forcibly "
+        "unavailable: windows opened promptly as exec surfaces, ran, and accepted "
+        "input; no hang, no stray agent, no KeepAlive job")
+    return 0
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1059,6 +1192,10 @@ def main():
     ap.add_argument("--agent-sigterm", action="store_true", dest="agent_sigterm",
                     help="graceful agent stop (T13b): SIGTERM the agent and assert it flushes "
                          "dirty rings to disk, then exits cleanly on its own (no SIGKILL escalation)")
+    ap.add_argument("--fallback", action="store_true",
+                    help="agent-unavailable fallback (T19): default-on config with the local "
+                         "agent forced unspawnable; assert windows open as usable exec surfaces "
+                         "(no hang, no stray agent, no KeepAlive job)")
     ap.add_argument("--quit", choices=("kill", "graceful"), default="kill",
                     help="how to terminate the app each cycle (default kill = SIGKILL)")
     ap.add_argument("--keep", action="store_true", help="leave app+windows running at end")
@@ -1069,6 +1206,23 @@ def main():
     if not os.path.exists(CLI):
         log(f"FATAL: debug CLI not found at {CLI} — build first (zig build -Doptimize=Debug)")
         return 2
+
+    # Agent-unavailable fallback (T19): a standalone flow — it must NOT require a
+    # live agent (the whole point is that none exists), so it runs its own reset +
+    # launch and skips the agent-required baseline below.
+    if args.fallback:
+        log("=" * 70)
+        log("Ghoztty session-persistence E2E — agent-unavailable FALLBACK (T19)")
+        log("=" * 70)
+        full_reset()
+        try:
+            return run_fallback_check(args)
+        finally:
+            ap2 = app_pids()
+            if ap2:
+                kill_pids(ap2, signal.SIGKILL)
+                wait_gone(ap2, 4)
+            launchagent_bootout()
 
     if args.agent_sigterm:
         mode = "AGENT graceful SIGTERM / ring flush (T13b)"
