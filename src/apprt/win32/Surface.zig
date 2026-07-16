@@ -1263,9 +1263,13 @@ pub fn handleSearchKey(self: *Surface, vk: u16) bool {
 // -----------------------------------------------------------------------
 
 /// A command palette entry: display name + the binding action to execute.
+/// `remote` entries have no binding action (there is none for "new remote
+/// window"); they are special-cased in `executePaletteSelection` to open the
+/// machine chooser locally, and `action` is an unused placeholder.
 const PaletteEntry = struct {
     name: []const u8,
     action: input.Binding.Action,
+    remote: bool = false,
 };
 
 /// Cap on user-configured command-palette-entry commands shown in the
@@ -1283,7 +1287,12 @@ fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
 }
 
 fn paletteEntryAction(self: *const Surface, idx: u16) ?input.Binding.Action {
-    if (idx < palette_entries.len) return palette_entries[idx].action;
+    if (idx < palette_entries.len) {
+        // Remote entries have no binding action (opened locally); returning
+        // null suppresses a misleading keybind hint on the palette row.
+        const entry = palette_entries[idx];
+        return if (entry.remote) null else entry.action;
+    }
     const user = self.app.config.@"command-palette-entry".value.items;
     const uidx = idx - palette_entries.len;
     if (uidx >= user.len) return null;
@@ -1300,6 +1309,7 @@ pub const PALETTE_ITEM_HEIGHT: f32 = 28.0;
 /// Static list of commands shown in the palette.
 const palette_entries = [_]PaletteEntry{
     .{ .name = "New Window", .action = .new_window },
+    .{ .name = "New Remote Window", .action = .new_window, .remote = true },
     .{ .name = "New Tab", .action = .new_tab },
     .{ .name = "Close Surface", .action = .close_surface },
     .{ .name = "Close Tab", .action = .{ .close_tab = .this } },
@@ -1565,10 +1575,20 @@ pub fn executePaletteSelection(self: *Surface) void {
     if (self.palette_selected >= self.palette_count) return;
 
     const entry_idx = self.palette_filtered[self.palette_selected];
-    const action = self.paletteEntryAction(entry_idx) orelse return;
 
-    // Close the palette first
+    // Close the palette first.
     self.setCommandPaletteActive(false);
+
+    // Remote entry (e.g. "New Remote Window") — opened locally via the machine
+    // chooser, not through a binding action (there is none). Special-cased here
+    // (T22c decision 4), the palette counterpart to the ctrl+shift+n intercept.
+    if (entry_idx < palette_entries.len and palette_entries[entry_idx].remote) {
+        log.info("machine chooser: opening via command palette", .{});
+        self.parent_window.openMachineChooser();
+        return;
+    }
+
+    const action = self.paletteEntryAction(entry_idx) orelse return;
 
     // Execute the action
     _ = self.core_surface.performBindingAction(action) catch |err| {
@@ -1996,6 +2016,25 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     // The actual character follows as WM_CHAR — don't set the
     // key_event_produced_text flag so WM_CHAR is allowed through.
     if (vk == w32.VK_PACKET) return;
+
+    // ctrl+shift+n → "New Remote Window" (the machine chooser). Handled
+    // locally (T22c decision 3): there is no core binding action for "new
+    // remote window", so intercept the chord here, BEFORE keyCallback. On
+    // Windows this shadows the cross-platform ctrl+shift+n → new_window
+    // default (ctrl+n still opens a plain local window). First press only —
+    // bit 30 of lparam is the previous key state, set on autorepeat.
+    if (action == .press and vk == 'N' and (lparam & (1 << 30)) == 0) {
+        const ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
+        const shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+        const alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0;
+        const winkey = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+            w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0;
+        if (ctrl and shift and !alt and !winkey) {
+            log.info("machine chooser: opening via ctrl+shift+n", .{});
+            self.parent_window.openMachineChooser();
+            return;
+        }
+    }
 
     // Determine left/right for modifier keys using the extended key flag
     // (bit 24 of lparam) and specific left/right VK codes.

@@ -812,6 +812,18 @@ pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 pub const WM_CTLCOLORBTN: u32 = 0x0135;
+pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
+
+// LISTBOX control styles, messages, and notifications (T22c machine chooser).
+pub const LBS_NOTIFY: u32 = 0x0001;
+pub const LBS_HASSTRINGS: u32 = 0x0040;
+pub const LB_ADDSTRING: u32 = 0x0180;
+pub const LB_RESETCONTENT: u32 = 0x0184;
+pub const LB_SETCURSEL: u32 = 0x0186;
+pub const LB_GETCURSEL: u32 = 0x0188;
+pub const LB_GETCOUNT: u32 = 0x018B;
+pub const LBN_SELCHANGE: u16 = 1;
+pub const LBN_DBLCLK: u16 = 2;
 
 // Button control styles / notifications
 pub const BS_DEFPUSHBUTTON: u32 = 0x00000001;

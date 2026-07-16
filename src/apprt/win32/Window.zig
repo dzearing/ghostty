@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 
 const App = @import("App.zig");
+const MachineChooser = @import("MachineChooser.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
@@ -98,6 +99,10 @@ rename_tab: usize = 0,
 /// RenameDialog itself; this is a backreference for key routing and
 /// teardown.
 rename_dialog: ?*RenameDialog = null,
+
+/// The open "New Remote Window" machine chooser (T22c), or null. Modal to
+/// this window while open; a backreference for key routing and teardown.
+machine_chooser: ?*MachineChooser = null,
 
 /// UTF-16 title buffers for each tab (for painting the tab bar).
 tab_titles: [64][256]u16 = undefined,
@@ -445,9 +450,10 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
 
 /// Deinitialize the Window: close all tabs, delete font, destroy HWND.
 pub fn deinit(self: *Window) void {
-    // Close the rename dialog first (it re-enables and refocuses this
-    // window's HWND, which must still be alive).
+    // Close the rename dialog / machine chooser first (each re-enables and
+    // refocuses this window's HWND, which must still be alive).
     if (self.rename_dialog) |dlg| dlg.cancel();
+    if (self.machine_chooser) |ch| ch.cancel();
 
     // Drop IPC names pointing at this window before the memory can be
     // recycled.
@@ -2099,6 +2105,11 @@ const RENAME_EDIT_ID: u16 = 300;
 /// tabs; the keybind path gets a real dialog (T50).
 pub fn promptRenameWindow(self: *Window) void {
     RenameDialog.open(self);
+}
+
+/// Open the "New Remote Window" machine chooser (ctrl+shift+n / palette).
+pub fn openMachineChooser(self: *Window) void {
+    MachineChooser.open(self);
 }
 
 /// Start inline editing of a tab title. Creates a small Edit control

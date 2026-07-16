@@ -11,4 +11,5 @@ pub const resourcesDir = internal_os.resourcesDir;
 
 test {
     _ = @import("win32/RenameDialog.zig");
+    _ = @import("win32/MachineChooser.zig");
 }

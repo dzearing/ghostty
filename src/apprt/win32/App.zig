@@ -15,10 +15,12 @@ const internal_os = @import("../../os/main.zig");
 
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
+const MachineChooser = @import("MachineChooser.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
+const relay_dial = @import("../../remote/relay_dial.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 
@@ -352,6 +354,12 @@ pub fn run(self: *App) !void {
             // and no global keybind bubbles out of a modal dialog.
             if (self.renameDialogOwning(msg.hwnd.?)) |dlg| {
                 if (dlg.handleKey(vk)) continue :loop;
+            } else if (self.machineChooserOwning(msg.hwnd.?)) |chooser| {
+                // Modal machine chooser: Enter/Escape/Tab/Up/Down handled by
+                // our code (typing falls through to the filter EDIT). Like the
+                // rename dialog, exclusive — its children must never reach the
+                // Surface-cast intercepts (their parent is a *MachineChooser).
+                if (chooser.handleKey(vk)) continue :loop;
             } else {
                 // Check if this edit is a tab rename edit
                 if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
@@ -560,6 +568,97 @@ pub fn createWindow(self: *App, opts: Window.InitOptions) !*Window {
     errdefer _ = self.windows.pop();
     _ = try window.addTab();
     return window;
+}
+
+/// Options for opening a remote-machine window (the shared open path below).
+/// All string values are REMOTE-native and forwarded verbatim in the agent
+/// OPEN (never wrapped by the local shell table). Slices are borrowed for the
+/// duration of the call — `openDialedWindow` copies what it retains.
+pub const RemoteOpenOptions = struct {
+    /// cwd ON THE REMOTE MACHINE, or null for the agent's default.
+    working_directory: ?[]const u8 = null,
+    /// Shell ON THE REMOTE MACHINE, or null for the agent's default.
+    shell: ?[]const u8 = null,
+    /// Command to run instead of an interactive shell, or null.
+    command: ?[]const u8 = null,
+    /// Register the new window under this IPC name for later targeting.
+    ipc_name: ?[]const u8 = null,
+    /// Title override to apply to the new window, or null.
+    title: ?[]const u8 = null,
+    /// Bring the new window to the foreground (false ⇒ show inactive).
+    activate: bool = true,
+};
+
+pub const RemoteOpenError = error{ DialFailed, CreateFailed } || Allocator.Error;
+
+/// The ONE remote-window open tail (T22c decision 6): build the `.remote`
+/// surface overrides from a completed dial, create the window, hand it
+/// ownership of the transport, and apply title/activation. Shared by the
+/// `+new-remote-window` IPC verb (both TCP and relay) and the machine chooser.
+///
+/// Takes ownership of `dialed`: on success the returned window owns it (torn
+/// down in `Window.deinit`); on `CreateFailed` this frees it before returning,
+/// so callers never double-free.
+pub fn openDialedWindow(
+    self: *App,
+    dialed: Window.RemoteDialed,
+    opts: RemoteOpenOptions,
+) error{ CreateFailed, OutOfMemory }!*Window {
+    const conn = switch (dialed) {
+        inline else => |d| d.conn,
+    };
+
+    const overrides: Surface.Overrides = .{
+        .remote = .{
+            .connection = conn,
+            .working_directory = opts.working_directory,
+            .shell = opts.shell,
+            .command = opts.command,
+        },
+    };
+
+    const window = self.createWindow(.{
+        .surface_overrides = &overrides,
+        .ipc_name = opts.ipc_name,
+    }) catch |err| {
+        log.warn("remote window: create window failed err={}", .{err});
+        dialed.deinitDestroy(self.core_app.alloc);
+        return error.CreateFailed;
+    };
+    window.remote_dialed = dialed;
+
+    if (opts.title) |title| window.setTitleOverride(title);
+    if (!opts.activate) {
+        if (window.hwnd) |hwnd| _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+    } else if (window.hwnd) |hwnd| {
+        _ = w32.SetForegroundWindow(hwnd);
+    }
+    return window;
+}
+
+/// Dial an enrolled relay device and open a window on it. The relay half of
+/// the shared open path (T22c): both the `--relay`/`--device` IPC verb and the
+/// machine chooser route through here so there is ONE relay-open path. The
+/// caller resolves the bearer `token` (so it can shape its own no-credential
+/// UX) and maps the two failure modes onto its own messaging.
+pub fn openRelayWindow(
+    self: *App,
+    relay_base: []const u8,
+    device: []const u8,
+    token: []const u8,
+    opts: RemoteOpenOptions,
+) RemoteOpenError!*Window {
+    const alloc = self.core_app.alloc;
+    const dialed = try alloc.create(relay_dial.Dialed);
+    dialed.* = relay_dial.dial(alloc, relay_base, device, token, .raw) catch |err| {
+        log.warn(
+            "remote window: relay dial failed relay={s} device={s} err={}",
+            .{ relay_base, device, err },
+        );
+        alloc.destroy(dialed);
+        return error.DialFailed;
+    };
+    return self.openDialedWindow(.{ .relay = dialed }, opts);
 }
 
 /// The next auto-generated window name (`window-N`). Caller owns the slice.
@@ -1676,6 +1775,18 @@ fn renameDialogOwning(self: *App, hwnd: w32.HWND) ?*RenameDialog {
     for (self.windows.items) |win| {
         if (win.rename_dialog) |dlg| {
             if (dlg.ownsHwnd(hwnd)) return dlg;
+        }
+    }
+    return null;
+}
+
+/// Returns the open machine chooser owning the given HWND (the chooser itself
+/// or one of its controls), if any. Used by the message loop to route chooser
+/// keys and keep its children away from the Surface-cast popup-edit intercepts.
+fn machineChooserOwning(self: *App, hwnd: w32.HWND) ?*MachineChooser {
+    for (self.windows.items) |win| {
+        if (win.machine_chooser) |chooser| {
+            if (chooser.ownsHwnd(hwnd)) return chooser;
         }
     }
     return null;

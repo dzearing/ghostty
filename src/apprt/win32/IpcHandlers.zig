@@ -10,7 +10,6 @@ const windows = std.os.windows;
 const App = @import("App.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
-const relay_dial = @import("../../remote/relay_dial.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const google_oauth = @import("../../remote/google_oauth.zig");
 const Surface = @import("Surface.zig");
@@ -274,11 +273,21 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         }
     }
 
-    // Dial the agent (TCP or relay): connect + mux + Connection + HELLO
-    // handshake, blocking until connected (≤10s). The Dialed is heap-owned
-    // so the window can take ownership for its lifetime.
-    const alloc = app.core_app.alloc;
-    const dialed: Window.RemoteDialed = if (use_relay) relay_blk: {
+    // Dial the agent (TCP or relay) and open the window through the shared
+    // open path (App.openRelayWindow / openDialedWindow — T22c decision 6, the
+    // same path the machine chooser uses). The dial blocks on the GUI thread
+    // until connected (≤10s HELLO deadline). Empty string ⇒ absent (the Mac
+    // treats `--shell=` as nil so an empty value can never forward "").
+    const opts: App.RemoteOpenOptions = .{
+        .working_directory = nonEmpty(args.working_directory),
+        .shell = nonEmpty(args.shell),
+        .command = nonEmpty(args.command),
+        .ipc_name = args.name,
+        .title = args.title,
+        .activate = !args.no_activate,
+    };
+
+    if (use_relay) {
         // Token tiers: explicit --token, then the signed-in account (refresh
         // grant), then the GUI's env. A tokenless relay dial is a guaranteed
         // 401 — refuse BEFORE dialing (Mac rule).
@@ -289,22 +298,17 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .{},
             );
         };
-
-        const dialed = try alloc.create(relay_dial.Dialed);
-        dialed.* = relay_dial.dial(alloc, relay.?, device.?, token, .raw) catch |err| {
-            log.warn(
-                "IPC new-remote-window: relay dial failed relay={s} device={s} err={}",
-                .{ relay.?, device.?, err },
-            );
-            alloc.destroy(dialed);
-            return try errorResponse(
+        _ = app.openRelayWindow(relay.?, device.?, token, opts) catch |err| switch (err) {
+            error.DialFailed => return try errorResponse(
                 ctx.alloc,
                 "failed to reach {s} via relay {s}: the agent is not running or not reachable",
                 .{ device.?, relay.? },
-            );
+            ),
+            error.CreateFailed => return try errorResponse(ctx.alloc, "failed to create window", .{}),
+            error.OutOfMemory => return error.OutOfMemory,
         };
-        break :relay_blk .{ .relay = dialed };
-    } else tcp_blk: {
+    } else {
+        const alloc = app.core_app.alloc;
         const host = args.host.?;
         const dialed = try alloc.create(tcp_dial.Dialed);
         dialed.* = tcp_dial.dial(alloc, host, args.port, .raw) catch |err| {
@@ -319,38 +323,10 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .{ host, args.port },
             );
         };
-        break :tcp_blk .{ .tcp = dialed };
-    };
-    const conn = switch (dialed) {
-        inline else => |d| d.conn,
-    };
-
-    // Empty string ⇒ absent (the Mac treats `--shell=` as nil so an empty
-    // value can never forward "").
-    const overrides: Surface.Overrides = .{
-        .remote = .{
-            .connection = conn,
-            .working_directory = nonEmpty(args.working_directory),
-            .shell = nonEmpty(args.shell),
-            .command = nonEmpty(args.command),
-        },
-    };
-
-    const window = app.createWindow(.{
-        .surface_overrides = &overrides,
-        .ipc_name = args.name,
-    }) catch |err| {
-        log.warn("IPC new-remote-window: create window failed err={}", .{err});
-        dialed.deinitDestroy(alloc);
-        return try errorResponse(ctx.alloc, "failed to create window", .{});
-    };
-    window.remote_dialed = dialed;
-
-    if (args.title) |title| window.setTitleOverride(title);
-    if (args.no_activate) {
-        if (window.hwnd) |hwnd| _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
-    } else if (window.hwnd) |hwnd| {
-        _ = w32.SetForegroundWindow(hwnd);
+        _ = app.openDialedWindow(.{ .tcp = dialed }, opts) catch |err| switch (err) {
+            error.CreateFailed => return try errorResponse(ctx.alloc, "failed to create window", .{}),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     }
 
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
@@ -368,7 +344,7 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
 /// falls through to the env token (graceful — Mac `resolveToken` behavior).
 /// Allocated on `arena`. Endpoints are `.google` unless a test injects a fake
 /// issuer via `GHOSTTY_OAUTH_TOKEN_ENDPOINT`.
-fn resolveAccountToken(arena: Allocator) ?[]const u8 {
+pub fn resolveAccountToken(arena: Allocator) ?[]const u8 {
     const path = relay_account.accountPath(arena) catch return null;
     if (!relay_account.isSignedIn(arena, path)) return null;
 
@@ -385,9 +361,19 @@ fn resolveAccountToken(arena: Allocator) ?[]const u8 {
 
 /// The env tier of relay token resolution: `GHOSTTY_RELAY_TOKEN` (empty ⇒
 /// null). Allocated on `arena`.
-fn resolveEnvToken(arena: Allocator) ?[]const u8 {
+pub fn resolveEnvToken(arena: Allocator) ?[]const u8 {
     const tok = std.process.getEnvVarOwned(arena, "GHOSTTY_RELAY_TOKEN") catch return null;
     return nonEmpty(tok);
+}
+
+/// Combined relay bearer-token resolution shared by the `+new-remote-window`
+/// verb and the machine chooser (T22c): the signed-in account first (a fresh
+/// ID token minted from the stored refresh grant), then `GHOSTTY_RELAY_TOKEN`.
+/// Null ⇒ no credential — the chooser shows an empty list + a sign-in hint,
+/// never an error. (`--token` is a per-call override the IPC verb applies
+/// ahead of this.) Allocated on `arena`.
+pub fn resolveToken(arena: Allocator) ?[]const u8 {
+    return resolveAccountToken(arena) orelse resolveEnvToken(arena);
 }
 
 fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
