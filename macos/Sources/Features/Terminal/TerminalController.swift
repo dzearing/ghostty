@@ -502,16 +502,34 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         return c
     }
 
+    /// - Parameter completion: Invoked (on the main actor, always asynchronously)
+    ///   with the controller that was actually built, or nil on genuine failure.
+    ///   This exists because the remote/local-agent path builds the tab AFTER an
+    ///   off-main cwd resolve, so the synchronous return value is nil even on
+    ///   success. Callers that need the real result (e.g. the AppleScript
+    ///   `new tab` handler) should use this instead of the return value.
+    @discardableResult
     static func newTab(
         _ ghostty: Ghostty.App,
         from parent: NSWindow? = nil,
-        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil
+        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil,
+        completion: ((TerminalController?) -> Void)? = nil
     ) -> TerminalController? {
+        // Fire `completion` on a later main-runloop turn so callers that suspend
+        // work (NSScriptCommand) always resume AFTER this function returns, even
+        // on the synchronous paths below.
+        func finish(_ controller: TerminalController?) {
+            guard let completion else { return }
+            DispatchQueue.main.async { completion(controller) }
+        }
+
         // Making sure that we're dealing with a TerminalController. If not,
         // then we just create a new window.
         guard let parent,
               let parentController = parent.windowController as? TerminalController else {
-            return newWindow(ghostty, withBaseConfig: baseConfig, withParent: parent)
+            let created = newWindow(ghostty, withBaseConfig: baseConfig, withParent: parent)
+            finish(created)
+            return created
         }
 
         // If our parent is in non-native fullscreen, then new tabs do not work.
@@ -524,6 +542,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             alert.addButton(withTitle: "OK")
             alert.alertStyle = .warning
             alert.beginSheetModal(for: parent)
+            finish(nil)
             return nil
         }
 
@@ -545,6 +564,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // rule as `newWindowInheritingRemote`.
             if parentRemote.machine.isRelay && !RelayAccount.hasCredentials {
                 AppDelegate.presentSignInRequiredAlert()
+                finish(nil)
                 return nil
             }
             BaseTerminalController.resolveRemoteInheritance(
@@ -569,22 +589,25 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 if cfg.remoteShell == nil {
                     cfg.remoteShell = parentRemote.machine.settings.shell
                 }
-                _ = buildTab(
+                let built = buildTab(
                     ghostty,
                     parent: parent,
                     parentController: parentController,
                     baseConfig: cfg,
                     undoBaseConfig: baseConfig)
+                finish(built)
             }
             return nil
         }
 
-        return buildTab(
+        let built = buildTab(
             ghostty,
             parent: parent,
             parentController: parentController,
             baseConfig: baseConfig,
             undoBaseConfig: baseConfig)
+        finish(built)
+        return built
     }
 
     /// Build the new-tab window and attach it to `parent`'s tab group. Split out

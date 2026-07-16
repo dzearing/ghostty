@@ -263,16 +263,39 @@ extension NSApplication {
             parentWindow = TerminalController.preferredParent?.window
         }
 
-        guard let createdController = TerminalController.newTab(
+        // The remote / local-agent (session-persistence) path builds the tab
+        // AFTER an off-main cwd resolve, so `newTab` returns nil even on success.
+        // Suspend the script command and resume it from the completion, which
+        // fires with the real controller in every path (see TerminalController.newTab).
+        command.suspendExecution()
+        TerminalController.newTab(
             appDelegate.ghostty,
             from: parentWindow,
             withBaseConfig: baseConfig
-        ) else {
-            command.scriptErrorNumber = errAEEventFailed
-            command.scriptErrorString = "Failed to create tab."
-            return nil
+        ) { createdController in
+            guard let createdController else {
+                command.scriptErrorNumber = errAEEventFailed
+                command.scriptErrorString = "Failed to create tab."
+                command.resumeExecution(withResult: nil)
+                return
+            }
+
+            let scriptTab = self.resolveCreatedTab(
+                createdController,
+                targetWindow: targetWindow)
+            command.resumeExecution(withResult: scriptTab)
         }
 
+        // Return value is ignored while the command is suspended.
+        return nil
+    }
+
+    /// Wrap a freshly created tab controller in its `ScriptTab`, preferring the
+    /// AppKit tab-group bookkeeping and falling back to a synthetic window.
+    private func resolveCreatedTab(
+        _ createdController: TerminalController,
+        targetWindow: ScriptWindow?
+    ) -> ScriptTab {
         let createdTabID = ScriptTab.stableID(controller: createdController)
 
         if let targetWindow,

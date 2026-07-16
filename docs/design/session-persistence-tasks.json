@@ -199,7 +199,7 @@
     {
       "id": "T06d",
       "title": "AppleScript 'new tab' returns error -10000 despite creating the tab",
-      "status": "pending",
+      "status": "in_progress",
       "dependsOn": ["T06a"],
       "goal": "handleNewTabScriptCommand (AppDelegate+AppleScript.swift:230) reliably errors 'Failed to create tab.' (errAEEventFailed) while the tab IS created — TerminalController.newTab apparently returns nil though the controller comes up fine. Scripts can't get the returned tab object (harness must re-discover via +list). Low priority; fix the return path (likely async window creation racing the synchronous script reply).",
       "steps": [],
