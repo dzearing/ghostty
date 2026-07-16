@@ -49,6 +49,7 @@ HOME = os.path.expanduser("~")
 MANIFEST = os.path.join(HOME, "Library", "Application Support", BUNDLE_ID, "session-layout.json")
 AGENT_DIR = os.path.join(HOME, ".config", "ghoztty", "local-agent-debug")
 PORT_FILE = os.path.join(AGENT_DIR, "port.json")
+SOCKET_FILE = os.path.join(AGENT_DIR, "agent.sock")  # the 0600 UDS the agent binds (T09c)
 LOCK_FILE = os.path.join(AGENT_DIR, "agent.lock")
 HEARTBEAT_FILE = os.path.join(AGENT_DIR, "agent.heartbeat")
 APP_LOG = os.path.join(tempfile.gettempdir(), "ghoztty-e2e", "e2e-app.log")
@@ -196,7 +197,7 @@ def full_reset():
     if agp is not None:
         kill_pids([agp], signal.SIGKILL)
         wait_gone([agp], 4)
-    for f in (MANIFEST, PORT_FILE, HEARTBEAT_FILE):
+    for f in (MANIFEST, PORT_FILE, SOCKET_FILE, HEARTBEAT_FILE):
         try:
             os.remove(f)
         except FileNotFoundError:

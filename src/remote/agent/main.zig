@@ -159,11 +159,12 @@ pub fn main() !void {
         },
         .listen_unix => |l| {
             defer alloc.free(l.path);
+            defer if (l.port_file) |pf| alloc.free(pf);
             // DAEMON mode: single-instance BEFORE the bind (a losing instance
             // must not clobber the winner's socket node).
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
             defer lock.release();
-            try runListenUnix(alloc, encoding, l.path, l.headless);
+            try runListenUnix(alloc, encoding, l.path, l.headless, l.port_file);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
@@ -399,6 +400,12 @@ const ListenUnix = struct {
     path: []const u8,
     headless: bool = false,
     force_replace: bool = false,
+    /// `--port-file=<path>`: after the socket binds, atomically write a JSON
+    /// info file `{"port":0,"pid":P,"socket":"<path>","startedAt":MS}` so the
+    /// supervisor that spawned us can pid-liveness-check a pre-existing agent
+    /// and learn the socket path to dial (a UDS has no ephemeral port to
+    /// publish). Owned (duped from argv).
+    port_file: ?[]const u8 = null,
 };
 
 /// Opt-in required to bind `--listen` to a NON-loopback interface. The TCP
@@ -487,9 +494,9 @@ fn parseArgs(alloc: Allocator) !Mode {
                 std.debug.print("ghoztty-agent: --listen-unix requires <path>\n", .{});
                 return error.InvalidArgs;
             }
-            return listenUnixMode(alloc, args[i], headless, force_replace);
+            return listenUnixMode(alloc, args[i], headless, force_replace, port_file_arg);
         } else if (std.mem.startsWith(u8, a, "--listen-unix=")) {
-            return listenUnixMode(alloc, a["--listen-unix=".len..], headless, force_replace);
+            return listenUnixMode(alloc, a["--listen-unix=".len..], headless, force_replace, port_file_arg);
         } else if (std.mem.eql(u8, a, "--relay")) {
             i += 1;
             if (i >= args.len) {
@@ -550,7 +557,7 @@ fn listenMode(alloc: Allocator, addr: std.net.Address, headless: bool, force_rep
 /// Windows (AF_UNIX local persistence is not this fork's Windows story — that is
 /// a named pipe, §5.2). `path` is duped here (argv is freed when parseArgs
 /// returns).
-fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_replace: bool) !Mode {
+fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_replace: bool, port_file: ?[]const u8) !Mode {
     if (path.len == 0) {
         std.debug.print("ghoztty-agent: --listen-unix requires a non-empty <path>\n", .{});
         return error.InvalidArgs;
@@ -559,8 +566,14 @@ fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_repl
         std.debug.print("ghoztty-agent: --listen-unix is not supported on Windows (use a named pipe)\n", .{});
         return error.InvalidArgs;
     }
+    if (port_file) |pf| if (pf.len == 0) {
+        std.debug.print("ghoztty-agent: --port-file requires a non-empty <path>\n", .{});
+        return error.InvalidArgs;
+    };
     const path_owned = try alloc.dupe(u8, path);
-    return .{ .listen_unix = .{ .path = path_owned, .headless = headless, .force_replace = force_replace } };
+    errdefer alloc.free(path_owned);
+    const pf_owned: ?[]const u8 = if (port_file) |pf| try alloc.dupe(u8, pf) else null;
+    return .{ .listen_unix = .{ .path = path_owned, .headless = headless, .force_replace = force_replace, .port_file = pf_owned } };
 }
 
 /// Whether `addr` is a loopback address (127.0.0.0/8 or ::1) — the only binds
@@ -801,6 +814,7 @@ fn runListenUnix(
     encoding: protocol.TransferEncoding,
     path: []const u8,
     headless: bool,
+    port_file: ?[]const u8,
 ) !void {
     _ = headless; // no Windows tray on the unix path; reserved for symmetry.
 
@@ -841,6 +855,20 @@ fn runListenUnix(
     // socket fd returns EINVAL, which std.posix.fchmod maps to `unreachable`
     // (panic) — the same class of trap that once killed the agent via
     // SO_NOSIGPIPE (see socket_stream.zig). umask is both sufficient and safe.
+
+    // Publish an info file for the supervisor that spawned us. A UDS has no
+    // ephemeral port to discover, so the body carries {"port":0,"pid":P,
+    // "socket":"<path>","startedAt":MS}: `pid` lets the supervisor liveness-
+    // check a pre-existing agent and `socket` tells it what to dial. Written
+    // AFTER the bind succeeds, atomically (tmp+rename). Fatal on failure — a
+    // supervisor waiting on this file would otherwise hang against a silently
+    // socket-less agent.
+    if (port_file) |pf| {
+        writeSocketFile(alloc, pf, path) catch |err| {
+            std.debug.print("ghoztty-agent: failed to write --port-file {s}: {s}\n", .{ pf, @errorName(err) });
+            return err;
+        };
+    }
 
     // DAEMON-SCOPED shared session store + spawner — identical lifetime rules to
     // the TCP path (sessions outlive each connection; the reaper evicts orphans).
@@ -914,14 +942,29 @@ fn shouldServe(enforce_same_uid: bool, peer_uid: ?posix.uid_t, our_uid: posix.ui
     return uid == our_uid;
 }
 
-/// Atomically publish the listener's bound port for a supervisor: write
-/// `{"port":N,"pid":P,"startedAt":MS}` to `path` via the same-directory
+/// Atomically publish the TCP listener's bound port for a supervisor: write
+/// `{"port":N,"pid":P,"startedAt":MS}` to `path`. Thin wrapper over
+/// `writeInfoFile` with no socket path (the endpoint is a port).
+fn writePortFile(alloc: Allocator, path: []const u8, port: u16) !void {
+    return writeInfoFile(alloc, path, port, null);
+}
+
+/// Atomically publish the UDS listener's socket path for a supervisor: write
+/// `{"port":0,"pid":P,"socket":"<socket>","startedAt":MS}` to `path`. A UDS has
+/// no port to advertise, so the supervisor dials the socket path instead; `pid`
+/// still lets it liveness-check a pre-existing agent.
+fn writeSocketFile(alloc: Allocator, path: []const u8, socket: []const u8) !void {
+    return writeInfoFile(alloc, path, 0, socket);
+}
+
+/// Atomically write the agent info file to `path` via the same-directory
 /// tmp+rename pattern (see `enroll.saveRelayEnv`), creating parent directories
 /// as needed. `pid` lets the reader liveness-check the writer; `startedAt`
-/// (unix ms) lets it spot a stale file from a previous boot.
-fn writePortFile(alloc: Allocator, path: []const u8, port: u16) !void {
+/// (unix ms) lets it spot a stale file from a previous boot; `socket` (when
+/// set) carries the UDS path to dial.
+fn writeInfoFile(alloc: Allocator, path: []const u8, port: u16, socket: ?[]const u8) !void {
     if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
-    const content = try formatPortFile(alloc, port, currentPid(), std.time.milliTimestamp());
+    const content = try formatInfoFile(alloc, port, currentPid(), std.time.milliTimestamp(), socket);
     defer alloc.free(content);
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
@@ -934,20 +977,62 @@ fn writePortFile(alloc: Allocator, path: []const u8, port: u16) !void {
         defer file.close();
         try file.writeAll(content);
         // Durable before the rename publishes it: a reader must never parse a
-        // partially-flushed port.
+        // partially-flushed record.
         try file.sync();
     }
     errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
     try std.fs.cwd().rename(tmp_path, path);
 }
 
-/// The port-file JSON body (pure — separated from the I/O for tests).
+/// The TCP info-file JSON body (pure — separated from the I/O for tests).
 fn formatPortFile(alloc: Allocator, port: u16, pid: i64, started_at_ms: i64) ![]u8 {
+    return formatInfoFile(alloc, port, pid, started_at_ms, null);
+}
+
+/// The info-file JSON body (pure — separated from the I/O for tests). With a
+/// `socket` path the body gains a `"socket":"<escaped>"` field (the UDS
+/// endpoint); without one it is the original TCP `{port,pid,startedAt}` shape.
+fn formatInfoFile(alloc: Allocator, port: u16, pid: i64, started_at_ms: i64, socket: ?[]const u8) ![]u8 {
+    if (socket) |s| {
+        const esc = try jsonEscape(alloc, s);
+        defer alloc.free(esc);
+        return std.fmt.allocPrint(
+            alloc,
+            "{{\"port\":{d},\"pid\":{d},\"socket\":\"{s}\",\"startedAt\":{d}}}\n",
+            .{ port, pid, esc, started_at_ms },
+        );
+    }
     return std.fmt.allocPrint(
         alloc,
         "{{\"port\":{d},\"pid\":{d},\"startedAt\":{d}}}\n",
         .{ port, pid, started_at_ms },
     );
+}
+
+/// Minimal JSON string-body escaping for a filesystem path: `"` and `\` (the
+/// only two bytes that would break the surrounding string literal) plus control
+/// characters, which are illegal unescaped in a JSON string. Socket paths are
+/// app-controlled and won't normally contain these, but escaping keeps the file
+/// well-formed for any path.
+fn jsonEscape(alloc: Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        0x08 => try out.appendSlice(alloc, "\\b"),
+        0x0c => try out.appendSlice(alloc, "\\f"),
+        '\n' => try out.appendSlice(alloc, "\\n"),
+        '\r' => try out.appendSlice(alloc, "\\r"),
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        else => if (c < 0x20) {
+            var hex: [6]u8 = undefined;
+            try out.appendSlice(alloc, std.fmt.bufPrint(&hex, "\\u{x:0>4}", .{c}) catch unreachable);
+        } else {
+            try out.append(alloc, c);
+        },
+    };
+    return out.toOwnedSlice(alloc);
 }
 
 fn currentPid() i64 {
@@ -1756,6 +1841,72 @@ test "listen-unix: bind creates a 0600 socket node (umask), probeUnixAlive sees 
 
     // A live listener answers the connect-probe used for stale-socket cleanup.
     try std.testing.expect(probeUnixAlive(path));
+}
+
+test "socket info file: JSON body carries port:0/pid/socket/startedAt" {
+    const alloc = std.testing.allocator;
+    const body = try formatInfoFile(alloc, 0, 987, 1770000000000, "/tmp/agent.sock");
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    // Port is 0 (a UDS has no port); the supervisor keys off `socket` instead.
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("port").?.integer);
+    try std.testing.expectEqual(@as(i64, 987), parsed.value.object.get("pid").?.integer);
+    try std.testing.expectEqualStrings("/tmp/agent.sock", parsed.value.object.get("socket").?.string);
+    try std.testing.expectEqual(@as(i64, 1770000000000), parsed.value.object.get("startedAt").?.integer);
+}
+
+test "socket info file: path with quote/backslash stays well-formed JSON" {
+    const alloc = std.testing.allocator;
+    // A pathological path (quotes/backslashes are legal in POSIX filenames):
+    // the escaper must keep the body parseable and the value byte-exact.
+    const weird = "/tmp/a\"b\\c.sock";
+    const body = try formatInfoFile(alloc, 0, 1, 2, weird);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(weird, parsed.value.object.get("socket").?.string);
+}
+
+test "socket info file: bind unix socket → write file → read back pid+socket" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var pbuf: [128]u8 = undefined;
+    const sock = try testSockPath(&pbuf, "info");
+    std.fs.cwd().deleteFile(sock) catch {};
+    defer std.fs.cwd().deleteFile(sock) catch {};
+
+    // Exactly what runListenUnix does: bind, then publish the socket path.
+    const addr = try std.net.Address.initUnix(sock);
+    var listener = try addr.listen(.{});
+    defer listener.deinit();
+
+    var ibuf: [160]u8 = undefined;
+    const info = try std.fmt.bufPrint(&ibuf, "/tmp/gztt-t09c-info-{d}.json", .{currentPid()});
+    std.fs.cwd().deleteFile(info) catch {};
+    defer std.fs.cwd().deleteFile(info) catch {};
+
+    try writeSocketFile(alloc, info, sock);
+
+    // A supervisor's read: parse the file, learn pid + socket, dial the socket.
+    const body = try std.fs.cwd().readFileAlloc(alloc, info, 4096);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(currentPid(), parsed.value.object.get("pid").?.integer);
+    try std.testing.expectEqualStrings(sock, parsed.value.object.get("socket").?.string);
+    try std.testing.expect(parsed.value.object.get("startedAt").?.integer > 0);
+
+    // The advertised socket actually dials (proves the published path is live).
+    try std.testing.expect(probeUnixAlive(sock));
+
+    // The staging file is consumed by the rename, never left behind.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{info});
+    defer alloc.free(tmp_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(tmp_path));
 }
 
 test "wssBase: https/wss normalize to wss; http/ws stay plaintext; others refused" {

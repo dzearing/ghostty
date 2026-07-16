@@ -7,15 +7,21 @@ import os
 /// agent survive the app process, so the app can be killed/upgraded and
 /// re-attach to the same PTYs.
 ///
+/// The local transport is a 0600 AF_UNIX socket with a same-uid peercred gate
+/// (design §5.2 hardening): unlike a 127.0.0.1 TCP port — reachable by any local
+/// uid — only this user can reach the shell.
+///
 /// Discovery order:
 ///
-///  1. **Find**: read the agent's port file (written atomically by
-///     `--port-file` after its listener binds), liveness-check the recorded
-///     pid, and dial `127.0.0.1:<port>`. The dial blocks through the HELLO
+///  1. **Find**: read the agent's info file (written atomically by
+///     `--port-file` after its socket binds), liveness-check the recorded pid,
+///     and dial the recorded AF_UNIX `socket` path (a legacy TCP `port` record
+///     still dials `127.0.0.1:<port>`). The dial blocks through the HELLO
 ///     handshake before returning, so a non-nil handle IS the health check.
 ///  2. **Spawn**: launch the agent bundled next to the app executable
 ///     (`Contents/MacOS/ghoztty-agent`) in its own session (`setsid`) so it
-///     outlives the app, then poll the port file until a dial succeeds.
+///     outlives the app with `--listen-unix=<dir>/agent.sock`, then poll the
+///     info file until a dial succeeds.
 ///
 /// All agent state lives in a per-lineage directory keyed by bundle id
 /// (`~/.config/ghoztty/local-agent[-debug]/`) so the debug app never shares an
@@ -40,7 +46,12 @@ final class LocalAgentManager {
     struct Paths: Equatable {
         let directory: URL
 
+        /// The agent's info file (still passed via `--port-file`): now carries
+        /// the UDS socket path + pid rather than a TCP port.
         var portFile: URL { directory.appendingPathComponent("port.json") }
+        /// The AF_UNIX socket the agent binds and clients dial. 0600, same-uid
+        /// gated — the secure local transport (design §5.2).
+        var socketFile: URL { directory.appendingPathComponent("agent.sock") }
         var lockFile: URL { directory.appendingPathComponent("agent.lock") }
         var heartbeatFile: URL { directory.appendingPathComponent("agent.heartbeat") }
         var logFile: URL { directory.appendingPathComponent("agent.log") }
@@ -62,16 +73,20 @@ final class LocalAgentManager {
         }
     }
 
-    /// The agent's `--port-file` body: `{"port":N,"pid":P,"startedAt":MS}`.
-    /// `startedAt` is ignored — the pid liveness check supersedes it.
+    /// The agent's `--port-file` body. The UDS agent writes
+    /// `{"port":0,"pid":P,"socket":"<path>","startedAt":MS}`; a legacy TCP agent
+    /// wrote `{"port":N,"pid":P,"startedAt":MS}` (no `socket`). Both decode here
+    /// — `socket` present ⇒ dial UDS, else dial the TCP `port`. `startedAt` is
+    /// ignored (the pid liveness check supersedes it).
     struct PortFile: Codable, Equatable {
-        let port: UInt16
+        var port: UInt16?
         let pid: pid_t
+        var socket: String?
     }
 
     /// A successfully dialed local-agent connection. The caller owns the
     /// handle (free with `ghostty_remote_connection_free`, or hand it to a
-    /// `RemoteConnection` owner).
+    /// `RemoteConnection` owner). `port` is 0 for the UDS transport (no port).
     struct Connection {
         let handle: ghostty_remote_connection_t
         let port: UInt16
@@ -103,7 +118,9 @@ final class LocalAgentManager {
     /// The Machine value describing the local agent endpoint. A loopback
     /// host/name makes `Machine.isLocalMachine` true, so remote-only UI (the
     /// titlebar machine pill) stays hidden for persistent local windows.
-    static func localMachine(port: UInt16) -> Machine {
+    static func localMachine(port: UInt16 = 0) -> Machine {
+        // The loopback `name` makes `isLocalMachine` true even with port 0 (the
+        // UDS transport has no port), so the machine pill stays hidden.
         Machine(name: "127.0.0.1", host: "127.0.0.1", port: port)
     }
 
@@ -175,12 +192,17 @@ final class LocalAgentManager {
         return owner
     }
 
-    /// Strict parse of the port file body. Static + pure for tests.
+    /// Strict parse of the info file body. Static + pure for tests. Accepts a
+    /// UDS record (non-empty `socket`) OR a legacy TCP record (`port > 0`);
+    /// either way `pid` must be positive. A record with neither a socket nor a
+    /// usable port is rejected.
     static func parsePortFile(_ data: Data) -> PortFile? {
         guard let parsed = try? JSONDecoder().decode(PortFile.self, from: data),
-              parsed.port > 0, parsed.pid > 0
+              parsed.pid > 0
         else { return nil }
-        return parsed
+        if let socket = parsed.socket, !socket.isEmpty { return parsed }
+        if let port = parsed.port, port > 0 { return parsed }
+        return nil
     }
 
     /// The bundled agent binary: a sibling of the app executable inside
@@ -197,9 +219,10 @@ final class LocalAgentManager {
 
     // MARK: - Find
 
-    /// Dial the agent recorded in the port file, if it looks alive. The port
-    /// file is never cleaned up on agent exit, so stale entries are expected:
-    /// dead pid or failed HELLO both mean "no healthy agent" (nil).
+    /// Dial the agent recorded in the info file, if it looks alive. The file is
+    /// never cleaned up on agent exit, so stale entries are expected: dead pid
+    /// or failed HELLO both mean "no healthy agent" (nil). Prefers the UDS
+    /// socket (the secure default) and falls back to a legacy TCP `port`.
     private static func dialExisting(paths: Paths) -> Connection? {
         guard let data = try? Data(contentsOf: paths.portFile),
               let record = parsePortFile(data)
@@ -209,10 +232,22 @@ final class LocalAgentManager {
         // EPERM still means "exists" (not expected same-uid, but harmless).
         guard kill(record.pid, 0) == 0 || errno == EPERM else { return nil }
 
-        guard let handle = "127.0.0.1".withCString({
-            ghostty_remote_connection_new_tcp($0, record.port)
-        }) else { return nil }
-        return Connection(handle: handle, port: record.port, pid: record.pid)
+        // UDS record: dial the 0600 same-uid-gated socket. The dial BLOCKS
+        // through HELLO, so a non-nil handle is the health check.
+        if let socket = record.socket, !socket.isEmpty {
+            guard let handle = socket.withCString({
+                ghostty_remote_connection_new_unix($0)
+            }) else { return nil }
+            return Connection(handle: handle, port: 0, pid: record.pid)
+        }
+
+        // Legacy TCP record (an older agent lineage still on --listen).
+        guard let port = record.port, port > 0,
+              let handle = "127.0.0.1".withCString({
+                  ghostty_remote_connection_new_tcp($0, port)
+              })
+        else { return nil }
+        return Connection(handle: handle, port: port, pid: record.pid)
     }
 
     // MARK: - Spawn
@@ -283,9 +318,13 @@ final class LocalAgentManager {
         posix_spawn_file_actions_addchdir_np(
             &actions, FileManager.default.homeDirectoryForCurrentUser.path)
 
+        // The SECURE local transport (design §5.2): a 0600 AF_UNIX socket with a
+        // same-uid peercred gate — unlike a 127.0.0.1 TCP port, no other local
+        // uid can reach the shell. The agent publishes its pid + socket path to
+        // the info file (`--port-file`) so we can find-or-dial it next time.
         let argv: [String] = [
             binary.path,
-            "--listen=127.0.0.1:0",
+            "--listen-unix=\(paths.socketFile.path)",
             "--port-file=\(paths.portFile.path)",
         ]
 
