@@ -199,12 +199,12 @@
     {
       "id": "T06d",
       "title": "AppleScript 'new tab' returns error -10000 despite creating the tab",
-      "status": "in_progress",
+      "status": "done",
       "dependsOn": ["T06a"],
       "goal": "handleNewTabScriptCommand (AppDelegate+AppleScript.swift:230) reliably errors 'Failed to create tab.' (errAEEventFailed) while the tab IS created — TerminalController.newTab apparently returns nil though the controller comes up fine. Scripts can't get the returned tab object (harness must re-discover via +list). Low priority; fix the return path (likely async window creation racing the synchronous script reply).",
       "steps": [],
       "acceptance": "osascript 'new tab in window …' returns the ScriptTab object with no error; existing AppleScript tests (if any) pass.",
-      "notes": ""
+      "notes": "2026-07-15: done, commit a0dce4b48. ROOT CAUSE confirmed: TerminalController.newTab (TerminalController.swift:505) takes an ASYNC path when the parent controller has a remoteConnection (ALL session-persistence flag-on windows are agent-backed) — it calls resolveRemoteInheritance OFF the main thread and returns nil synchronously, building the tab later in a completion closure. handleNewTabScriptCommand treated that nil as failure → errAEEventFailed 'Failed to create tab.' even though the tab appears fine. FIX (app-side only): (1) newTab gains optional `completion: ((TerminalController?)->Void)? = nil`, invoked via a local finish() helper that ALWAYS dispatches on DispatchQueue.main.async (so a suspending caller resumes AFTER newTab returns, even on the synchronous newWindow/buildTab paths). finish() wired at every terminal point: newWindow fallback, fullscreen-alert nil, signed-out nil, the async remote buildTab, and the synchronous buildTab. newTab is now @discardableResult; all existing callers (AppDelegate x3, Intent, ServiceProvider, self-undo) use only the return value and are untouched. (2) AppleScript handler now command.suspendExecution() before newTab and command.resumeExecution(withResult:) inside the completion — ScriptTab resolution factored into resolveCreatedTab(); genuine-failure nil resumes with scriptErrorNumber=errAEEventFailed. No unit tests exist for the AppleScript tab command (grep confirmed). LIVE VERIFIED against a restored 2-window/4-pane flag-on fixture (agent pid 43438): `osascript 'new tab in (first window whose id is tab-group-…)'` returned 'OK tab id=tab-bce1b5e00' exit 0 (previously errored); +list showed the new Tab 2 as an agent-backed pane (pid:0) grouped in the window; closed the test pane to restore the fixture. Note the earlier -2741 in my first attempt was just wrong osascript syntax ('make new tab' vs the sdef's 'new tab in <window>'), NOT the bug. Fixture LEFT RUNNING: 2 windows under agent 43438 for T07."
     },
     {
       "id": "T07",
