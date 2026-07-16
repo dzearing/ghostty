@@ -111,7 +111,7 @@ One line per row. Full spec + validation + evidence per task:
 | T20 | `+new-remote-window` direct TCP | G | T08 | done | 2ed989866 |
 | T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | done | 64c4329c2 |
 | T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
-| T22a | Machine chooser design (win32) | G | T21a | in-progress | — |
+| T22a | Machine chooser design (win32) | G | T21a | done | 6d944531e |
 | T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | todo | — |
 | T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |
