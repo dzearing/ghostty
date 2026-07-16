@@ -779,6 +779,141 @@ def reboot_teardown(args):
     full_reset()  # bootouts the LaunchAgent + clears manifest/agent state
 
 # ---------------------------------------------------------------------------
+# In-place recovery driver (T12e): agent crashes while the app STAYS UP
+# ---------------------------------------------------------------------------
+def assert_inplace_cycle(baseline, cur, gap, app_before, app_after,
+                         agent_before, agent_after, restart_secs, failures):
+    """In-place recovery (T12e / AC4 in-place): ONLY the agent was killed — the
+    GUI app never went down. launchd restarts the agent, and the LIVE app must
+    detect the dropped shared connection, re-dial the restarted agent, and
+    rebuild every open local window IN PLACE (re-ATTACH + auto-RELAUNCH). So this
+    asserts everything the reboot cycle does (agent pid changed, fresh child
+    PIDs, restart banner, exact topology from the manifest) PLUS the defining
+    in-place invariant: the APP process was never relaunched."""
+    def check(cond, msg):
+        if not cond:
+            failures.append(msg)
+
+    # The defining invariant: the GUI app was NEVER relaunched.
+    check(app_after and app_before and set(app_after) == set(app_before),
+          f"app pids changed {app_before} -> {app_after} (the app should NOT relaunch)")
+
+    # launchd restarted the agent as a NEW process within the AC4 budget.
+    check(agent_after is not None, "no agent after kill (launchd did not restart it)")
+    check(agent_after != agent_before,
+          f"agent pid unchanged {agent_before} (expected a launchd-restarted pid)")
+    check(restart_secs is not None and restart_secs <= 5.0,
+          f"launchd took {restart_secs}s to restart the agent (> 5s AC4 budget)")
+
+    # Layout rebuilt from the manifest — same as a restore.
+    check(cur["n_windows"] == baseline["n_windows"],
+          f"window count {cur['n_windows']} != baseline {baseline['n_windows']}")
+    check(cur["markers"] == EXPECTED_MARKERS,
+          f"marker set {sorted(cur['markers'])} != {sorted(EXPECTED_MARKERS)}")
+    for ns, struct in baseline["win_structs"].items():
+        if ns not in cur["win_structs"]:
+            failures.append(f"window with markers {sorted(ns)} missing after recovery")
+            continue
+        cs = cur["win_structs"][ns]
+        if len(cs) != len(struct) or not all(struct_equal(a, b) for a, b in zip(struct, cs)):
+            failures.append(f"topology mismatch for window {sorted(ns)}:\n"
+                            f"      baseline={struct}\n      recovered={cs}")
+
+    # Every pane RELAUNCHED in place: fresh child pid, banner shown, marker re-ran.
+    for n in sorted(EXPECTED_MARKERS):
+        bpid = baseline["pid"].get(n)
+        cpid = cur["pid"].get(n)
+        check(cpid is not None, f"pane {n} has no marker after recovery (never came back)")
+        check(cpid != bpid,
+              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
+        check(pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
+        text = cur["text"].get(n, "")
+        check(RESTART_DIVIDER in text,
+              f"pane {n} missing restart banner '{RESTART_DIVIDER}' after in-place recovery")
+
+    check(gap < 15.0, f"in-place recovery gap {gap:.1f}s >= 15s")
+
+def wait_inplace_recovered(app_before, timeout=20.0):
+    """Poll until the LIVE app has rebuilt every pane in place: all markers
+    readable AND each carries the restart banner. Fails if the app process
+    changed (it must never relaunch here)."""
+    deadline = time.time() + timeout
+    last = set()
+    while time.time() < deadline:
+        # The app must not have died/relaunched underneath us.
+        if set(app_pids()) != set(app_before):
+            raise E2EError(f"app process changed during in-place recovery "
+                           f"({app_before} -> {app_pids()}) — it should stay up")
+        try:
+            snap = snapshot()
+        except Exception:
+            time.sleep(0.4)
+            continue
+        last = snap["markers"]
+        banners = all(RESTART_DIVIDER in snap["text"].get(n, "")
+                      for n in EXPECTED_MARKERS)
+        if EXPECTED_MARKERS.issubset(last) and banners:
+            return
+        time.sleep(0.4)
+    raise E2EError(f"in-place recovery incomplete within {timeout}s "
+                   f"(markers {sorted(last)} / expected {sorted(EXPECTED_MARKERS)})")
+
+def run_inplace_cycles(args, baseline):
+    all_failures = []
+    agent_spawn_ts = None  # baseline agent already exceeds the throttle floor
+    for cycle in range(1, args.cycles + 1):
+        log("-" * 70)
+        log(f"[cycle {cycle}/{args.cycles}] IN-PLACE: SIGKILL agent ONLY (app stays up), "
+            f"launchd restarts agent, app auto-recovers in place, assert RELAUNCH")
+
+        settle_past_throttle(agent_spawn_ts)
+        app_before = app_pids()
+        if not app_before:
+            all_failures.append(f"cycle {cycle}: no app process running")
+            break
+        t0 = time.time()
+
+        # Kill ONLY the agent; the GUI app stays up. launchd (KeepAlive) brings a
+        # NEW one back, which materializes each session as a relaunchable tombstone.
+        agent_before = launchagent_pid() or agent_pid()
+        if agent_before is None:
+            all_failures.append(f"cycle {cycle}: no agent to kill")
+            break
+        kill_pids([agent_before], signal.SIGKILL)
+        agent_after, restart_secs = wait_agent_restarted(agent_before)
+        if agent_after is not None:
+            agent_spawn_ts = time.time()
+            log(f"    ↻ launchd restarted agent {agent_before} -> {agent_after} "
+                f"in {restart_secs:.1f}s")
+
+        # The LIVE app must notice the drop, re-dial, and rebuild in place.
+        wait_inplace_recovered(app_before)
+        gap = time.time() - t0
+        app_after = app_pids()
+        cur = snapshot()
+
+        failures = []
+        assert_inplace_cycle(baseline, cur, gap, app_before, app_after,
+                             agent_before, agent_after, restart_secs, failures)
+        if failures:
+            log(f"[cycle {cycle}] FAIL (recovery {gap:.1f}s):")
+            for f in failures:
+                log(f"    ✗ {f}")
+            all_failures.extend(f"cycle {cycle}: {f}" for f in failures)
+        else:
+            log(f"[cycle {cycle}] PASS  recovery={gap:.1f}s  app {app_after} unchanged  "
+                f"agent {agent_before}->{agent_after} ({restart_secs:.1f}s)  fresh PIDs {cur['pid']}")
+
+    log("=" * 70)
+    if all_failures:
+        log(f"RESULT: FAIL — {len(all_failures)} assertion(s) failed across {args.cycles} cycle(s)")
+        return 1
+    log(f"RESULT: PASS — {args.cycles}/{args.cycles} in-place recovery cycles; the app STAYED UP "
+        f"while launchd restarted the agent, sessions auto-relaunched in place with the restart "
+        f"banner, topology rebuilt from the manifest")
+    return 0
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -790,6 +925,10 @@ def main():
     ap.add_argument("--agent-restart", action="store_true", dest="agent_restart",
                     help="reboot-equivalent (T12d): kill BOTH app+agent; launchd restarts the "
                          "agent; app relaunch RELAUNCHES sessions from metadata (AC3/AC4)")
+    ap.add_argument("--agent-only", action="store_true", dest="agent_only",
+                    help="in-place (T12e): kill ONLY the agent (app stays up); launchd restarts "
+                         "it; the LIVE app auto-recovers, rebuilding local windows in place with "
+                         "the restart banner (AC4 in-place, no app relaunch)")
     ap.add_argument("--quit", choices=("kill", "graceful"), default="kill",
                     help="how to terminate the app each cycle (default kill = SIGKILL)")
     ap.add_argument("--keep", action="store_true", help="leave app+windows running at end")
@@ -801,14 +940,16 @@ def main():
         log(f"FATAL: debug CLI not found at {CLI} — build first (zig build -Doptimize=Debug)")
         return 2
 
-    if args.agent_restart:
+    if args.agent_only:
+        mode = "AGENT-only / in-place recovery (T12e)"
+    elif args.agent_restart:
         mode = "AGENT restart / reboot-equivalent (T12d)"
     elif args.upgrade:
         mode = "binary UPGRADE (T08)"
     else:
         mode = "kill -9 survival (T07)"
     log("=" * 70)
-    qdesc = "" if args.agent_restart else f", quit={args.quit}"
+    qdesc = "" if (args.agent_restart or args.agent_only) else f", quit={args.quit}"
     log(f"Ghoztty session-persistence E2E — {mode}{qdesc}")
     log("=" * 70)
 
@@ -835,7 +976,8 @@ def main():
     # ---- Reboot-equivalent mode (T12d): a distinct loop with opposite semantics
     # (relaunch, not survival). Split out because a reboot kills the children and
     # the agent's RAM — asserting PID *changes* + a restart banner, not PID stability.
-    if args.agent_restart:
+    if args.agent_restart or args.agent_only:
+        # Both modes need launchd to OWN the agent so a killed agent auto-restarts.
         # The app installs+bootstraps the job lazily (first persistent window /
         # warm-up); poll briefly for launchd to report it.
         deadline = time.time() + 8
@@ -847,7 +989,8 @@ def main():
                 "install/bootstrap it (T12d), so launchd cannot restart the agent")
             return 2
         log(f"[base] LaunchAgent job loaded (launchd manages agent pid {la_pid})")
-        rc = run_reboot_cycles(args, baseline)
+        rc = run_inplace_cycles(args, baseline) if args.agent_only \
+            else run_reboot_cycles(args, baseline)
         reboot_teardown(args)
         return rc
 

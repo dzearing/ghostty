@@ -11,7 +11,7 @@ kill the app, relaunch, and assert mechanically that every pane's process
 ## `session-persistence.py` — kill -9 survival (task T07)
 
 ```
-scripts/e2e/session-persistence.py [--cycles=3] [--upgrade | --agent-restart] [--quit=kill|graceful] [--keep] [--verbose]
+scripts/e2e/session-persistence.py [--cycles=3] [--upgrade | --agent-restart | --agent-only] [--quit=kill|graceful] [--keep] [--verbose]
 ```
 
 What it does:
@@ -144,10 +144,34 @@ KeepAlive job never lingers on the machine after a run. Because launchd owns the
 agent, `--agent-restart` (and any run after it) relies on that bootout — a bare
 `SIGKILL` of a `KeepAlive` agent would be undone by launchd instantly.
 
-> **Not yet covered — in-place AC4 (agent crash while the app stays up).** Today
-> the Zig client backend does not auto-redial a dropped local link (the LinkState
-> FSM computes backoff but the reconnect/re-attach increment is unbuilt), and the
-> local machine pill (with its manual Reconnect button) is hidden. So an agent
-> crash *without* an app relaunch leaves the panes dead until the app is
-> relaunched. `--agent-restart` therefore drives the reboot-equivalent (app
-> relaunch) path. True in-place recovery is a follow-up (task T12e).
+## `session-persistence.py --agent-only` — in-place recovery (task T12e)
+
+```
+scripts/e2e/session-persistence.py --agent-only [--cycles=3]
+```
+
+In-place **AC4**: the agent crashes while the GUI app **stays up**. This is the
+same reboot floor as `--agent-restart` (children + ring RAM are lost, sessions
+*relaunch*), but the app is **never** relaunched — recovery happens live.
+
+1. **Setup** — same 2-window / 5-pane fixture + LaunchAgent as `--agent-restart`.
+2. **Crash** — `SIGKILL` **only** the agent; the app keeps running. launchd's
+   `KeepAlive` restarts the agent, which materializes each session as a
+   relaunchable tombstone before accepting connections.
+3. **Recover in place** — the live app's shared local-agent connection observes
+   the dropped transport (the local UDS link never self-heals — the Zig FSM only
+   computes backoff), re-dials the restarted agent **once** for all windows, and
+   rebuilds each open window's full split tree in place → re-`ATTACH` finds the
+   tombstone → auto-`RELAUNCH` with the `--- session restarted ---` banner.
+
+Each cycle asserts the reboot-cycle checks (agent PID changed ≤ 5 s, fresh child
+PIDs, restart banner, exact topology from the manifest) **plus the defining
+in-place invariant: the app process is unchanged** (it did not relaunch). The
+local machine pill stays hidden throughout — recovery looks like the panes just
+restarted in place. Measured recovery ~2.5–3.7 s. Same launchd-throttle settling
+and LaunchAgent cleanliness as `--agent-restart` above.
+
+The per-window remote reconnect ladder (WP-D1) is intentionally **not** used for
+local windows: it re-dials the loopback machine over TCP (the local transport is
+a UDS) and would collapse the window to a single root pane. Local recovery is
+centralized in `LocalAgentManager` → `AppDelegate.recoverSessionLayoutInPlace`.

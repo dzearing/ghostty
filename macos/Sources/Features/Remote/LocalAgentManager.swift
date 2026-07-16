@@ -152,6 +152,21 @@ final class LocalAgentManager {
     /// The pid of the agent behind `sharedOwner`, for cheap liveness checks.
     private var sharedAgentPid: pid_t = 0
 
+    /// Link-state observer token for the CURRENT `sharedOwner`, so a shared
+    /// connection whose transport drops (the local agent crashed, T12e) can be
+    /// detected and recovered in place — without waiting for the next app
+    /// relaunch. Removed/rebound whenever `sharedOwner` changes. Main only.
+    private var sharedLinkObserver: NSObjectProtocol?
+
+    /// Called (main thread) the first time the shared connection's transport
+    /// drops to a non-self-healing state (`reconnecting`/`reattaching`/`dead`).
+    /// The local UDS transport never re-dials itself (the Zig FSM only computes
+    /// the backoff — see connection.zig), so a drop is permanent until we act:
+    /// `AppDelegate` wires this to `recoverSessionLayoutInPlace()`. Set once at
+    /// launch; fired at most once per shared connection (the recovery re-dials
+    /// and installs a fresh `sharedOwner` with a fresh observer). Main only.
+    var onSharedConnectionDrop: (@MainActor () -> Void)?
+
     /// The Machine value describing the local agent endpoint. A loopback
     /// host/name makes `Machine.isLocalMachine` true, so remote-only UI (the
     /// titlebar machine pill) stays hidden for persistent local windows.
@@ -225,8 +240,103 @@ final class LocalAgentManager {
             machine: Self.localMachine(port: conn.port))
         sharedOwner = owner
         sharedAgentPid = conn.pid
+        bindSharedLinkObserver(owner)
         Self.logger.info("shared local-agent connection ready (agent pid \(conn.pid), port \(conn.port))")
         return owner
+    }
+
+    /// (Re)bind the link-state observer to `owner` so a transport drop on the
+    /// shared connection triggers in-place recovery (T12e). The prior
+    /// observer, if any, is removed first. Main-thread only.
+    private func bindSharedLinkObserver(_ owner: RemoteConnection) {
+        if let existing = sharedLinkObserver {
+            NotificationCenter.default.removeObserver(existing)
+            sharedLinkObserver = nil
+        }
+        sharedLinkObserver = NotificationCenter.default.addObserver(
+            forName: .ghosttyRemoteConnectionLinkDidChange,
+            object: owner,
+            queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let conn = note.object as? RemoteConnection,
+                  conn === self.sharedOwner else { return }
+            switch conn.linkState {
+            case .reconnecting, .reattaching, .dead:
+                // The local UDS link does not self-heal (the Zig side computes
+                // backoff but never re-dials), so this is terminal for THIS
+                // connection: hand off to recovery ONCE. We stop observing this
+                // owner now — recovery re-dials and installs a fresh owner with
+                // its own observer — so a follow-up reconnecting→dead edge can't
+                // re-fire the same handoff.
+                if let observer = self.sharedLinkObserver {
+                    NotificationCenter.default.removeObserver(observer)
+                    self.sharedLinkObserver = nil
+                }
+                Self.logger.warning(
+                    "shared local-agent link dropped (\(String(describing: conn.linkState))); triggering in-place recovery")
+                self.onSharedConnectionDrop?()
+            case .connected, .degraded:
+                break
+            }
+        }
+    }
+
+    /// Drop the cached shared connection and its observer so the NEXT resolve
+    /// re-dials from scratch. Windows still riding the old connection keep it
+    /// alive via `connectionKeepAlive` until their surfaces are replaced. Used
+    /// by in-place recovery (T12e) before re-dialing the restarted agent.
+    /// Main-thread only.
+    func invalidateShared() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let existing = sharedLinkObserver {
+            NotificationCenter.default.removeObserver(existing)
+            sharedLinkObserver = nil
+        }
+        sharedOwner = nil
+        sharedAgentPid = 0
+    }
+
+    /// Force a FRESH shared connection for in-place recovery (T12e): invalidate
+    /// the dead one, then re-dial the (launchd-restarted) agent off the main
+    /// thread with a short retry ladder — a just-crashed agent is normally back
+    /// within a second or two, but launchd's KeepAlive respawn can lag behind a
+    /// throttle window, so a single `connect()` (≤5s) is retried. Delivers the
+    /// new shared `RemoteConnection` (or nil if the agent never came back) on
+    /// the main actor. Main-thread entry only.
+    func reconnectSharedForRecovery(
+        attempts: Int = 4,
+        _ completion: @escaping @MainActor (RemoteConnection?) -> Void
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        invalidateShared()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var conn: Connection?
+            for attempt in 1...max(1, attempts) {
+                conn = connect()
+                if conn != nil { break }
+                Self.logger.warning(
+                    "recovery re-dial attempt \(attempt)/\(attempts) found no agent; retrying")
+                Thread.sleep(forTimeInterval: 1.5)
+            }
+            let dialed = conn
+            DispatchQueue.main.async {
+                // A racing main-thread caller (e.g. a new window) may have
+                // cached a healthy shared owner already: keep it, discard ours.
+                if let existing = self.sharedOwner, existing.linkState != .dead,
+                   self.sharedAgentPid > 0,
+                   kill(self.sharedAgentPid, 0) == 0 || errno == EPERM {
+                    if let dialed { ghostty_remote_connection_free(dialed.handle) }
+                    completion(existing)
+                    return
+                }
+                guard let dialed else {
+                    completion(nil)
+                    return
+                }
+                completion(self.cacheShared(dialed))
+            }
+        }
     }
 
     /// Strict parse of the info file body. Static + pure for tests. Accepts a

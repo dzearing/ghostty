@@ -203,18 +203,7 @@ extension AppDelegate {
         // Each leaf ATTACHes its recorded session over the shared local-agent
         // connection. Dead sessions attach anyway and show their exited
         // overlay — the tree shape must survive partial death.
-        let root = SessionLayoutManifest.makeTreeNode(tree) { leaf -> Ghostty.SurfaceView in
-            var cfg = Ghostty.SurfaceConfiguration()
-            cfg.remoteMachine = connection.machine
-            cfg.remoteConnection = connection.handle
-            cfg.connectionKeepAlive = connection
-            cfg.remoteSessionId = leaf.sessionID
-            let view = Ghostty.SurfaceView(app, baseConfig: cfg)
-            // Seed the last-synced pane title; live OSC titles (if the
-            // session emits them) take over after re-attach.
-            if let title = leaf.title, !title.isEmpty { view.setTitle(title) }
-            return view
-        }
+        let root = Self.makeSessionLayoutRoot(tree: tree, connection: connection, app: app)
 
         let controller = TerminalController(
             ghostty,
@@ -281,5 +270,149 @@ extension AppDelegate {
         SessionLayoutManifest.syncAndCaptureSessionIDs(of: controller, entryID: entry.id)
 
         return controller
+    }
+
+    /// Build a live split-tree root from a manifest tree, each leaf a `.remote`
+    /// surface that re-`ATTACH`es its recorded session over `connection`. Shared
+    /// by launch restore (`presentRestoredSessionWindow`) and in-place recovery
+    /// (`rebuildSessionLayoutController`). Dead sessions attach anyway and show
+    /// their exited overlay (or, when the agent restarted, auto-RELAUNCH) — the
+    /// tree shape must survive partial death.
+    @MainActor
+    static func makeSessionLayoutRoot(
+        tree: SessionLayoutManifest.Node,
+        connection: RemoteConnection,
+        app: ghostty_app_t
+    ) -> SplitTree<Ghostty.SurfaceView>.Node {
+        SessionLayoutManifest.makeTreeNode(tree) { leaf -> Ghostty.SurfaceView in
+            var cfg = Ghostty.SurfaceConfiguration()
+            cfg.remoteMachine = connection.machine
+            cfg.remoteConnection = connection.handle
+            cfg.connectionKeepAlive = connection
+            cfg.remoteSessionId = leaf.sessionID
+            let view = Ghostty.SurfaceView(app, baseConfig: cfg)
+            // Seed the last-synced pane title; live OSC titles (if the
+            // session emits them) take over after re-attach.
+            if let title = leaf.title, !title.isEmpty { view.setTitle(title) }
+            return view
+        }
+    }
+
+    // MARK: In-place recovery (T12e)
+
+    /// The shared local-agent connection's transport dropped while the app
+    /// stayed up — the agent crashed and launchd (KeepAlive, T12d) is bringing
+    /// a NEW one back. Re-dial the restarted agent ONCE and rebuild every open
+    /// local-agent window in place: each leaf re-`ATTACH`es its recorded
+    /// session, finds a relaunchable tombstone (the restarted agent
+    /// materialized it from disk metadata, T12b), and auto-RELAUNCHes with the
+    /// "--- session restarted ---" banner (T12c). No app relaunch; the local
+    /// machine pill is never shown (isLocalMachine). Wired to
+    /// `LocalAgentManager.onSharedConnectionDrop`. Main-thread only.
+    @MainActor
+    func recoverSessionLayoutInPlace() {
+        guard ghostty.config.sessionPersistence else { return }
+        // Quit deliberately closes the transport; don't fight it.
+        guard !isQuitting else { return }
+        // A `reconnecting → dead` double-edge (or a second drop mid-recovery)
+        // must not kick two concurrent re-dials.
+        guard !isRecoveringSessionLayout else { return }
+
+        // Only windows actually backed by the local agent (a bound layout entry).
+        let hasLocalWindows = TerminalController.all.contains {
+            $0.sessionLayoutEntryID != nil
+        }
+        guard hasLocalWindows else {
+            // Nothing to rebuild: drop the dead shared connection so the next
+            // new window re-dials it lazily.
+            LocalAgentManager.shared.invalidateShared()
+            return
+        }
+
+        isRecoveringSessionLayout = true
+        Self.logger.warning(
+            "session recovery: shared local-agent link dropped; re-dialing the restarted agent to rebuild local windows in place")
+
+        LocalAgentManager.shared.reconnectSharedForRecovery { [weak self] connection in
+            guard let self else { return }
+            defer { self.isRecoveringSessionLayout = false }
+            guard let connection else {
+                Self.logger.error(
+                    "session recovery: local agent did not come back; local windows stay disconnected until the next app relaunch")
+                return
+            }
+            self.rebuildOpenSessionLayoutWindows(connection: connection)
+        }
+    }
+
+    /// Rebuild every currently-open local-agent window onto the freshly-dialed
+    /// `connection`. Controllers that closed during the re-dial are skipped.
+    /// Main-thread only.
+    @MainActor
+    private func rebuildOpenSessionLayoutWindows(connection: RemoteConnection) {
+        guard let app = ghostty.app else { return }
+        let entries = Dictionary(
+            SessionLayoutManifest.shared.allEntries().map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first })
+        var rebuilt = 0
+        for controller in TerminalController.all {
+            guard let entryID = controller.sessionLayoutEntryID,
+                  let entry = entries[entryID],
+                  let tree = entry.tree else { continue }
+            rebuildSessionLayoutController(
+                controller, entry: entry, tree: tree, connection: connection, app: app)
+            rebuilt += 1
+        }
+        if rebuilt > 0 {
+            Self.logger.warning(
+                "session recovery: rebuilt \(rebuilt) local window(s) on the restarted agent")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Rebuild ONE already-open controller's split tree in place on `connection`
+    /// (the WP-D1 reconnect-swap mechanism — replace `surfaceTree` on the live
+    /// controller — but with the FULL manifest topology, not a single root
+    /// pane). The window/frame/title stay; the old dead-transport surfaces are
+    /// released with the old tree, and the old shared connection frees once its
+    /// last surface deallocates. Main-thread only.
+    @MainActor
+    private func rebuildSessionLayoutController(
+        _ controller: TerminalController,
+        entry: SessionLayoutManifest.Entry,
+        tree: SessionLayoutManifest.Node,
+        connection: RemoteConnection,
+        app: ghostty_app_t
+    ) {
+        let root = Self.makeSessionLayoutRoot(tree: tree, connection: connection, app: app)
+
+        // Adopt the fresh connection (didSet rebinds the link observer to it;
+        // the entry id is already bound so no duplicate registration) and swap
+        // the rebuilt tree in.
+        controller.remoteConnection = connection
+        controller.remoteMachine = connection.machine
+        controller.surfaceTree = SplitTree(root: root, zoomed: nil)
+
+        // Re-register pane IPC names against the NEW surfaces (the window name,
+        // being controller-keyed, is unaffected — the controller is the same).
+        let leafInfos = SessionLayoutManifest.leaves(of: tree)
+        let views = root.leaves()
+        for (leaf, view) in zip(leafInfos, views) {
+            if let name = leaf.ipcName, !name.isEmpty {
+                ipcServer.registerRestoredPane(
+                    name: name, controller: controller, surface: view)
+            }
+        }
+
+        if let first = views.first {
+            controller.focusedSurface = first
+            DispatchQueue.main.async {
+                Ghostty.moveFocus(to: first, from: nil)
+            }
+        }
+
+        // The relaunched shells publish fresh session ids; re-sync so the
+        // manifest tracks them for the NEXT restore.
+        SessionLayoutManifest.syncAndCaptureSessionIDs(of: controller, entryID: entry.id)
     }
 }

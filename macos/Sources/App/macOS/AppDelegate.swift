@@ -121,6 +121,13 @@ class AppDelegate: NSObject,
     /// (SessionLayoutRestore.swift) can manage it.
     var hasPendingSessionRestore = false
 
+    /// True while an in-place recovery of local-agent windows is running (T12e:
+    /// the shared connection dropped, we are re-dialing the launchd-restarted
+    /// agent and rebuilding open windows). Guards against a `reconnecting→dead`
+    /// double-fire kicking two concurrent recoveries. Internal so the restore
+    /// extension (SessionLayoutRestore.swift) can manage it. Main only.
+    var isRecoveringSessionLayout = false
+
     /// The ghostty global state. Only one per process.
     let ghostty: Ghostty.App
 
@@ -286,6 +293,16 @@ class AppDelegate: NSObject,
             // pane to its still-running agent session (background dial +
             // probes; failures never alert).
             restoreSessionLayoutWindows()
+
+            // Session persistence (T12e): if the shared local-agent connection's
+            // transport drops (the agent crashed and launchd is restarting it),
+            // recover every open local window IN PLACE — re-dial the restarted
+            // agent once and rebuild each window's split tree (re-ATTACH +
+            // auto-RELAUNCH), no app relaunch. Set once; each shared connection
+            // fires it at most once (recovery installs a fresh one).
+            LocalAgentManager.shared.onSharedConnectionDrop = { [weak self] in
+                self?.recoverSessionLayoutInPlace()
+            }
 
             // Warm the machine chooser: touching `MachineRegistry.shared`
             // seeds it from the persisted device cache, and the quiet refresh

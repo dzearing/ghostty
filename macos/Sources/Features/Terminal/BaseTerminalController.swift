@@ -1971,6 +1971,18 @@ class BaseTerminalController: NSWindowController,
     ///                                    └─ session gone/evicted ─► disconnected
     private func remoteLinkStateDidChange(_ connection: RemoteConnection) {
         guard connection === remoteConnection else { return }
+        // Local-agent windows (session persistence, T12e) do NOT use the
+        // per-window remote reconnect ladder: it re-dials the loopback
+        // `Machine` over TCP (there is no port — the local transport is a
+        // 0600 UDS) and, even if it dialed, `completeRemoteReconnect`
+        // collapses the window to a single ROOT pane, losing the split
+        // topology. Local link-drop recovery is instead centralized in
+        // `LocalAgentManager` → `AppDelegate.recoverSessionLayoutInPlace`,
+        // which re-dials the launchd-restarted agent ONCE for all windows and
+        // rebuilds each window's FULL split tree in place (re-ATTACH +
+        // auto-RELAUNCH). The machine pill is hidden for `isLocalMachine`, so
+        // there is no per-window UI to drive here either.
+        if connection.machine.isLocalMachine { return }
         // This is the FIRST line read when tracing a reconnect: it must persist
         // (.warning maps to OSLog error level) and be readable — os_log redacts
         // string interpolation by default, so every field is tagged .public
