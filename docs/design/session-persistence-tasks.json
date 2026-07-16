@@ -375,6 +375,16 @@
       "steps": [],
       "acceptance": "Docs consistent with shipped behavior; final report delivered.",
       "notes": "T09–T13 may still be pending when the user wants a checkpoint; the report should state exactly which ACs are proven."
+    },
+    {
+      "id": "T15",
+      "title": "Dev workflow: silence the relay-account Keychain prompt on ad-hoc debug builds",
+      "status": "done",
+      "dependsOn": [],
+      "goal": "The user was being spammed by the login-keychain password prompt ('Ghoztty[DEBUG] wants to access ... relay-account') on every debug-app launch, and clicking 'Always Allow' did NOT stop it. Provide a real dev bypass.",
+      "steps": [],
+      "acceptance": "Rebuilt debug app launches with no keychain prompt; E2E still passes; release unaffected.",
+      "notes": "2026-07-16: done, commit caa49f690 (raised mid-T09c when the user hit the prompts). ROOT CAUSE: the debug bundle is ad-hoc signed (no team identity) → its login-keychain ACL trust for com.dzearing.ghoztty.relay-account is keyed to the exact cdhash, which changes on EVERY rebuild. So 'Always Allow' adds an entry for a hash that dies at the next build → the user is re-prompted forever (confirmed live: user clicked Always Allow repeatedly and was still spammed). The prompt fires from the launch-time RelayAccount.resolveToken()/keychain load in AppDelegate's restore path, independent of session-persistence. FIX: new RelayAccountKeychain.isDisabled (macos/Sources/Features/Remote/RelayAccount.swift) gates the SOLE relay-account SecItem caller — load→nil, save/delete→no-op when set, so the item is never touched and no prompt fires (app reads as signed out; relay falls back to GHOSTTY_RELAY_TOKEN). OFF by default (zero change for release / non-opted-in users). Enable: env GHOSTTY_RELAY_DISABLE=1 (dev shells; the E2E harness now sets it in its Popen launch) OR `defaults write com.dzearing.ghoztty.debug GhosttyRelayDisable -bool YES` (persists for Finder launches; the user's box HAS this set now — `defaults delete com.dzearing.ghoztty.debug GhosttyRelayDisable` to re-enable relay on the debug app for remote-window testing). VERIFIED: freshly-rebuilt (new cdhash) debug app launched relying ONLY on the UserDefault (no env) → NO SecurityAgent prompt, relay path skipped, app answered +list; E2E --cycles=1 kill = PASS with zero prompts. NOT unit-tested (isDisabled reads ProcessInfo env + UserDefaults.standard, not injectable without polluting global state) — live-verified instead. Durable knowledge in memory ghoztty-adhoc-signing-keychain-cdhash. A heavier 'make Always Allow actually stick' fix would be a STABLE self-signed code identity for the debug build (cert-based designated requirement survives rebuilds) — deferred; the opt-out solves the immediate pain."
     }
   ]
 }
