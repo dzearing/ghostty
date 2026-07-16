@@ -195,6 +195,9 @@ jobs:
         run: |
           # Version Info
           /usr/libexec/PlistBuddy -c "Set :GhosttyCommit $GHOSTTY_COMMIT" "macos/build/Release/Ghostty.app/Contents/Info.plist"
+          # Google OAuth client id (public; used to build the browser authorize
+          # URL). The confidential secret lives only on the relay.
+          /usr/libexec/PlistBuddy -c "Set :GhosttyGoogleClientID ${{ secrets.GOOGLE_CLIENT_ID }}" "macos/build/Release/Ghostty.app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GHOSTTY_BUILD" "macos/build/Release/Ghostty.app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $GHOSTTY_VERSION" "macos/build/Release/Ghostty.app/Contents/Info.plist"
 
