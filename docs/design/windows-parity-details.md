@@ -594,6 +594,20 @@ base with/without trailing slash; parse of a well-formed `{"devices":[…]}`
 (incl. a device with no `hostname`); parse of an empty list; 401→unauthorized,
 404→notFound, 500→http(500) mapping; a garbage body → badResponse.
 
+*Evidence (T22b DONE 2026-07-15, 7ec2c7119):* implemented as
+`src/remote/relay_directory.zig` — a pure data layer per the T22a decisions.
+Public surface: `Device{id,name,hostname:?,online}`, `ListResponse`,
+`classifyStatus(u16) ?DirectoryError` (`.unauthorized`/`.not_found`/`.{http}`),
+`joinUrl` (trailing-slash-tolerant), `parseDevices` (`.alloc_always` so the
+parse outlives a freed body — the lifetime `listDevices` relies on),
+`listDevices` (the live GET wrapper composing `joinUrl` + `http_client.getAuth`
++ `classifyStatus` + `parseDevices`; exercised on-box in T22c), and
+`resolveBase`/`default_base` mirroring `RelayDirectoryClient.defaultBase`.
+Registered in `main_ghostty.zig`'s test aggregate so its 11 unit tests run in
+BOTH lanes; `zig build test -Dapp-runtime=none` AND `-Dapp-runtime=win32` both
+green (exit 0). No runtime change ⇒ P1–P3 + `ipc-relay*.ps1` unaffected. The
+live GET itself lands in T22c (needs the account or a fake `GHOSTTY_RELAY_BASE`).
+
 ### T22c validation (when implemented)
 
 On-box: ctrl+shift+n opens the chooser; with an account signed in (or a fake

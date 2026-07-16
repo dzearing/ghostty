@@ -9,6 +9,15 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box) — T22b DONE (7ec2c7119): `src/remote/relay_directory.zig`
+  — pure Zig client for `GET /v1/client/devices` mirroring the macOS
+  `RelayDirectoryClient`. `Device{id,name,hostname?,online}` parse (`.alloc_always`
+  so it outlives a freed body), trailing-slash-tolerant `joinUrl`,
+  `classifyStatus` 401→unauthorized / 404→not_found / other→`{http}`, and
+  `listDevices` = thin compose over `http_client.getAuth`. 11 unit tests, run in
+  BOTH lanes via the `main_ghostty.zig` test aggregate; none + win32 lanes green.
+  Live GET deferred to T22c (needs the account or a fake `GHOSTTY_RELAY_BASE`).
+  Next: T22c (win32 chooser dialog + ctrl+shift+n + palette entry).
 - 2026-07-15 (on-box) — T22a DONE (design only): split T22 into T22a
   (design) → T22b (Zig `/v1/client/devices` directory client) → T22c (win32
   chooser dialog + ctrl+shift+n + palette entry); T51 dep bumped to T22c.

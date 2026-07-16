@@ -65,7 +65,9 @@ Work these first, in order, before falling back to first-todo-in-table:
    `--token`). T22 split 2026-07-15 (too big for one context): T22a (chooser
    design) → T22b (Zig device-directory client) → T22c (win32 chooser dialog
    + ctrl+shift+n + palette entry). T22a DONE 2026-07-15 (design in details
-   doc). Next: T22b. User explicitly needs ctrl+shift+n and auth/sign-in.
+   doc); T22b DONE 2026-07-15 (Zig device-directory client, 7ec2c7119, both
+   test lanes green). Next: T22c. User explicitly needs ctrl+shift+n and
+   auth/sign-in.
 4. **T48** — deadlock root-cause. The refreshed install has a matching
    pdb, so the next watchdog dump WILL be symbolizable. Adversarial
    investigation applies (three ranked candidates in the details section).
@@ -112,7 +114,7 @@ One line per row. Full spec + validation + evidence per task:
 | T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | done | 64c4329c2 |
 | T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
 | T22a | Machine chooser design (win32) | G | T21a | done | 6d944531e |
-| T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | in-progress | — |
+| T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | done | 7ec2c7119 |
 | T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |
 | T24 | Windows release channel + update check | H | T23 | todo | — |
