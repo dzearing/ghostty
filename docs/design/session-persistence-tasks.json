@@ -283,16 +283,47 @@
     },
     {
       "id": "T09",
-      "title": "Hardening: Unix-socket transport (agent listen + client dial + ABI), make it the default local transport",
-      "status": "pending",
+      "title": "Hardening (agent): --listen-unix transport + peercred same-uid check",
+      "status": "done",
       "dependsOn": ["T08"],
-      "goal": "Replace loopback TCP with a 0600 unix socket + LOCAL_PEERCRED same-uid check (design §5.2 security rationale: any local user can connect to 127.0.0.1 ports).",
+      "goal": "Agent-side of the UDS hardening (design §5.2: any local user can connect to a 127.0.0.1 port; a 0600 unix socket + LOCAL_PEERCRED/SO_PEERCRED same-uid check cannot be reached by another user). Add `--listen-unix=<path>`: bind an AF_UNIX stream socket at 0600, unlink a stale socket only after a connect-probe livecheck, then run the SAME acceptLoop with a per-connection same-uid peercred gate. Keep `--listen` TCP for dev/tests. Client dial + LocalAgentManager switch are T09b/T09c.",
       "steps": [
-        "Agent: --listen-unix=<path> (socket_stream.zig is the Stream template); unlink-stale-with-livecheck; peercred check.",
-        "Client: ghostty_remote_connection_new_unix(path) through embedded.zig; LocalAgentManager switches; port-file becomes socket-path file.",
-        "Keep --listen TCP for dev/tests."
+        "New Mode.listen_unix{path,headless,force_replace}; parse --listen-unix=<path> and --listen-unix <path> (single-instance guard as for --listen).",
+        "runListenUnix: connect-probe stale socket (live => single-instance already handles; refused/ENOENT => unlink), bind AF_UNIX via std.net.Address.initUnix, fchmod/chmod 0600, listen, banner, then acceptLoop.",
+        "peerUid(fd): LOCAL_PEERCRED (macOS/BSD, SOL_LOCAL=0, opt=1, struct xucred) / SO_PEERCRED (Linux). Same-uid gate in the accept path: geteuid mismatch OR unknown => close the fd, never serve.",
+        "socket_stream.SocketStream is already fd-based+transport-agnostic (recv/send/shutdown work on AF_UNIX) — reuse verbatim.",
+        "Tests (test-agent): peerUid on a real socketpair returns our uid; same-uid connect over a bound --listen-unix socket completes HELLO/OPEN; stale-socket unlink livecheck; 0600 perms asserted."
       ],
-      "acceptance": "E2E suite (T07+T08) passes over UDS; another-uid connect is refused (test with a root-owned probe or skip with documented manual check); tests added.",
+      "acceptance": "zig build test-agent passes incl. new tests; manual: agent --listen-unix=/tmp/x.sock binds a 0600 socket, a same-uid client HELLO+OPENs, socat/nc as same uid works; peerUid gate rejects a different-uid peer (documented manual/root check if not automatable).",
+      "notes": "2026-07-16: done, agent-side only (src/remote/agent/main.zig; ZERO app/other-module changes). SCOPE was split from the original monolithic T09 into T09/T09b/T09c because the full thing (agent listener + client dial + LocalAgentManager + E2E) balloons; this is the agent listener + peercred gate. WIRING: (1) new Mode.listen_unix{path,headless,force_replace}; parse --listen-unix=<path> and two-token --listen-unix <path> (order-independent --headless/--force-replace already pre-scanned); listenUnixMode() dupes the path, rejects empty + rejects Windows (that's a named pipe later, §5.2); main() dispatch takes the SAME per-user single-instance guard as --listen BEFORE the bind (a loser must not clobber the winner's socket node). (2) runListenUnix(): connect-probe stale-socket livecheck (probeUnixAlive: a successful connect ⇒ a live agent owns it ⇒ REFUSE with error.AlreadyListening rather than clobber; ECONNREFUSED/ENOENT ⇒ safe to unlink) → deleteFile stale node → makePath parent → std.net.Address.initUnix → bind under umask(0o177) so the node is created 0600 RACE-FREE (restore prev umask immediately after listen) → banner 'listening on unix:<path>' → same acceptLoop core as TCP with enforce_same_uid=true. (3) SECURITY GATE: acceptLoop gained an enforce_same_uid param; on the unix path it calls shouldServe(true, peerUid(fd), geteuid()) per accepted connection and CLOSEs + skips any peer that isn't us. peerUid() binds getpeereid(2) via an extern (cross-platform macOS LOCAL_PEERCRED / Linux SO_PEERCRED; not in Zig std) and returns null if the cred can't be read; shouldServe is a PURE decision (enforce off ⇒ always serve [TCP]; on ⇒ serve only a KNOWN uid == ours; unknown/null ⇒ REJECT — never serve a shell blind). AcceptArgs + the Windows-tray acceptLoopThread path also thread the flag (TCP passes false). socket_stream.SocketStream is already fd-based+transport-agnostic (recv/send/shutdown work verbatim on AF_UNIX) — reused unchanged.\n\nTRAPS AVOIDED: (a) sun_path is only ~104 bytes on macOS — my scratchpad dir overflows it; initUnix returns NameTooLong cleanly (no clobber). The real LocalAgentManager path ~/.config/ghoztty/local-agent-debug/agent.sock fits. (b) did NOT fchmod the bound socket fd as belt-and-braces: on macOS fchmod of a socket returns EINVAL, which std.posix.fchmod maps to `unreachable` (PANIC) — the exact class of trap that once killed the agent via SO_NOSIGPIPE (socket_stream.zig). umask alone is sufficient AND safe (node born 0600, never briefly more permissive). std has no fchmodat either. (c) probeUnixAlive builds the sockaddr.un manually (mirrors the CLI's connectUnixSocket) and returns false on the >=sun_path length guard.\n\nTESTS (test-agent exit 0, all green, no leftover /tmp sockets): shouldServe branch table (off-always-serve, on+same-uid-serve, on+diff-uid-reject, on+unknown-reject); peerUid on a REAL accepted AF_UNIX connection == geteuid() and the gate admits it; bind-creates-0600-node (statFile mode & 0777 == 0o600) + probeUnixAlive false-before/true-after-bind. LIVE SMOKE VERIFIED: agent --listen-unix=/tmp/t09.sock binds srw------- (0600), banner correct, pid alive; a SECOND agent (different lock path, bypassing the guard) hitting the same live socket is REFUSED by the livecheck ('a live agent already listens ...; exiting', error.AlreadyListening). Full HELLO/OPEN over UDS + the different-uid REJECT live check are deferred to T09b (unix dial round-trip test) / T09c (E2E + the sudo -u other manual check) since no client-side unix dial exists yet. Also updated the module header (4 transport modes now; SECURITY section describes the 0600 + peercred hardening) + printUsage (--listen-unix line). COMMIT: <pending>."
+    },
+    {
+      "id": "T09b",
+      "title": "Hardening (client): ghostty_remote_connection_new_unix dial + ABI",
+      "status": "pending",
+      "dependsOn": ["T09"],
+      "goal": "Client-side UDS dial mirroring the TCP path. Refactor tcp_dial.dial's post-connect steps (mux→Connection→HELLO) into a shared helper; add dialUnix(path) that connects an AF_UNIX socket + reuses it. Export ghostty_remote_connection_new_unix(path) in embedded.zig (store in the existing transport-agnostic handle.tcp Dialed slot) + declare in include/ghostty.h.",
+      "steps": [
+        "tcp_dial.zig: extract dialConnected(alloc, *SocketStream, encoding, timeout) from dial(); dial() (TCP) and new dialUnix(alloc, path, encoding) both build the SocketStream then call it.",
+        "embedded.zig: ghostty_remote_connection_new_unix([*:0]const u8 path) -> ?*RemoteConnectionHandle, same shape as _new_tcp (handle.tcp = Dialed). include/ghostty.h declaration + doc.",
+        "Test: a loopback AF_UNIX MiniAgent (reuse tcp_dial's MiniAgent over a bound unix socket) — dialUnix stands up a Connection, OPEN+DATA round-trip."
+      ],
+      "acceptance": "zig build test-agent + full app build pass; new dialUnix test round-trips OPEN+DATA over a real unix socket.",
+      "notes": ""
+    },
+    {
+      "id": "T09c",
+      "title": "Hardening: LocalAgentManager switches to UDS (default local transport) + E2E over UDS",
+      "status": "pending",
+      "dependsOn": ["T09b"],
+      "goal": "Make the 0600 unix socket the DEFAULT local-agent transport. LocalAgentManager spawns `--listen-unix=<dir>/agent.sock`, discovers the agent's pid via an info file (reuse/generalize --port-file to carry pid+socket, since UDS has no ephemeral port to publish), dials via ghostty_remote_connection_new_unix. Run the full E2E (T07 kill-9 + T08 upgrade) over UDS; verify a different-uid connect is refused.",
+      "steps": [
+        "Agent: in --listen-unix mode, still honor --port-file to publish {\"pid\":P,\"socket\":\"<path>\",\"startedAt\":MS} (port omitted/0) so the supervisor can pid-liveness-check a pre-existing agent (Swift side needs pid for the sharedAgentPid cheap check).",
+        "LocalAgentManager: Paths.socketFile (agent.sock); spawnDetached argv --listen-unix=<sock> --port-file=<info>; dialExisting reads pid+socket from the info file, kill(pid,0), ghostty_remote_connection_new_unix(socket); localMachine keeps isLocalMachine true (no port needed — synthesize a loopback Machine).",
+        "Run scripts/e2e/session-persistence.py --cycles=3 (kill) and --upgrade both quit modes; all must pass over UDS.",
+        "Different-uid refusal: documented manual check (e.g. sudo -u <other> socat - UNIX-CONNECT:<sock> is rejected) or an automatable variant; record the result."
+      ],
+      "acceptance": "E2E suite (T07+T08) passes over UDS 3x; another-uid connect is refused (documented); socket is 0600; tests added/updated.",
       "notes": ""
     },
     {

@@ -1,6 +1,6 @@
 //! `ghoztty-agent` entry point (WP2, §4.1–§4.2/§7.1) — the remote-host daemon.
 //!
-//! Three transport modes share the SAME session-server core (`server.zig`, real
+//! Four transport modes share the SAME session-server core (`server.zig`, real
 //! pty-backed children via `pty_child.zig`) and the SAME lane mux (`mux.zig`):
 //!
 //!   1. **stdio** (`--stdio`, or the default when stdin is not a tty / no listen
@@ -14,6 +14,16 @@
 //!      over the socket, sharing the daemon-scoped session store), so the accept
 //!      loop NEVER blocks on one connection's lifecycle. UNAUTHENTICATED — a
 //!      local/dev harness only (the authenticated path is `--relay`).
+//!
+//!   2b. **Unix-socket listen daemon** (`--listen-unix <path>`, POSIX-only): the
+//!      SECURE local transport for session persistence (design §5.2). Same
+//!      accept→serve→loop core as the TCP path, but bound to a 0600 AF_UNIX
+//!      socket (created that way race-free via umask) and gated with a
+//!      per-connection `getpeereid` same-uid check — so, unlike a 127.0.0.1 TCP
+//!      port that ANY local uid can connect to, only this user can reach the
+//!      shell. A stale socket node from a prior run is unlinked only after a
+//!      connect-probe confirms nothing live is listening. This is what the macOS
+//!      app spawns for local persistent windows (Windows uses a named pipe).
 //!
 //!   3. **Relay daemon** (`--relay <url>`): the single-binary rendezvous path (no
 //!      Go sidecar, no inbound port). Hold an authenticated `wss://` control
@@ -63,6 +73,13 @@
 //!   - binding a NON-loopback interface requires the explicit
 //!     `--insecure-allow-public` opt-in and prints a loud warning.
 //! So an unauthenticated shell can never be exposed to the network by accident.
+//!
+//! The `--listen-unix` path is the hardened LOCAL alternative: a filesystem
+//! socket is never network-reachable, is created 0600 (no group/other access),
+//! AND every accepted connection is admitted only if `getpeereid` reports the
+//! peer's uid equals ours (an unreadable credential is rejected — a shell is
+//! never served to an unauthenticated peer). This is the transport the app uses
+//! for local session persistence.
 //!
 //! ## Transport over a single byte channel
 //! The wire design (§4.3) uses two logical lanes — control + data, each a
@@ -139,6 +156,14 @@ pub fn main() !void {
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
             defer lock.release();
             try runListen(alloc, encoding, l.addr, l.headless, l.public, l.port_file);
+        },
+        .listen_unix => |l| {
+            defer alloc.free(l.path);
+            // DAEMON mode: single-instance BEFORE the bind (a losing instance
+            // must not clobber the winner's socket node).
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
+            defer lock.release();
+            try runListenUnix(alloc, encoding, l.path, l.headless);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
@@ -320,6 +345,7 @@ const Mode = union(enum) {
     usage,
     stdio,
     listen: Listen,
+    listen_unix: ListenUnix,
     relay: Relay,
     enroll: Enroll,
 };
@@ -358,6 +384,21 @@ const Listen = struct {
     /// with `--listen=127.0.0.1:0` (ephemeral port) can discover the bound
     /// port. Owned (duped from argv).
     port_file: ?[]const u8 = null,
+};
+
+/// Unix-domain-socket listen-daemon parameters (`--listen-unix=<path>`). The
+/// SECURE local transport (design §5.2): a 0600 socket node + a per-connection
+/// `LOCAL_PEERCRED`/`SO_PEERCRED` same-uid gate means — unlike a 127.0.0.1 TCP
+/// port, which ANY local uid can connect to — only this user can reach the
+/// shell. POSIX-only (Windows local persistence uses a named pipe later, §5.2).
+/// `headless`/`force_replace` mirror `Listen`; there is no public/loopback
+/// distinction (a filesystem socket is never network-reachable).
+const ListenUnix = struct {
+    /// Filesystem path to bind the AF_UNIX stream socket at (owned — duped from
+    /// argv so it outlives `argsFree`).
+    path: []const u8,
+    headless: bool = false,
+    force_replace: bool = false,
 };
 
 /// Opt-in required to bind `--listen` to a NON-loopback interface. The TCP
@@ -440,6 +481,15 @@ fn parseArgs(alloc: Allocator) !Mode {
             return listenMode(alloc, try parseAddr(args[i]), headless, force_replace, allow_public, port_file_arg);
         } else if (std.mem.startsWith(u8, a, "--listen=")) {
             return listenMode(alloc, try parseAddr(a["--listen=".len..]), headless, force_replace, allow_public, port_file_arg);
+        } else if (std.mem.eql(u8, a, "--listen-unix")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("ghoztty-agent: --listen-unix requires <path>\n", .{});
+                return error.InvalidArgs;
+            }
+            return listenUnixMode(alloc, args[i], headless, force_replace);
+        } else if (std.mem.startsWith(u8, a, "--listen-unix=")) {
+            return listenUnixMode(alloc, a["--listen-unix=".len..], headless, force_replace);
         } else if (std.mem.eql(u8, a, "--relay")) {
             i += 1;
             if (i >= args.len) {
@@ -496,6 +546,23 @@ fn listenMode(alloc: Allocator, addr: std.net.Address, headless: bool, force_rep
     return .{ .listen = .{ .addr = addr, .headless = headless, .force_replace = force_replace, .public = public, .port_file = pf_owned } };
 }
 
+/// Build a `.listen_unix` mode. Validates a non-empty path and rejects it on
+/// Windows (AF_UNIX local persistence is not this fork's Windows story — that is
+/// a named pipe, §5.2). `path` is duped here (argv is freed when parseArgs
+/// returns).
+fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_replace: bool) !Mode {
+    if (path.len == 0) {
+        std.debug.print("ghoztty-agent: --listen-unix requires a non-empty <path>\n", .{});
+        return error.InvalidArgs;
+    }
+    if (builtin.os.tag == .windows) {
+        std.debug.print("ghoztty-agent: --listen-unix is not supported on Windows (use a named pipe)\n", .{});
+        return error.InvalidArgs;
+    }
+    const path_owned = try alloc.dupe(u8, path);
+    return .{ .listen_unix = .{ .path = path_owned, .headless = headless, .force_replace = force_replace } };
+}
+
 /// Whether `addr` is a loopback address (127.0.0.0/8 or ::1) — the only binds
 /// that don't expose the unauthenticated listener beyond this machine.
 fn isLoopbackAddr(addr: std.net.Address) bool {
@@ -523,6 +590,11 @@ fn printUsage() void {
         \\  ghoztty-agent --version         Print the build version.
         \\
         \\Advanced / development:
+        \\  ghoztty-agent --listen-unix=<path>
+        \\                                  Local session daemon over a 0600 AF_UNIX socket
+        \\                                  with a same-uid peercred gate (the SECURE local
+        \\                                  transport — only this user can reach it). Used by
+        \\                                  the app's session-persistence local agent.
         \\  ghoztty-agent --listen=127.0.0.1:<port>
         \\                                  UNAUTHENTICATED TCP shell, loopback only.
         \\                                  Port 0 binds an ephemeral port; add
@@ -686,6 +758,8 @@ fn runListen(
             .store = &store,
             .spawner = spawner.spawner(),
             .listener = &listener,
+            // TCP listener: no peercred gate (loopback + --insecure-allow-public).
+            .enforce_same_uid = false,
         };
         if (std.Thread.spawn(.{}, acceptLoopThread, .{args})) |t| {
             // Hand the MAIN thread to the tray message loop. It returns TRUE only if
@@ -711,7 +785,133 @@ fn runListen(
     }
 
     // Headless / non-windows / tray-fallback: run the accept loop right here.
-    try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener);
+    try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener, false);
+}
+
+// -----------------------------------------------------------------------------
+// Unix-domain-socket listen daemon (`--listen-unix=<path>`): the SECURE local
+// transport (design §5.2). Same accept→serve→loop core as TCP, but bound to a
+// 0600 filesystem socket and gated with a per-connection same-uid peercred
+// check. POSIX-only (Windows uses a named pipe later); parseArgs already
+// rejected this mode on Windows.
+// -----------------------------------------------------------------------------
+
+fn runListenUnix(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    path: []const u8,
+    headless: bool,
+) !void {
+    _ = headless; // no Windows tray on the unix path; reserved for symmetry.
+
+    // Stale-socket livecheck: if something ANSWERS at `path`, a live agent owns
+    // it — refuse rather than clobber. The single-instance guard normally means
+    // we never reach here with a live peer, but be defensive if the guard was
+    // unavailable (it degrades to "serve anyway"). If nothing answers, remove
+    // any leftover socket node so bind() won't fail with AddressInUse.
+    if (probeUnixAlive(path)) {
+        std.debug.print("ghoztty-agent: a live agent already listens at {s}; exiting\n", .{path});
+        return error.AlreadyListening;
+    }
+    std.fs.cwd().deleteFile(path) catch {}; // ignore ENOENT / not-a-file
+
+    if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch {};
+
+    const addr = std.net.Address.initUnix(path) catch |err| {
+        std.debug.print("ghoztty-agent: bad --listen-unix path '{s}': {s}\n", .{ path, @errorName(err) });
+        return err;
+    };
+
+    // Bind under a restrictive umask so the socket node is created 0600 from the
+    // start (never briefly world-connectable): a 127.0.0.1 TCP port is reachable
+    // by ANY local uid, a 0600 socket is not. This is defense in depth on top of
+    // the peercred gate below. umask is process-global but we are single-threaded
+    // here (before the accept loop spawns any workers), so the swap is safe.
+    const prev_umask = std.c.umask(0o177);
+    var listener = addr.listen(.{}) catch |err| {
+        _ = std.c.umask(prev_umask);
+        std.debug.print("ghoztty-agent: failed to bind {s}: {s}\n", .{ path, @errorName(err) });
+        return err;
+    };
+    _ = std.c.umask(prev_umask);
+    defer listener.deinit();
+    // NOTE: the umask above is the whole story — the socket node is created 0600
+    // atomically (never briefly more permissive). We deliberately do NOT
+    // `fchmod` the bound socket fd as belt-and-braces: on macOS fchmod of a
+    // socket fd returns EINVAL, which std.posix.fchmod maps to `unreachable`
+    // (panic) — the same class of trap that once killed the agent via
+    // SO_NOSIGPIPE (see socket_stream.zig). umask is both sufficient and safe.
+
+    // DAEMON-SCOPED shared session store + spawner — identical lifetime rules to
+    // the TCP path (sessions outlive each connection; the reaper evicts orphans).
+    const seed = blk: {
+        var s: u64 = 0;
+        std.crypto.random.bytes(std.mem.asBytes(&s));
+        break :blk s;
+    };
+    var rng = std.Random.DefaultPrng.init(seed);
+
+    var spawner = try pty_child.PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    var store = session.SessionStore.init(
+        alloc,
+        rng.random(),
+        undefined,
+        realNow,
+        session.default_idle_ttl_ms,
+    );
+    defer store.deinit();
+    try store.startReaper();
+
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on unix:{s}\n", .{ agent_version, path }) catch "ghoztty-agent: listening\n") catch {};
+
+    // Same accept core as TCP, but with the same-uid peercred gate enabled.
+    try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener, true);
+}
+
+/// Whether a live peer answers at the AF_UNIX `path` (a successful connect ⇒
+/// something is listening; ECONNREFUSED / ENOENT / anything else ⇒ not live).
+/// Used to decide whether a leftover socket node is safe to unlink+rebind.
+fn probeUnixAlive(path: []const u8) bool {
+    if (path.len == 0) return false;
+    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch return false;
+    defer std.posix.close(fd);
+    var uaddr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
+    if (path.len >= uaddr.path.len) return false;
+    @memcpy(uaddr.path[0..path.len], path);
+    uaddr.path[path.len] = 0;
+    std.posix.connect(fd, @ptrCast(&uaddr), @sizeOf(std.posix.sockaddr.un)) catch return false;
+    return true;
+}
+
+/// `getpeereid(2)`: the effective uid/gid of the peer on a connected AF_UNIX
+/// socket. Cross-platform (macOS/BSD `LOCAL_PEERCRED`, Linux `SO_PEERCRED`); not
+/// declared in Zig std, so we bind it directly. Absent on Windows (unreachable —
+/// the unix listen mode is POSIX-only).
+const getpeereid = if (builtin.os.tag == .windows) struct {} else struct {
+    extern "c" fn getpeereid(fd: c_int, euid: *posix.uid_t, egid: *posix.uid_t) c_int;
+}.getpeereid;
+
+/// The peer's effective uid on an accepted AF_UNIX socket, or null if it can't
+/// be read (a null result is treated as "reject" by `shouldServe`).
+fn peerUid(fd: posix.socket_t) ?posix.uid_t {
+    if (builtin.os.tag == .windows) return null;
+    var euid: posix.uid_t = undefined;
+    var egid: posix.uid_t = undefined;
+    if (getpeereid(fd, &euid, &egid) != 0) return null;
+    return euid;
+}
+
+/// The same-uid admission decision — pure, so every branch is unit-testable
+/// without a real socket or a second uid. When enforcement is off, always serve
+/// (TCP path). When on: serve only a peer whose uid is known AND equals ours; an
+/// unknown peer (getpeereid failed) is rejected.
+fn shouldServe(enforce_same_uid: bool, peer_uid: ?posix.uid_t, our_uid: posix.uid_t) bool {
+    if (!enforce_same_uid) return true;
+    const uid = peer_uid orelse return false;
+    return uid == our_uid;
 }
 
 /// Atomically publish the listener's bound port for a supervisor: write
@@ -766,12 +966,13 @@ const AcceptArgs = struct {
     store: *session.SessionStore,
     spawner: server.Spawner,
     listener: *std.net.Server,
+    enforce_same_uid: bool,
 };
 
 /// Thread entry wrapper: run the accept loop, logging (but never propagating) a
 /// fatal accept error — this is a detached daemon thread.
 fn acceptLoopThread(args: AcceptArgs) void {
-    acceptLoop(args.alloc, args.encoding, args.store, args.spawner, args.listener) catch |err| {
+    acceptLoop(args.alloc, args.encoding, args.store, args.spawner, args.listener, args.enforce_same_uid) catch |err| {
         std.debug.print("ghoztty-agent: accept loop error: {s}\n", .{@errorName(err)});
     };
 }
@@ -786,6 +987,11 @@ fn acceptLoop(
     store: *session.SessionStore,
     spawner: server.Spawner,
     listener: *std.net.Server,
+    /// When true (the `--listen-unix` path), gate every accepted connection on a
+    /// `LOCAL_PEERCRED`/`SO_PEERCRED` same-uid check: only a peer running as
+    /// THIS user may reach the shell. The TCP path passes false (it relies on
+    /// loopback binding + the `--insecure-allow-public` opt-in instead).
+    enforce_same_uid: bool,
 ) !void {
     while (true) {
         const conn = listener.accept() catch |err| switch (err) {
@@ -793,6 +999,14 @@ fn acceptLoop(
             error.ConnectionAborted, error.ConnectionResetByPeer => continue,
             else => return err,
         };
+        // Same-uid gate (unix socket): reject — and immediately close — any peer
+        // that is not this user, or whose credentials can't be read. A shell is
+        // never served to an unauthenticated peer.
+        if (enforce_same_uid and !shouldServe(true, peerUid(conn.stream.handle), std.posix.geteuid())) {
+            std.debug.print("ghoztty-agent: rejecting unix connection from a non-matching uid\n", .{});
+            std.posix.close(conn.stream.handle);
+            continue;
+        }
         // Serve each accepted connection on its OWN detached thread so the accept
         // loop NEVER blocks on one connection's lifecycle (a slow/dead/wedging client
         // can no longer starve new connections — the P0 "never wedge" guarantee). The
@@ -1464,6 +1678,84 @@ test "port file: bind port 0 → write file → read back live port → dial it"
 
     // Rewrite (agent restart reusing the same path) must replace the file.
     try writePortFile(alloc, path, bound_port);
+}
+
+// --- T09: --listen-unix transport + same-uid peercred gate -------------------
+
+test "shouldServe: same-uid admission decision (all branches)" {
+    const our: posix.uid_t = 501;
+    // Enforcement OFF (the TCP path): always serve, regardless of peer.
+    try std.testing.expect(shouldServe(false, null, our));
+    try std.testing.expect(shouldServe(false, 999, our));
+    // Enforcement ON: serve only a KNOWN peer whose uid equals ours.
+    try std.testing.expect(shouldServe(true, our, our));
+    // Different uid → reject.
+    try std.testing.expect(!shouldServe(true, 999, our));
+    // Unknown peer (getpeereid failed → null) → reject, never serve blind.
+    try std.testing.expect(!shouldServe(true, null, our));
+}
+
+/// A short, unique AF_UNIX path under the system tmp dir (the sun_path field is
+/// only ~104 bytes on macOS, so a nested tmpDir realpath can overflow it).
+fn testSockPath(buf: []u8, tag: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "/tmp/gztt-t09-{s}-{d}.sock", .{ tag, currentPid() });
+}
+
+test "listen-unix: peerUid on a real accepted connection is our uid; gate passes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var pbuf: [128]u8 = undefined;
+    const path = try testSockPath(&pbuf, "peer");
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const addr = try std.net.Address.initUnix(path);
+    var listener = try addr.listen(.{});
+    defer listener.deinit();
+
+    // Connect a client (same process ⇒ same uid) and accept the server end.
+    const client_fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(client_fd);
+    var uaddr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
+    @memcpy(uaddr.path[0..path.len], path);
+    uaddr.path[path.len] = 0;
+    try std.posix.connect(client_fd, @ptrCast(&uaddr), @sizeOf(std.posix.sockaddr.un));
+
+    const conn = try listener.accept();
+    defer std.posix.close(conn.stream.handle);
+
+    // The accept-path credential read: the peer's uid is known and is ours.
+    const uid = peerUid(conn.stream.handle);
+    try std.testing.expectEqual(std.posix.geteuid(), uid.?);
+    // And the gate that acceptLoop applies admits it.
+    try std.testing.expect(shouldServe(true, uid, std.posix.geteuid()));
+}
+
+test "listen-unix: bind creates a 0600 socket node (umask), probeUnixAlive sees it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var pbuf: [128]u8 = undefined;
+    const path = try testSockPath(&pbuf, "perm");
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    // Nothing bound yet ⇒ not alive.
+    try std.testing.expect(!probeUnixAlive(path));
+
+    // Bind under the same restrictive umask runListenUnix uses.
+    const prev = std.c.umask(0o177);
+    const addr = try std.net.Address.initUnix(path);
+    var listener = try addr.listen(.{});
+    _ = std.c.umask(prev);
+    defer listener.deinit();
+
+    // The node is 0600 (never group/other-accessible) — the whole point vs a
+    // 127.0.0.1 TCP port that any local uid can reach.
+    const st = try std.fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(u16, 0o600), @as(u16, @intCast(st.mode & 0o777)));
+
+    // A live listener answers the connect-probe used for stale-socket cleanup.
+    try std.testing.expect(probeUnixAlive(path));
 }
 
 test "wssBase: https/wss normalize to wss; http/ws stay plaintext; others refused" {
