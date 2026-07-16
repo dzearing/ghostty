@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box) — T22a DONE (design only): split T22 into T22a
+  (design) → T22b (Zig `/v1/client/devices` directory client) → T22c (win32
+  chooser dialog + ctrl+shift+n + palette entry); T51 dep bumped to T22c.
+  Investigated the Mac reference (`MachineChooserView` / `MachineRegistry` /
+  `RelayDirectoryClient`) and the win32 landscape: `http_client.getAuth`
+  already does bearer GETs (T22b is a thin wrapper), win32 has NO menu bar
+  (so "menu item" = command-palette entry), there is NO core binding action
+  for remote (Mac uses an AppKit menu, not a keybind) → ctrl+shift+n gets
+  wired win32-native in the keyboard path (RenameDialog/ctrl+shift+r pattern,
+  minus the core action). Dialog models on `RenameDialog.zig` (T50). Design +
+  per-subtask validation pinned in the details `## T22a` section. No code.
+  Next: T22b (pure data layer, none-lane unit-tested).
 - 2026-07-15 (on-box, night 3) — T21a DONE (64c4329c2): Windows relay
   account sign-in. Zig port of macOS RelayAccount/GoogleOAuth —
   `google_oauth.zig` (PKCE S256, auth URL, JWT claims, token

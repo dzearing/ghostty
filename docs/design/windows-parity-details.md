@@ -504,11 +504,110 @@ fails the script instead of hanging it. Note: `zig build` needs
 `ZIG_GLOBAL_CACHE_DIR=D:\zig-global-cache` on this box (cross-drive
 Run-step assert in zig 0.15.2 otherwise).
 
-## T22 — Remote GUI: menu item + machine chooser (Phase G)
+## T22a — Machine chooser design (win32) (Phase G)
 
-Menu item + machine chooser dialog. Reconnect/restore manifests = stretch.
+The GUI counterpart to `+new-remote-window`: a native picker (ctrl+shift+n)
+that lists the signed-in account's enrolled machines and opens the selected
+one, so the remote flow is reachable without the CLI. T22 was too big for one
+context (new Zig HTTP directory client + a native list dialog + keybind/menu
+wiring + the open flow), so it is split: **T22a** (this design) → **T22b**
+(the Zig device-directory client) → **T22c** (the win32 dialog + trigger +
+open). Reconnect/restore manifests (WP-D2) stay a stretch goal, out of all
+three.
 
-*Validation:* chooser lists enrolled machines; opening one works.
+### Reference (Mac)
+
+Cmd-Shift-N opens `MachineChooserView` (`macos/Sources/Features/Remote/`),
+a filterable list over `MachineRegistry.machines`. The registry's machines are
+the account's relay devices, fetched live from `GET /v1/client/devices`
+(`RelayDirectoryClient`, response `{"devices":[{id,name,hostname,online}]}`)
+whenever the chooser opens and re-polled while open, plus a persisted
+names/hostnames cache seeded at launch, plus any direct-TCP entries. Selecting
+a row dials that machine (relay: `--relay`/`--device`; TCP: `host:port`) and
+opens a window — the same dial + `createWindow` the IPC `handleNewRemoteWindow`
+already does on win32. The Mac view also carries a metrics probe, activity
+monitor, rename/delete, and restore — all **out of scope** here.
+
+### Decisions (pinned for T22b/T22c)
+
+1. **Enrolled-machines source = the relay device directory.** "Enrolled" =
+   the signed-in account's relay devices, so T22b implements a Zig client for
+   `GET {base}/v1/client/devices`. Base from `GHOSTTY_RELAY_BASE`
+   (default `https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com`, matching
+   `RelayDirectoryClient.defaultBase`). Bearer via the SAME tiered resolution
+   the remote dial already uses in `IpcHandlers.zig`
+   (`resolveAccountToken` → `resolveEnvToken`); no token ⇒ the chooser shows an
+   empty list with a "sign in with +relay-login" footer, never an error.
+   Transport reuses `src/remote/http_client.zig` `getAuth` (already does
+   `Authorization: Bearer`), so T22b is a thin wrapper: build URL, GET, parse,
+   map 401/404/other onto typed errors (mirror `DirectoryError`).
+
+2. **T22b is a pure data layer, unit-tested in the none lane.** The parse
+   (JSON → `[]Device{id,name,hostname:?,online}`), URL join (base + path, with
+   or without a trailing slash on base), and status→error mapping are pure and
+   get none-lane unit tests. The live HTTP GET itself is exercised on-box in
+   T22c against the account (or a fake `GHOSTTY_RELAY_BASE` endpoint, the same
+   fake-issuer trick `ipc-relay-login.ps1` uses). Keep it in
+   `src/remote/relay_directory.zig` next to `relay_account.zig`/`relay_dial.zig`.
+
+3. **Trigger = ctrl+shift+n, wired win32-native (NOT a new core binding).**
+   There is no `input.Binding.Action` for "new remote window" (Mac drives it
+   from an AppKit menu, not a keybind), and adding a core action variant is a
+   cross-platform change out of scope for a Windows parity task. So intercept
+   ctrl+shift+n in the win32 keyboard path and call a `Window`/`App` method that
+   opens the chooser — the same shape as ctrl+shift+r, except ctrl+shift+r rides
+   the existing `prompt_title` core action while this one is handled locally.
+   Confirm the chosen chord doesn't collide with an existing win32 binding
+   before wiring (grep the ctrl-mirror block in `Config.zig` ~6880).
+
+4. **"Menu item" = command-palette entry (Windows has no menu bar).** win32
+   Ghoztty exposes actions through the command palette (`palette_entries` in
+   `Surface.zig`) and context menus, not a Mac-style menu bar. Add a "New Remote
+   Window" command-palette entry as the discoverable/"menu" affordance. Because
+   palette entries dispatch `input.Binding.Action`s and there is no remote
+   action (decision 3), the palette entry can't be a plain `.action` row; T22c
+   picks the mechanism — either a small palette special-case that calls the same
+   open-chooser method, or the minimal viable path is keybind-only for the first
+   cut with the palette entry folded in if it's cheap. Keybind is the must-have
+   (the user's explicit ask); the palette entry is the nice-to-have.
+
+5. **Dialog = native win32, modeled on `RenameDialog.zig` (the T50
+   pattern-setter).** A modal owned popup with a filter edit + an owner-drawn
+   list (or a `LISTBOX`/`SysListView32`) of rows: a "Local" row first, then one
+   row per device showing name + a subline (hostname / online dot). Keyboard:
+   type to filter, Up/Down move selection, Enter opens the highlighted row,
+   Escape cancels — the RenameDialog key-routing backreference pattern
+   (`Window.rename_dialog`) generalizes to a `Window.machine_chooser`. Live
+   re-poll while open is a nicety; the first cut may fetch once on open.
+
+6. **Open = reuse the existing dial path.** Selecting a device runs the same
+   relay dial + `createWindow(.{ .surface_overrides = &.{ .remote = … } })`
+   that `handleNewRemoteWindow` already performs for `--relay`/`--device`;
+   factor that dial+open into a shared helper both the IPC handler and the
+   chooser call, so there is ONE remote-open path. Local row → ordinary
+   `createWindow` (the `.new_window` path).
+
+### T22b validation (when implemented)
+
+`zig build test -Dapp-runtime=none` green with new unit tests: URL join for
+base with/without trailing slash; parse of a well-formed `{"devices":[…]}`
+(incl. a device with no `hostname`); parse of an empty list; 401→unauthorized,
+404→notFound, 500→http(500) mapping; a garbage body → badResponse.
+
+### T22c validation (when implemented)
+
+On-box: ctrl+shift+n opens the chooser; with an account signed in (or a fake
+`GHOSTTY_RELAY_BASE` serving a canned device list) it lists the enrolled
+machines; selecting one opens a working remote window (echo round-trips via
+`+send-keys`/`+read`, as in `ipc-relay.ps1`); Escape cancels cleanly; no
+account ⇒ empty list + sign-in hint, no crash. Both unit lanes green; P1–P3 +
+`ipc-relay*.ps1` stay ALL PASS. Add a `test/win32/` check where scriptable
+(the dialog itself is GUI, so at minimum assert the palette/keybind path
+reaches the open helper, e.g. via a debug log line the script greps).
+
+*Validation (T22a, design):* the split is recorded in the tracker (T22a/b/c
+rows, T51 dep updated) and this section pins the data source, trigger, dialog
+model, and open path for the implementer. No code.
 
 ## T23 — MSI fix → uninstall entry works (Phase H)
 

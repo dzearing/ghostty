@@ -62,8 +62,10 @@ Work these first, in order, before falling back to first-todo-in-table:
    DPAPI creds + `+relay-login`/`+relay-logout` + GUI account tier) DONE
    2026-07-15, validated by `ipc-relay-login.ps1` ALL PASS (fake-issuer
    login E2E + logout + error path + account-tier window open with no
-   `--token`). Next: T22 (menu item + machine chooser). User explicitly
-   needs ctrl+shift+n and auth/sign-in.
+   `--token`). T22 split 2026-07-15 (too big for one context): T22a (chooser
+   design) → T22b (Zig device-directory client) → T22c (win32 chooser dialog
+   + ctrl+shift+n + palette entry). T22a DONE 2026-07-15 (design in details
+   doc). Next: T22b. User explicitly needs ctrl+shift+n and auth/sign-in.
 4. **T48** — deadlock root-cause. The refreshed install has a matching
    pdb, so the next watchdog dump WILL be symbolizable. Adversarial
    investigation applies (three ranked candidates in the details section).
@@ -109,7 +111,9 @@ One line per row. Full spec + validation + evidence per task:
 | T20 | `+new-remote-window` direct TCP | G | T08 | done | 2ed989866 |
 | T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | done | 64c4329c2 |
 | T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
-| T22 | Remote GUI: menu item + machine chooser | G | T21a | todo | — |
+| T22a | Machine chooser design (win32) | G | T21a | in-progress | — |
+| T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | todo | — |
+| T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |
 | T24 | Windows release channel + update check | H | T23 | todo | — |
 | T25 | Full conformance checklist (spec §8) | — | T17,T19,T21a | todo | — |
@@ -138,7 +142,7 @@ One line per row. Full spec + validation + evidence per task:
 | T48 | FIX DEADLOCK: release GUI freeze under TUI load | I | — | in-progress | — |
 | T49 | Hero-mode regression report → stale binary | F | T19 | done | c795455ff.. |
 | T50 | Real "Rename Window" dialog | I | T44 | done | 39988009a |
-| T51 | Full parity RE-AUDIT | — | T50,T22,T48,T53 | todo | — |
+| T51 | Full parity RE-AUDIT | — | T50,T22c,T48,T53 | todo | — |
 | T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
 | T53 | Long-context reliability + perf soak/tuning | I | T40 | todo | — |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
