@@ -56,7 +56,7 @@ Work these first, in order, before falling back to first-todo-in-table:
 1. ~~T50~~ — DONE 2026-07-15 (real "Rename Window" dialog).
 2. ~~T54~~ — DONE 2026-07-15 (this doc restructure; resume read is now
    small).
-3. **~~T20~~ → ~~T21b~~ → ~~T21a~~ → T22** — remote windows on Windows: T20
+3. **~~T20~~ → ~~T21b~~ → ~~T21a~~ → ~~T22~~** — remote windows on Windows: T20
    (direct TCP) DONE 2026-07-15; T21 split 2026-07-15 (sizing rule);
    T21b (relay dial in the GUI) DONE 2026-07-15; T21a (browser sign-in +
    DPAPI creds + `+relay-login`/`+relay-logout` + GUI account tier) DONE
@@ -66,8 +66,13 @@ Work these first, in order, before falling back to first-todo-in-table:
    design) → T22b (Zig device-directory client) → T22c (win32 chooser dialog
    + ctrl+shift+n + palette entry). T22a DONE 2026-07-15 (design in details
    doc); T22b DONE 2026-07-15 (Zig device-directory client, 7ec2c7119, both
-   test lanes green). Next: T22c. User explicitly needs ctrl+shift+n and
-   auth/sign-in.
+   test lanes green); **T22c DONE 2026-07-15** (4e7edfc9b: ctrl+shift+n +
+   "New Remote Window" palette entry open a native machine chooser that
+   lists relay devices and opens one via the shared `App.openRelayWindow`;
+   `ipc-machine-chooser.ps1` ALL PASS on-box — real chord → chooser opens →
+   `GET /v1/client/devices` → Escape-close, no crash). The T22 remote-window
+   series is complete; remaining Phase-G follow-ups are T56 (reconnect) and
+   T42 (remote env/PATH). Next in this priority list: T48.
 4. **T48** — deadlock root-cause. The refreshed install has a matching
    pdb, so the next watchdog dump WILL be symbolizable. Adversarial
    investigation applies (three ranked candidates in the details section).
@@ -115,7 +120,7 @@ One line per row. Full spec + validation + evidence per task:
 | T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
 | T22a | Machine chooser design (win32) | G | T21a | done | 6d944531e |
 | T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | done | 7ec2c7119 |
-| T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | todo | — |
+| T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | done | 4e7edfc9b |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |
 | T24 | Windows release channel + update check | H | T23 | todo | — |
 | T25 | Full conformance checklist (spec §8) | — | T17,T19,T21a | todo | — |

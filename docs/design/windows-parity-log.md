@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box) — T22c DONE (code 4e7edfc9b; docs this commit): the
+  win32 "New Remote Window" machine chooser. ctrl+shift+n (intercepted locally
+  in `Surface.handleKeyEvent` — no core action exists, so it shadows the
+  cross-platform ctrl+shift+n → new_window default on Windows only; ctrl+n
+  still makes a plain window) and a "New Remote Window" command-palette entry
+  open `MachineChooser.zig`, a RenameDialog-style modal (native EDIT filter +
+  LISTBOX, keys routed via `App.machineChooserOwning`/`handleKey`). It fetches
+  the account's devices once via `relay_directory.listDevices`; no token / a
+  fetch error → Local-only list + footer hint, no crash. Selecting a device
+  dials+opens via the NEW `App.openRelayWindow` — the single relay-open path,
+  factored out of `handleNewRemoteWindow` so the IPC verb and the chooser
+  share it (IPC error strings still byte-match; ipc-relay* stayed ALL PASS).
+  Refactor surprise avoided: kept the tcp/relay error-string mapping in the
+  handler and pushed only dial+create into the App helpers. Both test lanes
+  green; new `test/win32/ipc-machine-chooser.ps1` ALL PASS on-box (real chord →
+  chooser opens → `GET /v1/client/devices` from a loopback fake dir → Escape,
+  no crash — the fake-dir GET is the positive control the keybind harness
+  demands). Also fixed a foreground-steal papercut: opening a device window
+  now skips the owner-refocus in `close()` so the new remote window stays on
+  top. T22 remote-window series complete. Next priority: T48 (deadlock).
 - 2026-07-15 (on-box) — T22b DONE (7ec2c7119): `src/remote/relay_directory.zig`
   — pure Zig client for `GET /v1/client/devices` mirroring the macOS
   `RelayDirectoryClient`. `Device{id,name,hostname?,online}` parse (`.alloc_always`

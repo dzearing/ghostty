@@ -619,6 +619,39 @@ account ⇒ empty list + sign-in hint, no crash. Both unit lanes green; P1–P3 
 (the dialog itself is GUI, so at minimum assert the palette/keybind path
 reaches the open helper, e.g. via a debug log line the script greps).
 
+*Evidence (T22c DONE 2026-07-15, 4e7edfc9b):* implemented per the T22a
+decisions. `src/apprt/win32/MachineChooser.zig` is a modal owned popup modeled
+on `RenameDialog` (dark chrome, native filter `EDIT` + `LISTBOX` + Open/Cancel,
+DPI-scaled layout): type to filter, Up/Down navigate, Enter opens, Escape
+cancels — keys routed from the main loop via `App.machineChooserOwning` +
+`handleKey`, exactly like the rename dialog (decision 5). The device list is
+fetched once on open via `relay_directory.listDevices` (synchronous GET on the
+GUI thread); no credential or a fetch error degrades to a Local-only list plus
+a footer hint, never a crash (decision 1). Selecting a device dials + opens
+through the new `App.openRelayWindow` — the ONE relay-open path (decision 6),
+factored out of `handleNewRemoteWindow` so the IPC verb (TCP + relay) and the
+chooser share it; the IPC error strings still byte-match. Trigger is
+ctrl+shift+n intercepted locally in `Surface.handleKeyEvent` (decision 3 — no
+core action exists for "new remote window"; shadows the cross-platform
+ctrl+shift+n → new_window default on Windows only, ctrl+n still opens a plain
+local window, Linux untouched), plus a "New Remote Window" command-palette
+entry special-cased in `executePaletteSelection` (decision 4).
+`IpcHandlers.resolveToken` was exposed for the chooser to reuse the account →
+env token resolution the dial uses.
+
+*Validation:* pure logic (`filterRows`, `clampSelection`, `nextFocus`,
+`layout`, `containsIgnoreCase`) unit-tested in both lanes (registered in
+`src/apprt/win32.zig`); `zig build test -Dapp-runtime=none` AND
+`-Dapp-runtime=win32` green; the win32 debug GUI links clean. On-box
+`test/win32/ipc-machine-chooser.ps1` ALL PASS — drives the REAL ctrl+shift+n
+chord into the surface, asserts the `GhozttyMachineChooser` window opens with
+caption "New Remote Window", that it performed `GET /v1/client/devices`
+against a loopback fake directory (the deterministic positive control — only
+happens if the chooser actually opened and ran its fetch), and that Escape
+closes it with no crash. P1–P3 + `ipc-relay*.ps1` stay ALL PASS (the shared
+open-path refactor did not regress the `+new-remote-window` verb). The live
+`listDevices` GET the T22b evidence deferred is now exercised here.
+
 *Validation (T22a, design):* the split is recorded in the tracker (T22a/b/c
 rows, T51 dep updated) and this section pins the data source, trigger, dialog
 model, and open path for the implementer. No code.
