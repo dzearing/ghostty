@@ -1034,6 +1034,13 @@ pub fn init(
                     // Machine.isLocalMachine); cross-machine windows leave it
                     // false and keep the idle-TTL.
                     .pinned = rb.local_shell_integration,
+                    // Reboot-floor policy (T12c): if this ATTACH target comes
+                    // back dead-but-relaunchable (the agent restarted), `auto`
+                    // respawns it in place; `prompt` shows the exited overlay.
+                    .relaunch_policy = switch (config.@"session-relaunch") {
+                        .auto => .auto,
+                        .prompt => .prompt,
+                    },
                 });
                 break :backend .{ .remote = io_remote };
             }

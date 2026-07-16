@@ -548,6 +548,17 @@ pub const AttachOutcome = struct {
     attached_elsewhere: bool,
     /// Present iff `status == .dead` (tombstone exit code, §7.1/§7.4).
     exit_code: ?i64,
+    /// Set (with `status == .dead`) when the dead session is a RELAUNCHABLE
+    /// tombstone the agent materialized from disk at start (§5.4 reboot floor,
+    /// T12b) — the recorded argv/cwd can respawn it via `relaunchChannel`. A
+    /// genuinely-exited child leaves this false. The caller uses it to decide
+    /// whether to auto-relaunch (T12c) instead of showing an exited overlay.
+    relaunchable: bool = false,
+    /// The agent-authoritative session channel the `ATTACHED` reply arrived on
+    /// (`rpc.channel`). Retained even for a dead attach (where no pane/ring is
+    /// kept) so the caller can address a follow-up `relaunchChannel` at the
+    /// SAME channel the agent will stream the respawned session on.
+    channel: u128 = 0,
     rows: u16,
     cols: u16,
     /// Duped from the reply and owned here (null when the reply omitted them).
@@ -562,6 +573,24 @@ pub const AttachOutcome = struct {
         if (self.title) |t| self.alloc.free(t);
         self.* = undefined;
     }
+};
+
+/// The outcome of `relaunchChannel` (§5.4 reboot floor, T12c). A `RELAUNCH`
+/// respawns a dead-but-relaunchable session in place and streams FRESH output
+/// from offset 0, so a live pane (`ok == true`) comes back with no resync
+/// watermark (unlike an attach, which gap-fills a retained ring).
+pub const RelaunchOutcome = struct {
+    /// The live pane on `ok == true`; null otherwise. Torn down via
+    /// `detachChannel`/`closeChannel` like any other pane.
+    pane: ?*Pane,
+    /// The session is alive under `pid` and streaming on its channel.
+    ok: bool,
+    /// The agent still has the session id. `ok == false, found == false` ⇒
+    /// reaped/unknown (the caller may fall back to a fresh OPEN); `ok == false,
+    /// found == true` ⇒ present but not relaunchable, or the respawn failed.
+    found: bool,
+    /// The respawned child pid (0 when `!ok`).
+    pid: i64,
 };
 
 /// A caller-owned, deep copy of a `PROC_SNAPSHOT` reply (§9.3 process view). The
@@ -1716,6 +1745,8 @@ pub const Connection = struct {
             .snapshot_at_offset = a.snapshot_at_offset,
             .attached_elsewhere = a.attached_elsewhere,
             .exit_code = a.exit_code,
+            .relaunchable = a.relaunchable,
+            .channel = id,
             .rows = a.rows,
             .cols = a.cols,
             .cwd = cwd,
@@ -1759,6 +1790,101 @@ pub const Connection = struct {
         keep_channel = true; // the pane now owns the registered ring
         outcome.pane = pane;
         return outcome;
+    }
+
+    /// Respawn a dead-but-relaunchable session on its known `channel` (§5.4 reboot
+    /// floor, T12c) and, on success, register the inbound ring + return a live pane.
+    ///
+    /// `channel` MUST be the agent-authoritative session channel a prior dead
+    /// `ATTACHED` reply arrived on (`AttachOutcome.channel`): the agent echoes
+    /// `RELAUNCHED` — and then streams the respawned session's DATA — on that same
+    /// channel. We PRE-REGISTER the ring on it before sending `RELAUNCH` (the note in
+    /// `attachChannelCancellable`) so no early output is dropped in the window
+    /// between the reply and ring registration, then keep it only on `ok`.
+    ///
+    /// A relaunch is a FRESH stream: the pane is created with `discard_below = 0`
+    /// and `resync_active = false` (no gap-fill replay, unlike an attach) so the
+    /// caller applies the respawned session's output from byte 0.
+    pub fn relaunchChannel(
+        self: *Connection,
+        session_id: []const u8,
+        channel: u128,
+        rows: u16,
+        cols: u16,
+        px_w: u16,
+        px_h: u16,
+    ) !RelaunchOutcome {
+        return self.relaunchChannelCancellable(session_id, channel, rows, cols, px_w, px_h, null);
+    }
+
+    /// `relaunchChannel` with an optional cancellation token (see `RpcCanceller`),
+    /// so surface teardown can wake a pane's IO thread out of a parked `RELAUNCH`.
+    pub fn relaunchChannelCancellable(
+        self: *Connection,
+        session_id: []const u8,
+        channel: u128,
+        rows: u16,
+        cols: u16,
+        px_w: u16,
+        px_h: u16,
+        canceller: ?*const RpcCanceller,
+    ) !RelaunchOutcome {
+        // Pre-register the inbound ring on the agent's known session channel so the
+        // respawned session's first DATA frames (the fresh shell prompt) are not
+        // dropped in the gap between RELAUNCHED and ring registration. Torn back
+        // down on any non-ok path (a value return doesn't fire `errdefer`).
+        const ch = try self.alloc.create(ring.Channel);
+        errdefer self.alloc.destroy(ch);
+        ch.* = try ring.Channel.init(self.alloc, channel, .{});
+        errdefer ch.deinit(self.alloc);
+        try self.registerChannel(ch);
+        var keep_channel = false;
+        errdefer if (!keep_channel) self.deregisterChannel(channel);
+
+        const req: protocol.Relaunch = .{
+            .session_id = session_id,
+            .rows = rows,
+            .cols = cols,
+            .px_w = px_w,
+            .px_h = px_h,
+        };
+        const json = try protocol.encodeJson(self.alloc, req);
+        defer self.alloc.free(json);
+        // The agent replies RELAUNCHED on the session's own channel (the relaunchable
+        // path), so correlate on the request channel we send it on.
+        const rpc = try self.rpcCall(channel, .relaunch, .relaunched, json, self.rpc_open_timeout_ns, canceller);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Relaunched, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        const r = parsed.value;
+
+        if (!r.ok) {
+            // Not respawned (reaped, not relaunchable, or spawn failed): keep no
+            // pane and tear the pre-registered channel back down here.
+            self.deregisterChannel(channel);
+            ch.deinit(self.alloc);
+            self.alloc.destroy(ch);
+            return .{ .pane = null, .ok = false, .found = r.found, .pid = r.pid };
+        }
+
+        const sid = try self.alloc.dupe(u8, session_id);
+        errdefer self.alloc.free(sid);
+        const pane = try self.alloc.create(Pane);
+        errdefer self.alloc.destroy(pane);
+        pane.* = .{
+            .id = channel,
+            .session_id = sid,
+            .pid = r.pid,
+            .ring = ch,
+            // A relaunch streams from offset 0 — no resync watermark, keep every byte.
+            .discard_below = 0,
+            .resync_active = false,
+        };
+        try self.trackPane(pane);
+        keep_channel = true; // the pane now owns the registered ring
+        return .{ .pane = pane, .ok = true, .found = true, .pid = r.pid };
     }
 
     /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote
@@ -2235,6 +2361,14 @@ pub const Connection = struct {
                 // Replies to PROC_KILL / PROC_SPAWN RPCs (§9.3 process control, inc
                 // 4+5). Same-channel correlation, like PROC_SNAPSHOT. Dropped if no
                 // caller is parked (a late reply after a timeout).
+                _ = self.deliverRpcReply(frame);
+            },
+            .relaunched => {
+                // Reply to a RELAUNCH RPC (§5.4 reboot floor, T12c). The agent echoes
+                // RELAUNCHED on the SESSION's channel (the relaunchable path), which is
+                // exactly the channel the client sent RELAUNCH on, so `deliverRpcReply`
+                // matches it via the `pending` map keyed by `frame.channel`. Dropped if
+                // no caller is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
             .pong => {
@@ -3599,6 +3733,9 @@ const LifecycleAgent = struct {
     snapshot_at_offset: u64 = 0,
     attached_elsewhere_first: bool = false, // true → first ATTACH reports stolen
     exit_code: ?i64 = null,
+    /// Reported in ATTACHED (T12c): a dead session materialized from disk that
+    /// can be respawned via RELAUNCH. Set alongside `attach_status = .dead`.
+    attach_relaunchable: bool = false,
     /// When true the agent receives OPEN but NEVER replies OPENED (models a remote
     /// session whose command/cwd failed to spawn). Exercises the RPC timeout so a
     /// silent agent can't wedge the caller (the pane IO thread) forever.
@@ -3621,6 +3758,16 @@ const LifecycleAgent = struct {
     saw_metrics_sub: std.atomic.Value(bool) = .{ .raw = false },
     saw_metrics_unsub: std.atomic.Value(bool) = .{ .raw = false },
     saw_proc_list: std.atomic.Value(bool) = .{ .raw = false },
+
+    // RELAUNCH reply config (T12c). A RELAUNCH gets RELAUNCHED on the SAME
+    // channel with these values; `saw_relaunch` records that one arrived and
+    // `relaunch_channel` the channel it came in on (must equal the dead ATTACHED
+    // channel the client re-uses).
+    relaunch_ok: bool = true,
+    relaunch_found: bool = true,
+    relaunch_pid: i64 = 5555,
+    saw_relaunch: std.atomic.Value(bool) = .{ .raw = false },
+    relaunch_channel: std.atomic.Value(u128) = .{ .raw = 0 },
 
     // PROC_KILL / PROC_SPAWN reply config (inc 4+5). A PROC_KILL for `kill_fail_pid`
     // replies ok=false (models no-such-pid); any other pid succeeds. PROC_SPAWN
@@ -3685,6 +3832,22 @@ const LifecycleAgent = struct {
                         .snapshot_at_offset = self.snapshot_at_offset,
                         .exit_code = self.exit_code,
                         .attached_elsewhere = elsewhere,
+                        .relaunchable = self.attach_relaunchable,
+                    });
+                },
+                .relaunch => {
+                    // Reply RELAUNCHED on the SAME channel (the relaunchable path),
+                    // as the real agent does when the tombstone is respawnable.
+                    self.saw_relaunch.store(true, .monotonic);
+                    self.relaunch_channel.store(frame.channel, .monotonic);
+                    var parsed = protocol.parseJson(protocol.Relaunch, self.alloc, frame.payload) catch continue;
+                    defer parsed.deinit();
+                    const sid = parsed.value.session_id;
+                    try self.ctrl.sendJson(.relaunched, frame.channel, protocol.Relaunched{
+                        .session_id = sid,
+                        .ok = self.relaunch_ok,
+                        .pid = if (self.relaunch_ok) self.relaunch_pid else 0,
+                        .found = self.relaunch_found,
                     });
                 },
                 .get_cwd => {
@@ -4550,6 +4713,93 @@ test "attachChannel: dead status surfaces exit_code; no pane" {
     try testing.expectEqual(protocol.Attached.AttachStatus.dead, outcome.status);
     try testing.expectEqual(@as(i64, 137), outcome.exit_code.?);
     try testing.expect(outcome.pane == null);
+}
+
+test "attachChannel: dead+relaunchable surfaces relaunchable + the session channel (T12c)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true; // a disk-materialized tombstone, no exit_code
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("reboot-floor", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.dead, outcome.status);
+    try testing.expect(outcome.relaunchable);
+    try testing.expect(outcome.pane == null);
+    // The channel the ATTACHED arrived on is retained so a follow-up RELAUNCH can
+    // target the same channel the agent will stream the respawned session on.
+    a.saw_request.wait();
+    try testing.expectEqual(a.seen_channel.load(.monotonic), outcome.channel);
+    try testing.expect(outcome.channel != 0);
+}
+
+test "relaunchChannel: revives a dead session → live pane, fresh stream routes DATA (T12c)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = true;
+    a.relaunch_pid = 31337;
+    try h.start();
+
+    // 1) Dead attach learns the session channel.
+    var outcome = try h.conn.attachChannel("sess-reboot", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expect(outcome.pane == null);
+    const channel = outcome.channel;
+
+    // 2) RELAUNCH on that channel → a live pane streaming from offset 0.
+    const r = try h.conn.relaunchChannel("sess-reboot", channel, 24, 80, 0, 0);
+    try testing.expect(r.ok);
+    try testing.expect(r.found);
+    try testing.expectEqual(@as(i64, 31337), r.pid);
+    const pane = r.pane orelse return error.NoPane;
+    try testing.expectEqual(channel, pane.id);
+    try testing.expectEqualStrings("sess-reboot", pane.session_id);
+
+    // The RELAUNCH went out on the SAME channel the dead ATTACHED came in on.
+    try testing.expect(a.saw_relaunch.load(.monotonic));
+    try testing.expectEqual(channel, a.relaunch_channel.load(.monotonic));
+
+    // Fresh output on the channel (offset 0, no resync discard) lands in the ring.
+    try agentSendData(&h.data_agent, pane.id, 0, "back after reboot");
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, "back after reboot".len);
+    try testing.expectEqualStrings("back after reboot", got.items);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "relaunchChannel: ok=false found=false → no pane, channel torn down (T12c)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = false; // agent reaped the tombstone between attach and relaunch
+    a.relaunch_found = false;
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("sess-gone", 24, 80, 0, false);
+    defer outcome.deinit();
+    const channel = outcome.channel;
+
+    const r = try h.conn.relaunchChannel("sess-gone", channel, 24, 80, 0, 0);
+    try testing.expect(!r.ok);
+    try testing.expect(!r.found);
+    try testing.expect(r.pane == null);
+    // The pre-registered channel was deregistered: later DATA on it is dropped
+    // without crashing (no pane owns it).
+    try agentSendData(&h.data_agent, channel, 0, "should be dropped");
+    try testing.expect(a.err == null);
 }
 
 test "attachChannel: not_found surfaces; no pane" {

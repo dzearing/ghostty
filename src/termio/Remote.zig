@@ -94,6 +94,13 @@ argv: ?[]const []const u8,
 /// for a persistent LOCAL-agent pane; sent in `OPEN.pinned`. Ignored on ATTACH.
 pinned: bool,
 
+/// What to do when an ATTACH finds the session a DEAD-but-relaunchable tombstone
+/// (the agent itself restarted and materialized it from disk, §5.4 reboot floor,
+/// T12c). `.auto` respawns it in place (`RELAUNCH`) and shows a restarted
+/// divider; `.prompt` leaves the pane in its exited state for the user to decide.
+/// Only meaningful for the LOCAL-agent ATTACH path; irrelevant on OPEN-new.
+relaunch_policy: RelaunchPolicy,
+
 /// Current grid/screen size, seeded by `initTerminal` and updated by `resize`.
 /// Sent in `OPEN`/`RESIZE` (rows/cols + pixel geometry, §6.5).
 grid_size: renderer.GridSize = .{},
@@ -181,7 +188,16 @@ pub const Config = struct {
     /// (they keep the idle-TTL). Sent in `OPEN.pinned`; irrelevant on ATTACH
     /// (the session was pinned at its original OPEN).
     pinned: bool = false,
+
+    /// Relaunch policy for a dead-but-relaunchable ATTACH target (T12c). See the
+    /// `relaunch_policy` field doc. Defaults to `.auto`.
+    relaunch_policy: RelaunchPolicy = .auto,
 };
+
+/// What a restored pane does when its ATTACH target comes back as a
+/// dead-but-relaunchable tombstone across an agent restart (§5.4, T12c). Mirrors
+/// `config.SessionRelaunch`; kept local so this backend need not import config.
+pub const RelaunchPolicy = enum { auto, prompt };
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
 /// (`Surface.zig`) can build the forwarded env list without importing the wire
@@ -228,6 +244,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .env = env,
         .argv = argv,
         .pinned = cfg.pinned,
+        .relaunch_policy = cfg.relaunch_policy,
         .arena = arena,
     };
 }
@@ -314,6 +331,11 @@ pub fn threadEnter(
 ) !void {
     _ = alloc;
 
+    // Set true when the pane below came back via RELAUNCH (a dead-but-relaunchable
+    // session respawned across an agent restart) rather than a live attach/open —
+    // used after bring-up to print a "session restarted" divider (T12c).
+    var did_relaunch = false;
+
     // Open a new session or attach to an existing one to obtain our pane.
     const pane: *connection.Pane = if (self.session_id) |sid| pane: {
         // ATTACH: re-attach to an existing agent session (§3.3 / §7.3).
@@ -345,17 +367,56 @@ pub fn threadEnter(
             outcome = try self.conn.attachChannelCancellable(sid, rows, cols, 0, true, &self.canceller);
         }
         defer outcome.deinit();
-        const p = outcome.pane orelse {
-            // .dead / .not_found / attached_elsewhere(!force): nothing registered.
-            // The caller (4b) decides recovery tier (§7.4); for now this is fatal
-            // to the pane bring-up. (`defer outcome.deinit()` frees it once.)
+        if (outcome.pane) |p| break :pane p;
+
+        // No live pane. A DEAD-but-relaunchable tombstone means the AGENT itself
+        // restarted (a reboot or an agent upgrade) and materialized this session
+        // from its on-disk metadata (§5.4 reboot floor, T12b) — the recorded
+        // argv/cwd can bring the process back. With the `auto` policy (the
+        // default), RELAUNCH it in place on the SAME channel the dead ATTACHED
+        // arrived on and stream fresh output; `prompt` falls through to the
+        // exited overlay so the user decides.
+        if (outcome.status == .dead and outcome.relaunchable and
+            self.relaunch_policy == .auto)
+        {
+            const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
+            const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
+            const r = self.conn.relaunchChannelCancellable(
+                sid,
+                outcome.channel,
+                rows,
+                cols,
+                px_w,
+                px_h,
+                &self.canceller,
+            ) catch |err| {
+                log.warn("relaunch of dead session failed err={}", .{err});
+                return error.RemoteAttachFailed;
+            };
+            if (r.pane) |p| {
+                log.info(
+                    "relaunched dead session pid={} ok={} found={}",
+                    .{ r.pid, r.ok, r.found },
+                );
+                did_relaunch = true;
+                break :pane p;
+            }
             log.warn(
-                "attach did not yield a live pane status={} attached_elsewhere={}",
-                .{ outcome.status, outcome.attached_elsewhere },
+                "relaunch did not yield a live pane ok={} found={}",
+                .{ r.ok, r.found },
             );
             return error.RemoteAttachFailed;
-        };
-        break :pane p;
+        }
+
+        // .dead(!relaunchable, or prompt policy) / .not_found /
+        // attached_elsewhere(!force): nothing registered. The caller (4b) decides
+        // recovery tier (§7.4); for now this is fatal to the pane bring-up.
+        // (`defer outcome.deinit()` frees it once.)
+        log.warn(
+            "attach did not yield a live pane status={} relaunchable={} attached_elsewhere={}",
+            .{ outcome.status, outcome.relaunchable, outcome.attached_elsewhere },
+        );
+        return error.RemoteAttachFailed;
     } else pane: {
         // OPEN-new: start a brand-new remote session (§3.3 open-new).
         const open: protocol.Open = .{
@@ -418,6 +479,16 @@ pub fn threadEnter(
         td,
         ringReady,
     );
+
+    // A relaunched session (T12c) streams a FRESH shell from offset 0 — its
+    // pre-restart scrollback is gone (the killed agent lost the ring; ring disk
+    // snapshots are T13). Print a divider ABOVE that fresh output so the restart
+    // is visible rather than looking like a spontaneous new prompt. Injected
+    // through the same terminal parse path as agent DATA, before the first drain.
+    if (did_relaunch) {
+        const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ io, divider });
+    }
 
     // Drain once immediately in case DATA landed in the ring between registration
     // and arming the wait (the agent may stream a snapshot right after OPENED).

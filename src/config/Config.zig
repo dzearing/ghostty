@@ -1215,6 +1215,24 @@ command: ?Command = null,
 /// Defaults to `false`.
 @"session-persistence": bool = false,
 
+/// Session relaunch policy (macOS, requires `session-persistence`): controls what
+/// a restored window does when a pane's persisted session comes back from the
+/// agent as a DEAD-but-relaunchable tombstone — i.e. the agent itself restarted
+/// (a reboot, an agent upgrade) and materialized the session's recorded
+/// metadata from disk but the child process is not running. There are two
+/// options:
+///
+///   * `auto` (the default) - immediately `RELAUNCH` the recorded command/shell
+///     in the same pane and print a `--- session restarted ---` divider above
+///     the fresh output.
+///   * `prompt` - do NOT auto-respawn; the pane comes up in its exited state so
+///     the user decides whether to bring it back.
+///
+/// This has no effect when the agent kept running (the ordinary app-upgrade /
+/// crash case): the session is still alive and simply re-attaches with its
+/// scrollback intact. It only matters across an agent restart.
+@"session-relaunch": SessionRelaunch = .auto,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///
@@ -10312,6 +10330,12 @@ pub const WindowPadding = struct {
 pub const Scrollbar = enum {
     system,
     never,
+};
+
+/// See session-relaunch
+pub const SessionRelaunch = enum {
+    auto,
+    prompt,
 };
 
 /// See scroll-to-bottom
