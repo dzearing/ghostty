@@ -54,12 +54,12 @@ extension AppDelegate {
             // by session id answers ok=false for a dead/unknown session,
             // bounded timeout — same probe as the relay restore).
             DispatchQueue.global(qos: .userInitiated).async {
-                let alive = Self.probeSessions(entries: restorable, handle: connection.handle)
+                let probe = Self.probeSessions(entries: restorable, handle: connection.handle)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.presentRestoredSessionWindows(
                         entries: restorable,
-                        alive: alive,
+                        probe: probe,
                         connection: connection)
                     self.sessionLayoutRestoreFinished()
                 }
@@ -81,27 +81,39 @@ extension AppDelegate {
         }
     }
 
-    /// The set of recorded session ids the agent still knows. Blocking
+    /// The tri-state liveness of every recorded session id (T06b). Blocking
     /// (bounded per-session RPC timeout) — background queue only.
+    ///
+    /// The distinction is what makes the drop policy safe: an empty
+    /// `query_cwd` reply is NOT proof a session is gone (seen live: a fast
+    /// relaunch races the agent's dead-peer detection, so every probe comes
+    /// back empty while every shell is still alive). Only a POSITIVE
+    /// not-found from the agent may forget a persisted entry; a
+    /// timeout/transport failure / older-agent reply stays `.unknown` and the
+    /// entry is kept.
+    enum SessionLiveness { case alive, dead, unknown }
+
     private static func probeSessions(
         entries: [SessionLayoutManifest.Entry],
         handle: ghostty_remote_connection_t
-    ) -> Set<String> {
-        var alive = Set<String>()
-        var probed = Set<String>()
+    ) -> [String: SessionLiveness] {
+        var result = [String: SessionLiveness]()
         for entry in entries {
             guard let tree = entry.tree else { continue }
             for leaf in SessionLayoutManifest.leaves(of: tree) {
                 guard let sid = leaf.sessionID, !sid.isEmpty,
-                      probed.insert(sid).inserted else { continue }
-                let cwd = sid.withCString {
-                    Ghostty.AllocatedString(
-                        ghostty_remote_connection_query_cwd_timeout(handle, $0, 5000)).string
+                      result[sid] == nil else { continue }
+                let code = sid.withCString {
+                    ghostty_remote_connection_probe_session(handle, $0, 5000)
                 }
-                if !cwd.isEmpty { alive.insert(sid) }
+                result[sid] = switch code {
+                case 1: .alive
+                case 0: .dead
+                default: .unknown
+                }
             }
         }
-        return alive
+        return result
     }
 
     /// Build every restorable window on the main thread. Entries sharing a
@@ -110,7 +122,7 @@ extension AppDelegate {
     @MainActor
     private func presentRestoredSessionWindows(
         entries: [SessionLayoutManifest.Entry],
-        alive: Set<String>,
+        probe: [String: SessionLiveness],
         connection: RemoteConnection
     ) {
         // Double-restore guard: an entry already bound to an open window
@@ -140,13 +152,23 @@ extension AppDelegate {
             for entry in group.sorted(by: { $0.tabIndex < $1.tabIndex }) {
                 guard !openEntryIDs.contains(entry.id), let tree = entry.tree else { continue }
 
-                // An entry with no live leaf has nothing to re-attach: drop
-                // it (uncaptured ids count as dead — attaching nil would
-                // OPEN a fresh session, which is not this entry's session).
+                // Drop policy (T06b): forget an entry ONLY when every leaf is
+                // POSITIVELY dead. A leaf whose probe was inconclusive
+                // (`.unknown` — fast-relaunch race, timeout, older agent) or a
+                // leaf with no recorded id is NOT proof the session is gone, so
+                // the entry is kept and rebuilt; `.unknown` leaves attach and
+                // (if the agent truly lost them) show their exited overlay,
+                // while a live session re-attaches normally. Losing a persisted
+                // layout to a transient probe failure is worse than a stale
+                // entry that recovers on the next launch.
                 let leaves = SessionLayoutManifest.leaves(of: tree)
-                let liveLeaves = leaves.filter { $0.sessionID.map(alive.contains) == true }
-                guard !liveLeaves.isEmpty else {
-                    Self.logger.info("session restore: all \(leaves.count) leaf sessions gone; dropping entry \(entry.id.uuidString, privacy: .public)")
+                let liveness: (SessionLayoutManifest.Leaf) -> SessionLiveness = { leaf in
+                    guard let sid = leaf.sessionID, !sid.isEmpty else { return .unknown }
+                    return probe[sid] ?? .unknown
+                }
+                let allDead = leaves.allSatisfy { liveness($0) == .dead }
+                guard !allDead else {
+                    Self.logger.info("session restore: all \(leaves.count) leaf sessions POSITIVELY dead; dropping entry \(entry.id.uuidString, privacy: .public)")
                     SessionLayoutManifest.shared.remove(entry.id)
                     continue
                 }

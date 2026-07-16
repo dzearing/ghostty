@@ -929,6 +929,11 @@ pub const Server = struct {
             .session_id = id_copy,
             .path = cwd,
             .ok = cwd != null,
+            // POSITIVE existence signal (T06b): restore probes must be able to
+            // tell "this session id is gone from the table" (safe to forget the
+            // layout entry) apart from "the session exists but the cwd read
+            // failed / child exited" (keep the entry; it is still attachable).
+            .found = s != null,
         }) catch {};
     }
 
@@ -1621,6 +1626,7 @@ test "GET_CWD→CWD: agent replies with the child's queried cwd on the request c
     try testing.expect(parsed.value.path != null);
     try testing.expectEqualStrings("/private/tmp", parsed.value.path.?);
     try testing.expectEqualStrings(opened.id[0..], parsed.value.session_id);
+    try testing.expectEqual(@as(?bool, true), parsed.value.found);
 }
 
 test "WEDGE: a session's blocking child write must NOT hold the global store lock" {
@@ -1693,6 +1699,9 @@ test "GET_CWD→CWD: unknown session replies ok=false (graceful, no crash)" {
     defer parsed.deinit();
     try testing.expect(!parsed.value.ok);
     try testing.expect(parsed.value.path == null);
+    // POSITIVE not-found (T06b): an unknown id must report found=false so a
+    // restore probe may safely forget it (vs. a transient cwd-read failure).
+    try testing.expectEqual(@as(?bool, false), parsed.value.found);
 }
 
 test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {

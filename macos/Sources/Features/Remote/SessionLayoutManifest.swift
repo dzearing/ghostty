@@ -407,7 +407,12 @@ final class SessionLayoutManifest {
         let tree: Node? = controller.surfaceTree.root.map { root in
             Self.encodeNode(root) { view in
                 Leaf(
-                    sessionID: Self.liveSessionID(of: view),
+                    // Fall back to the id the surface was CREATED to attach
+                    // when the live id is unavailable — surface creation can
+                    // fail entirely (dark-wake OutOfMemory, T06b) and a sync
+                    // in that state must not wipe the recorded session id
+                    // (next launch would then drop the whole entry).
+                    sessionID: Self.liveSessionID(of: view) ?? view.expectedRemoteSessionID,
                     title: view.title,
                     ipcName: ipc?.registeredPaneName(forSurface: view))
             }

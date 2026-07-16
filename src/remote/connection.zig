@@ -1328,6 +1328,46 @@ pub const Connection = struct {
         return self.alloc.dupe(u8, path);
     }
 
+    /// Tri-state result of a session liveness probe (T06b). The distinction
+    /// matters for session-restore drop policy: only `.dead` (the agent
+    /// POSITIVELY reported the id absent from its table) may forget a persisted
+    /// layout entry; `.unknown` (RPC failure/timeout, malformed reply, or an
+    /// older agent that can't disambiguate) must keep it.
+    pub const SessionProbe = enum { alive, dead, unknown };
+
+    /// Probe whether the agent still knows `session_id` (T06b). Rides the same
+    /// GET_CWD/CWD same-channel RPC as `queryCwdTimeout` but interprets the
+    /// reply's existence signal instead of its path:
+    ///   - `ok == true`  ⇒ `.alive` (session exists; cwd even resolved)
+    ///   - `found == true`  ⇒ `.alive` (exists/attachable; cwd read failed —
+    ///     e.g. the child exited but the session ring is retained)
+    ///   - `found == false` ⇒ `.dead` (positively absent from the table)
+    ///   - anything else (timeout, transport error, malformed reply, older
+    ///     agent without `found`) ⇒ `.unknown`
+    /// Never returns an error: probe failures are themselves a result.
+    pub fn probeSessionTimeout(
+        self: *Connection,
+        session_id: []const u8,
+        timeout_ns: u64,
+    ) SessionProbe {
+        const req_channel = std.crypto.random.int(u128);
+        const get: protocol.GetCwd = .{ .session_id = session_id };
+        const json = protocol.encodeJson(self.alloc, get) catch return .unknown;
+        defer self.alloc.free(json);
+
+        const rpc = self.rpcCall(req_channel, .get_cwd, .cwd, json, timeout_ns, null) catch
+            return .unknown;
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Cwd, self.alloc, rpc.payload) catch
+            return .unknown;
+        defer parsed.deinit();
+
+        if (parsed.value.ok) return .alive;
+        const found = parsed.value.found orelse return .unknown;
+        return if (found) .alive else .dead;
+    }
+
     /// Request the remote host's process table (§9.3 process view). Sends
     /// `PROC_LIST{sort, limit}` and awaits `PROC_SNAPSHOT{ok, host, procs,
     /// truncated}`, returning a caller-owned DEEP COPY (`OwnedProcSnapshot`): every
@@ -3451,7 +3491,10 @@ const LifecycleAgent = struct {
     // GET_CWD reply contents. `cwd_reply == null` ⇒ reply CWD{ok=false}; else
     // reply CWD{ok=true, path}. When `silent_cwd` is true the agent receives
     // GET_CWD but never replies (exercises the queryCwd RPC timeout).
+    // `cwd_found` is the CWD reply's existence signal (T06b): null models an
+    // OLDER agent that predates the field.
     cwd_reply: ?[]const u8 = "/private/tmp",
+    cwd_found: ?bool = null,
     silent_cwd: bool = false,
 
     // METRICS push contents. On `.metrics_sub` the agent pushes `metrics_push_count`
@@ -3538,6 +3581,7 @@ const LifecycleAgent = struct {
                         .session_id = sid,
                         .path = self.cwd_reply,
                         .ok = self.cwd_reply != null,
+                        .found = self.cwd_found,
                     });
                 },
                 .close => {
@@ -3805,6 +3849,75 @@ test "queryCwd: agent reporting ok=false surfaces CwdUnavailable (no hang)" {
     try h.start();
 
     try testing.expectError(error.CwdUnavailable, h.conn.queryCwd("sess-1"));
+}
+
+test "probeSession: tri-state — ok=true is alive regardless of found" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    h.configure().cwd_reply = "/private/tmp/work"; // ok=true
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.alive,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: found=true with a failed cwd read is still alive (attachable)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.cwd_reply = null; // ok=false (cwd read failed)…
+    a.cwd_found = true; // …but the session exists
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.alive,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: found=false is POSITIVE dead" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.cwd_reply = null;
+    a.cwd_found = false;
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.dead,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: an older agent (no found field) is INCONCLUSIVE, never dead" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    h.configure().cwd_reply = null; // ok=false, found omitted (old agent)
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.unknown,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: a silent agent times out as unknown (no error, no hang)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.createWithTimeout(alloc, 50 * std.time.ns_per_ms);
+    defer h.destroy();
+    h.configure().silent_cwd = true;
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.unknown,
+        h.conn.probeSessionTimeout("sess-1", 50 * std.time.ns_per_ms),
+    );
 }
 
 test "queryCwd: a silent agent (no CWD reply) times out instead of deadlocking" {

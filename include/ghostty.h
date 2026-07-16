@@ -1393,6 +1393,15 @@ GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd(
 GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd_timeout(
     ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
 
+// Tri-state session liveness probe (session-restore drop policy). Returns:
+//   1  => alive (the agent has the session; it is attachable)
+//   0  => POSITIVELY dead (the agent replied and does not have it)
+//   -1 => inconclusive (timeout/transport failure, or an agent too old to
+//         disambiguate) — callers must only forget persisted state on 0.
+// timeout_ms 0 => default 10s bound. Blocking; call off the main thread.
+GHOSTTY_API int ghostty_remote_connection_probe_session(
+    ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
+
 // A host-metrics snapshot pushed by the remote agent (activity monitor). Mirrors
 // the wire HostMetrics. uptime_s is 0 when the remote OS doesn't expose uptime;
 // load1 is -1 when there is no load average (e.g. Windows).

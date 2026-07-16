@@ -208,6 +208,14 @@ extension Ghostty {
         // by the user, this is set to the prior value (which may be empty, but non-nil).
         private var titleFromTerminal: String?
 
+        // The agent session id this surface was ASKED to attach (from its
+        // creation config), independent of whether surface creation succeeded.
+        // Session-layout sync falls back to this when the live session id is
+        // unavailable (`ghostty_surface_new` failed — e.g. the known dark-wake
+        // OutOfMemory — or the termio thread hasn't published yet), so a failed
+        // restore can never wipe a manifest entry's recorded session ids (T06b).
+        private(set) var expectedRemoteSessionID: String?
+
         // The cached contents of the screen.
         private(set) var cachedScreenContents: CachedValue<String>
         private(set) var cachedVisibleContents: CachedValue<String>
@@ -350,6 +358,7 @@ extension Ghostty {
 
             // Setup our surface. This will also initialize all the terminal IO.
             let surface_cfg = baseConfig ?? SurfaceConfiguration()
+            self.expectedRemoteSessionID = surface_cfg.remoteSessionId
             self.backgroundTint = surface_cfg.backgroundTint
             self.backgroundTintNSColor = surface_cfg.backgroundTintNSColor
                 ?? surface_cfg.backgroundTint.map { NSColor($0).resolvedSRGB }

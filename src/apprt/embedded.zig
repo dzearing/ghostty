@@ -2090,6 +2090,17 @@ pub const CAPI = struct {
     ) ?*Surface {
         return surface_new_(app, opts) catch |err| {
             log.err("error initializing surface err={}", .{err});
+            // Log the error-return trace addresses (T06b diagnostics): a live
+            // incident produced a persistent, unexplained error.OutOfMemory
+            // from this path; if it recurs these addresses attribute the
+            // failing `try` (symbolicate offline with atos against this
+            // binary). Debug builds only (release strips the trace).
+            if (@errorReturnTrace()) |trace| {
+                const n = @min(trace.index, trace.instruction_addresses.len);
+                for (trace.instruction_addresses[0..n], 0..) |addr, i| {
+                    log.err("surface init error trace[{d}] addr=0x{x}", .{ i, addr });
+                }
+            }
             return null;
         };
     }
@@ -2552,6 +2563,38 @@ pub const CAPI = struct {
         else
             @as(u64, timeout_ms) * std.time.ns_per_ms;
         return queryCwdImpl(handle, session_id, ns);
+    }
+
+    /// Probe whether the agent still knows `session_id` (T06b session-restore
+    /// liveness). Same GET_CWD RPC as `_query_cwd_timeout`, different contract:
+    /// the result is TRI-STATE so the caller can apply a conservative drop
+    /// policy. Returns:
+    ///   -  1 ⇒ alive (the agent has the session; it is attachable)
+    ///   -  0 ⇒ POSITIVELY dead (the agent replied and does not have it)
+    ///   - -1 ⇒ inconclusive (timeout/transport failure, connection not
+    ///          established, or an agent too old to disambiguate)
+    /// Callers must only forget persisted state on 0 — never on -1.
+    /// `timeout_ms == 0` ⇒ the default RPC bound. Blocking; call off the main
+    /// thread.
+    export fn ghostty_remote_connection_probe_session(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ms: u32,
+    ) c_int {
+        const conn = handle.conn() orelse return -1;
+        const sid = std.mem.sliceTo(session_id, 0);
+        if (sid.len == 0) return -1;
+
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            10 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        return switch (conn.probeSessionTimeout(sid, timeout_ns)) {
+            .alive => 1,
+            .dead => 0,
+            .unknown => -1,
+        };
     }
 
     fn queryCwdImpl(

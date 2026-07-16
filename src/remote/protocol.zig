@@ -491,10 +491,19 @@ pub const GetCwd = struct {
 /// `CWD` (0x23). Reply to `GET_CWD`. `ok == false` (and `path == null`) when the
 /// query failed (session gone, or the OS cwd read failed); the client then opens
 /// the new pane with no cwd hint rather than failing.
+///
+/// `found` (additive, T06b) disambiguates the two `ok == false` causes: `false`
+/// means the agent POSITIVELY does not have this session id in its table (it is
+/// gone for good — safe to forget); `true` means the session exists (attachable)
+/// but the cwd read failed. `null` ⇒ an older agent that predates the field, so
+/// an `ok == false` reply stays INCONCLUSIVE — session-restore liveness probes
+/// must not treat it as dead (losing a persisted layout on a transient probe
+/// failure is worse than keeping a stale entry).
 pub const Cwd = struct {
     session_id: []const u8,
     path: ?[]const u8 = null,
     ok: bool = false,
+    found: ?bool = null,
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
