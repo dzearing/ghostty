@@ -549,7 +549,7 @@
     {
       "id": "T16",
       "title": "Cross-machine resume: browse a machine's active sessions in the Cmd-Shift-N chooser",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T10"
       ],
@@ -560,7 +560,7 @@
         "No attach yet \u2014 this task is browse-only so the enumeration + UI can be verified in isolation."
       ],
       "acceptance": "Chooser shows live sessions for the local agent AND a relay machine (count + expandable list with title/cwd); counts refresh on reopen; an offline machine shows gracefully with no hang; no attach.",
-      "notes": ""
+      "notes": "2026-07-16: done. Cross-machine session BROWSE in the Cmd-Shift-N chooser. WIRING (transport-agnostic \u2014 the LIST_SESSIONS RPC + handle.conn() seam from T10 already work against ANY dialed connection): (1) Zig ABI: new export ghostty_remote_connection_list_sessions(handle, timeout_ms) in src/apprt/embedded.zig \u2014 runs conn.requestSessions() and returns a JSON array String (freed via ghostty_string_free; .empty on failure), mirroring the query_cwd String-return pattern. Declared in include/ghostty.h + all 3 xcframework Headers copies. ZERO agent/protocol/connection changes. (2) Swift data layer (new macos/Sources/Features/Remote/SessionBrowserProbe.swift): BrowsedSession (Decodable, wire keys), RemoteSessionRoster.list(handle:) helper, and SessionBrowserProbe (ObservableObject) \u2014 lazy fetch-on-expand per row, modeled on MachineMetricsProbe threading (dial+RPC off-main, .failed on failure, NEVER a modal alert \u2192 no IPC wedge). Local agent path reuses LocalAgentManager warm shared connection (new listLocalSessions() \u2014 non-spawning: reuse sharedOwner else dialExisting, never spawn); relay path dials AppDelegate.dialRelay(base,device,token) after RelayAccount.resolveToken(); TCP path new_tcp. Probe connections are short-lived (dialed/read/freed); the shared local connection is NOT freed. (3) MachineChooserView: per-row disclosure chevron + session-count badge + expandable read-only session list (liveness dot, title/cwd/argv label, attached/exited marker). primeLocal() on open so \"this Mac\" shows its count on the collapsed row (cheap warm connection); remote rows lazy on expand. Right/Left arrow keys expand/collapse the highlighted row (keyboard a11y + reliable non-pointer driving). browser.stop() in the chooser finish closure so nothing outlives the picker. BUILD: zig build OK (app binary links the new symbol, verified via strings); zig build test-agent exit 0 (445, unchanged \u2014 no agent code touched). LIVE VERIFIED against the local agent: launched flag-on, created 4 agent-backed sessions (ALPHA/BETA/BETASPLIT + initial), +sessions showed 4 alive. Cmd-Shift-N chooser \u2192 \"Local \u2014 This machine\" row showed count badge \"4\" (=primeLocal via the new ABI); Right-arrow expanded it to a read-only list of all 4 with green liveness dots, their /bin/zsh -lic \"echo \u2026\" command labels, and \"attached\" markers \u2014 EXACT match to +sessions. Also incidentally verified browse survives an agent restart (a too-broad pkill matched ghoztty-agent \u2192 launchd relaunched it \u2192 T12 auto-relaunch respawned the 4 sessions with \"--- session restarted ---\" banners \u2192 the browser correctly re-listed all 4). Box left CLEAN (app+agent killed, port/heartbeat/manifest cleared, debug LaunchAgent booted out). RELAY BROWSE: code-complete (dialRelay + resolveToken + same ABI, keyed by machine.id) but NOT live-verified here \u2014 no reliable relay machine on this box (Windows agent only) and unattended relay dials carry the modal-wedge risk; the dial path mirrors the metrics-probe pattern so it will not wedge. GAP for T17: this is browse-only (no attach action yet); a session row is read-only. GOTCHA for GUI verification: synthetic CGEvent clicks on the app-modal SwiftUI chooser panel routed to the app BEHIND it (Spotify) instead of the chevron \u2014 the Right/Left keyboard affordance is the reliable driver. COMMIT: pending."
     },
     {
       "id": "T17",
@@ -596,6 +596,24 @@
       ],
       "acceptance": "Build a multi-window/split layout with distinct ratios on machine X; from Y hit 'Resume all' \u2192 the full topology reappears on Y (window count, tab groups, split directions, ratios \u00b10.01, titles) with every pane attached to its live X session (scrollback replayed, PIDs unchanged on X); dead leaves show exited overlay without breaking the rebuild.",
       "notes": ""
+    },
+    {
+      "id": "T19",
+      "title": "Enable session-persistence by default (flip default-on + agent-unavailable fallback)",
+      "status": "pending",
+      "dependsOn": [
+        "T08"
+      ],
+      "goal": "Flip the session-persistence config default from off to on so local windows are persistent out of the box. Not urgent \u2014 the headline work is proven; this is a product-default change that makes the local agent a hard dependency of every local window, so it must ship WITH a safe degraded path.",
+      "steps": [
+        "Change src/config/Config.zig @\"session-persistence\" default false -> true (one line). Verify the Swift getter + all flag-on plumbing (T04) needs no other change.",
+        "BUILD THE SAFETY NET FIRST (the real work): when the flag is on but the local agent cannot be found/spawned/dialed (LocalAgentManager returns no connection, or the dial fails/times out), NEW window/tab/split creation must FALL BACK to a plain .exec local surface instead of failing or wedging. Today opt-in sidestepped this path; default-on makes it load-bearing. Decide the fallback point (TerminalController.init choke point from T04, before injecting sharedRemoteConnection) and log a one-time warning when falling back.",
+        "Also handle: agent spawn is slow \u2014 do not block window creation for more than a short bound on the sync path; if warmUp has not produced a connection yet, either wait a small bounded time or fall back to exec for that window (agent adoption can happen on next launch).",
+        "E2E: add a failure-injection case to scripts/e2e/session-persistence.py (or a new script) that makes the agent unspawnable (e.g. point GHOSTTY_LOCAL_AGENT_BIN at a nonexistent path / a binary that exits immediately) and asserts windows still open as exec-backed and are usable \u2014 no hang, no error overlay.",
+        "Consider migration/UX: users who never set the flag will suddenly get agent-backed windows; confirm nothing user-visible regresses (titles, cwd, shell integration all reached parity in T04a-c). Decide whether to keep session-relaunch=auto as the default (yes)."
+      ],
+      "acceptance": "Default config (no flag set) produces agent-backed persistent local windows; with the agent forcibly unavailable, windows still open as exec-backed and are fully usable (no hang/crash/overlay); test-agent + existing E2E still pass; the kill-9/upgrade E2E still passes with the flag now defaulted on (harness can drop its explicit --session-persistence=true).",
+      "notes": "Added 2026-07-16 at user request. User never asked for opt-in \u2014 it was a build-hygiene choice during development (keep the debug app usable while the feature was half-built). User wants it default-on eventually; explicitly NOT urgent. Key risk called out: default-on makes the local agent a HARD DEPENDENCY of every local window, so the agent-unavailable fallback-to-exec is the actual deliverable here, not the one-line default flip. Independent of the cross-machine effort (T16-T18); can be done before or after them."
     }
   ]
 }

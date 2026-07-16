@@ -1424,6 +1424,16 @@ GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd_timeout(
 GHOSTTY_API int ghostty_remote_connection_probe_session(
     ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
 
+// Enumerate every session the connected agent owns (cross-machine session
+// browse). Runs the same LIST_SESSIONS RPC as `ghoztty +sessions`, but against
+// any dialed connection (local agent or a relay machine). Returns a JSON array
+// string, each element {id, alive, exit_code, attached, activity, pid, cwd,
+// argv, title, created_at, last_activity, pinned}; free with ghostty_string_free.
+// Empty string on failure. timeout_ms==0 uses a 5s default. Blocking; call off
+// the main thread.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_list_sessions(
+    ghostty_remote_connection_t, uint32_t timeout_ms);
+
 // A host-metrics snapshot pushed by the remote agent (activity monitor). Mirrors
 // the wire HostMetrics. uptime_s is 0 when the remote OS doesn't expose uptime;
 // load1 is -1 when there is no load average (e.g. Windows).

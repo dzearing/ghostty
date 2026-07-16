@@ -232,6 +232,43 @@ final class LocalAgentManager {
         }
     }
 
+    /// List the local agent's sessions for the Cmd-Shift-N session browser (T16)
+    /// WITHOUT spawning an agent. Reuses the warm shared connection when healthy
+    /// (owned elsewhere — not freed here); otherwise dials the EXISTING agent
+    /// only (never spawns) and frees that probe connection after reading. The
+    /// `LIST_SESSIONS` RPC runs on a background queue; `completion` is delivered
+    /// on the main actor — nil ⇒ no local agent reachable or the RPC failed.
+    func listLocalSessions(_ completion: @escaping @MainActor ([BrowsedSession]?) -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        // Prefer the warm shared connection (do NOT free it — LocalAgentManager
+        // owns it for the app's lifetime). The muxed RPC is safe to issue from a
+        // background thread while the main thread also uses the connection.
+        if let existing = sharedOwner,
+           existing.linkState != .dead,
+           sharedAgentPid > 0,
+           kill(sharedAgentPid, 0) == 0 || errno == EPERM {
+            let handle = existing.handle
+            DispatchQueue.global(qos: .userInitiated).async {
+                let sessions = RemoteSessionRoster.list(handle: handle)
+                DispatchQueue.main.async { completion(sessions) }
+            }
+            return
+        }
+
+        // No warm shared connection: dial the EXISTING agent only (no spawn), so
+        // browsing never starts an agent. Free the probe connection afterward.
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let conn = Self.dialExisting(paths: .current) else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let sessions = RemoteSessionRoster.list(handle: conn.handle)
+            ghostty_remote_connection_free(conn.handle)
+            DispatchQueue.main.async { completion(sessions) }
+        }
+    }
+
     /// Wrap a dialed connection in a strong `RemoteConnection` owner and cache
     /// it as the shared one. Main-thread only.
     private func cacheShared(_ conn: Connection) -> RemoteConnection {

@@ -2697,6 +2697,74 @@ pub const CAPI = struct {
         return .fromSlice(copy);
     }
 
+    /// Enumerate every session the connected agent owns (T16 cross-machine
+    /// session browse). Runs the same LIST_SESSIONS RPC the `+sessions` CLI
+    /// uses, but against ANY dialed connection — local agent OR a relay
+    /// machine — because the transport is resolved through `handle.conn()`.
+    /// Returns a JSON array string (each element:
+    /// `{id, alive, exit_code, attached, activity, pid, cwd, argv, title,
+    /// created_at, last_activity, pinned}`), freed with `ghostty_string_free`.
+    /// Returns `.empty` on any failure (no connection, timeout, malformed
+    /// reply). `timeout_ms == 0` ⇒ the 5s default. BLOCKING; call off the main
+    /// thread (mirror the `_proc_list` / `_query_cwd_timeout` usage).
+    export fn ghostty_remote_connection_list_sessions(
+        handle: *RemoteConnectionHandle,
+        timeout_ms: u32,
+    ) String {
+        const conn = handle.conn() orelse return .empty;
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var roster = conn.requestSessions(timeout_ns) catch |err| {
+            log.debug("remote list_sessions failed err={}", .{err});
+            return .empty;
+        };
+        defer roster.deinit();
+
+        // Serialize into a stable JSON shape (every key emitted, matching the
+        // `+sessions --json` row) so the Swift side has a predictable decode.
+        const SessionJsonRow = struct {
+            id: []const u8,
+            alive: bool,
+            exit_code: ?i64,
+            attached: bool,
+            activity: []const u8,
+            pid: i64,
+            cwd: ?[]const u8,
+            argv: ?[]const u8,
+            title: ?[]const u8,
+            created_at: i64,
+            last_activity: i64,
+            pinned: bool,
+        };
+
+        const rows = handle.alloc.alloc(SessionJsonRow, roster.sessions.len) catch return .empty;
+        defer handle.alloc.free(rows);
+        for (roster.sessions, 0..) |s, i| {
+            rows[i] = .{
+                .id = s.id,
+                .alive = s.alive,
+                .exit_code = s.exit_code,
+                .attached = s.attached,
+                .activity = s.activity,
+                .pid = s.pid,
+                .cwd = s.cwd,
+                .argv = s.argv,
+                .title = s.title,
+                .created_at = s.created_at,
+                .last_activity = s.last_activity,
+                .pinned = s.pinned,
+            };
+        }
+
+        const json = std.json.Stringify.valueAlloc(handle.alloc, rows, .{}) catch return .empty;
+        defer handle.alloc.free(json);
+        const copy = handle.alloc.dupeZ(u8, json) catch return .empty;
+        return .fromSlice(copy);
+    }
+
     /// Zig-side `MetricsHandler` trampoline: marshal `protocol.HostMetrics` into a
     /// stack `ghostty_host_metrics_s` (optionals → sentinels) and invoke the stored
     /// C callback with the caller's `userdata`. `ctx` is the handle's

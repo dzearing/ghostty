@@ -29,6 +29,10 @@ struct MachineChooserView: View {
     /// Live per-machine metrics for the remote rows, refreshed while the picker
     /// is open. Drives each remote row's subline in place of the IP:port.
     @ObservedObject var probe: MachineMetricsProbe
+    /// Lazily-fetched per-machine session rosters (cross-machine resume browse,
+    /// T16). Drives each row's disclosure: a session-count badge + an expandable
+    /// read-only list of that machine's active sessions.
+    @ObservedObject var browser: SessionBrowserProbe
     var onSelect: (WindowTarget) -> Void
     var onCancel: () -> Void
     /// Secondary action: open the Remote Activity Monitor for a machine instead of
@@ -66,6 +70,152 @@ struct MachineChooserView: View {
         } else {
             Color.clear
         }
+    }
+
+    // MARK: - Session browse (T16)
+
+    /// The `SessionBrowserProbe` key for a target's row, or nil for a target
+    /// that never browses (`restoreRemote`, which is an action, not a row).
+    private func browseKey(for target: WindowTarget) -> String? {
+        switch target {
+        case .local: return SessionBrowserProbe.localKey
+        case .remote(let m): return m.id.uuidString
+        case .restoreRemote: return nil
+        }
+    }
+
+    /// Expand/collapse a row's session list (fetching the roster on first expand).
+    private func toggleBrowse(_ target: WindowTarget) {
+        switch target {
+        case .local: browser.toggleLocal()
+        case .remote(let m): browser.toggle(machine: m)
+        case .restoreRemote: break
+        }
+    }
+
+    /// Right-arrow: expand the highlighted row's session list if not already open.
+    private func expandSelection() {
+        guard let target = resolvedSelection, let key = browseKey(for: target),
+              !browser.isExpanded(key) else { return }
+        toggleBrowse(target)
+    }
+
+    /// Left-arrow: collapse the highlighted row's session list if it is open.
+    private func collapseSelection() {
+        guard let target = resolvedSelection, let key = browseKey(for: target),
+              browser.isExpanded(key) else { return }
+        toggleBrowse(target)
+    }
+
+    /// Leading disclosure triangle for a browsable row; a fixed-width spacer for
+    /// non-browsable rows so labels stay aligned.
+    @ViewBuilder
+    private func disclosureButton(for target: WindowTarget) -> some View {
+        if let key = browseKey(for: target) {
+            Button {
+                toggleBrowse(target)
+            } label: {
+                Image(systemName: browser.isExpanded(key) ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(browser.isExpanded(key) ? "Hide active sessions" : "Show active sessions")
+            .padding(.trailing, 2)
+        } else {
+            Spacer().frame(width: 18)
+        }
+    }
+
+    /// A small capsule showing a row's active-session count, once its roster has
+    /// loaded (hidden while loading/failed or when zero).
+    @ViewBuilder
+    private func countBadge(for target: WindowTarget) -> some View {
+        if let key = browseKey(for: target), let n = browser.count(for: key), n > 0 {
+            Text("\(n)")
+                .font(.caption2)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                .help("\(n) active session\(n == 1 ? "" : "s")")
+                .padding(.leading, 6)
+        }
+    }
+
+    /// The expanded, read-only list of a machine's active sessions.
+    @ViewBuilder
+    private func sessionBrowseList(for target: WindowTarget, key: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            switch browser.states[key] {
+            case .some(.loaded(let sessions)):
+                if sessions.isEmpty {
+                    Text("No active sessions")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(sessions) { session in
+                        sessionBrowseRow(session)
+                    }
+                }
+            case .some(.failed):
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                    Text("Couldn't reach this machine's agent")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            case .some(.loading), .none:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading sessions…")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 42)
+        .padding(.trailing, 10)
+        .padding(.bottom, 4)
+    }
+
+    /// One read-only session row: liveness dot, label (title/cwd/command),
+    /// working directory, and an "attached" marker when a viewer holds it.
+    @ViewBuilder
+    private func sessionBrowseRow(_ session: BrowsedSession) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 6))
+                .foregroundStyle(session.alive ? Color.green : Color.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.displayLabel)
+                    .font(.caption)
+                    .lineLimit(1)
+                if let cwd = session.cwd, !cwd.isEmpty {
+                    Text(cwd)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+            }
+            Spacer(minLength: 6)
+            if session.attached {
+                Text("attached")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if !session.alive {
+                Text("exited")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 1)
     }
 
     /// The current machine list (live from the registry), minus any relay
@@ -134,6 +284,15 @@ struct MachineChooserView: View {
                     Button { move(1) } label: { Color.clear }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.init("n"), modifiers: [.control])
+                    // Right/Left expand/collapse the highlighted row's session
+                    // list (cross-machine resume browse, T16) — the conventional
+                    // disclosure keys, and a reliable non-pointer affordance.
+                    Button { expandSelection() } label: { Color.clear }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut(.rightArrow, modifiers: [])
+                    Button { collapseSelection() } label: { Color.clear }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut(.leftArrow, modifiers: [])
                 }
                 .frame(width: 0, height: 0)
                 .accessibilityHidden(true)
@@ -159,7 +318,13 @@ struct MachineChooserView: View {
             ScrollView {
                 VStack(spacing: 2) {
                     ForEach(Array(targets.enumerated()), id: \.element) { idx, target in
+                      VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 0) {
+                            // Disclosure: expand the row into its machine's live
+                            // session roster (browse-only; T16). A fixed-width
+                            // spacer keeps non-browsable rows aligned.
+                            disclosureButton(for: target)
+
                             // The main row area is a Button so a single click
                             // reliably SELECTS (a SwiftUI `.onTapGesture` here did
                             // not respond to clicks; a Button action does). A double
@@ -177,6 +342,9 @@ struct MachineChooserView: View {
                             // stays consistent with the footer button.
                             .simultaneousGesture(TapGesture(count: 2).onEnded { activate(target) })
 
+                            // Live session-count badge (once the roster loads).
+                            countBadge(for: target)
+
                             // Secondary affordance (remote only): open the Activity
                             // Monitor. A SIBLING button so it doesn't nest inside the
                             // selection button.
@@ -188,6 +356,7 @@ struct MachineChooserView: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .help("Open Activity Monitor for \(machine.name)")
+                                .padding(.leading, 6)
                                 .padding(.trailing, 6)
 
                                 // Management menu: per-host settings for EVERY
@@ -215,6 +384,12 @@ struct MachineChooserView: View {
                                 managementActions(for: machine)
                             }
                         }
+
+                        // Expanded read-only session list for this machine.
+                        if let key = browseKey(for: target), browser.isExpanded(key) {
+                            sessionBrowseList(for: target, key: key)
+                        }
+                      }
                     }
                 }
                 .padding(.horizontal, 8)
@@ -819,10 +994,15 @@ enum MachineChooser {
         // outcome (pick remote, pick Local, or cancel).
         let probe = MachineMetricsProbe()
 
+        // Session-roster browse for the picker's lifetime (cross-machine resume,
+        // T16). Torn down in `finish` like the metrics probe.
+        let browser = SessionBrowserProbe()
+
         let finish: (WindowTarget?) -> Void = { target in
             // Tear down all probe connections BEFORE handing control back, so
             // no probe connection outlives the picker no matter the choice.
             probe.stop()
+            browser.stop()
             pollTask?.cancel()
             if let windowRef {
                 NSApp.stopModal()
@@ -834,6 +1014,7 @@ enum MachineChooser {
         let view = MachineChooserView(
             registry: registry,
             probe: probe,
+            browser: browser,
             onSelect: { finish($0) },
             onCancel: { finish(nil) },
             onActivityMonitor: { machine in
@@ -904,6 +1085,10 @@ enum MachineChooser {
         // arrive (or fall back to "Unreachable"). Relay machines are skipped:
         // the probe dials TCP only, and their subline shows directory status.
         probe.start(registry.machines.filter { !$0.isRelay })
+        // Prime the local agent's session count so "this Mac" shows it on the
+        // collapsed row (cheap: reuses the warm shared connection, no dial).
+        // Remote machines are browsed lazily on expand.
+        browser.primeLocal()
         NSApp.runModal(for: window)
     }
 }
