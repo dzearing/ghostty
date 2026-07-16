@@ -701,6 +701,10 @@ pub const Server = struct {
         } else if (open.shell) |sh| {
             s.setArgv(sh);
         }
+        // Pin persistent local sessions so the idle-TTL reaper never evicts them
+        // while orphaned (§7.1, T11). Set by the local-agent client for panes the
+        // viewer's session-layout manifest references; false for cross-machine.
+        s.pinned = open.pinned;
         // Bind the new session to THIS connection: install the outbound bridge so
         // live output frames to our writer, mark it bound (so the idle reaper leaves
         // it alone), and track its channel so disconnect detaches just our sessions.
@@ -977,6 +981,7 @@ pub const Server = struct {
                 .argv = if (s.argv) |a| a else null,
                 .created_at = s.created_ms,
                 .last_activity = s.last_activity_ms,
+                .pinned = s.pinned,
             }) catch break;
         }
 
@@ -1769,8 +1774,9 @@ test "LIST_SESSIONS→SESSIONS: agent enumerates its sessions on the request cha
     try h.client.handshake();
     _ = try h.server.waitHandshake();
 
-    // Open two sessions: one with an explicit command, one falling back to shell.
-    const o0 = try doOpen(&h, .{ .rows = 24, .cols = 80, .command = "run-marker-0" });
+    // Open two sessions: one with an explicit command AND pinned (persistent
+    // local pane, T11), one falling back to shell and unpinned (cross-machine).
+    const o0 = try doOpen(&h, .{ .rows = 24, .cols = 80, .command = "run-marker-0", .pinned = true });
     const o1 = try doOpen(&h, .{ .rows = 30, .cols = 100, .shell = "/bin/zsh" });
 
     // LIST_SESSIONS on a fresh request channel; the agent echoes SESSIONS on it.
@@ -1796,10 +1802,12 @@ test "LIST_SESSIONS→SESSIONS: agent enumerates its sessions on the request cha
             seen0 = true;
             try testing.expect(s.argv != null);
             try testing.expectEqualStrings("run-marker-0", s.argv.?);
+            try testing.expect(s.pinned); // OPEN.pinned reached the session + roster
         } else if (std.mem.eql(u8, s.id, o1.id[0..])) {
             seen1 = true;
             try testing.expect(s.argv != null);
             try testing.expectEqualStrings("/bin/zsh", s.argv.?);
+            try testing.expect(!s.pinned); // unpinned by default
         }
     }
     try testing.expect(seen0 and seen1);

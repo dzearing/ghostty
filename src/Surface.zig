@@ -1026,6 +1026,14 @@ pub fn init(
                     .term = config.term,
                     .env = remote_env.items,
                     .argv = forwarded_argv,
+                    // Pin persistent LOCAL-agent sessions against the agent's
+                    // idle-TTL reaper (T11): the viewer's session-layout manifest
+                    // references them, so they must survive the viewer quitting
+                    // until a restore re-ATTACHes. `local_shell_integration` is
+                    // the "this is the local agent" signal (set from
+                    // Machine.isLocalMachine); cross-machine windows leave it
+                    // false and keep the idle-TTL.
+                    .pinned = rb.local_shell_integration,
                 });
                 break :backend .{ .remote = io_remote };
             }

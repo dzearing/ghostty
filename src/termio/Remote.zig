@@ -90,6 +90,10 @@ env: []const protocol.Open.EnvPair,
 /// windows and for env-only shells. Each element is duped into `arena`.
 argv: ?[]const []const u8,
 
+/// Pin this session against the agent's idle-TTL reaper (§7.1, T11). True only
+/// for a persistent LOCAL-agent pane; sent in `OPEN.pinned`. Ignored on ATTACH.
+pinned: bool,
+
 /// Current grid/screen size, seeded by `initTerminal` and updated by `resize`.
 /// Sent in `OPEN`/`RESIZE` (rows/cols + pixel geometry, §6.5).
 grid_size: renderer.GridSize = .{},
@@ -169,6 +173,14 @@ pub const Config = struct {
     /// (env-only shells, user-command panes, cross-machine windows). Borrowed
     /// from the caller; `init` dupes each element into the backend arena.
     argv: ?[]const []const u8 = null,
+
+    /// Pin this session against the agent's idle-TTL reaper (§7.1, T11). Set true
+    /// ONLY by the LOCAL-agent client for a persistent local pane the viewer's
+    /// session-layout manifest (T05) references, so it survives the viewer
+    /// quitting until a restore re-ATTACHes. False for cross-machine windows
+    /// (they keep the idle-TTL). Sent in `OPEN.pinned`; irrelevant on ATTACH
+    /// (the session was pinned at its original OPEN).
+    pinned: bool = false,
 };
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
@@ -215,6 +227,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .term = term,
         .env = env,
         .argv = argv,
+        .pinned = cfg.pinned,
         .arena = arena,
     };
 }
@@ -352,6 +365,7 @@ pub fn threadEnter(
             .term = self.term,
             .env = self.env,
             .argv = self.argv,
+            .pinned = self.pinned,
             .rows = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
             .cols = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),

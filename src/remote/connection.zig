@@ -612,6 +612,8 @@ pub const OwnedSession = struct {
     argv: ?[]const u8,
     created_at: i64,
     last_activity: i64,
+    /// True when the session is pinned against idle-TTL reaping (§7.1, T11).
+    pinned: bool,
 };
 
 /// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
@@ -1540,6 +1542,7 @@ pub const Connection = struct {
                 .argv = argv,
                 .created_at = s.created_at,
                 .last_activity = s.last_activity,
+                .pinned = s.pinned,
             };
             filled = i + 1;
         }

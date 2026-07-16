@@ -184,6 +184,7 @@ fn printTable(stdout: *std.Io.Writer, sessions: []const connection.OwnedSession)
             "  {s}  {s}  pid={d}",
             .{ if (s.attached) "attached" else "detached", s.activity, s.pid },
         );
+        if (s.pinned) try stdout.writeAll("  pinned");
         if (s.cwd) |c| try stdout.print("  cwd={s}", .{c});
         if (s.argv) |a| try stdout.print("  cmd={s}", .{a});
         if (s.title) |t| try stdout.print("  title={s}", .{t});
@@ -206,6 +207,7 @@ const JsonRow = struct {
     title: ?[]const u8,
     created_at: i64,
     last_activity: i64,
+    pinned: bool,
 };
 
 fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connection.OwnedSession) !void {
@@ -223,6 +225,7 @@ fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connect
             .title = s.title,
             .created_at = s.created_at,
             .last_activity = s.last_activity,
+            .pinned = s.pinned,
         };
     }
     const json = try std.json.Stringify.valueAlloc(alloc, rows, .{ .whitespace = .indent_2 });

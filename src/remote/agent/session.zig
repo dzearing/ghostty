@@ -43,10 +43,11 @@ const protocol = @import("../protocol.zig");
 // Caps (§7.1 "Resource caps & TTL")
 // -----------------------------------------------------------------------------
 
-/// Maximum concurrent sessions per agent (§7.1: ≤ 64 sessions/daemon). An `OPEN`
-/// past this is refused. Kept small/const for this increment; a configurable
-/// limit is a later concern.
-pub const max_sessions: usize = 64;
+/// Maximum concurrent sessions per agent. Raised 64 → 256 (T11) so a heavy
+/// session-persistence user with many restored windows/panes plus fresh ones
+/// isn't refused new `OPEN`s; each idle session still costs a pty child + its
+/// output ring, so the cap is bounded. An `OPEN` past this is refused.
+pub const max_sessions: usize = 256;
 
 /// Default per-session raw-output ring size (§7.1: default 2 MB scrollback). Holds
 /// the most recent child-output bytes so `(last_byte_offset, S]` gap-fill is
@@ -323,6 +324,16 @@ pub const Session = struct {
     /// reaping. Re-set when a new connection ATTACHes. The idle reaper only evicts
     /// orphans (`!bound`), so an attached session never times out.
     bound: bool = false,
+
+    /// When true, the idle-TTL reaper NEVER evicts this session, even while
+    /// orphaned (`!bound`) and idle past the TTL (§7.1, T11). Set from
+    /// `OPEN.pinned` by the local-agent client for persistent local panes: the
+    /// viewer's session-layout manifest references them, so they must outlive the
+    /// viewer quitting until a restore re-ATTACHes — an overnight laptop-closed
+    /// session would otherwise be reaped before the next launch. Cross-machine
+    /// sessions leave this false and keep the plain idle-TTL. Only `CLOSE` or
+    /// child exit frees a pinned session.
+    pinned: bool = false,
 
     /// The currently-bound connection's outbound bridge: where live child→client
     /// DATA frames are enqueued. Null while orphaned (no live connection) — output
@@ -725,6 +736,7 @@ pub const SessionStore = struct {
         while (it.next()) |sp| {
             const s = sp.*;
             if (s.bound) continue; // a live connection owns it; never reap
+            if (s.pinned) continue; // pinned (persistent local pane); never TTL-reap
             if (s.last_activity_ms <= cutoff) {
                 victims.append(self.table.alloc, s.id) catch {};
             }
@@ -941,4 +953,65 @@ test "Session: recordOutput advances offset and feeds ring; tombstone retains ex
     try testing.expectEqual(@as(i64, 42), s.exit_code.?);
     s.markExited(99, 4); // idempotent: code unchanged
     try testing.expectEqual(@as(i64, 42), s.exit_code.?);
+}
+
+/// A mutable millisecond clock for reaper tests: `reapIdle` reads `now` through
+/// `nowFn`, and the test fast-forwards it past the idle-TTL.
+const MutClock = struct {
+    ms: i64 = 0,
+    fn nowFn(ctx: *anyopaque) i64 {
+        const self: *MutClock = @ptrCast(@alignCast(ctx));
+        return self.ms;
+    }
+};
+
+test "SessionStore.reapIdle: pinned survives fast-forward, unpinned is reaped" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xABCD);
+    var fakes: [2]FakeChild = .{ .{ .alloc = alloc }, .{ .alloc = alloc } };
+    defer for (&fakes) |*f| f.deinit();
+
+    var clock: MutClock = .{ .ms = 0 };
+    const ttl_ms: i64 = 1000;
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, ttl_ms);
+    defer store.deinit();
+
+    // Two orphaned (bound=false, the create default) sessions born at t=0.
+    const pinned = try store.table.create(fakes[0].child(), 200, 24, 80, 1024, 0);
+    const plain = try store.table.create(fakes[1].child(), 201, 24, 80, 1024, 0);
+    pinned.pinned = true;
+    const pinned_id = pinned.id;
+    try testing.expectEqual(@as(usize, 2), store.table.count());
+
+    // Not yet idle: nothing reaped (cutoff = now - ttl = -1 < last_activity 0).
+    clock.ms = ttl_ms - 1;
+    store.reapIdle();
+    try testing.expectEqual(@as(usize, 2), store.table.count());
+
+    // Fast-forward well past the TTL: the unpinned orphan is reaped, the pinned
+    // one survives even though it is equally idle.
+    clock.ms = ttl_ms * 100;
+    store.reapIdle();
+    try testing.expectEqual(@as(usize, 1), store.table.count());
+    try testing.expect(store.table.getById(pinned_id) != null);
+    try testing.expect(fakes[1].terminated); // plain child was terminated on reap
+    try testing.expect(!fakes[0].terminated); // pinned child untouched
+    _ = plain;
+}
+
+test "SessionStore.reapIdle: a bound session is never reaped regardless of pin" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x55AA);
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+
+    var clock: MutClock = .{ .ms = 0 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    const s = try store.table.create(fake.child(), 300, 24, 80, 1024, 0);
+    s.bound = true; // a live connection owns it
+    clock.ms = 1_000_000;
+    store.reapIdle();
+    try testing.expectEqual(@as(usize, 1), store.table.count());
 }

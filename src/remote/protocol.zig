@@ -429,6 +429,16 @@ pub const Open = struct {
     /// the default invocation. `argv[0]` is conventionally the shell path.
     argv: ?[]const []const u8 = null,
 
+    /// Pin this session so the agent's idle-TTL reaper NEVER evicts it while
+    /// orphaned (§7.1, T11). The LOCAL-agent client sets this for every
+    /// persistent local pane: the viewer's session-layout manifest (T05)
+    /// references the session, so it must survive the viewer quitting until a
+    /// restore re-ATTACHes it — a 24 h idle-TTL would still reap an overnight
+    /// laptop-closed session before the next launch. Cross-machine windows leave
+    /// it false and keep the idle-TTL. Additive/optional: older agents ignore
+    /// the field (unknown-field-tolerant parser) and fall back to TTL reaping.
+    pinned: bool = false,
+
     pub const EnvPair = struct { key: []const u8, value: []const u8 };
 };
 
@@ -550,6 +560,11 @@ pub const SessionInfo = struct {
     argv: ?[]const u8 = null,
     created_at: i64 = 0,
     last_activity: i64 = 0,
+    /// True when the session is pinned against idle-TTL reaping (§7.1, T11) — a
+    /// persistent local pane the viewer's session-layout manifest references.
+    /// Surfaced so `+sessions` can show which sessions survive indefinitely.
+    /// Additive/optional (defaults false; older agents omit it).
+    pinned: bool = false,
 };
 
 /// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty
@@ -1345,6 +1360,17 @@ test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     try testing.expectEqual(@as(usize, 0), op.value.env.len);
     // argv defaults to null (no explicit shell integration argv rewrite, T04c).
     try testing.expect(op.value.argv == null);
+    // pinned defaults to false (cross-machine / non-persistent, T11).
+    try testing.expect(!op.value.pinned);
+
+    // An OPEN pinning its session (T11, persistent local pane) round-trips true.
+    const open_pin: Open = .{ .rows = 24, .cols = 80, .pinned = true };
+    const pj = try encodeJson(alloc, open_pin);
+    defer alloc.free(pj);
+    try testing.expect(std.mem.indexOf(u8, pj, "\"pinned\":true") != null);
+    var pp = try parseJson(Open, alloc, pj);
+    defer pp.deinit();
+    try testing.expect(pp.value.pinned);
 
     // An OPEN carrying an explicit shell argv (T04c) round-trips: the elements
     // survive encode→decode intact and in order (bash rewrite `<shell> --posix`).
@@ -1538,6 +1564,7 @@ test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
             .title = "editor",
             .created_at = 1000,
             .last_activity = 2000,
+            .pinned = true,
         },
         .{
             .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -1562,11 +1589,13 @@ test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
     try testing.expectEqualStrings("/home/dev", a.cwd.?);
     try testing.expectEqualStrings("vim .", a.argv.?);
     try testing.expectEqualStrings("editor", a.title.?);
+    try testing.expect(a.pinned); // pinned round-trips (T11)
 
     const b = sp.value.sessions[1];
     try testing.expect(!b.alive);
     try testing.expectEqual(@as(?i64, 137), b.exit_code);
     try testing.expect(b.argv == null and b.title == null and b.cwd == null);
+    try testing.expect(!b.pinned); // defaults false when omitted
 
     // An empty roster still encodes the array key (never elided) so the client can
     // tell "answered, none" from "no reply".

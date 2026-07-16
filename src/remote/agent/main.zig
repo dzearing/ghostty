@@ -140,6 +140,16 @@ pub fn main() !void {
     const encoding = encodingFromEnv(alloc);
 
     const mode = try parseArgs(alloc);
+
+    // Ring size (T11): the `--ring-bytes` flag (resolved in parseArgs) wins; else
+    // fall back to GHOSTTY_AGENT_RING_BYTES. Resolved once here, read-only after.
+    if (!ring_bytes_from_flag) {
+        if (std.process.getEnvVarOwned(alloc, "GHOSTTY_AGENT_RING_BYTES")) |v| {
+            defer alloc.free(v);
+            if (parseRingBytes(v)) |n| configured_ring_bytes = n;
+        } else |_| {}
+    }
+
     switch (mode) {
         .version => {
             var buf: [128]u8 = undefined;
@@ -338,6 +348,32 @@ fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
     return .raw;
 }
 
+/// Process-wide per-session output-ring size in bytes, resolved once at startup
+/// (T11). Defaults to `session.default_ring_bytes` (2 MB); overridden by the
+/// `--ring-bytes=<N>` flag (set during `parseArgs`, highest priority) or, if the
+/// flag is absent, the `GHOSTTY_AGENT_RING_BYTES` env var. `serveOne` hands it to
+/// every per-connection `Server`, which uses it as the ring size for the sessions
+/// it opens. Set-once at startup, read-only thereafter → no synchronization.
+var configured_ring_bytes: usize = session.default_ring_bytes;
+
+/// True once `--ring-bytes` set `configured_ring_bytes`, so the env fallback in
+/// `main` knows the flag already won and skips `GHOSTTY_AGENT_RING_BYTES`.
+var ring_bytes_from_flag: bool = false;
+
+/// Floor for a configured ring size — a fat-fingered tiny value must not cripple
+/// scrollback/gap-fill. Values below this (or unparseable) are rejected. 64 KiB.
+const min_ring_bytes: usize = 64 * 1024;
+
+/// Parse a `--ring-bytes` / `GHOSTTY_AGENT_RING_BYTES` value: a plain byte count.
+/// Returns null on anything unparseable or below `min_ring_bytes` (the caller
+/// then keeps the default / reports an error). Pure + tested.
+fn parseRingBytes(text: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const n = std.fmt.parseInt(usize, trimmed, 10) catch return null;
+    if (n < min_ring_bytes) return null;
+    return n;
+}
+
 const Mode = union(enum) {
     /// `--version`: print the baked build version and exit.
     version,
@@ -457,6 +493,30 @@ fn parseArgs(alloc: Allocator) !Mode {
             } else if (std.mem.startsWith(u8, a, "--port-file=")) {
                 port_file_arg = a["--port-file=".len..];
             }
+            // Ring size (T11): order-independent config, like --port-file.
+            if (std.mem.eql(u8, a, "--ring-bytes")) {
+                j += 1;
+                if (j >= args.len) {
+                    std.debug.print("ghoztty-agent: --ring-bytes requires <bytes>\n", .{});
+                    return error.InvalidArgs;
+                }
+                if (parseRingBytes(args[j])) |n| {
+                    configured_ring_bytes = n;
+                    ring_bytes_from_flag = true;
+                } else {
+                    std.debug.print("ghoztty-agent: invalid --ring-bytes value '{s}' (min {d})\n", .{ args[j], min_ring_bytes });
+                    return error.InvalidArgs;
+                }
+            } else if (std.mem.startsWith(u8, a, "--ring-bytes=")) {
+                const v = a["--ring-bytes=".len..];
+                if (parseRingBytes(v)) |n| {
+                    configured_ring_bytes = n;
+                    ring_bytes_from_flag = true;
+                } else {
+                    std.debug.print("ghoztty-agent: invalid --ring-bytes value '{s}' (min {d})\n", .{ v, min_ring_bytes });
+                    return error.InvalidArgs;
+                }
+            }
         }
     }
 
@@ -467,10 +527,11 @@ fn parseArgs(alloc: Allocator) !Mode {
             std.mem.eql(u8, a, "--no-browser") or std.mem.eql(u8, a, "--headless-enroll") or
             std.mem.eql(u8, a, "--force-replace") or std.mem.eql(u8, a, "--replace") or
             std.mem.eql(u8, a, allow_public_flag) or
-            std.mem.startsWith(u8, a, "--port-file="))
+            std.mem.startsWith(u8, a, "--port-file=") or
+            std.mem.startsWith(u8, a, "--ring-bytes="))
         {
             continue; // handled in the pre-scan above
-        } else if (std.mem.eql(u8, a, "--port-file")) {
+        } else if (std.mem.eql(u8, a, "--port-file") or std.mem.eql(u8, a, "--ring-bytes")) {
             i += 1; // value consumed in the pre-scan above
             continue;
         } else if (std.mem.eql(u8, a, "--version")) {
@@ -616,6 +677,11 @@ fn printUsage() void {
         \\  ghoztty-agent --listen=<addr:port> --insecure-allow-public
         \\                                  UNAUTHENTICATED TCP shell on a routable interface
         \\                                  (trusted networks only — anyone who reaches it gets a shell).
+        \\
+        \\Options (any mode):
+        \\  --ring-bytes=<N>                Per-session output-ring size in bytes (scrollback /
+        \\                                  reconnect gap-fill). Default 2097152 (2 MB), min 65536.
+        \\                                  Also settable via GHOSTTY_AGENT_RING_BYTES (flag wins).
         \\
         \\For secure remote access, use --relay. A bare invocation intentionally does
         \\nothing (it will not open an unauthenticated listener).
@@ -1182,7 +1248,7 @@ fn serveOne(
         mux.dataStream(),
         spawner,
         store,
-        .{ .encoding = encoding, .hostname = hostname },
+        .{ .encoding = encoding, .hostname = hostname, .ring_bytes = configured_ring_bytes },
     );
     defer srv.destroy(alloc);
 
@@ -1706,6 +1772,20 @@ test "decideRelayCred: no cred + headless errors (no surprise browser on servers
 
 test "decideRelayCred: no cred + interactive auto-enrolls (MSI first launch)" {
     try std.testing.expectEqual(RelayCredDecision.auto_enroll, decideRelayCred(false, false, false));
+}
+
+test "parseRingBytes: plain byte count, floor, and junk rejection (T11)" {
+    // A valid value above the floor parses.
+    try std.testing.expectEqual(@as(?usize, 16 * 1024 * 1024), parseRingBytes("16777216"));
+    // Surrounding whitespace is trimmed (env values sometimes carry it).
+    try std.testing.expectEqual(@as(?usize, 65536), parseRingBytes("  65536\n"));
+    // Exactly the floor is accepted; one below is rejected → null (keep default).
+    try std.testing.expectEqual(@as(?usize, min_ring_bytes), parseRingBytes("65536"));
+    try std.testing.expectEqual(@as(?usize, null), parseRingBytes("65535"));
+    // Junk / empty / negative → null.
+    try std.testing.expectEqual(@as(?usize, null), parseRingBytes("2MB"));
+    try std.testing.expectEqual(@as(?usize, null), parseRingBytes(""));
+    try std.testing.expectEqual(@as(?usize, null), parseRingBytes("-1"));
 }
 
 test "port file: JSON body carries port/pid/startedAt" {
