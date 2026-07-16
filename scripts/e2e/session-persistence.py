@@ -51,6 +51,7 @@ AGENT_DIR = os.path.join(HOME, ".config", "ghoztty", "local-agent-debug")
 PORT_FILE = os.path.join(AGENT_DIR, "port.json")
 SOCKET_FILE = os.path.join(AGENT_DIR, "agent.sock")  # the 0600 UDS the agent binds (T09c)
 SESSIONS_FILE = os.path.join(AGENT_DIR, "sessions.json")  # reboot-floor metadata store (T12)
+RINGS_DIR = os.path.join(AGENT_DIR, "rings")  # reboot-scrollback ring snapshots (T13/T13b)
 LOCK_FILE = os.path.join(AGENT_DIR, "agent.lock")
 HEARTBEAT_FILE = os.path.join(AGENT_DIR, "agent.heartbeat")
 APP_LOG = os.path.join(tempfile.gettempdir(), "ghoztty-e2e", "e2e-app.log")
@@ -243,7 +244,24 @@ def full_reset():
             os.remove(f)
         except FileNotFoundError:
             pass
+    clear_ring_files()  # stale ring snapshots would preload into a fresh run
     time.sleep(0.5)
+
+def ring_files():
+    """Every persisted ring snapshot file (T13/T13b), newest last. Empty if the
+    rings dir doesn't exist yet."""
+    try:
+        return sorted(os.path.join(RINGS_DIR, f)
+                      for f in os.listdir(RINGS_DIR) if f.endswith(".ring"))
+    except FileNotFoundError:
+        return []
+
+def clear_ring_files():
+    for f in ring_files():
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
 
 # Popen handles for every app we launched, kept so we can reap them. Without this
 # a cleanly-exited app lingers as a ZOMBIE (defunct) child of this script until we
@@ -957,6 +975,71 @@ def run_inplace_cycles(args, baseline):
     return 0
 
 # ---------------------------------------------------------------------------
+# Graceful agent-SIGTERM ring-flush check (T13b)
+# ---------------------------------------------------------------------------
+def run_sigterm_check(args, baseline):
+    """T13b: a graceful SIGTERM to the agent must flush dirty output rings to disk
+    BEFORE it exits cleanly (T13 otherwise only snapshots every 30s + on a viewer
+    disconnect). Prove it deterministically: force fresh (dirty) output into
+    sessions, wipe the rings dir, then SIGTERM the agent and assert (a) it EXITED
+    promptly on its own (a working handler blocks+sigwaits SIGTERM, snapshots, and
+    exit(0)s — no SIGKILL escalation) and (b) the rings dir was repopulated by the
+    dying agent. Dirtying explicitly guards against a just-fired periodic snapshot
+    having marked the rings clean."""
+    failures = []
+
+    # 1. Dirty sessions with a fresh unique line so each ring's write offset is
+    #    provably past its last-snapshot offset, whatever the last periodic flush did.
+    for nm in ("A1", "A2", "B1"):
+        cli_ok(["+send-keys", f"--target={nm}", f"echo T13B-DIRTY-{nm}", "Enter"])
+    time.sleep(0.6)  # let the echoes land in the rings
+
+    # 2. Wipe the rings dir: for the next instant the ONLY writer that can recreate
+    #    a .ring is the SIGTERM handler (the 30s periodic tick can't fire in the ms
+    #    between this wipe and the signal).
+    clear_ring_files()
+    if ring_files():
+        failures.append("rings dir not empty after clear (could not isolate the SIGTERM write)")
+
+    agent_before = launchagent_pid() or agent_pid()
+    if agent_before is None:
+        log("RESULT: FAIL — no agent to SIGTERM")
+        return 1
+
+    # 3. Graceful SIGTERM. A working handler exits promptly and clean; a broken one
+    #    (signal blocked but never consumed) would hang until launchd's SIGKILL
+    #    escalation and write NOTHING.
+    log(f"[sigterm] SIGTERM agent {agent_before}; expecting a prompt clean exit + a ring flush")
+    t0 = time.time()
+    kill_pids([agent_before], signal.SIGTERM)
+    exited = wait_gone([agent_before], timeout=3.0)
+    dt = time.time() - t0
+    if not exited:
+        failures.append(f"agent {agent_before} still alive {dt:.1f}s after SIGTERM "
+                        "(handler never consumed it — would need SIGKILL escalation)")
+    else:
+        log(f"    ✓ agent exited {dt:.2f}s after SIGTERM (clean, on its own)")
+
+    # 4. The dying agent must have flushed dirty rings to disk.
+    rings = ring_files()
+    if rings:
+        log(f"    ✓ {len(rings)} ring snapshot(s) flushed before exit: "
+            f"{[os.path.basename(r) for r in rings]}")
+    else:
+        failures.append("no ring snapshot on disk after the agent exited "
+                        "(SIGTERM did not flush dirty rings)")
+
+    log("=" * 70)
+    if failures:
+        log(f"RESULT: FAIL — {len(failures)} assertion(s) failed")
+        for f in failures:
+            log(f"    ✗ {f}")
+        return 1
+    log("RESULT: PASS — a graceful SIGTERM flushed dirty rings to disk, then the agent "
+        "exited cleanly on its own (no SIGKILL escalation needed); launchd restart intact")
+    return 0
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -972,6 +1055,9 @@ def main():
                     help="in-place (T12e): kill ONLY the agent (app stays up); launchd restarts "
                          "it; the LIVE app auto-recovers, rebuilding local windows in place with "
                          "the restart banner (AC4 in-place, no app relaunch)")
+    ap.add_argument("--agent-sigterm", action="store_true", dest="agent_sigterm",
+                    help="graceful agent stop (T13b): SIGTERM the agent and assert it flushes "
+                         "dirty rings to disk, then exits cleanly on its own (no SIGKILL escalation)")
     ap.add_argument("--quit", choices=("kill", "graceful"), default="kill",
                     help="how to terminate the app each cycle (default kill = SIGKILL)")
     ap.add_argument("--keep", action="store_true", help="leave app+windows running at end")
@@ -983,7 +1069,9 @@ def main():
         log(f"FATAL: debug CLI not found at {CLI} — build first (zig build -Doptimize=Debug)")
         return 2
 
-    if args.agent_only:
+    if args.agent_sigterm:
+        mode = "AGENT graceful SIGTERM / ring flush (T13b)"
+    elif args.agent_only:
         mode = "AGENT-only / in-place recovery (T12e)"
     elif args.agent_restart:
         mode = "AGENT restart / reboot-equivalent (T12d)"
@@ -992,7 +1080,7 @@ def main():
     else:
         mode = "kill -9 survival (T07)"
     log("=" * 70)
-    qdesc = "" if (args.agent_restart or args.agent_only) else f", quit={args.quit}"
+    qdesc = "" if (args.agent_restart or args.agent_only or args.agent_sigterm) else f", quit={args.quit}"
     log(f"Ghoztty session-persistence E2E — {mode}{qdesc}")
     log("=" * 70)
 
@@ -1019,10 +1107,11 @@ def main():
     # ---- Reboot-equivalent mode (T12d): a distinct loop with opposite semantics
     # (relaunch, not survival). Split out because a reboot kills the children and
     # the agent's RAM — asserting PID *changes* + a restart banner, not PID stability.
-    if args.agent_restart or args.agent_only:
-        # Both modes need launchd to OWN the agent so a killed agent auto-restarts.
-        # The app installs+bootstraps the job lazily (first persistent window /
-        # warm-up); poll briefly for launchd to report it.
+    if args.agent_restart or args.agent_only or args.agent_sigterm:
+        # These modes want launchd to OWN the agent (a killed/exited agent
+        # auto-restarts, and T13b proves the launchd stop/restart survives a
+        # graceful SIGTERM). The app installs+bootstraps the job lazily (first
+        # persistent window / warm-up); poll briefly for launchd to report it.
         deadline = time.time() + 8
         while launchagent_pid() is None and time.time() < deadline:
             time.sleep(0.25)
@@ -1032,8 +1121,12 @@ def main():
                 "install/bootstrap it (T12d), so launchd cannot restart the agent")
             return 2
         log(f"[base] LaunchAgent job loaded (launchd manages agent pid {la_pid})")
-        rc = run_inplace_cycles(args, baseline) if args.agent_only \
-            else run_reboot_cycles(args, baseline)
+        if args.agent_sigterm:
+            rc = run_sigterm_check(args, baseline)
+        elif args.agent_only:
+            rc = run_inplace_cycles(args, baseline)
+        else:
+            rc = run_reboot_cycles(args, baseline)
         reboot_teardown(args)
         return rc
 

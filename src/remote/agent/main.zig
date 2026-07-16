@@ -162,6 +162,11 @@ pub fn main() !void {
             // Keep the GPA exit clean on the (error) paths where runListen returns.
             defer if (l.port_file) |pf| alloc.free(pf);
             defer if (l.sessions_file) |sf| alloc.free(sf);
+            // Graceful SIGTERM → ring snapshot (T13b): block SIGTERM on the main
+            // thread BEFORE the single-instance heartbeat (or ANY daemon thread)
+            // is spawned so they all inherit the block; the watcher that consumes
+            // it is started inside runListen once the store exists. POSIX-only.
+            blockSigterm();
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
             // (bind, banner, tray icon). Exits the process on conflict.
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
@@ -172,6 +177,9 @@ pub fn main() !void {
             defer alloc.free(l.path);
             defer if (l.port_file) |pf| alloc.free(pf);
             defer if (l.sessions_file) |sf| alloc.free(sf);
+            // Graceful SIGTERM → ring snapshot (T13b): block SIGTERM on the main
+            // thread BEFORE any daemon thread is spawned (see the `.listen` arm).
+            blockSigterm();
             // DAEMON mode: single-instance BEFORE the bind (a losing instance
             // must not clobber the winner's socket node).
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
@@ -864,6 +872,11 @@ fn runListen(
     // RELAUNCH. No-op when --sessions-file was not passed or the file is absent.
     const materialized = store.loadPersisted(configured_ring_bytes);
     if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
+    // Graceful SIGTERM → flush dirty rings before exit (T13b). Started here (the
+    // store now exists); SIGTERM was already blocked process-wide by
+    // `blockSigterm()` in main before any thread spawned, so this watcher's
+    // `sigwait` is its sole consumer. POSIX-only.
+    startSigtermWatcher(&store);
     try store.startReaper();
 
     const stdout = std.fs.File.stdout();
@@ -1022,6 +1035,8 @@ fn runListenUnix(
     // dead, relaunchable tombstones before accepting connections + starting the reaper.
     const materialized = store.loadPersisted(configured_ring_bytes);
     if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
+    // Graceful SIGTERM → flush dirty rings before exit (T13b) — see runListen.
+    startSigtermWatcher(&store);
     try store.startReaper();
 
     const stdout = std.fs.File.stdout();
@@ -1256,6 +1271,72 @@ fn acceptLoop(
 /// Wall-clock `now` for the `SessionStore` (matches its `nowFn` signature).
 fn realNow(_: *anyopaque) i64 {
     return std.time.milliTimestamp();
+}
+
+// -----------------------------------------------------------------------------
+// Graceful SIGTERM → ring snapshot (T13b, §5.4). A launchd stop / logout / plain
+// `kill <pid>` delivers SIGTERM; we catch it to flush any dirty output rings to
+// disk before exiting, so output produced AFTER the viewer left (T13 only
+// snapshots periodically + on a viewer disconnect — an agent that outlives its
+// viewer and is then told to stop would otherwise lose that tail) still reaches
+// the reboot floor.
+//
+// SAFE signal handling: we do NOT do work in an async signal handler —
+// `snapshotRings` takes the store mutex and does file I/O, both unsafe from a
+// handler interrupting an arbitrary thread. Instead SIGTERM is BLOCKED
+// process-wide and consumed synchronously by a dedicated `sigwait` watcher
+// thread running in ordinary context, where the mutex + I/O are safe.
+//
+// POSIX-only: Windows has no real SIGTERM (its graceful stop is the tray Exit
+// path). `blockSigterm`/`startSigtermWatcher` are no-ops there.
+// -----------------------------------------------------------------------------
+
+/// The signal set containing just SIGTERM. Declared once so `blockSigterm` and
+/// the watcher's `sigwait` agree on exactly what is blocked and waited on.
+fn sigtermSet() posix.sigset_t {
+    var set = posix.sigemptyset();
+    posix.sigaddset(&set, posix.SIG.TERM);
+    return set;
+}
+
+/// Block SIGTERM on the CALLING thread (POSIX-only). MUST run on the main thread
+/// BEFORE any daemon thread is spawned (the single-instance heartbeat, the
+/// reaper, the ring-snapshot watcher, per-connection workers) so every one
+/// INHERITS the block — then a process-directed SIGTERM is delivered to none of
+/// their default handlers and instead stays pending for the watcher's `sigwait`.
+/// `pthread_sigmask` (not `sigprocmask`): the daemon is multi-threaded.
+fn blockSigterm() void {
+    if (builtin.os.tag == .windows) return;
+    var set = sigtermSet();
+    var old: posix.sigset_t = undefined;
+    _ = std.c.pthread_sigmask(posix.SIG.BLOCK, &set, &old);
+}
+
+/// Start the detached watcher thread that turns a graceful SIGTERM into a ring
+/// snapshot + clean exit (POSIX-only). Call AFTER `blockSigterm` ran on the main
+/// thread (so this thread inherits the block and `sigwait` is the SOLE consumer
+/// of SIGTERM) and once `store` exists. A spawn failure only forfeits the
+/// on-stop snapshot — the daemon serves regardless.
+fn startSigtermWatcher(store: *session.SessionStore) void {
+    if (builtin.os.tag == .windows) return;
+    const t = std.Thread.spawn(.{}, sigtermWatcherLoop, .{store}) catch |err| {
+        std.debug.print("ghoztty-agent: SIGTERM watcher spawn failed ({s}); on-stop ring snapshot disabled\n", .{@errorName(err)});
+        return;
+    };
+    t.detach();
+}
+
+/// The watcher loop: `sigwait` for the (already-blocked) SIGTERM, then flush
+/// dirty rings and `exit(0)`. The clean exit means launchd's SIGTERM→SIGKILL
+/// escalation is never needed. `sigwait` runs in ORDINARY thread context (not a
+/// signal handler), so the mutex + file I/O inside `snapshotRings` are safe here.
+fn sigtermWatcherLoop(store: *session.SessionStore) void {
+    var set = sigtermSet();
+    var signo: c_int = 0;
+    // Loop past a spurious nonzero return (e.g. EINTR); we only wait on SIGTERM.
+    while (std.c.sigwait(&set, &signo) != 0) {}
+    store.snapshotRings();
+    std.process.exit(0);
 }
 
 /// A per-connection worker: owns the accepted socket fd, builds a `Mux` + `Server`
