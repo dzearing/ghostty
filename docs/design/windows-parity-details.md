@@ -447,6 +447,32 @@ NO --token (account tier). Production Google sign-in needs the user's
 Desktop OAuth client id (password manager) — leave the exact command in
 the log for the user if not available on the box.
 
+*Evidence (done, 64c4329c2):* on-box 2026-07-15. Both unit lanes green
+(`-Dapp-runtime=none` and `-Dapp-runtime=win32`) — PKCE S256 (RFC 7636
+Appendix B vector), auth-URL params, form-encode escaping, JWT claims
+decode, expiry math, redirect-target parse, and the DPAPI account-store
+round-trip (with/without client secret, SignedOut on missing file,
+idempotent delete). New `test/win32/ipc-relay-login.ps1` ALL PASS: a raw
+TCP fake-Google token endpoint (`GHOSTTY_OAUTH_TOKEN_ENDPOINT` injection)
++ simulated browser drives `+relay-login --no-browser` through PKCE +
+loopback redirect + code exchange to a written, non-plaintext
+`account.dat` ("Signed in as e2e@example.com"); `+relay-logout` removes it;
+a dead token endpoint makes login exit nonzero with "Token exchange
+failed" and no account written; and — with a live local relay+agent whose
+`DEV_CLIENT_TOKEN` is the minted JWT — `+new-remote-window --relay/--device`
+with NO `--token` opens and registers a window via the account tier. The
+existing `ipc-relay.ps1`, `ipc-remote.ps1`, `ipc-p1/p2/p3.ps1` all still
+ALL PASS. Key implementation notes: the loopback receiver must use raw
+`ws2_32.recv/send` (like `socket_stream.zig`) — `std.net.Stream.read/write`
+does `ReadFile`/`WriteFile` on the WSA_FLAG_OVERLAPPED socket and fails
+with ERROR_INVALID_PARAMETER (87); `json.parseFromSlice` needs
+`.allocate = .alloc_always` where the parsed value outlives its source
+buffer (claims payload, token response body); `advapi32` + `crypt32` are
+linked whenever the target is Windows because the store is reached from
+both the win32 GUI and the CLI/`none` graphs. Production Google sign-in
+(real client id from the user's password manager):
+`ghoztty +relay-login --client-id=<id> --client-secret=<secret>`.
+
 ## T21b — Relay dial path in win32 GUI (Phase G)
 
 Split from T21 2026-07-15. `+new-remote-window --relay=<base>

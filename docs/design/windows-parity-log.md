@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box, night 3) — T21a DONE (64c4329c2): Windows relay
+  account sign-in. Zig port of macOS RelayAccount/GoogleOAuth —
+  `google_oauth.zig` (PKCE S256, auth URL, JWT claims, token
+  exchange/refresh over http_client's new form-POST, loopback receiver),
+  `relay_account.zig` (DPAPI `account.dat` + owner-only DACL, resolveIdToken
+  = GUI account tier), `win_acl.zig` (DACL helper extracted from
+  enroll.zig), `+relay-login`/`+relay-logout` CLI (no IPC). IpcHandlers
+  token tiers now --token → account → env. Three surprises, all fixed
+  in-flight: (1) the loopback receiver's `std.net.Stream.read/write` fails
+  ERROR_INVALID_PARAMETER(87) on the overlapped Windows socket — switched to
+  raw `ws2_32.recv/send` like socket_stream.zig; (2) `json.parseFromSlice`
+  borrows into the source slice by default → dangling after the decoded
+  buffer frees → needed `.allocate = .alloc_always`; (3) `Start-Process
+  -RedirectStandardOutput` leaves `$p.ExitCode` null — the E2E runs
+  `+relay-login` via a cmd redirect (like Run-Cli) instead. New
+  `ipc-relay-login.ps1` ALL PASS (fake-issuer login + logout + error path +
+  account-tier window open, DEV_CLIENT_TOKEN set to the minted JWT so the
+  dev relay accepts the account bearer). Existing relay/remote/P1-P3 still
+  ALL PASS. Next: T22 (menu item + machine chooser).
+
 - 2026-07-15 (on-box, night 2) — T21 split (sizing rule) into T21a
   (sign-in + DPAPI creds + `+relay-login`) / T21b (relay dial in the
   GUI); T21b DONE (89e31b7fb): `--relay/--device/--token` dial via the
