@@ -5,7 +5,6 @@
   "branch": "users/dzearing/session-persistence",
   "worktree": "/Users/dzearing/git/ghoztty-session-persistence",
   "userIntent": "Build the hybrid local-agent session persistence (design doc §5) and prove it: simulate a binary upgrade where every window reloads intact — correct positions/splits, same screen buffers, processes still running (re-attached, NOT restarted). Test thoroughly, not just build.",
-
   "protocol": {
     "loop": [
       "1. On session start: read THIS file fully, then the design-doc sections referenced by the task you pick. Do not re-explore the codebase for facts already in keyFacts below.",
@@ -41,7 +40,6 @@
       "notes": "Official zig 0.15.2 binary cannot link on this macOS 26.4 box; the brew zig@0.15 bottle works (see memory ghoztty-macos26-zig-toolchain)."
     }
   },
-
   "decisions": [
     "Direction: design doc §5 hybrid — local ghoztty-agent owns PTYs; viewer keeps a layout+sessionId manifest; agent later gains disk metadata for reboot floor. User approved 2026-07-13 ('let's try it').",
     "v0 local transport = loopback TCP (both ends already exist: agent --listen, ghostty_remote_connection_new_tcp). Unix-socket + peercred is a hardening task AFTER the headline E2E works (T09).",
@@ -50,7 +48,6 @@
     "Reboot recovery (agent disk persistence, RELAUNCH) comes after the upgrade demo (T12/T13) — the upgrade scenario keeps the agent alive, so it does not need disk persistence.",
     "Future direction (user, 2026-07-16): cross-machine session RESUME. Scenario: a bunch of windows are live on machine X (reachable via relay); the user physically moves to machine Y, hits Cmd-Shift-N, sees X in the machine list, expands to see X's ACTIVE sessions, and resumes one or ALL of them 'on the local machine'. Clarified semantics: the PTYs KEEP RUNNING on X's agent (a running process can't migrate hosts) — 'resume on local machine' means local VIEWER windows on Y ATTACH to the live remote sessions on X over the relay, i.e. the SAME remote-attach mechanism as the local-persistence restore (presentRemoteWindow(sessionID:) / the relay ATTACH path), just driven from a session BROWSER instead of a saved manifest. Needs: (a) enumerate a machine's live sessions [T10 agent LIST_SESSIONS + a viewer-side RPC that can target ANY machine connection, not only the local agent], (b) chooser UI to browse + pick sessions [T16], (c) single-session attach from the browser [T17], (d) for 'resume ALL', the window/tab/split TOPOLOGY must be reachable from Y — today T05/T06 store the layout manifest ONLY in the owning viewer's local Application Support, so the agent (or account) has to own a layout blob [T18]. OPEN design Q: layout lives on the AGENT (Option A — fits the existing architecture; the agent already owns sessions + gains disk metadata in T12; the local viewer manifest becomes a cache/projection) vs SYNCED via the account/relay (Option B — needs account storage, works even when X's agent is offline). Leaning Option A. Tasks T16–T18."
   ],
-
   "headlineAcceptance": {
     "scenario": "Simulated binary upgrade (what the user asked to prove)",
     "criteria": [
@@ -59,7 +56,6 @@
       "Pass: every pane's shell/child PID unchanged and process never exited (tick counter continued monotonically across the gap — no reset to 0); split tree (directions, ratios ±0.01), window count, titles match the snapshot; +read on each pane shows pre-kill scrollback lines (replayed) AND post-gap ticks; time from kill to all panes interactive < 10 s."
     ]
   },
-
   "tasks": [
     {
       "id": "T01",
@@ -79,7 +75,9 @@
       "id": "T02",
       "title": "Agent: --port-file for ephemeral loopback listen",
       "status": "done",
-      "dependsOn": ["T01"],
+      "dependsOn": [
+        "T01"
+      ],
       "goal": "Let a supervisor spawn `ghoztty-agent --listen=127.0.0.1:0 --port-file=<path>` and discover the bound port from an atomically-written file (tmp+rename). Needed so the app can spawn/find its local agent without a fixed port.",
       "steps": [
         "src/remote/agent/main.zig: support port 0 in --listen (report bound port), new --port-file flag; write `{\"port\":N,\"pid\":P,\"startedAt\":...}` atomically after listen succeeds.",
@@ -92,7 +90,9 @@
       "id": "T03",
       "title": "App: LocalAgentManager — find-or-spawn the local agent",
       "status": "done",
-      "dependsOn": ["T02"],
+      "dependsOn": [
+        "T02"
+      ],
       "goal": "Swift manager that (a) locates a healthy local agent via its port file + HELLO probe, (b) else spawns the BUNDLED agent binary (ship ghoztty-agent inside Ghoztty-Debug.app/Contents/MacOS or Resources via the zig build) with debug-separated paths, (c) returns a dialed RemoteConnection handle.",
       "steps": [
         "Build: package ghoztty-agent into the app bundle (src/build/GhosttyXcodebuild or the zig install step).",
@@ -107,7 +107,9 @@
       "id": "T04",
       "title": "Config flag: route local windows through the local agent",
       "status": "done",
-      "dependsOn": ["T03"],
+      "dependsOn": [
+        "T03"
+      ],
       "goal": "New config `session-persistence = off|on` (default off). When on, NEW local windows/tabs/splits create their surface as a .remote backend attached to the local agent (fresh session per pane) instead of .exec.",
       "steps": [
         "Zig: add config key (src/config/Config.zig pattern), expose to Swift like other keys.",
@@ -122,7 +124,9 @@
       "id": "T04a",
       "title": "Parity: env forwarding for local-agent sessions (OPEN.env)",
       "status": "done",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "goal": "Agent-backed local panes dropped SurfaceConfiguration.environmentVariables (GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME + IPC/user env). Forward those overrides through the already-existing OPEN.env allowlist so an agent-backed pane reaches env parity with an exec pane. (Shell-integration/title-cwd injection SPLIT OUT to T04b — it ballooned: it needs client-side shell_integration.setup or agent-side injection, which is a larger, riskier change.)",
       "steps": [],
       "acceptance": "Flag-on pane has GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME set correctly (per-window/per-pane); test-agent + E2E still pass.",
@@ -132,7 +136,9 @@
       "id": "T04b",
       "title": "Parity: shell-integration injection + fresh GHOSTTY_* for local-agent sessions",
       "status": "done",
-      "dependsOn": ["T04a"],
+      "dependsOn": [
+        "T04a"
+      ],
       "goal": "Agent-backed local panes get a plain `-li`/`-lic` shell with NO ghostty shell integration: no OSC 133 prompt marks, no OSC 7 cwd tracking, no OSC 0/2 title updates, and stale/ambient GHOSTTY_SURFACE_ID + TERM_PROGRAM/TERM_PROGRAM_VERSION + GHOSTTY_RESOURCES_DIR/GHOSTTY_BIN_DIR (inherited from whatever launched the app, not computed per-pane). Inject shell integration for the LOCAL-agent case so titles/cwd/prompt-marks track like an exec pane and the GHOSTTY_* vars are correct.",
       "steps": [
         "Decide injection site: (a) CLIENT-side — run shell_integration.setup(resources_dir, shell, &env) in Surface.zig for the local-agent case, forward the resulting env (ZDOTDIR for zsh, XDG_DATA_DIRS for fish/elvish/nushell, GHOSTTY_SHELL_FEATURES, GHOSTTY_RESOURCES_DIR etc.) via OPEN.env AND forward the rewritten command (bash needs --rcfile argv, nushell needs --execute — env-only is insufficient for those); or (b) AGENT-side — apply shell_integration on the agent (it's a local ghoztty binary with the same module + resources), gated to a new OPEN flag so cross-machine/Windows agents are unaffected. Client-side is cleaner for correctness (the app knows its resources_dir + the shell) but must handle the argv-rewrite shells; agent-side avoids re-plumbing argv but needs the agent to locate resources.",
@@ -147,7 +153,9 @@
       "id": "T04c",
       "title": "Parity: forward argv-rewrite shell integration (bash/nushell) to local-agent sessions",
       "status": "done",
-      "dependsOn": ["T04b"],
+      "dependsOn": [
+        "T04b"
+      ],
       "goal": "T04b injected ghostty shell integration for ENV-ONLY shells (zsh/fish/elvish) client-side via OPEN.env. bash and nushell ALSO need an argv rewrite (bash: `--posix --rcfile <path>`; nushell: `--config/--env-config` or `--execute`) that shell_integration.setup() returns but the OPEN wire can't carry — the agent builds argv as `<shell> -lic/-li <command>` only. So a bash/nushell local-agent pane currently runs WITHOUT full integration (T04b logs 'needs an argv rewrite not yet forwarded (T04c)'; its env is still forwarded). Forward the rewritten argv so bash/nushell reach parity too.",
       "steps": [
         "Pick the wire shape: (a) client-side — add an OPEN.argv (string array) that, when present, the agent execs VERBATIM instead of synthesizing `<shell> -lic/-li`; Surface.zig forwards shell_integration.setup()'s rewritten command via it (gate to local agent so cross-machine is untouched). OR (b) agent-side — add OPEN.shell_integration mode + OPEN.resources_dir and have pty_child.zig run shell_integration.setup() itself (it builds argv anyway, so bash/nushell fall out for free) — reuses the exact module, but needs shell_integration.zig to compile into the lean agent binary (check its deps: config.zig, homedir, internal_os).",
@@ -162,7 +170,9 @@
       "id": "T05",
       "title": "Manifest v2: persist layout + session ids on change/quit",
       "status": "done",
-      "dependsOn": ["T04"],
+      "dependsOn": [
+        "T04"
+      ],
       "goal": "SessionLayoutManifest: for every persistent window, durably record {windowFrame, tabColor?, titleOverride, ipcName, tabs:[{splitTree with per-leaf {sessionID, title, ipcName}}]}. SplitTree is already Codable; add a parallel codable that captures sessionID per leaf.",
       "steps": [
         "New Swift store (UserDefaults JSON or file under ~/Library/Application Support/com.dzearing.ghoztty.debug/), modeled on RemoteSessionManifest.swift incl. its mark-don't-drain crash safety and isQuitting preservation.",
@@ -177,7 +187,9 @@
       "id": "T06",
       "title": "Restore at launch: rebuild windows + splits, re-attach every leaf",
       "status": "done",
-      "dependsOn": ["T05"],
+      "dependsOn": [
+        "T05"
+      ],
       "goal": "At app launch (flag on), replay the manifest: recreate each window at its frame, rebuild the SplitTree with exact directions/ratios, each leaf a .remote surface with its recorded sessionID (agent replays ring → scrollback restored), restore titles/ipc names.",
       "steps": [
         "Model on restoreRemoteWindows() (AppDelegate.swift:1365) + presentRemoteWindow(sessionID:), extended to multi-leaf trees: construct SplitTree nodes directly (native, exact ratios — do NOT shell out to +split/+rearrange).",
@@ -191,9 +203,13 @@
       "id": "T06a",
       "title": "Verify tab-group restore path live (GUI-driven)",
       "status": "done",
-      "dependsOn": ["T06"],
+      "dependsOn": [
+        "T06"
+      ],
       "goal": "The tabGroupID/tabIndex restore path (entries → native tabs of one window) is implemented but never executed live: no CLI command creates tabs, so it needs GUI driving (Cmd-T into a persistent window), then quit + relaunch and assert one window with N tabs, correct order, each tab's tree re-attached.",
-      "steps": ["GUI-drive Cmd-T on a flag-on window (memory: ghoztty-gui-driving-now-possible; screen must be unlocked), sync manifest (2 entries sharing tabGroupID), quit, relaunch, verify grouping + selection + per-tab session re-attach."],
+      "steps": [
+        "GUI-drive Cmd-T on a flag-on window (memory: ghoztty-gui-driving-now-possible; screen must be unlocked), sync manifest (2 entries sharing tabGroupID), quit, relaunch, verify grouping + selection + per-tab session re-attach."
+      ],
       "acceptance": "Restored tab group matches pre-quit: same window count, tab order, per-tab topology, sessions re-attached.",
       "notes": "2026-07-14: done, incl. TWO REAL BUGS FIXED (found by this verify): (1) adding a tab synced only the NEW controller's entry — siblings kept tabGroupID nil, so restore would NOT have grouped them; fix = sync() now refreshes every sibling entry in the tab group (private syncEntry does one controller, depth-1 no recursion). (2) closing a tab left the survivor's stale tabGroupID; windowWillClose's group is ALREADY solo (AppKit detaches the closing window from the shared group BEFORE windowWillClose — proven via log: groupWindows=1 there), so the close path refreshes ALL other persistent controllers via NSApp.windows; also syncEntry counts only isVisible||isMiniaturized group members (closed tabs linger in tabGroup.windows until dealloc). VERIFIED LIVE x2 (graceful quit + relaunch): 1 window, 2 tabs, order+selection preserved, tab-1 split topology exact, ticker monotonic across gap (f-tick-19→25 no reset), +read/+send-keys by name post-restore OK, agent pid 18770 unchanged; create→manifest shows shared tabGroupID idx 0/1 with ids captured; close→survivor's group cleared. HOW TO DRIVE TABS HEADLESSLY: the app's AppleScript interface works even with the SCREEN LOCKED — osascript 'tell application id \"com.dzearing.ghoztty.debug\" to new tab in (first window whose id is \"tab-group-…\")' / 'close tab (tab 2 of …)'; window/tab ids match +list. AX menu clicks do NOT work locked (app exposes zero AX windows; click 'succeeds', action no-ops). WARNING: NEVER 'tell process \"ghoztty\"' by NAME in System Events — it resolved to the RELEASE app and created a tab in the user's real terminal (removed it; verified fresh idle shell before closing). Manifest unit tests (12) pass. Discovered 3 new bugs → T06b/T06c/T06d. Also: old 3-window fixture's manifest entries were DESTROYED by the T06b bug during this work (sessions orphaned; ticker orphans killed); current fixture = 1 window/2 tabs (tab2 ticker f-tick) restored + live, agent 18770. Commit 0490b16fc."
     },
@@ -201,7 +217,9 @@
       "id": "T06b",
       "title": "Restore drop-policy is destructive on probe failure (+ fast-relaunch poisoned connection)",
       "status": "done",
-      "dependsOn": ["T06a"],
+      "dependsOn": [
+        "T06a"
+      ],
       "goal": "SEEN LIVE: kill -9 the app and relaunch ~1s later → LocalAgentManager dial reports ready, but ALL query_cwd probes return empty within ~2ms (agent still had the dead app's bridges bound) → restore treated every session as gone and REMOVED all manifest entries (layout permanently lost) even though every shell was alive under agent 18770. Worse, that instance's shared connection stayed poisoned: EVERY subsequent ghostty_surface_new failed ('surface error view will render', session=-) until the app was restarted. Make the drop policy conservative and the connection resilient.",
       "steps": [
         "SessionLayoutRestore.probeSessions: distinguish 'agent says dead/not_found' from 'probe failed/empty' (query_cwd empty ≠ dead — needs an RPC that returns session status; T10's LIST_SESSIONS is the natural fix, or probe retry with backoff).",
@@ -216,7 +234,9 @@
       "id": "T06c",
       "title": "Scrollback replay on re-attach is inconsistent (blocks headline '+read shows pre-kill lines')",
       "status": "done",
-      "dependsOn": ["T06a"],
+      "dependsOn": [
+        "T06a"
+      ],
       "goal": "SEEN LIVE: restored panes often show NO pre-quit/pre-kill scrollback despite the client sending last_byte_offset=0 (src/termio/Remote.zig:263) and the agent's ATTACH gap-fill (src/remote/agent/server.zig:784-816) supposedly replaying the whole retained ring. Graceful-quit relaunch: NO pane replayed pre-quit content (t06b showed post-attach ticks only). kill -9 relaunch: t06b replayed 300+ pre-kill lines fine, but the new tab's pane replayed NOTHING (2 lines: post-attach ticks only; ticks produced during the down-gap also missing). Same agent, same cycle, different panes.",
       "steps": [
         "Instrument/read agent ATTACH path: log snapshot_at, ring.base_offset, replay_from, bytes replayed per attach; reproduce both quit paths.",
@@ -231,7 +251,9 @@
       "id": "T06d",
       "title": "AppleScript 'new tab' returns error -10000 despite creating the tab",
       "status": "done",
-      "dependsOn": ["T06a"],
+      "dependsOn": [
+        "T06a"
+      ],
       "goal": "handleNewTabScriptCommand (AppDelegate+AppleScript.swift:230) reliably errors 'Failed to create tab.' (errAEEventFailed) while the tab IS created — TerminalController.newTab apparently returns nil though the controller comes up fine. Scripts can't get the returned tab object (harness must re-discover via +list). Low priority; fix the return path (likely async window creation racing the synchronous script reply).",
       "steps": [],
       "acceptance": "osascript 'new tab in window …' returns the ScriptTab object with no error; existing AppleScript tests (if any) pass.",
@@ -241,7 +263,11 @@
       "id": "T07",
       "title": "E2E harness: scripted kill -9 survival test",
       "status": "done",
-      "dependsOn": ["T06", "T06b", "T06c"],
+      "dependsOn": [
+        "T06",
+        "T06b",
+        "T06c"
+      ],
       "goal": "A repeatable script (e.g. scripts/e2e/session-persistence.sh or .py) that builds the full headlineAcceptance scenario via CLI, SIGKILLs the app, relaunches, and ASSERTS every criterion mechanically (exit nonzero on any failure).",
       "steps": [
         "Drive via debug CLI: +new-window/+split with --command markers (see headlineAcceptance), capture +list --json, capture marker PIDs via +read.",
@@ -256,7 +282,9 @@
       "id": "T08",
       "title": "E2E: simulated binary UPGRADE (the user's headline ask)",
       "status": "done",
-      "dependsOn": ["T07"],
+      "dependsOn": [
+        "T07"
+      ],
       "goal": "Extend the harness with an upgrade mode: between kill and relaunch, REPLACE the app bundle with a newly-built one (new mtime + bumped build marker), like Sparkle does. Everything must re-attach intact per headlineAcceptance.",
       "steps": [
         "Build a second copy of the bundle (or rebuild after touching a version string); rsync --delete over zig-out staged copy in a scratch dir — NEVER /Applications.",
@@ -271,7 +299,9 @@
       "id": "T08a",
       "title": "Graceful quit hangs ~45s with multiple agent-backed panes",
       "status": "done",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "goal": "SEEN LIVE (T08): Cmd-Q / AppleScript 'quit' of a session-persistence app with several agent-backed (.remote) panes wedges ~45s in AppKit window teardown before the process exits; a plain exec-backed 5-pane app quits in 0.6s, so it is session-persistence-specific and scales with pane/window count. Persistence is NOT affected (applicationShouldTerminate returns .terminateNow fast; the isQuitting/flushPendingSyncs manifest path runs before the hang; recovery after relaunch is <4s) — but a user quitting the app hangs for ~45s, which is unacceptable UX and forces the E2E harness to SIGKILL as a fallback.",
       "steps": [
         "Reproduce with scripts/e2e/session-persistence.py --quit=graceful (any --cycles); or build the 5-pane scenario and `osascript -e 'tell application id \"com.dzearing.ghoztty.debug\" to quit'`, then `sample <pid> 45`.",
@@ -286,7 +316,9 @@
       "id": "T09",
       "title": "Hardening (agent): --listen-unix transport + peercred same-uid check",
       "status": "done",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "goal": "Agent-side of the UDS hardening (design §5.2: any local user can connect to a 127.0.0.1 port; a 0600 unix socket + LOCAL_PEERCRED/SO_PEERCRED same-uid check cannot be reached by another user). Add `--listen-unix=<path>`: bind an AF_UNIX stream socket at 0600, unlink a stale socket only after a connect-probe livecheck, then run the SAME acceptLoop with a per-connection same-uid peercred gate. Keep `--listen` TCP for dev/tests. Client dial + LocalAgentManager switch are T09b/T09c.",
       "steps": [
         "New Mode.listen_unix{path,headless,force_replace}; parse --listen-unix=<path> and --listen-unix <path> (single-instance guard as for --listen).",
@@ -302,7 +334,9 @@
       "id": "T09b",
       "title": "Hardening (client): ghostty_remote_connection_new_unix dial + ABI",
       "status": "done",
-      "dependsOn": ["T09"],
+      "dependsOn": [
+        "T09"
+      ],
       "goal": "Client-side UDS dial mirroring the TCP path. Refactor tcp_dial.dial's post-connect steps (mux→Connection→HELLO) into a shared helper; add dialUnix(path) that connects an AF_UNIX socket + reuses it. Export ghostty_remote_connection_new_unix(path) in embedded.zig (store in the existing transport-agnostic handle.tcp Dialed slot) + declare in include/ghostty.h.",
       "steps": [
         "tcp_dial.zig: extract dialConnected(alloc, *SocketStream, encoding, timeout) from dial(); dial() (TCP) and new dialUnix(alloc, path, encoding) both build the SocketStream then call it.",
@@ -316,7 +350,9 @@
       "id": "T09c",
       "title": "Hardening: LocalAgentManager switches to UDS (default local transport) + E2E over UDS",
       "status": "done",
-      "dependsOn": ["T09b"],
+      "dependsOn": [
+        "T09b"
+      ],
       "goal": "Make the 0600 unix socket the DEFAULT local-agent transport. LocalAgentManager spawns `--listen-unix=<dir>/agent.sock`, discovers the agent's pid via an info file (reuse/generalize --port-file to carry pid+socket, since UDS has no ephemeral port to publish), dials via ghostty_remote_connection_new_unix. Run the full E2E (T07 kill-9 + T08 upgrade) over UDS; verify a different-uid connect is refused.",
       "steps": [
         "Agent: in --listen-unix mode, still honor --port-file to publish {\"pid\":P,\"socket\":\"<path>\",\"startedAt\":MS} (port omitted/0) so the supervisor can pid-liveness-check a pre-existing agent (Swift side needs pid for the sharedAgentPid cheap check).",
@@ -331,9 +367,13 @@
       "id": "T10",
       "title": "Agent: LIST_SESSIONS + `+sessions` CLI",
       "status": "done",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "goal": "Wire session enumeration: new LIST_SESSIONS/SESSIONS frames (store already internally enumerable — tray.zig:33 pattern), and `ghoztty +sessions [--json]` against the local agent. Foundation for cross-machine attach later.",
-      "steps": ["protocol.zig frames + server.zig handler + tests; src/cli/sessions.zig modeled on list.zig but dialing the agent directly (not the app socket)."],
+      "steps": [
+        "protocol.zig frames + server.zig handler + tests; src/cli/sessions.zig modeled on list.zig but dialing the agent directly (not the app socket)."
+      ],
       "acceptance": "test-agent passes; +sessions lists live sessions with id/state/attached/cwd/argv; documented in CLAUDE.md CLI section.",
       "notes": "2026-07-16: done, commit 29ffb1fc6 (impl+docs) — task-file docs commit follows. WIRING (4 layers, all additive/HELLO-compatible): (1) protocol.zig — new frame types list_sessions=0x24 / sessions=0x25; payloads ListSessions{} (empty request, same-channel RPC like GET_CWD) + SessionInfo{id,alive,exit_code?,attached,activity(str),pid,title?,cwd?,argv?,created_at,last_activity} + Sessions{sessions:[]}. `activity` is a STRING on the wire (not the agent's ActivityState enum) so protocol.zig needn't import session.zig (layering: session imports protocol). Empty roster encodes `{\"sessions\":[]}` — NOT elided (default `&.{}` is a present empty slice) so the client distinguishes 'answered, none' from 'no reply' (asserted). (2) session.zig — Session gains `argv: ?[]u8` + setArgv() (dupe-replacing, swallows OOM = best-effort) + free in deinit; captured in server.handleOpen from open.command ?? open.shell. (3) server.zig — dispatch `.list_sessions => handleListSessions`; the handler snapshots the WHOLE by_id roster into an ArrayList of SessionInfo (borrowing session strings) and sendJson's SESSIONS on the request channel WHILE HOLDING store.mutex — safe because encode is pure in-memory (no OS I/O, unlike handleGetCwd which must unlock for queryCwd) and the store→write_mutex lock order is the SAME one bridgeData already takes under the store lock (no new deadlock). attached=s.bound, activity=@tagName(s.state). (4) connection.zig — OwnedSession/OwnedSessions (deep-copy owned, mirrors OwnedProcSnapshot) + requestSessions(timeout) (rpcCall .list_sessions→.sessions, deep-copy out of the parsed arena). CLI src/cli/sessions.zig: `+sessions [--json]` resolves ~/.config/ghoztty/local-agent[-debug]/port.json (build_config.is_debug suffix, matching LocalAgentManager.Paths), reads {port,pid,socket}, dials the agent DIRECTLY via tcp_dial.dialUnix (UDS socket) else legacy dial(TCP port) — NOT the app IPC socket, so it works with the app closed — then requestSessions, prints a human table or a JSON array (dedicated JsonRow struct, emit_null_optional_fields=true for stable keys). Registered in ghostty.zig (import+enum+description+runMain+options); helpgen auto-generates --help from the run() doc comment. CLAUDE.md gained a +sessions section.\n\nBUG CAUGHT BY LIVE VERIFICATION (why the server unit test wasn't enough): handleControlInternal in connection.zig has an explicit switch listing which reply frame types get routed to deliverRpcReply (.opened/.attached/.cwd/.proc_snapshot/...). SESSIONS wasn't in it → the real client's control reader dropped the reply → `+sessions` timed out. The server test uses MockClient (its own frame reader), which BYPASSES handleControlInternal, so it passed while the real path hung. Fix: added `.sessions => deliverRpcReply` arm. Rebuilt; live-verified.\n\nTESTS: 2 new server tests (enumerate two sessions — argv label captured, alive+attached true; empty roster → empty array); protocol round-trip (alive+dead rows, null elision, empty-array non-elision). zig build test-agent exit 0; connection.zig 94/94; protocol.zig 25/25; full app build OK.\n\nLIVE VERIFIED: launched freshly-built debug app --session-persistence=true (agent pid 1370 over 0600 UDS), created 4 agent-backed sessions (2 plain shells + `sleep 600` + `sleep 700` split). `+sessions` (table) and `--json` both listed all 4 with correct ids, alive, attached=true, pids matching the child PIDs, and argv = the full `/bin/zsh -lic 'sleep 600; exec /bin/zsh -li'` for the command sessions. `--help` rendered from the doc comment (registration proven). Torn down clean (app+agent killed, release app 87536 untouched, state files removed).\n\nKNOWN GAPS (deferred, not T10-blocking): (a) argv is NULL for a PLAIN shell session (client sends neither command nor shell → the agent resolves its own default $SHELL inside pty_child.spawnChild, not reachable from handleOpen without duplicating shell-resolution). T12 (sessions.json) captures the fully-resolved argv at spawn — the right place. (b) cwd is NULL until the client reports it (no SET_META yet; design §5 has the client push title/cwd via SET_META, and queryCwd fills on demand) — the field is present, populated when known. (c) activity is always 'idle' — the agent's Session.state is never updated by +set-state (that updates the app-side surface, not the agent session); wiring OSC-7777/SET_META activity to the agent session is future. For T16: requestSessions already targets an arbitrary *Connection, so the cross-machine LIST_SESSIONS-over-relay generalization the task calls for is a matter of calling it on a relay-machine connection rather than the local-agent handle."
     },
@@ -341,9 +381,13 @@
       "id": "T11",
       "title": "Agent policy: pinned sessions (no TTL), session cap 256, configurable ring size",
       "status": "done",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "goal": "Persistent local sessions must never be TTL-reaped while a manifest references them; raise max_sessions 64→256; ring size via flag/env (default stays 2MB until measured; design target 16MB).",
-      "steps": ["OPEN gains pinned flag (additive, HELLO-compatible); reapIdle skips pinned; caps + --ring-bytes flag; tests incl. reaper behavior."],
+      "steps": [
+        "OPEN gains pinned flag (additive, HELLO-compatible); reapIdle skips pinned; caps + --ring-bytes flag; tests incl. reaper behavior."
+      ],
       "acceptance": "test-agent passes; pinned session survives a fake-TTL fast-forward test; unpinned still reaped.",
       "notes": "2026-07-16: done, commit 0f5ed678e (notes-SHA follow-up amends). THREE agent-policy changes + client wiring + observability.\n\n(1) PINNED SESSIONS (never TTL-reaped). Wire: protocol.Open gains `pinned: bool = false` (additive; unknown-field-tolerant parser → older agents ignore it and keep TTL). session.Session gains `pinned: bool = false`; server.zig handleOpen sets `s.pinned = open.pinned` after create/setArgv. session.zig reapIdle skips pinned: `if (s.pinned) continue;` right after the existing `if (s.bound) continue;` — a pinned orphan is NEVER evicted (alive OR tombstone; only CLOSE / child-exit-then-CLOSE frees it). CLIENT WIRING (so it actually fires): termio/Remote.zig Config.pinned + backend field, threadEnter puts `.pinned = self.pinned` in the OPEN; Surface.zig sets `.pinned = rb.local_shell_integration` on the Remote.init config — reusing the EXISTING local-agent signal (`local_shell_integration` == Machine.isLocalMachine, set by Swift SurfaceView.withCValue in T04b; true for ALL local-agent panes regardless of shell-integration config or command, false for cross-machine). So every persistent local pane is pinned; cross-machine windows keep the 24h idle-TTL. ATTACH is unaffected (session was pinned at its original OPEN; restore just re-ATTACHes).\n\n(2) max_sessions 64 → 256 (session.zig const + doc). An OPEN past the cap is still refused (handleOpen's existing TooManySessions path terminates the orphaned child).\n\n(3) CONFIGURABLE RING SIZE. `--ring-bytes=<N>` flag (highest priority) OR `GHOSTTY_AGENT_RING_BYTES` env (fallback), default stays session.default_ring_bytes (2MB). main.zig: module-global `configured_ring_bytes` (set-once at startup, read-only after → no sync) + `ring_bytes_from_flag`; pure tested `parseRingBytes(text) ?usize` (plain byte count, trims whitespace, floor `min_ring_bytes`=64KiB, junk/empty/negative/below-floor → null). Flag parsed in parseArgs's order-independent pre-scan (like --port-file, two-token + `=` forms; invalid value → InvalidArgs with message); env fallback resolved once in main() after parseArgs when the flag didn't win. serveOne (the single funnel for stdio/TCP/relay per the module doc) passes `.ring_bytes = configured_ring_bytes` into the per-connection Server opts (which handleOpen already threads to table.create). No SessionStore/serveOne signature churn. Usage text updated.\n\n(4) OBSERVABILITY (added so pinned is verifiable live + useful for a persistence feature): protocol.SessionInfo gains `pinned: bool = false` (additive); server LIST_SESSIONS populates `.pinned = s.pinned`; connection.OwnedSession gains pinned + requestSessions copies it; `+sessions` prints a `pinned` token (human) and `pinned` key (--json). CLAUDE.md +sessions doc updated.\n\nTESTS (all green): zig build test-agent exit 0. NEW: session.zig 'reapIdle: pinned survives fast-forward, unpinned is reaped' (MutClock; two orphans born t=0, one pinned; at ttl-1 nothing reaped, at ttl*100 the plain one is terminated+removed and the pinned one survives untouched) + 'a bound session is never reaped regardless of pin'. protocol.zig OPEN round-trip extended (pinned defaults false, pinned=true emits `\"pinned\":true` + round-trips) and SESSIONS roster extended (alive row pinned=true round-trips, dead row defaults false). server.zig LIST_SESSIONS test now opens o0 with .pinned=true / o1 unpinned and asserts each roster row's pinned — verifies the full OPEN→session→SESSIONS wire. main.zig parseRingBytes test (floor boundary 65535 rejected / 65536 accepted, junk '2MB'/''/'-1' → null). GOTCHA hit: first reaper test's 'not yet idle' step used clock=ttl_ms → cutoff=0, last_activity=0, `0<=0` REAPED it (off-by-one); fixed to ttl_ms-1 (cutoff=-1 < 0).\n\nLIVE VERIFIED: (a) --ring-bytes parsing against zig-out/bin/ghoztty-agent — good value + --version exit 0, junk 'abc' → InvalidArgs exit 1 with 'min 65536', below-floor '1000' rejected, GHOSTTY_AGENT_RING_BYTES=8388608 --version exit 0. (b) PINNED end-to-end: launched debug app --session-persistence=true, +new-window --command=ticker; `+sessions --json` showed BOTH local-agent sessions (initial shell + command pane) `\"pinned\": true` — proves Surface→Remote→OPEN→session→LIST_SESSIONS carries pinned for real local-agent panes. (c) E2E scripts/e2e/session-persistence.py kill-9 = 2/2 then 1/1 PASS after the observability rebuild (recovery ~1.0s, PIDs stable, topology exact, scrollback replayed, agent untouched) — pinned wiring didn't regress restore. Box left clean (agent needed SIGKILL after SIGTERM — known T12 concern re agent SIGTERM handling)."
     },
@@ -351,7 +395,9 @@
       "id": "T12",
       "title": "Reboot floor (part 1): agent session metadata persistence to disk (write side)",
       "status": "done",
-      "dependsOn": ["T11"],
+      "dependsOn": [
+        "T11"
+      ],
       "goal": "First slice of the reboot floor. Give the agent a durable, atomically-written `sessions.json` recording {id, argv, cwd, title, pinned, created_ms} for every live session, refreshed on the session-set-changing events (open/close/reap). Pure write side + on-disk format + a standalone parse/serialize round-trip; NO load-at-start materialization, NO RELAUNCH, NO viewer UX, NO launchd (those are T12b/T12c/T12d). This unblocks everything else in the reboot floor.",
       "steps": [
         "New src/remote/agent/session_meta.zig: on-disk format {version:1, sessions:[{id,argv?,cwd?,title?,pinned,created_ms}]}; pure serialize(alloc,recs) + parse(alloc,bytes) round-trip; writeAtomic(path,bytes) tmp+rename+fsync+makePath; load(alloc,path) -> ?Parsed (null when the file is absent). Add to agent_test.zig aggregator.",
@@ -368,7 +414,9 @@
       "id": "T12b",
       "title": "Reboot floor (part 2): load-at-start materialization + RELAUNCH frame/handler",
       "status": "done",
-      "dependsOn": ["T12"],
+      "dependsOn": [
+        "T12"
+      ],
       "goal": "On agent start, load sessions.json (T12) and materialize each record as a DEAD, relaunchable tombstone in the store (no child yet). New RELAUNCH protocol frame + agent handler: respawn the child under the recorded argv/cwd, re-key it into the same session id, transition the tombstone to alive, and stream fresh output. Additive/HELLO-compatible.",
       "steps": [
         "session_meta.load() at agent start (runListen/runListenUnix) → for each record insert a tombstone Session (alive=false, no child, exit_code=null-or-a 'relaunchable' marker) carrying argv/cwd/title/pinned so ATTACH replies dead and LIST_SESSIONS shows it.",
@@ -384,7 +432,9 @@
       "id": "T12c",
       "title": "Reboot floor (part 3): viewer relaunch UX + session-relaunch config",
       "status": "done",
-      "dependsOn": ["T12b"],
+      "dependsOn": [
+        "T12b"
+      ],
       "goal": "Viewer side: a restored leaf whose session comes back DEAD-but-relaunchable offers/auto-fires RELAUNCH and shows a '--- restarted ---' divider/banner. New config session-relaunch=auto|prompt (default auto).",
       "steps": [
         "Zig config key session-relaunch (enum auto|prompt) exposed to Swift like session-persistence.",
@@ -398,7 +448,9 @@
       "id": "T12c2",
       "title": "Reboot floor (part 3b): genuine interactive relaunch affordance for session-relaunch=prompt",
       "status": "done",
-      "dependsOn": ["T12c"],
+      "dependsOn": [
+        "T12c"
+      ],
       "goal": "T12c's `prompt` policy only SUPPRESSES the auto-respawn — the pane comes up in its exited state with no in-place way to bring the session back. Give prompt mode a real affordance: a visible 'Session ended — Relaunch' control on the dead-but-relaunchable pane that, on click/keypress, fires RELAUNCH in place (same path auto uses) and shows the '--- session restarted ---' divider.",
       "steps": [
         "Surface the dead+relaunchable state to Swift: either a new ABI/surface flag the Remote backend sets when threadEnter hits a relaunchable tombstone under prompt policy, or reuse the childExited message with a 'relaunchable' bit so the exited overlay can show a Relaunch button.",
@@ -413,7 +465,9 @@
       "id": "T12d",
       "title": "Reboot floor (part 4): per-user LaunchAgent packaging + reboot-equivalent E2E",
       "status": "done",
-      "dependsOn": ["T12b"],
+      "dependsOn": [
+        "T12b"
+      ],
       "goal": "Install a per-user LaunchAgent (com.dzearing.ghoztty.debug.agent for the debug lineage) with RunAtLoad+KeepAlive so the agent is restarted by launchd after a kill/reboot; add the reboot-equivalent E2E variant (full agent restart) to the harness.",
       "steps": [
         "LocalAgentManager writes/loads the LaunchAgent plist (RunAtLoad+KeepAlive, debug-suffixed label + paths, GHOSTTY_AGENT_* env); decide bootstrap vs the existing find-or-spawn (avoid double-spawn with the single-instance guard).",
@@ -427,7 +481,9 @@
       "id": "T12e",
       "title": "Reboot floor (part 5): in-place AC4 — local pane auto-reconnect+relaunch when the agent crashes while the app stays up",
       "status": "done",
-      "dependsOn": ["T12d"],
+      "dependsOn": [
+        "T12d"
+      ],
       "goal": "Today an agent crash while the GUI stays up leaves local agent-backed panes DEAD until the next app relaunch: the Zig client backend does not auto-redial a dropped local link (connection.zig controlReaderLoop returns on EOF; LinkState FSM computes backoff but the reconnect/re-dial/re-attach increment is unbuilt — its header literally says 'does NOT actually reconnect'), and the local machine pill + its manual Reconnect button are hidden for isLocalMachine so the user can't even trigger it. Wire automatic reconnect: on a dropped LOCAL link, redial the (launchd-restarted, per T12d) agent, re-ATTACH each pane by session id, and — finding a dead+relaunchable tombstone — fire the SAME auto-RELAUNCH path threadEnter already runs (T12c) so panes come back in place with the '--- session restarted ---' banner, no app relaunch needed.",
       "steps": [
         "Decide the driver: (a) Swift — LocalAgentManager observes sharedOwner.linkState==.dead (or a callback from the backend), redials, and re-drives each affected surface's attach (mirrors the remote MachinePill Reconnect flow but automatic + for local); or (b) Zig — build the connection.zig reconnect increment the FSM header foreshadows (re-dial stream + re-HELLO + re-ATTACH) so it's transport-agnostic and covers remote windows too. (b) is the more general fix but bigger/riskier; (a) is scoped to local persistence.",
@@ -441,18 +497,40 @@
     {
       "id": "T13",
       "title": "Reboot scrollback: ring disk snapshots",
-      "status": "pending",
-      "dependsOn": ["T12b"],
+      "status": "done",
+      "dependsOn": [
+        "T12b"
+      ],
       "goal": "Agent snapshots dirty rings every 30s + on SIGTERM; after restart, replay snapshot then a divider then live output (design §5.4).",
-      "steps": ["Snapshot format (offset+bytes), atomic write, load on start attaching to relaunched session; tests."],
+      "steps": [
+        "Snapshot format (offset+bytes), atomic write, load on start attaching to relaunched session; tests."
+      ],
       "acceptance": "Agent-restart E2E shows pre-restart scrollback + divider + fresh output.",
+      "notes": "2026-07-16: done, feature commit 1568e76c9. SCOPE: SIGTERM-on-graceful-agent-shutdown split out to new T13b (needs safe signal handling; NOT exercised by the E2E which SIGKILLs, and the connection-drop trigger already covers real logout/reboot). Everything else shipped.\n\nNEW FILE src/remote/agent/ring_snapshot.zig — compact BINARY format `<rings_dir>/<id>.ring`: magic 'GRS1' + base_offset(u64 LE) + byte_len(u64 LE) + bytes. Atomic tmp+fsync+rename (mirrors session_meta.writeAtomic but two writeAlls to avoid concatenating the 2MB ring). load() is best-effort: absent/short-header/wrong-magic/length-mismatch ALL -> null (a corrupt snapshot must never stop a session relaunching; the pane just comes back blank). delete() for CLOSE/reap cleanup. std-only, standalone tests. Added to agent_test.zig.\n\nARCHITECTURE (key decisions):\n(1) TRIGGERS: NOT the SIGKILL'd agent's own death (impossible) but (a) periodic every 30 reaper ticks and (b) on VIEWER DISCONNECT [server.zig shutdown -> detachAll -> store.snapshotRings]. (b) is what makes the reboot E2E pass without a 30s wait: the E2E SIGKILLs the APP first, the still-alive agent sees the dropped socket -> snapshots -> THEN the agent is SIGKILLed. This app-first-kill ordering is also what a real logout does. In-place mode (--agent-only) kills ONLY the agent so NO snapshot fires -> pre-restart scrollback legitimately lost there (honest contract); the E2E asserts scrollback ONLY for reboot, not in-place.\n(2) REPLAY: materialized dead session's ring is PRELOADED at start (loadPersisted->preloadRingSnapshot): renumbered to base 0 = [snapshot][divider], out_offset at tail. On RELAUNCH (handleRelaunch phase 3, under lock before child.attach) the agent copies that ring and sendData's it to the viewer BEFORE the fresh child's live output -> client sees scrollback->divider->live with NO offset hole (relaunch pane keeps every byte from 0).\n(3) DIVIDER OWNERSHIP: baked into the RING (between snapshot and live), NOT client-side — the client's synchronous processOutput(divider) can't be sequenced between async ring drains, so a client-side divider would land BEFORE the replayed scrollback (wrong order) AND double up. So agent bakes+replays; adds protocol.Relaunched.replayed (additive, threaded through RelaunchResult/RelaunchOutcome); client (termio/Remote.zig) suppresses its OWN divider when replayed=true, keeps it for the no-snapshot case. Same divider STRING as the client's so RESTART_DIVIDER still matches.\n(4) MEMORY BOUND: snapshotRings copies ONE ring at a time (collect dirty ids under lock; per-id re-lock/copy-to-reused-buffer/unlock/write) — never all 256x2MB at once, never OS I/O under the store lock. Dirty bit = out_offset != last_snapshot_offset; marked clean only after a successful write.\n\nE2E CHANGES (tricky): with T13 a reboot pane's scrollback is [OLD marker+ticks][divider][FRESH marker+ticks] — TWO PANE= lines. parse_marker returns the FIRST (old) -> broke 'fresh pid != baseline' AND wait_restored returned as soon as the REPLAYED old marker appeared (before fresh output -> pane-3 flake on first run). FIXES: fresh_marker(text) = marker AFTER the last divider (fallback to first when no divider); assert_reboot_cycle uses it for fresh pid + asserts 'PANE=n ' appears BEFORE the divider (pre-restart proof); wait_restored(relaunched=True) + wait_inplace_recovered require a POST-divider marker.\n\nVERIFIED: zig build (app+agent) OK; test-agent exit 0 (added ring_snapshot 3 tests, OutputRing copyRetained/preload, SessionStore snapshot round-trip, server 'RELAUNCH replays scrollback+divider before live output', protocol replayed round-trip). E2E all green: --agent-restart 3/3 (pre-restart scrollback + divider + fresh PIDs, 1.9-3.9s), --agent-only 2/2, kill/kill 2/2, --upgrade 1/1. Box left clean. GAP -> T13b: graceful SIGTERM snapshot; also snapshot ring size is default 2MB not the 16MB persistent-scrollback-bytes (T11 config not wired to the launchd plist)."
+    },
+    {
+      "id": "T13b",
+      "title": "Reboot scrollback part 2: snapshot dirty rings on graceful agent SIGTERM",
+      "status": "pending",
+      "dependsOn": [
+        "T13"
+      ],
+      "goal": "T13 snapshots rings periodically (30s) + on viewer disconnect, which covers the E2E (SIGKILL) and the common logout/reboot (viewer dies first -> agent snapshots -> launchd SIGTERMs the agent). Add the design's remaining trigger: snapshot on the agent's OWN graceful SIGTERM, so output produced between the viewer dying and the agent being told to stop (or an agent that outlives its viewer and is then asked to quit) is captured up to the last instant.",
+      "steps": [
+        "SAFE signal handling only: do NOT do work in an async signal handler (locks/malloc/file I/O unsafe there, and snapshotRings takes the store mutex). Use sigwait: block SIGTERM process-wide on the main thread BEFORE spawning accept/reaper/writer threads (they inherit the mask), then a dedicated watcher thread calls std.c.sigwait; on receipt run store.snapshotRings() then std.process.exit(0). Verify std.c.sigwait links on this macOS build before committing.",
+        "Gate to POSIX (Windows has the tray Exit path). Must NOT regress T12d/T12e launchd flows (KeepAlive+RunAtLoad): a clean exit(0) on SIGTERM is correct; confirm the watcher actually exits so launchd's SIGTERM->SIGKILL escalation isn't needed.",
+        "Test: SIGTERM (not SIGKILL) a live agent with a dirty session and assert the ring file was written before exit."
+      ],
+      "acceptance": "A graceful SIGTERM to the agent flushes dirty rings to disk before exit; launchd stop/restart still works; test-agent + existing E2E modes still green.",
       "notes": ""
     },
     {
       "id": "T14",
       "title": "Wrap-up: docs, design-doc status update, memory, final report",
       "status": "pending",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "goal": "Update CLAUDE.md (new CLI/config), design doc status + measured acceptance numbers, memory files; write the final user-facing summary (do NOT reset context after this — report instead).",
       "steps": [],
       "acceptance": "Docs consistent with shipped behavior; final report delivered.",
@@ -472,7 +550,9 @@
       "id": "T16",
       "title": "Cross-machine resume: browse a machine's active sessions in the Cmd-Shift-N chooser",
       "status": "pending",
-      "dependsOn": ["T10"],
+      "dependsOn": [
+        "T10"
+      ],
       "goal": "In the machine chooser (Cmd-Shift-N), show each machine's live-session count and let the user expand a machine to a read-only LIST of its active sessions (title, cwd, last-active, attached-elsewhere?). This is the browse half of the user's cross-machine RESUME vision (see decisions[]); attach is T17. Sessions are enumerated by querying the SELECTED machine's agent via T10's LIST_SESSIONS over that machine's existing transport (local loopback OR relay) — so the RPC must target an arbitrary Machine connection, not only the local agent.",
       "steps": [
         "Viewer-side RPC: generalize the T10 LIST_SESSIONS call so it runs against any dialed RemoteConnection (relay machine or local agent), not just the local-agent handle; return [{sessionID, title, cwd, argv, attached, lastActiveMs}].",
@@ -486,7 +566,9 @@
       "id": "T17",
       "title": "Cross-machine resume: attach a single remote session on the local machine",
       "status": "pending",
-      "dependsOn": ["T16"],
+      "dependsOn": [
+        "T16"
+      ],
       "goal": "From the T16 session browser, pick ONE session and open a LOCAL viewer window that ATTACHES to that (possibly remote) session id over the machine's transport — reusing presentRemoteWindow(sessionID:) / the relay ATTACH restore path (T06). The process keeps running on its host agent; only the viewer window is local. Handle attached-elsewhere per existing ATTACH semantics (force/steal vs decline).",
       "steps": [
         "Wire a 'Resume' action on a browsed session → build a .remote surface config with that machine + sessionID (nil-tree single leaf) and present it, exactly like the manifest restore does but sourced from the browser selection.",
@@ -500,7 +582,10 @@
       "id": "T18",
       "title": "Cross-machine resume: agent-owned layout blob + 'Resume all' (rebuild topology on another machine)",
       "status": "pending",
-      "dependsOn": ["T17", "T12"],
+      "dependsOn": [
+        "T17",
+        "T12"
+      ],
       "goal": "Make 'resume ALL of machine X's sessions on Y' rebuild X's full window/tab/split TOPOLOGY on Y — not just a flat list of attached panes. Today the layout manifest (T05/T06) lives ONLY in the owning viewer's local Application Support, unreachable from another machine. Direction (decisions[] Option A): the owning viewer PUSHES an opaque per-window layout blob (topology + per-leaf session ids + ratios/titles) to the agent; the agent persists it alongside its session metadata (T12) and serves it on request. A viewer on Y pulls sessions + layout and rebuilds every window/tab/split locally via SessionLayoutRestore's tree builder, attaching each leaf to its live remote session.",
       "steps": [
         "Protocol: SET_LAYOUT / GET_LAYOUT frames carrying an OPAQUE blob keyed by window/tab-group id (agent stays topology-agnostic — it just stores/returns bytes). Additive, HELLO-compatible.",
