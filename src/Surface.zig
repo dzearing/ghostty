@@ -734,6 +734,26 @@ pub fn init(
                 }
                 errdefer if (remote_command) |rc| alloc.free(rc);
 
+                // Forward the surface's env OVERRIDES to the agent (OPEN.env,
+                // T04a). These are the explicit `environmentVariables` the apprt
+                // set — GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME (window/pane
+                // self-identification) and IPC-set vars, plus any user `env`
+                // config — the same small set an exec pane applies LAST via
+                // `env_override`. We forward ONLY these overrides, NEVER the local
+                // inherited env map (already freed above): the agent has its own
+                // environment, and shipping a macOS PATH/HOME to a possibly
+                // different-OS agent would be wrong. `Remote.init` dupes each pair
+                // immediately, so this temporary list is freed as the block exits.
+                var remote_env: std.ArrayListUnmanaged(termio.Remote.EnvPair) = .empty;
+                defer remote_env.deinit(alloc);
+                {
+                    var env_it = config.env.iterator();
+                    while (env_it.next()) |entry| try remote_env.append(alloc, .{
+                        .key = entry.key_ptr.*,
+                        .value = entry.value_ptr.*,
+                    });
+                }
+
                 // Working directory (§WP4): we must NEVER forward the LOCAL
                 // `config.@"working-directory"` — by default Ghostty inherits the
                 // launching surface's pwd (e.g. a macOS path), which does not
@@ -751,6 +771,7 @@ pub fn init(
                     .working_directory = rb.working_directory,
                     .shell = rb.shell,
                     .term = config.term,
+                    .env = remote_env.items,
                 });
                 break :backend .{ .remote = io_remote };
             }

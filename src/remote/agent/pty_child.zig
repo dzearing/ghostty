@@ -764,11 +764,31 @@ pub const PtySpawner = struct {
         });
         errdefer pty.deinit();
 
+        // Build THIS child's environment: a clone of the agent's inherited env
+        // (`self.env`) plus per-session overrides. We clone rather than mutate
+        // `self.env` so one child's forwarded vars (e.g. GHOZTTY_WINDOW_NAME)
+        // never leak into the NEXT child's environment. The clone only needs to
+        // outlive the synchronous `cmd.start()` below (fork+exec copies the
+        // environment into the child), so it is freed on return from spawnChild.
+        var child_env = try cloneEnvMap(self.alloc, self.env);
+        defer child_env.deinit();
+
         // Set TERM for the child. COLORTERM signals 24-bit color support to
         // apps that don't trust TERM alone (the emulating end is Ghostty, which
         // renders truecolor regardless of the advertised TERM).
-        try self.env.put("TERM", open.term);
-        try self.env.put("COLORTERM", "truecolor");
+        try child_env.put("TERM", open.term);
+        try child_env.put("COLORTERM", "truecolor");
+
+        // Apply the forwarded env allowlist (OPEN.env, T04a). For the LOCAL
+        // agent these carry GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME + IPC/user
+        // vars so an agent-backed pane reaches env parity with an exec pane.
+        // Applied AFTER TERM/COLORTERM to mirror exec's env-override-wins order
+        // (empty keys are ignored — a malformed pair must not create a bare
+        // "=value" entry). `open.env` is empty for a cross-machine window.
+        for (open.env) |pair| {
+            if (pair.key.len == 0) continue;
+            try child_env.put(pair.key, pair.value);
+        }
 
         const pc = try self.alloc.create(PtyChild);
         errdefer self.alloc.destroy(pc);
@@ -836,7 +856,7 @@ pub const PtySpawner = struct {
                 .cmd = .{
                     .path = shell_z,
                     .args = args,
-                    .env = self.env,
+                    .env = &child_env,
                     .cwd = open.cwd,
                     .stdin = null,
                     .stdout = null,
@@ -868,7 +888,7 @@ pub const PtySpawner = struct {
             .cmd = .{
                 .path = shell_z,
                 .args = args,
-                .env = self.env,
+                .env = &child_env,
                 .cwd = open.cwd,
                 .stdin = slave_file,
                 .stdout = slave_file,
@@ -888,6 +908,19 @@ pub const PtySpawner = struct {
         return pc;
     }
 };
+
+/// Shallow-clone an `EnvMap` into a fresh map owned by `alloc`. `EnvMap.put`
+/// dupes keys/values, so the result is fully independent of `src` (mutating one
+/// never affects the other). Used to give each spawned child its own env so
+/// per-session overrides (OPEN.env) don't leak between children of the shared
+/// spawner env.
+fn cloneEnvMap(alloc: Allocator, src: *const std.process.EnvMap) !std.process.EnvMap {
+    var out = std.process.EnvMap.init(alloc);
+    errdefer out.deinit();
+    var it = src.iterator();
+    while (it.next()) |entry| try out.put(entry.key_ptr.*, entry.value_ptr.*);
+    return out;
+}
 
 /// The argv flag that makes a WINDOWS shell run a single command string, chosen
 /// by the shell's basename (case-insensitive, `.exe` optional, full paths ok):
@@ -978,6 +1011,68 @@ const CaptureSink = struct {
         self.buf.deinit(self.alloc);
     }
 };
+
+/// Spin (async reader thread) until the sink has captured `needle`, or fail.
+fn waitContains(cap: *CaptureSink, needle: []const u8) !void {
+    var spins: usize = 0;
+    while (spins < 30_000) : (spins += 1) {
+        if (cap.contains(needle)) return;
+        std.Thread.sleep(100 * std.time.ns_per_us);
+    }
+    return error.TimedOutWaitingForOutput;
+}
+
+test "PtyChild: OPEN.env reaches the child and does not leak between spawns" {
+    const alloc = testing.allocator;
+
+    var spawner = try PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    // Use a PRIVATE var name that is not in the ambient environment (a real
+    // GHOZTTY_* name would be inherited by this test process when run inside a
+    // Ghoztty pane, contaminating the "unset" assertion below).
+    const key = "T04A_TEST_VAR_9q2";
+    const marker = "T04A_MARKER_7f3a";
+
+    // Child A: forward the var (T04a env parity) and echo its shell-expanded
+    // value back through the pty.
+    const pairs = [_]protocol.Open.EnvPair{.{ .key = key, .value = marker }};
+    const pc_a = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .command = "printf 'A=[%s]\\n' \"$" ++ key ++ "\"; sleep 30",
+        .env = &pairs,
+    });
+    var term_a = false;
+    defer if (!term_a) pc_a.child().terminate();
+
+    var cap_a: CaptureSink = .{ .alloc = alloc };
+    defer cap_a.deinit();
+    pc_a.child().attach(&cap_a, CaptureSink.sink, 1);
+    try waitContains(&cap_a, "A=[" ++ marker ++ "]");
+
+    // Child B: NO env forwarded. The var must be UNSET — proof that A's override
+    // was applied to A's OWN cloned env and never leaked into the shared spawner
+    // env that B also clones from.
+    const pc_b = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .command = "printf 'B=[%s]\\n' \"$" ++ key ++ "\"; sleep 30",
+    });
+    var term_b = false;
+    defer if (!term_b) pc_b.child().terminate();
+
+    var cap_b: CaptureSink = .{ .alloc = alloc };
+    defer cap_b.deinit();
+    pc_b.child().attach(&cap_b, CaptureSink.sink, 2);
+    try waitContains(&cap_b, "B=[]");
+    try testing.expect(!cap_b.contains(marker));
+
+    pc_a.child().terminate();
+    term_a = true;
+    pc_b.child().terminate();
+    term_b = true;
+}
 
 test "PtyChild: real pty spawn → input echoes back → exit/tombstone" {
     const alloc = testing.allocator;

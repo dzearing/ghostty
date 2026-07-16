@@ -1287,6 +1287,26 @@ test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     defer op.deinit();
     try testing.expectEqual(@as(u16, 24), op.value.rows);
     try testing.expectEqualStrings("vim", op.value.command.?);
+    // env defaults to an empty slice (encoded as an empty array, harmless).
+    try testing.expectEqual(@as(usize, 0), op.value.env.len);
+
+    // An OPEN carrying a forwarded env allowlist (T04a) round-trips: the pairs
+    // survive encode→decode with keys/values intact and in order.
+    const pairs = [_]Open.EnvPair{
+        .{ .key = "GHOZTTY_WINDOW_NAME", .value = "0x00000000deadbeef" },
+        .{ .key = "GHOZTTY_PANE_NAME", .value = "logs" },
+    };
+    const open_env: Open = .{ .rows = 24, .cols = 80, .env = &pairs };
+    const ej = try encodeJson(alloc, open_env);
+    defer alloc.free(ej);
+    try testing.expect(std.mem.indexOf(u8, ej, "GHOZTTY_WINDOW_NAME") != null);
+    var ep = try parseJson(Open, alloc, ej);
+    defer ep.deinit();
+    try testing.expectEqual(@as(usize, 2), ep.value.env.len);
+    try testing.expectEqualStrings("GHOZTTY_WINDOW_NAME", ep.value.env[0].key);
+    try testing.expectEqualStrings("0x00000000deadbeef", ep.value.env[0].value);
+    try testing.expectEqualStrings("GHOZTTY_PANE_NAME", ep.value.env[1].key);
+    try testing.expectEqualStrings("logs", ep.value.env[1].value);
 
     const att: Attached = .{ .status = .alive, .rows = 24, .cols = 80, .snapshot_at_offset = 42 };
     const aj = try encodeJson(alloc, att);

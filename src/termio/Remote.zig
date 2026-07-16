@@ -75,6 +75,14 @@ shell: ?[]const u8,
 /// The TERM value advertised in `OPEN` (§4.2). Duped into `arena`.
 term: []const u8,
 
+/// Environment variables sent as the `OPEN.env` allowlist (§4.2) for an
+/// open-new session. For the LOCAL agent these forward the surface's env
+/// overrides (GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME set by the apprt + IPC,
+/// plus any user `env` config) so an agent-backed pane reaches env parity with
+/// an exec pane (T04a). Empty for a cross-machine remote window (env is
+/// agent-side there). Each pair's key/value is duped into `arena`.
+env: []const protocol.Open.EnvPair,
+
 /// Current grid/screen size, seeded by `initTerminal` and updated by `resize`.
 /// Sent in `OPEN`/`RESIZE` (rows/cols + pixel geometry, §6.5).
 grid_size: renderer.GridSize = .{},
@@ -140,7 +148,18 @@ pub const Config = struct {
     /// "terminal is not fully functional" on Windows). `xterm-256color` is
     /// understood everywhere and matches our VT emulation closely.
     term: []const u8 = "xterm-256color",
+
+    /// Environment variables for an open-new session (the `OPEN.env` allowlist).
+    /// Empty for cross-machine remote windows (env lives agent-side there);
+    /// populated for the LOCAL agent to forward GHOZTTY_*/IPC/user vars (T04a).
+    /// Borrowed from the caller; `init` dupes each pair into the backend arena.
+    env: []const protocol.Open.EnvPair = &.{},
 };
+
+/// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
+/// (`Surface.zig`) can build the forwarded env list without importing the wire
+/// protocol module directly.
+pub const EnvPair = protocol.Open.EnvPair;
 
 /// Initialize the remote backend state. Like `Exec.init`, this does NOT touch the
 /// wire — it only records what `threadEnter` will need. It does NOT open/attach a
@@ -156,6 +175,14 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
     const shell = if (cfg.shell) |s| try aa.dupe(u8, s) else null;
     const term = try aa.dupe(u8, cfg.term);
 
+    // Dupe the forwarded env allowlist (keys and values) into our arena so it
+    // is stable for the backend's lifetime (the caller only lends it).
+    const env = try aa.alloc(protocol.Open.EnvPair, cfg.env.len);
+    for (cfg.env, 0..) |pair, i| env[i] = .{
+        .key = try aa.dupe(u8, pair.key),
+        .value = try aa.dupe(u8, pair.value),
+    };
+
     return .{
         .conn = cfg.conn,
         .session_id = session_id,
@@ -163,6 +190,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .working_directory = working_directory,
         .shell = shell,
         .term = term,
+        .env = env,
         .arena = arena,
     };
 }
@@ -298,6 +326,7 @@ pub fn threadEnter(
             .cwd = self.working_directory,
             .shell = self.shell,
             .term = self.term,
+            .env = self.env,
             .rows = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
             .cols = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
