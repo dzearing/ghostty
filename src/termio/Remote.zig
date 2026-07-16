@@ -110,6 +110,14 @@ screen_size: renderer.ScreenSize = .{ .width = 1, .height = 1 },
 /// Null until the agent reports the session exited.
 exit_code: ?u32 = null,
 
+/// True while a `.prompt`-policy pane is a dead-but-relaunchable tombstone waiting
+/// for the user to consent to a respawn (T12c2). Set by `threadEnter` when it brings
+/// up a live-but-childless pane (via `prepareRelaunchPane`) and shows an
+/// "awaiting relaunch" prompt; the first keystroke in `queueWrite` clears it and
+/// fires the deferred `RELAUNCH`. Touched only on the IO thread (threadEnter →
+/// queueWrite), so no synchronization is needed.
+awaiting_relaunch: bool = false,
+
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
 
@@ -408,8 +416,26 @@ pub fn threadEnter(
             return error.RemoteAttachFailed;
         }
 
-        // .dead(!relaunchable, or prompt policy) / .not_found /
-        // attached_elsewhere(!force): nothing registered. The caller (4b) decides
+        // Same dead-but-relaunchable tombstone under the `prompt` policy (T12c2):
+        // do NOT respawn the process yet — the user must consent. Bring up a
+        // live-but-childless pane on the session's channel (ring pre-registered so
+        // the eventual respawn's first DATA is not dropped) and mark it awaiting;
+        // `threadEnter` prints a prompt below and `queueWrite` fires the deferred
+        // `RELAUNCH` on the first keystroke.
+        if (outcome.status == .dead and outcome.relaunchable and
+            self.relaunch_policy == .prompt)
+        {
+            const p = self.conn.prepareRelaunchPane(sid, outcome.channel) catch |err| {
+                log.warn("prepare relaunch pane failed err={}", .{err});
+                return error.RemoteAttachFailed;
+            };
+            self.awaiting_relaunch = true;
+            log.info("dead relaunchable session under prompt policy; awaiting user keystroke to relaunch", .{});
+            break :pane p;
+        }
+
+        // .dead(!relaunchable) / .not_found / attached_elsewhere(!force): nothing
+        // registered. The caller (4b) decides
         // recovery tier (§7.4); for now this is fatal to the pane bring-up.
         // (`defer outcome.deinit()` frees it once.)
         log.warn(
@@ -488,6 +514,12 @@ pub fn threadEnter(
     if (did_relaunch) {
         const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
         @call(.always_inline, termio.Termio.processOutput, .{ io, divider });
+    } else if (self.awaiting_relaunch) {
+        // Prompt policy (T12c2): the pane is a dead tombstone with no child. Show
+        // an interactive affordance — `queueWrite` respawns it on the first key.
+        const prompt =
+            "\r\n\x1b[1m[ Session ended ]\x1b[0m \x1b[2m— press any key to relaunch\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ io, prompt });
     }
 
     // Drain once immediately in case DATA landed in the ring between registration
@@ -572,13 +604,23 @@ pub fn queueWrite(
     data: []const u8,
     linefeed: bool,
 ) !void {
-    _ = self;
     _ = alloc;
     assert(td.backend == .remote);
     const rd = &td.backend.remote;
 
     // If the agent reported the session exited we stop sending input.
     if (rd.exited) return;
+
+    // Prompt policy (T12c2): a dead-but-relaunchable pane is showing the
+    // "press any key to relaunch" affordance. The first keystroke consents to the
+    // respawn — fire the deferred RELAUNCH and swallow the triggering byte(s) (there
+    // is no child yet to receive them). An empty write (e.g. a focus report) is
+    // ignored so it does not spuriously relaunch.
+    if (self.awaiting_relaunch) {
+        if (data.len == 0) return;
+        self.performAwaitedRelaunch(td);
+        return;
+    }
 
     if (!linefeed) {
         // Fast path: enqueue the bytes as a single DATA frame (§3.4). The pane
@@ -608,6 +650,48 @@ pub fn queueWrite(
         }
         try rd.conn.writeInput(rd.pane, buf[0..buf_i]);
     }
+}
+
+/// Fire the deferred `RELAUNCH` for a `.prompt`-policy pane once the user consents
+/// with a keystroke (T12c2). Runs on the IO thread (from `queueWrite`), which parks
+/// on the RPC exactly like `threadEnter`'s `.auto` relaunch — `shutdown` cancels the
+/// canceller so a doomed relaunch under teardown wakes immediately. On success the
+/// pane's child is live and streaming on its already-armed ring; we print the
+/// "restarted" divider above the fresh output. On failure the pane stays childless
+/// and we print a note (the pane still tears down cleanly on threadExit).
+fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
+    assert(td.backend == .remote);
+    const rd = &td.backend.remote;
+
+    // Clear the flag first so a second keystroke racing in cannot double-fire.
+    self.awaiting_relaunch = false;
+
+    const rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
+    const cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
+    const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
+    const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
+
+    const res = rd.conn.sendRelaunchOnPane(rd.pane, rows, cols, px_w, px_h, &self.canceller) catch |err| {
+        log.warn("awaited relaunch failed err={}", .{err});
+        const note = "\r\n\x1b[2m--- relaunch failed ---\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, note });
+        return;
+    };
+    if (!res.ok) {
+        log.warn("awaited relaunch not ok found={}", .{res.found});
+        const note = "\r\n\x1b[2m--- relaunch failed (session no longer available) ---\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, note });
+        return;
+    }
+
+    log.info("relaunched dead session on keystroke pid={}", .{res.pid});
+    const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
+    @call(.always_inline, termio.Termio.processOutput, .{ rd.io, divider });
+
+    // The respawned session's DATA arrives on the ring (armed since threadEnter);
+    // drain once immediately in case it landed while we were parked on the RPC (the
+    // async notify is coalesced, so ringReady will also run, but this is prompt).
+    drainRing(td);
 }
 
 pub fn childExitedAbnormally(

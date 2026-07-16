@@ -1819,6 +1819,11 @@ pub const Connection = struct {
 
     /// `relaunchChannel` with an optional cancellation token (see `RpcCanceller`),
     /// so surface teardown can wake a pane's IO thread out of a parked `RELAUNCH`.
+    ///
+    /// This is the `.auto` policy's one-shot path: prepare the pane, send `RELAUNCH`,
+    /// and return the live pane (or null + torn-down channel on a non-ok reply). The
+    /// `.prompt` policy (T12c2) instead splits these across a user consent step,
+    /// calling `prepareRelaunchPane` up front and `sendRelaunchOnPane` on a keystroke.
     pub fn relaunchChannelCancellable(
         self: *Connection,
         session_id: []const u8,
@@ -1829,45 +1834,42 @@ pub const Connection = struct {
         px_h: u16,
         canceller: ?*const RpcCanceller,
     ) !RelaunchOutcome {
-        // Pre-register the inbound ring on the agent's known session channel so the
-        // respawned session's first DATA frames (the fresh shell prompt) are not
-        // dropped in the gap between RELAUNCHED and ring registration. Torn back
-        // down on any non-ok path (a value return doesn't fire `errdefer`).
+        const pane = try self.prepareRelaunchPane(session_id, channel);
+        // Any failure below (a transport/RPC error) returns the pre-registered ring
+        // + pane to a clean state so the channel table is not left dangling.
+        errdefer self.teardownPane(pane);
+        const res = try self.sendRelaunchOnPane(pane, rows, cols, px_w, px_h, canceller);
+        if (!res.ok) {
+            // Not respawned (reaped, not relaunchable, or spawn failed): keep no pane
+            // and tear the pre-registered channel back down (a value return does not
+            // fire the `errdefer` above).
+            self.teardownPane(pane);
+            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid };
+        }
+        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid };
+    }
+
+    /// Register the inbound ring + a `Pane` for a session about to be relaunched,
+    /// WITHOUT sending `RELAUNCH` yet. The pane has no live child (pid 0) until a
+    /// later `sendRelaunchOnPane` succeeds. Used by the `.prompt` relaunch policy
+    /// (T12c2): the client brings up a live-but-childless pane showing an
+    /// "awaiting relaunch" prompt, then respawns the recorded process only once the
+    /// user consents with a keystroke. Pre-registering the ring on the agent's known
+    /// session channel means the respawned session's first DATA frames (the fresh
+    /// shell prompt) are not dropped in the gap between `RELAUNCHED` and ring
+    /// registration. Tear down via `detachChannel`/`closeChannel` (or
+    /// `sendRelaunchOnPane`'s failure handling) like any other pane.
+    pub fn prepareRelaunchPane(
+        self: *Connection,
+        session_id: []const u8,
+        channel: u128,
+    ) !*Pane {
         const ch = try self.alloc.create(ring.Channel);
         errdefer self.alloc.destroy(ch);
         ch.* = try ring.Channel.init(self.alloc, channel, .{});
         errdefer ch.deinit(self.alloc);
         try self.registerChannel(ch);
-        var keep_channel = false;
-        errdefer if (!keep_channel) self.deregisterChannel(channel);
-
-        const req: protocol.Relaunch = .{
-            .session_id = session_id,
-            .rows = rows,
-            .cols = cols,
-            .px_w = px_w,
-            .px_h = px_h,
-        };
-        const json = try protocol.encodeJson(self.alloc, req);
-        defer self.alloc.free(json);
-        // The agent replies RELAUNCHED on the session's own channel (the relaunchable
-        // path), so correlate on the request channel we send it on.
-        const rpc = try self.rpcCall(channel, .relaunch, .relaunched, json, self.rpc_open_timeout_ns, canceller);
-        defer self.alloc.free(rpc.payload);
-
-        var parsed = protocol.parseJson(protocol.Relaunched, self.alloc, rpc.payload) catch
-            return error.MalformedReply;
-        defer parsed.deinit();
-        const r = parsed.value;
-
-        if (!r.ok) {
-            // Not respawned (reaped, not relaunchable, or spawn failed): keep no
-            // pane and tear the pre-registered channel back down here.
-            self.deregisterChannel(channel);
-            ch.deinit(self.alloc);
-            self.alloc.destroy(ch);
-            return .{ .pane = null, .ok = false, .found = r.found, .pid = r.pid };
-        }
+        errdefer self.deregisterChannel(channel);
 
         const sid = try self.alloc.dupe(u8, session_id);
         errdefer self.alloc.free(sid);
@@ -1876,15 +1878,57 @@ pub const Connection = struct {
         pane.* = .{
             .id = channel,
             .session_id = sid,
-            .pid = r.pid,
+            // No child yet; `sendRelaunchOnPane` fills the pid on a successful respawn.
+            .pid = 0,
             .ring = ch,
             // A relaunch streams from offset 0 — no resync watermark, keep every byte.
             .discard_below = 0,
             .resync_active = false,
         };
         try self.trackPane(pane);
-        keep_channel = true; // the pane now owns the registered ring
-        return .{ .pane = pane, .ok = true, .found = true, .pid = r.pid };
+        return pane;
+    }
+
+    /// The result of `sendRelaunchOnPane`: whether the respawn succeeded, whether the
+    /// agent still had the session, and the (respawned) child pid. Unlike
+    /// `RelaunchOutcome` this carries no pane — `sendRelaunchOnPane` operates on a pane
+    /// the caller already prepared and still owns.
+    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64 };
+
+    /// Send `RELAUNCH` for an already-prepared pane (see `prepareRelaunchPane`) and
+    /// await `RELAUNCHED`. On `ok`, the recorded process is respawned and streaming on
+    /// the pane's channel (the pane's `pid` is updated). On `!ok` the pane is left
+    /// intact (still childless) so the caller can surface a "relaunch failed" note and
+    /// tear it down on threadExit. Correlates on the pane's channel (the agent replies
+    /// RELAUNCHED on the session's own channel, which is the one we send on). Cancellable
+    /// so surface teardown can wake the IO thread out of a parked `RELAUNCH`.
+    pub fn sendRelaunchOnPane(
+        self: *Connection,
+        pane: *Pane,
+        rows: u16,
+        cols: u16,
+        px_w: u16,
+        px_h: u16,
+        canceller: ?*const RpcCanceller,
+    ) !RelaunchResult {
+        const req: protocol.Relaunch = .{
+            .session_id = pane.session_id,
+            .rows = rows,
+            .cols = cols,
+            .px_w = px_w,
+            .px_h = px_h,
+        };
+        const json = try protocol.encodeJson(self.alloc, req);
+        defer self.alloc.free(json);
+        const rpc = try self.rpcCall(pane.id, .relaunch, .relaunched, json, self.rpc_open_timeout_ns, canceller);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Relaunched, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        const r = parsed.value;
+        if (r.ok) pane.pid = r.pid;
+        return .{ .ok = r.ok, .found = r.found, .pid = r.pid };
     }
 
     /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote
@@ -4800,6 +4844,78 @@ test "relaunchChannel: ok=false found=false → no pane, channel torn down (T12c
     // without crashing (no pane owns it).
     try agentSendData(&h.data_agent, channel, 0, "should be dropped");
     try testing.expect(a.err == null);
+}
+
+test "prompt relaunch: prepareRelaunchPane holds a childless pane; sendRelaunchOnPane revives it (T12c2)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = true;
+    a.relaunch_pid = 4242;
+    try h.start();
+
+    // 1) Dead attach learns the session channel (the viewer's prompt-policy path).
+    var outcome = try h.conn.attachChannel("sess-prompt", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expect(outcome.pane == null);
+    const channel = outcome.channel;
+
+    // 2) Prepare a live-but-childless pane WITHOUT sending RELAUNCH (awaiting user
+    //    consent). The ring is registered but no respawn has happened yet.
+    const pane = try h.conn.prepareRelaunchPane("sess-prompt", channel);
+    try testing.expectEqual(channel, pane.id);
+    try testing.expectEqualStrings("sess-prompt", pane.session_id);
+    try testing.expectEqual(@as(i64, 0), pane.pid); // no child yet
+    try testing.expect(!a.saw_relaunch.load(.monotonic)); // no RELAUNCH sent yet
+
+    // 3) User consents (a keystroke) → send RELAUNCH on the pane's channel.
+    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, null);
+    try testing.expect(res.ok);
+    try testing.expect(res.found);
+    try testing.expectEqual(@as(i64, 4242), res.pid);
+    try testing.expectEqual(@as(i64, 4242), pane.pid); // pid filled in on success
+    try testing.expect(a.saw_relaunch.load(.monotonic));
+    try testing.expectEqual(channel, a.relaunch_channel.load(.monotonic));
+
+    // 4) Fresh output on the (already-registered) channel lands in the ring.
+    try agentSendData(&h.data_agent, pane.id, 0, "prompt back");
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, "prompt back".len);
+    try testing.expectEqualStrings("prompt back", got.items);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "prompt relaunch: sendRelaunchOnPane ok=false leaves the pane childless + detachable (T12c2)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = false; // reaped between prepare and consent
+    a.relaunch_found = false;
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("sess-prompt-gone", 24, 80, 0, false);
+    defer outcome.deinit();
+    const channel = outcome.channel;
+
+    const pane = try h.conn.prepareRelaunchPane("sess-prompt-gone", channel);
+    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, null);
+    try testing.expect(!res.ok);
+    try testing.expect(!res.found);
+    // The pane is NOT torn down by a failed send (unlike the auto RelaunchOutcome
+    // path) — the prompt path keeps it so the surface can show a note, and threadExit
+    // detaches it cleanly. No child was ever installed.
+    try testing.expectEqual(@as(i64, 0), pane.pid);
+    try testing.expect(a.err == null);
+    h.conn.detachChannel(pane);
 }
 
 test "attachChannel: not_found surfaces; no pane" {
