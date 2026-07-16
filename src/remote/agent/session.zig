@@ -44,6 +44,9 @@ const session_meta = @import("session_meta.zig");
 // Ring disk snapshots (T13, §5.4 reboot scrollback). Like `session_meta`, depends
 // only on `std`, so no import cycle.
 const ring_snapshot = @import("ring_snapshot.zig");
+// Opaque layout-blob persistence (T18, §5.4 cross-machine "Resume all"). Like
+// `session_meta`, depends on nothing but `std`.
+const layout_meta = @import("layout_meta.zig");
 
 // -----------------------------------------------------------------------------
 // Caps (§7.1 "Resource caps & TTL")
@@ -789,6 +792,20 @@ pub const SessionStore = struct {
     /// disables ring snapshots entirely (tests / non-persistent paths unchanged).
     rings_dir: ?[]const u8 = null,
 
+    /// Opaque per-window layout blobs pushed by owning viewers (§5.4 "Resume
+    /// all", T18), keyed by the viewer's manifest-entry id. The agent stores +
+    /// returns each blob VERBATIM (topology-agnostic); it only inspects the
+    /// associated `session_ids` to reap a blob once none of its sessions exist.
+    /// Guarded by the same `mutex`. Freed in `deinit`.
+    layouts: std.StringHashMapUnmanaged(OwnedLayout) = .empty,
+
+    /// When set, `persistLayouts` atomically rewrites this path with the current
+    /// layout set (§5.4, T18). BORROWED — main.zig owns the string for the
+    /// store's lifetime. Null (the default) disables layout persistence (tests /
+    /// non-persistent paths keep no on-disk layouts, but the in-memory map still
+    /// works for a same-run push→pull).
+    layouts_path: ?[]const u8 = null,
+
     /// Background reaper: wakes periodically to evict idle orphaned sessions.
     reaper: ?std.Thread = null,
     reaper_mutex: std.Thread.Mutex = .{},
@@ -1142,6 +1159,178 @@ pub const SessionStore = struct {
         };
     }
 
+    // --- Layout blobs (§5.4 cross-machine "Resume all", T18) ------------------
+
+    /// One stored layout: the opaque `blob` (never parsed by the agent) and the
+    /// `session_ids` it references (used only to reap the blob once its sessions
+    /// are gone). All slices are owned by the store allocator; the map KEY (the
+    /// viewer's manifest-entry id) is owned separately.
+    pub const OwnedLayout = struct {
+        blob: []u8,
+        session_ids: [][]u8,
+    };
+
+    /// Upsert a layout blob under `key`. Replaces an existing blob in place
+    /// (keeping its owned key). Best-effort — an allocation failure leaves the
+    /// prior entry (if any) untouched and returns the error. Takes the lock.
+    /// Does NOT persist — the caller pairs this with `persistLayouts`.
+    pub fn setLayout(
+        self: *SessionStore,
+        key: []const u8,
+        blob: []const u8,
+        session_ids: []const []const u8,
+    ) !void {
+        const alloc = self.table.alloc;
+        const val = try dupOwnedLayout(alloc, blob, session_ids);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.putLayoutLocked(key, val) catch |err| {
+            freeOwnedLayoutValue(alloc, val);
+            return err;
+        };
+    }
+
+    /// Insert/replace `val` under `key` with the lock held. Consumes `val` on
+    /// success; on failure `val` is left for the caller to free and the map is
+    /// unchanged.
+    fn putLayoutLocked(self: *SessionStore, key: []const u8, val: OwnedLayout) !void {
+        const alloc = self.table.alloc;
+        const gop = try self.layouts.getOrPut(alloc, key);
+        if (gop.found_existing) {
+            freeOwnedLayoutValue(alloc, gop.value_ptr.*);
+            gop.value_ptr.* = val;
+        } else {
+            // getOrPut stored the BORROWED `key`; give the map an owned copy.
+            const key_copy = alloc.dupe(u8, key) catch |err| {
+                _ = self.layouts.remove(key);
+                return err;
+            };
+            gop.key_ptr.* = key_copy;
+            gop.value_ptr.* = val;
+        }
+    }
+
+    /// Remove the layout stored under `key` (a clean window close). Takes the
+    /// lock. Does NOT persist — the caller pairs this with `persistLayouts`.
+    pub fn removeLayout(self: *SessionStore, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.removeLayoutLocked(key);
+    }
+
+    fn removeLayoutLocked(self: *SessionStore, key: []const u8) void {
+        const alloc = self.table.alloc;
+        if (self.layouts.fetchRemove(key)) |kv| {
+            alloc.free(kv.key);
+            freeOwnedLayoutValue(alloc, kv.value);
+        }
+    }
+
+    /// Drop every stored layout whose referenced sessions are ALL gone from the
+    /// table (reaped/closed) — a blob nobody can attach to any more. A layout
+    /// with no recorded session ids references nothing attachable and is reaped
+    /// too. Takes the lock; caller pairs it with `persistLayouts`. Returns the
+    /// number reaped.
+    pub fn reapLayouts(self: *SessionStore) usize {
+        const alloc = self.table.alloc;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Collect dead keys first — can't remove while iterating.
+        var dead: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer dead.deinit(alloc);
+        var it = self.layouts.iterator();
+        while (it.next()) |e| {
+            var any_alive = false;
+            for (e.value_ptr.session_ids) |sid| {
+                if (self.table.getByIdStr(sid) != null) {
+                    any_alive = true;
+                    break;
+                }
+            }
+            if (!any_alive) dead.append(alloc, e.key_ptr.*) catch {};
+        }
+        for (dead.items) |k| self.removeLayoutLocked(k);
+        return dead.items.len;
+    }
+
+    /// Snapshot every stored layout into caller-owned `layout_meta.Record`s (key
+    /// + blob duped) for a GET_LAYOUTS reply. Caller frees each via
+    /// `freeLayoutMetaRecord` and the slice. `session_ids` are NOT included (the
+    /// resumer reads leaf ids from the blob). Takes the lock briefly.
+    pub fn snapshotLayouts(self: *SessionStore, alloc: Allocator) ![]layout_meta.Record {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged(layout_meta.Record) = .empty;
+        errdefer {
+            for (out.items) |r| freeLayoutMetaRecord(alloc, r);
+            out.deinit(alloc);
+        }
+        var it = self.layouts.iterator();
+        while (it.next()) |e| {
+            const key = try alloc.dupe(u8, e.key_ptr.*);
+            errdefer alloc.free(key);
+            const blob = try alloc.dupe(u8, e.value_ptr.blob);
+            try out.append(alloc, .{ .key = key, .blob = blob });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Atomically rewrite `layouts_path` with the current layout set (mirrors
+    /// `persistMeta`: snapshot owned records under the lock, serialize + write
+    /// OUTSIDE it). No-op when layout persistence is disabled. Best-effort.
+    pub fn persistLayouts(self: *SessionStore) void {
+        const path = self.layouts_path orelse return;
+        const alloc = self.table.alloc;
+
+        var recs: std.ArrayList(layout_meta.Record) = .empty;
+        defer {
+            for (recs.items) |r| freeLayoutMetaRecord(alloc, r);
+            recs.deinit(alloc);
+        }
+        self.mutex.lock();
+        var it = self.layouts.iterator();
+        while (it.next()) |e| {
+            const rec = dupLayoutMetaRecord(alloc, e.key_ptr.*, e.value_ptr.*) catch continue;
+            recs.append(alloc, rec) catch {
+                freeLayoutMetaRecord(alloc, rec);
+                continue;
+            };
+        }
+        self.mutex.unlock();
+
+        const body = layout_meta.serialize(alloc, recs.items) catch |err| {
+            std.log.warn("layout_meta: serialize failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer alloc.free(body);
+        layout_meta.writeAtomic(alloc, path, body) catch |err| {
+            std.log.warn("layout_meta: write to {s} failed: {s}", .{ path, @errorName(err) });
+        };
+    }
+
+    /// Load persisted layout blobs from `layouts_path` into the in-memory map at
+    /// agent start (mirrors `loadPersisted`). No-op when disabled or the file is
+    /// absent. Best-effort per record.
+    pub fn loadLayouts(self: *SessionStore) void {
+        const path = self.layouts_path orelse return;
+        const alloc = self.table.alloc;
+        var parsed = (layout_meta.load(alloc, path) catch |err| {
+            std.log.warn("layout_meta: load from {s} failed: {s}", .{ path, @errorName(err) });
+            return;
+        }) orelse return;
+        defer parsed.deinit();
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (parsed.value.layouts) |rec| {
+            const val = dupOwnedLayout(alloc, rec.blob, rec.session_ids) catch continue;
+            self.putLayoutLocked(rec.key, val) catch {
+                freeOwnedLayoutValue(alloc, val);
+                continue;
+            };
+        }
+    }
+
     /// Free the whole store: stop the reaper, then tear down every session. Unlinks
     /// all sessions under the lock, then terminates+frees them OUTSIDE the lock so a
     /// child reader thread mid-delivery (blocked on the lock) can drain and let its
@@ -1156,6 +1345,14 @@ pub const SessionStore = struct {
             self.reaper = null;
         }
         const alloc = self.table.alloc; // capture before `self.table` is invalidated
+        // Free the layout-blob map (keys + values). Independent of sessions; no
+        // child threads to join, so no two-phase dance is needed.
+        var lit = self.layouts.iterator();
+        while (lit.next()) |e| {
+            alloc.free(e.key_ptr.*);
+            freeOwnedLayoutValue(alloc, e.value_ptr.*);
+        }
+        self.layouts.deinit(alloc);
         // Phase 1: unlink everything under the lock.
         var unlinked: std.ArrayList(*Session) = .empty;
         defer unlinked.deinit(alloc);
@@ -1203,6 +1400,79 @@ fn freeMetaRecord(alloc: Allocator, r: session_meta.Record) void {
     if (r.argv) |a| alloc.free(a);
     if (r.cwd) |c| alloc.free(c);
     if (r.title) |t| alloc.free(t);
+}
+
+/// Build a fully-owned `OwnedLayout` (blob + each session id duped). On any
+/// allocation failure the partial dupes are freed (errdefer) and the error
+/// propagates.
+fn dupOwnedLayout(
+    alloc: Allocator,
+    blob: []const u8,
+    session_ids: []const []const u8,
+) Allocator.Error!SessionStore.OwnedLayout {
+    const blob_copy = try alloc.dupe(u8, blob);
+    errdefer alloc.free(blob_copy);
+    const ids = try alloc.alloc([]u8, session_ids.len);
+    var filled: usize = 0;
+    errdefer {
+        for (ids[0..filled]) |s| alloc.free(s);
+        alloc.free(ids);
+    }
+    for (session_ids, 0..) |sid, i| {
+        ids[i] = try alloc.dupe(u8, sid);
+        filled = i + 1;
+    }
+    return .{ .blob = blob_copy, .session_ids = ids };
+}
+
+/// Free an `OwnedLayout`'s value strings (NOT its map key — the caller owns that).
+fn freeOwnedLayoutValue(alloc: Allocator, val: SessionStore.OwnedLayout) void {
+    alloc.free(val.blob);
+    for (val.session_ids) |s| alloc.free(s);
+    alloc.free(val.session_ids);
+}
+
+/// Copy a stored layout into an OWNED `layout_meta.Record` (key + blob duped;
+/// `session_ids` intentionally omitted from the persisted-reply snapshot path
+/// but duped for the persist path). Used under the store lock so the snapshot
+/// survives the unlock + file write.
+fn dupLayoutMetaRecord(
+    alloc: Allocator,
+    key: []const u8,
+    val: SessionStore.OwnedLayout,
+) Allocator.Error!layout_meta.Record {
+    const key_copy = try alloc.dupe(u8, key);
+    errdefer alloc.free(key_copy);
+    const blob_copy = try alloc.dupe(u8, val.blob);
+    errdefer alloc.free(blob_copy);
+    const ids = try alloc.alloc([]const u8, val.session_ids.len);
+    var filled: usize = 0;
+    errdefer {
+        for (ids[0..filled]) |s| alloc.free(@constCast(s));
+        alloc.free(ids);
+    }
+    for (val.session_ids, 0..) |sid, i| {
+        ids[i] = try alloc.dupe(u8, sid);
+        filled = i + 1;
+    }
+    return .{ .key = key_copy, .blob = blob_copy, .session_ids = ids };
+}
+
+/// Free an owned `layout_meta.Record` (the inverse of `dupLayoutMetaRecord`, and
+/// what `snapshotLayouts`/`persistLayouts` use to free their snapshots).
+fn freeLayoutMetaRecord(alloc: Allocator, r: layout_meta.Record) void {
+    alloc.free(@constCast(r.key));
+    alloc.free(@constCast(r.blob));
+    for (r.session_ids) |s| alloc.free(@constCast(s));
+    alloc.free(@constCast(r.session_ids));
+}
+
+/// Free a slice of owned layout records returned by `SessionStore.snapshotLayouts`
+/// (each record + the slice). Public so `server.zig` can free a GET_LAYOUTS
+/// snapshot without importing `layout_meta`.
+pub fn freeLayoutRecords(alloc: Allocator, recs: []layout_meta.Record) void {
+    for (recs) |r| freeLayoutMetaRecord(alloc, r);
+    alloc.free(recs);
 }
 
 // =============================================================================
@@ -1437,6 +1707,52 @@ test "SessionStore.reapIdle: pinned survives fast-forward, unpinned is reaped" {
     try testing.expect(fakes[1].terminated); // plain child was terminated on reap
     try testing.expect(!fakes[0].terminated); // pinned child untouched
     _ = plain;
+}
+
+test "SessionStore.setLayout/reapLayouts: stores blobs, reaps when sessions vanish (T18)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x18);
+    var fake: FakeChild = .{ .alloc = alloc };
+    defer fake.deinit();
+    var clock: MutClock = .{ .ms = 0 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    const s = try store.table.create(fake.child(), 300, 24, 80, 1024, 0);
+    // Copy the borrowed session-id string (it dangles once the session is freed).
+    var buf: [64]u8 = undefined;
+    const sid = s.idStr();
+    @memcpy(buf[0..sid.len], sid);
+    const sid_copy = buf[0..sid.len];
+
+    // One layout references the LIVE session; one references a bogus id.
+    const live_ids = [_][]const u8{sid_copy};
+    try store.setLayout("live-win", "{\"a\":1}", &live_ids);
+    const dead_ids = [_][]const u8{"ffffffffffffffffffffffffffffffff"};
+    try store.setLayout("dead-win", "{\"b\":2}", &dead_ids);
+    try testing.expectEqual(@as(usize, 2), store.layouts.count());
+
+    // Reap drops the blob whose only session id is unknown to the table; the one
+    // referencing a live session survives.
+    try testing.expectEqual(@as(usize, 1), store.reapLayouts());
+    try testing.expectEqual(@as(usize, 1), store.layouts.count());
+    try testing.expect(store.layouts.get("live-win") != null);
+    try testing.expect(store.layouts.get("dead-win") == null);
+
+    // Upsert replaces the blob in place (same key), keeping the count at 1.
+    try store.setLayout("live-win", "{\"a\":2}", &live_ids);
+    try testing.expectEqual(@as(usize, 1), store.layouts.count());
+    try testing.expectEqualStrings("{\"a\":2}", store.layouts.get("live-win").?.blob);
+
+    // removeLayout drops it explicitly.
+    store.removeLayout("live-win");
+    try testing.expectEqual(@as(usize, 0), store.layouts.count());
+
+    // Re-add, then remove the SESSION and reap: the last-referencing blob is gone.
+    try store.setLayout("live-win", "{\"a\":3}", &live_ids);
+    store.table.remove(s.id);
+    try testing.expectEqual(@as(usize, 1), store.reapLayouts());
+    try testing.expectEqual(@as(usize, 0), store.layouts.count());
 }
 
 test "SessionStore.persistMeta: writes alive set, excludes tombstones, refreshes on removal" {

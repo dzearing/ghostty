@@ -269,6 +269,59 @@ final class LocalAgentManager {
         }
     }
 
+    /// The warm shared connection when it is healthy, else nil. Non-spawning,
+    /// non-dialing — the exact liveness gate `listLocalSessions` uses. Main-thread.
+    private func warmSharedOwner() -> RemoteConnection? {
+        guard let existing = sharedOwner,
+              existing.linkState != .dead,
+              sharedAgentPid > 0,
+              kill(sharedAgentPid, 0) == 0 || errno == EPERM
+        else { return nil }
+        return existing
+    }
+
+    /// Mirror one window's layout blob to the local agent (T18 cross-machine
+    /// "Resume all"). Best-effort and non-spawning: pushes over the warm shared
+    /// connection if one exists (it always does for agent-backed windows), else
+    /// silently skips. The `SET_LAYOUT` RPC blocks through its ack, so it runs on
+    /// a background queue. Safe to call from the manifest's change callback.
+    func pushLayout(key: String, blob: Data, sessionIDs: [String]) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let owner = warmSharedOwner(),
+              let blobStr = String(data: blob, encoding: .utf8) else { return }
+        let handle = owner.handle
+        let idsJoined = sessionIDs.joined(separator: "\n")
+        DispatchQueue.global(qos: .utility).async {
+            let ok = key.withCString { k in
+                blobStr.withCString { b in
+                    idsJoined.withCString { s in
+                        ghostty_remote_connection_set_layout(handle, k, b, s, false, 5000)
+                    }
+                }
+            }
+            if ok == 0 {
+                Self.logger.debug("layout push for \(key, privacy: .public) failed (agent unreachable or rejected)")
+            }
+        }
+    }
+
+    /// Remove a window's layout blob from the local agent (a clean window close,
+    /// T18). Best-effort, non-spawning, off-main — the mirror of `pushLayout`.
+    func deleteLayout(key: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let owner = warmSharedOwner() else { return }
+        let handle = owner.handle
+        DispatchQueue.global(qos: .utility).async {
+            _ = key.withCString { k in
+                "".withCString { b in
+                    "".withCString { s in
+                        ghostty_remote_connection_set_layout(handle, k, b, s, true, 5000)
+                    }
+                }
+            }
+        }
+    }
+
     /// Wrap a dialed connection in a strong `RemoteConnection` owner and cache
     /// it as the shared one. Main-thread only.
     private func cacheShared(_ conn: Connection) -> RemoteConnection {

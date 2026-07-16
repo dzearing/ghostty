@@ -196,43 +196,53 @@ extension AppDelegate {
     private func presentRestoredSessionWindow(
         entry: SessionLayoutManifest.Entry,
         connection: RemoteConnection,
-        tabParent: NSWindow?
+        tabParent: NSWindow?,
+        bindLocal: Bool = true,
+        reanchorFrame: Bool = false
     ) -> TerminalController? {
         guard let app = ghostty.app, let tree = entry.tree else { return nil }
 
-        // Each leaf ATTACHes its recorded session over the shared local-agent
-        // connection. Dead sessions attach anyway and show their exited
-        // overlay — the tree shape must survive partial death.
+        // Each leaf ATTACHes its recorded session over the connection. Dead
+        // sessions attach anyway and show their exited overlay — the tree shape
+        // must survive partial death.
         let root = Self.makeSessionLayoutRoot(tree: tree, connection: connection, app: app)
 
         let controller = TerminalController(
             ghostty,
             withSurfaceTree: SplitTree(root: root, zoomed: nil))
 
-        // Adopt the EXISTING manifest entry. Ordering matters: the entry id
-        // must be set before `remoteConnection` (whose didSet would register
-        // a duplicate entry) and before the window loads (whose windowDidLoad
-        // gates AppKit restorability off for tracked windows).
-        controller.sessionLayoutEntryID = entry.id
+        // For a LOCAL resume/restore, adopt the manifest entry so the window is
+        // itself restorable and detaches-on-close. Ordering matters: the entry id
+        // must be set before `remoteConnection` (whose didSet would otherwise
+        // register a DUPLICATE entry for a local-machine connection) and before
+        // the window loads (windowDidLoad gates AppKit restorability off for
+        // tracked windows). For a cross-machine resume (`bindLocal == false`) the
+        // entry id belongs to the OTHER machine — leave it unbound; the remote
+        // connection is not `isLocalMachine`, so the didSet registers nothing.
+        if bindLocal { controller.sessionLayoutEntryID = entry.id }
         controller.remoteConnection = connection
         controller.remoteMachine = connection.machine
 
         guard let window = controller.window else { return controller }
-        // The window usually loaded during init, BEFORE the entry id above
-        // bound — re-apply the AppKit-restoration gate now that it has.
-        controller.disableAppKitRestorationForSessionLayout()
+        if bindLocal {
+            // The window usually loaded during init, BEFORE the entry id above
+            // bound — re-apply the AppKit-restoration gate now that it has.
+            controller.disableAppKitRestorationForSessionLayout()
+        }
 
         if let tabParent {
             if tabParent.isMiniaturized { tabParent.deminiaturize(nil) }
             tabParent.addTabbedWindowSafely(window, ordered: .above)
         }
         controller.showWindow(self)
-        // Standalone windows (and the first tab of a group) get their exact
-        // persisted frame — AFTER showWindow, which applies config default
-        // size/position on the way to screen. Tab siblings inherit the
-        // group's frame.
+        // Standalone windows (and the first tab of a group) get their persisted
+        // frame — AFTER showWindow, which applies config default size/position on
+        // the way to screen. Tab siblings inherit the group's frame. A
+        // cross-machine resume re-anchors the frame to a visible local screen
+        // (the owning machine's coordinates may be off every display here).
         if tabParent == nil, let frame = entry.frame {
-            window.setFrame(frame.rect, display: true)
+            let rect = reanchorFrame ? Self.reanchoredFrame(frame.rect) : frame.rect
+            window.setFrame(rect, display: true)
         }
 
         // The user-set window title, through the same property a manual
@@ -243,15 +253,19 @@ extension AppDelegate {
 
         // Put restored windows/panes back in the IPC target registry under
         // their persisted names (existing live registrations win — same
-        // idempotent semantics as the CLI).
-        if let name = entry.ipcName, !name.isEmpty {
-            ipcServer.registerRestoredRemoteWindow(name: name, controller: controller)
-        }
+        // idempotent semantics as the CLI). Only for a LOCAL resume/restore: a
+        // cross-machine resumed window is not addressable by the OTHER machine's
+        // names (they belong to that machine's IPC namespace).
         let leafInfos = SessionLayoutManifest.leaves(of: tree)
         let views = root.leaves()
-        for (leaf, view) in zip(leafInfos, views) {
-            if let name = leaf.ipcName, !name.isEmpty {
-                ipcServer.registerRestoredPane(name: name, controller: controller, surface: view)
+        if bindLocal {
+            if let name = entry.ipcName, !name.isEmpty {
+                ipcServer.registerRestoredRemoteWindow(name: name, controller: controller)
+            }
+            for (leaf, view) in zip(leafInfos, views) {
+                if let name = leaf.ipcName, !name.isEmpty {
+                    ipcServer.registerRestoredPane(name: name, controller: controller, surface: view)
+                }
             }
         }
 
@@ -266,10 +280,31 @@ extension AppDelegate {
 
         // Re-sync the adopted entry against the live window (frame after
         // showWindow, confirmed session ids once the termio threads publish
-        // them — dropped leaves may have changed the recorded topology).
-        SessionLayoutManifest.syncAndCaptureSessionIDs(of: controller, entryID: entry.id)
+        // them — dropped leaves may have changed the recorded topology). Only
+        // when the entry is bound to the LOCAL manifest.
+        if bindLocal {
+            SessionLayoutManifest.syncAndCaptureSessionIDs(of: controller, entryID: entry.id)
+        }
 
         return controller
+    }
+
+    /// Clamp a window frame that came from ANOTHER machine's manifest onto a
+    /// visible local screen (T18 cross-machine "Resume all"): if the frame does
+    /// not intersect any screen (the owning machine had a different display
+    /// arrangement), re-center a same-sized window on the main screen's visible
+    /// area, also shrinking it to fit if necessary.
+    @MainActor
+    private static func reanchoredFrame(_ rect: NSRect) -> NSRect {
+        let intersectsAny = NSScreen.screens.contains { $0.visibleFrame.intersects(rect) }
+        if intersectsAny { return rect }
+        let visible = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            ?? NSRect(x: 100, y: 100, width: 800, height: 600)
+        let w = min(rect.width, visible.width)
+        let h = min(rect.height, visible.height)
+        let x = visible.origin.x + (visible.width - w) / 2
+        let y = visible.origin.y + (visible.height - h) / 2
+        return NSRect(x: x, y: y, width: w, height: h)
     }
 
     /// Build a live split-tree root from a manifest tree, each leaf a `.remote`
@@ -414,5 +449,201 @@ extension AppDelegate {
         // The relaunched shells publish fresh session ids; re-sync so the
         // manifest tracks them for the NEXT restore.
         SessionLayoutManifest.syncAndCaptureSessionIDs(of: controller, entryID: entry.id)
+    }
+
+    // MARK: Resume all (T18)
+
+    /// Resume ALL of `machine`'s windows on the local machine: pull the
+    /// agent-owned layout blobs (`GET_LAYOUTS`) + probe each leaf's liveness over
+    /// the machine's transport, then rebuild the full window/tab/split topology
+    /// locally, ATTACHing each leaf to its still-running session. The processes
+    /// keep running on their host agent; only the viewer windows are local.
+    /// `machine == nil` ⇒ the LOCAL agent, and the rebuild is sourced from the
+    /// AGENT's copy of the layout (not the local file), so it works even with an
+    /// empty local manifest — the property another machine relies on.
+    /// User-initiated, so failures surface an alert.
+    @MainActor
+    func resumeAllSessions(machine: Machine?) {
+        if let machine {
+            resumeAllRemoteSessions(machine: machine)
+        } else {
+            resumeAllLocalSessions()
+        }
+    }
+
+    @MainActor
+    private func resumeAllLocalSessions() {
+        LocalAgentManager.shared.sharedConnectionAsync { [weak self] connection in
+            guard let self else { return }
+            guard let connection else {
+                self.presentResumeAllUnreachable(name: "the local session agent")
+                return
+            }
+            self.pullAndResumeAll(connection: connection, bindLocal: true, reanchor: false)
+        }
+    }
+
+    @MainActor
+    private func resumeAllRemoteSessions(machine: Machine) {
+        if let base = machine.relayBase, let device = machine.deviceID {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let token = await RelayAccount.resolveToken() else {
+                    Self.presentSignInRequiredAlert()
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let handle = AppDelegate.dialRelay(base: base, device: device, token: token)
+                    DispatchQueue.main.async {
+                        guard let self else {
+                            if let handle { ghostty_remote_connection_free(handle) }
+                            return
+                        }
+                        guard let handle else {
+                            self.presentResumeAllUnreachable(name: machine.name)
+                            return
+                        }
+                        let connection = RemoteConnection(handle: handle, machine: machine)
+                        self.pullAndResumeAll(connection: connection, bindLocal: false, reanchor: true)
+                    }
+                }
+            }
+        } else {
+            let host = machine.host
+            let port = machine.port
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let handle = host.withCString { ghostty_remote_connection_new_tcp($0, port) }
+                DispatchQueue.main.async {
+                    guard let self else {
+                        if let handle { ghostty_remote_connection_free(handle) }
+                        return
+                    }
+                    guard let handle else {
+                        self.presentResumeAllUnreachable(name: machine.name)
+                        return
+                    }
+                    let connection = RemoteConnection(handle: handle, machine: machine)
+                    self.pullAndResumeAll(connection: connection, bindLocal: false, reanchor: true)
+                }
+            }
+        }
+    }
+
+    /// GET_LAYOUTS + liveness-probe off the main thread, then rebuild on main.
+    @MainActor
+    private func pullAndResumeAll(connection: RemoteConnection, bindLocal: Bool, reanchor: Bool) {
+        let handle = connection.handle
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let layouts = RemoteLayoutRoster.get(handle: handle) ?? []
+            let entries = layouts.compactMap { $0.entry }
+            let probe = Self.probeSessions(entries: entries, handle: handle)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.presentResumedTopology(
+                    entries: entries,
+                    probe: probe,
+                    connection: connection,
+                    bindLocal: bindLocal,
+                    reanchor: reanchor)
+            }
+        }
+    }
+
+    /// Rebuild every window in `entries` on `connection` (mirrors
+    /// `presentRestoredSessionWindows`: group tab siblings, drop all-dead
+    /// windows, build each). `bindLocal` adopts the local manifest (local resume,
+    /// so the windows are restorable again); `reanchor` re-clamps frames onto a
+    /// visible local screen (cross-machine).
+    @MainActor
+    private func presentResumedTopology(
+        entries: [SessionLayoutManifest.Entry],
+        probe: [String: SessionLiveness],
+        connection: RemoteConnection,
+        bindLocal: Bool,
+        reanchor: Bool
+    ) {
+        guard !entries.isEmpty else {
+            presentResumeAllEmpty()
+            return
+        }
+
+        // For a LOCAL resume, skip an entry already bound to an open window (the
+        // double-attach guard). For a cross-machine resume the entry ids belong
+        // to the other machine, so the guard doesn't apply.
+        let openEntryIDs = bindLocal
+            ? Set(TerminalController.all.compactMap(\.sessionLayoutEntryID))
+            : Set<UUID>()
+
+        // Group tab siblings, preserving order between groups.
+        var groups: [[SessionLayoutManifest.Entry]] = []
+        var groupIndex: [UUID: Int] = [:]
+        for entry in entries {
+            if let gid = entry.tabGroupID {
+                if let idx = groupIndex[gid] {
+                    groups[idx].append(entry)
+                } else {
+                    groupIndex[gid] = groups.count
+                    groups.append([entry])
+                }
+            } else {
+                groups.append([entry])
+            }
+        }
+
+        var resumedCount = 0
+        for group in groups {
+            var tabParent: NSWindow?
+            for entry in group.sorted(by: { $0.tabIndex < $1.tabIndex }) {
+                if openEntryIDs.contains(entry.id) { continue }
+                guard let tree = entry.tree else { continue }
+
+                // Skip a window whose leaves are ALL positively dead — nothing
+                // live to attach. `.unknown` leaves are rebuilt (attach anyway).
+                let leaves = SessionLayoutManifest.leaves(of: tree)
+                let liveness: (SessionLayoutManifest.Leaf) -> SessionLiveness = { leaf in
+                    guard let sid = leaf.sessionID, !sid.isEmpty else { return .unknown }
+                    return probe[sid] ?? .unknown
+                }
+                if leaves.allSatisfy({ liveness($0) == .dead }) { continue }
+
+                if let controller = presentRestoredSessionWindow(
+                    entry: entry,
+                    connection: connection,
+                    tabParent: tabParent,
+                    bindLocal: bindLocal,
+                    reanchorFrame: reanchor
+                ) {
+                    resumedCount += 1
+                    tabParent = controller.window ?? tabParent
+                }
+            }
+        }
+
+        if resumedCount > 0 {
+            Self.logger.info("resume all: rebuilt \(resumedCount) window(s)")
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            presentResumeAllEmpty()
+        }
+    }
+
+    @MainActor
+    private func presentResumeAllUnreachable(name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't resume sessions"
+        alert.informativeText = "\(name) is not reachable."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    @MainActor
+    private func presentResumeAllEmpty() {
+        let alert = NSAlert()
+        alert.messageText = "Nothing to resume"
+        alert.informativeText = "No saved window layout was found for this machine, or its sessions are no longer running. You can still resume individual sessions from the list."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 }

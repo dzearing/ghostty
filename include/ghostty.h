@@ -1434,6 +1434,23 @@ GHOSTTY_API int ghostty_remote_connection_probe_session(
 GHOSTTY_API ghostty_string_s ghostty_remote_connection_list_sessions(
     ghostty_remote_connection_t, uint32_t timeout_ms);
 
+// Push (remove_layout==true removes) an opaque per-window layout blob to the
+// connected agent (cross-machine "Resume all"). key is the viewer's
+// manifest-entry id; blob is the opaque layout JSON (ignored when deleting);
+// session_ids is a newline-separated list of the 32-hex session ids the blob
+// references. Returns 1 on success, 0 on failure. timeout_ms==0 uses a 5s
+// default. Blocking; call off the main thread.
+GHOSTTY_API int ghostty_remote_connection_set_layout(
+    ghostty_remote_connection_t, const char* key, const char* blob,
+    const char* session_ids, bool remove_layout, uint32_t timeout_ms);
+
+// Fetch every stored layout blob from the connected agent (cross-machine
+// "Resume all") as a JSON object string {"layouts":[{"key":...,"blob":...}]};
+// free with ghostty_string_free. Empty string on failure. timeout_ms==0 uses a
+// 5s default. Blocking; call off the main thread.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_get_layouts(
+    ghostty_remote_connection_t, uint32_t timeout_ms);
+
 // A host-metrics snapshot pushed by the remote agent (activity monitor). Mirrors
 // the wire HostMetrics. uptime_s is 0 when the remote OS doesn't expose uptime;
 // load1 is -1 when there is no load average (e.g. Windows).

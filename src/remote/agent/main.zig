@@ -865,12 +865,24 @@ fn runListen(
     const rings_dir = ringsDirFor(alloc, sessions_file);
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
+    // Cross-machine "Resume all" (§5.4, T18): opaque per-window layout blobs live
+    // in a `layouts.json` beside the sessions file. Borrowed; freed after
+    // `store.deinit` (LIFO defers).
+    const layouts_file = layoutsFileFor(alloc, sessions_file);
+    defer if (layouts_file) |f| alloc.free(f);
+    store.layouts_path = layouts_file;
     defer store.deinit();
     // Reboot-floor materialization (§5.4, T12b): before accepting connections (and
     // before the reaper starts), load the persisted roster and re-create each record
     // as a DEAD, relaunchable tombstone so a viewer's ATTACH finds a session it can
     // RELAUNCH. No-op when --sessions-file was not passed or the file is absent.
     const materialized = store.loadPersisted(configured_ring_bytes);
+    // Also load any persisted layout blobs (T18) so a browsing viewer sees this
+    // machine's window topology even after an agent restart.
+    store.loadLayouts();
+    // Self-heal: drop any loaded blob whose sessions did not materialize (truly
+    // gone), so a stale layouts.json never advertises unattachable windows.
+    if (store.reapLayouts() > 0) store.persistLayouts();
     if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
     // Graceful SIGTERM → flush dirty rings before exit (T13b). Started here (the
     // store now exists); SIGTERM was already blocked process-wide by
@@ -1030,10 +1042,18 @@ fn runListenUnix(
     const rings_dir = ringsDirFor(alloc, sessions_file);
     defer if (rings_dir) |d| alloc.free(d);
     store.rings_dir = rings_dir;
+    // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
+    const layouts_file = layoutsFileFor(alloc, sessions_file);
+    defer if (layouts_file) |f| alloc.free(f);
+    store.layouts_path = layouts_file;
     defer store.deinit();
     // Reboot-floor materialization (§5.4, T12b): re-create the persisted roster as
     // dead, relaunchable tombstones before accepting connections + starting the reaper.
     const materialized = store.loadPersisted(configured_ring_bytes);
+    store.loadLayouts();
+    // Self-heal: drop any loaded blob whose sessions did not materialize (truly
+    // gone), so a stale layouts.json never advertises unattachable windows.
+    if (store.reapLayouts() > 0) store.persistLayouts();
     if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
     // Graceful SIGTERM → flush dirty rings before exit (T13b) — see runListen.
     startSigtermWatcher(&store);
@@ -1105,6 +1125,17 @@ fn ringsDirFor(alloc: Allocator, sessions_file: ?[]const u8) ?[]u8 {
     const sf = sessions_file orelse return null;
     const dir = std.fs.path.dirname(sf) orelse ".";
     return std.fs.path.join(alloc, &.{ dir, "rings" }) catch null;
+}
+
+/// The layout-blob file for a given `--sessions-file`: a `layouts.json` beside
+/// it (e.g. `<state>/sessions.json` → `<state>/layouts.json`), so cross-machine
+/// "Resume all" blobs (§5.4, T18) share the metadata store's state dir. Returns
+/// null when no sessions file was given (layout persistence disabled, like the
+/// whole reboot floor). Caller frees.
+fn layoutsFileFor(alloc: Allocator, sessions_file: ?[]const u8) ?[]u8 {
+    const sf = sessions_file orelse return null;
+    const dir = std.fs.path.dirname(sf) orelse ".";
+    return std.fs.path.join(alloc, &.{ dir, "layouts.json" }) catch null;
 }
 
 /// Atomically publish the UDS listener's socket path for a supervisor: write

@@ -2765,6 +2765,79 @@ pub const CAPI = struct {
         return .fromSlice(copy);
     }
 
+    /// Push (or, with `delete == true`, remove) an OPAQUE per-window layout blob
+    /// to the connected agent (§5.4 cross-machine "Resume all", T18). `key` is the
+    /// owning viewer's manifest-entry id; `blob` is the opaque layout JSON (empty
+    /// / ignored when deleting); `session_ids` is a NEWLINE-separated list of the
+    /// 32-hex session ids the blob references (used by the agent only to reap the
+    /// blob once its sessions are gone). Returns 1 on success, 0 on any failure
+    /// (no connection, RPC timeout, agent reported not-ok). `timeout_ms == 0` ⇒
+    /// the 5s default. BLOCKING; call off the main thread.
+    export fn ghostty_remote_connection_set_layout(
+        handle: *RemoteConnectionHandle,
+        key: [*:0]const u8,
+        blob: [*:0]const u8,
+        session_ids: [*:0]const u8,
+        delete: bool,
+        timeout_ms: u32,
+    ) c_int {
+        const conn = handle.conn() orelse return 0;
+        const key_slice = std.mem.sliceTo(key, 0);
+        if (key_slice.len == 0) return 0;
+        const blob_slice = std.mem.sliceTo(blob, 0);
+        const ids_raw = std.mem.sliceTo(session_ids, 0);
+
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        // Split the newline-separated id list into a slice of slices (skipping
+        // empty tokens). Bounded scratch owned by the C-API allocator.
+        var ids: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer ids.deinit(handle.alloc);
+        if (!delete and ids_raw.len > 0) {
+            var it = std.mem.splitScalar(u8, ids_raw, '\n');
+            while (it.next()) |tok| {
+                if (tok.len == 0) continue;
+                ids.append(handle.alloc, tok) catch return 0;
+            }
+        }
+
+        const blob_arg: ?[]const u8 = if (delete) null else blob_slice;
+        conn.setLayout(key_slice, blob_arg, ids.items, delete, timeout_ns) catch |err| {
+            log.debug("remote set_layout failed err={}", .{err});
+            return 0;
+        };
+        return 1;
+    }
+
+    /// Fetch every stored layout blob from the connected agent (§5.4 "Resume
+    /// all", T18) as a JSON object string `{"layouts":[{"key":...,"blob":...}]}`,
+    /// freed with `ghostty_string_free`. The Swift resumer decodes it and the
+    /// opaque blobs (each a `SessionLayoutManifest.Entry` JSON). Returns `.empty`
+    /// on any failure. `timeout_ms == 0` ⇒ the 5s default. BLOCKING; call off the
+    /// main thread.
+    export fn ghostty_remote_connection_get_layouts(
+        handle: *RemoteConnectionHandle,
+        timeout_ms: u32,
+    ) String {
+        const conn = handle.conn() orelse return .empty;
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        const payload = conn.requestLayouts(timeout_ns) catch |err| {
+            log.debug("remote get_layouts failed err={}", .{err});
+            return .empty;
+        };
+        defer conn.alloc.free(payload);
+        // Re-dupe into the C-API allocator (matching `ghostty_string_free`).
+        const copy = handle.alloc.dupeZ(u8, payload) catch return .empty;
+        return .fromSlice(copy);
+    }
+
     /// Zig-side `MetricsHandler` trampoline: marshal `protocol.HostMetrics` into a
     /// stack `ghostty_host_metrics_s` (optionals → sentinels) and invoke the stored
     /// C callback with the caller's `userdata`. `ctx` is the handle's

@@ -662,6 +662,8 @@ pub const Server = struct {
             .close => self.handleClose(frame.channel),
             .get_cwd => self.handleGetCwd(frame.channel, frame.payload),
             .list_sessions => self.handleListSessions(frame.channel),
+            .set_layout => self.handleSetLayout(frame.channel, frame.payload),
+            .get_layouts => self.handleGetLayouts(frame.channel),
             .relaunch => self.handleRelaunch(frame.payload),
             .ping => self.handlePing(frame.payload),
             .flow => self.handleFlow(frame.payload),
@@ -922,6 +924,10 @@ pub const Server = struct {
             // The alive set shrank — refresh the reboot-floor metadata (§5.4,
             // T12). No-op when persistence is disabled or the channel was stale.
             self.store.persistMeta();
+            // A closed session may have been the last one a stored layout blob
+            // referenced (§5.4 "Resume all", T18) — reap orphaned blobs and
+            // rewrite the layout file so it doesn't accumulate dead topology.
+            if (self.store.reapLayouts() > 0) self.store.persistLayouts();
         }
     }
 
@@ -1008,6 +1014,61 @@ pub const Server = struct {
 
         self.sendJson(.sessions, channel, protocol.Sessions{
             .sessions = infos.items,
+        }) catch {};
+    }
+
+    /// `SET_LAYOUT` (§5.4 cross-machine "Resume all", T18): store (or, with
+    /// `delete`, remove) an OPAQUE per-window layout blob keyed by the owning
+    /// viewer's manifest-entry id. The agent never parses the blob; it persists
+    /// it verbatim so a viewer on another machine can pull it and rebuild the
+    /// window topology. Reply `SET_LAYOUT_RESULT{ok}` on the request channel.
+    fn handleSetLayout(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.SetLayout, self.alloc, payload) catch {
+            self.sendJson(.set_layout_result, channel, protocol.SetLayoutResult{ .ok = false }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        var ok = true;
+        if (req.delete) {
+            self.store.removeLayout(req.key);
+        } else if (req.blob) |blob| {
+            self.store.setLayout(req.key, blob, req.session_ids) catch {
+                ok = false;
+            };
+        } else {
+            // No blob and not a delete: nothing to store.
+            ok = false;
+        }
+
+        // Persist the updated set (best-effort; no-op when disabled). Runs after
+        // the in-memory mutation so a subsequent agent restart re-materializes it.
+        if (ok) self.store.persistLayouts();
+
+        self.sendJson(.set_layout_result, channel, protocol.SetLayoutResult{ .ok = ok }) catch {};
+    }
+
+    /// `GET_LAYOUTS` (§5.4, T18): reply with every stored layout blob on the
+    /// request channel. Snapshots owned copies under the store lock, then encodes
+    /// + enqueues OUTSIDE it (the blobs can be large; unlike `handleListSessions`
+    /// we don't hold the lock across encode).
+    fn handleGetLayouts(self: *Server, channel: u128) void {
+        const recs = self.store.snapshotLayouts(self.alloc) catch {
+            // On OOM, still answer (empty) so the client gets a reply, not a timeout.
+            self.sendJson(.layouts, channel, protocol.Layouts{}) catch {};
+            return;
+        };
+        defer session.freeLayoutRecords(self.alloc, recs);
+
+        var blobs: std.ArrayListUnmanaged(protocol.LayoutBlob) = .empty;
+        defer blobs.deinit(self.alloc);
+        for (recs) |r| {
+            blobs.append(self.alloc, .{ .key = r.key, .blob = r.blob }) catch break;
+        }
+
+        self.sendJson(.layouts, channel, protocol.Layouts{
+            .layouts = blobs.items,
         }) catch {};
     }
 
@@ -2023,6 +2084,76 @@ test "LIST_SESSIONS→SESSIONS: empty roster is answered with an empty array" {
     var parsed = try protocol.parseJson(protocol.Sessions, alloc, reply.payload);
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 0), parsed.value.sessions.len);
+}
+
+test "SET_LAYOUT stores a blob; GET_LAYOUTS returns it; delete removes it (T18)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc0: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    var kids = [_]*FakeChild{&fc0};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(41);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o0 = try doOpen(&h, .{ .rows = 24, .cols = 80, .command = "run-marker" });
+
+    // A GET_LAYOUTS on a fresh agent answers with an empty (present) array.
+    try h.client.sendControlJson(.get_layouts, 0x1000, protocol.GetLayouts{});
+    {
+        const reply = try h.client.waitControl(.layouts);
+        var parsed = try protocol.parseJson(protocol.Layouts, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 0), parsed.value.layouts.len);
+    }
+
+    // Push a layout blob keyed "win-1" referencing the open session.
+    const ids = [_][]const u8{o0.id[0..]};
+    const set_ch: u128 = 0x1A;
+    try h.client.sendControlJson(.set_layout, set_ch, protocol.SetLayout{
+        .key = "win-1",
+        .blob = "{\"tree\":\"opaque\"}",
+        .session_ids = &ids,
+    });
+    {
+        const reply = try h.client.waitControl(.set_layout_result);
+        try testing.expectEqual(set_ch, reply.channel);
+        var parsed = try protocol.parseJson(protocol.SetLayoutResult, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expect(parsed.value.ok);
+    }
+
+    // GET_LAYOUTS now returns the stored blob verbatim on the request channel.
+    const get_ch: u128 = 0x2B;
+    try h.client.sendControlJson(.get_layouts, get_ch, protocol.GetLayouts{});
+    {
+        const reply = try h.client.waitControl(.layouts);
+        try testing.expectEqual(get_ch, reply.channel);
+        var parsed = try protocol.parseJson(protocol.Layouts, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 1), parsed.value.layouts.len);
+        try testing.expectEqualStrings("win-1", parsed.value.layouts[0].key);
+        try testing.expectEqualStrings("{\"tree\":\"opaque\"}", parsed.value.layouts[0].blob);
+    }
+
+    // A delete removes the blob; the next GET_LAYOUTS is empty again.
+    try h.client.sendControlJson(.set_layout, 0x1B, protocol.SetLayout{
+        .key = "win-1",
+        .delete = true,
+    });
+    _ = try h.client.waitControl(.set_layout_result);
+    try h.client.sendControlJson(.get_layouts, 0x2C, protocol.GetLayouts{});
+    {
+        const reply = try h.client.waitControl(.layouts);
+        var parsed = try protocol.parseJson(protocol.Layouts, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 0), parsed.value.layouts.len);
+    }
 }
 
 test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {

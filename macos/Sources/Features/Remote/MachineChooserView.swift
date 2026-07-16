@@ -17,6 +17,13 @@ enum WindowTarget: Hashable {
     /// by clicking / keyboard-selecting a row in a machine's expanded session
     /// list; never a top-level `targets` row.
     case resumeSession(machine: Machine?, session: BrowsedSession)
+    /// Resume ALL of a machine's windows (cross-machine "Resume all", T18):
+    /// rebuild the full window/tab/split topology locally from the machine's
+    /// agent-owned layout blobs, attaching each leaf to its live session.
+    /// `machine == nil` means the local agent. Produced by the "Resume all"
+    /// affordance at the foot of a machine's expanded session list; never a
+    /// top-level `targets` row.
+    case resumeAll(machine: Machine?)
 }
 
 /// A native, filterable chooser for picking where to open a new window: the
@@ -92,7 +99,7 @@ struct MachineChooserView: View {
         switch target {
         case .local: return SessionBrowserProbe.localKey
         case .remote(let m): return m.id.uuidString
-        case .restoreRemote, .resumeSession: return nil
+        case .restoreRemote, .resumeSession, .resumeAll: return nil
         }
     }
 
@@ -101,7 +108,7 @@ struct MachineChooserView: View {
         switch target {
         case .local: browser.toggleLocal()
         case .remote(let m): browser.toggle(machine: m)
-        case .restoreRemote, .resumeSession: break
+        case .restoreRemote, .resumeSession, .resumeAll: break
         }
     }
 
@@ -121,8 +128,43 @@ struct MachineChooserView: View {
         switch parent {
         case .local: return .resumeSession(machine: nil, session: session)
         case .remote(let m): return .resumeSession(machine: m, session: session)
-        case .restoreRemote, .resumeSession: return nil
+        case .restoreRemote, .resumeSession, .resumeAll: return nil
         }
+    }
+
+    /// Build the `resumeAll` target for `parent` (`.local` ⇒ local agent,
+    /// `.remote` ⇒ that machine). `nil` for rows that never browse.
+    private func resumeAllTarget(_ parent: WindowTarget) -> WindowTarget? {
+        switch parent {
+        case .local: return .resumeAll(machine: nil)
+        case .remote(let m): return .resumeAll(machine: m)
+        case .restoreRemote, .resumeSession, .resumeAll: return nil
+        }
+    }
+
+    /// The number of ALIVE sessions in the currently-highlighted expanded row.
+    /// "Resume all" is offered only when there are at least two (a single pane is
+    /// covered by the per-session resume, and there is no topology to rebuild).
+    private var highlightedAliveSessionCount: Int {
+        highlightedSessions.filter { $0.alive }.count
+    }
+
+    /// Whether the highlighted expanded row can offer "Resume all".
+    private var resumeAllAvailable: Bool {
+        highlightedAliveSessionCount >= 2
+    }
+
+    /// The `browseCursor` slot index for the "Resume all" affordance (it sits
+    /// just past the last session in the list), or nil when it isn't offered.
+    private var resumeAllSlot: Int? {
+        resumeAllAvailable ? highlightedSessions.count : nil
+    }
+
+    /// Resume all sessions under `parent`: dismiss the chooser and hand the
+    /// selection to the app.
+    private func resumeAll(parent: WindowTarget) {
+        guard let target = resumeAllTarget(parent) else { return }
+        onSelect(target)
     }
 
     /// Resume `session` under `parent`: dismiss the chooser and hand the
@@ -203,6 +245,15 @@ struct MachineChooserView: View {
                             session,
                             parent: target,
                             highlighted: isSessionCursor(key: key, index: idx))
+                    }
+                    // "Resume all" — rebuild this machine's whole window/tab/split
+                    // topology locally (T18). Offered only when there are ≥2 alive
+                    // sessions (a single pane is covered by the per-session resume).
+                    if sessions.filter({ $0.alive }).count >= 2 {
+                        resumeAllRow(
+                            parent: target,
+                            count: sessions.filter { $0.alive }.count,
+                            highlighted: isResumeAllCursor(key: key, sessionCount: sessions.count))
                     }
                 }
             case .some(.failed):
@@ -291,6 +342,49 @@ struct MachineChooserView: View {
         } else {
             content
         }
+    }
+
+    /// Whether the keyboard sub-cursor points at the "Resume all" slot (T18) —
+    /// i.e. the row keyed `key` is highlighted and its cursor sits just past the
+    /// last session.
+    private func isResumeAllCursor(key: String, sessionCount: Int) -> Bool {
+        guard browseCursor == sessionCount,
+              let target = resolvedSelection,
+              browseKey(for: target) == key
+        else { return false }
+        return true
+    }
+
+    /// The "Resume all" affordance at the foot of a machine's expanded session
+    /// list — rebuilds the whole window/tab/split topology locally (T18).
+    @ViewBuilder
+    private func resumeAllRow(
+        parent: WindowTarget,
+        count: Int,
+        highlighted: Bool
+    ) -> some View {
+        let content = HStack(spacing: 8) {
+            Image(systemName: "rectangle.3.group")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Text("Resume all")
+                .font(.caption)
+                .fontWeight(.medium)
+            Text("\(count) windows")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(highlighted ? Color.accentColor.opacity(0.25) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .contentShape(Rectangle())
+
+        Button { resumeAll(parent: parent) } label: { content }
+            .buttonStyle(.plain)
+            .help("Rebuild this machine's full window layout here")
     }
 
     /// The current machine list (live from the registry), minus any relay
@@ -690,7 +784,7 @@ struct MachineChooserView: View {
                 // button in the row wrapper, NOT here, so it doesn't nest inside the
                 // row's selection button.)
             }
-        case .restoreRemote, .resumeSession:
+        case .restoreRemote, .resumeSession, .resumeAll:
             // Never appears in `targets`; they're action results, not rows.
             EmptyView()
         }
@@ -952,7 +1046,10 @@ struct MachineChooserView: View {
             if !sessions.isEmpty {
                 let next = (browseCursor ?? -1) + 1
                 if next < sessions.count { browseCursor = next; return }
-                // Past the last session: fall through to the next machine row.
+                // Just past the last session: the "Resume all" affordance, if
+                // this row offers one (≥2 alive sessions).
+                if next == resumeAllSlot { browseCursor = next; return }
+                // Past everything: fall through to the next machine row.
             }
             browseCursor = nil
             select(min(selectedIndex + 1, targets.count - 1))
@@ -1017,6 +1114,11 @@ struct MachineChooserView: View {
             let sessions = highlightedSessions
             if cur < sessions.count {
                 resume(sessions[cur], parent: target)
+                return
+            }
+            // The trailing "Resume all" slot (T18).
+            if cur == resumeAllSlot {
+                resumeAll(parent: target)
                 return
             }
         }

@@ -52,6 +52,34 @@ enum RemoteSessionRoster {
     }
 }
 
+/// One stored layout blob as reported by an agent's `GET_LAYOUTS` RPC (T18
+/// cross-machine "Resume all"): the opaque `blob` (a `SessionLayoutManifest.Entry`
+/// JSON) and the `key` it was stored under.
+struct BrowsedLayout: Decodable {
+    let key: String
+    let blob: String
+
+    /// Decode the opaque blob back into a manifest entry, or nil if malformed.
+    var entry: SessionLayoutManifest.Entry? {
+        SessionLayoutManifest.decodeBlob(Data(blob.utf8))
+    }
+}
+
+/// Runs the `GET_LAYOUTS` RPC against a dialed connection and decodes the stored
+/// layout blobs. Transport-agnostic (local agent OR relay machine), blocking —
+/// call off the main thread. Used by "Resume all" to pull a machine's whole
+/// window/tab/split topology and rebuild it locally.
+enum RemoteLayoutRoster {
+    static func get(handle: ghostty_remote_connection_t, timeoutMs: UInt32 = 5000) -> [BrowsedLayout]? {
+        let cstr = ghostty_remote_connection_get_layouts(handle, timeoutMs)
+        defer { ghostty_string_free(cstr) }
+        guard let ptr = cstr.ptr, cstr.len > 0 else { return nil }
+        let data = Data(bytes: ptr, count: Int(cstr.len))
+        struct Reply: Decodable { let layouts: [BrowsedLayout] }
+        return (try? JSONDecoder().decode(Reply.self, from: data))?.layouts
+    }
+}
+
 /// Lazily fetches a machine's live-session roster for the lifetime of one
 /// Cmd-Shift-N machine-picker presentation, so the picker can expand a row into
 /// a read-only list of that machine's active sessions (the browse half of

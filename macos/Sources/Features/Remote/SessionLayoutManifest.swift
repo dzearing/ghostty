@@ -120,6 +120,28 @@ final class SessionLayoutManifest {
     private let lock = NSLock()
     private var entries: [Entry]
 
+    /// Installed by `AppDelegate` (T18): mirror every layout change to the local
+    /// `ghoztty-agent` so a viewer on ANOTHER machine can pull the topology and
+    /// "Resume all". `onEntryChanged` fires (on the main queue) after an entry is
+    /// upserted; `onEntryRemoved` after a clean-close removal. Kept out of the
+    /// manifest's own concerns (it stays transport-agnostic) — the app owns the
+    /// push. Fired AFTER the lock is released (via `DispatchQueue.main.async`) so
+    /// the callback never re-enters the manifest under the lock.
+    var onEntryChanged: ((Entry) -> Void)?
+    var onEntryRemoved: ((UUID) -> Void)?
+
+    /// Schedule the upsert callback for `entry` on the main queue (post-unlock).
+    private func notifyChanged(_ entry: Entry) {
+        guard let cb = onEntryChanged else { return }
+        DispatchQueue.main.async { cb(entry) }
+    }
+
+    /// Schedule the removal callback for `id` on the main queue (post-unlock).
+    private func notifyRemoved(_ id: UUID) {
+        guard let cb = onEntryRemoved else { return }
+        DispatchQueue.main.async { cb(id) }
+    }
+
     /// `Application Support/<bundle id>/session-layout.json`. The debug and
     /// release apps have different bundle ids, so their manifests are
     /// naturally separate files.
@@ -205,6 +227,7 @@ final class SessionLayoutManifest {
         guard entry != entries[idx] else { return }
         entries[idx] = entry
         saveLocked()
+        notifyChanged(entry)
     }
 
     /// Record the user-set window title (nil ⇒ rename cleared). Called from
@@ -217,6 +240,7 @@ final class SessionLayoutManifest {
         guard entries[idx].titleOverride != windowTitle else { return }
         entries[idx].titleOverride = windowTitle
         saveLocked()
+        notifyChanged(entries[idx])
     }
 
     /// Remove an entry (clean close). Removing an unknown id is a no-op.
@@ -226,6 +250,7 @@ final class SessionLayoutManifest {
         guard entries.contains(where: { $0.id == id }) else { return }
         entries.removeAll { $0.id == id }
         saveLocked()
+        notifyRemoved(id)
     }
 
     /// Read-only snapshot of every entry (tests/diagnostics/restore).
@@ -254,6 +279,28 @@ final class SessionLayoutManifest {
             return hasMissingSessionIDs(split.left)
                 || hasMissingSessionIDs(split.right)
         }
+    }
+
+    // MARK: Agent-owned blob (T18)
+
+    /// Encode `entry` to the opaque JSON blob pushed to the agent for
+    /// cross-machine "Resume all", plus the leaf session ids it references (for
+    /// the agent's reaping). Returns nil when the entry has no tree, or no leaf
+    /// has a captured session id yet (nothing another machine could attach to).
+    static func layoutBlob(for entry: Entry) -> (blob: Data, sessionIDs: [String])? {
+        guard let tree = entry.tree else { return nil }
+        let ids = leaves(of: tree).compactMap { leaf in
+            leaf.sessionID.flatMap { $0.isEmpty ? nil : $0 }
+        }
+        guard !ids.isEmpty else { return nil }
+        guard let blob = try? JSONEncoder().encode(entry) else { return nil }
+        return (blob, ids)
+    }
+
+    /// Decode an agent-stored blob back into an `Entry` (the resumer side of
+    /// "Resume all"). Returns nil on malformed JSON.
+    static func decodeBlob(_ data: Data) -> Entry? {
+        return try? JSONDecoder().decode(Entry.self, from: data)
     }
 
     // MARK: Tree encoding

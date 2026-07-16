@@ -1583,6 +1583,60 @@ pub const Connection = struct {
         return .{ .sessions = out, .alloc = self.alloc };
     }
 
+    /// Push (or, with `delete`, remove) an OPAQUE per-window layout blob to the
+    /// agent (§5.4 cross-machine "Resume all", T18). Sends `SET_LAYOUT{key, blob,
+    /// session_ids, delete}` and awaits `SET_LAYOUT_RESULT{ok}`. Same-channel RPC
+    /// (mirrors `queryCwdTimeout`), bounded by `timeout_ns`. Returns
+    /// `error.SetLayoutFailed` when the agent reports `ok == false`.
+    pub fn setLayout(
+        self: *Connection,
+        key: []const u8,
+        blob: ?[]const u8,
+        session_ids: []const []const u8,
+        delete: bool,
+        timeout_ns: u64,
+    ) !void {
+        const req_channel = std.crypto.random.int(u128);
+        const set: protocol.SetLayout = .{
+            .key = key,
+            .blob = blob,
+            .session_ids = session_ids,
+            .delete = delete,
+        };
+        const json = try protocol.encodeJson(self.alloc, set);
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .set_layout, .set_layout_result, json, timeout_ns, null);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.SetLayoutResult, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        if (!parsed.value.ok) return error.SetLayoutFailed;
+    }
+
+    /// Fetch every stored layout blob (§5.4 "Resume all", T18). Sends
+    /// `GET_LAYOUTS{}` and awaits `LAYOUTS{layouts:[...]}`, returning the RAW reply
+    /// payload JSON duped into `self.alloc` (the caller — the Swift resumer —
+    /// decodes the `{layouts:[{key,blob}]}` shape and the opaque blobs itself, so
+    /// there is no need to deep-copy into an `Owned*` struct here). Caller frees.
+    /// Same-channel RPC, bounded by `timeout_ns`.
+    pub fn requestLayouts(self: *Connection, timeout_ns: u64) ![]u8 {
+        const req_channel = std.crypto.random.int(u128);
+        const json = try protocol.encodeJson(self.alloc, protocol.GetLayouts{});
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .get_layouts, .layouts, json, timeout_ns, null);
+        // Validate it parses (a malformed reply is an error, not a passthrough),
+        // but hand back the raw bytes for the caller to decode.
+        var parsed = protocol.parseJson(protocol.Layouts, self.alloc, rpc.payload) catch {
+            self.alloc.free(rpc.payload);
+            return error.MalformedReply;
+        };
+        parsed.deinit();
+        return rpc.payload;
+    }
+
     /// Kill a remote process by pid (§9.3 process control, inc 4). Sends
     /// `PROC_KILL{pid, signal}` and awaits `PROC_KILL_RESULT{pid, ok, error?}`,
     /// returning a caller-owned `ProcKillOutcome` (any error string is duped into
@@ -2409,6 +2463,13 @@ pub const Connection = struct {
                 // Replies to PROC_KILL / PROC_SPAWN RPCs (§9.3 process control, inc
                 // 4+5). Same-channel correlation, like PROC_SNAPSHOT. Dropped if no
                 // caller is parked (a late reply after a timeout).
+                _ = self.deliverRpcReply(frame);
+            },
+            .set_layout_result, .layouts => {
+                // Replies to SET_LAYOUT / GET_LAYOUTS RPCs (§5.4 "Resume all",
+                // T18). Same-channel correlation, like CWD/SESSIONS: the agent
+                // echoes the reply on the request channel. Dropped if no caller
+                // is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
             .relaunched => {

@@ -93,6 +93,11 @@ pub const FrameType = enum(u8) {
     relaunch = 0x26, // C→A  {session_id, rows, cols}  respawn a loaded/dead session
     relaunched = 0x27, // A→C  {session_id, ok, pid, found}  reply to RELAUNCH
 
+    set_layout = 0x28, // C→A  {key, blob?, session_ids, delete}  store/remove a layout blob
+    set_layout_result = 0x29, // A→C  {ok}  reply to SET_LAYOUT
+    get_layouts = 0x2a, // C→A  {}  fetch every stored layout blob
+    layouts = 0x2b, // A→C  {layouts:[{key, blob}]}  reply to GET_LAYOUTS
+
     rpc = 0x30, // C→A  JSON-RPC 2.0 request (§9.5)
     rpc_result = 0x31, // A→C  JSON-RPC 2.0 response / subscription notification
 
@@ -589,6 +594,52 @@ pub const SessionInfo = struct {
 /// elided — so the client can distinguish "answered, none" from "no reply".
 pub const Sessions = struct {
     sessions: []const SessionInfo = &.{},
+};
+
+/// `SET_LAYOUT` (0x28). Store (or, with `delete`, remove) an OPAQUE per-window
+/// layout blob keyed by `key` (the owning viewer's manifest-entry id — a
+/// window/tab-group identity). The agent NEVER parses `blob`; it persists it
+/// verbatim beside the session metadata (§5.4, T18) so a viewer on ANOTHER
+/// machine can pull the full window/tab/split topology and rebuild it, attaching
+/// each leaf to its live session. `session_ids` lists the sessions the blob
+/// references so the agent can REAP the blob once none of them exist any more
+/// (the agent stays topology-agnostic — it never inspects the blob to learn
+/// this). `delete == true` removes `key` (a clean window close); `blob`/
+/// `session_ids` are then ignored. Correlated by `Frame.channel` (same-channel
+/// RPC, like `GET_CWD`): the agent echoes `SET_LAYOUT_RESULT` on that channel.
+/// Additive/HELLO-compatible.
+pub const SetLayout = struct {
+    key: []const u8,
+    blob: ?[]const u8 = null,
+    session_ids: []const []const u8 = &.{},
+    delete: bool = false,
+};
+
+/// `SET_LAYOUT_RESULT` (0x29). Reply to `SET_LAYOUT`: `ok` is true when the
+/// upsert/remove was applied (a store failure — OOM, disk write — yields false).
+pub const SetLayoutResult = struct {
+    ok: bool = false,
+};
+
+/// `GET_LAYOUTS` (0x2a). Fetch EVERY stored layout blob this agent holds (the
+/// resumer wants a machine's whole set of windows). No arguments today; an empty
+/// `{}` payload keeps it additive/HELLO-compatible. Correlated by `Frame.channel`
+/// (same-channel RPC): the agent echoes `LAYOUTS` on that channel.
+pub const GetLayouts = struct {};
+
+/// One stored layout in a `LAYOUTS` reply: the opaque `blob` and the `key` it was
+/// stored under. `session_ids` are NOT echoed back (the resumer reads the leaf
+/// session ids out of the blob it decodes).
+pub const LayoutBlob = struct {
+    key: []const u8,
+    blob: []const u8,
+};
+
+/// `LAYOUTS` (0x2b). Reply to `GET_LAYOUTS`: every stored layout. An empty set
+/// encodes as `{"layouts":[]}` (a healthy agent with no stored layouts), never
+/// elided — so the client can distinguish "answered, none" from "no reply".
+pub const Layouts = struct {
+    layouts: []const LayoutBlob = &.{},
 };
 
 /// `RELAUNCH` (0x26). Ask the agent to respawn a DEAD session — a relaunchable
@@ -1135,6 +1186,10 @@ fn sampleFrames(alloc: Allocator) ![]Frame {
     try list.append(alloc, .{ .type = .meta, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .get_cwd, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .cwd, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .set_layout, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .set_layout_result, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .get_layouts, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .layouts, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc, .channel = control_channel, .seq = 13, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc_result, .channel = control_channel, .seq = 14, .payload = "{}" });
     try list.append(alloc, .{ .type = .tunnel, .channel = control_channel, .seq = 15, .payload = "{}" });
@@ -1674,6 +1729,75 @@ test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
     try testing.expect(!rsp.value.sessions[0].alive);
     try testing.expect(rsp.value.sessions[0].relaunchable);
     try testing.expect(rsp.value.sessions[0].exit_code == null);
+}
+
+test "SET_LAYOUT / LAYOUTS JSON payloads round-trip (T18)" {
+    const alloc = testing.allocator;
+
+    // A SET_LAYOUT upsert: opaque blob + the sessions it references, null
+    // `delete` elided (default false), `session_ids` array in order.
+    const ids = [_][]const u8{
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    };
+    const set: SetLayout = .{
+        .key = "11111111-2222-3333-4444-555555555555",
+        .blob = "{\"tree\":\"opaque\"}",
+        .session_ids = &ids,
+    };
+    const setj = try encodeJson(alloc, set);
+    defer alloc.free(setj);
+    // `delete` defaults false; the wire omits nothing important but `blob`/
+    // `session_ids` must survive a round-trip in order.
+    var setp = try parseJson(SetLayout, alloc, setj);
+    defer setp.deinit();
+    try testing.expectEqualStrings("11111111-2222-3333-4444-555555555555", setp.value.key);
+    try testing.expectEqualStrings("{\"tree\":\"opaque\"}", setp.value.blob.?);
+    try testing.expectEqual(@as(usize, 2), setp.value.session_ids.len);
+    try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", setp.value.session_ids[0]);
+    try testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", setp.value.session_ids[1]);
+    try testing.expect(!setp.value.delete);
+
+    // A delete carries no blob; the blob key is elided (null optional).
+    const del: SetLayout = .{ .key = "gone", .delete = true };
+    const delj = try encodeJson(alloc, del);
+    defer alloc.free(delj);
+    try testing.expect(std.mem.indexOf(u8, delj, "\"blob\"") == null);
+    var delp = try parseJson(SetLayout, alloc, delj);
+    defer delp.deinit();
+    try testing.expect(delp.value.delete);
+    try testing.expect(delp.value.blob == null);
+
+    // SET_LAYOUT_RESULT.
+    const okj = try encodeJson(alloc, SetLayoutResult{ .ok = true });
+    defer alloc.free(okj);
+    var okp = try parseJson(SetLayoutResult, alloc, okj);
+    defer okp.deinit();
+    try testing.expect(okp.value.ok);
+
+    // GET_LAYOUTS is an empty object.
+    const gj = try encodeJson(alloc, GetLayouts{});
+    defer alloc.free(gj);
+    try testing.expectEqualStrings("{}", gj);
+
+    // A populated LAYOUTS reply round-trips key+blob in order.
+    const blobs = [_]LayoutBlob{
+        .{ .key = "w1", .blob = "{\"a\":1}" },
+        .{ .key = "w2", .blob = "{\"b\":2}" },
+    };
+    const lj = try encodeJson(alloc, Layouts{ .layouts = &blobs });
+    defer alloc.free(lj);
+    var lp = try parseJson(Layouts, alloc, lj);
+    defer lp.deinit();
+    try testing.expectEqual(@as(usize, 2), lp.value.layouts.len);
+    try testing.expectEqualStrings("w1", lp.value.layouts[0].key);
+    try testing.expectEqualStrings("{\"a\":1}", lp.value.layouts[0].blob);
+    try testing.expectEqualStrings("w2", lp.value.layouts[1].key);
+
+    // An empty layout set keeps the array key (never elided).
+    const empty = try encodeJson(alloc, Layouts{});
+    defer alloc.free(empty);
+    try testing.expectEqualStrings("{\"layouts\":[]}", empty);
 }
 
 test "RELAUNCH / RELAUNCHED JSON payloads round-trip (T12b)" {

@@ -288,6 +288,19 @@ class AppDelegate: NSObject,
             // the app last quit (background dials; failures never alert).
             restoreRemoteWindows()
 
+            // Session persistence (T18): mirror every layout change to the local
+            // agent so a viewer on ANOTHER machine can pull the topology and
+            // "Resume all". Only entries with at least one captured session id
+            // are pushable (nothing else could be attached elsewhere).
+            SessionLayoutManifest.shared.onEntryChanged = { entry in
+                guard let (blob, ids) = SessionLayoutManifest.layoutBlob(for: entry) else { return }
+                LocalAgentManager.shared.pushLayout(
+                    key: entry.id.uuidString, blob: blob, sessionIDs: ids)
+            }
+            SessionLayoutManifest.shared.onEntryRemoved = { id in
+                LocalAgentManager.shared.deleteLayout(key: id.uuidString)
+            }
+
             // Session persistence (T06): rebuild the local-agent-backed
             // windows recorded in the layout manifest, re-ATTACHing every
             // pane to its still-running agent session (background dial +
@@ -1175,6 +1188,11 @@ class AppDelegate: NSObject,
                 // The process keeps running on its host agent; only the viewer
                 // is local. `machine == nil` ⇒ the local agent.
                 self.resumeBrowsedSession(machine: machine, session: session)
+            case .resumeAll(let machine):
+                // Cross-machine "Resume all" (T18): rebuild the machine's full
+                // window/tab/split topology locally from its agent-owned layout
+                // blobs, ATTACHing each leaf to its live session.
+                self.resumeAllSessions(machine: machine)
             }
         }
     }
