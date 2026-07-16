@@ -385,6 +385,17 @@ right at x=502) → ctrl+alt+down moves the hero → toggle-off restores the
 exact tree layout; screenshot archived; both test lanes + P1–P3 acceptance
 green. LAST `return false` action stub is gone.
 
+**CORRECTION (user, 2026-07-16):** this port missed the actual Mac design.
+The T19a scouting notes reduced hero mode to its geometry (hero left,
+"carousel" right) and both the design and the implementation shipped a
+static layout that stacks the *live* panes in the right column. The real
+Mac hero mode is a maximized hero pane with a right-side vertical carousel
+of *thumbnail snapshots* you swap between, with animations, selection
+chrome, a draggable divider, and scroll — none of which was ported. The
+keybind/toggle/focus/tree-change plumbing from T19 is still valid and
+reusable. See T58 (re-design) / T59 (implement); full behavioral spec of
+the Mac implementation is recorded in the T58 section.
+
 ## T20 — `+new-remote-window --host/--port` direct TCP (Phase G)
 
 Un-guard the CLI; dial with `src/remote` (tcp_dial/connection) + termio
@@ -1325,6 +1336,106 @@ Windows-native status affordance.
 *Validation:* extend `ipc-relay.ps1`: kill + restart the agent under a
 live window → the pane comes back (reattach) or reports a clear
 disconnected state; no hang, no crash, no orphan connection threads.
+
+## T58 — Hero mode TRUE port: design (win32) (Phase F)
+
+Filed 2026-07-16 from a mid-session user correction: "the macos hero mode
+maximizes the current screen and has a right side vertical carousel with
+thumbnails of the other screens you can swap between, with animations and
+such. you didn't port that at all. you need to add tasks to the list to
+reevaluate this." T19 shipped a static live-pane stand-in (see the T19
+CORRECTION note). This task designs the real port; T59 implements it.
+
+**Behavioral spec of the Mac implementation** (extracted 2026-07-16 from
+`macos/Sources/Features/HeroMode/` — HeroModeState/HeroModeView/
+HeroPaneView/HeroCarouselView.swift — so the T58/T59 sessions do not need
+to re-read the Swift):
+
+- *Layout*: hero pane fills `(1 − carouselRatio)` of the width, full
+  height, on the LEFT; carousel column on the RIGHT. `carouselRatio`
+  defaults to 0.25, clamped 0.1–0.6, adjustable by dragging the divider.
+- *Hero pane* (HeroPaneView): ALL leaves live in a vertical strip of
+  hero-sized slots (slot = full hero rect + 40px gap); the strip's Y
+  offset positions the selected slot in view. Selection change ANIMATES
+  the strip (0.35s ease-in-ease-out slide) — the outgoing pane slides
+  out, the incoming one slides in. Only the visible slot's terminal grid
+  is reflowed (`sizeDidChange`); off-screen slots reflow lazily on
+  selection. During divider drags the reflow is debounced (80ms) so the
+  drag glides; frames resize immediately.
+- *Carousel* (HeroCarouselView): vertical strip of thumbnail TILES, one
+  per leaf (including the hero's own leaf). Tiles show SNAPSHOT IMAGES of
+  each pane (Mac: `surfaceLayer.render` into a bitmap), not live panes.
+  Visible tiles refresh on a 0.15s timer (paused while scrolling; one
+  refresh 0.2s after scrolling ends). Thumb size mirrors the hero pane's
+  aspect ratio: width ≤ 88% of carousel width, height capped at 70% of
+  carousel height (shrink width to preserve AR when the cap binds); 8px
+  gap; ~6% horizontal padding. The strip CENTERS the selected tile
+  vertically and animates re-centering on selection change (0.3s ease,
+  skipped on first show). Mouse wheel scrolls the strip with clamped
+  offset (max half the overflow either way); selection change resets the
+  scroll offset.
+- *Tile chrome*: rounded corners (6px), 1px border. Selected: 2px blue
+  border (0.416, 0.416, 1.0) + soft glow shadow (radius 15, opacity 0.4),
+  full alpha. Hovered: purple border (0.545, 0.361, 0.965), alpha 0.6.
+  Normal: gray border (white 0.5 @ 0.3), alpha 0.35 (i.e. unselected
+  thumbnails are dimmed). Click (mouse-up inside) a tile selects it —
+  which swaps it into the hero with both animations. Carousel background:
+  black @ 0.3 alpha over the window background.
+- *Divider*: 6px hit area, 1px visible line; gray normally, blue while
+  hovered/dragged; horizontal-resize cursor on hover; drag adjusts
+  `carouselRatio` (measured in global coords so it doesn't oscillate),
+  clamped 0.1–0.6.
+- *Navigation*: shift+cmd+up/down select prev/next (win32 already maps
+  ctrl+alt+arrows via gotoSplit interception — keep). Focus follows
+  selection; external focus change moves the selection (T19 plumbing).
+- *Unchanged T19 plumbing that stays*: toggle action + keybind, >1 leaf
+  activation guard, seed selection from focused leaf, zoom mutual
+  exclusion, tree-change clamp/deactivate, per-tab state, +list
+  unaffected.
+
+**Design questions for win32 (decide in T58, record here):**
+
+- *Thumbnails*: surfaces are OpenGL child HWNDs. Candidates:
+  `PrintWindow` with `PW_RENDERFULLCONTENT` (captures DWM-composited GL
+  content, works for occluded-but-visible windows; hidden windows render
+  blank — so non-hero surfaces must stay visible-but-clipped, not
+  SW_HIDE, OR snapshots must come from the renderer), vs a renderer-side
+  snapshot (glReadPixels into a shared bitmap on the renderer thread).
+  DWM thumbnail API is top-level-window-only — not applicable.
+- *Carousel rendering*: prefer owner-paint — Window.zig paints the
+  carousel region itself in WM_PAINT (StretchBlt cached snapshots +
+  GDI/Direct2D chrome), handling mouse hover/click/wheel/divider in the
+  parent window. Avoids per-tile child HWNDs. Rounded corners/glow: keep
+  Windows-native-looking; simplified chrome is acceptable if it looks
+  deliberate (T50 quality bar).
+- *Animations*: timer-driven easing (SetTimer or a 60Hz animation tick)
+  of strip offsets + InvalidateRect for the carousel; for the hero slide,
+  either SetWindowPos-per-tick of the live surface HWND or a
+  snapshot-crossfade. Must not jank the renderer (T53 bar).
+- *Where live surfaces go while not hero*: they currently stack in the
+  right column; in the new design non-hero surfaces are NOT visible as
+  live panes. Decide hide-vs-clip based on the thumbnail capture answer.
+- *hero-mode.ps1*: geometry oracle must be rewritten for the new layout
+  (hero rect + no visible non-hero surface rects + carousel region
+  owner-painted, so pane-HWND geometry assertions change shape).
+
+*Validation (T58):* design recorded in this section (decisions above
+resolved), sized implementation plan for T59; split T59 further if it
+looks >250k context.
+
+## T59 — Hero mode TRUE port: implement per T58 (Phase F)
+
+Implement the T58 design. Sub-split in the table first if T58 concludes
+it's too big for one context (e.g. T59a thumbnails/carousel, T59b
+animations/divider).
+
+*Validation:* on-box: 3-pane layout → toggle hero → hero maximized left,
+carousel of dimmed thumbnails right, selected tile highlighted; click a
+tile → it swaps into the hero (animated); ctrl+alt+up/down move
+selection; wheel scrolls the carousel; divider drag resizes the split;
+thumbnails visibly update while a busy TUI runs in a non-hero pane;
+toggle-off restores the exact tree. Rewritten `hero-mode.ps1` ALL PASS;
+both test lanes + P1–P3 green; screenshot archived.
 
 Promote to a task row when prioritized; don't work these ad hoc.
 

@@ -72,13 +72,13 @@ Work these first, in order, before falling back to first-todo-in-table:
    `ipc-machine-chooser.ps1` ALL PASS on-box — real chord → chooser opens →
    `GET /v1/client/devices` → Escape-close, no crash). The T22 remote-window
    series is complete; remaining Phase-G follow-ups are T56 (reconnect) and
-   T42 (remote env/PATH). Next in this priority list: T48.
+   T42 (remote env/PATH). Next in this priority list: T58.
 4. **~~T48a~~ → ~~T48~~** — deadlock. **T48 (fix) DONE 2026-07-15**
    (e35ef81fd): `App.deferSetFocus` posts WM_APP_SETFOCUS; the run loop does
    the real SetFocus at the top of the loop so the IME/CTF cascade never runs
    nested inside a mouse/focus WndProc. 23 terminal-surface focus sites
    deferred; EDIT/dialog focus stays synchronous. `focus-defer.ps1` ALL PASS
-   (9). Next in this priority list: T53. T48a (root-cause) DONE 2026-07-15:
+   (9). T48a (root-cause) DONE 2026-07-15:
    analyzed the existing 744MB dump with cdb + MS public symbols (no
    ghoztty pdb needed). NOT a lock cycle — the GUI thread calls `SetFocus`
    inside its WindowProc, the IME/CTF cascade re-enters the WindowProc via a
@@ -87,11 +87,18 @@ Work these first, in order, before falling back to first-todo-in-table:
    `t48-deadlock-dump-analysis.md`. **T48 (implement fix) is next**: defer
    SetFocus out of WindowProc so the IME/CTF cascade runs where the thread
    can pump.
-5. **T53** — long-context reliability + perf soak/tuning pass.
-6. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
+5. **T58 → T59** — hero mode TRUE port (user, 2026-07-16, mid-session
+   correction: "the macos hero mode maximizes the current screen and has a
+   right side vertical carousel with thumbnails of the other screens you
+   can swap between, with animations and such. you didn't port that at
+   all"). T19's win32 port is a static live-pane stand-in; re-design
+   (T58), then implement (T59). Behavioral spec extracted from the Swift
+   sources is in the T58 details section — start there, not in Swift.
+6. **T53** — long-context reliability + perf soak/tuning pass.
+7. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
    report was a July-5 exe — make "which build is this" answerable at a
    glance).
-7. **T51** — full parity re-audit. Deliberately LAST in the queue per the
+8. **T51** — full parity re-audit. Deliberately LAST in the queue per the
    user: after the above land, re-audit Windows vs Mac so nothing is
    missing, and file new tasks from the findings.
 
@@ -125,7 +132,7 @@ One line per row. Full spec + validation + evidence per task:
 | T17 | Skill conformance on the box | E | T12,T16 | done | doc only |
 | T18 | `swap_split` on win32 | F | — | done | see details |
 | T19a | Hero mode design (win32) | F | T18 | done | see details |
-| T19 | Hero mode on win32 (implement) | F | T19a | done | f37bd1e3c |
+| T19 | Hero mode on win32 (implement) (CORRECTION 2026-07-16: shipped a static geometric stand-in, NOT the Mac design — see T58/T59) | F | T19a | done | f37bd1e3c |
 | T20 | `+new-remote-window` direct TCP | G | T08 | done | 2ed989866 |
 | T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | done | 64c4329c2 |
 | T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
@@ -166,9 +173,11 @@ One line per row. Full spec + validation + evidence per task:
 | T53 | Long-context reliability + perf soak/tuning | I | T40 | todo | — |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
 | T55 | FIX: hero-mode.ps1 fails on HEAD (chords not dispatched) — root cause was the TEST's positive control: ctrl+shift+r now opens the T50 modal rename dialog, which disables the owner window and silently ate every later chord. Control switched to ctrl+k (clear_screen, no UI left behind); not a key-path regression | F | T19 | done | (this commit) |
-| T56 | FIX: window title jitters a few px left/right on a timer while busy (user, 2026-07-16). Likely cause: Claude Code's title spinner — the braille glyphs (⠐/⠂/…) come from a FALLBACK font (MS Gothic per app log) with per-glyph advance widths, so the centered title re-centers to a different width every spinner frame. Investigate where the win32 tab/title text is drawn (Window.zig caption/tab paint); candidate fixes: left-align the title, reserve a fixed-width cell for the leading glyph, or measure/center on the title minus the spinner char | I | — | todo | — |
+| T60 | FIX: window title jitters a few px left/right on a timer while busy (user, 2026-07-16; row renumbered from a duplicate T56 on 2026-07-16). Likely cause: Claude Code's title spinner — the braille glyphs (⠐/⠂/…) come from a FALLBACK font (MS Gothic per app log) with per-glyph advance widths, so the centered title re-centers to a different width every spinner frame. Investigate where the win32 tab/title text is drawn (Window.zig caption/tab paint); candidate fixes: left-align the title, reserve a fixed-width cell for the leading glyph, or measure/center on the title minus the spinner char | I | — | todo | — |
 | T57 | FIX: "Toggle Hero Mode" (and other fork actions) missing from the win32 command palette — the REAL cause of the T49 user report ("no hero mode in command palette", 2026-07-16): the palette is a hardcoded static list (Surface.zig palette_entries), never updated with fork actions, so hero mode was undiscoverable even though the keybind worked. Added: Toggle Hero Mode, Swap Split Right/Down/Left/Up, Rename Window (prompt_surface_title). Skipped prompt_surface_banner (win32 no-op until T35). hero-mode.ps1 grew a palette section: ctrl+shift+p → type "hero" → Enter → hero geometry asserted. Consider (T51 audit): generate palette entries from core command.zig defaults instead of a parallel list, so this class of drift can't recur | F | T19 | done | (this commit) |
 | T56 | Remote reconnect on win32 (WP-D1 parity) | G | T21b | todo | — |
+| T58 | Hero mode TRUE port — design (win32): Mac hero = animated hero strip + snapshot thumbnail carousel + drag divider; T19 shipped a static live-pane stand-in (user, 2026-07-16) | F | T19 | todo | — |
+| T59 | Hero mode TRUE port — implement per T58 (thumbnails, animations, divider drag, selection/hover chrome; rewrite hero-mode.ps1 geometry oracle) | F | T58 | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.

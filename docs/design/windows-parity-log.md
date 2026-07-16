@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-16 (on-box) — T58/T59 FILED from a mid-session user correction:
+  the T19 hero-mode port missed the actual Mac design (maximized hero +
+  right-side vertical carousel of pane THUMBNAILS with animations, drag
+  divider, selection chrome — T19 shipped a static live-pane stand-in).
+  Read all four Swift HeroMode sources and recorded a full behavioral
+  spec + win32 design questions in the T58 details section, so T58 need
+  not re-read Swift. T19 row/section got a CORRECTION note (keybind/
+  toggle/focus plumbing stays valid). T58→T59 inserted at the head of the
+  priority queue (before T53). Also fixed a tracker bug: two rows were
+  both numbered T56 — the title-jitter task (2026-07-16) renumbered to
+  T60; T56 stays the remote-reconnect task. No code changes.
+
 - 2026-07-15 (on-box) — T48 DONE (e35ef81fd): implemented the deferral fix
   for the release GUI deadlock T48a root-caused. `App.deferSetFocus(hwnd)`
   posts a private WM_APP_SETFOCUS (WM_APP+5); the run loop intercepts it
