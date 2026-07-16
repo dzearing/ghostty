@@ -224,8 +224,13 @@ def launch_app():
     logf = open(APP_LOG, "ab")
     logf.write(f"\n\n===== launch {time.strftime('%H:%M:%S')} =====\n".encode())
     logf.flush()
+    # GHOSTTY_RELAY_DISABLE=1: skip the relay-account Keychain read so the
+    # ad-hoc-signed debug build doesn't pop a login-keychain password prompt on
+    # every launch (its code hash changes each rebuild, so the ACL never matches
+    # and "Always Allow" can't stick). Session persistence needs no relay account.
+    env = dict(os.environ, GHOSTTY_RELAY_DISABLE="1")
     p = subprocess.Popen([CLI] + LAUNCH_ARGS, stdout=logf, stderr=logf,
-                         start_new_session=True)
+                         start_new_session=True, env=env)
     _launched_procs.append(p)
     return p.pid
 

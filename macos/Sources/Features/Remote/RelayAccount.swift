@@ -359,6 +359,32 @@ struct RelayAccountKeychain {
     let service: String
     private let account = "google-account"
 
+    /// Dev/test opt-out: when set, ALL Keychain access is skipped (`load` → nil,
+    /// `save`/`delete` → no-op), so an ad-hoc-signed debug build never triggers
+    /// the login-keychain ACL password prompt.
+    ///
+    /// Why this is needed: an ad-hoc signature (`codesign -s -`, no team
+    /// identity) has NO stable designated requirement — the keychain ACL can
+    /// only trust the app by its exact code hash, which changes on EVERY
+    /// rebuild. So macOS re-prompts after each build and "Always Allow" can't
+    /// stick (the entry it adds is for the previous hash). This gate lets the
+    /// rebuild-heavy dev/test loop (and manual debug launches that don't need
+    /// relay) run prompt-free.
+    ///
+    /// Off by default → ZERO change for the release app or anyone who hasn't
+    /// opted in. Enable via env `GHOSTTY_RELAY_DISABLE=1` (dev shells / the E2E
+    /// harness) or `defaults write <bundle id> GhosttyRelayDisable -bool YES`
+    /// (persists across Finder launches of the debug app; delete the key or set
+    /// it NO to re-enable relay). While disabled the app reads as signed out and
+    /// relay calls fall back to `GHOSTTY_RELAY_TOKEN` if present.
+    static var isDisabled: Bool {
+        if let env = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_DISABLE"],
+           !env.isEmpty, env != "0", env.lowercased() != "false" {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "GhosttyRelayDisable")
+    }
+
     struct Stored: Codable, Equatable {
         var refreshToken: String
         var email: String
@@ -369,6 +395,7 @@ struct RelayAccountKeychain {
     }
 
     func load() -> Stored? {
+        if Self.isDisabled { return nil }
         var query = baseQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -381,6 +408,7 @@ struct RelayAccountKeychain {
     }
 
     func save(_ stored: Stored) throws {
+        if Self.isDisabled { return }
         guard let data = try? JSONEncoder().encode(stored) else {
             throw RelayAccount.AccountError.keychain(errSecParam)
         }
@@ -396,6 +424,7 @@ struct RelayAccountKeychain {
     }
 
     func delete() {
+        if Self.isDisabled { return }
         SecItemDelete(baseQuery() as CFDictionary)
     }
 
