@@ -112,7 +112,7 @@ One line per row. Full spec + validation + evidence per task:
 | T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | done | 64c4329c2 |
 | T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
 | T22a | Machine chooser design (win32) | G | T21a | done | 6d944531e |
-| T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | todo | — |
+| T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | in-progress | — |
 | T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |
 | T24 | Windows release channel + update check | H | T23 | todo | — |

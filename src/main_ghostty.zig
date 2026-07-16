@@ -265,4 +265,5 @@ test {
     // in BOTH the `none` and `win32` lanes.
     _ = @import("remote/google_oauth.zig");
     _ = @import("remote/relay_account.zig");
+    _ = @import("remote/relay_directory.zig");
 }
