@@ -159,13 +159,15 @@ One line per row. Full spec + validation + evidence per task:
 | T47 | ctrl+k → clear_screen keybind | I | — | done | see details |
 | T48a | Root-cause the release GUI deadlock (dump analysis) | I | — | done | see details |
 | T48 | FIX DEADLOCK: defer SetFocus out of WindowProc (re-entrant IME/CTF hang) | I | T48a | done | e35ef81fd |
-| T49 | Hero-mode regression report → stale binary | F | T19 | done | c795455ff.. |
+| T49 | Hero-mode regression report → stale binary (CORRECTION 2026-07-16: the user's actual repro was the command palette, not the keybind — see T57) | F | T19 | done | c795455ff.. |
 | T50 | Real "Rename Window" dialog | I | T44 | done | 39988009a |
 | T51 | Full parity RE-AUDIT | — | T50,T22c,T48,T53 | todo | — |
 | T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
 | T53 | Long-context reliability + perf soak/tuning | I | T40 | todo | — |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
-| T55 | FIX: hero-mode.ps1 fails on HEAD (chords not dispatched) | F | T19 | todo | — |
+| T55 | FIX: hero-mode.ps1 fails on HEAD (chords not dispatched) — root cause was the TEST's positive control: ctrl+shift+r now opens the T50 modal rename dialog, which disables the owner window and silently ate every later chord. Control switched to ctrl+k (clear_screen, no UI left behind); not a key-path regression | F | T19 | done | (this commit) |
+| T56 | FIX: window title jitters a few px left/right on a timer while busy (user, 2026-07-16). Likely cause: Claude Code's title spinner — the braille glyphs (⠐/⠂/…) come from a FALLBACK font (MS Gothic per app log) with per-glyph advance widths, so the centered title re-centers to a different width every spinner frame. Investigate where the win32 tab/title text is drawn (Window.zig caption/tab paint); candidate fixes: left-align the title, reserve a fixed-width cell for the leading glyph, or measure/center on the title minus the spinner char | I | — | todo | — |
+| T57 | FIX: "Toggle Hero Mode" (and other fork actions) missing from the win32 command palette — the REAL cause of the T49 user report ("no hero mode in command palette", 2026-07-16): the palette is a hardcoded static list (Surface.zig palette_entries), never updated with fork actions, so hero mode was undiscoverable even though the keybind worked. Added: Toggle Hero Mode, Swap Split Right/Down/Left/Up, Rename Window (prompt_surface_title). Skipped prompt_surface_banner (win32 no-op until T35). hero-mode.ps1 grew a palette section: ctrl+shift+p → type "hero" → Enter → hero geometry asserted. Consider (T51 audit): generate palette entries from core command.zig defaults instead of a parallel list, so this class of drift can't recur | F | T19 | done | (this commit) |
 | T56 | Remote reconnect on win32 (WP-D1 parity) | G | T21b | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

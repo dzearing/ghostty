@@ -121,6 +121,38 @@ public class HeroDrv {
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
 
+    // Find the visible palette popup: a top-level owned window of the same
+    // pid using the terminal class (WS_POPUP, so not a child of `top`).
+    public static IntPtr FindPalettePopup(uint pid, IntPtr top) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if (p == pid && h != top && IsWindowVisible(h)) {
+                var sb = new StringBuilder(64);
+                GetClassNameW(h, sb, 64);
+                if (sb.ToString() == "GhozttyTerminal") { found = h; return false; }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // Type plain VKs (letters/Enter) into `edit` in one attachment burst.
+    public static string TypeKeys(IntPtr owner, IntPtr edit, ushort[] vks) {
+        uint pid; uint tid = GetWindowThreadProcessId(owner, out pid);
+        uint cur = GetCurrentThreadId();
+        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
+        try {
+            SetFocus(edit);
+            Thread.Sleep(60);
+            foreach (var vk in vks) {
+                Key(vk, false); Thread.Sleep(15); Key(vk, true); Thread.Sleep(30);
+            }
+            Thread.Sleep(100);
+            return "SENT";
+        } finally { AttachThreadInput(cur, tid, false); }
+    }
+
     // Send mods+vk with focus on `surface`. Returns "SENT" or a reason.
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
@@ -253,24 +285,28 @@ $leaf0 = ($tree | Sort-Object Top, Left | Select-Object -First 1)
 $leaf0Hwnd = [IntPtr]$leaf0.Hwnd
 Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-tree.png')
 
-# --- Positive control: ctrl+shift+r reaches binding dispatch (T44-proven) ----
-# Debug builds prove it via the stderr binding-dispatch log; release builds
-# have no log, so the control degrades to chord delivery only.
+# --- Positive control: ctrl+k reaches binding dispatch (T47-proven) ----------
+# Debug builds prove it via the stderr io-mailbox log; release builds have no
+# log, so the control degrades to chord delivery only.
+#
+# Deliberately NOT ctrl+shift+r: since T50 that opens the real Rename dialog,
+# which DISABLES the owner window while open (RenameDialog.zig) — a control
+# that leaves it up silently kills every later chord in this script (that was
+# T55: "chords not dispatched" was the dialog eating them, not a key-path
+# regression). ctrl+k just clears pane 0's primary screen and leaves no UI.
 $haveLog = (Test-Path $errlog)
-$r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11, 0x10), 0x52)
+$r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11), 0x4B)
 if ($r -ne 'SENT') { Write-Host "ABORT: control chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
 Start-Sleep -Milliseconds 300
 if ($haveLog) {
-    if (-not (Select-String -Path $errlog -Pattern 'prompt_surface_title' -Quiet)) {
-        Write-Host 'ABORT: positive control failed (prompt_surface_title never dispatched) - injection broken, not a hero verdict'
+    if (-not (Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -Quiet)) {
+        Write-Host 'ABORT: positive control failed (clear_screen never dispatched) - injection broken, not a hero verdict'
         Stop-Process -Id $proc.Id -Force; exit 1
     }
-    Write-Host 'OK    positive control: injection reaches bindings (prompt_surface_title dispatched)'
+    Write-Host 'OK    positive control: injection reaches bindings (clear_screen dispatched)'
 } else {
     Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
 }
-[HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(), 0x1B) | Out-Null   # Escape cancels any rename edit
-Start-Sleep -Milliseconds 300
 
 # --- Toggle hero mode on ------------------------------------------------------
 $r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11, 0x10), 0x20)  # ctrl+shift+space
@@ -332,6 +368,45 @@ Start-Sleep -Milliseconds 500
 Assert (-not $proc.HasExited) 'no crash after hero un-toggle'
 $after = Parse-Panes ([HeroDrv]::Panes($top))
 Assert (Rects-Equal $tree $after) 'tree geometry restored exactly after toggle-off'
+
+# --- Palette path: ctrl+shift+p, type "hero", Enter toggles hero mode --------
+# (T49 real root cause: the win32 palette list was hardcoded and had no
+# "Toggle Hero Mode" entry, so the feature was undiscoverable.)
+$treeNow = Parse-Panes ([HeroDrv]::Panes($top))
+$r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11, 0x10), 0x50)  # ctrl+shift+p
+if ($r -ne 'SENT') { Write-Host "SKIP palette test: $r" }
+else {
+    $popup = [IntPtr]::Zero
+    for ($t = 0; $t -lt 50 -and $popup -eq [IntPtr]::Zero; $t++) {
+        Start-Sleep -Milliseconds 20
+        $popup = [HeroDrv]::FindPalettePopup([uint32]$proc.Id, $top)
+    }
+    Assert ($popup -ne [IntPtr]::Zero) 'palette popup opened via ctrl+shift+p'
+    if ($popup -ne [IntPtr]::Zero) {
+        $palEdit = [HeroDrv]::FindWindowExW($popup, [IntPtr]::Zero, 'EDIT', $null)
+        Assert ($palEdit -ne [IntPtr]::Zero) 'palette search edit found'
+        if ($palEdit -ne [IntPtr]::Zero) {
+            # H E R O then Enter
+            $r = [HeroDrv]::TypeKeys($popup, $palEdit, [uint16[]]@(0x48, 0x45, 0x52, 0x4F, 0x0D))
+            Assert ($r -eq 'SENT') "palette keys typed ($r)"
+            Start-Sleep -Milliseconds 600
+            Assert (-not $proc.HasExited) 'no crash after palette hero toggle'
+            $heroP = Parse-Panes ([HeroDrv]::Panes($top))
+            $bigP = $heroP | Sort-Object Width -Descending | Select-Object -First 1
+            $restP = @($heroP | Where-Object { $_.Hwnd -ne $bigP.Hwnd })
+            $heroOnP = ($heroP.Count -eq 3) -and
+                       ($bigP.Width -ge [int](0.6 * $client[0])) -and
+                       ($restP.Count -eq 2) -and
+                       ($restP[0].Left -eq $restP[1].Left) -and ($restP[0].Left -gt $bigP.Right - 5)
+            Assert $heroOnP 'palette "Toggle Hero Mode" produced hero geometry'
+            # Restore via the keybind for symmetric teardown.
+            [HeroDrv]::Chord($top, [IntPtr]$bigP.Hwnd, [uint16[]]@(0x11, 0x10), 0x20) | Out-Null
+            Start-Sleep -Milliseconds 400
+            $afterP = Parse-Panes ([HeroDrv]::Panes($top))
+            Assert (Rects-Equal $treeNow $afterP) 'tree geometry restored after palette round-trip'
+        }
+    }
+}
 
 # --- Teardown ----------------------------------------------------------------
 if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }

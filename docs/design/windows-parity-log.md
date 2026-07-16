@@ -200,6 +200,22 @@ next, any surprises>`.
   reprioritized: T50 → T20/T21/T22 (remote + auth, user needs
   ctrl+shift+n) → T48 → T53 → T52 → T51. Goal + autonomy directives
   recorded in go.md quality bar and the tracker header. NEXT: T50.
+- 2026-07-16 (on-box, early morning) — T57 (palette gap = real T49 cause),
+  T55 (test bug, fixed), T56 filed. User re-repro'd "no hero mode": they were
+  searching the COMMAND PALETTE, which on win32 is a hardcoded list
+  (Surface.zig palette_entries) missing every fork action — keybind worked
+  all along. Added Toggle Hero Mode + Swap Split x4 + Rename Window to the
+  palette; hero-mode.ps1 now drives the palette end-to-end (ctrl+shift+p,
+  type "hero", Enter → geometry; 23 asserts ALL PASS). T55's "chords not
+  dispatched" was the script's own ctrl+shift+r positive control leaving the
+  T50 modal rename dialog open — it DISABLES the owner (RenameDialog.zig),
+  eating all later chords; control is now ctrl+k. Full board green: both
+  unit lanes, kb-actions (25), P1–P3, hero-mode (23). Also: user reported
+  the busy-window title jittering px-wise on a timer → T56 filed (suspect
+  fallback-font braille spinner re-centering). The overnight window loss had
+  NO ghoztty crash signature (process up since 7/15 23:49, no dumps, no WER)
+  — likely the claude CLI/shell died; unexplained, watch for recurrence.
+  Release refresh with the palette fix launched detached at turn end.
 - 2026-07-14 (on-box, late night) — T49 investigated, NO repro on HEAD;
   release refresh launched. New `test/win32/hero-mode.ps1` (geometry oracle,
   real chords, reuses the kb-actions recipe + a positive-control chord):
