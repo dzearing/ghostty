@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box) — T48a DONE (root-caused the release GUI deadlock);
+  split T48 into T48a (investigate, done) + T48 (implement fix, todo). Loaded
+  the existing 744MB dump in the store WinDbg's cdb with MS public symbols —
+  no ghoztty pdb needed, system frames resolve. Two access gotchas worth
+  remembering: the watchdog wrote the dump elevated so its DACL denied read to
+  the owner (fix: `icacls <dump> /grant $USER:R` — owner has implicit
+  WRITE_DAC), and the store cdb runs in an app container that can't read D:\
+  (fix: invoke the underlying exe, and the dump lives in a user-profile path
+  so it reads once the DACL is fixed). Verdict: NOT a lock cycle (`!locks`
+  finds nothing owned; all non-GUI threads idle; no EventPairLow — the old
+  note's "EventPairLow ×2" was WER noise). The GUI thread calls `SetFocus`
+  inside its WindowProc → IME/CTF (`ImeSystemHandler`→`CtfImeSetActiveContext`)
+  does a synchronous SendMessage (WM_IME_SETCONTEXT) that re-enters the
+  WindowProc, where ghoztty `std.Thread.Condition.wait()`s (→
+  `SleepConditionVariableSRW`, INFINITE) forever on a non-pumping stack.
+  Same re-entrancy class as the already-fixed WM_GETOBJECT/oleacc hang
+  (App.zig:2485, present in the dump build) but reached through the uncovered
+  IME/CTF path. All three old ranked candidates refuted. Full evidence +
+  reproduce steps + fix direction: `t48-deadlock-dump-analysis.md`. Next:
+  T48 — defer SetFocus out of WindowProc (PostMessage WM_APP_SETFOCUS, call
+  it at the top of the loop) so the cascade runs where the thread can pump;
+  repro under the now-symbolized watchdog build to pin `+0x1ffa0e`.
 - 2026-07-15 (on-box) — T22c DONE (code 4e7edfc9b; docs this commit): the
   win32 "New Remote Window" machine chooser. ctrl+shift+n (intercepted locally
   in `Surface.handleKeyEvent` — no core action exists, so it shadows the

@@ -1083,6 +1083,15 @@ same chord matches the binding but is NOT consumed (no clear io message —
 falls through to the TUI); Surface.zig clear_screen returns false on
 alternate screen (verified in code + on-box).
 
+## T48a — Root-cause the release GUI deadlock (Phase I)
+
+DONE 2026-07-15. Full dump analysis + reproduce steps:
+`t48-deadlock-dump-analysis.md`. Verdict + fix direction are summarised in
+the T48 section below (they were investigated together). The re-entrant
+IME/CTF `SetFocus` → `Condition.wait()` mechanism is confirmed from the dump
+with debugger evidence (`~*k` / `!locks` / raw-stack walk / disasm at
+`ghoztty+0x1ffa0e`). T48 (implement the deferral fix) remains todo.
+
 ## T48 — FIX DEADLOCK: release GUI freeze under busy TUI load (Phase I)
 
 Release GUI froze (Responding=false, all 18 threads Wait, CPU delta 0)
@@ -1102,26 +1111,38 @@ relaunch w/ claude --continue, keeps 4 dumps); release staging rebuilt
 with `-Dstrip=false` (pdb now emitted); upgrade script copies ghoztty.pdb
 beside installed exe.
 
-Static analysis (code read, unverified vs dump) candidate causes ranked:
+ROOT CAUSE CONFIRMED 2026-07-15 (T48a) via cdb + MS public symbols on the
+existing 744MB dump — full analysis + reproduce steps in
+`t48-deadlock-dump-analysis.md`. Summary:
 
-1. GUI-thread reentrant win32k callback self-block — same class as the
-   fixed WM_GETOBJECT/oleacc hang documented at
-   src/apprt/win32/App.zig:2294 (EventPairLow matches that signature);
-2. GUI thread blocks on renderer_state.mutex per keystroke
-   (src/apprt/win32/Surface.zig:2534 isWin32InputMode, also
-   IpcHandlers.zig:358 +read) while PTY-reader thread holds it in
-   processOutputLocked (src/termio/Termio.zig:675) — starvation unless
-   owner itself blocked;
-3. unsynchronized shared CS_OWNDC HDC: GUI WM_ERASEBKGND FillRect
-   (App.zig:2211) vs renderer-thread wglMakeCurrent/SwapBuffers
-   (renderer/OpenGL.zig:266,336).
+- **Not a lock cycle.** `!locks` = 15 CS scanned, none owned; every non-GUI
+  thread is cleanly idle (IOCP / ReadFile / NVIDIA waits); the OS wait-chain
+  finds only the GUI thread stuck with wait type `(null)`. No EventPairLow
+  anywhere (the old "EventPairLow ×2" was WER bucket noise).
+- **Mechanism:** the GUI thread calls `SetFocus` *synchronously inside its
+  WindowProc*. SetFocus runs the IME/CTF cascade inline
+  (`user32!ImeSystemHandler → imm32!ImmSetActiveContext →
+  msctf!CtfImeSetActiveContext`), which does a synchronous `SendMessage`
+  (WM_IME_SETCONTEXT) that **re-enters our WindowProc**; on that nested,
+  non-pumping stack ghoztty calls `std.Thread.Condition.wait()` (Zig →
+  `SleepConditionVariableSRW`, INFINITE) and blocks forever. Raw-stack walk
+  + disasm at `ghoztty+0x1ffa0e` confirm the primitive and the chain.
+- Same re-entrancy CLASS as the WM_GETOBJECT/oleacc hang whose fix
+  (`return 0` for `OBJID_CLIENT`, App.zig:2485) was already in this build
+  (`e0118f682`, ancestor of dump build `2bb4c802d`). That guard closed only
+  the oleacc trigger; the **IME/CTF SetFocus path is uncovered** → recurrence.
+- All three old ranked candidates refuted (details in the analysis doc).
 
-IPC pipe-busy is downstream: listener blocks unbounded on GUI thread at
-IpcServer.zig:294.
-
-NEXT: wait for a symbolized watchdog dump, then confirm cycle via ~*kb +
-lock-owner walk. The refreshed install has a matching pdb, so the next
-watchdog dump WILL be symbolizable. Adversarial investigation applies.
+Task split (sizing rule): **T48a = root-cause investigation → DONE** (this
+context). **T48 = implement the fix** (todo, dep T48a). Fix direction:
+defer `SetFocus` out of WindowProc (PostMessage a private WM_APP_SETFOCUS,
+call SetFocus at the top of the message loop) so the IME/CTF cascade runs
+where the thread can pump; belt-and-suspenders, once a *matching* symbolized
+dump identifies the `+0x1ffa0e` subsystem, stop the GUI thread from
+`Condition.wait()`-ing inside message dispatch. Candidate SetFocus-in-WndProc
+sites: App.zig:2537/2546/2555/2566 + Surface/Window focus-on-click paths.
+IPC pipe-busy is purely downstream (listener on the stuck GUI thread,
+IpcServer.zig:294).
 
 ## T49 — Hero mode regression report → stale binary (Phase F)
 

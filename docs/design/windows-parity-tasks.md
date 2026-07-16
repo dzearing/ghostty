@@ -73,9 +73,15 @@ Work these first, in order, before falling back to first-todo-in-table:
    `GET /v1/client/devices` → Escape-close, no crash). The T22 remote-window
    series is complete; remaining Phase-G follow-ups are T56 (reconnect) and
    T42 (remote env/PATH). Next in this priority list: T48.
-4. **T48** — deadlock root-cause. The refreshed install has a matching
-   pdb, so the next watchdog dump WILL be symbolizable. Adversarial
-   investigation applies (three ranked candidates in the details section).
+4. **~~T48a~~ → T48** — deadlock. T48a (root-cause) DONE 2026-07-15:
+   analyzed the existing 744MB dump with cdb + MS public symbols (no
+   ghoztty pdb needed). NOT a lock cycle — the GUI thread calls `SetFocus`
+   inside its WindowProc, the IME/CTF cascade re-enters the WindowProc via a
+   synchronous SendMessage, and ghoztty `Condition.wait()`s forever on that
+   non-pumping stack. Refutes all three old candidates. Full analysis:
+   `t48-deadlock-dump-analysis.md`. **T48 (implement fix) is next**: defer
+   SetFocus out of WindowProc so the IME/CTF cascade runs where the thread
+   can pump.
 5. **T53** — long-context reliability + perf soak/tuning pass.
 6. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
    report was a July-5 exe — make "which build is this" answerable at a
@@ -146,7 +152,8 @@ One line per row. Full spec + validation + evidence per task:
 | T45 | `--when-idle` acceptance test `ipc-when-idle.ps1` | I | T11 | done | see details |
 | T46 | `--when-idle` busy-marker drift fix | I | T45 | done | see details |
 | T47 | ctrl+k → clear_screen keybind | I | — | done | see details |
-| T48 | FIX DEADLOCK: release GUI freeze under TUI load | I | — | in-progress | — |
+| T48a | Root-cause the release GUI deadlock (dump analysis) | I | — | done | see details |
+| T48 | FIX DEADLOCK: defer SetFocus out of WindowProc (re-entrant IME/CTF hang) | I | T48a | todo | — |
 | T49 | Hero-mode regression report → stale binary | F | T19 | done | c795455ff.. |
 | T50 | Real "Rename Window" dialog | I | T44 | done | 39988009a |
 | T51 | Full parity RE-AUDIT | — | T50,T22c,T48,T53 | todo | — |
