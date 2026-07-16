@@ -2312,7 +2312,10 @@ pub const Connection = struct {
         // dropped. On a high-water crossing, emit a single FLOW{pause}.
         const res = self.channels.pushTo(channel, to_push);
         switch (res) {
-            .unknown => {},
+            // `.unknown` (dropped) can no longer occur for a live-but-unregistered
+            // channel: `pushTo` buffers those in the pre-registration buffer
+            // (`.buffered`) and `register` flushes them (T06c). Both need no FLOW.
+            .unknown, .buffered => {},
             .routed => |push| {
                 if (push.send_pause) {
                     var buf: [protocol.Flow.encoded_len]u8 = undefined;

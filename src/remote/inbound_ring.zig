@@ -314,7 +314,30 @@ pub const Channel = struct {
 pub const ChannelTable = struct {
     mutex: std.Thread.Mutex = .{},
     map: std.AutoHashMapUnmanaged(u128, *Channel) = .empty,
+    /// Pre-registration buffer for DATA that arrives on the data lane BEFORE its
+    /// channel is registered (the ATTACH/OPEN replay race, §7.3). The agent frames
+    /// its reply (ATTACHED/OPENED) on the control lane and the replay/initial DATA
+    /// on the data lane; the client only calls `register` after the control-lane
+    /// reply unblocks the caller. Because the two lanes are independent streams
+    /// with no cross-stream ordering, the data thread can `pushTo` the channel id
+    /// before `register` runs — those bytes would otherwise be dropped as
+    /// `.unknown` (seen live as missing scrollback on some restored panes, T06c).
+    /// Instead we stash them here and `register` flushes them into the ring, in
+    /// arrival order, atomically under `mutex`. Bounded (see the caps below) so a
+    /// never-claimed id (stale/hostile) can't grow without limit; freed in
+    /// `deinit`. Keyed by channel id like `map`.
+    pending: std.AutoHashMapUnmanaged(u128, std.ArrayListUnmanaged(u8)) = .empty,
     alloc: Allocator,
+
+    /// Per-channel prebuffer cap. The real race window is microseconds (rpc reply →
+    /// `register`), so legitimate replay buffered here is tiny; this only bounds a
+    /// misbehaving/stale channel. Sized at one client ring so a full ring's worth
+    /// of replay is never dropped for lack of buffer.
+    const max_pending_bytes_per_channel: usize = default_capacity;
+    /// Cap on distinct un-claimed channels buffered at once (hostile-input bound):
+    /// once this many are pending, further unknown channels are dropped (not
+    /// buffered) until one is claimed or the connection tears down.
+    const max_pending_channels: usize = 16;
 
     pub fn init(alloc: Allocator) ChannelTable {
         return .{ .alloc = alloc };
@@ -322,15 +345,29 @@ pub const ChannelTable = struct {
 
     pub fn deinit(self: *ChannelTable) void {
         self.map.deinit(self.alloc);
+        var it = self.pending.valueIterator();
+        while (it.next()) |buf| buf.deinit(self.alloc);
+        self.pending.deinit(self.alloc);
         self.* = undefined;
     }
 
     /// Register a pane's channel. The pointer must outlive every `pushTo` until
-    /// `deregister` returns (guaranteed by the teardown order).
+    /// `deregister` returns (guaranteed by the teardown order). If any DATA raced
+    /// in before registration (see `pending`), it is flushed into the channel's
+    /// ring here — under the same lock `pushTo` takes, so buffered (pre-register)
+    /// bytes always precede live (post-register) bytes and none are lost.
     pub fn register(self: *ChannelTable, ch: *Channel) Allocator.Error!void {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.map.put(self.alloc, ch.id, ch);
+        if (self.pending.fetchRemove(ch.id)) |kv| {
+            var buf = kv.value;
+            // Flush the raced-in prefix. We ignore the pause edge: the buffered
+            // amount is small and any real backpressure re-fires on the next live
+            // push. `ch.push` truncates to ring capacity if somehow oversized.
+            _ = ch.push(buf.items);
+            buf.deinit(self.alloc);
+        }
     }
 
     /// Unlink a channel. After this returns, no in-flight `pushTo` can be touching
@@ -340,6 +377,13 @@ pub const ChannelTable = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         _ = self.map.remove(id);
+        // Drop any never-claimed prebuffer for this id (e.g. an attach that failed
+        // after data raced in). Normally `register` consumes it first; this frees
+        // the leftover on the failure path.
+        if (self.pending.fetchRemove(id)) |kv| {
+            var buf = kv.value;
+            buf.deinit(self.alloc);
+        }
     }
 
     pub fn count(self: *ChannelTable) usize {
@@ -373,6 +417,10 @@ pub const ChannelTable = struct {
         /// No such channel (already torn down, or a hostile/stale `channel` id —
         /// §15 M3). The demux drops the frame; never a crash.
         unknown,
+        /// The channel is not registered YET but the bytes were held in the
+        /// pre-registration buffer to be flushed by `register` (the replay race,
+        /// §7.3). Like `.unknown` the caller emits no FLOW — no channel to pause.
+        buffered,
         /// Routed; carries the push outcome (written count + pause edge).
         routed: PushResult,
     };
@@ -382,11 +430,40 @@ pub const ChannelTable = struct {
     /// IMPORTANT: nothing else may be locked while `mutex` is held that could in
     /// turn be held while waiting on the renderer mutex — the push path takes no
     /// other lock, preserving the §3.4 lock ordering (no inversion).
+    ///
+    /// If `id` is not (yet) registered, the bytes are stashed in the
+    /// pre-registration buffer (`pending`) rather than dropped, so DATA that races
+    /// ahead of `register` on the independent data lane is not lost (T06c). A
+    /// truly-stale/hostile id also lands here but is bounded by
+    /// `max_pending_channels` / `max_pending_bytes_per_channel` and freed on
+    /// `deregister`/`deinit`.
     pub fn pushTo(self: *ChannelTable, id: u128, bytes: []const u8) RouteResult {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ch = self.map.get(id) orelse return .unknown;
-        return .{ .routed = ch.push(bytes) };
+        if (self.map.get(id)) |ch| return .{ .routed = ch.push(bytes) };
+        self.bufferPendingLocked(id, bytes);
+        return .buffered;
+    }
+
+    /// Append `bytes` to `id`'s pre-registration buffer, honoring the caps. Caller
+    /// holds `mutex`. Silent best-effort: on OOM or an over-cap condition the excess
+    /// is dropped (the same failure mode as the old `.unknown` drop, just far rarer).
+    fn bufferPendingLocked(self: *ChannelTable, id: u128, bytes: []const u8) void {
+        const gop = self.pending.getOrPut(self.alloc, id) catch return;
+        if (!gop.found_existing) {
+            // New pending channel: enforce the channel-count cap. If we're already
+            // at the cap, back the entry out and drop (don't buffer unbounded ids).
+            if (self.pending.count() > max_pending_channels) {
+                _ = self.pending.remove(id);
+                return;
+            }
+            gop.value_ptr.* = .empty;
+        }
+        const buf = gop.value_ptr;
+        const room = max_pending_bytes_per_channel -| buf.items.len;
+        if (room == 0) return;
+        const take = @min(room, bytes.len);
+        buf.appendSlice(self.alloc, bytes[0..take]) catch return;
     }
 };
 
@@ -473,7 +550,7 @@ test "Channel: flow pause/resume edges fire exactly once each" {
     try testing.expect(!ch.isPaused());
 }
 
-test "ChannelTable: register / route / deregister; unknown id is graceful" {
+test "ChannelTable: register / route / deregister; unregistered id is buffered then dropped" {
     const alloc = testing.allocator;
     var table = ChannelTable.init(alloc);
     defer table.deinit();
@@ -481,22 +558,85 @@ test "ChannelTable: register / route / deregister; unknown id is graceful" {
     var ch = try Channel.init(alloc, 0xABCD, .{ .capacity = 64 });
     defer ch.deinit(alloc);
 
-    // Routing before registration → unknown (no crash), models a stale/hostile
-    // channel id (§15 M3).
-    try testing.expect(table.pushTo(0xABCD, "hi") == .unknown);
+    // Routing before registration → buffered (no crash): the bytes are held in the
+    // pre-registration buffer for the replay race (§7.3 / T06c), not dropped.
+    try testing.expect(table.pushTo(0xABCD, "hi") == .buffered);
 
     try table.register(&ch);
     try testing.expectEqual(@as(usize, 1), table.count());
+    // register flushed the raced-in "hi" into the ring.
+    try testing.expectEqual(@as(usize, 2), ch.ring.len());
 
     const res = table.pushTo(0xABCD, "hello");
     try testing.expect(res == .routed);
     try testing.expectEqual(@as(usize, 5), res.routed.written);
+    // Ring now holds the buffered prefix THEN the live push, in order.
+    try testing.expectEqual(@as(usize, 7), ch.ring.len());
 
     table.deregister(0xABCD);
     try testing.expectEqual(@as(usize, 0), table.count());
-    // After deregister, routing is unknown again (the pane will free `ch` only
-    // after its consumer thread has joined — teardown order §3.4).
-    try testing.expect(table.pushTo(0xABCD, "x") == .unknown);
+    // After deregister, routing is buffered again (a fresh pending entry). The pane
+    // frees `ch` only after its consumer thread has joined (teardown order §3.4);
+    // an un-claimed buffer is freed by table.deinit.
+    try testing.expect(table.pushTo(0xABCD, "x") == .buffered);
+}
+
+test "ChannelTable: pre-register buffer flushes raced-in DATA in order (T06c)" {
+    const alloc = testing.allocator;
+    var table = ChannelTable.init(alloc);
+    defer table.deinit();
+
+    // Simulate the ATTACH replay race: multiple DATA frames land on the data lane
+    // for a channel id BEFORE the caller registers it (the reply came on the
+    // separate control lane).
+    try testing.expect(table.pushTo(0x1234, "line-one\r\n") == .buffered);
+    try testing.expect(table.pushTo(0x1234, "line-two\r\n") == .buffered);
+    try testing.expect(table.pushTo(0x1234, "line-three\r\n") == .buffered);
+
+    var ch = try Channel.init(alloc, 0x1234, .{ .capacity = 4096 });
+    defer ch.deinit(alloc);
+    try table.register(&ch);
+
+    // All three frames survived and appear in arrival order.
+    var dst: [64]u8 = undefined;
+    const got = ch.pop(&dst);
+    try testing.expectEqualSlices(u8, "line-one\r\nline-two\r\nline-three\r\n", dst[0..got.read]);
+    // The pending entry was consumed (no leak, nothing left to flush).
+    try testing.expectEqual(@as(usize, 0), table.pending.count());
+}
+
+test "ChannelTable: pre-register buffer respects the per-channel byte cap" {
+    const alloc = testing.allocator;
+    var table = ChannelTable.init(alloc);
+    defer table.deinit();
+
+    // Push more than one channel-ring's worth into an unregistered id; only the
+    // cap is retained (excess dropped, matching the old bounded-drop behavior).
+    const chunk = [_]u8{'x'} ** 4096;
+    var pushed: usize = 0;
+    while (pushed < ChannelTable.max_pending_bytes_per_channel + 4096 * 4) : (pushed += chunk.len) {
+        _ = table.pushTo(0x99, &chunk);
+    }
+    const buf = table.pending.get(0x99).?;
+    try testing.expectEqual(ChannelTable.max_pending_bytes_per_channel, buf.items.len);
+}
+
+test "ChannelTable: pre-register buffer bounds the number of pending channels" {
+    const alloc = testing.allocator;
+    var table = ChannelTable.init(alloc);
+    defer table.deinit();
+
+    // Beyond max_pending_channels distinct un-claimed ids, further ids are dropped
+    // (hostile-input bound), never buffered.
+    var id: u128 = 1;
+    while (id <= ChannelTable.max_pending_channels) : (id += 1) {
+        try testing.expect(table.pushTo(id, "a") == .buffered);
+    }
+    try testing.expectEqual(ChannelTable.max_pending_channels, table.pending.count());
+    // One past the cap: still reported buffered (best-effort) but not retained.
+    _ = table.pushTo(9999, "a");
+    try testing.expectEqual(ChannelTable.max_pending_channels, table.pending.count());
+    try testing.expect(table.pending.get(9999) == null);
 }
 
 test "Channel: signalExit sets isExited, publishes code/runtime, and wakes" {
