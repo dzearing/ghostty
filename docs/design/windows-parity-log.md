@@ -32,9 +32,16 @@ next, any surprises>`.
   GUI thread responsive (SendMessageTimeout SMTO_ABORTIFHUNG + live +list +
   focus still moves). Harness note: an IPC +close teardown *waits* on the
   flooded GUI-thread listener, so teardown direct-kills instead. Both test
-  lanes green, GUI build clean, kb-actions/ipc-p1/p2/p3 unaffected. Next: T53
-  (long-context reliability/perf soak — where a real release soak under the
-  symbolized watchdog is the natural home for confirming no recurrence).
+  lanes green, GUI build clean, kb-actions/ipc-p1/p2/p3 unaffected. DELIVERED
+  to all install locations (this fix matters — it's the release freeze):
+  ReleaseFast gnu build (`-Dstrip=false`) staged to zig-out-release
+  (`+version` = `+312ff857d`); Desktop portable + `\\homeassistant\share`
+  refreshed (exe+pdb, share mirrored, dated `.bak-20260715c`); installed
+  release swapped via the detached upgrade script and relaunched as a FRESH
+  clean Claude session (no `--continue`) re-entering go.md — so this delivery
+  doubles as the context reset. Next: T53 (long-context reliability/perf soak
+  — the natural home for confirming no recurrence under a real release soak
+  with the now-symbolized watchdog).
 
 - 2026-07-15 (on-box) — T48a DONE (root-caused the release GUI deadlock);
   split T48 into T48a (investigate, done) + T48 (implement fix, todo). Loaded
