@@ -87,6 +87,9 @@ pub const FrameType = enum(u8) {
     get_cwd = 0x22, // C→A  {session_id}  on-demand "what is this session's cwd?"
     cwd = 0x23, // A→C  {session_id, path?, ok}  reply to GET_CWD
 
+    list_sessions = 0x24, // C→A  {}  enumerate every session this agent owns
+    sessions = 0x25, // A→C  {sessions:[SessionInfo]}  reply to LIST_SESSIONS
+
     rpc = 0x30, // C→A  JSON-RPC 2.0 request (§9.5)
     rpc_result = 0x31, // A→C  JSON-RPC 2.0 response / subscription notification
 
@@ -520,6 +523,40 @@ pub const Cwd = struct {
     path: ?[]const u8 = null,
     ok: bool = false,
     found: ?bool = null,
+};
+
+/// `LIST_SESSIONS` (0x24). Enumerate every session this agent owns (live +
+/// tombstoned). No arguments today (a future increment may add filters); an empty
+/// `{}` payload keeps it additive/HELLO-compatible. Correlated by `Frame.channel`
+/// (same-channel RPC, like `GET_CWD`): the agent echoes `SESSIONS` on that channel.
+pub const ListSessions = struct {};
+
+/// One row of a `SESSIONS` reply (design §5's `{id, state, title, cwd, argv,
+/// attached, created_at, exit_code?}`). Strings borrow the agent's session
+/// storage until the reply is encoded (the agent holds the store lock across the
+/// snapshot+encode). `activity` is the idle/busy/needs_input state as a string so
+/// this wire type need not import the agent's `ActivityState` enum. `alive == false`
+/// is a tombstone (a dead session, still listed until reaped) — `exit_code` is set
+/// then. `attached` is true while a viewer is currently bound to the stream.
+pub const SessionInfo = struct {
+    id: []const u8,
+    alive: bool = true,
+    exit_code: ?i64 = null,
+    attached: bool = false,
+    activity: []const u8 = "idle",
+    pid: i64 = 0,
+    title: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    argv: ?[]const u8 = null,
+    created_at: i64 = 0,
+    last_activity: i64 = 0,
+};
+
+/// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty
+/// roster encodes as `{"sessions":[]}` (a healthy agent with no sessions), never
+/// elided — so the client can distinguish "answered, none" from "no reply".
+pub const Sessions = struct {
+    sessions: []const SessionInfo = &.{},
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
@@ -1476,6 +1513,67 @@ test "PROC_KILL / PROC_SPAWN JSON payloads round-trip (incl. null elision)" {
     try testing.expect(srp.value.ok);
     try testing.expectEqual(@as(i64, 4242), srp.value.pid.?);
     try testing.expect(srp.value.@"error" == null);
+}
+
+test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
+    const alloc = testing.allocator;
+
+    // LIST_SESSIONS is an empty object today.
+    const req: ListSessions = .{};
+    const rj = try encodeJson(alloc, req);
+    defer alloc.free(rj);
+    try testing.expectEqualStrings("{}", rj);
+
+    // A populated roster: alive + dead rows survive with all fields intact and in
+    // order. `argv`/`title` null on the dead row are elided; `exit_code` present.
+    const rows = [_]SessionInfo{
+        .{
+            .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .alive = true,
+            .attached = true,
+            .activity = "busy",
+            .pid = 4242,
+            .cwd = "/home/dev",
+            .argv = "vim .",
+            .title = "editor",
+            .created_at = 1000,
+            .last_activity = 2000,
+        },
+        .{
+            .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .alive = false,
+            .exit_code = 137,
+            .activity = "idle",
+            .pid = 99,
+        },
+    };
+    const sessions: Sessions = .{ .sessions = &rows };
+    const sj = try encodeJson(alloc, sessions);
+    defer alloc.free(sj);
+    var sp = try parseJson(Sessions, alloc, sj);
+    defer sp.deinit();
+    try testing.expectEqual(@as(usize, 2), sp.value.sessions.len);
+
+    const a = sp.value.sessions[0];
+    try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", a.id);
+    try testing.expect(a.alive and a.attached);
+    try testing.expectEqualStrings("busy", a.activity);
+    try testing.expectEqual(@as(i64, 4242), a.pid);
+    try testing.expectEqualStrings("/home/dev", a.cwd.?);
+    try testing.expectEqualStrings("vim .", a.argv.?);
+    try testing.expectEqualStrings("editor", a.title.?);
+
+    const b = sp.value.sessions[1];
+    try testing.expect(!b.alive);
+    try testing.expectEqual(@as(?i64, 137), b.exit_code);
+    try testing.expect(b.argv == null and b.title == null and b.cwd == null);
+
+    // An empty roster still encodes the array key (never elided) so the client can
+    // tell "answered, none" from "no reply".
+    const empty: Sessions = .{};
+    const ej = try encodeJson(alloc, empty);
+    defer alloc.free(ej);
+    try testing.expectEqualStrings("{\"sessions\":[]}", ej);
 }
 
 test "JSON-RPC request/response envelope" {

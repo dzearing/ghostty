@@ -57,6 +57,21 @@ ghoztty +list [--json] [--tty=<tty>]
 
 - `--tty`: Print only the registered name of the pane whose terminal matches the given tty (`ttys014` or `/dev/ttys014`; raw padded `ps -o tty=` output is accepted), then exit. Exits 1 if no match. Lets a process find its own pane: `ghoztty +list --tty="$(ps -o tty= -p $PPID)"`.
 
+### `ghoztty +sessions`
+
+List the persistent terminal sessions owned by the local `ghoztty-agent` (the daemon that keeps session-persistence PTYs alive across app restarts). Unlike the other IPC commands, this dials the agent **directly** over its 0600 unix socket (`~/.config/ghoztty/local-agent[-debug]/agent.sock`) — NOT the app's IPC socket — so it works even when the Ghoztty app is not running (as long as the agent is). Requires `session-persistence = on`.
+
+```
+ghoztty +sessions [--json]
+```
+
+Each row reports the session id, liveness (`alive`, or `dead(<code>)` for a tombstoned session), whether a viewer is currently `attached`, the activity state (`idle`/`busy`/`needs_input`), the child pid, the working directory (when known), and the command. `--json` emits one object per session for scripts and agents.
+
+```bash
+ghoztty +sessions
+ghoztty +sessions --json
+```
+
 ### `ghoztty +send-keys`
 
 Send text input to a named pane's terminal PTY.

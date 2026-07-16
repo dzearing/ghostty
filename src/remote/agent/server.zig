@@ -655,6 +655,7 @@ pub const Server = struct {
             .detach => self.handleDetach(frame.channel),
             .close => self.handleClose(frame.channel),
             .get_cwd => self.handleGetCwd(frame.channel, frame.payload),
+            .list_sessions => self.handleListSessions(frame.channel),
             .ping => self.handlePing(frame.payload),
             .flow => self.handleFlow(frame.payload),
             .metrics_sub => self.handleMetricsSub(frame.payload),
@@ -692,6 +693,14 @@ pub const Server = struct {
             spawned.child.terminate();
             return;
         };
+        // Record a human-readable command label for LIST_SESSIONS (T10): the
+        // explicit command if the client asked for one, else the resolved shell.
+        // Best-effort (setArgv swallows OOM) — a missing label just lists as null.
+        if (open.command) |cmd| {
+            s.setArgv(cmd);
+        } else if (open.shell) |sh| {
+            s.setArgv(sh);
+        }
         // Bind the new session to THIS connection: install the outbound bridge so
         // live output frames to our writer, mark it bound (so the idle reaper leaves
         // it alone), and track its channel so disconnect detaches just our sessions.
@@ -934,6 +943,45 @@ pub const Server = struct {
             // layout entry) apart from "the session exists but the cwd read
             // failed / child exited" (keep the entry; it is still attachable).
             .found = s != null,
+        }) catch {};
+    }
+
+    /// `LIST_SESSIONS`: snapshot the entire session roster and reply with `SESSIONS`
+    /// on the request channel. We build the reply array AND encode it while holding
+    /// the store lock so the borrowed session strings (id/title/cwd/argv) stay valid
+    /// through JSON encoding; `sendJson` only enqueues (the store→write_mutex lock
+    /// order is the SAME one `bridgeData` already takes under the store lock, so
+    /// there is no new deadlock risk). A pure in-memory snapshot — no OS I/O — so
+    /// holding the lock across it is cheap (unlike `handleGetCwd`, which must query
+    /// the OS and therefore unlocks first).
+    fn handleListSessions(self: *Server, channel: u128) void {
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
+
+        var infos: std.ArrayListUnmanaged(protocol.SessionInfo) = .empty;
+        defer infos.deinit(self.alloc);
+
+        var it = self.store.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            // On OOM, stop and send what we have rather than dropping the reply.
+            infos.append(self.alloc, .{
+                .id = s.id_str[0..],
+                .alive = s.alive,
+                .exit_code = s.exit_code,
+                .attached = s.bound,
+                .activity = @tagName(s.state),
+                .pid = s.pid,
+                .title = if (s.title) |t| t else null,
+                .cwd = if (s.cwd) |c| c else null,
+                .argv = if (s.argv) |a| a else null,
+                .created_at = s.created_ms,
+                .last_activity = s.last_activity_ms,
+            }) catch break;
+        }
+
+        self.sendJson(.sessions, channel, protocol.Sessions{
+            .sessions = infos.items,
         }) catch {};
     }
 
@@ -1702,6 +1750,78 @@ test "GET_CWD→CWD: unknown session replies ok=false (graceful, no crash)" {
     // POSITIVE not-found (T06b): an unknown id must report found=false so a
     // restore probe may safely forget it (vs. a transient cwd-read failure).
     try testing.expectEqual(@as(?bool, false), parsed.value.found);
+}
+
+test "LIST_SESSIONS→SESSIONS: agent enumerates its sessions on the request channel" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc0: FakeChild = .{ .alloc = alloc };
+    var fc1: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    defer fc1.deinit();
+    var kids = [_]*FakeChild{ &fc0, &fc1 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(11);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Open two sessions: one with an explicit command, one falling back to shell.
+    const o0 = try doOpen(&h, .{ .rows = 24, .cols = 80, .command = "run-marker-0" });
+    const o1 = try doOpen(&h, .{ .rows = 30, .cols = 100, .shell = "/bin/zsh" });
+
+    // LIST_SESSIONS on a fresh request channel; the agent echoes SESSIONS on it.
+    const req_ch: u128 = 0x5E5510;
+    try h.client.sendControlJson(.list_sessions, req_ch, protocol.ListSessions{});
+    const reply = try h.client.waitControl(.sessions);
+    try testing.expectEqual(req_ch, reply.channel);
+
+    var parsed = try protocol.parseJson(protocol.Sessions, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.sessions.len);
+
+    // The roster is unordered (hash-map iteration); find each opened session and
+    // assert its argv label + that it is alive and attached (this connection is
+    // bound to both).
+    var seen0 = false;
+    var seen1 = false;
+    for (parsed.value.sessions) |s| {
+        try testing.expect(s.alive);
+        try testing.expect(s.attached);
+        try testing.expectEqualStrings("idle", s.activity);
+        if (std.mem.eql(u8, s.id, o0.id[0..])) {
+            seen0 = true;
+            try testing.expect(s.argv != null);
+            try testing.expectEqualStrings("run-marker-0", s.argv.?);
+        } else if (std.mem.eql(u8, s.id, o1.id[0..])) {
+            seen1 = true;
+            try testing.expect(s.argv != null);
+            try testing.expectEqualStrings("/bin/zsh", s.argv.?);
+        }
+    }
+    try testing.expect(seen0 and seen1);
+}
+
+test "LIST_SESSIONS→SESSIONS: empty roster is answered with an empty array" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(12);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.list_sessions, 0xABCD, protocol.ListSessions{});
+    const reply = try h.client.waitControl(.sessions);
+    var parsed = try protocol.parseJson(protocol.Sessions, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.value.sessions.len);
 }
 
 test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {

@@ -304,6 +304,12 @@ pub const Session = struct {
     title: ?[]u8 = null,
     state: ActivityState = .idle,
 
+    /// The command this session is running, as a human-readable label captured at
+    /// OPEN time (the explicit `command`, else the resolved `shell`). Surfaced by
+    /// `LIST_SESSIONS` (T10) so a session browser can show "what is this". T12 will
+    /// persist the full argv to disk; this in-memory copy is the live view.
+    argv: ?[]u8 = null,
+
     /// Lifecycle: while `alive`, `DETACH`/drop keeps the session; only `CLOSE` or
     /// child exit frees it. On exit it becomes a **tombstone** retaining
     /// `exit_code` + final state until GC (§7.1).
@@ -386,6 +392,7 @@ pub const Session = struct {
         self.ring.deinit();
         if (self.cwd) |c| self.alloc.free(c);
         if (self.title) |t| self.alloc.free(t);
+        if (self.argv) |a| self.alloc.free(a);
         if (self.last_signal) |s| self.alloc.free(s);
         self.* = undefined;
     }
@@ -423,6 +430,15 @@ pub const Session = struct {
     pub fn setSignal(self: *Session, name: []const u8) Allocator.Error!void {
         if (self.last_signal) |s| self.alloc.free(s);
         self.last_signal = try self.alloc.dupe(u8, name);
+    }
+
+    /// Record the command label surfaced by `LIST_SESSIONS`. Owns a copy; replaces
+    /// any prior value. A best-effort field — a failure to allocate simply leaves
+    /// `argv` null rather than propagating.
+    pub fn setArgv(self: *Session, label: []const u8) void {
+        const copy = self.alloc.dupe(u8, label) catch return;
+        if (self.argv) |a| self.alloc.free(a);
+        self.argv = copy;
     }
 };
 

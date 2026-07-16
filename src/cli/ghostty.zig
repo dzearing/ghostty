@@ -25,6 +25,7 @@ const close = @import("close.zig");
 const rename = @import("rename.zig");
 const rearrange = @import("rearrange.zig");
 const list = @import("list.zig");
+const sessions = @import("sessions.zig");
 const read = @import("read.zig");
 const send_keys = @import("send_keys.zig");
 const set_state = @import("set_state.zig");
@@ -98,6 +99,9 @@ pub const Action = enum {
     // Use IPC to list open windows, tabs, and panes.
     list,
 
+    // Dial the local agent directly to list persistent terminal sessions.
+    sessions,
+
     // Use IPC to read terminal output from a named pane.
     read,
 
@@ -137,6 +141,7 @@ pub const Action = enum {
             .rename => "Rename a named pane or window via IPC",
             .rearrange => "Rearrange the pane layout of a window via IPC",
             .list => "List open windows, tabs, and panes via IPC",
+            .sessions => "List the local agent's persistent terminal sessions",
             .read => "Read terminal output from a pane via IPC",
             .@"send-keys" => "Send text input to a named pane via IPC",
             .@"set-state" => "Set the activity state of a pane or window via IPC",
@@ -229,6 +234,7 @@ pub const Action = enum {
             .rename => try rename.run(alloc),
             .rearrange => try rearrange.run(alloc),
             .list => try list.run(alloc),
+            .sessions => try sessions.run(alloc),
             .read => try read.run(alloc),
             .@"send-keys" => try send_keys.run(alloc),
             .@"set-state" => try set_state.run(alloc),
@@ -279,6 +285,7 @@ pub const Action = enum {
                 .rename => rename.Options,
                 .rearrange => rearrange.Options,
                 .list => list.Options,
+                .sessions => sessions.Options,
                 .read => read.Options,
                 .@"send-keys" => send_keys.Options,
                 .@"set-state" => set_state.Options,

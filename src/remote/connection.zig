@@ -595,6 +595,45 @@ pub const OwnedProcSnapshot = struct {
     }
 };
 
+/// One session row from a `LIST_SESSIONS` RPC (T10), deep-copied out of the
+/// transient parsed-JSON arena into caller memory. Mirrors `protocol.SessionInfo`
+/// but owns every string (freed by `OwnedSessions.deinit`).
+pub const OwnedSession = struct {
+    id: []const u8,
+    alive: bool,
+    exit_code: ?i64,
+    attached: bool,
+    /// idle | busy | needs_input (owned).
+    activity: []const u8,
+    pid: i64,
+    /// Owned; null when the agent had no title/cwd/argv for the session.
+    title: ?[]const u8,
+    cwd: ?[]const u8,
+    argv: ?[]const u8,
+    created_at: i64,
+    last_activity: i64,
+};
+
+/// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
+/// strings are duped into `alloc` so the roster outlives the parsed-JSON arena.
+/// Free with `deinit`.
+pub const OwnedSessions = struct {
+    sessions: []OwnedSession,
+    alloc: Allocator,
+
+    pub fn deinit(self: *OwnedSessions) void {
+        for (self.sessions) |s| {
+            self.alloc.free(@constCast(s.id));
+            self.alloc.free(@constCast(s.activity));
+            if (s.title) |t| self.alloc.free(@constCast(t));
+            if (s.cwd) |c| self.alloc.free(@constCast(c));
+            if (s.argv) |a| self.alloc.free(@constCast(a));
+        }
+        self.alloc.free(self.sessions);
+        self.* = undefined;
+    }
+};
+
 /// A caller-owned result of a `PROC_KILL` RPC (§9.3 process control, inc 4). The
 /// optional `error_msg` is duped into `alloc` (the parsed JSON arena is freed
 /// before `killProc` returns), so free with `deinit`.
@@ -1443,6 +1482,71 @@ pub const Connection = struct {
         };
     }
 
+    /// Enumerate the agent's sessions (T10). Sends `LIST_SESSIONS{}` and awaits
+    /// `SESSIONS{sessions:[...]}`, returning a caller-owned DEEP COPY
+    /// (`OwnedSessions`): every row + its strings are duped into `self.alloc` so the
+    /// result outlives the transient parsed-JSON arena (freed before this returns).
+    /// Free with `OwnedSessions.deinit`.
+    ///
+    /// Same-channel RPC (mirrors `requestProcSnapshot`): a fresh request channel, the
+    /// agent echoes `SESSIONS` on it, correlated via the `pending` map. Bounded by
+    /// `timeout_ns` — a missing/late reply returns `error.Timeout` rather than
+    /// hanging.
+    pub fn requestSessions(self: *Connection, timeout_ns: u64) !OwnedSessions {
+        const req_channel = std.crypto.random.int(u128);
+        const json = try protocol.encodeJson(self.alloc, protocol.ListSessions{});
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .list_sessions, .sessions, json, timeout_ns, null);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Sessions, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        const src = parsed.value.sessions;
+        var out = try self.alloc.alloc(OwnedSession, src.len);
+        // On a mid-copy failure, free everything duped so far (no leak).
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |s| {
+                self.alloc.free(@constCast(s.id));
+                self.alloc.free(@constCast(s.activity));
+                if (s.title) |t| self.alloc.free(@constCast(t));
+                if (s.cwd) |c| self.alloc.free(@constCast(c));
+                if (s.argv) |a| self.alloc.free(@constCast(a));
+            }
+            self.alloc.free(out);
+        }
+        for (src, 0..) |s, i| {
+            const id = try self.alloc.dupe(u8, s.id);
+            errdefer self.alloc.free(id);
+            const activity = try self.alloc.dupe(u8, s.activity);
+            errdefer self.alloc.free(activity);
+            const title: ?[]const u8 = if (s.title) |t| try self.alloc.dupe(u8, t) else null;
+            errdefer if (title) |t| self.alloc.free(t);
+            const cwd: ?[]const u8 = if (s.cwd) |c| try self.alloc.dupe(u8, c) else null;
+            errdefer if (cwd) |c| self.alloc.free(c);
+            const argv: ?[]const u8 = if (s.argv) |a| try self.alloc.dupe(u8, a) else null;
+            out[i] = .{
+                .id = id,
+                .alive = s.alive,
+                .exit_code = s.exit_code,
+                .attached = s.attached,
+                .activity = activity,
+                .pid = s.pid,
+                .title = title,
+                .cwd = cwd,
+                .argv = argv,
+                .created_at = s.created_at,
+                .last_activity = s.last_activity,
+            };
+            filled = i + 1;
+        }
+
+        return .{ .sessions = out, .alloc = self.alloc };
+    }
+
     /// Kill a remote process by pid (§9.3 process control, inc 4). Sends
     /// `PROC_KILL{pid, signal}` and awaits `PROC_KILL_RESULT{pid, ok, error?}`,
     /// returning a caller-owned `ProcKillOutcome` (any error string is duped into
@@ -2116,6 +2220,12 @@ pub const Connection = struct {
                 // Reply to a PROC_LIST RPC (§9.3 process view). Same-channel
                 // correlation, exactly like CWD: the agent echoes PROC_SNAPSHOT on the
                 // request channel. Dropped if no caller is parked (late reply).
+                _ = self.deliverRpcReply(frame);
+            },
+            .sessions => {
+                // Reply to a LIST_SESSIONS RPC (T10). Same-channel correlation, like
+                // CWD/PROC_SNAPSHOT: the agent echoes SESSIONS on the request channel.
+                // Dropped if no caller is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
             .proc_kill_result, .proc_spawn_result => {
