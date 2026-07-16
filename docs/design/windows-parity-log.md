@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-16 (on-box) — T58 DONE (design, doc-only): resolved all five
+  win32 design questions from code study (Window/Surface/generic/OpenGL/
+  Thread.zig). Headline decisions: thumbnails come from the RENDERER
+  (FBO-downscaled BGRA readback in a pre-SwapBuffers hook in generic.zig
+  drawFrame; HWND capture rejected — WS_CHILD GL windows have no DWM
+  redirection surface and hidden windows aren't composited); non-hero
+  panes SW_HIDE but renderer kept awake, ALL panes kept hero-sized so
+  selection swap needs no reflow (Mac slot model); carousel is
+  owner-painted in a new HeroCarousel.zig + hero_math.zig (no per-tile
+  HWNDs, no mega-file growth); hero swap animates as a snapshot-slide
+  (no live-GL SetWindowPos per tick); divider drag → per-tab ratio.
+  Known risk (hidden-window back-buffer rendering) gets a de-risk spike
+  as T59a step 1 with a documented fallback. T59 split → T59a (pipeline
+  + static carousel) / T59b (interactions + motion), each with ordered
+  steps and validation. Next: T59a.
+
 - 2026-07-16 (on-box) — T58/T59 FILED from a mid-session user correction:
   the T19 hero-mode port missed the actual Mac design (maximized hero +
   right-side vertical carousel of pane THUMBNAILS with animations, drag

@@ -1393,49 +1393,185 @@ to re-read the Swift):
   exclusion, tree-change clamp/deactivate, per-tab state, +list
   unaffected.
 
-**Design questions for win32 (decide in T58, record here):**
+**Design decisions (T58, resolved 2026-07-16, from code study of
+Window.zig/Surface.zig/generic.zig/OpenGL.zig/Thread.zig):**
 
-- *Thumbnails*: surfaces are OpenGL child HWNDs. Candidates:
-  `PrintWindow` with `PW_RENDERFULLCONTENT` (captures DWM-composited GL
-  content, works for occluded-but-visible windows; hidden windows render
-  blank — so non-hero surfaces must stay visible-but-clipped, not
-  SW_HIDE, OR snapshots must come from the renderer), vs a renderer-side
-  snapshot (glReadPixels into a shared bitmap on the renderer thread).
-  DWM thumbnail API is top-level-window-only — not applicable.
-- *Carousel rendering*: prefer owner-paint — Window.zig paints the
-  carousel region itself in WM_PAINT (StretchBlt cached snapshots +
-  GDI/Direct2D chrome), handling mouse hover/click/wheel/divider in the
-  parent window. Avoids per-tile child HWNDs. Rounded corners/glow: keep
-  Windows-native-looking; simplified chrome is acceptable if it looks
-  deliberate (T50 quality bar).
-- *Animations*: timer-driven easing (SetTimer or a 60Hz animation tick)
-  of strip offsets + InvalidateRect for the carousel; for the hero slide,
-  either SetWindowPos-per-tick of the live surface HWND or a
-  snapshot-crossfade. Must not jank the renderer (T53 bar).
-- *Where live surfaces go while not hero*: they currently stack in the
-  right column; in the new design non-hero surfaces are NOT visible as
-  live panes. Decide hide-vs-clip based on the thumbnail capture answer.
-- *hero-mode.ps1*: geometry oracle must be rewritten for the new layout
-  (hero rect + no visible non-hero surface rects + carousel region
-  owner-painted, so pane-HWND geometry assertions change shape).
+1. *Thumbnails — renderer-side snapshots. Capture-from-HWND REJECTED.*
+   Surfaces are `WS_CHILD` GL windows: child HWNDs have no DWM
+   redirection surface of their own, SW_HIDE'd windows aren't composited
+   at all, and `PrintWindow(PW_RENDERFULLCONTENT)` on a GL child is
+   driver-fragile — no HWND-capture path can give live thumbnails of
+   hidden panes. Instead the renderer thread captures its own output:
+   - Hook: in `generic.zig` `drawFrame` (win32-only, `comptime`-gated),
+     immediately BEFORE `drawFrameEnd`'s SwapBuffers — register the
+     snapshot `defer` AFTER the `defer self.api.drawFrameEnd()` at
+     generic.zig:1492 so it runs first (LIFO); the back buffer then
+     holds the complete frame. Renderer reaches the apprt surface via
+     `rt_surface` (Options.zig:21).
+   - Capture: if the per-surface snapshot request flag is set (one
+     atomic load per frame when idle — T53 bar), `glBlitFramebuffer`
+     default-FB → small lazily-created FBO at the requested THUMB size
+     (GL_LINEAR), `glReadPixels` BGRA from the FBO (≈0.5MB vs ≈10MB
+     full-res per capture), store into an apprt-Surface-owned
+     mutex-guarded buffer, bump seq, clear the flag,
+     `PostMessage(parent, WM_APP_HERO_SNAP, wparam = leaf HWND)`. GUI
+     validates the HWND (`GWLP_USERDATA` surface lookup) before touching
+     anything, memcpys into a per-leaf `CreateDIBSection` cache when seq
+     changed, `InvalidateRect`s the tile. GL's bottom-up readback
+     matches bottom-up DIB layout — no flip needed.
+   - Request side: a 150ms GUI timer (Mac-parity refresh) while hero is
+     active on the active tab sets requested+size per visible tile and
+     `renderer_thread.wakeup.notify()`. Idle panes produce no frame →
+     no capture → stale thumb is correct (content unchanged).
+   - RISK + de-risk spike (T59a step 1): back-buffer rendering of a
+     HIDDEN window relies on compositor-era pixel ownership (fine on
+     Win10/11 DWM in practice; classic offscreen-GL technique). Spike
+     asserts non-black capture from a hidden pane on the box FIRST.
+     Fallback if blank: non-hero surfaces stay visible-but-occluded
+     stacked BEHIND the hero pane with `WS_CLIPSIBLINGS` added to the
+     surface class (snapshot pipeline unchanged; only HWND placement
+     changes).
+2. *Non-hero surfaces: SW_HIDE, renderer kept awake, all hero-sized.*
+   Non-hero leaves are hidden like zoom does today, BUT keep
+   `setVisible(true)` (renderer occlusion stays "visible" — Thread.zig
+   gates drawFrame on it) so they keep producing frames for thumbnails.
+   ALL leaves stay `MoveWindow`'d to the hero rect even while hidden:
+   thumbnails inherit the hero aspect ratio for free and selection swap
+   needs NO grid reflow — the Mac keeps all strip slots hero-sized for
+   exactly this reason. Enter/exit hero = one reflow per leaf.
+3. *Carousel: owner-paint in the parent window; new module.* No child
+   HWNDs per tile. New `src/apprt/win32/HeroCarousel.zig` (Window.zig is
+   already ~105KB — no-mega-files rule): per-tab state (ratio, scroll,
+   hover, animations, DIB cache), double-buffered paint (memory DC),
+   hit-test, input handlers; Window.zig gets thin shims (WM_PAINT after
+   paintTabBar, mouse branches, WM_APP_HERO_SNAP, WM_TIMER ids). Pure
+   geometry/easing/scroll-clamp math in `hero_math.zig` with unit tests
+   (win32 test lane; no OS imports so the none lane can take it too).
+   Chrome (Windows-native, T50 bar): tile = 6px rounded rect
+   (`CreateRoundRectRgn` clip + `RoundRect` border); snapshot BitBlt
+   (captured at tile size; StretchBlt HALFTONE only on size mismatch);
+   dimming via `AlphaBlend` `SourceConstantAlpha` ≈ 255/153/89
+   (selected/hover/normal — Mac 1.0/0.6/0.35); borders: selected
+   RGB(106,106,255) 2px, hover RGB(139,92,246) 1px, normal gray 1px;
+   SKIP the Mac glow shadow (GDI has no cheap soft shadow — deliberate
+   simplification). Carousel bg = window bg darkened 30% toward black.
+   Decls to add in win32.zig: `StretchBlt`, `SetStretchBltMode`,
+   `AlphaBlend` (msimg32), `CreateRoundRectRgn`, `RoundRect`,
+   `SelectClipRgn` (CreateDIBSection/BitBlt/TrackMouseEvent exist).
+   Geometry (Mac parity): thumb w ≤ 88% carousel w, ~6% h-padding,
+   h = w/heroAR capped at 70% carousel h (shrink w to keep AR when the
+   cap binds), 8px gap, selected tile centered vertically, wheel scroll
+   clamped to ±half the overflow, offset reset on selection change.
+4. *Input routing.* Parent WndProc gains carousel branches when hero
+   active: WM_MOUSEMOVE hover (TrackMouseEvent) → invalidate changed
+   tiles; WM_LBUTTONUP inside a tile → select (Mac selects on mouse-up);
+   NEW parent WM_MOUSEWHEEL handler (screen→client coords) — wheel
+   reaches the parent via Win10+ "scroll inactive windows on hover"
+   routing, PLUS fallback: the Surface wheel handler forwards to the
+   carousel when hero is active and the cursor sits over the carousel
+   region (WM_MOUSEWHEEL otherwise follows keyboard focus = hero pane).
+   Divider: 6px hit band at the hero/carousel boundary (1px visible
+   line; gray, accent while hovered/dragged), IDC_SIZEWE cursor, drag
+   updates NEW per-tab `tab_hero_ratio` (default 0.25, clamp 0.1–0.6;
+   replaces the T19 `HERO_CAROUSEL_RATIO` const; save/restore it in
+   moveTabTo's hero bookkeeping like the other per-tab hero arrays),
+   with `MoveWindow` of the hero throttled to 80ms during the drag (Mac
+   debounces reflow 80ms; on win32 frame==grid, so throttle the resize
+   itself — deliberate simplification, carousel repaints every tick).
+5. *Animations: timer-driven easing, snapshot-slide for the hero.* One
+   ~16ms `SetTimer` alive only while an animation runs; progress from a
+   real-time clock (std.time.Instant), ease-in-out cubic; honor
+   `SPI_GETCLIENTAREAANIMATION` (skip animations when the user disabled
+   them). Selection slide (0.35s, Mac parity): during the slide BOTH
+   hero HWNDs stay hidden and the hero region owner-paints the outgoing
+   + incoming SNAPSHOTS sliding by hero_h + 40px·scale in the selection
+   direction; at the end SW_SHOW the incoming surface and SetFocus
+   (deferred, T48). Avoids per-tick SetWindowPos of live GL children
+   and SetWindowRgn clipping hacks; content freezes ≤350ms, which reads
+   the same as the Mac's live slide. Carousel re-center (0.3s, skipped
+   on first show) animates the scroll offset the same way.
+6. *Plumbing kept from T19 (unchanged behavior, new effects).* Toggle
+   action/keybind, >1-leaf guard, seed from focused leaf, zoom mutual
+   exclusion, tree-change clamp/deactivate (now also clamps scroll and
+   cancels animations), per-tab state, ctrl+alt arrows via gotoSplit
+   interception, heroOnSurfaceFocused → full swap path (show/hide +
+   animation). Background tabs: tab switch occludes panes as today →
+   thumbnails pause; re-request on re-activation. Teardown: snapshot
+   buffer freed AFTER core_surface deinit (renderer thread already
+   stopped) — matches existing deinit order.
+7. *hero-mode.ps1 rewrite (new geometry oracle).* After toggle: hero
+   HWND visible with rect == client minus carousel (ratio 0.25) at full
+   height; ALL other leaf HWNDs `IsWindowVisible == false` AND sized ==
+   hero rect; no child HWNDs inside the carousel region. ctrl+alt+down
+   (600ms settle for the slide) → next leaf visible at hero rect,
+   previous hidden. Toggle off → all leaves visible, tree rects
+   restored. Palette section (T57) and ctrl+k positive control (T55)
+   unchanged.
 
-*Validation (T58):* design recorded in this section (decisions above
-resolved), sized implementation plan for T59; split T59 further if it
-looks >250k context.
+*T59 sizing:* too big for one context → split into T59a (snapshot
+pipeline + layout rework + static carousel) and T59b (interactions +
+motion + polish); rows + sections added 2026-07-16, T59 umbrella row
+replaced (T21/T22 precedent).
 
-## T59 — Hero mode TRUE port: implement per T58 (Phase F)
+*Validation (T58):* DONE 2026-07-16 — decisions 1–7 above recorded with
+code-level anchors (hook line, module split, decls to add, risk spike
+first); T59 split into two context-sized tasks with ordered steps.
 
-Implement the T58 design. Sub-split in the table first if T58 concludes
-it's too big for one context (e.g. T59a thumbnails/carousel, T59b
-animations/divider).
+## T59a — Hero mode TRUE port: snapshot pipeline + static carousel (Phase F)
 
-*Validation:* on-box: 3-pane layout → toggle hero → hero maximized left,
-carousel of dimmed thumbnails right, selected tile highlighted; click a
-tile → it swaps into the hero (animated); ctrl+alt+up/down move
-selection; wheel scrolls the carousel; divider drag resizes the split;
-thumbnails visibly update while a busy TUI runs in a non-hero pane;
-toggle-off restores the exact tree. Rewritten `hero-mode.ps1` ALL PASS;
-both test lanes + P1–P3 green; screenshot archived.
+First half of the T58 design (read the T58 decisions section first — it
+has the code-level anchors). Ordered steps, riskiest first:
+
+1. *De-risk spike*: hidden-pane capture — hide a pane's HWND while
+   keeping renderer visibility true, request a snapshot (T58 decision 1
+   pipeline, can be a crude full-res glReadPixels first), assert
+   non-black pixels on the box. If blank on this driver, switch to the
+   documented fallback (visible-but-occluded behind hero +
+   WS_CLIPSIBLINGS) and record it here.
+2. Snapshot plumbing end-to-end: request flag + thumb size + FBO blit +
+   BGRA readback in the generic.zig pre-swap hook; mutex buffer + seq on
+   the apprt Surface; WM_APP_HERO_SNAP + HWND-validated GUI pickup +
+   per-leaf DIB cache; 150ms refresh timer while hero active.
+3. Hero layout rework: all leaves MoveWindow'd to the hero rect,
+   non-hero SW_HIDE with renderer kept awake, enter/exit reflow,
+   per-tab `tab_hero_ratio` field (still fixed 0.25 until T59b drag).
+4. `HeroCarousel.zig` + `hero_math.zig` static render: tile geometry
+   (Mac-parity numbers), snapshots BitBlt'd with rounded-corner clip,
+   dimming + selected border, click-to-select (instant swap, no
+   animation yet), selected tile statically centered. Unit tests for
+   hero_math in the win32 lane (+ none lane if the build wires it).
+5. Rewrite `test/win32/hero-mode.ps1` per the T58 oracle (decision 7).
+
+*Validation:* on-box: 3-pane layout → toggle hero → hero maximized
+left, carousel of dimmed thumbnails right, selected tile highlighted;
+click a tile → it swaps into the hero; ctrl+alt+up/down move selection;
+thumbnails visibly update while a busy TUI runs in a non-hero pane
+(spike + timer working); toggle-off restores the exact tree. Rewritten
+`hero-mode.ps1` ALL PASS; both test lanes + P1–P3 green.
+
+## T59b — Hero mode TRUE port: interactions, motion, polish (Phase F)
+
+Second half of the T58 design, on top of T59a:
+
+1. Wheel scroll (parent WM_MOUSEWHEEL + Surface-side fallback), clamped
+   offset, selected-tile centering math shared with T59a.
+2. Divider: hit band + hover/drag chrome + IDC_SIZEWE, drag updates
+   per-tab ratio (clamp 0.1–0.6), 80ms-throttled hero resize.
+3. Hover chrome (TrackMouseEvent, purple border, 0.6 alpha) + tile
+   invalidation on hover change.
+4. Animations: selection snapshot-slide (0.35s) + carousel re-center
+   (0.3s), 16ms timer, ease-in-out cubic, SPI_GETCLIENTAREAANIMATION
+   respected; hero-mode.ps1 gets the 600ms settle before geometry
+   asserts.
+5. Perf pass: GHOZTTY_PERF fps with hero on vs off (no regression, no
+   jank while a busy TUI feeds thumbnails); tune refresh/anim timers if
+   needed.
+
+*Validation:* on-box: everything in the T59a list PLUS click-swap is
+animated, wheel scrolls the carousel, divider drag resizes hero/carousel
+live, hover highlights tiles; GHOZTTY_PERF shows no fps regression.
+`hero-mode.ps1` ALL PASS; both test lanes + P1–P3 green; screenshot
+archived in `test/win32/artifacts/`.
 
 Promote to a task row when prioritized; don't work these ad hoc.
 

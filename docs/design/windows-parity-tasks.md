@@ -87,13 +87,14 @@ Work these first, in order, before falling back to first-todo-in-table:
    `t48-deadlock-dump-analysis.md`. **T48 (implement fix) is next**: defer
    SetFocus out of WindowProc so the IME/CTF cascade runs where the thread
    can pump.
-5. **T58 → T59** — hero mode TRUE port (user, 2026-07-16, mid-session
-   correction: "the macos hero mode maximizes the current screen and has a
-   right side vertical carousel with thumbnails of the other screens you
-   can swap between, with animations and such. you didn't port that at
-   all"). T19's win32 port is a static live-pane stand-in; re-design
-   (T58), then implement (T59). Behavioral spec extracted from the Swift
-   sources is in the T58 details section — start there, not in Swift.
+5. **~~T58~~ → T59a → T59b** — hero mode TRUE port (user, 2026-07-16,
+   mid-session correction: T19's win32 port is a static live-pane
+   stand-in; the Mac hero = maximized pane + animated snapshot-thumbnail
+   carousel). T58 (design) DONE 2026-07-16: decisions + sized two-part
+   plan recorded in the T58 details section — renderer-side snapshots
+   (HWND capture rejected), owner-painted carousel, snapshot-slide
+   animation. Next: T59a (pipeline + static carousel, spike first),
+   then T59b (interactions + motion).
 6. **T53** — long-context reliability + perf soak/tuning pass.
 7. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
    report was a July-5 exe — make "which build is this" answerable at a
@@ -176,8 +177,9 @@ One line per row. Full spec + validation + evidence per task:
 | T60 | FIX: window title jitters a few px left/right on a timer while busy (user, 2026-07-16; row renumbered from a duplicate T56 on 2026-07-16). Likely cause: Claude Code's title spinner — the braille glyphs (⠐/⠂/…) come from a FALLBACK font (MS Gothic per app log) with per-glyph advance widths, so the centered title re-centers to a different width every spinner frame. Investigate where the win32 tab/title text is drawn (Window.zig caption/tab paint); candidate fixes: left-align the title, reserve a fixed-width cell for the leading glyph, or measure/center on the title minus the spinner char | I | — | todo | — |
 | T57 | FIX: "Toggle Hero Mode" (and other fork actions) missing from the win32 command palette — the REAL cause of the T49 user report ("no hero mode in command palette", 2026-07-16): the palette is a hardcoded static list (Surface.zig palette_entries), never updated with fork actions, so hero mode was undiscoverable even though the keybind worked. Added: Toggle Hero Mode, Swap Split Right/Down/Left/Up, Rename Window (prompt_surface_title). Skipped prompt_surface_banner (win32 no-op until T35). hero-mode.ps1 grew a palette section: ctrl+shift+p → type "hero" → Enter → hero geometry asserted. Consider (T51 audit): generate palette entries from core command.zig defaults instead of a parallel list, so this class of drift can't recur | F | T19 | done | (this commit) |
 | T56 | Remote reconnect on win32 (WP-D1 parity) | G | T21b | todo | — |
-| T58 | Hero mode TRUE port — design (win32): Mac hero = animated hero strip + snapshot thumbnail carousel + drag divider; T19 shipped a static live-pane stand-in (user, 2026-07-16) | F | T19 | todo | — |
-| T59 | Hero mode TRUE port — implement per T58 (thumbnails, animations, divider drag, selection/hover chrome; rewrite hero-mode.ps1 geometry oracle) | F | T58 | todo | — |
+| T58 | Hero mode TRUE port — design (win32): Mac hero = animated hero strip + snapshot thumbnail carousel + drag divider; T19 shipped a static live-pane stand-in (user, 2026-07-16). Decided: renderer-side FBO-downscaled snapshots (pre-swap hook in generic.zig; HWND capture rejected — child GL windows have no DWM surface), non-hero panes SW_HIDE + renderer kept awake + all hero-sized (no reflow on swap), owner-painted carousel in new HeroCarousel.zig, snapshot-slide animation, per-tab ratio + divider drag. T59 split → T59a/T59b | F | T19 | done | (this commit) |
+| T59a | Hero mode TRUE port — snapshot pipeline + static carousel: hidden-pane capture spike FIRST, then plumbing, hero layout rework, HeroCarousel.zig/hero_math.zig static paint + click-select, hero-mode.ps1 rewrite | F | T58 | todo | — |
+| T59b | Hero mode TRUE port — interactions/motion: wheel scroll, divider drag + per-tab ratio, hover chrome, slide + re-center animations, reduced-motion, GHOZTTY_PERF check, screenshot | F | T59a | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.
