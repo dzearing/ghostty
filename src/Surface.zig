@@ -524,12 +524,15 @@ const DerivedConfig = struct {
 /// `scratch` is a caller-owned, initially-empty `EnvMap` that MUST outlive the
 /// `OPEN` construction: the appended pairs borrow its key/value strings until
 /// `Remote.init` dupes them. Env-only shells (zsh/fish/elvish) get FULL
-/// integration this way. bash/nushell additionally need an argv rewrite the
-/// `OPEN` wire can't carry yet (T04c); for them the agent still spawns a plain
-/// `-li`/`-lic` shell, so their integration won't fully activate — we set the
-/// GHOSTTY_* vars regardless and log the gap. `shell_path` is the shell the
-/// agent will spawn (the caller's `rb.shell` or the inherited `$SHELL`), used to
-/// detect which integration to inject; null falls back to the zsh default.
+/// integration this way and this returns null. bash/nushell additionally need
+/// an argv rewrite (bash → `<shell> --posix`, nushell → `<shell> --execute 'use
+/// ghostty *'`); for them this RETURNS that argv (duped into `alloc`, owned by
+/// the caller) so it can be forwarded to the agent via `OPEN.argv` (T04c). The
+/// GHOSTTY_* vars are set for every shell regardless. `shell_path` is the shell
+/// the agent will spawn (the caller's `rb.shell` or the inherited `$SHELL`),
+/// used to detect which integration to inject; null falls back to the zsh
+/// default. The returned argv is only meaningful for a plain interactive shell
+/// (no user command) — the caller drops it when a command is present.
 fn appendLocalShellIntegrationEnv(
     alloc: Allocator,
     scratch: *std.process.EnvMap,
@@ -537,10 +540,10 @@ fn appendLocalShellIntegrationEnv(
     config: *const configpkg.Config,
     surface_id_str: []const u8,
     shell_path: ?[]const u8,
-) !void {
+) !?[]const []const u8 {
     const resources_dir = global_state.resources_dir.host() orelse {
         log.warn("no resources dir set; local shell integration disabled", .{});
-        return;
+        return null;
     };
 
     // Per-pane surface id: an exec pane sets this, but the remote branch dropped
@@ -596,13 +599,17 @@ fn appendLocalShellIntegrationEnv(
     );
 
     // Inject the shell-specific integration (ZDOTDIR for zsh, XDG for
-    // fish/elvish). `break :integrate` on any non-injectable case still forwards
-    // the GHOSTTY_* vars accumulated above.
-    integrate: {
+    // fish/elvish; argv rewrite for bash/nushell). `break :integrate null` on any
+    // non-injectable case still forwards the GHOSTTY_* vars accumulated above and
+    // yields no argv (the agent keeps its `-li` default). A local arena backs the
+    // `setup()` call so its temporaries + the returned command (which we only
+    // need until we copy the argv out below) don't leak into `alloc`; the env
+    // side effects are duped into `scratch` (its own allocator) and survive it.
+    const result_argv: ?[]const []const u8 = integrate: {
         const force: ?shell_integration.Shell = switch (config.@"shell-integration") {
             .none => {
                 log.info("shell integration disabled by configuration", .{});
-                break :integrate;
+                break :integrate null;
             },
             .detect => null,
             .bash => .bash,
@@ -612,39 +619,65 @@ fn appendLocalShellIntegrationEnv(
             .zsh => .zsh,
         };
 
+        var setup_arena = std.heap.ArenaAllocator.init(alloc);
+        defer setup_arena.deinit();
+        const sa = setup_arena.allocator();
+
         // `config.Command.shell` is a sentinel-terminated string; dupe into a
         // `[:0]u8` (works for both `shell_path` and the literal default).
-        const shell_z = try alloc.dupeZ(u8, shell_path orelse "/bin/zsh");
-        defer alloc.free(shell_z);
+        const shell_z = try sa.dupeZ(u8, shell_path orelse "/bin/zsh");
         const integration = (shell_integration.setup(
-            alloc,
+            sa,
             resources_dir,
             .{ .shell = shell_z },
             scratch,
             force,
         ) catch |err| {
             log.warn("local shell integration setup error err={}", .{err});
-            break :integrate;
+            break :integrate null;
         }) orelse {
             log.warn("shell could not be detected; no local shell integration injected", .{});
-            break :integrate;
+            break :integrate null;
         };
 
         switch (integration.shell) {
-            // Env-only shells are fully integrated by the env we just built.
-            .zsh, .fish, .elvish => log.info(
-                "local shell integration injected shell={s}",
-                .{@tagName(integration.shell)},
-            ),
-            // These need an argv rewrite the OPEN wire can't carry yet (T04c);
-            // the agent spawns a plain shell so integration won't fully activate.
-            .bash, .nushell => log.warn(
-                "local shell integration for {s} needs an argv rewrite not yet " ++
-                    "forwarded (T04c); pane runs without full integration",
-                .{@tagName(integration.shell)},
-            ),
+            // Env-only shells are fully integrated by the env we just built; the
+            // agent's default `<shell> -li` invocation is exactly right for them,
+            // so forward no argv (a rewrite would strip login/interactive flags).
+            .zsh, .fish, .elvish => {
+                log.info(
+                    "local shell integration injected shell={s}",
+                    .{@tagName(integration.shell)},
+                );
+                break :integrate null;
+            },
+            // bash/nushell need an argv rewrite (bash → `<shell> --posix` so it
+            // sources $ENV=ghostty.bash; nushell → `--execute 'use ghostty *'`).
+            // Split the rewritten command into an argv array (duped into `alloc`,
+            // owned by the caller) so it rides `OPEN.argv` to the agent (T04c).
+            .bash, .nushell => {
+                var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+                errdefer {
+                    for (argv.items) |a| alloc.free(a);
+                    argv.deinit(alloc);
+                }
+                var arg_it = try integration.command.argIterator(sa);
+                defer arg_it.deinit();
+                while (arg_it.next()) |a| {
+                    try argv.append(alloc, try alloc.dupe(u8, a));
+                }
+                if (argv.items.len == 0) {
+                    argv.deinit(alloc);
+                    break :integrate null;
+                }
+                log.info(
+                    "local shell integration injected shell={s} via argv rewrite ({d} args)",
+                    .{ @tagName(integration.shell), argv.items.len },
+                );
+                break :integrate try argv.toOwnedSlice(alloc);
+            },
         }
-    }
+    };
 
     // Append everything accumulated in `scratch` to the forwarded env list. The
     // pairs borrow `scratch`'s strings (stable until it is deinited, after
@@ -654,6 +687,8 @@ fn appendLocalShellIntegrationEnv(
         .key = entry.key_ptr.*,
         .value = entry.value_ptr.*,
     });
+
+    return result_argv;
 }
 
 /// Create a new surface. This must be called from the main thread. The
@@ -927,20 +962,40 @@ pub fn init(
                 // cross-machine window (`local_shell_integration` is false there).
                 var integ_env = std.process.EnvMap.init(alloc);
                 defer integ_env.deinit();
+                // The bash/nushell argv rewrite (T04c) returned by the injector,
+                // forwarded to the agent via `OPEN.argv`. Owned here (elements +
+                // slice on `alloc`); freed at block exit AFTER `Remote.init` dupes
+                // it. Null for env-only shells / no-integration / cross-machine.
+                var integ_argv: ?[]const []const u8 = null;
+                defer if (integ_argv) |argv| {
+                    for (argv) |a| alloc.free(a);
+                    alloc.free(argv);
+                };
                 if (rb.local_shell_integration) {
                     const shell_for_integration = rb.shell orelse inherited_shell;
-                    appendLocalShellIntegrationEnv(
+                    integ_argv = appendLocalShellIntegrationEnv(
                         alloc,
                         &integ_env,
                         &remote_env,
                         config,
                         surface_id_str,
                         shell_for_integration,
-                    ) catch |err| log.warn(
-                        "local shell integration setup failed err={}",
-                        .{err},
-                    );
+                    ) catch |err| argv: {
+                        log.warn(
+                            "local shell integration setup failed err={}",
+                            .{err},
+                        );
+                        break :argv null;
+                    };
                 }
+
+                // The argv rewrite is the FULL interactive-shell invocation, so it
+                // must not coexist with an explicit user command (it would run the
+                // shell instead of the command). Drop it when a command is present
+                // — that pane keeps the agent's `-lic <command>` path (integration
+                // for a command-running bash/nushell pane is out of scope, T04c).
+                const forwarded_argv: ?[]const []const u8 =
+                    if (remote_command == null) integ_argv else null;
 
                 // User/apprt env overrides applied LAST (they win over the
                 // integration env above, mirroring exec's `env_override`).
@@ -970,6 +1025,7 @@ pub fn init(
                     .shell = rb.shell,
                     .term = config.term,
                     .env = remote_env.items,
+                    .argv = forwarded_argv,
                 });
                 break :backend .{ .remote = io_remote };
             }

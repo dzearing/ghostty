@@ -824,22 +824,41 @@ pub const PtySpawner = struct {
             for (args_list.items) |a| self.alloc.free(a);
             args_list.deinit(self.alloc);
         }
-        // argv[0] is the shell path (a fresh dupe so freeing the list frees it).
-        try args_list.append(self.alloc, try self.alloc.dupeZ(u8, shell_path));
-        if (is_windows) {
-            if (open.command) |cmd| if (cmd.len > 0) {
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, windowsCommandArg(shell_path)));
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
-            };
-        } else if (open.command) |cmd| {
-            if (cmd.len > 0) {
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-lic"));
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
+        // POSIX only: an explicit `OPEN.argv` (the local-agent shell-integration
+        // argv-rewrite for bash/nushell, T04c) is exec'd VERBATIM in place of the
+        // synthesized `-lic`/`-li` convention. The binary is still our resolved
+        // `shell_path` (always absolute); `open.argv` supplies argv (argv[0] is
+        // conventionally the shell, the rest are the integration flags, e.g.
+        // `--posix`). Set only by the local-agent client for a plain interactive
+        // shell, so it never coexists with a user `open.command`. A Windows agent
+        // never receives it (the client leaves it null cross-platform), but gate
+        // to POSIX defensively so a stray value can't bypass the ConPTY path.
+        const explicit_argv: ?[]const []const u8 =
+            if (!is_windows) open.argv else null;
+
+        if (explicit_argv) |argv| if (argv.len > 0) {
+            for (argv) |a| try args_list.append(self.alloc, try self.alloc.dupeZ(u8, a));
+        };
+
+        // Fall back to the default `<shell> …` synthesis when no explicit argv.
+        if (args_list.items.len == 0) {
+            // argv[0] is the shell path (a fresh dupe so freeing the list frees it).
+            try args_list.append(self.alloc, try self.alloc.dupeZ(u8, shell_path));
+            if (is_windows) {
+                if (open.command) |cmd| if (cmd.len > 0) {
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, windowsCommandArg(shell_path)));
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
+                };
+            } else if (open.command) |cmd| {
+                if (cmd.len > 0) {
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-lic"));
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
+                } else {
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-li"));
+                }
             } else {
                 try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-li"));
             }
-        } else {
-            try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-li"));
         }
         const args = args_list.items;
 
@@ -1072,6 +1091,42 @@ test "PtyChild: OPEN.env reaches the child and does not leak between spawns" {
     term_a = true;
     pc_b.child().terminate();
     term_b = true;
+}
+
+test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {
+    const alloc = testing.allocator;
+
+    var spawner = try PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    // No `command` → the default synthesis would spawn a SILENT interactive shell
+    // (`<shell> -li`) that prints nothing. Supplying an explicit `argv` (the shell
+    // integration rewrite path, T04c) must instead exec exactly this argv, which
+    // prints a marker. Observing the marker proves argv-verbatim, not `-li`. We
+    // route through `/bin/sh -c` (universally present) as a stand-in for the
+    // bash `<shell> --posix` rewrite the client actually forwards.
+    const marker = "ARGV_VERBATIM_OK_5b8c";
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf '" ++ marker ++ "\\n'; sleep 30",
+    };
+    const pc = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .shell = "/bin/sh",
+        .argv = &argv,
+    });
+    var terminated = false;
+    defer if (!terminated) pc.child().terminate();
+
+    var capture: CaptureSink = .{ .alloc = alloc };
+    defer capture.deinit();
+    pc.child().attach(&capture, CaptureSink.sink, 0x5b8c);
+    try waitContains(&capture, marker);
+
+    pc.child().terminate();
+    terminated = true;
 }
 
 test "PtyChild: real pty spawn → input echoes back → exit/tombstone" {

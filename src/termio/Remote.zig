@@ -83,6 +83,13 @@ term: []const u8,
 /// agent-side there). Each pair's key/value is duped into `arena`.
 env: []const protocol.Open.EnvPair,
 
+/// Explicit shell argv to exec verbatim (§ local shell integration, T04c), or
+/// null to let the agent synthesize `<shell> -lic/-li`. Carries the
+/// `shell_integration.setup()` argv-rewrite for bash/nushell so those shells
+/// activate ghostty integration on the LOCAL agent. Null for cross-machine
+/// windows and for env-only shells. Each element is duped into `arena`.
+argv: ?[]const []const u8,
+
 /// Current grid/screen size, seeded by `initTerminal` and updated by `resize`.
 /// Sent in `OPEN`/`RESIZE` (rows/cols + pixel geometry, §6.5).
 grid_size: renderer.GridSize = .{},
@@ -154,6 +161,14 @@ pub const Config = struct {
     /// populated for the LOCAL agent to forward GHOZTTY_*/IPC/user vars (T04a).
     /// Borrowed from the caller; `init` dupes each pair into the backend arena.
     env: []const protocol.Open.EnvPair = &.{},
+
+    /// Explicit shell argv to exec verbatim instead of the agent's synthesized
+    /// `<shell> -lic/-li` (§ local shell integration, T04c). Set ONLY by the
+    /// LOCAL-agent client for a plain interactive bash/nushell pane (the
+    /// argv-rewrite `shell_integration.setup()` returns); null everywhere else
+    /// (env-only shells, user-command panes, cross-machine windows). Borrowed
+    /// from the caller; `init` dupes each element into the backend arena.
+    argv: ?[]const []const u8 = null,
 };
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
@@ -183,6 +198,14 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .value = try aa.dupe(u8, pair.value),
     };
 
+    // Dupe the explicit shell argv (if any) into our arena, element by element,
+    // so it is stable for the backend's lifetime (the caller only lends it).
+    const argv: ?[]const []const u8 = if (cfg.argv) |src| argv: {
+        const dst = try aa.alloc([]const u8, src.len);
+        for (src, 0..) |a, i| dst[i] = try aa.dupe(u8, a);
+        break :argv dst;
+    } else null;
+
     return .{
         .conn = cfg.conn,
         .session_id = session_id,
@@ -191,6 +214,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .shell = shell,
         .term = term,
         .env = env,
+        .argv = argv,
         .arena = arena,
     };
 }
@@ -327,6 +351,7 @@ pub fn threadEnter(
             .shell = self.shell,
             .term = self.term,
             .env = self.env,
+            .argv = self.argv,
             .rows = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
             .cols = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),

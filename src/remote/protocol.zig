@@ -410,6 +410,22 @@ pub const Open = struct {
     px_h: u16 = 0,
     name: ?[]const u8 = null,
 
+    /// Explicit shell argv to exec VERBATIM instead of the agent's synthesized
+    /// `<shell> -lic/-li <command>` convention (§ local shell integration, T04c).
+    /// Carries the argv-rewrite that `shell_integration.setup()` produces for
+    /// shells that need one (bash → `<shell> --posix`, nushell → `<shell>
+    /// --execute 'use ghostty *'`) so an agent-backed local pane running those
+    /// shells activates ghostty integration (prompt marks / OSC 7 / title) —
+    /// env-only shells (zsh/fish/elvish) never set this (their integration rides
+    /// `OPEN.env` alone). Set ONLY by the LOCAL-agent client for a plain
+    /// interactive shell (no user `command`); a cross-machine window leaves it
+    /// null. When present and non-empty the agent (POSIX) execs it as-is, using
+    /// its own resolved shell path as the binary and this array as argv; when
+    /// null the agent keeps the `-lic/-li` synthesis. Additive/optional: older
+    /// agents ignore the field (unknown-field-tolerant parser) and fall back to
+    /// the default invocation. `argv[0]` is conventionally the shell path.
+    argv: ?[]const []const u8 = null,
+
     pub const EnvPair = struct { key: []const u8, value: []const u8 };
 };
 
@@ -1281,14 +1297,31 @@ test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     const open: Open = .{ .rows = 24, .cols = 80, .command = "vim" };
     const oj = try encodeJson(alloc, open);
     defer alloc.free(oj);
-    // null optionals (cwd, shell, name) are elided.
+    // null optionals (cwd, shell, name, argv) are elided.
     try testing.expect(std.mem.indexOf(u8, oj, "cwd") == null);
+    try testing.expect(std.mem.indexOf(u8, oj, "argv") == null);
     var op = try parseJson(Open, alloc, oj);
     defer op.deinit();
     try testing.expectEqual(@as(u16, 24), op.value.rows);
     try testing.expectEqualStrings("vim", op.value.command.?);
     // env defaults to an empty slice (encoded as an empty array, harmless).
     try testing.expectEqual(@as(usize, 0), op.value.env.len);
+    // argv defaults to null (no explicit shell integration argv rewrite, T04c).
+    try testing.expect(op.value.argv == null);
+
+    // An OPEN carrying an explicit shell argv (T04c) round-trips: the elements
+    // survive encode→decode intact and in order (bash rewrite `<shell> --posix`).
+    const argv = [_][]const u8{ "/opt/homebrew/bin/bash", "--posix" };
+    const open_argv: Open = .{ .rows = 24, .cols = 80, .argv = &argv };
+    const gj = try encodeJson(alloc, open_argv);
+    defer alloc.free(gj);
+    try testing.expect(std.mem.indexOf(u8, gj, "--posix") != null);
+    var gp = try parseJson(Open, alloc, gj);
+    defer gp.deinit();
+    try testing.expect(gp.value.argv != null);
+    try testing.expectEqual(@as(usize, 2), gp.value.argv.?.len);
+    try testing.expectEqualStrings("/opt/homebrew/bin/bash", gp.value.argv.?[0]);
+    try testing.expectEqualStrings("--posix", gp.value.argv.?[1]);
 
     // An OPEN carrying a forwarded env allowlist (T04a) round-trips: the pairs
     // survive encode→decode with keys/values intact and in order.
