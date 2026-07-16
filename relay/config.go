@@ -136,6 +136,12 @@ type Config struct {
 
 	// DevEmail is the identity that a successful dev-auth maps to.
 	DevEmail string
+
+	// SessionEncKey is the AES-256 key (32 bytes) protecting Google refresh
+	// tokens at rest for the brokered-OAuth session store (oauth.go). Sourced
+	// from SESSION_ENC_KEY (base64 of 32 bytes). Empty disables the brokered
+	// flow (fail-closed): /oauth/exchange + /oauth/renew answer 503.
+	SessionEncKey []byte
 }
 
 // LoadConfig reads configuration from the environment, applying defaults.
@@ -171,6 +177,10 @@ func LoadConfig() *Config {
 		if e != "" {
 			cfg.AllowedEmails = append(cfg.AllowedEmails, e)
 		}
+	}
+
+	if k, err := decodeSessionEncKey(os.Getenv("SESSION_ENC_KEY")); err == nil {
+		cfg.SessionEncKey = k
 	}
 
 	// Subs are opaque case-sensitive identifiers — trimmed, never lowercased.
