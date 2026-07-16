@@ -58,6 +58,14 @@ per mode, 0 s relaunch gap. Debug build on macOS 26.4.
 | AC2 | `kill -9`, relaunch same binary (T07) | ✅ 3/3 | ~6–8 s | all 5 PIDs unchanged & alive; ticks monotonic across gap; topology exact (±0.01); pre-gap scrollback replayed; agent PID unchanged |
 | AC1 | `kill -9` + **bundle swapped on disk**, relaunch (T08) | ✅ 3/3 | ~8 s | as above; main-exec inode replaced each cycle (proof of on-disk swap); agent PID unchanged across the swap |
 | AC1 | **graceful quit** + bundle swap, relaunch (T08) | ✅ 3/3 | ~3 s | as above; `isQuitting` manifest path exercised; ⚠️ graceful *quit* itself wedges ~45 s in AppKit window teardown with many agent-backed panes (task T08a) — persistence + recovery unaffected |
+| AC3 / AC4 | **reboot-equivalent**: `kill -9` app **and** agent; launchd restarts the agent; relaunch app (T12d, `--agent-restart`) | ✅ 3/3 | ~1.9–3.9 s | launchd (`RunAtLoad`+`KeepAlive`) restarts the agent in **≤ 2 s** (0.0–2.0 s measured); the new agent materializes sessions from `sessions.json` as relaunchable tombstones; app relaunch re-attaches → auto-RELAUNCH spawns each pane fresh (**new child PID, marker re-ran, `--- session restarted ---` banner**); topology rebuilt from the manifest. Honest contract: children die + ring RAM is lost (POSIX), so scrollback restarts — no pre-kill replay until the ring disk snapshot (T13). |
+
+The `--agent-restart` cycle settles each live agent past launchd's 10 s respawn
+`ThrottleInterval` before killing it, so the measured restart is the real
+single-crash latency of a long-lived agent, not a throttle artifact of rapid
+E2E cycling. The debug lineage installs a distinct LaunchAgent label
+(`com.dzearing.ghoztty.debug.agent`) so it never collides with the release job;
+the harness boots it out on reset so no KeepAlive job lingers after a run.
 
 The swapped bundle is byte-identical (ad-hoc signing binds keychain auth to the
 exact code hash; a recompiled binary would prompt on every launch). This is

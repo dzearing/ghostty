@@ -11,7 +11,7 @@ kill the app, relaunch, and assert mechanically that every pane's process
 ## `session-persistence.py` — kill -9 survival (task T07)
 
 ```
-scripts/e2e/session-persistence.py [--cycles=3] [--upgrade] [--quit=kill|graceful] [--keep] [--verbose]
+scripts/e2e/session-persistence.py [--cycles=3] [--upgrade | --agent-restart] [--quit=kill|graceful] [--keep] [--verbose]
 ```
 
 What it does:
@@ -101,3 +101,53 @@ window-teardown before the process exits (plain exec-backed windows quit in
 persistence is unaffected, and recovery after relaunch is still <4s — but the
 harness waits out the hang (up to 45s) then `SIGKILL`s as a last resort. This is
 a pre-existing app-teardown issue tracked as T08a, not a persistence regression.
+
+## `session-persistence.py --agent-restart` — reboot-equivalent (task T12d)
+
+```
+scripts/e2e/session-persistence.py --agent-restart [--cycles=3]
+```
+
+The **reboot floor** (design ACs 3 & 4). A reboot — or an agent crash — is the
+one scenario no design can keep processes alive across: when the agent dies, its
+children die (POSIX PTY semantics) and its in-RAM output ring is gone. The honest
+contract is *session state restores + processes **relaunch***, not survival. This
+variant proves it end to end:
+
+1. **Setup** — same 2-window / 5-pane fixture. The app installs a per-user
+   **LaunchAgent** (`com.dzearing.ghoztty.debug.agent`, `RunAtLoad`+`KeepAlive`)
+   so launchd — not the app — owns the agent.
+2. **Reboot** — `SIGKILL` **both** the app and the agent (a reboot takes down
+   everything). launchd's `KeepAlive` restarts the agent; the fresh agent loads
+   `sessions.json` and materializes every session as a *relaunchable tombstone*
+   before it accepts connections.
+3. **Recover** — relaunch the app. It rebuilds the layout from the manifest,
+   re-attaches each leaf by session id, and (session-relaunch = `auto`) fires
+   `RELAUNCH` per pane: the agent respawns the child from recorded argv/cwd.
+
+Each cycle asserts the **opposite** of the survival tests: the agent PID
+**changed** (launchd brought a new one, in ≤ 5 s — measured 0–2 s), every pane's
+child PID is **new** (relaunched, not re-attached), the pane shows the
+`--- session restarted ---` banner, the marker command re-ran, and the split
+topology is still rebuilt exactly from the manifest.
+
+**launchd respawn throttle.** launchd rate-limits `KeepAlive` respawns to once
+per `ThrottleInterval` (default 10 s) since the job's last spawn. A real agent
+crash happens long after startup, so before each kill the harness settles the
+live agent past that floor (tracking its spawn wall-clock — this box's
+`ps -o etimes=` is not a valid keyword) to measure the true single-crash latency
+rather than a throttle artifact of rapid cycling.
+
+**Cleanliness.** The debug LaunchAgent is a distinct label from the release job,
+and `full_reset` boots it out (+ removes the plist) at start and teardown, so a
+KeepAlive job never lingers on the machine after a run. Because launchd owns the
+agent, `--agent-restart` (and any run after it) relies on that bootout — a bare
+`SIGKILL` of a `KeepAlive` agent would be undone by launchd instantly.
+
+> **Not yet covered — in-place AC4 (agent crash while the app stays up).** Today
+> the Zig client backend does not auto-redial a dropped local link (the LinkState
+> FSM computes backoff but the reconnect/re-attach increment is unbuilt), and the
+> local machine pill (with its manual Reconnect button) is hidden. So an agent
+> crash *without* an app relaunch leaves the panes dead until the app is
+> relaunched. `--agent-restart` therefore drives the reboot-equivalent (app
+> relaunch) path. True in-place recovery is a follow-up (task T12e).

@@ -55,6 +55,14 @@ LOCK_FILE = os.path.join(AGENT_DIR, "agent.lock")
 HEARTBEAT_FILE = os.path.join(AGENT_DIR, "agent.heartbeat")
 APP_LOG = os.path.join(tempfile.gettempdir(), "ghoztty-e2e", "e2e-app.log")
 
+# LaunchAgent (T12d): the app installs a per-user KeepAlive+RunAtLoad job so
+# launchd restarts the agent after a kill/crash/reboot. The debug lineage gets a
+# distinct label so it never collides with the release job. The --agent-restart
+# mode relies on this; full_reset boots it out so KeepAlive can't fight a reset
+# and no job lingers after a run.
+LAUNCHAGENT_LABEL = "com.dzearing.ghoztty.debug.agent"
+LAUNCHAGENT_PLIST = os.path.join(HOME, "Library", "LaunchAgents", LAUNCHAGENT_LABEL + ".plist")
+
 # --upgrade staging: a pristine, byte-identical RESERVE copy of the fresh build.
 # The app ALWAYS launches from the installed zig-out path (whose ad-hoc code hash
 # is already authorized in the keychain — launching a differently-signed copy would
@@ -167,6 +175,34 @@ def pid_alive(pid):
         return False              # no such process (reaped or never existed)
     return not st.startswith("Z")  # zombie == effectively terminated
 
+def launchctl(args, timeout=10):
+    """Run /bin/launchctl; return (rc, combined output)."""
+    try:
+        p = subprocess.run(["/bin/launchctl"] + args, capture_output=True,
+                           text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr)
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+
+def launchagent_service():
+    return f"gui/{os.getuid()}/{LAUNCHAGENT_LABEL}"
+
+def launchagent_pid():
+    """The pid launchd reports for the managed agent job, or None if not loaded."""
+    rc, out = launchctl(["print", launchagent_service()])
+    if rc != 0:
+        return None
+    m = re.search(r"^\s*pid = (\d+)", out, re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+def launchagent_bootout():
+    """Stop + unload the debug agent job and remove its plist (idempotent)."""
+    launchctl(["bootout", launchagent_service()])
+    try:
+        os.remove(LAUNCHAGENT_PLIST)
+    except FileNotFoundError:
+        pass
+
 def kill_pids(pids, sig):
     for pid in pids:
         try:
@@ -194,6 +230,10 @@ def full_reset():
         if not wait_gone(ap, 4):
             kill_pids(ap, signal.SIGKILL)
             wait_gone(ap, 4)
+    # Unload the LaunchAgent FIRST: with KeepAlive a bare SIGKILL of the agent is
+    # instantly undone by launchd (T12d). bootout stops the job + removes the plist
+    # so the reset actually sticks and no debug KeepAlive job lingers after the run.
+    launchagent_bootout()
     agp = agent_pid()
     if agp is not None:
         kill_pids([agp], signal.SIGKILL)
@@ -580,6 +620,164 @@ def assert_cycle(baseline, cur, prev, gap, agent_before, agent_after, failures, 
     check(agent_after is not None and agent_after == agent_before,
           f"agent PID changed {agent_before} -> {agent_after} (agent did not survive)")
 
+RESTART_DIVIDER = "--- session restarted ---"
+
+def assert_reboot_cycle(baseline, cur, gap, agent_before, agent_after,
+                        restart_secs, failures):
+    """Reboot-equivalent (T12d / AC3+AC4): the agent was killed and RESTARTED by
+    launchd, so its RAM (children + output ring) is GONE by POSIX semantics — the
+    honest contract is *relaunch*, not survival. Assert the OPPOSITE of the
+    survival cycle: agent pid CHANGED (launchd brought a new one), every pane's
+    child is a FRESH process (new pid, marker re-ran, ticks from 0), each pane
+    shows the restart banner, and the LAYOUT is still rebuilt exactly from the
+    manifest (that part is identical to a survival restore)."""
+    def check(cond, msg):
+        if not cond:
+            failures.append(msg)
+
+    # launchd restarted the agent as a NEW process within the AC4 budget.
+    check(agent_after is not None, "no agent after kill (launchd did not restart it)")
+    check(agent_after != agent_before,
+          f"agent pid unchanged {agent_before} (expected a launchd-restarted pid)")
+    check(restart_secs is not None and restart_secs <= 5.0,
+          f"launchd took {restart_secs}s to restart the agent (> 5s AC4 budget)")
+
+    # Layout rebuilt from the manifest — same as a survival restore.
+    check(cur["n_windows"] == baseline["n_windows"],
+          f"window count {cur['n_windows']} != baseline {baseline['n_windows']}")
+    check(cur["markers"] == EXPECTED_MARKERS,
+          f"marker set {sorted(cur['markers'])} != {sorted(EXPECTED_MARKERS)}")
+    for ns, struct in baseline["win_structs"].items():
+        if ns not in cur["win_structs"]:
+            failures.append(f"window with markers {sorted(ns)} missing after relaunch")
+            continue
+        cs = cur["win_structs"][ns]
+        if len(cs) != len(struct) or not all(struct_equal(a, b) for a, b in zip(struct, cs)):
+            failures.append(f"topology mismatch for window {sorted(ns)}:\n"
+                            f"      baseline={struct}\n      restored={cs}")
+
+    # Every pane RELAUNCHED: fresh child pid, banner shown, marker command re-ran.
+    for n in sorted(EXPECTED_MARKERS):
+        bpid = baseline["pid"].get(n)
+        cpid = cur["pid"].get(n)
+        check(cpid is not None, f"pane {n} has no marker after relaunch (never came back)")
+        check(cpid != bpid,
+              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
+        check(pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
+        text = cur["text"].get(n, "")
+        check(RESTART_DIVIDER in text,
+              f"pane {n} missing restart banner '{RESTART_DIVIDER}' after relaunch")
+
+    check(gap < 15.0, f"reboot recovery gap {gap:.1f}s >= 15s")
+
+# ---------------------------------------------------------------------------
+# Reboot-equivalent driver (T12d)
+# ---------------------------------------------------------------------------
+def wait_agent_restarted(old_pid, timeout=8.0):
+    """Poll launchd until it reports a NEW agent pid (KeepAlive restart). Returns
+    (new_pid, seconds) or (None, None) if it never restarted."""
+    t0 = time.time()
+    deadline = t0 + timeout
+    while time.time() < deadline:
+        p = launchagent_pid()
+        if p is not None and p != old_pid and pid_alive(p):
+            return p, time.time() - t0
+        time.sleep(0.1)
+    return None, None
+
+# launchd throttles KeepAlive respawns to once per ThrottleInterval (default 10s)
+# since the job's LAST spawn. A real-world agent crash happens after the agent has
+# been up far longer than that; the E2E's rapid kill/relaunch cycles would
+# otherwise trip the throttle and see a spurious multi-second restart delay. So
+# before each kill we let the current agent reach >THROTTLE seconds since it was
+# spawned, isolating the honest "single crash of a long-lived agent" AC4 measures.
+# (We track the spawn wall-clock ourselves; this box's `ps -o etimes=` is not a
+# valid keyword and `etime`'s dd-hh:mm:ss format is fiddly to parse.)
+THROTTLE_FLOOR = 12.0
+
+def settle_past_throttle(spawn_ts):
+    if spawn_ts is None:
+        return  # baseline agent: already up through build + baseline (>THROTTLE)
+    elapsed = time.time() - spawn_ts
+    if elapsed < THROTTLE_FLOOR:
+        wait = THROTTLE_FLOOR - elapsed
+        vlog(f"agent up {elapsed:.0f}s; waiting {wait:.0f}s to clear launchd respawn throttle")
+        time.sleep(wait)
+
+def run_reboot_cycles(args, baseline):
+    all_failures = []
+    agent_spawn_ts = None  # baseline agent already exceeds the throttle floor
+    for cycle in range(1, args.cycles + 1):
+        log("-" * 70)
+        log(f"[cycle {cycle}/{args.cycles}] REBOOT-equivalent: SIGKILL app + agent, "
+            f"launchd restarts agent, relaunch app, assert RELAUNCH")
+
+        # Let the live agent clear launchd's respawn throttle first (see
+        # THROTTLE_FLOOR) so the measured restart is the real single-crash latency.
+        settle_past_throttle(agent_spawn_ts)
+        t_reboot = time.time()
+
+        # 1. Kill the app (a reboot takes the GUI down too).
+        pids = app_pids()
+        if pids:
+            kill_pids(pids, signal.SIGKILL)
+            wait_gone(pids, 5)
+
+        # 2. Kill the agent; launchd (KeepAlive) must bring a NEW one back, which
+        #    loads sessions.json and materializes each session as a relaunchable
+        #    tombstone before it accepts connections.
+        agent_before = launchagent_pid() or agent_pid()
+        if agent_before is None:
+            all_failures.append(f"cycle {cycle}: no agent to kill")
+            break
+        kill_pids([agent_before], signal.SIGKILL)
+        agent_after, restart_secs = wait_agent_restarted(agent_before)
+        if agent_after is None:
+            all_failures.append(
+                f"cycle {cycle}: launchd did not restart the agent within 8s")
+            # keep going to relaunch the app so teardown is clean, but record it
+        else:
+            agent_spawn_ts = time.time()  # for the next cycle's throttle settle
+            log(f"    ↻ launchd restarted agent {agent_before} -> {agent_after} "
+                f"in {restart_secs:.1f}s")
+
+        # 3. Relaunch the app: manifest restore -> re-attach -> auto-RELAUNCH.
+        launch_app()
+        wait_app_ready()
+        wait_restored()
+        gap = time.time() - t_reboot
+        cur = snapshot()
+
+        failures = []
+        assert_reboot_cycle(baseline, cur, gap, agent_before, agent_after,
+                            restart_secs, failures)
+        if failures:
+            log(f"[cycle {cycle}] FAIL (recovery {gap:.1f}s):")
+            for f in failures:
+                log(f"    ✗ {f}")
+            all_failures.extend(f"cycle {cycle}: {f}" for f in failures)
+        else:
+            log(f"[cycle {cycle}] PASS  recovery={gap:.1f}s  agent {agent_before}->{agent_after} "
+                f"({restart_secs:.1f}s)  fresh PIDs {cur['pid']}")
+
+    log("=" * 70)
+    if all_failures:
+        log(f"RESULT: FAIL — {len(all_failures)} assertion(s) failed across {args.cycles} cycle(s)")
+        return 1
+    log(f"RESULT: PASS — {args.cycles}/{args.cycles} reboot-equivalent cycles; "
+        f"launchd restarted the agent each time (≤5s), sessions relaunched from "
+        f"metadata with the restart banner, topology rebuilt from the manifest")
+    return 0
+
+def reboot_teardown(args):
+    if args.keep:
+        log("[teardown] --keep: leaving app + windows running (LaunchAgent still loaded)")
+        return
+    log("[teardown] closing test windows + unloading LaunchAgent + clearing state")
+    for nm in ("A1", "A2", "B1"):
+        cli_ok(["+close", f"--target={nm}"])
+    full_reset()  # bootouts the LaunchAgent + clears manifest/agent state
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -589,6 +787,9 @@ def main():
     ap.add_argument("--cycles", type=int, default=3, help="terminate/relaunch cycles (default 3)")
     ap.add_argument("--upgrade", action="store_true",
                     help="replace the app bundle on disk between terminate and relaunch (T08)")
+    ap.add_argument("--agent-restart", action="store_true", dest="agent_restart",
+                    help="reboot-equivalent (T12d): kill BOTH app+agent; launchd restarts the "
+                         "agent; app relaunch RELAUNCHES sessions from metadata (AC3/AC4)")
     ap.add_argument("--quit", choices=("kill", "graceful"), default="kill",
                     help="how to terminate the app each cycle (default kill = SIGKILL)")
     ap.add_argument("--keep", action="store_true", help="leave app+windows running at end")
@@ -600,9 +801,15 @@ def main():
         log(f"FATAL: debug CLI not found at {CLI} — build first (zig build -Doptimize=Debug)")
         return 2
 
-    mode = ("binary UPGRADE (T08)" if args.upgrade else "kill -9 survival (T07)")
+    if args.agent_restart:
+        mode = "AGENT restart / reboot-equivalent (T12d)"
+    elif args.upgrade:
+        mode = "binary UPGRADE (T08)"
+    else:
+        mode = "kill -9 survival (T07)"
     log("=" * 70)
-    log(f"Ghoztty session-persistence E2E — {mode}, quit={args.quit}")
+    qdesc = "" if args.agent_restart else f", quit={args.quit}"
+    log(f"Ghoztty session-persistence E2E — {mode}{qdesc}")
     log("=" * 70)
 
     full_reset()
@@ -624,6 +831,25 @@ def main():
         f"PIDs {baseline['pid']}, ticks {baseline['tick']}")
     for ns, s in baseline["win_structs"].items():
         log(f"[base]   window {sorted(ns)} topology {s}")
+
+    # ---- Reboot-equivalent mode (T12d): a distinct loop with opposite semantics
+    # (relaunch, not survival). Split out because a reboot kills the children and
+    # the agent's RAM — asserting PID *changes* + a restart banner, not PID stability.
+    if args.agent_restart:
+        # The app installs+bootstraps the job lazily (first persistent window /
+        # warm-up); poll briefly for launchd to report it.
+        deadline = time.time() + 8
+        while launchagent_pid() is None and time.time() < deadline:
+            time.sleep(0.25)
+        la_pid = launchagent_pid()
+        if la_pid is None:
+            log("FATAL: LaunchAgent job not loaded after build — the app did not "
+                "install/bootstrap it (T12d), so launchd cannot restart the agent")
+            return 2
+        log(f"[base] LaunchAgent job loaded (launchd manages agent pid {la_pid})")
+        rc = run_reboot_cycles(args, baseline)
+        reboot_teardown(args)
+        return rc
 
     prev = baseline
     all_failures = []

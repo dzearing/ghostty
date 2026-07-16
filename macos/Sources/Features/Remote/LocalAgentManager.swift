@@ -45,6 +45,13 @@ final class LocalAgentManager {
     /// can assert the layout without touching the filesystem or the real bundle.
     struct Paths: Equatable {
         let directory: URL
+        /// The real user home (LaunchAgents plists live under the true `~`, never
+        /// a sandbox container) — kept so `launchAgentPlistURL` is derivable.
+        let home: URL
+        /// The per-user LaunchAgent label/job name (design §5.2 "Lifecycle").
+        /// Debug and release lineages get distinct labels so their KeepAlive jobs
+        /// never collide.
+        let launchAgentLabel: String
 
         /// The agent's info file (still passed via `--port-file`): now carries
         /// the UDS socket path + pid rather than a TCP port.
@@ -61,14 +68,26 @@ final class LocalAgentManager {
         var heartbeatFile: URL { directory.appendingPathComponent("agent.heartbeat") }
         var logFile: URL { directory.appendingPathComponent("agent.log") }
 
+        /// The LaunchAgent plist launchd loads for this lineage
+        /// (`~/Library/LaunchAgents/<label>.plist`). Always under the true home:
+        /// launchd's `gui/<uid>` domain only reads plists from there.
+        var launchAgentPlistURL: URL {
+            home.appendingPathComponent(
+                "Library/LaunchAgents/\(launchAgentLabel).plist")
+        }
+
         init(bundleID: String?, home: URL) {
             // The debug lineage (com.dzearing.ghoztty.debug) gets its own
             // directory; anything else — including a nil bundle id when
             // running bare — is the release lineage.
-            let name = bundleID?.hasSuffix(".debug") == true
-                ? "local-agent-debug" : "local-agent"
+            let isDebug = bundleID?.hasSuffix(".debug") == true
+            let name = isDebug ? "local-agent-debug" : "local-agent"
+            self.home = home
             self.directory = home
                 .appendingPathComponent(".config/ghoztty/\(name)", isDirectory: true)
+            self.launchAgentLabel = isDebug
+                ? "com.dzearing.ghoztty.debug.agent"
+                : "com.dzearing.ghoztty.agent"
         }
 
         static var current: Paths {
@@ -105,6 +124,19 @@ final class LocalAgentManager {
         defer { lock.unlock() }
         let paths = Paths.current
         if let conn = Self.dialExisting(paths: paths) { return conn }
+        // Prefer launchd ownership: a launchd-managed agent is auto-restarted
+        // after a kill/crash/reboot (RunAtLoad + KeepAlive) — the reboot-floor
+        // guarantee (design §5.2, AC4). launchd is the SOLE spawner on this
+        // path (no posix_spawn race → no single-instance-guard respawn loop).
+        if Self.ensureLaunchAgentLoaded(paths: paths) {
+            if let conn = Self.pollDial(paths: paths, seconds: 5.0) { return conn }
+            Self.logger.error("launchd agent did not become dialable within 5s; see \(paths.logFile.path, privacy: .public)")
+            return nil
+        }
+        // Fallback (launchctl unavailable — e.g. no Aqua/gui session): spawn the
+        // agent detached, as before. No KeepAlive on this path, so a killed
+        // agent won't auto-restart; find-or-spawn still recovers it on demand.
+        Self.logger.warning("launchd unavailable; falling back to detached agent spawn")
         return Self.spawnAndDial(paths: paths)
     }
 
@@ -289,15 +321,174 @@ final class LocalAgentManager {
         // Poll for a healthy dial. The winner of the agent's single-instance
         // guard (ours, or a concurrent spawner's) rewrites the port file after
         // its bind; the loser exits 183 without touching it.
-        let deadline = Date().addingTimeInterval(5.0)
-        while Date() < deadline {
-            usleep(100_000)
-            let data = try? Data(contentsOf: paths.portFile)
-            if data == staleData, staleData != nil { continue }
-            if let conn = dialExisting(paths: paths) { return conn }
+        if let conn = pollDial(paths: paths, seconds: 5.0, staleData: staleData) {
+            return conn
         }
         logger.error("local agent did not become dialable within 5s; see \(paths.logFile.path, privacy: .public)")
         return nil
+    }
+
+    /// Poll the info file until a dial succeeds, or `seconds` elapse. Shared by
+    /// the launchd path (wait for launchd's RunAtLoad agent to bind) and the
+    /// detached-spawn fallback. `staleData`, when given, is the pre-action
+    /// snapshot of the port file: a byte-identical read is skipped so we never
+    /// dial the record that just failed (the fresh agent overwrites it on bind).
+    private static func pollDial(
+        paths: Paths, seconds: TimeInterval, staleData: Data? = nil
+    ) -> Connection? {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            usleep(100_000)
+            let data = try? Data(contentsOf: paths.portFile)
+            if let stale = staleData, data == stale { continue }
+            if let conn = dialExisting(paths: paths) { return conn }
+        }
+        return nil
+    }
+
+    // MARK: - LaunchAgent (reboot floor, design §5.2)
+
+    /// Write/refresh this lineage's LaunchAgent plist and load it into the
+    /// per-user `gui/<uid>` domain, so launchd owns the agent with RunAtLoad +
+    /// KeepAlive — it is (re)started at login and restarted within seconds if it
+    /// is ever killed or crashes (AC3 reboot, AC4 agent crash). Idempotent:
+    /// re-loading an unchanged, already-bootstrapped job is a no-op + kickstart.
+    ///
+    /// Returns true once launchd is managing the job (so the caller can poll for
+    /// the agent to bind); false when launchctl is unavailable or the load
+    /// failed, signalling the caller to fall back to a detached spawn.
+    private static func ensureLaunchAgentLoaded(paths: Paths) -> Bool {
+        // The agent binds sockets / writes the port + sessions files under this
+        // directory; launchd won't create it, so ensure it exists first (0700 —
+        // the UDS lives here and the same-uid gate assumes a private dir).
+        do {
+            try FileManager.default.createDirectory(
+                at: paths.directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+        } catch {
+            logger.error("failed to create \(paths.directory.path, privacy: .public): \(error)")
+            return false
+        }
+
+        guard let desired = launchAgentPlistData(paths: paths) else { return false }
+
+        let plistURL = paths.launchAgentPlistURL
+        let existing = try? Data(contentsOf: plistURL)
+        let changed = existing != desired
+        if changed {
+            do {
+                try FileManager.default.createDirectory(
+                    at: plistURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true)
+                try desired.write(to: plistURL, options: .atomic)
+            } catch {
+                logger.error("failed to write \(plistURL.path, privacy: .public): \(error)")
+                return false
+            }
+        }
+
+        let domain = "gui/\(getuid())"
+        let service = "\(domain)/\(paths.launchAgentLabel)"
+        let loaded = launchctl(["print", service]).status == 0
+
+        // Already loaded with an unchanged plist: just make sure it's running.
+        if loaded && !changed {
+            _ = launchctl(["kickstart", service])
+            return true
+        }
+
+        // Changed plist (new bundle path/argv) → replace the stale job first so
+        // launchd re-reads it. `bootout` is best-effort (may already be gone).
+        if loaded { _ = launchctl(["bootout", service]) }
+
+        let (rc, out) = launchctl(["bootstrap", domain, plistURL.path])
+        // rc 5 == "service already bootstrapped" — a benign race with another
+        // process/launch; anything else is a real failure.
+        if rc != 0 && rc != 5 {
+            logger.error("launchctl bootstrap \(service, privacy: .public) failed rc=\(rc): \(out, privacy: .public)")
+            return false
+        }
+        _ = launchctl(["kickstart", service])
+        return launchctl(["print", service]).status == 0
+    }
+
+    /// Remove the LaunchAgent job + plist for this lineage. Not called in the
+    /// normal flow (the agent is meant to persist across app quits); exposed for
+    /// teardown/tests so a KeepAlive job doesn't linger.
+    @discardableResult
+    static func uninstallLaunchAgent(paths: Paths = .current) -> Bool {
+        let service = "gui/\(getuid())/\(paths.launchAgentLabel)"
+        _ = launchctl(["bootout", service])
+        try? FileManager.default.removeItem(at: paths.launchAgentPlistURL)
+        return true
+    }
+
+    /// The plist bytes launchd loads. Uses `PropertyListSerialization` so paths
+    /// with XML-special characters are escaped correctly.
+    private static func launchAgentPlistData(paths: Paths) -> Data? {
+        guard let bin = agentBinaryURL(),
+              FileManager.default.isExecutableFile(atPath: bin.path)
+        else {
+            logger.error("local agent binary not found or not executable at \(Self.agentBinaryURL()?.path ?? "<nil>", privacy: .public)")
+            return nil
+        }
+
+        let argv: [String] = [
+            bin.path,
+            "--listen-unix=\(paths.socketFile.path)",
+            "--port-file=\(paths.portFile.path)",
+            "--sessions-file=\(paths.sessionsFile.path)",
+        ]
+
+        // launchd does NOT inherit the app's environment, so bake in the guard
+        // paths + self-update opt-out (as spawnDetached passes) plus the few
+        // vars the agent needs to resolve a login shell for its sessions.
+        var env: [String: String] = [
+            "GHOSTTY_AGENT_LOCK": paths.lockFile.path,
+            "GHOSTTY_AGENT_HEARTBEAT": paths.heartbeatFile.path,
+            "GHOSTTY_AGENT_NO_SELFUPDATE": "1",
+        ]
+        let appEnv = ProcessInfo.processInfo.environment
+        for key in ["SHELL", "PATH", "LANG"] {
+            if let v = appEnv[key], !v.isEmpty { env[key] = v }
+        }
+
+        let plist: [String: Any] = [
+            "Label": paths.launchAgentLabel,
+            "ProgramArguments": argv,
+            "EnvironmentVariables": env,
+            "WorkingDirectory": paths.home.path,
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            // Interactive: latency-sensitive, not a batch job — keep it off the
+            // throttled background band.
+            "ProcessType": "Interactive",
+            "StandardOutPath": paths.logFile.path,
+            "StandardErrorPath": paths.logFile.path,
+        ]
+        return try? PropertyListSerialization.data(
+            fromPropertyList: plist, format: .xml, options: 0)
+    }
+
+    /// Run `/bin/launchctl` with `args`, returning its exit status + combined
+    /// output. Synchronous (each launchctl verb returns promptly).
+    @discardableResult
+    private static func launchctl(_ args: [String]) -> (status: Int32, output: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do {
+            try proc.run()
+        } catch {
+            return (-1, "\(error)")
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
     }
 
     /// posix_spawn the agent in a NEW session (POSIX_SPAWN_SETSID): no

@@ -33,6 +33,26 @@ struct LocalAgentManagerPathsTests {
         #expect(paths.lockFile.path == paths.directory.path + "/agent.lock")
         #expect(paths.heartbeatFile.path == paths.directory.path + "/agent.heartbeat")
         #expect(paths.logFile.path == paths.directory.path + "/agent.log")
+        #expect(paths.sessionsFile.path == paths.directory.path + "/sessions.json")
+    }
+
+    @Test func debugAndReleaseGetDistinctLaunchAgentLabels() {
+        // The KeepAlive LaunchAgent jobs must never collide across lineages.
+        let debug = LocalAgentManager.Paths(
+            bundleID: "com.dzearing.ghoztty.debug", home: home)
+        let release = LocalAgentManager.Paths(
+            bundleID: "com.dzearing.ghoztty", home: home)
+        #expect(debug.launchAgentLabel == "com.dzearing.ghoztty.debug.agent")
+        #expect(release.launchAgentLabel == "com.dzearing.ghoztty.agent")
+        #expect(debug.launchAgentLabel != release.launchAgentLabel)
+    }
+
+    @Test func launchAgentPlistLivesUnderTheRealHomeKeyedByLabel() {
+        // launchd's gui/<uid> domain only reads ~/Library/LaunchAgents.
+        let paths = LocalAgentManager.Paths(
+            bundleID: "com.dzearing.ghoztty.debug", home: home)
+        #expect(paths.launchAgentPlistURL.path ==
+            "/Users/test/Library/LaunchAgents/com.dzearing.ghoztty.debug.agent.plist")
     }
 }
 
