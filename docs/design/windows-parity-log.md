@@ -9,6 +9,33 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-15 (on-box) — T48 DONE (e35ef81fd): implemented the deferral fix
+  for the release GUI deadlock T48a root-caused. `App.deferSetFocus(hwnd)`
+  posts a private WM_APP_SETFOCUS (WM_APP+5); the run loop intercepts it
+  before Translate/Dispatch and calls the real SetFocus there — at the top of
+  the message loop, never nested inside a WndProc — so SetFocus's inline
+  IME/CTF cascade (the WM_IME_SETCONTEXT re-entry that wedged the GUI thread
+  on a Condition.wait) runs on a shallow, pumpable stack. Principled boundary
+  that kept the diff honest: defer ONLY terminal-surface focus targets (the
+  OpenGL windows that drive the nvoglv64/IME hook path); EDIT controls and
+  dialog Tab-navigation keep synchronous focus so typing/key-routing stay
+  immediate. 23 sites converted; tab_active_surface is set directly by the tab
+  ops so deferring the actual SetFocus doesn't leave bookkeeping stale.
+  Belt-and-suspenders half (no GUI-thread Condition.wait inside dispatch)
+  still open pending a *matching* symbolized `+0x1ffa0e` dump — watchdog is
+  `-Dstrip=false` now, so the next hang is symbolizable. New
+  `test/win32/focus-defer.ps1` (ALL PASS, 9) drives the exact fixed path:
+  PostMessage real WM_LBUTTONDOWN into each surface HWND (no foreground
+  needed) → asserts deferred SetFocus actually lands real GUI focus on the
+  clicked pane (cross-thread GetGUIThreadInfo().hwndFocus), and that a
+  1500-focus-change click storm during heavy `for /L … echo` output leaves the
+  GUI thread responsive (SendMessageTimeout SMTO_ABORTIFHUNG + live +list +
+  focus still moves). Harness note: an IPC +close teardown *waits* on the
+  flooded GUI-thread listener, so teardown direct-kills instead. Both test
+  lanes green, GUI build clean, kb-actions/ipc-p1/p2/p3 unaffected. Next: T53
+  (long-context reliability/perf soak — where a real release soak under the
+  symbolized watchdog is the natural home for confirming no recurrence).
+
 - 2026-07-15 (on-box) — T48a DONE (root-caused the release GUI deadlock);
   split T48 into T48a (investigate, done) + T48 (implement fix, todo). Loaded
   the existing 744MB dump in the store WinDbg's cdb with MS public symbols —

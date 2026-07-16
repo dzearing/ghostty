@@ -1144,6 +1144,34 @@ sites: App.zig:2537/2546/2555/2566 + Surface/Window focus-on-click paths.
 IPC pipe-busy is purely downstream (listener on the stuck GUI thread,
 IpcServer.zig:294).
 
+DONE 2026-07-15. Implemented the primary deferral fix. New
+`App.deferSetFocus(hwnd)` posts a private `WM_APP_SETFOCUS` (WM_APP+5) to the
+target window; the run loop performs the real `SetFocus` at the **top of the
+message loop** (intercepted before Translate/Dispatch, never dispatched to a
+WndProc), so SetFocus's IME/CTF cascade runs on a shallow, pumpable stack
+instead of nested inside a mouse/focus WndProc under the NVIDIA WH_CALLWNDPROC
+hook. Principled boundary: **defer only terminal-surface focus targets** (the
+OpenGL windows that drive the IME/CTF hook path); EDIT controls and dialog
+Tab-navigation keep synchronous focus (immediate typing/key routing, and they
+don't trigger the nvoglv64 cascade). 23 surface-focus sites converted across
+App.zig (mouse handlers + present_terminal), Window.zig (tab/split/close/hero
++ WM_SETFOCUS forward + rename-close), Surface.zig (search/palette close),
+IpcHandlers.zig, QuickTerminal.zig, RenameDialog/MachineChooser close. The
+belt-and-suspenders "no Condition.wait on the GUI thread inside dispatch"
+half stays open pending a *matching* symbolized dump of `+0x1ffa0e` (watchdog
+is now `-Dstrip=false`, so the next hang dump is symbolizable).
+
+*Validation (done):* GUI build (`-Dapp-runtime=win32 -Doptimize=Debug`)
+clean; both test lanes (`none`+`win32`) green; kb-actions.ps1 ALL PASS (25,
+focus-on-input + rename-dialog deferred refocus + ctrl+k); ipc-p1/p2/p3 ALL
+PASS (window/pane/send-keys unaffected). New `test/win32/focus-defer.ps1` ALL
+PASS (9): PostMessage real WM_LBUTTONDOWN into each surface HWND → deferred
+SetFocus lands real GUI focus on the clicked pane (verified cross-thread via
+GetGUIThreadInfo().hwndFocus), and under a 1500-focus-change click storm
+during heavy terminal output the GUI thread stays responsive
+(SendMessageTimeout SMTO_ABORTIFHUNG returns; +list still answers — the IPC
+listener lives on the GUI thread; focus still moves after the storm).
+
 ## T49 — Hero mode regression report → stale binary (Phase F)
 
 User report 2026-07-14: hero mode "still doesn't work" on Windows despite
