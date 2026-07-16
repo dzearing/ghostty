@@ -852,6 +852,11 @@ fn runListen(
     // --sessions-file, the store atomically rewrites it with the live-session
     // roster on every open/close. Borrowed; `sessions_file` outlives `store`.
     store.meta_path = sessions_file;
+    // Reboot scrollback (§5.4, T13): ring disk snapshots live in a `rings/` subdir
+    // beside the sessions file. Borrowed; freed after `store.deinit` (LIFO defers).
+    const rings_dir = ringsDirFor(alloc, sessions_file);
+    defer if (rings_dir) |d| alloc.free(d);
+    store.rings_dir = rings_dir;
     defer store.deinit();
     // Reboot-floor materialization (§5.4, T12b): before accepting connections (and
     // before the reaper starts), load the persisted roster and re-create each record
@@ -1008,6 +1013,10 @@ fn runListenUnix(
     );
     // Reboot-floor metadata store (§5.4, T12) — borrowed; outlives `store`.
     store.meta_path = sessions_file;
+    // Reboot scrollback (§5.4, T13): ring snapshots in a `rings/` subdir beside it.
+    const rings_dir = ringsDirFor(alloc, sessions_file);
+    defer if (rings_dir) |d| alloc.free(d);
+    store.rings_dir = rings_dir;
     defer store.deinit();
     // Reboot-floor materialization (§5.4, T12b): re-create the persisted roster as
     // dead, relaunchable tombstones before accepting connections + starting the reaper.
@@ -1070,6 +1079,17 @@ fn shouldServe(enforce_same_uid: bool, peer_uid: ?posix.uid_t, our_uid: posix.ui
 /// `writeInfoFile` with no socket path (the endpoint is a port).
 fn writePortFile(alloc: Allocator, path: []const u8, port: u16) !void {
     return writeInfoFile(alloc, path, port, null);
+}
+
+/// The ring-snapshot directory for a given `--sessions-file`: a `rings/` subdir
+/// beside it (e.g. `<state>/sessions.json` → `<state>/rings`), so reboot
+/// scrollback snapshots (§5.4, T13) share the metadata store's state dir. Returns
+/// null when no sessions file was given (ring snapshots disabled, like the whole
+/// reboot floor). Caller frees. A best-effort join failure also yields null.
+fn ringsDirFor(alloc: Allocator, sessions_file: ?[]const u8) ?[]u8 {
+    const sf = sessions_file orelse return null;
+    const dir = std.fs.path.dirname(sf) orelse ".";
+    return std.fs.path.join(alloc, &.{ dir, "rings" }) catch null;
 }
 
 /// Atomically publish the UDS listener's socket path for a supervisor: write

@@ -343,6 +343,10 @@ pub fn threadEnter(
     // session respawned across an agent restart) rather than a live attach/open —
     // used after bring-up to print a "session restarted" divider (T12c).
     var did_relaunch = false;
+    // Set true when the agent ALREADY replayed pre-restart scrollback + the restart
+    // divider from a ring disk snapshot (§5.4, T13) — the client then suppresses its
+    // own snapshot-less divider so there is exactly one marker.
+    var relaunch_replayed = false;
 
     // Open a new session or attach to an existing one to obtain our pane.
     const pane: *connection.Pane = if (self.session_id) |sid| pane: {
@@ -403,10 +407,11 @@ pub fn threadEnter(
             };
             if (r.pane) |p| {
                 log.info(
-                    "relaunched dead session pid={} ok={} found={}",
-                    .{ r.pid, r.ok, r.found },
+                    "relaunched dead session pid={} ok={} found={} replayed={}",
+                    .{ r.pid, r.ok, r.found, r.replayed },
                 );
                 did_relaunch = true;
+                relaunch_replayed = r.replayed;
                 break :pane p;
             }
             log.warn(
@@ -506,12 +511,14 @@ pub fn threadEnter(
         ringReady,
     );
 
-    // A relaunched session (T12c) streams a FRESH shell from offset 0 — its
-    // pre-restart scrollback is gone (the killed agent lost the ring; ring disk
-    // snapshots are T13). Print a divider ABOVE that fresh output so the restart
-    // is visible rather than looking like a spontaneous new prompt. Injected
-    // through the same terminal parse path as agent DATA, before the first drain.
-    if (did_relaunch) {
+    // A relaunched session (T12c) streams a FRESH shell. When the agent had a ring
+    // disk snapshot (T13) it already replayed pre-restart scrollback + the divider
+    // ahead of the fresh output (`relaunch_replayed`), so we print nothing — doing
+    // so would double the divider AND land it BEFORE the replayed scrollback (our
+    // inject is synchronous; the replay drains async from the channel ring). Only
+    // when there was NO snapshot (blank relaunch) do we print the divider ourselves,
+    // so the restart is visible rather than looking like a spontaneous new prompt.
+    if (did_relaunch and !relaunch_replayed) {
         const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
         @call(.always_inline, termio.Termio.processOutput, .{ io, divider });
     } else if (self.awaiting_relaunch) {

@@ -369,6 +369,12 @@ pub const Server = struct {
     /// could never make progress and the join would hang, wedging the accept loop.
     pub fn shutdown(self: *Server) void {
         self.detachAll();
+        // Reboot scrollback (T13, §5.4): a viewer disconnecting is the moment its
+        // sessions become vulnerable to a subsequent reboot (the agent could be
+        // killed before the next periodic snapshot). Flush dirty rings to disk now
+        // so a restart can replay the scrollback up to this instant. No-op when
+        // ring snapshots are disabled or nothing is dirty; best-effort.
+        self.store.snapshotRings();
         // Stop + join the metrics pump BEFORE the streams close path completes: it
         // is a per-connection thread that frames onto our writer, so it must never
         // outlive the Server (the just-fixed UAF class). Signalling stop wakes its
@@ -1129,7 +1135,34 @@ pub const Server = struct {
         self.bindLocked(rs);
         const pid = rs.pid;
         const child = rs.child; // value copy of the vtable handle
+
+        // Reboot scrollback (T13, §5.4): a session materialized from disk has its
+        // pre-restart ring snapshot + the restart divider PRELOADED into the ring
+        // (loadPersisted → preloadRingSnapshot), sitting at offsets
+        // `[base, out_offset)`. The fresh child hasn't produced output yet (its
+        // reader is attached below, after the unlock), so `out_offset` still marks
+        // the end of that preloaded content. Copy it now (under the lock, ring
+        // stable) and replay it to the reattaching viewer BEFORE the child's live
+        // output — the client sees pre-restart scrollback → divider → fresh output,
+        // with no offset hole (its relaunch pane keeps every byte from offset 0).
+        const replay_lo = rs.ring.base_offset;
+        const replay_len = rs.ring.len;
+        var replay_buf: ?[]u8 = null;
+        var replay_n: usize = 0;
+        if (replay_len > 0) {
+            if (self.alloc.alloc(u8, replay_len)) |rb| {
+                replay_buf = rb;
+                replay_n = rs.ring.copyRetained(rb);
+            } else |_| {}
+        }
         self.store.mutex.unlock();
+
+        // Replay the preloaded scrollback + divider first (outside the lock), so
+        // its DATA frames are queued ahead of any live child output.
+        if (replay_buf) |rb| {
+            defer self.alloc.free(rb);
+            if (replay_n > 0) self.sendData(channel, replay_lo, rb[0..replay_n]) catch {};
+        }
 
         // Start the real child's reader routing output to the STORE sink on our
         // channel (done after unlock — the sink takes the store lock).
@@ -1140,6 +1173,9 @@ pub const Server = struct {
             .ok = true,
             .pid = pid,
             .found = true,
+            // Tell the client we already replayed scrollback + the divider so it
+            // suppresses its own snapshot-less divider (no double marker).
+            .replayed = replay_n > 0,
         }) catch {};
 
         // The alive set changed (a tombstone became alive) — refresh the on-disk
@@ -2426,6 +2462,88 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     const dp = try protocol.DataPayload.decode(d.?.payload);
     try testing.expectEqual(@as(u64, 0), dp.byte_offset); // fresh stream from 0
     try testing.expectEqualSlices(u8, "back!", dp.bytes);
+}
+
+test "RELAUNCH: reboot ring snapshot is replayed (scrollback + divider) before live output" {
+    const ring_snapshot = @import("ring_snapshot.zig");
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xD1CE);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 1 << 16, prng.random());
+    defer h.deinit();
+
+    // Point the store's reboot-floor state at a temp dir and seed BOTH files a real
+    // agent restart would find: sessions.json (the roster) + rings/<id>.ring (the
+    // pre-restart scrollback snapshot). Then loadPersisted materializes the session
+    // AND preloads its ring — exactly the reboot path.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(meta);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+    h.store.meta_path = meta;
+    h.store.rings_dir = rings;
+
+    const rec_id = "abcabcabcabcabcabcabcabcabcabcab";
+    const scrollback = "PANE=3 PID=4242\r\ntick-3-0\r\ntick-3-1\r\n";
+    {
+        const recs = [_]@import("session_meta.zig").Record{.{ .id = rec_id, .argv = "sleep 600", .pinned = true, .created_ms = 50 }};
+        const body = try @import("session_meta.zig").serialize(alloc, &recs);
+        defer alloc.free(body);
+        try @import("session_meta.zig").writeAtomic(alloc, meta, body);
+        const rp = try ring_snapshot.pathFor(alloc, rings, rec_id);
+        defer alloc.free(rp);
+        try ring_snapshot.writeAtomic(alloc, rp, 0, scrollback);
+    }
+    try testing.expectEqual(@as(usize, 1), h.store.loadPersisted(1 << 16));
+
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // ATTACH → dead + relaunchable.
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+    });
+    const af = try h.client.waitControl(.attached);
+    const channel = af.channel;
+
+    // RELAUNCH → reply carries replayed=true; the agent replays [scrollback][divider]
+    // as one DATA frame at offset 0 BEFORE any live output.
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    try testing.expect(rp.value.replayed); // scrollback was replayed
+
+    // First DATA frame: the replayed scrollback + divider at offset 0.
+    const d0 = (try h.client.nextData()).?;
+    const dp0 = try protocol.DataPayload.decode(d0.payload);
+    try testing.expectEqual(@as(u64, 0), dp0.byte_offset);
+    const want = scrollback ++ session.reboot_divider;
+    try testing.expectEqualSlices(u8, want, dp0.bytes);
+
+    // Live output continues immediately AFTER the replayed content (no offset hole).
+    h.server.onChildOutput(channel, "fresh-prompt$ ");
+    const d1 = (try h.client.nextData()).?;
+    const dp1 = try protocol.DataPayload.decode(d1.payload);
+    try testing.expectEqual(@as(u64, want.len), dp1.byte_offset);
+    try testing.expectEqualSlices(u8, "fresh-prompt$ ", dp1.bytes);
 }
 
 test "RELAUNCH: unknown session id → not found (client falls back to OPEN)" {

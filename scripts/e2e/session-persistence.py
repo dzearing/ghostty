@@ -392,6 +392,15 @@ def parse_marker(text):
     m = _MARKER_RE.search(text)
     return (int(m.group(1)), int(m.group(2))) if m else (None, None)
 
+def fresh_marker(text):
+    """The RELAUNCHED child's PANE= marker. With ring disk snapshots (T13) the
+    agent replays the pre-restart scrollback (the OLD marker) ahead of a
+    '--- session restarted ---' divider, so the fresh child's marker is the one
+    AFTER the last divider. Falls back to the first marker when there is no
+    divider (survival/upgrade, or a blank relaunch with no ring snapshot)."""
+    idx = text.rfind(RESTART_DIVIDER)
+    return parse_marker(text[idx:] if idx >= 0 else text)
+
 def count_markers(text, n):
     return len(re.findall(rf"PANE={n} PID=\d+", text))
 
@@ -548,8 +557,12 @@ def build_scenario():
     log("[build] letting ticks accumulate (5s)")
     time.sleep(5)
 
-def wait_restored(timeout=12.0):
-    """Poll until all EXPECTED_MARKERS are readable (re-attached & interactive)."""
+def wait_restored(timeout=12.0, relaunched=False):
+    """Poll until all EXPECTED_MARKERS are readable (re-attached & interactive).
+    When `relaunched` (the reboot path), require the marker to appear AFTER the
+    restart divider — otherwise the replayed pre-restart scrollback (T13) satisfies
+    the wait before the freshly-relaunched child has actually produced output."""
+    marker = fresh_marker if relaunched else (lambda t: parse_marker(t))
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -559,7 +572,7 @@ def wait_restored(timeout=12.0):
         if len(names) >= EXPECTED_LEAVES:
             found = set()
             for nm in names:
-                n, _ = parse_marker(read_pane(nm, 3000))
+                n, _ = marker(read_pane(nm, 3000))
                 if n is not None:
                     found.add(n)
             if EXPECTED_MARKERS.issubset(found):
@@ -656,17 +669,31 @@ def assert_reboot_cycle(baseline, cur, gap, agent_before, agent_after,
             failures.append(f"topology mismatch for window {sorted(ns)}:\n"
                             f"      baseline={struct}\n      restored={cs}")
 
-    # Every pane RELAUNCHED: fresh child pid, banner shown, marker command re-ran.
+    # Every pane RELAUNCHED: fresh child pid, banner shown, marker command re-ran,
+    # AND (T13, §5.4) the pre-restart scrollback was replayed from the agent's ring
+    # disk snapshot — so the pane reads [old scrollback][divider][fresh output].
     for n in sorted(EXPECTED_MARKERS):
         bpid = baseline["pid"].get(n)
-        cpid = cur["pid"].get(n)
-        check(cpid is not None, f"pane {n} has no marker after relaunch (never came back)")
-        check(cpid != bpid,
-              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
-        check(pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
         text = cur["text"].get(n, "")
         check(RESTART_DIVIDER in text,
               f"pane {n} missing restart banner '{RESTART_DIVIDER}' after relaunch")
+
+        # With T13 the ring snapshot replays the OLD marker line ahead of the
+        # divider, so the FIRST PANE= line is the pre-restart one and the FRESH
+        # child's marker is AFTER the divider — parse the fresh pid from there.
+        idx = text.rfind(RESTART_DIVIDER)
+        pre = text[:idx] if idx >= 0 else ""
+        _, cpid = fresh_marker(text)
+        check(cpid is not None, f"pane {n} has no marker after the divider (relaunch never came back)")
+        check(cpid != bpid,
+              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
+        check(cpid is not None and pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
+
+        # Pre-restart scrollback present: the OLD marker line (from before the kill)
+        # appears BEFORE the divider — proof the ring snapshot was persisted on the
+        # viewer disconnect and replayed on relaunch (not a blank fresh shell).
+        check(f"PANE={n} " in pre,
+              f"pane {n} missing pre-restart scrollback before divider (ring snapshot not replayed)")
 
     check(gap < 15.0, f"reboot recovery gap {gap:.1f}s >= 15s")
 
@@ -744,7 +771,7 @@ def run_reboot_cycles(args, baseline):
         # 3. Relaunch the app: manifest restore -> re-attach -> auto-RELAUNCH.
         launch_app()
         wait_app_ready()
-        wait_restored()
+        wait_restored(relaunched=True)
         gap = time.time() - t_reboot
         cur = snapshot()
 
@@ -757,8 +784,11 @@ def run_reboot_cycles(args, baseline):
                 log(f"    ✗ {f}")
             all_failures.extend(f"cycle {cycle}: {f}" for f in failures)
         else:
+            # Report the FRESH (post-divider) pids — cur["pid"] holds the replayed
+            # OLD marker (T13 scrollback), so derive the relaunched pids here.
+            fresh_pids = {n: fresh_marker(cur["text"].get(n, ""))[1] for n in sorted(EXPECTED_MARKERS)}
             log(f"[cycle {cycle}] PASS  recovery={gap:.1f}s  agent {agent_before}->{agent_after} "
-                f"({restart_secs:.1f}s)  fresh PIDs {cur['pid']}")
+                f"({restart_secs:.1f}s)  fresh PIDs {fresh_pids}")
 
     log("=" * 70)
     if all_failures:
@@ -820,16 +850,25 @@ def assert_inplace_cycle(baseline, cur, gap, app_before, app_after,
                             f"      baseline={struct}\n      recovered={cs}")
 
     # Every pane RELAUNCHED in place: fresh child pid, banner shown, marker re-ran.
+    #
+    # NOTE (T13): unlike the reboot cycle, in-place does NOT assert pre-restart
+    # scrollback. Here ONLY the agent is SIGKILLed — it has no chance to flush its
+    # ring (the app-disconnect snapshot trigger fires on the AGENT when the VIEWER
+    # drops; here the viewer stays up and the agent dies), and the periodic 30 s
+    # snapshot won't have fired in the fast cycle. So the ring RAM is legitimately
+    # lost (the honest T12e contract) and the divider is the client-side one. We
+    # still parse the fresh pid via `fresh_marker` so that IF a periodic snapshot
+    # happened to fire (replay present), the post-divider marker is still found.
     for n in sorted(EXPECTED_MARKERS):
         bpid = baseline["pid"].get(n)
-        cpid = cur["pid"].get(n)
-        check(cpid is not None, f"pane {n} has no marker after recovery (never came back)")
-        check(cpid != bpid,
-              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
-        check(pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
         text = cur["text"].get(n, "")
         check(RESTART_DIVIDER in text,
               f"pane {n} missing restart banner '{RESTART_DIVIDER}' after in-place recovery")
+        _, cpid = fresh_marker(text)
+        check(cpid is not None, f"pane {n} has no marker after recovery (never came back)")
+        check(cpid != bpid,
+              f"pane {n} PID unchanged {bpid} (expected a relaunched process — agent RAM was lost)")
+        check(cpid is not None and pid_alive(cpid), f"pane {n} relaunched PID {cpid} is not alive")
 
     check(gap < 15.0, f"in-place recovery gap {gap:.1f}s >= 15s")
 
@@ -850,9 +889,13 @@ def wait_inplace_recovered(app_before, timeout=20.0):
             time.sleep(0.4)
             continue
         last = snap["markers"]
-        banners = all(RESTART_DIVIDER in snap["text"].get(n, "")
-                      for n in EXPECTED_MARKERS)
-        if EXPECTED_MARKERS.issubset(last) and banners:
+        # Require a FRESH marker after the divider (T13: the replayed pre-restart
+        # scrollback carries the OLD marker + the divider ahead of the fresh
+        # child's output — waiting only for the banner would return too early).
+        fresh = set(n for n in EXPECTED_MARKERS
+                    if fresh_marker(snap["text"].get(n, ""))[0] is not None
+                    and RESTART_DIVIDER in snap["text"].get(n, ""))
+        if EXPECTED_MARKERS.issubset(fresh):
             return
         time.sleep(0.4)
     raise E2EError(f"in-place recovery incomplete within {timeout}s "

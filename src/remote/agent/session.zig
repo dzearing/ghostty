@@ -41,6 +41,9 @@ const protocol = @import("../protocol.zig");
 // Metadata persistence (T12, §5.4 reboot floor). `session_meta` depends on
 // nothing but `std`, so importing it here introduces no cycle.
 const session_meta = @import("session_meta.zig");
+// Ring disk snapshots (T13, §5.4 reboot scrollback). Like `session_meta`, depends
+// only on `std`, so no import cycle.
+const ring_snapshot = @import("ring_snapshot.zig");
 
 // -----------------------------------------------------------------------------
 // Caps (§7.1 "Resource caps & TTL")
@@ -56,6 +59,14 @@ pub const max_sessions: usize = 256;
 /// the most recent child-output bytes so `(last_byte_offset, S]` gap-fill is
 /// possible on reattach (§7.3). Lowered freely in tests.
 pub const default_ring_bytes: usize = 2 * 1024 * 1024;
+
+/// The divider baked into a reboot-restored ring between the replayed pre-restart
+/// scrollback and the freshly-relaunched shell's output (§5.4, T13). Byte-for-byte
+/// the SAME string the client prints on a snapshot-less relaunch (termio/Remote.zig)
+/// so there is exactly one canonical "restart" marker — when the agent replays a
+/// snapshot it owns the divider (baked here, at the right place in the byte stream)
+/// and the client suppresses its own (`Relaunched.replayed`).
+pub const reboot_divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
 
 // -----------------------------------------------------------------------------
 // Activity state (mirrors the local +set-state model: idle/busy/needs_input)
@@ -270,6 +281,32 @@ pub const OutputRing = struct {
         self.len += src.len;
     }
 
+    /// Copy every retained byte, oldest→newest, into `out` (which must be at least
+    /// `self.len` long). Returns the number copied (== `self.len`). Used by the
+    /// disk-snapshot writer (T13) to flush the ring in stream order.
+    pub fn copyRetained(self: OutputRing, out: []u8) usize {
+        assert(out.len >= self.len);
+        const cap = self.buf.len;
+        var ridx = self.start;
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            out[i] = self.buf[ridx];
+            ridx = (ridx + 1) % cap;
+        }
+        return self.len;
+    }
+
+    /// Reset the ring to hold exactly `bytes` starting at absolute offset
+    /// `base_offset` (T13 reboot preload of a disk snapshot). Discards any prior
+    /// contents. If `bytes` exceeds capacity only its tail is kept (the same
+    /// eviction rule `append` applies), with `base_offset` advanced to match.
+    pub fn preload(self: *OutputRing, base_offset: u64, bytes: []const u8) void {
+        self.start = 0;
+        self.len = 0;
+        self.base_offset = base_offset;
+        self.append(base_offset, bytes);
+    }
+
     /// Copy the retained bytes in the half-open absolute range `(lo, hi]` (i.e.
     /// offsets `lo .. hi`) into `out` (which must be large enough). Returns null if
     /// any requested byte has been evicted (caller emits a "scrollback truncated"
@@ -329,6 +366,12 @@ pub const Session = struct {
     /// frame's `byte_offset` comes from `out_offset.advance(n)`; the SAME counter
     /// the client uses to discard already-applied DATA after a snapshot.
     out_offset: protocol.ByteOffset = .{},
+
+    /// The outbound offset captured at the last successful ring disk snapshot
+    /// (T13, §5.4). The ring is "dirty" (needs re-snapshotting) when
+    /// `out_offset.value != last_snapshot_offset`. Materialize sets it equal to a
+    /// preloaded ring's tail so a just-loaded dead session isn't flagged dirty.
+    last_snapshot_offset: u64 = 0,
 
     /// Streaming gate. When false (client sent `FLOW{pause}` or `DETACH`), child
     /// output is buffered in the ring but NOT framed onto the wire until resumed
@@ -740,6 +783,12 @@ pub const SessionStore = struct {
     /// non-persistent serve path are byte-for-byte unchanged.
     meta_path: ?[]const u8 = null,
 
+    /// When set, `snapshotRings` flushes each dirty ALIVE session's output ring to
+    /// `<rings_dir>/<session-id>.ring` (§5.4 reboot scrollback, T13). BORROWED —
+    /// main.zig owns the string for the store's lifetime. Null (the default)
+    /// disables ring snapshots entirely (tests / non-persistent paths unchanged).
+    rings_dir: ?[]const u8 = null,
+
     /// Background reaper: wakes periodically to evict idle orphaned sessions.
     reaper: ?std.Thread = null,
     reaper_mutex: std.Thread.Mutex = .{},
@@ -808,9 +857,14 @@ pub const SessionStore = struct {
         self.reaper = try std.Thread.spawn(.{}, reaperLoop, .{self});
     }
 
+    /// Ring-snapshot cadence: flush dirty rings to disk every this-many reaper
+    /// ticks (§5.4 "every 30 s"). The reaper wakes once a second, so 30 ticks.
+    const snapshot_every_ticks: u32 = 30;
+
     fn reaperLoop(self: *SessionStore) void {
         // Wake at most once a second (or on stop) to check for idle orphans.
         const tick_ns: u64 = 1 * std.time.ns_per_s;
+        var ticks: u32 = 0;
         while (true) {
             self.reaper_mutex.lock();
             if (!self.reaper_stop) self.reaper_cond.timedWait(&self.reaper_mutex, tick_ns) catch {};
@@ -818,6 +872,15 @@ pub const SessionStore = struct {
             self.reaper_mutex.unlock();
             if (stop) break;
             self.reapIdle();
+            // Periodic ring disk snapshot (T13): catch dirty rings whose viewer is
+            // still attached / recently detached (the connection-drop trigger only
+            // fires on disconnect). No-op when ring snapshots are disabled or
+            // nothing is dirty.
+            ticks +%= 1;
+            if (ticks >= snapshot_every_ticks) {
+                ticks = 0;
+                self.snapshotRings();
+            }
         }
     }
 
@@ -846,7 +909,12 @@ pub const SessionStore = struct {
             if (self.table.unlink(id)) |s| unlinked.append(self.table.alloc, s) catch {};
         }
         self.mutex.unlock();
-        for (unlinked.items) |s| self.table.freeUnlinked(s);
+        for (unlinked.items) |s| {
+            // Delete the reaped session's ring snapshot BEFORE freeing it (id_str
+            // is on the session). Best-effort; a stale file is harmless anyway.
+            self.deleteRingSnapshot(s.idStr());
+            self.table.freeUnlinked(s);
+        }
         // Refresh the on-disk metadata if the alive set actually shrank (§5.4,
         // T12). No-op when persistence is disabled or nothing was reaped.
         if (unlinked.items.len > 0) self.persistMeta();
@@ -862,7 +930,18 @@ pub const SessionStore = struct {
         };
         const unlinked = self.table.unlink(s.id);
         self.mutex.unlock();
-        if (unlinked) |u| self.table.freeUnlinked(u);
+        if (unlinked) |u| {
+            self.deleteRingSnapshot(u.idStr()); // CLOSE discards persisted scrollback
+            self.table.freeUnlinked(u);
+        }
+    }
+
+    /// Best-effort delete of a session's ring disk snapshot (T13). No-op when ring
+    /// snapshots are disabled. Called when a session is CLOSEd or reaped so its
+    /// stale scrollback file doesn't linger.
+    fn deleteRingSnapshot(self: *SessionStore, id_str: []const u8) void {
+        const dir = self.rings_dir orelse return;
+        ring_snapshot.delete(self.table.alloc, dir, id_str);
     }
 
     /// Load persisted session metadata (T12) and MATERIALIZE each record as a DEAD,
@@ -893,9 +972,119 @@ pub const SessionStore = struct {
                 std.log.warn("session_meta: materialize {s} failed: {s}", .{ rec.id, @errorName(err) });
                 continue;
             };
-            if (s != null) n += 1;
+            if (s) |sess| {
+                n += 1;
+                // Reboot scrollback (T13): if this session has a ring disk snapshot,
+                // preload it into the fresh ring + bake the restart divider so the
+                // eventual RELAUNCH replays pre-restart scrollback + divider + live
+                // output. Best-effort; a missing/corrupt snapshot just leaves the
+                // ring empty (the pane comes back without pre-restart scrollback).
+                self.preloadRingSnapshot(sess);
+            }
         }
         return n;
+    }
+
+    /// Load `sess`'s ring disk snapshot (if any) into its output ring, then append
+    /// the reboot divider, and anchor `out_offset` at the ring tail so a later
+    /// RELAUNCH's fresh child output continues after it (T13, §5.4). The ring is
+    /// renumbered to base offset 0 (a freshly-restored viewer applies DATA from 0
+    /// with no resync watermark — a non-zero base would manufacture a phantom gap).
+    /// No-op when ring snapshots are disabled or none exists. Called under the store
+    /// lock from `loadPersisted`, before any connection or the reaper runs.
+    fn preloadRingSnapshot(self: *SessionStore, sess: *Session) void {
+        const dir = self.rings_dir orelse return;
+        const alloc = self.table.alloc;
+        const path = ring_snapshot.pathFor(alloc, dir, sess.idStr()) catch return;
+        defer alloc.free(path);
+        var loaded = (ring_snapshot.load(alloc, path) catch |err| {
+            std.log.warn("ring_snapshot: load {s} failed: {s}", .{ path, @errorName(err) });
+            return;
+        }) orelse return;
+        defer loaded.free(alloc);
+        if (loaded.bytes.len == 0) return; // nothing to replay
+
+        // Renumber to base 0: [snapshot bytes][divider]. out_offset := tail so the
+        // relaunched child's first output lands immediately after the divider.
+        sess.ring.preload(0, loaded.bytes);
+        sess.out_offset.value = sess.ring.tailOffset();
+        sess.ring.append(sess.out_offset.value, reboot_divider);
+        sess.out_offset.value +%= reboot_divider.len;
+        // Not dirty: this is loaded-from-disk content, not new child output.
+        sess.last_snapshot_offset = sess.out_offset.value;
+    }
+
+    /// Flush every dirty ALIVE session's output ring to `<rings_dir>/<id>.ring`
+    /// (§5.4 reboot scrollback, T13). No-op when `rings_dir` is null (disabled).
+    /// Triggered periodically by the reaper and on a viewer disconnect (server
+    /// `shutdown`). Best-effort: any per-session failure is logged and skipped.
+    ///
+    /// Bounded memory (mirrors `persistMeta`'s snapshot-then-IO discipline but one
+    /// session at a time): collect the dirty ids under the lock, then for each id
+    /// re-lock, copy just THAT ring into a single reused buffer, release the lock,
+    /// and write the file outside it — so at most one ring (not all 256) is copied
+    /// at once and no OS I/O ever runs under the lock (which serializes child output).
+    pub fn snapshotRings(self: *SessionStore) void {
+        const dir = self.rings_dir orelse return;
+        const alloc = self.table.alloc;
+
+        // Phase 1: collect dirty alive session ids under the lock.
+        var ids: std.ArrayList(u128) = .empty;
+        defer ids.deinit(alloc);
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive) continue; // dead/relaunchable: nothing new to persist
+            if (s.out_offset.value == s.last_snapshot_offset) continue; // clean
+            ids.append(alloc, s.id) catch {};
+        }
+        self.mutex.unlock();
+        if (ids.items.len == 0) return;
+
+        // A single reused copy buffer, grown to the largest ring encountered.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(alloc);
+
+        for (ids.items) |id| {
+            // Re-lock and copy just this ring (it may have been closed/reaped in
+            // the meantime — skip if gone or now dead).
+            self.mutex.lock();
+            const s = self.table.getById(id) orelse {
+                self.mutex.unlock();
+                continue;
+            };
+            if (!s.alive) {
+                self.mutex.unlock();
+                continue;
+            }
+            const need = s.ring.len;
+            buf.ensureTotalCapacity(alloc, need) catch {
+                self.mutex.unlock();
+                continue;
+            };
+            buf.items.len = need;
+            const n = s.ring.copyRetained(buf.items);
+            const base = s.ring.base_offset;
+            const at = s.out_offset.value;
+            var id_str_buf: [32]u8 = s.id_str;
+            self.mutex.unlock();
+
+            // Write OUTSIDE the lock.
+            const path = ring_snapshot.pathFor(alloc, dir, id_str_buf[0..]) catch continue;
+            defer alloc.free(path);
+            ring_snapshot.writeAtomic(alloc, path, base, buf.items[0..n]) catch |err| {
+                std.log.warn("ring_snapshot: write {s} failed: {s}", .{ path, @errorName(err) });
+                continue;
+            };
+            // Mark clean only after a successful write, and only if no newer output
+            // arrived in the meantime (else leave it dirty so the next pass retries).
+            self.mutex.lock();
+            if (self.table.getById(id)) |s2| {
+                if (s2.last_snapshot_offset < at) s2.last_snapshot_offset = at;
+            }
+            self.mutex.unlock();
+        }
     }
 
     /// Persist the current ALIVE + RELAUNCHABLE session set to `meta_path` (§5.4
@@ -1115,6 +1304,37 @@ test "OutputRing: oversized single append keeps only the tail" {
     var out: [8]u8 = undefined;
     const n = ring.slice(4, 8, &out).?;
     try testing.expectEqualSlices(u8, "efgh", out[0..n]);
+}
+
+test "OutputRing: copyRetained returns bytes oldest→newest, incl. after wrap" {
+    const alloc = testing.allocator;
+    var ring = try OutputRing.init(alloc, 4);
+    defer ring.deinit();
+    ring.append(0, "ab");
+    var out: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), ring.copyRetained(&out));
+    try testing.expectEqualSlices(u8, "ab", out[0..2]);
+    // Force a wrap (start advances), then copy in stream order.
+    ring.append(2, "cdef"); // ring now holds "cdef" (base 2)
+    try testing.expectEqual(@as(u64, 2), ring.base_offset);
+    const n = ring.copyRetained(&out);
+    try testing.expectEqualSlices(u8, "cdef", out[0..n]);
+}
+
+test "OutputRing: preload resets to bytes at a base offset (tail kept if oversized)" {
+    const alloc = testing.allocator;
+    var ring = try OutputRing.init(alloc, 8);
+    defer ring.deinit();
+    ring.append(0, "junk");
+    ring.preload(1000, "hello");
+    try testing.expectEqual(@as(u64, 1000), ring.base_offset);
+    try testing.expectEqual(@as(u64, 1005), ring.tailOffset());
+    var out: [8]u8 = undefined;
+    try testing.expectEqualSlices(u8, "hello", out[0..ring.copyRetained(&out)]);
+    // Oversized preload keeps only the tail (base advances to match).
+    ring.preload(0, "0123456789"); // 10 bytes into an 8-byte ring
+    try testing.expectEqual(@as(u64, 2), ring.base_offset);
+    try testing.expectEqualSlices(u8, "23456789", out[0..ring.copyRetained(&out)]);
 }
 
 test "SessionTable: create mints unique ids/channels, enforces cap, frees cleanly" {
@@ -1403,5 +1623,81 @@ test "SessionStore.loadPersisted materializes + persistMeta keeps relaunchable t
         var p = (try session_meta.load(alloc, path)).?;
         defer p.deinit();
         try testing.expectEqual(@as(usize, 1), p.value.sessions.len); // only the relaunchable one
+    }
+}
+
+test "SessionStore ring snapshot: dirty alive ring persists; reload preloads scrollback + divider" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(meta);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+
+    const payload = "PANE=3 PID=4242\r\ntick-3-0\r\ntick-3-1\r\n";
+    var id_buf: [32]u8 = undefined;
+
+    // --- Agent run #1: an alive session produces output, then a viewer-disconnect
+    //     (snapshotRings) flushes the ring and persistMeta records the roster.
+    {
+        var prng = std.Random.DefaultPrng.init(0x5151);
+        var clock: MutClock = .{ .ms = 500 };
+        var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+        store.meta_path = meta;
+        store.rings_dir = rings;
+        defer store.deinit();
+
+        var fake: FakeChild = .{ .alloc = alloc };
+        defer fake.deinit();
+        const s = try store.table.create(fake.child(), 4242, 24, 80, 1 << 16, 500);
+        s.pinned = true; // a persistent local pane
+        s.setArgv("sleep 600");
+        _ = s.recordOutput(payload, 600); // ring is now dirty
+        @memcpy(&id_buf, s.id_str[0..]);
+
+        // Clean → nothing written; then dirty → a file appears.
+        store.snapshotRings();
+        store.persistMeta();
+
+        const rp = try ring_snapshot.pathFor(alloc, rings, id_buf[0..]);
+        defer alloc.free(rp);
+        var loaded = (try ring_snapshot.load(alloc, rp)).?;
+        defer loaded.free(alloc);
+        try testing.expectEqualStrings(payload, loaded.bytes);
+
+        // A second snapshot with no new output must be a no-op (session now clean):
+        // corrupt sentinel? Simpler: assert the dirty watermark advanced.
+        try testing.expectEqual(s.out_offset.value, s.last_snapshot_offset);
+    }
+
+    // --- Agent run #2 (fresh store): loadPersisted materializes the tombstone AND
+    //     preloads the ring snapshot + the restart divider, anchoring out_offset.
+    {
+        var prng = std.Random.DefaultPrng.init(0x6262);
+        var clock: MutClock = .{ .ms = 9000 };
+        var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+        store.meta_path = meta;
+        store.rings_dir = rings;
+        defer store.deinit();
+
+        try testing.expectEqual(@as(usize, 1), store.loadPersisted(1 << 16));
+        const s = store.table.getByIdStr(id_buf[0..]).?;
+        try testing.expect(!s.alive and s.relaunchable);
+
+        // The ring holds [payload][divider]; out_offset is anchored at the tail so a
+        // RELAUNCH's fresh child output continues after the divider.
+        const want_len = payload.len + reboot_divider.len;
+        try testing.expectEqual(@as(u64, want_len), s.out_offset.value);
+        try testing.expectEqual(@as(u64, want_len), s.ring.tailOffset());
+        try testing.expectEqual(@as(u64, 0), s.ring.base_offset);
+        const buf = try alloc.alloc(u8, want_len);
+        defer alloc.free(buf);
+        const n = s.ring.copyRetained(buf);
+        try testing.expect(std.mem.startsWith(u8, buf[0..n], payload));
+        try testing.expect(std.mem.endsWith(u8, buf[0..n], reboot_divider));
     }
 }

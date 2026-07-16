@@ -621,6 +621,12 @@ pub const Relaunched = struct {
     ok: bool = false,
     pid: i64 = 0,
     found: bool = false,
+    /// True when the agent already replayed pre-restart scrollback + the "session
+    /// restarted" divider from a ring disk snapshot (§5.4 reboot scrollback, T13).
+    /// The client then SUPPRESSES its own snapshot-less divider so there is exactly
+    /// one marker. Additive/defaulted → older agents (never set it) and older
+    /// clients (ignore it) interoperate unchanged.
+    replayed: bool = false,
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
@@ -1691,6 +1697,16 @@ test "RELAUNCH / RELAUNCHED JSON payloads round-trip (T12b)" {
     defer op.deinit();
     try testing.expect(op.value.ok and op.value.found);
     try testing.expectEqual(@as(i64, 7777), op.value.pid);
+    try testing.expect(!op.value.replayed); // defaults false; absent → false
+
+    // A reboot-scrollback reply sets replayed=true (T13) so the client suppresses
+    // its own divider; it round-trips.
+    const replayed_reply: Relaunched = .{ .session_id = req.session_id, .ok = true, .pid = 42, .found = true, .replayed = true };
+    const pj = try encodeJson(alloc, replayed_reply);
+    defer alloc.free(pj);
+    var pp = try parseJson(Relaunched, alloc, pj);
+    defer pp.deinit();
+    try testing.expect(pp.value.replayed);
 
     // A "no such session" reply: ok=false, found=false, pid defaults 0.
     const gone: Relaunched = .{ .session_id = req.session_id };

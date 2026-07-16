@@ -591,6 +591,10 @@ pub const RelaunchOutcome = struct {
     found: bool,
     /// The respawned child pid (0 when `!ok`).
     pid: i64,
+    /// The agent already replayed pre-restart scrollback + the restart divider from
+    /// a ring disk snapshot (§5.4 reboot scrollback, T13); the caller should NOT
+    /// print its own divider. False when the agent had no snapshot (blank relaunch).
+    replayed: bool = false,
 };
 
 /// A caller-owned, deep copy of a `PROC_SNAPSHOT` reply (§9.3 process view). The
@@ -1844,9 +1848,9 @@ pub const Connection = struct {
             // and tear the pre-registered channel back down (a value return does not
             // fire the `errdefer` above).
             self.teardownPane(pane);
-            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid };
+            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid, .replayed = res.replayed };
         }
-        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid };
+        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid, .replayed = res.replayed };
     }
 
     /// Register the inbound ring + a `Pane` for a session about to be relaunched,
@@ -1893,7 +1897,7 @@ pub const Connection = struct {
     /// agent still had the session, and the (respawned) child pid. Unlike
     /// `RelaunchOutcome` this carries no pane — `sendRelaunchOnPane` operates on a pane
     /// the caller already prepared and still owns.
-    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64 };
+    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64, replayed: bool = false };
 
     /// Send `RELAUNCH` for an already-prepared pane (see `prepareRelaunchPane`) and
     /// await `RELAUNCHED`. On `ok`, the recorded process is respawned and streaming on
@@ -1928,7 +1932,7 @@ pub const Connection = struct {
         defer parsed.deinit();
         const r = parsed.value;
         if (r.ok) pane.pid = r.pid;
-        return .{ .ok = r.ok, .found = r.found, .pid = r.pid };
+        return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed };
     }
 
     /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote
