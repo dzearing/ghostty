@@ -19,6 +19,14 @@
 #   4. ctrl+shift+space again restores the exact tree geometry.
 #   5. Palette path (T57): ctrl+shift+p -> "hero" -> Enter produces the
 #      same hero layout.
+# PHASE 3 (T59b — interactions & motion):
+#   6. Click-swap ANIMATES: mid-slide every hero HWND is hidden (the
+#      region owner-paints sliding snapshots); skipped when the OS
+#      reduced-motion setting disables client-area animations.
+#   7. Hover + wheel reach the carousel (debug-log oracles); with 5 tiles
+#      the strip overflows and the wheel offset is nonzero.
+#   8. Divider drag narrows the hero (all leaves re-sized to the new hero
+#      rect); double-clicking the divider resets the ratio to 0.25.
 # The harness makes itself per-monitor-DPI-aware; without it PrintWindow
 # captures are CLIPPED on >100% DPI monitors (2026-07-16 lesson).
 #
@@ -78,7 +86,24 @@ public class HeroDrv {
     public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] public static extern bool SystemParametersInfoW(uint action, uint p, out int v, uint winini);
     public delegate bool EnumProc(IntPtr h, IntPtr l);
+
+    // Mirrors the app's reduced-motion gate (SPI_GETCLIENTAREAANIMATION):
+    // when the user disabled client-area animations, hero swaps are
+    // instant and the mid-slide oracle must be skipped.
+    public static bool AnimEnabled() {
+        int v;
+        if (!SystemParametersInfoW(0x1042, 0, out v, 0)) return true;
+        return v != 0;
+    }
+
+    // Map a client-space point of `from` to screen coords (x, y).
+    public static int[] ToScreen(IntPtr from, int x, int y) {
+        RECT r; r.left = x; r.top = y; r.right = x; r.bottom = y;
+        MapWindowPoints(from, IntPtr.Zero, ref r, 2);
+        return new int[] { r.left, r.top };
+    }
 
     // Make this PowerShell process per-monitor-DPI-aware so GetWindowRect/
     // GetClientRect return PHYSICAL pixels and PrintWindow captures the
@@ -519,6 +544,140 @@ else {
             }
         }
     }
+}
+
+# --- Phase 3 (T59b): interactions & motion ------------------------------------
+# Wheel scroll, divider drag + double-click reset, hover chrome, and the
+# selection slide (mid-slide every hero HWND is hidden while the region
+# owner-paints sliding snapshots). Posted mouse messages are deterministic:
+# the WndProc branches only read message coords.
+$r = [HeroDrv]::Chord($top, $leaf0Hwnd, [uint16[]]@(0x11, 0x10), 0x20)
+Assert ($r -eq 'SENT') "phase-3 hero toggle delivered ($r)"
+Start-Sleep -Milliseconds 1200   # let the 150ms heartbeat build snapshot DIBs
+$hero4 = Parse-Panes ([HeroDrv]::Panes($top))
+$res4 = Assert-HeroLayout $hero4 $client 'phase-3 hero on'
+$big4 = $res4.Hero
+
+if ($null -ne $big4) {
+    # Shared tile geometry (mirror of hero_math.zig, as in the click test).
+    $carouselLeft = $big4.Right + 8
+    $carouselW = $client[0] - $carouselLeft
+    $carouselH = $client[1] - $big4.Top
+    $ar = $big4.Width / [double]$big4.Height
+    $thumbW = [int](0.88 * $carouselW)
+    $thumbH = [int]($thumbW / $ar)
+    if ($thumbH -gt [int](0.7 * $carouselH)) { $thumbH = [int](0.7 * $carouselH) }
+    $ccx = $carouselLeft + [int]($carouselW / 2)
+    $ccy = $big4.Top + [int]($carouselH / 2)
+
+    # (a) Animated click-swap: poll for the mid-slide state (0 visible
+    # panes) right after the selecting mouse-up. Selection is clamped at
+    # the strip ends, so try one tile below center, then one above.
+    if ([HeroDrv]::AnimEnabled()) {
+        $midSlideSeen = $false
+        $swapped = $false
+        foreach ($step in 1, -1) {
+            $cy = $ccy + $step * ($thumbH + 8)
+            $lp = [IntPtr](($cy -shl 16) -bor ($ccx -band 0xFFFF))
+            [HeroDrv]::PostMessageW($top, 0x0201, [UIntPtr]::Zero, $lp) | Out-Null
+            [HeroDrv]::PostMessageW($top, 0x0202, [UIntPtr]::Zero, $lp) | Out-Null
+            for ($t = 0; $t -lt 12; $t++) {
+                Start-Sleep -Milliseconds 30
+                $mid = @((Parse-Panes ([HeroDrv]::Panes($top))) | Where-Object Visible)
+                if ($mid.Count -eq 0) { $midSlideSeen = $true }
+            }
+            Start-Sleep -Milliseconds 500
+            $now = @((Parse-Panes ([HeroDrv]::Panes($top))) | Where-Object Visible)
+            if ($now.Count -eq 1 -and $now[0].Hwnd -ne $big4.Hwnd) { $swapped = $true; break }
+        }
+        Assert $midSlideSeen 'selection slide: mid-slide state seen (all hero HWNDs hidden, region owner-painted)'
+        Assert $swapped 'selection slide: click-swap completed (new hero visible after the slide)'
+    } else {
+        Write-Host 'SKIP  slide oracle: OS client-area animations disabled (reduced motion)'
+    }
+
+    # (b) Hover chrome: a posted WM_MOUSEMOVE over the carousel sets the
+    # hovered tile (debug-log oracle; hover repaint is visual-only).
+    $lpHover = [IntPtr](($ccy -shl 16) -bor ($ccx -band 0xFFFF))
+    [HeroDrv]::PostMessageW($top, 0x0200, [UIntPtr]::Zero, $lpHover) | Out-Null  # WM_MOUSEMOVE
+    Start-Sleep -Milliseconds 250
+    if ($haveLog) {
+        Assert ((Select-String -Path $errlog -Pattern 'hero hover tile=' -Quiet)) 'hover: carousel tile hover tracked (log)'
+    }
+
+    # (c) Wheel over the carousel is consumed by the strip (3 tiles fit ->
+    # scroll clamps to 0 but the path logs). Wheel coords are SCREEN coords.
+    $scr = [HeroDrv]::ToScreen($top, $ccx, $ccy)
+    $lpWheel = [IntPtr](($scr[1] -shl 16) -bor ($scr[0] -band 0xFFFF))
+    # Delta -120 in the high word. Decimal literal: PS 5.1 parses the hex
+    # 0xFF880000 as a NEGATIVE Int32 and the UInt64 cast throws.
+    $wpWheel = [UIntPtr][uint64]4287102976
+    [HeroDrv]::PostMessageW($top, 0x020A, $wpWheel, $lpWheel) | Out-Null  # WM_MOUSEWHEEL
+    Start-Sleep -Milliseconds 250
+    if ($haveLog) {
+        Assert ((Select-String -Path $errlog -Pattern 'hero wheel scroll=' -Quiet)) 'wheel: carousel consumed the wheel (log)'
+    }
+
+    # (d) With 5 tiles the strip always overflows -> wheel scroll is
+    # nonzero. Splitting while hero is active must keep the hero layout.
+    & $exe +split --direction=down --name=herod | Out-Null
+    Start-Sleep -Milliseconds 500
+    & $exe +split --direction=down --name=heroe | Out-Null
+    Start-Sleep -Milliseconds 800
+    $five = Parse-Panes ([HeroDrv]::Panes($top))
+    Assert ($five.Count -eq 5) "phase-3 setup: 5 panes exist (got $($five.Count))"
+    $res5 = Assert-HeroLayout $five $client 'hero layout holds after splits while active'
+    $big5 = $res5.Hero
+    if ($null -ne $big5 -and $haveLog) {
+        [HeroDrv]::PostMessageW($top, 0x020A, $wpWheel, $lpWheel) | Out-Null
+        Start-Sleep -Milliseconds 250
+        $scrollLines = @(Select-String -Path $errlog -Pattern 'hero wheel scroll=(-?\d+)')
+        $lastScroll = if ($scrollLines.Count -gt 0) { [int]$scrollLines[-1].Matches[0].Groups[1].Value } else { 0 }
+        Assert ($lastScroll -ne 0) "wheel: overflowing strip scrolled (offset $lastScroll)"
+    }
+
+    # (e) Divider drag: press in the divider band, drag 150px left, release.
+    # The per-tab ratio grows and every leaf lands on the new hero rect.
+    if ($null -ne $big5) {
+        $midY = [int](($big5.Top + $big5.Bottom) / 2)
+        $divX = $big5.Right + 3
+        $lpDown = [IntPtr](($midY -shl 16) -bor ($divX -band 0xFFFF))
+        $dragX = $divX - 150
+        $lpMove = [IntPtr](($midY -shl 16) -bor ($dragX -band 0xFFFF))
+        [HeroDrv]::PostMessageW($top, 0x0201, [UIntPtr]::Zero, $lpDown) | Out-Null
+        Start-Sleep -Milliseconds 60
+        [HeroDrv]::PostMessageW($top, 0x0200, [UIntPtr][uint32]1, $lpMove) | Out-Null  # MK_LBUTTON
+        Start-Sleep -Milliseconds 150
+        [HeroDrv]::PostMessageW($top, 0x0200, [UIntPtr][uint32]1, $lpMove) | Out-Null  # post-throttle tick
+        Start-Sleep -Milliseconds 120
+        [HeroDrv]::PostMessageW($top, 0x0202, [UIntPtr]::Zero, $lpMove) | Out-Null
+        Start-Sleep -Milliseconds 400
+        $dragged = Parse-Panes ([HeroDrv]::Panes($top))
+        $visD = @($dragged | Where-Object Visible)
+        Assert ($visD.Count -eq 1) 'divider drag: still exactly one visible pane'
+        if ($visD.Count -eq 1) {
+            $heroD = $visD[0]
+            Assert ($heroD.Width -le ($big5.Width - 100)) "divider drag: hero narrowed (was $($big5.Width), now $($heroD.Width))"
+            $hiddenD = @($dragged | Where-Object { -not $_.Visible })
+            $allSized = ($hiddenD.Count -gt 0) -and -not ($hiddenD | Where-Object { -not (Same-Rect $_ $heroD) })
+            Assert $allSized 'divider drag: all hidden leaves re-sized to the new hero rect'
+
+            # (f) Double-click the (moved) divider: ratio resets to the
+            # default 0.25 -> the standard hero layout assertions hold again.
+            $divX2 = $heroD.Right + 3
+            $lpDbl = [IntPtr](($midY -shl 16) -bor ($divX2 -band 0xFFFF))
+            [HeroDrv]::PostMessageW($top, 0x0203, [UIntPtr]::Zero, $lpDbl) | Out-Null  # WM_LBUTTONDBLCLK
+            Start-Sleep -Milliseconds 60
+            [HeroDrv]::PostMessageW($top, 0x0202, [UIntPtr]::Zero, $lpDbl) | Out-Null
+            Start-Sleep -Milliseconds 400
+            $reset = Parse-Panes ([HeroDrv]::Panes($top))
+            $resR = Assert-HeroLayout $reset $client 'divider double-click resets the ratio'
+        }
+    }
+
+    $artifacts = Join-Path $PSScriptRoot 'artifacts'
+    New-Item -ItemType Directory -Force $artifacts | Out-Null
+    Save-WindowShot $top (Join-Path $artifacts 'hero-mode-t59b.png')
 }
 
 # --- Teardown ----------------------------------------------------------------

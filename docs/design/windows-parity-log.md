@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-16 (on-box) — T59b DONE: hero-mode TRUE port complete. Wheel
+  scroll (parent WM_MOUSEWHEEL + surface fallback for wheel-follows-focus),
+  divider drag with 80ms-throttled leaf resize + double-click ratio reset,
+  hover chrome, snapshot-slide (0.35s) + carousel re-center (0.3s) on one
+  16ms timer with SPI_GETCLIENTAREAANIMATION honored. Perf pass clean
+  (thumbnail heartbeat ≈7fps/renderer while hero on, max gap 174ms, no
+  spike during animated swaps). hero-mode.ps1 grew a phase 3 — the
+  mid-slide oracle (poll for a 0-visible-panes state right after a
+  selecting click) proved the owner-painted slide on the real box; ALL
+  PASS (58). Harness lesson: PS 5.1 parses 32-bit-filling hex literals
+  (0xFF880000) as NEGATIVE Int32 — a [uint64] cast throws; use decimal.
+  Also: a hero-mode.ps1 crash mid-run leaves the outer pipeline hung
+  because the spawned GUI inherits the stdout handle — kill the zig-out
+  ghoztty to unblock. DELIVERED to all install locations (user explicitly
+  corrected the hero port on 2026-07-16): ReleaseFast gnu -Dstrip=false
+  staged to zig-out-release; Desktop portable + \\homeassistant\share
+  refreshed; installed release swapped via the detached upgrade script,
+  relaunched as a fresh session re-entering go.md (doubles as the context
+  reset, T48 precedent). Next: T53.
+
 - 2026-07-16 (on-box) — T59a DONE: hero-mode TRUE port first half — renderer
   snapshot pipeline (captureThumb blits the OFFSCREEN render target, so the
   T58 hidden-window spike risk evaporated: hidden panes capture cleanly, no

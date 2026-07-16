@@ -52,6 +52,19 @@ pub const WM_APP_HERO_SNAP: u32 = w32.WM_APP + 6;
 const HERO_SNAP_INTERVAL_MS: u32 = 150;
 const HERO_SNAP_TIMER_ID: usize = 0x4853; // 'HS'
 
+/// Hero-mode animation clock (T59b): one ~16ms timer, alive only while a
+/// selection slide (0.35s, Mac parity) and/or carousel re-center (0.3s)
+/// runs; progress comes from a real-time clock, not tick counts.
+const HERO_ANIM_TIMER_ID: usize = 0x4841; // 'HA'
+const HERO_ANIM_TICK_MS: u32 = 16;
+pub const HERO_SLIDE_MS: f32 = 350.0;
+const HERO_RECENTER_MS: f32 = 300.0;
+
+/// During a hero divider drag the leaf resize (MoveWindow of every leaf)
+/// is throttled to 80ms while the carousel repaints every tick — the Mac
+/// debounces grid reflow by the same 80ms (T58 decision 4).
+const HERO_DRAG_RESIZE_MS: i64 = 80;
+
 /// Maximum number of tabs per window.
 const MAX_TABS: usize = 64;
 
@@ -200,8 +213,41 @@ ipc_name: ?[]u8 = null,
 tab_hero_active: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
 tab_hero_index: [MAX_TABS]u16 = [_]u16{0} ** MAX_TABS,
 /// Carousel share of the window width, per tab (Mac default 0.25,
-/// clamped 0.1–0.6; divider drag lands in T59b).
+/// clamped 0.1–0.6; adjusted by dragging the hero divider, T59b).
 tab_hero_ratio: [MAX_TABS]f32 = [_]f32{hero_math.RATIO_DEFAULT} ** MAX_TABS,
+/// Carousel wheel-scroll offset in px, per tab (Mac parity: clamped to
+/// half the strip overflow either way; reset on selection change). T59b.
+tab_hero_scroll: [MAX_TABS]i32 = [_]i32{0} ** MAX_TABS,
+
+/// Transient hero-mode interaction state (T59b; active tab only — reset
+/// on tab switch and tree change). Hovered carousel tile, or -1.
+hero_hover_tile: isize = -1,
+/// The hero/carousel divider is hovered (accent color + resize cursor).
+hero_divider_hover: bool = false,
+/// A divider drag is in progress (mouse captured).
+hero_divider_drag: bool = false,
+/// Wall-clock ms of the last throttled leaf resize during a divider drag.
+hero_drag_resize_ms: i64 = 0,
+
+/// Selection snapshot-slide animation (T58 decision 5): while it runs,
+/// every hero-region HWND stays hidden and the region owner-paints the
+/// outgoing + incoming SNAPSHOTS sliding by one strip slot; the incoming
+/// surface is shown (and focused) when the slide completes.
+hero_slide: ?HeroSlide = null,
+/// Carousel re-center animation: a visual strip offset decaying from
+/// `from_offset` to 0 (Mac: 0.3s ease, skipped on first show).
+hero_recenter: ?HeroRecenter = null,
+
+pub const HeroSlide = struct {
+    from_index: usize,
+    to_index: usize,
+    start: std.time.Instant,
+};
+
+pub const HeroRecenter = struct {
+    from_offset: i32,
+    start: std.time.Instant,
+};
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -594,12 +640,14 @@ pub fn addTab(self: *Window) !*Surface {
         self.tab_hero_active[i] = self.tab_hero_active[i - 1];
         self.tab_hero_index[i] = self.tab_hero_index[i - 1];
         self.tab_hero_ratio[i] = self.tab_hero_ratio[i - 1];
+        self.tab_hero_scroll[i] = self.tab_hero_scroll[i - 1];
     }
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
     self.tab_hero_active[pos] = false;
     self.tab_hero_index[pos] = 0;
     self.tab_hero_ratio[pos] = hero_math.RATIO_DEFAULT;
+    self.tab_hero_scroll[pos] = 0;
     self.tab_count += 1;
 
     // Set default title.
@@ -652,6 +700,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_hero_active[i] = self.tab_hero_active[i + 1];
         self.tab_hero_index[i] = self.tab_hero_index[i + 1];
         self.tab_hero_ratio[i] = self.tab_hero_ratio[i + 1];
+        self.tab_hero_scroll[i] = self.tab_hero_scroll[i + 1];
     }
     self.tab_count -= 1;
     if (self.tab_count == 0) {
@@ -764,6 +813,10 @@ fn setActiveTabVisible(self: *Window, visible: bool) void {
 pub fn selectTabIndex(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
     self.cancelTabRename();
+    // Hero animations/hover/drag are active-tab state — drop them before
+    // the switch (a mid-slide switch would otherwise leave the old tab's
+    // panes hidden with no timer to show them).
+    self.heroResetTransients();
     // Clear any in-progress tab drag
     if (self.drag_tab >= 0) {
         self.drag_tab = -1;
@@ -802,8 +855,9 @@ fn leafIndexOf(self: *Window, tab: usize, surface: *Surface) ?usize {
     return null;
 }
 
-/// The leaf at a tree-iteration-order index, if in range.
-fn leafAt(self: *Window, tab: usize, index: usize) ?*Surface {
+/// The leaf at a tree-iteration-order index, if in range. Pub: the
+/// hero slide painter resolves its outgoing/incoming snapshots by index.
+pub fn leafAt(self: *Window, tab: usize, index: usize) ?*Surface {
     var i: usize = 0;
     var it = self.tab_trees[tab].iterator();
     while (it.next()) |entry| : (i += 1) {
@@ -820,10 +874,12 @@ pub fn toggleHeroMode(self: *Window) void {
     const tab = self.active_tab;
     if (self.tab_hero_active[tab]) {
         self.tab_hero_active[tab] = false;
+        self.heroResetTransients();
     } else {
         if (self.leafCount(tab) <= 1) return;
         const focused = self.tab_active_surface[tab];
         self.tab_hero_index[tab] = @intCast(self.leafIndexOf(tab, focused) orelse 0);
+        self.tab_hero_scroll[tab] = 0;
         self.tab_trees[tab].zoom(null);
         self.tab_hero_active[tab] = true;
     }
@@ -833,7 +889,8 @@ pub fn toggleHeroMode(self: *Window) void {
     if (self.tab_active_surface[tab].hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
-/// Move the hero selection (clamped), focus it, and re-layout.
+/// Move the hero selection (clamped), focus it, and re-layout — animated
+/// (snapshot slide + carousel re-center) when possible, instant otherwise.
 fn heroSelect(self: *Window, index: isize) void {
     const tab = self.active_tab;
     const n = self.leafCount(tab);
@@ -841,16 +898,30 @@ fn heroSelect(self: *Window, index: isize) void {
     const clamped: usize = @intCast(@max(0, @min(index, @as(isize, @intCast(n - 1)))));
     log.debug("heroSelect req={} clamped={} cur={} n={}", .{ index, clamped, self.tab_hero_index[tab], n });
     if (clamped == self.tab_hero_index[tab]) return;
+    const old_index: usize = self.tab_hero_index[tab];
+
+    // Capture the strip's CURRENT visual position before the switch so
+    // the re-center can animate from it (includes wheel scroll and any
+    // still-running re-center).
+    const old_top0: ?i32 = if (HeroCarousel.geometry(self)) |g| g.top0 else null;
+
     self.tab_hero_index[tab] = @intCast(clamped);
     const view = self.leafAt(tab, clamped) orelse return;
     self.tab_active_surface[tab] = view;
+    // Mac parity: a selection change resets the wheel-scroll offset.
+    self.tab_hero_scroll[tab] = 0;
+
+    if (self.heroStartAnims(old_index, clamped, old_top0)) return;
     self.layoutSplits();
     if (view.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
 /// Clamp/deactivate hero state after the tab's tree changed (split
-/// created, pane closed, layout rearranged).
+/// created, pane closed, layout rearranged). Also cancels any running
+/// animations and drops transient hover/drag state — leaf indices (and
+/// tile geometry) are no longer what they referred to.
 pub fn heroOnTreeChanged(self: *Window, tab: usize) void {
+    self.heroResetTransients();
     if (!self.tab_hero_active[tab]) return;
     const n = self.leafCount(tab);
     if (n <= 1) {
@@ -861,15 +932,344 @@ pub fn heroOnTreeChanged(self: *Window, tab: usize) void {
 }
 
 /// Focus-follows: clicking (or otherwise focusing) a carousel pane makes
-/// it the hero. Called from the WM_SETFOCUS path.
+/// it the hero. Called from the WM_SETFOCUS path. Routed through
+/// heroSelect so external focus changes get the same animations as
+/// keyboard/click selection (the redundant deferred SetFocus it issues is
+/// a no-op — the surface already has focus).
 pub fn heroOnSurfaceFocused(self: *Window, surface: *Surface) void {
     const tab = self.active_tab;
     if (!self.tab_hero_active[tab]) return;
     const index = self.leafIndexOf(tab, surface) orelse return;
     log.debug("heroOnSurfaceFocused hwnd={?} index={} cur={}", .{ surface.hwnd, index, self.tab_hero_index[tab] });
     if (index == self.tab_hero_index[tab]) return;
-    self.tab_hero_index[tab] = @intCast(index);
+    self.heroSelect(@intCast(index));
+}
+
+/// SPI_GETCLIENTAREAANIMATION: users who disabled "animate controls and
+/// elements inside windows" get instant selection swaps (T58 decision 5).
+fn heroAnimationsEnabled() bool {
+    var enabled: i32 = 1;
+    if (w32.SystemParametersInfoW(
+        w32.SPI_GETCLIENTAREAANIMATION,
+        0,
+        @ptrCast(&enabled),
+        0,
+    ) == 0) return true;
+    return enabled != 0;
+}
+
+/// Eased 0→1 progress of an animation started at `start`, or null once
+/// the duration has elapsed (or the monotonic clock is unavailable).
+pub fn heroAnimProgress(start: std.time.Instant, duration_ms: f32) ?f32 {
+    const now = std.time.Instant.now() catch return null;
+    const ms = @as(f32, @floatFromInt(now.since(start))) / std.time.ns_per_ms;
+    if (ms >= duration_ms) return null;
+    return hero_math.easeInOutCubic(ms / duration_ms);
+}
+
+/// The re-center animation's current visual strip offset (0 when idle).
+pub fn heroRecenterOffset(self: *Window) i32 {
+    const rc = self.hero_recenter orelse return 0;
+    const p = heroAnimProgress(rc.start, HERO_RECENTER_MS) orelse return 0;
+    const f: f32 = @floatFromInt(rc.from_offset);
+    return @intFromFloat(@round(f * (1.0 - p)));
+}
+
+/// Begin the selection snapshot-slide + carousel re-center. Returns false
+/// when animations should not run (OS reduced-motion, missing snapshots,
+/// no window) — the caller then falls back to the instant swap. Call
+/// AFTER tab_hero_index/scroll have been updated to the new selection.
+fn heroStartAnims(self: *Window, old_index: usize, new_index: usize, old_top0: ?i32) bool {
+    if (!heroAnimationsEnabled()) return false;
+    const hwnd = self.hwnd orelse return false;
+    const tab = self.active_tab;
+    const out_view = self.leafAt(tab, old_index) orelse return false;
+    const in_view = self.leafAt(tab, new_index) orelse return false;
+    // The slide owner-paints both SNAPSHOTS; without both DIBs (e.g.
+    // immediately after entering hero mode) swap instantly instead.
+    if (out_view.snap_dib == null or in_view.snap_dib == null) return false;
+    const start = std.time.Instant.now() catch return false;
+
+    self.hero_slide = .{ .from_index = old_index, .to_index = new_index, .start = start };
+    // Both hero HWNDs stay hidden for the whole slide; the incoming one
+    // is shown (and focused) by heroAnimTick when the slide completes.
+    if (out_view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+
+    // Re-center: decay from the old strip position to the new centered
+    // one (Mac: 0.3s, skipped on first show — entering hero mode never
+    // lands here). Clear any previous re-center BEFORE computing the
+    // target so geometry() yields the settled position.
+    self.hero_recenter = null;
+    if (old_top0) |old| recenter: {
+        const geo = HeroCarousel.geometry(self) orelse break :recenter;
+        const delta = old - geo.top0;
+        if (delta != 0) self.hero_recenter = .{ .from_offset = delta, .start = start };
+    }
+
+    _ = w32.SetTimer(hwnd, HERO_ANIM_TIMER_ID, HERO_ANIM_TICK_MS, null);
+    self.heroInvalidateAnimRegions(true, self.hero_recenter != null);
+    return true;
+}
+
+/// ~16ms animation heartbeat: repaint the animating regions; finish the
+/// slide (show + focus the incoming pane) and the re-center when their
+/// clocks run out; kill the timer once nothing animates.
+fn heroAnimTick(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.tab_count == 0 or !self.tab_hero_active[self.active_tab]) {
+        self.heroCancelAnims();
+        return;
+    }
+    const had_slide = self.hero_slide != null;
+    const had_recenter = self.hero_recenter != null;
+    var any = false;
+    if (self.hero_slide) |s| {
+        if (heroAnimProgress(s.start, HERO_SLIDE_MS) == null) {
+            self.hero_slide = null;
+            self.heroShowSelected(true);
+        } else any = true;
+    }
+    if (self.hero_recenter) |rc| {
+        if (heroAnimProgress(rc.start, HERO_RECENTER_MS) == null) {
+            self.hero_recenter = null;
+        } else any = true;
+    }
+    self.heroInvalidateAnimRegions(had_slide, had_recenter);
+    if (!any) _ = w32.KillTimer(hwnd, HERO_ANIM_TIMER_ID);
+}
+
+/// Show (and optionally focus) the selected hero pane. Used at the end
+/// of a slide — while one runs, every hero HWND is hidden.
+fn heroShowSelected(self: *Window, focus: bool) void {
+    const tab = self.active_tab;
+    if (!self.tab_hero_active[tab]) return;
+    const view = self.leafAt(tab, self.tab_hero_index[tab]) orelse return;
+    if (view.hwnd) |h| {
+        _ = w32.ShowWindow(h, w32.SW_SHOW);
+        if (focus) App.deferSetFocus(h); // T48: defer out of WndProc
+    }
+}
+
+/// Drop animation state without waiting for it to complete. If a slide
+/// was mid-flight its panes are all hidden — reveal the selected one
+/// (without stealing focus; every caller either re-layouts right after
+/// or is tearing the tab down).
+fn heroCancelAnims(self: *Window) void {
+    if (self.hero_slide == null and self.hero_recenter == null) return;
+    const had_slide = self.hero_slide != null;
+    self.hero_slide = null;
+    self.hero_recenter = null;
+    if (self.hwnd) |h| _ = w32.KillTimer(h, HERO_ANIM_TIMER_ID);
+    if (had_slide) self.heroShowSelected(false);
+}
+
+/// Reset every transient hero interaction: animations, hover chrome, and
+/// a divider drag (releasing the mouse capture). Called on tab switch,
+/// tree change, and hero-mode exit.
+fn heroResetTransients(self: *Window) void {
+    self.heroCancelAnims();
+    self.hero_hover_tile = -1;
+    self.hero_divider_hover = false;
+    if (self.hero_divider_drag) {
+        self.hero_divider_drag = false;
+        _ = w32.ReleaseCapture();
+    }
+}
+
+/// Invalidate the regions the animations paint: the hero rect for the
+/// slide, the divider + carousel column for the re-center.
+fn heroInvalidateAnimRegions(self: *Window, slide: bool, recenter: bool) void {
+    const hwnd = self.hwnd orelse return;
+    if (!slide and !recenter) return;
+    const split = HeroCarousel.splitRects(self, self.surfaceRect());
+    if (slide) {
+        var r: w32.RECT = .{
+            .left = split.hero.left,
+            .top = split.hero.top,
+            .right = split.hero.right,
+            .bottom = split.hero.bottom,
+        };
+        _ = w32.InvalidateRect(hwnd, &r, 0);
+    }
+    if (recenter) {
+        var r: w32.RECT = .{
+            .left = split.divider.left,
+            .top = split.carousel.top,
+            .right = split.carousel.right,
+            .bottom = split.carousel.bottom,
+        };
+        _ = w32.InvalidateRect(hwnd, &r, 0);
+    }
+}
+
+/// Repaint the divider + carousel column (hover chrome, wheel scroll,
+/// divider drag).
+fn heroInvalidateCarousel(self: *Window) void {
+    self.heroInvalidateAnimRegions(false, true);
+}
+
+/// Is the point (client coords) inside the hero/carousel divider band?
+fn heroHitDivider(self: *Window, x: i32, y: i32) bool {
+    if (self.tab_count == 0 or !self.tab_hero_active[self.active_tab]) return false;
+    if (self.leafCount(self.active_tab) <= 1) return false;
+    const split = HeroCarousel.splitRects(self, self.surfaceRect());
+    return split.divider.contains(x, y);
+}
+
+/// Wheel over the carousel column (divider band included) scrolls the
+/// thumbnail strip — clamped to half the strip overflow either way (Mac
+/// parity). Client coords; returns true when the event was consumed.
+pub fn heroWheel(self: *Window, x: i32, y: i32, raw_delta: i16) bool {
+    if (self.tab_count == 0 or !self.tab_hero_active[self.active_tab]) return false;
+    const geo = HeroCarousel.geometry(self) orelse return false;
+    if (x < geo.split.divider.left or y < geo.split.carousel.top) return false;
+    // One detent scrolls half a tile step — proportional to tile size so
+    // the feel is stable across carousel widths and DPI.
+    const step: f32 = @as(f32, @floatFromInt(geo.layout.thumb_h + geo.layout.gap)) / 2.0;
+    const notches: f32 = @as(f32, @floatFromInt(raw_delta)) /
+        @as(f32, @floatFromInt(w32.WHEEL_DELTA));
+    // Manual scrolling takes over from a running re-center animation.
+    self.hero_recenter = null;
+    const tab = self.active_tab;
+    const cur = hero_math.clampScroll(
+        self.tab_hero_scroll[tab],
+        geo.split.carousel,
+        geo.layout,
+        geo.count,
+    );
+    const next = hero_math.clampScroll(
+        cur + @as(i32, @intFromFloat(@round(notches * step))),
+        geo.split.carousel,
+        geo.layout,
+        geo.count,
+    );
+    self.tab_hero_scroll[tab] = next;
+    // Debug-build oracle for hero-mode.ps1 (wheel reaches the carousel).
+    log.debug("hero wheel scroll={} raw={}", .{ next, raw_delta });
+    self.heroInvalidateCarousel();
+    return true;
+}
+
+/// Surface-side wheel fallback (T58 decision 4): without Win10+ hover
+/// routing, wheel messages follow keyboard focus (= the hero pane), so
+/// the hero surface forwards wheel events that happen over the carousel.
+/// Returns true when consumed.
+pub fn heroWheelScreenCursor(self: *Window, raw_delta: i16) bool {
+    if (self.tab_count == 0 or !self.tab_hero_active[self.active_tab]) return false;
+    const hwnd = self.hwnd orelse return false;
+    var pt: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&pt) == 0) return false;
+    _ = w32.ScreenToClient(hwnd, &pt);
+    return self.heroWheel(pt.x, pt.y, raw_delta);
+}
+
+/// Mouse move below the tab bar while hero mode is active: tile hover
+/// chrome + divider hover accent. Registers TrackMouseEvent (shared
+/// `tracking_mouse` flag with the tab bar) so WM_MOUSELEAVE clears state.
+fn heroMouseMove(self: *Window, x: i32, y: i32) void {
+    if (!self.tracking_mouse) {
+        var tme = w32.TRACKMOUSEEVENT{
+            .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+            .dwFlags = w32.TME_LEAVE,
+            .hwndTrack = self.hwnd orelse return,
+            .dwHoverTime = 0,
+        };
+        _ = w32.TrackMouseEvent(&tme);
+        self.tracking_mouse = true;
+    }
+    const new_tile: isize = if (HeroCarousel.hitTest(self, x, y)) |i| @intCast(i) else -1;
+    if (new_tile != self.hero_hover_tile) {
+        self.heroInvalidateTile(self.hero_hover_tile);
+        self.heroInvalidateTile(new_tile);
+        self.hero_hover_tile = new_tile;
+        // Debug-build oracle for hero-mode.ps1 (hover chrome reacts).
+        log.debug("hero hover tile={}", .{new_tile});
+    }
+    const new_div = self.heroHitDivider(x, y);
+    if (new_div != self.hero_divider_hover) {
+        self.hero_divider_hover = new_div;
+        self.heroInvalidateDivider();
+    }
+}
+
+/// WM_MOUSELEAVE: drop hover chrome (tile + divider).
+fn heroMouseLeave(self: *Window) void {
+    if (self.hero_hover_tile != -1) {
+        self.heroInvalidateTile(self.hero_hover_tile);
+        self.hero_hover_tile = -1;
+    }
+    if (self.hero_divider_hover) {
+        self.hero_divider_hover = false;
+        self.heroInvalidateDivider();
+    }
+}
+
+fn heroInvalidateTile(self: *Window, index: isize) void {
+    if (index < 0) return;
+    const hwnd = self.hwnd orelse return;
+    if (HeroCarousel.tileRect(self, @intCast(index))) |r| {
+        var inv = r;
+        _ = w32.InvalidateRect(hwnd, &inv, 0);
+    }
+}
+
+fn heroInvalidateDivider(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const split = HeroCarousel.splitRects(self, self.surfaceRect());
+    var r: w32.RECT = .{
+        .left = split.divider.left,
+        .top = split.divider.top,
+        .right = split.divider.right,
+        .bottom = split.divider.bottom,
+    };
+    _ = w32.InvalidateRect(hwnd, &r, 0);
+}
+
+/// Begin a hero divider drag (mouse captured until WM_LBUTTONUP).
+fn heroStartDividerDrag(self: *Window) void {
+    self.hero_divider_drag = true;
+    self.hero_drag_resize_ms = 0;
+    if (self.hwnd) |h| _ = w32.SetCapture(h);
+    self.heroInvalidateDivider();
+}
+
+/// Divider drag tick: recompute the per-tab ratio from the absolute
+/// cursor position (no incremental deltas — the Mac measures in global
+/// coords for the same no-oscillation reason). The carousel repaints
+/// every tick; the leaf resize is throttled to 80ms (T58 decision 4).
+fn heroUpdateDividerDrag(self: *Window, x: i32) void {
+    if (!self.hero_divider_drag) return;
+    const tab = self.active_tab;
+    const rect = self.surfaceRect();
+    const w: f32 = @floatFromInt(@max(rect.right - rect.left, 1));
+    const band: f32 = @floatFromInt(HeroCarousel.splitRects(self, rect).divider.width());
+    // The cursor rides the band center; the carousel starts at the band's
+    // right edge.
+    const carousel_w: f32 = @as(f32, @floatFromInt(rect.right - x)) - band / 2.0;
+    self.tab_hero_ratio[tab] = hero_math.clampRatio(carousel_w / w);
+
+    const now = std.time.milliTimestamp();
+    if (now - self.hero_drag_resize_ms >= HERO_DRAG_RESIZE_MS) {
+        self.hero_drag_resize_ms = now;
+        self.layoutHero(rect);
+    }
+    // Repaint the whole content region: the divider/carousel boundary
+    // moves every tick even between throttled leaf resizes.
+    if (self.hwnd) |h| {
+        var inv = rect;
+        _ = w32.InvalidateRect(h, &inv, 0);
+    }
+}
+
+/// End a hero divider drag: release capture and do the final,
+/// un-throttled layout at the exact ratio.
+fn heroEndDividerDrag(self: *Window) void {
+    if (!self.hero_divider_drag) return;
+    self.hero_divider_drag = false;
+    _ = w32.ReleaseCapture();
+    log.debug("hero ratio={d:.3}", .{self.tab_hero_ratio[self.active_tab]});
     self.layoutSplits();
+    if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
 }
 
 /// 150ms heartbeat while hero mode is active: ask every leaf's renderer
@@ -926,6 +1326,10 @@ fn heroOnSnapReady(self: *Window, leaf_hwnd_int: usize) void {
 /// exactly this reason). The carousel column itself has no child HWNDs;
 /// it is owner-painted by HeroCarousel.
 fn layoutHero(self: *Window, rect: w32.RECT) void {
+    // A re-layout mid-animation (window resize, tab ops) invalidates the
+    // animation's captured geometry — finish instantly and lay out the
+    // settled state.
+    self.heroCancelAnims();
     const tab = self.active_tab;
     const n = self.leafCount(tab);
     if (self.tab_hero_index[tab] >= n) self.tab_hero_index[tab] = @intCast(n - 1);
@@ -1579,6 +1983,9 @@ fn paintWindow(self: *Window) void {
     self.paintTabBar(hdc_screen);
     if (self.tab_count > 0 and self.tab_hero_active[self.active_tab]) {
         HeroCarousel.paint(self, hdc_screen);
+        // While a selection slide runs every hero HWND is hidden and the
+        // hero region is owner-painted (outgoing/incoming snapshots).
+        if (self.hero_slide != null) HeroCarousel.paintSlide(self, hdc_screen);
     }
 }
 
@@ -2004,6 +2411,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     const saved_hero_active = self.tab_hero_active[from];
     const saved_hero_index = self.tab_hero_index[from];
     const saved_hero_ratio = self.tab_hero_ratio[from];
+    const saved_hero_scroll = self.tab_hero_scroll[from];
 
     if (from < to) {
         // Shift left: move [from+1..to+1] to [from..to]
@@ -2016,6 +2424,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_hero_active[i] = self.tab_hero_active[i + 1];
             self.tab_hero_index[i] = self.tab_hero_index[i + 1];
             self.tab_hero_ratio[i] = self.tab_hero_ratio[i + 1];
+            self.tab_hero_scroll[i] = self.tab_hero_scroll[i + 1];
         }
     } else {
         // Shift right: move [to..from] to [to+1..from+1]
@@ -2028,6 +2437,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_hero_active[i] = self.tab_hero_active[i - 1];
             self.tab_hero_index[i] = self.tab_hero_index[i - 1];
             self.tab_hero_ratio[i] = self.tab_hero_ratio[i - 1];
+            self.tab_hero_scroll[i] = self.tab_hero_scroll[i - 1];
         }
     }
 
@@ -2039,6 +2449,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_hero_active[to] = saved_hero_active;
     self.tab_hero_index[to] = saved_hero_index;
     self.tab_hero_ratio[to] = saved_hero_ratio;
+    self.tab_hero_scroll[to] = saved_hero_scroll;
 
     self.active_tab = to;
     self.invalidateTabBar();
@@ -2536,6 +2947,10 @@ pub fn windowWndProc(
                 window.heroSnapTick();
                 return 0;
             }
+            if (wparam == HERO_ANIM_TIMER_ID) {
+                window.heroAnimTick();
+                return 0;
+            }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         WM_APP_HERO_SNAP => {
@@ -2658,6 +3073,10 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            if (window.heroHitDivider(x, y)) {
+                window.heroStartDividerDrag();
+                return 0;
+            }
             if (window.hitTestDivider(x, y)) |hit| {
                 window.startDividerDrag(hit.handle, hit.layout);
                 return 0;
@@ -2668,6 +3087,10 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_LBUTTONUP => {
+            if (window.hero_divider_drag) {
+                window.heroEndDividerDrag();
+                return 0;
+            }
             if (window.dragging_split) {
                 window.endDividerDrag();
                 return 0;
@@ -2693,6 +3116,14 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDBLCLK => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            // Double-click the hero divider: reset the carousel ratio to
+            // the default (parity with tree-divider double-click → 0.5).
+            if (window.heroHitDivider(x, y)) {
+                window.tab_hero_ratio[window.active_tab] = hero_math.RATIO_DEFAULT;
+                window.layoutSplits();
+                if (window.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
+                return 0;
+            }
             // Double-click on tab bar starts inline rename
             if (y < window.tabBarHeight()) {
                 for (0..window.tab_count) |i| {
@@ -2723,6 +3154,10 @@ pub fn windowWndProc(
         w32.WM_MOUSEMOVE => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            if (window.hero_divider_drag) {
+                window.heroUpdateDividerDrag(x);
+                return 0;
+            }
             if (window.dragging_split) {
                 window.updateDividerDrag(x, y);
                 return 0;
@@ -2760,13 +3195,34 @@ pub fn windowWndProc(
             }
             if (y < window.tabBarHeight()) {
                 window.handleTabBarMouseMove(@truncate(x), @truncate(y));
+            } else if (window.tab_count > 0 and window.tab_hero_active[window.active_tab]) {
+                window.heroMouseMove(x, y);
             }
             return 0;
+        },
+        w32.WM_MOUSEWHEEL => {
+            // Wheel over the owner-painted carousel scrolls it. The
+            // message lands here (not on a child surface) via Win10+
+            // hover routing; wheel coords are SCREEN coords.
+            var pt: w32.POINT = .{
+                .x = @as(i16, @truncate(lparam & 0xFFFF)),
+                .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+            };
+            _ = w32.ScreenToClient(hwnd, &pt);
+            const raw: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
+            if (window.heroWheel(pt.x, pt.y, raw)) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_SETCURSOR => {
             var pt: w32.POINT = undefined;
             if (w32.GetCursorPos_(&pt) != 0) {
                 if (window.hwnd) |h| _ = w32.ScreenToClient(h, &pt);
+                if (window.heroHitDivider(pt.x, pt.y) or window.hero_divider_drag) {
+                    if (w32.LoadCursorW(null, w32.IDC_SIZEWE)) |cursor| {
+                        _ = w32.SetCursor(cursor);
+                    }
+                    return 1;
+                }
                 if (window.hitTestDivider(pt.x, pt.y)) |hit| {
                     const cursor_id: usize = if (hit.layout == .horizontal) w32.IDC_SIZEWE else w32.IDC_SIZENS;
                     if (w32.LoadCursorW(null, cursor_id)) |cursor| {
@@ -2779,6 +3235,7 @@ pub fn windowWndProc(
         },
         w32.WM_MOUSELEAVE => {
             window.handleTabBarMouseLeave();
+            window.heroMouseLeave();
             return 0;
         },
         w32.WM_ACTIVATE => {

@@ -1616,6 +1616,50 @@ live, hover highlights tiles; GHOZTTY_PERF shows no fps regression.
 `hero-mode.ps1` ALL PASS; both test lanes + P1–P3 green; screenshot
 archived in `test/win32/artifacts/`.
 
+*Evidence (DONE 2026-07-16):*
+
+- *Wheel (step 1):* per-tab `tab_hero_scroll` + `hero_math.clampScroll`
+  (±half the strip overflow, Mac parity; strip that fits pins to 0;
+  clamped at read time in `HeroCarousel.geometry` so tree changes
+  self-heal stale offsets). Two delivery paths per T58 decision 4: a new
+  parent `WM_MOUSEWHEEL` branch (screen→client coords; Win10+ hover
+  routing) AND a Surface-side fallback (`heroWheelScreenCursor`) for
+  wheel-follows-focus routing. One detent = half a tile step; selection
+  change resets the offset; manual scroll cancels a live re-center.
+- *Divider (step 2):* `heroHitDivider` on the 6px band; IDC_SIZEWE on
+  hover (WM_SETCURSOR branch), accent-blue divider line while
+  hovered/dragged; drag recomputes the per-tab ratio from the absolute
+  cursor x (clamp 0.1–0.6), leaf `MoveWindow`s throttled to 80ms while
+  the carousel repaints every tick; double-click resets ratio to 0.25
+  (parity with tree-divider double-click).
+- *Hover (step 3):* `hero_hover_tile` tracked in a parent WM_MOUSEMOVE
+  branch (TrackMouseEvent shared with the tab bar; WM_MOUSELEAVE
+  clears); hovered tile paints alpha 153 + 1px purple RGB(139,92,246).
+- *Animations (step 4):* selection snapshot-slide (0.35s) — both hero
+  HWNDs hidden, hero region owner-paints outgoing+incoming snapshot DIBs
+  (HALFTONE-stretched) sliding by hero_h + 40px·scale; incoming shown +
+  focused at slide end. Carousel re-center (0.3s) — visual strip offset
+  decays from the pre-switch position to the new centered one. One 16ms
+  timer alive only while animating; progress from std.time.Instant;
+  `hero_math.easeInOutCubic`; `SPI_GETCLIENTAREAANIMATION` honored
+  (instant swap when the user disabled client-area animations). Layout,
+  tab switch, and tree change cancel animations (slide cancel reveals
+  the selected pane); rapid re-selects retarget cleanly.
+- *Perf (step 5):* GHOZTTY_PERF with a busy `ping -t` pane: hero OFF avg
+  1.4 fps/renderer (1Hz workload, max gap ≈ ping cadence); hero ON avg
+  7.1 fps — exactly the 150ms thumbnail heartbeat, max gap 174ms, no
+  stalls; during an animated swap avg 7.3 fps, no gap spike. No tuning
+  needed: the anim timer lives only for the 350ms slide.
+- *hero-mode.ps1:* phase 3 added (mid-slide oracle: 0 visible panes
+  while the region owner-paints — gated on the OS animation setting;
+  hover + wheel debug-log oracles; 5-pane overflow wheel scrolled
+  offset −88; divider drag narrowed the hero 578→427px with all hidden
+  leaves re-sized; double-click reset restored ~25%). ALL PASS on-box,
+  58 assertions. Screenshot: `test/win32/artifacts/hero-mode-t59b.png`.
+  PS 5.1 lesson: hex literals that fill 32 bits (0xFF880000) parse as
+  NEGATIVE Int32 — use decimal for UIntPtr wparams.
+- Both unit-test lanes green (3 new hero_math tests); P1–P3 ALL PASS.
+
 Promote to a task row when prioritized; don't work these ad hoc.
 
 - **Session/window save-restore** — no equivalent of `TerminalRestorable*`;

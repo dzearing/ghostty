@@ -2605,6 +2605,14 @@ pub fn handleMouseWheel(self: *Surface, wparam: usize, axis: enum { vertical, ho
     // apply SPI_GETWHEELSCROLLLINES here — that double-multiplies
     // (verified 9 lines/notch, test/win32/wheel-scroll.ps1).
     const raw_delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
+
+    // T59b: with hero mode active and the cursor over the owner-painted
+    // carousel column, the wheel scrolls the carousel, not the terminal.
+    // Fallback path for wheel-follows-focus routing — under the Win10+
+    // "scroll inactive windows on hover" default the parent window gets
+    // the message directly and this never fires.
+    if (axis == .vertical and self.parent_window.heroWheelScreenCursor(raw_delta)) return;
+
     const delta: f64 = @as(f64, @floatFromInt(raw_delta)) / @as(f64, @floatFromInt(w32.WHEEL_DELTA));
 
     const scroll_mods: input.ScrollMods = .{};

@@ -1155,6 +1155,11 @@ pub extern "gdi32" fn SelectClipRgn(hdc: HDC, hrgn: ?*anyopaque) callconv(.winap
 pub extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) i32;
 pub const NULL_BRUSH: i32 = 5;
 
+// Hero-mode animations (T59b): honor the OS "animate controls and elements
+// inside windows" accessibility setting.
+pub extern "user32" fn SystemParametersInfoW(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWinIni: u32) callconv(.winapi) i32;
+pub const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+
 pub extern "user32" fn BeginPaint(hwnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
 pub extern "user32" fn EndPaint(hwnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) i32;
 

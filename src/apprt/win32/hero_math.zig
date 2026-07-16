@@ -140,6 +140,38 @@ pub fn tileRect(
     };
 }
 
+/// Total height of the tile strip (`count` tiles + gaps between them).
+pub fn stripHeight(layout: TileLayout, count: usize) i32 {
+    if (count == 0) return 0;
+    const n: i32 = @intCast(count);
+    return n * layout.thumb_h + (n - 1) * layout.gap;
+}
+
+/// Clamp a wheel-scroll offset. Mac behavior: the strip scrolls at most
+/// half the overflow either way (the selected tile stays centered at
+/// scroll 0, so ±half-overflow reaches both strip ends); a strip that
+/// fits entirely does not scroll at all.
+pub fn clampScroll(
+    scroll: i32,
+    carousel: Rect,
+    layout: TileLayout,
+    count: usize,
+) i32 {
+    const overflow = stripHeight(layout, count) - carousel.height();
+    if (overflow <= 0) return 0;
+    const limit = @divTrunc(overflow + 1, 2);
+    return @min(limit, @max(-limit, scroll));
+}
+
+/// Ease-in-out cubic (Mac's easeInEaseOut curve, close enough for GDI
+/// animation parity). Input clamped to [0, 1].
+pub fn easeInOutCubic(t: f32) f32 {
+    const c = @min(@as(f32, 1.0), @max(@as(f32, 0.0), t));
+    if (c < 0.5) return 4.0 * c * c * c;
+    const u = -2.0 * c + 2.0;
+    return 1.0 - (u * u * u) / 2.0;
+}
+
 /// Which tile (if any) contains the point. Mac selects on mouse-up
 /// inside a tile.
 pub fn hitTest(
@@ -226,6 +258,39 @@ test "tileRect horizontal centering and stacking" {
     try std.testing.expectEqual(@as(i32, 210), r0.bottom);
     const r1 = tileRect(carousel, l, 100, 1);
     try std.testing.expectEqual(@as(i32, 218), r1.top); // 100 + 110 + 8
+}
+
+test "clampScroll: strip that fits does not scroll" {
+    const carousel: Rect = .{ .left = 750, .top = 0, .right = 1000, .bottom = 800 };
+    const l: TileLayout = .{ .thumb_w = 220, .thumb_h = 110, .gap = 8 };
+    // 3 tiles: strip = 3*110 + 2*8 = 346 < 800 → overflow 0 → pinned to 0.
+    try std.testing.expectEqual(@as(i32, 0), clampScroll(500, carousel, l, 3));
+    try std.testing.expectEqual(@as(i32, 0), clampScroll(-500, carousel, l, 3));
+}
+
+test "clampScroll: overflow clamps to half either way" {
+    const carousel: Rect = .{ .left = 750, .top = 0, .right = 1000, .bottom = 400 };
+    const l: TileLayout = .{ .thumb_w = 220, .thumb_h = 110, .gap = 8 };
+    // 5 tiles: strip = 5*110 + 4*8 = 582; overflow = 182; limit = 91.
+    try std.testing.expectEqual(@as(i32, 91), clampScroll(500, carousel, l, 5));
+    try std.testing.expectEqual(@as(i32, -91), clampScroll(-500, carousel, l, 5));
+    try std.testing.expectEqual(@as(i32, 40), clampScroll(40, carousel, l, 5));
+}
+
+test "easeInOutCubic endpoints, midpoint, monotonic" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), easeInOutCubic(0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), easeInOutCubic(0.5), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), easeInOutCubic(1.0), 1e-6);
+    // Clamps outside [0,1].
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), easeInOutCubic(-2.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), easeInOutCubic(3.0), 1e-6);
+    var prev: f32 = 0.0;
+    var i: usize = 1;
+    while (i <= 20) : (i += 1) {
+        const v = easeInOutCubic(@as(f32, @floatFromInt(i)) / 20.0);
+        try std.testing.expect(v >= prev);
+        prev = v;
+    }
 }
 
 test "hitTest finds tiles and rejects gaps/outside" {

@@ -1,13 +1,12 @@
-//! Owner-painted hero-mode carousel column (T58 design, T59a static pass).
+//! Owner-painted hero-mode carousel column (T58 design; T59a static
+//! pass, T59b interactions/motion).
 //!
 //! The carousel lives in the parent Window's client area — there are NO
 //! child HWNDs per tile. Tiles show snapshot DIBs captured by each pane's
 //! renderer thread (Surface.heroSnap*). This module is geometry + GDI
 //! painting + hit-testing only; all state lives on Window (per-tab hero
-//! arrays) and Surface (DIB cache). Pure math is in hero_math.zig.
-//!
-//! T59a scope: static render (selected tile centered, no scroll/hover/
-//! animation — those land in T59b) + click-to-select hit testing.
+//! arrays + transient hover/drag/animation) and Surface (DIB cache).
+//! Pure math is in hero_math.zig.
 const std = @import("std");
 
 const Window = @import("Window.zig");
@@ -61,7 +60,16 @@ pub fn geometry(win: *Window) ?Geometry {
     const layout = hero_math.tileLayout(split.carousel, hero_w / hero_h, win.scale);
 
     const selected: usize = @min(@as(usize, win.tab_hero_index[tab]), count - 1);
-    const top0 = hero_math.stripTop(split.carousel, layout, selected, 0);
+    // Strip position = centered selected tile + wheel scroll (clamped at
+    // read time so layout/tree changes self-heal a stale offset) + the
+    // decaying re-center animation offset.
+    const scroll = hero_math.clampScroll(
+        win.tab_hero_scroll[tab],
+        split.carousel,
+        layout,
+        count,
+    ) + win.heroRecenterOffset();
+    const top0 = hero_math.stripTop(split.carousel, layout, selected, scroll);
     return .{
         .split = split,
         .layout = layout,
@@ -124,8 +132,8 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         _ = w32.DeleteObject(@ptrCast(brush));
     }
 
-    // Divider: thin vertical line centered in the band; gray for now
-    // (hover/drag accent lands with T59b's drag support).
+    // Divider: thin vertical line centered in the band; gray normally,
+    // accent while hovered or dragged (Mac: blue while hovered/dragged).
     const line_w = @max(@as(i32, @intFromFloat(@round(1.0 * win.scale))), 1);
     const band_w = geo.split.divider.width();
     var line: w32.RECT = .{
@@ -134,7 +142,11 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         .right = @divTrunc(band_w - line_w, 2) + line_w,
         .bottom = rh,
     };
-    if (w32.CreateSolidBrush(w32.RGB(96, 96, 96))) |brush| {
+    const div_color = if (win.hero_divider_hover or win.hero_divider_drag)
+        w32.RGB(106, 106, 255)
+    else
+        w32.RGB(96, 96, 96);
+    if (w32.CreateSolidBrush(div_color)) |brush| {
         _ = w32.FillRect(mem_dc, &line, brush);
         _ = w32.DeleteObject(@ptrCast(brush));
     }
@@ -152,21 +164,25 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
             .right = tr.right - region.left,
             .bottom = tr.bottom - region.top,
         };
-        paintTile(win, mem_dc, entry.view, local, i == geo.selected);
+        const hovered = win.hero_hover_tile >= 0 and
+            @as(usize, @intCast(win.hero_hover_tile)) == i;
+        paintTile(win, mem_dc, entry.view, local, i == geo.selected, hovered);
     }
 
     _ = w32.BitBlt(hdc_screen, region.left, region.top, rw, rh, mem_dc, 0, 0, w32.SRCCOPY);
 }
 
-/// One thumbnail tile: rounded-clipped snapshot (dimmed unless selected)
-/// + rounded border. Mac chrome parity minus the glow shadow (GDI has no
-/// cheap soft shadow — deliberate simplification, T58 decision 3).
+/// One thumbnail tile: rounded-clipped snapshot (dimmed unless selected,
+/// half-dimmed while hovered) + rounded border. Mac chrome parity minus
+/// the glow shadow (GDI has no cheap soft shadow — deliberate
+/// simplification, T58 decision 3).
 fn paintTile(
     win: *Window,
     dc: w32.HDC,
     surface: *Surface,
     rect: w32.RECT,
     selected: bool,
+    hovered: bool,
 ) void {
     const corner = @max(@as(i32, @intFromFloat(@round(12.0 * win.scale))), 4); // 6px radius
     const w = rect.right - rect.left;
@@ -185,16 +201,16 @@ fn paintTile(
         _ = w32.DeleteObject(@ptrCast(brush));
     }
 
-    // Snapshot, dimmed unless selected (Mac alpha 1.0 / 0.35; hover 0.6
-    // lands in T59b). AlphaBlend also stretches on transient size
-    // mismatches right after a resize.
+    // Snapshot, dimmed unless selected (Mac alpha 1.0 selected / 0.6
+    // hovered / 0.35 normal). AlphaBlend also stretches on transient
+    // size mismatches right after a resize.
     if (surface.snap_dib) |dib| blit: {
         const src_dc = w32.CreateCompatibleDC(dc) orelse break :blit;
         defer _ = w32.DeleteDC(src_dc);
         const old = w32.SelectObject(src_dc, dib);
         defer _ = w32.SelectObject(src_dc, old);
         const bf: w32.BLENDFUNCTION = .{
-            .SourceConstantAlpha = if (selected) 255 else 89,
+            .SourceConstantAlpha = if (selected) 255 else if (hovered) 153 else 89,
             // The GL readback's alpha channel is not meaningful — blend
             // with the constant alpha only.
             .AlphaFormat = 0,
@@ -216,7 +232,8 @@ fn paintTile(
 
     // Border on top of the content, outside the clip so the full stroke
     // width lands. Selected: 2px accent blue (Mac 0.416,0.416,1.0).
-    // Normal: 1px dim gray (Mac white 0.5 @ 0.3).
+    // Hovered: 1px purple (Mac 0.545,0.361,0.965). Normal: 1px dim gray
+    // (Mac white 0.5 @ 0.3).
     if (rgn) |r| {
         _ = w32.SelectClipRgn(dc, null);
         _ = w32.DeleteObject(r);
@@ -225,7 +242,12 @@ fn paintTile(
         @max(@as(i32, @intFromFloat(@round(2.0 * win.scale))), 2)
     else
         @max(@as(i32, @intFromFloat(@round(1.0 * win.scale))), 1);
-    const border_color = if (selected) w32.RGB(106, 106, 255) else w32.RGB(110, 110, 110);
+    const border_color = if (selected)
+        w32.RGB(106, 106, 255)
+    else if (hovered)
+        w32.RGB(139, 92, 246)
+    else
+        w32.RGB(110, 110, 110);
     const pen = w32.CreatePen(0, border_w, border_color) orelse return;
     defer _ = w32.DeleteObject(pen);
     const old_pen = w32.SelectObject(dc, pen);
@@ -233,4 +255,93 @@ fn paintTile(
     const old_brush = w32.SelectObject(dc, w32.GetStockObject(w32.NULL_BRUSH));
     defer _ = w32.SelectObject(dc, old_brush);
     _ = w32.RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, corner, corner);
+}
+
+/// Owner-paint the hero region during a selection slide (T58 decision 5):
+/// every hero HWND is hidden; the outgoing and incoming SNAPSHOTS slide
+/// vertically by one strip slot (hero height + 40px·scale gap, Mac
+/// parity) in the selection direction. Double-buffered; snapshots are
+/// HALFTONE-stretched from thumbnail size — content freezes for ≤350ms,
+/// which reads like the Mac's live slide.
+pub fn paintSlide(win: *Window, hdc_screen: w32.HDC) void {
+    const slide = win.hero_slide orelse return;
+    const tab = win.active_tab;
+    if (!win.tab_hero_active[tab]) return;
+
+    const split = splitRects(win, win.surfaceRect());
+    const hero = split.hero;
+    const w = hero.width();
+    const h = hero.height();
+    if (w <= 0 or h <= 0) return;
+
+    // Eased progress; a finished slide paints its end state (the next
+    // anim tick shows the real pane and clears the state).
+    const p = Window.heroAnimProgress(slide.start, Window.HERO_SLIDE_MS) orelse 1.0;
+
+    const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
+    defer _ = w32.DeleteDC(mem_dc);
+    const mem_bmp = w32.CreateCompatibleBitmap(hdc_screen, w, h) orelse return;
+    const old_bmp = w32.SelectObject(mem_dc, mem_bmp);
+    defer {
+        _ = w32.SelectObject(mem_dc, old_bmp);
+        _ = w32.DeleteObject(mem_bmp);
+    }
+
+    // Background fill (visible in the inter-slot gap mid-slide).
+    const bg = win.app.config.background;
+    var full: w32.RECT = .{ .left = 0, .top = 0, .right = w, .bottom = h };
+    if (w32.CreateSolidBrush(w32.RGB(bg.r, bg.g, bg.b))) |brush| {
+        _ = w32.FillRect(mem_dc, &full, brush);
+        _ = w32.DeleteObject(@ptrCast(brush));
+    }
+
+    // Strip slot distance: hero height + 40px (scaled) gap, Mac parity.
+    // Selecting a later leaf moves the strip UP (content slides up).
+    const gap: i32 = @intFromFloat(@round(40.0 * win.scale));
+    const distance = h + gap;
+    const dir: i32 = if (slide.to_index > slide.from_index) 1 else -1;
+    const shift: i32 = @intFromFloat(@round(p * @as(f32, @floatFromInt(distance))));
+    const out_y = -dir * shift;
+    const in_y = dir * (distance - shift);
+
+    _ = w32.SetStretchBltMode(mem_dc, w32.HALFTONE);
+    _ = w32.SetBrushOrgEx(mem_dc, 0, 0, null);
+    paintSlideSnap(win, mem_dc, tab, slide.from_index, out_y, w, h);
+    paintSlideSnap(win, mem_dc, tab, slide.to_index, in_y, w, h);
+
+    _ = w32.BitBlt(hdc_screen, hero.left, hero.top, w, h, mem_dc, 0, 0, w32.SRCCOPY);
+}
+
+/// One hero-sized snapshot at vertical offset `y` inside the slide's
+/// memory DC. A leaf without a snapshot paints nothing (bg shows).
+fn paintSlideSnap(
+    win: *Window,
+    dc: w32.HDC,
+    tab: usize,
+    index: usize,
+    y: i32,
+    w: i32,
+    h: i32,
+) void {
+    if (y >= h or y + h <= 0) return;
+    const view = win.leafAt(tab, index) orelse return;
+    const dib = view.snap_dib orelse return;
+    if (view.snap_dib_w <= 0 or view.snap_dib_h <= 0) return;
+    const src_dc = w32.CreateCompatibleDC(dc) orelse return;
+    defer _ = w32.DeleteDC(src_dc);
+    const old = w32.SelectObject(src_dc, dib);
+    defer _ = w32.SelectObject(src_dc, old);
+    _ = w32.StretchBlt(
+        dc,
+        0,
+        y,
+        w,
+        h,
+        src_dc,
+        0,
+        0,
+        view.snap_dib_w,
+        view.snap_dib_h,
+        w32.SRCCOPY,
+    );
 }
