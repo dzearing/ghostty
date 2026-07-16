@@ -151,15 +151,19 @@ def agent_pid():
     return pids[0] if pids else None
 
 def pid_alive(pid):
+    """True only if `pid` exists AND is not a zombie. A zombie/defunct process has
+    already run to exit() — for "has the app finished terminating?" that IS gone.
+    `os.kill(pid, 0)` alone reports a zombie as alive until its parent reaps it, so
+    we first reap our own launched children, then consult the process state (`ps`)
+    and treat a zombie (`Z`) or missing pid as not-alive."""
     if pid is None:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+    _reap_children()
+    st = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                        capture_output=True, text=True).stdout.strip()
+    if not st:
+        return False              # no such process (reaped or never existed)
+    return not st.startswith("Z")  # zombie == effectively terminated
 
 def kill_pids(pids, sig):
     for pid in pids:
@@ -199,6 +203,21 @@ def full_reset():
             pass
     time.sleep(0.5)
 
+# Popen handles for every app we launched, kept so we can reap them. Without this
+# a cleanly-exited app lingers as a ZOMBIE (defunct) child of this script until we
+# call waitpid — and `os.kill(zombie, 0)` reports it as ALIVE, which made a fast,
+# graceful quit look like a 45s teardown hang (was misdiagnosed as T08a). Reaping
+# turns the zombie into a truly-gone pid so `pid_alive`/`wait_gone` see the exit.
+_launched_procs = []
+
+def _reap_children():
+    """Poll every app we launched; Popen.poll() reaps any that have exited."""
+    for p in _launched_procs:
+        try:
+            p.poll()
+        except Exception:
+            pass
+
 def launch_app():
     os.makedirs(os.path.dirname(APP_LOG), exist_ok=True)
     logf = open(APP_LOG, "ab")
@@ -206,6 +225,7 @@ def launch_app():
     logf.flush()
     p = subprocess.Popen([CLI] + LAUNCH_ARGS, stdout=logf, stderr=logf,
                          start_new_session=True)
+    _launched_procs.append(p)
     return p.pid
 
 def wait_app_ready(timeout=20.0):
@@ -221,14 +241,16 @@ def wait_app_ready(timeout=20.0):
         time.sleep(0.25)
     raise E2EError("app did not answer +list --json within timeout")
 
-def graceful_quit(pids, timeout=45.0):
+def graceful_quit(pids, timeout=20.0):
     """Terminate the app the way a real quit / Sparkle relaunch does: AppleScript
     `quit` scoped BY BUNDLE ID (never by process name — the release app shares the
     name). Routes through applicationShouldTerminate (isQuitting → manifest kept).
-    The app's teardown can be slow (agent-backed surface teardown — see T08a), so
-    we wait generously to let the graceful path fully complete; SIGKILL is only a
-    last resort so a wedged teardown can't hang the whole suite. Returns True if it
-    exited on its own."""
+    A session-persistence app exits cleanly in well under a second (verified: it
+    reaches its atexit handler within ms of the quit); `wait_gone` returns as soon
+    as `pid_alive` sees the exit — which now requires reaping the zombie the exited
+    app leaves as our child (see `pid_alive`). The timeout is only a safety net so a
+    genuinely wedged teardown can't hang the whole suite. Returns True if it exited
+    on its own (it always should)."""
     subprocess.run(
         ["osascript", "-e", f'tell application id "{BUNDLE_ID}" to quit'],
         capture_output=True, text=True, timeout=15)
@@ -630,7 +652,9 @@ def main():
         wait_restored()
         # Recovery gap: from the OLD process being gone to all panes interactive.
         # The headline SLA is recovery speed, not how long a graceful quit takes to
-        # tear down (that's logged as term_secs; slow graceful teardown = T08a).
+        # tear down (logged separately as term_secs; a session-persistence app quits
+        # cleanly in <1s — the historical 45s "hang" was a zombie-reaping artifact of
+        # this harness, since fixed in pid_alive, not an app teardown bug).
         gap = time.time() - t_gone
 
         agent_after = agent_pid()
