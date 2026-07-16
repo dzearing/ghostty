@@ -11,6 +11,8 @@ const App = @import("App.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
+const relay_account = @import("../../remote/relay_account.zig");
+const google_oauth = @import("../../remote/google_oauth.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
@@ -229,10 +231,11 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 /// deadline), exactly like the Mac menu/IPC path; `--name` registers the
 /// window for later targeting.
 ///
-/// Relay token tiers (T21b): explicit `--token` wins (the CLI already
-/// forwards its own GHOSTTY_RELAY_TOKEN env as `--token`), then this GUI
-/// process's GHOSTTY_RELAY_TOKEN. The signed-in-account tier (Mac
-/// `RelayAccount.resolveToken()` parity) lands with T21a.
+/// Relay token tiers (T21a/T21b): explicit `--token` wins (the CLI already
+/// forwards its own GHOSTTY_RELAY_TOKEN env as `--token`), then the signed-in
+/// account (a fresh ID token minted from the stored refresh grant — Mac
+/// `RelayAccount.resolveToken()` parity), then this GUI process's
+/// GHOSTTY_RELAY_TOKEN.
 ///
 /// `--working-directory`/`--shell`/`--command` are REMOTE-native values
 /// forwarded verbatim in the agent OPEN (empty ⇒ absent, like the Mac);
@@ -276,16 +279,13 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // so the window can take ownership for its lifetime.
     const alloc = app.core_app.alloc;
     const dialed: Window.RemoteDialed = if (use_relay) relay_blk: {
-        // Token tiers: explicit --token, then the GUI's env. A tokenless
-        // relay dial is a guaranteed 401 — refuse BEFORE dialing (Mac rule).
-        const env_token: ?[]const u8 = std.process.getEnvVarOwned(
-            arena,
-            "GHOSTTY_RELAY_TOKEN",
-        ) catch null;
-        const token = nonEmpty(args.token) orelse nonEmpty(env_token) orelse {
+        // Token tiers: explicit --token, then the signed-in account (refresh
+        // grant), then the GUI's env. A tokenless relay dial is a guaranteed
+        // 401 — refuse BEFORE dialing (Mac rule).
+        const token = nonEmpty(args.token) orelse resolveAccountToken(arena) orelse resolveEnvToken(arena) orelse {
             return try errorResponse(
                 ctx.alloc,
-                "not signed in: pass --token= (or set GHOSTTY_RELAY_TOKEN) to open relay windows",
+                "not signed in: sign in with +relay-login, pass --token=, or set GHOSTTY_RELAY_TOKEN to open relay windows",
                 .{},
             );
         };
@@ -360,6 +360,34 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 fn nonEmpty(v: ?[]const u8) ?[]const u8 {
     const s = v orelse return null;
     return if (s.len > 0) s else null;
+}
+
+/// The account tier of relay token resolution (T21a): if an account is signed
+/// in (`account.dat` exists), mint a fresh ID token from its stored refresh
+/// grant. A missing account or a failed refresh returns null so resolution
+/// falls through to the env token (graceful — Mac `resolveToken` behavior).
+/// Allocated on `arena`. Endpoints are `.google` unless a test injects a fake
+/// issuer via `GHOSTTY_OAUTH_TOKEN_ENDPOINT`.
+fn resolveAccountToken(arena: Allocator) ?[]const u8 {
+    const path = relay_account.accountPath(arena) catch return null;
+    if (!relay_account.isSignedIn(arena, path)) return null;
+
+    var endpoints = google_oauth.Endpoints.google;
+    if (std.process.getEnvVarOwned(arena, "GHOSTTY_OAUTH_TOKEN_ENDPOINT")) |t| {
+        if (t.len > 0) endpoints.token = t;
+    } else |_| {}
+
+    return relay_account.resolveIdToken(arena, endpoints, path) catch |err| {
+        log.warn("IPC new-remote-window: account token refresh failed err={}", .{err});
+        return null;
+    };
+}
+
+/// The env tier of relay token resolution: `GHOSTTY_RELAY_TOKEN` (empty ⇒
+/// null). Allocated on `arena`.
+fn resolveEnvToken(arena: Allocator) ?[]const u8 {
+    const tok = std.process.getEnvVarOwned(arena, "GHOSTTY_RELAY_TOKEN") catch return null;
+    return nonEmpty(tok);
 }
 
 fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {

@@ -142,9 +142,9 @@ ghoztty +new-remote-window --host=<host> --port=<port> --relay=<base> --device=<
 - `--relay` + `--device`: Dial the enrolled agent `--device=<id>` through the
   rendezvous relay at `--relay=<https-base>` instead of direct TCP (takes
   precedence over `--host`/`--port` when both are given). Auth bearer:
-  explicit `--token=`, else the signed-in account (macOS), else the
-  `GHOSTTY_RELAY_TOKEN` env var — with no source the command fails with
-  "not signed in".
+  explicit `--token=`, else the signed-in account (macOS Keychain; on Windows
+  the `+relay-login` account store, see below), else the `GHOSTTY_RELAY_TOKEN`
+  env var — with no source the command fails with "not signed in".
 - `--working-directory`: Working directory ON THE REMOTE MACHINE for the new
   session. Overrides the machine's per-host default.
 - `--shell`: Shell ON THE REMOTE MACHINE to run (e.g. `wsl.exe`,
@@ -167,6 +167,34 @@ row `⋯` menu → "Host Settings…") and persist in UserDefaults keyed by rela
 device id or `host:port`; explicit `--working-directory`/`--shell` flags
 override them per window. New tabs/splits on a remote window use the per-host
 default shell too (their cwd inherits from the parent pane).
+
+### `ghoztty +relay-login` / `ghoztty +relay-logout` (Windows)
+
+Sign in to (or out of) a Google account used to authenticate relay
+connections, the Windows analog of the macOS Keychain-backed `RelayAccount`.
+Both run entirely in the CLI process (no IPC — the GUI only *reads* the stored
+credential); `+relay-login` opens the system browser for Google's
+authorization-code + PKCE flow (Desktop-app client, loopback redirect),
+exchanges the code, and stores the refresh token, OAuth client config, and
+email **DPAPI-encrypted** at `%LOCALAPPDATA%\ghoztty\account.dat` (owner-only
+DACL).
+
+```
+ghoztty +relay-login --client-id=<id> --client-secret=<secret> [--no-browser]
+ghoztty +relay-logout
+```
+
+- `--client-id` / `--client-secret`: the Google OAuth Desktop-app client.
+  Fall back to `GHOSTTY_GOOGLE_CLIENT_ID` / `GHOSTTY_GOOGLE_CLIENT_SECRET`.
+  Persisted with the credential so GUI-side token refreshes need no env.
+- `--no-browser`: print the sign-in URL and wait for the loopback redirect
+  instead of opening a browser (headless/automation).
+
+Once signed in, `+new-remote-window --relay/--device` with **no** `--token`
+uses the account: the GUI mints a fresh ID token from the stored refresh grant
+(token-resolution order: explicit `--token` → signed-in account →
+`GHOSTTY_RELAY_TOKEN`). `+relay-logout` deletes the store (falling back to the
+env token); signing out when already signed out succeeds silently.
 
 ### Naming
 

@@ -105,7 +105,7 @@ One line per row. Full spec + validation + evidence per task:
 | T19a | Hero mode design (win32) | F | T18 | done | see details |
 | T19 | Hero mode on win32 (implement) | F | T19a | done | f37bd1e3c |
 | T20 | `+new-remote-window` direct TCP | G | T08 | done | 2ed989866 |
-| T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | todo | — |
+| T21a | Browser sign-in + DPAPI creds + `+relay-login` CLI | G | T21b | in-progress | — |
 | T21b | Relay dial path in win32 GUI (`--relay`/`--device`) | G | T20 | done | 89e31b7fb |
 | T22 | Remote GUI: menu item + machine chooser | G | T21a | todo | — |
 | T23 | MSI fix → uninstall entry works | H | — | todo | — |

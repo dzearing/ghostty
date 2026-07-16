@@ -258,4 +258,11 @@ test {
     _ = @import("extra/sublime.zig");
     _ = @import("extra/vim.zig");
     _ = @import("extra/zsh.zig");
+
+    // Relay client account (T21a): pure OAuth/PKCE/claims logic + the DPAPI
+    // account-store round-trip. Reached only through the win32 apprt and the
+    // CLI verbs otherwise, so pull them in explicitly to run their unit tests
+    // in BOTH the `none` and `win32` lanes.
+    _ = @import("remote/google_oauth.zig");
+    _ = @import("remote/relay_account.zig");
 }

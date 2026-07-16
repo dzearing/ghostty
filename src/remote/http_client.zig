@@ -83,19 +83,26 @@ pub const Response = struct {
 /// `https://` the certificate is verified against the system roots with host
 /// verification ON; `http://` is plaintext (use only for loopback test relays).
 pub fn postJson(alloc: Allocator, url: []const u8, json_body: []const u8) !Response {
-    return request(alloc, url, "POST", json_body, null, max_body_len);
+    return request(alloc, url, "POST", .{ .json = json_body }, null, max_body_len);
+}
+
+/// POST an `application/x-www-form-urlencoded` body to the absolute `url`.
+/// Same connection-per-call and TLS semantics as `postJson`. Added for the
+/// Google OAuth token endpoint (code exchange + refresh grant, T21a).
+pub fn postForm(alloc: Allocator, url: []const u8, form_body: []const u8) !Response {
+    return request(alloc, url, "POST", .{ .form = form_body }, null, max_body_len);
 }
 
 /// GET with a bearer token (`Authorization: Bearer <token>`). For the agent's
 /// device-authenticated relay endpoints (`/v1/agent/whoami`).
 pub fn getAuth(alloc: Allocator, url: []const u8, bearer: []const u8, max_len: usize) !Response {
-    return request(alloc, url, "GET", null, bearer, max_len);
+    return request(alloc, url, "GET", .none, bearer, max_len);
 }
 
 /// Bearer-authenticated POST with an OPTIONAL body. Used by the agent's self
 /// de-enroll (`/v1/agent/deenroll`, no body). Pass `null` for a body-less POST.
 pub fn postAuth(alloc: Allocator, url: []const u8, bearer: []const u8, json_body: ?[]const u8) !Response {
-    return request(alloc, url, "POST", json_body, bearer, max_body_len);
+    return request(alloc, url, "POST", if (json_body) |b| .{ .json = b } else .none, bearer, max_body_len);
 }
 
 /// GET the absolute `url` into memory, returning the status + owned body
@@ -104,14 +111,37 @@ pub fn postAuth(alloc: Allocator, url: []const u8, bearer: []const u8, json_body
 /// and TLS/plaintext scheme split as `postJson`. Added for the agent
 /// self-updater (version manifest + binary download).
 pub fn get(alloc: Allocator, url: []const u8, max_len: usize) !Response {
-    return request(alloc, url, "GET", null, null, max_len);
+    return request(alloc, url, "GET", .none, null, max_len);
 }
+
+/// A request body with its Content-Type (or none, for GETs and body-less
+/// POSTs).
+const Body = union(enum) {
+    none,
+    json: []const u8,
+    form: []const u8,
+
+    fn contentType(self: Body) []const u8 {
+        return switch (self) {
+            .none => unreachable,
+            .json => "application/json",
+            .form => "application/x-www-form-urlencoded",
+        };
+    }
+
+    fn bytes(self: Body) ?[]const u8 {
+        return switch (self) {
+            .none => null,
+            .json, .form => |b| b,
+        };
+    }
+};
 
 fn request(
     alloc: Allocator,
     url: []const u8,
     method: []const u8,
-    json_body: ?[]const u8,
+    body: Body,
     auth_bearer: ?[]const u8,
     max_len: usize,
 ) !Response {
@@ -130,7 +160,7 @@ fn request(
 
     switch (u.scheme) {
         .http => {
-            try writeRequest(&tcp_writer.interface, method, u, json_body, auth_bearer);
+            try writeRequest(&tcp_writer.interface, method, u, body, auth_bearer);
             try tcp_writer.interface.flush();
             return readResponse(alloc, tcp_reader.interface(), max_len);
         },
@@ -150,7 +180,7 @@ fn request(
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
             });
-            try writeRequest(&tls_client.writer, method, u, json_body, auth_bearer);
+            try writeRequest(&tls_client.writer, method, u, body, auth_bearer);
             // The TLS flush only stages ciphertext; the socket isn't written
             // until the TCP writer flushes too (same dance as ws_client).
             try tls_client.writer.flush();
@@ -160,17 +190,17 @@ fn request(
     }
 }
 
-/// Emit the full request (headers + optional JSON body) into `w`. Caller
-/// flushes. A null `json_body` is a body-less request (GET).
-fn writeRequest(w: *std.Io.Writer, method: []const u8, u: Url, json_body: ?[]const u8, auth_bearer: ?[]const u8) !void {
+/// Emit the full request (headers + optional body) into `w`. Caller
+/// flushes. A `.none` body is a body-less request (GET).
+fn writeRequest(w: *std.Io.Writer, method: []const u8, u: Url, body: Body, auth_bearer: ?[]const u8) !void {
     try w.print("{s} {s} HTTP/1.1\r\nHost: {s}\r\n", .{ method, u.path, u.host });
     if (auth_bearer) |tok| try w.print("Authorization: Bearer {s}\r\n", .{tok});
-    if (json_body) |body| try w.print(
-        "Content-Type: application/json\r\nContent-Length: {d}\r\n",
-        .{body.len},
+    if (body.bytes()) |b| try w.print(
+        "Content-Type: {s}\r\nContent-Length: {d}\r\n",
+        .{ body.contentType(), b.len },
     );
     try w.writeAll("Connection: close\r\n\r\n");
-    if (json_body) |body| try w.writeAll(body);
+    if (body.bytes()) |b| try w.writeAll(b);
 }
 
 /// Parse a full HTTP/1.1 response from `r`: status line, headers (we only care

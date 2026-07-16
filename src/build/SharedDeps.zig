@@ -619,6 +619,17 @@ pub fn add(
                 }
             },
         }
+
+        // The relay client account (T21a, `src/remote/relay_account.zig` +
+        // `win_acl.zig`) is in BOTH the win32 GUI and the CLI/`none` graphs, so
+        // link its Windows deps whenever the TARGET is Windows regardless of
+        // app_runtime: advapi32 for the owner-only DACL (token/security APIs)
+        // and crypt32 for DPAPI (CryptProtect/UnprotectData) at-rest encryption.
+        // kernel32 is auto-linked. No-op cross-compiling to a non-Windows host.
+        if (step.rootModuleTarget().os.tag == .windows) {
+            step.linkSystemLibrary2("advapi32", .{});
+            step.linkSystemLibrary2("crypt32", .{});
+        }
     }
 
     self.help_strings.addImport(step);
