@@ -47,7 +47,8 @@
     "v0 local transport = loopback TCP (both ends already exist: agent --listen, ghostty_remote_connection_new_tcp). Unix-socket + peercred is a hardening task AFTER the headline E2E works (T09).",
     "session-persistence is an opt-in config flag initially (default off) so the debug app stays usable throughout.",
     "Ring stays 2 MB default for the demo; configurable size + 16 MB default comes with T11.",
-    "Reboot recovery (agent disk persistence, RELAUNCH) comes after the upgrade demo (T12/T13) — the upgrade scenario keeps the agent alive, so it does not need disk persistence."
+    "Reboot recovery (agent disk persistence, RELAUNCH) comes after the upgrade demo (T12/T13) — the upgrade scenario keeps the agent alive, so it does not need disk persistence.",
+    "Future direction (user, 2026-07-16): cross-machine session RESUME. Scenario: a bunch of windows are live on machine X (reachable via relay); the user physically moves to machine Y, hits Cmd-Shift-N, sees X in the machine list, expands to see X's ACTIVE sessions, and resumes one or ALL of them 'on the local machine'. Clarified semantics: the PTYs KEEP RUNNING on X's agent (a running process can't migrate hosts) — 'resume on local machine' means local VIEWER windows on Y ATTACH to the live remote sessions on X over the relay, i.e. the SAME remote-attach mechanism as the local-persistence restore (presentRemoteWindow(sessionID:) / the relay ATTACH path), just driven from a session BROWSER instead of a saved manifest. Needs: (a) enumerate a machine's live sessions [T10 agent LIST_SESSIONS + a viewer-side RPC that can target ANY machine connection, not only the local agent], (b) chooser UI to browse + pick sessions [T16], (c) single-session attach from the browser [T17], (d) for 'resume ALL', the window/tab/split TOPOLOGY must be reachable from Y — today T05/T06 store the layout manifest ONLY in the owning viewer's local Application Support, so the agent (or account) has to own a layout blob [T18]. OPEN design Q: layout lives on the AGENT (Option A — fits the existing architecture; the agent already owns sessions + gains disk metadata in T12; the local viewer manifest becomes a cache/projection) vs SYNCED via the account/relay (Option B — needs account storage, works even when X's agent is offline). Leaning Option A. Tasks T16–T18."
   ],
 
   "headlineAcceptance": {
@@ -385,6 +386,50 @@
       "steps": [],
       "acceptance": "Rebuilt debug app launches with no keychain prompt; E2E still passes; release unaffected.",
       "notes": "2026-07-16: done, commit caa49f690 (raised mid-T09c when the user hit the prompts). ROOT CAUSE: the debug bundle is ad-hoc signed (no team identity) → its login-keychain ACL trust for com.dzearing.ghoztty.relay-account is keyed to the exact cdhash, which changes on EVERY rebuild. So 'Always Allow' adds an entry for a hash that dies at the next build → the user is re-prompted forever (confirmed live: user clicked Always Allow repeatedly and was still spammed). The prompt fires from the launch-time RelayAccount.resolveToken()/keychain load in AppDelegate's restore path, independent of session-persistence. FIX: new RelayAccountKeychain.isDisabled (macos/Sources/Features/Remote/RelayAccount.swift) gates the SOLE relay-account SecItem caller — load→nil, save/delete→no-op when set, so the item is never touched and no prompt fires (app reads as signed out; relay falls back to GHOSTTY_RELAY_TOKEN). OFF by default (zero change for release / non-opted-in users). Enable: env GHOSTTY_RELAY_DISABLE=1 (dev shells; the E2E harness now sets it in its Popen launch) OR `defaults write com.dzearing.ghoztty.debug GhosttyRelayDisable -bool YES` (persists for Finder launches; the user's box HAS this set now — `defaults delete com.dzearing.ghoztty.debug GhosttyRelayDisable` to re-enable relay on the debug app for remote-window testing). VERIFIED: freshly-rebuilt (new cdhash) debug app launched relying ONLY on the UserDefault (no env) → NO SecurityAgent prompt, relay path skipped, app answered +list; E2E --cycles=1 kill = PASS with zero prompts. NOT unit-tested (isDisabled reads ProcessInfo env + UserDefaults.standard, not injectable without polluting global state) — live-verified instead. Durable knowledge in memory ghoztty-adhoc-signing-keychain-cdhash. A heavier 'make Always Allow actually stick' fix would be a STABLE self-signed code identity for the debug build (cert-based designated requirement survives rebuilds) — deferred; the opt-out solves the immediate pain."
+    },
+    {
+      "id": "T16",
+      "title": "Cross-machine resume: browse a machine's active sessions in the Cmd-Shift-N chooser",
+      "status": "pending",
+      "dependsOn": ["T10"],
+      "goal": "In the machine chooser (Cmd-Shift-N), show each machine's live-session count and let the user expand a machine to a read-only LIST of its active sessions (title, cwd, last-active, attached-elsewhere?). This is the browse half of the user's cross-machine RESUME vision (see decisions[]); attach is T17. Sessions are enumerated by querying the SELECTED machine's agent via T10's LIST_SESSIONS over that machine's existing transport (local loopback OR relay) — so the RPC must target an arbitrary Machine connection, not only the local agent.",
+      "steps": [
+        "Viewer-side RPC: generalize the T10 LIST_SESSIONS call so it runs against any dialed RemoteConnection (relay machine or local agent), not just the local-agent handle; return [{sessionID, title, cwd, argv, attached, lastActiveMs}].",
+        "MachineChooser UI: per-machine session count badge + expandable row listing sessions; lazy-fetch on expand; refresh on chooser open; render offline/unreachable machines without blocking the list (the dial can be slow / fail — never wedge the chooser, cf. the remote-dial-modal-wedge rule).",
+        "No attach yet — this task is browse-only so the enumeration + UI can be verified in isolation."
+      ],
+      "acceptance": "Chooser shows live sessions for the local agent AND a relay machine (count + expandable list with title/cwd); counts refresh on reopen; an offline machine shows gracefully with no hang; no attach.",
+      "notes": ""
+    },
+    {
+      "id": "T17",
+      "title": "Cross-machine resume: attach a single remote session on the local machine",
+      "status": "pending",
+      "dependsOn": ["T16"],
+      "goal": "From the T16 session browser, pick ONE session and open a LOCAL viewer window that ATTACHES to that (possibly remote) session id over the machine's transport — reusing presentRemoteWindow(sessionID:) / the relay ATTACH restore path (T06). The process keeps running on its host agent; only the viewer window is local. Handle attached-elsewhere per existing ATTACH semantics (force/steal vs decline).",
+      "steps": [
+        "Wire a 'Resume' action on a browsed session → build a .remote surface config with that machine + sessionID (nil-tree single leaf) and present it, exactly like the manifest restore does but sourced from the browser selection.",
+        "Attached-elsewhere: surface the existing ATTACH conflict result to the user (steal vs cancel); don't silently force.",
+        "Detach-on-close: closing the resumed window detaches (session stays alive on the host), matching current remote-window teardown."
+      ],
+      "acceptance": "With a live session on machine X, resume it from Y → a window on Y attaches, scrollback replays, input works; closing the window leaves the session alive on X (re-browsable); attached-elsewhere is handled, not forced.",
+      "notes": ""
+    },
+    {
+      "id": "T18",
+      "title": "Cross-machine resume: agent-owned layout blob + 'Resume all' (rebuild topology on another machine)",
+      "status": "pending",
+      "dependsOn": ["T17", "T12"],
+      "goal": "Make 'resume ALL of machine X's sessions on Y' rebuild X's full window/tab/split TOPOLOGY on Y — not just a flat list of attached panes. Today the layout manifest (T05/T06) lives ONLY in the owning viewer's local Application Support, unreachable from another machine. Direction (decisions[] Option A): the owning viewer PUSHES an opaque per-window layout blob (topology + per-leaf session ids + ratios/titles) to the agent; the agent persists it alongside its session metadata (T12) and serves it on request. A viewer on Y pulls sessions + layout and rebuilds every window/tab/split locally via SessionLayoutRestore's tree builder, attaching each leaf to its live remote session.",
+      "steps": [
+        "Protocol: SET_LAYOUT / GET_LAYOUT frames carrying an OPAQUE blob keyed by window/tab-group id (agent stays topology-agnostic — it just stores/returns bytes). Additive, HELLO-compatible.",
+        "Agent: persist the blob with session metadata (extends T12's sessions.json/disk store); reap a blob when all its referenced sessions are gone.",
+        "Viewer (owner): push the blob on layout change — reuse the T05 sync triggers so the agent copy tracks the local manifest.",
+        "Viewer (resumer): 'Resume all' in the chooser → GET_LAYOUT + LIST_SESSIONS, rebuild the SplitTree(s) via makeTreeNode with per-leaf ATTACH configs, handle dead / attached-elsewhere leaves (exited overlay, don't abort the whole rebuild).",
+        "Decide the local-vs-agent manifest relationship: local Application Support manifest becomes a cache/projection of the agent-owned blob for local-agent sessions (avoid two sources of truth)."
+      ],
+      "acceptance": "Build a multi-window/split layout with distinct ratios on machine X; from Y hit 'Resume all' → the full topology reappears on Y (window count, tab groups, split directions, ratios ±0.01, titles) with every pane attached to its live X session (scrollback replayed, PIDs unchanged on X); dead leaves show exited overlay without breaking the rebuild.",
+      "notes": ""
     }
   ]
 }
