@@ -127,7 +127,7 @@ fn focusTarget(entry: App.IpcTarget) void {
     switch (entry) {
         .window => {},
         .pane => |s| if (s.hwnd) |h| {
-            _ = w32.SetFocus(h);
+            App.deferSetFocus(h); // T48
         },
     }
 }
@@ -673,7 +673,7 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     window.tab_active_surface[tab] = focus;
     window.heroOnTreeChanged(tab);
     window.layoutSplits();
-    if (focus.hwnd) |h| _ = w32.SetFocus(h);
+    if (focus.hwnd) |h| App.deferSetFocus(h); // T48
     window.updateWindowTitle();
 
     return response;

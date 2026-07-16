@@ -478,7 +478,7 @@ fn close(self: *RenameDialog) void {
 
     if (window.hwnd) |owner| _ = w32.SetForegroundWindow(owner);
     if (window.getActiveSurface()) |s| {
-        if (s.hwnd) |h| _ = w32.SetFocus(h);
+        if (s.hwnd) |h| App.deferSetFocus(h); // T48
     }
 
     window.app.core_app.alloc.destroy(self);

@@ -46,6 +46,13 @@ const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 /// WM_APP_UPDATE_AVAILABLE, WM_APP_TRAY.)
 pub const WM_APP_IPC: u32 = w32.WM_APP + 4;
 
+/// Posted (via `deferSetFocus`) to move keyboard focus to a terminal
+/// surface HWND from the top of the message loop instead of synchronously
+/// inside a WndProc. The target is the posted window itself (msg.hwnd); the
+/// run loop performs the real SetFocus and never dispatches this to a
+/// WndProc. See `deferSetFocus` for why (T48 deadlock).
+pub const WM_APP_SETFOCUS: u32 = w32.WM_APP + 5;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
@@ -302,6 +309,24 @@ pub fn init(
     self.startUpdateCheck();
 }
 
+/// Defer a focus change to a terminal surface out of the current WndProc.
+///
+/// Calling `SetFocus` synchronously from inside a WndProc (mouse-button
+/// handlers, WM_SETFOCUS forwarding, focus-after-popup, or performAction)
+/// runs the IME/CTF activation cascade inline; that cascade does a
+/// synchronous SendMessage (WM_IME_SETCONTEXT) which re-enters our
+/// WindowProc, and on that nested, non-pumping stack the GUI thread can
+/// `std.Thread.Condition.wait()` forever — the T48 release deadlock
+/// (docs/design/t48-deadlock-dump-analysis.md). Posting WM_APP_SETFOCUS
+/// makes the run loop perform the SetFocus at the top of the loop, outside
+/// any nested SendMessage/hook/CTF callback, so the cascade runs where the
+/// thread can pump. Use this for terminal-surface targets; plain EDIT
+/// controls and dialog windows don't drive the OpenGL surface's IME/CTF
+/// hook path and keep synchronous focus (immediate typing/Tab routing).
+pub fn deferSetFocus(hwnd: w32.HWND) void {
+    _ = w32.PostMessageW(hwnd, WM_APP_SETFOCUS, 0, 0);
+}
+
 pub fn run(self: *App) !void {
     // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
@@ -326,6 +351,20 @@ pub fn run(self: *App) !void {
         }
         if (result < 0) return error.Win32Error;
         if (self.quit_requested) break;
+
+        // Deferred focus (T48). Perform SetFocus here — at the top of the
+        // message loop, outside any nested SendMessage/hook/CTF callback —
+        // rather than synchronously inside a WndProc. SetFocus runs the
+        // IME/CTF activation cascade inline; from a deep WndProc stack that
+        // cascade re-enters our WindowProc and the GUI thread can then
+        // Condition.wait() forever (the release deadlock, see deferSetFocus
+        // and docs/design/t48-deadlock-dump-analysis.md). We never dispatch
+        // this message; the target is the posted window (msg.hwnd), whose
+        // queued messages the OS drops if it was destroyed meanwhile.
+        if (msg.message == WM_APP_SETFOCUS) {
+            if (msg.hwnd) |h| _ = w32.SetFocus(h);
+            continue;
+        }
 
         // Dispatch a global hotkey to its bound action.
         if (msg.message == w32.WM_HOTKEY) {
@@ -1622,9 +1661,9 @@ pub fn performAction(
                         if (win.findTabIndex(core_surface.rt_surface)) |idx| {
                             if (idx != win.active_tab) win.selectTabIndex(idx);
                         }
-                        // Focus the surface's child HWND.
+                        // Focus the surface's child HWND (deferred — T48).
                         if (core_surface.rt_surface.hwnd) |sh| {
-                            _ = w32.SetFocus(sh);
+                            deferSetFocus(sh);
                         }
                     }
                 },
@@ -2534,7 +2573,7 @@ fn surfaceWndProc(
             // auto-focus the way top-level windows do, so without this
             // an active sibling popup edit (tab rename, search, palette)
             // keeps focus and the click never commits/dismisses it.
-            _ = w32.SetFocus(hwnd);
+            deferSetFocus(hwnd);
             surface.handleMouseButton(.left, .press, lparam);
             return 0;
         },
@@ -2543,7 +2582,7 @@ fn surfaceWndProc(
             return 0;
         },
         w32.WM_RBUTTONDOWN => {
-            _ = w32.SetFocus(hwnd);
+            deferSetFocus(hwnd);
             surface.handleMouseButton(.right, .press, lparam);
             return 0;
         },
@@ -2552,7 +2591,7 @@ fn surfaceWndProc(
             return 0;
         },
         w32.WM_MBUTTONDOWN => {
-            _ = w32.SetFocus(hwnd);
+            deferSetFocus(hwnd);
             surface.handleMouseButton(.middle, .press, lparam);
             return 0;
         },
@@ -2563,7 +2602,7 @@ fn surfaceWndProc(
         w32.WM_XBUTTONDOWN => {
             // X1 = back (button four), X2 = forward (button five). Deliver to
             // the terminal for mouse reporting instead of the shell nav.
-            _ = w32.SetFocus(hwnd);
+            deferSetFocus(hwnd);
             const btn: input.MouseButton =
                 if ((wparam >> 16) & 0xFFFF == w32.XBUTTON2) .five else .four;
             surface.handleMouseButton(btn, .press, lparam);

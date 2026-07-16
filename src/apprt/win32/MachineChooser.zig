@@ -709,7 +709,7 @@ fn close(self: *MachineChooser, refocus_owner: bool) void {
     if (refocus_owner) {
         if (window.hwnd) |owner| _ = w32.SetForegroundWindow(owner);
         if (window.getActiveSurface()) |s| {
-            if (s.hwnd) |h| _ = w32.SetFocus(h);
+            if (s.hwnd) |h| App.deferSetFocus(h); // T48
         }
     }
 

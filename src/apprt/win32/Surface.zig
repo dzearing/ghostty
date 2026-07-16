@@ -1063,9 +1063,9 @@ pub fn setSearchActive(self: *Surface, active: bool, needle: [:0]const u8) void 
         if (self.search_hwnd) |popup| {
             _ = w32.ShowWindow(popup, 0); // SW_HIDE
         }
-        // Return focus to the main window
+        // Return focus to the main window (deferred — T48).
         if (self.hwnd) |hwnd| {
-            _ = w32.SetFocus(hwnd);
+            App.deferSetFocus(hwnd);
         }
     }
 }
@@ -1381,7 +1381,7 @@ pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
             _ = w32.ShowWindow(popup, 0); // SW_HIDE
         }
         if (self.hwnd) |hwnd| {
-            _ = w32.SetFocus(hwnd);
+            App.deferSetFocus(hwnd); // T48
         }
     }
 }

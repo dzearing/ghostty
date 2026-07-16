@@ -341,9 +341,9 @@ fn forceForeground(self: *QuickTerminal) void {
     } else {
         _ = w32.SetForegroundWindow(hwnd);
     }
-    // Focus the terminal surface inside the window.
+    // Focus the terminal surface inside the window (deferred — T48).
     if (self.window.getActiveSurface()) |s| {
-        if (s.hwnd) |sh| _ = w32.SetFocus(sh);
+        if (s.hwnd) |sh| App.deferSetFocus(sh);
     }
 }
 

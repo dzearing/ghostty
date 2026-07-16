@@ -601,7 +601,7 @@ pub fn addTab(self: *Window) !*Surface {
         self.updateWindowTitle();
         // Set keyboard focus to the child surface so it receives input.
         if (!self.is_quick_terminal) {
-            if (surface.hwnd) |h| _ = w32.SetFocus(h);
+            if (surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
         }
     } else {
         self.selectTabIndex(pos);
@@ -724,7 +724,7 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
         self.tab_active_surface[tab] = ns;
         self.heroOnTreeChanged(tab);
         self.layoutSplits();
-        if (ns.hwnd) |h| _ = w32.SetFocus(h);
+        if (ns.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     } else {
         log.debug("closeSplitSurface: no next surface, closing tab", .{});
         self.closeTabByIndex(tab);
@@ -760,7 +760,7 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.active_tab = idx;
     const surface = self.tab_active_surface[idx];
     self.layoutSplits();
-    if (surface.hwnd) |h| _ = w32.SetFocus(h);
+    if (surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     self.updateWindowTitle();
 }
 
@@ -813,7 +813,7 @@ pub fn toggleHeroMode(self: *Window) void {
         self.tab_hero_active[tab] = true;
     }
     self.layoutSplits();
-    if (self.tab_active_surface[tab].hwnd) |h| _ = w32.SetFocus(h);
+    if (self.tab_active_surface[tab].hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
 /// Move the hero selection (clamped), focus it, and re-layout.
@@ -827,7 +827,7 @@ fn heroSelect(self: *Window, index: isize) void {
     const view = self.leafAt(tab, clamped) orelse return;
     self.tab_active_surface[tab] = view;
     self.layoutSplits();
-    if (view.hwnd) |h| _ = w32.SetFocus(h);
+    if (view.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
 /// Clamp/deactivate hero state after the tab's tree changed (split
@@ -1161,7 +1161,7 @@ pub fn newSplitAt(
 
     if (tab == self.active_tab) {
         self.layoutSplits();
-        if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
+        if (new_surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     } else {
         // Surface.init shows its child hwnd; this pane belongs to a
         // background tab, so hide it until its tab is selected.
@@ -1206,7 +1206,7 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     switch (tree.nodes[dest_handle.idx()]) {
         .leaf => |surface| {
             self.tab_active_surface[tab] = surface;
-            if (surface.hwnd) |h| _ = w32.SetFocus(h);
+            if (surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
         },
         .split => {},
     }
@@ -1248,7 +1248,7 @@ pub fn swapSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     old_tree.deinit();
 
     self.layoutSplits();
-    if (active_surface.hwnd) |h| _ = w32.SetFocus(h);
+    if (active_surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
 }
 
 /// Resize the nearest split in the given direction by the given pixel amount.
@@ -2232,7 +2232,7 @@ pub fn finishTabRename(self: *Window) void {
 
     // Return focus to the active surface
     if (self.getActiveSurface()) |s| {
-        if (s.hwnd) |h| _ = w32.SetFocus(h);
+        if (s.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     }
 }
 
@@ -2247,7 +2247,7 @@ pub fn cancelTabRename(self: *Window) void {
             self.rename_font = null;
         }
         if (self.getActiveSurface()) |s| {
-            if (s.hwnd) |h| _ = w32.SetFocus(h);
+            if (s.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
         }
     }
 }
@@ -2553,7 +2553,7 @@ pub fn windowWndProc(
             // Without this, keyboard input stays on the parent and
             // is never delivered to the terminal.
             if (window.getActiveSurface()) |s| {
-                if (s.hwnd) |h| _ = w32.SetFocus(h);
+                if (s.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
             }
             return 0;
         },
