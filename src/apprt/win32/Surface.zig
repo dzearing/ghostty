@@ -2179,9 +2179,15 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
 
     // VK_PACKET is sent by SendInput with KEYEVENTF_UNICODE (used by
     // accessibility tools, on-screen keyboards, and Unicode injection).
-    // The actual character follows as WM_CHAR — don't set the
-    // key_event_produced_text flag so WM_CHAR is allowed through.
-    if (vk == w32.VK_PACKET) return;
+    // The actual character follows as WM_CHAR (App.run exempts VK_PACKET
+    // from its TranslateMessage skip, T64). CLEAR the produced-text flag —
+    // ordinary keys never get their WM_CHAR under the translate skip, so
+    // the flag is still stuck from the last text-producing keydown and
+    // would eat the injected character.
+    if (vk == w32.VK_PACKET) {
+        self.key_event_produced_text = false;
+        return;
+    }
 
     // ctrl+shift+n → "New Remote Window" (the machine chooser). Handled
     // locally (T22c decision 3): there is no core binding action for "new

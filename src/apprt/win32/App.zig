@@ -498,6 +498,16 @@ pub fn run(self: *App) !void {
                 // dead. This does not disturb the ToUnicode dead-key state:
                 // handleKeyEvent never calls ToUnicode for VK_PROCESSKEY.
                 if (msg.wParam == w32.VK_PROCESSKEY) break :blk false;
+
+                // VK_PACKET (SendInput KEYEVENTF_UNICODE: screen readers,
+                // on-screen keyboards, automation) MUST also be translated:
+                // TranslateMessage is the only thing that turns the packet
+                // into the WM_CHAR carrying the injected character —
+                // handleKeyEvent deliberately ignores VK_PACKET (T64).
+                // Safe for the dead-key state: a packet bypasses layout
+                // translation entirely.
+                if (msg.wParam == w32.VK_PACKET) break :blk false;
+
                 const h = msg.hwnd orelse break :blk false;
                 const atom: u16 = @truncate(w32.GetClassLongW(h, w32.GCW_ATOM));
                 break :blk atom != 0 and atom == self.terminal_class_atom;
@@ -2498,12 +2508,19 @@ fn surfaceWndProc(
         },
 
         w32.WM_CHAR => {
-            // In Win32 Input Mode, the Unicode character is already
-            // included in the WM_KEYDOWN event (Uc parameter). WM_CHAR
-            // from TranslateMessage would duplicate it. IME text arrives
-            // via WM_IME_COMPOSITION (handled separately), so suppress
-            // all WM_CHAR in this mode.
-            if (surface.isWin32InputMode()) return 0;
+            // In Win32 Input Mode a WM_CHAR can only be INJECTED text
+            // (T64): the run loop skips TranslateMessage for ordinary
+            // surface keydowns (their Unicode goes in the WM_KEYDOWN's Uc
+            // field instead), IME results are consumed whole in
+            // WM_IME_COMPOSITION (never DefWindowProc'd, so no WM_IME_CHAR
+            // duplicates), which leaves VK_PACKET translation and direct
+            // WM_CHAR posts. Encode the injected character as a synthetic
+            // win32-input sequence instead of dropping it.
+            if (surface.isWin32InputMode()) {
+                log.debug("injected WM_CHAR in win32-input mode uc={x}", .{wparam & 0xFFFF});
+                surface.sendWin32CharEvent(@intCast(wparam & 0xFFFF));
+                return 0;
+            }
 
             // If handleKeyEvent already produced text via ToUnicode for
             // the preceding WM_KEYDOWN, suppress this WM_CHAR to avoid

@@ -82,6 +82,38 @@ public class KbDrv {
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
 
+    static void Uni(char c, bool up) {
+        var i = new INPUT[1];
+        i[0].type = 1;
+        i[0].ki.wVk = 0;
+        i[0].ki.wScan = (ushort)c;
+        i[0].ki.dwFlags = (up ? 2u : 0u) | 4u; // KEYEVENTF_UNICODE -> VK_PACKET
+        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    // T64: type prefixVk via plain VK events (arms the produced-text flag
+    // like real typing does), then the uni string via KEYEVENTF_UNICODE
+    // (VK_PACKET). Returns "SENT" or an ABORT/failure reason.
+    public static string TypeUni(IntPtr top, IntPtr surface, string prefixVk, string uni) {
+        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
+        uint cur = GetCurrentThreadId();
+        SetForegroundWindow(top);
+        Thread.Sleep(150);
+        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
+        try {
+            SetFocus(surface);
+            Thread.Sleep(60);
+            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
+            foreach (char c in prefixVk) {
+                ushort vk = (ushort)char.ToUpperInvariant(c);
+                Key(vk, false); Thread.Sleep(5); Key(vk, true); Thread.Sleep(5);
+            }
+            foreach (char c in uni) { Uni(c, false); Thread.Sleep(5); Uni(c, true); Thread.Sleep(5); }
+            Thread.Sleep(100);
+            return "SENT";
+        } finally { AttachThreadInput(cur, tid, false); }
+    }
+
     // Send mods+vk to the surface. Returns "SENT" or an ABORT/failure reason.
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
@@ -289,6 +321,42 @@ else {
             $clearsAfter = (Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -AllMatches | Measure-Object).Count
             Assert ($clearsAfter -eq $clearsBefore) 'T47 alt screen: clear_screen NOT consumed (fell through)'
         }
+    }
+}
+
+# --- T64: SendInput-unicode (VK_PACKET) text injection ------------------------
+# Screen readers, on-screen keyboards, and automation inject text as
+# KEYEVENTF_UNICODE -> VK_PACKET keydown + WM_CHAR. Both terminal input
+# modes are forced explicitly so the test does not depend on whether
+# ConPTY enabled win32-input mode (9001) on its own.
+
+# T47 left the pane on the alt screen; leave it, then force mode 9001 OFF.
+& $exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?1049l')`"" Enter | Out-Null
+Start-Sleep -Seconds 2
+& $exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?9001l')`"" Enter | Out-Null
+Start-Sleep -Seconds 2
+
+$r = [KbDrv]::TypeUni($top, $surface, 'a', 'uni1ok')
+if ($r -like 'ABORT*') { Write-Host "SKIP T64: $r" }
+else {
+    Start-Sleep -Milliseconds 800
+    $tail = & $exe +read --name=$pane --lines=5 | Out-String
+    # 'a' goes through the plain-VK path (arms the produced-text flag);
+    # the unicode chars must still land right after it.
+    Assert ($tail -match 'auni1ok') 'T64 unicode injection lands in normal mode (after a real VK key)'
+    [KbDrv]::Chord($top, $surface, [uint16[]]@(), 0x1B) | Out-Null  # ESC clears the input line
+    Start-Sleep -Milliseconds 300
+
+    # Force win32-input mode (9001) ON and inject again.
+    & $exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?9001h')`"" Enter | Out-Null
+    Start-Sleep -Seconds 2
+    $r2 = [KbDrv]::TypeUni($top, $surface, 'b', 'uni2ok')
+    if ($r2 -like 'ABORT*') { Write-Host "SKIP T64-9001: $r2" }
+    else {
+        Start-Sleep -Milliseconds 800
+        $tail2 = & $exe +read --name=$pane --lines=5 | Out-String
+        Assert ($tail2 -match 'buni2ok') 'T64 unicode injection lands in win32-input mode (9001)'
+        Assert ((Select-String -Path $errlog -Pattern 'injected WM_CHAR in win32-input mode' -Quiet)) 'T64 injected char routed via win32-input encoding (log oracle)'
     }
 }
 
