@@ -263,8 +263,11 @@ extension AppDelegate {
                 ipcServer.registerRestoredRemoteWindow(name: name, controller: controller)
             }
             for (leaf, pane) in zip(leafInfos, views) {
-                if let name = leaf.ipcName, !name.isEmpty, let surface = pane.surfaceView {
+                guard let name = leaf.ipcName, !name.isEmpty else { continue }
+                if let surface = pane.surfaceView {
                     ipcServer.registerRestoredPane(name: name, controller: controller, surface: surface)
+                } else if pane.viewerView != nil {
+                    ipcServer.registerRestoredViewerPane(name: name, controller: controller, pane: pane)
                 }
             }
         }
@@ -320,6 +323,13 @@ extension AppDelegate {
         app: ghostty_app_t
     ) -> SplitTree<PaneView>.Node {
         SessionLayoutManifest.makeTreeNode(tree) { leaf -> PaneView in
+            // Viewer leaves have no agent session: restore by re-opening the
+            // viewed file/URL. Missing files render an in-page error rather
+            // than failing the tree.
+            if leaf.isViewer {
+                return PaneView(viewer: ViewerView(location: leaf.viewerLocation ?? ""))
+            }
+
             var cfg = Ghostty.SurfaceConfiguration()
             cfg.remoteMachine = connection.machine
             cfg.remoteConnection = connection.handle
@@ -433,9 +443,13 @@ extension AppDelegate {
         let leafInfos = SessionLayoutManifest.leaves(of: tree)
         let views = root.leaves()
         for (leaf, pane) in zip(leafInfos, views) {
-            if let name = leaf.ipcName, !name.isEmpty, let surface = pane.surfaceView {
+            guard let name = leaf.ipcName, !name.isEmpty else { continue }
+            if let surface = pane.surfaceView {
                 ipcServer.registerRestoredPane(
                     name: name, controller: controller, surface: surface)
+            } else if pane.viewerView != nil {
+                ipcServer.registerRestoredViewerPane(
+                    name: name, controller: controller, pane: pane)
             }
         }
 

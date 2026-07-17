@@ -185,7 +185,7 @@
     {
       "id": "T09",
       "title": "Session-persistence manifest round-trip for viewer leaves",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T08"
       ],
@@ -197,7 +197,7 @@
         "E2E: persistence on → window with terminal+viewer split → quit app → relaunch → both back, terminal SAME pid, viewer re-rendered."
       ],
       "acceptance": "E2E passes; a window that is ONLY a viewer also restores; killing the agent does not affect viewer restore. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done, E2E verified across TWO quit/relaunch cycles. Leaf gains kind ('viewer') + viewerLocation + isViewer (optional fields — pre-viewer manifests decode unchanged); syncEntry emits them; hasMissingSessionIDs skips viewers (no 30s capture spin); probeSessions already skips nil-sid leaves; drop policy already safe (nil sid = .unknown, never counts dead — viewer leaves therefore always-restorable); makeSessionLayoutRoot branches isViewer -> PaneView(viewer:) re-opening the location; registerRestoredViewerPane + registeredPaneName(forViewerPane:) keep t09view addressable after restore (verified: +read t09view returns the clean viewer error = name resolved to live pane). Restored window shows target t09 in +list (registerRestoredRemoteWindow now adopts the name as controller.windowName — improves ALL restored windows). NOTE: viewer-ONLY windows never register in the manifest (no agent session -> no remoteConnection hook) — they persist via the AppKit path (T10), by design. Agent-unreachable keeps all entries for next launch (existing policy, viewers included)."
     },
     {
       "id": "T10",

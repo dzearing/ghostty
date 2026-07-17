@@ -1659,6 +1659,9 @@ class IPCServer {
             return
         }
         targetRegistry[name] = .window(WeakRef(controller))
+        // Adopt the name as the controller's display name too so +list shows
+        // the persisted target instead of a fresh "window-N" alias.
+        controller.windowName = name
         Self.logger.info("IPC: re-registered restored remote window target '\(name)'")
     }
 
@@ -1836,6 +1839,29 @@ class IPCServer {
             }
         }
         return nil
+    }
+
+    @MainActor
+    func registeredPaneName(forViewerPane pane: PaneView) -> String? {
+        for (name, entry) in targetRegistry {
+            if case .viewerPane(_, let paneRef) = entry, paneRef.value === pane {
+                return name
+            }
+        }
+        return nil
+    }
+
+    /// Re-register a RESTORED viewer pane under its persisted IPC name.
+    /// Same idempotent semantics as `registerRestoredPane`.
+    @MainActor
+    func registerRestoredViewerPane(name: String, controller: TerminalController, pane: PaneView) {
+        pruneStaleTargets()
+        guard targetRegistry[name] == nil else {
+            Self.logger.info("IPC: restored viewer pane not re-registered — target '\(name)' already in use")
+            return
+        }
+        targetRegistry[name] = .viewerPane(controller: WeakRef(controller), pane: WeakRef(pane))
+        Self.logger.info("IPC: re-registered restored viewer pane target '\(name)'")
     }
 
     private static func randomDarkColor() -> NSColor {

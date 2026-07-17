@@ -45,12 +45,13 @@ final class SessionLayoutManifest {
         case vertical
     }
 
-    /// One terminal pane: what T06 needs to re-attach and re-label it.
+    /// One pane: what T06 needs to re-attach (terminal) or re-open (viewer)
+    /// and re-label it.
     struct Leaf: Codable, Equatable {
         /// The agent session UUID to re-`ATTACH` to. Nil until the termio
         /// thread has opened the session and the capture loop recorded the
         /// id; leaves that never resolve one cannot be re-attached (restore
-        /// shows them exited).
+        /// shows them exited). Always nil for viewer leaves.
         var sessionID: String?
         /// The pane's title at last sync (best-effort; live OSC titles take
         /// over after re-attach).
@@ -58,6 +59,15 @@ final class SessionLayoutManifest {
         /// The IPC target-registry name (`+split --name=...`) so a restored
         /// pane stays addressable by `+send-keys`/`+read`/`+close`.
         var ipcName: String?
+        /// Pane kind: "viewer" for viewer panes; nil/"terminal" for terminal
+        /// panes (nil keeps pre-viewer manifests decoding unchanged).
+        var kind: String?
+        /// The viewed file path or URL (viewer leaves only). Restore re-opens
+        /// this location — viewers have no process, so they are always
+        /// restorable and never counted toward the all-dead drop policy.
+        var viewerLocation: String?
+
+        var isViewer: Bool { kind == "viewer" }
     }
 
     /// A parallel codable of `SplitTree.Node` capturing per-leaf session
@@ -274,6 +284,8 @@ final class SessionLayoutManifest {
         guard let node else { return true }
         switch node {
         case .leaf(let leaf):
+            // Viewer leaves never get a session id; don't poll for one.
+            if leaf.isViewer { return false }
             return leaf.sessionID == nil
         case .split(let split):
             return hasMissingSessionIDs(split.left)
@@ -453,6 +465,14 @@ final class SessionLayoutManifest {
 
         let tree: Node? = controller.surfaceTree.root.map { root in
             Self.encodeNode(root) { pane in
+                if let viewer = pane.viewerView {
+                    return Leaf(
+                        sessionID: nil,
+                        title: pane.title,
+                        ipcName: ipc?.registeredPaneName(forViewerPane: pane),
+                        kind: "viewer",
+                        viewerLocation: viewer.location)
+                }
                 let view = pane.surfaceView
                 return Leaf(
                     // Fall back to the id the surface was CREATED to attach
