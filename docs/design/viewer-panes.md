@@ -174,3 +174,46 @@ Two systems (mutually exclusive per window):
 - Bundle ids stay `com.dzearing.ghoztty.*`.
 - After a build with user-facing change: kill + relaunch the debug app before
   testing (stale-instance trap; check process start time > binary mtime).
+
+## 7. Shipped — E2E results (2026-07-17)
+
+All verified live in the debug app (`zig-out/Ghoztty-Debug.app`) via CLI,
+with screenshots captured during T02–T12:
+
+- **Markdown torture test** (headings, GFM aligned tables, nested + task
+  lists, zig/swift/plain fences with hljs highlighting, nested blockquotes,
+  relative images via the scheme handler, hr, inline styles, typographer):
+  renders GitHub-style in-pane; both palettes verified (dark in-app, light
+  in the Chrome harness — the window appearance is pinned by the user's
+  dark terminal theme, which is the intended semantics).
+- **Website pane**: example.com loads, page title flows into pane title and
+  `+list` ("Example Domain").
+- **Mixed window**: terminal 45% | torture.md | example.com (35% down-split
+  off the viewer). `--percent` honored; splits anchored ON viewer panes work
+  (both viewer→viewer and viewer→terminal); zoom toggle with viewer siblings
+  works; equalize anchors on the first terminal leaf.
+- **Links**: real-click verified — external → default browser (pane
+  untouched), relative `.md` → new viewer split, template/asset loads
+  unaffected.
+- **Live reload**: append → atomic rename (`os.replace`) → append → rewrite
+  all re-rendered within the 100ms debounce; watcher survives inode swaps.
+- **`+list`**: `view: <title> <url> [name: …]` human lines; `--json` leaves
+  carry `"type": "viewer"` + `"url"`; auto-registration works.
+- **Clean errors**: `+read`/`+send-keys`/`+set-state`/`+set-banner` on a
+  viewer → `… is a viewer pane, not a terminal`, exit 1. `+close` silent.
+- **Persistence (manifest)**: terminal+viewer split survived two
+  quit/relaunch cycles — terminal re-ATTACHed (scrollback marker intact),
+  viewer re-opened, ratios + IPC names preserved.
+- **Persistence (AppKit)**: viewer-only windows round-trip through
+  NSSecureCoding (verified with per-app NSQuitAlwaysKeepsWindows=YES since
+  macOS defaults suppress AppKit restore on quit); a file deleted between
+  quit and relaunch restores as the in-page "Cannot read file" card.
+- **File → Open**: `open -a Ghoztty-Debug x.md` opens a viewer window;
+  scripts/dirs keep terminal behavior.
+
+Known v1 gaps (accepted): goto_split keybinds don't originate FROM a
+focused viewer pane (nav INTO viewers works); hero mode skips viewers;
+activity state/banners unsupported on viewers (clean error); web page
+titles don't retitle viewer-only windows (pinned at open); backgrounded
+apps blank their WKWebViews to volatile layers until reactivated (WebKit
+suspension — cosmetic, not a hang).

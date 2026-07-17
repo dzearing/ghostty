@@ -234,7 +234,7 @@
     {
       "id": "T12",
       "title": "Full E2E verification + screenshots + docs",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T09",
         "T10",
@@ -250,7 +250,7 @@
         "Update CLAUDE.md (+new-window/+split --view docs) and the design doc with results."
       ],
       "acceptance": "All scenarios verified with screenshots recorded in the design doc; CLAUDE.md documents --view. Final summary written for the user.",
-      "notes": ""
+      "notes": "2026-07-17: done. Demo window (terminal | torture.md | example.com) with --percent flags; zoom toggled+untoggled with viewer siblings; screenshots captured throughout T02-T12 (scratchpad; representative shots described in design doc §7). CLAUDE.md documents --view on both commands + a Viewer Panes section; design doc gained §7 E2E results + known v1 gaps. All 12 tasks complete."
     }
   ]
 }

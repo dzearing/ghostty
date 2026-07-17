@@ -11,22 +11,24 @@ IPC commands communicate with a running Ghoztty instance over a Unix domain sock
 Create or focus a terminal window. Auto-launches Ghoztty if no instance is running.
 
 ```
-ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> --shell=<path> --title=<title> --split=right|down|left|up --split-command=<cmd> --no-activate -e <args...>
+ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> --view=<path-or-url> --shell=<path> --title=<title> --split=right|down|left|up --split-command=<cmd> --no-activate -e <args...>
 ```
 
 - `--shell`: Shell to use for `--command`/`--split-command`, invoked with `-lic` so profile is loaded. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`.
+- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal. Mutually exclusive with `--command`/`-e`.
 
 ### `ghoztty +split`
 
 Create a split pane in a running window.
 
 ```
-ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --command=<cmd> --shell=<path> --working-directory=<path> -e <args...>
+ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --command=<cmd> --view=<path-or-url> --shell=<path> --working-directory=<path> -e <args...>
 ```
 
 - `--direction`: Split direction. Default: `right`.
 - `--target`: Named window to split in (default: most recently focused).
 - `--name`: Register the new pane with a name for later targeting.
+- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal. Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
 
 ### `ghoztty +close`
 
@@ -188,6 +190,45 @@ ghoztty +close --target=logs
 ghoztty +close --target=term
 ghoztty +close --target=ide
 ```
+
+## Viewer Panes
+
+A pane (or a whole window) can render **content** instead of a terminal: a
+markdown file, a plain text/code file, or a website. Viewers live in the
+normal split tree — they resize, focus, zoom, close, and persist like any
+pane. View-only, no editing.
+
+```bash
+ghoztty +new-window --view=README.md                 # viewer window
+ghoztty +split --target=dev --name=doc --view=docs/design.md
+ghoztty +split --pane=doc --direction=down --view=https://example.com
+ghoztty +close --target=doc
+```
+
+- **Markdown** (`.md`, `.markdown`, `.mdown`, `.mkd`, `.mdwn`): GitHub-style
+  rendering via bundled markdown-it + highlight.js (offline, zero network) —
+  headings, GFM tables, nested/task lists, fenced code with syntax
+  highlighting, blockquotes, images (relative paths resolve against the
+  file's directory), links. Light/dark follows the window appearance.
+- **Text/code files** (anything else): syntax-highlighted by extension.
+- **Websites** (`http://`/`https://`): the pane navigates there directly.
+- **Links** in file viewers: http(s) opens the default browser; a relative
+  `.md` link opens another viewer split; other local files open in their
+  default app.
+- **Live reload**: file viewers watch the file (including atomic saves) and
+  re-render preserving scroll position.
+- Relative `--view` paths resolve against `--working-directory` if given,
+  else the caller's cwd.
+- `+list` marks viewer panes with a `view:` prefix (JSON: `"type": "viewer"`
+  plus `"url"`); they auto-register names like terminal panes.
+- `+read`/`+send-keys`/`+set-state`/`+set-banner` against a viewer fail with
+  `... is a viewer pane, not a terminal` (exit 1). `+close` works normally
+  and never prompts for viewers.
+- Session persistence: viewer panes restore by re-opening their file/URL
+  (terminals in the same window re-attach as usual); a missing file restores
+  as an in-page error card.
+- File → Open (or dragging onto the dock icon, or `open -a Ghoztty file.md`)
+  opens `.md`-family files as a viewer window.
 
 ## Session Persistence
 
