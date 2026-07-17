@@ -92,6 +92,27 @@ final class ViewerView: NSView, Codable, ObservableObject {
         if let chromeMonitor { NSEvent.removeMonitor(chromeMonitor) }
     }
 
+    /// Called when this pane leaves/joins the split tree (close, undo). A
+    /// detached pane must go quiet: pause any media (the closed tree is
+    /// retained by the undo stack, so deinit is NOT prompt) and tear down
+    /// the chrome hosting view, whose rootView strongly references us —
+    /// leaving it mounted is a retain cycle that would keep the web view
+    /// alive (and audible) forever.
+    func setDetached(_ detached: Bool) {
+        if detached {
+            removeEventMonitor()
+            chromeHideTimer?.invalidate()
+            chromeHost?.removeFromSuperview()
+            chromeHost = nil
+            chromeVisible = false
+            if isWebURL {
+                webView.pauseAllMediaPlayback()
+            }
+        } else {
+            installEventMonitor()
+        }
+    }
+
     private static func mode(for location: String) -> Mode {
         if location.hasPrefix("http://") || location.hasPrefix("https://"),
            let url = URL(string: location) {
@@ -165,8 +186,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 let value = webView.canGoForward
                 DispatchQueue.main.async { self?.canGoForward = value }
             }
-            installChromeRevealMonitor()
         }
+
+        installEventMonitor()
     }
 
     // MARK: - Browser chrome (web mode)
@@ -222,15 +244,41 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
-    /// WKWebView swallows normal mouse events and tracking areas over web
-    /// content are unreliable, so chrome reveal uses an app-local event
-    /// monitor: every mouseMoved in our window is checked against the pane's
-    /// top strip.
-    private func installChromeRevealMonitor() {
-        chromeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] event in
-            self?.handleChromeMouseMoved(event)
+    /// WKWebView swallows normal mouse events, tracking areas over web
+    /// content are unreliable, and SwiftUI's focus plumbing can keep first
+    /// responder on the last terminal even after a click lands in web
+    /// content. One app-local event monitor solves both: clicks inside the
+    /// pane claim keyboard focus for the web view, and mouse movement near
+    /// the pane top reveals the chrome bar (web mode).
+    private func installEventMonitor() {
+        guard chromeMonitor == nil else { return }
+        chromeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] event in
+            guard let self else { return event }
+            switch event.type {
+            case .leftMouseDown: self.handleMouseDown(event)
+            case .mouseMoved: if self.isWebURL { self.handleChromeMouseMoved(event) }
+            default: break
+            }
             return event
         }
+    }
+
+    private func removeEventMonitor() {
+        if let chromeMonitor { NSEvent.removeMonitor(chromeMonitor) }
+        chromeMonitor = nil
+    }
+
+    /// A click anywhere in this pane gives the web view keyboard focus so
+    /// pane-level keybinds (Cmd+W, Cmd+D, nav) target THIS pane.
+    private func handleMouseDown(_ event: NSEvent) {
+        guard let window, event.window === window else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else { return }
+        if let responder = window.firstResponder as? NSView,
+           responder === webView || responder.isDescendant(of: self) {
+            return // already ours
+        }
+        window.makeFirstResponder(webView)
     }
 
     private func handleChromeMouseMoved(_ event: NSEvent) {

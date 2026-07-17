@@ -1100,15 +1100,15 @@ class BaseTerminalController: NSWindowController,
 
     /// Find the next surface to focus when a node is being closed.
     /// Goes to previous split unless we're the leftmost leaf, then goes to next.
-    private func findNextFocusTargetAfterClosing(node: SplitTree<PaneView>.Node) -> Ghostty.SurfaceView? {
+    private func findNextFocusTargetAfterClosing(node: SplitTree<PaneView>.Node) -> PaneView? {
         guard let root = surfaceTree.root else { return nil }
 
-        // If we're the leftmost, then we move to the next surface after closing.
+        // If we're the leftmost, then we move to the next pane after closing.
         // Otherwise, we move to the previous.
         if root.leftmostLeaf() == node.leftmostLeaf() {
-            return surfaceTree.focusTarget(for: .next, from: node)?.surfaceView
+            return surfaceTree.focusTarget(for: .next, from: node)
         } else {
-            return surfaceTree.focusTarget(for: .previous, from: node)?.surfaceView
+            return surfaceTree.focusTarget(for: .previous, from: node)
         }
     }
 
@@ -1118,21 +1118,26 @@ class BaseTerminalController: NSWindowController,
     ///
     /// This does no confirmation and assumes confirmation is already done.
     private func removeSurfaceNode(_ node: SplitTree<PaneView>.Node) {
-        // Move focus if the closed surface was focused and we have a next target
-        let nextFocus: Ghostty.SurfaceView? = if node.contains(
-            where: { $0.surfaceView === focusedSurface }
-        ) {
-            findNextFocusTargetAfterClosing(node: node)
-        } else {
-            nil
-        }
+        // Move focus if the closed node held focus (a focused terminal OR a
+        // focused viewer pane) and we have a next target. The target may be
+        // a viewer pane, which replaceSurfaceTree's surface-based focus move
+        // can't express — hand it focus explicitly afterwards.
+        let closedHadFocus = node.contains(where: { $0.surfaceView === focusedSurface })
+            || focusedViewerPane.map { pane in node.contains(where: { $0 === pane }) } ?? false
+        let nextFocus: PaneView? = closedHadFocus
+            ? findNextFocusTargetAfterClosing(node: node)
+            : nil
 
         replaceSurfaceTree(
             surfaceTree.removing(node),
-            moveFocusTo: nextFocus,
+            moveFocusTo: nextFocus?.surfaceView,
             moveFocusFrom: focusedSurface,
             undoAction: "Close Terminal"
         )
+
+        if let nextFocus, nextFocus.surfaceView == nil {
+            DispatchQueue.main.async { Ghostty.moveFocus(to: nextFocus) }
+        }
     }
 
     func replaceSurfaceTree(
@@ -1502,7 +1507,7 @@ class BaseTerminalController: NSWindowController,
         // keep track of our old one so undo sends focus back to the right place.
         let oldFocusedSurface = focusedSurface
         if focusedSurface == target {
-            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)
+            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)?.surfaceView
         }
 
         // Remove the surface from our tree

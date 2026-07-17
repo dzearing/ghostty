@@ -120,10 +120,12 @@ final class PaneView: NSView, Codable, Identifiable, ObservableObject {
     }
 
     /// Forward the session close-on-free intent to terminal content
-    /// (session persistence: close kills the agent session). No-op for
-    /// viewers — they have no session.
+    /// (session persistence: close kills the agent session). Viewer content
+    /// uses it as its detach signal: going quiet (pause media, tear down
+    /// chrome) when leaving the tree, reviving on undo re-adoption.
     func setSessionCloseIntent(_ intent: Bool) {
         surfaceView?.setSessionCloseIntent(intent)
+        viewerView?.setDetached(intent)
     }
 
     // MARK: - Codable
