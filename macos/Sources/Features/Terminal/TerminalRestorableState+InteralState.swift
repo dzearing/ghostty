@@ -16,18 +16,24 @@ extension TerminalRestorableState {
         let tabColor: TerminalTabColor?
         let titleOverride: String?
 
+        // Window-level title override (pins the titlebar over any tab/pane
+        // title). Optional so version-7 archives decode fine (missing ⇒ nil).
+        let windowTitleOverride: String?
+
         init(
             focusedSurface: String?,
             surfaceTree: SplitTree<ViewType>,
             effectiveFullscreenMode: FullscreenMode?,
             tabColor: TerminalTabColor?,
             titleOverride: String?,
+            windowTitleOverride: String? = nil,
         ) {
             self.focusedSurface = focusedSurface
             self.surfaceTree = surfaceTree
             self.effectiveFullscreenMode = effectiveFullscreenMode
             self.tabColor = tabColor
             self.titleOverride = titleOverride
+            self.windowTitleOverride = windowTitleOverride
         }
     }
 }
@@ -40,6 +46,7 @@ extension TerminalRestorableState.InternalState where ViewType == Ghostty.Surfac
             effectiveFullscreenMode: controller.fullscreenStyle?.fullscreenMode,
             tabColor: (controller.window as? TerminalWindow)?.tabColor,
             titleOverride: controller.titleOverride,
+            windowTitleOverride: controller.windowTitleOverride,
         )
     }
 }

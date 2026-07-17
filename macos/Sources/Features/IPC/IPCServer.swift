@@ -431,7 +431,9 @@ class IPCServer {
             let controller = TerminalController.newWindow(ghostty, withBaseConfig: config, activate: !parsed.noActivate)
 
             if let title = parsed.title {
-                controller.titleOverride = title
+                // A CLI-set title is a WINDOW title: it pins the titlebar
+                // and survives pane focus/title changes.
+                controller.setWindowTitle(title)
             }
 
             // Apply color scheme after the surface has initialized
@@ -785,7 +787,9 @@ class IPCServer {
         }
 
         DispatchQueue.main.async {
-            controller.titleOverride = newTitle
+            // A CLI rename is a WINDOW title: it pins the titlebar and
+            // survives pane focus/title changes.
+            controller.setWindowTitle(newTitle)
         }
 
         Self.logger.info("IPC: renamed display title for '\(target)' to '\(newTitle)'")

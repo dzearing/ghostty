@@ -255,6 +255,23 @@ struct SessionLayoutManifestTests {
         #expect(SessionLayoutManifest(fileURL: url).allEntries().first?.titleOverride == nil)
     }
 
+    @Test func updateWindowTitleOverrideRoundTripsAndClears() {
+        let url = tempFileURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        let store = SessionLayoutManifest(fileURL: url)
+        let id = store.register()
+        store.updateWindowTitleOverride(id, title: "pinned")
+        #expect(SessionLayoutManifest(fileURL: url).allEntries().first?.windowTitleOverride == "pinned")
+        // Independent of the tab-level titleOverride.
+        #expect(SessionLayoutManifest(fileURL: url).allEntries().first?.titleOverride == nil)
+        store.updateWindowTitleOverride(id, title: nil)
+        #expect(SessionLayoutManifest(fileURL: url).allEntries().first?.windowTitleOverride == nil)
+        // Unknown ids are a no-op.
+        store.updateWindowTitleOverride(UUID(), title: "nope")
+        #expect(SessionLayoutManifest(fileURL: url).allEntries().first?.windowTitleOverride == nil)
+    }
+
     @Test func removeDeletesEntryAndEmptyManifestDeletesFile() {
         let url = tempFileURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

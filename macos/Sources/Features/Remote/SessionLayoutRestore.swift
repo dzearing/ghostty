@@ -263,6 +263,13 @@ extension AppDelegate {
             controller.titleOverride = title
         }
 
+        // The user-set WINDOW-level title (pins the titlebar over any
+        // tab/pane title). Per-controller storage, so restore order within
+        // a tab group doesn't matter — the group scan finds the holder.
+        if let title = entry.windowTitleOverride, !title.isEmpty {
+            controller.windowTitleOverride = title
+        }
+
         // Put restored windows/panes back in the IPC target registry under
         // their persisted names (existing live registrations win — same
         // idempotent semantics as the CLI). Only for a LOCAL resume/restore: a

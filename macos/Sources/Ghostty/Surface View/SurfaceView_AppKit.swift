@@ -589,7 +589,7 @@ extension Ghostty {
         func promptTitle() {
             // Create an alert dialog
             let alert = NSAlert()
-            alert.messageText = "Change Terminal Title"
+            alert.messageText = "Change Pane Title"
             alert.informativeText = "Leave blank to restore the default."
             alert.alertStyle = .informational
 
@@ -1678,7 +1678,7 @@ extension Ghostty {
             menu.addItem(.separator())
             item = menu.addItem(withTitle: "Change Tab Title...", action: #selector(BaseTerminalController.changeTabTitle(_:)), keyEquivalent: "")
             item.setImageIfDesired(systemSymbolName: "pencil.line")
-            item = menu.addItem(withTitle: "Change Terminal Title...", action: #selector(changeTitle(_:)), keyEquivalent: "")
+            item = menu.addItem(withTitle: "Change Pane Title...", action: #selector(changeTitle(_:)), keyEquivalent: "")
 
             return menu
         }
