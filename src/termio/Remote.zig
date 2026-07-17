@@ -167,6 +167,14 @@ live_session_id_len: std.atomic.Value(usize) = .init(0),
 child_pid: std.atomic.Value(i64) = .init(0),
 tty_name_ptr: std.atomic.Value(?[*:0]const u8) = .init(null),
 
+/// The LIVE foreground pid pushed by the agent (`META{foreground_pid}`, wp3):
+/// the agent samples `tcgetpgrp` on its pty every second and pushes changes;
+/// the control reader signals the pane's ring and the IO thread copies the
+/// value here (see `drainRing`) for lock-free GUI reads. 0 = never reported
+/// (older agent / Windows ConPTY) — `getProcessInfo` then falls back to
+/// `child_pid`, which is also the correct answer for a fresh shell.
+fg_pid: std.atomic.Value(i64) = .init(0),
+
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
 /// machinery here (that all lives on the agent side), but the connection handle
@@ -435,6 +443,10 @@ pub fn threadEnter(
                 cols,
                 px_w,
                 px_h,
+                // Respawn fidelity (wp3): the agent's on-disk record has no
+                // env/TERM/argv, so send our live copies — the respawned shell
+                // keeps GHOZTTY_PANE_ID & co. and its shell integration.
+                .{ .env = self.env, .term = self.term, .argv = self.argv },
                 &self.canceller,
             ) catch |err| {
                 log.warn("relaunch of dead session failed err={}", .{err});
@@ -741,7 +753,16 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
     const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
 
-    const res = rd.conn.sendRelaunchOnPane(rd.pane, rows, cols, px_w, px_h, &self.canceller) catch |err| {
+    const res = rd.conn.sendRelaunchOnPane(
+        rd.pane,
+        rows,
+        cols,
+        px_w,
+        px_h,
+        // Respawn fidelity (wp3): same live env/TERM/argv as the auto path.
+        .{ .env = self.env, .term = self.term, .argv = self.argv },
+        &self.canceller,
+    ) catch |err| {
         log.warn("awaited relaunch failed err={}", .{err});
         const note = "\r\n\x1b[2m--- relaunch failed ---\x1b[0m\r\n";
         @call(.always_inline, termio.Termio.processOutput, .{ rd.io, note });
@@ -795,10 +816,14 @@ pub fn getProcessInfo(self: *Remote, comptime info: ProcessInfo) ?ProcessInfo.Ty
     // handles the null. Callable from any thread (the GUI reads it for the IPC
     // `+list` pid/tty fields).
     return switch (info) {
-        // First increment: the agent-reported CHILD pid stands in for the
-        // foreground pid (an exec pane answers `tcgetpgrp`; live foreground
-        // tracking agent-side is a later increment).
+        // Prefer the LIVE foreground pid the agent samples via `tcgetpgrp`
+        // (pushed as `META{foreground_pid}` on change — full Exec parity);
+        // fall back to the child pid when the agent has not reported one
+        // (older agent, Windows ConPTY, or a fresh shell where they are the
+        // same process anyway).
         .foreground_pid => pid: {
+            const fg = self.fg_pid.load(.acquire);
+            if (fg > 0) break :pid @intCast(fg);
             const pid = self.child_pid.load(.acquire);
             if (pid <= 0) break :pid null;
             break :pid @intCast(pid);
@@ -818,6 +843,12 @@ pub fn getProcessInfo(self: *Remote, comptime info: ProcessInfo) ?ProcessInfo.Ty
 /// `+list --tty` lookups — see `Config.local`).
 fn publishProcessInfo(self: *Remote, pane: *const connection.Pane) void {
     if (pane.pid > 0) self.child_pid.store(pane.pid, .release);
+
+    // A (re)published pane means a fresh child or a fresh viewer binding: any
+    // previously-cached live foreground pid is stale (the agent re-pushes the
+    // current one within a tick of the rebind — `bindLocked` resets its sampler
+    // baseline). Until then the child pid above is the correct fallback.
+    self.fg_pid.store(0, .release);
 
     if (!self.local) return;
     const tty = pane.tty orelse return;
@@ -911,6 +942,13 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
     // re-arms and may wake again. This reuses `Surface.childExited`'s existing
     // close / `wait-after-command` logic, so a remote shell `exit` closes the
     // pane just like a local one — no special remote close path.
+    // Republish the agent's live foreground pid (wp3): the control reader
+    // signaled it on the ring (`signalForegroundPid`, which also woke us);
+    // copy it onto the STABLE Remote backend so GUI-thread `getProcessInfo`
+    // reads never touch the pane/ring (which die at threadExit).
+    const fg = ch.foregroundPid();
+    if (fg > 0) rd.io.backend.remote.fg_pid.store(fg, .release);
+
     if (!rd.exited and ch.isExited()) {
         rd.exited = true;
         // Coerce the agent's i64 exit code to the surface message's u32. A negative

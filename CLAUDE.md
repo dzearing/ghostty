@@ -178,6 +178,25 @@ default shell too (their cwd inherits from the parent pane).
 - `+split --name=<name>` registers a **pane**
 - `+split --target`, `+close --target`, and `+send-keys --target` reference either kind
 
+### Pane identity
+
+Every pane has a **stable, ghoztty-owned pane id** (a UUID):
+
+- Exported to the pane's processes as `$GHOZTTY_PANE_ID` (baked at spawn).
+- Shown as the leaf `id` in `+list --json`.
+- Accepted directly by every `--target`/`--name` (case-insensitive), with no
+  prior registration or `+list` needed: `ghoztty +set-banner
+  --target=$GHOZTTY_PANE_ID …` works from inside any local pane.
+- Stable for the pane's whole life: persisted in the session-layout manifest and
+  restored on app relaunch (session-persistence panes keep the same id AND the
+  same baked env), preserved across remote reconnect swaps, and re-applied to
+  the respawned shell when the agent relaunches a session after its own restart
+  (the RELAUNCH carries the pane's env/TERM/argv).
+
+Prefer the pane id over pid/tty matching for self-identification: pids and ttys
+belong to the machine the process runs on and are meaningless for remote panes.
+(`+list --tty=<tty>` still works for local panes as a fallback.)
+
 ### Example: three-pane layout
 
 ```bash

@@ -337,7 +337,13 @@ extension AppDelegate {
             cfg.remoteConnection = connection.handle
             cfg.connectionKeepAlive = connection
             cfg.remoteSessionId = leaf.sessionID
-            let view = Ghostty.SurfaceView(app, baseConfig: cfg)
+            // Recreate the pane under its PERSISTED surface uuid (wp3 pane
+            // identity) so `+list` ids and the shell's baked GHOZTTY_PANE_ID
+            // stay valid across the relaunch. Nil (older manifest) mints fresh.
+            let view = Ghostty.SurfaceView(
+                app,
+                baseConfig: cfg,
+                uuid: leaf.surfaceID.flatMap { UUID(uuidString: $0) })
             // Seed the last-synced pane title; live OSC titles (if the
             // session emits them) take over after re-attach.
             if let title = leaf.title, !title.isEmpty { view.setTitle(title) }

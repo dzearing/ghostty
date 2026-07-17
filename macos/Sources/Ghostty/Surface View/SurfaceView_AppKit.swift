@@ -369,7 +369,17 @@ extension Ghostty {
             ) { [weak self] event in self?.localEventHandler(event) }
 
             // Setup our surface. This will also initialize all the terminal IO.
-            let surface_cfg = baseConfig ?? SurfaceConfiguration()
+            var surface_cfg = baseConfig ?? SurfaceConfiguration()
+            // Stable pane identity (wp3): bake this surface's UUID into the
+            // pane's environment as GHOZTTY_PANE_ID so any process inside the
+            // pane can address its own pane reliably (`+send-keys/+set-banner
+            // --target=$GHOZTTY_PANE_ID`) without pid/tty matching — pids/ttys
+            // are per-machine and break for remote panes. Every creation path
+            // funnels through this init, and the restore paths pass the
+            // PERSISTED uuid back in (session-layout manifest / window state /
+            // reconnect swap), so the baked value never goes stale: the same
+            // id fronts the pane for its whole life, across app relaunches.
+            surface_cfg.environmentVariables["GHOZTTY_PANE_ID"] = self.id.uuidString
             self.expectedRemoteSessionID = surface_cfg.remoteSessionId
             self.backgroundTint = surface_cfg.backgroundTint
             self.backgroundTintNSColor = surface_cfg.backgroundTintNSColor

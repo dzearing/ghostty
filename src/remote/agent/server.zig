@@ -513,6 +513,15 @@ pub const Server = struct {
         }) catch {};
     }
 
+    /// Push the session's changed foreground pid as `META{foreground_pid}` on
+    /// its channel (wp3 live-fg sampling; see `SessionStore.sampleForegroundPids`).
+    fn bridgeFgPid(ctx: *anyopaque, channel: u128, fg_pid: i64) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.sendJson(.meta, channel, protocol.Meta{
+            .foreground_pid = fg_pid,
+        }) catch {};
+    }
+
     /// Test/back-compat shim: deliver child output through the store (which bridges
     /// to this Server if bound). Real production output arrives via the store sink
     /// installed on the pty child; tests still call `server.onChildOutput(...)`.
@@ -766,6 +775,11 @@ pub const Server = struct {
         s.bridge_ctx = self;
         s.bridge_data = bridgeData;
         s.bridge_exit = bridgeExit;
+        s.bridge_fgpid = bridgeFgPid;
+        // Reset the sampler baseline so a freshly-(re)bound viewer receives the
+        // CURRENT foreground pid on the next tick even if it hasn't changed —
+        // the previous viewer's pushes died with its connection (wp3).
+        s.fg_pid = 0;
         s.bound = true;
         s.streaming = true;
         // Track the channel once (avoid dupes across re-attach within one conn).
@@ -1193,15 +1207,26 @@ pub const Server = struct {
 
         // Phase 2: spawn the child OUTSIDE the lock. Synthesize an OPEN from the
         // recorded metadata (the recorded argv is treated as the command to run;
-        // null → a plain login shell, the agent resolves its own default $SHELL).
+        // null → a plain login shell, the agent resolves its own default $SHELL)
+        // PLUS the respawn-fidelity fields the viewer sent on the RELAUNCH (wp3):
+        // env (GHOZTTY_PANE_ID & co.), TERM, and an explicit shell-integration
+        // argv rewrite. When the viewer supplies argv (a plain interactive shell
+        // with an argv-rewrite) it IS the full invocation, so the recorded
+        // command label must not also run (same exclusivity as an original
+        // OPEN). Older clients send none of these — recorded metadata alone,
+        // the pre-wp3 behavior. `req`'s borrowed slices outlive the synchronous
+        // spawn (parsed is freed at function exit).
         const open: protocol.Open = .{
-            .command = argv_copy,
+            .command = if (req.argv != null) null else argv_copy,
             .cwd = cwd_copy,
             .rows = req.rows,
             .cols = req.cols,
             .px_w = req.px_w,
             .px_h = req.px_h,
             .pinned = pinned,
+            .env = req.env,
+            .term = req.term orelse "xterm-ghostty",
+            .argv = req.argv,
         };
         const spawned = self.spawner.spawn(open) catch {
             // Spawn failed — the session stays a relaunchable tombstone; report
@@ -1661,6 +1686,9 @@ const FakeChild = struct {
     /// When set, `queryCwd` returns a copy of this (models the OS cwd read). When
     /// null the vtable's `queryCwd` is still wired but returns null (query failed).
     fake_cwd: ?[]const u8 = null,
+    /// When nonzero, `queryForegroundPid` reports this (models `tcgetpgrp` on the
+    /// pty master, wp3). Zero → null (Windows / query failed / no fg tracking).
+    fake_fg_pid: i64 = 0,
     /// Optional write gate (wedge test): when both are set, `write` signals
     /// `gate_entered` and then BLOCKS on `gate_release` before sinking the bytes —
     /// modeling a stalled ConPTY input pipe whose `WriteFile` never returns. Lets a
@@ -1681,11 +1709,19 @@ const FakeChild = struct {
         .tryWait = tw,
         .terminate = tm,
         .queryCwd = qcwd,
+        .queryForegroundPid = qfg,
     };
     fn qcwd(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
         const c = self.fake_cwd orelse return null;
         return alloc.dupe(u8, c) catch null;
+    }
+    fn qfg(ctx: *anyopaque) ?i64 {
+        const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.fake_fg_pid == 0) return null;
+        return self.fake_fg_pid;
     }
     fn wr(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
@@ -1741,12 +1777,42 @@ const FakeSpawner = struct {
     /// pty-slave path. Null models a Windows/no-tty spawn.
     tty: ?[]const u8 = null,
 
+    /// Captured from the LAST spawn's OPEN (owned fixed-buffer copies — the
+    /// OPEN's memory is freed when the handler returns), so relaunch-fidelity
+    /// tests (wp3) can assert the viewer-sent env/TERM reached the respawn.
+    last_env_count: usize = 0,
+    last_env_key_buf: [64]u8 = undefined,
+    last_env_key_len: usize = 0,
+    last_env_val_buf: [64]u8 = undefined,
+    last_env_val_len: usize = 0,
+    last_term_buf: [32]u8 = undefined,
+    last_term_len: usize = 0,
+
+    fn lastEnvKey(self: *const FakeSpawner) []const u8 {
+        return self.last_env_key_buf[0..self.last_env_key_len];
+    }
+    fn lastEnvValue(self: *const FakeSpawner) []const u8 {
+        return self.last_env_val_buf[0..self.last_env_val_len];
+    }
+    fn lastTerm(self: *const FakeSpawner) []const u8 {
+        return self.last_term_buf[0..self.last_term_len];
+    }
+
     fn spawner(self: *FakeSpawner) Spawner {
         return .{ .ctx = self, .spawnFn = spawn, .spawnDetachedFn = spawnDetached };
     }
-    fn spawn(ctx: *anyopaque, _: protocol.Open) anyerror!Spawner.Result {
+    fn spawn(ctx: *anyopaque, open: protocol.Open) anyerror!Spawner.Result {
         const self: *FakeSpawner = @ptrCast(@alignCast(ctx));
         if (self.next >= self.children.len) return error.NoMoreChildren;
+        self.last_env_count = open.env.len;
+        if (open.env.len > 0) {
+            self.last_env_key_len = @min(open.env[0].key.len, self.last_env_key_buf.len);
+            @memcpy(self.last_env_key_buf[0..self.last_env_key_len], open.env[0].key[0..self.last_env_key_len]);
+            self.last_env_val_len = @min(open.env[0].value.len, self.last_env_val_buf.len);
+            @memcpy(self.last_env_val_buf[0..self.last_env_val_len], open.env[0].value[0..self.last_env_val_len]);
+        }
+        self.last_term_len = @min(open.term.len, self.last_term_buf.len);
+        @memcpy(self.last_term_buf[0..self.last_term_len], open.term[0..self.last_term_len]);
         const fc = self.children[self.next];
         self.next += 1;
         return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)), .tty = self.tty };
@@ -2505,6 +2571,51 @@ test "OPEN/ATTACH carry the child's pid+tty (wp3 getProcessInfo metadata)" {
     try testing.expectEqualStrings("/dev/ttys014", ap.value.tty.?);
 }
 
+test "foreground-pid sampling pushes META on change only (wp3)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(43);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // The shell puts a program in the foreground → next tick pushes META.
+    fc.mutex.lock();
+    fc.fake_fg_pid = 4321;
+    fc.mutex.unlock();
+    h.server.store.sampleForegroundPids();
+
+    // Unchanged fg on later ticks must NOT re-push; then a change pushes again.
+    h.server.store.sampleForegroundPids();
+    fc.mutex.lock();
+    fc.fake_fg_pid = 4322;
+    fc.mutex.unlock();
+    h.server.store.sampleForegroundPids();
+
+    // Exactly two METAs arrive, in order (a spurious duplicate would make the
+    // second read observe 4321 again — `waitControl` skips nothing here since
+    // no other control frames are in flight).
+    const m1 = try h.client.waitControl(.meta);
+    try testing.expectEqual(o.channel, m1.channel);
+    var p1 = try protocol.parseJson(protocol.Meta, alloc, m1.payload);
+    defer p1.deinit();
+    try testing.expectEqual(@as(i64, 4321), p1.value.foreground_pid.?);
+
+    const m2 = try h.client.waitControl(.meta);
+    var p2 = try protocol.parseJson(protocol.Meta, alloc, m2.payload);
+    defer p2.deinit();
+    try testing.expectEqual(@as(i64, 4322), p2.value.foreground_pid.?);
+}
+
 test "OPEN with a tty-less spawner elides tty (Windows / older-agent shape)" {
     const alloc = testing.allocator;
     var clock: TestClock = .{};
@@ -2690,10 +2801,18 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     const channel = af.channel; // the session's data channel
 
     // RELAUNCH → the agent spawns the child, revives the session, and replies ok.
+    // The viewer sends its live env/TERM (respawn fidelity, wp3): the agent must
+    // apply them to the synthesized OPEN so the respawned shell keeps its
+    // GHOZTTY_PANE_ID & co. and TERM.
+    const relaunch_env = [_]protocol.Open.EnvPair{
+        .{ .key = "GHOZTTY_PANE_ID", .value = "0BAD-CAFE" },
+    };
     try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
         .session_id = rec_id,
         .rows = 40,
         .cols = 120,
+        .env = &relaunch_env,
+        .term = "xterm-256color",
     });
     const rf = try h.client.waitControl(.relaunched);
     try testing.expectEqual(channel, rf.channel);
@@ -2703,6 +2822,11 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     try testing.expect(rp.value.pid != 0);
     // The fresh spawn's tty rides RELAUNCHED (wp3).
     try testing.expectEqualStrings("/dev/ttys099", rp.value.tty.?);
+    // The respawn's OPEN carried the viewer-sent env + TERM (wp3 fidelity).
+    try testing.expectEqual(@as(usize, 1), sp.last_env_count);
+    try testing.expectEqualStrings("GHOZTTY_PANE_ID", sp.lastEnvKey());
+    try testing.expectEqualStrings("0BAD-CAFE", sp.lastEnvValue());
+    try testing.expectEqualStrings("xterm-256color", sp.lastTerm());
 
     // The session is now alive + not relaunchable, and streams fresh output.
     h.server.store.mutex.lock();

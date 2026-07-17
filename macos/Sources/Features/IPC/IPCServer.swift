@@ -370,7 +370,7 @@ class IPCServer {
         // Idempotent: if target exists and window is alive, focus it
         if let target = parsed.target {
             pruneStaleTargets()
-            if let entry = targetRegistry[target], let controller = entry.controller {
+            if let entry = resolveTarget(target), let controller = entry.controller {
                 if !parsed.noActivate {
                     DispatchQueue.main.async {
                         controller.window?.makeKeyAndOrderFront(nil)
@@ -531,7 +531,7 @@ class IPCServer {
         // Idempotent: if --name exists and pane is alive, focus it
         if let name = parsed.name {
             pruneStaleTargets()
-            if let entry = targetRegistry[name], let surface = entry.surfaceView {
+            if let entry = resolveTarget(name), let surface = entry.surfaceView {
                 DispatchQueue.main.async {
                     if let controller = entry.controller {
                         controller.focusSurface(surface)
@@ -591,7 +591,7 @@ class IPCServer {
         // Resolve --pane targeting: find the named pane's surface and controller
         if let paneName = parsed.pane {
             pruneStaleTargets()
-            guard let entry = targetRegistry[paneName] else {
+            guard let entry = resolveTarget(paneName) else {
                 return IPCResponse(success: false, error: "pane '\(paneName)' not found")
             }
             guard let surface = entry.surfaceView, let controller = entry.controller else {
@@ -659,7 +659,7 @@ class IPCServer {
             let controller: TerminalController?
             if let target = parsed.target {
                 self?.pruneStaleTargets()
-                controller = self?.targetRegistry[target]?.controller
+                controller = self?.resolveTarget(target)?.controller
                 if controller == nil {
                     Self.logger.warning("IPC: target '\(target)' not found")
                 }
@@ -738,7 +738,7 @@ class IPCServer {
 
         pruneStaleTargets()
 
-        guard let entry = targetRegistry[target] else {
+        guard let entry = resolveTarget(target) else {
             // Idempotent: already gone
             return .ok
         }
@@ -776,7 +776,7 @@ class IPCServer {
 
         pruneStaleTargets()
 
-        guard let entry = targetRegistry[target] else {
+        guard let entry = resolveTarget(target) else {
             return IPCResponse(success: false, error: "target '\(target)' not found in registry")
         }
 
@@ -823,7 +823,7 @@ class IPCServer {
 
         pruneStaleTargets()
 
-        guard let entry = targetRegistry[target] else {
+        guard let entry = resolveTarget(target) else {
             return IPCResponse(success: false, error: "target '\(target)' not found in registry")
         }
 
@@ -883,7 +883,7 @@ class IPCServer {
 
         pruneStaleTargets()
 
-        guard let entry = targetRegistry[target] else {
+        guard let entry = resolveTarget(target) else {
             return IPCResponse(success: false, error: "target '\(target)' not found in registry")
         }
 
@@ -1069,7 +1069,7 @@ class IPCServer {
 
         pruneStaleTargets()
 
-        guard let entry = targetRegistry[name] else {
+        guard let entry = resolveTarget(name) else {
             return IPCResponse(success: false, error: "pane '\(name)' not found in registry")
         }
 
@@ -1147,7 +1147,7 @@ class IPCServer {
 
         pruneStaleTargets()
 
-        guard let entry = targetRegistry[target] else {
+        guard let entry = resolveTarget(target) else {
             return IPCResponse(success: false, error: "target '\(target)' not found")
         }
 
@@ -1244,7 +1244,7 @@ class IPCServer {
                 // Resolve target controller
                 let controller: TerminalController?
                 if let target = parsed.target {
-                    controller = self.targetRegistry[target]?.controller
+                    controller = self.resolveTarget(target)?.controller
                     if controller == nil {
                         result = IPCResponse(success: false, error: "target window '\(target)' not found")
                         return
@@ -1262,7 +1262,7 @@ class IPCServer {
                 // Resolve all pane names to surfaces in this controller's tree
                 var surfacesByName: [String: Ghostty.SurfaceView] = [:]
                 for name in layoutPaneNames {
-                    guard let entry = self.targetRegistry[name] else {
+                    guard let entry = self.resolveTarget(name) else {
                         result = IPCResponse(success: false, error: "pane '\(name)' not found in registry")
                         return
                     }
@@ -1577,6 +1577,43 @@ class IPCServer {
 
     private func pruneStaleTargets() {
         targetRegistry = targetRegistry.filter { $0.value.isAlive }
+    }
+
+    /// Resolve a `--target`/`--name` argument: the name registry first, then —
+    /// when the string parses as a UUID — a scan of every live pane for a
+    /// matching STABLE surface uuid (wp3 pane identity: the `+list` leaf `id`
+    /// and the pane's own `$GHOZTTY_PANE_ID`). UUID parsing normalizes case, so
+    /// the env value matches regardless of casing. A uuid hit is registered on
+    /// the way out so later lookups are O(1). This makes the pane id targetable
+    /// even before any `+list` auto-registration has run, and independent of
+    /// (renameable) registry names.
+    ///
+    /// Callable from the IPC queue OR the main thread (handlers are split
+    /// across both): the window scan touches AppKit state, so it hops to main
+    /// synchronously when needed — the same bounded main-thread round-trip
+    /// `handleList` already performs per request.
+    private func resolveTarget(_ target: String) -> TargetEntry? {
+        if let entry = targetRegistry[target], entry.isAlive { return entry }
+        guard let uuid = UUID(uuidString: target) else { return nil }
+        let scan = { () -> TargetEntry? in
+            MainActor.assumeIsolated {
+                for scriptWindow in NSApp.scriptWindows {
+                    for tab in scriptWindow.tabs {
+                        guard let controller = tab.parentController as? TerminalController else { continue }
+                        for view in controller.surfaceTree.root?.leaves() ?? [] where view.id == uuid {
+                            let entry = TargetEntry.pane(
+                                controller: WeakRef(controller),
+                                surface: WeakRef(view))
+                            self.targetRegistry[view.id.uuidString] = entry
+                            return entry
+                        }
+                    }
+                }
+                return nil
+            }
+        }
+        if Thread.isMainThread { return scan() }
+        return DispatchQueue.main.sync(execute: scan)
     }
 
     private func windowName(for controller: TerminalController) -> String? {

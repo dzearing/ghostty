@@ -2613,12 +2613,17 @@ class BaseTerminalController: NSWindowController,
         cfg.remoteSessionId = sessionID
         cfg.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
 
+        // Preserve the replaced pane's STABLE surface uuid (wp3 pane identity):
+        // the swap is the same logical pane on a fresh transport, so the
+        // `+list` id and the shell's baked GHOZTTY_PANE_ID must not change.
+        let preservedID = focusedSurface?.id ?? surfaceTree.root?.leaves().first?.id
+
         // Debug-build-only deterministic failure hook: skips creating the
         // real view so the guard below takes the failure path (the orchestrator
         // can't force a real surface-alloc OOM). See debugShouldFailReconnectSwap.
         let newView: Ghostty.SurfaceView? = Self.debugShouldFailReconnectSwap()
             ? nil
-            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg)
+            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg, uuid: preservedID)
 
         guard let newView, newView.error == nil else {
             // `ghostty_surface_new` FAILED (seen in production: OutOfMemory

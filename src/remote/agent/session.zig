@@ -131,6 +131,13 @@ pub const Child = struct {
         /// read). Returns a NEW `alloc`-owned UTF-8 slice (caller frees), or null
         /// if the query is unsupported or fails. The fake child leaves this null.
         queryCwd: ?*const fn (ctx: *anyopaque, alloc: Allocator) ?[]u8 = null,
+        /// Optional: the pty's CURRENT foreground pid (`tcgetpgrp` on the master
+        /// fd), or null when unsupported (Windows ConPTY has no foreground
+        /// process group — parity with the local `WindowsPty`, which also
+        /// answers null) or the query fails. MUST be cheap and non-blocking (a
+        /// single syscall): the store's sampling tick calls it UNDER the store
+        /// mutex so the child cannot be freed mid-query (wp3).
+        queryForegroundPid: ?*const fn (ctx: *anyopaque) ?i64 = null,
     };
 
     /// Hand the child its owning channel + output sink (see `VTable.attach`).
@@ -179,6 +186,13 @@ pub const Child = struct {
     pub fn queryCwd(self: Child, alloc: Allocator) ?[]u8 {
         const f = self.vtable.queryCwd orelse return null;
         return f(self.ctx, alloc);
+    }
+
+    /// The pty's current foreground pid (see `VTable.queryForegroundPid`).
+    /// Null when the impl declines or the query fails.
+    pub fn queryForegroundPid(self: Child) ?i64 {
+        const f = self.vtable.queryForegroundPid orelse return null;
+        return f(self.ctx);
     }
 };
 
@@ -446,6 +460,15 @@ pub const Session = struct {
     /// Frames EXIT on the session's channel (ordered after final DATA). Same
     /// lifetime/locking rules as `bridge_data`.
     bridge_exit: ?*const fn (ctx: *anyopaque, channel: u128, code: i64, runtime_ms: u64) void = null,
+    /// Frames `META{foreground_pid}` on the session's channel when the pty's
+    /// foreground process group changes (wp3 live-fg sampling). Same
+    /// lifetime/locking rules as `bridge_data`.
+    bridge_fgpid: ?*const fn (ctx: *anyopaque, channel: u128, fg_pid: i64) void = null,
+
+    /// The last foreground pid the sampling tick observed (0 = none yet).
+    /// Guarded by the store mutex; reset to 0 on (re)bind so a fresh viewer gets
+    /// the current value pushed within one tick even if it hasn't changed.
+    fg_pid: i64 = 0,
 
     /// Timestamps (ms). `last_activity_ms` drives the idle-TTL reaper (`startReaper`).
     created_ms: i64,
@@ -906,6 +929,12 @@ pub const SessionStore = struct {
             self.reaper_mutex.unlock();
             if (stop) break;
             self.reapIdle();
+            // Live foreground-pid sampling (wp3): push `META{foreground_pid}`
+            // for any bound session whose pty foreground group changed since
+            // the last tick, so viewer-side `getProcessInfo(.foreground_pid)`
+            // tracks the running program (Exec `tcgetpgrp` parity) instead of
+            // reporting the shell forever.
+            self.sampleForegroundPids();
             // Periodic ring disk snapshot (T13): catch dirty rings whose viewer is
             // still attached / recently detached (the connection-drop trigger only
             // fires on disconnect). No-op when ring snapshots are disabled or
@@ -916,6 +945,48 @@ pub const SessionStore = struct {
                 self.snapshotRings();
             }
         }
+    }
+
+    /// Sample every bound+alive session's pty foreground pid and push
+    /// `META{foreground_pid}` (via `bridge_fgpid`) for the ones that changed
+    /// since the previous tick (wp3). The vtable query runs UNDER the store
+    /// mutex — it is contractually a single non-blocking syscall
+    /// (`tcgetpgrp`) — so a concurrent CLOSE/reap can never free the child
+    /// mid-query. The bridge calls fire OUTSIDE the lock (they take the
+    /// connection's writer lock; same collect-then-act shape as `reapIdle`).
+    /// A child that answers null (Windows ConPTY, transient failure, fake
+    /// children without the hook) is skipped — its viewer keeps the child-pid
+    /// fallback.
+    pub fn sampleForegroundPids(self: *SessionStore) void {
+        const Push = struct {
+            f: *const fn (ctx: *anyopaque, channel: u128, fg_pid: i64) void,
+            ctx: *anyopaque,
+            channel: u128,
+            fg: i64,
+        };
+        var pushes: std.ArrayList(Push) = .empty;
+        defer pushes.deinit(self.table.alloc);
+
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive or !s.bound) continue;
+            const fg = s.child.queryForegroundPid() orelse continue;
+            if (fg <= 0 or fg == s.fg_pid) continue;
+            s.fg_pid = fg;
+            const f = s.bridge_fgpid orelse continue;
+            const ctx = s.bridge_ctx orelse continue;
+            pushes.append(self.table.alloc, .{
+                .f = f,
+                .ctx = ctx,
+                .channel = s.channel,
+                .fg = fg,
+            }) catch break; // OOM: drop this tick's remaining pushes, retry next tick
+        }
+        self.mutex.unlock();
+
+        for (pushes.items) |p| p.f(p.ctx, p.channel, p.fg);
     }
 
     /// Evict any session whose `bound` connection is gone (orphaned) AND whose

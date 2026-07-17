@@ -58,6 +58,13 @@ final class SessionLayoutManifest {
         /// The IPC target-registry name (`+split --name=...`) so a restored
         /// pane stays addressable by `+send-keys`/`+read`/`+close`.
         var ipcName: String?
+        /// The pane's STABLE surface UUID (wp3 pane identity): restore
+        /// recreates the SurfaceView with this exact uuid so the `+list`
+        /// leaf `id` — and the GHOZTTY_PANE_ID env baked into the still-
+        /// running shell at spawn — survive an app relaunch unchanged.
+        /// Optional/additive: older manifests decode with nil (restore then
+        /// mints a fresh uuid, today's behavior).
+        var surfaceID: String?
     }
 
     /// A parallel codable of `SplitTree.Node` capturing per-leaf session
@@ -461,7 +468,8 @@ final class SessionLayoutManifest {
                     // (next launch would then drop the whole entry).
                     sessionID: Self.liveSessionID(of: view) ?? view.expectedRemoteSessionID,
                     title: view.title,
-                    ipcName: ipc?.registeredPaneName(forSurface: view))
+                    ipcName: ipc?.registeredPaneName(forSurface: view),
+                    surfaceID: view.id.uuidString)
             }
         }
 

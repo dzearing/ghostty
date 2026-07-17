@@ -1866,6 +1866,18 @@ pub const Connection = struct {
         return outcome;
     }
 
+    /// Respawn-fidelity payload for a `RELAUNCH` (wp3): the viewer's live copy
+    /// of what the agent's on-disk record lacks — the forwarded env allowlist
+    /// (GHOZTTY_PANE_ID / GHOZTTY_WINDOW_NAME / shell-integration vars), the
+    /// TERM value, and the explicit shell-integration argv rewrite. Borrowed
+    /// for the duration of the call. All optional: `.{}` sends none (an older
+    /// agent ignores them anyway).
+    pub const RelaunchFidelity = struct {
+        env: []const protocol.Open.EnvPair = &.{},
+        term: ?[]const u8 = null,
+        argv: ?[]const []const u8 = null,
+    };
+
     /// Respawn a dead-but-relaunchable session on its known `channel` (§5.4 reboot
     /// floor, T12c) and, on success, register the inbound ring + return a live pane.
     ///
@@ -1888,7 +1900,7 @@ pub const Connection = struct {
         px_w: u16,
         px_h: u16,
     ) !RelaunchOutcome {
-        return self.relaunchChannelCancellable(session_id, channel, rows, cols, px_w, px_h, null);
+        return self.relaunchChannelCancellable(session_id, channel, rows, cols, px_w, px_h, .{}, null);
     }
 
     /// `relaunchChannel` with an optional cancellation token (see `RpcCanceller`),
@@ -1906,13 +1918,14 @@ pub const Connection = struct {
         cols: u16,
         px_w: u16,
         px_h: u16,
+        fidelity: RelaunchFidelity,
         canceller: ?*const RpcCanceller,
     ) !RelaunchOutcome {
         const pane = try self.prepareRelaunchPane(session_id, channel);
         // Any failure below (a transport/RPC error) returns the pre-registered ring
         // + pane to a clean state so the channel table is not left dangling.
         errdefer self.teardownPane(pane);
-        const res = try self.sendRelaunchOnPane(pane, rows, cols, px_w, px_h, canceller);
+        const res = try self.sendRelaunchOnPane(pane, rows, cols, px_w, px_h, fidelity, canceller);
         if (!res.ok) {
             // Not respawned (reaped, not relaunchable, or spawn failed): keep no pane
             // and tear the pre-registered channel back down (a value return does not
@@ -1983,6 +1996,7 @@ pub const Connection = struct {
         cols: u16,
         px_w: u16,
         px_h: u16,
+        fidelity: RelaunchFidelity,
         canceller: ?*const RpcCanceller,
     ) !RelaunchResult {
         const req: protocol.Relaunch = .{
@@ -1991,6 +2005,9 @@ pub const Connection = struct {
             .cols = cols,
             .px_w = px_w,
             .px_h = px_h,
+            .env = fidelity.env,
+            .term = fidelity.term,
+            .argv = fidelity.argv,
         };
         const json = try protocol.encodeJson(self.alloc, req);
         defer self.alloc.free(json);
@@ -2549,6 +2566,26 @@ pub const Connection = struct {
                     ExitSig{ .code = parsed.value.code, .runtime_ms = parsed.value.runtime_ms },
                     ExitSig.apply,
                 );
+            },
+            .meta => {
+                // Session metadata push. Today the routed payload is the live
+                // foreground pid (wp3 `tcgetpgrp` sampling): signal it on the
+                // pane's inbound ring under the channel-table lock (the same
+                // `withChannel` discipline as `.exit` — the ring can't be freed
+                // mid-call, and an unknown/late channel is dropped silently).
+                // The pane's IO thread republishes it on the stable Remote
+                // backend for GUI reads. Additive: the user `ctrl_handler`
+                // still observes the frame afterward in `controlReaderLoop`.
+                var parsed = protocol.parseJson(protocol.Meta, self.alloc, frame.payload) catch return;
+                defer parsed.deinit();
+                const fg = parsed.value.foreground_pid orelse return;
+                const FgSig = struct {
+                    pid: i64,
+                    fn apply(self_sig: @This(), ch: *ring.Channel) void {
+                        ch.signalForegroundPid(self_sig.pid);
+                    }
+                };
+                _ = self.channels.withChannel(frame.channel, FgSig{ .pid = fg }, FgSig.apply);
             },
             .detached => {
                 // Server-initiated eviction / steal (§5.3): terminal DEAD.
@@ -4233,6 +4270,41 @@ test "EXIT frame: signals the pane's ring so the consumer can close the pane" {
     h.conn.closeChannel(pane);
 }
 
+test "META foreground_pid: routed to the pane's ring; unknown channel dropped (wp3)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.session_id = "sess-fg";
+    try h.start();
+
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
+    a.saw_request.wait();
+    try testing.expectEqual(@as(i64, 0), pane.ring.foregroundPid());
+
+    // The agent pushes META{foreground_pid} on the session channel when the pty
+    // foreground group changes; the control reader signals the pane's ring.
+    try h.ctrl_agent.sendJson(.meta, pane.id, protocol.Meta{ .foreground_pid = 7777 });
+    const RingWait = struct {
+        ring: *ring.Channel,
+        fn done(self: *@This()) bool {
+            return self.ring.foregroundPid() == 7777;
+        }
+    };
+    var rw: RingWait = .{ .ring = pane.ring };
+    try spinUntil(RingWait, &rw, RingWait.done);
+
+    // A META with NO foreground_pid (title/cwd-only, or an older agent) must not
+    // disturb the cached value; an unknown channel is dropped silently.
+    try h.ctrl_agent.sendJson(.meta, pane.id, protocol.Meta{ .title = "hi" });
+    try h.ctrl_agent.sendJson(.meta, 0xDEADBEEF, protocol.Meta{ .foreground_pid = 1 });
+
+    // The link stays healthy: input still round-trips after those frames.
+    try testing.expectEqual(@as(i64, 7777), pane.ring.foregroundPid());
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
 test "EXIT frame: an unknown channel id is dropped without crashing" {
     const alloc = testing.allocator;
     const h = try LifecycleHarness.create(alloc);
@@ -4977,7 +5049,7 @@ test "prompt relaunch: prepareRelaunchPane holds a childless pane; sendRelaunchO
     try testing.expect(!a.saw_relaunch.load(.monotonic)); // no RELAUNCH sent yet
 
     // 3) User consents (a keystroke) → send RELAUNCH on the pane's channel.
-    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, null);
+    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, .{}, null);
     try testing.expect(res.ok);
     try testing.expect(res.found);
     try testing.expectEqual(@as(i64, 4242), res.pid);
@@ -5013,7 +5085,7 @@ test "prompt relaunch: sendRelaunchOnPane ok=false leaves the pane childless + d
     const channel = outcome.channel;
 
     const pane = try h.conn.prepareRelaunchPane("sess-prompt-gone", channel);
-    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, null);
+    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, .{}, null);
     try testing.expect(!res.ok);
     try testing.expect(!res.found);
     // The pane is NOT torn down by a failed send (unlike the auto RelaunchOutcome

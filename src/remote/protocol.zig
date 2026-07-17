@@ -539,6 +539,15 @@ pub const Meta = struct {
     title: ?[]const u8 = null,
     listening_ports: ?[]const u16 = null,
     foreground_cmd: ?[]const u8 = null,
+
+    /// The session's current FOREGROUND pid (`tcgetpgrp` on the pty master),
+    /// pushed by the agent whenever it changes (sampled on the agent's 1 s
+    /// tick) so `getProcessInfo(.foreground_pid)` has live Exec parity for
+    /// agent-backed panes (wp3). Absent on Windows (ConPTY has no foreground
+    /// process group — matching WindowsPty, which returns null locally too)
+    /// and from older agents; the client then falls back to the child pid.
+    /// Additive/optional both ways (unknown-field-tolerant parsers).
+    foreground_pid: ?i64 = null,
 };
 
 /// `GET_CWD` (0x22). On-demand request for a session's child working directory.
@@ -676,6 +685,19 @@ pub const Relaunch = struct {
     cols: u16,
     px_w: u16 = 0,
     px_h: u16 = 0,
+
+    /// Respawn fidelity (wp3): the agent's on-disk session record keeps only
+    /// argv-label/cwd, so a synthesized relaunch OPEN used to lose the pane's
+    /// forwarded environment (GHOZTTY_PANE_ID / GHOZTTY_WINDOW_NAME / shell
+    /// integration vars), its TERM, and any explicit shell-integration argv
+    /// rewrite. RELAUNCH is always viewer-initiated, and the viewer still holds
+    /// all three — so it sends them and the agent applies them to the respawn
+    /// exactly like an original OPEN. All additive/optional: an older agent
+    /// ignores them (env-less respawn, today's behavior); an older client omits
+    /// them and a new agent falls back to the recorded metadata alone.
+    env: []const Open.EnvPair = &.{},
+    term: ?[]const u8 = null,
+    argv: ?[]const []const u8 = null,
 };
 
 /// `RELAUNCHED` (0x27). Reply to `RELAUNCH`. `ok == true` ⇒ the session is now
@@ -1594,6 +1616,52 @@ test "OPENED/ATTACHED/RELAUNCHED pid+tty round-trip and default when omitted" {
     var sp = try parseJson(Relaunched, alloc, sj);
     defer sp.deinit();
     try testing.expect(sp.value.tty == null);
+}
+
+test "META foreground_pid and RELAUNCH env/term/argv round-trip with skew defaults (wp3)" {
+    const alloc = testing.allocator;
+
+    // META{foreground_pid} round-trips; omitted (older agent) defaults null.
+    const meta: Meta = .{ .foreground_pid = 4321 };
+    const mj = try encodeJson(alloc, meta);
+    defer alloc.free(mj);
+    var mp = try parseJson(Meta, alloc, mj);
+    defer mp.deinit();
+    try testing.expectEqual(@as(i64, 4321), mp.value.foreground_pid.?);
+    var op = try parseJson(Meta, alloc, "{\"title\":\"hi\"}");
+    defer op.deinit();
+    try testing.expect(op.value.foreground_pid == null);
+
+    // RELAUNCH respawn-fidelity fields round-trip.
+    const pairs = [_]Open.EnvPair{
+        .{ .key = "GHOZTTY_PANE_ID", .value = "ABC-123" },
+    };
+    const argv = [_][]const u8{ "/bin/bash", "--posix" };
+    const rel: Relaunch = .{
+        .session_id = "s1",
+        .rows = 24,
+        .cols = 80,
+        .env = &pairs,
+        .term = "xterm-256color",
+        .argv = &argv,
+    };
+    const rj = try encodeJson(alloc, rel);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunch, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqual(@as(usize, 1), rp.value.env.len);
+    try testing.expectEqualStrings("GHOZTTY_PANE_ID", rp.value.env[0].key);
+    try testing.expectEqualStrings("ABC-123", rp.value.env[0].value);
+    try testing.expectEqualStrings("xterm-256color", rp.value.term.?);
+    try testing.expectEqual(@as(usize, 2), rp.value.argv.?.len);
+
+    // An OLD client's RELAUNCH (no fidelity fields) parses with empty/null
+    // defaults — the agent then falls back to recorded metadata alone.
+    var old = try parseJson(Relaunch, alloc, "{\"session_id\":\"s1\",\"rows\":24,\"cols\":80}");
+    defer old.deinit();
+    try testing.expectEqual(@as(usize, 0), old.value.env.len);
+    try testing.expect(old.value.term == null);
+    try testing.expect(old.value.argv == null);
 }
 
 test "METRICS/HostMetrics JSON round-trips with null optional elision" {
