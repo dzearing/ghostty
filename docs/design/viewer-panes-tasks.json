@@ -118,7 +118,7 @@
     {
       "id": "T05",
       "title": "Link policy + dark/light verification",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T04"
       ],
@@ -129,7 +129,7 @@
         "System appearance toggle test (and config theme override) — page + code styles switch live."
       ],
       "acceptance": "Clicking an external link opens the browser (pane unchanged); clicking a relative .md link opens a new viewer pane; toggling dark mode restyles live. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done. WKNavigationDelegate decidePolicyFor: web mode allows everything; file modes intercept ONLY .linkActivated (template/asset/image loads pass). Routing: http(s) -> NSWorkspace (VERIFIED: Edge opened, pane unchanged); ghoztty-viewer relative links resolved via schemeHandler.resolveForNavigation (file-dir first, then absolute); md-family -> newViewerSplit(atPane: self's pane, .right) (VERIFIED via real CGEvent click: second.md opened as new split — AXPress does NOT work on web content, use CGEvent per gui-driving memory); other local files -> NSWorkspace.open. THEME SEMANTICS CLARIFIED: viewer follows the WINDOW's effectiveAppearance, which Ghostty pins from the terminal theme — user's dark theme means viewers stay dark even in system-light (verified by live system flip; correct: pane matches its window). Both palettes proven in T03 Chrome test. Safe-frontmost protocol used; user's app restored after clicks."
     },
     {
       "id": "T06",

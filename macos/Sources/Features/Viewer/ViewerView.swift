@@ -248,6 +248,75 @@ extension ViewerView: WKNavigationDelegate {
         pageLoaded = true
         renderFileContent()
     }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+
+        // Websites navigate freely within the pane.
+        if case .web = mode {
+            decisionHandler(.allow)
+            return
+        }
+
+        // File modes: only user link clicks get special routing; the page's
+        // own loads (template, assets, images) pass through.
+        guard navigationAction.navigationType == .linkActivated else {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.cancel)
+        handleFileModeLink(url)
+    }
+
+    /// Route a clicked link in a markdown/code viewer:
+    /// - http(s) → default browser
+    /// - relative/local markdown file → new viewer split next to this pane
+    /// - other local files → open with the default app
+    private func handleFileModeLink(_ url: URL) {
+        if url.scheme == "http" || url.scheme == "https" {
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        // Relative links render as ghoztty-viewer:// URLs; map them back to
+        // a real file next to the viewed file. file:// links come through
+        // as-is (markdown-it linkify or explicit file URLs).
+        let fileURL: URL?
+        if url.scheme == ViewerSchemeHandler.scheme {
+            let relative = String(url.path.dropFirst())
+            fileURL = schemeHandler?.resolveForNavigation(relative)
+        } else if url.isFileURL {
+            fileURL = url
+        } else {
+            fileURL = nil
+        }
+        guard let fileURL else { return }
+
+        switch Self.mode(for: fileURL.path) {
+        case .markdown:
+            openViewerSplit(location: fileURL.path)
+        default:
+            NSWorkspace.shared.open(fileURL)
+        }
+    }
+
+    /// Open another viewer as a split next to this pane.
+    private func openViewerSplit(location: String) {
+        guard let controller = window?.windowController as? BaseTerminalController,
+              let myPane = controller.surfaceTree.first(where: { $0.viewerView === self })
+        else { return }
+        controller.newViewerSplit(
+            atPane: myPane,
+            direction: .right,
+            viewer: ViewerView(location: location))
+    }
 }
 
 // MARK: - Scheme handler
@@ -304,6 +373,16 @@ final class ViewerSchemeHandler: NSObject, WKURLSchemeHandler {
 
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         // Synchronous handler; nothing to cancel.
+    }
+
+    /// Resolve a clicked relative link against the viewed file's directory
+    /// (never the bundle assets — navigation targets are user files).
+    func resolveForNavigation(_ relativePath: String) -> URL? {
+        let candidate = baseDirectory.appendingPathComponent(relativePath)
+        if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        let absolute = URL(fileURLWithPath: "/" + relativePath)
+        if FileManager.default.fileExists(atPath: absolute.path) { return absolute }
+        return nil
     }
 
     /// Resolution order: bundled template assets first (viewer.html, vendor/…),
