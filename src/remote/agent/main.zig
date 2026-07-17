@@ -177,6 +177,11 @@ pub fn main() !void {
             defer alloc.free(l.path);
             defer if (l.port_file) |pf| alloc.free(pf);
             defer if (l.sessions_file) |sf| alloc.free(sf);
+            // AF_UNIX listen is POSIX-only (Windows persistence is a named
+            // pipe, §5.2); listenUnixMode rejects it at parse time, and this
+            // comptime gate keeps the UDS code out of Windows analysis
+            // (std.net.Address.initUnix does not compile for windows targets).
+            if (builtin.os.tag == .windows) unreachable;
             // Graceful SIGTERM → ring snapshot (T13b): block SIGTERM on the main
             // thread BEFORE any daemon thread is spawned (see the `.listen` arm).
             blockSigterm();
@@ -1275,11 +1280,16 @@ fn acceptLoop(
         };
         // Same-uid gate (unix socket): reject — and immediately close — any peer
         // that is not this user, or whose credentials can't be read. A shell is
-        // never served to an unauthenticated peer.
-        if (enforce_same_uid and !shouldServe(true, peerUid(conn.stream.handle), std.posix.geteuid())) {
-            std.debug.print("ghoztty-agent: rejecting unix connection from a non-matching uid\n", .{});
-            std.posix.close(conn.stream.handle);
-            continue;
+        // never served to an unauthenticated peer. POSIX-only: the unix listen
+        // path never runs on Windows (enforce_same_uid is always false there),
+        // and geteuid/peercred don't exist in Windows libc — comptime-gate so
+        // the TCP path still links.
+        if (builtin.os.tag != .windows) {
+            if (enforce_same_uid and !shouldServe(true, peerUid(conn.stream.handle), std.posix.geteuid())) {
+                std.debug.print("ghoztty-agent: rejecting unix connection from a non-matching uid\n", .{});
+                std.posix.close(conn.stream.handle);
+                continue;
+            }
         }
         // Serve each accepted connection on its OWN detached thread so the accept
         // loop NEVER blocks on one connection's lifecycle (a slow/dead/wedging client
