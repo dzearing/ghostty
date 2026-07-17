@@ -610,13 +610,12 @@ class IPCServer {
             return .ok
         }
 
-        // Resolve --pane targeting: find the named pane's surface and controller
+        // Resolve --pane targeting: find the named pane (terminal surface or
+        // viewer) and its controller.
         if let paneName = parsed.pane {
             pruneStaleTargets()
-            guard let entry = targetRegistry[paneName] else {
-                return IPCResponse(success: false, error: "pane '\(paneName)' not found")
-            }
-            guard let surface = entry.surfaceView, let controller = entry.controller else {
+            guard let entry = targetRegistry[paneName], entry.isAlive,
+                  let controller = entry.controller else {
                 return IPCResponse(success: false, error: "pane '\(paneName)' not found")
             }
 
@@ -626,16 +625,62 @@ class IPCServer {
             }
 
             DispatchQueue.main.async { [weak self] in
+                // Resolve the anchor pane (works for terminal AND viewer targets).
+                let anchorPane: PaneView?
+                if let surface = entry.surfaceView {
+                    anchorPane = controller.surfaceTree.pane(for: surface)
+                } else {
+                    anchorPane = entry.viewerPaneView
+                }
+                guard let anchorPane else {
+                    Self.logger.warning("IPC: pane '\(paneName)' is no longer in a tree")
+                    return
+                }
+
                 if let viewLocation = parsed.view {
                     self?.createViewerSplit(
                         controller: controller,
-                        at: surface,
+                        atPane: anchorPane,
                         direction: direction,
                         ratio: ratio,
                         location: viewLocation,
                         name: parsed.name)
                     return
                 }
+
+                // Terminal split anchored at a viewer pane: no surface to
+                // inherit from — build a plain local surface.
+                if entry.surfaceView == nil {
+                    var splitConfig = Ghostty.SurfaceConfiguration()
+                    if let command = parsed.config.command { splitConfig.command = command }
+                    if let workingDirectory = parsed.config.workingDirectory {
+                        splitConfig.workingDirectory = workingDirectory
+                    }
+                    splitConfig.backgroundTint = tintColor
+                    splitConfig.backgroundTintNSColor = tintNSColor
+                    for (key, val) in parsed.config.environmentVariables {
+                        splitConfig.environmentVariables[key] = val
+                    }
+                    if let name = parsed.name {
+                        splitConfig.environmentVariables["GHOZTTY_PANE_NAME"] = name
+                    }
+                    if let newView = controller.newTerminalSplit(
+                        atPane: anchorPane,
+                        direction: direction,
+                        baseConfig: splitConfig,
+                        ratio: ratio
+                    ) {
+                        Self.applyColorScheme(for: tintColor, to: newView)
+                        if let name = parsed.name {
+                            self?.targetRegistry[name] = .pane(
+                                controller: WeakRef(controller),
+                                surface: WeakRef(newView))
+                        }
+                    }
+                    return
+                }
+
+                guard let surface = entry.surfaceView else { return }
 
                 var splitConfig = Ghostty.SurfaceConfiguration()
                 if let splitCommand = parsed.splitCommand {
@@ -711,13 +756,15 @@ class IPCServer {
             }
 
             if let viewLocation = parsed.view {
-                self?.createViewerSplit(
-                    controller: controller,
-                    at: surfaceView,
-                    direction: direction,
-                    ratio: ratio,
-                    location: viewLocation,
-                    name: parsed.name)
+                if let anchorPane = controller.surfaceTree.pane(for: surfaceView) {
+                    self?.createViewerSplit(
+                        controller: controller,
+                        atPane: anchorPane,
+                        direction: direction,
+                        ratio: ratio,
+                        location: viewLocation,
+                        name: parsed.name)
+                }
                 return
             }
 
@@ -772,7 +819,7 @@ class IPCServer {
     @MainActor
     private func createViewerSplit(
         controller: TerminalController,
-        at surface: Ghostty.SurfaceView,
+        atPane anchorPane: PaneView,
         direction: SplitTree<PaneView>.NewDirection,
         ratio: Double,
         location: String,
@@ -780,7 +827,7 @@ class IPCServer {
     ) {
         let viewer = ViewerView(location: location)
         guard let pane = controller.newViewerSplit(
-            at: surface,
+            atPane: anchorPane,
             direction: direction,
             viewer: viewer,
             ratio: ratio

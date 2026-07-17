@@ -515,7 +515,7 @@ class BaseTerminalController: NSWindowController,
 
     /// Create a new viewer split: a non-terminal pane rendering a file or URL.
     /// Unlike `newSplit` this never touches PTY/agent plumbing — the pane has
-    /// no process. Focus stays on the originating surface.
+    /// no process. Focus stays where it was.
     @discardableResult
     func newViewerSplit(
         at oldView: Ghostty.SurfaceView,
@@ -524,6 +524,18 @@ class BaseTerminalController: NSWindowController,
         ratio: Double = 0.5
     ) -> PaneView? {
         guard let oldPane = surfaceTree.pane(for: oldView) else { return nil }
+        return newViewerSplit(atPane: oldPane, direction: direction, viewer: viewer, ratio: ratio)
+    }
+
+    /// Viewer split anchored at any existing pane (terminal or viewer).
+    @discardableResult
+    func newViewerSplit(
+        atPane oldPane: PaneView,
+        direction: SplitTree<PaneView>.NewDirection,
+        viewer: ViewerView,
+        ratio: Double = 0.5
+    ) -> PaneView? {
+        guard surfaceTree.root?.node(view: oldPane) != nil else { return nil }
 
         let pane = PaneView(viewer: viewer)
         let newTree: SplitTree<PaneView>
@@ -541,10 +553,50 @@ class BaseTerminalController: NSWindowController,
         replaceSurfaceTree(
             newTree,
             moveFocusTo: nil,
-            moveFocusFrom: oldView,
+            moveFocusFrom: oldPane.surfaceView,
             undoAction: "New Split")
 
         return pane
+    }
+
+    /// Terminal split anchored at a VIEWER pane. The regular `newSplit`
+    /// inherits tint/remote context from its anchor surface; a viewer has
+    /// neither, so this creates a plain local surface from the given config.
+    @discardableResult
+    func newTerminalSplit(
+        atPane oldPane: PaneView,
+        direction: SplitTree<PaneView>.NewDirection,
+        baseConfig config: Ghostty.SurfaceConfiguration? = nil,
+        ratio: Double = 0.5
+    ) -> Ghostty.SurfaceView? {
+        guard surfaceTree.root?.node(view: oldPane) != nil else { return nil }
+        guard let ghostty_app = ghostty.app else { return nil }
+
+        var effectiveConfig = config ?? Ghostty.SurfaceConfiguration()
+        if effectiveConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] == nil {
+            effectiveConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
+        }
+
+        let newView = Ghostty.SurfaceView(ghostty_app, baseConfig: effectiveConfig)
+        let newTree: SplitTree<PaneView>
+        do {
+            newTree = try surfaceTree.inserting(
+                view: PaneView(surface: newView),
+                at: oldPane,
+                direction: direction,
+                ratio: ratio)
+        } catch {
+            Ghostty.logger.warning("failed to insert split: \(error)")
+            return nil
+        }
+
+        replaceSurfaceTree(
+            newTree,
+            moveFocusTo: newView,
+            moveFocusFrom: focusedSurface,
+            undoAction: "New Split")
+
+        return newView
     }
 
     /// Build the new surface, insert it into the tree, and finalize focus/undo.

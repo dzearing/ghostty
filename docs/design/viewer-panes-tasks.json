@@ -99,7 +99,7 @@
     {
       "id": "T04",
       "title": "ViewerView: WKWebView + scheme handler + three content modes",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T02",
         "T03"
@@ -113,7 +113,7 @@
         "Nonpersistent WKWebsiteDataStore for file modes (no network anyway); default store for web mode."
       ],
       "acceptance": "Injected viewer pane renders the torture-test .md beautifully with relative images; a .zig source file renders highlighted; a website loads and is interactive. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done. ViewerView rewritten: WKWebView + ViewerSchemeHandler (ghoztty-viewer:// serving bundle viewer assets first, then the file's directory, then absolute paths; symlink-resolved prefix checks). Modes: markdown (md/markdown/mdown/mkd/mdwn), code (ext->hljs lang map, plain fallback), web (direct load, nonpersistent store for file modes only). Content injected via evaluateJavaScript(__viewer.setMarkdown/setCode) after didFinish; JSON-literal escaping via JSONSerialization .fragmentsAllowed. Web title KVO -> pane title ('Example Domain' showed in +list). becomeFirstResponder forwards to webView. FIXED ALONG THE WAY: +split --pane=<viewer-target> previously failed (entry.surfaceView nil guard) — anchor resolution generalized to panes; added BaseTerminalController.newViewerSplit(atPane:) + newTerminalSplit(atPane:) (terminal split anchored at a viewer builds a plain local surface, no tint/remote inheritance). LIVE-VERIFIED: torture.md renders dark GitHub-style in-pane; relative images render; PaneView.swift syntax-highlighted; example.com loads; splits FROM viewer panes work; 5-pane mixed window stable. Live theme-switch + link policy = T05; reload = T06."
     },
     {
       "id": "T05",
