@@ -123,6 +123,63 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    /// A window-level title override set by the user (Change Window Title
+    /// prompt, `+new-window --title=`, `+rename`). When set, it pins the
+    /// window titlebar for the whole window — all tabs, regardless of pane
+    /// focus or terminal-set titles — until cleared. Stored on ONE
+    /// controller of a native tab group (see `effectiveWindowTitleOverride`);
+    /// use `setWindowTitle(_:)` to change it so the single-holder invariant
+    /// holds.
+    var windowTitleOverride: String? {
+        didSet {
+            // Same persistence contract as `titleOverride`: this is the
+            // choke point every window-rename path funnels through.
+            if let remoteManifestEntryID {
+                RemoteSessionManifest.shared.updateWindowTitleOverride(
+                    remoteManifestEntryID, title: windowTitleOverride)
+            }
+            if let sessionLayoutEntryID {
+                SessionLayoutManifest.shared.updateWindowTitleOverride(
+                    sessionLayoutEntryID, title: windowTitleOverride)
+            }
+
+            // The override affects the titlebar of every tab in the group.
+            applyTitleToWindow()
+            guard let window else { return }
+            for w in window.tabGroup?.windows ?? [] where w !== window {
+                (w.windowController as? BaseTerminalController)?.applyTitleToWindow()
+            }
+        }
+    }
+
+    /// The window title pinning this controller's titlebar, if any: this
+    /// controller's own override, or the override held by any other tab in
+    /// the same native tab group.
+    var effectiveWindowTitleOverride: String? {
+        if let windowTitleOverride { return windowTitleOverride }
+        guard let window else { return nil }
+        for w in window.tabGroup?.windows ?? [] where w !== window {
+            if let title = (w.windowController as? BaseTerminalController)?.windowTitleOverride {
+                return title
+            }
+        }
+        return nil
+    }
+
+    /// Set (or clear, with nil) the window title for this window and its tab
+    /// group, keeping exactly one controller in the group as the holder.
+    func setWindowTitle(_ newTitle: String?) {
+        if let window {
+            for w in window.tabGroup?.windows ?? [] where w !== window {
+                if let c = w.windowController as? BaseTerminalController,
+                   c.windowTitleOverride != nil {
+                    c.windowTitleOverride = nil
+                }
+            }
+        }
+        windowTitleOverride = newTitle
+    }
+
     var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
 
     /// The remote machine this window's terminals run on, if any. When set, the
@@ -884,6 +941,34 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    /// Prompt the user to change the window title. The title set here pins
+    /// the titlebar for the whole window (all tabs) until cleared.
+    func promptWindowTitle() {
+        guard let window else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Change Window Title"
+        alert.informativeText = "Leave blank to follow the active tab or pane title."
+        alert.alertStyle = .informational
+
+        let textField = PromptTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
+        textField.stringValue = effectiveWindowTitleOverride ?? ""
+        alert.accessoryView = textField
+
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+
+        alert.window.initialFirstResponder = textField
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .alertFirstButtonReturn else { return }
+
+            let newTitle = textField.stringValue
+            self.setWindowTitle(newTitle.isEmpty ? nil : newTitle)
+        }
+    }
+
     /// Close a surface from a view.
     func closeSurface(
         _ view: Ghostty.SurfaceView,
@@ -1424,21 +1509,30 @@ class BaseTerminalController: NSWindowController,
         applyTitleToWindow()
     }
 
-    private func applyTitleToWindow() {
+    func applyTitleToWindow() {
         guard let window else { return }
 
-        var title: String
+        // The tab-level title: the user's tab rename if set, else the
+        // focused pane's computed title.
+        var tabTitle: String
         if let titleOverride {
-            title = computeTitle(
+            tabTitle = computeTitle(
                 title: titleOverride,
                 bell: focusedSurface?.bell ?? false)
         } else {
-            title = lastComputedTitle
+            tabTitle = lastComputedTitle
         }
+
+        // Titlebar fallback order: window title if set, else the tab's
+        // title (which itself falls back to the active pane's title).
+        let windowOverride = effectiveWindowTitleOverride
+        var title = windowOverride ?? tabTitle
 
         if let termWindow = window as? TerminalWindow,
            termWindow.activityState != .idle {
-            title += " (\(termWindow.activityState.rawValue))"
+            let suffix = " (\(termWindow.activityState.rawValue))"
+            title += suffix
+            tabTitle += suffix
         }
 
         // The remote machine name is shown as a titlebar pill (see
@@ -1446,6 +1540,11 @@ class BaseTerminalController: NSWindowController,
         // plain title suffix, so it is intentionally not appended here.
 
         window.title = title
+
+        // When a window title pins the titlebar, keep the tab bar labels
+        // showing each tab's own title. An empty tab title restores the
+        // default behavior of following `window.title`.
+        window.tab.title = windowOverride != nil ? tabTitle : ""
     }
 
     func pwdDidChange(to: URL?) {
@@ -2774,6 +2873,10 @@ class BaseTerminalController: NSWindowController,
     @IBAction func closeWindow(_ sender: Any) {
         guard let window = window else { return }
         window.performClose(sender)
+    }
+
+    @IBAction func changeWindowTitle(_ sender: Any) {
+        promptWindowTitle()
     }
 
     @IBAction func changeTabTitle(_ sender: Any) {

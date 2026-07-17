@@ -5867,6 +5867,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .tab,
         ),
 
+        .prompt_window_title => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_title,
+            .window,
+        ),
+
         .prompt_surface_banner => return try self.rt_app.performAction(
             .{ .surface = self },
             .prompt_banner,

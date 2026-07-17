@@ -71,6 +71,7 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuResetFontSize: NSMenuItem?
     @IBOutlet private var menuChangeTitle: NSMenuItem?
     @IBOutlet private var menuChangeTabTitle: NSMenuItem?
+    @IBOutlet private var menuChangeWindowTitle: NSMenuItem?
     @IBOutlet private var menuReadonly: NSMenuItem?
     @IBOutlet private var menuQuickTerminal: NSMenuItem?
     @IBOutlet private var menuTerminalInspector: NSMenuItem?
@@ -1481,6 +1482,7 @@ class AppDelegate: NSObject,
         namePinned: Bool = false,
         sessionID: String?,
         windowTitle: String? = nil,
+        windowTitleOverride: String? = nil,
         ipcName: String? = nil,
         workingDirectory: String? = nil,
         shell: String? = nil,
@@ -1569,6 +1571,13 @@ class AppDelegate: NSObject,
         // the original rename did.
         if let windowTitle, !windowTitle.isEmpty {
             controller.titleOverride = windowTitle
+        }
+
+        // The user-set WINDOW-level title (pins the titlebar over any
+        // tab/pane title). Set AFTER `remoteManifestEntryID` above so the
+        // didSet re-persists it into the fresh (replacing) manifest entry.
+        if let windowTitleOverride, !windowTitleOverride.isEmpty {
+            controller.windowTitleOverride = windowTitleOverride
         }
 
         return controller
@@ -1770,6 +1779,7 @@ class AppDelegate: NSObject,
                         namePinned: entry.namePinned == true,
                         sessionID: sessionID,
                         windowTitle: entry.windowTitle,
+                        windowTitleOverride: entry.windowTitleOverride,
                         ipcName: entry.ipcName,
                         replacingManifestEntry: entry.id)
                 }
@@ -2007,6 +2017,7 @@ extension AppDelegate {
         self.menuCommandPalette?.setImageIfDesired(systemSymbolName: "filemenu.and.selection")
         self.menuQuickTerminal?.setImageIfDesired(systemSymbolName: "apple.terminal")
         self.menuChangeTabTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
+        self.menuChangeWindowTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
         self.menuTerminalInspector?.setImageIfDesired(systemSymbolName: "scope")
         self.menuReadonly?.setImageIfDesired(systemSymbolName: "eye.fill")
         self.menuSetAsDefaultTerminal?.setImageIfDesired(systemSymbolName: "star.fill")
@@ -2082,6 +2093,7 @@ extension AppDelegate {
         syncMenuShortcut(config, action: "reset_font_size", menuItem: self.menuResetFontSize)
         syncMenuShortcut(config, action: "prompt_surface_title", menuItem: self.menuChangeTitle)
         syncMenuShortcut(config, action: "prompt_tab_title", menuItem: self.menuChangeTabTitle)
+        syncMenuShortcut(config, action: "prompt_window_title", menuItem: self.menuChangeWindowTitle)
         syncMenuShortcut(config, action: "toggle_quick_terminal", menuItem: self.menuQuickTerminal)
         syncMenuShortcut(config, action: "toggle_visibility", menuItem: self.menuToggleVisibility)
         syncMenuShortcut(config, action: "toggle_window_float_on_top", menuItem: self.menuFloatOnTop)
