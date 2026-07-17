@@ -47,6 +47,10 @@ extension Ghostty {
         // Maintain whether our window has focus (is key) or not
         @State private var windowFocus: Bool = true
 
+        // Measured height of the sticky pane banner, used to inset the
+        // terminal surface so content isn't covered by the overlay.
+        @State private var bannerHeight: CGFloat = 0
+
         #if canImport(AppKit)
         // Observe SecureInput to detect when its enabled
         @ObservedObject private var secureInput = SecureInput.shared
@@ -54,6 +58,16 @@ extension Ghostty {
 
         @EnvironmentObject private var ghostty: Ghostty.App
         @Environment(\.ghosttyLastFocusedSurface) private var lastFocusedSurface
+
+        /// The pane's effective background color: the surface's own color
+        /// when the pty changed it (macOS only), else the config default.
+        private var paneBackgroundColor: Color {
+            #if canImport(AppKit)
+            surfaceView.backgroundColor ?? ghostty.config.backgroundColor
+            #else
+            ghostty.config.backgroundColor
+            #endif
+        }
 
         private var isFocusedSurface: Bool {
             surfaceFocus || lastFocusedSurface?.value === surfaceView
@@ -104,6 +118,10 @@ extension Ghostty {
 
                     }
                 }
+                // Inset the terminal below the sticky banner so the
+                // scrollable content ends under it instead of being
+                // covered by it.
+                .padding(.top, surfaceView.paneBanner != nil ? bannerHeight : 0)
                 .ghosttySurfaceView(surfaceView)
 
                 // Background tint from IPC --color flag
@@ -118,7 +136,12 @@ extension Ghostty {
                 // clickable.
                 if let banner = surfaceView.paneBanner {
                     VStack(spacing: 0) {
-                        SurfacePaneBanner(text: banner)
+                        SurfacePaneBanner(text: banner, background: paneBackgroundColor)
+                            .onGeometryChange(for: CGFloat.self) { proxy in
+                                proxy.size.height
+                            } action: { height in
+                                bannerHeight = height
+                            }
                         Spacer()
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)

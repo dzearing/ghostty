@@ -8,27 +8,95 @@ extension Ghostty {
         /// Raw banner source text in the banner markdown subset.
         let text: String
 
+        /// The pane's terminal background color, when known. The banner
+        /// renders as a shade off of it — lighter on dark backgrounds,
+        /// darker on light — so it reads as a distinct sticky region.
+        var background: Color?
+
         /// Total display cap in lines. Table rows (including the header)
         /// each count as one line; the separator row never renders.
         static let maxDisplayLines = 10
 
+        /// Content height when collapsed: the first line fully visible
+        /// plus a sliver of the next, which the fade mask dissolves to
+        /// hint that there's more to view.
+        private static let collapsedContentHeight: CGFloat = 24
+
+        /// Collapsed state is per-pane and ephemeral; it resets when the
+        /// banner is cleared and set again.
+        @State private var collapsed = false
+
         var body: some View {
             let blocks = BannerMarkdown.parseBlocks(text, maxLines: Self.maxDisplayLines)
-            HStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 3) {
+            // Single-line banners have nothing to collapse; hide the
+            // chevron and ignore background clicks.
+            let collapsible = text.contains("\n")
+
+            HStack(alignment: .top, spacing: 8) {
+                // Paragraph-style gap between blocks (text runs, tables);
+                // lines within a text run stay tight since a run is a
+                // single Text.
+                let content = VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                         blockView(block)
                     }
                 }
+                if collapsed {
+                    content
+                        .frame(height: Self.collapsedContentHeight, alignment: .topLeading)
+                        .clipped()
+                        .mask {
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .black, location: 0),
+                                    .init(color: .black, location: 0.55),
+                                    .init(color: .clear, location: 1),
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        }
+                } else {
+                    content
+                }
                 Spacer(minLength: 0)
+                if collapsible {
+                    Button(action: toggleCollapsed) {
+                        Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(collapsed ? "Expand banner" : "Collapse banner")
+                }
             }
             .font(.system(size: 12))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(.ultraThinMaterial)
+            .padding(12)
+            .background(backgroundStyle)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard collapsible else { return }
+                toggleCollapsed()
+            }
             .overlay(alignment: .bottom) {
                 Divider()
             }
+        }
+
+        private func toggleCollapsed() {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                collapsed.toggle()
+            }
+        }
+
+        /// A shade deviated from the pane background (lighter when dark,
+        /// darker when light); falls back to the translucent material
+        /// when the background isn't known.
+        private var backgroundStyle: AnyShapeStyle {
+            guard let background else { return AnyShapeStyle(.ultraThinMaterial) }
+            let os = OSColor(background)
+            let shaded = os.isLightColor ? os.darken(by: 0.06) : os.lighten(by: 0.1)
+            return AnyShapeStyle(Color(shaded))
         }
 
         @ViewBuilder
