@@ -210,6 +210,7 @@
 				Features/Update/UpdatePopoverView.swift,
 				Features/Update/UpdateSimulator.swift,
 				Features/Update/UpdateViewModel.swift,
+				Features/Viewer/ViewerCommands.swift,
 				Features/Viewer/ViewerSplitLeaf.swift,
 				Features/Viewer/ViewerView.swift,
 				"Ghostty/FullscreenMode+Extension.swift",

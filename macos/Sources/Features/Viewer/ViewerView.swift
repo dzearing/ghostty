@@ -131,7 +131,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             break
         }
 
-        let webView = EdgePassthroughWebView(frame: .zero, configuration: config)
+        let webView = WKWebView(frame: .zero, configuration: config)
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = self
         webView.allowsBackForwardNavigationGestures = isWebURL
@@ -199,10 +199,25 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
+    /// True while keyboard focus (window first responder) is inside the
+    /// chrome bar — the URL field's field editor or any of its buttons.
+    /// Checked at hide time at the AppKit level because SwiftUI @FocusState
+    /// doesn't propagate reliably inside an NSHostingView.
+    private var chromeKeyboardFocused: Bool {
+        guard let chromeHost, let responder = window?.firstResponder as? NSView else { return false }
+        return responder === chromeHost || responder.isDescendant(of: chromeHost)
+    }
+
     private func scheduleChromeHide(after delay: TimeInterval = 2.0) {
         chromeHideTimer?.invalidate()
         chromeHideTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-            guard let self, !self.chromeHeld else { return }
+            guard let self else { return }
+            // Never hide out from under the user: keep the bar while it is
+            // hovered (chromeHeld) or holds keyboard focus; check again later.
+            if self.chromeHeld || self.chromeKeyboardFocused {
+                self.scheduleChromeHide(after: 1.0)
+                return
+            }
             self.setChromeVisible(false)
         }
     }
@@ -503,26 +518,6 @@ extension ViewerView: WKNavigationDelegate {
             atPane: myPane,
             direction: .right,
             viewer: ViewerView(location: location))
-    }
-}
-
-// MARK: - Edge passthrough
-
-/// A WKWebView that gives up a thin strip along its edges so the SwiftUI
-/// split divider — whose invisible grab zone overlaps each pane by only a
-/// few points — wins the hit test there. Without this, grabbing a divider
-/// next to web content is nearly impossible: the web view swallows the
-/// mouse down.
-private final class EdgePassthroughWebView: WKWebView {
-    static let edgeInset: CGFloat = 6
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        let local = convert(point, from: superview)
-        if local.x < Self.edgeInset || local.x > bounds.width - Self.edgeInset ||
-           local.y < Self.edgeInset || local.y > bounds.height - Self.edgeInset {
-            return nil
-        }
-        return super.hitTest(point)
     }
 }
 

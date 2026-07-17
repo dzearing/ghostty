@@ -1,5 +1,78 @@
 import SwiftUI
 
+/// The AppKit grab handle for a split divider. The panes host AppKit views
+/// (terminal surfaces, WKWebViews) that win hit-testing over any SwiftUI
+/// gesture area, so the drag target must itself be an NSView layered above
+/// them. Placed by SplitView over the divider line, spanning the visible
+/// line plus a few points of grab zone on each side.
+struct DividerHandle: NSViewRepresentable {
+    let direction: SplitViewDirection
+    /// Called during a drag with (cumulative delta in points, split at drag start).
+    let onDragDelta: (CGFloat, CGFloat) -> Void
+    let onDoubleClick: () -> Void
+    /// Reads the current split fraction (captured at mouse-down).
+    let currentSplit: () -> CGFloat
+
+    func makeNSView(context: Context) -> DividerHandleView {
+        let view = DividerHandleView()
+        update(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: DividerHandleView, context: Context) {
+        update(nsView)
+    }
+
+    private func update(_ view: DividerHandleView) {
+        view.direction = direction
+        view.onDragDelta = onDragDelta
+        view.onDoubleClick = onDoubleClick
+        view.currentSplit = currentSplit
+    }
+
+    final class DividerHandleView: NSView {
+        var direction: SplitViewDirection = .horizontal
+        var onDragDelta: ((CGFloat, CGFloat) -> Void)?
+        var onDoubleClick: (() -> Void)?
+        var currentSplit: (() -> CGFloat)?
+
+        private var dragOrigin: CGPoint?
+        private var dragStartSplit: CGFloat = 0.5
+
+        override func mouseDown(with event: NSEvent) {
+            if event.clickCount == 2 {
+                dragOrigin = nil
+                onDoubleClick?()
+                return
+            }
+            dragOrigin = event.locationInWindow
+            dragStartSplit = currentSplit?() ?? 0.5
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let dragOrigin else { return }
+            let location = event.locationInWindow
+            // Window coordinates are y-up; a downward drag grows a vertical
+            // split's top pane, so flip the vertical delta.
+            let delta: CGFloat = switch direction {
+            case .horizontal: location.x - dragOrigin.x
+            case .vertical: dragOrigin.y - location.y
+            }
+            onDragDelta?(delta, dragStartSplit)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            dragOrigin = nil
+        }
+
+        override func resetCursorRects() {
+            addCursorRect(
+                bounds,
+                cursor: direction == .horizontal ? .resizeLeftRight : .resizeUpDown)
+        }
+    }
+}
+
 extension SplitView {
     /// The split divider that is rendered and can be used to resize a split view.
     struct Divider: View {

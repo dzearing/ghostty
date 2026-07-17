@@ -33,16 +33,19 @@ struct SplitView<L: View, R: View>: View {
     /// The visible size of the splitter, in points. The invisible size is a transparent hitbox that can still
     /// be used for getting a resize handle. The total width/height of the splitter is the sum of both.
     private let splitterVisibleSize: CGFloat = 1
-    // 10pt of invisible grab zone (~5pt into each pane) — 6 was hard to
-    // hit, especially next to web viewer panes whose WKWebView yields its
-    // edge strip to the divider (see EdgePassthroughWebView).
-    private let splitterInvisibleSize: CGFloat = 10
+    /// Extra grab zone around the visible line (~4pt into each pane). This is
+    /// realized by an APPKIT handle view (`DividerHandle`) layered above the
+    /// panes: the panes host AppKit views (terminal surfaces, web views) that
+    /// out-hit-test any SwiftUI gesture area, so a SwiftUI-only divider is
+    /// effectively a 1px target no matter how large its invisible frame is.
+    private let splitterInvisibleSize: CGFloat = 8
 
     var body: some View {
         GeometryReader { geo in
             let leftRect = self.leftRect(for: geo.size)
             let rightRect = self.rightRect(for: geo.size, leftRect: leftRect)
             let splitterPoint = self.splitterPoint(for: geo.size, leftRect: leftRect)
+            let handleTotal = splitterVisibleSize + splitterInvisibleSize
 
             ZStack(alignment: .topLeading) {
                 left
@@ -61,10 +64,20 @@ struct SplitView<L: View, R: View>: View {
                         color: dividerColor,
                         split: $split)
                     .position(splitterPoint)
-                    .gesture(dragGesture(geo.size, splitterPoint: splitterPoint))
-                    .onTapGesture(count: 2) {
-                        onEqualize()
-                    }
+                DividerHandle(
+                    direction: direction,
+                    onDragDelta: { delta, startSplit in
+                        let dim = direction == .horizontal ? geo.size.width : geo.size.height
+                        guard dim > 0 else { return }
+                        let newPos = min(max(minSize, startSplit * dim + delta), dim - minSize)
+                        split = newPos / dim
+                    },
+                    onDoubleClick: onEqualize,
+                    currentSplit: { split })
+                    .frame(
+                        width: direction == .horizontal ? handleTotal : geo.size.width,
+                        height: direction == .horizontal ? geo.size.height : handleTotal)
+                    .position(splitterPoint)
             }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(splitViewLabel)
