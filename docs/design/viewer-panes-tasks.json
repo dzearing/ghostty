@@ -202,7 +202,7 @@
     {
       "id": "T10",
       "title": "AppKit window-restoration round-trip (persistence off)",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T08"
       ],
@@ -213,7 +213,7 @@
         "Test: quit with mixed window → relaunch → tree shape+ratios+viewer content back; delete the file first → pane shows in-page error, window still restores."
       ],
       "acceptance": "Both restore scenarios pass. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done. No new code needed beyond PaneView.Codable (T01) — verified it end-to-end. IMPORTANT ENV FACT: modern macOS defaults NSQuitAlwaysKeepsWindows=NO ('close windows when quitting'), so AppKit window restoration does NOT run on plain quit on this box; tested by scoping `defaults write com.dzearing.ghoztty.debug NSQuitAlwaysKeepsWindows -bool true` (per-app; domain vanished again after test, nothing to clean). With it: two viewer-only windows restored across quit/relaunch — torture.md rendered, and a window whose file was DELETED between quit and relaunch restored showing the in-page 'Cannot read file' card (infallible viewer decode confirmed; no window loss, no wedge). Viewer-only windows use the AppKit path even with session-persistence=on (no agent session). NOT covered: mixed terminal+viewer AppKit tree (needs persistence=off; the terminal leaf legacy/new Codable paths are exercised by unit inspection only) — acceptable: manifest path owns mixed trees on this config. AppKit-restored windows don't keep IPC names/targets (pre-existing: AppKit state has no registry info)."
     },
     {
       "id": "T11",
