@@ -50,6 +50,8 @@
 	<string></string>
 	<key>GhosttyCommit</key>
 	<string></string>
+	<key>GhosttyGoogleClientID</key>
+	<string>$(GHOSTTY_GOOGLE_CLIENT_ID)</string>
 	<key>LSEnvironment</key>
 	<dict>
 		<key>GHOSTTY_MAC_LAUNCH_SOURCE</key>

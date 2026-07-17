@@ -96,6 +96,14 @@ pub fn init(
             b.fmt("CURRENT_PROJECT_VERSION={s}", .{marketing_version}),
         });
 
+        // Pass the Google OAuth client id so it lands in the app's Info.plist
+        // (GhosttyGoogleClientID). Public value; the confidential secret lives
+        // only on the relay. Empty in a build with neither -Dgoogle-client-id
+        // nor macos/google-client-id.txt.
+        step.addArgs(&.{
+            b.fmt("GHOSTTY_GOOGLE_CLIENT_ID={s}", .{config.google_client_id}),
+        });
+
         // We need the xcframework
         deps.xcframework.addStepDependencies(&step.step);
 
@@ -129,6 +137,9 @@ pub fn init(
             "GhosttyUITests",
         });
         if (xc_arch) |arch| step.addArgs(&.{ "-arch", arch });
+        step.addArgs(&.{
+            b.fmt("GHOSTTY_GOOGLE_CLIENT_ID={s}", .{config.google_client_id}),
+        });
 
         // We need the xcframework
         deps.xcframework.addStepDependencies(&step.step);

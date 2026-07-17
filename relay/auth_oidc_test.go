@@ -181,9 +181,12 @@ func TestOIDCValidTokenAccepted(t *testing.T) {
 	a := newOIDCAuthenticator(t, f, nil)
 
 	token := mint(t, f.key, f.validClaims())
-	ident, err := a.AuthenticateClient(context.Background(), requestWithBearer(token))
+	// Client calls now authenticate with a relay session token; the Google
+	// ID-token verification + allowlist logic this test covers lives in
+	// VerifyIDToken (used by /oauth/exchange).
+	ident, err := a.VerifyIDToken(context.Background(), token)
 	if err != nil {
-		t.Fatalf("AuthenticateClient: %v", err)
+		t.Fatalf("VerifyIDToken: %v", err)
 	}
 	if ident.Email != allowedEmail {
 		t.Errorf("email = %q, want %q (lowercased)", ident.Email, allowedEmail)
@@ -218,19 +221,19 @@ func TestOIDCRejections(t *testing.T) {
 			claims := f.validClaims()
 			tc.mutate(claims)
 			token := mint(t, f.key, claims)
-			if _, err := a.AuthenticateClient(context.Background(), requestWithBearer(token)); err == nil {
+			if _, err := a.VerifyIDToken(context.Background(), token); err == nil {
 				t.Fatalf("token with %s was accepted; want rejection", tc.name)
 			}
 		})
 	}
 
 	t.Run("garbage token", func(t *testing.T) {
-		if _, err := a.AuthenticateClient(context.Background(), requestWithBearer("not-a-jwt")); err == nil {
+		if _, err := a.VerifyIDToken(context.Background(), "not-a-jwt"); err == nil {
 			t.Fatal("garbage token accepted")
 		}
 	})
 	t.Run("no token", func(t *testing.T) {
-		if _, err := a.AuthenticateClient(context.Background(), requestWithBearer("")); err == nil {
+		if _, err := a.VerifyIDToken(context.Background(), ""); err == nil {
 			t.Fatal("missing token accepted")
 		}
 	})
@@ -247,7 +250,7 @@ func TestOIDCForgedSignatureRejected(t *testing.T) {
 		t.Fatalf("generate attacker key: %v", err)
 	}
 	token := mint(t, attackerKey, f.validClaims())
-	if _, err := a.AuthenticateClient(context.Background(), requestWithBearer(token)); err == nil {
+	if _, err := a.VerifyIDToken(context.Background(), token); err == nil {
 		t.Fatal("forged-signature token accepted")
 	}
 }
@@ -269,7 +272,7 @@ func TestOIDCDualAudience(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			claims := f.validClaims()
 			claims["aud"] = aud
-			ident, err := a.AuthenticateClient(context.Background(), requestWithBearer(mint(t, f.key, claims)))
+			ident, err := a.VerifyIDToken(context.Background(), mint(t, f.key, claims))
 			if err != nil {
 				t.Fatalf("token with %s rejected: %v", name, err)
 			}
@@ -282,7 +285,7 @@ func TestOIDCDualAudience(t *testing.T) {
 	t.Run("unknown aud rejected", func(t *testing.T) {
 		claims := f.validClaims()
 		claims["aud"] = "someone-elses-client-id"
-		if _, err := a.AuthenticateClient(context.Background(), requestWithBearer(mint(t, f.key, claims))); err == nil {
+		if _, err := a.VerifyIDToken(context.Background(), mint(t, f.key, claims)); err == nil {
 			t.Fatal("token with unknown aud accepted despite dual-client config")
 		}
 	})
@@ -296,7 +299,7 @@ func TestOIDCDeviceAudRejectedWhenUnconfigured(t *testing.T) {
 
 	claims := f.validClaims()
 	claims["aud"] = testDeviceClientID
-	if _, err := a.AuthenticateClient(context.Background(), requestWithBearer(mint(t, f.key, claims))); err == nil {
+	if _, err := a.VerifyIDToken(context.Background(), mint(t, f.key, claims)); err == nil {
 		t.Fatal("device-client aud accepted without GOOGLE_DEVICE_CLIENT_ID configured")
 	}
 }
@@ -320,13 +323,15 @@ func TestDevAuthCoexistsWithOIDC(t *testing.T) {
 		t.Errorf("dev identity = %+v, want dev@example.com / dev", ident)
 	}
 
-	// Real OIDC token works alongside dev auth.
+	// Real OIDC token verifies alongside dev auth (the Google-token verification
+	// path used by /oauth/exchange).
 	real := mint(t, f.key, f.validClaims())
-	if ident, err := a.AuthenticateClient(context.Background(), requestWithBearer(real)); err != nil || ident.Email != allowedEmail {
+	if ident, err := a.VerifyIDToken(context.Background(), real); err != nil || ident.Email != allowedEmail {
 		t.Errorf("real token alongside dev auth: ident=%+v err=%v", ident, err)
 	}
 
-	// A wrong static token falls through to OIDC and fails there.
+	// A wrong static token falls through past the dev branch and fails (no
+	// matching session).
 	if _, err := a.AuthenticateClient(context.Background(), requestWithBearer("wrong-dev-token")); err == nil {
 		t.Fatal("wrong static token accepted")
 	}
@@ -368,11 +373,13 @@ func TestOIDCEndToEndHTTP(t *testing.T) {
 	f := newFakeIssuer(t)
 
 	cfg := &Config{
-		ListenAddr:     "127.0.0.1:0",
-		StateDir:       t.TempDir(),
-		GoogleClientID: testClientID,
-		IssuerURL:      f.srv.URL,
-		AllowedEmails:  []string{allowedEmail},
+		ListenAddr:         "127.0.0.1:0",
+		StateDir:           t.TempDir(),
+		GoogleClientID:     testClientID,
+		GoogleClientSecret: "test-client-secret",
+		IssuerURL:          f.srv.URL,
+		AllowedEmails:      []string{allowedEmail},
+		SessionEncKey:      testKey(t), // enable the brokered /oauth/exchange flow
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -392,15 +399,20 @@ func TestOIDCEndToEndHTTP(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
-	token := mint(t, f.key, f.validClaims())
-
-	// Enroll with the real ID token.
-	deviceID, deviceToken := enrollDevice(t, ts, token, "oidcbox")
-	if deviceID == "" || deviceToken == "" {
-		t.Fatal("enroll with OIDC token failed")
+	// Sign in through the brokered exchange to get a relay session token (the
+	// client bearer). The fake issuer's /token returns a real ID token.
+	token := sessionToken(t, ts, f, f.validClaims())
+	if token == "" {
+		t.Fatal("brokered sign-in did not mint a session token")
 	}
 
-	// List devices with the real ID token; the enrolled device is visible.
+	// Enroll with the session token.
+	deviceID, deviceToken := enrollDevice(t, ts, token, "oidcbox")
+	if deviceID == "" || deviceToken == "" {
+		t.Fatal("enroll with session token failed")
+	}
+
+	// List devices with the session token; the enrolled device is visible.
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/client/devices", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := http.DefaultClient.Do(req)

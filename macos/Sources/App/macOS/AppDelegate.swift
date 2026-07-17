@@ -1149,19 +1149,11 @@ class AppDelegate: NSObject,
     @IBAction func newRemoteWindow(_ sender: Any?) {
         let registry = MachineRegistry.shared
 
-        // Nothing remote to choose — no registered machine, no relay account,
-        // AND no Google client to sign in with — so just open a normal local
-        // window. The Google-client check matters when SIGNED OUT at zero
-        // machines: the chooser is the only sign-in surface, so it must open
-        // (showing just "Local" + the sign-in footer) or sign-in is
-        // unreachable from the UI.
-        guard !registry.machines.isEmpty || registry.hasRelayAccount
-            || RelayAccount.isConfigured
-        else {
-            _ = TerminalController.newWindow(ghostty)
-            return
-        }
-
+        // Sign-in is always possible now (the Google client id is baked into
+        // the build), so ⌘⇧N ALWAYS presents the chooser — "Local" + any
+        // registered machines + the sign-in/out footer. It must never silently
+        // open a plain local window (that made the app look broken when signed
+        // out with zero machines).
         MachineChooser.present(registry: registry) { [weak self] selected in
             guard let self, let target = selected else { return }
             switch target {
@@ -1422,7 +1414,7 @@ class AppDelegate: NSObject,
         // "couldn't connect" alert. Refuse with the sign-in message instead.
         guard !token.isEmpty else {
             Self.presentSignInRequiredAlert()
-            return "not signed in: sign in (or set GHOSTTY_RELAY_TOKEN) to open relay windows"
+            return "not signed in: sign in to open relay windows"
         }
 
         // Dial the agent through the relay. This blocks through the handshake and

@@ -58,6 +58,13 @@ type Authenticator struct {
 	// the Store, which the Authenticator is built before, hence the late bind.
 	gate *SigninGate
 
+	// store backs session-token client auth (brokered OAuth, BFF). The client
+	// bearer is a relay-minted session token, not a raw Google ID token; Google
+	// verification happens only at /oauth/exchange and /oauth/renew. Late-bound
+	// by NewHandler (SetStore), mirroring SetGate/SetRateLimits; nil during
+	// construction.
+	store *Store
+
 	// limits is the M4 rate-limiter set (ratelimit.go); only the failed
 	// sign-in limiter is consulted here. Late-bound by NewHandler
 	// (SetRateLimits, mirroring SetGate); nil-safe when never bound.
@@ -158,21 +165,26 @@ func NewAuthenticator(ctx context.Context, cfg *Config, logger *slog.Logger) (*A
 // ALLOWED_EMAILS path is used and live auth is unchanged.
 func (a *Authenticator) SetGate(g *SigninGate) { a.gate = g }
 
+// SetStore binds the session store for client session-token auth (brokered
+// OAuth). Called once at startup after the Store exists.
+func (a *Authenticator) SetStore(s *Store) { a.store = s }
+
 // AuthenticateClient verifies a human client request and returns the caller's
 // verified, authorized identity (email + Google sub). Order of checks:
 //  1. (dev only) static DEV_CLIENT_TOKEN match -> DEV_EMAIL.
-//  2. Full Google ID-token verification: signature/issuer/aud/exp.
-//  3. email_verified == true, email and sub present.
-//  4. Authorization: ALLOWED_EMAILS (flag OFF) or the invite-code account
-//     model (flag ON — active account required; the client API carries no
-//     invite code, so a brand-new account without a code is rejected here and
-//     must instead sign up through the enroll flow).
+//  2. Relay session-token lookup (brokered OAuth, BFF): the bearer is an
+//     opaque relay-minted session token, matched against the sessions store
+//     (not revoked, not expired). Google ID-token verification + the
+//     ALLOWED_EMAILS allowlist are enforced ONCE, server-side, at
+//     /oauth/exchange and re-checked on /oauth/renew — they stamp the
+//     allowlisted identity onto the session, so a valid session is sufficient
+//     here without a per-request Google round-trip.
 //
 // Presence of a token is never sufficient.
 //
 // M4 abuse control: failed sign-ins are rate limited per client IP. The
 // budget is CHECKED before any verification work (a brute-forcer gets 429s
-// without costing a JWKS/signature check) and CHARGED only on failure, so
+// without costing a store lookup) and CHARGED only on failure, so
 // successful authenticated traffic never consumes it (see ratelimit.go).
 func (a *Authenticator) AuthenticateClient(ctx context.Context, r *http.Request) (Identity, error) {
 	if err := a.limits.checkSigninBudget(clientIP(r)); err != nil {
@@ -211,22 +223,16 @@ func (a *Authenticator) authenticateClient(ctx context.Context, r *http.Request)
 		// Not the dev token — fall through to real OIDC if configured.
 	}
 
-	// Flag OFF: exact legacy accept/reject behavior (verify + ALLOWED_EMAILS);
-	// the client IP rides along for the (logging-only) attempt audit.
-	if a.gate == nil || !a.gate.Enabled() {
-		return a.verifyIDTokenIP(ctx, token, clientIP(r))
+	// Brokered OAuth: the client bearer is a relay-minted session token, not a
+	// raw Google ID token. Google verification + the allowlist happen only at
+	// /oauth/exchange and /oauth/renew (which stamp the allowlist onto the
+	// session); a valid, unexpired, unrevoked session is sufficient here.
+	if a.store != nil {
+		if ident, ok := a.store.AuthenticateSession(token); ok {
+			return ident, nil
+		}
 	}
-
-	// Flag ON: verify identity (unchanged OIDC strictness), then authorize via
-	// the account model. The client API supplies no invite code.
-	ident, err := a.VerifyIdentity(ctx, token)
-	if err != nil {
-		return Identity{}, err
-	}
-	if err := a.gate.Authorize(ident, "", clientIP(r), tokenFingerprint(token)); err != nil {
-		return Identity{}, err
-	}
-	return ident, nil
+	return Identity{}, ErrUnauthorized
 }
 
 // clientIP extracts a best-effort client IP for the audit log. Behind Caddy the

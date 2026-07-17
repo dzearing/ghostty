@@ -141,7 +141,11 @@ func TestAllowlistCacheAndBust(t *testing.T) {
 // allowed-row audit throttle out of the way.
 func clientDevicesStatus(t *testing.T, ts *httptest.Server, f *fakeIssuer, sub, email string) int {
 	t.Helper()
-	token := mint(t, f.key, claimsFor(f, sub, email))
+	// Sign in via the brokered /oauth/exchange (it runs the allowlist/account
+	// gate + mints a session), then exercise the client surface with the
+	// session token. A rejected sign-in yields no token → the client call 401s,
+	// preserving the original allowed→200 / rejected→401 contract.
+	token := sessionToken(t, ts, f, claimsFor(f, sub, email))
 	resp := doJSON(t, http.MethodGet, ts.URL+"/v1/client/devices", token, "")
 	resp.Body.Close()
 	return resp.StatusCode

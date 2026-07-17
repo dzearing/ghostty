@@ -60,6 +60,9 @@ func NewHandler(cfg *Config, auth *Authenticator, store *Store, dir *Directory, 
 	// mirroring SetGate) so production and every test wiring get it through
 	// this one path with no main.go changes.
 	auth.SetRateLimits(h.rl)
+	// Bind the session store for client session-token auth (brokered OAuth),
+	// mirroring SetGate/SetRateLimits — one path for production and every test.
+	auth.SetStore(store)
 	return h
 }
 
@@ -76,6 +79,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/client/connect", h.handleClientConnect)
 	mux.HandleFunc("POST /v1/enroll/start", h.handleEnrollStart)
 	mux.HandleFunc("POST /v1/enroll/poll", h.handleEnrollPoll)
+	// Brokered-OAuth (BFF): the app hands the relay a PKCE authorization code;
+	// the relay holds the client secret + Google tokens and mints session
+	// tokens. See oauth.go.
+	mux.HandleFunc("POST /oauth/exchange", h.handleOAuthExchange)
+	mux.HandleFunc("POST /oauth/renew", h.handleOAuthRenew)
+	mux.HandleFunc("POST /oauth/signout", h.handleOAuthSignout)
 	// Browser-facing web-enroll leg. The literal "callback" segment wins over
 	// the {nonce} wildcard per ServeMux precedence, so both can coexist.
 	mux.HandleFunc("GET /enroll/callback", h.handleEnrollCallback)

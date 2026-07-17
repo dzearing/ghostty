@@ -3,36 +3,50 @@ import Foundation
 import Network
 
 /// The pure, headlessly-testable pieces of the Google OAuth 2.0
-/// authorization-code + PKCE flow used by `RelayAccount` (WP-B2):
+/// authorization-code + PKCE flow used by `RelayAccount` (WP-B2), now in a
+/// relay-brokered (BFF) posture:
 ///
 /// - PKCE verifier/challenge generation (RFC 7636, S256)
-/// - the authorization URL builder
+/// - the authorization URL builder (the browser leg still goes to Google)
 /// - a loopback redirect receiver (`http://127.0.0.1:<random port>` — the
 ///   redirect style Google supports for **Desktop app** OAuth clients, no
 ///   registered redirect URI needed)
-/// - the token-endpoint client (code exchange + refresh) with decoding of
-///   Google's token response and ID-token (JWT) claims
-/// - ID-token expiry math
+/// - the **relay session client** (`RelaySessionClient`): the app hands the
+///   authorization `code` (+ PKCE verifier) to the RELAY's `/oauth/exchange`,
+///   which holds the confidential client secret, performs the Google token
+///   exchange server-side, and returns a short-lived **relay session token**.
+///   Google id/refresh tokens never touch the client.
 ///
 /// Endpoint URLs are injectable via `Endpoints` **at construction time only**
 /// (the relay's `IssuerURL` pattern: tests build their own `Endpoints`
-/// pointing at a local fake; production always uses `.google` — there is no
-/// environment override).
+/// pointing at a local fake; production always uses `.relay(base:)`).
 ///
 /// Everything here is UI-free (Foundation + CryptoKit + Network) so it can be
 /// exercised by a standalone `swiftc` harness without the app.
 enum GoogleOAuth {
     // MARK: - Endpoints
 
-    /// The OAuth endpoints in use. Injectable for tests only; production code
-    /// always passes `.google`.
+    /// The OAuth/relay endpoints in use. `authorization` is Google's (the
+    /// browser leg); the token `exchange`/`renew`/`signout` are the RELAY's —
+    /// the app never talks to Google's token endpoint (BFF). Injectable for
+    /// tests only; production uses `.relay(base:)`.
     struct Endpoints: Sendable {
         var authorization: URL
-        var token: URL
+        var exchange: URL
+        var renew: URL
+        var signout: URL
 
-        static let google = Endpoints(
-            authorization: URL(string: "https://accounts.google.com/o/oauth2/v2/auth")!,
-            token: URL(string: "https://oauth2.googleapis.com/token")!)
+        static let googleAuthorization =
+            URL(string: "https://accounts.google.com/o/oauth2/v2/auth")!
+
+        /// Production endpoints for a given relay base (e.g. the Azure relay).
+        static func relay(base: URL) -> Endpoints {
+            Endpoints(
+                authorization: googleAuthorization,
+                exchange: base.appendingPathComponent("oauth/exchange"),
+                renew: base.appendingPathComponent("oauth/renew"),
+                signout: base.appendingPathComponent("oauth/signout"))
+        }
     }
 
     // MARK: - PKCE (RFC 7636)
@@ -85,7 +99,8 @@ enum GoogleOAuth {
 
     /// The browser URL that starts the sign-in: Google's authorization
     /// endpoint with the code+PKCE parameters. `access_type=offline` +
-    /// `prompt=consent` guarantee a refresh token on every (re-)sign-in.
+    /// `prompt=consent` guarantee a refresh token on every (re-)sign-in — the
+    /// relay captures and holds that refresh token (it never reaches the app).
     static func authorizationURL(
         endpoints: Endpoints,
         clientID: String,
@@ -109,116 +124,34 @@ enum GoogleOAuth {
         return comps.url!
     }
 
-    // MARK: - Token response + ID-token claims
+    // MARK: - Relay session client
 
-    /// Google's token-endpoint response (both the code exchange and the
-    /// refresh grant). Snake-case keys per OAuth.
-    struct TokenResponse: Decodable, Equatable {
-        var accessToken: String?
-        var expiresIn: Double?
-        var idToken: String?
-        var refreshToken: String?
-        var scope: String?
-        var tokenType: String?
-
-        enum CodingKeys: String, CodingKey {
-            case accessToken = "access_token"
-            case expiresIn = "expires_in"
-            case idToken = "id_token"
-            case refreshToken = "refresh_token"
-            case scope
-            case tokenType = "token_type"
-        }
-    }
-
-    /// The ID-token (JWT) claims we read. NOTE: the client does NOT verify
-    /// the signature — the token came over TLS straight from Google's token
-    /// endpoint and the RELAY is the enforcement point (it verifies signature,
-    /// `aud`, `exp`, allowlist). The claims here are display/cache hints only.
-    struct IDTokenClaims: Decodable, Equatable {
-        var email: String?
-        var emailVerified: Bool?
-        var exp: Double?
-        var sub: String?
-        /// Display name (`profile` scope). Nil for sessions minted before the
-        /// scope was requested.
-        var name: String?
-        /// Profile-photo URL (`profile` scope). Nil for sessions minted before
-        /// the scope was requested — the UI falls back to a monogram.
-        var picture: String?
-
-        enum CodingKeys: String, CodingKey {
-            case email
-            case emailVerified = "email_verified"
-            case exp
-            case sub
-            case name
-            case picture
-        }
-    }
-
-    enum ClaimsError: LocalizedError {
-        case malformed
-        var errorDescription: String? { "The Google ID token could not be parsed." }
-    }
-
-    /// Decode the payload (claims) segment of a JWT without verifying it.
-    static func parseIDTokenClaims(_ idToken: String) throws -> IDTokenClaims {
-        let parts = idToken.split(separator: ".")
-        guard parts.count == 3,
-              let payload = PKCE.base64URLDecode(String(parts[1])),
-              let claims = try? JSONDecoder().decode(IDTokenClaims.self, from: payload)
-        else { throw ClaimsError.malformed }
-        return claims
-    }
-
-    // MARK: - Expiry math
-
-    /// An ID token cached in memory with its expiry. The token is considered
-    /// usable only while it has more than `refreshLeeway` (60s) of life left,
-    /// so relay calls never race the expiry.
-    struct CachedIDToken {
-        let token: String
-        let expiresAt: Date
-
-        static let refreshLeeway: TimeInterval = 60
-
-        /// Expiry resolution order: the JWT `exp` claim (authoritative),
-        /// else `expires_in` relative to `now`, else "already stale" (forces
-        /// a refresh on next use — safe default for an opaque response).
-        init(token: String, expiresIn: Double?, now: Date = Date()) {
-            self.token = token
-            if let exp = (try? GoogleOAuth.parseIDTokenClaims(token))?.exp {
-                self.expiresAt = Date(timeIntervalSince1970: exp)
-            } else if let expiresIn {
-                self.expiresAt = now.addingTimeInterval(expiresIn)
-            } else {
-                self.expiresAt = now
-            }
-        }
-
-        func isFresh(now: Date = Date()) -> Bool {
-            expiresAt.timeIntervalSince(now) > Self.refreshLeeway
-        }
-    }
-
-    // MARK: - Token-endpoint client
-
-    /// Client for the token endpoint: authorization-code exchange and
-    /// refresh-token grant. The endpoint comes from `Endpoints` (injectable
-    /// for tests, `.google` in production).
-    struct TokenClient {
+    /// The app's client for the relay's brokered-OAuth endpoints. It exchanges
+    /// the PKCE authorization code for a relay session token, renews it, and
+    /// signs out. Google tokens never touch the client — the relay holds them.
+    struct RelaySessionClient {
         let endpoints: Endpoints
-        let clientID: String
-        /// Desktop-app clients are issued a `client_secret` that Google
-        /// requires at the token endpoint even though it is not confidential
-        /// for this client type.
-        let clientSecret: String?
         var urlSession: URLSession = .shared
 
-        enum TokenError: LocalizedError {
-            /// Non-2xx from the token endpoint; carries the OAuth `error`
-            /// / `error_description` when the body had one.
+        /// The relay's session response: an opaque session token, its expiry
+        /// (unix seconds), and display fields.
+        struct SessionResponse: Decodable, Equatable {
+            let sessionToken: String
+            let expiry: Double
+            let email: String
+            let picture: String?
+
+            enum CodingKeys: String, CodingKey {
+                case sessionToken = "session_token"
+                case expiry
+                case email
+                case picture
+            }
+
+            var expiresAt: Date { Date(timeIntervalSince1970: expiry) }
+        }
+
+        enum SessionError: LocalizedError {
             case http(Int, String)
             case badResponse
 
@@ -226,82 +159,63 @@ enum GoogleOAuth {
                 switch self {
                 case .http(let code, let detail):
                     return detail.isEmpty
-                        ? "Google's token endpoint returned HTTP \(code)."
-                        : "Google's token endpoint returned HTTP \(code): \(detail)"
+                        ? "The relay returned HTTP \(code) during sign-in."
+                        : "The relay returned HTTP \(code) during sign-in: \(detail)"
                 case .badResponse:
-                    return "Google's token endpoint returned a response that couldn't be parsed."
+                    return "The relay returned a sign-in response that couldn't be parsed."
                 }
             }
         }
 
-        /// Exchange an authorization code (+ PKCE verifier) for tokens.
+        /// POST /oauth/exchange — trade the PKCE code for a relay session token.
         func exchange(
             code: String,
             redirectURI: String,
             codeVerifier: String
-        ) async throws -> TokenResponse {
-            var form = [
-                "grant_type": "authorization_code",
-                "code": code,
-                "client_id": clientID,
-                "redirect_uri": redirectURI,
-                "code_verifier": codeVerifier,
-            ]
-            if let clientSecret { form["client_secret"] = clientSecret }
-            return try await post(form)
-        }
-
-        /// Redeem a refresh token for a fresh ID token.
-        func refresh(refreshToken: String) async throws -> TokenResponse {
-            var form = [
-                "grant_type": "refresh_token",
-                "refresh_token": refreshToken,
-                "client_id": clientID,
-            ]
-            if let clientSecret { form["client_secret"] = clientSecret }
-            return try await post(form)
-        }
-
-        private func post(_ form: [String: String]) async throws -> TokenResponse {
-            var req = URLRequest(url: endpoints.token)
+        ) async throws -> SessionResponse {
+            var req = URLRequest(url: endpoints.exchange)
             req.httpMethod = "POST"
-            req.timeoutInterval = 15
-            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            req.httpBody = Data(Self.formEncode(form).utf8)
+            req.timeoutInterval = 20
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: [
+                "code": code,
+                "code_verifier": codeVerifier,
+                "redirect_uri": redirectURI,
+            ])
+            return try await send(req)
+        }
+
+        /// POST /oauth/renew — rotate the session token using the relay-held
+        /// Google refresh token. The current (possibly just-expired) session
+        /// token is the bearer.
+        func renew(sessionToken: String) async throws -> SessionResponse {
+            var req = URLRequest(url: endpoints.renew)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 20
+            req.setValue("Bearer \(sessionToken)", forHTTPHeaderField: "Authorization")
+            return try await send(req)
+        }
+
+        /// POST /oauth/signout — best-effort revoke (failures are ignored).
+        func signOut(sessionToken: String) async {
+            var req = URLRequest(url: endpoints.signout)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 10
+            req.setValue("Bearer \(sessionToken)", forHTTPHeaderField: "Authorization")
+            _ = try? await urlSession.data(for: req)
+        }
+
+        private func send(_ req: URLRequest) async throws -> SessionResponse {
             let (data, resp) = try await urlSession.data(for: req)
-            guard let http = resp as? HTTPURLResponse else { throw TokenError.badResponse }
+            guard let http = resp as? HTTPURLResponse else { throw SessionError.badResponse }
             guard (200..<300).contains(http.statusCode) else {
-                struct OAuthErrorBody: Decodable {
-                    let error: String?
-                    let errorDescription: String?
-                    enum CodingKeys: String, CodingKey {
-                        case error
-                        case errorDescription = "error_description"
-                    }
-                }
-                let body = try? JSONDecoder().decode(OAuthErrorBody.self, from: data)
-                throw TokenError.http(
-                    http.statusCode, body?.errorDescription ?? body?.error ?? "")
+                let detail = String(decoding: data, as: UTF8.self)
+                throw SessionError.http(http.statusCode, String(detail.prefix(200)))
             }
-            guard let tokens = try? JSONDecoder().decode(TokenResponse.self, from: data) else {
-                throw TokenError.badResponse
+            guard let out = try? JSONDecoder().decode(SessionResponse.self, from: data) else {
+                throw SessionError.badResponse
             }
-            return tokens
-        }
-
-        /// `application/x-www-form-urlencoded` encoding. Keys are sorted so
-        /// the output is deterministic (testability).
-        static func formEncode(_ form: [String: String]) -> String {
-            form.sorted { $0.key < $1.key }
-                .map { "\(formEscape($0.key))=\(formEscape($0.value))" }
-                .joined(separator: "&")
-        }
-
-        private static let unreserved = CharacterSet(
-            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-
-        static func formEscape(_ s: String) -> String {
-            s.addingPercentEncoding(withAllowedCharacters: unreserved) ?? s
+            return out
         }
     }
 
