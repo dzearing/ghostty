@@ -461,6 +461,10 @@ class IPCServer {
                 // caller chose one.
                 controller.titleOverride = parsed.title ?? pane.title
                 if let target = parsed.target {
+                    // Also adopt the target as the controller's window name so
+                    // +list doesn't mint a second "window-N" alias (terminal
+                    // windows get this via the GHOZTTY_WINDOW_NAME env var).
+                    controller.windowName = target
                     self?.targetRegistry[target] = .window(WeakRef(controller))
                     Self.logger.info("IPC: registered window target '\(target)'")
                 }
@@ -988,6 +992,10 @@ class IPCServer {
             return IPCResponse(success: false, error: "target '\(target)' is no longer alive")
         }
 
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "target '\(target)' is a viewer pane, not a terminal")
+        }
+
         DispatchQueue.main.async {
             // Set activity state on all surfaces in the window, or just the targeted pane
             switch entry {
@@ -996,8 +1004,7 @@ class IPCServer {
                     surface.activityState = activityState
                 }
             case .viewerPane:
-                // Activity state is unsupported for viewer panes (v1).
-                break
+                break // rejected above
             case .window:
                 for pane in controller.surfaceTree {
                     pane.surfaceView?.activityState = activityState
@@ -1045,6 +1052,10 @@ class IPCServer {
 
         guard let entry = targetRegistry[target] else {
             return IPCResponse(success: false, error: "target '\(target)' not found in registry")
+        }
+
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "target '\(target)' is a viewer pane, not a terminal")
         }
 
         var setError: String?
@@ -1233,6 +1244,10 @@ class IPCServer {
             return IPCResponse(success: false, error: "pane '\(name)' not found in registry")
         }
 
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "pane '\(name)' is a viewer pane, not a terminal")
+        }
+
         guard let surfaceView = entry.surfaceView else {
             return IPCResponse(success: false, error: "pane '\(name)' is no longer alive")
         }
@@ -1309,6 +1324,10 @@ class IPCServer {
 
         guard let entry = targetRegistry[target] else {
             return IPCResponse(success: false, error: "target '\(target)' not found")
+        }
+
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "target '\(target)' is a viewer pane, not a terminal")
         }
 
         var sendError: String?
@@ -1674,6 +1693,23 @@ class IPCServer {
     }
 
     @MainActor
+    private func ensureViewerPaneRegistered(name: String, controller: BaseTerminalController, pane: PaneView) {
+        if targetRegistry[name] == nil, let tc = controller as? TerminalController {
+            targetRegistry[name] = .viewerPane(controller: WeakRef(tc), pane: WeakRef(pane))
+        }
+    }
+
+    @MainActor
+    private func paneNameForViewerPane(_ pane: PaneView) -> String {
+        for (name, entry) in targetRegistry {
+            if case .viewerPane(_, let paneRef) = entry, paneRef.value === pane {
+                return name
+            }
+        }
+        return pane.id.uuidString
+    }
+
+    @MainActor
     private func paneNameForSurface(_ view: Ghostty.SurfaceView) -> String {
         for (name, entry) in targetRegistry {
             if case .pane(_, let surfaceRef) = entry, surfaceRef.value === view {
@@ -1704,8 +1740,22 @@ class IPCServer {
 
         switch node {
         case .leaf(let pane):
-            // TODO(viewer-panes T08): emit a viewer discriminator + url for
-            // viewer panes. For now viewers report their pane id/title only.
+            if let viewer = pane.viewerView {
+                let paneName = paneNameForViewerPane(pane)
+                ensureViewerPaneRegistered(name: paneName, controller: controller, pane: pane)
+                return .leaf(IPCData.TerminalData(
+                    id: pane.id.uuidString,
+                    title: pane.title,
+                    working_directory: "",
+                    pid: 0,
+                    tty: "",
+                    name: paneName,
+                    focused: false,
+                    exit_code: nil,
+                    pane_type: "viewer",
+                    url: viewer.location
+                ))
+            }
             guard let view = pane.surfaceView else {
                 return .leaf(IPCData.TerminalData(
                     id: pane.id.uuidString,

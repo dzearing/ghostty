@@ -167,7 +167,7 @@
     {
       "id": "T08",
       "title": "+list/+read/+send-keys/+close/banner/state viewer behavior",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T07"
       ],
@@ -180,7 +180,7 @@
         "Clean-error guards in handleRead/handleSendKeys/handleSetBanner/handleSetState."
       ],
       "acceptance": "+list (human + --json) correctly describes a mixed window; +read/+send-keys against a viewer exit 1 with the documented message; +close removes the viewer pane. Commit. RESET CONTEXT after this task.",
-      "notes": ""
+      "notes": "2026-07-17: done, all live-verified. +list: viewer leaves auto-register (.viewerPane; ensureViewerPaneRegistered/paneNameForViewerPane, uuid fallback), JSON leaf gains type:'terminal'|'viewer' + url (key is 'type' — TerminalData field named pane_type to avoid Swift clash), human tree prints 'view: <title>  <url>  [name: x]' and suppresses pid/tty/running for viewers. Clean errors verified on all four: +read/+send-keys/+set-state/+set-banner -> \"...is a viewer pane, not a terminal\", exit 1. +close viewer silent (T02). Also fixed: viewer WINDOWS adopt --target as controller.windowName so +list doesn't mint a second window-N alias. NOTE: .pane registry case still surface-typed (full generalization not needed — viewerPane case covers viewers)."
     },
     {
       "id": "T09",
