@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-17 (on-box, night) — T53b DONE (T53 complete) + T64 found+fixed.
+  The detached 180-min soak finished ALL PASS (11): zero leak growth,
+  responsive at all 720 samples, echo median 248ms, median fps 59; only
+  WARN = the known T62 stall (pre-fix binary). New profile-latency.ps1
+  (ALL PASS 14): keyboard latency 65→81ms at 0→150k lines, GUI-thread
+  RTT 0ms through seek bursts even while the same pane storms; T62/T63
+  bounds re-verified on ReleaseFast. Its unicode-typing probe exposed
+  T64: SendInput KEYEVENTF_UNICODE (screen readers, OSK, automation)
+  typed NOTHING — the TranslateMessage skip starved VK_PACKET of its
+  WM_CHAR, the stale produced-text flag ate the char, and win32-input
+  mode dropped all WM_CHAR; fixed all three layers (3cb802605),
+  kb-actions grew a two-mode T64 section (ALL PASS 28). Delivered HEAD
+  release to all 3 install locations at the boundary (deferred from the
+  T62 session). Surprise for posterity: `ps -W` in Git Bash does NOT
+  list Windows-native PIDs in column 1 — liveness checks must use
+  tasklist/Get-Process (a Monitor false-fired on this). Next: T52.
 - 2026-07-17 (on-box) — T62 DONE + T63 found+fixed. Arrived 3 min after
   the detached 180-min soak launched, so worked T62 instead of the T53b
   harvest. Fix: threadMainWindows batches pty output (64KB buffer +

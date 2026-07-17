@@ -1349,6 +1349,31 @@ detached 180-min soak launched 2026-07-16 23:24 (`%TEMP%\ghoztty-soak\
 baseline probe already logged the known T62 stall (19.1s, WARN, not
 asserted); read the report with that in mind.
 
+*Evidence (done 2026-07-17):* the detached 180-min soak finished
+**ALL PASS (11)**: GUI alive + responding at all 720 samples, 180/180
+echo probes ok (median 248ms, worst 304ms), median fps 59 under the
+4-pane stream/alt-screen load, growth q1→q4 ≈ zero (private +0.5MB,
+handles/GDI/USER +0), big-scrollback +read 76ms at the end, zero
+slow-mutex warns. Only WARN: the known T62 baseline stall (19.1s) on
+the pre-fix binary — already fixed and regression-guarded. Interactive
+profiling via the new `test/win32/profile-latency.ps1` (landed with
+T64, 3cb802605): fully isolated instance (`-prof` pipe suffix + own
+log file via LOCALAPPDATA override so a concurrent soak's telemetry
+slice stays clean), real SendInput keyboard path with a pixel-hash
+viewport-moved oracle and per-key WM_NULL GUI-thread RTT sampling.
+Results (ReleaseFast, ALL PASS 14): keyboard echo latency median 65ms
+on a fresh pane → 81ms at 150k scrollback lines (no degradation);
+ctrl+home/shift+pgdn seek bursts show GUI RTT 0ms and renderer
+59–60fps both idle and while the SAME pane streams an echo storm;
++read mid-storm 79ms and +close of the storming window 122ms (T62/T63
+bounds hold in release optimization). No tuning fixes warranted from
+either run; the harness's one product finding became T64 (SendInput
+unicode injection dropped — fixed same session). Delivery: HEAD
+release (T62/T63/T64) rebuilt to zig-out-release and refreshed to all
+three install locations (installed via upgrade-ghoztty-windows.ps1,
+Desktop portable, homeassistant share) at this boundary, as deferred
+from the T62 session.
+
 ## T62 — FIX: +read stalls under tiny-write floods (renderer-mutex starvation)
 
 Found by the T53a soak baseline probe: `+read --name=<pane>` took

@@ -100,17 +100,19 @@ Work these first, in order, before falling back to first-todo-in-table:
    clean (thumbnail heartbeat ≈7fps/renderer, no stalls); hero-mode.ps1
    ALL PASS (58 assertions, incl. a mid-slide oracle); both test lanes +
    P1–P3 green. The hero-mode TRUE port is COMPLETE. Next: T53.
-6. **T53** — long-context reliability + perf soak/tuning pass. Split
-   2026-07-16: **T53a DONE** (soak harness; found+fixed the WM_APP_WAKEUP
-   queue flood that broke ALL IPC under load — `ipc-under-load.ps1` guards
-   it; filed T62 read-stall). **T62 DONE 2026-07-17** (read-thread
-   batching bounds the renderer-mutex cadence: +read mid-storm 16–19s →
-   80–127ms; found+fixed T63 +close hang in the same pass; test kill
-   sweeps narrowed so they can't kill the detached soak). **T53b next**:
-   harvest the detached soak report from `%TEMP%\ghoztty-soak\
-   20260716-232428\` (launched 2026-07-16 23:24, 180 min — binary
-   predates the T62/T63 fixes), profile scrollback-seek/input latency,
-   tuning fixes from findings.
+6. ~~T53~~ — COMPLETE 2026-07-17. T53a DONE (soak harness; found+fixed
+   the WM_APP_WAKEUP queue flood). T62/T63 DONE (pty read batching;
+   +close join race). **T53b DONE 2026-07-17**: the detached 180-min
+   soak finished ALL PASS (11) — zero leak growth (private +0.5MB,
+   handles/GDI/USER +0 q1→q4), responsive at all 720 samples, 180/180
+   echo probes median 248ms, median fps 59; only WARN was the known
+   T62 stall (binary predated the fix). Interactive profiling
+   (`profile-latency.ps1`, ALL PASS 14): keyboard latency 65→81ms at
+   0→150k scrollback lines, GUI-thread RTT 0ms through seek bursts
+   idle AND mid-storm, T62/T63 bounds re-verified on ReleaseFast. No
+   tuning fixes needed; the harness's one product finding became T64
+   (unicode injection, fixed same session). HEAD release delivered to
+   all 3 install locations. Next in this list: T52.
 7. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
    report was a July-5 exe — make "which build is this" answerable at a
    glance).
@@ -186,8 +188,8 @@ One line per row. Full spec + validation + evidence per task:
 | T50 | Real "Rename Window" dialog | I | T44 | done | 39988009a |
 | T51 | Full parity RE-AUDIT | — | T50,T22c,T48,T53 | todo | — |
 | T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
-| T53a | Soak harness `test/win32/soak.ps1` + first bounded on-box soak + findings filed. FOUND+FIXED: WM_APP_WAKEUP message-queue flood broke ALL IPC under load (see details); regression guard `test/win32/ipc-under-load.ps1` | I | T40 | done | (this commit) |
-| T53b | Multi-hour detached soak + input-latency/scrollback-seek profiling + tuning fixes from findings | I | T53a | todo | — |
+| T53a | Soak harness `test/win32/soak.ps1` + first bounded on-box soak + findings filed. FOUND+FIXED: WM_APP_WAKEUP message-queue flood broke ALL IPC under load (see details); regression guard `test/win32/ipc-under-load.ps1` | I | T40 | done | 517967173 |
+| T53b | Multi-hour detached soak (180 min ALL PASS, zero leaks) + keyboard-latency/scrollback-seek profiling (`profile-latency.ps1` ALL PASS; no degradation at 150k lines) + release delivered to all install locations. No tuning fixes needed; found T64. See details | I | T53a | done | 3cb802605.. |
 | T62 | FIX: +read stalls many seconds (16s observed) while a pane floods tiny writes — renderer-mutex starvation on the GUI/IPC path (T48 static candidate 2, now reproduced). Fixed: read-thread batching (64KB + pipe top-up), one lock cycle per batch; 80–127ms post-fix. See details | I | T53a | done | 5562c65ab |
 | T63 | FIX: +close of a noisy window hung the GUI thread forever — Exec.threadExit's one-shot CancelIoEx missed while the reader parsed, join() never returned (found by the T62 validation run, 9+ min hang observed). Fixed with T62: quit-byte check before every blocking read + retrying cancel; +close now asserted <10s in ipc-under-load.ps1 (277ms). See details | I | T62 | done | 5562c65ab |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
