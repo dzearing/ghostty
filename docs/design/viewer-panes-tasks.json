@@ -134,7 +134,7 @@
     {
       "id": "T06",
       "title": "Live reload with scroll preservation",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T04"
       ],
@@ -145,7 +145,7 @@
         "Test with echo-append AND an atomic-save (write to temp + mv) pattern."
       ],
       "acceptance": "Editing the file updates the pane within ~200ms without losing scroll position; atomic saves keep working repeatedly. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done. DispatchSource vnode watcher (write|extend|delete|rename, main queue, O_EVTONLY fd, cancel handler closes fd), 100ms debounce via DispatchWorkItem; rename/delete sets a STICKY rearm flag (a write arriving inside the debounce window must not cancel re-arming onto the new inode) then re-opens the path. LIVE-VERIFIED: append -> python os.replace (atomic rename) -> append -> full rewrite all rendered; watcher survived inode swap. GOTCHA discovered: WKWebViews in a BACKGROUNDED app get suspended by WebKit (markLayersVolatile logs) and screenshot as blank panes — NOT a bug; content restores on app activation. Don't chase blank-viewer reports without checking frontmost first. Scroll preservation is page-side (verified in T03 Chrome harness)."
     },
     {
       "id": "T07",

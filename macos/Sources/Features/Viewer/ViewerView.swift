@@ -32,6 +32,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private var schemeHandler: ViewerSchemeHandler?
     private var titleObservation: NSKeyValueObservation?
     private var pageLoaded = false
+    private var fileMonitor: DispatchSourceFileSystemObject?
+    private var reloadDebounce: DispatchWorkItem?
+    private var reloadNeedsRearm = false
 
     /// True when location is a web URL (network allowed) rather than a file.
     var isWebURL: Bool {
@@ -54,10 +57,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
         super.init(frame: .zero)
         setupWebView()
         load()
+        startWatchingFile()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported for this view")
+    }
+
+    deinit {
+        fileMonitor?.cancel()
+        reloadDebounce?.cancel()
     }
 
     private static func mode(for location: String) -> Mode {
@@ -161,6 +170,53 @@ final class ViewerView: NSView, Codable, ObservableObject {
             call = "window.__viewer.setError(\(Self.js("Cannot read file")), \(Self.js(fileURL.path)))"
         }
         webView.evaluateJavaScript(call)
+    }
+
+    // MARK: - Live reload
+
+    /// Watch the viewed file for changes and re-render (scroll preserved by
+    /// the page). Atomic-save editors replace the file via rename, so on
+    /// delete/rename events the watcher re-opens the path once the debounce
+    /// fires.
+    private func startWatchingFile() {
+        guard let fileURL else { return }
+        fileMonitor?.cancel()
+        fileMonitor = nil
+
+        let fd = open(fileURL.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .delete, .rename],
+            queue: .main)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let events = self.fileMonitor?.data ?? []
+            let replaced = events.contains(.delete) || events.contains(.rename)
+            self.scheduleReload(rearmWatcher: replaced)
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        fileMonitor = source
+    }
+
+    private func scheduleReload(rearmWatcher: Bool) {
+        // Sticky across the debounce window: a rename followed by a write
+        // must still re-arm onto the new inode.
+        reloadNeedsRearm = reloadNeedsRearm || rearmWatcher
+        reloadDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.reloadNeedsRearm {
+                self.reloadNeedsRearm = false
+                // The path was atomically replaced; track the new inode.
+                self.startWatchingFile()
+            }
+            self.renderFileContent()
+        }
+        reloadDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
     }
 
     /// Encode a string as a JS string literal (JSON is a subset of JS).
