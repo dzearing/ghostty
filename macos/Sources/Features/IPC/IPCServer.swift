@@ -382,6 +382,11 @@ class IPCServer {
             parsed.splitCommand = wrapCommandInShell(splitCommand, shell: parsed.shell)
         }
 
+        // A viewer window has no command; reject the ambiguous combination.
+        if parsed.view != nil, parsed.config.command != nil {
+            return IPCResponse(success: false, error: "--view cannot be combined with --command/-e")
+        }
+
         // Idempotent: if target exists and window is alive, focus it
         if let target = parsed.target {
             pruneStaleTargets()
@@ -437,6 +442,33 @@ class IPCServer {
                     ghostty,
                     withBaseConfig: config,
                     from: TerminalController.preferredParent?.window)
+            }
+            return .ok
+        }
+
+        // Viewer window: a one-pane tree whose leaf renders the file/URL.
+        if let viewLocation = parsed.view {
+            DispatchQueue.main.async { [ghostty = self.ghostty, weak self] in
+                let pane = PaneView(viewer: ViewerView(location: viewLocation))
+                let controller = TerminalController.newWindow(
+                    ghostty,
+                    tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
+                if !parsed.noActivate {
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                // Window titles track the focused *surface*; a viewer-only
+                // window has none, so pin the viewer's title unless the
+                // caller chose one.
+                controller.titleOverride = parsed.title ?? pane.title
+                if let target = parsed.target {
+                    self?.targetRegistry[target] = .window(WeakRef(controller))
+                    Self.logger.info("IPC: registered window target '\(target)'")
+                }
+                if let name = parsed.name {
+                    self?.targetRegistry[name] = .viewerPane(
+                        controller: WeakRef(controller),
+                        pane: WeakRef(pane))
+                }
             }
             return .ok
         }

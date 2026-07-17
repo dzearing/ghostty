@@ -150,7 +150,7 @@
     {
       "id": "T07",
       "title": "--view on +new-window and +split (CLI + IPC + registry)",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T04"
       ],
@@ -162,7 +162,7 @@
         "Idempotency: existing named target focuses instead of recreating."
       ],
       "acceptance": "From a shell: +new-window --view=README.md opens a viewer window; +split --view=https://example.com --name=web splits a viewer pane; --view with --command errors cleanly; repeat with same --target focuses. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done (split-side landed in T02/T04). +new-window --view: one-pane viewer tree via TerminalController.newWindow(tree:), titleOverride pinned to viewer title (viewer-only windows have no focused surface to drive the title; web page-title updates won't retitle the window in v1), --target registers .window, --name registers the .viewerPane, --no-activate honored, idempotent focus verified (no duplicate). Mutual-exclusion error verified on BOTH commands. Zig: --view doc blocks + resolveViewArgument in split.zig/new_window.zig (resolve relative against --working-directory else caller cwd via std.fs.path.resolve; skips URLs and absolute paths); relative resolution live-verified from a cd'd shell for both commands. COSMETIC ISSUE for T08: +list ensureWindowRegistered adds a window-N alias even when the controller already has a registered name (windowName(for:) then shows an arbitrary one)."
     },
     {
       "id": "T08",

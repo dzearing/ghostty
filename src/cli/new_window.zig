@@ -167,6 +167,12 @@ pub const Options = struct {
 ///
 ///   * `--command`: The command to be executed in the first surface of the new window.
 ///
+///   * `--view=<path-or-url>`: Open a window whose single pane is a VIEWER
+///     instead of a terminal: a rendered markdown file, a syntax-highlighted
+///     text/code file, or a website (http/https URL). Relative paths resolve
+///     against `--working-directory` if given, else the caller's cwd.
+///     Mutually exclusive with `--command`/`-e`.
+///
 ///   * `--working-directory=<directory>`: The working directory to pass to Ghoztty.
 ///
 ///   * `--title`: A title that will override the title of the first surface in
@@ -272,6 +278,8 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    try resolveViewArgument(alloc, opts._arguments.items);
+
     const arguments = if (opts._arguments.items.len == 0) null else opts._arguments.items;
 
     if (apprt.App.performIpc(
@@ -298,3 +306,26 @@ fn runArgs(
     return 1;
 }
 
+/// Rewrite a relative `--view=` path to an absolute one, resolved against
+/// `--working-directory=` when present (else the caller's cwd; note this
+/// command always inserts the caller's cwd as `--working-directory` when
+/// none was given, so the base is always present here). URLs (containing
+/// "://") and absolute paths pass through untouched.
+fn resolveViewArgument(alloc: Allocator, arguments: [][:0]const u8) !void {
+    for (arguments, 0..) |arg, i| {
+        const rest = lib.cutPrefix(u8, arg, "--view=") orelse continue;
+        if (rest.len == 0) return;
+        if (rest[0] == '/') return;
+        if (std.mem.indexOf(u8, rest, "://") != null) return;
+
+        var base: ?[]const u8 = null;
+        for (arguments) |a| {
+            if (lib.cutPrefix(u8, a, "--working-directory=")) |wd| base = wd;
+        }
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = base orelse try std.fs.cwd().realpath(".", &buf);
+        const resolved = try std.fs.path.resolve(alloc, &.{ cwd, rest });
+        arguments[i] = try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{resolved}, 0);
+        return;
+    }
+}
