@@ -32,7 +32,7 @@ extension TerminalRestorableState {
     }
 }
 
-extension TerminalRestorableState.InternalState where ViewType == Ghostty.SurfaceView {
+extension TerminalRestorableState.InternalState where ViewType == PaneView {
     init(from controller: TerminalController) {
         self.init(
             focusedSurface: controller.focusedSurface?.id.uuidString,

@@ -41,7 +41,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     /// The tree of splits within this terminal window.
-    @Published var surfaceTree: SplitTree<Ghostty.SurfaceView> = .init() {
+    @Published var surfaceTree: SplitTree<PaneView> = .init() {
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
@@ -264,7 +264,7 @@ class BaseTerminalController: NSWindowController,
 
     init(_ ghostty: Ghostty.App,
          baseConfig base: Ghostty.SurfaceConfiguration? = nil,
-         surfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil
+         surfaceTree tree: SplitTree<PaneView>? = nil
     ) {
         self.ghostty = ghostty
         self.derivedConfig = DerivedConfig(ghostty.config)
@@ -418,7 +418,7 @@ class BaseTerminalController: NSWindowController,
     @discardableResult
     func newSplit(
         at oldView: Ghostty.SurfaceView,
-        direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
+        direction: SplitTree<PaneView>.NewDirection,
         baseConfig config: Ghostty.SurfaceConfiguration? = nil,
         ratio: Double = 0.5,
         onCreate: ((Ghostty.SurfaceView) -> Void)? = nil
@@ -520,7 +520,7 @@ class BaseTerminalController: NSWindowController,
     private func finishSplit(
         config effectiveConfig: Ghostty.SurfaceConfiguration,
         at oldView: Ghostty.SurfaceView,
-        direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
+        direction: SplitTree<PaneView>.NewDirection,
         ratio: Double,
         hasExplicitTint: Bool
     ) -> Ghostty.SurfaceView? {
@@ -533,7 +533,7 @@ class BaseTerminalController: NSWindowController,
         let newView = Ghostty.SurfaceView(ghostty_app, baseConfig: effectiveConfig)
 
         // Do the split
-        let newTree: SplitTree<Ghostty.SurfaceView>
+        let newTree: SplitTree<PaneView>
         do {
             newTree = try surfaceTree.inserting(
                 view: newView,
@@ -690,7 +690,7 @@ class BaseTerminalController: NSWindowController,
     /// Called when the surfaceTree variable changed.
     ///
     /// Subclasses should call super first.
-    func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+    func surfaceTreeDidChange(from: SplitTree<PaneView>, to: SplitTree<PaneView>) {
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
             focusedSurface = nil
@@ -725,13 +725,14 @@ class BaseTerminalController: NSWindowController,
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
     /// what surface is focused. This must be called whenever a surface OR window changes focus.
     func syncFocusToSurfaceTree() {
-        for surfaceView in surfaceTree {
+        for pane in surfaceTree {
             // Our focus state requires that this window is key and our currently
-            // focused surface is the surface in this view.
+            // focused surface is the surface in this view. Note the pane itself
+            // is never in the responder chain; its content view is.
             let focused: Bool = (window?.isKeyWindow ?? false) &&
-                surfaceView == focusedSurface &&
-                surfaceView.isFirstResponder
-            surfaceView.focusDidChange(focused)
+                pane.surfaceView === focusedSurface &&
+                pane.contentIsFirstResponder
+            pane.focusDidChange(focused)
         }
     }
 
@@ -873,7 +874,7 @@ class BaseTerminalController: NSWindowController,
     ///
     /// This will also insert the proper undo stack information in.
     func closeSurface(
-        _ node: SplitTree<Ghostty.SurfaceView>.Node,
+        _ node: SplitTree<PaneView>.Node,
         withConfirmation: Bool = true
     ) {
         // This node must be part of our tree
@@ -904,15 +905,15 @@ class BaseTerminalController: NSWindowController,
 
     /// Find the next surface to focus when a node is being closed.
     /// Goes to previous split unless we're the leftmost leaf, then goes to next.
-    private func findNextFocusTargetAfterClosing(node: SplitTree<Ghostty.SurfaceView>.Node) -> Ghostty.SurfaceView? {
+    private func findNextFocusTargetAfterClosing(node: SplitTree<PaneView>.Node) -> Ghostty.SurfaceView? {
         guard let root = surfaceTree.root else { return nil }
 
         // If we're the leftmost, then we move to the next surface after closing.
         // Otherwise, we move to the previous.
         if root.leftmostLeaf() == node.leftmostLeaf() {
-            return surfaceTree.focusTarget(for: .next, from: node)
+            return surfaceTree.focusTarget(for: .next, from: node)?.surfaceView
         } else {
-            return surfaceTree.focusTarget(for: .previous, from: node)
+            return surfaceTree.focusTarget(for: .previous, from: node)?.surfaceView
         }
     }
 
@@ -921,10 +922,10 @@ class BaseTerminalController: NSWindowController,
     /// This also updates the undo manager to support restoring this node.
     ///
     /// This does no confirmation and assumes confirmation is already done.
-    private func removeSurfaceNode(_ node: SplitTree<Ghostty.SurfaceView>.Node) {
+    private func removeSurfaceNode(_ node: SplitTree<PaneView>.Node) {
         // Move focus if the closed surface was focused and we have a next target
         let nextFocus: Ghostty.SurfaceView? = if node.contains(
-            where: { $0 == focusedSurface }
+            where: { $0.surfaceView === focusedSurface }
         ) {
             findNextFocusTargetAfterClosing(node: node)
         } else {
@@ -940,7 +941,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     func replaceSurfaceTree(
-        _ newTree: SplitTree<Ghostty.SurfaceView>,
+        _ newTree: SplitTree<PaneView>,
         moveFocusTo newView: Ghostty.SurfaceView? = nil,
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
         undoAction: String? = nil
@@ -1077,7 +1078,7 @@ class BaseTerminalController: NSWindowController,
         // Determine our desired direction
         guard let directionAny = notification.userInfo?["direction"] else { return }
         guard let direction = directionAny as? ghostty_action_split_direction_e else { return }
-        let splitDirection: SplitTree<Ghostty.SurfaceView>.NewDirection
+        let splitDirection: SplitTree<PaneView>.NewDirection
         switch direction {
         case GHOSTTY_SPLIT_DIRECTION_RIGHT: splitDirection = .right
         case GHOSTTY_SPLIT_DIRECTION_LEFT: splitDirection = .left
@@ -1154,7 +1155,7 @@ class BaseTerminalController: NSWindowController,
 
         guard let targetNode = surfaceTree.root?.node(view: target) else { return }
 
-        let focusDirection: SplitTree<Ghostty.SurfaceView>.FocusDirection = direction.toSplitTreeFocusDirection()
+        let focusDirection: SplitTree<PaneView>.FocusDirection = direction.toSplitTreeFocusDirection()
         guard let neighborView = surfaceTree.focusTarget(for: focusDirection, from: targetNode) else {
             return
         }
@@ -1226,7 +1227,7 @@ class BaseTerminalController: NSWindowController,
             let leaves = surfaceTree.root?.leaves() ?? []
             guard leaves.count > 1 else { return }
 
-            let focusedIndex = leaves.firstIndex(where: { $0 === target }) ?? 0
+            let focusedIndex = leaves.firstIndex(where: { $0.surfaceView === target }) ?? 0
             heroModeState.activate(focusedIndex: focusedIndex, leafCount: leaves.count)
         }
 
@@ -1236,7 +1237,7 @@ class BaseTerminalController: NSWindowController,
     private func heroSurfaceForCurrentSelection() -> Ghostty.SurfaceView? {
         let leaves = surfaceTree.root?.leaves() ?? []
         guard heroModeState.selectedIndex < leaves.count else { return nil }
-        return leaves[heroModeState.selectedIndex]
+        return leaves[heroModeState.selectedIndex].surfaceView
     }
 
     private func heroSelectionDidChange(to index: Int) {
@@ -1259,7 +1260,7 @@ class BaseTerminalController: NSWindowController,
         guard let amount = amountAny as? UInt16 else { return }
 
         // Convert Ghostty.SplitResizeDirection to SplitTree.Spatial.Direction
-        let spatialDirection: SplitTree<Ghostty.SurfaceView>.Spatial.Direction
+        let spatialDirection: SplitTree<PaneView>.Spatial.Direction
         switch direction {
         case .up: spatialDirection = .up
         case .down: spatialDirection = .down
@@ -1313,7 +1314,7 @@ class BaseTerminalController: NSWindowController,
         let removedTree = surfaceTree.removing(targetNode)
 
         // Create a new tree with the dragged surface and open a new window
-        let newTree = SplitTree<Ghostty.SurfaceView>(view: target)
+        let newTree = SplitTree<PaneView>(view: target)
 
         // Treat our undo below as a full group.
         undoManager?.beginUndoGrouping()
@@ -1343,13 +1344,13 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func localEventFlagsChanged(_ event: NSEvent) -> NSEvent? {
-        var surfaces: [Ghostty.SurfaceView] = surfaceTree.map { $0 }
+        var surfaces: [Ghostty.SurfaceView] = surfaceTree.compactMap { $0.surfaceView }
 
         // If we're the main window receiving key input, then we want to avoid
         // calling this on our focused surface because that'll trigger a double
         // flagsChanged call.
         if NSApp.mainWindow == window {
-            surfaces = surfaces.filter { $0 != focusedSurface }
+            surfaces = surfaces.filter { $0 !== focusedSurface }
         }
 
         for surface in surfaces {
@@ -1453,7 +1454,7 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
-    private func splitDidResize(node: SplitTree<Ghostty.SurfaceView>.Node, to newRatio: Double) {
+    private func splitDidResize(node: SplitTree<PaneView>.Node, to newRatio: Double) {
         let resizedNode = node.resizing(to: newRatio)
         do {
             surfaceTree = try surfaceTree.replacing(node: node, with: resizedNode)
@@ -1468,7 +1469,7 @@ class BaseTerminalController: NSWindowController,
         zone: TerminalSplitDropZone
     ) {
         // Map drop zone to split direction
-        let direction: SplitTree<Ghostty.SurfaceView>.NewDirection = switch zone {
+        let direction: SplitTree<PaneView>.NewDirection = switch zone {
         case .top: .up
         case .bottom: .down
         case .left: .left
@@ -1479,7 +1480,7 @@ class BaseTerminalController: NSWindowController,
         if let sourceNode = surfaceTree.root?.node(view: source) {
             // Source is in our tree - same window move
             let treeWithoutSource = surfaceTree.removing(sourceNode)
-            let newTree: SplitTree<Ghostty.SurfaceView>
+            let newTree: SplitTree<PaneView>
             do {
                 newTree = try treeWithoutSource.inserting(view: source, at: destination, direction: direction)
             } catch {
@@ -1497,7 +1498,7 @@ class BaseTerminalController: NSWindowController,
 
         // Source is not in our tree - search other windows
         var sourceController: BaseTerminalController?
-        var sourceNode: SplitTree<Ghostty.SurfaceView>.Node?
+        var sourceNode: SplitTree<PaneView>.Node?
         for window in NSApp.windows {
             guard let controller = window.windowController as? BaseTerminalController else { continue }
             guard controller !== self else { continue }
@@ -1516,7 +1517,7 @@ class BaseTerminalController: NSWindowController,
         // Remove from source controller's tree and add it to our tree.
         // We do this first because if there is an error then we can
         // abort.
-        let newTree: SplitTree<Ghostty.SurfaceView>
+        let newTree: SplitTree<PaneView>
         do {
             newTree = try surfaceTree.inserting(view: source, at: destination, direction: direction)
         } catch {
@@ -3027,9 +3028,9 @@ extension BaseTerminalController {
     /// The publisher emits a dictionary of surface IDs to values whenever the tree changes
     /// or any surface publishes a new value for the key path.
     func surfaceValuesPublisher<Value>(
-        valueKeyPath: KeyPath<Ghostty.SurfaceView, Value>,
-        publisherKeyPath: KeyPath<Ghostty.SurfaceView, Published<Value>.Publisher>
-    ) -> AnyPublisher<[Ghostty.SurfaceView.ID: Value], Never> {
+        valueKeyPath: KeyPath<PaneView, Value>,
+        publisherKeyPath: KeyPath<PaneView, Published<Value>.Publisher>
+    ) -> AnyPublisher<[PaneView.ID: Value], Never> {
         // `surfaceTree` can be replaced entirely when splits are added/removed/closed.
         // For each tree snapshot we build a fresh publisher that watches all surfaces
         // in that snapshot.

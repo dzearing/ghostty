@@ -64,7 +64,7 @@ final class TerminalRestorableState: TerminalRestorable {
     var focusedSurface: String? {
         internalState.focusedSurface
     }
-    var surfaceTree: SplitTree<Ghostty.SurfaceView> {
+    var surfaceTree: SplitTree<PaneView> {
         internalState.surfaceTree
     }
     var effectiveFullscreenMode: FullscreenMode? {
@@ -82,7 +82,7 @@ final class TerminalRestorableState: TerminalRestorable {
     /// Since we can't really change the type of `TerminalRestorableState`
     /// due to `CodableBridge<TerminalRestorableState>` supporting secure coding,
     /// we use an internal type to perform migration and tests
-    private let internalState: InternalState<Ghostty.SurfaceView>
+    private let internalState: InternalState<PaneView>
 
     init(from controller: TerminalController) {
         internalState = .init(from: controller)
@@ -96,7 +96,7 @@ final class TerminalRestorableState: TerminalRestorable {
     ///
     /// - Important: If you intend to add more things, go to `InternalState`.
     init(from decoder: any Decoder) throws {
-        self.internalState = try InternalState<Ghostty.SurfaceView>(from: decoder)
+        self.internalState = try InternalState<PaneView>(from: decoder)
     }
 
     /// This is just wrapper around internalState
@@ -175,8 +175,8 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // Find the focused surface in surfaceTree
         if let focusedStr = state.focusedSurface {
             var foundView: Ghostty.SurfaceView?
-            for view in c.surfaceTree where view.id.uuidString == focusedStr {
-                foundView = view
+            for pane in c.surfaceTree where pane.id.uuidString == focusedStr {
+                foundView = pane.surfaceView
                 break
             }
 

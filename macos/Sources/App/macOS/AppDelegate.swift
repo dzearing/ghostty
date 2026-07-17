@@ -1074,8 +1074,8 @@ class AppDelegate: NSObject,
 
     func findSurface(forUUID uuid: UUID) -> Ghostty.SurfaceView? {
         for c in TerminalController.all {
-            for view in c.surfaceTree where view.id == uuid {
-                return view
+            for pane in c.surfaceTree where pane.id == uuid {
+                return pane.surfaceView
             }
         }
 

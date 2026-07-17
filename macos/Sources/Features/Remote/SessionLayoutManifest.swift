@@ -452,16 +452,17 @@ final class SessionLayoutManifest {
         let ipc = (NSApp.delegate as? AppDelegate)?.ipcServer
 
         let tree: Node? = controller.surfaceTree.root.map { root in
-            Self.encodeNode(root) { view in
-                Leaf(
+            Self.encodeNode(root) { pane in
+                let view = pane.surfaceView
+                return Leaf(
                     // Fall back to the id the surface was CREATED to attach
                     // when the live id is unavailable — surface creation can
                     // fail entirely (dark-wake OutOfMemory, T06b) and a sync
                     // in that state must not wipe the recorded session id
                     // (next launch would then drop the whole entry).
-                    sessionID: Self.liveSessionID(of: view) ?? view.expectedRemoteSessionID,
-                    title: view.title,
-                    ipcName: ipc?.registeredPaneName(forSurface: view))
+                    sessionID: view.flatMap { Self.liveSessionID(of: $0) ?? $0.expectedRemoteSessionID },
+                    title: pane.title,
+                    ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) })
             }
         }
 

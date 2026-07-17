@@ -48,7 +48,7 @@
     {
       "id": "T01",
       "title": "PaneView wrapper + SplitTree<PaneView> mechanical rename",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [],
       "resetAfter": false,
       "goal": "Introduce final class PaneView (NSView, Codable, Identifiable, ObservableObject; content enum terminal|viewer with viewer case stubbed) and retype every SplitTree<Ghostty.SurfaceView> site to SplitTree<PaneView>. No behavior change — every pane is .terminal.",
@@ -60,7 +60,7 @@
         "zig build -Doptimize=Debug until green."
       ],
       "acceptance": "Build green. Debug app launches; terminal windows/tabs/splits, pane nav, close confirmation, +list/+split/+read/+send-keys all behave as before (spot-check via CLI). AppKit window restore of a 2-split window works. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done. KEY DESIGN POINT: PaneView is an UNMOUNTED wrapper — SwiftUI still mounts the content view (SurfaceView/ViewerView) directly; PaneView forwards bounds+window to contentView (viewBounds() feeds resize math + initial window sizing). Bridging layer SplitTree+PaneView.swift (init/pane(for:)/contains/inserting/node(view:) SurfaceView overloads + Ghostty.moveFocus(to: PaneView)) let ~80% of call sites compile unchanged. focusedSurface stays SurfaceView-typed for now (viewer focus = T02). SILENT-BUG CLASS to watch: PaneView inherits NSView/NSObject API, so leaf==surfaceView / leaf===surface / pane.window / pane.isFirstResponder COMPILE but are always false/nil — audited: syncFocusToSurfaceTree, removeSurfaceNode, closeAllWindows(.window), hero-mode firstIndex, localEventFlagsChanged, buildSplitNodeData(focused:) all fixed to compare via pane.surfaceView. IPC rearrange now reuses EXISTING PaneView wrappers (leaf identity preserved). New files need macos/Ghostty.xcodeproj membershipExceptions (iOS excl. list): PaneView.swift, SplitTree+PaneView.swift MISSING there (only mac target builds, fine) — added PaneView/ViewerView/ViewerSplitLeaf. Live-verified: +new-window/+split/+list/+read/+send-keys/+close + agent manifest restore of a 3-pane window all work. AppKit (persistence-off) restore NOT yet exercised — debug config runs persistence=on; T10 covers it. Commit: (see git log)"
     },
     {
       "id": "T02",

@@ -839,8 +839,8 @@ class IPCServer {
                     surface.activityState = activityState
                 }
             case .window:
-                for surface in controller.surfaceTree {
-                    surface.activityState = activityState
+                for pane in controller.surfaceTree {
+                    pane.surfaceView?.activityState = activityState
                 }
             }
         }
@@ -1259,8 +1259,11 @@ class IPCServer {
 
                 guard let controller else { return }
 
-                // Resolve all pane names to surfaces in this controller's tree
-                var surfacesByName: [String: Ghostty.SurfaceView] = [:]
+                // Resolve all pane names to panes in this controller's tree.
+                // We reuse the EXISTING PaneView wrappers so leaf identity (and
+                // therefore SwiftUI structural identity) is preserved across the
+                // rearrange.
+                var panesByName: [String: PaneView] = [:]
                 for name in layoutPaneNames {
                     guard let entry = self.targetRegistry[name] else {
                         result = IPCResponse(success: false, error: "pane '\(name)' not found in registry")
@@ -1270,37 +1273,38 @@ class IPCServer {
                         result = IPCResponse(success: false, error: "pane '\(name)' is no longer alive")
                         return
                     }
-                    guard controller.surfaceTree.root?.node(view: surface) != nil else {
+                    guard let pane = controller.surfaceTree.pane(for: surface) else {
                         result = IPCResponse(success: false, error: "pane '\(name)' is not in the target window")
                         return
                     }
-                    surfacesByName[name] = surface
+                    panesByName[name] = pane
                 }
 
                 // Build the new split tree from the layout
-                let newRoot: SplitTree<Ghostty.SurfaceView>.Node
+                let newRoot: SplitTree<PaneView>.Node
                 do {
-                    newRoot = try self.buildSplitNode(from: layout, surfaces: surfacesByName)
+                    newRoot = try self.buildSplitNode(from: layout, panes: panesByName)
                 } catch {
                     result = IPCResponse(success: false, error: "failed to build layout: \(error)")
                     return
                 }
 
-                // Collect all current surfaces in the tree
-                let currentSurfaces = Set(controller.surfaceTree.map { $0 })
-                let keptSurfaces = Set(surfacesByName.values)
-                let removedSurfaces = currentSurfaces.subtracting(keptSurfaces)
+                // Collect all current panes in the tree
+                let currentPanes = Set(controller.surfaceTree.map { $0 })
+                let keptPanes = Set(panesByName.values)
+                let removedPanes = currentPanes.subtracting(keptPanes)
 
                 // Remember the currently focused surface
                 let focusedSurface = controller.focusedSurface
-                let newFocus: Ghostty.SurfaceView? = if let focusedSurface, keptSurfaces.contains(focusedSurface) {
+                let newFocus: Ghostty.SurfaceView? = if let focusedSurface,
+                    keptPanes.contains(where: { $0.surfaceView === focusedSurface }) {
                     focusedSurface
                 } else {
-                    newRoot.leftmostLeaf()
+                    newRoot.leftmostLeaf().surfaceView
                 }
 
                 // Replace the tree
-                let newTree = SplitTree<Ghostty.SurfaceView>(root: newRoot, zoomed: nil)
+                let newTree = SplitTree<PaneView>(root: newRoot, zoomed: nil)
                 controller.replaceSurfaceTree(
                     newTree,
                     moveFocusTo: newFocus,
@@ -1309,9 +1313,9 @@ class IPCServer {
                 )
 
                 // Remove registry entries for panes no longer in the tree
-                for surface in removedSurfaces {
+                for pane in removedPanes {
                     for (name, entry) in self.targetRegistry {
-                        if case .pane(_, let surfaceRef) = entry, surfaceRef.value === surface {
+                        if case .pane(_, let surfaceRef) = entry, surfaceRef.value === pane.surfaceView {
                             self.targetRegistry.removeValue(forKey: name)
                             break
                         }
@@ -1350,20 +1354,20 @@ class IPCServer {
     @MainActor
     private func buildSplitNode(
         from layout: LayoutNode,
-        surfaces: [String: Ghostty.SurfaceView]
-    ) throws -> SplitTree<Ghostty.SurfaceView>.Node {
+        panes: [String: PaneView]
+    ) throws -> SplitTree<PaneView>.Node {
         if let paneName = layout.pane {
-            guard let surface = surfaces[paneName] else {
+            guard let pane = panes[paneName] else {
                 throw RearrangeError.paneNotFound(paneName)
             }
-            return .leaf(view: surface)
+            return .leaf(view: pane)
         }
 
         guard let dirStr = layout.direction else {
             throw RearrangeError.invalidNode
         }
 
-        let direction: SplitTree<Ghostty.SurfaceView>.Direction = switch dirStr.lowercased() {
+        let direction: SplitTree<PaneView>.Direction = switch dirStr.lowercased() {
         case "horizontal": .horizontal
         case "vertical": .vertical
         default: throw RearrangeError.invalidDirection(dirStr)
@@ -1376,8 +1380,8 @@ class IPCServer {
         let ratioPercent = layout.ratio ?? 50
         let clampedRatio = min(0.9, max(0.1, ratioPercent / 100.0))
 
-        let leftNode = try buildSplitNode(from: leftLayout, surfaces: surfaces)
-        let rightNode = try buildSplitNode(from: rightLayout, surfaces: surfaces)
+        let leftNode = try buildSplitNode(from: leftLayout, panes: panes)
+        let rightNode = try buildSplitNode(from: rightLayout, panes: panes)
 
         return .split(.init(
             direction: direction,
@@ -1521,7 +1525,7 @@ class IPCServer {
 
     @MainActor
     private func buildSplitNodeData(
-        node: SplitTree<Ghostty.SurfaceView>.Node?,
+        node: SplitTree<PaneView>.Node?,
         focusedSurface: Ghostty.SurfaceView?,
         controller: BaseTerminalController
     ) -> IPCData.SplitNodeData {
@@ -1539,13 +1543,27 @@ class IPCServer {
         }
 
         switch node {
-        case .leaf(let view):
+        case .leaf(let pane):
+            // TODO(viewer-panes T08): emit a viewer discriminator + url for
+            // viewer panes. For now viewers report their pane id/title only.
+            guard let view = pane.surfaceView else {
+                return .leaf(IPCData.TerminalData(
+                    id: pane.id.uuidString,
+                    title: pane.title,
+                    working_directory: "",
+                    pid: 0,
+                    tty: "",
+                    name: nil,
+                    focused: false,
+                    exit_code: nil
+                ))
+            }
             let paneName = paneNameForSurface(view)
             ensurePaneRegistered(name: paneName, controller: controller, surface: view)
 
             return .leaf(IPCData.TerminalData(
                 id: view.id.uuidString,
-                title: view.title ?? "",
+                title: view.title,
                 working_directory: view.pwd ?? "",
                 pid: view.surfaceModel?.foregroundPID ?? 0,
                 tty: view.surfaceModel?.ttyName ?? "",
@@ -1636,7 +1654,7 @@ class IPCServer {
         Ghostty.SurfaceView.adjustPaletteForContrast(surface: surface, background: resolved)
     }
 
-    private static func parseSplitDirection(_ value: String) -> SplitTree<Ghostty.SurfaceView>.NewDirection? {
+    private static func parseSplitDirection(_ value: String) -> SplitTree<PaneView>.NewDirection? {
         switch value.lowercased() {
         case "right": return .right
         case "down": return .down

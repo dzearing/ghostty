@@ -28,7 +28,7 @@ protocol TerminalViewDelegate: AnyObject {
 protocol TerminalViewModel: ObservableObject {
     /// The tree of terminal surfaces (splits) within the view. This is mutated by TerminalView
     /// and children. This should be @Published.
-    var surfaceTree: SplitTree<Ghostty.SurfaceView> { get set }
+    var surfaceTree: SplitTree<PaneView> { get set }
 
     /// The hero mode state for this window.
     var heroModeState: HeroModeState { get }

@@ -329,8 +329,8 @@ final class RemoteSessionManifest {
 
         let sid: String? = controller.surfaceTree
             .first(where: { _ in true })
-            .flatMap { (view: Ghostty.SurfaceView) -> String? in
-                guard let surface = view.surface else { return nil }
+            .flatMap { (pane: PaneView) -> String? in
+                guard let surface = pane.surface else { return nil }
                 let s = Ghostty.AllocatedString(
                     ghostty_surface_remote_session_id(surface)).string
                 return s.isEmpty ? nil : s
