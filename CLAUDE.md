@@ -16,6 +16,7 @@ ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> -
 
 - `--shell`: Shell to use for `--command`/`--split-command`, invoked with `-lic` so profile is loaded. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`.
 - `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal. Mutually exclusive with `--command`/`-e`.
+- `--title`: Set the **window title**. A window title pins the titlebar — it wins over any tab or pane title and survives pane focus changes and shell OSC title updates — until cleared. The titlebar falls back to window title → active tab's title → active pane's title. Interactive equivalents: Cmd+Shift+R ("Change Window Title", also sets/clears it), plus separate "Change Tab Title" and "Change Pane Title" commands in the menu and command palette. `ghoztty +rename --target=<name> --title=<title>` changes it later (`--title=""` clears the pin).
 
 ### `ghoztty +split`
 
@@ -33,6 +34,9 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 ### `ghoztty +close`
 
 Close a named pane or window. Closing a nonexistent target succeeds silently.
+For a session-persistence pane this ENDS the agent session (the process is
+killed once the close's undo window expires) — same as closing the pane in the
+GUI. Only an app quit keeps sessions alive for re-attach.
 
 ```
 ghoztty +close --target=<name>
@@ -126,7 +130,13 @@ ghoztty +set-banner --target=<name> [--clear] [text...]
 - `--clear`: Remove the banner (empty text does the same).
 - All other arguments are treated as the banner text (multiple are joined with spaces).
 
-Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic_`, `__underline__`, `` `code` ``, and `[text](url)` clickable links (URL must include a scheme, e.g. `https://`). Note `__underline__` intentionally differs from CommonMark (where `__` is bold). `\` escapes the next character. Unterminated delimiters render literally. A literal `\n` in CLI banner text becomes a line break — banners can span multiple lines (display is capped at 6 lines).
+Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic_`, `__underline__`, `` `code` ``, and `[text](url)` clickable links (URL must include a scheme, e.g. `https://`). Note `__underline__` intentionally differs from CommonMark (where `__` is bold). `\` escapes the next character. Unterminated delimiters render literally. A literal `\n` in CLI banner text becomes a line break — banners can span multiple lines (display is capped at 10 lines).
+
+Banners also support standard markdown pipe tables, rendered as an aligned grid with a bold header row: a `| a | b |` header line immediately followed by a `|---|---|` separator with the same column count, then `| 1 | 2 |` body rows. Separator cells may carry `:` alignment markers (`:---` left, `:---:` center, `---:` right). Cells support the full inline subset; `\|` puts a literal pipe inside a cell. Ragged body rows are padded/truncated to the header width. The separator row doesn't render; every other table row counts toward the 10-line display cap.
+
+```bash
+ghoztty +set-banner --target=dev "**Build status**\n| Job | State |\n|---|---:|\n| lint | ok |\n| tests | **3 failed** |"
+```
 
 ```bash
 ghoztty +set-banner --target=dev "**PR #123** — _3 files_, +120/−45 — [view](https://github.com/org/repo/pull/123)"
@@ -176,6 +186,25 @@ default shell too (their cwd inherits from the parent pane).
 - `+new-window --target=<name>` registers a **window**
 - `+split --name=<name>` registers a **pane**
 - `+split --target`, `+close --target`, and `+send-keys --target` reference either kind
+
+### Pane identity
+
+Every pane has a **stable, ghoztty-owned pane id** (a UUID):
+
+- Exported to the pane's processes as `$GHOZTTY_PANE_ID` (baked at spawn).
+- Shown as the leaf `id` in `+list --json`.
+- Accepted directly by every `--target`/`--name` (case-insensitive), with no
+  prior registration or `+list` needed: `ghoztty +set-banner
+  --target=$GHOZTTY_PANE_ID …` works from inside any local pane.
+- Stable for the pane's whole life: persisted in the session-layout manifest and
+  restored on app relaunch (session-persistence panes keep the same id AND the
+  same baked env), preserved across remote reconnect swaps, and re-applied to
+  the respawned shell when the agent relaunches a session after its own restart
+  (the RELAUNCH carries the pane's env/TERM/argv).
+
+Prefer the pane id over pid/tty matching for self-identification: pids and ttys
+belong to the machine the process runs on and are meaningless for remote panes.
+(`+list --tty=<tty>` still works for local panes as a fallback.)
 
 ### Example: three-pane layout
 
@@ -234,9 +263,9 @@ ghoztty +close --target=doc
 
 Terminal processes can be made independent of the GUI app so they survive app
 crashes, quits, and binary upgrades (and relaunch across reboots / agent
-crashes). It is **opt-in** via config and **off by default**.
+crashes). It is **on by default** (disable with `session-persistence = off`).
 
-- `session-persistence = off|on` (macOS, default `off`). When `on`, new local
+- `session-persistence = off|on` (macOS, default `on`). When `on`, new local
   windows/tabs/splits run their shell under the local `ghoztty-agent` (found or
   spawned on demand) instead of directly under the app process, so the child
   processes outlive the app. On next launch the app re-attaches: layout, split
@@ -247,6 +276,14 @@ crashes). It is **opt-in** via config and **off by default**.
   metadata was materialized from disk as a relaunchable tombstone. `auto`
   respawns the recorded command in-place with a `--- session restarted ---`
   divider; `prompt` leaves the pane in its exited state for the user to decide.
+
+Session lifecycle: a process DIES when the user closes its pane/tab/window (or
+`+close`s it — the CLOSE lands when the close's undo window expires), when the
+shell itself exits, or when the agent dies (children then relaunch as
+tombstones per `session-relaunch`). It SURVIVES app quit/crash/upgrade (quit
+never prompts for persistent windows — their sessions re-attach on relaunch).
+E2E: `scripts/e2e/session-persistence.py` (incl. `--winsize` for re-attach
+PTY-geometry integrity).
 
 The agent owns the PTYs, keeps a per-session output ring (2 MB default;
 snapshotted to disk for reboot scrollback), persists session metadata to

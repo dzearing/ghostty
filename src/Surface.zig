@@ -1034,6 +1034,11 @@ pub fn init(
                     // Machine.isLocalMachine); cross-machine windows leave it
                     // false and keep the idle-TTL.
                     .pinned = rb.local_shell_integration,
+                    // Only a LOCAL-agent pane surfaces the agent-reported tty
+                    // via `getProcessInfo` (wp3): a cross-machine tty names a
+                    // remote device and could false-match local `+list --tty`
+                    // self-lookups. Same signal as `pinned`.
+                    .local = rb.local_shell_integration,
                     // Reboot-floor policy (T12c): if this ATTACH target comes
                     // back dead-but-relaunchable (the agent restarted), `auto`
                     // respawns it in place; `prompt` shows the exited overlay.
@@ -1374,6 +1379,15 @@ pub fn needsConfirmQuit(self: *Surface) bool {
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
     };
+}
+
+/// Mark whether this surface's remote/agent session should be CLOSEd
+/// (terminate the child, free the session) rather than DETACHed (keep-alive)
+/// when the surface is freed. The apprt sets this when the USER closes the
+/// pane/window — never on app quit — so persistent sessions end on explicit
+/// close but survive a quit for re-attach. No-op for local exec surfaces.
+pub fn setSessionCloseIntent(self: *Surface, close_on_exit: bool) void {
+    self.io.setSessionCloseIntent(close_on_exit);
 }
 
 /// The LIVE remote agent session id for this surface, or null if this is a local
@@ -5851,6 +5865,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .{ .surface = self },
             .prompt_title,
             .tab,
+        ),
+
+        .prompt_window_title => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_title,
+            .window,
         ),
 
         .prompt_surface_banner => return try self.rt_app.performAction(

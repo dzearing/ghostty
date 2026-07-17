@@ -71,6 +71,7 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuResetFontSize: NSMenuItem?
     @IBOutlet private var menuChangeTitle: NSMenuItem?
     @IBOutlet private var menuChangeTabTitle: NSMenuItem?
+    @IBOutlet private var menuChangeWindowTitle: NSMenuItem?
     @IBOutlet private var menuReadonly: NSMenuItem?
     @IBOutlet private var menuQuickTerminal: NSMenuItem?
     @IBOutlet private var menuTerminalInspector: NSMenuItem?
@@ -544,13 +545,33 @@ class AppDelegate: NSObject,
             }
         }
 
-        // If our app says we don't need to confirm, we can exit now.
-        if !ghostty.needsConfirmQuit { return .terminateNow }
+        // Agent-backed windows (remoteConnection != nil — both true remote
+        // machines and local session-persistence windows) survive the quit:
+        // their sessions DETACH and re-attach on the next launch. Only windows
+        // withOUT a live agent connection can actually lose a running process,
+        // so only those gate the confirmation. The libghostty aggregate
+        // (`ghostty.needsConfirmQuit`) can't make this distinction — it only
+        // sees "is a command running", which is true for exactly the sessions
+        // that would survive.
+        let terminatedOnQuit = NSApp.windows.compactMap { window in
+            window.windowController as? BaseTerminalController
+        }.filter { controller in
+            controller.remoteConnection == nil &&
+                controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
+        }
+        if terminatedOnQuit.isEmpty { return .terminateNow }
 
         // We have some visible window. Show an app-wide modal to confirm quitting.
+        // Mention persistence only when it's actually in play (mixed case);
+        // with no agent-backed windows the classic wording stays accurate.
+        let anyPersistent = NSApp.windows.contains { window in
+            (window.windowController as? BaseTerminalController)?.remoteConnection != nil
+        }
         let alert = NSAlert()
         alert.messageText = "Quit Ghoztty?"
-        alert.informativeText = "All terminal sessions will be terminated."
+        alert.informativeText = anyPersistent
+            ? "Some terminals are not persistent and have running processes that will be terminated. Persistent sessions keep running and re-attach on the next launch."
+            : "All terminal sessions will be terminated."
         alert.addButton(withTitle: "Close Ghoztty")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
@@ -1143,19 +1164,11 @@ class AppDelegate: NSObject,
     @IBAction func newRemoteWindow(_ sender: Any?) {
         let registry = MachineRegistry.shared
 
-        // Nothing remote to choose — no registered machine, no relay account,
-        // AND no Google client to sign in with — so just open a normal local
-        // window. The Google-client check matters when SIGNED OUT at zero
-        // machines: the chooser is the only sign-in surface, so it must open
-        // (showing just "Local" + the sign-in footer) or sign-in is
-        // unreachable from the UI.
-        guard !registry.machines.isEmpty || registry.hasRelayAccount
-            || RelayAccount.isConfigured
-        else {
-            _ = TerminalController.newWindow(ghostty)
-            return
-        }
-
+        // Sign-in is always possible now (the Google client id is baked into
+        // the build), so ⌘⇧N ALWAYS presents the chooser — "Local" + any
+        // registered machines + the sign-in/out footer. It must never silently
+        // open a plain local window (that made the app look broken when signed
+        // out with zero machines).
         MachineChooser.present(registry: registry) { [weak self] selected in
             guard let self, let target = selected else { return }
             switch target {
@@ -1416,7 +1429,7 @@ class AppDelegate: NSObject,
         // "couldn't connect" alert. Refuse with the sign-in message instead.
         guard !token.isEmpty else {
             Self.presentSignInRequiredAlert()
-            return "not signed in: sign in (or set GHOSTTY_RELAY_TOKEN) to open relay windows"
+            return "not signed in: sign in to open relay windows"
         }
 
         // Dial the agent through the relay. This blocks through the handshake and
@@ -1483,6 +1496,7 @@ class AppDelegate: NSObject,
         namePinned: Bool = false,
         sessionID: String?,
         windowTitle: String? = nil,
+        windowTitleOverride: String? = nil,
         ipcName: String? = nil,
         workingDirectory: String? = nil,
         shell: String? = nil,
@@ -1571,6 +1585,13 @@ class AppDelegate: NSObject,
         // the original rename did.
         if let windowTitle, !windowTitle.isEmpty {
             controller.titleOverride = windowTitle
+        }
+
+        // The user-set WINDOW-level title (pins the titlebar over any
+        // tab/pane title). Set AFTER `remoteManifestEntryID` above so the
+        // didSet re-persists it into the fresh (replacing) manifest entry.
+        if let windowTitleOverride, !windowTitleOverride.isEmpty {
+            controller.windowTitleOverride = windowTitleOverride
         }
 
         return controller
@@ -1772,6 +1793,7 @@ class AppDelegate: NSObject,
                         namePinned: entry.namePinned == true,
                         sessionID: sessionID,
                         windowTitle: entry.windowTitle,
+                        windowTitleOverride: entry.windowTitleOverride,
                         ipcName: entry.ipcName,
                         replacingManifestEntry: entry.id)
                 }
@@ -2009,6 +2031,7 @@ extension AppDelegate {
         self.menuCommandPalette?.setImageIfDesired(systemSymbolName: "filemenu.and.selection")
         self.menuQuickTerminal?.setImageIfDesired(systemSymbolName: "apple.terminal")
         self.menuChangeTabTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
+        self.menuChangeWindowTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
         self.menuTerminalInspector?.setImageIfDesired(systemSymbolName: "scope")
         self.menuReadonly?.setImageIfDesired(systemSymbolName: "eye.fill")
         self.menuSetAsDefaultTerminal?.setImageIfDesired(systemSymbolName: "star.fill")
@@ -2084,6 +2107,7 @@ extension AppDelegate {
         syncMenuShortcut(config, action: "reset_font_size", menuItem: self.menuResetFontSize)
         syncMenuShortcut(config, action: "prompt_surface_title", menuItem: self.menuChangeTitle)
         syncMenuShortcut(config, action: "prompt_tab_title", menuItem: self.menuChangeTabTitle)
+        syncMenuShortcut(config, action: "prompt_window_title", menuItem: self.menuChangeWindowTitle)
         syncMenuShortcut(config, action: "toggle_quick_terminal", menuItem: self.menuQuickTerminal)
         syncMenuShortcut(config, action: "toggle_visibility", menuItem: self.menuToggleVisibility)
         syncMenuShortcut(config, action: "toggle_window_float_on_top", menuItem: self.menuFloatOnTop)

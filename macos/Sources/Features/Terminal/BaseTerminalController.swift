@@ -123,6 +123,63 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    /// A window-level title override set by the user (Change Window Title
+    /// prompt, `+new-window --title=`, `+rename`). When set, it pins the
+    /// window titlebar for the whole window — all tabs, regardless of pane
+    /// focus or terminal-set titles — until cleared. Stored on ONE
+    /// controller of a native tab group (see `effectiveWindowTitleOverride`);
+    /// use `setWindowTitle(_:)` to change it so the single-holder invariant
+    /// holds.
+    var windowTitleOverride: String? {
+        didSet {
+            // Same persistence contract as `titleOverride`: this is the
+            // choke point every window-rename path funnels through.
+            if let remoteManifestEntryID {
+                RemoteSessionManifest.shared.updateWindowTitleOverride(
+                    remoteManifestEntryID, title: windowTitleOverride)
+            }
+            if let sessionLayoutEntryID {
+                SessionLayoutManifest.shared.updateWindowTitleOverride(
+                    sessionLayoutEntryID, title: windowTitleOverride)
+            }
+
+            // The override affects the titlebar of every tab in the group.
+            applyTitleToWindow()
+            guard let window else { return }
+            for w in window.tabGroup?.windows ?? [] where w !== window {
+                (w.windowController as? BaseTerminalController)?.applyTitleToWindow()
+            }
+        }
+    }
+
+    /// The window title pinning this controller's titlebar, if any: this
+    /// controller's own override, or the override held by any other tab in
+    /// the same native tab group.
+    var effectiveWindowTitleOverride: String? {
+        if let windowTitleOverride { return windowTitleOverride }
+        guard let window else { return nil }
+        for w in window.tabGroup?.windows ?? [] where w !== window {
+            if let title = (w.windowController as? BaseTerminalController)?.windowTitleOverride {
+                return title
+            }
+        }
+        return nil
+    }
+
+    /// Set (or clear, with nil) the window title for this window and its tab
+    /// group, keeping exactly one controller in the group as the holder.
+    func setWindowTitle(_ newTitle: String?) {
+        if let window {
+            for w in window.tabGroup?.windows ?? [] where w !== window {
+                if let c = w.windowController as? BaseTerminalController,
+                   c.windowTitleOverride != nil {
+                    c.windowTitleOverride = nil
+                }
+            }
+        }
+        windowTitleOverride = newTitle
+    }
+
     var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
 
     /// The remote machine this window's terminals run on, if any. When set, the
@@ -280,6 +337,14 @@ class BaseTerminalController: NSWindowController,
             initialConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
         }
         self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: initialConfig))
+
+        // A passed-in tree re-adopts existing surfaces (undo of a window
+        // close, moves between windows): they are alive again, so clear any
+        // pending CLOSE-on-free intent. (didSet does not fire for this init
+        // assignment, so the surfaceTreeDidChange clearing doesn't run here.)
+        if tree != nil {
+            for view in surfaceTree { view.setSessionCloseIntent(false) }
+        }
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
@@ -782,6 +847,22 @@ class BaseTerminalController: NSWindowController,
             focusedSurface = nil
         }
 
+        // Session close intent: a leaf that LEFT the tree was closed by the
+        // user (removeSurfaceNode, or a redo of a close) — its agent session
+        // must actually END when the view is eventually freed (after the undo
+        // window expires), not linger detached in the agent forever. A leaf
+        // PRESENT in the tree is alive — clear any pending intent, which is
+        // what un-marks a view brought back by undo (the undo restore assigns
+        // the old tree directly, landing here).
+        let toLeaves = to.root?.leaves() ?? []
+        for view in toLeaves { view.setSessionCloseIntent(false) }
+        if let fromLeaves = from.root?.leaves(), !fromLeaves.isEmpty {
+            let toSet = Set(toLeaves.map { ObjectIdentifier($0) })
+            for view in fromLeaves where !toSet.contains(ObjectIdentifier(view)) {
+                view.setSessionCloseIntent(true)
+            }
+        }
+
         // Session persistence (T05): the split topology is the heart of the
         // layout manifest — re-sync on every tree change (new split, close,
         // resize-equalize, ...). Debounced; each sync also restarts the
@@ -944,6 +1025,34 @@ class BaseTerminalController: NSWindowController,
             } else {
                 self.titleOverride = newTitle
             }
+        }
+    }
+
+    /// Prompt the user to change the window title. The title set here pins
+    /// the titlebar for the whole window (all tabs) until cleared.
+    func promptWindowTitle() {
+        guard let window else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Change Window Title"
+        alert.informativeText = "Leave blank to follow the active tab or pane title."
+        alert.alertStyle = .informational
+
+        let textField = PromptTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
+        textField.stringValue = effectiveWindowTitleOverride ?? ""
+        alert.accessoryView = textField
+
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+
+        alert.window.initialFirstResponder = textField
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .alertFirstButtonReturn else { return }
+
+            let newTitle = textField.stringValue
+            self.setWindowTitle(newTitle.isEmpty ? nil : newTitle)
         }
     }
 
@@ -1487,21 +1596,30 @@ class BaseTerminalController: NSWindowController,
         applyTitleToWindow()
     }
 
-    private func applyTitleToWindow() {
+    func applyTitleToWindow() {
         guard let window else { return }
 
-        var title: String
+        // The tab-level title: the user's tab rename if set, else the
+        // focused pane's computed title.
+        var tabTitle: String
         if let titleOverride {
-            title = computeTitle(
+            tabTitle = computeTitle(
                 title: titleOverride,
                 bell: focusedSurface?.bell ?? false)
         } else {
-            title = lastComputedTitle
+            tabTitle = lastComputedTitle
         }
+
+        // Titlebar fallback order: window title if set, else the tab's
+        // title (which itself falls back to the active pane's title).
+        let windowOverride = effectiveWindowTitleOverride
+        var title = windowOverride ?? tabTitle
 
         if let termWindow = window as? TerminalWindow,
            termWindow.activityState != .idle {
-            title += " (\(termWindow.activityState.rawValue))"
+            let suffix = " (\(termWindow.activityState.rawValue))"
+            title += suffix
+            tabTitle += suffix
         }
 
         // The remote machine name is shown as a titlebar pill (see
@@ -1509,6 +1627,11 @@ class BaseTerminalController: NSWindowController,
         // plain title suffix, so it is intentionally not appended here.
 
         window.title = title
+
+        // When a window title pins the titlebar, keep the tab bar labels
+        // showing each tab's own title. An empty tab title restores the
+        // default behavior of following `window.title`.
+        window.tab.title = windowOverride != nil ? tabTitle : ""
     }
 
     func pwdDidChange(to: URL?) {
@@ -1872,6 +1995,19 @@ class BaseTerminalController: NSWindowController,
 
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
+
+        // User-initiated window/tab close (NOT app quit, NOT sign-out): the
+        // agent sessions of every pane in this window must actually END —
+        // mark them CLOSE-on-free. Quit and sign-out keep sessions alive for
+        // restore (same gate as the manifest-entry removal below). If the
+        // close is undone, the restore path re-adopts the views into a tree
+        // and clears the intent.
+        do {
+            let delegate = NSApp.delegate as? AppDelegate
+            if delegate?.isQuitting != true && delegate?.isSigningOut != true {
+                for view in surfaceTree { view.setSessionCloseIntent(true) }
+            }
+        }
 
         // WP-D1: cancel any in-flight reconnect retry loop and stop observing
         // link-state changes — the window is going away.
@@ -2663,12 +2799,17 @@ class BaseTerminalController: NSWindowController,
         cfg.remoteSessionId = sessionID
         cfg.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
 
+        // Preserve the replaced pane's STABLE surface uuid (wp3 pane identity):
+        // the swap is the same logical pane on a fresh transport, so the
+        // `+list` id and the shell's baked GHOZTTY_PANE_ID must not change.
+        let preservedID = focusedSurface?.id ?? surfaceTree.root?.leaves().first?.id
+
         // Debug-build-only deterministic failure hook: skips creating the
         // real view so the guard below takes the failure path (the orchestrator
         // can't force a real surface-alloc OOM). See debugShouldFailReconnectSwap.
         let newView: Ghostty.SurfaceView? = Self.debugShouldFailReconnectSwap()
             ? nil
-            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg)
+            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg, uuid: preservedID)
 
         guard let newView, newView.error == nil else {
             // `ghostty_surface_new` FAILED (seen in production: OutOfMemory
@@ -2819,6 +2960,10 @@ class BaseTerminalController: NSWindowController,
     @IBAction func closeWindow(_ sender: Any) {
         guard let window = window else { return }
         window.performClose(sender)
+    }
+
+    @IBAction func changeWindowTitle(_ sender: Any) {
+        promptWindowTitle()
     }
 
     @IBAction func changeTabTitle(_ sender: Any) {

@@ -5,10 +5,9 @@ import Foundation
 /// `docs/design/remote-relay-roadmap.md` and `relay/README.md` for the
 /// endpoint shapes.
 ///
-/// Auth (WP-B2): the bearer comes from the single token-resolution seam
-/// (`RelayAccount.resolveToken()`) — the signed-in Google account's ID token
-/// first, falling back to the dev token (`GHOSTTY_RELAY_TOKEN`) when signed
-/// out. Use `current()` to build a client.
+/// Auth: the bearer comes from the single token-resolution seam
+/// (`RelayAccount.resolveToken()`) — the signed-in account's relay session
+/// token (brokered OAuth). Use `current()` to build a client.
 struct RelayDirectoryClient {
     /// The dev relay base URL used when `GHOSTTY_RELAY_BASE` is not set.
     static let defaultBase: String =
@@ -42,9 +41,9 @@ struct RelayDirectoryClient {
         var errorDescription: String? {
             switch self {
             case .noAccount:
-                return "No relay account is available. Sign in with Google (or set GHOSTTY_RELAY_TOKEN for dev)."
+                return "No relay account is available. Sign in with Google."
             case .unauthorized:
-                return "The relay rejected the client token (401). Sign in again (or check GHOSTTY_RELAY_TOKEN)."
+                return "The relay rejected the session token (401). Sign in again."
             case .notFound:
                 return "The relay doesn't know this device (404). It may already have been removed."
             case .http(let code):
@@ -59,11 +58,11 @@ struct RelayDirectoryClient {
     let token: String
 
     /// Resolve the CURRENT directory client: base from `GHOSTTY_RELAY_BASE`
-    /// (defaulting to the dev relay) and the CLIENT bearer from the WP-B2
-    /// token-resolution seam (`RelayAccount.resolveToken()` — signed-in
-    /// account's ID token, dev-token fallback). Returns nil when no token
-    /// source is available — callers then skip account-list features entirely
-    /// (hardcoded/TCP registry entries keep working).
+    /// (defaulting to the dev relay) and the CLIENT bearer from the
+    /// token-resolution seam (`RelayAccount.resolveToken()` — the signed-in
+    /// account's relay session token). Returns nil when no token is available —
+    /// callers then skip account-list features entirely (hardcoded/TCP registry
+    /// entries keep working).
     static func current() async -> RelayDirectoryClient? {
         guard let token = await RelayAccount.resolveToken(),
               let url = URL(string: defaultBase)

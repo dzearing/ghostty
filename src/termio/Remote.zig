@@ -94,6 +94,10 @@ argv: ?[]const []const u8,
 /// for a persistent LOCAL-agent pane; sent in `OPEN.pinned`. Ignored on ATTACH.
 pinned: bool,
 
+/// True when the connection is the LOCAL agent (see `Config.local`). Gates
+/// publishing the agent-reported tty for `getProcessInfo(.tty_name)` (wp3).
+local: bool,
+
 /// What to do when an ATTACH finds the session a DEAD-but-relaunchable tombstone
 /// (the agent itself restarted and materialized it from disk, §5.4 reboot floor,
 /// T12c). `.auto` respawns it in place (`RELAUNCH`) and shows a restarted
@@ -118,6 +122,15 @@ exit_code: ?u32 = null,
 /// queueWrite), so no synchronization is needed.
 awaiting_relaunch: bool = false,
 
+/// When true, `threadExit` sends `CLOSE` (terminate the remote child + free the
+/// session) instead of the default `DETACH` (keep-alive for re-attach). Set via
+/// `Surface.setSessionCloseIntent` when the USER closes the pane/window — an
+/// app quit never sets it, so quit keeps sessions alive for restore while an
+/// explicit close actually ends the process (no orphaned pinned sessions
+/// accumulating in the agent). Atomic: written on the GUI thread (before the
+/// surface free joins the IO thread), read on the IO thread in `threadExit`.
+close_on_exit: std.atomic.Value(bool) = .init(false),
+
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
 
@@ -140,6 +153,27 @@ canceller: connection.RpcCanceller = .{},
 /// query right after, well before any teardown).
 live_session_id: std.atomic.Value(?[*]const u8) = .init(null),
 live_session_id_len: std.atomic.Value(usize) = .init(0),
+
+/// Agent-reported process info for `getProcessInfo` (wp3): the child pid and
+/// PTY slave path from `OPENED`/`ATTACHED`/`RELAUNCHED`, published by the IO
+/// thread (`threadEnter` / relaunch) and read lock-free from the GUI thread
+/// (`ghostty_surface_foreground_pid` / `ghostty_surface_tty_name`, which power
+/// the IPC `+list` pid/tty fields). The tty is a single NUL-terminated pointer
+/// (its length is derived at read time, so there is no two-atomic tear), duped
+/// into `arena` (never freed until backend deinit) so a published pointer stays
+/// valid even when a relaunch publishes a replacement. 0/null until the agent
+/// reports them (older agent ⇒ never: `getProcessInfo` then returns null, the
+/// pre-wp3 behavior).
+child_pid: std.atomic.Value(i64) = .init(0),
+tty_name_ptr: std.atomic.Value(?[*:0]const u8) = .init(null),
+
+/// The LIVE foreground pid pushed by the agent (`META{foreground_pid}`, wp3):
+/// the agent samples `tcgetpgrp` on its pty every second and pushes changes;
+/// the control reader signals the pane's ring and the IO thread copies the
+/// value here (see `drainRing`) for lock-free GUI reads. 0 = never reported
+/// (older agent / Windows ConPTY) — `getProcessInfo` then falls back to
+/// `child_pid`, which is also the correct answer for a fresh shell.
+fg_pid: std.atomic.Value(i64) = .init(0),
 
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
@@ -200,6 +234,14 @@ pub const Config = struct {
     /// Relaunch policy for a dead-but-relaunchable ATTACH target (T12c). See the
     /// `relaunch_policy` field doc. Defaults to `.auto`.
     relaunch_policy: RelaunchPolicy = .auto,
+
+    /// True when `conn` dials the LOCAL agent (same machine, UDS) — the
+    /// session-persistence path. Gates surfacing the agent-reported tty from
+    /// `getProcessInfo(.tty_name)` (wp3): a cross-machine agent's tty names a
+    /// REMOTE device, and exposing it locally could false-match `+list --tty`
+    /// against an unrelated local tty. Set from the same
+    /// `local_shell_integration` signal as `pinned`.
+    local: bool = false,
 };
 
 /// What a restored pane does when its ATTACH target comes back as a
@@ -252,6 +294,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .env = env,
         .argv = argv,
         .pinned = cfg.pinned,
+        .local = cfg.local,
         .relaunch_policy = cfg.relaunch_policy,
         .arena = arena,
     };
@@ -400,6 +443,10 @@ pub fn threadEnter(
                 cols,
                 px_w,
                 px_h,
+                // Respawn fidelity (wp3): the agent's on-disk record has no
+                // env/TERM/argv, so send our live copies — the respawned shell
+                // keeps GHOZTTY_PANE_ID & co. and its shell integration.
+                .{ .env = self.env, .term = self.term, .argv = self.argv },
                 &self.canceller,
             ) catch |err| {
                 log.warn("relaunch of dead session failed err={}", .{err});
@@ -469,6 +516,21 @@ pub fn threadEnter(
     // §3.3) so the remote session survives for a later re-attach.
     errdefer self.conn.detachChannel(pane);
 
+    // Re-assert the winsize now that the pane is live. ATTACH carries only
+    // rows/cols (the agent zeroes the pixel geometry), and a forced-reclaim
+    // retry above re-applies the same possibly-stale seed — so send one
+    // authoritative RESIZE with the full current geometry. Harmless when it
+    // matches what ATTACH/OPEN already applied; it guarantees the agent PTY
+    // and the client grid agree at bring-up (WP-D2 restore: "big window,
+    // small content").
+    self.conn.sendResize(
+        pane,
+        @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
+        @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
+        @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
+        @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
+    ) catch |err| log.warn("post-attach RESIZE re-assert failed err={}", .{err});
+
     // Publish the resolved live session id on the STABLE backend so the GUI thread
     // can read it for an on-demand cwd query (§WP4). `pane.session_id` is stable
     // for the pane's lifetime; we publish the pointer + len with release ordering
@@ -478,6 +540,11 @@ pub fn threadEnter(
         self.live_session_id.store(sid.ptr, .release);
         self.live_session_id_len.store(sid.len, .release);
     }
+
+    // Publish the agent-reported pid/tty for `getProcessInfo` (wp3). All three
+    // bring-up paths land here: OPEN-new (OPENED), re-attach (ATTACHED), and
+    // auto-relaunch (RELAUNCHED) — each filled `pane.pid`/`pane.tty`.
+    self.publishProcessInfo(pane);
 
     // The async handle the demux thread notifies to wake THIS pane's IO thread.
     // It is registered on this thread's xev loop; its callback drains the ring.
@@ -541,17 +608,22 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     // §3.4 teardown order (use-after-free guard): this IS the consumer thread, and
     // by the time `threadExit` runs the xev loop has stopped, so no further
     // `drainRing`/`ringReady` will run — the consumer has stopped draining. We may
-    // now DETACH, which deregisters the channel under the connection's table lock
-    // (after which no in-flight demux `pushTo` can touch the ring) and frees the
-    // ring + pane. DETACH keeps the remote session alive for a later re-attach
-    // (NOT CLOSE — a `+close` would route through a different path, §3.3).
+    // now DETACH or CLOSE, which deregisters the channel under the connection's
+    // table lock (after which no in-flight demux `pushTo` can touch the ring) and
+    // frees the ring + pane. DETACH (the default) keeps the remote session alive
+    // for a later re-attach; CLOSE (user closed the pane/window — see
+    // `close_on_exit`) terminates the child and frees the agent session.
     // Un-publish the live session id BEFORE the pane (and its `session_id`
-    // backing) is freed by detach, so the GUI thread never reads a dangling
-    // slice. Clear the len first, then the ptr (mirror of the publish order).
+    // backing) is freed, so the GUI thread never reads a dangling slice. Clear
+    // the len first, then the ptr (mirror of the publish order).
     self.live_session_id_len.store(0, .release);
     self.live_session_id.store(null, .release);
 
-    self.conn.detachChannel(rd.pane);
+    if (self.close_on_exit.load(.acquire)) {
+        self.conn.closeChannel(rd.pane);
+    } else {
+        self.conn.detachChannel(rd.pane);
+    }
     rd.pane = undefined;
 }
 
@@ -595,6 +667,9 @@ pub fn resize(
     const td_live = td orelse return;
     assert(td_live.backend == .remote);
     const rd = &td_live.backend.remote;
+    log.debug("RESIZE send rows={} cols={} ch={x}", .{
+        grid_size.rows, grid_size.columns, rd.pane.id,
+    });
     rd.conn.sendResize(
         rd.pane,
         @intCast(@min(grid_size.rows, std.math.maxInt(u16))),
@@ -678,7 +753,16 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
     const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
 
-    const res = rd.conn.sendRelaunchOnPane(rd.pane, rows, cols, px_w, px_h, &self.canceller) catch |err| {
+    const res = rd.conn.sendRelaunchOnPane(
+        rd.pane,
+        rows,
+        cols,
+        px_w,
+        px_h,
+        // Respawn fidelity (wp3): same live env/TERM/argv as the auto path.
+        .{ .env = self.env, .term = self.term, .argv = self.argv },
+        &self.canceller,
+    ) catch |err| {
         log.warn("awaited relaunch failed err={}", .{err});
         const note = "\r\n\x1b[2m--- relaunch failed ---\x1b[0m\r\n";
         @call(.always_inline, termio.Termio.processOutput, .{ rd.io, note });
@@ -692,6 +776,9 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     }
 
     log.info("relaunched dead session on keystroke pid={}", .{res.pid});
+    // The respawned child has a fresh pid + pty; re-publish for `getProcessInfo`
+    // (`sendRelaunchOnPane` updated the pane's pid/tty on ok).
+    self.publishProcessInfo(rd.pane);
     const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
     @call(.always_inline, termio.Termio.processOutput, .{ rd.io, divider });
 
@@ -723,12 +810,51 @@ pub fn childExitedAbnormally(
 }
 
 pub fn getProcessInfo(self: *Remote, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
-    _ = self;
-    // §3.3: "cached agent metadata or null". The agent reports pid/tty/foreground
-    // info via `META`/`OPENED` frames; until that metadata is plumbed through to
-    // the backend (a later increment) we return null, which all callers handle.
-    // TODO(wp3): return cached foreground pid from agent metadata.
-    return null;
+    // §3.3: cached agent metadata or null (wp3). The metadata is published by
+    // the IO thread from `OPENED`/`ATTACHED`/`RELAUNCHED` replies (see
+    // `publishProcessInfo`); an older agent never reports it and every caller
+    // handles the null. Callable from any thread (the GUI reads it for the IPC
+    // `+list` pid/tty fields).
+    return switch (info) {
+        // Prefer the LIVE foreground pid the agent samples via `tcgetpgrp`
+        // (pushed as `META{foreground_pid}` on change — full Exec parity);
+        // fall back to the child pid when the agent has not reported one
+        // (older agent, Windows ConPTY, or a fresh shell where they are the
+        // same process anyway).
+        .foreground_pid => pid: {
+            const fg = self.fg_pid.load(.acquire);
+            if (fg > 0) break :pid @intCast(fg);
+            const pid = self.child_pid.load(.acquire);
+            if (pid <= 0) break :pid null;
+            break :pid @intCast(pid);
+        },
+        .tty_name => tty: {
+            const ptr = self.tty_name_ptr.load(.acquire) orelse break :tty null;
+            break :tty std.mem.sliceTo(ptr, 0);
+        },
+    };
+}
+
+/// Publish the pane's agent-reported pid/tty for `getProcessInfo` (wp3). Runs on
+/// the IO thread (`threadEnter`, and again after an in-place relaunch replaces
+/// the child). The tty is duped into `arena` so previously-published pointers
+/// remain valid for racing readers; only LOCAL-agent connections publish it (a
+/// cross-machine tty names a remote device and could false-match local
+/// `+list --tty` lookups — see `Config.local`).
+fn publishProcessInfo(self: *Remote, pane: *const connection.Pane) void {
+    if (pane.pid > 0) self.child_pid.store(pane.pid, .release);
+
+    // A (re)published pane means a fresh child or a fresh viewer binding: any
+    // previously-cached live foreground pid is stale (the agent re-pushes the
+    // current one within a tick of the rebind — `bindLocked` resets its sampler
+    // baseline). Until then the child pid above is the correct fallback.
+    self.fg_pid.store(0, .release);
+
+    if (!self.local) return;
+    const tty = pane.tty orelse return;
+    if (tty.len == 0) return;
+    const copy = self.arena.allocator().dupeZ(u8, tty) catch return;
+    self.tty_name_ptr.store(copy.ptr, .release);
 }
 
 // -----------------------------------------------------------------------------
@@ -816,6 +942,13 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
     // re-arms and may wake again. This reuses `Surface.childExited`'s existing
     // close / `wait-after-command` logic, so a remote shell `exit` closes the
     // pane just like a local one — no special remote close path.
+    // Republish the agent's live foreground pid (wp3): the control reader
+    // signaled it on the ring (`signalForegroundPid`, which also woke us);
+    // copy it onto the STABLE Remote backend so GUI-thread `getProcessInfo`
+    // reads never touch the pane/ring (which die at threadExit).
+    const fg = ch.foregroundPid();
+    if (fg > 0) rd.io.backend.remote.fg_pid.store(fg, .release);
+
     if (!rd.exited and ch.isExited()) {
         rd.exited = true;
         // Coerce the agent's i64 exit code to the surface message's u32. A negative

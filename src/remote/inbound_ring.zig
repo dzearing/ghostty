@@ -217,6 +217,15 @@ pub const Channel = struct {
     /// The agent-reported child runtime in ms. Valid only once `exited` is true.
     runtime_ms: u64 = 0,
 
+    /// The session's live FOREGROUND pid, pushed by the agent as
+    /// `META{foreground_pid}` whenever the pty's foreground process group
+    /// changes (wp3 complete-semantics: `tcgetpgrp` parity with local Exec).
+    /// 0 = never reported (older agent / Windows ConPTY / no change yet — the
+    /// consumer falls back to the child pid). Written by the control reader
+    /// (`signalForegroundPid`), read by the pane's IO thread during drain,
+    /// which republishes it on the stable Remote backend for GUI reads.
+    fg_pid: Atomic(i64) = .init(0),
+
     pub const InitOptions = struct {
         capacity: usize = default_capacity,
         /// Pause threshold; defaults to `capacity * 3/4` (== 192 KiB at the
@@ -298,6 +307,20 @@ pub const Channel = struct {
     /// load so that, if true, `exit_code`/`runtime_ms` are visible.
     pub fn isExited(self: *const Channel) bool {
         return self.exited.load(.acquire);
+    }
+
+    /// Producer entry point (control reader, on `META{foreground_pid}`): record
+    /// the session's current foreground pid and wake the consumer so its next
+    /// drain republishes it for GUI reads. Mirrors `signalExit`'s wake pattern.
+    pub fn signalForegroundPid(self: *Channel, pid: i64) void {
+        self.fg_pid.store(pid, .release);
+        self.waker.wake();
+    }
+
+    /// Consumer entry point: the last agent-reported foreground pid (0 = never
+    /// reported; fall back to the child pid).
+    pub fn foregroundPid(self: *const Channel) i64 {
+        return self.fg_pid.load(.acquire);
     }
 };
 

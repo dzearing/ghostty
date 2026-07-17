@@ -9,6 +9,40 @@
 
 ## 0. Status snapshot (the baseline — read first on resume)
 
+**2026-07-16 — BROKERED OAUTH (BFF): the Google `client_secret` moved off the app
+onto the relay.** The desktop app no longer performs the Google token exchange or
+holds any Google credential. New model:
+- The app keeps PKCE + loopback and obtains the authorization `code` locally, then
+  POSTs `{code, code_verifier, redirect_uri}` to the relay's new
+  **`POST /oauth/exchange`**. The relay (holding `GOOGLE_CLIENT_ID` +
+  `GOOGLE_CLIENT_SECRET`) does the Google code→token exchange server-side, verifies
+  the id_token (existing dual-aud allowlist + `ALLOWED_EMAILS`), stores the Google
+  **refresh token AES-256-GCM-encrypted at rest** (new `SESSION_ENC_KEY` env), and
+  mints an opaque **relay session token** (same opaque + SHA-256-hashed pattern as
+  device tokens; new `sessions` table, migration `0007`). Returns
+  `{session_token, expiry, email, picture?}`.
+- **`POST /oauth/renew`** rotates the session token using the stored refresh token
+  and re-checks the allowlist (catches upstream revocation). **`POST /oauth/signout`**
+  revokes the session + destroys the stored refresh token.
+- **`/v1/client/*` now authenticate with the relay session token**, not a raw Google
+  ID token (that client path is REMOVED; Google verification lives only in
+  exchange/renew). `authenticateClient` does a session-store lookup.
+- **Google id/refresh tokens never touch the client.** The app stores only the
+  short-lived, revocable session token in the Keychain.
+- **The client id is a build-time constant** baked into `Info.plist`
+  (`GhosttyGoogleClientID`) via the `-Dgoogle-client-id` build option (CI secret
+  `GOOGLE_CLIENT_ID` for releases; git-ignored `macos/google-client-id.txt` for dev
+  builds). The runtime credential lookups are GONE: the
+  `GHOSTTY_GOOGLE_CLIENT_ID`/`_SECRET` env + `GhosttyGoogleClientID`/`Secret`
+  UserDefaults paths AND the `GHOSTTY_RELAY_TOKEN` devToken fallback are removed.
+  `RelayAccount.isConfigured` is effectively always true in a shipped build, so
+  **⌘⇧N always opens the chooser** (never a silent local window — the bug that
+  motivated this).
+- New relay env: `SESSION_ENC_KEY` (base64 of 32 bytes; the brokered flow answers
+  503 without it). Reuses existing `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`.
+- Spec + plan: `docs/superpowers/specs/2026-07-16-brokered-oauth-bff-design.md`,
+  `docs/superpowers/plans/2026-07-16-brokered-oauth-bff.md`.
+
 **Core tunneling is PROVEN end-to-end, Tailscale-free.** A real Ghoztty remote window
 into a Windows box (`MaximusHome`) was opened entirely through an Azure-hosted relay
 (`hostname` → `MaximusHome` confirmed over the wire).
@@ -390,7 +424,10 @@ able to take one WP with only this doc + the repo.
   click-by-click deploy runbook in `docs/design/relay-oidc-setup.md`. **Remaining:**
   register the OAuth client in the console + flip the VM env per the runbook
   (do it with the user present — the Mac dev-token flow 401s until WP-B2).
-- **WP-B2 — Client sign-in (macOS). ✅ BUILT (needs the real Google client id).**
+- **WP-B2 — Client sign-in (macOS). ✅ BUILT — ⚠️ SUPERSEDED 2026-07-16 by the
+  brokered BFF model (see §0): the app no longer holds Google tokens or the client
+  secret; it stores a relay session token and the client id is a build-time
+  constant. The description below is the pre-brokered design, kept for history.**
   *Goal:* in-app Google OAuth (browser) → token in Keychain + refresh; signed-in
   identity drives all relay calls. *Accept:* user signs in with Google+2FA; chooser
   loads their resources. *Shipped:* `GoogleOAuth.swift` (PKCE + loopback-redirect

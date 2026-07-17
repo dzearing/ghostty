@@ -2170,6 +2170,17 @@ pub const CAPI = struct {
         return surface.core_surface.needsConfirmQuit();
     }
 
+    /// Mark whether freeing this surface should CLOSE its remote/agent session
+    /// (terminate the child + free it agent-side) instead of the default DETACH
+    /// (keep-alive for re-attach). Set on user-initiated close; never on quit.
+    /// No-op for local exec surfaces.
+    export fn ghostty_surface_set_session_close_intent(
+        surface: *Surface,
+        close_on_exit: bool,
+    ) void {
+        surface.core_surface.setSessionCloseIntent(close_on_exit);
+    }
+
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;

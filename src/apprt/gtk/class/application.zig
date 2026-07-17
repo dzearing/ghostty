@@ -2432,7 +2432,10 @@ const Action = struct {
                     return true;
                 },
             },
-            .tab => {
+            // GTK has no separate window-level title override; the window
+            // titlebar follows the active tab, so the closest equivalent
+            // is the tab title prompt.
+            .tab, .window => {
                 switch (target) {
                     .app => return false,
                     .surface => |v| {

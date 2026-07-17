@@ -234,14 +234,26 @@ extension AppDelegate {
             if tabParent.isMiniaturized { tabParent.deminiaturize(nil) }
             tabParent.addTabbedWindowSafely(window, ordered: .above)
         }
-        controller.showWindow(self)
         // Standalone windows (and the first tab of a group) get their persisted
-        // frame — AFTER showWindow, which applies config default size/position on
-        // the way to screen. Tab siblings inherit the group's frame. A
-        // cross-machine resume re-anchors the frame to a visible local screen
-        // (the owning machine's coordinates may be off every display here).
-        if tabParent == nil, let frame = entry.frame {
-            let rect = reanchorFrame ? Self.reanchoredFrame(frame.rect) : frame.rect
+        // frame BEFORE showWindow as well: the surfaces' first real layout (and
+        // therefore the grid size their termio threads carry into ATTACH) then
+        // happens at the final size instead of the config default, so the
+        // agent-side PTY winsize starts correct instead of relying on a
+        // corrective RESIZE after the window grows ("big window, small
+        // content"). showWindow can re-apply default sizing on the way to
+        // screen, so the frame is asserted again right after (that second set
+        // is a no-op when showWindow left it alone).
+        let persistedRect: NSRect? = if tabParent == nil, let frame = entry.frame {
+            reanchorFrame ? Self.reanchoredFrame(frame.rect) : frame.rect
+        } else { nil }
+        if let rect = persistedRect {
+            window.setFrame(rect, display: true)
+        }
+        controller.showWindow(self)
+        // Tab siblings inherit the group's frame. A cross-machine resume
+        // re-anchors the frame to a visible local screen (the owning machine's
+        // coordinates may be off every display here).
+        if let rect = persistedRect {
             window.setFrame(rect, display: true)
         }
 
@@ -249,6 +261,13 @@ extension AppDelegate {
         // rename sets, so it survives later shell OSC title updates.
         if let title = entry.titleOverride, !title.isEmpty {
             controller.titleOverride = title
+        }
+
+        // The user-set WINDOW-level title (pins the titlebar over any
+        // tab/pane title). Per-controller storage, so restore order within
+        // a tab group doesn't matter — the group scan finds the holder.
+        if let title = entry.windowTitleOverride, !title.isEmpty {
+            controller.windowTitleOverride = title
         }
 
         // Put restored windows/panes back in the IPC target registry under
@@ -335,7 +354,13 @@ extension AppDelegate {
             cfg.remoteConnection = connection.handle
             cfg.connectionKeepAlive = connection
             cfg.remoteSessionId = leaf.sessionID
-            let view = Ghostty.SurfaceView(app, baseConfig: cfg)
+            // Recreate the pane under its PERSISTED surface uuid (wp3 pane
+            // identity) so `+list` ids and the shell's baked GHOZTTY_PANE_ID
+            // stay valid across the relaunch. Nil (older manifest) mints fresh.
+            let view = Ghostty.SurfaceView(
+                app,
+                baseConfig: cfg,
+                uuid: leaf.surfaceID.flatMap { UUID(uuidString: $0) })
             // Seed the last-synced pane title; live OSC titles (if the
             // session emits them) take over after re-attach.
             if let title = leaf.title, !title.isEmpty { view.setTitle(title) }

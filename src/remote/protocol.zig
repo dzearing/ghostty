@@ -454,6 +454,14 @@ pub const Open = struct {
 pub const Opened = struct {
     session_id: []const u8,
     pid: i64,
+
+    /// The PTY slave path of the spawned child ON THE AGENT'S MACHINE (e.g.
+    /// `/dev/ttys014`), so a viewer pane can answer `getProcessInfo(.tty_name)`
+    /// (the `+list --tty` self-lookup path). POSIX agents report it; the Windows
+    /// ConPTY agent has no tty name and leaves it null. Additive/optional:
+    /// older agents omit it (unknown-field-tolerant parser → null) and the
+    /// client degrades to its pre-field behavior (no tty).
+    tty: ?[]const u8 = null,
 };
 
 /// `ATTACH` (0x03). `last_byte_offset` anchors the sequence-anchored resync
@@ -491,6 +499,17 @@ pub const Attached = struct {
     /// `exit_code` instead). Additive/optional (older agents omit it → false).
     relaunchable: bool = false,
 
+    /// The live child pid (set with `status == .alive`; 0 otherwise). ATTACH is
+    /// the path that matters for `getProcessInfo` — the app relaunch re-attaches
+    /// every persistence pane, and `OPENED.pid` from the original open is gone
+    /// with the old app process. Additive/optional (older agents omit it → 0,
+    /// today's behavior).
+    pid: i64 = 0,
+
+    /// The child's PTY slave path on the agent's machine (set with `status ==
+    /// .alive`; see `Opened.tty`). Additive/optional (older agents omit it).
+    tty: ?[]const u8 = null,
+
     pub const AttachStatus = enum { alive, dead, not_found };
 };
 
@@ -520,6 +539,15 @@ pub const Meta = struct {
     title: ?[]const u8 = null,
     listening_ports: ?[]const u16 = null,
     foreground_cmd: ?[]const u8 = null,
+
+    /// The session's current FOREGROUND pid (`tcgetpgrp` on the pty master),
+    /// pushed by the agent whenever it changes (sampled on the agent's 1 s
+    /// tick) so `getProcessInfo(.foreground_pid)` has live Exec parity for
+    /// agent-backed panes (wp3). Absent on Windows (ConPTY has no foreground
+    /// process group — matching WindowsPty, which returns null locally too)
+    /// and from older agents; the client then falls back to the child pid.
+    /// Additive/optional both ways (unknown-field-tolerant parsers).
+    foreground_pid: ?i64 = null,
 };
 
 /// `GET_CWD` (0x22). On-demand request for a session's child working directory.
@@ -657,6 +685,19 @@ pub const Relaunch = struct {
     cols: u16,
     px_w: u16 = 0,
     px_h: u16 = 0,
+
+    /// Respawn fidelity (wp3): the agent's on-disk session record keeps only
+    /// argv-label/cwd, so a synthesized relaunch OPEN used to lose the pane's
+    /// forwarded environment (GHOZTTY_PANE_ID / GHOZTTY_WINDOW_NAME / shell
+    /// integration vars), its TERM, and any explicit shell-integration argv
+    /// rewrite. RELAUNCH is always viewer-initiated, and the viewer still holds
+    /// all three — so it sends them and the agent applies them to the respawn
+    /// exactly like an original OPEN. All additive/optional: an older agent
+    /// ignores them (env-less respawn, today's behavior); an older client omits
+    /// them and a new agent falls back to the recorded metadata alone.
+    env: []const Open.EnvPair = &.{},
+    term: ?[]const u8 = null,
+    argv: ?[]const []const u8 = null,
 };
 
 /// `RELAUNCHED` (0x27). Reply to `RELAUNCH`. `ok == true` ⇒ the session is now
@@ -678,6 +719,11 @@ pub const Relaunched = struct {
     /// one marker. Additive/defaulted → older agents (never set it) and older
     /// clients (ignore it) interoperate unchanged.
     replayed: bool = false,
+
+    /// The respawned child's PTY slave path (set with `ok == true`; a relaunch
+    /// opens a FRESH pty, so any previously-reported tty is stale). See
+    /// `Opened.tty`. Additive/optional (older agents omit it).
+    tty: ?[]const u8 = null,
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
@@ -1521,6 +1567,101 @@ test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     defer ap.deinit();
     try testing.expectEqual(Attached.AttachStatus.alive, ap.value.status);
     try testing.expectEqual(@as(u64, 42), ap.value.snapshot_at_offset);
+    // pid/tty default when omitted (an older agent's ATTACHED) — no error, no tty.
+    try testing.expectEqual(@as(i64, 0), ap.value.pid);
+    try testing.expect(ap.value.tty == null);
+}
+
+test "OPENED/ATTACHED/RELAUNCHED pid+tty round-trip and default when omitted" {
+    const alloc = testing.allocator;
+
+    // OPENED with tty (a POSIX agent) round-trips.
+    const opened: Opened = .{ .session_id = "abc123", .pid = 4242, .tty = "/dev/ttys014" };
+    const oj = try encodeJson(alloc, opened);
+    defer alloc.free(oj);
+    var op = try parseJson(Opened, alloc, oj);
+    defer op.deinit();
+    try testing.expectEqual(@as(i64, 4242), op.value.pid);
+    try testing.expectEqualStrings("/dev/ttys014", op.value.tty.?);
+
+    // OPENED without tty (a Windows or pre-field agent): null tty is elided on
+    // encode and defaults to null on parse — version skew degrades cleanly.
+    const opened_old: Opened = .{ .session_id = "abc123", .pid = 4242 };
+    const yj = try encodeJson(alloc, opened_old);
+    defer alloc.free(yj);
+    try testing.expect(std.mem.indexOf(u8, yj, "tty") == null);
+    var yp = try parseJson(Opened, alloc, yj);
+    defer yp.deinit();
+    try testing.expect(yp.value.tty == null);
+
+    // ATTACHED alive carries pid + tty (the app-relaunch re-attach path).
+    const att: Attached = .{ .status = .alive, .rows = 24, .cols = 80, .pid = 777, .tty = "/dev/ttys020" };
+    const aj = try encodeJson(alloc, att);
+    defer alloc.free(aj);
+    var ap = try parseJson(Attached, alloc, aj);
+    defer ap.deinit();
+    try testing.expectEqual(@as(i64, 777), ap.value.pid);
+    try testing.expectEqualStrings("/dev/ttys020", ap.value.tty.?);
+
+    // RELAUNCHED carries the fresh pty's tty on ok; defaults null when omitted.
+    const rel: Relaunched = .{ .session_id = "abc123", .ok = true, .pid = 99, .found = true, .tty = "/dev/ttys021" };
+    const rj = try encodeJson(alloc, rel);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunched, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqualStrings("/dev/ttys021", rp.value.tty.?);
+    const rel_old: Relaunched = .{ .session_id = "abc123", .ok = true, .pid = 99, .found = true };
+    const sj = try encodeJson(alloc, rel_old);
+    defer alloc.free(sj);
+    var sp = try parseJson(Relaunched, alloc, sj);
+    defer sp.deinit();
+    try testing.expect(sp.value.tty == null);
+}
+
+test "META foreground_pid and RELAUNCH env/term/argv round-trip with skew defaults (wp3)" {
+    const alloc = testing.allocator;
+
+    // META{foreground_pid} round-trips; omitted (older agent) defaults null.
+    const meta: Meta = .{ .foreground_pid = 4321 };
+    const mj = try encodeJson(alloc, meta);
+    defer alloc.free(mj);
+    var mp = try parseJson(Meta, alloc, mj);
+    defer mp.deinit();
+    try testing.expectEqual(@as(i64, 4321), mp.value.foreground_pid.?);
+    var op = try parseJson(Meta, alloc, "{\"title\":\"hi\"}");
+    defer op.deinit();
+    try testing.expect(op.value.foreground_pid == null);
+
+    // RELAUNCH respawn-fidelity fields round-trip.
+    const pairs = [_]Open.EnvPair{
+        .{ .key = "GHOZTTY_PANE_ID", .value = "ABC-123" },
+    };
+    const argv = [_][]const u8{ "/bin/bash", "--posix" };
+    const rel: Relaunch = .{
+        .session_id = "s1",
+        .rows = 24,
+        .cols = 80,
+        .env = &pairs,
+        .term = "xterm-256color",
+        .argv = &argv,
+    };
+    const rj = try encodeJson(alloc, rel);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunch, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqual(@as(usize, 1), rp.value.env.len);
+    try testing.expectEqualStrings("GHOZTTY_PANE_ID", rp.value.env[0].key);
+    try testing.expectEqualStrings("ABC-123", rp.value.env[0].value);
+    try testing.expectEqualStrings("xterm-256color", rp.value.term.?);
+    try testing.expectEqual(@as(usize, 2), rp.value.argv.?.len);
+
+    // An OLD client's RELAUNCH (no fidelity fields) parses with empty/null
+    // defaults — the agent then falls back to recorded metadata alone.
+    var old = try parseJson(Relaunch, alloc, "{\"session_id\":\"s1\",\"rows\":24,\"cols\":80}");
+    defer old.deinit();
+    try testing.expectEqual(@as(usize, 0), old.value.env.len);
+    try testing.expect(old.value.term == null);
+    try testing.expect(old.value.argv == null);
 }
 
 test "METRICS/HostMetrics JSON round-trips with null optional elision" {

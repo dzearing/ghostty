@@ -393,6 +393,19 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
+/// Mark whether backend teardown should CLOSE the remote session (terminate
+/// the agent-side child and free the session) instead of the default DETACH
+/// (keep-alive for a later re-attach). Set when the user explicitly closes a
+/// pane/window; never set on app quit. No-op for the exec backend, whose child
+/// dies with the surface anyway. Safe to call from the GUI thread: the write
+/// is atomic and strictly precedes the surface free that joins the IO thread.
+pub fn setSessionCloseIntent(self: *Termio, close_on_exit: bool) void {
+    switch (self.backend) {
+        .remote => |*remote| remote.close_on_exit.store(close_on_exit, .release),
+        else => {},
+    }
+}
+
 /// Signal the IO backend to abort any blocking work so the IO thread can be
 /// joined promptly. Safe to call from another thread (the GUI thread calls it
 /// from `Surface.deinit` right before joining the IO thread). See

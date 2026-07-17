@@ -66,6 +66,13 @@ final class SessionLayoutManifest {
         /// this location — viewers have no process, so they are always
         /// restorable and never counted toward the all-dead drop policy.
         var viewerLocation: String?
+        /// The pane's STABLE surface UUID (wp3 pane identity): restore
+        /// recreates the SurfaceView with this exact uuid so the `+list`
+        /// leaf `id` — and the GHOZTTY_PANE_ID env baked into the still-
+        /// running shell at spawn — survive an app relaunch unchanged.
+        /// Optional/additive: older manifests decode with nil (restore then
+        /// mints a fresh uuid, today's behavior).
+        var surfaceID: String?
 
         var isViewer: Bool { kind == "viewer" }
     }
@@ -112,6 +119,11 @@ final class SessionLayoutManifest {
         /// The USER-set window title (`titleOverride`), nil when never
         /// renamed (shell-computed titles are transient, not persisted).
         var titleOverride: String?
+        /// The USER-set WINDOW-level title (`windowTitleOverride`) that pins
+        /// the titlebar over any tab/pane title. Held by exactly one entry of
+        /// a tab group. Optional so manifests persisted before this field
+        /// decode fine (missing key ⇒ nil).
+        var windowTitleOverride: String? = nil
         /// The IPC target-registry name (`+new-window --target=...`).
         var ipcName: String?
         /// Shared by every entry in one native tab group; nil for a
@@ -212,13 +224,14 @@ final class SessionLayoutManifest {
     /// Overwrite an entry's synced fields from a live snapshot. Nil `frame`,
     /// `ipcName`, and `tree` mean "not available right now" and keep the
     /// previous value (window not yet on screen / name registered later /
-    /// tree unchanged); `titleOverride`, `tabGroupID`, and `tabIndex` are
-    /// authoritative each sync. No-op (and no disk write) when nothing
-    /// changed. Unknown ids are a no-op.
+    /// tree unchanged); `titleOverride`, `windowTitleOverride`, `tabGroupID`,
+    /// and `tabIndex` are authoritative each sync. No-op (and no disk write)
+    /// when nothing changed. Unknown ids are a no-op.
     func update(
         _ id: UUID,
         frame: Frame?,
         titleOverride: String?,
+        windowTitleOverride: String? = nil,
         ipcName: String?,
         tabGroupID: UUID?,
         tabIndex: Int,
@@ -230,6 +243,7 @@ final class SessionLayoutManifest {
         var entry = entries[idx]
         if let frame { entry.frame = frame }
         entry.titleOverride = titleOverride
+        entry.windowTitleOverride = windowTitleOverride
         if let ipcName { entry.ipcName = ipcName }
         entry.tabGroupID = tabGroupID
         entry.tabIndex = tabIndex
@@ -249,6 +263,19 @@ final class SessionLayoutManifest {
         guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
         guard entries[idx].titleOverride != windowTitle else { return }
         entries[idx].titleOverride = windowTitle
+        saveLocked()
+        notifyChanged(entries[idx])
+    }
+
+    /// Record the user-set WINDOW-level title (nil ⇒ cleared). Called from
+    /// the `windowTitleOverride` didSet choke point, same contract as
+    /// `updateWindowTitle`. Unknown ids are a no-op.
+    func updateWindowTitleOverride(_ id: UUID, title: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
+        guard entries[idx].windowTitleOverride != title else { return }
+        entries[idx].windowTitleOverride = title
         saveLocked()
         notifyChanged(entries[idx])
     }
@@ -471,7 +498,8 @@ final class SessionLayoutManifest {
                         title: pane.title,
                         ipcName: ipc?.registeredPaneName(forViewerPane: pane),
                         kind: "viewer",
-                        viewerLocation: viewer.location)
+                        viewerLocation: viewer.location,
+                        surfaceID: nil)
                 }
                 let view = pane.surfaceView
                 return Leaf(
@@ -482,7 +510,8 @@ final class SessionLayoutManifest {
                     // (next launch would then drop the whole entry).
                     sessionID: view.flatMap { Self.liveSessionID(of: $0) ?? $0.expectedRemoteSessionID },
                     title: pane.title,
-                    ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) })
+                    ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) },
+                    surfaceID: view?.id.uuidString)
             }
         }
 
@@ -512,6 +541,7 @@ final class SessionLayoutManifest {
             entryID,
             frame: frame,
             titleOverride: controller.titleOverride,
+            windowTitleOverride: controller.windowTitleOverride,
             ipcName: ipcName,
             tabGroupID: tabGroupID,
             tabIndex: tabIndex,
