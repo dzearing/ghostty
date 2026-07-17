@@ -298,6 +298,64 @@ Cross-machine session *move* (browse another machine's live sessions from the
 Cmd-Shift-N chooser and resume them locally over the relay) is **scoped but not
 yet built** — see tasks T16–T18 in `docs/design/session-persistence-tasks.json`.
 
+### Agent contract & upgrade compatibility
+
+The `ghoztty-agent` outlives the app on purpose (per-user LaunchAgent; survives
+quit/crash/upgrade). The direct consequence: **a running agent is frequently a
+DIFFERENT build than the app talking to it** — an app upgrade replaces the app
+binary while the old agent process keeps running with every PTY attached. The
+app↔agent wire contract is therefore a **compatibility boundary.** Forward
+compatibility across it is the **default and strongly preferred** path; a
+breaking change is allowed but only as a *conscious* decision routed through the
+mandatory agent-update process (below), never as an accident. What is never
+acceptable is an *unhandled* skew — garbled output, a wedged socket, or a crash.
+Treat this boundary with the same care as an on-disk format or a public API.
+
+Rules for any change to the agent↔app protocol (messages, fields, framing, the
+ring/snapshot/gap-fill replay, HELLO handshake):
+
+- **Old agent + new app MUST keep working, and new agent + old app MUST keep
+  working.** Neither side may assume the peer is its own build. A skew must
+  degrade to reduced function, never to garbled output, a wedged socket, or a
+  crash. (The 1.14.0 re-attach corruption — new app replaying an old agent's
+  scrollback into smeared, non-interactive panes — is exactly the failure this
+  rule exists to prevent.)
+- **Evolve additively.** New messages and new fields only. Never change the
+  meaning, type, or framing of an existing message or field, and never remove
+  one that an older peer still sends or expects. Readers ignore unknown fields
+  and tolerate absent ones (fall back, don't fail). A field that goes missing
+  because the peer is older must degrade gracefully — the way agent-side
+  pid/tty already reports null to an app that doesn't understand it.
+- **Detect capability at runtime — never at compile time.** Attach begins with
+  a **HELLO handshake** that exchanges a protocol/capability version so each
+  side negotiates behavior from what the peer *actually* advertises, not from
+  what this build happens to ship. Gate every new behavior on the negotiated
+  capability, and document each protocol version and what it added in the agent
+  protocol source so the compatibility matrix is checkable at runtime and in
+  review.
+- **Breaking changes are allowed — deliberately, never accidentally.** Forward
+  compatibility is the default because it's the cheapest path (no disruption),
+  but a break is a legitimate tool when additive evolution would be worse. What
+  makes a break acceptable is that it is *conscious* and *backed by the
+  mandatory agent-update process* — not that it's forbidden. When you break the
+  contract: bump the protocol version, and on an incompatible skew the app must
+  NOT replay across it. Instead the mandatory-update mechanism takes over:
+  - **Prefer a lazy, non-destructive agent upgrade.** Carry sessions across by
+    upgrading the agent when it is safe — on idle, or as each session naturally
+    closes — draining/snapshotting and resuming so no work is lost, then proceed
+    with the app upgrade transparently. This is what makes most breaks painless.
+  - **When a session cannot be carried across**, show a **mandatory, explicit
+    confirmation before resetting**: *"Upgrading will reset all windows.
+    Continue?"* Never silently reset live sessions, and never silently replay
+    across a version the handshake flagged as incompatible.
+
+  The mandatory-update process is the safety net that makes breaking changes
+  survivable; the HELLO handshake is what lets us detect when we need it. Build
+  and keep both robust, and a breaking change becomes a conscious, bounded cost
+  rather than a corrupted-session incident.
+
+Design + status: `docs/design/session-persistence.md`.
+
 ## Build & Test
 
 ```bash
