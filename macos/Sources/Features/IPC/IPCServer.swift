@@ -430,7 +430,7 @@ class IPCServer {
         DispatchQueue.main.async { [ghostty = self.ghostty, weak self] in
             let controller = TerminalController.newWindow(ghostty, withBaseConfig: config, activate: !parsed.noActivate)
 
-            if let title = parsed.title {
+            if let title = parsed.title, !title.isEmpty {
                 // A CLI-set title is a WINDOW title: it pins the titlebar
                 // and survives pane focus/title changes.
                 controller.setWindowTitle(title)
@@ -788,8 +788,9 @@ class IPCServer {
 
         DispatchQueue.main.async {
             // A CLI rename is a WINDOW title: it pins the titlebar and
-            // survives pane focus/title changes.
-            controller.setWindowTitle(newTitle)
+            // survives pane focus/title changes. An empty title clears the
+            // pin so the titlebar falls back to the tab/pane title.
+            controller.setWindowTitle(newTitle.isEmpty ? nil : newTitle)
         }
 
         Self.logger.info("IPC: renamed display title for '\(target)' to '\(newTitle)'")
