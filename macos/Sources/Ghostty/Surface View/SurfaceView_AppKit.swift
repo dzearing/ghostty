@@ -147,6 +147,18 @@ extension Ghostty {
             return ghostty_surface_process_exited(surface)
         }
 
+        /// Mark whether freeing this surface should CLOSE its agent session
+        /// (terminate the remote child) instead of the default DETACH
+        /// (keep-alive for re-attach). Set true when the user closes the
+        /// pane/tab/window; cleared when the view is (re)adopted into a live
+        /// surface tree (undo restore). Never set on app quit, so persistent
+        /// sessions survive quit for the next launch's restore. No-op for
+        /// local exec surfaces.
+        func setSessionCloseIntent(_ closeOnFree: Bool) {
+            guard let surface = self.surface else { return }
+            ghostty_surface_set_session_close_intent(surface, closeOnFree)
+        }
+
         // Returns the inspector instance for this surface, or nil if the
         // surface has been closed or no inspector is active.
         var inspector: Ghostty.Inspector? {

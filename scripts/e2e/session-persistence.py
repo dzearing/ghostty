@@ -296,7 +296,7 @@ def launch_app():
     # ad-hoc-signed debug build doesn't pop a login-keychain password prompt on
     # every launch (its code hash changes each rebuild, so the ACL never matches
     # and "Always Allow" can't stick). Session persistence needs no relay account.
-    env = dict(os.environ, GHOSTTY_RELAY_DISABLE="1")
+    env = dict(os.environ, GHOSTTY_RELAY_DISABLE="1", GHOSTTY_LOG="stderr")
     if AGENT_BIN_OVERRIDE is not None:
         env["GHOSTTY_LOCAL_AGENT_BIN"] = AGENT_BIN_OVERRIDE
     p = subprocess.Popen([CLI] + LAUNCH_ARGS, stdout=logf, stderr=logf,
@@ -1051,6 +1051,180 @@ def run_sigterm_check(args, baseline):
     return 0
 
 # ---------------------------------------------------------------------------
+# Winsize / re-attach resize integrity (the "big window, small content" bug)
+# ---------------------------------------------------------------------------
+def agent_pane_ttys():
+    """session-id -> /dev/ttysNNN via the AGENT (+sessions --json gives each
+    live session's child pid; ps maps pid -> controlling tty). The client-side
+    +list tty field is not published for agent-backed panes, and the agent-side
+    view is what we want anyway: session ids AND ptys are stable across an app
+    kill/relaunch, so the same keys work before and after restore."""
+    rc, out, _ = run_cli(["+sessions", "--json"], timeout=10)
+    if rc != 0:
+        return {}
+    start = out.find("[")
+    if start < 0:
+        return {}
+    try:
+        sessions = json.loads(out[start:])
+    except json.JSONDecodeError:
+        return {}
+    ttys = {}
+    for obj in sessions:
+        pid = obj.get("pid")
+        if not pid or not obj.get("alive", False):
+            continue
+        t = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                           capture_output=True, text=True).stdout.strip()
+        if t and t != "??":
+            ttys[obj.get("id", str(pid))] = ("/dev/" + t, obj.get("created_at", 0))
+    return ttys
+
+def stty_size(tty):
+    """The AGENT-side PTY winsize, read directly off the device — no typing into
+    the pane needed, no dependence on what the pane's child is running."""
+    p = subprocess.run(["/bin/stty", "-f", tty, "size"],
+                       capture_output=True, text=True, timeout=5)
+    if p.returncode != 0:
+        raise E2EError(f"stty -f {tty}: {p.stderr.strip()}")
+    r, c = p.stdout.split()
+    return (int(r), int(c))
+
+def ax_resize_all_windows(pid, width, height):
+    """Resize every window of the app via Accessibility (needs the Accessibility
+    permission the GUI-driving setup already granted)."""
+    script = (
+        'tell application "System Events"\n'
+        f'  tell (first process whose unix id is {pid})\n'
+        '    repeat with w in windows\n'
+        f'      set size of w to {{{width}, {height}}}\n'
+        '    end repeat\n'
+        '  end tell\n'
+        'end tell')
+    p = subprocess.run(["/usr/bin/osascript", "-e", script],
+                       capture_output=True, text=True, timeout=15)
+    if p.returncode != 0:
+        raise E2EError(f"AX resize failed: {p.stderr.strip()}")
+
+def poll_sizes(ttys, pred, timeout=8.0):
+    """Poll each tty's winsize until pred(sizes) or timeout; return last sizes."""
+    deadline = time.time() + timeout
+    sizes = {}
+    while time.time() < deadline:
+        sizes = {n: stty_size(t) for n, t in ttys.items()}
+        if pred(sizes):
+            return sizes
+        time.sleep(0.4)
+    return sizes
+
+def run_winsize_check(args):
+    """Re-attach winsize integrity: after a kill -9 + relaunch the agent-side PTY
+    of every restored pane must agree with the restored window geometry, and a
+    LIVE window resize after re-attach must still reach the PTY. Guards the
+    'window is big but the content renders small' restore bug."""
+    launch_app()
+    wait_app_ready()
+    wait_window_count(1)
+    initial_leaves = all_leaf_names()
+
+    log("[winsize] creating window wsW + split wsR")
+    retry_cli(["+new-window", "--target=wsW"], "new-window wsW")
+    wait_window_count(2)
+    deadline = time.time() + 15
+    while time.time() < deadline and len(all_windows()) > 1:
+        for nm in initial_leaves:
+            cli_ok(["+close", f"--target={nm}"])
+        time.sleep(0.6)
+    wait_window_count(1)
+    retry_cli(["+split", "--target=wsW", "--direction=right", "--name=wsR"], "split wsR")
+    wait_for_pane("wsR")
+
+    # wsW and wsR are the two NEWEST agent sessions (created after the initial
+    # window's pane, which is on its way to being CLOSEd by the earlier +close
+    # and must not be measured — its pty vanishes when the undo window expires).
+    ttys = poll_ttys = None
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        poll_ttys = agent_pane_ttys()
+        if len(poll_ttys) >= 2:
+            newest = sorted(poll_ttys.items(), key=lambda kv: kv[1][1])[-2:]
+            ttys = {sid: tty for sid, (tty, _) in newest}
+            break
+        time.sleep(0.5)
+    if ttys is None:
+        raise E2EError(f"agent sessions never appeared: {poll_ttys}")
+    log(f"[winsize] pane sessions: {ttys}")
+
+    pids = app_pids()
+    if not pids:
+        raise E2EError("no app pid")
+    pid = pids[0]
+
+    # Resize to a deliberate reference size WELL AWAY from the config default
+    # (a resize to the size the window already has produces no events at all)
+    # and capture the PTY sizes.
+    base = {n: stty_size(t) for n, t in ttys.items()}
+    log(f"[winsize] pre-resize PTY sizes: {base}")
+    ax_resize_all_windows(pid, 1000, 640)
+    ref = poll_sizes(ttys, lambda s: s != base)
+    if ref == base:
+        raise E2EError(f"pre-kill window resize never reached the PTYs: {ref}")
+    # Keep only the sessions that tracked the window resize: those are wsW/wsR.
+    # A just-closed session (the initial window; alive only until its undo
+    # window expires and the CLOSE lands) has no window and never resizes.
+    ttys = {n: t for n, t in ttys.items() if ref[n] != base[n]}
+    ref = {n: ref[n] for n in ttys}
+    if len(ttys) < 2:
+        raise E2EError(f"expected 2 live resizable panes, have {ttys}")
+    log(f"[winsize] reference PTY sizes @1280x820: {ref}")
+
+    # Let the (debounced) layout sync capture the frame before the hard kill.
+    time.sleep(4)
+
+    log("[winsize] SIGKILL app + relaunch")
+    kill_pids(app_pids(), signal.SIGKILL)
+    wait_gone(app_pids(), 8)
+    launch_app()
+    wait_app_ready()
+
+    # Restored panes come back with the SAME agent sessions/ptys (same
+    # processes). Wait for the window + named pane to re-register, and confirm
+    # the agent still reports the same tty set.
+    wait_for_pane("wsR", timeout=20.0)
+    restored = {tty for tty, _ in agent_pane_ttys().values()}
+    if not restored >= set(ttys.values()):
+        raise E2EError(f"restored agent ttys changed: {restored} vs {ttys}")
+
+    pid2 = app_pids()[0]
+    # Re-assert the reference frame (no-op if the restore already applied it),
+    # then the PTYs must agree with the reference sizes again. A stale ATTACH
+    # seed that never gets corrected fails here.
+    ax_resize_all_windows(pid2, 1000, 640)
+    post = poll_sizes(ttys, lambda s: s == ref, timeout=10.0)
+    ok = True
+    if post != ref:
+        log(f"FAIL: PTY sizes after re-attach {post} != reference {ref} "
+            "(stale winsize after restore)")
+        ok = False
+    else:
+        log(f"[winsize] PASS: post-restore PTY sizes match reference: {post}")
+
+    # A LIVE resize after re-attach must still reach the agent PTYs.
+    ax_resize_all_windows(pid2, 1520, 940)
+    live = poll_sizes(ttys, lambda s: all(s[n] != ref[n] for n in s), timeout=10.0)
+    if any(live[n] == ref[n] for n in live):
+        log(f"FAIL: live resize after re-attach did not reach the PTYs: {live}")
+        ok = False
+    else:
+        log(f"[winsize] PASS: live post-restore resize reached the PTYs: {live}")
+
+    if not args.keep:
+        cli_ok(["+close", "--target=wsR"])
+        cli_ok(["+close", "--target=wsW"])
+    log("winsize check: " + ("ALL PASS" if ok else "FAILURES (see above)"))
+    return 0 if ok else 1
+
+# ---------------------------------------------------------------------------
 # Agent-unavailable fallback check (T19)
 # ---------------------------------------------------------------------------
 def run_fallback_check(args):
@@ -1192,6 +1366,9 @@ def main():
     ap.add_argument("--agent-sigterm", action="store_true", dest="agent_sigterm",
                     help="graceful agent stop (T13b): SIGTERM the agent and assert it flushes "
                          "dirty rings to disk, then exits cleanly on its own (no SIGKILL escalation)")
+    ap.add_argument("--winsize", action="store_true",
+                    help="re-attach winsize integrity: PTY sizes must match the "
+                         "restored window and live resizes must work after re-attach")
     ap.add_argument("--fallback", action="store_true",
                     help="agent-unavailable fallback (T19): default-on config with the local "
                          "agent forced unspawnable; assert windows open as usable exec surfaces "
@@ -1210,6 +1387,21 @@ def main():
     # Agent-unavailable fallback (T19): a standalone flow — it must NOT require a
     # live agent (the whole point is that none exists), so it runs its own reset +
     # launch and skips the agent-required baseline below.
+    if args.winsize:
+        log("=" * 70)
+        log("Ghoztty session-persistence E2E — re-attach WINSIZE integrity")
+        log("=" * 70)
+        full_reset()
+        try:
+            return run_winsize_check(args)
+        finally:
+            if not args.keep:
+                ap2 = app_pids()
+                if ap2:
+                    kill_pids(ap2, signal.SIGKILL)
+                    wait_gone(ap2, 4)
+                launchagent_bootout()
+
     if args.fallback:
         log("=" * 70)
         log("Ghoztty session-persistence E2E — agent-unavailable FALLBACK (T19)")

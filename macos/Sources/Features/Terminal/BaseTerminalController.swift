@@ -281,6 +281,14 @@ class BaseTerminalController: NSWindowController,
         }
         self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: initialConfig))
 
+        // A passed-in tree re-adopts existing surfaces (undo of a window
+        // close, moves between windows): they are alive again, so clear any
+        // pending CLOSE-on-free intent. (didSet does not fire for this init
+        // assignment, so the surfaceTreeDidChange clearing doesn't run here.)
+        if tree != nil {
+            for view in surfaceTree { view.setSessionCloseIntent(false) }
+        }
+
         // Setup our bell state for the window
         setupBellNotificationPublisher()
 
@@ -694,6 +702,22 @@ class BaseTerminalController: NSWindowController,
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
             focusedSurface = nil
+        }
+
+        // Session close intent: a leaf that LEFT the tree was closed by the
+        // user (removeSurfaceNode, or a redo of a close) — its agent session
+        // must actually END when the view is eventually freed (after the undo
+        // window expires), not linger detached in the agent forever. A leaf
+        // PRESENT in the tree is alive — clear any pending intent, which is
+        // what un-marks a view brought back by undo (the undo restore assigns
+        // the old tree directly, landing here).
+        let toLeaves = to.root?.leaves() ?? []
+        for view in toLeaves { view.setSessionCloseIntent(false) }
+        if let fromLeaves = from.root?.leaves(), !fromLeaves.isEmpty {
+            let toSet = Set(toLeaves.map { ObjectIdentifier($0) })
+            for view in fromLeaves where !toSet.contains(ObjectIdentifier(view)) {
+                view.setSessionCloseIntent(true)
+            }
         }
 
         // Session persistence (T05): the split topology is the heart of the
@@ -1785,6 +1809,19 @@ class BaseTerminalController: NSWindowController,
 
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
+
+        // User-initiated window/tab close (NOT app quit, NOT sign-out): the
+        // agent sessions of every pane in this window must actually END —
+        // mark them CLOSE-on-free. Quit and sign-out keep sessions alive for
+        // restore (same gate as the manifest-entry removal below). If the
+        // close is undone, the restore path re-adopts the views into a tree
+        // and clears the intent.
+        do {
+            let delegate = NSApp.delegate as? AppDelegate
+            if delegate?.isQuitting != true && delegate?.isSigningOut != true {
+                for view in surfaceTree { view.setSessionCloseIntent(true) }
+            }
+        }
 
         // WP-D1: cancel any in-flight reconnect retry loop and stop observing
         // link-state changes — the window is going away.

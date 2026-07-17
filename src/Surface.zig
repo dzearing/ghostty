@@ -1376,6 +1376,15 @@ pub fn needsConfirmQuit(self: *Surface) bool {
     };
 }
 
+/// Mark whether this surface's remote/agent session should be CLOSEd
+/// (terminate the child, free the session) rather than DETACHed (keep-alive)
+/// when the surface is freed. The apprt sets this when the USER closes the
+/// pane/window — never on app quit — so persistent sessions end on explicit
+/// close but survive a quit for re-attach. No-op for local exec surfaces.
+pub fn setSessionCloseIntent(self: *Surface, close_on_exit: bool) void {
+    self.io.setSessionCloseIntent(close_on_exit);
+}
+
 /// The LIVE remote agent session id for this surface, or null if this is a local
 /// surface or its remote pane is not yet resolved. Lock-free (the backend
 /// publishes the id atomically); the returned slice borrows the live pane's

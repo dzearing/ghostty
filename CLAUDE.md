@@ -31,6 +31,9 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 ### `ghoztty +close`
 
 Close a named pane or window. Closing a nonexistent target succeeds silently.
+For a session-persistence pane this ENDS the agent session (the process is
+killed once the close's undo window expires) — same as closing the pane in the
+GUI. Only an app quit keeps sessions alive for re-attach.
 
 ```
 ghoztty +close --target=<name>
@@ -193,9 +196,9 @@ ghoztty +close --target=ide
 
 Terminal processes can be made independent of the GUI app so they survive app
 crashes, quits, and binary upgrades (and relaunch across reboots / agent
-crashes). It is **opt-in** via config and **off by default**.
+crashes). It is **on by default** (disable with `session-persistence = off`).
 
-- `session-persistence = off|on` (macOS, default `off`). When `on`, new local
+- `session-persistence = off|on` (macOS, default `on`). When `on`, new local
   windows/tabs/splits run their shell under the local `ghoztty-agent` (found or
   spawned on demand) instead of directly under the app process, so the child
   processes outlive the app. On next launch the app re-attaches: layout, split
@@ -206,6 +209,14 @@ crashes). It is **opt-in** via config and **off by default**.
   metadata was materialized from disk as a relaunchable tombstone. `auto`
   respawns the recorded command in-place with a `--- session restarted ---`
   divider; `prompt` leaves the pane in its exited state for the user to decide.
+
+Session lifecycle: a process DIES when the user closes its pane/tab/window (or
+`+close`s it — the CLOSE lands when the close's undo window expires), when the
+shell itself exits, or when the agent dies (children then relaunch as
+tombstones per `session-relaunch`). It SURVIVES app quit/crash/upgrade (quit
+never prompts for persistent windows — their sessions re-attach on relaunch).
+E2E: `scripts/e2e/session-persistence.py` (incl. `--winsize` for re-attach
+PTY-geometry integrity).
 
 The agent owns the PTYs, keeps a per-session output ring (2 MB default;
 snapshotted to disk for reboot scrollback), persists session metadata to

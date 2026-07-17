@@ -118,6 +118,15 @@ exit_code: ?u32 = null,
 /// queueWrite), so no synchronization is needed.
 awaiting_relaunch: bool = false,
 
+/// When true, `threadExit` sends `CLOSE` (terminate the remote child + free the
+/// session) instead of the default `DETACH` (keep-alive for re-attach). Set via
+/// `Surface.setSessionCloseIntent` when the USER closes the pane/window — an
+/// app quit never sets it, so quit keeps sessions alive for restore while an
+/// explicit close actually ends the process (no orphaned pinned sessions
+/// accumulating in the agent). Atomic: written on the GUI thread (before the
+/// surface free joins the IO thread), read on the IO thread in `threadExit`.
+close_on_exit: std.atomic.Value(bool) = .init(false),
+
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
 
@@ -469,6 +478,21 @@ pub fn threadEnter(
     // §3.3) so the remote session survives for a later re-attach.
     errdefer self.conn.detachChannel(pane);
 
+    // Re-assert the winsize now that the pane is live. ATTACH carries only
+    // rows/cols (the agent zeroes the pixel geometry), and a forced-reclaim
+    // retry above re-applies the same possibly-stale seed — so send one
+    // authoritative RESIZE with the full current geometry. Harmless when it
+    // matches what ATTACH/OPEN already applied; it guarantees the agent PTY
+    // and the client grid agree at bring-up (WP-D2 restore: "big window,
+    // small content").
+    self.conn.sendResize(
+        pane,
+        @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
+        @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
+        @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
+        @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
+    ) catch |err| log.warn("post-attach RESIZE re-assert failed err={}", .{err});
+
     // Publish the resolved live session id on the STABLE backend so the GUI thread
     // can read it for an on-demand cwd query (§WP4). `pane.session_id` is stable
     // for the pane's lifetime; we publish the pointer + len with release ordering
@@ -541,17 +565,22 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     // §3.4 teardown order (use-after-free guard): this IS the consumer thread, and
     // by the time `threadExit` runs the xev loop has stopped, so no further
     // `drainRing`/`ringReady` will run — the consumer has stopped draining. We may
-    // now DETACH, which deregisters the channel under the connection's table lock
-    // (after which no in-flight demux `pushTo` can touch the ring) and frees the
-    // ring + pane. DETACH keeps the remote session alive for a later re-attach
-    // (NOT CLOSE — a `+close` would route through a different path, §3.3).
+    // now DETACH or CLOSE, which deregisters the channel under the connection's
+    // table lock (after which no in-flight demux `pushTo` can touch the ring) and
+    // frees the ring + pane. DETACH (the default) keeps the remote session alive
+    // for a later re-attach; CLOSE (user closed the pane/window — see
+    // `close_on_exit`) terminates the child and frees the agent session.
     // Un-publish the live session id BEFORE the pane (and its `session_id`
-    // backing) is freed by detach, so the GUI thread never reads a dangling
-    // slice. Clear the len first, then the ptr (mirror of the publish order).
+    // backing) is freed, so the GUI thread never reads a dangling slice. Clear
+    // the len first, then the ptr (mirror of the publish order).
     self.live_session_id_len.store(0, .release);
     self.live_session_id.store(null, .release);
 
-    self.conn.detachChannel(rd.pane);
+    if (self.close_on_exit.load(.acquire)) {
+        self.conn.closeChannel(rd.pane);
+    } else {
+        self.conn.detachChannel(rd.pane);
+    }
     rd.pane = undefined;
 }
 
@@ -595,6 +624,9 @@ pub fn resize(
     const td_live = td orelse return;
     assert(td_live.backend == .remote);
     const rd = &td_live.backend.remote;
+    log.debug("RESIZE send rows={} cols={} ch={x}", .{
+        grid_size.rows, grid_size.columns, rd.pane.id,
+    });
     rd.conn.sendResize(
         rd.pane,
         @intCast(@min(grid_size.rows, std.math.maxInt(u16))),

@@ -234,14 +234,26 @@ extension AppDelegate {
             if tabParent.isMiniaturized { tabParent.deminiaturize(nil) }
             tabParent.addTabbedWindowSafely(window, ordered: .above)
         }
-        controller.showWindow(self)
         // Standalone windows (and the first tab of a group) get their persisted
-        // frame — AFTER showWindow, which applies config default size/position on
-        // the way to screen. Tab siblings inherit the group's frame. A
-        // cross-machine resume re-anchors the frame to a visible local screen
-        // (the owning machine's coordinates may be off every display here).
-        if tabParent == nil, let frame = entry.frame {
-            let rect = reanchorFrame ? Self.reanchoredFrame(frame.rect) : frame.rect
+        // frame BEFORE showWindow as well: the surfaces' first real layout (and
+        // therefore the grid size their termio threads carry into ATTACH) then
+        // happens at the final size instead of the config default, so the
+        // agent-side PTY winsize starts correct instead of relying on a
+        // corrective RESIZE after the window grows ("big window, small
+        // content"). showWindow can re-apply default sizing on the way to
+        // screen, so the frame is asserted again right after (that second set
+        // is a no-op when showWindow left it alone).
+        let persistedRect: NSRect? = if tabParent == nil, let frame = entry.frame {
+            reanchorFrame ? Self.reanchoredFrame(frame.rect) : frame.rect
+        } else { nil }
+        if let rect = persistedRect {
+            window.setFrame(rect, display: true)
+        }
+        controller.showWindow(self)
+        // Tab siblings inherit the group's frame. A cross-machine resume
+        // re-anchors the frame to a visible local screen (the owning machine's
+        // coordinates may be off every display here).
+        if let rect = persistedRect {
             window.setFrame(rect, display: true)
         }
 

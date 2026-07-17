@@ -847,16 +847,26 @@ pub const Server = struct {
     }
 
     fn handleResize(self: *Server, channel: u128, payload: []const u8) void {
-        var parsed = protocol.parseJson(protocol.Resize, self.alloc, payload) catch return;
+        var parsed = protocol.parseJson(protocol.Resize, self.alloc, payload) catch {
+            std.log.warn("RESIZE parse failed ch={x} payload={s}", .{ channel, payload });
+            return;
+        };
         defer parsed.deinit();
         const rz = parsed.value;
+        std.log.debug("RESIZE recv ch={x} rows={} cols={}", .{ channel, rz.rows, rz.cols });
         // Update dims + snapshot the child under the lock; do the (potentially
         // blocking) ConPTY resize OUTSIDE it — never hold the global store lock
         // across child I/O (see handleInboundData).
         self.store.mutex.lock();
         const child: ?session.Child = blk: {
-            const s = self.store.table.getByChannel(channel) orelse break :blk null;
-            if (!s.alive) break :blk null;
+            const s = self.store.table.getByChannel(channel) orelse {
+                std.log.warn("RESIZE: no session for ch={x}", .{channel});
+                break :blk null;
+            };
+            if (!s.alive) {
+                std.log.warn("RESIZE: session for ch={x} not alive", .{channel});
+                break :blk null;
+            }
             s.rows = rz.rows;
             s.cols = rz.cols;
             s.px_w = rz.px_w;
@@ -864,7 +874,9 @@ pub const Server = struct {
             break :blk s.child;
         };
         self.store.mutex.unlock();
-        if (child) |c| c.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch {};
+        if (child) |c| c.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch |err| {
+            std.log.warn("RESIZE: child.resize failed err={}", .{err});
+        };
     }
 
     fn handleSignal(self: *Server, channel: u128, payload: []const u8) void {
