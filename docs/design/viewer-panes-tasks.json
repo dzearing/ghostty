@@ -263,7 +263,7 @@
       "goal": "Make split dividers grabbable next to web content.",
       "steps": [],
       "acceptance": "User can resize mixed splits comfortably.",
-      "notes": "2026-07-17: EdgePassthroughWebView (WKWebView subclass) returns nil from hitTest within 6pt of its edges so the divider's overlapping grab zone wins; splitterInvisibleSize widened 6->10 (all splits — ~5pt reach into each pane). VERIFICATION CAVEAT: synthetic CGEvent drags do NOT drive SwiftUI DragGesture at all (control test: even a terminal|terminal divider ignores them — clicks work, drags don't; add to gui-driving notes) so this is verified by inspection + user hands-on, not automation."
+      "notes": "2026-07-17: EdgePassthroughWebView (WKWebView subclass) returns nil from hitTest within 6pt of its edges so the divider's overlapping grab zone wins; splitterInvisibleSize widened 6->10 (all splits — ~5pt reach into each pane). VERIFICATION CAVEAT: synthetic CGEvent drags do NOT drive SwiftUI DragGesture at all (control test: even a terminal|terminal divider ignores them — clicks work, drags don't; add to gui-driving notes) so this is verified by inspection + user hands-on, not automation. REWORKED same day: root cause found — panes host AppKit views that out-hit-test ANY SwiftUI gesture area, so the invisible-zone approach was structurally dead (always was, even terminal|terminal: only the 1px gap worked). Replaced drag mechanics with an AppKit DividerHandle NSView layered above the panes (delta-based resize, double-click equalize, cursor rects), total ~9pt target both orientations; EdgePassthroughWebView carve-out removed (obsolete + scrollbar/window-edge dead zones)."
     },
     {
       "id": "T14",
@@ -277,6 +277,19 @@
       "steps": [],
       "acceptance": "Bar appears on hover near pane top, hides after inactivity, navigates.",
       "notes": "2026-07-17: full-width toolbar anchored to pane top (user corrected the first floating-capsule design mid-flight): NSHostingView(WebChromeBar) mounted by ViewerView ABOVE the webview (SwiftUI overlays were unreliable over WKWebView), leading/trailing/top pinned; Liquid Glass .glassEffect(.regular, in: .rect) on macOS 26 (ultraThinMaterial fallback) + hairline bottom Divider. Reveal: app-local NSEvent mouseMoved monitor (tracking areas + SwiftUI onHover DON'T fire reliably over WKWebView; NSLog also never reaches unified log in this app — use os Logger for diagnostics) — top-80pt strip shows bar, 2s inactivity hides (0.7s when mouse moves into content, 0.5s on exit), bar hover or URL-field focus holds it open. KVO url/canGoBack/canGoForward -> published; URL submit normalizes bare hosts to https. Live-verified: bar reveals on hover with correct URL, auto-hides, full width."
+    },
+    {
+      "id": "T15",
+      "title": "Palette commands + focus-hold + Cmd+W viewer close + main merge",
+      "status": "done",
+      "dependsOn": [
+        "T14"
+      ],
+      "resetAfter": false,
+      "goal": "User feedback round 2.",
+      "steps": [],
+      "acceptance": "Palette can open file/URL viewer panes; chrome bar never hides while focused; Cmd+W in a viewer closes the viewer; backspace works in relaunched sessions.",
+      "notes": "2026-07-17: (1) Command palette: 'Viewer: Open File in Pane…' (NSOpenPanel sheet) + 'Viewer: Open URL in Pane…' (NSAlert sheet + text field) via ViewerCommands, split .right of the palette's surface — sheets not app-modal so IPC never wedges. (2) Chrome bar hide timer now checks window.firstResponder isDescendant(of: chromeHost) at AppKit level (SwiftUI @FocusState unreliable in NSHostingView) and re-checks every 1s instead of hiding. (3) Cmd+W with keyboard focus in a viewer closed the LAST TERMINAL (focusedSurface stale) — close(_:) now detects responder inside a viewer pane, closes THAT node, moves focus to the next pane. (4) Merged main: 106dcdc9c re-attach-asserts-winsize fixes user-reported broken backspace in relaunched persistent sessions (branch was cut before the fix); conflicts resolved keeping viewer kind/location + main's surfaceID pane identity, resolveTarget made pane-aware."
     }
   ]
 }

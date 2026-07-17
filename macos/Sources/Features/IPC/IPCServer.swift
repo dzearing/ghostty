@@ -1836,11 +1836,18 @@ class IPCServer {
                 for scriptWindow in NSApp.scriptWindows {
                     for tab in scriptWindow.tabs {
                         guard let controller = tab.parentController as? TerminalController else { continue }
-                        for view in controller.surfaceTree.root?.leaves() ?? [] where view.id == uuid {
-                            let entry = TargetEntry.pane(
-                                controller: WeakRef(controller),
-                                surface: WeakRef(view))
-                            self.targetRegistry[view.id.uuidString] = entry
+                        for pane in controller.surfaceTree.root?.leaves() ?? [] where pane.id == uuid {
+                            let entry: TargetEntry
+                            if let surface = pane.surfaceView {
+                                entry = .pane(
+                                    controller: WeakRef(controller),
+                                    surface: WeakRef(surface))
+                            } else {
+                                entry = .viewerPane(
+                                    controller: WeakRef(controller),
+                                    pane: WeakRef(pane))
+                            }
+                            self.targetRegistry[pane.id.uuidString] = entry
                             return entry
                         }
                     }

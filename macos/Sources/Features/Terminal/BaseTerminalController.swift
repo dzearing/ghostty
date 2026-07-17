@@ -2953,6 +2953,23 @@ class BaseTerminalController: NSWindowController,
     // MARK: First Responder
 
     @IBAction func close(_ sender: Any) {
+        // When keyboard focus is inside a VIEWER pane, close that pane —
+        // `focusedSurface` still points at the last terminal, and closing
+        // that out from under the user is wrong. Viewers have no process,
+        // so no confirmation.
+        if let responder = window?.firstResponder as? NSView,
+           let pane = surfaceTree.first(where: {
+               $0.viewerView != nil && responder.isDescendant(of: $0.contentView)
+           }),
+           let node = surfaceTree.root?.node(view: pane) {
+            let next = findNextFocusTargetAfterClosing(node: node)
+            closeSurface(node, withConfirmation: false)
+            if let next {
+                DispatchQueue.main.async { Ghostty.moveFocus(to: next) }
+            }
+            return
+        }
+
         guard let surface = focusedSurface?.surface else { return }
         ghostty.requestClose(surface: surface)
     }

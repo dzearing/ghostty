@@ -119,6 +119,13 @@ final class PaneView: NSView, Codable, Identifiable, ObservableObject {
         surfaceView?.highlight()
     }
 
+    /// Forward the session close-on-free intent to terminal content
+    /// (session persistence: close kills the agent session). No-op for
+    /// viewers — they have no session.
+    func setSessionCloseIntent(_ intent: Bool) {
+        surfaceView?.setSessionCloseIntent(intent)
+    }
+
     // MARK: - Codable
 
     private enum CodingKeys: String, CodingKey {
