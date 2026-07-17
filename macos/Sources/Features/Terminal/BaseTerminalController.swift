@@ -2952,15 +2952,33 @@ class BaseTerminalController: NSWindowController,
 
     // MARK: First Responder
 
+    /// The viewer pane containing the window's current first responder, if
+    /// any. Keybind/menu actions route through `focusedSurface` (a terminal),
+    /// which goes stale when a viewer has keyboard focus — actions that
+    /// should operate on "the focused pane" must check this first.
+    var focusedViewerPane: PaneView? {
+        guard let responder = window?.firstResponder as? NSView else { return nil }
+        return surfaceTree.first(where: {
+            $0.viewerView != nil && responder.isDescendant(of: $0.contentView)
+        })
+    }
+
+    /// Config for a terminal split created FROM a viewer pane: inherit the
+    /// viewed file's directory as the working directory.
+    private func splitConfigFromViewer(_ pane: PaneView) -> Ghostty.SurfaceConfiguration {
+        var config = Ghostty.SurfaceConfiguration()
+        if let dir = pane.viewerView?.fileURL?.deletingLastPathComponent().path {
+            config.workingDirectory = dir
+        }
+        return config
+    }
+
     @IBAction func close(_ sender: Any) {
         // When keyboard focus is inside a VIEWER pane, close that pane —
         // `focusedSurface` still points at the last terminal, and closing
         // that out from under the user is wrong. Viewers have no process,
         // so no confirmation.
-        if let responder = window?.firstResponder as? NSView,
-           let pane = surfaceTree.first(where: {
-               $0.viewerView != nil && responder.isDescendant(of: $0.contentView)
-           }),
+        if let pane = focusedViewerPane,
            let node = surfaceTree.root?.node(view: pane) {
             let next = findNextFocusTargetAfterClosing(node: node)
             closeSurface(node, withConfirmation: false)
@@ -2999,26 +3017,51 @@ class BaseTerminalController: NSWindowController,
     }
 
     @IBAction func splitRight(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .right, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_RIGHT)
     }
 
     @IBAction func splitLeft(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .left, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_LEFT)
     }
 
     @IBAction func splitDown(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .down, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_DOWN)
     }
 
     @IBAction func splitUp(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .up, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_UP)
     }
 
     @IBAction func splitZoom(_ sender: Any) {
+        if let pane = focusedViewerPane,
+           let node = surfaceTree.root?.node(view: pane) {
+            if surfaceTree.zoomed == node {
+                surfaceTree = SplitTree(root: surfaceTree.root, zoomed: nil)
+            } else if surfaceTree.isSplit {
+                surfaceTree = SplitTree(root: surfaceTree.root, zoomed: node)
+            }
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.splitToggleZoom(surface: surface)
     }
@@ -3048,6 +3091,10 @@ class BaseTerminalController: NSWindowController,
     }
 
     @IBAction func equalizeSplits(_ sender: Any) {
+        if focusedViewerPane != nil {
+            surfaceTree = surfaceTree.equalized()
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.splitEqualize(surface: surface)
     }
@@ -3073,6 +3120,18 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func splitMoveFocus(direction: Ghostty.SplitFocusDirection) {
+        // Navigate FROM a focused viewer pane directly on the tree —
+        // libghostty can only navigate from a terminal surface.
+        if let pane = focusedViewerPane,
+           let node = surfaceTree.root?.node(view: pane) {
+            if let next = surfaceTree.focusTarget(
+                for: direction.toSplitTreeFocusDirection(),
+                from: node
+            ) {
+                DispatchQueue.main.async { Ghostty.moveFocus(to: next) }
+            }
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.splitMoveFocus(surface: surface, direction: direction)
     }
