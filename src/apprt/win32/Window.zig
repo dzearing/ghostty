@@ -1697,6 +1697,23 @@ pub fn swapSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     if (self.tab_count == 0) return;
     const alloc = self.app.core_app.alloc;
     const tab = self.active_tab;
+
+    // Hero mode intercepts swap_split: the tree's spatial geometry is
+    // invisible while hero is active, so a spatial swap silently mutates
+    // the layout the user gets back on exit (reported 2026-07-16 — panes
+    // came back in the wrong places, and focus-follows made the selection
+    // chase the swapped pane to a surprise tile). up/down move the
+    // carousel selection instead — ctrl+shift+arrows is the natural
+    // Windows mirror of the Mac hero-nav chord (cmd+shift+arrows) —
+    // and left/right do nothing.
+    if (self.tab_hero_active[tab]) {
+        switch (goto_target) {
+            .previous, .up => return self.heroSelect(@as(isize, self.tab_hero_index[tab]) - 1),
+            .next, .down => return self.heroSelect(@as(isize, self.tab_hero_index[tab]) + 1),
+            .left, .right => return,
+        }
+    }
+
     const tree = &self.tab_trees[tab];
 
     const active_surface = self.tab_active_surface[tab];

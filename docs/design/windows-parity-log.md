@@ -9,6 +9,14 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-16 (on-box) — T61 DONE (mid-turn user bug reports, took priority
+  over queued T53): in hero mode ctrl+shift+up/down (bound to swap_split
+  on Windows) spatially SWAPPED panes in the hidden tree — the selection
+  chased the swapped pane ("index 1 up went to 2") and toggle-off restored
+  a mutated layout. Window.swapSplit now intercepts under hero: up/down =
+  heroSelect prev/next (Windows mirror of the Mac cmd+shift hero-nav
+  chord), left/right no-op. hero-mode.ps1 step 3b added; ALL PASS (60);
+  both lanes + P1–P3 green. Delivered to all install locations. Next: T53.
 - 2026-07-16 (on-box) — T59b DONE: hero-mode TRUE port complete. Wheel
   scroll (parent WM_MOUSEWHEEL + surface fallback for wheel-follows-focus),
   divider drag with 80ms-throttled leaf resize + double-click ratio reset,

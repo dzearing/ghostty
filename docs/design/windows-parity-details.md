@@ -1660,6 +1660,35 @@ archived in `test/win32/artifacts/`.
   NEGATIVE Int32 — use decimal for UIntPtr wparams.
 - Both unit-test lanes green (3 new hero_math tests); P1–P3 ALL PASS.
 
+## T61 — FIX: swap_split in hero mode mutates the hidden tree (Phase F)
+
+Filed + fixed 2026-07-16 from two live user reports: hero nav from index 1
+"goes back to index 2 rather than 0", and toggling hero off restored panes
+in the wrong locations. Root cause: on Windows ctrl+shift+arrows is bound
+to `swap_split` (Config.zig ~6806); hero mode only intercepted
+`goto_split`, so the chord did a real SPATIAL tree swap while the tree's
+geometry was hidden behind the hero layout. Focus-follows
+(`heroOnSurfaceFocused`) then chased the swapped pane to its new leaf
+index — the "went to 2" symptom — and the mutated tree is what toggle-off
+restored. Both reports, one bug. The intended hero-nav chord was only
+ever bound on Mac (cmd+shift+up/down, Config.zig ~7127); the Windows
+binding promised there ("with hero mode itself, T19") never landed.
+
+Fix (Window.zig `swapSplit`): hero mode intercepts swap_split at the same
+choke point as the gotoSplit interception (covers keybind + palette
+entries). up/down (and previous/next) move the carousel selection via
+`heroSelect` — making ctrl+shift+up/down the natural Windows mirror of
+the Mac hero-nav chord — and left/right are no-ops. Outside hero mode
+swap_split is unchanged.
+
+*Validation (done 2026-07-16):* hero-mode.ps1 grew step 3b: in hero mode
+ctrl+shift+down then up must move the selection, and the pre-existing
+per-HWND "tree geometry restored exactly after toggle-off" assertion now
+runs AFTER those chords, doubling as the no-tree-mutation oracle. ALL
+PASS on-box (60 assertions); both unit-test lanes green; P1–P3 ALL PASS.
+
+## Backlog — Mac features with no win32 equivalent yet
+
 Promote to a task row when prioritized; don't work these ad hoc.
 
 - **Session/window save-restore** — no equivalent of `TerminalRestorable*`;

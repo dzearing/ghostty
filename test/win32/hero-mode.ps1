@@ -16,6 +16,8 @@
 #   2. ctrl+alt+down moves the selection: a different leaf becomes the
 #      single visible pane, at the same hero rect.
 #   3. Click a carousel tile: selects that leaf (mouse-up inside tile).
+#   3b. ctrl+shift+down/up ALSO navigates (T61: swap_split is intercepted
+#       in hero mode instead of silently swapping the hidden tree).
 #   4. ctrl+shift+space again restores the exact tree geometry.
 #   5. Palette path (T57): ctrl+shift+p -> "hero" -> Enter produces the
 #      same hero layout.
@@ -500,6 +502,30 @@ if ($null -ne $big2) {
     $hero3 = Parse-Panes ([HeroDrv]::Panes($top))
     $vis3 = @($hero3 | Where-Object Visible)
     Assert (($vis3.Count -eq 1) -and ($vis3[0].Hwnd -ne $big2.Hwnd)) 'clicking a carousel tile swaps it into the hero'
+}
+
+# --- Navigate: ctrl+shift+down/up ALSO moves the selection (T61) --------------
+# ctrl+shift+arrows is bound to swap_split; in hero mode that used to
+# spatially SWAP panes in the hidden tree (user report 2026-07-16: the
+# selection chased the swapped pane to a surprise tile, and toggle-off
+# restored a mutated layout). Hero now intercepts it as prev/next
+# navigation. The toggle-off "geometry restored exactly" assertion below
+# doubles as the no-tree-mutation oracle: Rects-Equal is per-HWND, so a
+# real swap surviving these chords would fail it.
+$visCS = @((Parse-Panes ([HeroDrv]::Panes($top))) | Where-Object Visible)
+if ($visCS.Count -eq 1) {
+    $bigCS = $visCS[0]
+    $movedCS = $false
+    foreach ($vk in 0x28, 0x26) {  # VK_DOWN, then VK_UP (prev/next clamp at the ends)
+        $r = [HeroDrv]::Chord($top, [IntPtr]$bigCS.Hwnd, [uint16[]]@(0x11, 0x10), $vk)
+        if ($vk -eq 0x28) { Assert ($r -eq 'SENT') "ctrl+shift nav chord delivered ($r)" }
+        Start-Sleep -Milliseconds 600
+        $cand = @((Parse-Panes ([HeroDrv]::Panes($top))) | Where-Object Visible)
+        if ($cand.Count -eq 1 -and $cand[0].Hwnd -ne $bigCS.Hwnd) { $movedCS = $true; break }
+    }
+    Assert $movedCS 'ctrl+shift+down/up moves the hero selection (swap_split intercepted, T61)'
+} else {
+    Assert $false "ctrl+shift nav precondition: exactly one visible pane (got $($visCS.Count))"
 }
 
 # --- Toggle hero mode off: exact tree geometry restored -----------------------
