@@ -33,7 +33,10 @@ struct SplitView<L: View, R: View>: View {
     /// The visible size of the splitter, in points. The invisible size is a transparent hitbox that can still
     /// be used for getting a resize handle. The total width/height of the splitter is the sum of both.
     private let splitterVisibleSize: CGFloat = 1
-    private let splitterInvisibleSize: CGFloat = 6
+    // 10pt of invisible grab zone (~5pt into each pane) — 6 was hard to
+    // hit, especially next to web viewer panes whose WKWebView yields its
+    // edge strip to the divider (see EdgePassthroughWebView).
+    private let splitterInvisibleSize: CGFloat = 10
 
     var body: some View {
         GeometryReader { geo in

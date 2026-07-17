@@ -1,5 +1,7 @@
 import AppKit
 import Combine
+import OSLog
+import SwiftUI
 import WebKit
 
 /// A non-terminal pane content view that renders a markdown file, a text/code
@@ -11,6 +13,10 @@ import WebKit
 /// file's directory so relative images resolve. Websites load directly over
 /// the network. View-only — no editing.
 final class ViewerView: NSView, Codable, ObservableObject {
+    fileprivate static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.dzearing.ghoztty",
+        category: "Viewer")
+
     /// The viewed location: an absolute file path or an http(s) URL.
     let location: String
 
@@ -35,6 +41,21 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var reloadDebounce: DispatchWorkItem?
     private var reloadNeedsRearm = false
+
+    // Browser chrome state (web mode). The chrome bar is a SwiftUI overlay
+    // (WebChromeBar) that appears when the mouse moves near the top of the
+    // pane and auto-hides after inactivity so content keeps the space.
+    @Published private(set) var chromeVisible = false
+    @Published private(set) var currentURL: String = ""
+    @Published private(set) var canGoBack = false
+    @Published private(set) var canGoForward = false
+    private var urlObservation: NSKeyValueObservation?
+    private var backObservation: NSKeyValueObservation?
+    private var forwardObservation: NSKeyValueObservation?
+    private var chromeHideTimer: Timer?
+    private var chromeHeld = false
+    private var chromeMonitor: Any?
+    private var chromeHost: NSHostingView<WebChromeBar>?
 
     /// True when location is a web URL (network allowed) rather than a file.
     var isWebURL: Bool {
@@ -67,6 +88,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
     deinit {
         fileMonitor?.cancel()
         reloadDebounce?.cancel()
+        chromeHideTimer?.invalidate()
+        if let chromeMonitor { NSEvent.removeMonitor(chromeMonitor) }
     }
 
     private static func mode(for location: String) -> Mode {
@@ -108,7 +131,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             break
         }
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = EdgePassthroughWebView(frame: .zero, configuration: config)
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = self
         webView.allowsBackForwardNavigationGestures = isWebURL
@@ -129,7 +152,115 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 guard let self, let pageTitle = webView.title, !pageTitle.isEmpty else { return }
                 DispatchQueue.main.async { self.title = pageTitle }
             }
+            currentURL = location
+            urlObservation = webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
+                guard let self, let url = webView.url else { return }
+                DispatchQueue.main.async { self.currentURL = url.absoluteString }
+            }
+            backObservation = webView.observe(\.canGoBack, options: [.new]) { [weak self] webView, _ in
+                let value = webView.canGoBack
+                DispatchQueue.main.async { self?.canGoBack = value }
+            }
+            forwardObservation = webView.observe(\.canGoForward, options: [.new]) { [weak self] webView, _ in
+                let value = webView.canGoForward
+                DispatchQueue.main.async { self?.canGoForward = value }
+            }
+            installChromeRevealMonitor()
         }
+    }
+
+    // MARK: - Browser chrome (web mode)
+
+    /// The pane-top strip (in points) that reveals the chrome bar on hover.
+    private static let chromeRevealHeight: CGFloat = 80
+
+    func goBack() { webView.goBack() }
+    func goForward() { webView.goForward() }
+    func reloadPage() { webView.reload() }
+
+    /// Navigate from the chrome URL field. A bare host gets https://.
+    func navigate(to input: String) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let candidate = trimmed.contains("://") ? trimmed : "https://" + trimmed
+        guard let url = URL(string: candidate) else { return }
+        webView.load(URLRequest(url: url))
+    }
+
+    /// The chrome bar calls this while hovered or while the URL field is
+    /// focused so auto-hide pauses.
+    func holdChrome(_ hold: Bool) {
+        chromeHeld = hold
+        if hold {
+            chromeHideTimer?.invalidate()
+            setChromeVisible(true)
+        } else {
+            scheduleChromeHide()
+        }
+    }
+
+    private func scheduleChromeHide(after delay: TimeInterval = 2.0) {
+        chromeHideTimer?.invalidate()
+        chromeHideTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self, !self.chromeHeld else { return }
+            self.setChromeVisible(false)
+        }
+    }
+
+    /// WKWebView swallows normal mouse events and tracking areas over web
+    /// content are unreliable, so chrome reveal uses an app-local event
+    /// monitor: every mouseMoved in our window is checked against the pane's
+    /// top strip.
+    private func installChromeRevealMonitor() {
+        chromeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] event in
+            self?.handleChromeMouseMoved(event)
+            return event
+        }
+    }
+
+    private func handleChromeMouseMoved(_ event: NSEvent) {
+        guard let window, event.window === window else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else {
+            if chromeVisible, !chromeHeld { scheduleChromeHide(after: 0.5) }
+            return
+        }
+        // Non-flipped view: the top strip is the high-y band.
+        if point.y > bounds.height - Self.chromeRevealHeight {
+            if !chromeVisible { setChromeVisible(true) }
+            scheduleChromeHide()
+        } else if chromeVisible, !chromeHeld {
+            scheduleChromeHide(after: 0.7)
+        }
+    }
+
+    /// Mount/animate the chrome bar hosting view. AppKit-level (not a SwiftUI
+    /// overlay) so it reliably layers above the WKWebView subview.
+    private func setChromeVisible(_ visible: Bool) {
+        chromeVisible = visible
+
+        if visible, chromeHost == nil {
+            let host = NSHostingView(rootView: WebChromeBar(viewerView: self))
+            host.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(host, positioned: .above, relativeTo: webView)
+            NSLayoutConstraint.activate([
+                host.topAnchor.constraint(equalTo: topAnchor),
+                host.leadingAnchor.constraint(equalTo: leadingAnchor),
+                host.trailingAnchor.constraint(equalTo: trailingAnchor),
+            ])
+            chromeHost = host
+        }
+
+        guard let chromeHost else { return }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            chromeHost.animator().alphaValue = visible ? 1 : 0
+        } completionHandler: { [weak self] in
+            if !visible, self?.chromeVisible == false {
+                self?.chromeHost?.isHidden = true
+            }
+        }
+        if visible { chromeHost.isHidden = false }
     }
 
     // MARK: - Loading
@@ -372,6 +503,26 @@ extension ViewerView: WKNavigationDelegate {
             atPane: myPane,
             direction: .right,
             viewer: ViewerView(location: location))
+    }
+}
+
+// MARK: - Edge passthrough
+
+/// A WKWebView that gives up a thin strip along its edges so the SwiftUI
+/// split divider — whose invisible grab zone overlaps each pane by only a
+/// few points — wins the hit test there. Without this, grabbing a divider
+/// next to web content is nearly impossible: the web view swallows the
+/// mouse down.
+private final class EdgePassthroughWebView: WKWebView {
+    static let edgeInset: CGFloat = 6
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        if local.x < Self.edgeInset || local.x > bounds.width - Self.edgeInset ||
+           local.y < Self.edgeInset || local.y > bounds.height - Self.edgeInset {
+            return nil
+        }
+        return super.hitTest(point)
     }
 }
 

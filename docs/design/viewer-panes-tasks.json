@@ -251,6 +251,32 @@
       ],
       "acceptance": "All scenarios verified with screenshots recorded in the design doc; CLAUDE.md documents --view. Final summary written for the user.",
       "notes": "2026-07-17: done. Demo window (terminal | torture.md | example.com) with --percent flags; zoom toggled+untoggled with viewer siblings; screenshots captured throughout T02-T12 (scratchpad; representative shots described in design doc §7). CLAUDE.md documents --view on both commands + a Viewer Panes section; design doc gained §7 E2E results + known v1 gaps. All 12 tasks complete."
+    },
+    {
+      "id": "T13",
+      "title": "Divider grab buffer next to viewer panes",
+      "status": "done",
+      "dependsOn": [
+        "T12"
+      ],
+      "resetAfter": false,
+      "goal": "Make split dividers grabbable next to web content.",
+      "steps": [],
+      "acceptance": "User can resize mixed splits comfortably.",
+      "notes": "2026-07-17: EdgePassthroughWebView (WKWebView subclass) returns nil from hitTest within 6pt of its edges so the divider's overlapping grab zone wins; splitterInvisibleSize widened 6->10 (all splits — ~5pt reach into each pane). VERIFICATION CAVEAT: synthetic CGEvent drags do NOT drive SwiftUI DragGesture at all (control test: even a terminal|terminal divider ignores them — clicks work, drags don't; add to gui-driving notes) so this is verified by inspection + user hands-on, not automation."
+    },
+    {
+      "id": "T14",
+      "title": "Auto-hiding browser chrome for web panes",
+      "status": "done",
+      "dependsOn": [
+        "T12"
+      ],
+      "resetAfter": false,
+      "goal": "Back/forward/reload + URL field on web viewer panes, native feel, content keeps the space.",
+      "steps": [],
+      "acceptance": "Bar appears on hover near pane top, hides after inactivity, navigates.",
+      "notes": "2026-07-17: full-width toolbar anchored to pane top (user corrected the first floating-capsule design mid-flight): NSHostingView(WebChromeBar) mounted by ViewerView ABOVE the webview (SwiftUI overlays were unreliable over WKWebView), leading/trailing/top pinned; Liquid Glass .glassEffect(.regular, in: .rect) on macOS 26 (ultraThinMaterial fallback) + hairline bottom Divider. Reveal: app-local NSEvent mouseMoved monitor (tracking areas + SwiftUI onHover DON'T fire reliably over WKWebView; NSLog also never reaches unified log in this app — use os Logger for diagnostics) — top-80pt strip shows bar, 2s inactivity hides (0.7s when mouse moves into content, 0.5s on exit), bar hover or URL-field focus holds it open. KVO url/canGoBack/canGoForward -> published; URL submit normalizes bare hosts to https. Live-verified: bar reveals on hover with correct URL, auto-hides, full width."
     }
   ]
 }
