@@ -1282,6 +1282,87 @@ surfaces (each finding = task row or fix-in-place if small). Also: profile
 input latency and scrollback-seek on huge histories; verify no degradation
 at 100k+ lines.
 
+Split 2026-07-16 (sizing rule): T53a = harness + first bounded soak;
+T53b = the multi-hour run + profiling + fixes.
+
+### T53a — Soak harness + first bounded soak
+
+`test/win32/soak.ps1`: fully IPC-driven (no chords — safe to run beside
+real work), release-staging exe isolated on the `-soak` pipe suffix with
+GHOZTTY_PERF=1. Layout: named window + 3 load panes, all `--shell=cmd`:
+`soak-stream` (endless 8MB `type` loop — sustained visible streaming),
+`soak-altscr` (PS loop toggling ESC[?1049h/l with output bursts —
+alt-screen churn), `soak-grow` (150k-line scrollback, then idle), plus the
+original pane kept idle for latency probes. Samples every 15s: working
+set, private bytes, handle/thread counts, GDI/USER objects
+(GetGuiResources), Responding. Every 60s: input-latency probe
+(`+send-keys` marker echo → poll `+read` until visible, ms). At the end:
++read-on-big-scrollback latency, telemetry slice from the app log
+(release info-level lines; only the soak exe has GHOZTTY_PERF set, so
+`perf ` lines are attributable), assertions (alive+responding, IPC
+answers, median fps under load, no >5s frame stall, bounded
+private-bytes/handle growth in the second half, big-scrollback +read <
+1s), CSV + report under `%TEMP%\ghoztty-soak\<stamp>\`, single
+ALL PASS / N FAILURE(S) line. `-Minutes` parameterizes duration
+(default 30); `-Detach` relaunches itself detached for the T53b
+multi-hour run and writes the same report for a later session to read.
+
+*Validation:* bounded soak on the box completes with the report written
+and assertions green (or findings filed as task rows).
+
+*Evidence (done 2026-07-16):* the harness's very first smoke found a
+P0-class bug: **`App.wakeup()` posted one WM_APP_WAKEUP per surface-
+mailbox push with no coalescing**, so a pane flooding tiny writes (cmd
+echo loop: 600k lines in <10s through ConPTY) filled the GUI thread's
+10,000-entry posted-message quota and **every PostMessageW in the process
+failed** — IPC answered `{"success":false,"error":"server not ready"}`
+(40/40 +list failures during a storm), and deferred SetFocus (T48) and
+hero snapshots (T59a) would silently drop on the same quota. Fix:
+`wakeup_pending` atomic flag — at most one wakeup queued (xev.Async's
+N-signals→≥1-delivery contract), cleared before `tick()` in msgWndProc
+so signals during tick re-post; failed posts clear the flag so it can't
+wedge shut. After: `ipc-under-load.ps1` ALL PASS (40/40 +list, 5/5
++send-keys mid-storm, +read returns content mid-storm); 2-min soak smoke
+11/11 (fps median 24 across 4 panes under stream+altscr churn, memory/
+handle growth ~0, echo latency 264ms median). Findings filed: T62
+(+read stalled 16.1s against the tiny-write storm — renderer-mutex
+starvation; two all-empty +read results were also seen near peak in an
+earlier probe). One unexplained one-off: an isolated test instance
+exited silently (no WER, no watchdog kill) minutes after a storm —
+never reproduced; the long soak's alive-assertion watches for it.
+Diagnosis trail for posterity: raw pipe client caught the "server not
+ready" error string the CLI hides; cmd builtins (echo) never update the
+ConPTY title, so title-based "is it running" checks are useless — use
++read content. Telemetry gotcha: idle unfocused panes redraw only on
+demand, so `perf max_gap_ms` legitimately hits ~60s on them — never
+assert a global stall bound from it.
+
+### T62 — +read stalls under tiny-write floods
+
+Found by the T53a soak baseline probe: `+read --name=<pane>` took
+**16.1s** while the target pane's cmd blasted ~60k echo lines/s
+(finished normally; 75ms on the same 150k-line scrollback once idle;
+the 8MB/s `type` storm did NOT trigger it — small-write count, not
+byte rate, is the trigger). Matches T48's static candidate 2: the GUI
+thread (serving the marshaled IPC verb) waits on `renderer_state.mutex`
+while the IO thread re-acquires it per small batch in
+`processOutputLocked` (src/termio/Termio.zig) — starvation, not
+deadlock. A GUI-thread stall this long also freezes the UI (same class
+as the user's "not responding" complaints under load). Candidate fixes:
+bound the IO thread's lock-hold/reacquire cadence (batch small reads),
+add fairness (yield/park between batches), or serve +read from a
+snapshot that doesn't contend. Validate with the soak baseline probe
+(<2s) + ipc-under-load extended with an echo-storm read assertion +
+GHOZTTY_PERF renderer-wait telemetry (generic.zig:1190).
+
+### T53b — Multi-hour soak + profiling + fixes
+
+Launch `soak.ps1 -Minutes 180+ -Detach` (survives context resets; report
+harvested from `%TEMP%\ghoztty-soak\`), plus interactive profiling the
+harness can't do: keyboard scrollback-seek feel at 100k+ lines
+(scroll_to_top/page-up under load), input latency at the keyboard, and
+tuning fixes from whatever T53a/the long run surface.
+
 ## T54 — Resume-doc diet
 
 User 2026-07-15: "divide up the logs so your context doesn't bloat

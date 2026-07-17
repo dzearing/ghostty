@@ -100,7 +100,12 @@ Work these first, in order, before falling back to first-todo-in-table:
    clean (thumbnail heartbeat ≈7fps/renderer, no stalls); hero-mode.ps1
    ALL PASS (58 assertions, incl. a mid-slide oracle); both test lanes +
    P1–P3 green. The hero-mode TRUE port is COMPLETE. Next: T53.
-6. **T53** — long-context reliability + perf soak/tuning pass.
+6. **T53** — long-context reliability + perf soak/tuning pass. Split
+   2026-07-16: **T53a DONE** (soak harness; found+fixed the WM_APP_WAKEUP
+   queue flood that broke ALL IPC under load — `ipc-under-load.ps1` guards
+   it; filed T62 read-stall). **T53b next**: harvest the detached
+   multi-hour soak report from `%TEMP%\ghoztty-soak\` (launched at the
+   T53a boundary), profile scrollback-seek/input latency, work T62.
 7. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
    report was a July-5 exe — make "which build is this" answerable at a
    glance).
@@ -176,7 +181,9 @@ One line per row. Full spec + validation + evidence per task:
 | T50 | Real "Rename Window" dialog | I | T44 | done | 39988009a |
 | T51 | Full parity RE-AUDIT | — | T50,T22c,T48,T53 | todo | — |
 | T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
-| T53 | Long-context reliability + perf soak/tuning | I | T40 | todo | — |
+| T53a | Soak harness `test/win32/soak.ps1` + first bounded on-box soak + findings filed. FOUND+FIXED: WM_APP_WAKEUP message-queue flood broke ALL IPC under load (see details); regression guard `test/win32/ipc-under-load.ps1` | I | T40 | done | (this commit) |
+| T53b | Multi-hour detached soak + input-latency/scrollback-seek profiling + tuning fixes from findings | I | T53a | todo | — |
+| T62 | FIX: +read stalls many seconds (16s observed) while a pane floods tiny writes — renderer-mutex starvation on the GUI/IPC path (T48 static candidate 2, now reproduced). See details | I | T53a | todo | — |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
 | T55 | FIX: hero-mode.ps1 fails on HEAD (chords not dispatched) — root cause was the TEST's positive control: ctrl+shift+r now opens the T50 modal rename dialog, which disables the owner window and silently ate every later chord. Control switched to ctrl+k (clear_screen, no UI left behind); not a key-path regression | F | T19 | done | (this commit) |
 | T60 | FIX: window title jitters a few px left/right on a timer while busy (user, 2026-07-16; row renumbered from a duplicate T56 on 2026-07-16). Likely cause: Claude Code's title spinner — the braille glyphs (⠐/⠂/…) come from a FALLBACK font (MS Gothic per app log) with per-glyph advance widths, so the centered title re-centers to a different width every spinner frame. Investigate where the win32 tab/title text is drawn (Window.zig caption/tab paint); candidate fixes: left-align the title, reserve a fixed-width cell for the leading glyph, or measure/center on the title minus the spinner char | I | — | todo | — |

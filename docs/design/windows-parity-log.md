@@ -9,6 +9,24 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-16 (on-box, late) — T53a DONE, T62 filed. Built the soak harness
+  (`soak.ps1`, IPC-only so it can run beside real work) and its first smoke
+  immediately caught a P0: App.wakeup() had NO coalescing, so a tiny-write
+  storm (cmd echo loop, 600k lines <10s) filled the GUI thread's 10k
+  posted-message quota and EVERY PostMessageW failed — all IPC answered
+  "server not ready" (40/40 +list failures), deferred SetFocus + hero
+  snaps drop on the same quota. Fixed with a wakeup_pending atomic
+  (xev.Async contract); `ipc-under-load.ps1` is the regression guard
+  (ALL PASS post-fix; 0/40 pre-fix). Soak smoke 11/11 after. T62 filed:
+  +read stalled 16.1s against the tiny-write storm (renderer-mutex
+  starvation, T48 candidate 2 made real; byte-heavy `type` storms do NOT
+  trigger it). Surprises: cmd echoes 600k lines through ConPTY in
+  seconds (bounded echo loops are useless as sustained storms — use
+  endless `type` loops); idle panes make `perf max_gap_ms` meaningless
+  as a stall bound; one test instance exited silently ONCE (no WER, no
+  watchdog) — unreproduced, long soak watches for it. Boundary: 3-hour
+  detached soak launched (report in %TEMP%\ghoztty-soak\<stamp>\, T53b
+  harvests it) + release refresh launched to deliver the wakeup fix.
 - 2026-07-16 (on-box) — T61 DONE (mid-turn user bug reports, took priority
   over queued T53): in hero mode ctrl+shift+up/down (bound to swap_split
   on Windows) spatially SWAPPED panes in the hidden tree — the selection

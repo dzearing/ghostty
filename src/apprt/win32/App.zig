@@ -76,6 +76,15 @@ config: Config,
 /// This is not a visible window; it just participates in the message loop.
 msg_hwnd: ?w32.HWND = null,
 
+/// Coalesces WM_APP_WAKEUP posts (same N-signals -> >=1-delivery contract
+/// as xev.Async): at most one wakeup message is in the queue at a time.
+/// Without this, heavy PTY output posts one message per surface-mailbox
+/// push (tens of thousands/s), fills the thread's 10,000-entry posted-
+/// message quota, and EVERY PostMessageW in the process starts failing —
+/// IPC requests answer "server not ready", deferred SetFocus and hero
+/// snapshots get dropped (found by the T53a soak).
+wakeup_pending: std.atomic.Value(bool) = .init(false),
+
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
 
@@ -568,10 +577,18 @@ pub fn terminate(self: *App) void {
 }
 
 /// Wake up the message loop from any thread by posting a message
-/// to the message-only window.
+/// to the message-only window. Coalesced: if a wakeup is already queued
+/// and undelivered, this is a no-op (see `wakeup_pending`).
 pub fn wakeup(self: *App) void {
+    if (self.wakeup_pending.swap(true, .acq_rel)) return;
     if (self.msg_hwnd) |hwnd| {
-        _ = w32.PostMessageW(hwnd, WM_APP_WAKEUP, 0, 0);
+        if (w32.PostMessageW(hwnd, WM_APP_WAKEUP, 0, 0) == 0) {
+            // Queue full or window gone: clear so a later wakeup retries
+            // instead of the flag wedging shut forever.
+            self.wakeup_pending.store(false, .release);
+        }
+    } else {
+        self.wakeup_pending.store(false, .release);
     }
 }
 
@@ -2743,6 +2760,9 @@ fn msgWndProc(
     const app: *App = @ptrFromInt(@as(usize, @bitCast(userdata)));
 
     if (msg == WM_APP_WAKEUP) {
+        // Clear BEFORE tick: a wakeup arriving during tick must post a new
+        // message (its work might land after tick already drained).
+        app.wakeup_pending.store(false, .release);
         app.tick();
         return 0;
     }
