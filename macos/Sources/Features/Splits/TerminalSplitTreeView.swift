@@ -9,7 +9,7 @@ enum TerminalSplitOperation {
     case drop(Drop)
 
     struct Resize {
-        let node: SplitTree<Ghostty.SurfaceView>.Node
+        let node: SplitTree<PaneView>.Node
         let ratio: Double
     }
 
@@ -26,7 +26,7 @@ enum TerminalSplitOperation {
 }
 
 struct TerminalSplitTreeView: View {
-    let tree: SplitTree<Ghostty.SurfaceView>
+    let tree: SplitTree<PaneView>
     let action: (TerminalSplitOperation) -> Void
     @ObservedObject var heroModeState: HeroModeState
 
@@ -51,14 +51,19 @@ struct TerminalSplitTreeView: View {
 private struct TerminalSplitSubtreeView: View {
     @EnvironmentObject var ghostty: Ghostty.App
 
-    let node: SplitTree<Ghostty.SurfaceView>.Node
+    let node: SplitTree<PaneView>.Node
     var isRoot: Bool = false
     let action: (TerminalSplitOperation) -> Void
 
     var body: some View {
         switch node {
-        case .leaf(let leafView):
-            TerminalSplitLeaf(surfaceView: leafView, isSplit: !isRoot, action: action)
+        case .leaf(let pane):
+            switch pane.content {
+            case .terminal(let surfaceView):
+                TerminalSplitLeaf(surfaceView: surfaceView, isSplit: !isRoot, action: action)
+            case .viewer(let viewerView):
+                ViewerSplitLeaf(viewerView: viewerView)
+            }
 
         case .split(let split):
             let splitViewDirection: SplitViewDirection = switch split.direction {
@@ -82,7 +87,9 @@ private struct TerminalSplitSubtreeView: View {
                     TerminalSplitSubtreeView(node: split.right, action: action)
                 },
                 onEqualize: {
-                    guard let surface = node.leftmostLeaf().surface else { return }
+                    // Any terminal surface in the subtree can host the equalize
+                    // action (the leftmost leaf may be a viewer pane).
+                    guard let surface = node.leaves().compactMap(\.surface).first else { return }
                     ghostty.splitEqualize(surface: surface)
                 }
             )

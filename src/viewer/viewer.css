@@ -1,0 +1,73 @@
+/* Page chrome around the GitHub-styled markdown body. The colors follow
+ * github-markdown.css's own light/dark variables so the gutter matches. */
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background-color: #0d1117;
+  }
+}
+
+.markdown-body {
+  box-sizing: border-box;
+  min-width: 200px;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 32px 40px 64px;
+}
+
+@media (max-width: 767px) {
+  .markdown-body {
+    padding: 16px;
+  }
+}
+
+/* Keep images inside the column. */
+.markdown-body img {
+  max-width: 100%;
+}
+
+/* A little breathing room for the plain text/code mode. */
+.markdown-body > pre.viewer-code {
+  padding: 16px;
+  overflow: auto;
+  border-radius: 6px;
+}
+
+/* Error card shown when a file is missing/unreadable. */
+.viewer-error {
+  margin: 48px auto;
+  max-width: 640px;
+  padding: 24px 28px;
+  border: 1px solid #d1d9e0;
+  border-radius: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+.viewer-error h1 {
+  font-size: 1.1em;
+  margin: 0 0 8px;
+}
+
+.viewer-error p {
+  margin: 0;
+  color: #59636e;
+  word-break: break-all;
+}
+
+@media (prefers-color-scheme: dark) {
+  .viewer-error {
+    border-color: #3d444d;
+  }
+  .viewer-error p {
+    color: #9198a1;
+  }
+}

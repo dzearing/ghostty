@@ -304,12 +304,23 @@ fn formatTerminal(stdout: *std.Io.Writer, terminal_val: std.json.Value) !void {
     const term = terminal_val.object;
 
     const title = jsonStr(term.get("title"));
-    const cwd = jsonStr(term.get("working_directory"));
-    const pid = jsonInt(term.get("pid"));
-    const tty = jsonStr(term.get("tty"));
     const focused = jsonBool(term.get("focused"));
 
-    try stdout.print("{s}  {s}  pid:{d}  {s}", .{ title, cwd, pid, tty });
+    // Viewer panes render a file or website instead of a terminal; they
+    // have no cwd/pid/tty, so show their kind + location instead.
+    const is_viewer = if (term.get("type")) |t|
+        t == .string and std.mem.eql(u8, t.string, "viewer")
+    else
+        false;
+
+    if (is_viewer) {
+        try stdout.print("view: {s}  {s}", .{ title, jsonStr(term.get("url")) });
+    } else {
+        const cwd = jsonStr(term.get("working_directory"));
+        const pid = jsonInt(term.get("pid"));
+        const tty = jsonStr(term.get("tty"));
+        try stdout.print("{s}  {s}  pid:{d}  {s}", .{ title, cwd, pid, tty });
+    }
 
     if (term.get("name")) |name| {
         if (name != .null) {
@@ -319,11 +330,13 @@ fn formatTerminal(stdout: *std.Io.Writer, terminal_val: std.json.Value) !void {
         }
     }
 
-    if (term.get("exit_code")) |exit_code| {
-        switch (exit_code) {
-            .integer => |code| try stdout.print("  exited({d})", .{code}),
-            .null => try stdout.writeAll("  running"),
-            else => {},
+    if (!is_viewer) {
+        if (term.get("exit_code")) |exit_code| {
+            switch (exit_code) {
+                .integer => |code| try stdout.print("  exited({d})", .{code}),
+                .null => try stdout.writeAll("  running"),
+                else => {},
+            }
         }
     }
 

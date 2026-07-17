@@ -45,12 +45,13 @@ final class SessionLayoutManifest {
         case vertical
     }
 
-    /// One terminal pane: what T06 needs to re-attach and re-label it.
+    /// One pane: what T06 needs to re-attach (terminal) or re-open (viewer)
+    /// and re-label it.
     struct Leaf: Codable, Equatable {
         /// The agent session UUID to re-`ATTACH` to. Nil until the termio
         /// thread has opened the session and the capture loop recorded the
         /// id; leaves that never resolve one cannot be re-attached (restore
-        /// shows them exited).
+        /// shows them exited). Always nil for viewer leaves.
         var sessionID: String?
         /// The pane's title at last sync (best-effort; live OSC titles take
         /// over after re-attach).
@@ -58,6 +59,13 @@ final class SessionLayoutManifest {
         /// The IPC target-registry name (`+split --name=...`) so a restored
         /// pane stays addressable by `+send-keys`/`+read`/`+close`.
         var ipcName: String?
+        /// Pane kind: "viewer" for viewer panes; nil/"terminal" for terminal
+        /// panes (nil keeps pre-viewer manifests decoding unchanged).
+        var kind: String?
+        /// The viewed file path or URL (viewer leaves only). Restore re-opens
+        /// this location — viewers have no process, so they are always
+        /// restorable and never counted toward the all-dead drop policy.
+        var viewerLocation: String?
         /// The pane's STABLE surface UUID (wp3 pane identity): restore
         /// recreates the SurfaceView with this exact uuid so the `+list`
         /// leaf `id` — and the GHOZTTY_PANE_ID env baked into the still-
@@ -65,6 +73,8 @@ final class SessionLayoutManifest {
         /// Optional/additive: older manifests decode with nil (restore then
         /// mints a fresh uuid, today's behavior).
         var surfaceID: String?
+
+        var isViewer: Bool { kind == "viewer" }
     }
 
     /// A parallel codable of `SplitTree.Node` capturing per-leaf session
@@ -301,6 +311,8 @@ final class SessionLayoutManifest {
         guard let node else { return true }
         switch node {
         case .leaf(let leaf):
+            // Viewer leaves never get a session id; don't poll for one.
+            if leaf.isViewer { return false }
             return leaf.sessionID == nil
         case .split(let split):
             return hasMissingSessionIDs(split.left)
@@ -479,17 +491,27 @@ final class SessionLayoutManifest {
         let ipc = (NSApp.delegate as? AppDelegate)?.ipcServer
 
         let tree: Node? = controller.surfaceTree.root.map { root in
-            Self.encodeNode(root) { view in
-                Leaf(
+            Self.encodeNode(root) { pane in
+                if let viewer = pane.viewerView {
+                    return Leaf(
+                        sessionID: nil,
+                        title: pane.title,
+                        ipcName: ipc?.registeredPaneName(forViewerPane: pane),
+                        kind: "viewer",
+                        viewerLocation: viewer.location,
+                        surfaceID: nil)
+                }
+                let view = pane.surfaceView
+                return Leaf(
                     // Fall back to the id the surface was CREATED to attach
                     // when the live id is unavailable — surface creation can
                     // fail entirely (dark-wake OutOfMemory, T06b) and a sync
                     // in that state must not wipe the recorded session id
                     // (next launch would then drop the whole entry).
-                    sessionID: Self.liveSessionID(of: view) ?? view.expectedRemoteSessionID,
-                    title: view.title,
-                    ipcName: ipc?.registeredPaneName(forSurface: view),
-                    surfaceID: view.id.uuidString)
+                    sessionID: view.flatMap { Self.liveSessionID(of: $0) ?? $0.expectedRemoteSessionID },
+                    title: pane.title,
+                    ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) },
+                    surfaceID: view?.id.uuidString)
             }
         }
 

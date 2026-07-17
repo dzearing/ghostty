@@ -101,6 +101,7 @@ final class ScriptTab: NSObject {
         guard NSApp.isAppleScriptEnabled else { return [] }
         guard let controller else { return [] }
         return (controller.surfaceTree.root?.leaves() ?? [])
+            .compactMap(\.surfaceView)
             .map(ScriptTerminal.init)
     }
 
@@ -110,6 +111,7 @@ final class ScriptTab: NSObject {
         guard NSApp.isAppleScriptEnabled else { return nil }
         guard let controller else { return nil }
         return (controller.surfaceTree.root?.leaves() ?? [])
+            .compactMap(\.surfaceView)
             .first(where: { $0.id.uuidString == uniqueID })
             .map(ScriptTerminal.init)
     }

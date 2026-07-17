@@ -63,7 +63,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     init(_ ghostty: Ghostty.App,
          withBaseConfig base: Ghostty.SurfaceConfiguration? = nil,
-         withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
+         withSurfaceTree tree: SplitTree<PaneView>? = nil,
          parent: NSWindow? = nil
     ) {
         // The window we manage is not restorable if we've specified a command
@@ -211,7 +211,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     // MARK: Base Controller Overrides
 
-    override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+    override func surfaceTreeDidChange(from: SplitTree<PaneView>, to: SplitTree<PaneView>) {
         super.surfaceTreeDidChange(from: from, to: to)
 
         // Whenever our surface tree changes in any way (new split, close split, etc.)
@@ -230,7 +230,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     override func replaceSurfaceTree(
-        _ newTree: SplitTree<Ghostty.SurfaceView>,
+        _ newTree: SplitTree<PaneView>,
         moveFocusTo newView: Ghostty.SurfaceView? = nil,
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
         undoAction: String? = nil
@@ -450,7 +450,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     ///               If nil, the window will cascade from the last cascade point.
     static func newWindow(
         _ ghostty: Ghostty.App,
-        tree: SplitTree<Ghostty.SurfaceView>,
+        tree: SplitTree<PaneView>,
         position: NSPoint? = nil,
         confirmUndo: Bool = true,
     ) -> TerminalController {
@@ -861,7 +861,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     /// This is called anytime a node in the surface tree is being removed.
     override func closeSurface(
-        _ node: SplitTree<Ghostty.SurfaceView>.Node,
+        _ node: SplitTree<PaneView>.Node,
         withConfirmation: Bool = true
     ) {
         // If this isn't the root then we're dealing with a split closure.
@@ -1147,7 +1147,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard let confirmWindow = all
             .first(where: { $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })?
             .surfaceTree.first(where: { $0.needsConfirmQuit })?
-            .window
+            .contentView.window
         else {
             closeAllWindowsImmediately()
             return
@@ -1182,7 +1182,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// The state that we require to recreate a TerminalController from an undo.
     struct UndoState {
         let frame: NSRect
-        let surfaceTree: SplitTree<Ghostty.SurfaceView>
+        let surfaceTree: SplitTree<PaneView>
         let focusedSurface: UUID?
         let tabIndex: Int?
         weak var tabGroup: NSWindowTabGroup?
@@ -1221,12 +1221,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 DispatchQueue.main.async {
                     Ghostty.moveFocus(to: focusTarget, from: nil)
                 }
-            } else if let focusedSurface = surfaceTree.first {
+            } else if let focusedPane = surfaceTree.first {
                 // No prior focused surface or we can't find it, let's focus
                 // the first.
-                self.focusedSurface = focusedSurface
+                self.focusedSurface = focusedPane.surfaceView
                 DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: focusedSurface, from: nil)
+                    Ghostty.moveFocus(to: focusedPane, from: nil)
                 }
             }
         }
@@ -1283,7 +1283,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if case let .leaf(view) = surfaceTree.root {
             // If this is our first surface then our focused surface will be nil
             // so we force the focused surface to the leaf.
-            focusedSurface = view
+            focusedSurface = view.surfaceView
         }
 
         // Initialize our content view to the SwiftUI root

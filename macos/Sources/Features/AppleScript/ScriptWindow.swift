@@ -94,6 +94,7 @@ final class ScriptWindow: NSObject {
         guard NSApp.isAppleScriptEnabled else { return [] }
         return controllers
             .flatMap { $0.surfaceTree.root?.leaves() ?? [] }
+            .compactMap(\.surfaceView)
             .map(ScriptTerminal.init)
     }
 
@@ -103,6 +104,7 @@ final class ScriptWindow: NSObject {
         guard NSApp.isAppleScriptEnabled else { return nil }
         return controllers
             .flatMap { $0.surfaceTree.root?.leaves() ?? [] }
+            .compactMap(\.surfaceView)
             .first(where: { $0.id.uuidString == uniqueID })
             .map(ScriptTerminal.init)
     }

@@ -343,6 +343,7 @@ extension NSApplication {
     fileprivate var allSurfaceViews: [Ghostty.SurfaceView] {
         allTerminalControllers
             .flatMap { $0.surfaceTree.root?.leaves() ?? [] }
+            .compactMap(\.surfaceView)
     }
 
     /// All terminal controllers in undefined order.

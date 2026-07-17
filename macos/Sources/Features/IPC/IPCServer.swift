@@ -22,11 +22,13 @@ class IPCServer {
     private enum TargetEntry {
         case window(WeakRef<TerminalController>)
         case pane(controller: WeakRef<TerminalController>, surface: WeakRef<Ghostty.SurfaceView>)
+        case viewerPane(controller: WeakRef<TerminalController>, pane: WeakRef<PaneView>)
 
         var controller: TerminalController? {
             switch self {
             case .window(let ref): return ref.value
             case .pane(let ref, _): return ref.value
+            case .viewerPane(let ref, _): return ref.value
             }
         }
 
@@ -34,6 +36,15 @@ class IPCServer {
             switch self {
             case .window(let ref): return ref.value?.focusedSurface
             case .pane(_, let ref): return ref.value
+            case .viewerPane: return nil
+            }
+        }
+
+        /// The viewer pane wrapper, when this target is a viewer pane.
+        var viewerPaneView: PaneView? {
+            switch self {
+            case .viewerPane(_, let ref): return ref.value
+            default: return nil
             }
         }
 
@@ -41,6 +52,7 @@ class IPCServer {
             switch self {
             case .window(let ref): return ref.value != nil
             case .pane(_, let ref): return ref.value != nil
+            case .viewerPane(_, let ref): return ref.value != nil
             }
         }
     }
@@ -344,6 +356,9 @@ class IPCServer {
         var shell: String?
         var state: String?
         var noActivate: Bool = false
+        // A path or http(s) URL to open as a viewer pane instead of a terminal
+        // (mutually exclusive with command/-e).
+        var view: String?
         // When true, `+new-window` mirrors the keyboard/menu "New Window" action:
         // it resolves the focused/preferred window as the parent and inherits its
         // REMOTE host + command + cwd (§WP4). Lets the inheriting path be driven
@@ -365,6 +380,11 @@ class IPCServer {
         }
         if let splitCommand = parsed.splitCommand {
             parsed.splitCommand = wrapCommandInShell(splitCommand, shell: parsed.shell)
+        }
+
+        // A viewer window has no command; reject the ambiguous combination.
+        if parsed.view != nil, parsed.config.command != nil {
+            return IPCResponse(success: false, error: "--view cannot be combined with --command/-e")
         }
 
         // Idempotent: if target exists and window is alive, focus it
@@ -422,6 +442,37 @@ class IPCServer {
                     ghostty,
                     withBaseConfig: config,
                     from: TerminalController.preferredParent?.window)
+            }
+            return .ok
+        }
+
+        // Viewer window: a one-pane tree whose leaf renders the file/URL.
+        if let viewLocation = parsed.view {
+            DispatchQueue.main.async { [ghostty = self.ghostty, weak self] in
+                let pane = PaneView(viewer: ViewerView(location: viewLocation))
+                let controller = TerminalController.newWindow(
+                    ghostty,
+                    tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
+                if !parsed.noActivate {
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                // Window titles track the focused *surface*; a viewer-only
+                // window has none, so pin the viewer's title unless the
+                // caller chose one.
+                controller.titleOverride = parsed.title ?? pane.title
+                if let target = parsed.target {
+                    // Also adopt the target as the controller's window name so
+                    // +list doesn't mint a second "window-N" alias (terminal
+                    // windows get this via the GHOZTTY_WINDOW_NAME env var).
+                    controller.windowName = target
+                    self?.targetRegistry[target] = .window(WeakRef(controller))
+                    Self.logger.info("IPC: registered window target '\(target)'")
+                }
+                if let name = parsed.name {
+                    self?.targetRegistry[name] = .viewerPane(
+                        controller: WeakRef(controller),
+                        pane: WeakRef(pane))
+                }
             }
             return .ok
         }
@@ -516,6 +567,11 @@ class IPCServer {
             parsed = ParsedArguments(config: Ghostty.SurfaceConfiguration())
         }
 
+        // A viewer pane has no command; reject the ambiguous combination.
+        if parsed.view != nil, parsed.config.command != nil {
+            return IPCResponse(success: false, error: "--view cannot be combined with --command/-e")
+        }
+
         // Wrap IPC commands in the user's shell so aliases and PATH are available
         if let command = parsed.config.command {
             parsed.config.command = wrapCommandInShell(command, shell: parsed.shell)
@@ -533,10 +589,12 @@ class IPCServer {
         // Idempotent: if --name exists and pane is alive, focus it
         if let name = parsed.name {
             pruneStaleTargets()
-            if let entry = resolveTarget(name), let surface = entry.surfaceView {
+            if let entry = resolveTarget(name), entry.isAlive {
                 DispatchQueue.main.async {
-                    if let controller = entry.controller {
+                    if let surface = entry.surfaceView, let controller = entry.controller {
                         controller.focusSurface(surface)
+                    } else if let pane = entry.viewerPaneView {
+                        pane.window?.makeKeyAndOrderFront(nil)
                     }
                 }
                 return .ok
@@ -590,13 +648,12 @@ class IPCServer {
             return .ok
         }
 
-        // Resolve --pane targeting: find the named pane's surface and controller
+        // Resolve --pane targeting: find the named pane (terminal surface or
+        // viewer) and its controller.
         if let paneName = parsed.pane {
             pruneStaleTargets()
-            guard let entry = resolveTarget(paneName) else {
-                return IPCResponse(success: false, error: "pane '\(paneName)' not found")
-            }
-            guard let surface = entry.surfaceView, let controller = entry.controller else {
+            guard let entry = resolveTarget(paneName), entry.isAlive,
+                  let controller = entry.controller else {
                 return IPCResponse(success: false, error: "pane '\(paneName)' not found")
             }
 
@@ -606,6 +663,63 @@ class IPCServer {
             }
 
             DispatchQueue.main.async { [weak self] in
+                // Resolve the anchor pane (works for terminal AND viewer targets).
+                let anchorPane: PaneView?
+                if let surface = entry.surfaceView {
+                    anchorPane = controller.surfaceTree.pane(for: surface)
+                } else {
+                    anchorPane = entry.viewerPaneView
+                }
+                guard let anchorPane else {
+                    Self.logger.warning("IPC: pane '\(paneName)' is no longer in a tree")
+                    return
+                }
+
+                if let viewLocation = parsed.view {
+                    self?.createViewerSplit(
+                        controller: controller,
+                        atPane: anchorPane,
+                        direction: direction,
+                        ratio: ratio,
+                        location: viewLocation,
+                        name: parsed.name)
+                    return
+                }
+
+                // Terminal split anchored at a viewer pane: no surface to
+                // inherit from — build a plain local surface.
+                if entry.surfaceView == nil {
+                    var splitConfig = Ghostty.SurfaceConfiguration()
+                    if let command = parsed.config.command { splitConfig.command = command }
+                    if let workingDirectory = parsed.config.workingDirectory {
+                        splitConfig.workingDirectory = workingDirectory
+                    }
+                    splitConfig.backgroundTint = tintColor
+                    splitConfig.backgroundTintNSColor = tintNSColor
+                    for (key, val) in parsed.config.environmentVariables {
+                        splitConfig.environmentVariables[key] = val
+                    }
+                    if let name = parsed.name {
+                        splitConfig.environmentVariables["GHOZTTY_PANE_NAME"] = name
+                    }
+                    if let newView = controller.newTerminalSplit(
+                        atPane: anchorPane,
+                        direction: direction,
+                        baseConfig: splitConfig,
+                        ratio: ratio
+                    ) {
+                        Self.applyColorScheme(for: tintColor, to: newView)
+                        if let name = parsed.name {
+                            self?.targetRegistry[name] = .pane(
+                                controller: WeakRef(controller),
+                                surface: WeakRef(newView))
+                        }
+                    }
+                    return
+                }
+
+                guard let surface = entry.surfaceView else { return }
+
                 var splitConfig = Ghostty.SurfaceConfiguration()
                 if let splitCommand = parsed.splitCommand {
                     splitConfig.command = splitCommand
@@ -679,6 +793,19 @@ class IPCServer {
                 return
             }
 
+            if let viewLocation = parsed.view {
+                if let anchorPane = controller.surfaceTree.pane(for: surfaceView) {
+                    self?.createViewerSplit(
+                        controller: controller,
+                        atPane: anchorPane,
+                        direction: direction,
+                        ratio: ratio,
+                        location: viewLocation,
+                        name: parsed.name)
+                }
+                return
+            }
+
             var splitConfig = Ghostty.SurfaceConfiguration()
             if let splitCommand = parsed.splitCommand {
                 splitConfig.command = splitCommand
@@ -726,6 +853,34 @@ class IPCServer {
         return .ok
     }
 
+    /// Create a viewer split pane and register its name. Main thread only.
+    @MainActor
+    private func createViewerSplit(
+        controller: TerminalController,
+        atPane anchorPane: PaneView,
+        direction: SplitTree<PaneView>.NewDirection,
+        ratio: Double,
+        location: String,
+        name: String?
+    ) {
+        let viewer = ViewerView(location: location)
+        guard let pane = controller.newViewerSplit(
+            atPane: anchorPane,
+            direction: direction,
+            viewer: viewer,
+            ratio: ratio
+        ) else {
+            Self.logger.warning("IPC: failed to create viewer split")
+            return
+        }
+        if let name {
+            targetRegistry[name] = .viewerPane(
+                controller: WeakRef(controller),
+                pane: WeakRef(pane))
+            Self.logger.info("IPC: registered viewer pane target '\(name)'")
+        }
+    }
+
     private func handleClose(_ request: IPCRequest) -> IPCResponse {
         let parsed: ParsedArguments
         if let arguments = request.arguments {
@@ -750,6 +905,12 @@ class IPCServer {
             case .pane(let controllerRef, let surfaceRef):
                 if let controller = controllerRef.value, let surface = surfaceRef.value {
                     controller.closeSurface(surface, withConfirmation: false)
+                }
+            case .viewerPane(let controllerRef, let paneRef):
+                if let controller = controllerRef.value, let pane = paneRef.value,
+                   let node = controller.surfaceTree.root?.node(view: pane) {
+                    // Viewers never have a running process; close silently.
+                    controller.closeSurface(node, withConfirmation: false)
                 }
             case .window(let controllerRef):
                 controllerRef.value?.closeWindowImmediately()
@@ -836,6 +997,10 @@ class IPCServer {
             return IPCResponse(success: false, error: "target '\(target)' is no longer alive")
         }
 
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "target '\(target)' is a viewer pane, not a terminal")
+        }
+
         DispatchQueue.main.async {
             // Set activity state on all surfaces in the window, or just the targeted pane
             switch entry {
@@ -843,9 +1008,11 @@ class IPCServer {
                 if let surface = surfaceRef.value {
                     surface.activityState = activityState
                 }
+            case .viewerPane:
+                break // rejected above
             case .window:
-                for surface in controller.surfaceTree {
-                    surface.activityState = activityState
+                for pane in controller.surfaceTree {
+                    pane.surfaceView?.activityState = activityState
                 }
             }
         }
@@ -890,6 +1057,10 @@ class IPCServer {
 
         guard let entry = resolveTarget(target) else {
             return IPCResponse(success: false, error: "target '\(target)' not found in registry")
+        }
+
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "target '\(target)' is a viewer pane, not a terminal")
         }
 
         var setError: String?
@@ -1078,6 +1249,10 @@ class IPCServer {
             return IPCResponse(success: false, error: "pane '\(name)' not found in registry")
         }
 
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "pane '\(name)' is a viewer pane, not a terminal")
+        }
+
         guard let surfaceView = entry.surfaceView else {
             return IPCResponse(success: false, error: "pane '\(name)' is no longer alive")
         }
@@ -1154,6 +1329,10 @@ class IPCServer {
 
         guard let entry = resolveTarget(target) else {
             return IPCResponse(success: false, error: "target '\(target)' not found")
+        }
+
+        if case .viewerPane = entry {
+            return IPCResponse(success: false, error: "target '\(target)' is a viewer pane, not a terminal")
         }
 
         var sendError: String?
@@ -1264,8 +1443,11 @@ class IPCServer {
 
                 guard let controller else { return }
 
-                // Resolve all pane names to surfaces in this controller's tree
-                var surfacesByName: [String: Ghostty.SurfaceView] = [:]
+                // Resolve all pane names to panes in this controller's tree.
+                // We reuse the EXISTING PaneView wrappers so leaf identity (and
+                // therefore SwiftUI structural identity) is preserved across the
+                // rearrange.
+                var panesByName: [String: PaneView] = [:]
                 for name in layoutPaneNames {
                     guard let entry = self.resolveTarget(name) else {
                         result = IPCResponse(success: false, error: "pane '\(name)' not found in registry")
@@ -1275,37 +1457,38 @@ class IPCServer {
                         result = IPCResponse(success: false, error: "pane '\(name)' is no longer alive")
                         return
                     }
-                    guard controller.surfaceTree.root?.node(view: surface) != nil else {
+                    guard let pane = controller.surfaceTree.pane(for: surface) else {
                         result = IPCResponse(success: false, error: "pane '\(name)' is not in the target window")
                         return
                     }
-                    surfacesByName[name] = surface
+                    panesByName[name] = pane
                 }
 
                 // Build the new split tree from the layout
-                let newRoot: SplitTree<Ghostty.SurfaceView>.Node
+                let newRoot: SplitTree<PaneView>.Node
                 do {
-                    newRoot = try self.buildSplitNode(from: layout, surfaces: surfacesByName)
+                    newRoot = try self.buildSplitNode(from: layout, panes: panesByName)
                 } catch {
                     result = IPCResponse(success: false, error: "failed to build layout: \(error)")
                     return
                 }
 
-                // Collect all current surfaces in the tree
-                let currentSurfaces = Set(controller.surfaceTree.map { $0 })
-                let keptSurfaces = Set(surfacesByName.values)
-                let removedSurfaces = currentSurfaces.subtracting(keptSurfaces)
+                // Collect all current panes in the tree
+                let currentPanes = Set(controller.surfaceTree.map { $0 })
+                let keptPanes = Set(panesByName.values)
+                let removedPanes = currentPanes.subtracting(keptPanes)
 
                 // Remember the currently focused surface
                 let focusedSurface = controller.focusedSurface
-                let newFocus: Ghostty.SurfaceView? = if let focusedSurface, keptSurfaces.contains(focusedSurface) {
+                let newFocus: Ghostty.SurfaceView? = if let focusedSurface,
+                    keptPanes.contains(where: { $0.surfaceView === focusedSurface }) {
                     focusedSurface
                 } else {
-                    newRoot.leftmostLeaf()
+                    newRoot.leftmostLeaf().surfaceView
                 }
 
                 // Replace the tree
-                let newTree = SplitTree<Ghostty.SurfaceView>(root: newRoot, zoomed: nil)
+                let newTree = SplitTree<PaneView>(root: newRoot, zoomed: nil)
                 controller.replaceSurfaceTree(
                     newTree,
                     moveFocusTo: newFocus,
@@ -1314,9 +1497,9 @@ class IPCServer {
                 )
 
                 // Remove registry entries for panes no longer in the tree
-                for surface in removedSurfaces {
+                for pane in removedPanes {
                     for (name, entry) in self.targetRegistry {
-                        if case .pane(_, let surfaceRef) = entry, surfaceRef.value === surface {
+                        if case .pane(_, let surfaceRef) = entry, surfaceRef.value === pane.surfaceView {
                             self.targetRegistry.removeValue(forKey: name)
                             break
                         }
@@ -1355,20 +1538,20 @@ class IPCServer {
     @MainActor
     private func buildSplitNode(
         from layout: LayoutNode,
-        surfaces: [String: Ghostty.SurfaceView]
-    ) throws -> SplitTree<Ghostty.SurfaceView>.Node {
+        panes: [String: PaneView]
+    ) throws -> SplitTree<PaneView>.Node {
         if let paneName = layout.pane {
-            guard let surface = surfaces[paneName] else {
+            guard let pane = panes[paneName] else {
                 throw RearrangeError.paneNotFound(paneName)
             }
-            return .leaf(view: surface)
+            return .leaf(view: pane)
         }
 
         guard let dirStr = layout.direction else {
             throw RearrangeError.invalidNode
         }
 
-        let direction: SplitTree<Ghostty.SurfaceView>.Direction = switch dirStr.lowercased() {
+        let direction: SplitTree<PaneView>.Direction = switch dirStr.lowercased() {
         case "horizontal": .horizontal
         case "vertical": .vertical
         default: throw RearrangeError.invalidDirection(dirStr)
@@ -1381,8 +1564,8 @@ class IPCServer {
         let ratioPercent = layout.ratio ?? 50
         let clampedRatio = min(0.9, max(0.1, ratioPercent / 100.0))
 
-        let leftNode = try buildSplitNode(from: leftLayout, surfaces: surfaces)
-        let rightNode = try buildSplitNode(from: rightLayout, surfaces: surfaces)
+        let leftNode = try buildSplitNode(from: leftLayout, panes: panes)
+        let rightNode = try buildSplitNode(from: rightLayout, panes: panes)
 
         return .split(.init(
             direction: direction,
@@ -1481,6 +1664,9 @@ class IPCServer {
             return
         }
         targetRegistry[name] = .window(WeakRef(controller))
+        // Adopt the name as the controller's display name too so +list shows
+        // the persisted target instead of a fresh "window-N" alias.
+        controller.windowName = name
         Self.logger.info("IPC: re-registered restored remote window target '\(name)'")
     }
 
@@ -1515,6 +1701,23 @@ class IPCServer {
     }
 
     @MainActor
+    private func ensureViewerPaneRegistered(name: String, controller: BaseTerminalController, pane: PaneView) {
+        if targetRegistry[name] == nil, let tc = controller as? TerminalController {
+            targetRegistry[name] = .viewerPane(controller: WeakRef(tc), pane: WeakRef(pane))
+        }
+    }
+
+    @MainActor
+    private func paneNameForViewerPane(_ pane: PaneView) -> String {
+        for (name, entry) in targetRegistry {
+            if case .viewerPane(_, let paneRef) = entry, paneRef.value === pane {
+                return name
+            }
+        }
+        return pane.id.uuidString
+    }
+
+    @MainActor
     private func paneNameForSurface(_ view: Ghostty.SurfaceView) -> String {
         for (name, entry) in targetRegistry {
             if case .pane(_, let surfaceRef) = entry, surfaceRef.value === view {
@@ -1526,7 +1729,7 @@ class IPCServer {
 
     @MainActor
     private func buildSplitNodeData(
-        node: SplitTree<Ghostty.SurfaceView>.Node?,
+        node: SplitTree<PaneView>.Node?,
         focusedSurface: Ghostty.SurfaceView?,
         controller: BaseTerminalController
     ) -> IPCData.SplitNodeData {
@@ -1544,13 +1747,41 @@ class IPCServer {
         }
 
         switch node {
-        case .leaf(let view):
+        case .leaf(let pane):
+            if let viewer = pane.viewerView {
+                let paneName = paneNameForViewerPane(pane)
+                ensureViewerPaneRegistered(name: paneName, controller: controller, pane: pane)
+                return .leaf(IPCData.TerminalData(
+                    id: pane.id.uuidString,
+                    title: pane.title,
+                    working_directory: "",
+                    pid: 0,
+                    tty: "",
+                    name: paneName,
+                    focused: false,
+                    exit_code: nil,
+                    pane_type: "viewer",
+                    url: viewer.location
+                ))
+            }
+            guard let view = pane.surfaceView else {
+                return .leaf(IPCData.TerminalData(
+                    id: pane.id.uuidString,
+                    title: pane.title,
+                    working_directory: "",
+                    pid: 0,
+                    tty: "",
+                    name: nil,
+                    focused: false,
+                    exit_code: nil
+                ))
+            }
             let paneName = paneNameForSurface(view)
             ensurePaneRegistered(name: paneName, controller: controller, surface: view)
 
             return .leaf(IPCData.TerminalData(
                 id: view.id.uuidString,
-                title: view.title ?? "",
+                title: view.title,
                 working_directory: view.pwd ?? "",
                 pid: view.surfaceModel?.foregroundPID ?? 0,
                 tty: view.surfaceModel?.ttyName ?? "",
@@ -1605,11 +1836,18 @@ class IPCServer {
                 for scriptWindow in NSApp.scriptWindows {
                     for tab in scriptWindow.tabs {
                         guard let controller = tab.parentController as? TerminalController else { continue }
-                        for view in controller.surfaceTree.root?.leaves() ?? [] where view.id == uuid {
-                            let entry = TargetEntry.pane(
-                                controller: WeakRef(controller),
-                                surface: WeakRef(view))
-                            self.targetRegistry[view.id.uuidString] = entry
+                        for pane in controller.surfaceTree.root?.leaves() ?? [] where pane.id == uuid {
+                            let entry: TargetEntry
+                            if let surface = pane.surfaceView {
+                                entry = .pane(
+                                    controller: WeakRef(controller),
+                                    surface: WeakRef(surface))
+                            } else {
+                                entry = .viewerPane(
+                                    controller: WeakRef(controller),
+                                    pane: WeakRef(pane))
+                            }
+                            self.targetRegistry[pane.id.uuidString] = entry
                             return entry
                         }
                     }
@@ -1652,6 +1890,29 @@ class IPCServer {
         return nil
     }
 
+    @MainActor
+    func registeredPaneName(forViewerPane pane: PaneView) -> String? {
+        for (name, entry) in targetRegistry {
+            if case .viewerPane(_, let paneRef) = entry, paneRef.value === pane {
+                return name
+            }
+        }
+        return nil
+    }
+
+    /// Re-register a RESTORED viewer pane under its persisted IPC name.
+    /// Same idempotent semantics as `registerRestoredPane`.
+    @MainActor
+    func registerRestoredViewerPane(name: String, controller: TerminalController, pane: PaneView) {
+        pruneStaleTargets()
+        guard targetRegistry[name] == nil else {
+            Self.logger.info("IPC: restored viewer pane not re-registered — target '\(name)' already in use")
+            return
+        }
+        targetRegistry[name] = .viewerPane(controller: WeakRef(controller), pane: WeakRef(pane))
+        Self.logger.info("IPC: re-registered restored viewer pane target '\(name)'")
+    }
+
     private static func randomDarkColor() -> NSColor {
         let hue = CGFloat.random(in: 0...1)
         let saturation = CGFloat.random(in: 0.2...0.3)
@@ -1678,7 +1939,7 @@ class IPCServer {
         Ghostty.SurfaceView.adjustPaletteForContrast(surface: surface, background: resolved)
     }
 
-    private static func parseSplitDirection(_ value: String) -> SplitTree<Ghostty.SurfaceView>.NewDirection? {
+    private static func parseSplitDirection(_ value: String) -> SplitTree<PaneView>.NewDirection? {
         switch value.lowercased() {
         case "right": return .right
         case "down": return .down
@@ -1711,6 +1972,11 @@ class IPCServer {
 
             if let value = arg.dropPrefix("--command=") {
                 result.config.command = String(value)
+                continue
+            }
+
+            if let value = arg.dropPrefix("--view=") {
+                result.view = String(value)
                 continue
             }
 

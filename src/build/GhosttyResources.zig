@@ -125,6 +125,21 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         try steps.append(b.allocator, &install_step.step);
     }
 
+    // Viewer panes: offline markdown/text renderer assets (template +
+    // vendored markdown-it/highlight.js/github-markdown-css). Rides the
+    // `share/ghostty` folder reference into the macOS bundle Resources.
+    // Note: NO .md exclusion here — vendored docs are excluded by name via
+    // the vendor/ layout, and the exclude would strip nothing we need; but
+    // LICENSE files must ship, so keep the copy unfiltered.
+    {
+        const install_step = b.addInstallDirectory(.{
+            .source_dir = b.path("src/viewer"),
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = b.pathJoin(&.{ "ghostty", "viewer" }),
+        });
+        try steps.append(b.allocator, &install_step.step);
+    }
+
     // Themes
     if (cfg.emit_themes) {
         if (b.lazyDependency("iterm2_themes", .{})) |upstream| {
