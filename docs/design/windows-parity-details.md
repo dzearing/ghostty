@@ -1337,7 +1337,19 @@ ConPTY title, so title-based "is it running" checks are useless — use
 demand, so `perf max_gap_ms` legitimately hits ~60s on them — never
 assert a global stall bound from it.
 
-### T62 — +read stalls under tiny-write floods
+### T53b — Multi-hour soak + profiling + fixes
+
+Launch `soak.ps1 -Minutes 180+ -Detach` (survives context resets; report
+harvested from `%TEMP%\ghoztty-soak\`), plus interactive profiling the
+harness can't do: keyboard scrollback-seek feel at 100k+ lines
+(scroll_to_top/page-up under load), input latency at the keyboard, and
+tuning fixes from whatever T53a/the long run surface. Harvest note: the
+detached 180-min soak launched 2026-07-16 23:24 (`%TEMP%\ghoztty-soak\
+20260716-232428\`) runs a binary that PREDATES the T62/T63 fixes — its
+baseline probe already logged the known T62 stall (19.1s, WARN, not
+asserted); read the report with that in mind.
+
+## T62 — FIX: +read stalls under tiny-write floods (renderer-mutex starvation)
 
 Found by the T53a soak baseline probe: `+read --name=<pane>` took
 **16.1s** while the target pane's cmd blasted ~60k echo lines/s
@@ -1348,20 +1360,46 @@ thread (serving the marshaled IPC verb) waits on `renderer_state.mutex`
 while the IO thread re-acquires it per small batch in
 `processOutputLocked` (src/termio/Termio.zig) — starvation, not
 deadlock. A GUI-thread stall this long also freezes the UI (same class
-as the user's "not responding" complaints under load). Candidate fixes:
-bound the IO thread's lock-hold/reacquire cadence (batch small reads),
-add fairness (yield/park between batches), or serve +read from a
-snapshot that doesn't contend. Validate with the soak baseline probe
-(<2s) + ipc-under-load extended with an echo-storm read assertion +
-GHOZTTY_PERF renderer-wait telemetry (generic.zig:1190).
+as the user's "not responding" complaints under load).
 
-### T53b — Multi-hour soak + profiling + fixes
+*Fix (done 2026-07-17):* bound the lock cadence by DATA rate, not write
+count. `ReadThread.threadMainWindows` (src/termio/Exec.zig) now reads
+into a 64KB buffer and, after each blocking ReadFile, tops up via
+PeekNamedPipe→ReadFile until the buffer is full or the pipe is drained —
+ONE processOutput (one renderer-mutex cycle) per batch instead of one
+per tiny write. Idle-pane keystrokes peek 0 and parse immediately (no
+latency added). The GHOZTTY_PERF pty line grew `batches_per_s`.
 
-Launch `soak.ps1 -Minutes 180+ -Detach` (survives context resets; report
-harvested from `%TEMP%\ghoztty-soak\`), plus interactive profiling the
-harness can't do: keyboard scrollback-seek feel at 100k+ lines
-(scroll_to_top/page-up under load), input latency at the keyboard, and
-tuning fixes from whatever T53a/the long run surface.
+*Validation (2026-07-17):* `ipc-under-load.ps1` grew a T62 section — an
+endless cmd echo-storm pane, then `+read` against it with a 2s bound:
+**80–127ms observed post-fix vs 16–19s pre-fix**; ALL PASS (7) incl.
+the original wakeup-flood guards. Both unit lanes green; P1–P3 ALL
+PASS. Also hardened the kill sweeps in ipc-p1/p2/p3 + ipc-under-load to
+match only the exact exe under test — the old `*zig-out*` pattern would
+have killed the detached zig-out-release soak (it survived the full
+validation run).
+
+## T63 — FIX: +close of a noisy window hung the GUI thread forever (read-thread join race)
+
+Found 2026-07-17 by the T62 validation run: teardown's `+close
+--target=ipcload` sat 9+ minutes (app Not Responding) until killed. cdb
+stacks: GUI thread in handleClose → cleanupAllSurfaces → Exec deinit →
+`read_thread.join()`; reader parked in a blocking ReadFile. Root cause:
+`Exec.threadExit` fired CancelIoEx ONCE, but the cancel only lands if
+the reader has a ReadFile in flight at that exact instant — it misses
+when the reader is parsing (e.g. the final burst subprocess stop
+flushes through ConPTY), and the missed cancel left join() waiting
+forever. Pre-existing race; the T62 batching widened the parse window
+enough to hit it reliably. Fix (same commit as T62): the reader checks
+the quit byte (PeekNamedPipe on the quit pipe) before EVERY blocking
+read, and threadExit retries CancelIoEx + WaitForSingleObject(20ms) on
+the thread handle until the reader exits. os/windows.zig re-exports
+WAIT_OBJECT_0/WAIT_TIMEOUT.
+
+*Validation (2026-07-17):* `ipc-under-load.ps1` teardown is now
+asserted, not just performed: `+close` of the storm window must return
+in <10s — 277ms observed (pre-fix: 9+ min hang). ALL PASS (7); P1–P3
+ALL PASS (heavy +close coverage).
 
 ## T54 — Resume-doc diet
 

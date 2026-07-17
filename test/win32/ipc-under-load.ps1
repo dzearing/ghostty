@@ -24,8 +24,11 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
+# Kill only stale instances of THE EXE UNDER TEST — never the whole
+# zig-out* family: a detached soak (T53b) runs from zig-out-release and
+# must survive this script running against the debug exe.
 Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-    Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') -and $_.CommandLine -notmatch '\+' } |
+    Where-Object { $_.ExecutablePath -eq $exe -and $_.CommandLine -notmatch '\+' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 500
 
@@ -94,8 +97,30 @@ Start-Sleep -Milliseconds 800
 $probeTail = & $exe +read --name=$probePane --lines=10 | Out-String
 Assert ($probeTail -match 'LOADPROBE_5') 'probe echoes executed in the idle pane'
 
-# Teardown.
+# T62: +read against a TINY-WRITE storm. The type-loop storm above is
+# byte-heavy but write-light and never triggered the stall; the trigger
+# is write COUNT — a cmd echo loop is one ConPTY write per line
+# (~60k/s). Before the read-thread batching fix each write took its own
+# renderer-mutex cycle and this +read starved 16-19s on the GUI thread
+# (whole app frozen). Bound: 2s.
+& $exe +split --target=ipcload --name=ipcload-echo --direction=down --shell=cmd `
+    "--command=for /l %i in (0,0,1) do @echo tiny-write-storm %i zzzzzzzzzzzzzzzzzzzzzzzzzzzz" | Out-Null
+Start-Sleep -Seconds 2
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$echoTail = & $exe +read --name=ipcload-echo --lines=5 | Out-String
+$sw.Stop()
+Assert ($echoTail -match 'tiny-write-storm') "echo-storm pane +read returns content (len $($echoTail.Length))"
+Assert ($sw.ElapsedMilliseconds -lt 2000) "echo-storm +read latency $($sw.ElapsedMilliseconds)ms < 2000ms (T62)"
+
+# Teardown — asserted, not just performed: closing a window with noisy
+# panes used to hang the GUI thread forever in Exec.threadExit's
+# read_thread.join() when the one-shot CancelIoEx missed (the reader was
+# parsing the kill-flush burst, not blocked in ReadFile). Observed: +close
+# stuck 9+ minutes with the app Not Responding.
+$swClose = [System.Diagnostics.Stopwatch]::StartNew()
 & $exe +close --target=ipcload | Out-Null
+$swClose.Stop()
+Assert ($swClose.ElapsedMilliseconds -lt 10000) "+close of the storm window returns in $($swClose.ElapsedMilliseconds)ms < 10s"
 Start-Sleep -Seconds 1
 Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
     Where-Object { $_.ExecutablePath -eq $exe -and $_.CommandLine -notmatch '\+' } |

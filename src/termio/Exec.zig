@@ -216,12 +216,26 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     };
 
     if (comptime builtin.os.tag == .windows) {
-        // Interrupt the blocking read so the thread can see the quit message
-        if (windows.kernel32.CancelIoEx(exec.read_thread_fd, null) == 0) {
-            switch (windows.kernel32.GetLastError()) {
-                .NOT_FOUND => {},
-                else => |err| log.warn("error interrupting read thread err={}", .{err}),
+        // Interrupt the blocking read so the thread can see the quit
+        // message. A single shot is a coin flip: CancelIoEx only lands if
+        // the reader has a ReadFile in flight at this exact instant, and
+        // misses when it is parsing output instead (e.g. the final burst
+        // the subprocess stop above flushed through ConPTY) — a missed
+        // cancel left join() below hung forever on the GUI thread. Retry
+        // until the thread exits; it re-checks the quit byte before every
+        // blocking read, so this converges immediately.
+        const read_thread_handle = exec.read_thread.getHandle();
+        while (true) {
+            if (windows.kernel32.CancelIoEx(exec.read_thread_fd, null) == 0) {
+                switch (windows.kernel32.GetLastError()) {
+                    .NOT_FOUND => {},
+                    else => |err| log.warn("error interrupting read thread err={}", .{err}),
+                }
             }
+            if (windows.kernel32.WaitForSingleObject(
+                read_thread_handle,
+                20,
+            ) != windows.WAIT_TIMEOUT) break;
         }
     }
 
@@ -1394,59 +1408,91 @@ pub const ReadThread = struct {
         const perf_on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
         var perf_start: ?std.time.Instant = null;
         var perf_reads: u64 = 0;
+        var perf_batches: u64 = 0;
         var perf_bytes: u64 = 0;
 
-        var buf: [1024]u8 = undefined;
+        // Batch pty output before parsing it. processOutput takes the
+        // renderer state mutex, so the lock cadence must be bounded by
+        // DATA rate, not WRITE count: a tiny-write flood (cmd echo loop,
+        // >60k lines/s through ConPTY) with the old read-one-write-per-
+        // lock loop starved the GUI thread off the same mutex for 16s+
+        // observed (T62) — IPC verbs, input, and focus all stall.
+        var buf: [64 * 1024]u8 = undefined;
         while (true) {
-            while (true) {
-                var n: windows.DWORD = 0;
-                if (windows.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == 0) {
-                    const err = windows.kernel32.GetLastError();
-                    switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
-
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                }
-
-                if (perf_on) perf: {
-                    const now = std.time.Instant.now() catch break :perf;
-                    perf_reads += 1;
-                    perf_bytes += n;
-                    const start = perf_start orelse {
-                        perf_start = now;
-                        break :perf;
-                    };
-                    const elapsed = now.since(start);
-                    if (elapsed >= std.time.ns_per_s) {
-                        log.info("perf pty reads_per_s={d} kb_per_s={d}", .{
-                            perf_reads * std.time.ns_per_s / @max(elapsed, 1),
-                            (perf_bytes * std.time.ns_per_s / @max(elapsed, 1)) / 1024,
-                        });
-                        perf_start = now;
-                        perf_reads = 0;
-                        perf_bytes = 0;
-                    }
-                }
-
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
-            }
-
+            // Check the quit pipe BEFORE the blocking read: threadExit's
+            // CancelIoEx only lands if a ReadFile is in flight at that
+            // exact instant. When the cancel fires while we're parsing a
+            // batch below, this check is what exits the thread — without
+            // it a missed cancel left the reader blocked in ReadFile
+            // forever and +close hung the GUI thread in join().
             var quit_bytes: windows.DWORD = 0;
             if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
                 const err = windows.kernel32.GetLastError();
                 log.err("quit pipe reader error err={}", .{err});
                 unreachable;
             }
-
             if (quit_bytes > 0) {
                 log.info("read thread got quit signal", .{});
                 return;
             }
+
+            var n: windows.DWORD = 0;
+            if (windows.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == 0) {
+                const err = windows.kernel32.GetLastError();
+                switch (err) {
+                    // Cancelled by threadExit — loop back to the quit check.
+                    .OPERATION_ABORTED => continue,
+
+                    else => {
+                        log.err("io reader error err={}", .{err});
+                        unreachable;
+                    },
+                }
+            }
+            if (perf_on) perf_reads += 1;
+
+            // Top up: if more output is already pending, drain it into
+            // the buffer BEFORE taking the terminal lock. An idle-pane
+            // keystroke echo peeks 0 and parses immediately (no added
+            // latency); a flood coalesces into few large batches. Any
+            // peek/read failure just parses what we have — a real
+            // error repeats on the next blocking read above.
+            var filled: usize = n;
+            while (filled < buf.len) {
+                var avail: windows.DWORD = 0;
+                if (windows.exp.kernel32.PeekNamedPipe(fd, null, 0, null, &avail, null) == 0) break;
+                if (avail == 0) break;
+                var m: windows.DWORD = 0;
+                const want: windows.DWORD = @intCast(@min(buf.len - filled, avail));
+                if (windows.kernel32.ReadFile(fd, buf[filled..].ptr, want, &m, null) == 0) break;
+                if (m == 0) break;
+                if (perf_on) perf_reads += 1;
+                filled += m;
+            }
+
+            if (perf_on) perf: {
+                const now = std.time.Instant.now() catch break :perf;
+                perf_batches += 1;
+                perf_bytes += filled;
+                const start = perf_start orelse {
+                    perf_start = now;
+                    break :perf;
+                };
+                const elapsed = now.since(start);
+                if (elapsed >= std.time.ns_per_s) {
+                    log.info("perf pty reads_per_s={d} batches_per_s={d} kb_per_s={d}", .{
+                        perf_reads * std.time.ns_per_s / @max(elapsed, 1),
+                        perf_batches * std.time.ns_per_s / @max(elapsed, 1),
+                        (perf_bytes * std.time.ns_per_s / @max(elapsed, 1)) / 1024,
+                    });
+                    perf_start = now;
+                    perf_reads = 0;
+                    perf_batches = 0;
+                    perf_bytes = 0;
+                }
+            }
+
+            @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..filled] });
         }
     }
 };

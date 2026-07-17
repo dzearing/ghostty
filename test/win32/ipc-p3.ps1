@@ -17,7 +17,9 @@ function Assert($name, $cond) {
 }
 function Stop-DebugGhoztty {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
+        # Exact exe match only — '*zig-out*' also matched a detached soak
+        # instance running from zig-out-release (T53b) and killed it.
+        Where-Object { $_.ExecutablePath -eq $Exe } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
 }

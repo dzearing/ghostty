@@ -103,9 +103,14 @@ Work these first, in order, before falling back to first-todo-in-table:
 6. **T53** — long-context reliability + perf soak/tuning pass. Split
    2026-07-16: **T53a DONE** (soak harness; found+fixed the WM_APP_WAKEUP
    queue flood that broke ALL IPC under load — `ipc-under-load.ps1` guards
-   it; filed T62 read-stall). **T53b next**: harvest the detached
-   multi-hour soak report from `%TEMP%\ghoztty-soak\` (launched at the
-   T53a boundary), profile scrollback-seek/input latency, work T62.
+   it; filed T62 read-stall). **T62 DONE 2026-07-17** (read-thread
+   batching bounds the renderer-mutex cadence: +read mid-storm 16–19s →
+   80–127ms; found+fixed T63 +close hang in the same pass; test kill
+   sweeps narrowed so they can't kill the detached soak). **T53b next**:
+   harvest the detached soak report from `%TEMP%\ghoztty-soak\
+   20260716-232428\` (launched 2026-07-16 23:24, 180 min — binary
+   predates the T62/T63 fixes), profile scrollback-seek/input latency,
+   tuning fixes from findings.
 7. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
    report was a July-5 exe — make "which build is this" answerable at a
    glance).
@@ -183,7 +188,8 @@ One line per row. Full spec + validation + evidence per task:
 | T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
 | T53a | Soak harness `test/win32/soak.ps1` + first bounded on-box soak + findings filed. FOUND+FIXED: WM_APP_WAKEUP message-queue flood broke ALL IPC under load (see details); regression guard `test/win32/ipc-under-load.ps1` | I | T40 | done | (this commit) |
 | T53b | Multi-hour detached soak + input-latency/scrollback-seek profiling + tuning fixes from findings | I | T53a | todo | — |
-| T62 | FIX: +read stalls many seconds (16s observed) while a pane floods tiny writes — renderer-mutex starvation on the GUI/IPC path (T48 static candidate 2, now reproduced). See details | I | T53a | todo | — |
+| T62 | FIX: +read stalls many seconds (16s observed) while a pane floods tiny writes — renderer-mutex starvation on the GUI/IPC path (T48 static candidate 2, now reproduced). Fixed: read-thread batching (64KB + pipe top-up), one lock cycle per batch; 80–127ms post-fix. See details | I | T53a | done | (this commit) |
+| T63 | FIX: +close of a noisy window hung the GUI thread forever — Exec.threadExit's one-shot CancelIoEx missed while the reader parsed, join() never returned (found by the T62 validation run, 9+ min hang observed). Fixed with T62: quit-byte check before every blocking read + retrying cancel; +close now asserted <10s in ipc-under-load.ps1 (277ms). See details | I | T62 | done | (this commit) |
 | T54 | Resume-doc diet (this restructure) | — | — | done | 6968d82e7 |
 | T55 | FIX: hero-mode.ps1 fails on HEAD (chords not dispatched) — root cause was the TEST's positive control: ctrl+shift+r now opens the T50 modal rename dialog, which disables the owner window and silently ate every later chord. Control switched to ctrl+k (clear_screen, no UI left behind); not a key-path regression | F | T19 | done | (this commit) |
 | T60 | FIX: window title jitters a few px left/right on a timer while busy (user, 2026-07-16; row renumbered from a duplicate T56 on 2026-07-16). Likely cause: Claude Code's title spinner — the braille glyphs (⠐/⠂/…) come from a FALLBACK font (MS Gothic per app log) with per-glyph advance widths, so the centered title re-centers to a different width every spinner frame. Investigate where the win32 tab/title text is drawn (Window.zig caption/tab paint); candidate fixes: left-align the title, reserve a fixed-width cell for the leading glyph, or measure/center on the title minus the spinner char | I | — | todo | — |

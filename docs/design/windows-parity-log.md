@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-17 (on-box) — T62 DONE + T63 found+fixed. Arrived 3 min after
+  the detached 180-min soak launched, so worked T62 instead of the T53b
+  harvest. Fix: threadMainWindows batches pty output (64KB buffer +
+  PeekNamedPipe top-up) so the renderer mutex is taken once per BATCH,
+  not once per tiny write — echo-storm +read went 16–19s → 80–127ms.
+  Validation immediately exposed T63: +close of the storm window hung
+  the GUI thread 9+ min in read_thread.join() — threadExit's one-shot
+  CancelIoEx misses whenever the reader is parsing (pre-existing race;
+  batching widened it). Fixed: quit-byte check before every blocking
+  read + retrying cancel with 20ms thread-handle waits. ipc-under-load
+  grew echo-storm +read (<2s) and timed +close (<10s; 277ms) asserts —
+  ALL PASS (7); both lanes green; P1–P3 ALL PASS. Also hardened
+  p1/p2/p3 + ipc-under-load kill sweeps to exact-exe match: the old
+  `*zig-out*` pattern would have killed the running zig-out-release
+  soak (it survived). Delivery to install locations deferred to the
+  T53b boundary (soak locks zig-out-release; user-facing fix, deliver
+  then). Next: T53b harvest (~02:25+ report), profiling, then T52.
 - 2026-07-16 (on-box, late) — T53a DONE, T62 filed. Built the soak harness
   (`soak.ps1`, IPC-only so it can run beside real work) and its first smoke
   immediately caught a P0: App.wakeup() had NO coalescing, so a tiny-write
