@@ -544,13 +544,33 @@ class AppDelegate: NSObject,
             }
         }
 
-        // If our app says we don't need to confirm, we can exit now.
-        if !ghostty.needsConfirmQuit { return .terminateNow }
+        // Agent-backed windows (remoteConnection != nil — both true remote
+        // machines and local session-persistence windows) survive the quit:
+        // their sessions DETACH and re-attach on the next launch. Only windows
+        // withOUT a live agent connection can actually lose a running process,
+        // so only those gate the confirmation. The libghostty aggregate
+        // (`ghostty.needsConfirmQuit`) can't make this distinction — it only
+        // sees "is a command running", which is true for exactly the sessions
+        // that would survive.
+        let terminatedOnQuit = NSApp.windows.compactMap { window in
+            window.windowController as? BaseTerminalController
+        }.filter { controller in
+            controller.remoteConnection == nil &&
+                controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
+        }
+        if terminatedOnQuit.isEmpty { return .terminateNow }
 
         // We have some visible window. Show an app-wide modal to confirm quitting.
+        // Mention persistence only when it's actually in play (mixed case);
+        // with no agent-backed windows the classic wording stays accurate.
+        let anyPersistent = NSApp.windows.contains { window in
+            (window.windowController as? BaseTerminalController)?.remoteConnection != nil
+        }
         let alert = NSAlert()
         alert.messageText = "Quit Ghoztty?"
-        alert.informativeText = "All terminal sessions will be terminated."
+        alert.informativeText = anyPersistent
+            ? "Some terminals are not persistent and have running processes that will be terminated. Persistent sessions keep running and re-attach on the next launch."
+            : "All terminal sessions will be terminated."
         alert.addButton(withTitle: "Close Ghoztty")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
