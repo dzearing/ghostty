@@ -42,7 +42,12 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
             .optimize = cfg.optimize,
             .strip = cfg.strip,
             .omit_frame_pointer = cfg.strip,
-            .unwind_tables = if (cfg.strip) .none else .sync,
+            // NOT gated on strip like the knobs above: `.none` crashes zig
+            // 0.15.2 ("terminated unexpectedly", no diagnostics) compiling this
+            // exe for aarch64-macos in release configs, which killed the DMG
+            // build (the app embeds the agent). `.sync` compiles clean; keep it
+            // until the compiler is fixed.
+            .unwind_tables = .sync,
         }),
         // Crashes on x86_64 self-hosted on 0.15.x; mirror GhosttyExe.
         .use_llvm = true,
