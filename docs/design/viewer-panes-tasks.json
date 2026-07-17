@@ -66,7 +66,9 @@
       "id": "T02",
       "title": "SwiftUI leaf render branch + viewer focus/close/drag handling",
       "status": "done",
-      "dependsOn": ["T01"],
+      "dependsOn": [
+        "T01"
+      ],
       "resetAfter": true,
       "goal": "TerminalSplitTreeView leaf case switches on PaneView.content: terminal → existing InspectableSurface path (focusedValue preserved), viewer → ViewerRepresentable hosting the (still stub) ViewerView. Viewer panes focusable via pane-nav as targets, closable without confirmation, excluded from surface drag/drop.",
       "steps": [
@@ -81,7 +83,7 @@
     {
       "id": "T03",
       "title": "Bundled viewer assets + resources install + HTML template",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [],
       "resetAfter": false,
       "goal": "src/viewer/ (viewer.html/css/js + vendor/, vendor already checked in) installed via GhosttyResources.zig into share/ghostty/viewer → Contents/Resources/ghostty/viewer.",
@@ -92,13 +94,16 @@
         "Standalone sanity check of the page in a browser or minimal WKWebView harness is fine."
       ],
       "acceptance": "Assets present in the built bundle; template renders the markdown torture-test file correctly standalone (tables, nested+task lists, fenced code highlighted, blockquotes, images, hr, inline styles) in light AND dark. Commit.",
-      "notes": "Vendor files already at src/viewer/vendor/ (markdown-it 14.3.0, task-lists 2.1.1, highlight.js 11.11.1 CDN bundle, github-markdown-css 5.9.0, licenses)."
+      "notes": "2026-07-17: done. src/viewer/{viewer.html,viewer.css,viewer.js} + vendor/. GhosttyResources.zig installs src/viewer -> share/ghostty/viewer (NO exclude_extensions so LICENSEs ship); verified files land in zig-out/Ghoztty-Debug.app/Contents/Resources/ghostty/viewer. Page API: window.__viewer.setMarkdown(text)/setCode(text,lang)/setError(title,detail); markdown-it {html:false,linkify:true,typographer:true} + task-lists plugin; hljs via highlight callback; scroll preserved across re-render (scrollY + rAF restore). Theming: github-markdown.css auto variant + hljs github/github-dark <link media=prefers-color-scheme>; body bg matched in viewer.css. Standalone-verified in Chrome (light AND dark screenshots): headings, aligned table, nested+task lists, zig/swift fences highlighted, nested blockquote, relative images, hr, long-code overflow. Torture fixture: scratchpad/torture/torture.md + img/*.png (regenerate for T12 if scratchpad rotated). NOTE for T04: relative asset hrefs (vendor/...) resolve against the page URL — scheme handler must serve assets as siblings of the page path."
     },
     {
       "id": "T04",
       "title": "ViewerView: WKWebView + scheme handler + three content modes",
       "status": "pending",
-      "dependsOn": ["T02", "T03"],
+      "dependsOn": [
+        "T02",
+        "T03"
+      ],
       "resetAfter": false,
       "goal": "Real ViewerView replacing the stub: WKURLSchemeHandler (ghoztty-viewer://) serving /page (template+content), /vendor/* (bundle), /local/* (markdown file's directory for relative images); website mode loads URL directly; text/code mode via extension→language map.",
       "steps": [
@@ -114,7 +119,9 @@
       "id": "T05",
       "title": "Link policy + dark/light verification",
       "status": "pending",
-      "dependsOn": ["T04"],
+      "dependsOn": [
+        "T04"
+      ],
       "resetAfter": false,
       "goal": "decidePolicyFor: http(s) links from file modes → default browser; .md file links → new viewer split; scheme-handler loads pass through. Dark/light follows app appearance live.",
       "steps": [
@@ -128,7 +135,9 @@
       "id": "T06",
       "title": "Live reload with scroll preservation",
       "status": "pending",
-      "dependsOn": ["T04"],
+      "dependsOn": [
+        "T04"
+      ],
       "resetAfter": false,
       "goal": "DispatchSource vnode watcher (write|delete|rename|extend), re-open fd after atomic-save rename, 100ms debounce, JS __update preserves scrollY.",
       "steps": [
@@ -142,7 +151,9 @@
       "id": "T07",
       "title": "--view on +new-window and +split (CLI + IPC + registry)",
       "status": "pending",
-      "dependsOn": ["T04"],
+      "dependsOn": [
+        "T04"
+      ],
       "resetAfter": false,
       "goal": "ghoztty +new-window --view=<path-or-url> and +split --view=... create viewer panes end-to-end. Mutual exclusion with --command/-e. Relative paths resolved CLI-side.",
       "steps": [
@@ -157,7 +168,9 @@
       "id": "T08",
       "title": "+list/+read/+send-keys/+close/banner/state viewer behavior",
       "status": "pending",
-      "dependsOn": ["T07"],
+      "dependsOn": [
+        "T07"
+      ],
       "resetAfter": true,
       "goal": "+list shows viewer panes (view: prefix; --json type+url fields) and auto-registers them; +read/+send-keys/+set-banner/+set-state on viewers → clean errors; +close closes viewers silently.",
       "steps": [
@@ -173,7 +186,9 @@
       "id": "T09",
       "title": "Session-persistence manifest round-trip for viewer leaves",
       "status": "pending",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "resetAfter": false,
       "goal": "With session-persistence=on, mixed trees restore: terminals re-attach, viewers re-open their file/URL; viewer leaves never probed, never counted dead, never routed to the agent.",
       "steps": [
@@ -188,7 +203,9 @@
       "id": "T10",
       "title": "AppKit window-restoration round-trip (persistence off)",
       "status": "pending",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "resetAfter": false,
       "goal": "With session-persistence=off and window-save-state default, a mixed window restores via NSWindowRestoration; viewer decode is infallible (missing file → in-page error).",
       "steps": [
@@ -202,7 +219,9 @@
       "id": "T11",
       "title": "File→Open + CFBundleDocumentTypes for markdown",
       "status": "pending",
-      "dependsOn": ["T08"],
+      "dependsOn": [
+        "T08"
+      ],
       "resetAfter": false,
       "goal": "File→Open on a .md file (and drag onto dock icon / `open -a`) opens a viewer window; other extensions keep today's behavior.",
       "steps": [
@@ -216,7 +235,11 @@
       "id": "T12",
       "title": "Full E2E verification + screenshots + docs",
       "status": "pending",
-      "dependsOn": ["T09", "T10", "T11"],
+      "dependsOn": [
+        "T09",
+        "T10",
+        "T11"
+      ],
       "resetAfter": false,
       "goal": "Prove the whole feature in the debug app per the original ask, with screenshots.",
       "steps": [
