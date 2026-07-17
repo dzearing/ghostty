@@ -1,0 +1,233 @@
+{
+  "project": "Ghoztty viewer panes (markdown / text / website)",
+  "createdAt": "2026-07-17",
+  "designDoc": "docs/design/viewer-panes.md",
+  "branch": "users/dzearing/markdown-preview",
+  "worktree": "/Users/dzearing/git/ghoztty-markdown-preview",
+  "userIntent": "Add viewer panes: a split-tree pane whose content is a beautifully rendered markdown file (headings, nested+task lists, tables, syntax-highlighted code, blockquotes, links, images, hr, inline formatting), a text/code file, or a website — via WKWebView with fully bundled offline assets. CLI: +new-window/+split --view=<path-or-url>. In-app: File→Open on .md. Live reload. Sensible +list/+read/+send-keys/+close/persistence behavior. View-only.",
+  "protocol": {
+    "loop": [
+      "1. On session start: read THIS file fully, then docs/design/viewer-panes.md fully. Do not re-explore the codebase for facts already recorded there — the file:line maps come from a thorough 2026-07-17 sweep.",
+      "2. Pick the first task with status=pending whose dependsOn are all done. Set it to in_progress (edit this file) before starting work.",
+      "3. Do the task. Keep it small; if it balloons, split it into sub-tasks in this file and finish only the first.",
+      "4. Verify per the task's acceptance. Build must pass. For user-facing changes, kill + relaunch the DEBUG app from this worktree and verify live.",
+      "5. Commit on this branch: git add -A && git commit with a descriptive message ending in the Claude Co-Authored-By trailer. Record SHA + outcome + surprises in the task's notes, set status=done (or blocked with reason).",
+      "6. Add newly-discovered follow-up tasks to the tasks array (small, ordered).",
+      "7. If the just-finished task has resetAfter=true AND tasks remain: invoke the Skill tool with skill='dzearing-skills:reset-context' and args='Read /Users/dzearing/git/ghoztty-markdown-preview/docs/design/viewer-panes-tasks.json and follow its protocol: execute pending tasks until the next resetAfter boundary, then reset context again.' Otherwise continue to the next task in THIS session.",
+      "8. If ALL tasks are done (or only blocked ones remain): do NOT reset. Write a final summary: what shipped, E2E results (screenshots), what is blocked and why."
+    ],
+    "rules": [
+      "NEVER touch /Applications/Ghoztty.app in any way — it is the user's primary terminal. Debug app only: zig-out/Ghoztty-Debug.app (bundle id com.dzearing.ghoztty.debug, socket ghostty-debug-<uid>.sock).",
+      "All bundle identifiers stay in com.dzearing.ghoztty.* — NEVER com.mitchellh.*.",
+      "Use /usr/bin/log (never bare `log` — zsh builtin shadows it).",
+      "Stale-instance trap: after rebuilding, kill any running debug instance and relaunch from THIS worktree before trusting live behavior (verify process start time > binary mtime). Killing DEBUG instances is safe unless this effort created live test windows the user is using.",
+      "NEVER 'tell process \"ghoztty\"' by NAME in System Events — the RELEASE app shares the process name. Scope by pid or use 'tell application id \"com.dzearing.ghoztty.debug\"'.",
+      "NEVER run +new-remote-window unattended: a failed dial pops a modal alert that wedges ALL CLI IPC.",
+      "GUI driving + screenshots are permitted on this machine (Accessibility/Screen Recording granted).",
+      "Zero network for the markdown/text viewer path — all assets bundled; only the website mode may touch the network.",
+      "If the user interrupts with new instructions, encode them as tasks in this file instead of drifting."
+    ],
+    "environment": {
+      "toolchain": "export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH; export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer",
+      "buildApp": "zig build -Doptimize=Debug   # → zig-out/Ghoztty-Debug.app",
+      "cli": "zig-out/Ghoztty-Debug.app/Contents/MacOS/ghoztty +<action> …  (debug socket, separate from release app)",
+      "notes": "Official zig 0.15.2 binary cannot link on this macOS 26.4 box; the brew zig@0.15 bottle works (memory: ghoztty-macos26-zig-toolchain)."
+    }
+  },
+  "decisions": [
+    "Pane-based viewers in the split tree; NOT a standalone preview window type (user rejected that).",
+    "Engine: WKWebView + bundled markdown-it/highlight.js/github-markdown-css, fully offline for files. Approved.",
+    "Leaf refactor: concrete PaneView wrapper (enum content: terminal|viewer), tree → SplitTree<PaneView>. Approved 2026-07-17 over protocol/existential leaf (SplitTree Codable decodes one concrete ViewType).",
+    "CLI: extend +new-window/+split with --view=<path-or-url>; mutually exclusive with --command/-e; relative paths resolved CLI-side against --working-directory else caller cwd.",
+    "+read/+send-keys/+set-banner/+set-state on a viewer → clean IPC error, exit 1. Close never confirms for viewers.",
+    "Persistence: manifest leaves gain kind+viewerLocation, viewers count always-restorable/never probed; AppKit restore rides PaneView.Codable with infallible viewer decode (missing file → in-page error).",
+    "File→Open reroutes only the .md family to a viewer window; other extensions keep today's terminal behavior. Clickable .md paths in terminal output: deferred.",
+    "Context plan: /reset-context at resetAfter boundaries (after T02 and T08)."
+  ],
+  "tasks": [
+    {
+      "id": "T01",
+      "title": "PaneView wrapper + SplitTree<PaneView> mechanical rename",
+      "status": "pending",
+      "dependsOn": [],
+      "resetAfter": false,
+      "goal": "Introduce final class PaneView (NSView, Codable, Identifiable, ObservableObject; content enum terminal|viewer with viewer case stubbed) and retype every SplitTree<Ghostty.SurfaceView> site to SplitTree<PaneView>. No behavior change — every pane is .terminal.",
+      "steps": [
+        "Baseline: toolchain exports; zig build -Doptimize=Debug must pass BEFORE changes.",
+        "New macos/Sources/Features/Splits/PaneView.swift: content enum (viewer case can hold a placeholder ViewerView stub class for now), edge-pinned content subview, surface-shaped accessors (surface, needsConfirmQuit, processExited, pwd, @Published title/bell/activityState pass-throughs via Combine assign, focusDidChange, flagsChanged, isFirstResponder forwarding), Codable with discriminator delegating terminal payload to SurfaceView Codable.",
+        "Rename sweep per design doc §1 map; keep property name surfaceTree to minimize churn. Where call sites need the SurfaceView specifically, use pane.surfaceView accessor (optional) and compiler-forced switches.",
+        "Watch the tricky sites: focusedSurface typed property, surfaceValuesPublisher keypaths, drag/drop Transferable, IPC tree building, session-layout manifest/restore leaf handling (keep terminal-only assumptions for now, guarded).",
+        "zig build -Doptimize=Debug until green."
+      ],
+      "acceptance": "Build green. Debug app launches; terminal windows/tabs/splits, pane nav, close confirmation, +list/+split/+read/+send-keys all behave as before (spot-check via CLI). AppKit window restore of a 2-split window works. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T02",
+      "title": "SwiftUI leaf render branch + viewer focus/close/drag handling",
+      "status": "pending",
+      "dependsOn": ["T01"],
+      "resetAfter": true,
+      "goal": "TerminalSplitTreeView leaf case switches on PaneView.content: terminal → existing InspectableSurface path (focusedValue preserved), viewer → ViewerRepresentable hosting the (still stub) ViewerView. Viewer panes focusable via pane-nav as targets, closable without confirmation, excluded from surface drag/drop.",
+      "steps": [
+        "Branch TerminalSplitTreeView.swift:60 leaf rendering.",
+        "Verify terminal rendering/inspector/focus unchanged.",
+        "Programmatically inject a stub viewer pane (temporary debug hook or unit of T07 pulled forward if trivial) to prove split/focus/close mechanics with a non-terminal leaf.",
+        "Equalize/resize with a viewer sibling must not crash (leftmostLeaf().surface nil-guard)."
+      ],
+      "acceptance": "Build green; terminal UX unchanged; a stub viewer pane can sit in a split with a terminal, gets focus via pane-nav, resizes, closes with no prompt. Commit. RESET CONTEXT after this task.",
+      "notes": ""
+    },
+    {
+      "id": "T03",
+      "title": "Bundled viewer assets + resources install + HTML template",
+      "status": "pending",
+      "dependsOn": [],
+      "resetAfter": false,
+      "goal": "src/viewer/ (viewer.html/css/js + vendor/, vendor already checked in) installed via GhosttyResources.zig into share/ghostty/viewer → Contents/Resources/ghostty/viewer.",
+      "steps": [
+        "Author viewer.html/viewer.js/viewer.css: markdown-it (html:false, linkify:true) + task-lists plugin + hljs fence highlighting; window.__setMarkdown(text)/__setCode(text, lang)/__update with scroll preservation; github-markdown.css auto variant + both hljs styles behind prefers-color-scheme media queries; polished page chrome (max-width ~880px, padding, GitHub-like).",
+        "GhosttyResources.zig addInstallDirectory block (mirror shell-integration ~:118-126) → share/ghostty/viewer.",
+        "zig build; verify files land in zig-out/Ghoztty-Debug.app/Contents/Resources/ghostty/viewer.",
+        "Standalone sanity check of the page in a browser or minimal WKWebView harness is fine."
+      ],
+      "acceptance": "Assets present in the built bundle; template renders the markdown torture-test file correctly standalone (tables, nested+task lists, fenced code highlighted, blockquotes, images, hr, inline styles) in light AND dark. Commit.",
+      "notes": "Vendor files already at src/viewer/vendor/ (markdown-it 14.3.0, task-lists 2.1.1, highlight.js 11.11.1 CDN bundle, github-markdown-css 5.9.0, licenses)."
+    },
+    {
+      "id": "T04",
+      "title": "ViewerView: WKWebView + scheme handler + three content modes",
+      "status": "pending",
+      "dependsOn": ["T02", "T03"],
+      "resetAfter": false,
+      "goal": "Real ViewerView replacing the stub: WKURLSchemeHandler (ghoztty-viewer://) serving /page (template+content), /vendor/* (bundle), /local/* (markdown file's directory for relative images); website mode loads URL directly; text/code mode via extension→language map.",
+      "steps": [
+        "ViewerView(location:) where location = file path or URL; mode inference (:// → web; .md family → markdown; else text/code).",
+        "Scheme handler with path-traversal guard (resolve + prefix check against the file's directory).",
+        "Title publisher: filename for files; WKWebView.title KVO for websites.",
+        "Nonpersistent WKWebsiteDataStore for file modes (no network anyway); default store for web mode."
+      ],
+      "acceptance": "Injected viewer pane renders the torture-test .md beautifully with relative images; a .zig source file renders highlighted; a website loads and is interactive. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T05",
+      "title": "Link policy + dark/light verification",
+      "status": "pending",
+      "dependsOn": ["T04"],
+      "resetAfter": false,
+      "goal": "decidePolicyFor: http(s) links from file modes → default browser; .md file links → new viewer split; scheme-handler loads pass through. Dark/light follows app appearance live.",
+      "steps": [
+        "WKNavigationDelegate on ViewerView.",
+        "System appearance toggle test (and config theme override) — page + code styles switch live."
+      ],
+      "acceptance": "Clicking an external link opens the browser (pane unchanged); clicking a relative .md link opens a new viewer pane; toggling dark mode restyles live. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T06",
+      "title": "Live reload with scroll preservation",
+      "status": "pending",
+      "dependsOn": ["T04"],
+      "resetAfter": false,
+      "goal": "DispatchSource vnode watcher (write|delete|rename|extend), re-open fd after atomic-save rename, 100ms debounce, JS __update preserves scrollY.",
+      "steps": [
+        "Watcher owned by ViewerView, torn down on close.",
+        "Test with echo-append AND an atomic-save (write to temp + mv) pattern."
+      ],
+      "acceptance": "Editing the file updates the pane within ~200ms without losing scroll position; atomic saves keep working repeatedly. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T07",
+      "title": "--view on +new-window and +split (CLI + IPC + registry)",
+      "status": "pending",
+      "dependsOn": ["T04"],
+      "resetAfter": false,
+      "goal": "ghoztty +new-window --view=<path-or-url> and +split --view=... create viewer panes end-to-end. Mutual exclusion with --command/-e. Relative paths resolved CLI-side.",
+      "steps": [
+        "Zig: help text in split.zig/new_window.zig; resolve bare relative paths against --working-directory else cwd before forwarding.",
+        "Swift: ParsedArguments.view, parseArguments case, handleNewWindow/handleSplit viewer branches (validation error if command also set), TargetEntry pane entries hold PaneView, onCreate name registration unchanged.",
+        "Idempotency: existing named target focuses instead of recreating."
+      ],
+      "acceptance": "From a shell: +new-window --view=README.md opens a viewer window; +split --view=https://example.com --name=web splits a viewer pane; --view with --command errors cleanly; repeat with same --target focuses. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T08",
+      "title": "+list/+read/+send-keys/+close/banner/state viewer behavior",
+      "status": "pending",
+      "dependsOn": ["T07"],
+      "resetAfter": true,
+      "goal": "+list shows viewer panes (view: prefix; --json type+url fields) and auto-registers them; +read/+send-keys/+set-banner/+set-state on viewers → clean errors; +close closes viewers silently.",
+      "steps": [
+        "IPCMessage TerminalData: type + url fields (leaf data reused for viewers; pid/tty/etc. omitted or null).",
+        "buildSplitNodeData/paneNameForSurface/ensurePaneRegistered generalized to PaneView.",
+        "list.zig human formatter: view: prefix + location for viewer leaves.",
+        "Clean-error guards in handleRead/handleSendKeys/handleSetBanner/handleSetState."
+      ],
+      "acceptance": "+list (human + --json) correctly describes a mixed window; +read/+send-keys against a viewer exit 1 with the documented message; +close removes the viewer pane. Commit. RESET CONTEXT after this task.",
+      "notes": ""
+    },
+    {
+      "id": "T09",
+      "title": "Session-persistence manifest round-trip for viewer leaves",
+      "status": "pending",
+      "dependsOn": ["T08"],
+      "resetAfter": false,
+      "goal": "With session-persistence=on, mixed trees restore: terminals re-attach, viewers re-open their file/URL; viewer leaves never probed, never counted dead, never routed to the agent.",
+      "steps": [
+        "Manifest Leaf kind+viewerLocation; encodeNode/makeTreeNode branches.",
+        "Guards: TerminalController.swift:92-112 agent routing, probeSessions, hasMissingSessionIDs, drop policy (viewer = always restorable).",
+        "E2E: persistence on → window with terminal+viewer split → quit app → relaunch → both back, terminal SAME pid, viewer re-rendered."
+      ],
+      "acceptance": "E2E passes; a window that is ONLY a viewer also restores; killing the agent does not affect viewer restore. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T10",
+      "title": "AppKit window-restoration round-trip (persistence off)",
+      "status": "pending",
+      "dependsOn": ["T08"],
+      "resetAfter": false,
+      "goal": "With session-persistence=off and window-save-state default, a mixed window restores via NSWindowRestoration; viewer decode is infallible (missing file → in-page error).",
+      "steps": [
+        "Exercise PaneView.Codable viewer payload; version bump TerminalRestorableState if needed.",
+        "Test: quit with mixed window → relaunch → tree shape+ratios+viewer content back; delete the file first → pane shows in-page error, window still restores."
+      ],
+      "acceptance": "Both restore scenarios pass. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T11",
+      "title": "File→Open + CFBundleDocumentTypes for markdown",
+      "status": "pending",
+      "dependsOn": ["T08"],
+      "resetAfter": false,
+      "goal": "File→Open on a .md file (and drag onto dock icon / `open -a`) opens a viewer window; other extensions keep today's behavior.",
+      "steps": [
+        "Ghostty-Info.plist markdown document type (net.daringfireball.markdown; md/markdown/mdown/mkd).",
+        "AppDelegate.application(_:openFile:) branch → viewer window via the T07 creation path."
+      ],
+      "acceptance": "open -a Ghoztty-Debug README.md opens a viewer window; File→Open dialog lists .md files and opens them; .sh files still run in a terminal. Commit.",
+      "notes": ""
+    },
+    {
+      "id": "T12",
+      "title": "Full E2E verification + screenshots + docs",
+      "status": "pending",
+      "dependsOn": ["T09", "T10", "T11"],
+      "resetAfter": false,
+      "goal": "Prove the whole feature in the debug app per the original ask, with screenshots.",
+      "steps": [
+        "Fresh build; kill+relaunch debug app.",
+        "Via CLI: (1) markdown torture-test file (tables, nested+task lists, fenced code, images) — screenshot light AND dark; (2) website pane — screenshot; (3) mixed terminal+viewer split — screenshot, exercise ratio drag + pane-nav + zoom.",
+        "+list human+json output captured; +read/+send-keys clean errors; +close all panes.",
+        "Live-reload demo (append to the md, watch update).",
+        "Update CLAUDE.md (+new-window/+split --view docs) and the design doc with results."
+      ],
+      "acceptance": "All scenarios verified with screenshots recorded in the design doc; CLAUDE.md documents --view. Final summary written for the user.",
+      "notes": ""
+    }
+  ]
+}
