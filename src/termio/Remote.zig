@@ -94,6 +94,10 @@ argv: ?[]const []const u8,
 /// for a persistent LOCAL-agent pane; sent in `OPEN.pinned`. Ignored on ATTACH.
 pinned: bool,
 
+/// True when the connection is the LOCAL agent (see `Config.local`). Gates
+/// publishing the agent-reported tty for `getProcessInfo(.tty_name)` (wp3).
+local: bool,
+
 /// What to do when an ATTACH finds the session a DEAD-but-relaunchable tombstone
 /// (the agent itself restarted and materialized it from disk, §5.4 reboot floor,
 /// T12c). `.auto` respawns it in place (`RELAUNCH`) and shows a restarted
@@ -149,6 +153,19 @@ canceller: connection.RpcCanceller = .{},
 /// query right after, well before any teardown).
 live_session_id: std.atomic.Value(?[*]const u8) = .init(null),
 live_session_id_len: std.atomic.Value(usize) = .init(0),
+
+/// Agent-reported process info for `getProcessInfo` (wp3): the child pid and
+/// PTY slave path from `OPENED`/`ATTACHED`/`RELAUNCHED`, published by the IO
+/// thread (`threadEnter` / relaunch) and read lock-free from the GUI thread
+/// (`ghostty_surface_foreground_pid` / `ghostty_surface_tty_name`, which power
+/// the IPC `+list` pid/tty fields). The tty is a single NUL-terminated pointer
+/// (its length is derived at read time, so there is no two-atomic tear), duped
+/// into `arena` (never freed until backend deinit) so a published pointer stays
+/// valid even when a relaunch publishes a replacement. 0/null until the agent
+/// reports them (older agent ⇒ never: `getProcessInfo` then returns null, the
+/// pre-wp3 behavior).
+child_pid: std.atomic.Value(i64) = .init(0),
+tty_name_ptr: std.atomic.Value(?[*:0]const u8) = .init(null),
 
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
@@ -209,6 +226,14 @@ pub const Config = struct {
     /// Relaunch policy for a dead-but-relaunchable ATTACH target (T12c). See the
     /// `relaunch_policy` field doc. Defaults to `.auto`.
     relaunch_policy: RelaunchPolicy = .auto,
+
+    /// True when `conn` dials the LOCAL agent (same machine, UDS) — the
+    /// session-persistence path. Gates surfacing the agent-reported tty from
+    /// `getProcessInfo(.tty_name)` (wp3): a cross-machine agent's tty names a
+    /// REMOTE device, and exposing it locally could false-match `+list --tty`
+    /// against an unrelated local tty. Set from the same
+    /// `local_shell_integration` signal as `pinned`.
+    local: bool = false,
 };
 
 /// What a restored pane does when its ATTACH target comes back as a
@@ -261,6 +286,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .env = env,
         .argv = argv,
         .pinned = cfg.pinned,
+        .local = cfg.local,
         .relaunch_policy = cfg.relaunch_policy,
         .arena = arena,
     };
@@ -503,6 +529,11 @@ pub fn threadEnter(
         self.live_session_id_len.store(sid.len, .release);
     }
 
+    // Publish the agent-reported pid/tty for `getProcessInfo` (wp3). All three
+    // bring-up paths land here: OPEN-new (OPENED), re-attach (ATTACHED), and
+    // auto-relaunch (RELAUNCHED) — each filled `pane.pid`/`pane.tty`.
+    self.publishProcessInfo(pane);
+
     // The async handle the demux thread notifies to wake THIS pane's IO thread.
     // It is registered on this thread's xev loop; its callback drains the ring.
     var ring_async = try xev.Async.init();
@@ -724,6 +755,9 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     }
 
     log.info("relaunched dead session on keystroke pid={}", .{res.pid});
+    // The respawned child has a fresh pid + pty; re-publish for `getProcessInfo`
+    // (`sendRelaunchOnPane` updated the pane's pid/tty on ok).
+    self.publishProcessInfo(rd.pane);
     const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
     @call(.always_inline, termio.Termio.processOutput, .{ rd.io, divider });
 
@@ -755,12 +789,41 @@ pub fn childExitedAbnormally(
 }
 
 pub fn getProcessInfo(self: *Remote, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
-    _ = self;
-    // §3.3: "cached agent metadata or null". The agent reports pid/tty/foreground
-    // info via `META`/`OPENED` frames; until that metadata is plumbed through to
-    // the backend (a later increment) we return null, which all callers handle.
-    // TODO(wp3): return cached foreground pid from agent metadata.
-    return null;
+    // §3.3: cached agent metadata or null (wp3). The metadata is published by
+    // the IO thread from `OPENED`/`ATTACHED`/`RELAUNCHED` replies (see
+    // `publishProcessInfo`); an older agent never reports it and every caller
+    // handles the null. Callable from any thread (the GUI reads it for the IPC
+    // `+list` pid/tty fields).
+    return switch (info) {
+        // First increment: the agent-reported CHILD pid stands in for the
+        // foreground pid (an exec pane answers `tcgetpgrp`; live foreground
+        // tracking agent-side is a later increment).
+        .foreground_pid => pid: {
+            const pid = self.child_pid.load(.acquire);
+            if (pid <= 0) break :pid null;
+            break :pid @intCast(pid);
+        },
+        .tty_name => tty: {
+            const ptr = self.tty_name_ptr.load(.acquire) orelse break :tty null;
+            break :tty std.mem.sliceTo(ptr, 0);
+        },
+    };
+}
+
+/// Publish the pane's agent-reported pid/tty for `getProcessInfo` (wp3). Runs on
+/// the IO thread (`threadEnter`, and again after an in-place relaunch replaces
+/// the child). The tty is duped into `arena` so previously-published pointers
+/// remain valid for racing readers; only LOCAL-agent connections publish it (a
+/// cross-machine tty names a remote device and could false-match local
+/// `+list --tty` lookups — see `Config.local`).
+fn publishProcessInfo(self: *Remote, pane: *const connection.Pane) void {
+    if (pane.pid > 0) self.child_pid.store(pane.pid, .release);
+
+    if (!self.local) return;
+    const tty = pane.tty orelse return;
+    if (tty.len == 0) return;
+    const copy = self.arena.allocator().dupeZ(u8, tty) catch return;
+    self.tty_name_ptr.store(copy.ptr, .release);
 }
 
 // -----------------------------------------------------------------------------

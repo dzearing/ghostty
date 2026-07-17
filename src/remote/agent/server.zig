@@ -159,6 +159,11 @@ pub const Spawner = struct {
     pub const Result = struct {
         child: session.Child,
         pid: i64,
+        /// The child's PTY slave path (wp3), or null when unavailable (Windows
+        /// ConPTY, or the tty-name query failed). BORROWS storage owned by the
+        /// child (stable until `terminate`); consumers must copy before any
+        /// window where the child could be torn down.
+        tty: ?[]const u8 = null,
     };
 
     /// Result of a detached spawn (mirrors `proc_spawn.SpawnOutcome` but defined
@@ -687,6 +692,16 @@ pub const Server = struct {
         // agent would reply with an error META (out of scope).
         const spawned = self.spawner.spawn(open) catch return;
 
+        // Stable copy of the child's tty path (wp3): `Result.tty` borrows storage
+        // the child frees on terminate, so copy it before any window where an
+        // exit/teardown could race the OPENED send below.
+        var tty_buf: [128]u8 = undefined;
+        const tty_copy: ?[]const u8 = if (spawned.tty) |t| blk: {
+            const n = @min(t.len, tty_buf.len);
+            @memcpy(tty_buf[0..n], t[0..n]);
+            break :blk tty_buf[0..n];
+        } else null;
+
         self.store.mutex.lock();
         const s = self.store.table.create(
             spawned.child,
@@ -714,6 +729,8 @@ pub const Server = struct {
         // while orphaned (§7.1, T11). Set by the local-agent client for panes the
         // viewer's session-layout manifest references; false for cross-machine.
         s.pinned = open.pinned;
+        // Record the pty slave path (wp3) so a later ATTACH can re-report it.
+        s.setTty(tty_copy);
         // Bind the new session to THIS connection: install the outbound bridge so
         // live output frames to our writer, mark it bound (so the idle reaper leaves
         // it alone), and track its channel so disconnect detaches just our sessions.
@@ -733,6 +750,7 @@ pub const Server = struct {
         self.sendJson(.opened, channel, protocol.Opened{
             .session_id = id_copy[0..],
             .pid = pid,
+            .tty = tty_copy,
         }) catch {};
 
         // A new session entered the alive set — durably record the reboot-floor
@@ -809,6 +827,12 @@ pub const Server = struct {
             .cwd = if (s.cwd) |c| c else null,
             .title = if (s.title) |t| t else null,
             .snapshot_at_offset = snapshot_at,
+            // pid/tty (wp3): re-attach is how an app relaunch recovers every
+            // persistence pane, so `getProcessInfo` metadata must ride ATTACHED
+            // too (OPENED went to the previous app process). Sent under the
+            // store lock, so borrowing the session's strings is safe.
+            .pid = s.pid,
+            .tty = if (s.tty) |t| t else null,
         }) catch {};
 
         // Gap-fill / CATCH-UP (§7.3): replay everything the client missed while it
@@ -1127,12 +1151,21 @@ pub const Server = struct {
             // no respawn. The child reader is already attached to the store sink.
             self.bindLocked(s);
             const pid = s.pid;
+            // Stable copy of the tty (wp3): the reply is sent after unlock, where
+            // the session's string could be replaced/freed by a racing setTty.
+            var tty_buf: [128]u8 = undefined;
+            const tty_copy: ?[]const u8 = if (s.tty) |t| blk: {
+                const n = @min(t.len, tty_buf.len);
+                @memcpy(tty_buf[0..n], t[0..n]);
+                break :blk tty_buf[0..n];
+            } else null;
             self.store.mutex.unlock();
             self.sendJson(.relaunched, channel, protocol.Relaunched{
                 .session_id = id_copy,
                 .ok = true,
                 .pid = pid,
                 .found = true,
+                .tty = tty_copy,
             }) catch {};
             return;
         }
@@ -1204,6 +1237,15 @@ pub const Server = struct {
         rs.relaunchable = false;
         rs.exit_code = null;
         rs.last_activity_ms = self.clock.now();
+        // Fresh pty ⇒ fresh tty path (wp3); stable stack copy for the
+        // after-unlock reply (`Result.tty` borrows child-owned storage).
+        var tty_buf: [128]u8 = undefined;
+        const tty_copy: ?[]const u8 = if (spawned.tty) |t| blk: {
+            const n = @min(t.len, tty_buf.len);
+            @memcpy(tty_buf[0..n], t[0..n]);
+            break :blk tty_buf[0..n];
+        } else null;
+        rs.setTty(tty_copy);
         // Bind to THIS connection so live output frames flow to our writer.
         self.bindLocked(rs);
         const pid = rs.pid;
@@ -1249,6 +1291,7 @@ pub const Server = struct {
             // Tell the client we already replayed scrollback + the divider so it
             // suppresses its own snapshot-less divider (no double marker).
             .replayed = replay_n > 0,
+            .tty = tty_copy,
         }) catch {};
 
         // The alive set changed (a tombstone became alive) — refresh the on-disk
@@ -1694,6 +1737,9 @@ const FakeSpawner = struct {
     children: []*FakeChild,
     next: usize = 0,
     pid_base: i64 = 1000,
+    /// Reported as `Result.tty` (wp3) — the fake analogue of the real spawner's
+    /// pty-slave path. Null models a Windows/no-tty spawn.
+    tty: ?[]const u8 = null,
 
     fn spawner(self: *FakeSpawner) Spawner {
         return .{ .ctx = self, .spawnFn = spawn, .spawnDetachedFn = spawnDetached };
@@ -1703,7 +1749,7 @@ const FakeSpawner = struct {
         if (self.next >= self.children.len) return error.NoMoreChildren;
         const fc = self.children[self.next];
         self.next += 1;
-        return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)) };
+        return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)), .tty = self.tty };
     }
     /// REAL detached spawn so the `PROC_SPAWN`→`PROC_KILL` round-trip test
     /// exercises a genuine OS process. Uses `std.process.Child` directly (std-only,
@@ -2419,6 +2465,68 @@ test "ATTACH alive returns snapshot anchor and streams forward from > S" {
     try testing.expectEqualSlices(u8, "!", dp.bytes);
 }
 
+test "OPEN/ATTACH carry the child's pid+tty (wp3 getProcessInfo metadata)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids, .tty = "/dev/ttys014" };
+    var prng = std.Random.DefaultPrng.init(41);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // OPENED carries the spawner-reported tty (and the pid, as before).
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+    try testing.expectEqual(@as(i64, 1001), op.value.pid);
+    try testing.expectEqualStrings("/dev/ttys014", op.value.tty.?);
+    var id: [32]u8 = undefined;
+    @memcpy(&id, op.value.session_id[0..32]);
+
+    // ATTACHED (alive) re-reports pid + tty — the app-relaunch recovery path,
+    // where OPENED's metadata died with the previous app process.
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id[0..],
+        .rows = 24,
+        .cols = 80,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+    try testing.expectEqual(@as(i64, 1001), ap.value.pid);
+    try testing.expectEqualStrings("/dev/ttys014", ap.value.tty.?);
+}
+
+test "OPEN with a tty-less spawner elides tty (Windows / older-agent shape)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids }; // tty = null
+    var prng = std.Random.DefaultPrng.init(42);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+    try testing.expect(op.value.tty == null);
+}
+
 test "ATTACH gap-fills retained ring bytes in (L, S]" {
     const alloc = testing.allocator;
     var clock: TestClock = .{};
@@ -2546,7 +2654,7 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     var fc: FakeChild = .{ .alloc = alloc };
     defer fc.deinit();
     var kids = [_]*FakeChild{&fc};
-    var sp: FakeSpawner = .{ .children = &kids };
+    var sp: FakeSpawner = .{ .children = &kids, .tty = "/dev/ttys099" };
     var prng = std.Random.DefaultPrng.init(0xB0B);
 
     var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
@@ -2593,6 +2701,8 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     defer rp.deinit();
     try testing.expect(rp.value.ok and rp.value.found);
     try testing.expect(rp.value.pid != 0);
+    // The fresh spawn's tty rides RELAUNCHED (wp3).
+    try testing.expectEqualStrings("/dev/ttys099", rp.value.tty.?);
 
     // The session is now alive + not relaunchable, and streams fresh output.
     h.server.store.mutex.lock();

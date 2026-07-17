@@ -737,7 +737,12 @@ pub const PtySpawner = struct {
         // is the integer pid; on Windows it is the process HANDLE (a pointer), so we
         // surface its integer value (the OS process id is not separately tracked).
         const pid_i64: i64 = if (is_windows) @intCast(@intFromPtr(pc.pid)) else @intCast(pc.pid);
-        return .{ .child = pc.child(), .pid = pid_i64 };
+        // The PTY slave path (wp3): `Pty.getProcessInfo` resolves it per-OS
+        // (macOS TIOCPTYGNAME / Linux ptsname_r, cached in the pty struct inside
+        // the heap-owned PtyChild — stable until terminate) and returns null on
+        // Windows (ConPTY has no tty name), so no comptime gate is needed here.
+        const tty: ?[]const u8 = pc.pty.getProcessInfo(.tty_name);
+        return .{ .child = pc.child(), .pid = pid_i64, .tty = tty };
     }
 
     /// Matches `server.Spawner.spawnDetachedFn`: launch a detached process for

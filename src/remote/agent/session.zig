@@ -392,6 +392,13 @@ pub const Session = struct {
     /// persist the full argv to disk; this in-memory copy is the live view.
     argv: ?[]u8 = null,
 
+    /// The child's PTY slave path (e.g. `/dev/ttys014`), captured at spawn (OPEN /
+    /// RELAUNCH) and surfaced via `OPENED`/`ATTACHED`/`RELAUNCHED` so a viewer pane
+    /// can answer `getProcessInfo(.tty_name)` (wp3). Null on Windows (ConPTY has no
+    /// tty name) and for sessions materialized from disk that haven't relaunched
+    /// (no live pty). NOT persisted — a relaunch opens a fresh pty and re-reports.
+    tty: ?[]u8 = null,
+
     /// Lifecycle: while `alive`, `DETACH`/drop keeps the session; only `CLOSE` or
     /// child exit frees it. On exit it becomes a **tombstone** retaining
     /// `exit_code` + final state until GC (§7.1).
@@ -496,6 +503,7 @@ pub const Session = struct {
         if (self.cwd) |c| self.alloc.free(c);
         if (self.title) |t| self.alloc.free(t);
         if (self.argv) |a| self.alloc.free(a);
+        if (self.tty) |t| self.alloc.free(t);
         if (self.last_signal) |s| self.alloc.free(s);
         self.* = undefined;
     }
@@ -542,6 +550,15 @@ pub const Session = struct {
         const copy = self.alloc.dupe(u8, label) catch return;
         if (self.argv) |a| self.alloc.free(a);
         self.argv = copy;
+    }
+
+    /// Record (or clear, with null) the child's PTY slave path. Owns a copy;
+    /// replaces any prior value. Best-effort like `setArgv` — an allocation
+    /// failure leaves the field unchanged rather than propagating.
+    pub fn setTty(self: *Session, tty: ?[]const u8) void {
+        const copy: ?[]u8 = if (tty) |t| (self.alloc.dupe(u8, t) catch return) else null;
+        if (self.tty) |t| self.alloc.free(t);
+        self.tty = copy;
     }
 };
 

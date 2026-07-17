@@ -454,6 +454,14 @@ pub const Open = struct {
 pub const Opened = struct {
     session_id: []const u8,
     pid: i64,
+
+    /// The PTY slave path of the spawned child ON THE AGENT'S MACHINE (e.g.
+    /// `/dev/ttys014`), so a viewer pane can answer `getProcessInfo(.tty_name)`
+    /// (the `+list --tty` self-lookup path). POSIX agents report it; the Windows
+    /// ConPTY agent has no tty name and leaves it null. Additive/optional:
+    /// older agents omit it (unknown-field-tolerant parser → null) and the
+    /// client degrades to its pre-field behavior (no tty).
+    tty: ?[]const u8 = null,
 };
 
 /// `ATTACH` (0x03). `last_byte_offset` anchors the sequence-anchored resync
@@ -490,6 +498,17 @@ pub const Attached = struct {
     /// exited overlay. A genuinely-exited child leaves this false (it carries an
     /// `exit_code` instead). Additive/optional (older agents omit it → false).
     relaunchable: bool = false,
+
+    /// The live child pid (set with `status == .alive`; 0 otherwise). ATTACH is
+    /// the path that matters for `getProcessInfo` — the app relaunch re-attaches
+    /// every persistence pane, and `OPENED.pid` from the original open is gone
+    /// with the old app process. Additive/optional (older agents omit it → 0,
+    /// today's behavior).
+    pid: i64 = 0,
+
+    /// The child's PTY slave path on the agent's machine (set with `status ==
+    /// .alive`; see `Opened.tty`). Additive/optional (older agents omit it).
+    tty: ?[]const u8 = null,
 
     pub const AttachStatus = enum { alive, dead, not_found };
 };
@@ -678,6 +697,11 @@ pub const Relaunched = struct {
     /// one marker. Additive/defaulted → older agents (never set it) and older
     /// clients (ignore it) interoperate unchanged.
     replayed: bool = false,
+
+    /// The respawned child's PTY slave path (set with `ok == true`; a relaunch
+    /// opens a FRESH pty, so any previously-reported tty is stale). See
+    /// `Opened.tty`. Additive/optional (older agents omit it).
+    tty: ?[]const u8 = null,
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
@@ -1521,6 +1545,55 @@ test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     defer ap.deinit();
     try testing.expectEqual(Attached.AttachStatus.alive, ap.value.status);
     try testing.expectEqual(@as(u64, 42), ap.value.snapshot_at_offset);
+    // pid/tty default when omitted (an older agent's ATTACHED) — no error, no tty.
+    try testing.expectEqual(@as(i64, 0), ap.value.pid);
+    try testing.expect(ap.value.tty == null);
+}
+
+test "OPENED/ATTACHED/RELAUNCHED pid+tty round-trip and default when omitted" {
+    const alloc = testing.allocator;
+
+    // OPENED with tty (a POSIX agent) round-trips.
+    const opened: Opened = .{ .session_id = "abc123", .pid = 4242, .tty = "/dev/ttys014" };
+    const oj = try encodeJson(alloc, opened);
+    defer alloc.free(oj);
+    var op = try parseJson(Opened, alloc, oj);
+    defer op.deinit();
+    try testing.expectEqual(@as(i64, 4242), op.value.pid);
+    try testing.expectEqualStrings("/dev/ttys014", op.value.tty.?);
+
+    // OPENED without tty (a Windows or pre-field agent): null tty is elided on
+    // encode and defaults to null on parse — version skew degrades cleanly.
+    const opened_old: Opened = .{ .session_id = "abc123", .pid = 4242 };
+    const yj = try encodeJson(alloc, opened_old);
+    defer alloc.free(yj);
+    try testing.expect(std.mem.indexOf(u8, yj, "tty") == null);
+    var yp = try parseJson(Opened, alloc, yj);
+    defer yp.deinit();
+    try testing.expect(yp.value.tty == null);
+
+    // ATTACHED alive carries pid + tty (the app-relaunch re-attach path).
+    const att: Attached = .{ .status = .alive, .rows = 24, .cols = 80, .pid = 777, .tty = "/dev/ttys020" };
+    const aj = try encodeJson(alloc, att);
+    defer alloc.free(aj);
+    var ap = try parseJson(Attached, alloc, aj);
+    defer ap.deinit();
+    try testing.expectEqual(@as(i64, 777), ap.value.pid);
+    try testing.expectEqualStrings("/dev/ttys020", ap.value.tty.?);
+
+    // RELAUNCHED carries the fresh pty's tty on ok; defaults null when omitted.
+    const rel: Relaunched = .{ .session_id = "abc123", .ok = true, .pid = 99, .found = true, .tty = "/dev/ttys021" };
+    const rj = try encodeJson(alloc, rel);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunched, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqualStrings("/dev/ttys021", rp.value.tty.?);
+    const rel_old: Relaunched = .{ .session_id = "abc123", .ok = true, .pid = 99, .found = true };
+    const sj = try encodeJson(alloc, rel_old);
+    defer alloc.free(sj);
+    var sp = try parseJson(Relaunched, alloc, sj);
+    defer sp.deinit();
+    try testing.expect(sp.value.tty == null);
 }
 
 test "METRICS/HostMetrics JSON round-trips with null optional elision" {

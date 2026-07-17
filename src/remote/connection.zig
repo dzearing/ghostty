@@ -506,8 +506,16 @@ pub const Pane = struct {
     /// The agent-assigned session id (duped, connection-owned). Empty for a pane
     /// whose attach did not yield one (e.g. `not_found`).
     session_id: []u8,
-    /// The child pid reported by OPENED (0 for an attach, which doesn't report it).
+    /// The child pid reported by OPENED / ATTACHED(alive) / RELAUNCHED (0 when
+    /// the agent pre-dates the ATTACHED.pid field or the session has no child).
     pid: i64,
+    /// The child's PTY slave path on the AGENT'S machine (wp3), duped and
+    /// connection-owned (freed in `teardownPane`). Null when the agent didn't
+    /// report one (older agent, Windows ConPTY, or a childless pane). NOTE: for
+    /// a cross-machine connection this names a REMOTE tty — callers deciding to
+    /// surface it locally (e.g. `+list --tty` matching) must gate on the
+    /// connection being the local agent.
+    tty: ?[]u8 = null,
     /// The inbound ring the pane's consumer drains. Connection-owned; registered in
     /// the channel table for the pane's lifetime.
     ring: *ring.Channel,
@@ -1351,6 +1359,8 @@ pub const Connection = struct {
 
         const session_id = try self.alloc.dupe(u8, parsed.value.session_id);
         errdefer self.alloc.free(session_id);
+        const tty: ?[]u8 = if (parsed.value.tty) |t| try self.alloc.dupe(u8, t) else null;
+        errdefer if (tty) |t| self.alloc.free(t);
 
         const pane = try self.alloc.create(Pane);
         errdefer self.alloc.destroy(pane);
@@ -1358,6 +1368,7 @@ pub const Connection = struct {
             .id = id,
             .session_id = session_id,
             .pid = parsed.value.pid,
+            .tty = tty,
             .ring = ch,
         };
         try self.trackPane(pane);
@@ -1825,12 +1836,17 @@ pub const Connection = struct {
 
         const sid = try self.alloc.dupe(u8, session_id);
         errdefer self.alloc.free(sid);
+        const pane_tty: ?[]u8 = if (a.tty) |t| try self.alloc.dupe(u8, t) else null;
+        errdefer if (pane_tty) |t| self.alloc.free(t);
         const pane = try self.alloc.create(Pane);
         errdefer self.alloc.destroy(pane);
         pane.* = .{
             .id = id,
             .session_id = sid,
-            .pid = 0, // an attach does not report a pid (OPENED does)
+            // pid/tty ride ATTACHED for a live session (wp3); 0/null from an
+            // older agent that pre-dates the fields.
+            .pid = a.pid,
+            .tty = pane_tty,
             .ring = ch,
             // §7.3 resync discard, anchored at what THIS CLIENT already applied
             // (`last_byte_offset` = next byte we expect), NOT at the agent's
@@ -1985,7 +2001,15 @@ pub const Connection = struct {
             return error.MalformedReply;
         defer parsed.deinit();
         const r = parsed.value;
-        if (r.ok) pane.pid = r.pid;
+        if (r.ok) {
+            pane.pid = r.pid;
+            // A relaunch opened a FRESH pty (wp3): replace any stale tty with the
+            // reported one (null from an older agent leaves the field cleared —
+            // the old path is definitely wrong now).
+            const new_tty: ?[]u8 = if (r.tty) |t| self.alloc.dupe(u8, t) catch null else null;
+            if (pane.tty) |t| self.alloc.free(t);
+            pane.tty = new_tty;
+        }
         return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed };
     }
 
@@ -2073,6 +2097,7 @@ pub const Connection = struct {
         pane.ring.deinit(self.alloc);
         self.alloc.destroy(pane.ring);
         self.alloc.free(pane.session_id);
+        if (pane.tty) |t| self.alloc.free(t);
         self.alloc.destroy(pane);
     }
 
@@ -3830,6 +3855,9 @@ const LifecycleAgent = struct {
     // OPENED reply contents.
     session_id: []const u8 = "sess-1",
     pid: i64 = 4242,
+    /// Reported as the child's pty slave path in OPENED, alive ATTACHED, and ok
+    /// RELAUNCHED (wp3). Null models an older/Windows agent that omits it.
+    tty: ?[]const u8 = null,
     /// When true, each OPEN gets a fresh, unique session id (so N concurrent
     /// OPENs produce N distinct panes). The id buffers are owned by the agent and
     /// freed on `deinit` via `session_buf`.
@@ -3923,6 +3951,7 @@ const LifecycleAgent = struct {
                     try self.ctrl.sendJson(.opened, frame.channel, protocol.Opened{
                         .session_id = sid,
                         .pid = self.pid,
+                        .tty = self.tty,
                     });
                 },
                 .attach => {
@@ -3942,6 +3971,8 @@ const LifecycleAgent = struct {
                         .exit_code = self.exit_code,
                         .attached_elsewhere = elsewhere,
                         .relaunchable = self.attach_relaunchable,
+                        .pid = if (self.attach_status == .alive) self.pid else 0,
+                        .tty = if (self.attach_status == .alive) self.tty else null,
                     });
                 },
                 .relaunch => {
@@ -3957,6 +3988,7 @@ const LifecycleAgent = struct {
                         .ok = self.relaunch_ok,
                         .pid = if (self.relaunch_ok) self.relaunch_pid else 0,
                         .found = self.relaunch_found,
+                        .tty = if (self.relaunch_ok) self.tty else null,
                     });
                 },
                 .get_cwd => {
@@ -4138,6 +4170,7 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
     const a = h.configure();
     a.session_id = "session-abc";
     a.pid = 9001;
+    a.tty = "/dev/ttys014";
     try h.start();
 
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
@@ -4145,9 +4178,10 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
     // The agent received a well-formed OPEN on the pane's channel id.
     a.saw_request.wait();
     try testing.expectEqual(pane.id, a.seen_channel.load(.monotonic));
-    // The pane carries the agent-assigned identity.
+    // The pane carries the agent-assigned identity (incl. the wp3 tty).
     try testing.expectEqualStrings("session-abc", pane.session_id);
     try testing.expectEqual(@as(i64, 9001), pane.pid);
+    try testing.expectEqualStrings("/dev/ttys014", pane.tty.?);
 
     // Subsequent agent DATA on that channel lands in the pane's ring.
     try agentSendData(&h.data_agent, pane.id, 0, "hello from the agent");
@@ -4734,6 +4768,7 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     const a = h.configure();
     a.attach_status = .alive;
     a.snapshot_at_offset = 10;
+    a.tty = "/dev/ttys020";
     try h.start();
 
     // The client already APPLIED absolute bytes [0,11) (last_byte_offset = 11 =
@@ -4747,6 +4782,9 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     const pane = outcome.pane orelse return error.NoPane;
     try testing.expectEqualStrings("/home/me", outcome.cwd.?);
     try testing.expectEqualStrings("remote", outcome.title.?);
+    // pid/tty ride the alive ATTACHED (wp3) — the app-relaunch recovery path.
+    try testing.expectEqual(@as(i64, 4242), pane.pid);
+    try testing.expectEqualStrings("/dev/ttys020", pane.tty.?);
 
     h.agent.saw_request.wait();
     const ch = pane.id;
@@ -4920,6 +4958,7 @@ test "prompt relaunch: prepareRelaunchPane holds a childless pane; sendRelaunchO
     a.attach_relaunchable = true;
     a.relaunch_ok = true;
     a.relaunch_pid = 4242;
+    a.tty = "/dev/ttys021";
     try h.start();
 
     // 1) Dead attach learns the session channel (the viewer's prompt-policy path).
@@ -4934,6 +4973,7 @@ test "prompt relaunch: prepareRelaunchPane holds a childless pane; sendRelaunchO
     try testing.expectEqual(channel, pane.id);
     try testing.expectEqualStrings("sess-prompt", pane.session_id);
     try testing.expectEqual(@as(i64, 0), pane.pid); // no child yet
+    try testing.expect(pane.tty == null); // no pty yet either
     try testing.expect(!a.saw_relaunch.load(.monotonic)); // no RELAUNCH sent yet
 
     // 3) User consents (a keystroke) → send RELAUNCH on the pane's channel.
@@ -4942,6 +4982,7 @@ test "prompt relaunch: prepareRelaunchPane holds a childless pane; sendRelaunchO
     try testing.expect(res.found);
     try testing.expectEqual(@as(i64, 4242), res.pid);
     try testing.expectEqual(@as(i64, 4242), pane.pid); // pid filled in on success
+    try testing.expectEqualStrings("/dev/ttys021", pane.tty.?); // fresh pty's tty too (wp3)
     try testing.expect(a.saw_relaunch.load(.monotonic));
     try testing.expectEqual(channel, a.relaunch_channel.load(.monotonic));
 

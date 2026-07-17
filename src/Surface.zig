@@ -1034,6 +1034,11 @@ pub fn init(
                     // Machine.isLocalMachine); cross-machine windows leave it
                     // false and keep the idle-TTL.
                     .pinned = rb.local_shell_integration,
+                    // Only a LOCAL-agent pane surfaces the agent-reported tty
+                    // via `getProcessInfo` (wp3): a cross-machine tty names a
+                    // remote device and could false-match local `+list --tty`
+                    // self-lookups. Same signal as `pinned`.
+                    .local = rb.local_shell_integration,
                     // Reboot-floor policy (T12c): if this ATTACH target comes
                     // back dead-but-relaunchable (the agent restarted), `auto`
                     // respawns it in place; `prompt` shows the exited overlay.
