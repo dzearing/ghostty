@@ -218,7 +218,7 @@
     {
       "id": "T11",
       "title": "File→Open + CFBundleDocumentTypes for markdown",
-      "status": "pending",
+      "status": "done",
       "dependsOn": [
         "T08"
       ],
@@ -229,7 +229,7 @@
         "AppDelegate.application(_:openFile:) branch → viewer window via the T07 creation path."
       ],
       "acceptance": "open -a Ghoztty-Debug README.md opens a viewer window; File→Open dialog lists .md files and opens them; .sh files still run in a terminal. Commit.",
-      "notes": ""
+      "notes": "2026-07-17: done. Ghostty-Info.plist gains 'Markdown documents' type (Viewer role, LSHandlerRank Alternate, md/markdown/mdown/mkd/mdwn + net.daringfireball.markdown). application(_:openFile:) intercepts the md family BEFORE the execute-with-confirm path and opens a viewer window via the T07 tree path. Verified: `open -a Ghoztty-Debug torture.md` opens a rendered viewer window. .sh/dir behavior untouched (by inspection — did NOT live-test the .sh confirm since its modal alert wedges CLI IPC). File→Open dialog + dock drag ride the same handler."
     },
     {
       "id": "T12",

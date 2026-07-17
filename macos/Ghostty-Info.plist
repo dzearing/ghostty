@@ -2,12 +2,30 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSAutoFillRequiresTextContentTypeForOneTimeCodeOnMac</key>
-	<true/>
-	<key>NSDockTilePlugIn</key>
-	<string>DockTilePlugin.plugin</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>md</string>
+				<string>markdown</string>
+				<string>mdown</string>
+				<string>mkd</string>
+				<string>mdwn</string>
+			</array>
+			<key>CFBundleTypeIconFile</key>
+			<string>AppIcon.icns</string>
+			<key>CFBundleTypeName</key>
+			<string>Markdown documents</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>net.daringfireball.markdown</string>
+			</array>
+		</dict>
 		<dict>
 			<key>CFBundleTypeExtensions</key>
 			<array>
@@ -59,10 +77,12 @@
 	<string>Terminal</string>
 	<key>NSAppleScriptEnabled</key>
 	<true/>
+	<key>NSAutoFillRequiresTextContentTypeForOneTimeCodeOnMac</key>
+	<true/>
+	<key>NSDockTilePlugIn</key>
+	<string>DockTilePlugin.plugin</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>OSAScriptingDefinition</key>
-	<string>Ghostty.sdef</string>
 	<key>NSServices</key>
 	<array>
 		<dict>
@@ -104,6 +124,8 @@
 			</array>
 		</dict>
 	</array>
+	<key>OSAScriptingDefinition</key>
+	<string>Ghostty.sdef</string>
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
 	<key>SUPublicEDKey</key>
@@ -111,14 +133,14 @@
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
-			<key>UTTypeIdentifier</key>
-			<string>com.dzearing.ghoztty.surfaceId</string>
-			<key>UTTypeDescription</key>
-			<string>Ghoztty Surface Identifier</string>
 			<key>UTTypeConformsTo</key>
 			<array>
 				<string>public.data</string>
 			</array>
+			<key>UTTypeDescription</key>
+			<string>Ghoztty Surface Identifier</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.dzearing.ghoztty.surfaceId</string>
 			<key>UTTypeTagSpecification</key>
 			<dict/>
 		</dict>

@@ -606,6 +606,20 @@ class AppDelegate: NSObject,
         var isDirectory = ObjCBool(true)
         guard FileManager.default.fileExists(atPath: filename, isDirectory: &isDirectory) else { return false }
 
+        // Markdown files open as a viewer pane in a new window (File → Open,
+        // dock drops, `open -a`), not as an executed terminal command. Other
+        // extensions keep the terminal behavior below.
+        if !isDirectory.boolValue,
+           ["md", "markdown", "mdown", "mkd", "mdwn"]
+               .contains((filename as NSString).pathExtension.lowercased()) {
+            let pane = PaneView(viewer: ViewerView(location: filename))
+            let controller = TerminalController.newWindow(
+                ghostty,
+                tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
+            controller.titleOverride = pane.title
+            return true
+        }
+
         // Set to true if confirmation is required before starting up the
         // new terminal.
         var requiresConfirm: Bool = false
