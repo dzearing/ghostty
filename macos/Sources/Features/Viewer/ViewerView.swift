@@ -21,6 +21,23 @@ final class ViewerView: NSView, Codable {
         self.location = location
         self.title = Self.initialTitle(for: location)
         super.init(frame: .zero)
+
+        // Temporary placeholder chrome until the WKWebView engine lands (T04):
+        // a centered label so viewer panes are visibly present in the split.
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        let label = NSTextField(labelWithString: "Viewer\n\(location)")
+        label.alignment = .center
+        label.maximumNumberOfLines = 3
+        label.lineBreakMode = .byTruncatingMiddle
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -24),
+        ])
     }
 
     required init?(coder: NSCoder) {

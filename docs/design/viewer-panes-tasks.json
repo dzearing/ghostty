@@ -65,7 +65,7 @@
     {
       "id": "T02",
       "title": "SwiftUI leaf render branch + viewer focus/close/drag handling",
-      "status": "pending",
+      "status": "done",
       "dependsOn": ["T01"],
       "resetAfter": true,
       "goal": "TerminalSplitTreeView leaf case switches on PaneView.content: terminal → existing InspectableSurface path (focusedValue preserved), viewer → ViewerRepresentable hosting the (still stub) ViewerView. Viewer panes focusable via pane-nav as targets, closable without confirmation, excluded from surface drag/drop.",
@@ -76,7 +76,7 @@
         "Equalize/resize with a viewer sibling must not crash (leftmostLeaf().surface nil-guard)."
       ],
       "acceptance": "Build green; terminal UX unchanged; a stub viewer pane can sit in a split with a terminal, gets focus via pane-nav, resizes, closes with no prompt. Commit. RESET CONTEXT after this task.",
-      "notes": ""
+      "notes": "2026-07-17: done. Render branch landed with T01 (TerminalSplitTreeView switches on pane.content → ViewerSplitLeaf/ViewerRepresentable; stub ViewerView shows centered label). PULLED FORWARD from T07: minimal `+split --view=` Swift path — ParsedArguments.view + parseArguments `--view=` case, handleSplit mutual-exclusion error (--view + --command), viewer branches in BOTH the --pane and default/--target paths, createViewerSplit helper, BaseTerminalController.newViewerSplit(at:direction:viewer:ratio:), TargetEntry gained .viewerPane case (kept .pane surface-typed — full generalization is T08), handleClose .viewerPane branch (node removal, no confirm), idempotency check now entry.isAlive-based so named viewer targets focus-not-recreate. handleSetState .viewerPane = silent break for now (T08 converts to clean error). Equalize picks the FIRST TERMINAL leaf in the subtree (leftmost may be a viewer). LIVE-VERIFIED in debug app: mixed terminal+viewer split renders (screenshot), file + https locations, idempotent named re-split, cmd-opt-arrow nav no crash, +close viewer silent, window close with viewer inside clean. T07 remaining: +new-window --view, Zig help text + relative-path resolution, validation polish."
     },
     {
       "id": "T03",

@@ -87,7 +87,9 @@ private struct TerminalSplitSubtreeView: View {
                     TerminalSplitSubtreeView(node: split.right, action: action)
                 },
                 onEqualize: {
-                    guard let surface = node.leftmostLeaf().surface else { return }
+                    // Any terminal surface in the subtree can host the equalize
+                    // action (the leftmost leaf may be a viewer pane).
+                    guard let surface = node.leaves().compactMap(\.surface).first else { return }
                     ghostty.splitEqualize(surface: surface)
                 }
             )

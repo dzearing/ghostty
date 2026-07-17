@@ -513,6 +513,40 @@ class BaseTerminalController: NSWindowController,
         return newView
     }
 
+    /// Create a new viewer split: a non-terminal pane rendering a file or URL.
+    /// Unlike `newSplit` this never touches PTY/agent plumbing — the pane has
+    /// no process. Focus stays on the originating surface.
+    @discardableResult
+    func newViewerSplit(
+        at oldView: Ghostty.SurfaceView,
+        direction: SplitTree<PaneView>.NewDirection,
+        viewer: ViewerView,
+        ratio: Double = 0.5
+    ) -> PaneView? {
+        guard let oldPane = surfaceTree.pane(for: oldView) else { return nil }
+
+        let pane = PaneView(viewer: viewer)
+        let newTree: SplitTree<PaneView>
+        do {
+            newTree = try surfaceTree.inserting(
+                view: pane,
+                at: oldPane,
+                direction: direction,
+                ratio: ratio)
+        } catch {
+            Ghostty.logger.warning("failed to insert viewer split: \(error)")
+            return nil
+        }
+
+        replaceSurfaceTree(
+            newTree,
+            moveFocusTo: nil,
+            moveFocusFrom: oldView,
+            undoAction: "New Split")
+
+        return pane
+    }
+
     /// Build the new surface, insert it into the tree, and finalize focus/undo.
     /// Split out of `newSplit` so the remote path can call it AFTER an off-main
     /// cwd query, while the local path calls it synchronously.

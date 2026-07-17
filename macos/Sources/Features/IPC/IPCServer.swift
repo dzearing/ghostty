@@ -22,11 +22,13 @@ class IPCServer {
     private enum TargetEntry {
         case window(WeakRef<TerminalController>)
         case pane(controller: WeakRef<TerminalController>, surface: WeakRef<Ghostty.SurfaceView>)
+        case viewerPane(controller: WeakRef<TerminalController>, pane: WeakRef<PaneView>)
 
         var controller: TerminalController? {
             switch self {
             case .window(let ref): return ref.value
             case .pane(let ref, _): return ref.value
+            case .viewerPane(let ref, _): return ref.value
             }
         }
 
@@ -34,6 +36,15 @@ class IPCServer {
             switch self {
             case .window(let ref): return ref.value?.focusedSurface
             case .pane(_, let ref): return ref.value
+            case .viewerPane: return nil
+            }
+        }
+
+        /// The viewer pane wrapper, when this target is a viewer pane.
+        var viewerPaneView: PaneView? {
+            switch self {
+            case .viewerPane(_, let ref): return ref.value
+            default: return nil
             }
         }
 
@@ -41,6 +52,7 @@ class IPCServer {
             switch self {
             case .window(let ref): return ref.value != nil
             case .pane(_, let ref): return ref.value != nil
+            case .viewerPane(_, let ref): return ref.value != nil
             }
         }
     }
@@ -344,6 +356,9 @@ class IPCServer {
         var shell: String?
         var state: String?
         var noActivate: Bool = false
+        // A path or http(s) URL to open as a viewer pane instead of a terminal
+        // (mutually exclusive with command/-e).
+        var view: String?
         // When true, `+new-window` mirrors the keyboard/menu "New Window" action:
         // it resolves the focused/preferred window as the parent and inherits its
         // REMOTE host + command + cwd (§WP4). Lets the inheriting path be driven
@@ -514,6 +529,11 @@ class IPCServer {
             parsed = ParsedArguments(config: Ghostty.SurfaceConfiguration())
         }
 
+        // A viewer pane has no command; reject the ambiguous combination.
+        if parsed.view != nil, parsed.config.command != nil {
+            return IPCResponse(success: false, error: "--view cannot be combined with --command/-e")
+        }
+
         // Wrap IPC commands in the user's shell so aliases and PATH are available
         if let command = parsed.config.command {
             parsed.config.command = wrapCommandInShell(command, shell: parsed.shell)
@@ -531,10 +551,12 @@ class IPCServer {
         // Idempotent: if --name exists and pane is alive, focus it
         if let name = parsed.name {
             pruneStaleTargets()
-            if let entry = targetRegistry[name], let surface = entry.surfaceView {
+            if let entry = targetRegistry[name], entry.isAlive {
                 DispatchQueue.main.async {
-                    if let controller = entry.controller {
+                    if let surface = entry.surfaceView, let controller = entry.controller {
                         controller.focusSurface(surface)
+                    } else if let pane = entry.viewerPaneView {
+                        pane.window?.makeKeyAndOrderFront(nil)
                     }
                 }
                 return .ok
@@ -604,6 +626,17 @@ class IPCServer {
             }
 
             DispatchQueue.main.async { [weak self] in
+                if let viewLocation = parsed.view {
+                    self?.createViewerSplit(
+                        controller: controller,
+                        at: surface,
+                        direction: direction,
+                        ratio: ratio,
+                        location: viewLocation,
+                        name: parsed.name)
+                    return
+                }
+
                 var splitConfig = Ghostty.SurfaceConfiguration()
                 if let splitCommand = parsed.splitCommand {
                     splitConfig.command = splitCommand
@@ -677,6 +710,17 @@ class IPCServer {
                 return
             }
 
+            if let viewLocation = parsed.view {
+                self?.createViewerSplit(
+                    controller: controller,
+                    at: surfaceView,
+                    direction: direction,
+                    ratio: ratio,
+                    location: viewLocation,
+                    name: parsed.name)
+                return
+            }
+
             var splitConfig = Ghostty.SurfaceConfiguration()
             if let splitCommand = parsed.splitCommand {
                 splitConfig.command = splitCommand
@@ -724,6 +768,34 @@ class IPCServer {
         return .ok
     }
 
+    /// Create a viewer split pane and register its name. Main thread only.
+    @MainActor
+    private func createViewerSplit(
+        controller: TerminalController,
+        at surface: Ghostty.SurfaceView,
+        direction: SplitTree<PaneView>.NewDirection,
+        ratio: Double,
+        location: String,
+        name: String?
+    ) {
+        let viewer = ViewerView(location: location)
+        guard let pane = controller.newViewerSplit(
+            at: surface,
+            direction: direction,
+            viewer: viewer,
+            ratio: ratio
+        ) else {
+            Self.logger.warning("IPC: failed to create viewer split")
+            return
+        }
+        if let name {
+            targetRegistry[name] = .viewerPane(
+                controller: WeakRef(controller),
+                pane: WeakRef(pane))
+            Self.logger.info("IPC: registered viewer pane target '\(name)'")
+        }
+    }
+
     private func handleClose(_ request: IPCRequest) -> IPCResponse {
         let parsed: ParsedArguments
         if let arguments = request.arguments {
@@ -748,6 +820,12 @@ class IPCServer {
             case .pane(let controllerRef, let surfaceRef):
                 if let controller = controllerRef.value, let surface = surfaceRef.value {
                     controller.closeSurface(surface, withConfirmation: false)
+                }
+            case .viewerPane(let controllerRef, let paneRef):
+                if let controller = controllerRef.value, let pane = paneRef.value,
+                   let node = controller.surfaceTree.root?.node(view: pane) {
+                    // Viewers never have a running process; close silently.
+                    controller.closeSurface(node, withConfirmation: false)
                 }
             case .window(let controllerRef):
                 controllerRef.value?.closeWindowImmediately()
@@ -838,6 +916,9 @@ class IPCServer {
                 if let surface = surfaceRef.value {
                     surface.activityState = activityState
                 }
+            case .viewerPane:
+                // Activity state is unsupported for viewer panes (v1).
+                break
             case .window:
                 for pane in controller.surfaceTree {
                     pane.surfaceView?.activityState = activityState
@@ -1687,6 +1768,11 @@ class IPCServer {
 
             if let value = arg.dropPrefix("--command=") {
                 result.config.command = String(value)
+                continue
+            }
+
+            if let value = arg.dropPrefix("--view=") {
+                result.view = String(value)
                 continue
             }
 
