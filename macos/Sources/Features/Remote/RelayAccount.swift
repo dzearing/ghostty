@@ -340,8 +340,7 @@ struct RelayAccountKeychain {
     /// opted in. Enable via env `GHOSTTY_RELAY_DISABLE=1` (dev shells / the E2E
     /// harness) or `defaults write <bundle id> GhosttyRelayDisable -bool YES`
     /// (persists across Finder launches of the debug app; delete the key or set
-    /// it NO to re-enable relay). While disabled the app reads as signed out and
-    /// relay calls fall back to `GHOSTTY_RELAY_TOKEN` if present.
+    /// it NO to re-enable relay). While disabled the app reads as signed out.
     static var isDisabled: Bool {
         if let env = ProcessInfo.processInfo.environment["GHOSTTY_RELAY_DISABLE"],
            !env.isEmpty, env != "0", env.lowercased() != "false" {

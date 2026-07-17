@@ -1154,13 +1154,12 @@ class AppDelegate: NSObject,
         _ = TerminalController.newWindow(ghostty)
     }
 
-    /// New Window with target picker (Cmd-Shift-N): always shows a chooser
-    /// listing "Local" plus every registered remote machine whenever at least
-    /// one machine is registered (even a single machine — no auto-skip).
-    /// Selecting "Local" opens a normal local window; selecting a machine dials
-    /// it over TCP and opens a window whose terminal runs on that machine
-    /// (splits/tabs inherit the same machine + connection). With zero machines
-    /// registered, this just opens a local window.
+    /// New Window with target picker (Cmd-Shift-N): ALWAYS shows a chooser
+    /// listing "Local" plus every registered remote machine, plus a sign-in
+    /// footer (sign-in is always possible, so there is no auto-skip to a plain
+    /// local window). Selecting "Local" opens a normal local window; selecting
+    /// a machine dials it (relay or TCP) and opens a window whose terminal runs
+    /// on that machine (splits/tabs inherit the same machine + connection).
     @IBAction func newRemoteWindow(_ sender: Any?) {
         let registry = MachineRegistry.shared
 
@@ -1176,9 +1175,9 @@ class AppDelegate: NSObject,
                 _ = TerminalController.newWindow(self.ghostty)
             case .remote(let machine):
                 // Relay machines dial through the rendezvous relay; the bearer
-                // comes from the WP-B2 token-resolution seam (signed-in Google
-                // account first, dev env token fallback — never hardcoded).
-                // TCP machines use the direct host:port dial.
+                // comes from the token-resolution seam (the signed-in account's
+                // relay session token — never hardcoded). TCP machines use the
+                // direct host:port dial.
                 if let base = machine.relayBase, let device = machine.deviceID {
                     Task { @MainActor in
                         // Check the token seam BEFORE dialing: signed out with
