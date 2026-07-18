@@ -2403,15 +2403,79 @@ T21b-era HEAD, so the break landed somewhere in the T48–T80 span
 (candidates: T48 SetFocus deferral, T62/T63 read/close paths, T65
 child-exited rework — bisect first).
 
-*Symptom shape:* GUI thread blocked >15s (not dead — it answers again
-by ==7), then the base window is missing from `+list`. Likely the
-link-down/teardown path for a dead relay connection stalls the GUI
-thread and/or tears down more than the one window. Related: T56 (win32
-remote reconnect, WP-D1) — a reconnect banner would change this flow
-anyway; fix the hang first, don't couple them.
+**ROOT CAUSE (2026-07-18): a process-killing PANIC, not a hang.** When
+the agent dies, the relay drops the client WebSocket without a WS close
+frame; the mux pump's `transport.read` errors → `shutdownOnce` →
+`WsClient.closeImpl`, which did `posix.shutdown(.both)` and THEN sent a
+"best-effort" WS close frame. On Windows that send returns
+`WSAESHUTDOWN`, which `std.net.Stream.Writer`'s `handleSendError` maps
+to `unreachable` → the whole GUI process aborts (debug stack:
+`pumpInput → shutdownOnce → transport.close → closeImpl →
+sendCloseDuringShutdown → flushOut → std sendBufs → unreachable`). The
+"15s +list hang" was the CLI waiting on a server dying mid-panic
+(symbolizing the stack takes seconds, during which IPC still answers);
+the "missing base window" afterwards was simply no app left. Repro'd
+outside the harness with GUI stderr captured (manual script, kill →
+panic ~t+3–13s, process exit).
 
-*Repro:* `powershell -NoProfile -File test\win32\ipc-relay.ps1` (needs
-Go for the local relay build) — sections ==6/==7.
+**Bug 2 (why a clean `+close` never crashed):** `Window.onDestroy` —
+the path every WM_CLOSE/`+close` takes — skipped `deinit()`'s remote
+teardown entirely: `remote_dialed` (connection + ws socket + pump/
+reader/writer/heartbeat threads) LEAKED on every remote-window close,
+so the healthy-close path never even reached `closeImpl`.
 
-*Validation:* ipc-relay.ps1 back to ALL PASS ×3; P1–P3 +
-remote-inherit.ps1 stay green.
+*Fix (this commit):*
+- New `src/remote/socket_rw.zig`: `recvOnce`/`sendOnce` with COMPLETE
+  Winsock/errno mappings (extraction of `socket_stream.zig`'s
+  `posixRecv`/`posixSend`; every close-race flavour → `error.Closed`
+  etc., never std's `unreachable`) + heap-pinned `std.Io.Reader`/
+  `Writer` impls over them. `ws_client.zig` now uses these instead of
+  `std.net.Stream.Reader/Writer` (whose overlapped send/recv path
+  panics on `WSAESHUTDOWN`/`WSA_OPERATION_ABORTED`); also fixes the
+  same class agent-side (the agent reuses `WsClient`), and the ws
+  socket now gets `SO_NOSIGPIPE` on Darwin (parity with SocketStream).
+- `closeImpl` no longer sends a close frame after `shutdown(.both)` —
+  it could never be delivered on ANY platform post-shutdown; peers must
+  treat raw EOF as disconnect (already the documented contract).
+- `Window.onDestroy` tears down `remote_dialed`/`remote_machine` like
+  `deinit()` (safe: `close()` ran `cleanupAllSurfaces` first, so no
+  termio backend borrows the conn).
+- Unit tests in `socket_rw.zig` incl. the T81 regression (flush after
+  `shutdown(.both)` must be `error.WriteFailed`, not a panic), wired
+  into both lanes (`main_ghostty.zig`) and `test-agent`
+  (`agent_test.zig`).
+
+*Evidence (2026-07-18, on-box):* `ipc-relay.ps1` ALL PASS ×3 (was 3
+FAILURES at ==6/==7); P1–P3 + `remote-inherit.ps1` ALL PASS; both unit
+lanes green. `test-agent` failures proven PRE-EXISTING (identical 5
+failures + crash at a 52e1fd73b baseline worktree) → filed T82.
+Related: T56 (reconnect) unchanged — a dead link now degrades to a
+quiet EOF'd session instead of killing the app.
+
+## T82 — FIX: `zig build test-agent` never green on Windows (Phase G)
+
+Found during T81 (2026-07-18) and proven pre-existing: a baseline
+worktree at 52e1fd73b (pre-T81-fix) shows the IDENTICAL failure set.
+Not part of the parity validation lanes (`-Dapp-runtime=none`/`win32`
++ P1–P3), so it went unnoticed.
+
+Failure inventory (agent-core aggregator `ghoztty-agent-core-test`,
+160/167 at baseline; 164/171 with T81's 4 new socket_rw tests):
+- `keepalive` integration ×2: the TEST HARNESS's `TestWsServer.
+  handleConn` reads with `std.net.Stream.read` → `windows.ReadFile`
+  on an overlapped SOCKET with a null OVERLAPPED →
+  `GetLastError(87)` (ERROR_INVALID_PARAMETER) → upgrade never
+  answered → dial fails. Fix direction: use `socket_rw.recvOnce` (or
+  the Reader) in the harness instead of `Stream.read`.
+- `self_update` ×3 (`checkAndStage`, `applyStaged`, `runLoop`): same
+  87 signature via `http_client`'s std reader against the local test
+  HTTP server; `runLoop` then fails `expect(staged)`.
+- A leaked thread from the failed integration tests crashes later
+  (exit 3), attributed by the runner to whatever test is executing —
+  observed against `socket_stream: close unblocks a blocked read`
+  (that test is fine in isolation; do NOT chase it first).
+- `ghoztty-agent-test` root: `pty_child: real pty spawn` segfault
+  (0xffffffffffffffff, KERNELBASE) — separate, needs its own look.
+
+*Validation:* `zig build test-agent` exits 0 on the box, three runs in
+a row; the parity lanes + P1–P3 stay green.

@@ -16,4 +16,5 @@ test {
     _ = @import("agent/keepalive.zig");
     _ = @import("agent/self_update.zig");
     _ = @import("socket_stream.zig");
+    _ = @import("socket_rw.zig");
 }

@@ -3090,6 +3090,20 @@ fn onDestroy(self: *Window) void {
         self.title_override = null;
     }
 
+    // Tear down the remote-agent transport (T81: this path used to LEAK it —
+    // the connection, its ws socket, and all its threads outlived every
+    // window close). Safe here for the same reason as in deinit(): close()
+    // already ran cleanupAllSurfaces() before DestroyWindow, so no termio
+    // backend borrows the conn anymore.
+    if (self.remote_dialed) |d| {
+        d.deinitDestroy(app.core_app.alloc);
+        self.remote_dialed = null;
+    }
+    if (self.remote_machine) |m| {
+        m.deinitFree(app.core_app.alloc);
+        self.remote_machine = null;
+    }
+
     // Clean up Window-level resources.
     if (self.tab_font) |font| {
         _ = w32.DeleteObject(font);

@@ -21,8 +21,8 @@
 //!      blocked `read`) and joins the connection's writer/reader/heartbeat
 //!      threads.
 //!   2. `mux.joinPump()` — joins the inbound demux thread (already unblocked).
-//!   3. free `conn`, `mux`; `ws.deinit()` (best-effort close frame, close the
-//!      socket, free all WebSocket-owned memory).
+//!   3. free `conn`, `mux`; `ws.deinit()` (close the socket, free all
+//!      WebSocket-owned memory).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

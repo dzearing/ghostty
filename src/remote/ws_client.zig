@@ -56,6 +56,7 @@ const tls = std.crypto.tls;
 
 const connection = @import("connection.zig");
 const server = @import("agent/server.zig");
+const socket_rw = @import("socket_rw.zig");
 
 const log = std.log.scoped(.remote_ws);
 
@@ -128,8 +129,14 @@ pub const WsClient = struct {
     /// The TCP-side ciphertext Reader/Writer the TLS client pulls/pushes through.
     /// Heap-pinned: the TLS client stores raw `*Io.Reader`/`*Io.Writer` pointers
     /// into these, and their interfaces use `@fieldParentPtr`.
-    tcp_reader: *std.net.Stream.Reader,
-    tcp_writer: *std.net.Stream.Writer,
+    ///
+    /// `socket_rw`, NOT `std.net.Stream.Reader/Writer`: std's socket ops treat
+    /// several close-race Winsock errors as `unreachable`, so a send racing —
+    /// or following — our own `closeImpl` `shutdown(.both)` PANICKED the whole
+    /// process (T81: killing a relay agent under a live remote window took
+    /// down the GUI).
+    tcp_reader: *socket_rw.Reader,
+    tcp_writer: *socket_rw.Writer,
 
     /// The TLS client, or null for a plaintext (`tls: false`, loopback-test-only)
     /// connection. When present, app data goes through `tls_client.reader` /
@@ -182,6 +189,9 @@ pub const WsClient = struct {
         // --- TCP connect -----------------------------------------------------
         const socket = try std.net.tcpConnectToHost(alloc, options.host, options.port);
         errdefer socket.close();
+        // EPIPE-not-SIGPIPE on Darwin/BSD (Linux passes MSG_NOSIGNAL per send;
+        // Windows has no SIGPIPE).
+        socket_rw.disableSigpipe(socket.handle);
 
         // --- System CA roots (TLS only; stays empty for plaintext) ------------
         var ca_bundle: Certificate.Bundle = .{};
@@ -198,13 +208,13 @@ pub const WsClient = struct {
         const tls_write_buf = try alloc.create([tls_buf_len]u8);
         errdefer alloc.destroy(tls_write_buf);
 
-        const tcp_reader = try alloc.create(std.net.Stream.Reader);
+        const tcp_reader = try alloc.create(socket_rw.Reader);
         errdefer alloc.destroy(tcp_reader);
-        tcp_reader.* = socket.reader(tcp_read_buf);
+        tcp_reader.* = socket_rw.Reader.init(socket.handle, tcp_read_buf);
 
-        const tcp_writer = try alloc.create(std.net.Stream.Writer);
+        const tcp_writer = try alloc.create(socket_rw.Writer);
         errdefer alloc.destroy(tcp_writer);
-        tcp_writer.* = socket.writer(tcp_write_buf);
+        tcp_writer.* = socket_rw.Writer.init(socket.handle, tcp_write_buf);
 
         // --- TLS handshake (host verification ON), skipped for plaintext ------
         const tls_client: ?*tls.Client = if (options.tls) blk: {
@@ -279,9 +289,10 @@ pub const WsClient = struct {
         return connect(alloc, .{ .host = host, .port = port, .path = path, .headers = headers, .tls = use_tls });
     }
 
-    /// Tear down: best-effort close frame, then close the socket + free all owned
-    /// memory. Not safe to call concurrently with read/write (it frees); call it
-    /// only after the using `Connection` has been shut down (which calls `close`).
+    /// Tear down: close the socket (shutdown-first, no close frame — see
+    /// `closeImpl`), then free all owned memory. Not safe to call concurrently
+    /// with read/write (it frees); call it only after the using `Connection`
+    /// has been shut down (which calls `close`).
     pub fn deinit(self: *WsClient) void {
         self.close();
         self.ca_bundle.deinit(self.alloc);
@@ -644,7 +655,7 @@ pub const WsClient = struct {
                     error.ConnectionResetByPeer,
                     error.SocketNotConnected,
                     error.ConnectionTimedOut,
-                    error.Canceled,
+                    error.Closed,
                     => return 0,
                     else => {},
                 };
@@ -714,44 +725,26 @@ pub const WsClient = struct {
     }
 
     /// Idempotent. `shutdown(.both)` FIRST (unblocks any thread parked in a
-    /// socket recv/send), then a best-effort masked close frame, then `close`
-    /// the socket fd.
+    /// socket recv/send), then `close` the socket fd.
     ///
     /// Order matters: on a silently-dead link the kernel send buffer can be
     /// full, so a writer thread may be blocked inside `send` while HOLDING
-    /// `write_mtx`. Sending the close frame first would (a) block on that
-    /// mutex and (b) block in `send` itself — wedging teardown forever (the
-    /// reconnect-churn hang). `shutdown(.both)` errors out both the blocked
-    /// send and any blocked recv immediately, after which the close-frame
-    /// attempt fails fast and harmlessly. On a healthy link this trades the
-    /// WS close frame for a plain TCP FIN — acceptable: the frame was always
+    /// `write_mtx`. `shutdown(.both)` errors out both the blocked send and any
+    /// blocked recv immediately (through `socket_rw`'s mappings that failure
+    /// is an error, never std's `unreachable`). The peer gets a plain TCP FIN
+    /// instead of a WS close frame — acceptable: the frame was always
     /// best-effort, and every peer (relay, agent) must treat raw EOF as a
-    /// disconnect anyway.
+    /// disconnect anyway. (An earlier version sent a best-effort close frame
+    /// AFTER the shutdown; on Windows that send came back `WSAESHUTDOWN`,
+    /// which `std.net.Stream.Writer` treats as `unreachable` — the T81 panic
+    /// that killed the GUI when a relay agent died under a live window. After
+    /// `shutdown(.both)` the frame can never reach the peer on ANY platform,
+    /// so it is simply gone.)
     fn closeImpl(self: *WsClient) void {
         if (self.closed.swap(true, .acq_rel)) return;
         // shutdown wakes a blocked recv with EOF and fails a blocked send.
         posix.shutdown(self.socket.handle, .both) catch {};
-        // Best-effort close frame (under the write mutex, released promptly by
-        // any writer the shutdown just unblocked). Ignore errors — the socket
-        // is going away. We set `closed=true` above first, so `sendFrame`'s own
-        // guard would bail; do the frame write directly here instead.
-        self.sendCloseDuringShutdown();
         self.socket.close();
-    }
-
-    /// Like `sendFrame(.close, "")` but callable after `closed` is set (used only
-    /// from `closeImpl`). Still takes the write mutex so it can't interleave with
-    /// an in-flight writer-thread frame.
-    fn sendCloseDuringShutdown(self: *WsClient) void {
-        self.write_mtx.lock();
-        defer self.write_mtx.unlock();
-        const w = self.appWriter();
-        var frame: [6]u8 = undefined;
-        frame[0] = 0x80 | @as(u8, @intFromEnum(Opcode.close));
-        frame[1] = 0x80 | 0; // masked, zero-length payload
-        std.crypto.random.bytes(frame[2..6]); // mask key (no payload to mask)
-        w.writeAll(&frame) catch return;
-        self.flushOut() catch {};
     }
 
     /// Public idempotent close (the `Stream` contract entry point).

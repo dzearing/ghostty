@@ -36,6 +36,7 @@ const Allocator = std.mem.Allocator;
 
 const server = @import("agent/server.zig");
 const connection = @import("connection.zig");
+const socket_rw = @import("socket_rw.zig");
 
 /// A `Stream` over a single connected TCP socket fd. Heap-allocate it (so its
 /// address is stable for the vtable `ctx`) via `create`, or embed it and take a
@@ -44,35 +45,11 @@ pub const SocketStream = struct {
     fd: posix.socket_t,
     closed: std.atomic.Value(bool) = .{ .raw = false },
 
-    /// On Linux, `send` needs `MSG_NOSIGNAL`; elsewhere we rely on `SO_NOSIGPIPE`.
-    const send_flags: u32 = if (builtin.os.tag == .linux) std.os.linux.MSG.NOSIGNAL else 0;
-
-    /// Wrap an already-connected socket fd. Sets `SO_NOSIGPIPE` on Darwin/BSD.
+    /// Wrap an already-connected socket fd. Sets `SO_NOSIGPIPE` on Darwin/BSD
+    /// (best-effort, via raw libc — see `socket_rw.disableSigpipe` for why the
+    /// std wrapper would panic on a reset backlog socket).
     pub fn init(fd: posix.socket_t) SocketStream {
-        switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => {
-                // SO_NOSIGPIPE: a write to a reset peer returns EPIPE instead of
-                // raising SIGPIPE. Best-effort (ignore failure).
-                //
-                // MUST go through libc directly, NOT `posix.setsockopt`: the std
-                // wrapper treats `EINVAL` as `unreachable`, but Darwin returns
-                // EINVAL for a socket that was RESET while sitting in the accept
-                // backlog (e.g. a reconnect dial that hit its handshake deadline
-                // and closed while the agent was frozen). The std wrapper turned
-                // that into a PANIC inside the agent's accept path — one stale
-                // queued connection at thaw killed the whole agent (and every
-                // live session with it). The `catch {}` never got a chance.
-                const one: c_int = 1;
-                _ = std.c.setsockopt(
-                    fd,
-                    posix.SOL.SOCKET,
-                    posix.SO.NOSIGPIPE,
-                    &one,
-                    @sizeOf(c_int),
-                );
-            },
-            else => {},
-        }
+        socket_rw.disableSigpipe(fd);
         return .{ .fd = fd };
     }
 
@@ -109,68 +86,11 @@ pub const SocketStream = struct {
         return n; // 0 == orderly EOF (peer closed)
     }
 
-    /// `posix.recv` but with the close-race `EBADF`/`ENOTSOCK` mapped to a catchable
-    /// `error.Closed` instead of std's `unreachable` (which would panic when our own
-    /// `close` races a blocked read on another thread).
-    ///
-    /// Windows needs its own branch: Winsock reports failure as
-    /// `SOCKET_ERROR` + `WSAGetLastError()`, NOT via errno — `posix.errno(-1)`
-    /// reads a stale libc errno there, classifying every failure as
-    /// `.SUCCESS` and feeding -1 into `@intCast` (an instant panic on the
-    /// pump thread the first time the peer closes).
-    const RecvError = error{
-        Closed,
-        ConnectionResetByPeer,
-        SocketNotConnected,
-        ConnectionTimedOut,
-        SystemResources,
-        Unexpected,
-    };
-
-    const SendError = error{
-        Closed,
-        BrokenPipe,
-        ConnectionResetByPeer,
-        SystemResources,
-        AccessDenied,
-        Unexpected,
-    };
-
-    fn posixRecv(fd: posix.socket_t, buf: []u8) RecvError!usize {
-        if (builtin.os.tag == .windows) {
-            const w = std.os.windows;
-            while (true) {
-                const len: i32 = @intCast(@min(buf.len, std.math.maxInt(i32)));
-                const rc = w.ws2_32.recv(fd, buf.ptr, len, 0);
-                if (rc != w.ws2_32.SOCKET_ERROR) return @intCast(rc);
-                switch (w.ws2_32.WSAGetLastError()) {
-                    .WSAEINTR => continue,
-                    .WSAEBADF, .WSAENOTSOCK => return error.Closed,
-                    // WSAESHUTDOWN: our own `close` did shutdown(.both) while
-                    // this read raced it — same close-race class as EBADF.
-                    .WSAESHUTDOWN => return error.Closed,
-                    .WSAECONNRESET, .WSAECONNABORTED, .WSAENETRESET, .WSAECONNREFUSED => return error.ConnectionResetByPeer,
-                    .WSAENOTCONN => return error.SocketNotConnected,
-                    .WSAETIMEDOUT => return error.ConnectionTimedOut,
-                    .WSAENOBUFS => return error.SystemResources,
-                    else => |e| return w.unexpectedWSAError(e),
-                }
-            }
-        } else while (true) {
-            const rc = posix.system.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
-            switch (posix.errno(rc)) {
-                .SUCCESS => return @intCast(rc),
-                .INTR => continue,
-                .BADF, .NOTSOCK => return error.Closed,
-                .CONNRESET, .CONNREFUSED => return error.ConnectionResetByPeer,
-                .NOTCONN => return error.SocketNotConnected,
-                .TIMEDOUT => return error.ConnectionTimedOut,
-                .NOMEM => return error.SystemResources,
-                .FAULT => unreachable,
-                else => |e| return posix.unexpectedErrno(e),
-            }
-        }
-    }
+    /// `recv`/`send` with the close-race errnos mapped to catchable errors
+    /// instead of std's `unreachable` — extracted to `socket_rw.zig` (T81) so
+    /// the WebSocket client's Reader/Writer share the exact same mappings.
+    const posixRecv = socket_rw.recvOnce;
+    const posixSend = socket_rw.sendOnce;
 
     fn writeImpl(self: *SocketStream, bytes: []const u8) anyerror!usize {
         if (self.closed.load(.acquire)) return 0;
@@ -183,43 +103,6 @@ pub const SocketStream = struct {
             => 0,
             else => err,
         };
-    }
-
-    /// `posix.send` with the close-race `EBADF`/`ENOTSOCK` mapped to `error.Closed`
-    /// (std marks them `unreachable`), for the same reason as `posixRecv`.
-    /// Windows branch for the same reason as `posixRecv` (SOCKET_ERROR +
-    /// WSAGetLastError, not errno). There is no SIGPIPE on Windows.
-    fn posixSend(fd: posix.socket_t, bytes: []const u8) SendError!usize {
-        if (builtin.os.tag == .windows) {
-            const w = std.os.windows;
-            while (true) {
-                const len: i32 = @intCast(@min(bytes.len, std.math.maxInt(i32)));
-                const rc = w.ws2_32.send(fd, bytes.ptr, len, 0);
-                if (rc != w.ws2_32.SOCKET_ERROR) return @intCast(rc);
-                switch (w.ws2_32.WSAGetLastError()) {
-                    .WSAEINTR => continue,
-                    // A send on a not-/no-longer-connected socket is a dead
-                    // lane (writeImpl maps Closed → 0 → WriteZero upstream).
-                    .WSAEBADF, .WSAENOTSOCK, .WSAESHUTDOWN, .WSAENOTCONN => return error.Closed,
-                    .WSAECONNRESET, .WSAECONNABORTED, .WSAENETRESET => return error.ConnectionResetByPeer,
-                    .WSAENOBUFS => return error.SystemResources,
-                    else => |e| return w.unexpectedWSAError(e),
-                }
-            }
-        } else while (true) {
-            const rc = posix.system.sendto(fd, bytes.ptr, bytes.len, send_flags, null, 0);
-            switch (posix.errno(rc)) {
-                .SUCCESS => return @intCast(rc),
-                .INTR => continue,
-                .BADF, .NOTSOCK => return error.Closed,
-                .PIPE => return error.BrokenPipe,
-                .CONNRESET => return error.ConnectionResetByPeer,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                .ACCES => return error.AccessDenied,
-                .FAULT => unreachable,
-                else => |e| return posix.unexpectedErrno(e),
-            }
-        }
     }
 
     /// Idempotent. `shutdown(.both)` unblocks any blocked `recv` (it returns 0);

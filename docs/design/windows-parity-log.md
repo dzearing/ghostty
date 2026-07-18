@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 11) — T81 DONE. The "GUI unresponsive after
+  agent death" was a process-killing PANIC: ws teardown sent the WS
+  close frame AFTER `shutdown(.both)`; Windows returns `WSAESHUTDOWN`,
+  which std's socket writer maps to `unreachable`. Fixed with new
+  `socket_rw.zig` (panic-free socket send/recv + Io.Reader/Writer,
+  shared with SocketStream; ws_client now uses it) and by dropping the
+  undeliverable post-shutdown close frame. Bug 2: `Window.onDestroy`
+  leaked `remote_dialed` on every `+close` (why clean closes never hit
+  the panic) — now torn down like `deinit()`. ipc-relay.ps1 ALL PASS
+  ×3 (was 3 FAILURES); P1–P3 + remote-inherit + both lanes green.
+  SURPRISE: `zig build test-agent` was never green on Windows (5
+  pre-existing integration failures, harness ReadFile-on-socket
+  GetLastError(87); proven identical at baseline 52e1fd73b) → filed
+  T82. Next: T67.
 - 2026-07-18 (on-box, 10) — T68 DONE (c8f1da16e). Remote inheritance:
   `--from-focused` on +new-window/+split; plain tabs/splits (ctrl+t/
   ctrl+d + IPC) in a remote window reuse the connection and inherit the

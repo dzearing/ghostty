@@ -130,10 +130,12 @@ Work these first, in order, before falling back to first-todo-in-table:
    ~~T80~~ (done 2026-07-18), ~~T74~~ (done 2026-07-18), ~~T73~~ (done
    2026-07-18), ~~T76~~ (done 2026-07-18), ~~T75~~ (done 2026-07-18), ~~T69~~ (done
    2026-07-18), ~~T68~~ (done 2026-07-18; filed T81 — pre-existing
-   relay-agent-death GUI hang found by its regression runs), **T81 next**
-   (user-visible hang beats the remaining feature/theming work), then
-   T67, T70, T71, T66, T72, T78. After that the priority queue is
-   exhausted — fall back to first-todo-in-table / the order above.
+   relay-agent-death GUI hang found by its regression runs), ~~T81~~ (done
+   2026-07-18: was a process-killing PANIC in the ws teardown + a remote
+   transport leak on `+close`; filed T82 — pre-existing test-agent
+   failures on Windows), **T67 next**, then T70, T71, T66, T72, T78.
+   After that the priority queue is exhausted — fall back to
+   first-todo-in-table / the order above.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -233,7 +235,8 @@ One line per row. Full spec + validation + evidence per task:
 | T78 | `window-title-font-family` — needs custom-draw titlebar; design-level backlog like window-save-state (T51 F14) | I | — | todo | — |
 | T79 | Dark-mode context menus — done 2026-07-18: DarkMode.zig routes `window-theme` through uxtheme ordinals #135/#136 at init/config-reload/WM_SETTINGCHANGE; `dark-menus.ps1` ALL PASS (6) (T51 F15) | I | — | done | 3c0960d0d |
 | T80 | Dark-mode message boxes — done 2026-07-18: shared ConfirmDialog.zig (T50-pattern dark dialog, synchronous nested-pump API) replaces all 4 remaining MessageBoxW sites; `confirm-dialogs.ps1` ALL PASS (20) ×3 (T51 F16) | I | — | done | f3626ba2f |
-| T81 | FIX: GUI unresponsive after agent death under a live relay window — `ipc-relay.ps1` ==6/==7 now 3 FAILURES (+list no answer in 15s; base window missing from later list). PRE-EXISTING: reproduced identically at a22134f44 (pre-T68) during T68 regression runs 2026-07-18. Likely link-down handling; related to T56 (reconnect). See details | G | — | todo | — |
+| T81 | FIX: "GUI unresponsive" after agent death under a live relay window — done 2026-07-18: was a PANIC, not a hang (ws close-frame send after `shutdown(.both)` → `WSAESHUTDOWN` → std `unreachable` killed the process) + `onDestroy` leaked the remote transport on every `+close`. New `socket_rw.zig` panic-free socket Reader/Writer; `ipc-relay.ps1` ALL PASS ×3. See details | G | — | done | (this commit) |
+| T82 | FIX: `zig build test-agent` has never been green on Windows — 5 pre-existing agent-core integration failures (keepalive ×2, self_update ×3; harness uses `std.net.Stream.read` = `ReadFile`-on-overlapped-socket → GetLastError(87)) + a leaked-thread crash mis-attributed to socket_stream + a pty_child segfault. Found (and proven pre-existing at 52e1fd73b baseline) during T81. Not in the parity validation lanes; fix when Phase-G hardening resumes | G | — | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.

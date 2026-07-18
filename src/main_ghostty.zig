@@ -266,4 +266,8 @@ test {
     _ = @import("remote/google_oauth.zig");
     _ = @import("remote/relay_account.zig");
     _ = @import("remote/relay_directory.zig");
+
+    // Socket Reader/Writer with panic-free close-race error mappings (T81):
+    // the ws transport teardown depends on these staying error-returning.
+    _ = @import("remote/socket_rw.zig");
 }
