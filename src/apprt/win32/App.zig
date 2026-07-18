@@ -13,6 +13,7 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
+const ConfirmDialog = @import("ConfirmDialog.zig");
 const DarkMode = @import("DarkMode.zig");
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
@@ -351,6 +352,96 @@ pub fn deferSetFocus(hwnd: w32.HWND) void {
     _ = w32.PostMessageW(hwnd, WM_APP_SETFOCUS, 0, 0);
 }
 
+/// Open the config file in the default editor.
+fn openConfigFile(self: *App) void {
+    const config_path = configpkg.preferredDefaultFilePath(
+        self.core_app.alloc,
+    ) catch |err| {
+        log.err("failed to get config path: {}", .{err});
+        return;
+    };
+    defer self.core_app.alloc.free(config_path);
+
+    // Convert to wide string for ShellExecuteW.
+    var wbuf: [512]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, config_path) catch return;
+    if (wlen < wbuf.len) {
+        wbuf[wlen] = 0;
+        _ = w32.ShellExecuteW(
+            null,
+            std.unicode.utf8ToUtf16LeStringLiteral("open"),
+            @ptrCast(&wbuf),
+            null,
+            null,
+            w32.SW_SHOW,
+        );
+    }
+}
+
+/// Show the given config's load diagnostics in a dialog, if it has any
+/// (T69). Without this the diagnostics only reach `log.err`, which is
+/// invisible in a GUI-subsystem release build — the user just silently
+/// gets defaults (Mac shows ConfigurationErrorsController, GTK the
+/// config-errors dialog). "Open Config" launches the editor, "Ignore"
+/// carries on with the settings that did parse.
+fn showConfigErrorsIfAny(
+    self: *App,
+    config: *const Config,
+    owner: ?*Window,
+) void {
+    const diags = &config._diagnostics;
+    if (diags.empty()) return;
+
+    const alloc = self.core_app.alloc;
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    const items = diags.items();
+    // Cap the list so a wildly broken file can't build a dialog taller
+    // than the screen.
+    const shown = @min(items.len, 8);
+    buf.writer.print(
+        "{d} issue{s} found while loading the configuration:\n\n",
+        .{ items.len, if (items.len == 1) "" else "s" },
+    ) catch return;
+    for (items[0..shown]) |*diag| {
+        diag.format(&buf.writer) catch return;
+        buf.writer.writeByte('\n') catch return;
+    }
+    if (items.len > shown) {
+        buf.writer.print(
+            "\u{2026}and {d} more.\n",
+            .{items.len - shown},
+        ) catch return;
+    }
+    buf.writer.writeAll(
+        "\nGhoztty is running with the remaining settings.",
+    ) catch return;
+
+    const text = buf.toOwnedSliceSentinel(0) catch return;
+    defer alloc.free(text);
+    const text_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return;
+    defer alloc.free(text_w);
+
+    const refocus: ?w32.HWND = if (owner) |win|
+        (if (win.getActiveSurface()) |s| s.hwnd else null)
+    else
+        null;
+    const result = ConfirmDialog.show(
+        self,
+        if (owner) |win| win.hwnd else null,
+        if (owner) |win| win.scale else 1.0,
+        refocus,
+        .{
+            .title = std.unicode.utf8ToUtf16LeStringLiteral("Configuration Errors"),
+            .text = text_w,
+            .icon = .warning,
+            .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Open Config"),
+            .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Ignore"),
+        },
+    );
+    if (result == .ok) self.openConfigFile();
+}
+
 pub fn run(self: *App) !void {
     // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
@@ -359,6 +450,12 @@ pub fn run(self: *App) !void {
     try window.init(self, .{});
     try self.windows.append(alloc, window);
     _ = try window.addTab();
+
+    // Surface config load diagnostics once at startup (T69). After the
+    // first window exists so the dialog has an owner to center on; the
+    // dialog pumps its own modal loop, so startup messages (paints, IPC)
+    // keep flowing while it is up.
+    self.showConfigErrorsIfAny(&self.config, window);
 
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
@@ -984,29 +1081,7 @@ pub fn performAction(
         },
 
         .open_config => {
-            // Open the config file in the default editor.
-            const config_path = configpkg.preferredDefaultFilePath(
-                self.core_app.alloc,
-            ) catch |err| {
-                log.err("failed to get config path: {}", .{err});
-                return true;
-            };
-            defer self.core_app.alloc.free(config_path);
-
-            // Convert to wide string for ShellExecuteW.
-            var wbuf: [512]u16 = undefined;
-            const wlen = std.unicode.utf8ToUtf16Le(&wbuf, config_path) catch return true;
-            if (wlen < wbuf.len) {
-                wbuf[wlen] = 0;
-                _ = w32.ShellExecuteW(
-                    null,
-                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                    @ptrCast(&wbuf),
-                    null,
-                    null,
-                    w32.SW_SHOW,
-                );
-            }
+            self.openConfigFile();
             return true;
         },
 
@@ -1233,6 +1308,19 @@ pub fn performAction(
                 self.core_app.updateConfig(self, &new_config) catch |err| {
                     log.err("config update error: {}", .{err});
                 };
+
+                // A hard reload re-parses the file: surface any
+                // diagnostics like startup does (T69).
+                const owner: ?*Window = switch (target) {
+                    .surface => |core_surface| core_surface.rt_surface.parent_window,
+                    .app => if (self.core_app.focusedSurface()) |s|
+                        s.rt_surface.parent_window
+                    else if (self.windows.items.len > 0)
+                        self.windows.items[0]
+                    else
+                        null,
+                };
+                self.showConfigErrorsIfAny(&new_config, owner);
             }
             return true;
         },

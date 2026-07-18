@@ -2061,6 +2061,24 @@ with "Open Config" and "Ignore" buttons.
 *Validation:* write a config with a bad key, launch → dialog lists the
 diagnostic; fix config → no dialog.
 
+**DONE 2026-07-18.** `App.showConfigErrorsIfAny` formats the config's
+`_diagnostics` (capped at 8, "…and N more") and shows a T80
+`ConfirmDialog` with custom captions — "Open Config" (runs the extracted
+`openConfigFile` helper, same code as the `open_config` action) and
+"Ignore". Shown twice: once at startup in `run()` right after the first
+window exists (so it has an owner to center on; the dialog's own modal
+pump keeps paints/IPC flowing), and after every hard `reload_config`
+(soft reloads don't re-parse). ConfirmDialog grew `ok_label`/
+`cancel_label` options with a measured button width
+(`buttonWidth`, unit-tested; buttons widen past the standard 88 DIP to
+fit captions). Evidence: `test/win32/config-errors.ps1` ALL PASS (10)
+×3 — broken-config startup shows the dark dialog with the right
+captions, Escape ignores and the app lives, clean config shows nothing,
+ctrl+shift+comma reload on a newly-broken file shows the dialog (rename
+dialog as chord positive control) and stays silent once fixed. P1–P3,
+confirm-dialogs.ps1 (20), both test lanes: all green. Config isolation
+in the script via `XDG_CONFIG_HOME`.
+
 ## T70 — CLI on PATH for Windows installs (Phase H)
 
 Found by T51 (F6). Mac self-heals `~/.local/bin/ghoztty` + shell PATH on

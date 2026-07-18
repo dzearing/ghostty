@@ -9,6 +9,15 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 9) — T69 DONE. Config-error UI: startup + hard
+  reload_config now show parse diagnostics in a dark ConfirmDialog
+  ("Open Config" opens the editor via the extracted openConfigFile
+  helper; "Ignore" continues). ConfirmDialog gained custom button
+  captions + measured button width (unit-tested buttonWidth). New
+  `test/win32/config-errors.ps1` ALL PASS (10) ×3 (XDG_CONFIG_HOME
+  isolation; rename-dialog chord as positive control); P1–P3 +
+  confirm-dialogs (20) + both lanes green. Next per T51 order: T68.
+
 - 2026-07-18 (on-box, 8) — T75 DONE. `focus-follows-mouse` honored:
   handleMouseMove now defers focus (T48 path) to the hovered unfocused
   pane, gated on real SCREEN-coord motion (app-level last-pos guard, the

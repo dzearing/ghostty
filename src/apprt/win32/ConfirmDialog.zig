@@ -37,6 +37,13 @@ pub const Options = struct {
     icon: Icon = .warning,
     /// MB_DEFBUTTON2 parity: focus + Enter default on Cancel.
     default_cancel: bool = true,
+    /// Button captions. The affirmative/dismissive semantics (and the
+    /// Result values) stay OK/Cancel regardless of the label — callers
+    /// like the T69 config-errors dialog relabel them ("Open Config" /
+    /// "Ignore") without changing any dialog behavior. Buttons widen to
+    /// fit the longer caption.
+    ok_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("OK"),
+    cancel_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Cancel"),
 };
 
 /// Dialog colors — the RenameDialog dark palette (matches the command
@@ -71,11 +78,12 @@ pub const Layout = struct {
     font_h: i32,
 };
 
-pub fn layoutFor(scale: f32, text_w: i32, text_h: i32, has_icon: bool, has_cancel: bool) Layout {
+/// `btn_w` is the physical-pixel button width — at least the standard
+/// 88 DIP, wider when a caption needs the room (see buttonWidth).
+pub fn layoutFor(scale: f32, text_w: i32, text_h: i32, has_icon: bool, has_cancel: bool, btn_w: i32) Layout {
     const margin = px(16, scale);
     const icon_px = px(32, scale);
     const icon_gap = px(12, scale);
-    const btn_w = px(88, scale);
     const btn_h = px(28, scale);
     const btn_gap_h = px(8, scale);
     const btn_gap_v = px(18, scale);
@@ -132,6 +140,13 @@ fn px(v: f32, scale: f32) i32 {
     return @intFromFloat(@round(v * scale));
 }
 
+/// Button width for the given widest caption extent (physical pixels):
+/// the standard 88-DIP button, widened with 12 DIP of padding per side
+/// when the caption needs the room.
+pub fn buttonWidth(scale: f32, max_label_w: i32) i32 {
+    return @max(px(88, scale), max_label_w + px(24, scale));
+}
+
 /// Show the dialog modally and return the user's choice. `owner` is
 /// disabled for the duration (input-modal to that window; the app loop
 /// keeps effectively running because we pump here). `refocus`, when given,
@@ -182,6 +197,7 @@ pub fn show(
         .right = px(420, scale),
         .bottom = 0,
     };
+    var label_w: i32 = 0;
     {
         const hdc = w32.GetDC(null) orelse return fallback(owner, opts);
         defer _ = w32.ReleaseDC(null, hdc);
@@ -196,6 +212,21 @@ pub fn show(
             &text_rect,
             w32.DT_CALCRECT | w32.DT_WORDBREAK | w32.DT_NOPREFIX,
         );
+
+        // Widest button caption, so custom labels never truncate.
+        const labels: [2][:0]const u16 = .{ opts.ok_label, opts.cancel_label };
+        for (labels, 0..) |label, i| {
+            if (i == 1 and !has_cancel) break;
+            var r: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+            _ = w32.DrawTextW(
+                hdc,
+                label.ptr,
+                @intCast(label.len),
+                &r,
+                w32.DT_CALCRECT | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+            );
+            label_w = @max(label_w, r.right - r.left);
+        }
     }
     const l = layoutFor(
         scale,
@@ -203,6 +234,7 @@ pub fn show(
         text_rect.bottom - text_rect.top,
         has_icon,
         has_cancel,
+        buttonWidth(scale, label_w),
     );
 
     // Outer size from the desired client size, centered on the owner (or
@@ -281,7 +313,7 @@ pub fn show(
     self.ok_btn = w32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
-        std.unicode.utf8ToUtf16LeStringLiteral("OK"),
+        opts.ok_label.ptr,
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE |
             (if (self.default_cancel) 0 else w32.BS_DEFPUSHBUTTON),
         l.ok.left,
@@ -302,7 +334,7 @@ pub fn show(
         const cancel_btn = w32.CreateWindowExW(
             0,
             std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
-            std.unicode.utf8ToUtf16LeStringLiteral("Cancel"),
+            opts.cancel_label.ptr,
             w32.WS_CHILD | w32.WS_VISIBLE_STYLE |
                 (if (self.default_cancel) w32.BS_DEFPUSHBUTTON else 0),
             l.cancel.left,
@@ -553,7 +585,7 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
 const testing = std.testing;
 
 test "layoutFor: controls nest inside the client area at 1.0 scale" {
-    const l = layoutFor(1.0, 300, 40, true, true);
+    const l = layoutFor(1.0, 300, 40, true, true, 88);
     try testing.expect(l.client_w > 0 and l.client_h > 0);
     for ([_]w32.RECT{ l.icon, l.text, l.ok, l.cancel }) |r| {
         try testing.expect(r.left >= 0 and r.top >= 0);
@@ -562,49 +594,67 @@ test "layoutFor: controls nest inside the client area at 1.0 scale" {
 }
 
 test "layoutFor: buttons right-aligned, OK left of Cancel, no overlap" {
-    const l = layoutFor(1.0, 300, 40, true, true);
+    const l = layoutFor(1.0, 300, 40, true, true, 88);
     try testing.expect(l.ok.right < l.cancel.left);
     try testing.expectEqual(l.ok.top, l.cancel.top);
     try testing.expectEqual(l.cancel.right, l.client_w - 16);
 }
 
 test "layoutFor: ok-only puts OK in the rightmost slot, no cancel rect" {
-    const l = layoutFor(1.0, 300, 40, false, false);
+    const l = layoutFor(1.0, 300, 40, false, false, 88);
     try testing.expectEqual(l.ok.right, l.client_w - 16);
     try testing.expectEqual(@as(i32, 0), l.cancel.right - l.cancel.left);
     try testing.expectEqual(@as(i32, 0), l.icon.right - l.icon.left);
 }
 
 test "layoutFor: text starts right of the icon with a gap" {
-    const l = layoutFor(1.0, 300, 40, true, true);
+    const l = layoutFor(1.0, 300, 40, true, true, 88);
     try testing.expect(l.text.left >= l.icon.right + 12);
     // Without an icon the text hugs the margin.
-    const l2 = layoutFor(1.0, 300, 40, false, true);
+    const l2 = layoutFor(1.0, 300, 40, false, true, 88);
     try testing.expectEqual(@as(i32, 16), l2.text.left);
 }
 
 test "layoutFor: short text is vertically centered against the icon" {
-    const l = layoutFor(1.0, 300, 16, true, true);
+    const l = layoutFor(1.0, 300, 16, true, true, 88);
     // Icon (32px) taller than text (16px): text drops to center.
     try testing.expect(l.text.top > l.icon.top);
     try testing.expectEqual(l.icon.top, 16);
     // Text (60px) taller than icon: icon centers instead.
-    const l2 = layoutFor(1.0, 300, 60, true, true);
+    const l2 = layoutFor(1.0, 300, 60, true, true, 88);
     try testing.expect(l2.icon.top > l2.text.top);
 }
 
 test "layoutFor: narrow text still fits the button row" {
-    const l = layoutFor(1.0, 40, 20, false, true);
+    const l = layoutFor(1.0, 40, 20, false, true, 88);
     // Two 88px buttons + 8px gap + 2*16 margins = 216, floored at 280.
     try testing.expect(l.client_w >= 280);
     try testing.expect(l.ok.left >= 16);
 }
 
 test "layoutFor: scales with DPI" {
-    const l1 = layoutFor(1.0, 300, 40, true, true);
-    const l2 = layoutFor(2.0, 600, 80, true, true);
+    const l1 = layoutFor(1.0, 300, 40, true, true, 88);
+    const l2 = layoutFor(2.0, 600, 80, true, true, 176);
     try testing.expectEqual(l1.client_w * 2, l2.client_w);
     try testing.expectEqual(l1.client_h * 2, l2.client_h);
     try testing.expectEqual(l1.ok.left * 2, l2.ok.left);
     try testing.expectEqual(l1.font_h * 2, l2.font_h);
+}
+
+test "buttonWidth: standard until the caption outgrows it, then padded" {
+    // "OK"/"Cancel"-sized captions keep the 88-DIP standard width.
+    try testing.expectEqual(@as(i32, 88), buttonWidth(1.0, 40));
+    try testing.expectEqual(@as(i32, 176), buttonWidth(2.0, 80));
+    // A wide caption ("Open Config") gets 12 DIP padding per side.
+    try testing.expectEqual(@as(i32, 124), buttonWidth(1.0, 100));
+}
+
+test "layoutFor: wide buttons widen the row and never overlap" {
+    const l = layoutFor(1.0, 40, 20, false, true, 124);
+    try testing.expectEqual(@as(i32, 124), l.ok.right - l.ok.left);
+    try testing.expectEqual(@as(i32, 124), l.cancel.right - l.cancel.left);
+    try testing.expect(l.ok.right < l.cancel.left);
+    try testing.expect(l.ok.left >= 16);
+    // Client floor still respected: 2*124 + 8 + 2*16 = 288 > 280.
+    try testing.expectEqual(@as(i32, 288), l.client_w);
 }

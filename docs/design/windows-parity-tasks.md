@@ -128,7 +128,8 @@ Work these first, in order, before falling back to first-todo-in-table:
    "windowsy" theming → config parity → features): ~~T65~~ (done
    2026-07-18), ~~T77~~ (done 2026-07-18), ~~T79~~ (done 2026-07-18),
    ~~T80~~ (done 2026-07-18), ~~T74~~ (done 2026-07-18), ~~T73~~ (done
-   2026-07-18), ~~T76~~ (done 2026-07-18), ~~T75~~ (done 2026-07-18), T69, T68, T67, T70,
+   2026-07-18), ~~T76~~ (done 2026-07-18), ~~T75~~ (done 2026-07-18), ~~T69~~ (done
+   2026-07-18), T68, T67, T70,
    T71, T66, T72, T78. With T51
    done the priority queue is exhausted — fall back to
    first-todo-in-table / the order above.
@@ -219,7 +220,7 @@ One line per row. Full spec + validation + evidence per task:
 | T66 | FIX: reset_window_size hardcodes 800×600 — track the initial_size (window-width/height × cell size) per window and reset to that, Mac returnToDefaultSize parity (T51 F2) | I | — | todo | — |
 | T67 | Window/pane background tint: implement `--color`/`--split-color` (accepted-and-ignored in args.zig:115) + palette contrast shift + context-menu color picker per docs/design/window-color.md (T51 F3) | I | — | todo | — |
 | T68 | Remote inheritance: implement `--from-focused`, and New Window/split on a focused remote pane should reuse the remote host (Mac newWindowInheritingRemote, spec WP4) (T51 F4) | G | T21b | todo | — |
-| T69 | Config-error UI: show config parse diagnostics in a visible dialog at startup (Mac ConfigurationErrorsController; win32 only log.err — invisible in release builds) (T51 F5) | I | — | todo | — |
+| T69 | Config-error UI — done 2026-07-18: startup + hard-reload diagnostics shown in a dark ConfirmDialog with "Open Config"/"Ignore" (custom captions + measured button width); `config-errors.ps1` ALL PASS (10) ×3 (T51 F5) | I | — | done | (pinned next) |
 | T70 | CLI on PATH for installs: MSI Environment/PATH entry or runtime self-heal so `ghoztty` resolves from any shell (Mac CommandLineInstaller analog; distinct from T23) (T51 F6) | H | — | todo | — |
 | T71 | Claude Code integration setup: detect `claude` CLI + offer ghoztty-claude-plugin install, first-run + palette entry (Mac ClaudeCodeIntegration.swift) (T51 F7) | I | — | todo | — |
 | T72 | Tab accent-color tagging in the custom tab bar (Mac TerminalTabColor, 10 named colors) — cosmetic (T51 F8) | I | — | todo | — |
