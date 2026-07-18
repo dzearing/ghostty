@@ -1835,6 +1835,18 @@ extension Ghostty {
         }
 
         @objc private func backgroundColorDidChange(_ sender: NSColorPanel) {
+            // The shared NSColorPanel stays wired to this surface as its
+            // target/action after the user opens the background-color picker,
+            // and we never unbind it. AppKit can then invoke this action via
+            // the responder chain even when the panel is hidden — e.g. opening
+            // the pane banner editor (Cmd+R) or a title prompt makes a text
+            // field first responder and the panel re-sends changeColor: with
+            // the *system* text color, which resolves to white in dark mode.
+            // Applying that silently flips the pane to white long after the
+            // user was done picking. Only honor callbacks from a live edit in
+            // the visible panel; a real pick is always `isVisible`.
+            guard sender.isVisible else { return }
+
             let color = sender.color
             let srgbColor = color.usingColorSpace(.sRGB) ?? color
             backgroundTintNSColor = srgbColor
