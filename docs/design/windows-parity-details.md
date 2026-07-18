@@ -1260,6 +1260,22 @@ Windows-native look-and-feel gaps ("get the windows things looking
 windowsy"). Every finding becomes a new task row — the audit is not done
 until the table contains them.
 
+*Evidence (done 2026-07-18):* four parallel code sweeps (action matrix vs
+`src/apprt/action.zig` + Mac dispatch; IPC verbs/GUI features vs
+IPCServer.swift + macos/Sources/Features; config coverage vs Config.zig
+consumers; look-and-feel vs the T50 bar across all 20 win32 UI surfaces),
+each with file:line verification, plus an on-box behavior leg: fresh
+Debug build, `ipc-p1`/`ipc-p2`/`ipc-p3` ALL PASS, `hero-mode.ps1` ALL
+PASS (60), `ipc-version.ps1` ALL PASS, both unit-test lanes exit 0 —
+every user-reported item from the week (hero, rename, remote/auth, perf,
+palette) re-verified green at HEAD. Findings: 16, filed as T65–T80 (see
+their sections below; F-numbers in the rows map to the finding list).
+Two corrections to the 2026-07-12 audit recorded in
+`windows-parity-audit.md` (split-divider-color and unfocused-split-* were
+listed "honored" but are not implemented). T28's no-op set confirmed
+unchanged; `check_for_updates` no-op is deliberate (T24). Mac-side gap
+reconfirmed: the Swift IPC server still lacks the `version` verb (T37).
+
 ## T52 — Build provenance visible in-app (Phase I)
 
 The 2026-07-15 "no parity" report came from a July-5 exe among FOUR
@@ -1922,3 +1938,198 @@ Out of scope (platform N/A, decided): secure input
 behavior, Quick Look, macOS titlebar-tab styles, Sparkle (T24 covers the
 Windows-appropriate update path), AX attributes (`AXWindowActivityState` —
 ztabby is a Mac consumer).
+
+## T65 — FIX: show_child_exited suppresses the core fallback (Phase I)
+
+Found by T51 (F1). `src/apprt/win32/App.zig:1226-1262` only shows a
+blocking `MessageBoxW` when `exit_code != 0`, yet returns `true` in every
+case — so the core (`src/Surface.zig:1402-1493`) never runs its fallback:
+with `wait-after-command` a clean exit shows NOTHING (terminal sits
+static, looks like a hang), and fast abnormal exits lose the rich
+in-terminal diagnostic (command + runtime, Surface.zig:1496-1553). Mac
+shows a non-modal dismissible banner even for exit 0
+(Ghostty.ChildExitedMessage.swift). This also subsumes the backlog's
+"child-exited inline bar" note above.
+
+*Fix:* return `false` whenever nothing was displayed (minimum); better,
+replace the modal with a non-blocking banner overlay showing the same
+success/error content as Mac.
+
+*Validation:* on-box — `+new-window --command="cmd /c exit 0"` with
+`wait-after-command=true` must show the press-any-key message; abnormal
+exit (`exit 3` inside 250ms) must show code + runtime; no modal blocks
+the GUI thread.
+
+## T66 — FIX: reset_window_size hardcodes 800×600 (Phase I)
+
+Found by T51 (F2). `src/apprt/win32/App.zig:1331-1357` resizes to a
+literal 800×600; `.initial_size` (App.zig:1160-1187) applies once and
+stores nothing; `window-width`/`window-height` are referenced nowhere in
+the win32 apprt. Mac stores the initial-size action per window and
+`returnToDefaultSize` restores it (TerminalController.swift:1492).
+
+*Fix:* store the last `initial_size` w/h on the Window; use it in
+`reset_window_size` (fall back to 800×600 only if never set).
+
+*Validation:* set `window-width`/`window-height`, resize the window, run
+the reset keybind → returns to configured size, not 800×600.
+
+## T67 — Window/pane background tint (`--color`/`--split-color`) (Phase I)
+
+Found by T51 (F3). Mac implements per-window/pane background tint with
+palette-contrast adjustment + context-menu NSColorPanel picker
+(IPCServer.swift:401-483, docs/design/window-color.md). win32 parses and
+drops both flags (`src/apprt/ipc/args.zig:115-116`); no consumer in
+IpcHandlers.zig; no picker in the context menu (Surface.zig:2523-2542).
+
+*Fix:* honor the flags end-to-end (surface bg override + contrast shift),
+add a "Background Color…" context-menu entry using the common color
+dialog (`ChooseColorW`).
+
+*Validation:* `+new-window --color=#334455` tints; `+split
+--split-color=…` tints the pane; picker round-trips; P1–P3 stay green.
+
+## T68 — Remote inheritance: `--from-focused` + New Window on remote (Phase G)
+
+Found by T51 (F4). Mac reuses the focused window's remote host for
+`--from-focused` (IPCServer.swift:413-427, 555-589 →
+newWindowInheritingRemote; spec WP4). win32 drops the flag
+(args.zig:115-116) and `.new_window` (App.zig:834-853) never checks for
+a focused remote surface — New Window on a remote pane always opens
+local.
+
+*Fix:* plumb the focused surface's remote connection (relay device or
+host:port + per-host defaults) into new-window/split creation when the
+flag is set or the keybind fires on a remote pane.
+
+*Validation:* extend the `ipc-relay-login.ps1`-style fake-agent harness:
+open a remote window, ctrl+shift+n / `+new-window --from-focused` → the
+second window dials the same agent.
+
+## T69 — Config-error UI on win32 (Phase I)
+
+Found by T51 (F5). A broken config only produces `log.err`
+(App.zig:156-165) — invisible in release (GUI-subsystem) builds; the
+user gets defaults with no explanation. Mac shows
+ConfigurationErrorsController with the diagnostic list.
+
+*Fix:* when config load yields diagnostics, show them once at startup —
+a T50-pattern dialog (or T80's TaskDialog) listing file:line + message,
+with "Open Config" and "Ignore" buttons.
+
+*Validation:* write a config with a bad key, launch → dialog lists the
+diagnostic; fix config → no dialog.
+
+## T70 — CLI on PATH for Windows installs (Phase H)
+
+Found by T51 (F6). Mac self-heals `~/.local/bin/ghoztty` + shell PATH on
+every launch (CommandLineInstaller.swift). The MSI
+(`dist/windows-installer/build-msi.sh`) writes no Environment/PATH table
+entries; only the manually-set user PATH (2026-07-13) makes `ghoztty`
+resolve today. Distinct from T23 (uninstall entry bug).
+
+*Fix:* add the install dir to the user PATH via the MSI Environment
+table (and/or a first-run self-check in the app mirroring the Mac flow).
+
+*Validation:* fresh MSI install on a clean PATH → new shell resolves
+`ghoztty`; uninstall removes the entry.
+
+## T71 — Claude Code integration setup flow (Phase I)
+
+Found by T51 (F7). Mac detects the `claude` CLI and offers to install
+the ghoztty-claude-plugin marketplace plugin (first-run + menu action,
+ClaudeCodeIntegration.swift). No win32 trace.
+
+*Fix:* port the detection + prompt (T50-pattern dialog) + a command
+palette entry ("Install Claude Code Integration"); run the same
+`claude plugin` commands.
+
+*Validation:* on-box with claude installed: palette entry runs the
+install; declining is remembered.
+
+## T72 — Tab accent-color tagging (Phase I)
+
+Found by T51 (F8). Mac tags tabs with 10 named accent colors
+(TerminalTabColor.swift); the win32 custom tab bar has no equivalent.
+Cosmetic, lower priority. Fix: context-menu submenu on the tab → accent
+stripe/background in the owner-drawn tab paint; persist per tab.
+Validation: visual + tab context menu exercised in a script where
+feasible.
+
+## T73 — Honor `split-divider-color` (Phase I)
+
+Found by T51 (F9); corrects the 2026-07-12 audit. `paintDividerNode`
+hardcodes `CreatePen(0, line_w, 0x00808080)` (Window.zig:1464). Fix:
+read the config color (fall back to current gray), convert RGB→COLORREF.
+Validation: set `split-divider-color = #ff0000`, split, divider is red;
+config reload re-colors live.
+
+## T74 — Implement `unfocused-split-opacity`/`-fill` (Phase I)
+
+Found by T51 (F10); corrects the 2026-07-12 audit (listed honored, is
+not — no dimming code exists in the win32 apprt). Mac/GTK dim unfocused
+split panes toward `unfocused-split-fill` at `unfocused-split-opacity`.
+Fix: layered dim overlay or paint-over in the split container on focus
+change (the hero carousel's dimmed thumbs are a separate hardcoded
+path). Validation: two splits, unfocused pane visibly dims; config knobs
+respected; focus flip updates both panes.
+
+## T75 — Honor `focus-follows-mouse` (Phase I)
+
+Found by T51 (F11). Mac focuses the split under the pointer on
+mouse-move when enabled (SurfaceView_AppKit.swift:1049). win32
+`handleMouseMove` (Surface.zig:2575-2587) only forwards cursor position.
+Fix: when enabled and the surface under the cursor is unfocused, focus
+it (via the T48 deferred-SetFocus path). Validation: config on, two
+splits, hover switches focus without click; off → no change.
+
+## T76 — Honor `window-inherit-font-size` (Phase I)
+
+Found by T51 (F12). embedded.zig:1427-1431 carries the focused surface's
+live (ctrl+scroll-zoomed) font size into new surfaces; win32's newConfig
+path only inherits working directory — new windows/tabs/splits snap back
+to the configured `font-size`. Fix: mirror newSurfaceOptions in the
+win32 new-surface path. Validation: zoom a pane, open tab/split/window →
+same size; config off → default size.
+
+## T77 — FIX: gotoSplit while zoomed focuses a hidden pane (Phase I)
+
+Found by T51 (F13). `gotoSplit` (Window.zig:1652-1691) never touches
+`tree.zoomed`: navigating splits while zoomed moves keyboard focus to a
+pane that is not rendered (the zoomed one stays on screen). Mac/GTK
+honor `split-preserve-zoom.navigation` (clear zoom by default, or move
+it). Fix: in gotoSplit, if zoomed and the target differs — clear zoom
+(default) or re-zoom the target per config. Validation: script — zoom,
+ctrl+alt+arrow, assert the focused pane is visible for both config
+values.
+
+## T78 — `window-title-font-family` (Phase I)
+
+Found by T51 (F14). Honored on Mac (TerminalController.swift:762); win32
+uses plain `SetWindowTextW` — a custom titlebar font needs a custom-draw
+caption. Design-level backlog (same tier as window-save-state); revisit
+if the custom tab bar ever absorbs the caption row.
+
+## T79 — Dark-mode context menus (Phase I)
+
+Found by T51 (F15). Both `TrackPopupMenuEx` menus — terminal
+(Surface.zig:2530) and tab bar (Window.zig:2547) — draw with the light
+classic menu palette on dark chrome; no
+`SetPreferredAppMode`/`AllowDarkModeForWindow`/CBT hook exists anywhere
+in the win32 tree (every custom popup dark-themes itself individually).
+Fix: call uxtheme ordinal-135 `SetPreferredAppMode(AllowDark)` +
+`FlushMenuThemes` at app init (undocumented-but-stable, used by
+Terminal/Explorer), matching the app's theme; fall back to owner-draw if
+the ordinal is unavailable. Validation: on-box screenshot check of both
+menus in dark theme; light theme unchanged.
+
+## T80 — Dark-mode message boxes (Phase I)
+
+Found by T51 (F16). Six light `MessageBoxW` sites break the dark chrome:
+About (Surface.zig:1799), per-window close confirm (Window.zig:2796),
+per-surface close confirm (Surface.zig:810), clipboard paste-protection
+confirm (Surface.zig:849), child-exited ×2 (App.zig:1243,1252 — note
+T65 may remove these). Fix: a small shared T50-pattern confirm dialog
+(or `TaskDialogIndirect` + CBT-hook dark theming) used by all sites.
+Validation: each prompt visually dark; Enter/Esc semantics preserved;
+existing acceptance scripts (close-confirm paths) stay green.

@@ -9,6 +9,19 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box) — T51 DONE. Full parity re-audit via 4 parallel
+  code sweeps (actions, IPC/GUI features, config, look-and-feel) + on-box
+  verification (P1–P3, hero-mode 60, ipc-version ALL PASS; both test
+  lanes green at HEAD). 16 findings filed as T65–T80; two 2026-07-12
+  audit claims corrected (split-divider-color, unfocused-split-* NOT
+  implemented). Standouts: show_child_exited swallows the core exit
+  fallback (T65), gotoSplit-while-zoomed focuses a hidden pane (T77),
+  light context menus/message boxes on dark chrome (T79/T80). Priority
+  queue now exhausted — next work follows the suggested order in the
+  tracker (T65 first). Surprise: a PS5.1 whole-file rewrite mojibake'd
+  the details doc mid-session (Get-Content -Raw reads BOM-less UTF-8 as
+  ANSI); restored from git, re-applied via Edit tool — never rewrite
+  these docs with PowerShell.
 - 2026-07-18 (on-box) — T52 DONE. Build provenance in-app: new win32
   provenance.zig feeds an IPC `version` verb, a "Running Instance"
   section in `+version` (works from any pane; "none detected" when no

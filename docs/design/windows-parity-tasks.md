@@ -120,9 +120,15 @@ Work these first, in order, before falling back to first-todo-in-table:
    shape untouched); command palette gained "About Ghoztty". Validated by
    `test/win32/ipc-version.ps1` ALL PASS (22) three runs in a row; P1–P3
    + both test lanes green. Next: T51.
-8. **T51** — full parity re-audit. Deliberately LAST in the queue per the
-   user: after the above land, re-audit Windows vs Mac so nothing is
-   missing, and file new tasks from the findings.
+8. ~~T51~~ — DONE 2026-07-18: full parity re-audit (4 parallel sweeps —
+   action matrix, IPC/GUI features, config coverage, native
+   look-and-feel — plus on-box verification: P1–P3, hero-mode (60),
+   ipc-version, both test lanes ALL green at HEAD). 16 findings filed as
+   **T65–T80**. Suggested order for working them (user-visible bugs →
+   "windowsy" theming → config parity → features): T65, T77, T79, T80,
+   T74, T73, T76, T75, T69, T68, T67, T70, T71, T66, T72, T78. With T51
+   done the priority queue is exhausted — fall back to
+   first-todo-in-table / the order above.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -190,7 +196,7 @@ One line per row. Full spec + validation + evidence per task:
 | T48 | FIX DEADLOCK: defer SetFocus out of WindowProc (re-entrant IME/CTF hang) | I | T48a | done | e35ef81fd |
 | T49 | Hero-mode regression report → stale binary (CORRECTION 2026-07-16: the user's actual repro was the command palette, not the keybind — see T57) | F | T19 | done | c795455ff.. |
 | T50 | Real "Rename Window" dialog | I | T44 | done | 39988009a |
-| T51 | Full parity RE-AUDIT | — | T50,T22c,T48,T53 | todo | — |
+| T51 | Full parity RE-AUDIT — done 2026-07-18: 4-sweep audit (actions, IPC/GUI features, config, native look-and-feel) + on-box verification; 16 findings filed as T65–T80; audit appendix updated (2 prior-audit corrections) | — | T50,T22c,T48,T53 | done | (this commit) |
 | T52 | Build provenance visible in-app: IPC `version` verb, `+version` "Running Instance" section, `+list --json` data.build, palette "About Ghoztty" box (shared win32 provenance.zig); `ipc-version.ps1` ALL PASS 3x | I | — | done | cd3c47068 |
 | T53a | Soak harness `test/win32/soak.ps1` + first bounded on-box soak + findings filed. FOUND+FIXED: WM_APP_WAKEUP message-queue flood broke ALL IPC under load (see details); regression guard `test/win32/ipc-under-load.ps1` | I | T40 | done | 517967173 |
 | T53b | Multi-hour detached soak (180 min ALL PASS, zero leaks) + keyboard-latency/scrollback-seek profiling (`profile-latency.ps1` ALL PASS; no degradation at 150k lines) + release delivered to all install locations. No tuning fixes needed; found T64. See details | I | T53a | done | 3cb802605.. |
@@ -206,6 +212,22 @@ One line per row. Full spec + validation + evidence per task:
 | T59b | Hero mode TRUE port — interactions/motion: wheel scroll, divider drag + per-tab ratio, hover chrome, slide + re-center animations, reduced-motion, GHOZTTY_PERF check, screenshot | F | T59a | done | 5a10762ed |
 | T61 | FIX: swap_split (ctrl+shift+arrows) in hero mode silently swapped panes in the hidden tree (user, 2026-07-16: nav from index 1 "went to 2", and exit restored a mutated layout). Hero now intercepts swap_split: up/down = prev/next selection (Windows mirror of the Mac hero-nav chord), left/right no-op | F | T59b | done | 26f375c76 |
 | T64 | FIX: SendInput-unicode (VK_PACKET) text injection silently dropped — screen readers/on-screen keyboards/automation typed nothing into panes (found by the T53b profiling harness; both input modes affected). See details | I | — | done | 3cb802605 |
+| T65 | FIX: show_child_exited always returns true → core fallback suppressed: exit-0 + wait-after-command shows NOTHING (looks like a hang), abnormal exits lose the rich in-terminal diagnostic; also a blocking MessageBox vs Mac's non-modal banner (T51 F1) | I | — | todo | — |
+| T66 | FIX: reset_window_size hardcodes 800×600 — track the initial_size (window-width/height × cell size) per window and reset to that, Mac returnToDefaultSize parity (T51 F2) | I | — | todo | — |
+| T67 | Window/pane background tint: implement `--color`/`--split-color` (accepted-and-ignored in args.zig:115) + palette contrast shift + context-menu color picker per docs/design/window-color.md (T51 F3) | I | — | todo | — |
+| T68 | Remote inheritance: implement `--from-focused`, and New Window/split on a focused remote pane should reuse the remote host (Mac newWindowInheritingRemote, spec WP4) (T51 F4) | G | T21b | todo | — |
+| T69 | Config-error UI: show config parse diagnostics in a visible dialog at startup (Mac ConfigurationErrorsController; win32 only log.err — invisible in release builds) (T51 F5) | I | — | todo | — |
+| T70 | CLI on PATH for installs: MSI Environment/PATH entry or runtime self-heal so `ghoztty` resolves from any shell (Mac CommandLineInstaller analog; distinct from T23) (T51 F6) | H | — | todo | — |
+| T71 | Claude Code integration setup: detect `claude` CLI + offer ghoztty-claude-plugin install, first-run + palette entry (Mac ClaudeCodeIntegration.swift) (T51 F7) | I | — | todo | — |
+| T72 | Tab accent-color tagging in the custom tab bar (Mac TerminalTabColor, 10 named colors) — cosmetic (T51 F8) | I | — | todo | — |
+| T73 | Honor `split-divider-color` — paintDividerNode hardcodes a 0x808080 pen (Window.zig:1464) (T51 F9) | I | — | todo | — |
+| T74 | Implement `unfocused-split-opacity`/`-fill` dimming — NOT implemented; corrects the 2026-07-12 audit which wrongly listed it honored (T51 F10) | I | — | todo | — |
+| T75 | Honor `focus-follows-mouse` for splits in WM_MOUSEMOVE (T51 F11) | I | — | todo | — |
+| T76 | Honor `window-inherit-font-size`: carry the focused surface's live (zoomed) font size into new window/tab/split configs (mirror embedded.zig newSurfaceOptions) (T51 F12) | I | — | todo | — |
+| T77 | FIX: gotoSplit while split-zoomed moves keyboard focus to a hidden pane — honor `split-preserve-zoom.navigation` (clear or follow zoom on navigation) (T51 F13) | I | — | todo | — |
+| T78 | `window-title-font-family` — needs custom-draw titlebar; design-level backlog like window-save-state (T51 F14) | I | — | todo | — |
+| T79 | Dark-mode context menus: terminal + tab-bar TrackPopupMenuEx menus render light on dark chrome — uxtheme SetPreferredAppMode/AllowDarkModeForWindow + FlushMenuThemes, or owner-draw (T51 F15) | I | — | todo | — |
+| T80 | Dark-mode message boxes: About / close-confirm ×2 / clipboard-confirm / child-exited MessageBoxW render light — TaskDialogIndirect or small custom dialogs per the T50 pattern (T51 F16) | I | — | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.

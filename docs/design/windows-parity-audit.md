@@ -43,3 +43,26 @@ auto-update disabled (→ T24). Config file on Windows:
 `quit_timer`, `toggle_tab_overview` appear to fall through to
 `showChildExited` in the Mac dispatch — suspected bad fork merge (→ T29).
 
+# Re-audit 2026-07-18 (T51)
+
+Four sweeps (action matrix, IPC verbs/GUI features, config coverage,
+Windows-native look-and-feel vs the T50 bar) with file:line
+verification, plus on-box behavior: P1–P3, hero-mode (60 assertions),
+ipc-version ALL PASS and both test lanes green at HEAD. 16 findings →
+rows T65–T80 in the tracker (details sections have the evidence).
+
+**Corrections to the 2026-07-12 audit above:** `split-divider-color` and
+`unfocused-split-opacity`/`-fill` were listed as honored but are NOT
+implemented on win32 — the divider pen is hardcoded 0x808080
+(Window.zig:1464) and no unfocused-split dimming code exists (→ T73,
+T74). Otherwise the action no-op set (T28) is unchanged;
+`check_for_updates` remains a deliberate no-op (T24); the Mac IPC server
+still lacks the `version` verb (T37).
+
+**Highlights:** show_child_exited suppresses the core's
+wait-after-command / abnormal-exit fallbacks (T65); gotoSplit-while-
+zoomed focuses a hidden pane (T77); the only non-native-looking surfaces
+left are the standard context menus and MessageBoxW prompts, both light-
+themed on dark chrome from the missing app-wide dark-mode declaration
+(T79, T80); 13 of 20 win32 UI surfaces already meet the T50 bar.
+
