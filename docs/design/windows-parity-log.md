@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 16) — T72 DONE. Tab accent colors (Mac
+  TerminalTabColor parity): "Tab Color" submenu in the tab context menu
+  (10 colors, anti-aliased DIB swatches via new pure tab_color.zig,
+  checkmark on current) + a top accent stripe in the owner-drawn tab
+  paint; per-tab color rides addTab/close/moveTab/drag shuffles.
+  Adjacent fix: moveTab never swapped the hero-state arrays (latent
+  since T59a) — now it does. tab-color.ps1 ALL PASS (11) ×3; P1–P3,
+  hero-mode (60), both lanes green. SURPRISE: SendInput arrow-key nav
+  inside a TrackPopupMenuEx modal loop is unreliable (End/Right
+  silently dropped while Down worked); menu first-letter matching
+  ('T', then 'R'/'N') is the robust way to script menus. Next: T78.
+
 - 2026-07-18 (on-box, 15) — T66 DONE. `reset_window_size` now returns to
   the stored `initial_size` (window-width/height × cell size; 800×600
   only when unset) via new `Window.setClientSize` +

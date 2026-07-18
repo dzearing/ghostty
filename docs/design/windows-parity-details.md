@@ -2286,6 +2286,28 @@ stripe/background in the owner-drawn tab paint; persist per tab.
 Validation: visual + tab context menu exercised in a script where
 feasible.
 
+**DONE 2026-07-18.** New pure module `tab_color.zig` (hero_math pattern,
+unit tests in both lanes): the 10-value `TabColor` enum in Mac order,
+the macOS *dark* system-color RGB table (vibrant on the dark tab bar),
+menu labels, and `writeSwatch` — an anti-aliased premultiplied-ARGB
+swatch renderer (filled disc per color; ring + slash for None, the Mac
+glyph). Window.zig: per-tab `tab_colors` array that rides every tab
+shuffle (addTab insert, close shift, moveTab swap, drag moveTabTo — and
+moveTab gained the previously-missing hero-state swaps, a latent bug of
+the same shape); the tab context menu grew a "Tab Color" submenu
+(DPI-scaled 32bpp DIB swatch via MENUITEMINFOW.hbmpItem, MF_CHECKED on
+the current pick, bitmaps deleted after the menu closes); paintTabBar
+draws a `max(3px·scale, 2)` accent stripe across the top of tagged tabs
+(active and inactive — the tag marks the tab, not focus). Evidence:
+`test/win32/tab-color.ps1` ALL PASS (11) ×3 on-box 2026-07-18 — ctrl+t
+positive control (bar height → DPI scale → tab geometry), right-click →
+#32768 menu-window assert, menu driven by first-letter matching ('T'
+opens the submenu, 'R'/'N' select — SendInput arrow-key nav proved
+unreliable against the menu modal loop, first-letter matching is the
+robust path), red stripe pixel-asserted on tab 0 (and absent on tab 1),
+stripe persists while the tab is inactive, None clears it. Regression:
+P1–P3, hero-mode (60), both test lanes — all green.
+
 ## T73 — Honor `split-divider-color` (Phase I)
 
 Found by T51 (F9); corrects the 2026-07-12 audit. `paintDividerNode`

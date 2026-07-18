@@ -72,6 +72,7 @@ const HeroCarousel = @import("HeroCarousel.zig");
 const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
 const color_math = @import("color_math.zig");
+const tab_color = @import("tab_color.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -167,6 +168,10 @@ tab_titles: [64][256]u16 = undefined,
 
 /// Length of each tab title in UTF-16 code units.
 tab_title_lens: [64]u16 = undefined,
+
+/// User-assigned accent color per tab (T72, Mac TerminalTabColor parity).
+/// Set from the tab context menu; painted as a stripe in the tab bar.
+tab_colors: [MAX_TABS]tab_color.TabColor = [_]tab_color.TabColor{.none} ** MAX_TABS,
 
 /// Whether the window is currently in fullscreen mode.
 is_fullscreen: bool = false,
@@ -798,6 +803,7 @@ pub fn addTab(self: *Window) !*Surface {
         self.tab_active_surface[i] = self.tab_active_surface[i - 1];
         self.tab_titles[i] = self.tab_titles[i - 1];
         self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+        self.tab_colors[i] = self.tab_colors[i - 1];
         self.tab_hero_active[i] = self.tab_hero_active[i - 1];
         self.tab_hero_index[i] = self.tab_hero_index[i - 1];
         self.tab_hero_ratio[i] = self.tab_hero_ratio[i - 1];
@@ -805,6 +811,7 @@ pub fn addTab(self: *Window) !*Surface {
     }
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
+    self.tab_colors[pos] = .none;
     self.tab_hero_active[pos] = false;
     self.tab_hero_index[pos] = 0;
     self.tab_hero_ratio[pos] = hero_math.RATIO_DEFAULT;
@@ -858,6 +865,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_active_surface[i] = self.tab_active_surface[i + 1];
         self.tab_titles[i] = self.tab_titles[i + 1];
         self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+        self.tab_colors[i] = self.tab_colors[i + 1];
         self.tab_hero_active[i] = self.tab_hero_active[i + 1];
         self.tab_hero_index[i] = self.tab_hero_index[i + 1];
         self.tab_hero_ratio[i] = self.tab_hero_ratio[i + 1];
@@ -2088,6 +2096,13 @@ pub fn moveTab(self: *Window, amount: isize) void {
     std.mem.swap(*Surface, &self.tab_active_surface[self.active_tab], &self.tab_active_surface[new_index]);
     std.mem.swap([256]u16, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
     std.mem.swap(u16, &self.tab_title_lens[self.active_tab], &self.tab_title_lens[new_index]);
+    std.mem.swap(tab_color.TabColor, &self.tab_colors[self.active_tab], &self.tab_colors[new_index]);
+    // Hero state travels with the tab too (was missed when hero mode
+    // landed — moveTabTo already handles it; this path didn't).
+    std.mem.swap(bool, &self.tab_hero_active[self.active_tab], &self.tab_hero_active[new_index]);
+    std.mem.swap(u16, &self.tab_hero_index[self.active_tab], &self.tab_hero_index[new_index]);
+    std.mem.swap(f32, &self.tab_hero_ratio[self.active_tab], &self.tab_hero_ratio[new_index]);
+    std.mem.swap(i32, &self.tab_hero_scroll[self.active_tab], &self.tab_hero_scroll[new_index]);
     self.active_tab = new_index;
     self.invalidateTabBar();
 }
@@ -2383,6 +2398,23 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
             var hover_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
             if (w32.CreateSolidBrush(hover_color)) |brush| {
                 _ = w32.FillRect(mem_dc, &hover_rect, brush);
+                _ = w32.DeleteObject(@ptrCast(brush));
+            }
+        }
+
+        // Draw the user-assigned accent-color stripe across the top of the
+        // tab (T72, Mac tab-color parity). Painted on active and inactive
+        // tabs alike — the tag identifies the tab, not focus.
+        if (tab_color.rgb(self.tab_colors[i])) |tc| {
+            const stripe_h: i32 = @max(@as(i32, @intFromFloat(@round(3.0 * self.scale))), 2);
+            var stripe_rect = w32.RECT{
+                .left = x,
+                .top = 0,
+                .right = x + this_tab_w,
+                .bottom = stripe_h,
+            };
+            if (w32.CreateSolidBrush(w32.RGB(tc.r, tc.g, tc.b))) |brush| {
+                _ = w32.FillRect(mem_dc, &stripe_rect, brush);
                 _ = w32.DeleteObject(@ptrCast(brush));
             }
         }
@@ -2687,6 +2719,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     const saved_surface = self.tab_active_surface[from];
     const saved_title = self.tab_titles[from];
     const saved_title_len = self.tab_title_lens[from];
+    const saved_color = self.tab_colors[from];
     const saved_hero_active = self.tab_hero_active[from];
     const saved_hero_index = self.tab_hero_index[from];
     const saved_hero_ratio = self.tab_hero_ratio[from];
@@ -2700,6 +2733,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i + 1];
             self.tab_titles[i] = self.tab_titles[i + 1];
             self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+            self.tab_colors[i] = self.tab_colors[i + 1];
             self.tab_hero_active[i] = self.tab_hero_active[i + 1];
             self.tab_hero_index[i] = self.tab_hero_index[i + 1];
             self.tab_hero_ratio[i] = self.tab_hero_ratio[i + 1];
@@ -2713,6 +2747,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i - 1];
             self.tab_titles[i] = self.tab_titles[i - 1];
             self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+            self.tab_colors[i] = self.tab_colors[i - 1];
             self.tab_hero_active[i] = self.tab_hero_active[i - 1];
             self.tab_hero_index[i] = self.tab_hero_index[i - 1];
             self.tab_hero_ratio[i] = self.tab_hero_ratio[i - 1];
@@ -2725,6 +2760,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_active_surface[to] = saved_surface;
     self.tab_titles[to] = saved_title;
     self.tab_title_lens[to] = saved_title_len;
+    self.tab_colors[to] = saved_color;
     self.tab_hero_active[to] = saved_hero_active;
     self.tab_hero_index[to] = saved_hero_index;
     self.tab_hero_ratio[to] = saved_hero_ratio;
@@ -2788,6 +2824,8 @@ const TAB_CTX_CLOSE: usize = 9001;
 const TAB_CTX_CLOSE_OTHERS: usize = 9002;
 const TAB_CTX_CLOSE_RIGHT: usize = 9003;
 const TAB_CTX_NEW_TAB: usize = 9004;
+// Tab-color submenu (T72): one id per TabColor, in enum order.
+const TAB_CTX_COLOR_BASE: usize = 9100;
 
 /// Handle a right-button click in the tab bar region.
 /// Shows a context menu for the clicked tab.
@@ -2816,6 +2854,22 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
         _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     }
     _ = w32.AppendMenuW(menu, w32.MF_STRING, TAB_CTX_NEW_TAB, std.unicode.utf8ToUtf16LeStringLiteral("New Tab"));
+
+    // "Tab Color" submenu (T72): one swatch item per color, checkmark on
+    // the current assignment. Swatch DIBs are app-owned — DestroyMenu does
+    // not free hbmpItem bitmaps, so they are deleted after the menu closes.
+    var swatches: [tab_color.count]?w32.HANDLE = [_]?w32.HANDLE{null} ** tab_color.count;
+    defer for (swatches) |maybe_bmp| {
+        if (maybe_bmp) |bmp| _ = w32.DeleteObject(bmp);
+    };
+    if (clicked_tab) |tab| {
+        _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+        if (self.buildTabColorMenu(tab, &swatches)) |submenu| {
+            _ = w32.AppendMenuW(menu, w32.MF_POPUP, @intFromPtr(submenu), std.unicode.utf8ToUtf16LeStringLiteral("Tab Color"));
+        } else {
+            log.warn("tab color submenu creation failed", .{});
+        }
+    }
 
     // Convert client coords to screen coords for the popup.
     var pt = w32.POINT{ .x = @intCast(x), .y = @intCast(y) };
@@ -2861,8 +2915,66 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
                 log.err("failed to create new tab: {}", .{err});
             };
         },
-        else => {},
+        else => |c| {
+            if (c >= TAB_CTX_COLOR_BASE and c < TAB_CTX_COLOR_BASE + tab_color.count) {
+                if (clicked_tab) |tab| {
+                    self.tab_colors[tab] = @enumFromInt(c - TAB_CTX_COLOR_BASE);
+                    log.debug("tab {} color set to {}", .{ tab, self.tab_colors[tab] });
+                    self.invalidateTabBar();
+                }
+            }
+        },
     }
+}
+
+/// Build the "Tab Color" submenu (T72): ten items in TabColor order, each
+/// with a rendered swatch bitmap, the current color checked. The created
+/// swatch DIB handles are returned via `swatches` so the caller can delete
+/// them after the menu closes (they outlive this function — the menu holds
+/// only weak references). Returns null if menu creation fails.
+fn buildTabColorMenu(
+    self: *Window,
+    tab: usize,
+    swatches: *[tab_color.count]?w32.HANDLE,
+) ?w32.HMENU {
+    const submenu = w32.CreatePopupMenu() orelse return null;
+    const current = self.tab_colors[tab];
+    inline for (comptime std.meta.tags(tab_color.TabColor), 0..) |c, idx| {
+        var flags: u32 = w32.MF_STRING;
+        if (c == current) flags |= w32.MF_CHECKED;
+        const id = TAB_CTX_COLOR_BASE + idx;
+        _ = w32.AppendMenuW(submenu, flags, id, tab_color.labelW(c));
+        if (self.makeSwatchBitmap(c)) |bmp| {
+            swatches[idx] = bmp;
+            const mii = w32.MENUITEMINFOW{
+                .fMask = w32.MIIM_BITMAP,
+                .hbmpItem = bmp,
+            };
+            _ = w32.SetMenuItemInfoW(submenu, @intCast(id), 0, &mii);
+        }
+    }
+    return submenu;
+}
+
+/// Create a DPI-scaled 32bpp premultiplied-ARGB DIB swatch for a tab color
+/// (rendered by the pure tab_color.writeSwatch). Caller owns the handle.
+fn makeSwatchBitmap(self: *Window, c: tab_color.TabColor) ?w32.HANDLE {
+    const size_f = @round(16.0 * self.scale);
+    const size: usize = @intFromFloat(@max(size_f, 8.0));
+    var bits: ?*anyopaque = null;
+    const bmi = w32.BITMAPINFO{
+        .bmiHeader = .{
+            .biWidth = @intCast(size),
+            .biHeight = -@as(i32, @intCast(size)), // top-down
+        },
+    };
+    const bmp = w32.CreateDIBSection(null, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
+    const pixels = @as([*]u32, @ptrCast(@alignCast(bits orelse {
+        _ = w32.DeleteObject(bmp);
+        return null;
+    })))[0 .. size * size];
+    tab_color.writeSwatch(pixels, size, tab_color.rgb(c));
+    return bmp;
 }
 
 /// Handle WM_MOUSELEAVE: reset all hover state and repaint.

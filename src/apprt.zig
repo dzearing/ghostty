@@ -75,4 +75,7 @@ test {
 
     // Pure win32 Claude Code setup logic (T71), same no-OS-imports deal.
     _ = @import("apprt/win32/claude_setup.zig");
+
+    // Pure win32 tab accent-color logic (T72), same no-OS-imports deal.
+    _ = @import("apprt/win32/tab_color.zig");
 }

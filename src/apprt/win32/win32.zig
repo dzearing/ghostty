@@ -1278,6 +1278,32 @@ pub extern "user32" fn TrackMouseEvent(
 pub const MF_STRING: u32 = 0x00000000;
 pub const MF_SEPARATOR: u32 = 0x00000800;
 pub const MF_GRAYED: u32 = 0x00000001;
+pub const MF_CHECKED: u32 = 0x00000008;
+pub const MF_POPUP: u32 = 0x00000010;
+
+pub const MIIM_BITMAP: u32 = 0x00000080;
+
+pub const MENUITEMINFOW = extern struct {
+    cbSize: u32 = @sizeOf(MENUITEMINFOW),
+    fMask: u32 = 0,
+    fType: u32 = 0,
+    fState: u32 = 0,
+    wID: u32 = 0,
+    hSubMenu: ?HMENU = null,
+    hbmpChecked: ?HANDLE = null,
+    hbmpUnchecked: ?HANDLE = null,
+    dwItemData: usize = 0,
+    dwTypeData: ?[*:0]u16 = null,
+    cch: u32 = 0,
+    hbmpItem: ?HANDLE = null,
+};
+
+pub extern "user32" fn SetMenuItemInfoW(
+    hmenu: HMENU,
+    item: u32,
+    fByPosition: i32,
+    lpmii: *const MENUITEMINFOW,
+) callconv(.winapi) i32;
 
 pub const TPM_LEFTALIGN: u32 = 0x0000;
 pub const TPM_TOPALIGN: u32 = 0x0000;
