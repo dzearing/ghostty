@@ -5,8 +5,20 @@ import SwiftUI
 struct BannerMarkdownTests {
     typealias Block = Ghostty.BannerMarkdown.Block
 
+    typealias Inline = Ghostty.BannerMarkdown.Inline
+
     private func plain(_ str: AttributedString) -> String {
         String(str.characters)
+    }
+
+    /// Flatten inline segments (checkboxes → box glyph) for text assertions.
+    private func plain(_ segments: [Inline]) -> String {
+        String(Ghostty.BannerMarkdown.attributed(segments).characters)
+    }
+
+    /// Inline segments as a single AttributedString for run/style assertions.
+    private func attr(_ segments: [Inline]) -> AttributedString {
+        Ghostty.BannerMarkdown.attributed(segments)
     }
 
     // MARK: Inline (existing subset still intact)
@@ -136,15 +148,15 @@ struct BannerMarkdownTests {
             return
         }
         #expect(plain(table.header[0]) == "PR")
-        let headerBold = table.header[0].runs.first {
+        let headerBold = attr(table.header[0]).runs.first {
             $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true
         }
         #expect(headerBold != nil)
-        let codeRun = table.rows[0][0].runs.first {
+        let codeRun = attr(table.rows[0][0]).runs.first {
             $0.inlinePresentationIntent?.contains(.code) == true
         }
         #expect(codeRun != nil)
-        #expect(table.rows[0][1].runs.first?.link != nil)
+        #expect(attr(table.rows[0][1]).runs.first?.link != nil)
     }
 
     @Test func tableEscapedPipeStaysInCell() {
@@ -278,5 +290,175 @@ struct BannerMarkdownTests {
             Issue.record("expected only the text block")
             return
         }
+    }
+
+    // MARK: Task-list checkboxes
+
+    private func segs(_ s: String) -> [Inline] {
+        Ghostty.BannerMarkdown.segments(Substring(s))
+    }
+
+    // Native segment output: checkbox tokens become `.checkbox`, not glyphs.
+
+    @Test func checkboxSegmentsCheckedAndUnchecked() {
+        #expect(segs("[x] a") == [.checkbox(true), .text(AttributedString(" a"))])
+        #expect(segs("[X] a") == [.checkbox(true), .text(AttributedString(" a"))])
+        #expect(segs("[ ] a") == [.checkbox(false), .text(AttributedString(" a"))])
+    }
+
+    @Test func checkboxSegmentsMixedLine() {
+        let s = segs("[x] tests pass   [ ] docs TODO")
+        #expect(s == [
+            .checkbox(true),
+            .text(AttributedString(" tests pass   ")),
+            .checkbox(false),
+            .text(AttributedString(" docs TODO")),
+        ])
+    }
+
+    @Test func checkboxSegmentsLeadingListMarker() {
+        // A leading "- "/"* " before a checkbox is consumed (no stray dash).
+        #expect(segs("- [x] done") == [.checkbox(true), .text(AttributedString(" done"))])
+        #expect(segs("* [ ] todo") == [.checkbox(false), .text(AttributedString(" todo"))])
+        // A dash NOT followed by a checkbox stays literal text.
+        #expect(segs("- item") == [.text(AttributedString("- item"))])
+    }
+
+    @Test func checkboxSegmentsNotFullTokenIsLiteral() {
+        // [xx] and [y] are not checkbox tokens; left to link/literal logic.
+        #expect(segs("[xx]") == [.text(AttributedString("[xx]"))])
+        #expect(segs("[y]") == [.text(AttributedString("[y]"))])
+    }
+
+    @Test func checkboxSegmentsLinkIsNotCheckbox() {
+        // [x](url) is a link (x is the link text), not a checkbox segment.
+        let s = segs("[x](https://example.com)")
+        #expect(s.count == 1)
+        guard case .text(let a) = s.first else {
+            Issue.record("expected a single text (link) segment")
+            return
+        }
+        #expect(String(a.characters) == "x")
+        #expect(a.runs.contains { $0.link != nil })
+    }
+
+    // Block-level: consecutive list lines form a `.list` block so the items
+    // render with proper spacing and a shared marker gutter rather than tight
+    // text lines.
+
+    typealias ListItem = Ghostty.BannerMarkdown.ListItem
+
+    private func item(_ marker: Ghostty.BannerMarkdown.ListMarker, _ text: String) -> ListItem {
+        ListItem(marker: marker, content: text.isEmpty ? [] : [.text(AttributedString(text))])
+    }
+
+    @Test func checkboxListFromConsecutiveLines() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("- [x] done\n- [ ] todo\n[x] also")
+        #expect(blocks.count == 1)
+        guard case .list(let items) = blocks.first else {
+            Issue.record("expected list block, got \(blocks)")
+            return
+        }
+        // Marker is the checkbox; content follows with leading space stripped.
+        #expect(items == [
+            item(.checkbox(true), "done"),
+            item(.checkbox(false), "todo"),
+            item(.checkbox(true), "also"),
+        ])
+    }
+
+    @Test func bulletList() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("- alpha\n* beta")
+        guard case .list(let items) = blocks.first else {
+            Issue.record("expected list block, got \(blocks)")
+            return
+        }
+        #expect(items == [item(.bullet, "alpha"), item(.bullet, "beta")])
+    }
+
+    @Test func orderedList() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("1. first\n2. second\n10. tenth")
+        guard case .list(let items) = blocks.first else {
+            Issue.record("expected list block, got \(blocks)")
+            return
+        }
+        #expect(items == [
+            item(.ordered(1), "first"),
+            item(.ordered(2), "second"),
+            item(.ordered(10), "tenth"),
+        ])
+    }
+
+    @Test func mixedMarkersShareOneListBlock() {
+        // Bullets, ordered items, and checkboxes on consecutive lines all
+        // belong to a single list so they align in a shared gutter.
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("- bullet\n1. one\n[x] check")
+        #expect(blocks.count == 1)
+        guard case .list(let items) = blocks.first else {
+            Issue.record("expected one list block, got \(blocks)")
+            return
+        }
+        #expect(items == [
+            item(.bullet, "bullet"),
+            item(.ordered(1), "one"),
+            item(.checkbox(true), "check"),
+        ])
+    }
+
+    @Test func listItemContentKeepsInlineStyles() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("- **bold** item")
+        guard case .list(let items) = blocks.first, items.count == 1 else {
+            Issue.record("expected one list item, got \(blocks)")
+            return
+        }
+        #expect(items[0].marker == .bullet)
+        #expect(plain(items[0].content) == "bold item")
+        #expect(attr(items[0].content).runs.contains {
+            $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true
+        })
+    }
+
+    @Test func decimalIsNotAnOrderedList() {
+        // "1.5" has no space after the dot, so it stays plain text.
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("1.5 kg")
+        guard case .text = blocks.first else {
+            Issue.record("expected text block, got \(blocks)")
+            return
+        }
+    }
+
+    @Test func listSeparatedFromSurroundingText() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("Status:\n[x] shipped\nnote")
+        #expect(blocks.count == 3)
+        guard case .text = blocks[0], case .list(let items) = blocks[1],
+              case .text = blocks[2] else {
+            Issue.record("expected text / list / text, got \(blocks)")
+            return
+        }
+        #expect(items == [item(.checkbox(true), "shipped")])
+    }
+
+    // Table cells render native checkboxes too (still a single `.table` block).
+
+    @Test func checkboxInsideTableCell() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks(
+            "| Job | State |\n|---|---|\n| lint | [x] |\n| tests | [ ] |"
+        )
+        guard case .table(let table) = blocks.first else {
+            Issue.record("expected table block")
+            return
+        }
+        #expect(table.rows[0][1] == [.checkbox(true)])
+        #expect(table.rows[1][1] == [.checkbox(false)])
+        // The label cells are plain text.
+        #expect(plain(table.rows[0][0]) == "lint")
+    }
+
+    // The inline glyph fallback (used for wrapping text and tests) still maps
+    // checkboxes to ☑/☐.
+
+    @Test func checkboxGlyphFallback() {
+        #expect(plain(Ghostty.BannerMarkdown.parse("[x] a")) == "\u{2611} a")
+        #expect(plain(Ghostty.BannerMarkdown.parse("[ ] a")) == "\u{2610} a")
     }
 }

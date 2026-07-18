@@ -107,6 +107,22 @@ extension Ghostty {
                     .lineLimit(lineLimit)
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
+            case .list(let items):
+                // A two-column grid: markers share the first (auto-sized)
+                // column so every item's content left-aligns in the second,
+                // with table-like row spacing.
+                Grid(alignment: .leading, horizontalSpacing: 6, verticalSpacing: 4) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                        GridRow {
+                            listMarkerView(item.marker)
+                                // Center every marker in the shared gutter so a
+                                // bullet dot sits under the middle of a checkbox
+                                // rather than at the column's left edge.
+                                .gridColumnAlignment(.center)
+                            inlineRow(item.content)
+                        }
+                    }
+                }
             case .heading(let str, let level):
                 Text(str)
                     .font(.system(size: headingFontSize(level), weight: .semibold))
@@ -119,9 +135,8 @@ extension Ghostty {
                     if showHeader {
                         GridRow {
                             ForEach(Array(table.header.enumerated()), id: \.offset) { col, cell in
-                                Text(cell)
+                                inlineRow(cell)
                                     .bold()
-                                    .lineLimit(1)
                                     .gridColumnAlignment(horizontalAlignment(table.alignments[col]))
                             }
                         }
@@ -135,17 +150,54 @@ extension Ghostty {
                                 // With no header row to carry it, the first
                                 // body row sets each column's alignment.
                                 if !showHeader && rowIdx == 0 {
-                                    Text(cell)
-                                        .lineLimit(1)
+                                    inlineRow(cell)
                                         .gridColumnAlignment(horizontalAlignment(table.alignments[col]))
                                 } else {
-                                    Text(cell)
-                                        .lineLimit(1)
+                                    inlineRow(cell)
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        /// Lay out one line of inline content — a table cell or a task-list
+        /// item — as a single non-wrapping row, drawing each `.checkbox`
+        /// segment as a native box (see `CheckboxMark`) and each `.text`
+        /// segment as styled text. Source spaces provide the gaps, so a
+        /// leading `[x] ` renders "☑ done" with the box vertically centered.
+        @ViewBuilder
+        private func inlineRow(_ segments: [BannerMarkdown.Inline]) -> some View {
+            HStack(alignment: .center, spacing: 0) {
+                ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                    switch seg {
+                    case .text(let str):
+                        Text(str).lineLimit(1)
+                    case .checkbox(let checked):
+                        CheckboxMark(checked: checked)
+                    }
+                }
+            }
+        }
+
+        /// The leading marker of a list row, drawn in the shared gutter column.
+        @ViewBuilder
+        private func listMarkerView(_ marker: BannerMarkdown.ListMarker) -> some View {
+            switch marker {
+            case .checkbox(let checked):
+                CheckboxMark(checked: checked)
+            case .bullet:
+                // A drawn dot reads more evenly than the "•" glyph and sizes
+                // predictably relative to the 12pt box.
+                Circle()
+                    .fill(Color.secondary)
+                    .frame(width: 5, height: 5)
+            case .ordered(let number):
+                Text(verbatim: "\(number).")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
             }
         }
 
@@ -169,6 +221,39 @@ extension Ghostty {
             case .center: return .center
             case .trailing: return .trailing
             case .leading, nil: return .leading
+            }
+        }
+
+        /// A task-list checkbox drawn as a small native control rather than a
+        /// glyph: a rounded (2pt-radius) box with a thin border, filled with a
+        /// tinted wash and a colored check when checked. Sized to sit inline
+        /// with the 12pt banner text like a character.
+        private struct CheckboxMark: View {
+            let checked: Bool
+
+            private static let side: CGFloat = 12
+            private static let radius: CGFloat = 2
+
+            var body: some View {
+                RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                    .fill(checked ? Color.green.opacity(0.16) : Color.clear)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                            .strokeBorder(
+                                checked ? Color.green.opacity(0.55)
+                                        : Color.secondary.opacity(0.55),
+                                lineWidth: 1
+                            )
+                    )
+                    .overlay {
+                        if checked {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(Color.green)
+                        }
+                    }
+                    .frame(width: Self.side, height: Self.side)
+                    .accessibilityLabel(checked ? "checked" : "unchecked")
             }
         }
     }
@@ -207,18 +292,47 @@ extension Ghostty {
             case trailing
         }
 
+        /// One piece of inline content. Text spans are pre-styled
+        /// `AttributedString`; a `checkbox` is a task-list mark that the view
+        /// draws natively (a rounded box with a colored check) rather than a
+        /// glyph, so it reads as a real control instead of plaintext.
+        enum Inline: Equatable {
+            case text(AttributedString)
+            case checkbox(Bool)
+        }
+
+        /// The leading marker of a list item, drawn in a shared gutter so all
+        /// item content aligns regardless of marker kind.
+        enum ListMarker: Equatable {
+            /// `[x]`/`[ ]` — a native checkbox (`- [x]` marker also lands here).
+            case checkbox(Bool)
+            /// `- ` or `* ` — an unordered bullet.
+            case bullet
+            /// `1.`, `2.`, … — an ordered item; the associated value is the
+            /// parsed number, rendered verbatim (source numbering is kept).
+            case ordered(Int)
+        }
+
+        struct ListItem: Equatable {
+            var marker: ListMarker
+            var content: [Inline]
+        }
+
         struct Table: Equatable {
-            var header: [AttributedString]
+            var header: [[Inline]]
             /// One entry per column; nil when the separator had no `:` markers.
             var alignments: [ColumnAlignment?]
-            var rows: [[AttributedString]]
+            var rows: [[[Inline]]]
 
-            /// True when at least one header cell carries visible text. An
+            /// True when at least one header cell carries visible content. An
             /// all-empty header (e.g. `|  |  |`) is a layout scaffold — a
             /// caller wanting an aligned key/value grid with no column
             /// titles — so the view skips rendering that blank row.
             var hasVisibleHeader: Bool {
-                header.contains { !$0.characters.isEmpty }
+                header.contains { cell in cell.contains { seg in
+                    if case .text(let a) = seg { return !a.characters.isEmpty }
+                    return true // a checkbox is visible content
+                } }
             }
         }
 
@@ -228,6 +342,13 @@ extension Ghostty {
             /// the extra headroom lets long lines soft-wrap like they always
             /// have without the total exceeding the banner cap).
             case text(AttributedString, lineLimit: Int)
+            /// A run of consecutive list lines — bullets (`- `/`* `), ordered
+            /// items (`1.`), and task-list checkboxes (`[x]`/`[ ]`, optionally
+            /// after a `- `/`* ` marker), in any mix. Rendered as evenly spaced
+            /// rows whose markers share a gutter so every item's content aligns,
+            /// separate from `.text` so lists get table-like vertical rhythm
+            /// instead of tight line spacing.
+            case list([ListItem])
             /// An ATX heading (`# text` … `###### text`); `level` is 1–6.
             /// Rendered bold at a size that grows as the level shrinks.
             case heading(AttributedString, level: Int)
@@ -236,6 +357,21 @@ extension Ghostty {
 
         static func parse(_ source: String) -> AttributedString {
             parseInline(Substring(source))
+        }
+
+        /// Flatten inline segments to a single `AttributedString`, rendering a
+        /// checkbox as its box glyph (`☑`/`☐`). Used for the plain-text
+        /// fallback (a checkbox mid-paragraph), heading text, and tests.
+        static func attributed(_ segments: [Inline]) -> AttributedString {
+            var result = AttributedString()
+            for seg in segments {
+                switch seg {
+                case .text(let a): result.append(a)
+                case .checkbox(let checked):
+                    result.append(AttributedString(checked ? "\u{2611}" : "\u{2610}"))
+                }
+            }
+            return result
         }
 
         /// Parse banner source into displayable blocks, truncated to at most
@@ -289,13 +425,13 @@ extension Ghostty {
                             remaining -= 1 + keptRows.count
                             let columns = headerCells.count
                             blocks.append(.table(Table(
-                                header: headerCells.map { parseInline(Substring($0)) },
+                                header: headerCells.map { segments(Substring($0)) },
                                 alignments: sepCells.map(columnAlignment),
                                 rows: keptRows.map { row in
                                     (0..<columns).map { col in
                                         col < row.count
-                                            ? parseInline(Substring(row[col]))
-                                            : AttributedString()
+                                            ? segments(Substring(row[col]))
+                                            : []
                                     }
                                 }
                             )))
@@ -304,6 +440,27 @@ extension Ghostty {
                         i = j
                         continue
                     }
+                }
+
+                // A run of list lines (bullets, ordered items, checkboxes)
+                // becomes its own block so the items get table-like vertical
+                // rhythm and a shared marker gutter, instead of tight text
+                // line spacing.
+                if listItem(lines[i]) != nil {
+                    flushText()
+                    var items: [ListItem] = []
+                    while i < lines.count, let item = listItem(lines[i]) {
+                        if remaining > 0 {
+                            items.append(ListItem(
+                                marker: item.marker,
+                                content: segments(item.content)
+                            ))
+                            remaining -= 1
+                        }
+                        i += 1
+                    }
+                    if !items.isEmpty { blocks.append(.list(items)) }
+                    continue
                 }
 
                 textLines.append(lines[i])
@@ -399,15 +556,35 @@ extension Ghostty {
             ("`", .code),
         ]
 
+        /// Parse inline markdown into a flat `AttributedString`, rendering any
+        /// checkbox as its box glyph. Used for nested contexts (link labels,
+        /// styled spans), heading text, and the wrapping-text fallback.
         private static func parseInline(_ s: Substring) -> AttributedString {
-            var result = AttributedString()
+            attributed(segments(s))
+        }
+
+        /// Parse inline markdown into ordered segments, emitting a native
+        /// `.checkbox` for each top-level `[x]`/`[X]`/`[ ]` token (optionally
+        /// after a leading `- `/`* ` marker) and `.text` for everything else.
+        /// A checkbox nested inside a link/bold/italic span stays a glyph (via
+        /// the `parseInline` recursion) — native boxes are a top-level affair.
+        static func segments(_ s: Substring) -> [Inline] {
+            var out: [Inline] = []
+            var run = AttributedString()
             var literal = ""
             var i = s.startIndex
 
             func flushLiteral() {
                 guard !literal.isEmpty else { return }
-                result.append(AttributedString(literal))
+                run.append(AttributedString(literal))
                 literal = ""
+            }
+            func flushRun() {
+                flushLiteral()
+                if !run.characters.isEmpty {
+                    out.append(.text(run))
+                    run = AttributedString()
+                }
             }
 
             while i < s.endIndex {
@@ -423,6 +600,28 @@ extension Ghostty {
                     }
                 }
 
+                // Task-list list marker: a leading "- "/"* " directly before a
+                // checkbox token is consumed so "- [x] done" renders "☑ done"
+                // instead of leaving a stray dash. Only fires at the very start
+                // and only when a checkbox follows.
+                if i == s.startIndex,
+                   s.hasPrefix("- ") || s.hasPrefix("* "),
+                   checkboxToken(in: s, at: s.index(i, offsetBy: 2)) != nil {
+                    i = s.index(i, offsetBy: 2)
+                    continue
+                }
+
+                // Task-list checkbox → native segment. Runs before the link
+                // parser so a bare [x] isn't swallowed by the [text](url) path;
+                // a [x](url) token (checkbox NOT matched because "(" follows)
+                // falls through and stays a link.
+                if let (checked, after) = checkboxToken(in: s, at: i) {
+                    flushRun()
+                    out.append(.checkbox(checked))
+                    i = after
+                    continue
+                }
+
                 // Links: [text](url)
                 if c == "[",
                    let closeBracket = find("]", in: s, from: s.index(after: i)),
@@ -435,7 +634,7 @@ extension Ghostty {
                     var linked = parseInline(s[s.index(after: i)..<closeBracket])
                     linked.link = url
                     linked.underlineStyle = Text.LineStyle.single
-                    result.append(linked)
+                    run.append(linked)
                     i = s.index(after: closeParen)
                     continue
                 }
@@ -455,7 +654,7 @@ extension Ghostty {
                         } else {
                             styled.underlineStyle = Text.LineStyle.single
                         }
-                        result.append(styled)
+                        run.append(styled)
                         i = s.index(close, offsetBy: delim.count)
                         continue
                     }
@@ -465,8 +664,75 @@ extension Ghostty {
                 i = s.index(after: i)
             }
 
-            flushLiteral()
-            return result
+            flushRun()
+            return out
+        }
+
+        /// Classify `line` as a list item, returning its marker and the content
+        /// that follows (leading spaces stripped so item content aligns in the
+        /// gutter). Returns nil when the line isn't a list item.
+        ///
+        /// Recognized: `- `/`* ` bullets, `1.`/`2.`… ordered items, and
+        /// `[x]`/`[X]`/`[ ]` checkboxes (a `- `/`* ` before a checkbox is the
+        /// checkbox's marker, not a separate bullet).
+        static func listItem(_ line: Substring) -> (marker: ListMarker, content: Substring)? {
+            let trimmed = line.drop { $0 == " " }
+            guard !trimmed.isEmpty else { return nil }
+
+            // A leading "- "/"* " may introduce a checkbox or a plain bullet.
+            var afterDash = trimmed
+            let hadDash = trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ")
+            if hadDash { afterDash = trimmed.dropFirst(2) }
+
+            if let (checked, after) = checkboxToken(in: afterDash, at: afterDash.startIndex) {
+                return (.checkbox(checked), afterDash[after...].drop { $0 == " " })
+            }
+            if hadDash {
+                return (.bullet, afterDash.drop { $0 == " " })
+            }
+            if let (number, rest) = orderedPrefix(trimmed) {
+                return (.ordered(number), rest.drop { $0 == " " })
+            }
+            return nil
+        }
+
+        /// Match a leading `<digits>. ` (period then a required space, so a
+        /// decimal like `1.5` isn't a list). Returns the number and the rest.
+        private static func orderedPrefix(_ s: Substring) -> (number: Int, rest: Substring)? {
+            var idx = s.startIndex
+            while idx < s.endIndex, s[idx] >= "0", s[idx] <= "9" {
+                idx = s.index(after: idx)
+            }
+            guard idx > s.startIndex, let number = Int(s[s.startIndex..<idx]) else { return nil }
+            guard idx < s.endIndex, s[idx] == "." else { return nil }
+            let afterDot = s.index(after: idx)
+            guard afterDot < s.endIndex, s[afterDot] == " " else { return nil }
+            return (number, s[afterDot...])
+        }
+
+        /// If a task-list checkbox token (`[x]`, `[X]`, or `[ ]`) begins at
+        /// `at`, return whether it's checked and the index just past the token.
+        /// Returns nil when the token isn't a checkbox, or when a `(` follows
+        /// the closing `]` (then it's a `[text](url)` link, not a checkbox).
+        private static func checkboxToken(
+            in s: Substring,
+            at index: Substring.Index
+        ) -> (checked: Bool, after: Substring.Index)? {
+            guard index < s.endIndex, s[index] == "[" else { return nil }
+            let i1 = s.index(after: index)
+            guard i1 < s.endIndex else { return nil }
+            let i2 = s.index(after: i1)
+            guard i2 < s.endIndex, s[i2] == "]" else { return nil }
+            let checked: Bool
+            switch s[i1] {
+            case "x", "X": checked = true
+            case " ": checked = false
+            default: return nil
+            }
+            let after = s.index(after: i2)
+            // A trailing "(" means this is link text, e.g. [x](https://…).
+            if after < s.endIndex, s[after] == "(" { return nil }
+            return (checked, after)
         }
 
         /// Find the next unescaped occurrence of `needle` at or after `from`.
