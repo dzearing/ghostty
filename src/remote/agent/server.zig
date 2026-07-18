@@ -832,6 +832,12 @@ pub const Server = struct {
         s.cols = att.cols;
         s.last_activity_ms = now;
         s.child.resize(att.rows, att.cols, 0, 0) catch {};
+        // Re-attach repaint: the geometry restored here is only the pre-layout
+        // seed; the client sends an authoritative RESIZE once the pane is live
+        // (threadEnter, 106dcdc9c). Latch a one-shot SIGWINCH onto that RESIZE so
+        // alt-screen apps repaint even when the restored size is byte-identical
+        // (else they stay blank until a manual resize). See winch_on_next_resize.
+        s.winch_on_next_resize = true;
         const snapshot_at = s.snapshotOffset();
 
         self.sendJson(.attached, s.channel, protocol.Attached{
@@ -896,6 +902,7 @@ pub const Server = struct {
         // blocking) ConPTY resize OUTSIDE it — never hold the global store lock
         // across child I/O (see handleInboundData).
         self.store.mutex.lock();
+        var winch_after = false;
         const child: ?session.Child = blk: {
             const s = self.store.table.getByChannel(channel) orelse {
                 std.log.warn("RESIZE: no session for ch={x}", .{channel});
@@ -909,12 +916,24 @@ pub const Server = struct {
             s.cols = rz.cols;
             s.px_w = rz.px_w;
             s.px_h = rz.px_h;
+            // First authoritative RESIZE after an ATTACH/RELAUNCH: deliver one
+            // SIGWINCH after applying the size so alt-screen apps repaint even
+            // when the geometry is unchanged (TIOCSWINSZ alone raises SIGWINCH
+            // only on a delta). One-shot — cleared here so live resizes don't
+            // pay for a redundant signal.
+            winch_after = s.winch_on_next_resize;
+            s.winch_on_next_resize = false;
             break :blk s.child;
         };
         self.store.mutex.unlock();
-        if (child) |c| c.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch |err| {
-            std.log.warn("RESIZE: child.resize failed err={}", .{err});
-        };
+        if (child) |c| {
+            c.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch |err| {
+                std.log.warn("RESIZE: child.resize failed err={}", .{err});
+            };
+            // Ordered AFTER the resize: the app re-queries winsize on SIGWINCH,
+            // so the child must already see the final dimensions.
+            if (winch_after) c.signal("WINCH") catch {};
+        }
     }
 
     fn handleSignal(self: *Server, channel: u128, payload: []const u8) void {
@@ -1273,7 +1292,15 @@ pub const Server = struct {
         rs.setTty(tty_copy);
         // Bind to THIS connection so live output frames flow to our writer.
         self.bindLocked(rs);
+        // Same re-attach repaint latch as ATTACH: the client re-asserts geometry
+        // with an authoritative RESIZE right after RELAUNCH; fire one SIGWINCH on
+        // it so a relaunched full-screen program paints against the final size.
+        rs.winch_on_next_resize = true;
         const pid = rs.pid;
+        // Capture the replayed-scrollback capture geometry under the lock so the
+        // reply (sent after unlock) can tell the viewer what width to replay at.
+        const replay_cols = rs.replay_cols;
+        const replay_rows = rs.replay_rows;
         const child = rs.child; // value copy of the vtable handle
 
         // Reboot scrollback (T13, §5.4): a session materialized from disk has its
@@ -1316,6 +1343,10 @@ pub const Server = struct {
             // Tell the client we already replayed scrollback + the divider so it
             // suppresses its own snapshot-less divider (no double marker).
             .replayed = replay_n > 0,
+            // Width the replayed bytes were drawn at (0 when unknown) so the client
+            // can replay at that width then reflow — see Relaunched.replay_cols.
+            .replay_cols = if (replay_n > 0) replay_cols else 0,
+            .replay_rows = if (replay_n > 0) replay_rows else 0,
             .tty = tty_copy,
         }) catch {};
 
@@ -2890,7 +2921,7 @@ test "RELAUNCH: reboot ring snapshot is replayed (scrollback + divider) before l
         try @import("session_meta.zig").writeAtomic(alloc, meta, body);
         const rp = try ring_snapshot.pathFor(alloc, rings, rec_id);
         defer alloc.free(rp);
-        try ring_snapshot.writeAtomic(alloc, rp, 0, scrollback);
+        try ring_snapshot.writeAtomic(alloc, rp, 0, 80, 24, scrollback);
     }
     try testing.expectEqual(@as(usize, 1), h.store.loadPersisted(1 << 16));
 
