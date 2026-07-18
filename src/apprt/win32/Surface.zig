@@ -20,6 +20,7 @@ const ConfirmDialog = @import("ConfirmDialog.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
+const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const provenance = @import("provenance.zig");
 
 const log = std.log.scoped(.win32);
@@ -96,6 +97,12 @@ frame_event: ?w32.HANDLE = null,
 /// Themed scrollbar (custom layered-popup overlay).
 /// Created lazily after the surface HWND exists.
 scrollbar: ?*Scrollbar = null,
+
+/// Unfocused-split dim overlay (T74): a layered popup filled with
+/// `unfocused-split-fill` shown over this pane while an unfocused split.
+/// Created lazily on first dim (single-pane windows never pay for one).
+/// Driven by Window.updateDimOverlays.
+dim_overlay: ?*DimOverlay = null,
 
 /// The current mouse cursor. Cached so WM_SETCURSOR can restore it
 /// (DefWindowProc resets the cursor to the class cursor on every
@@ -520,6 +527,12 @@ pub fn deinit(self: *Surface) void {
         self.scrollbar = null;
     }
 
+    // Destroy the dim overlay before the surface HWND (its owner) is gone.
+    if (self.dim_overlay) |d| {
+        d.destroy();
+        self.dim_overlay = null;
+    }
+
     // Destroy popup windows and their GDI resources.
     if (self.search_hwnd) |popup| {
         _ = w32.DestroyWindow(popup);
@@ -676,6 +689,29 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     self.core_surface.occlusionCallback(visible) catch |err| {
         log.warn("occlusionCallback failed err={}", .{err});
     };
+}
+
+/// Show (or reposition) this pane's dim overlay at the given fill color
+/// (COLORREF) and alpha. Lazily creates the overlay popup on first use.
+/// Called by Window.updateDimOverlays (T74).
+pub fn showDimOverlay(self: *Surface, color: u32, alpha: u8) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.dim_overlay == null) {
+        self.dim_overlay = DimOverlay.create(
+            self.app.core_app.alloc,
+            hwnd,
+            self.app.hinstance,
+        ) catch |err| {
+            log.warn("dim overlay create failed err={}", .{err});
+            return;
+        };
+    }
+    self.dim_overlay.?.show(color, alpha);
+}
+
+/// Hide this pane's dim overlay if it exists.
+pub fn hideDimOverlay(self: *Surface) void {
+    if (self.dim_overlay) |d| d.hide();
 }
 
 // -----------------------------------------------------------------------

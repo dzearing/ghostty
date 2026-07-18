@@ -2115,6 +2115,33 @@ change (the hero carousel's dimmed thumbs are a separate hardcoded
 path). Validation: two splits, unfocused pane visibly dims; config knobs
 respected; focus flip updates both panes.
 
+**DONE 2026-07-18.** New `DimOverlay.zig`: per-pane WS_EX_LAYERED +
+WS_EX_TRANSPARENT + WS_EX_NOACTIVATE popup owned by the surface HWND
+(the Scrollbar.zig pattern — DWM composites it above the pane's OpenGL,
+which a plain child window can't do), created lazily on first dim.
+Uniform dimming uses SetLayeredWindowAttributes(LWA_ALPHA) + a solid
+brush — alpha = (1 − opacity) × 255, fill = `unfocused-split-fill`
+orelse `background`, exactly the Mac formula
+(Ghostty.Config.swift/SurfaceView.swift). Pure alpha/decision logic in
+`dim_math.zig` (overlayAlpha + shouldDim), unit-tested in both lanes
+via apprt.zig. `Window.updateDimOverlays` walks ALL tabs (popups don't
+hide with their pane's HWND) and runs from: layoutSplits (defer — every
+layout path incl. hero/zoom early returns), the surface WM_SETFOCUS
+handler, the top-level WM_MOVE handler (screen-positioned popups), and
+Window.onConfigChange. Dimming is suppressed for zoom, hero mode,
+single-pane tabs, inactive tabs, and opacity=1 (alpha 0 = off).
+Evidence: new `test/win32/split-dim.ps1` ALL PASS (23) ×3 on-box
+2026-07-18 — three GUI launches: defaults (one overlay over the
+unfocused pane, alpha 77 read via GetLayeredWindowAttributes, ex-style
+bits asserted, ctrl+alt+up focus flip moves the overlay, zoom hides /
+unzoom restores), `--unfocused-split-opacity=1` (no overlay ever), and
+`--unfocused-split-opacity=0.5 --unfocused-split-fill=#ff0000
+--background=#000000` (alpha 128 + composited screen pixel at the
+dimmed pane center reads exactly 128,0,0). Regression: P1–P3,
+split-zoom-nav (16), hero-mode (60), both test lanes — all green.
+Harness note: wrap 1-element function returns in `@()` (PS 5.1 unrolls
++ pscustomobject lacks intrinsic .Count).
+
 ## T75 — Honor `focus-follows-mouse` (Phase I)
 
 Found by T51 (F11). Mac focuses the split under the pointer on

@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 5) — T74 DONE. `unfocused-split-opacity`/`-fill`
+  now honored: new DimOverlay.zig — a Scrollbar-pattern WS_EX_LAYERED +
+  WS_EX_TRANSPARENT popup per pane (lazy), filled with the fill color at
+  (1-opacity)*255 alpha (Mac parity); pure decision/alpha logic in
+  dim_math.zig (unit tests, both lanes). Window.updateDimOverlays drives
+  it from layoutSplits (defer, all paths), WM_SETFOCUS, WM_MOVE, and
+  config reload; hidden under zoom/hero/inactive tabs. New
+  `test/win32/split-dim.ps1` ALL PASS (23) ×3 — alpha 77/128 read back
+  via GetLayeredWindowAttributes, focus flip moves the overlay, zoom
+  hides it, opacity=1 disables, and a screen-pixel blend check reads
+  exactly r=128,0,0 for red fill @0.5 over black. P1–P3 + zoom-nav (16)
+  + hero-mode (60) + both lanes green. Harness gotcha: PS 5.1 unrolls a
+  1-element function return AND pscustomobject has no intrinsic .Count —
+  wrap call sites in @(). Next per T51 order: T73.
 - 2026-07-18 (on-box, 4) — T80 DONE. Dark message boxes: new
   `ConfirmDialog.zig` — a T50-pattern dark dialog with a *synchronous*
   API (owner disabled + own nested message pump, the MessageBoxW shape

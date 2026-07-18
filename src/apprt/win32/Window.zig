@@ -41,6 +41,7 @@ const w32 = @import("win32.zig");
 const DarkMode = @import("DarkMode.zig");
 const HeroCarousel = @import("HeroCarousel.zig");
 const hero_math = @import("hero_math.zig");
+const dim_math = @import("dim_math.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -354,6 +355,8 @@ pub fn onConfigChange(self: *Window) void {
         applyChromeTheme(hwnd, self.app.config.@"window-theme", self.app.config.background);
         applyBackgroundBlur(hwnd, self.app.config.@"background-blur".enabled());
     }
+    // Re-apply unfocused-split-opacity/-fill (T74).
+    self.updateDimOverlays();
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -1368,6 +1371,9 @@ fn layoutHero(self: *Window, rect: w32.RECT) void {
 
 pub fn layoutSplits(self: *Window) void {
     if (self.tab_count == 0) return;
+    // Runs after every layout path below (including the hero/zoom early
+    // returns) so the dim overlays track pane rects and layout state.
+    defer self.updateDimOverlays();
     const tree = self.tab_trees[self.active_tab];
     const rect = self.surfaceRect();
     if (self.tab_hero_active[self.active_tab]) {
@@ -1407,6 +1413,41 @@ pub fn layoutSplits(self: *Window) void {
         if (hdc) |dc| {
             self.paintDividers(dc);
             _ = w32.ReleaseDC(hwnd, dc);
+        }
+    }
+}
+
+/// Show/hide/reposition the unfocused-split dim overlays (T74): every
+/// unfocused pane of the active tab's split gets a click-through layered
+/// popup filled with `unfocused-split-fill` at 1 - `unfocused-split-opacity`
+/// alpha (Mac parity). Walks ALL tabs so a tab switch hides the old tab's
+/// overlays (they are popups — hiding the pane HWND does not hide them).
+/// Idempotent and cheap; called from layoutSplits, focus changes, WM_MOVE,
+/// and config reload.
+pub fn updateDimOverlays(self: *Window) void {
+    const config = &self.app.config;
+    // Config clamps opacity to [0.15, 1]; 1 → alpha 0 → feature off.
+    const alpha = dim_math.overlayAlpha(config.@"unfocused-split-opacity");
+    const fill = config.@"unfocused-split-fill" orelse config.background;
+    const color = w32.RGB(fill.r, fill.g, fill.b);
+
+    for (0..self.tab_count) |tab| {
+        const tree = self.tab_trees[tab];
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const dim = dim_math.shouldDim(.{
+                .alpha = alpha,
+                .active_tab = tab == self.active_tab,
+                .is_split = tree.isSplit(),
+                .zoomed = tree.zoomed != null,
+                .hero = self.tab_hero_active[tab],
+                .focused_pane = entry.view == self.tab_active_surface[tab],
+            });
+            if (dim) {
+                entry.view.showDimOverlay(color, alpha);
+            } else {
+                entry.view.hideDimOverlay();
+            }
         }
     }
 }
@@ -3046,6 +3087,8 @@ pub fn windowWndProc(
                     if (entry.view.scrollbar) |sb| _ = sb.repositionAndResize();
                 }
             }
+            // The dim overlays are screen-positioned popups too (T74).
+            window.updateDimOverlays();
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_GETMINMAXINFO => {

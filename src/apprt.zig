@@ -63,4 +63,7 @@ test {
     // Pure win32 hero-mode geometry: no OS imports, so its unit tests run
     // in every app-runtime lane (T59a).
     _ = @import("apprt/win32/hero_math.zig");
+
+    // Pure win32 unfocused-split dim logic (T74), same no-OS-imports deal.
+    _ = @import("apprt/win32/dim_math.zig");
 }

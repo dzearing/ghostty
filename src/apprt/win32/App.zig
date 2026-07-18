@@ -2747,6 +2747,8 @@ fn surfaceWndProc(
             const tab = surface.parent_window.active_tab;
             surface.parent_window.tab_active_surface[tab] = surface;
             surface.parent_window.heroOnSurfaceFocused(surface);
+            // Dim the pane that lost the active slot, undim this one (T74).
+            surface.parent_window.updateDimOverlays();
             surface.handleFocus(true);
             return 0;
         },
