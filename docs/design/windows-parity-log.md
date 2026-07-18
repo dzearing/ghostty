@@ -9,6 +9,15 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 6) — T73 DONE. `split-divider-color` honored:
+  paintDividers computes the pen color from config (0x808080 fallback)
+  and passes it down; onConfigChange repaints dividers (GetDC path) so
+  reload re-colors live. New `test/win32/split-divider.ps1` ALL PASS
+  (9) ×3 (red via config file, live reload → blue, gray fallback);
+  P1–P3 + split-dim + both lanes green. Surprise: the harness needed
+  PER_MONITOR_AWARE_V2 — virtualized GetPixel can't see a 1-2 px line
+  on this DPI-scaled box. Next per T51 order: T76.
+
 - 2026-07-18 (on-box, 5) — T74 DONE. `unfocused-split-opacity`/`-fill`
   now honored: new DimOverlay.zig — a Scrollbar-pattern WS_EX_LAYERED +
   WS_EX_TRANSPARENT popup per pane (lazy), filled with the fill color at

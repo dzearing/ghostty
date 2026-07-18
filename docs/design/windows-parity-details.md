@@ -2105,6 +2105,21 @@ read the config color (fall back to current gray), convert RGB→COLORREF.
 Validation: set `split-divider-color = #ff0000`, split, divider is red;
 config reload re-colors live.
 
+**DONE 2026-07-18.** `paintDividers` computes the pen COLORREF once
+(`split-divider-color` orelse the old 0x808080 gray) and threads it
+through `paintDividerNode`; `Window.onConfigChange` now repaints
+dividers via the same GetDC path layoutSplits uses (the lines live in
+inter-pane gaps WM_PAINT never covers), so a config reload re-colors
+live. Evidence: new `test/win32/split-divider.ps1` ALL PASS (9) ×3
+on-box 2026-07-18 — hermetic config-file launch shows a red divider
+pixel in the gap (and no gray), rewriting the file + ctrl+shift+,
+re-colors it blue live (polled), defaults run shows the gray fallback;
+ctrl+k positive control gates the chord path. Regression: P1–P3,
+split-dim (23), both test lanes — all green. Harness note: the script
+must call `SetProcessDpiAwarenessContext(-4)` first — virtualized
+GetPixel sampling on this >100% DPI box never sees the 1-2 px line
+(same lesson as hero-mode.ps1).
+
 ## T74 — Implement `unfocused-split-opacity`/`-fill` (Phase I)
 
 Found by T51 (F10); corrects the 2026-07-12 audit (listed honored, is

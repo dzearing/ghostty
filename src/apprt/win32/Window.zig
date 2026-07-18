@@ -357,6 +357,15 @@ pub fn onConfigChange(self: *Window) void {
     }
     // Re-apply unfocused-split-opacity/-fill (T74).
     self.updateDimOverlays();
+    // Re-paint split dividers so split-divider-color takes effect live
+    // (T73). Same GetDC path as layoutSplits — the lines sit in the
+    // inter-pane gaps that WM_PAINT never covers.
+    if (self.hwnd) |hwnd| {
+        if (w32.GetDC(hwnd)) |dc| {
+            self.paintDividers(dc);
+            _ = w32.ReleaseDC(hwnd, dc);
+        }
+    }
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -1493,10 +1502,14 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
     if (!tree.isSplit()) return;
     if (tree.zoomed != null) return;
     const rect = self.surfaceRect();
-    self.paintDividerNode(hdc, tree, .root, rect);
+    const color: u32 = if (self.app.config.@"split-divider-color") |c|
+        w32.RGB(c.r, c.g, c.b)
+    else
+        0x00808080;
+    self.paintDividerNode(hdc, tree, .root, rect, color);
 }
 
-fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
+fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT, color: u32) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
         .leaf => {},
@@ -1504,7 +1517,7 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
             const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
             const line_w: i32 = @max(@as(i32, @intFromFloat(@round(1.0 * self.scale))), 1);
 
-            const pen = w32.CreatePen(0, line_w, 0x00808080) orelse return;
+            const pen = w32.CreatePen(0, line_w, color) orelse return;
             defer _ = w32.DeleteObject(pen);
             const old_pen = w32.SelectObject(hdc, pen);
             defer _ = w32.SelectObject(hdc, old_pen);
@@ -1516,8 +1529,8 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
                 _ = w32.LineTo(hdc, split_x, rect.bottom);
                 const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
                 const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, left_rect);
-                self.paintDividerNode(hdc, tree, s.right, right_rect);
+                self.paintDividerNode(hdc, tree, s.left, left_rect, color);
+                self.paintDividerNode(hdc, tree, s.right, right_rect, color);
             } else {
                 const total_h = rect.bottom - rect.top;
                 const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
@@ -1525,8 +1538,8 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
                 _ = w32.LineTo(hdc, rect.right, split_y);
                 const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
                 const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, top_rect);
-                self.paintDividerNode(hdc, tree, s.right, bottom_rect);
+                self.paintDividerNode(hdc, tree, s.left, top_rect, color);
+                self.paintDividerNode(hdc, tree, s.right, bottom_rect, color);
             }
         },
     }

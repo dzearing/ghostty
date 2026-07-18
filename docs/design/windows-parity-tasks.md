@@ -127,7 +127,8 @@ Work these first, in order, before falling back to first-todo-in-table:
    **T65–T80**. Suggested order for working them (user-visible bugs →
    "windowsy" theming → config parity → features): ~~T65~~ (done
    2026-07-18), ~~T77~~ (done 2026-07-18), ~~T79~~ (done 2026-07-18),
-   ~~T80~~ (done 2026-07-18), ~~T74~~ (done 2026-07-18), T73, T76, T75, T69, T68, T67, T70,
+   ~~T80~~ (done 2026-07-18), ~~T74~~ (done 2026-07-18), ~~T73~~ (done
+   2026-07-18), T76, T75, T69, T68, T67, T70,
    T71, T66, T72, T78. With T51
    done the priority queue is exhausted — fall back to
    first-todo-in-table / the order above.
@@ -222,7 +223,7 @@ One line per row. Full spec + validation + evidence per task:
 | T70 | CLI on PATH for installs: MSI Environment/PATH entry or runtime self-heal so `ghoztty` resolves from any shell (Mac CommandLineInstaller analog; distinct from T23) (T51 F6) | H | — | todo | — |
 | T71 | Claude Code integration setup: detect `claude` CLI + offer ghoztty-claude-plugin install, first-run + palette entry (Mac ClaudeCodeIntegration.swift) (T51 F7) | I | — | todo | — |
 | T72 | Tab accent-color tagging in the custom tab bar (Mac TerminalTabColor, 10 named colors) — cosmetic (T51 F8) | I | — | todo | — |
-| T73 | Honor `split-divider-color` — paintDividerNode hardcodes a 0x808080 pen (Window.zig:1464) (T51 F9) | I | — | todo | — |
+| T73 | `split-divider-color` — done 2026-07-18: paintDividers reads the config color (gray 0x808080 fallback), onConfigChange repaints so reload re-colors live; `split-divider.ps1` ALL PASS (9) ×3 (T51 F9) | I | — | done | (this commit) |
 | T74 | `unfocused-split-opacity`/`-fill` — done 2026-07-18: per-pane layered click-through dim popups (DimOverlay.zig + dim_math.zig, Mac-parity alpha), driven from layout/focus/move/config-reload; `split-dim.ps1` ALL PASS (23) ×3 (T51 F10) | I | — | done | 630f5fef0 |
 | T75 | Honor `focus-follows-mouse` for splits in WM_MOUSEMOVE (T51 F11) | I | — | todo | — |
 | T76 | Honor `window-inherit-font-size`: carry the focused surface's live (zoomed) font size into new window/tab/split configs (mirror embedded.zig newSurfaceOptions) (T51 F12) | I | — | todo | — |
