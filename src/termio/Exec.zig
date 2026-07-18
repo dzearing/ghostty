@@ -35,6 +35,11 @@ const log = std.log.scoped(.io_exec);
 /// The termios poll rate in milliseconds.
 const TERMIOS_POLL_MS = 200;
 
+/// Windows: poll cadence for ConPTY output quiescence after the child
+/// exits, and the max number of polls before notifying the surface anyway.
+const EXIT_NOTIFY_POLL_MS = 50;
+const EXIT_NOTIFY_MAX_TICKS = 20;
+
 /// If we build with flatpak support then we have to keep track of
 /// a potential execution on the host.
 const FlatpakHostCommand = if (!build_config.flatpak) struct {
@@ -136,24 +141,31 @@ pub fn threadEnter(
     var termios_timer = try xev.Timer.init();
     errdefer termios_timer.deinit();
 
-    // Start our read thread
-    const read_thread = try std.Thread.spawn(
-        .{},
-        if (builtin.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
-        .{ pty_fds.read, io, pipe[0] },
-    );
-    read_thread.setName("io-reader") catch {};
+    var exit_notify_timer = try xev.Timer.init();
+    errdefer exit_notify_timer.deinit();
 
-    // Setup our threadata backend state to be our own
+    // Setup our threadata backend state to be our own. This happens
+    // BEFORE the read thread spawns so the thread gets a stable pointer
+    // to the read_activity counter; read_thread is filled in just after.
     td.backend = .{ .exec = .{
         .start = process_start,
         .write_stream = stream,
         .process = process,
-        .read_thread = read_thread,
+        .read_thread = undefined,
         .read_thread_pipe = pipe[1],
         .read_thread_fd = pty_fds.read,
         .termios_timer = termios_timer,
+        .exit_notify_timer = exit_notify_timer,
     } };
+
+    // Start our read thread
+    const read_thread = try std.Thread.spawn(
+        .{},
+        if (builtin.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
+        .{ pty_fds.read, io, pipe[0], &td.backend.exec.read_activity },
+    );
+    read_thread.setName("io-reader") catch {};
+    td.backend.exec.read_thread = read_thread;
 
     // Start our process watcher. If we have an xev.Process use it.
     if (process) |*p| p.wait(
@@ -318,14 +330,88 @@ fn processExitCommon(td: *termio.Termio.ThreadData, exit_code: u32) void {
     }
     exit_diagnostics.logUnexpectedExit(exit_code, runtime_ms orelse 0, "termio.processExit");
 
+    const info: apprt.surface.Message.ChildExited = .{
+        .exit_code = exit_code,
+        .runtime_ms = runtime_ms orelse 0,
+    };
+
+    // On Windows, ConPTY keeps rendering after the process exits: its
+    // final frame(s) — a repaint of the child's screen — reach the read
+    // thread AFTER this process-exit callback. Notifying the surface now
+    // would let that late repaint overwrite whatever the surface draws in
+    // response (the in-terminal child-exited message, T65). Hold the
+    // notification until pty output has been quiet for one poll tick,
+    // bounded by EXIT_NOTIFY_MAX_TICKS.
+    if (comptime builtin.os.tag == .windows) {
+        execdata.pending_exit = info;
+        execdata.exit_activity_snapshot = execdata.read_activity.load(.monotonic);
+        execdata.exit_notify_ticks = 0;
+        execdata.exit_notify_timer.run(
+            td.loop,
+            &execdata.exit_notify_timer_c,
+            EXIT_NOTIFY_POLL_MS,
+            termio.Termio.ThreadData,
+            td,
+            exitNotifyTimer,
+        );
+        return;
+    }
+
     // We always notify the surface immediately that the child has
     // exited and some metadata about the exit.
-    _ = td.surface_mailbox.push(.{
-        .child_exited = .{
-            .exit_code = exit_code,
-            .runtime_ms = runtime_ms orelse 0,
-        },
-    }, .{ .forever = {} });
+    _ = td.surface_mailbox.push(.{ .child_exited = info }, .{ .forever = {} });
+}
+
+/// Windows child-exit notification gate (pure logic for exitNotifyTimer):
+/// fire once pty output has been quiet for a full tick, or when out of
+/// patience.
+fn exitNotifyShouldFire(snapshot: u64, activity: u64, ticks: u32) bool {
+    return activity == snapshot or ticks >= EXIT_NOTIFY_MAX_TICKS;
+}
+
+test "exitNotifyShouldFire" {
+    const testing = std.testing;
+    try testing.expect(exitNotifyShouldFire(5, 5, 1));
+    try testing.expect(!exitNotifyShouldFire(5, 9, 1));
+    try testing.expect(exitNotifyShouldFire(5, 9, EXIT_NOTIFY_MAX_TICKS));
+}
+
+fn exitNotifyTimer(
+    td_: ?*termio.Termio.ThreadData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    // A cancellation means the termio thread is shutting down: the
+    // surface is going away, never notify.
+    r catch return .disarm;
+    const td = td_.?;
+    assert(td.backend == .exec);
+    const execdata = &td.backend.exec;
+    const info = execdata.pending_exit orelse return .disarm;
+
+    const activity = execdata.read_activity.load(.monotonic);
+    execdata.exit_notify_ticks += 1;
+    if (exitNotifyShouldFire(
+        execdata.exit_activity_snapshot,
+        activity,
+        execdata.exit_notify_ticks,
+    )) {
+        execdata.pending_exit = null;
+        _ = td.surface_mailbox.push(.{ .child_exited = info }, .{ .forever = {} });
+        return .disarm;
+    }
+
+    execdata.exit_activity_snapshot = activity;
+    execdata.exit_notify_timer.run(
+        td.loop,
+        &execdata.exit_notify_timer_c,
+        EXIT_NOTIFY_POLL_MS,
+        termio.Termio.ThreadData,
+        td,
+        exitNotifyTimer,
+    );
+    return .disarm;
 }
 
 fn processExit(
@@ -572,6 +658,21 @@ pub const ThreadData = struct {
     /// to prevent unnecessary locking of expensive mutexes.
     termios_mode: ptypkg.Mode = .{},
 
+    /// Bytes read from the pty, bumped by the read thread. On Windows this
+    /// gates the child-exited notification: ConPTY renders its final
+    /// frame(s) asynchronously AFTER the process exits, and notifying the
+    /// surface before that output lands lets the late repaint overwrite
+    /// anything the surface draws in response (the child-exited message).
+    read_activity: std.atomic.Value(u64) = .init(0),
+
+    /// Timer used on Windows to delay the child-exited notification until
+    /// pty output goes quiet (see read_activity).
+    exit_notify_timer: xev.Timer,
+    exit_notify_timer_c: xev.Completion = .{},
+    pending_exit: ?apprt.surface.Message.ChildExited = null,
+    exit_activity_snapshot: u64 = 0,
+    exit_notify_ticks: u32 = 0,
+
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         posix.close(self.read_thread_pipe);
 
@@ -589,6 +690,9 @@ pub const ThreadData = struct {
 
         // Stop our termios timer
         self.termios_timer.deinit();
+
+        // Stop our exit-notify timer
+        self.exit_notify_timer.deinit();
     }
 };
 
@@ -1291,7 +1395,16 @@ const Subprocess = struct {
 /// fds and this is still much faster and lower overhead than any async
 /// mechanism.
 pub const ReadThread = struct {
-    fn threadMainPosix(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
+    fn threadMainPosix(
+        fd: posix.fd_t,
+        io: *termio.Termio,
+        quit: posix.fd_t,
+        activity: *std.atomic.Value(u64),
+    ) void {
+        // The activity counter only gates the Windows child-exit
+        // notification (ConPTY late frames); unused on posix.
+        _ = activity;
+
         // Always close our end of the pipe when we exit.
         defer posix.close(quit);
 
@@ -1393,7 +1506,12 @@ pub const ReadThread = struct {
         }
     }
 
-    fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
+    fn threadMainWindows(
+        fd: posix.fd_t,
+        io: *termio.Termio,
+        quit: posix.fd_t,
+        activity: *std.atomic.Value(u64),
+    ) void {
         // Always close our end of the pipe when we exit.
         defer posix.close(quit);
 
@@ -1492,7 +1610,12 @@ pub const ReadThread = struct {
                 }
             }
 
+            // Bump the activity counter on both sides of the parse so a
+            // quiescence poll landing mid-parse still observes movement
+            // across its tick (see exitNotifyTimer).
+            _ = activity.fetchAdd(filled, .monotonic);
             @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..filled] });
+            _ = activity.fetchAdd(1, .monotonic);
         }
     }
 };

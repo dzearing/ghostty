@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box) — T65 DONE. Child-exited UI fixed end-to-end:
+  removed the modal-and-return-true show_child_exited handler so the
+  core's in-terminal UI shows (press-any-key notice on clean exits, rich
+  diagnostic on abnormal). Validation surfaced three adjacent bugs, all
+  fixed: (1) ConPTY renders its final frame AFTER process exit, erasing
+  the core-written message — the child-exited notify now waits for pty
+  quiescence (Exec.zig 50ms-poll timer, 1s cap); (2) the run-loop
+  popup-edit key intercept cast the top-level Window's GWLP_USERDATA to
+  *Surface on EVERY surface keystroke — out-of-bounds garbage reads that
+  randomly ate keys and gave a reproducible AV (new surfaceParentOf
+  class-checks TERMINAL_CLASS_NAME first); (3) Win32 Input Mode (DEC
+  9001, ConPTY always enables it) makes encodeKey return null, so
+  close-on-keypress never fired for exited panes — keyCallback now
+  closes an exited surface on any non-modifier press (Windows-gated).
+  Plus queueRender after the exit messages (win32 renderer is
+  wakeup-driven; text sat unpainted). New test/win32/ipc-child-exited.ps1
+  (18 asserts, real SendInput key — +send-keys writes to the PTY and
+  cannot exercise close-on-key) ALL PASS x3; both lanes, P1–P3,
+  kb-actions (28), ipc-under-load (7), hero-mode (60) all green.
+  Release delivered to install locations. Next: T77.
 - 2026-07-18 (on-box) — T51 DONE. Full parity re-audit via 4 parallel
   code sweeps (actions, IPC/GUI features, config, look-and-feel) + on-box
   verification (P1–P3, hero-mode 60, ipc-version ALL PASS; both test

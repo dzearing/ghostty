@@ -1481,6 +1481,13 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
         // any key press that encodes a character.
         t.modes.set(.disable_keyboard, false);
         t.screens.active.kitty_keyboard.set(.set, .disabled);
+
+        // Wake the renderer: on wakeup-driven apprts (win32) nothing else
+        // repaints after the pty goes quiet, so the message would sit
+        // unpainted until the next unrelated event.
+        self.queueRender() catch |err| {
+            log.err("error queueing render after child exit err={}", .{err});
+        };
     }
 
     // Waiting after command we stop here. The terminal is updated, our
@@ -1576,6 +1583,11 @@ fn childExitedAbnormally(
 
     // Hide the cursor
     t.modes.set(.cursor_visible, false);
+
+    // Wake the renderer: on wakeup-driven apprts (win32) nothing else
+    // repaints after the pty goes quiet, so the diagnostic would sit
+    // unpainted until the next unrelated event.
+    try self.queueRender();
 }
 
 /// Called when the terminal detects there is a password input prompt.
@@ -2966,6 +2978,18 @@ pub fn keyCallback(
 
         break :event copy;
     };
+
+    // On Windows, ConPTY enables Win32 Input Mode (DEC 9001), which makes
+    // encodeKey return null (the apprt's Win32 Input Mode emitter owns
+    // encoding) — so the "key press that encodes closes an exited
+    // surface" check below can never fire. Close on any non-modifier
+    // press here instead.
+    if (comptime builtin.os.tag == .windows) {
+        if (self.child_exited and event.action == .press and !event.key.modifier()) {
+            self.close();
+            return .closed;
+        }
+    }
 
     // Encode and send our key. If we didn't encode anything, then we
     // return the effect as ignored.

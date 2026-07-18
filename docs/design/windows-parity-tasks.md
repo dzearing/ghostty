@@ -125,7 +125,8 @@ Work these first, in order, before falling back to first-todo-in-table:
    look-and-feel — plus on-box verification: P1–P3, hero-mode (60),
    ipc-version, both test lanes ALL green at HEAD). 16 findings filed as
    **T65–T80**. Suggested order for working them (user-visible bugs →
-   "windowsy" theming → config parity → features): T65, T77, T79, T80,
+   "windowsy" theming → config parity → features): ~~T65~~ (done
+   2026-07-18), T77, T79, T80,
    T74, T73, T76, T75, T69, T68, T67, T70, T71, T66, T72, T78. With T51
    done the priority queue is exhausted — fall back to
    first-todo-in-table / the order above.
@@ -212,7 +213,7 @@ One line per row. Full spec + validation + evidence per task:
 | T59b | Hero mode TRUE port — interactions/motion: wheel scroll, divider drag + per-tab ratio, hover chrome, slide + re-center animations, reduced-motion, GHOZTTY_PERF check, screenshot | F | T59a | done | 5a10762ed |
 | T61 | FIX: swap_split (ctrl+shift+arrows) in hero mode silently swapped panes in the hidden tree (user, 2026-07-16: nav from index 1 "went to 2", and exit restored a mutated layout). Hero now intercepts swap_split: up/down = prev/next selection (Windows mirror of the Mac hero-nav chord), left/right no-op | F | T59b | done | 26f375c76 |
 | T64 | FIX: SendInput-unicode (VK_PACKET) text injection silently dropped — screen readers/on-screen keyboards/automation typed nothing into panes (found by the T53b profiling harness; both input modes affected). See details | I | — | done | 3cb802605 |
-| T65 | FIX: show_child_exited always returns true → core fallback suppressed: exit-0 + wait-after-command shows NOTHING (looks like a hang), abnormal exits lose the rich in-terminal diagnostic; also a blocking MessageBox vs Mac's non-modal banner (T51 F1) | I | — | todo | — |
+| T65 | FIX: show_child_exited suppressed the core fallback — done 2026-07-18: returns false (modal removed), core in-terminal UI shows; + 3 adjacent fixes found by validation (ConPTY late-frame notify delay in Exec.zig, GWLP_USERDATA wrong-type-cast keystroke crash in App.zig run loop, win32-input-mode close-on-keypress). `ipc-child-exited.ps1` ALL PASS x3 (T51 F1) | I | — | done | (this commit) |
 | T66 | FIX: reset_window_size hardcodes 800×600 — track the initial_size (window-width/height × cell size) per window and reset to that, Mac returnToDefaultSize parity (T51 F2) | I | — | todo | — |
 | T67 | Window/pane background tint: implement `--color`/`--split-color` (accepted-and-ignored in args.zig:115) + palette contrast shift + context-menu color picker per docs/design/window-color.md (T51 F3) | I | — | todo | — |
 | T68 | Remote inheritance: implement `--from-focused`, and New Window/split on a focused remote pane should reuse the remote host (Mac newWindowInheritingRemote, spec WP4) (T51 F4) | G | T21b | todo | — |

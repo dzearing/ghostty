@@ -488,6 +488,12 @@ pub extern "user32" fn GetParent(
     hWnd: HWND,
 ) callconv(.winapi) ?HWND;
 
+pub extern "user32" fn GetClassNameW(
+    hWnd: HWND,
+    lpClassName: [*]u16,
+    nMaxCount: i32,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn AdjustWindowRectEx(
     lpRect: *RECT,
     dwStyle: u32,

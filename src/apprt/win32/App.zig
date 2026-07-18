@@ -424,17 +424,12 @@ pub fn run(self: *App) !void {
                 }
 
                 // Find the parent surface of this edit control
-                const parent = w32.GetParent(msg.hwnd.?);
-                if (parent) |p| {
-                    const userdata = w32.GetWindowLongPtrW(p, w32.GWLP_USERDATA);
-                    if (userdata != 0) {
-                        const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
-                        if (surface.search_active and surface.search_edit == msg.hwnd) {
-                            if (surface.handleSearchKey(vk)) continue;
-                        }
-                        if (surface.palette_active and surface.palette_edit == msg.hwnd) {
-                            if (surface.handlePaletteKey(vk)) continue;
-                        }
+                if (surfaceParentOf(msg.hwnd.?)) |surface| {
+                    if (surface.search_active and surface.search_edit == msg.hwnd) {
+                        if (surface.handleSearchKey(vk)) continue;
+                    }
+                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
+                        if (surface.handlePaletteKey(vk)) continue;
                     }
                 }
 
@@ -460,10 +455,7 @@ pub fn run(self: *App) !void {
                             }
                         }
                         // Palette/search edits are children of a surface HWND.
-                        const pp = w32.GetParent(msg.hwnd.?) orelse break :blk null;
-                        const ud = w32.GetWindowLongPtrW(pp, w32.GWLP_USERDATA);
-                        if (ud == 0) break :blk null;
-                        const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(ud)));
+                        const surface = surfaceParentOf(msg.hwnd.?) orelse break :blk null;
                         if (surface.palette_active and surface.palette_edit == msg.hwnd) {
                             surface.setCommandPaletteActive(false);
                             break :blk surface;
@@ -1223,43 +1215,14 @@ pub fn performAction(
             return true;
         },
 
-        .show_child_exited => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    const exit_code = value.exit_code;
-                    if (exit_code != 0) {
-                        // Show a message box including the actual exit code.
-                        const hwnd_val = core_surface.rt_surface.parent_window.hwnd;
-                        var utf8_buf: [128]u8 = undefined;
-                        const msg_utf8 = std.fmt.bufPrint(
-                            &utf8_buf,
-                            "The shell process exited with code {d}.",
-                            .{exit_code},
-                        ) catch "The shell process exited unexpectedly.";
-
-                        var utf16_buf: [256]u16 = undefined;
-                        const utf16_len = std.unicode.utf8ToUtf16Le(&utf16_buf, msg_utf8) catch {
-                            _ = w32.MessageBoxW(
-                                hwnd_val,
-                                std.unicode.utf8ToUtf16LeStringLiteral("The shell process exited unexpectedly."),
-                                std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
-                                w32.MB_ICONWARNING,
-                            );
-                            return true;
-                        };
-                        utf16_buf[utf16_len] = 0;
-                        _ = w32.MessageBoxW(
-                            hwnd_val,
-                            @ptrCast(&utf16_buf),
-                            std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
-                            w32.MB_ICONWARNING,
-                        );
-                    }
-                },
-            }
-            return true;
-        },
+        // Return false so the core draws its in-terminal child-exited UI
+        // (press-any-key notice on clean exits, rich abnormal-exit
+        // diagnostic with command + runtime). A modal MessageBox here both
+        // suppressed that fallback (clean exit + wait-after-command showed
+        // nothing) and blocked the GUI thread. A native non-modal banner
+        // (Mac ChildExitedMessage parity) rides on the T35 pane-banner
+        // infrastructure.
+        .show_child_exited => return false,
 
         .toggle_window_decorations => {
             switch (target) {
@@ -1856,6 +1819,24 @@ fn machineChooserOwning(self: *App, hwnd: w32.HWND) ?*MachineChooser {
         }
     }
     return null;
+}
+
+/// If `child`'s parent is a terminal surface HWND (TERMINAL_CLASS_NAME),
+/// return that surface. The popup-edit keystroke intercepts in run() MUST
+/// use this rather than casting the parent's GWLP_USERDATA directly: a
+/// keystroke on the surface itself has the top-level GhozttyWindow as
+/// parent, whose GWLP_USERDATA is a *Window — casting that to *Surface
+/// read out-of-bounds garbage on every keypress (randomly eating keys or
+/// crashing; found by the T65 close-on-keypress validation).
+fn surfaceParentOf(child: w32.HWND) ?*Surface {
+    const parent = w32.GetParent(child) orelse return null;
+    var cls: [40]u16 = undefined;
+    const n = w32.GetClassNameW(parent, &cls, cls.len);
+    if (n <= 0) return null;
+    if (!std.mem.eql(u16, cls[0..@intCast(n)], TERMINAL_CLASS_NAME)) return null;
+    const userdata = w32.GetWindowLongPtrW(parent, w32.GWLP_USERDATA);
+    if (userdata == 0) return null;
+    return @ptrFromInt(@as(usize, @bitCast(userdata)));
 }
 
 /// Ctrl-modified VKs that should remain with the focused Edit control

@@ -1955,10 +1955,51 @@ shows a non-modal dismissible banner even for exit 0
 replace the modal with a non-blocking banner overlay showing the same
 success/error content as Mac.
 
-*Validation:* on-box — `+new-window --command="cmd /c exit 0"` with
-`wait-after-command=true` must show the press-any-key message; abnormal
-exit (`exit 3` inside 250ms) must show code + runtime; no modal blocks
-the GUI thread.
+*Done 2026-07-18.* `.show_child_exited` now returns `false` (MessageBoxW
+removed); the core draws its in-terminal UI. A native non-modal banner
+(full Mac parity) rides on the T35 pane-banner infrastructure. Validation
+surfaced three adjacent bugs, all fixed in the same change:
+
+1. **ConPTY late-frame race** (`src/termio/Exec.zig`): ConPTY renders its
+   final frame(s) asynchronously AFTER the process exits, so the
+   immediately-notified surface wrote its exit message and the late
+   repaint erased it (blank pane; a pre-exit `echo` survived because it
+   was in ConPTY's buffer — that asymmetry was the tell). On Windows,
+   `processExitCommon` now parks the notification and a 50ms timer
+   (`exitNotifyTimer`) fires it once a read-thread byte counter
+   (`read_activity`, bumped both sides of each parse batch) is stable for
+   a full tick, capped at 20 ticks (1s). Pure gate logic
+   (`exitNotifyShouldFire`) is unit-tested in both lanes.
+2. **Wrong-type GWLP_USERDATA cast, random key eating + AV**
+   (`src/apprt/win32/App.zig` run loop): the popup-edit WM_KEYDOWN
+   intercepts did `GetParent(msg.hwnd)` → cast its GWLP_USERDATA to
+   `*Surface`. For a keystroke on the terminal surface itself (every
+   normal keypress) the parent is the top-level GhozttyWindow whose
+   userdata is a `*Window`, so `search_active`/`palette_edit` reads were
+   out-of-bounds garbage — usually false (harmless), sometimes true
+   (keys silently eaten by handleSearchKey), sometimes AV (reproduced
+   under cdb: `run+0x944`, App.zig:432). New `surfaceParentOf()` verifies
+   the parent's class is TERMINAL_CLASS_NAME before the cast; both
+   intercept sites use it.
+3. **Close-on-keypress dead under Win32 Input Mode** (`src/Surface.zig`):
+   ConPTY enables DEC 9001, which makes `encodeKey` return null on
+   Windows (the apprt emitter owns encoding), so the core's "key press
+   that encodes closes an exited surface" check could never fire.
+   `keyCallback` now closes an exited surface on any non-modifier press
+   (comptime Windows-gated). Also `queueRender()` after both exit-message
+   writes — the win32 renderer is wakeup-driven and the text otherwise
+   sat unpainted until an unrelated event.
+
+*Validation:* `test/win32/ipc-child-exited.ps1` ALL PASS (18) three runs.
+Covers: clean exit 0 + `wait-after-command` shows the press-any-key
+notice; abnormal exit 3 shows the rich diagnostic (header + command +
+`Runtime:`); no `#32770` dialog owned by ghoztty + IPC responsive; a REAL
+SendInput key press (kb-actions recipe — `+send-keys` writes to the PTY
+and cannot exercise the close-on-key path) closes the waited pane while
+the abnormal pane stays. Uses a private `XDG_CONFIG_HOME` config
+(`wait-after-command=true`, `abnormal-command-exit-runtime=5000` for
+determinism). Regression: both test lanes, P1–P3, kb-actions (28),
+ipc-under-load (7), hero-mode (60) ALL PASS.
 
 ## T66 — FIX: reset_window_size hardcodes 800×600 (Phase I)
 
