@@ -37,6 +37,10 @@ pub const VerbArgs = struct {
     /// of this process id (Windows; the tty-less equivalent of --tty).
     pid: ?u32 = null,
     no_activate: bool = false,
+    /// `+new-window --from-focused` / `+split --from-focused`: mirror the
+    /// keyboard "New Window"/split action on the focused window so the new
+    /// frame inherits its remote host (T68, Mac §WP4 parity).
+    from_focused: bool = false,
     env: []const EnvVar = &.{},
     /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
     e_args: []const [:0]const u8 = &.{},
@@ -62,6 +66,8 @@ pub fn parseVerbArgs(
             e_flag = true;
         } else if (std.mem.eql(u8, arg, "--no-activate")) {
             result.no_activate = true;
+        } else if (std.mem.eql(u8, arg, "--from-focused")) {
+            result.from_focused = true;
         } else if (dropPrefix(arg, "--working-directory=")) |v| {
             result.working_directory = v;
         } else if (dropPrefix(arg, "--command=")) |v| {
@@ -112,8 +118,8 @@ pub fn parseVerbArgs(
                 });
             }
         }
-        // Remaining Mac flags (--color, --from-focused) are
-        // accepted-and-ignored until their features land.
+        // Remaining Mac flags (--color, --split-color) are
+        // accepted-and-ignored until their features land (T67).
     }
 
     result.env = env.items;
@@ -276,6 +282,7 @@ test "parseVerbArgs: full flag set" {
         "--pane=logs",               "--percent=30",                "--lines=10",
         "--no-activate",             "--env=A=1",                   "--env=B=x=y",
         "--layout={\"pane\":\"a\"}", "--pid=4242",
+        "--from-focused",
     };
     const parsed = try parseVerbArgs(arena.allocator(), &args);
     try testing.expectEqualStrings("dev", parsed.target.?);
@@ -291,6 +298,7 @@ test "parseVerbArgs: full flag set" {
     try testing.expectEqual(@as(?i64, 30), parsed.percent);
     try testing.expectEqual(@as(?i64, 10), parsed.lines);
     try testing.expect(parsed.no_activate);
+    try testing.expect(parsed.from_focused);
     try testing.expectEqual(@as(usize, 2), parsed.env.len);
     try testing.expectEqualStrings("A", parsed.env[0].key);
     try testing.expectEqualStrings("1", parsed.env[0].value);

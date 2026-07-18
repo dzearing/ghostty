@@ -23,6 +23,8 @@ const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
+const tcp_dial = @import("../../remote/tcp_dial.zig");
+const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 
@@ -757,6 +759,10 @@ pub const RemoteOpenOptions = struct {
     title: ?[]const u8 = null,
     /// Bring the new window to the foreground (false ⇒ show inactive).
     activate: bool = true,
+    /// The machine identity being dialed (T68): recorded on the window so
+    /// "New Window" on it can re-dial the same agent. Strings borrowed;
+    /// `Window.setRemoteMachine` dupes.
+    machine: ?Window.RemoteMachine = null,
 };
 
 pub const RemoteOpenError = error{ DialFailed, CreateFailed } || Allocator.Error;
@@ -796,6 +802,13 @@ pub fn openDialedWindow(
         return error.CreateFailed;
     };
     window.remote_dialed = dialed;
+    if (opts.machine) |machine| {
+        window.setRemoteMachine(machine) catch |err| {
+            // Non-fatal: the window works; only T68 "New Window inherits the
+            // remote host" degrades to a local window for this one.
+            log.warn("remote window: recording machine identity failed err={}", .{err});
+        };
+    }
 
     if (opts.title) |title| window.setTitleOverride(title);
     if (!opts.activate) {
@@ -828,7 +841,109 @@ pub fn openRelayWindow(
         alloc.destroy(dialed);
         return error.DialFailed;
     };
-    return self.openDialedWindow(.{ .relay = dialed }, opts);
+    var opts_with_machine = opts;
+    opts_with_machine.machine = .{ .relay = .{ .base = relay_base, .device = device } };
+    return self.openDialedWindow(.{ .relay = dialed }, opts_with_machine);
+}
+
+/// T68: the "New Window" action on a focused REMOTE window — dial the same
+/// machine again (a fresh connection; win32 windows each own their
+/// transport) and open the new window with the parent pane's command + cwd
+/// inherited (Mac newWindowInheritingRemote semantics; the cwd is a bounded
+/// GET_CWD RPC on the parent's still-live connection). Relay windows resolve
+/// a fresh bearer token (account tier, then env) — signed out ⇒ error, like
+/// the Mac's WP-B2 rule.
+pub fn openRemoteWindowFrom(
+    self: *App,
+    parent: *Window,
+    /// Explicit REMOTE-native values that beat inheritance (the IPC
+    /// `+new-window --from-focused` flags); all-null for the keybind path.
+    explicit: struct {
+        working_directory: ?[]const u8 = null,
+        shell: ?[]const u8 = null,
+        command: ?[]const u8 = null,
+    },
+) RemoteOpenError!*Window {
+    const machine = parent.remote_machine orelse return error.DialFailed;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.core_app.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Inheritance snapshot from the parent's active pane (cheap, lock-free),
+    // then the bounded cwd RPC on the parent's existing connection. Explicit
+    // values suppress the corresponding inheritance (Mac rule).
+    var command: ?[]const u8 = explicit.command;
+    var cwd: ?[]const u8 = explicit.working_directory;
+    if (parent.tab_count > 0) {
+        const pane = parent.tab_active_surface[parent.active_tab];
+        if (command == null) command = pane.core_surface.remoteCommand();
+        if (cwd == null) {
+            if (parent.remote_dialed) |dialed| {
+                if (pane.core_surface.remoteSessionId()) |sid| {
+                    if (dialed.conn().queryCwdTimeout(
+                        sid,
+                        1500 * std.time.ns_per_ms,
+                    )) |path| {
+                        cwd = try arena.dupe(u8, path);
+                        self.core_app.alloc.free(path);
+                    } else |err| {
+                        log.debug("new window remote inherit: cwd query failed err={}", .{err});
+                    }
+                }
+            }
+        }
+    }
+
+    const opts: RemoteOpenOptions = .{
+        .working_directory = cwd,
+        .shell = explicit.shell,
+        .command = command,
+        .machine = machine,
+    };
+
+    switch (machine) {
+        .tcp => |t| {
+            const alloc = self.core_app.alloc;
+            const dialed = try alloc.create(tcp_dial.Dialed);
+            dialed.* = tcp_dial.dial(alloc, t.host, t.port, .raw) catch |err| {
+                log.warn(
+                    "new window remote inherit: dial failed host={s} port={d} err={}",
+                    .{ t.host, t.port, err },
+                );
+                alloc.destroy(dialed);
+                return error.DialFailed;
+            };
+            return self.openDialedWindow(.{ .tcp = dialed }, opts);
+        },
+        .relay => |r| {
+            const token = IpcHandlers.resolveToken(arena) orelse {
+                log.warn("new window remote inherit: no relay credential (signed out)", .{});
+                return error.DialFailed;
+            };
+            return self.openRelayWindow(r.base, r.device, token, opts);
+        },
+    }
+}
+
+/// Show the T68 "couldn't reach the machine" dialog (T80 dark ConfirmDialog,
+/// OK-only) over `owner` after a failed inheriting re-dial.
+fn showRemoteOpenFailed(self: *App, owner: *Window) void {
+    const label: [:0]const u16 = switch (owner.remote_machine orelse return) {
+        .tcp => std.unicode.utf8ToUtf16LeStringLiteral(
+            "Couldn't open a new window on the remote machine.\nIs its agent still running?",
+        ),
+        .relay => std.unicode.utf8ToUtf16LeStringLiteral(
+            "Couldn't open a new window on the remote machine.\nIs its agent still running (and are you signed in)?",
+        ),
+    };
+    const refocus: ?w32.HWND = if (owner.getActiveSurface()) |s| s.hwnd else null;
+    _ = ConfirmDialog.show(self, owner.hwnd, owner.scale, refocus, .{
+        .title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
+        .text = label,
+        .style = .ok_only,
+        .icon = .warning,
+    });
 }
 
 /// The next auto-generated window name (`window-N`). Caller owns the slice.
@@ -936,6 +1051,25 @@ pub fn performAction(
         },
 
         .new_window => {
+            // T68: New Window on a focused REMOTE window opens on the SAME
+            // machine (fresh dial, inherited command/cwd — the Mac
+            // newWindowInheritingRemote analog). A failed re-dial shows an
+            // error dialog instead of silently opening a local window the
+            // user would mistake for the remote one.
+            const parent_window: ?*Window = switch (target) {
+                .app => null,
+                .surface => |cs| cs.rt_surface.parent_window,
+            };
+            if (parent_window) |pw| {
+                if (pw.remote_machine != null) {
+                    _ = self.openRemoteWindowFrom(pw, .{}) catch |err| {
+                        log.warn("new window on remote parent failed err={}", .{err});
+                        self.showRemoteOpenFailed(pw);
+                    };
+                    return true;
+                }
+            }
+
             // Inherit opacity-toggle state from the parent window: if the
             // user toggled it to opaque via toggle_background_opacity, the
             // new window should start opaque too. Mirrors macOS behavior

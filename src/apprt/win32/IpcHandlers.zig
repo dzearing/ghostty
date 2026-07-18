@@ -142,7 +142,39 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const args = try parseVerbArgs(arena, request.arguments);
+    var args = try parseVerbArgs(arena, request.arguments);
+
+    // `--from-focused` (T68): mirror the keyboard "New Window" action on the
+    // focused window so a REMOTE parent's machine is inherited (the Mac
+    // newWindowInheritingRemote analog — win32 re-dials the same agent).
+    // Like the Mac, this path ignores `--target`/`--name` registration and
+    // the inline-split flags.
+    if (args.from_focused) {
+        if (frontWindow(app)) |front| {
+            if (front.remote_machine != null) {
+                _ = app.openRemoteWindowFrom(front, .{
+                    .working_directory = nonEmpty(args.working_directory),
+                    .shell = nonEmpty(args.shell),
+                    .command = nonEmpty(args.command),
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DialFailed => return try errorResponse(
+                        ctx.alloc,
+                        "failed to reach the focused window's remote machine: the agent is not running or not reachable",
+                        .{},
+                    ),
+                    error.CreateFailed => return try errorResponse(ctx.alloc, "failed to create window", .{}),
+                };
+                return try ctx.alloc.dupe(u8, "{\"success\":true}");
+            }
+        }
+        // Local (or no) parent: a normal local window; drop the flags the
+        // Mac ignores for the inheriting case and fall through.
+        args.target = null;
+        args.name = null;
+        args.split_direction = null;
+        args.title = null;
+    }
 
     // Idempotent: an existing live target is focused, not recreated.
     if (args.target) |target| {
@@ -326,7 +358,9 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .{ host, args.port },
             );
         };
-        _ = app.openDialedWindow(.{ .tcp = dialed }, opts) catch |err| switch (err) {
+        var tcp_opts = opts;
+        tcp_opts.machine = .{ .tcp = .{ .host = host, .port = args.port } };
+        _ = app.openDialedWindow(.{ .tcp = dialed }, tcp_opts) catch |err| switch (err) {
             error.CreateFailed => return try errorResponse(ctx.alloc, "failed to create window", .{}),
             error.OutOfMemory => return error.OutOfMemory,
         };
@@ -420,6 +454,24 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const direction = parseSplitDirection(dir_str) orelse
         return try errorResponse(ctx.alloc, "invalid direction: {s}", .{dir_str});
 
+    // `--from-focused` (T68): mirror the keyboard split on the focused
+    // window's active pane, passing NO overrides so remote inheritance
+    // (same connection + parent command/cwd) is never suppressed (Mac
+    // rule). Like the Mac, `--name`/tint plumbing is skipped — this
+    // trigger is the inheriting case.
+    if (args.from_focused) {
+        const window = frontWindow(app) orelse
+            return try errorResponse(ctx.alloc, "no window found for split", .{});
+        if (window.tab_count == 0)
+            return try errorResponse(ctx.alloc, "no surface to split", .{});
+        const at = window.tab_active_surface[window.active_tab];
+        _ = window.newSplitAt(at, direction, ratio) catch |err| {
+            log.warn("IPC split --from-focused failed err={}", .{err});
+            return try errorResponse(ctx.alloc, "failed to create split", .{});
+        } orelse return try errorResponse(ctx.alloc, "failed to create split", .{});
+        return try ctx.alloc.dupe(u8, "{\"success\":true}");
+    }
+
     // Resolve where to split: --pane names the exact surface; --target
     // names a window (or a pane, whose window is used) and splits at its
     // active surface; neither → the foreground (else most recent) window.
@@ -463,7 +515,36 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         try env.append(arena, .{ .key = "GHOZTTY_PANE_NAME", .value = n });
     }
     const command = args.split_command orelse args.command;
-    const overrides: Surface.Overrides = .{
+
+    // T68: a split in a REMOTE window opens a fresh session on the same
+    // machine/connection, never a local ConPTY pane. Explicit
+    // `--command`/`--working-directory` are REMOTE-native (never wrapped by
+    // the local shell table — the agent applies its own shell's convention);
+    // a `-e` argv is joined into one command line for the agent's shell.
+    // With no explicit values we pass NO overrides at all, so newSplitAt's
+    // inheritance (parent pane's command + cwd) applies, like the Mac.
+    const remote_command: ?[]const u8 = if (args.e_args.len > 0) cmd: {
+        var joined: std.ArrayList(u8) = .empty;
+        for (args.e_args, 0..) |a, i| {
+            if (i > 0) try joined.append(arena, ' ');
+            try joined.appendSlice(arena, a);
+        }
+        break :cmd joined.items;
+    } else nonEmpty(command);
+
+    const overrides: ?Surface.Overrides = if (window.remote_dialed) |dialed| ov: {
+        if (remote_command == null and nonEmpty(args.working_directory) == null)
+            break :ov null; // full inheritance in newSplitAt
+        break :ov .{
+            .remote = .{
+                .connection = dialed.conn(),
+                .working_directory = nonEmpty(args.working_directory),
+                .shell = nonEmpty(args.shell),
+                .command = remote_command,
+            },
+            .env = env.items,
+        };
+    } else .{
         .command_argv = if (args.e_args.len > 0)
             args.e_args
         else if (command) |cmd|
@@ -474,7 +555,7 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         .env = env.items,
     };
 
-    window.pending_surface_overrides = &overrides;
+    if (overrides) |*ov| window.pending_surface_overrides = ov;
     defer window.pending_surface_overrides = null;
     const new_surface = window.newSplitAt(at, direction, ratio) catch |err| {
         log.warn("IPC split failed err={}", .{err});

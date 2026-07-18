@@ -19,6 +19,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
+const remote_connection = @import("../../remote/connection.zig");
 
 /// The two remote transports a window can ride on: a direct TCP dial to the
 /// agent (T20) or a rendezvous-relay WebSocket (T21b). Both `Dialed` shapes
@@ -33,6 +34,31 @@ pub const RemoteDialed = union(enum) {
             inline else => |d| {
                 d.deinit();
                 alloc.destroy(d);
+            },
+        }
+    }
+
+    /// The live connection carried by either transport.
+    pub fn conn(self: RemoteDialed) *remote_connection.Connection {
+        return switch (self) {
+            inline else => |d| d.conn,
+        };
+    }
+};
+
+/// How a remote window's agent was reached, recorded so "New Window" on a
+/// focused remote window can dial the SAME machine again (T68). All strings
+/// owned (duped by `setRemoteMachine`, freed in `deinit`).
+pub const RemoteMachine = union(enum) {
+    tcp: struct { host: []const u8, port: u16 },
+    relay: struct { base: []const u8, device: []const u8 },
+
+    pub fn deinitFree(self: RemoteMachine, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .tcp => |t| alloc.free(t.host),
+            .relay => |r| {
+                alloc.free(r.base);
+                alloc.free(r.device);
             },
         }
     }
@@ -196,6 +222,11 @@ pending_surface_overrides: ?*const Surface.Overrides = null,
 /// the transport's `conn`; core surface deinit joins the IO thread first).
 /// Attached by the IPC handler right after createWindow succeeds.
 remote_dialed: ?RemoteDialed = null,
+
+/// The machine identity `remote_dialed` was dialed to (T68): lets New Window
+/// on this window open a fresh connection to the same agent. Owned strings
+/// (set via `setRemoteMachine`, freed in `deinit`). Null for local windows.
+remote_machine: ?RemoteMachine = null,
 
 /// When set, the title bar shows this instead of terminal-reported titles
 /// (`+new-window --title`, `+rename`) — mirrors the Mac titleOverride
@@ -555,6 +586,10 @@ pub fn deinit(self: *Window) void {
         d.deinitDestroy(self.app.core_app.alloc);
         self.remote_dialed = null;
     }
+    if (self.remote_machine) |m| {
+        m.deinitFree(self.app.core_app.alloc);
+        self.remote_machine = null;
+    }
 
     // Delete the tab bar font.
     if (self.tab_font) |font| {
@@ -619,6 +654,81 @@ fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surfa
     return null;
 }
 
+/// Record the machine identity this window's remote transport was dialed to
+/// (T68). Dupes all strings; call once right after attaching `remote_dialed`.
+pub fn setRemoteMachine(self: *Window, machine: RemoteMachine) Allocator.Error!void {
+    const alloc = self.app.core_app.alloc;
+    self.remote_machine = switch (machine) {
+        .tcp => |t| .{ .tcp = .{
+            .host = try alloc.dupe(u8, t.host),
+            .port = t.port,
+        } },
+        .relay => |r| relay: {
+            const base = try alloc.dupe(u8, r.base);
+            errdefer alloc.free(base);
+            break :relay .{ .relay = .{
+                .base = base,
+                .device = try alloc.dupe(u8, r.device),
+            } };
+        },
+    };
+}
+
+/// Remote inheritance for one new tab/split in a REMOTE window (T68, Mac
+/// BaseTerminalController.newSplit / §WP4 parity): the synthesized surface
+/// overrides (same shared connection, the parent pane's command, the parent
+/// pane's cwd) plus the owned cwd string they borrow. The cwd is a bounded
+/// agent RPC (GET_CWD); on any failure the new pane simply opens in the
+/// agent's default cwd. Freed by the caller after Surface.init consumed the
+/// overrides (termio.Remote dupes what it keeps).
+const RemoteInherit = struct {
+    overrides: Surface.Overrides,
+    cwd: ?[]u8,
+
+    /// Tight bound for the on-demand cwd RPC (Mac remoteCwdQueryTimeoutMs).
+    /// A healthy agent replies in single-digit ms; the bound caps how long a
+    /// wedged agent can hold the GUI thread (the same synchronous-GUI-dial
+    /// trade the ≤10s remote open already makes on win32).
+    const cwd_timeout_ns: u64 = 1500 * std.time.ns_per_ms;
+
+    fn deinit(self: *RemoteInherit, alloc: Allocator) void {
+        if (self.cwd) |c| alloc.free(c);
+        self.* = undefined;
+    }
+};
+
+/// Build the T68 remote-inheriting overrides for the NEXT surface in this
+/// window, or null if this window is local. `parent` is the pane the new
+/// frame conceptually splits from (the active surface for tabs); null skips
+/// command/cwd inheritance and opens the agent's default shell in its
+/// default cwd.
+fn buildRemoteInherit(self: *Window, parent: ?*Surface) ?RemoteInherit {
+    const dialed = self.remote_dialed orelse return null;
+    const conn = dialed.conn();
+
+    var command: ?[]const u8 = null;
+    var cwd: ?[]u8 = null;
+    if (parent) |p| {
+        command = p.core_surface.remoteCommand();
+        if (p.core_surface.remoteSessionId()) |sid| {
+            cwd = conn.queryCwdTimeout(sid, RemoteInherit.cwd_timeout_ns) catch |err| cwd: {
+                log.debug("remote inherit: cwd query failed err={}", .{err});
+                break :cwd null;
+            };
+        }
+    }
+    return .{
+        .overrides = .{ .remote = .{
+            .connection = conn,
+            .working_directory = cwd,
+            // No per-host default shell store on win32 (yet): a fresh session
+            // uses the agent's default shell, like the Mac with no override.
+            .command = command,
+        } },
+        .cwd = cwd,
+    };
+}
+
 /// Add a new tab surface to this window. The surface is created,
 /// initialized, and inserted at the position dictated by config.
 pub fn addTab(self: *Window) !*Surface {
@@ -627,6 +737,26 @@ pub fn addTab(self: *Window) !*Surface {
     self.cancelTabRename();
 
     const alloc = self.app.core_app.alloc;
+
+    // T68: a plain new tab in a remote window opens a fresh session on the
+    // SAME machine/connection, inheriting the active pane's command + cwd
+    // (Mac parity). IPC-provided overrides (the pending baton) win.
+    var inherit: ?RemoteInherit = null;
+    defer if (inherit) |*i| i.deinit(alloc);
+    if (self.pending_surface_overrides == null) {
+        const parent: ?*Surface = if (self.tab_count > 0)
+            self.tab_active_surface[self.active_tab]
+        else
+            null;
+        inherit = self.buildRemoteInherit(parent);
+        if (inherit) |*i| self.pending_surface_overrides = &i.overrides;
+    }
+    // Surface.init consumes the baton; clear it on every exit path so a
+    // failed init can never leave a dangling pointer to our stack.
+    defer if (inherit != null) {
+        self.pending_surface_overrides = null;
+    };
+
     const surface = try alloc.create(Surface);
     try surface.init(self.app, self, .tab);
     // After surface.init succeeds, create the SplitTree which takes ownership
@@ -1657,6 +1787,19 @@ pub fn newSplitAt(
     const alloc = self.app.core_app.alloc;
     const tab = self.findTabIndex(at) orelse return null;
     const handle = self.findHandle(tab, at) orelse return null;
+
+    // T68: a plain split in a remote window opens a fresh session on the
+    // SAME machine/connection, inheriting the split-parent pane's command +
+    // cwd (Mac parity). IPC-provided overrides (the pending baton) win.
+    var inherit: ?RemoteInherit = null;
+    defer if (inherit) |*i| i.deinit(alloc);
+    if (self.pending_surface_overrides == null) {
+        inherit = self.buildRemoteInherit(at);
+        if (inherit) |*i| self.pending_surface_overrides = &i.overrides;
+    }
+    defer if (inherit != null) {
+        self.pending_surface_overrides = null;
+    };
 
     // Create new surface.
     const new_surface = try alloc.create(Surface);
