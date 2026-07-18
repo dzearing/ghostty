@@ -280,6 +280,7 @@ pub const Server = struct {
         capabilities: []const []const u8 = &.{
             protocol.capability.resync,
             protocol.capability.flow,
+            protocol.capability.close_session,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -674,6 +675,7 @@ pub const Server = struct {
             .signal => self.handleSignal(frame.channel, frame.payload),
             .detach => self.handleDetach(frame.channel),
             .close => self.handleClose(frame.channel),
+            .close_session => self.handleCloseSession(frame.channel, frame.payload),
             .get_cwd => self.handleGetCwd(frame.channel, frame.payload),
             .list_sessions => self.handleListSessions(frame.channel),
             .set_layout => self.handleSetLayout(frame.channel, frame.payload),
@@ -998,6 +1000,58 @@ pub const Server = struct {
             // rewrite the layout file so it doesn't accumulate dead topology.
             if (self.store.reapLayouts() > 0) self.store.persistLayouts();
         }
+    }
+
+    /// `CLOSE_SESSION` (0x2c): end a session BY SESSION ID — the session-scoped
+    /// equivalent of `handleClose`, for the chooser's "Kill" action on a BROWSED
+    /// session that has no local pane (hence no channel to address `CLOSE` at).
+    /// Resolves the session by id, then reuses the EXACT two-phase lock discipline
+    /// of `handleClose` (UNLINK under the lock, then terminate+free OUTSIDE it, so
+    /// the pty reader's sink — which takes this very lock — can't deadlock). Replies
+    /// `CLOSE_SESSION_RESULT{session_id, ok, found}` on the request `channel`
+    /// (same-channel RPC, like `handleGetCwd`). `found` = a session with that id
+    /// existed; `ok` = it was closed.
+    fn handleCloseSession(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.CloseSession, self.alloc, payload) catch {
+            // Malformed request: we can't extract an id, but still give the client a
+            // definitive answer (found=false, ok=false) rather than a silent hang.
+            self.sendJson(.close_session_result, channel, protocol.CloseSessionResult{
+                .session_id = "",
+                .ok = false,
+                .found = false,
+            }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        // Stable copy of the session id for the reply (the parsed value is freed by
+        // the trailing defer before sendJson runs through the writer queue).
+        var id_buf: [64]u8 = undefined;
+        const id_len = @min(req.session_id.len, id_buf.len);
+        @memcpy(id_buf[0..id_len], req.session_id[0..id_len]);
+        const id_copy = id_buf[0..id_len];
+
+        // Phase 1: UNLINK under the lock (mirrors handleClose, but resolved by id).
+        self.store.mutex.lock();
+        const s = self.store.table.getByIdStr(req.session_id);
+        const found = s != null;
+        const unlinked = if (s) |sess| self.store.table.unlink(sess.id) else null;
+        self.store.mutex.unlock();
+
+        // Phase 2: terminate+free OUTSIDE the lock, then refresh reboot-floor
+        // metadata and reap orphaned layout blobs — EXACTLY like handleClose.
+        if (unlinked) |u| {
+            self.store.table.freeUnlinked(u);
+            self.store.persistMeta();
+            if (self.store.reapLayouts() > 0) self.store.persistLayouts();
+        }
+
+        self.sendJson(.close_session_result, channel, protocol.CloseSessionResult{
+            .session_id = id_copy,
+            .ok = unlinked != null,
+            .found = found,
+        }) catch {};
     }
 
     /// `GET_CWD` (§WP4): on-demand "what is this session's child cwd?". Looks the
@@ -1933,7 +1987,10 @@ const MockClient = struct {
 
     /// Send the client HELLO and consume the agent's HELLO reply.
     fn handshake(self: *MockClient) !void {
-        const hello: protocol.Hello = .{ .transfer_encoding = self.encoding };
+        // Advertise the app-side capabilities so capability negotiation (e.g.
+        // close_session) reflects a modern peer, like the real Connection client.
+        const caps = [_][]const u8{protocol.capability.close_session};
+        const hello: protocol.Hello = .{ .transfer_encoding = self.encoding, .capabilities = &caps };
         const json = try hello.encode(self.alloc);
         defer self.alloc.free(json);
         try self.sendFrameOn(self.control, .{
@@ -2788,6 +2845,68 @@ test "child exit emits EXIT after final DATA; reattach → dead+exit_code; CLOSE
     try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
     h.server.store.mutex.unlock();
     try testing.expect(fc.terminated);
+}
+
+test "CLOSE_SESSION by id: frees the session + terminates the child; unknown id → found=false" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 500 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(11);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+
+    // The agent advertises the close_session capability; with the mock client also
+    // advertising it, the negotiated intersection is true (a new app can gate on it).
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.close_session);
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // CLOSE_SESSION addressed BY ID on a distinct request channel (NOT the session
+    // channel — this is the chooser's "Kill" of a session with no local pane). The
+    // reply rides the request channel.
+    const req_channel: u128 = 0xC0FFEE;
+    try h.client.sendControlJson(.close_session, req_channel, protocol.CloseSession{
+        .session_id = o.id[0..],
+    });
+    const rf = try h.client.waitControl(.close_session_result);
+    try testing.expectEqual(req_channel, rf.channel);
+    var rp = try protocol.parseJson(protocol.CloseSessionResult, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.found);
+    try testing.expect(rp.value.ok);
+    try testing.expectEqualStrings(o.id[0..], rp.value.session_id);
+
+    // The session is gone and the child was terminated (same as a CLOSE).
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        h.server.store.mutex.lock();
+        const gone = h.server.store.table.getByChannel(o.channel) == null;
+        h.server.store.mutex.unlock();
+        if (gone) break;
+        std.Thread.yield() catch {};
+    }
+    h.server.store.mutex.lock();
+    try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
+    h.server.store.mutex.unlock();
+    try testing.expect(fc.terminated);
+
+    // CLOSE_SESSION for an unknown id → found=false, ok=false (definitive answer).
+    const bogus = "ffffffffffffffffffffffffffffffff";
+    try h.client.sendControlJson(.close_session, req_channel, protocol.CloseSession{
+        .session_id = bogus,
+    });
+    const rf2 = try h.client.waitControl(.close_session_result);
+    var rp2 = try protocol.parseJson(protocol.CloseSessionResult, alloc, rf2.payload);
+    defer rp2.deinit();
+    try testing.expect(!rp2.value.found);
+    try testing.expect(!rp2.value.ok);
 }
 
 test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH revives it" {

@@ -1540,6 +1540,16 @@ GHOSTTY_API bool ghostty_remote_connection_proc_kill(
     ghostty_remote_connection_t, int64_t pid, const char* signal,
     uint32_t timeout_ms);
 
+// Close (end) a session on the agent BY SESSION ID (the session-scoped equivalent
+// of the pane CLOSE): terminate + free the remote session even when no local pane
+// is attached to it (the session chooser's "Kill" action). SYNCHRONOUS: blocks on
+// the RPC reply up to timeout_ms (0 => default 5s); run OFF the main thread.
+// Returns true iff the agent confirmed the session was closed; false when the peer
+// agent does not advertise the close_session capability (older agent), on no
+// connection / timeout / agent error / unknown session id.
+GHOSTTY_API bool ghostty_remote_connection_close_session(
+    ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
+
 // Spawn a DETACHED process on the REMOTE host (run through the remote platform
 // shell, no pty). SYNCHRONOUS: blocks on the RPC reply up to timeout_ms (0 =>
 // default 5s); run OFF the main thread. cwd is a NUL-terminated string; "" => the

@@ -98,6 +98,9 @@ pub const FrameType = enum(u8) {
     get_layouts = 0x2a, // C→A  {}  fetch every stored layout blob
     layouts = 0x2b, // A→C  {layouts:[{key, blob}]}  reply to GET_LAYOUTS
 
+    close_session = 0x2c, // C→A  {session_id}  end a session BY ID (session-scoped CLOSE)
+    close_session_result = 0x2d, // A→C  {session_id, ok, found}  reply to CLOSE_SESSION
+
     rpc = 0x30, // C→A  JSON-RPC 2.0 request (§9.5)
     rpc_result = 0x31, // A→C  JSON-RPC 2.0 response / subscription notification
 
@@ -356,6 +359,12 @@ pub const capability = struct {
     pub const rpc = "rpc";
     /// Port-forward tunneling (§8) supported.
     pub const tunnel = "tunnel";
+    /// Session-scoped `CLOSE_SESSION` (0x2c) — end a session BY SESSION ID even
+    /// when no local pane is attached to it (the chooser's "Kill" action). Gated:
+    /// a peer sends the `close_session` opcode ONLY when the other side advertised
+    /// this string (an unknown opcode is a fatal framing error), so an older peer
+    /// that omits it keeps working over the channel-scoped `close` alone.
+    pub const close_session = "close_session";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -387,18 +396,38 @@ pub const Hello = struct {
 pub const Negotiated = struct {
     proto_version: u16,
     transfer_encoding: TransferEncoding,
+    /// True iff BOTH peers advertised `capability.close_session` in their HELLO —
+    /// i.e. the session-scoped `close_session` RPC is safe to send. Additive: an
+    /// older peer that never advertises it leaves this false, so the app keeps
+    /// using the channel-scoped `close` and never emits an opcode the peer would
+    /// treat as a fatal framing error.
+    close_session: bool = false,
 };
+
+/// True iff `caps` contains the capability string `name`.
+fn hasCapability(caps: []const []const u8, name: []const u8) bool {
+    for (caps) |c| {
+        if (std.mem.eql(u8, c, name)) return true;
+    }
+    return false;
+}
 
 /// Negotiate the local and remote `HELLO`s. v1 policy is strict: both sides must
 /// agree on the exact `proto_version` and `transfer_encoding` (the encoding is
 /// chosen by the side that knows the hop is a Windows hop and proposed in its
 /// `HELLO`; the other side echoes it). A mismatch is fatal (§4.2 "mismatch → drop").
+///
+/// Capabilities evolve additively ON TOP of the pinned `proto_version`: each
+/// negotiated capability flag is the INTERSECTION of both peers' advertised
+/// capability strings, so a behavior is only enabled when both sides support it.
 pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
     if (local.proto_version != remote.proto_version) return error.Incompatible;
     if (local.transfer_encoding != remote.transfer_encoding) return error.Incompatible;
     return .{
         .proto_version = local.proto_version,
         .transfer_encoding = local.transfer_encoding,
+        .close_session = hasCapability(local.capabilities, capability.close_session) and
+            hasCapability(remote.capabilities, capability.close_session),
     };
 }
 
@@ -668,6 +697,32 @@ pub const LayoutBlob = struct {
 /// elided — so the client can distinguish "answered, none" from "no reply".
 pub const Layouts = struct {
     layouts: []const LayoutBlob = &.{},
+};
+
+/// `CLOSE_SESSION` (0x2c). End a session BY SESSION ID — the session-scoped
+/// equivalent of `CLOSE` (0x14). `CLOSE` is CHANNEL-scoped (the agent looks the
+/// session up by the frame's channel), so it can only target a session a local
+/// pane is attached to. The chooser's "Kill" action must end a BROWSED session
+/// that has no local pane (hence no channel), so it addresses the session by id:
+/// the agent unlinks + terminates + frees the session container (the same core as
+/// `handleClose`). Correlated by `Frame.channel` (same-channel RPC, like
+/// `GET_CWD`): the agent echoes `CLOSE_SESSION_RESULT` on that channel.
+/// Additive/HELLO-compatible — gated on the `close_session` capability so the
+/// opcode is NEVER sent to a peer that didn't advertise support (an unknown
+/// opcode is a fatal framing error for the receiver).
+pub const CloseSession = struct {
+    session_id: []const u8,
+};
+
+/// `CLOSE_SESSION_RESULT` (0x2d). Reply to `CLOSE_SESSION`. `found` = whether a
+/// session with that id existed in the agent's table; `ok` = it was closed
+/// successfully (unlinked + terminated + freed). An unknown id yields
+/// `{found = false, ok = false}` — a definitive "already gone" answer.
+/// Additive/HELLO-compatible.
+pub const CloseSessionResult = struct {
+    session_id: []const u8,
+    ok: bool = false,
+    found: bool = false,
 };
 
 /// `RELAUNCH` (0x26). Ask the agent to respawn a DEAD session — a relaunchable
@@ -1245,6 +1300,8 @@ fn sampleFrames(alloc: Allocator) ![]Frame {
     try list.append(alloc, .{ .type = .set_layout_result, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .get_layouts, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .layouts, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .close_session, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .close_session_result, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc, .channel = control_channel, .seq = 13, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc_result, .channel = control_channel, .seq = 14, .payload = "{}" });
     try list.append(alloc, .{ .type = .tunnel, .channel = control_channel, .seq = 15, .payload = "{}" });
@@ -1496,6 +1553,43 @@ test "HELLO encode / parse / negotiate" {
         .{ .proto_version = 1, .transfer_encoding = .raw },
         .{ .proto_version = 2, .transfer_encoding = .raw },
     ));
+}
+
+test "negotiate: close_session capability is the intersection of both HELLOs" {
+    const both = [_][]const u8{capability.close_session};
+    const other = [_][]const u8{capability.rpc};
+
+    // Both advertise → enabled.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(n.close_session);
+    }
+    // Only one side, or neither → disabled (never enable a one-sided capability).
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+        );
+        try testing.expect(!n.close_session);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(!n.close_session);
+    }
+    {
+        // Older peers advertise no capabilities at all.
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw },
+            .{ .transfer_encoding = .raw },
+        );
+        try testing.expect(!n.close_session);
+    }
 }
 
 test "HELLO parse ignores unknown fields (forward-compat)" {
@@ -1799,6 +1893,37 @@ test "PROC_KILL / PROC_SPAWN JSON payloads round-trip (incl. null elision)" {
     try testing.expect(srp.value.ok);
     try testing.expectEqual(@as(i64, 4242), srp.value.pid.?);
     try testing.expect(srp.value.@"error" == null);
+}
+
+test "CLOSE_SESSION / CLOSE_SESSION_RESULT JSON payloads round-trip" {
+    const alloc = testing.allocator;
+
+    // Request carries just the session id.
+    const req: CloseSession = .{ .session_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    const rj = try encodeJson(alloc, req);
+    defer alloc.free(rj);
+    var rp = try parseJson(CloseSession, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", rp.value.session_id);
+
+    // A found + closed result.
+    const ok: CloseSessionResult = .{ .session_id = "s1", .ok = true, .found = true };
+    const oj = try encodeJson(alloc, ok);
+    defer alloc.free(oj);
+    var op = try parseJson(CloseSessionResult, alloc, oj);
+    defer op.deinit();
+    try testing.expectEqualStrings("s1", op.value.session_id);
+    try testing.expect(op.value.ok);
+    try testing.expect(op.value.found);
+
+    // An unknown-id result: found=false, ok=false (defaults), round-trips intact.
+    const gone: CloseSessionResult = .{ .session_id = "s2" };
+    const gj = try encodeJson(alloc, gone);
+    defer alloc.free(gj);
+    var gp = try parseJson(CloseSessionResult, alloc, gj);
+    defer gp.deinit();
+    try testing.expect(!gp.value.ok);
+    try testing.expect(!gp.value.found);
 }
 
 test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {

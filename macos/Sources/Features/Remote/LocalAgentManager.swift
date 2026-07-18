@@ -351,6 +351,39 @@ final class LocalAgentManager {
         }
     }
 
+    /// Close (end) a local-agent session by id — the session-scoped equivalent
+    /// of closing its pane (`+close`): the agent terminates the child and frees
+    /// the session container. Reuses the warm shared connection when healthy (NOT
+    /// freed here — the app owns it), else dials the EXISTING agent only (never
+    /// spawns, so killing a browsed session never starts an agent). The
+    /// `CLOSE_SESSION` RPC blocks, so it runs on a background queue; `completion`
+    /// (true iff the agent confirmed the close) is delivered on the main actor.
+    func closeLocalSession(_ sessionID: String, completion: @escaping @MainActor (Bool) -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        if let existing = sharedOwner,
+           existing.linkState != .dead,
+           sharedAgentPid > 0,
+           kill(sharedAgentPid, 0) == 0 || errno == EPERM {
+            let handle = existing.handle
+            DispatchQueue.global(qos: .userInitiated).async {
+                let ok = RemoteSessionKiller.close(handle: handle, sessionID: sessionID)
+                DispatchQueue.main.async { completion(ok) }
+            }
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let conn = Self.dialExisting(paths: .current) else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            let ok = RemoteSessionKiller.close(handle: conn.handle, sessionID: sessionID)
+            ghostty_remote_connection_free(conn.handle)
+            DispatchQueue.main.async { completion(ok) }
+        }
+    }
+
     /// The warm shared connection when it is healthy, else nil. Non-spawning,
     /// non-dialing — the exact liveness gate `listLocalSessions` uses. Main-thread.
     private func warmSharedOwner() -> RemoteConnection? {

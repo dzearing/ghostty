@@ -898,6 +898,13 @@ pub const Connection = struct {
         return createOpts(alloc, control, data, local_hello, .{});
     }
 
+    /// The capabilities this app-side client advertises in its HELLO. Injected in
+    /// `createOpts` when the caller left `local_hello.capabilities` empty (every
+    /// dial path today), so ALL client connections advertise them regardless of
+    /// transport. Additive: the agent negotiates the intersection and an older
+    /// agent that doesn't advertise `close_session` simply leaves it disabled.
+    pub const client_capabilities = [_][]const u8{protocol.capability.close_session};
+
     /// `create` with explicit health/heartbeat tunables (increment 2).
     pub fn createOpts(
         alloc: Allocator,
@@ -908,12 +915,17 @@ pub const Connection = struct {
     ) !*Connection {
         const self = try alloc.create(Connection);
         errdefer alloc.destroy(self);
+        // Advertise the app-side capabilities. Preserve any the caller set
+        // explicitly; otherwise inject the client default so every dial path
+        // (tcp/ssh/relay/mux) negotiates `close_session` with a modern agent.
+        var hello = local_hello;
+        if (hello.capabilities.len == 0) hello.capabilities = &client_capabilities;
         self.* = .{
             .alloc = alloc,
             .control = control,
             .data = data,
-            .local_hello = local_hello,
-            .encoding = local_hello.transfer_encoding,
+            .local_hello = hello,
+            .encoding = hello.transfer_encoding,
             .channels = ring.ChannelTable.init(alloc),
             .clock = opts.clock,
             .heartbeat_interval_ms = opts.heartbeat_interval_ms,
@@ -2033,6 +2045,42 @@ pub const Connection = struct {
             pane.tty = new_tty;
         }
         return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed, .replay_cols = r.replay_cols, .replay_rows = r.replay_rows };
+    }
+
+    /// True iff the negotiated peer advertised the `close_session` capability —
+    /// i.e. `closeSession` is safe to send (the agent understands the opcode). An
+    /// older agent (or a not-yet-completed / failed handshake) reports false, so
+    /// the caller falls back rather than emitting an opcode the peer would treat as
+    /// a fatal framing error.
+    pub fn supportsCloseSession(self: *Connection) bool {
+        if (self.negotiated) |n| return n.close_session else |_| return false;
+    }
+
+    /// End a session on the agent BY SESSION ID (the session-scoped equivalent of
+    /// the channel-scoped pane `CLOSE`): terminate + free the remote session even
+    /// when no local pane is attached to it (the chooser's "Kill" of a browsed
+    /// session). Sends `CLOSE_SESSION{session_id}` and awaits
+    /// `CLOSE_SESSION_RESULT{ok, found}` on a fresh request channel (same-channel
+    /// RPC, mirrors `requestSessions`/`relaunch`), bounded by `timeout_ns`. Returns
+    /// the agent's `ok` (true ⇒ the session was closed). Returns `error.Unsupported`
+    /// when the peer never advertised the capability (gate the opcode: never send it
+    /// to a peer that can't decode it).
+    pub fn closeSession(self: *Connection, session_id: []const u8, timeout_ns: u64) !bool {
+        if (!self.supportsCloseSession()) return error.Unsupported;
+
+        const req_channel = std.crypto.random.int(u128);
+        const json = try protocol.encodeJson(self.alloc, protocol.CloseSession{
+            .session_id = session_id,
+        });
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .close_session, .close_session_result, json, timeout_ns, null);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.CloseSessionResult, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        return parsed.value.ok;
     }
 
     /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote

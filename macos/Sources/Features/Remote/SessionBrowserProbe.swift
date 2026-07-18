@@ -26,13 +26,38 @@ struct BrowsedSession: Identifiable, Hashable, Decodable {
         case lastActivity = "last_activity"
     }
 
-    /// A human label for the row: the title if the agent has one, else the last
-    /// path component of the cwd, else the command, else the short id.
-    var displayLabel: String {
+    /// A human label for the row, most-current first:
+    /// - `liveTitle`: the title of an OPEN pane bound to this session, read
+    ///   straight from the app — the freshest source, so a pane RENAME shows
+    ///   immediately (the agent does not track title renames).
+    /// - the agent-reported `title` (captured at session creation / relaunch).
+    /// - `persistedTitle`: the saved layout title (so a name still shows for a
+    ///   relaunched-but-not-yet-retitled session across app restarts).
+    /// - the last path component of the cwd, then the command, and finally — the
+    ///   ultimate fallback — the actual pid (an opaque short session id reads like
+    ///   a pid and means nothing, so we show the real pid instead).
+    func label(liveTitle: String? = nil, persistedTitle: String? = nil) -> String {
+        if let liveTitle, !liveTitle.isEmpty { return liveTitle }
         if let title, !title.isEmpty { return title }
+        if let persistedTitle, !persistedTitle.isEmpty { return persistedTitle }
         if let cwd, !cwd.isEmpty { return (cwd as NSString).lastPathComponent }
         if let argv, !argv.isEmpty { return argv }
-        return String(id.prefix(8))
+        return "pid \(pid)"
+    }
+
+    /// Convenience with no persisted-title cross-reference (existing callers).
+    var displayLabel: String { label() }
+}
+
+/// Ends a session by id over a dialed connection — the session-scoped
+/// equivalent of closing a pane (`+close`): the agent terminates the child and
+/// frees the session container. Blocking (blocks on the RPC reply); call OFF the
+/// main thread. Returns true iff the agent confirmed the session closed; false
+/// on an older agent that doesn't advertise the `close_session` capability, no
+/// connection, timeout, or an unknown id.
+enum RemoteSessionKiller {
+    static func close(handle: ghostty_remote_connection_t, sessionID: String, timeoutMs: UInt32 = 5000) -> Bool {
+        sessionID.withCString { ghostty_remote_connection_close_session(handle, $0, timeoutMs) }
     }
 }
 
@@ -116,6 +141,21 @@ final class SessionBrowserProbe: ObservableObject {
     private var inflight: Set<String> = []
     private var stopped = false
 
+    /// Sessions the user just KILLED, per roster key, hidden optimistically so
+    /// the row vanishes immediately instead of lingering (and degrading to a
+    /// "pid" label) during the close's undo window while the agent still lists
+    /// it. An id is dropped once a refetch confirms the session is truly gone.
+    private var killedByKey: [String: Set<String>] = [:]
+
+    /// Optimistically hide a just-killed session so its row disappears at once.
+    /// Called from the chooser's Kill action before the close/RPC lands.
+    func markKilled(_ id: String, key: String) {
+        killedByKey[key, default: []].insert(id)
+        if case .loaded(let sessions) = states[key] {
+            states[key] = .loaded(sessions.filter { $0.id != id })
+        }
+    }
+
     func isExpanded(_ key: String) -> Bool { expanded.contains(key) }
 
     /// The session count for a row once its roster has loaded, else nil (still
@@ -169,7 +209,7 @@ final class SessionBrowserProbe: ObservableObject {
         }
     }
 
-    private func fetch(machine: Machine) {
+    private func fetch(machine: Machine, keepOnFailure: Bool = false) {
         let key = machine.id.uuidString
         guard !inflight.contains(key) else { return }
         inflight.insert(key)
@@ -177,7 +217,7 @@ final class SessionBrowserProbe: ObservableObject {
 
         if machine.isRelay {
             guard let base = machine.relayBase, let device = machine.deviceID else {
-                finish(key, nil)
+                finish(key, nil, keepOnFailure: keepOnFailure)
                 return
             }
             // Resolve the account token (async, may touch the Keychain), then
@@ -188,15 +228,15 @@ final class SessionBrowserProbe: ObservableObject {
                     self?.inflight.remove(key)
                     return
                 }
-                guard let token else { self.finish(key, nil); return }
-                self.dialAndList(key: key) {
+                guard let token else { self.finish(key, nil, keepOnFailure: keepOnFailure); return }
+                self.dialAndList(key: key, keepOnFailure: keepOnFailure) {
                     AppDelegate.dialRelay(base: base, device: device, token: token)
                 }
             }
         } else {
             let host = machine.host
             let port = machine.port
-            dialAndList(key: key) {
+            dialAndList(key: key, keepOnFailure: keepOnFailure) {
                 host.withCString { ghostty_remote_connection_new_tcp($0, port) }
             }
         }
@@ -206,6 +246,7 @@ final class SessionBrowserProbe: ObservableObject {
     /// probe connection, and publish the result on the main actor.
     private func dialAndList(
         key: String,
+        keepOnFailure: Bool = false,
         dial: @escaping () -> ghostty_remote_connection_t?
     ) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -213,19 +254,138 @@ final class SessionBrowserProbe: ObservableObject {
             let sessions: [BrowsedSession]? = handle.flatMap { RemoteSessionRoster.list(handle: $0) }
             if let handle { ghostty_remote_connection_free(handle) }
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.finish(key, sessions) }
+                MainActor.assumeIsolated { self?.finish(key, sessions, keepOnFailure: keepOnFailure) }
+            }
+        }
+    }
+
+    // MARK: Master-detail selection (fetch-on-select)
+
+    /// Ensure the local-agent roster is loaded and marked expanded, so the
+    /// detail pane can render it the instant "Local" is selected. Fetches only
+    /// if not already loaded (the local roster is primed on open).
+    func fetchIfNeededLocal() {
+        expanded.insert(Self.localKey)
+        if states[Self.localKey] == nil { fetchLocal() }
+    }
+
+    /// Ensure a machine's roster is loaded and marked expanded, so selecting it
+    /// in the master list drives the detail pane. Fetches lazily on first select.
+    func fetchIfNeeded(machine: Machine) {
+        let key = machine.id.uuidString
+        expanded.insert(key)
+        if states[key] == nil { fetch(machine: machine) }
+    }
+
+    // MARK: Live refresh (poll while the chooser is open)
+
+    /// Re-fetch the local roster IN PLACE while the chooser is open, so newly
+    /// spawned panes appear and closed ones drop without reopening. No loading
+    /// flicker (the current roster stays visible) and a transient failure keeps
+    /// the last good roster rather than flipping the list to an error.
+    func refreshLocalInPlace() {
+        let key = Self.localKey
+        guard expanded.contains(key), !inflight.contains(key) else { return }
+        inflight.insert(key)
+        LocalAgentManager.shared.listLocalSessions { [weak self] sessions in
+            self?.finish(key, sessions, keepOnFailure: true)
+        }
+    }
+
+    /// Re-fetch a machine's roster IN PLACE (same no-flicker / keep-last-good
+    /// contract as `refreshLocalInPlace`). Only the currently-selected remote is
+    /// polled by the chooser, so this dials at most one machine per tick.
+    func refreshInPlace(machine: Machine) {
+        let key = machine.id.uuidString
+        guard expanded.contains(key), !inflight.contains(key) else { return }
+        fetch(machine: machine, keepOnFailure: true)
+    }
+
+    // MARK: Kill (end a session)
+
+    /// Kill (end) a browsed session by id, then refetch its machine's roster so
+    /// the detail list reflects the removal live. `machine == nil` ⇒ the local
+    /// agent. The close RPC blocks, so it runs off the main thread (the same
+    /// wedge-safe discipline as the roster fetch — it NEVER blocks the chooser).
+    func kill(session: BrowsedSession, machine: Machine?) {
+        if let machine {
+            killRemote(sessionID: session.id, machine: machine)
+        } else {
+            killLocal(sessionID: session.id)
+        }
+    }
+
+    private func killLocal(sessionID: String) {
+        LocalAgentManager.shared.closeLocalSession(sessionID) { [weak self] _ in
+            guard let self, !self.stopped else { return }
+            // Force a re-fetch so the roster reflects the kill.
+            self.states[Self.localKey] = nil
+            self.fetchLocal()
+        }
+    }
+
+    private func killRemote(sessionID: String, machine: Machine) {
+        let key = machine.id.uuidString
+        if machine.isRelay {
+            guard let base = machine.relayBase, let device = machine.deviceID else { return }
+            Task { @MainActor [weak self] in
+                let token = await RelayAccount.resolveToken()
+                guard let self, !self.stopped, let token else { return }
+                self.dialAndClose(key: key, sessionID: sessionID, machine: machine) {
+                    AppDelegate.dialRelay(base: base, device: device, token: token)
+                }
+            }
+        } else {
+            let host = machine.host
+            let port = machine.port
+            dialAndClose(key: key, sessionID: sessionID, machine: machine) {
+                host.withCString { ghostty_remote_connection_new_tcp($0, port) }
+            }
+        }
+    }
+
+    /// Dial a short-lived probe connection, close `sessionID`, free the handle,
+    /// then re-fetch the machine's roster on the main actor so the list updates.
+    private func dialAndClose(
+        key: String,
+        sessionID: String,
+        machine: Machine,
+        dial: @escaping () -> ghostty_remote_connection_t?
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let handle = dial()
+            if let handle {
+                _ = RemoteSessionKiller.close(handle: handle, sessionID: sessionID)
+                ghostty_remote_connection_free(handle)
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, !self.stopped else { return }
+                    self.states[key] = nil
+                    self.fetch(machine: machine)
+                }
             }
         }
     }
 
     // MARK: Completion / teardown
 
-    private func finish(_ key: String, _ sessions: [BrowsedSession]?) {
+    private func finish(_ key: String, _ sessions: [BrowsedSession]?, keepOnFailure: Bool = false) {
         guard !stopped else { return }
         inflight.remove(key)
-        // Cache the roster regardless of expansion (the local agent is primed
-        // while collapsed); a nil result becomes .failed.
-        states[key] = sessions.map { .loaded($0) } ?? .failed
+        // On a live-refresh poll, a transient failure keeps the last good roster
+        // visible rather than flipping the detail list to an error card.
+        if sessions == nil, keepOnFailure, case .loaded = states[key] { return }
+        guard let sessions else { states[key] = .failed; return }
+        // Keep just-killed sessions hidden while the agent still lists them
+        // (undo window); once one is truly gone from the roster, stop hiding it.
+        if var kills = killedByKey[key], !kills.isEmpty {
+            kills = kills.intersection(Set(sessions.map(\.id)))
+            killedByKey[key] = kills.isEmpty ? nil : kills
+            states[key] = .loaded(kills.isEmpty ? sessions : sessions.filter { !kills.contains($0.id) })
+        } else {
+            states[key] = .loaded(sessions)
+        }
     }
 
     /// Tear down: drop all state. Called from the chooser's `finish` closure so
@@ -236,5 +396,6 @@ final class SessionBrowserProbe: ObservableObject {
         states.removeAll()
         expanded.removeAll()
         inflight.removeAll()
+        killedByKey.removeAll()
     }
 }

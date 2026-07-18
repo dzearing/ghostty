@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 /// The result of the window-target chooser: either a normal local window or a
 /// specific remote `Machine`.
@@ -78,6 +79,11 @@ struct MachineChooserView: View {
     @State private var browseCursor: Int?
     @FocusState private var isFilterFocused: Bool
 
+    /// Drives the live-refresh poll: while the chooser is open, re-fetch the
+    /// relevant rosters every couple seconds so new/closed panes and pane
+    /// renames show without reopening. Bounded to local + the selected remote.
+    private let rosterRefreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
     /// The background for row `idx`: accent when selected, a faint wash on hover,
     /// else clear. Drives the manual selection/hover highlight.
     @ViewBuilder
@@ -100,15 +106,6 @@ struct MachineChooserView: View {
         case .local: return SessionBrowserProbe.localKey
         case .remote(let m): return m.id.uuidString
         case .restoreRemote, .resumeSession, .resumeAll: return nil
-        }
-    }
-
-    /// Expand/collapse a row's session list (fetching the roster on first expand).
-    private func toggleBrowse(_ target: WindowTarget) {
-        switch target {
-        case .local: browser.toggleLocal()
-        case .remote(let m): browser.toggle(machine: m)
-        case .restoreRemote, .resumeSession, .resumeAll: break
         }
     }
 
@@ -154,12 +151,6 @@ struct MachineChooserView: View {
         highlightedAliveSessionCount >= 2
     }
 
-    /// The `browseCursor` slot index for the "Resume all" affordance (it sits
-    /// just past the last session in the list), or nil when it isn't offered.
-    private var resumeAllSlot: Int? {
-        resumeAllAvailable ? highlightedSessions.count : nil
-    }
-
     /// Resume all sessions under `parent`: dismiss the chooser and hand the
     /// selection to the app.
     private func resumeAll(parent: WindowTarget) {
@@ -173,43 +164,6 @@ struct MachineChooserView: View {
     private func resume(_ session: BrowsedSession, parent: WindowTarget) {
         guard session.alive, let target = resumeTarget(session, parent: parent) else { return }
         onSelect(target)
-    }
-
-    /// Right-arrow: expand the highlighted row's session list if not already open.
-    private func expandSelection() {
-        guard let target = resolvedSelection, let key = browseKey(for: target),
-              !browser.isExpanded(key) else { return }
-        toggleBrowse(target)
-    }
-
-    /// Left-arrow: collapse the highlighted row's session list if it is open.
-    private func collapseSelection() {
-        guard let target = resolvedSelection, let key = browseKey(for: target),
-              browser.isExpanded(key) else { return }
-        browseCursor = nil
-        toggleBrowse(target)
-    }
-
-    /// Leading disclosure triangle for a browsable row; a fixed-width spacer for
-    /// non-browsable rows so labels stay aligned.
-    @ViewBuilder
-    private func disclosureButton(for target: WindowTarget) -> some View {
-        if let key = browseKey(for: target) {
-            Button {
-                toggleBrowse(target)
-            } label: {
-                Image(systemName: browser.isExpanded(key) ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16, height: 16)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(browser.isExpanded(key) ? "Hide active sessions" : "Show active sessions")
-            .padding(.trailing, 2)
-        } else {
-            Spacer().frame(width: 18)
-        }
     }
 
     /// A small capsule showing a row's active-session count, once its roster has
@@ -229,56 +183,6 @@ struct MachineChooserView: View {
         }
     }
 
-    /// The expanded, read-only list of a machine's active sessions.
-    @ViewBuilder
-    private func sessionBrowseList(for target: WindowTarget, key: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            switch browser.states[key] {
-            case .some(.loaded(let sessions)):
-                if sessions.isEmpty {
-                    Text("No active sessions")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(Array(sessions.enumerated()), id: \.element) { idx, session in
-                        sessionBrowseRow(
-                            session,
-                            parent: target,
-                            highlighted: isSessionCursor(key: key, index: idx))
-                    }
-                    // "Resume all" — rebuild this machine's whole window/tab/split
-                    // topology locally (T18). Offered only when there are ≥2 alive
-                    // sessions (a single pane is covered by the per-session resume).
-                    if sessions.filter({ $0.alive }).count >= 2 {
-                        resumeAllRow(
-                            parent: target,
-                            count: sessions.filter { $0.alive }.count,
-                            highlighted: isResumeAllCursor(key: key, sessionCount: sessions.count))
-                    }
-                }
-            case .some(.failed):
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.yellow)
-                    Text("Couldn't reach this machine's agent")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            case .some(.loading), .none:
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading sessions…")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.leading, 42)
-        .padding(.trailing, 10)
-        .padding(.bottom, 4)
-    }
-
     /// Whether the keyboard session sub-cursor (T17) currently points at
     /// session `index` under the row keyed `key` — i.e. that row is the
     /// highlighted machine row AND its list is where the cursor lives.
@@ -288,103 +192,6 @@ struct MachineChooserView: View {
               browseKey(for: target) == key
         else { return false }
         return true
-    }
-
-    /// One session row: liveness dot, label (title/cwd/command), working
-    /// directory, and an "attached" / "exited" marker. An ALIVE session is a
-    /// clickable Button that resumes it (cross-machine resume, T17) — a local
-    /// viewer window that re-`ATTACH`es to the session over its machine's
-    /// transport; a dead session is non-interactive (nothing to attach).
-    @ViewBuilder
-    private func sessionBrowseRow(
-        _ session: BrowsedSession,
-        parent: WindowTarget,
-        highlighted: Bool
-    ) -> some View {
-        let content = HStack(spacing: 8) {
-            Image(systemName: "circle.fill")
-                .font(.system(size: 6))
-                .foregroundStyle(session.alive ? Color.green : Color.secondary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(session.displayLabel)
-                    .font(.caption)
-                    .lineLimit(1)
-                if let cwd = session.cwd, !cwd.isEmpty {
-                    Text(cwd)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                }
-            }
-            Spacer(minLength: 6)
-            if session.attached {
-                Text("attached")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } else if !session.alive {
-                Text("exited")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(highlighted ? Color.accentColor.opacity(0.25) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 5))
-        .contentShape(Rectangle())
-
-        if session.alive {
-            Button { resume(session, parent: parent) } label: { content }
-                .buttonStyle(.plain)
-                .help("Resume this session in a new window")
-        } else {
-            content
-        }
-    }
-
-    /// Whether the keyboard sub-cursor points at the "Resume all" slot (T18) —
-    /// i.e. the row keyed `key` is highlighted and its cursor sits just past the
-    /// last session.
-    private func isResumeAllCursor(key: String, sessionCount: Int) -> Bool {
-        guard browseCursor == sessionCount,
-              let target = resolvedSelection,
-              browseKey(for: target) == key
-        else { return false }
-        return true
-    }
-
-    /// The "Resume all" affordance at the foot of a machine's expanded session
-    /// list — rebuilds the whole window/tab/split topology locally (T18).
-    @ViewBuilder
-    private func resumeAllRow(
-        parent: WindowTarget,
-        count: Int,
-        highlighted: Bool
-    ) -> some View {
-        let content = HStack(spacing: 8) {
-            Image(systemName: "rectangle.3.group")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-            Text("Resume all")
-                .font(.caption)
-                .fontWeight(.medium)
-            Text("\(count) windows")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 6)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(highlighted ? Color.accentColor.opacity(0.25) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 5))
-        .contentShape(Rectangle())
-
-        Button { resumeAll(parent: parent) } label: { content }
-            .buttonStyle(.plain)
-            .help("Rebuild this machine's full window layout here")
     }
 
     /// The current machine list (live from the registry), minus any relay
@@ -430,15 +237,62 @@ struct MachineChooserView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // No in-content header: the panel titlebar already says
-            // "New Window" — repeating it inside the content just wasted
-            // vertical space.
+        VStack(spacing: 0) {
+            // Top header: the account area (avatar + email + Sign Out, or Sign
+            // In) right-aligned. Account state is a global affordance, so it
+            // sits above the master-detail split rather than in the footer.
+            HStack(spacing: 0) {
+                Spacer()
+                accountRow
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            Divider()
 
-            // Invisible shortcut buttons that drive list navigation from the
-            // keyboard regardless of which control has focus. Mirrors the
-            // command-palette pattern so arrows move the selection even while
-            // the filter field is focused for typing.
+            // Master–detail: a machine list on the LEFT drives a rich detail
+            // pane on the RIGHT (that machine's sessions + management actions).
+            HStack(spacing: 0) {
+                machineListColumn
+                    .frame(width: 260)
+                    .background(Color.primary.opacity(0.035))
+                Divider()
+                detailColumn
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            .frame(maxHeight: .infinity)
+
+            Divider()
+            footer
+        }
+        .frame(width: 840, height: 540)
+        .onAppear {
+            // Preselect the first target so its detail pane shows on open and
+            // Return immediately opens it.
+            select(0)
+            // Focus the filter so typing narrows the list right away. Arrow
+            // navigation still works via the invisible shortcut buttons.
+            // Dispatch to the next runloop turn so focus actually sticks
+            // (matches the command-palette workaround).
+            DispatchQueue.main.async {
+                isFilterFocused = true
+            }
+        }
+        .onReceive(rosterRefreshTimer) { _ in
+            refreshRosters()
+        }
+    }
+
+    // MARK: - Master column (machine list)
+
+    /// The left column: a filter field over a scrollable machine list. Selecting
+    /// a row drives the detail pane; the account-refresh status pins to the foot.
+    @ViewBuilder
+    private var machineListColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Invisible shortcut buttons that drive navigation from the keyboard
+            // regardless of which control has focus (command-palette pattern):
+            // Up/Down (and ⌃P/⌃N) move the machine highlight; Right steps INTO
+            // the detail pane's session list, Left steps back out.
             ZStack {
                 Group {
                     Button { move(-1) } label: { Color.clear }
@@ -453,13 +307,10 @@ struct MachineChooserView: View {
                     Button { move(1) } label: { Color.clear }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.init("n"), modifiers: [.control])
-                    // Right/Left expand/collapse the highlighted row's session
-                    // list (cross-machine resume browse, T16) — the conventional
-                    // disclosure keys, and a reliable non-pointer affordance.
-                    Button { expandSelection() } label: { Color.clear }
+                    Button { enterSessions() } label: { Color.clear }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.rightArrow, modifiers: [])
-                    Button { collapseSelection() } label: { Color.clear }
+                    Button { exitSessions() } label: { Color.clear }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.leftArrow, modifiers: [])
                 }
@@ -470,163 +321,563 @@ struct MachineChooserView: View {
                     .textFieldStyle(.roundedBorder)
                     .focused($isFilterFocused)
                     .onSubmit { submit() }
-                    .onChange(of: query) { _ in
-                        // Keep the selection valid as the filtered list changes.
-                        reanchorSelection()
-                    }
+                    .onChange(of: query) { _ in reanchorSelection() }
             }
-            .padding([.top, .horizontal], 16)
-            .padding(.bottom, 8)
+            .padding([.top, .horizontal], 14)
+            .padding(.bottom, 10)
 
             // Rows are a ScrollView+VStack, NOT a `List`: a SwiftUI List swallows
             // row taps for its own selection machinery, so `.onTapGesture` there
-            // never fired (single-click select was dead; only the explicit
-            // double-click gesture worked). In a plain VStack the tap reliably
-            // fires. Selection is driven manually off `selectedIndex`; a single tap
-            // selects, a double tap opens, `.onHover` gives feedback.
+            // never fired. In a plain VStack the tap reliably fires. Selection is
+            // driven manually off `selectedIndex`; a single tap selects, a double
+            // tap opens, `.onHover` gives feedback.
             ScrollView {
                 VStack(spacing: 2) {
                     ForEach(Array(targets.enumerated()), id: \.element) { idx, target in
-                      VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 0) {
-                            // Disclosure: expand the row into its machine's live
-                            // session roster (browse-only; T16). A fixed-width
-                            // spacer keeps non-browsable rows aligned.
-                            disclosureButton(for: target)
-
-                            // The main row area is a Button so a single click
-                            // reliably SELECTS (a SwiftUI `.onTapGesture` here did
-                            // not respond to clicks; a Button action does). A double
-                            // click opens via a simultaneous gesture.
-                            Button {
-                                select(idx)
-                            } label: {
-                                row(for: target)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            // Double-click follows the PRIMARY action for the
-                            // row (New or Restore), not always "new", so it
-                            // stays consistent with the footer button.
-                            .simultaneousGesture(TapGesture(count: 2).onEnded { activate(target) })
-
-                            // Live session-count badge (once the roster loads).
-                            countBadge(for: target)
-
-                            // Secondary affordance (remote only): open the Activity
-                            // Monitor. A SIBLING button so it doesn't nest inside the
-                            // selection button.
-                            if case .remote(let machine) = target {
-                                Button {
-                                    onActivityMonitor(machine)
-                                } label: {
-                                    Image(systemName: "chart.bar.xaxis")
-                                }
-                                .buttonStyle(.borderless)
-                                .help("Open Activity Monitor for \(machine.name)")
-                                .padding(.leading, 6)
-                                .padding(.trailing, 6)
-
-                                // Management menu: per-host settings for EVERY
-                                // remote machine; account-resource actions
-                                // (rename/remove, WP-C2) for relay devices only.
-                                Menu {
-                                    managementActions(for: machine)
-                                } label: {
-                                    Image(systemName: "ellipsis.circle")
-                                }
-                                .menuStyle(.borderlessButton)
-                                .menuIndicator(.hidden)
-                                .fixedSize()
-                                .help("Manage \(machine.name)")
-                                .padding(.trailing, 6)
-                            }
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(rowHighlight(idx))
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .onHover { hovering in hoveredIndex = hovering ? idx : nil }
-                        .contextMenu {
-                            if case .remote(let machine) = target {
-                                managementActions(for: machine)
-                            }
-                        }
-
-                        // Expanded read-only session list for this machine.
-                        if let key = browseKey(for: target), browser.isExpanded(key) {
-                            sessionBrowseList(for: target, key: key)
-                        }
-                      }
+                        machineRow(idx: idx, target: target)
                     }
                 }
                 .padding(.horizontal, 8)
-                .padding(.vertical, 6)
+                .padding(.bottom, 8)
             }
-            .frame(minHeight: 180)
             .onChange(of: machines) { _ in
                 // Keep the highlighted row valid — and on the SAME machine —
                 // as the account fetch/poll or a removal changes the list.
                 reanchorSelection()
             }
 
-            // Account-list refresh status (WP-C2): a small spinner while the
-            // device directory is being fetched, or the fetch error. Never
-            // blocks the list — existing rows stay usable.
             if registry.isRefreshing || registry.lastRefreshError != nil {
-                HStack(spacing: 6) {
-                    if registry.isRefreshing {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Refreshing devices…")
-                    } else if let err = registry.lastRefreshError {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.yellow)
-                        Text("Couldn't refresh devices: \(err)")
-                            .lineLimit(2)
+                refreshStatus
+            }
+        }
+    }
+
+    /// One machine row in the master list: glyph, name, subline, and a live
+    /// session-count badge. Selection drives the detail pane; a double-click
+    /// runs the primary action.
+    @ViewBuilder
+    private func machineRow(idx: Int, target: WindowTarget) -> some View {
+        HStack(spacing: 0) {
+            Button {
+                select(idx)
+            } label: {
+                row(for: target)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .simultaneousGesture(TapGesture(count: 2).onEnded { activate(target) })
+
+            countBadge(for: target)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(rowHighlight(idx))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .onHover { hovering in hoveredIndex = hovering ? idx : nil }
+        .contextMenu {
+            if case .remote(let machine) = target {
+                managementActions(for: machine)
+            }
+        }
+    }
+
+    /// Account-list refresh status (WP-C2): a small spinner while the device
+    /// directory is being fetched, or the fetch error. Never blocks the list.
+    @ViewBuilder
+    private var refreshStatus: some View {
+        HStack(spacing: 6) {
+            if registry.isRefreshing {
+                ProgressView().controlSize(.small)
+                Text("Refreshing devices…")
+            } else if let err = registry.lastRefreshError {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text("Couldn't refresh devices: \(err)")
+                    .lineLimit(2)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Detail column (selected machine)
+
+    /// The right pane: header + action bar for the selected machine, then its
+    /// live session list. Empty state when there is nothing to select.
+    @ViewBuilder
+    private var detailColumn: some View {
+        if let target = resolvedSelection {
+            VStack(alignment: .leading, spacing: 0) {
+                detailHeader(target)
+                Divider()
+                detailSessions(target)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            VStack(spacing: 8) {
+                Spacer()
+                Image(systemName: "rectangle.on.rectangle.slash")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.tertiary)
+                Text("No machines")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// The detail header: the machine's glyph + name + subtitle, then an action
+    /// bar. The prominent primary button (New Window / Restore) is the default
+    /// action (Return); Restore-all / Activity / management sit beside it.
+    @ViewBuilder
+    private func detailHeader(_ target: WindowTarget) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: detailGlyph(target))
+                    .font(.system(size: 22))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 30)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(detailTitle(target))
+                        .font(.title3).fontWeight(.semibold)
+                        .lineLimit(1)
+                    detailSubtitle(target)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    submit()
+                } label: {
+                    Label(primaryButtonTitle, systemImage: primaryButtonIcon)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .help("Open a new window on \(detailTitle(target))")
+
+                if resumeAllAvailable {
+                    Button {
+                        resumeAll(parent: target)
+                    } label: {
+                        Label("Restore All", systemImage: "rectangle.3.group")
+                    }
+                    .help("Rebuild this machine's full window layout here")
+                }
+
+                if case .remote(let machine) = target {
+                    Button {
+                        onActivityMonitor(machine)
+                    } label: {
+                        Label("Activity", systemImage: "chart.bar.xaxis")
+                    }
+                    .help("Open Activity Monitor for \(machine.name)")
+
+                    Menu {
+                        managementActions(for: machine)
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Manage \(machine.name)")
+                }
+                Spacer()
+            }
+        }
+        .padding(16)
+    }
+
+    /// The glyph for the detail header — laptop for the local/this-Mac machine,
+    /// server otherwise.
+    private func detailGlyph(_ target: WindowTarget) -> String {
+        switch target {
+        case .local: return "laptopcomputer"
+        case .remote(let m): return m.isLocalMachine ? "laptopcomputer" : "server.rack"
+        default: return "server.rack"
+        }
+    }
+
+    /// The detail header title — "This Mac" for local, else the machine name.
+    private func detailTitle(_ target: WindowTarget) -> String {
+        switch target {
+        case .local: return "This Mac"
+        case .remote(let m): return m.name
+        default: return ""
+        }
+    }
+
+    /// The detail header subtitle — session count + machine status/metrics.
+    @ViewBuilder
+    private func detailSubtitle(_ target: WindowTarget) -> some View {
+        HStack(spacing: 8) {
+            if let key = browseKey(for: target), let n = browser.count(for: key) {
+                Text("\(n) session\(n == 1 ? "" : "s")")
+            }
+            switch target {
+            case .remote(let m):
+                if m.isRelay {
+                    if let hostname = hostnameSubtext(for: m) {
+                        Text("· \(hostname)")
+                    }
+                } else {
+                    Text("· \(tcpSublineText(for: m))")
+                }
+            default:
+                EmptyView()
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+    }
+
+    /// The detail pane's session list: loading / failed / empty states, else a
+    /// rich, per-session row with liveness, activity, badges, and Resume/Kill.
+    @ViewBuilder
+    private func detailSessions(_ target: WindowTarget) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                if let key = browseKey(for: target) {
+                    switch browser.states[key] {
+                    case .some(.loaded(let sessions)):
+                        if sessions.isEmpty {
+                            sessionsPlaceholder(icon: "moon.zzz", text: "No active sessions")
+                        } else {
+                            let titles = persistedTitles
+                            let live = liveSessionInfo
+                            ForEach(Array(sessions.enumerated()), id: \.element) { idx, session in
+                                sessionDetailRow(
+                                    session,
+                                    index: idx,
+                                    target: target,
+                                    persistedTitle: titles[session.id],
+                                    liveTitle: live.titles[session.id],
+                                    isOpenLocally: live.openIDs.contains(session.id),
+                                    highlighted: isSessionCursor(key: key, index: idx))
+                            }
+                        }
+                    case .some(.failed):
+                        sessionsPlaceholder(
+                            icon: "exclamationmark.triangle.fill",
+                            text: "Couldn't reach this machine's agent",
+                            tint: .yellow)
+                    case .some(.loading), .none:
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading sessions…").foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
+                        .padding(.vertical, 8)
                     }
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 16)
-                .padding(.top, 6)
             }
-
-            // Hairline separating the machine list from the footer row.
-            Divider()
-                .padding(.top, 8)
-
-            // Footer: account area (avatar + email + Sign Out, or Sign In)
-            // left-aligned; Cancel + the primary button right-aligned. The
-            // primary button reads "New" (it creates a new window) — or
-            // "Restore"/"Restore (N)" when the highlighted machine has
-            // recoverable windows. Recomputed on every render, so it live-
-            // updates as the selection moves.
-            HStack {
-                accountRow
-                Spacer()
-                Button("Cancel") { onCancel() }
-                    .keyboardShortcut(.cancelAction)
-                Button(primaryButtonTitle) { submit() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(resolvedSelection == nil)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
         }
-        .frame(width: 440)
-        .onAppear {
-            // Preselect the first target so something is highlighted on open
-            // and Enter immediately opens it.
-            select(0)
-            // Focus the filter so typing narrows the list right away. Arrow
-            // navigation still works via the invisible shortcut buttons above.
-            // Dispatch to the next runloop turn so focus actually sticks
-            // (matches the command-palette workaround).
-            DispatchQueue.main.async {
-                isFilterFocused = true
+    }
+
+    /// A centered placeholder card for the empty / failed session states.
+    @ViewBuilder
+    private func sessionsPlaceholder(icon: String, text: String, tint: Color = .secondary) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon).foregroundStyle(tint)
+            Text(text).foregroundStyle(.secondary)
+        }
+        .font(.callout)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 24)
+    }
+
+    /// One rich session row in the detail pane: liveness dot, real-name label
+    /// (live pane title → agent title → persisted title → cwd → command → pid),
+    /// activity + status badges, cwd / command sublines, and Show/Resume + Kill.
+    /// A session already open in a window shows **Show** (which focuses that
+    /// window) instead of "Resume" (which would open a duplicate). A single click
+    /// moves the keyboard session cursor here; double-click runs the row action.
+    @ViewBuilder
+    private func sessionDetailRow(
+        _ session: BrowsedSession,
+        index: Int,
+        target: WindowTarget,
+        persistedTitle: String?,
+        liveTitle: String?,
+        isOpenLocally: Bool,
+        highlighted: Bool
+    ) -> some View {
+        let machine = detailMachine(target)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: session.alive ? "circle.fill" : "circle")
+                .font(.system(size: 8))
+                .foregroundStyle(session.alive ? Color.green : Color.secondary)
+                .padding(.top, 4)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(session.label(liveTitle: liveTitle, persistedTitle: persistedTitle))
+                        .font(.body).fontWeight(.medium)
+                        .lineLimit(1)
+                    if session.alive {
+                        activityBadge(session.activity)
+                    } else {
+                        pill(exitedLabel(session), .secondary)
+                    }
+                    // Note: no "pinned" badge — every persistent local session is
+                    // pinned (protected from the idle reaper), so it's noise, not
+                    // signal. "open" is what the user cares about; show it (and
+                    // keep "attached" only for attached-ELSEWHERE sessions).
+                    if isOpenLocally {
+                        pill("open", .green)
+                    } else if session.attached {
+                        pill("attached", .secondary)
+                    }
+                }
+                if let cwd = session.cwd, !cwd.isEmpty {
+                    Text(cwd)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+                if let argv = session.argv, !argv.isEmpty {
+                    Text(argv)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 6) {
+                if session.alive {
+                    if isOpenLocally {
+                        Button("Show") { resume(session, parent: target) }
+                            .controlSize(.small)
+                            .help("Bring this session's window to the front")
+                    } else {
+                        Button("Resume") { resume(session, parent: target) }
+                            .controlSize(.small)
+                            .help("Resume this session in a new window")
+                    }
+                }
+                Button {
+                    confirmKill(session, machine: machine)
+                } label: {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.large)
+                .foregroundStyle(.secondary)
+                .help("End this session (terminates its process)")
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(highlighted ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(highlighted ? Color.accentColor.opacity(0.55) : Color.clear, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { browseCursor = index }
+        .simultaneousGesture(TapGesture(count: 2).onEnded { resume(session, parent: target) })
+    }
+
+    /// A small activity badge for a live session: busy / needs-input are shown;
+    /// idle is intentionally unbadged (the default, no need for noise).
+    @ViewBuilder
+    private func activityBadge(_ activity: String) -> some View {
+        switch activity {
+        case "busy": pill("busy", .orange)
+        case "needs_input": pill("needs input", .red)
+        default: EmptyView()
+        }
+    }
+
+    /// A small rounded status capsule.
+    private func pill(_ text: String, _ color: Color) -> some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundStyle(color == .secondary ? Color.secondary : color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(color.opacity(color == .secondary ? 0.15 : 0.18)))
+    }
+
+    /// A dead session's exit label — "exited" or "exited (code)".
+    private func exitedLabel(_ session: BrowsedSession) -> String {
+        if let code = session.exitCode { return "exited (\(code))" }
+        return "exited"
+    }
+
+    // MARK: - Footer
+
+    /// The footer: just Cancel, right-aligned. The account area moved to the
+    /// top header, and the primary action lives in the detail header, so the
+    /// footer stays minimal.
+    private var footer: some View {
+        HStack {
+            Spacer()
+            Button("Cancel") { onCancel() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(16)
+    }
+
+    // MARK: - Detail helpers
+
+    /// The machine backing a target (`nil` for Local / non-machine targets).
+    private func detailMachine(_ target: WindowTarget) -> Machine? {
+        if case .remote(let m) = target { return m }
+        return nil
+    }
+
+    /// The primary button's SF Symbol — restore vs. new.
+    private var primaryButtonIcon: String {
+        guard let target = resolvedSelection else { return "plus" }
+        return restorableCount(for: target) > 0 ? "arrow.clockwise" : "plus"
+    }
+
+    /// A map of session id → persisted layout title, harvested from the saved
+    /// `SessionLayoutManifest`. Lets a relaunched-but-not-yet-retitled session
+    /// still show its real name in the detail list before the pane re-titles
+    /// itself (survives app restart). Recomputed per detail render (the roster
+    /// is small, and a restore that happens while the chooser is open should be
+    /// reflected).
+    private var persistedTitles: [String: String] {
+        var map: [String: String] = [:]
+        for entry in SessionLayoutManifest.shared.allEntries() {
+            guard let tree = entry.tree else { continue }
+            for leaf in SessionLayoutManifest.leaves(of: tree) {
+                if let sid = leaf.sessionID, let title = leaf.title, !title.isEmpty {
+                    map[sid] = title
+                }
+            }
+        }
+        return map
+    }
+
+    /// Live state harvested from the app's OPEN windows, so the detail list
+    /// reflects reality as it changes — recomputed every render (and the poll
+    /// timer forces renders): `openIDs` are the sessions currently bound to an
+    /// open pane (so their row shows "Show" and focuses the window instead of
+    /// "Resume"-ing a duplicate), and `titles` are those panes' LIVE titles (so
+    /// a pane rename shows immediately — the agent doesn't track renames).
+    private struct LiveSessionInfo {
+        var openIDs: Set<String> = []
+        var titles: [String: String] = [:]
+    }
+
+    private var liveSessionInfo: LiveSessionInfo {
+        var info = LiveSessionInfo()
+        for controller in TerminalController.all {
+            for pane in controller.surfaceTree {
+                guard let view = pane.surfaceView,
+                      let sid = SessionLayoutManifest.liveSessionID(of: view)
+                else { continue }
+                info.openIDs.insert(sid)
+                if !pane.title.isEmpty { info.titles[sid] = pane.title }
+            }
+        }
+        return info
+    }
+
+    /// Live-refresh the currently-relevant rosters (the poll tick): the local
+    /// agent always (cheap, warm connection — keeps "This Mac" and its list
+    /// current), plus the selected remote machine. In-place, so newly spawned
+    /// panes appear and closed ones drop without flicker or a reopen.
+    private func refreshRosters() {
+        browser.refreshLocalInPlace()
+        if case .remote(let m) = resolvedSelection {
+            browser.refreshInPlace(machine: m)
+        }
+    }
+
+    /// Step the keyboard cursor INTO the detail pane's session list (Right).
+    private func enterSessions() {
+        guard browseCursor == nil, !highlightedSessions.isEmpty else { return }
+        browseCursor = 0
+    }
+
+    /// Step the keyboard cursor back OUT of the session list to the machine
+    /// (Left).
+    private func exitSessions() {
+        browseCursor = nil
+    }
+
+    /// Ensure the selected target's session roster is fetched so the detail pane
+    /// can render it (fetch-on-select; lazy for remote machines).
+    private func ensureFetched(_ target: WindowTarget?) {
+        switch target {
+        case .local: browser.fetchIfNeededLocal()
+        case .remote(let m): browser.fetchIfNeeded(machine: m)
+        default: break
+        }
+    }
+
+    /// Confirm, then end (`Kill`) a session — the session-scoped equivalent of
+    /// closing its pane. Destructive, so an NSAlert confirms first (the chooser
+    /// runs an AppKit modal session, matching Rename/Remove).
+    ///
+    /// If the session is currently OPEN in one of our panes, close THAT pane —
+    /// closing the pane ends the session cleanly (the `+close` lifecycle) AND
+    /// removes the pane, instead of killing the session on the agent and leaving
+    /// an orphaned pane attached to a now-dead session. Otherwise (a detached /
+    /// browsed session) end it with the session-scoped `close_session` RPC. Both
+    /// paths let the live roster poll drop the row.
+    private func confirmKill(_ session: BrowsedSession, machine: Machine?) {
+        let alert = NSAlert()
+        alert.messageText = "End session “\(session.label(liveTitle: liveSessionInfo.titles[session.id], persistedTitle: persistedTitles[session.id]))”?"
+        alert.informativeText = "This ends the session — the same as closing its pane. Any unsaved work in it is lost."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "End Session")
+        alert.addButton(withTitle: "Cancel")
+        if #available(macOS 11.0, *) {
+            alert.buttons.first?.hasDestructiveAction = true
+        }
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // Optimistically drop the row now so it doesn't linger (and degrade to a
+        // "pid" label) during the close's undo window while the agent still
+        // lists the ending session.
+        let key = machine.map { $0.id.uuidString } ?? SessionBrowserProbe.localKey
+        browser.markKilled(session.id, key: key)
+
+        if let (controller, surface) = localSurface(forSession: session.id) {
+            // Open in one of our panes: close the pane (ends the session for a
+            // local persistence pane; for a remote session open locally the
+            // viewer close only detaches, so ALSO end it on its agent below).
+            controller.closeSurface(surface, withConfirmation: false)
+            if machine != nil {
+                browser.kill(session: session, machine: machine)
+            }
+        } else {
+            browser.kill(session: session, machine: machine)
+        }
+    }
+
+    /// The (controller, surface) of a local pane currently bound to `sessionID`,
+    /// or nil when the session isn't open in any of our windows. Used so Kill
+    /// closes an open pane rather than orphaning it against a dead session.
+    private func localSurface(forSession sessionID: String) -> (TerminalController, Ghostty.SurfaceView)? {
+        for controller in TerminalController.all {
+            for pane in controller.surfaceTree {
+                if let view = pane.surfaceView,
+                   SessionLayoutManifest.liveSessionID(of: view) == sessionID {
+                    return (controller, view)
+                }
+            }
+        }
+        return nil
     }
 
     /// The account footer (WP-B2): avatar + email + a standard "Sign Out"
@@ -637,15 +888,23 @@ struct MachineChooserView: View {
     @ViewBuilder
     private var accountRow: some View {
         if let email = account.email {
-            HStack(spacing: 8) {
-                avatar(for: email)
-                Text(email)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .foregroundStyle(.secondary)
-                    .help("Signed in as \(email)")
-                Button("Sign Out") { account.signOut() }
+            // Email + Sign Out stacked on two right-aligned lines, to the LEFT
+            // of a larger avatar pinned to the corner. Sign Out is a link, not a
+            // button.
+            HStack(spacing: 10) {
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(email)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 240, alignment: .trailing)
+                        .help("Signed in as \(email)")
+                    Button("Sign Out") { account.signOut() }
+                        .buttonStyle(.ghosttyLink)
+                        .font(.caption)
+                }
+                avatar(for: email, size: 34)
             }
         } else if isSigningIn {
             HStack(spacing: 6) {
@@ -671,7 +930,7 @@ struct MachineChooserView: View {
     /// when absent — e.g. a session signed in before the `profile` scope was
     /// requested has no picture until the user re-signs in.
     @ViewBuilder
-    private func avatar(for email: String) -> some View {
+    private func avatar(for email: String, size: CGFloat = 20) -> some View {
         Group {
             if let url = account.pictureURL {
                 AsyncImage(url: url) { phase in
@@ -680,21 +939,21 @@ struct MachineChooserView: View {
                             .resizable()
                             .aspectRatio(contentMode: .fill)
                     } else {
-                        monogram(for: email)
+                        monogram(for: email, size: size)
                     }
                 }
             } else {
-                monogram(for: email)
+                monogram(for: email, size: size)
             }
         }
-        .frame(width: 20, height: 20)
+        .frame(width: size, height: size)
         .clipShape(Circle())
         .accessibilityLabel("Signed in as \(email)")
     }
 
     /// A Google-style monogram circle: the email's first letter on an accent
     /// gradient. The no-network fallback for the avatar.
-    private func monogram(for email: String) -> some View {
+    private func monogram(for email: String, size: CGFloat = 20) -> some View {
         ZStack {
             Circle()
                 .fill(
@@ -703,7 +962,7 @@ struct MachineChooserView: View {
                         startPoint: .top,
                         endPoint: .bottom))
             Text(String(email.prefix(1)).uppercased())
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: size * 0.42, weight: .semibold))
                 .foregroundStyle(.white)
         }
     }
@@ -1040,36 +1299,27 @@ struct MachineChooserView: View {
     /// machines and their sessions — is keyboard-navigable.
     private func move(_ delta: Int) {
         guard !targets.isEmpty else { return }
-        let sessions = highlightedSessions
-
-        if delta > 0 {
-            if !sessions.isEmpty {
-                let next = (browseCursor ?? -1) + 1
-                if next < sessions.count { browseCursor = next; return }
-                // Just past the last session: the "Resume all" affordance, if
-                // this row offers one (≥2 alive sessions).
-                if next == resumeAllSlot { browseCursor = next; return }
-                // Past everything: fall through to the next machine row.
-            }
-            browseCursor = nil
-            select(min(selectedIndex + 1, targets.count - 1))
-        } else {
-            if let cur = browseCursor {
-                // Up within the list; stepping above the first returns to the
-                // machine row itself (cursor cleared).
-                browseCursor = cur > 0 ? cur - 1 : nil
-                return
-            }
-            select(max(selectedIndex - 1, 0))
+        // With a session cursor active, Up/Down traverse the detail pane's
+        // session list; stepping above the first returns to machine navigation.
+        if let cur = browseCursor {
+            let count = highlightedSessions.count
+            let next = cur + delta
+            if next < 0 { browseCursor = nil; return }
+            if next >= count { browseCursor = max(count - 1, 0); return }
+            browseCursor = next
+            return
         }
+        select(min(max(selectedIndex + delta, 0), targets.count - 1))
     }
 
-    /// Highlight row `idx` and remember the machine identity under it, so a
-    /// later list change can re-anchor the highlight to the same machine.
+    /// Highlight row `idx`, remember the machine identity under it (so a later
+    /// list change can re-anchor to the same machine), and fetch that machine's
+    /// session roster so the detail pane fills in.
     private func select(_ idx: Int) {
         if idx != selectedIndex { browseCursor = nil }
         selectedIndex = idx
         selectedMachineID = machineID(at: idx)
+        ensureFetched(resolvedSelection)
     }
 
     /// The registry UUID of the machine at row `idx`, or nil for the Local
@@ -1095,10 +1345,12 @@ struct MachineChooserView: View {
                return false
            }) {
             selectedIndex = idx
+            ensureFetched(resolvedSelection)
             return
         }
         clampSelection()
         selectedMachineID = machineID(at: selectedIndex)
+        ensureFetched(resolvedSelection)
     }
 
     /// Clamp `selectedIndex` to the current (possibly newly filtered) list.
@@ -1109,16 +1361,11 @@ struct MachineChooserView: View {
 
     private func submit() {
         // A session sub-cursor (T17) resumes that session; otherwise the
-        // highlighted machine row's primary action (New / Restore) fires.
+        // selected machine's primary action (New / Restore) fires.
         if let cur = browseCursor, let target = resolvedSelection {
             let sessions = highlightedSessions
             if cur < sessions.count {
                 resume(sessions[cur], parent: target)
-                return
-            }
-            // The trailing "Resume all" slot (T18).
-            if cur == resumeAllSlot {
-                resumeAll(parent: target)
                 return
             }
         }
@@ -1155,7 +1402,7 @@ struct MachineChooserView: View {
         guard let target = resolvedSelection else { return "New" }
         let count = restorableCount(for: target)
         switch count {
-        case 0: return "New"
+        case 0: return "New Window"
         case 1: return "Restore"
         default: return "Restore (\(count))"
         }
@@ -1247,10 +1494,10 @@ enum MachineChooser {
         windowRef = window
 
         // Size the window to the SwiftUI content's natural size BEFORE centering.
-        // The view fixes its width at 440; force a layout so `fittingSize` returns
-        // the real height, then set the content size. Without this, the panel's
-        // frame size is still its default at center time (width ≈ 0 → the left edge
-        // lands at the screen midpoint, so it appears shoved to the right).
+        // The master-detail view fixes its size (840×540); force a layout so
+        // `fittingSize` returns it, then set the content size. Without this, the
+        // panel's frame size is still its default at center time (width ≈ 0 → the
+        // left edge lands at the screen midpoint, so it appears shoved right).
         hosting.view.layoutSubtreeIfNeeded()
         window.setContentSize(hosting.view.fittingSize)
 

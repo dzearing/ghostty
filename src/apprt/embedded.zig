@@ -3034,6 +3034,31 @@ pub const CAPI = struct {
         return out.ok;
     }
 
+    /// Close (end) a session on the agent BY SESSION ID (the session-scoped
+    /// equivalent of the pane CLOSE). SYNCHRONOUS: blocks on the RPC reply up to
+    /// `timeout_ms` (0 => default 5s); run OFF the main thread. Returns true iff the
+    /// agent confirmed the session was closed. Returns false when the peer agent
+    /// does not advertise the `close_session` capability (older agent), on no
+    /// connection, timeout, agent error, or an unknown session id.
+    export fn ghostty_remote_connection_close_session(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ms: u32,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        const id = std.mem.sliceTo(session_id, 0);
+        const ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        const ok = conn.closeSession(id, ns) catch |err| {
+            log.debug("remote close_session failed err={}", .{err});
+            return false;
+        };
+        return ok;
+    }
+
     /// Spawn a DETACHED process on the REMOTE host (§9.3 process control, inc 5).
     /// SYNCHRONOUS: blocks on the RPC reply up to `timeout_ms` (0 ⇒ default 5s); run
     /// OFF the main thread. `cmd` is run through the remote platform shell. `cwd` is
