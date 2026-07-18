@@ -1506,8 +1506,13 @@ pub const MA_NOACTIVATE: isize = 3;
 pub const HKEY = *opaque {};
 pub const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
 pub const KEY_READ: u32 = 0x00020019;
+pub const KEY_QUERY_VALUE: u32 = 0x0001;
+pub const KEY_SET_VALUE: u32 = 0x0002;
+pub const REG_SZ: u32 = 1;
+pub const REG_EXPAND_SZ: u32 = 2;
 pub const REG_DWORD: u32 = 4;
 pub const ERROR_SUCCESS: u32 = 0;
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
 
 pub extern "advapi32" fn RegOpenKeyExW(
     hKey: HKEY,
@@ -1526,7 +1531,22 @@ pub extern "advapi32" fn RegQueryValueExW(
     lpcbData: *u32,
 ) callconv(.winapi) u32;
 
+pub extern "advapi32" fn RegSetValueExW(
+    hKey: HKEY,
+    lpValueName: [*:0]const u16,
+    Reserved: u32,
+    dwType: u32,
+    lpData: [*]const u8,
+    cbData: u32,
+) callconv(.winapi) u32;
+
 pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) u32;
+
+pub extern "kernel32" fn ExpandEnvironmentStringsW(
+    lpSrc: [*:0]const u16,
+    lpDst: ?[*]u16,
+    nSize: u32,
+) callconv(.winapi) u32;
 
 // -----------------------------------------------------------------------
 // Settings change broadcast
@@ -1534,6 +1554,18 @@ pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) u32;
 
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
+pub const HWND_BROADCAST: HWND = @ptrFromInt(0xFFFF);
+pub const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+pub extern "user32" fn SendMessageTimeoutW(
+    hWnd: HWND,
+    Msg: u32,
+    wParam: usize,
+    lParam: isize,
+    fuFlags: u32,
+    uTimeout: u32,
+    lpdwResult: ?*usize,
+) callconv(.winapi) isize;
 
 // -----------------------------------------------------------------------
 // SetWindowCompositionAttribute — accent blur-behind for background-blur.

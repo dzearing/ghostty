@@ -15,6 +15,7 @@ const internal_os = @import("../../os/main.zig");
 
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const DarkMode = @import("DarkMode.zig");
+const PathInstaller = @import("PathInstaller.zig");
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
@@ -334,6 +335,10 @@ pub fn init(
 
     // Check for updates in the background (non-blocking).
     self.startUpdateCheck();
+
+    // Keep the `ghoztty` CLI resolvable from any shell (T70). Background
+    // thread; only acts when running from the canonical install dir.
+    PathInstaller.ensureOnPathAsync();
 }
 
 /// Defer a focus change to a terminal surface out of the current WndProc.

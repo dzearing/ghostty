@@ -133,8 +133,9 @@ Work these first, in order, before falling back to first-todo-in-table:
    relay-agent-death GUI hang found by its regression runs), ~~T81~~ (done
    2026-07-18: was a process-killing PANIC in the ws teardown + a remote
    transport leak on `+close`; filed T82 — pre-existing test-agent
-   failures on Windows), ~~T67~~ (done 2026-07-18), **T70 next**, then
-   T71, T66, T72, T78.
+   failures on Windows), ~~T67~~ (done 2026-07-18), ~~T70~~ (done
+   2026-07-18: PATH self-heal + MSI Environment entry), **T71 next**,
+   then T66, T72, T78.
    After that the priority queue is exhausted — fall back to
    first-todo-in-table / the order above.
 
@@ -225,7 +226,7 @@ One line per row. Full spec + validation + evidence per task:
 | T67 | Window/pane background tint — done 2026-07-18: `--color`/`--split-color`/`random` end-to-end (bg + contrast fg + WCAG-4.5 palette), plain splits inherit shifted parent bg, "Background Color…" ChooseColorW menu entry, `+list` additive `background_tint`; `window-color.ps1` ALL PASS (14) ×3 (T51 F3) | I | — | done | 5bf9a65d6 |
 | T68 | Remote inheritance — done 2026-07-18: `--from-focused` on +new-window/+split; plain tabs/splits in a remote window reuse the connection + inherit command/live cwd (GET_CWD); ctrl+n re-dials the recorded machine; `remote-inherit.ps1` ALL PASS ×3 (T51 F4) | G | T21b | done | c8f1da16e |
 | T69 | Config-error UI — done 2026-07-18: startup + hard-reload diagnostics shown in a dark ConfirmDialog with "Open Config"/"Ignore" (custom captions + measured button width); `config-errors.ps1` ALL PASS (10) ×3 (T51 F5) | I | — | done | 9cef52567 |
-| T70 | CLI on PATH for installs: MSI Environment/PATH entry or runtime self-heal so `ghoztty` resolves from any shell (Mac CommandLineInstaller analog; distinct from T23) (T51 F6) | H | — | todo | — |
+| T70 | CLI on PATH — done 2026-07-18: PathInstaller.zig self-heal at GUI launch (gated to %LOCALAPPDATA%\Programs\Ghoztty, any-spelling detection, WM_SETTINGCHANGE) + MSI user-PATH Environment entry (wixl drops Permanent=no; build-msi.sh patches `=-PATH` post-compile). `path-selfheal.ps1` ALL PASS (13) ×3; MSI add/remove E2E via throwaway MSI (T51 F6) | H | — | done | see details |
 | T71 | Claude Code integration setup: detect `claude` CLI + offer ghoztty-claude-plugin install, first-run + palette entry (Mac ClaudeCodeIntegration.swift) (T51 F7) | I | — | todo | — |
 | T72 | Tab accent-color tagging in the custom tab bar (Mac TerminalTabColor, 10 named colors) — cosmetic (T51 F8) | I | — | todo | — |
 | T73 | `split-divider-color` — done 2026-07-18: paintDividers reads the config color (gray 0x808080 fallback), onConfigChange repaints so reload re-colors live; `split-divider.ps1` ALL PASS (9) ×3 (T51 F9) | I | — | done | ef4b6de11 |

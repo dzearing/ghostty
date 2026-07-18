@@ -2167,6 +2167,47 @@ table (and/or a first-run self-check in the app mirroring the Mac flow).
 *Validation:* fresh MSI install on a clean PATH → new shell resolves
 `ghoztty`; uninstall removes the entry.
 
+**DONE 2026-07-18.** Both prongs:
+
+- *Runtime self-heal* (covers script-delivered installs, the delivery
+  path actually used on this box): `src/apprt/win32/PathInstaller.zig`
+  runs on a detached thread at the end of `App.init` (master instance
+  only). Gate: only acts when the exe runs from
+  `%LOCALAPPDATA%\Programs\Ghoztty`, so zig-out/portable never touch
+  the PATH; `GHOZTTY_PATH_SELFHEAL=0|off` disables, `=force` bypasses
+  the gate (test hook). Reads `HKCU\Environment\Path` preserving the
+  value kind (REG_SZ/REG_EXPAND_SZ; bails on any other type), detects
+  the entry in any spelling — case, quotes, trailing `\`, or an
+  unexpanded `%VAR%` form (compares against the
+  ExpandEnvironmentStringsW-expanded value too) — appends only when
+  genuinely missing, then broadcasts WM_SETTINGCHANGE("Environment")
+  with SMTO_ABORTIFHUNG so new Explorer-launched shells see it. Pure
+  decision logic in `path_env.zig` (normalize/eqlDir/contains/append),
+  unit-tested in both lanes via apprt.zig.
+- *MSI*: `build-msi.sh` gained a `C_UserPathEntry` component
+  (`<Environment Name="PATH" Value="[INSTALLDIR]" Part="last"
+  Action="set" Permanent="no" System="no">`). **wixl gotcha (0.106):
+  it ignores `Permanent="no"`** and emits the Environment table Name
+  as `=PATH` — install works but uninstall leaves the entry behind.
+  The script now patches the table post-compile (msiinfo export → sed
+  `=PATH`→`=-PATH` → msibuild -i), with a grep guard that fails the
+  build if wixl's output shape changes. Also made the version-stamp
+  sed portable (BSD `sed -i ''` → redirect+mv) so the script runs on
+  Linux/Docker as well as Mac.
+
+*Evidence:* `test/win32/path-selfheal.ps1` ALL PASS (13) ×3 on-box
+2026-07-18 — location gate (zig-out exe never writes), forced heal
+appends exactly once preserving value kind, idempotent relaunch is
+byte-identical, quoted/case/trailing-`\` and %VAR% spellings detected
+as present, original PATH restored. MSI E2E on-box via a throwaway
+`GhozttyPathTest` MSI (distinct UpgradeCode/Name/dir so the real
+install is untouched; built with msitools+wixl in a debian:stable
+Docker container, same patch): install /qn → user PATH entry appears;
+uninstall /qn → entry removed, files gone. The real MSI built by the
+updated script shows `=-PATH  [~];[INSTALLDIR]  C_UserPathEntry` in
+its Environment table. Regression: P1–P3 ALL PASS, both test lanes
+green at HEAD.
+
 ## T71 — Claude Code integration setup flow (Phase I)
 
 Found by T51 (F7). Mac detects the `claude` CLI and offers to install

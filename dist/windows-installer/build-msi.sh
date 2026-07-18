@@ -205,6 +205,20 @@ template = """<?xml version="1.0" encoding="utf-8"?>
                              Type="string" KeyPath="yes"/>
               <RemoveFolder Id="RemoveInstallDir" On="uninstall"/>
             </Component>
+            <!-- User PATH entry so `ghoztty` resolves from any shell (T70).
+                 Removed automatically on uninstall (Permanent=no). The app
+                 also self-heals this entry on launch (PathInstaller.zig),
+                 which covers pre-existing installs and manual deletion. -->
+            <Component Id="C_UserPathEntry" Guid="@PATHENV_GUID@">
+              <RegistryValue Root="HKCU"
+                             Key="Software\\dzearing\\Ghoztty"
+                             Name="PathEntry" Value="1"
+                             Type="integer" KeyPath="yes"/>
+              <Environment Id="E_UserPath" Name="PATH"
+                           Value="[INSTALLDIR]"
+                           Part="last" Action="set" Permanent="no"
+                           System="no"/>
+            </Component>
           </Directory>
         </Directory>
       </Directory>
@@ -227,6 +241,7 @@ template = """<?xml version="1.0" encoding="utf-8"?>
     <Feature Id="Ghoztty" Level="1" Title="Ghoztty">
 @REFS@
       <ComponentRef Id="C_InstallDirCleanup"/>
+      <ComponentRef Id="C_UserPathEntry"/>
       <ComponentRef Id="C_StartMenuShortcut"/>
     </Feature>
 
@@ -246,17 +261,34 @@ template = """<?xml version="1.0" encoding="utf-8"?>
 xml = template.replace("@FILES@", files_xml).replace("@REFS@", refs_xml)
 xml = xml.replace("@CLEANUP_GUID@", guid("__installdir_cleanup__"))
 xml = xml.replace("@SHORTCUT_GUID@", guid("__startmenu_shortcut__"))
+xml = xml.replace("@PATHENV_GUID@", guid("__user_path_entry__"))
 # Version/stamp substituted by the shell (python only handles layout).
 with open(out, "w") as f:
     f.write(xml)
 print(f"generated {out}: {len(comp_refs)} file components")
 PYEOF
 
-# Substitute version/stamp placeholders.
-sed -i '' -e "s/@PRODUCT_VERSION@/$PRODUCT_VERSION/g" -e "s/@STAMP@/$VERSION/g" "$WXS"
+# Substitute version/stamp placeholders (portable across BSD/GNU sed).
+sed -e "s/@PRODUCT_VERSION@/$PRODUCT_VERSION/g" -e "s/@STAMP@/$VERSION/g" "$WXS" > "$WXS.tmp"
+mv "$WXS.tmp" "$WXS"
 
 echo "==> wixl compile"
 wixl -o "$OUT" "$WXS"
+
+# wixl (msitools <= 0.106) ignores Environment/@Permanent="no": it emits the
+# Name column as `=PATH` instead of `=-PATH`, and without the `-` flag
+# Windows Installer leaves the user PATH entry behind on uninstall (verified
+# empirically on-box, T70). Patch the Environment table post-compile.
+echo "==> patch Environment table (=PATH -> =-PATH for uninstall removal)"
+TAB="$(printf '\t')"
+msiinfo export "$OUT" Environment > "$WORK/Environment.idt"
+grep -q "${TAB}=PATH${TAB}" "$WORK/Environment.idt" || {
+  echo "error: Environment table has no =PATH row to patch (wixl behavior changed?)" >&2
+  exit 1
+}
+sed -e "s/${TAB}=PATH${TAB}/${TAB}=-PATH${TAB}/" "$WORK/Environment.idt" > "$WORK/Environment.idt.new"
+mv "$WORK/Environment.idt.new" "$WORK/Environment.idt"
+msibuild "$OUT" -i "$WORK/Environment.idt"
 
 echo "==> validate"
 msiinfo suminfo "$OUT" | head -12

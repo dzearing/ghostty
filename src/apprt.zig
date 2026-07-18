@@ -69,4 +69,7 @@ test {
 
     // Pure win32 background-tint color math (T67), same no-OS-imports deal.
     _ = @import("apprt/win32/color_math.zig");
+
+    // Pure win32 user-PATH self-heal logic (T70), same no-OS-imports deal.
+    _ = @import("apprt/win32/path_env.zig");
 }

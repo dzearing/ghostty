@@ -9,6 +9,21 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 13) — T70 DONE. `ghoztty` now self-installs on the
+  user PATH: new `PathInstaller.zig` (background thread at App.init,
+  gated to %LOCALAPPDATA%\Programs\Ghoztty; `GHOZTTY_PATH_SELFHEAL`
+  0/off/force knob) + pure `path_env.zig` (normalize/contains/append,
+  unit-tested both lanes); detects existing entries in any spelling
+  (case, quotes, trailing `\`, unexpanded %VAR%). MSI now writes a user
+  PATH Environment entry too. path-selfheal.ps1 ALL PASS (13) ×3; MSI
+  install/uninstall E2E-verified on-box via a throwaway
+  GhozttyPathTest MSI (msitools in Docker). SURPRISE: wixl ignores
+  Environment/@Permanent="no" (emits `=PATH`, entry survives
+  uninstall) — build-msi.sh now patches the table to `=-PATH`
+  post-compile (verified: uninstall removes the entry). Also made
+  build-msi.sh sed portable (BSD `-i ''` → redirect+mv) so it runs on
+  Linux/Docker as well as Mac. Next: T71.
+
 - 2026-07-18 (on-box, 12) — T67 DONE (5bf9a65d6). Background tint at
   Mac parity: `--color`/`--split-color`/`random` set terminal bg +
   contrast fg + WCAG-4.5-adjusted ANSI palette (pure `color_math.zig`,
