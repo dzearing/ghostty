@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 3) — T79 DONE. Dark context menus: new
+  DarkMode.zig applies the undocumented uxtheme ordinals (#135
+  SetPreferredAppMode, #136 FlushMenuThemes, #138 probed for the 1809
+  signature split) at init/config-reload/WM_SETTINGCHANGE, mode derived
+  like applyChromeTheme so menus match the title bar. New
+  `test/win32/dark-menus.ps1` ALL PASS (6): real right-click opens
+  surface + tab-bar menus, screenshot-averages the #32768 menu window —
+  dark 52/49, light 240/244. Both lanes + P1–P3 green. Surprise: a
+  hand-rolled x64 INPUT struct without the 8-aligned dwExtraInfo made
+  Marshal.SizeOf report 36 (not 40) and SendInput silently no-op. Next
+  per T51 order: T80 (dark message boxes).
 - 2026-07-18 (on-box, 2) — T77 DONE. gotoSplit now handles `tree.zoomed`
   exactly like GTK: navigating away clears the zoom by default or carries
   it to the target under `split-preserve-zoom = navigation`; also added

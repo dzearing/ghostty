@@ -13,6 +13,7 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
+const DarkMode = @import("DarkMode.zig");
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
@@ -194,6 +195,12 @@ pub fn init(
         config.deinit();
         config = applied;
     }
+
+    // Opt the app into dark USER menus (TrackPopupMenuEx renders with the
+    // classic light palette otherwise, breaking dark chrome — T79). Must
+    // happen before any menu is shown; kept in sync on config reload and
+    // WM_SETTINGCHANGE.
+    DarkMode.apply(config.@"window-theme", config.background);
 
     self.* = .{
         .core_app = core_app,
@@ -906,6 +913,13 @@ pub fn performAction(
                 // every live window so a config reload that changes
                 // the background color updates the title bar.
                 for (self.windows.items) |w| w.onConfigChange();
+
+                // Keep USER menu dark mode in sync with the (possibly
+                // changed) window-theme/background (T79).
+                DarkMode.apply(
+                    self.config.@"window-theme",
+                    self.config.background,
+                );
 
                 // Re-register global hotkeys against the new keybinds.
                 for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);

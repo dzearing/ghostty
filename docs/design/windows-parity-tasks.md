@@ -126,7 +126,7 @@ Work these first, in order, before falling back to first-todo-in-table:
    ipc-version, both test lanes ALL green at HEAD). 16 findings filed as
    **T65–T80**. Suggested order for working them (user-visible bugs →
    "windowsy" theming → config parity → features): ~~T65~~ (done
-   2026-07-18), ~~T77~~ (done 2026-07-18), T79, T80,
+   2026-07-18), ~~T77~~ (done 2026-07-18), ~~T79~~ (done 2026-07-18), T80,
    T74, T73, T76, T75, T69, T68, T67, T70, T71, T66, T72, T78. With T51
    done the priority queue is exhausted — fall back to
    first-todo-in-table / the order above.
@@ -227,7 +227,7 @@ One line per row. Full spec + validation + evidence per task:
 | T76 | Honor `window-inherit-font-size`: carry the focused surface's live (zoomed) font size into new window/tab/split configs (mirror embedded.zig newSurfaceOptions) (T51 F12) | I | — | todo | — |
 | T77 | FIX: gotoSplit while split-zoomed moves keyboard focus to a hidden pane — honor `split-preserve-zoom.navigation` (clear or follow zoom on navigation); `split-zoom-nav.ps1` ALL PASS (16) both config values (T51 F13) | I | — | done | 1e02507c1 |
 | T78 | `window-title-font-family` — needs custom-draw titlebar; design-level backlog like window-save-state (T51 F14) | I | — | todo | — |
-| T79 | Dark-mode context menus: terminal + tab-bar TrackPopupMenuEx menus render light on dark chrome — uxtheme SetPreferredAppMode/AllowDarkModeForWindow + FlushMenuThemes, or owner-draw (T51 F15) | I | — | todo | — |
+| T79 | Dark-mode context menus — done 2026-07-18: DarkMode.zig routes `window-theme` through uxtheme ordinals #135/#136 at init/config-reload/WM_SETTINGCHANGE; `dark-menus.ps1` ALL PASS (6) (T51 F15) | I | — | done | (this commit) |
 | T80 | Dark-mode message boxes: About / close-confirm ×2 / clipboard-confirm / child-exited MessageBoxW render light — TaskDialogIndirect or small custom dialogs per the T50 pattern (T51 F16) | I | — | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

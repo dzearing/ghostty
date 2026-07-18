@@ -538,6 +538,17 @@ pub extern "kernel32" fn GetModuleHandleW(
     lpModuleName: ?[*:0]const u16,
 ) callconv(.winapi) ?HINSTANCE;
 
+pub extern "kernel32" fn LoadLibraryW(
+    lpLibFileName: [*:0]const u16,
+) callconv(.winapi) ?HINSTANCE;
+
+/// lpProcName is either a name or an ordinal packed as a pointer
+/// (MAKEINTRESOURCEA semantics).
+pub extern "kernel32" fn GetProcAddress(
+    hModule: HINSTANCE,
+    lpProcName: ?[*:0]const u8,
+) callconv(.winapi) ?*anyopaque;
+
 pub extern "user32" fn ToUnicode(
     wVirtKey: u32,
     wScanCode: u32,

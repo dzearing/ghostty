@@ -37,6 +37,7 @@ pub const RemoteDialed = union(enum) {
     }
 };
 const w32 = @import("win32.zig");
+const DarkMode = @import("DarkMode.zig");
 const HeroCarousel = @import("HeroCarousel.zig");
 const hero_math = @import("hero_math.zig");
 
@@ -2954,6 +2955,14 @@ pub fn windowWndProc(
             window.reportColorScheme();
             applyChromeTheme(
                 hwnd,
+                window.app.config.@"window-theme",
+                window.app.config.background,
+            );
+            // Flush the USER menu theme cache so context menus track the
+            // flip too (`system` runs in allow-dark mode — the mode value
+            // is unchanged, but menus already created cached the old
+            // palette) (T79).
+            DarkMode.apply(
                 window.app.config.@"window-theme",
                 window.app.config.background,
             );
