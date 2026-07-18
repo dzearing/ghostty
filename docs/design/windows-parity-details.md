@@ -1271,6 +1271,28 @@ at build time.
 *Acceptance:* from any pane, one command answers "which build is this
 window running?"
 
+*Validation:* `test/win32/ipc-version.ps1` — `+version` "Running Instance"
+commit/mode/runtime/exe/pid match the served instance and git HEAD;
+`+list --json` `data.build` matches; palette → "about" → Enter opens the
+About box (chord-injected, palette-popup positive control); `+version`
+with no instance still exits 0 with "none detected".
+
+*Evidence (done 2026-07-18):* one collection point,
+`src/apprt/win32/provenance.zig` (comptime version/commit/mode/runtime +
+runtime exe path, exe mtime as "YYYY-MM-DD HH:MM:SS UTC", pid), feeds all
+three surfaces: new IPC `version` verb (IpcHandlers), `+list --json`
+`data.build` (optional `List.Build` — null omits the field, so the golden
+Mac shape and its tests are unchanged), and `+version`'s new "Running
+Instance" section (dials via ipc_client; prints "none detected" /
+"running, but no version support" instead of failing — the Mac Swift
+server doesn't implement the verb yet, see T37/T51). Palette "About
+Ghoztty" entry is local-only like the remote entry (MessageBox is
+WndProc-safe — it pumps its own modal loop, unlike the T48 hang).
+`ipc-version.ps1` ALL PASS (22) x3 (the chord retries the foreground race
+up to 3x — same caveat as hero-mode.ps1); P1–P3 and both test lanes
+green. The CLI exe vs server exe can differ (stale-install confusion,
+T49) — that's exactly what the Running Instance section exposes.
+
 ## T53 — Long-context reliability + perf soak/tuning (Phase I)
 
 User 2026-07-15: "usable for long contexts... not slow, or crashing, well

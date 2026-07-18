@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box) — T52 DONE. Build provenance in-app: new win32
+  provenance.zig feeds an IPC `version` verb, a "Running Instance"
+  section in `+version` (works from any pane; "none detected" when no
+  server), `+list --json` data.build (additive, Mac golden shape kept),
+  and a palette "About Ghoztty" MessageBox. ipc-version.ps1 ALL PASS
+  (22) x3; P1–P3 + both lanes green. Session also root-caused why the
+  loop sat idle 1.5 days: the 07-17 02:31 upgrade relaunch was invoked
+  with -ResumeCommand 'claude' (no --continue) — the script now
+  substitutes the loop-resuming default unless -AllowPlainResume
+  (34c515735), and go.md pins the rule. Next: T51 (full parity
+  re-audit).
 - 2026-07-17 (on-box, night) — T53b DONE (T53 complete) + T64 found+fixed.
   The detached 180-min soak finished ALL PASS (11): zero leak growth,
   responsive at all 720 samples, echo median 248ms, median fps 59; only

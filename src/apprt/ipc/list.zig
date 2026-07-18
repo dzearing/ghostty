@@ -8,6 +8,21 @@ const Allocator = std.mem.Allocator;
 pub const List = struct {
     windows: []const Window,
 
+    /// Build provenance of the serving instance (T52). Additive and
+    /// optional: the Mac server does not send it (yet), and `null` omits
+    /// the field entirely, so the golden Mac shape below is unchanged.
+    build: ?Build = null,
+
+    pub const Build = struct {
+        version: []const u8,
+        commit: []const u8,
+        mode: []const u8,
+        runtime: []const u8,
+        exe: []const u8,
+        exe_modified: []const u8,
+        pid: i64,
+    };
+
     pub const Terminal = struct {
         id: []const u8,
         title: []const u8,
@@ -78,11 +93,32 @@ pub const List = struct {
             jws.beginArray() catch break :write;
             for (self.windows) |w| writeWindow(&jws, w) catch break :write;
             jws.endArray() catch break :write;
+            if (self.build) |b| writeBuild(&jws, b) catch break :write;
             jws.endObject() catch break :write;
             jws.endObject() catch break :write;
             return out.toOwnedSlice();
         }
         return error.OutOfMemory;
+    }
+
+    fn writeBuild(jws: *std.json.Stringify, b: Build) !void {
+        try jws.objectField("build");
+        try jws.beginObject();
+        try jws.objectField("version");
+        try jws.write(b.version);
+        try jws.objectField("commit");
+        try jws.write(b.commit);
+        try jws.objectField("mode");
+        try jws.write(b.mode);
+        try jws.objectField("runtime");
+        try jws.write(b.runtime);
+        try jws.objectField("exe");
+        try jws.write(b.exe);
+        try jws.objectField("exe_modified");
+        try jws.write(b.exe_modified);
+        try jws.objectField("pid");
+        try jws.write(b.pid);
+        try jws.endObject();
     }
 
     fn writeWindow(jws: *std.json.Stringify, w: Window) !void {
@@ -162,6 +198,30 @@ pub const List = struct {
         try jws.endObject();
     }
 };
+
+test "List: build provenance is additive (T52)" {
+    const testing = std.testing;
+    const json = try (List{
+        .windows = &.{},
+        .build = .{
+            .version = "1.2.0-main+abc1234",
+            .commit = "abc1234",
+            .mode = "Debug",
+            .runtime = "win32",
+            .exe = "C:\\g\\ghoztty.exe",
+            .exe_modified = "2026-07-17 09:31:40 UTC",
+            .pid = 42,
+        },
+    }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\"success\":true,\"data\":{\"windows\":[]," ++
+            "\"build\":{\"version\":\"1.2.0-main+abc1234\",\"commit\":\"abc1234\"," ++
+            "\"mode\":\"Debug\",\"runtime\":\"win32\",\"exe\":\"C:\\\\g\\\\ghoztty.exe\"," ++
+            "\"exe_modified\":\"2026-07-17 09:31:40 UTC\",\"pid\":42}}}",
+        json,
+    );
+}
 
 test "List: empty tree serializes like the Mac server" {
     const testing = std.testing;

@@ -113,9 +113,13 @@ Work these first, in order, before falling back to first-todo-in-table:
    tuning fixes needed; the harness's one product finding became T64
    (unicode injection, fixed same session). HEAD release delivered to
    all 3 install locations. Next in this list: T52.
-7. **T52** — build provenance surfaced in-app (the 2026-07-15 "no parity"
-   report was a July-5 exe — make "which build is this" answerable at a
-   glance).
+7. ~~T52~~ — DONE 2026-07-18: `ghoztty +version` now answers "which build
+   is this window running?" from any pane (new IPC `version` verb →
+   "Running Instance" section with version/commit/mode/exe/modified/pid);
+   `+list --json` carries the same as `data.build` (additive — Mac golden
+   shape untouched); command palette gained "About Ghoztty". Validated by
+   `test/win32/ipc-version.ps1` ALL PASS (22) three runs in a row; P1–P3
+   + both test lanes green. Next: T51.
 8. **T51** — full parity re-audit. Deliberately LAST in the queue per the
    user: after the above land, re-audit Windows vs Mac so nothing is
    missing, and file new tasks from the findings.
@@ -187,7 +191,7 @@ One line per row. Full spec + validation + evidence per task:
 | T49 | Hero-mode regression report → stale binary (CORRECTION 2026-07-16: the user's actual repro was the command palette, not the keybind — see T57) | F | T19 | done | c795455ff.. |
 | T50 | Real "Rename Window" dialog | I | T44 | done | 39988009a |
 | T51 | Full parity RE-AUDIT | — | T50,T22c,T48,T53 | todo | — |
-| T52 | Build provenance visible in-app (`+version`) | I | — | todo | — |
+| T52 | Build provenance visible in-app: IPC `version` verb, `+version` "Running Instance" section, `+list --json` data.build, palette "About Ghoztty" box (shared win32 provenance.zig); `ipc-version.ps1` ALL PASS 3x | I | — | done | (this commit) |
 | T53a | Soak harness `test/win32/soak.ps1` + first bounded on-box soak + findings filed. FOUND+FIXED: WM_APP_WAKEUP message-queue flood broke ALL IPC under load (see details); regression guard `test/win32/ipc-under-load.ps1` | I | T40 | done | 517967173 |
 | T53b | Multi-hour detached soak (180 min ALL PASS, zero leaks) + keyboard-latency/scrollback-seek profiling (`profile-latency.ps1` ALL PASS; no degradation at 150k lines) + release delivered to all install locations. No tuning fixes needed; found T64. See details | I | T53a | done | 3cb802605.. |
 | T62 | FIX: +read stalls many seconds (16s observed) while a pane floods tiny writes — renderer-mutex starvation on the GUI/IPC path (T48 static candidate 2, now reproduced). Fixed: read-thread batching (64KB + pipe top-up), one lock cycle per batch; 80–127ms post-fix. See details | I | T53a | done | 5562c65ab |

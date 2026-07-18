@@ -19,6 +19,7 @@ const App = @import("App.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
+const provenance = @import("provenance.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -1425,11 +1426,13 @@ pub fn handleSearchKey(self: *Surface, vk: u16) bool {
 /// A command palette entry: display name + the binding action to execute.
 /// `remote` entries have no binding action (there is none for "new remote
 /// window"); they are special-cased in `executePaletteSelection` to open the
-/// machine chooser locally, and `action` is an unused placeholder.
+/// machine chooser locally, and `action` is an unused placeholder. `about`
+/// entries are likewise local-only (T52): they show the About box.
 const PaletteEntry = struct {
     name: []const u8,
     action: input.Binding.Action,
     remote: bool = false,
+    about: bool = false,
 };
 
 /// Cap on user-configured command-palette-entry commands shown in the
@@ -1448,10 +1451,10 @@ fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
 
 fn paletteEntryAction(self: *const Surface, idx: u16) ?input.Binding.Action {
     if (idx < palette_entries.len) {
-        // Remote entries have no binding action (opened locally); returning
-        // null suppresses a misleading keybind hint on the palette row.
+        // Remote/about entries have no binding action (handled locally);
+        // returning null suppresses a misleading keybind hint on the row.
         const entry = palette_entries[idx];
-        return if (entry.remote) null else entry.action;
+        return if (entry.remote or entry.about) null else entry.action;
     }
     const user = self.app.config.@"command-palette-entry".value.items;
     const uidx = idx - palette_entries.len;
@@ -1520,6 +1523,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Reset Terminal", .action = .reset },
     .{ .name = "Open Config", .action = .open_config },
     .{ .name = "Reload Config", .action = .reload_config },
+    .{ .name = "About Ghoztty", .action = .new_window, .about = true },
     .{ .name = "Quit", .action = .quit },
 };
 
@@ -1754,12 +1758,50 @@ pub fn executePaletteSelection(self: *Surface) void {
         return;
     }
 
+    // About entry (T52) — local-only, like remote: show build provenance.
+    if (entry_idx < palette_entries.len and palette_entries[entry_idx].about) {
+        self.showAboutDialog();
+        return;
+    }
+
     const action = self.paletteEntryAction(entry_idx) orelse return;
 
     // Execute the action
     _ = self.core_surface.performBindingAction(action) catch |err| {
         log.err("palette action error: {}", .{err});
     };
+}
+
+/// Show the About box: build provenance of THIS running instance (T52) —
+/// the same answer as the IPC `version` verb, one MessageBox away. The
+/// modal MessageBox pumps its own message loop, so this is WndProc-safe
+/// (unlike a Condition.wait — the T48 lesson).
+pub fn showAboutDialog(self: *Surface) void {
+    var arena_state = std.heap.ArenaAllocator.init(self.app.core_app.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prov = provenance.collect(arena) catch return;
+    const text = std.fmt.allocPrint(
+        arena,
+        "Ghoztty {s}\n\nCommit: {s}\nMode: {s}\nRuntime: {s}\nPID: {d}\n\nExecutable:\n{s}\nModified: {s}",
+        .{
+            prov.version,
+            prov.commit,
+            prov.mode,
+            prov.runtime,
+            prov.pid,
+            prov.exe,
+            prov.exe_modified,
+        },
+    ) catch return;
+    const text_w = std.unicode.utf8ToUtf16LeAllocZ(arena, text) catch return;
+    _ = w32.MessageBoxW(
+        self.hwnd,
+        text_w,
+        std.unicode.utf8ToUtf16LeStringLiteral("About Ghoztty"),
+        w32.MB_OK | w32.MB_ICONINFORMATION,
+    );
 }
 
 /// Paint the command palette list area.

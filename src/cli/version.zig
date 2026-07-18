@@ -9,6 +9,7 @@ const renderer = @import("../renderer.zig");
 
 const gtk_version = @import("../apprt/gtk/gtk_version.zig");
 const adw_version = @import("../apprt/gtk/adw_version.zig");
+const ipc_client = @import("../os/ipc_client.zig");
 
 pub const Options = struct {};
 
@@ -70,7 +71,82 @@ pub fn run(alloc: Allocator) !u8 {
         }
     }
 
+    // Build provenance of the RUNNING instance, not this CLI exe (T52):
+    // the two can differ (stale installed exe vs fresh zig-out), which is
+    // exactly the confusion this section exists to catch.
+    printRunningInstance(alloc, stdout) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    };
+
     // Don't forget to flush!
     try stdout.flush();
     return 0;
+}
+
+/// Query the running instance (if any) for its build provenance over IPC
+/// and print it as a "Running Instance" section. Absence of an instance —
+/// or a server without the `version` verb (e.g. the Mac Swift server
+/// today) — prints a one-line note instead of failing `+version`.
+fn printRunningInstance(alloc: Allocator, stdout: *std.Io.Writer) !void {
+    try stdout.print("Running Instance\n", .{});
+
+    const conn = ipc_client.connect(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stdout.print("  - none detected\n", .{});
+            return;
+        },
+    };
+    defer conn.close();
+
+    const req = try ipc_client.buildRequest(alloc, "version", null);
+    defer alloc.free(req);
+
+    var err_buf: [256]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writerStreaming(&err_buf);
+    const resp = ipc_client.exchange(alloc, conn, req, .{}, &stderr_writer.interface) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stdout.print("  - query failed\n", .{});
+            return;
+        },
+    };
+    defer alloc.free(resp);
+
+    const parsed = std.json.parseFromSlice(
+        struct {
+            success: bool = false,
+            data: ?struct {
+                version: []const u8 = "",
+                commit: []const u8 = "",
+                mode: []const u8 = "",
+                runtime: []const u8 = "",
+                exe: []const u8 = "",
+                exe_modified: []const u8 = "",
+                pid: i64 = 0,
+            } = null,
+        },
+        alloc,
+        resp,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        try stdout.print("  - unrecognized response\n", .{});
+        return;
+    };
+    defer parsed.deinit();
+
+    if (!parsed.value.success or parsed.value.data == null) {
+        try stdout.print("  - running, but no version support\n", .{});
+        return;
+    }
+    const data = parsed.value.data.?;
+
+    try stdout.print("  - version : {s}\n", .{data.version});
+    try stdout.print("  - commit  : {s}\n", .{data.commit});
+    try stdout.print("  - mode    : {s}\n", .{data.mode});
+    try stdout.print("  - runtime : {s}\n", .{data.runtime});
+    try stdout.print("  - exe     : {s}\n", .{data.exe});
+    try stdout.print("  - modified: {s}\n", .{data.exe_modified});
+    try stdout.print("  - pid     : {d}\n", .{data.pid});
 }

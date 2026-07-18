@@ -9,6 +9,7 @@ const windows = std.os.windows;
 
 const App = @import("App.zig");
 const ProcessTree = @import("ProcessTree.zig");
+const provenance = @import("provenance.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const google_oauth = @import("../../remote/google_oauth.zig");
@@ -71,6 +72,8 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         return try handleRearrange(ctx, request);
     } else if (std.mem.eql(u8, request.action, "new-remote-window")) {
         return try handleNewRemoteWindow(ctx, request);
+    } else if (std.mem.eql(u8, request.action, "version")) {
+        return try handleVersion(ctx);
     }
 
     // Verbs the Mac server implements that are still pending on Windows
@@ -891,6 +894,46 @@ fn parseSplitDirection(s: []const u8) ?SplitTree.Split.Direction {
     return null;
 }
 
+/// `version` (T52): build provenance of THIS instance, so any pane can
+/// answer "which build is this window running?" (`ghoztty +version` shows
+/// it as the "Running Instance" section).
+fn handleVersion(ctx: Context) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prov = try provenance.collect(arena);
+
+    var out: std.Io.Writer.Allocating = .init(ctx.alloc);
+    errdefer out.deinit();
+    var jws: std.json.Stringify = .{ .writer = &out.writer };
+    write: {
+        jws.beginObject() catch break :write;
+        jws.objectField("success") catch break :write;
+        jws.write(true) catch break :write;
+        jws.objectField("data") catch break :write;
+        jws.beginObject() catch break :write;
+        jws.objectField("version") catch break :write;
+        jws.write(prov.version) catch break :write;
+        jws.objectField("commit") catch break :write;
+        jws.write(prov.commit) catch break :write;
+        jws.objectField("mode") catch break :write;
+        jws.write(prov.mode) catch break :write;
+        jws.objectField("runtime") catch break :write;
+        jws.write(prov.runtime) catch break :write;
+        jws.objectField("exe") catch break :write;
+        jws.write(prov.exe) catch break :write;
+        jws.objectField("exe_modified") catch break :write;
+        jws.write(prov.exe_modified) catch break :write;
+        jws.objectField("pid") catch break :write;
+        jws.write(prov.pid) catch break :write;
+        jws.endObject() catch break :write;
+        jws.endObject() catch break :write;
+        return try out.toOwnedSlice();
+    }
+    return error.OutOfMemory;
+}
+
 fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const app = ctx.app;
 
@@ -988,7 +1031,19 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         });
     }
 
-    const json = (apprt.ipc.List{ .windows = window_list.items }).serializeResponse(arena) catch
+    const prov = try provenance.collect(arena);
+    const json = (apprt.ipc.List{
+        .windows = window_list.items,
+        .build = .{
+            .version = prov.version,
+            .commit = prov.commit,
+            .mode = prov.mode,
+            .runtime = prov.runtime,
+            .exe = prov.exe,
+            .exe_modified = prov.exe_modified,
+            .pid = prov.pid,
+        },
+    }).serializeResponse(arena) catch
         return error.OutOfMemory;
     return try ctx.alloc.dupe(u8, json);
 }
