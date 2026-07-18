@@ -2141,6 +2141,15 @@ pub const CAPI = struct {
         return surface.userdata;
     }
 
+    /// Sets (or, with null, clears) the userdata associated with the surface.
+    /// The apprt clears it when the host view backing the surface is torn down
+    /// but the surface's own free is deferred: a callback (e.g. SET_TITLE)
+    /// delivered on the host's run loop during that window would otherwise
+    /// resurrect the freed host object via a stale `userdata` back-pointer.
+    export fn ghostty_surface_set_userdata(surface: *Surface, ud: ?*anyopaque) void {
+        surface.userdata = ud;
+    }
+
     /// Returns the app associated with a surface.
     export fn ghostty_surface_app(surface: *Surface) *App {
         return surface.app;

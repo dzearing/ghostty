@@ -51,6 +51,21 @@ extension Ghostty {
             // use-after-free.
             let surface = self.surface
             let keepAlive = self.connectionKeepAlive
+
+            // Clear the host back-pointer (`userdata`) NOW, synchronously,
+            // BEFORE the deferred free below. `userdata` is an UNRETAINED
+            // pointer to the host view (`passUnretained`), and the host view is
+            // already being torn down when this Surface deinits. The free is
+            // deferred to a later main-loop turn, so between here and that free
+            // the core surface still lives with a dangling `userdata`. Any
+            // surface-targeted callback delivered in that window — SET_TITLE is
+            // the common one, since panes emit OSC title sequences constantly —
+            // would resolve `surfaceView(from:)` to the freed view and message
+            // it (objc_msgSend on a zombie → EXC_BAD_ACCESS). Nil-ing it here
+            // makes that lookup return nil, so those callbacks become no-ops.
+            // The free path itself (`closeSurface`) does not read `userdata`.
+            ghostty_surface_set_userdata(surface, nil)
+
             Task.detached { @MainActor in
                 ghostty_surface_free(surface)
                 // Keep the connection owner alive until the free above completes,
