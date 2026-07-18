@@ -9,6 +9,14 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 7) — T76 DONE. `window-inherit-font-size` honored:
+  win32 Surface init captures the focused surface's live font points
+  pre-init, applies post-init via setFontSize (embedded.zig parity —
+  reset_font_size still returns to the config default). New
+  `test/win32/font-inherit.ps1` ALL PASS (21) ×3 (mode-con-columns
+  oracle, split + new-window paths, both config values); P1–P3 + both
+  lanes green. Next per T51 order: T75.
+
 - 2026-07-18 (on-box, 6) — T73 DONE. `split-divider-color` honored:
   paintDividers computes the pen color from config (0x808080 fallback)
   and passes it down; onConfigChange repaints dividers (GetDC path) so

@@ -390,6 +390,19 @@ pub fn init(
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
 
+    // Capture the focused surface's live (possibly ctrl+scroll-zoomed)
+    // font size for `window-inherit-font-size` (Mac parity: embedded.zig
+    // newSurfaceOptions). Captured before core_surface.init: focus only
+    // moves to this new pane later via the deferred SetFocus, so the
+    // focused surface is still the pane the user opened us from. Applied
+    // AFTER init via setFontSize so `original_font_size` keeps the config
+    // default and reset_font_size returns to it.
+    const inherit_font_points: f32 = points: {
+        if (!app.config.@"window-inherit-font-size") break :points 0;
+        const focused = app.core_app.focusedSurface() orelse break :points 0;
+        break :points focused.font_size.points;
+    };
+
     // Apply IPC overrides (command/cwd/env) queued on the parent window by
     // the IPC server. One-shot: cleared here so a later plain tab/split
     // doesn't inherit them.
@@ -443,6 +456,19 @@ pub fn init(
         app,
         self,
     );
+
+    // Apply the inherited font size (embedded.zig applies opts.font_size
+    // the same way, post-init). Non-fatal: a font failure must not kill
+    // surface creation.
+    if (inherit_font_points != 0 and
+        inherit_font_points != self.core_surface.font_size.points)
+    {
+        var font_size = self.core_surface.font_size;
+        font_size.points = inherit_font_points;
+        self.core_surface.setFontSize(font_size) catch |err| {
+            log.warn("failed to inherit font size err={}", .{err});
+        };
+    }
 
     // The remote cwd/shell strings were borrowed from the IPC request arena
     // for the duration of core_surface.init only (termio.Remote duped them).

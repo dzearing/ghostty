@@ -2175,6 +2175,26 @@ to the configured `font-size`. Fix: mirror newSurfaceOptions in the
 win32 new-surface path. Validation: zoom a pane, open tab/split/window →
 same size; config off → default size.
 
+**DONE 2026-07-18.** win32 `Surface.zig` init now captures
+`app.core_app.focusedSurface().font_size.points` before
+`core_surface.init` (focus only moves to the new pane later via the T48
+deferred SetFocus, so the focused surface is still the opener) and, when
+`window-inherit-font-size` is set and the size differs, applies it AFTER
+init via `setFontSize` — exactly the embedded.zig split (options
+captured in newSurfaceOptions, applied post-init at embedded.zig:1084),
+so `original_font_size` keeps the config default and `reset_font_size`
+still returns to it. Covers window/tab/split and IPC-created surfaces
+alike (same init path; consistent with how win32 already inherits the
+working directory from the focused surface for IPC windows). Evidence:
+new `test/win32/font-inherit.ps1` ALL PASS (21) ×3 on-box 2026-07-18 —
+two GUI launches (default + `--window-inherit-font-size=false`); oracle
+is `mode con` grid columns (full-width down-splits: same font ⇔ same
+columns) plus estimated cell px width for the new-window path; ctrl+= ×6
+zoom doubles as the injection positive control (64→43 cols). Inherit on:
+split and new window both at 43 cols / 14.56 cell px (== zoomed); off:
+both back at 64 cols / 9.78 cell px (== default). Both test lanes +
+P1–P3 ALL PASS at HEAD.
+
 ## T77 — FIX: gotoSplit while zoomed focuses a hidden pane (Phase I)
 
 Found by T51 (F13). `gotoSplit` (Window.zig:1652-1691) never touches
