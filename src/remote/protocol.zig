@@ -720,6 +720,15 @@ pub const Relaunched = struct {
     /// clients (ignore it) interoperate unchanged.
     replayed: bool = false,
 
+    /// The width/height the replayed scrollback (`replayed == true`) was drawn at
+    /// — the snapshot's capture geometry (§5.4). 0 = unknown (blank relaunch, or a
+    /// legacy GRS1 snapshot with no width). The client replays the raw stream at
+    /// this width and then reflows to the live pane, so in-place prompt redraws
+    /// don't smear when the restored pane is a different size. Additive/defaulted →
+    /// an older agent sends 0 and the client falls back to live-width replay.
+    replay_cols: u16 = 0,
+    replay_rows: u16 = 0,
+
     /// The respawned child's PTY slave path (set with `ok == true`; a relaunch
     /// opens a FRESH pty, so any previously-reported tty is stale). See
     /// `Opened.tty`. Additive/optional (older agents omit it).

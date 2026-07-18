@@ -376,6 +376,28 @@ pub const Session = struct {
     px_w: u16 = 0,
     px_h: u16 = 0,
 
+    /// Re-attach repaint latch (§5.4). `TIOCSWINSZ` only raises `SIGWINCH` on a
+    /// dimension *change*, so a re-attach that restores the SAME geometry leaves
+    /// alt-screen apps (vim, htop, Claude Code) showing a stale/blank frame until
+    /// the user manually resizes. Set on ATTACH (alive re-attach) and RELAUNCH;
+    /// the first authoritative RESIZE that follows (the client's threadEnter
+    /// re-assert, 106dcdc9c) delivers one explicit `SIGWINCH` to the child pgid
+    /// and clears this, forcing the foreground app to re-query size and repaint.
+    /// The design's "post-attach RESIZE (rows±0 trick or SIGWINCH) nudges" — done
+    /// as a real SIGWINCH, because a rows±0 no-op changes nothing and so signals
+    /// nothing.
+    winch_on_next_resize: bool = false,
+
+    /// Capture width/height of a PRELOADED reboot-scrollback snapshot (T13, §5.4),
+    /// i.e. the pty geometry the ring bytes were drawn at. 0 = unknown (no
+    /// snapshot, or a legacy width-less GRS1 file). Sent to the reattaching viewer
+    /// on RELAUNCH (`Relaunched.replay_cols/rows`) so it can replay the raw stream
+    /// at the original width and reflow to the live pane — replayed narrower, the
+    /// stream's in-place prompt redraws smear. Only meaningful until the first live
+    /// resize; the fresh child then owns the geometry.
+    replay_cols: u16 = 0,
+    replay_rows: u16 = 0,
+
     /// Recent raw child output for gap-fill/scrollback (§7.1/§7.3).
     ring: OutputRing,
 
@@ -1109,6 +1131,11 @@ pub const SessionStore = struct {
         defer loaded.free(alloc);
         if (loaded.bytes.len == 0) return; // nothing to replay
 
+        // Remember the width these bytes were drawn at (0 for a legacy GRS1
+        // snapshot) so RELAUNCH can tell the viewer to replay at that width.
+        sess.replay_cols = loaded.cols;
+        sess.replay_rows = loaded.rows;
+
         // Renumber to base 0: [snapshot bytes][divider]. out_offset := tail so the
         // relaunched child's first output lands immediately after the divider.
         sess.ring.preload(0, loaded.bytes);
@@ -1172,13 +1199,17 @@ pub const SessionStore = struct {
             const n = s.ring.copyRetained(buf.items);
             const base = s.ring.base_offset;
             const at = s.out_offset.value;
+            // Capture the width these bytes were drawn at so replay can render at
+            // it and then reflow to the live pane width (§5.4 smear fix).
+            const cap_cols = s.cols;
+            const cap_rows = s.rows;
             var id_str_buf: [32]u8 = s.id_str;
             self.mutex.unlock();
 
             // Write OUTSIDE the lock.
             const path = ring_snapshot.pathFor(alloc, dir, id_str_buf[0..]) catch continue;
             defer alloc.free(path);
-            ring_snapshot.writeAtomic(alloc, path, base, buf.items[0..n]) catch |err| {
+            ring_snapshot.writeAtomic(alloc, path, base, cap_cols, cap_rows, buf.items[0..n]) catch |err| {
                 std.log.warn("ring_snapshot: write {s} failed: {s}", .{ path, @errorName(err) });
                 continue;
             };

@@ -603,6 +603,11 @@ pub const RelaunchOutcome = struct {
     /// a ring disk snapshot (§5.4 reboot scrollback, T13); the caller should NOT
     /// print its own divider. False when the agent had no snapshot (blank relaunch).
     replayed: bool = false,
+    /// The width/height the replayed scrollback was drawn at (0 = unknown). The
+    /// caller replays at this width then reflows to the live pane so in-place
+    /// prompt redraws in the raw stream don't smear (§5.4).
+    replay_cols: u16 = 0,
+    replay_rows: u16 = 0,
 };
 
 /// A caller-owned, deep copy of a `PROC_SNAPSHOT` reply (§9.3 process view). The
@@ -1931,9 +1936,9 @@ pub const Connection = struct {
             // and tear the pre-registered channel back down (a value return does not
             // fire the `errdefer` above).
             self.teardownPane(pane);
-            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid, .replayed = res.replayed };
+            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows };
         }
-        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid, .replayed = res.replayed };
+        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows };
     }
 
     /// Register the inbound ring + a `Pane` for a session about to be relaunched,
@@ -1980,7 +1985,7 @@ pub const Connection = struct {
     /// agent still had the session, and the (respawned) child pid. Unlike
     /// `RelaunchOutcome` this carries no pane — `sendRelaunchOnPane` operates on a pane
     /// the caller already prepared and still owns.
-    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64, replayed: bool = false };
+    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64, replayed: bool = false, replay_cols: u16 = 0, replay_rows: u16 = 0 };
 
     /// Send `RELAUNCH` for an already-prepared pane (see `prepareRelaunchPane`) and
     /// await `RELAUNCHED`. On `ok`, the recorded process is respawned and streaming on
@@ -2027,7 +2032,7 @@ pub const Connection = struct {
             if (pane.tty) |t| self.alloc.free(t);
             pane.tty = new_tty;
         }
-        return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed };
+        return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed, .replay_cols = r.replay_cols, .replay_rows = r.replay_rows };
     }
 
     /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote

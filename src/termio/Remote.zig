@@ -390,6 +390,11 @@ pub fn threadEnter(
     // divider from a ring disk snapshot (§5.4, T13) — the client then suppresses its
     // own snapshot-less divider so there is exactly one marker.
     var relaunch_replayed = false;
+    // The width/height the replayed scrollback was drawn at (0 = unknown). Used to
+    // replay at that width and reflow to the live pane so in-place prompt redraws
+    // don't smear (§5.4). Only meaningful with `relaunch_replayed`.
+    var replay_cols: u16 = 0;
+    var replay_rows: u16 = 0;
 
     // Open a new session or attach to an existing one to obtain our pane.
     const pane: *connection.Pane = if (self.session_id) |sid| pane: {
@@ -459,6 +464,8 @@ pub fn threadEnter(
                 );
                 did_relaunch = true;
                 relaunch_replayed = r.replayed;
+                replay_cols = r.replay_cols;
+                replay_rows = r.replay_rows;
                 break :pane p;
             }
             log.warn(
@@ -596,9 +603,30 @@ pub fn threadEnter(
         @call(.always_inline, termio.Termio.processOutput, .{ io, prompt });
     }
 
+    // §5.4 smear fix: replay the reboot-scrollback at the width it was CAPTURED
+    // at, then reflow to the live pane. The raw byte stream is full of in-place
+    // prompt redraws (`\r` + erase-to-end) that only land cleanly at their
+    // original width; drained straight into a narrower grid, each redraw wraps and
+    // the erase can't reclaim the row it already pushed to scrollback, so the
+    // prompts stack (the visible "spam"). Rendered at the capture width every
+    // redraw self-erases to one prompt; the trailing reflow re-wraps that single
+    // logical line to the live width. Guarded to the relaunch-replayed case with a
+    // known capture width that actually differs from the live grid (0 = an older
+    // agent or a legacy GRS1 snapshot → fall back to today's live-width replay).
+    const live_cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
+    const live_rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
+    const reflow_replay = relaunch_replayed and replay_cols != 0 and replay_cols != live_cols;
+    if (reflow_replay) io.reflowLocalGrid(replay_cols, live_rows);
+
     // Drain once immediately in case DATA landed in the ring between registration
     // and arming the wait (the agent may stream a snapshot right after OPENED).
     drainRing(td);
+
+    // Reflow the just-replayed scrollback back to the live width. Leaves the grid
+    // at `self.size.grid()` so later real resizes stay consistent. Fresh child
+    // output (produced at the live width — the authoritative RESIZE above set the
+    // agent pty) then continues to land at the live width.
+    if (reflow_replay) io.reflowLocalGrid(live_cols, live_rows);
 }
 
 pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {

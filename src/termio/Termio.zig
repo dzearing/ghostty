@@ -544,6 +544,27 @@ pub fn resize(
     self.renderer_wakeup.notify() catch {};
 }
 
+/// Reflow ONLY the local terminal grid to `cols`x`rows` — no pty/agent RESIZE and
+/// no change to `self.size`. Used to replay reboot-scrollback (§5.4) at the width
+/// it was captured at and then reflow to the live pane width: a raw byte stream
+/// full of in-place prompt redraws (`\r` + erase-to-end) only lands cleanly at its
+/// original width, so we render it there, then reflow. Caller MUST leave the grid
+/// back at the live size (== `self.size.grid()`) when done, so a later real resize
+/// stays consistent. Same locking as `resize`; notifies the renderer.
+pub fn reflowLocalGrid(self: *Termio, cols: u16, rows: u16) void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.terminal.resize(self.alloc, cols, rows) catch |err| {
+            log.warn("reflowLocalGrid resize failed err={}", .{err});
+            return;
+        };
+        self.terminal.modes.set(.synchronized_output, false);
+    }
+    _ = self.renderer_mailbox.push(.{ .resize = self.size }, .{ .forever = {} });
+    self.renderer_wakeup.notify() catch {};
+}
+
 /// Make a size report.
 pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
     self.renderer_state.mutex.lock();
