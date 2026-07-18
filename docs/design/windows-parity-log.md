@@ -9,6 +9,16 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 14) — T71 DONE. Claude Code integration setup at
+  Mac parity: `ClaudeIntegration.zig` (detect claude → one-time
+  first-run offer via ConfirmDialog, canonical-install-gated; answer
+  file remembers declining) + "Install Claude Code Integration"
+  palette entry; both run marketplace-add + plugin-install on a
+  background thread, outcomes via WM_APP → Mac-parity dialogs. Pure
+  logic in `claude_setup.zig` (both lanes). claude-integration.ps1
+  ALL PASS (26) ×3 with a stub claude.cmd; P1–P3 green. No surprises.
+  Next: T66 (reset_window_size parity).
+
 - 2026-07-18 (on-box, 13) — T70 DONE. `ghoztty` now self-installs on the
   user PATH: new `PathInstaller.zig` (background thread at App.init,
   gated to %LOCALAPPDATA%\Programs\Ghoztty; `GHOZTTY_PATH_SELFHEAL`

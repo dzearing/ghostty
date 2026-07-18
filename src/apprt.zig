@@ -72,4 +72,7 @@ test {
 
     // Pure win32 user-PATH self-heal logic (T70), same no-OS-imports deal.
     _ = @import("apprt/win32/path_env.zig");
+
+    // Pure win32 Claude Code setup logic (T71), same no-OS-imports deal.
+    _ = @import("apprt/win32/claude_setup.zig");
 }

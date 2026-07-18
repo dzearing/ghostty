@@ -16,6 +16,7 @@ const internal_os = @import("../../os/main.zig");
 const remote_connection = @import("../../remote/connection.zig");
 
 const App = @import("App.zig");
+const ClaudeIntegration = @import("ClaudeIntegration.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
@@ -1510,6 +1511,8 @@ const PaletteEntry = struct {
     action: input.Binding.Action,
     remote: bool = false,
     about: bool = false,
+    /// Local-only like `about` (T71): runs the Claude Code plugin install.
+    claude: bool = false,
 };
 
 /// Cap on user-configured command-palette-entry commands shown in the
@@ -1528,10 +1531,10 @@ fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
 
 fn paletteEntryAction(self: *const Surface, idx: u16) ?input.Binding.Action {
     if (idx < palette_entries.len) {
-        // Remote/about entries have no binding action (handled locally);
-        // returning null suppresses a misleading keybind hint on the row.
+        // Remote/about/claude entries have no binding action (handled
+        // locally); returning null suppresses a misleading keybind hint.
         const entry = palette_entries[idx];
-        return if (entry.remote or entry.about) null else entry.action;
+        return if (entry.remote or entry.about or entry.claude) null else entry.action;
     }
     const user = self.app.config.@"command-palette-entry".value.items;
     const uidx = idx - palette_entries.len;
@@ -1601,6 +1604,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Open Config", .action = .open_config },
     .{ .name = "Reload Config", .action = .reload_config },
     .{ .name = "About Ghoztty", .action = .new_window, .about = true },
+    .{ .name = "Install Claude Code Integration", .action = .new_window, .claude = true },
     .{ .name = "Quit", .action = .quit },
 };
 
@@ -1838,6 +1842,13 @@ pub fn executePaletteSelection(self: *Surface) void {
     // About entry (T52) — local-only, like remote: show build provenance.
     if (entry_idx < palette_entries.len and palette_entries[entry_idx].about) {
         self.showAboutDialog();
+        return;
+    }
+
+    // Claude Code integration (T71) — local-only: run the plugin install
+    // on a background thread; the outcome dialog arrives via WM_APP.
+    if (entry_idx < palette_entries.len and palette_entries[entry_idx].claude) {
+        ClaudeIntegration.installAsync(self.app, .palette);
         return;
     }
 

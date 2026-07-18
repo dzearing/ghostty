@@ -2221,6 +2221,38 @@ palette entry ("Install Claude Code Integration"); run the same
 *Validation:* on-box with claude installed: palette entry runs the
 install; declining is remembered.
 
+**DONE 2026-07-18.** New `ClaudeIntegration.zig` + pure
+`claude_setup.zig` (step/outcome/state-grammar logic, unit tests in both
+lanes via apprt.zig). Launch check runs on a detached thread with the
+PathInstaller-style canonical-install gate (`GHOZTTY_CLAUDE_SETUP`:
+`0`/`off` disables, `force` skips the gate): find the claude CLI
+(`GHOZTTY_CLAUDE_EXE` override → process PATH claude.exe/.cmd/.bat →
+native `%USERPROFILE%\.local\bin` / npm `%APPDATA%\npm` well-knowns);
+skip silently — recording `accepted` — when installed_plugins.json
+(`GHOZTTY_CLAUDE_PLUGINS_JSON` override) already has any `ghoztty@`
+plugin; else post WM_APP_CLAUDE_PROMPT → T80 ConfirmDialog "Set Up
+Claude Code Integration?" (Set Up / Not Now; answer persisted at
+`%LOCALAPPDATA%\ghoztty\claude_setup`, `GHOZTTY_CLAUDE_STATE_DIR`
+override; `declined` is written pre-show so a crash mid-dialog never
+turns into a per-launch nag; a missing claude leaves the prompt
+unburned). Accepting — or the new "Install Claude Code Integration"
+palette entry (local-only like About, T52 pattern) — runs
+`claude plugin marketplace add dzearing/ghoztty-claude-plugin` +
+`claude plugin install ghoztty@ghoztty-claude-plugin` on a background
+thread (create_no_window, .cmd shims handled by Zig's Child; "already"
+in output counts as success, the Mac rule; single-flight guard);
+outcome returns via WM_APP_CLAUDE_DONE — first-run success stays
+silent, palette outcomes and all failures get Mac-parity dialogs
+(Ready / Already Set Up / Not Found / Failed+detail). Evidence:
+`test/win32/claude-integration.ps1` ALL PASS (26) ×3 on-box 2026-07-18
+— stub claude.cmd logs exact command ids; decline persists across
+relaunch; accept via Enter runs both commands silently; palette rerun
+reports "Claude Code Integration Ready"; no-claude case burns nothing
+and reports "Claude Code Not Found". Regression: P1–P3 + both test
+lanes green. Known limit: no per-invocation timeout on the claude runs
+(Mac uses 120 s) — a hung CLI only wedges its background thread, never
+the GUI.
+
 ## T72 — Tab accent-color tagging (Phase I)
 
 Found by T51 (F8). Mac tags tabs with 10 named accent colors

@@ -13,6 +13,7 @@ const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
+const ClaudeIntegration = @import("ClaudeIntegration.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const DarkMode = @import("DarkMode.zig");
 const PathInstaller = @import("PathInstaller.zig");
@@ -48,7 +49,8 @@ const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 
 /// Posted by the IPC listener thread to marshal a request to the GUI
 /// thread. wparam = *IpcServer.Pending. (WM_APP+2/+3 are defined below:
-/// WM_APP_UPDATE_AVAILABLE, WM_APP_TRAY.)
+/// WM_APP_UPDATE_AVAILABLE, WM_APP_TRAY. WM_APP+6 is Window.WM_APP_HERO_SNAP;
+/// WM_APP+7/+8 are ClaudeIntegration's prompt/done messages.)
 pub const WM_APP_IPC: u32 = w32.WM_APP + 4;
 
 /// Posted (via `deferSetFocus`) to move keyboard focus to a terminal
@@ -339,6 +341,10 @@ pub fn init(
     // Keep the `ghoztty` CLI resolvable from any shell (T70). Background
     // thread; only acts when running from the canonical install dir.
     PathInstaller.ensureOnPathAsync();
+
+    // One-time Claude Code integration offer (T71). Background thread;
+    // same canonical-install gate as the PATH self-heal.
+    ClaudeIntegration.checkOnLaunchAsync(self);
 }
 
 /// Defer a focus change to a terminal surface out of the current WndProc.
@@ -3022,6 +3028,20 @@ fn msgWndProc(
         if (wparam != 0) {
             const pending: *IpcServer.Pending = @ptrFromInt(wparam);
             IpcServer.serveOnGuiThread(pending);
+        }
+        return 0;
+    }
+
+    if (msg == ClaudeIntegration.WM_APP_CLAUDE_PROMPT) {
+        ClaudeIntegration.showFirstRunPrompt(app);
+        return 0;
+    }
+
+    if (msg == ClaudeIntegration.WM_APP_CLAUDE_DONE) {
+        // wparam = heap *Done owned by the handler.
+        if (wparam != 0) {
+            const done: *ClaudeIntegration.Done = @ptrFromInt(wparam);
+            ClaudeIntegration.onDone(app, done);
         }
         return 0;
     }
