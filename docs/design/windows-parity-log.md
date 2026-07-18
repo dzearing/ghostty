@@ -22,7 +22,12 @@ next, any surprises>`.
   SURPRISE: `zig build test-agent` was never green on Windows (5
   pre-existing integration failures, harness ReadFile-on-socket
   GetLastError(87); proven identical at baseline 52e1fd73b) → filed
-  T82. Next: T67.
+  T82. Delivered aeb856ebe ReleaseFast (gnu, -Dstrip=false) to all 3
+  install locations: Desktop portable + share extracted copy
+  (rename-then-copy, dated .baks), share zip refreshed
+  (jul12 .bak kept), share ghoztty-agent.exe refreshed (agent shares
+  the ws fix; jul3 .bak kept), installed release via
+  upgrade-ghoztty-windows.ps1 at this boundary. Next: T67.
 - 2026-07-18 (on-box, 10) — T68 DONE (c8f1da16e). Remote inheritance:
   `--from-focused` on +new-window/+split; plain tabs/splits (ctrl+t/
   ctrl+d + IPC) in a remote window reuse the connection and inherit the
