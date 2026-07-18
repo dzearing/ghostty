@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 2) — T77 DONE. gotoSplit now handles `tree.zoomed`
+  exactly like GTK: navigating away clears the zoom by default or carries
+  it to the target under `split-preserve-zoom = navigation`; also added
+  the GTK same-target early-out. New `test/win32/split-zoom-nav.ps1`
+  (2 GUI launches — default + `--split-preserve-zoom=navigation` CLI
+  config arg; GetGUIThreadInfo reads real keyboard focus, no thread
+  attach) ALL PASS (16): pre-fix bug asserted dead — focused pane is
+  always visible after nav-out-of-zoom in both modes. Both test lanes +
+  P1–P3 green. Session start note: upgrade-log resume args were partially
+  dropped again ("read" instead of "read go.md and go") — the session
+  still resumed fine; refreshed install verified answering +list.
 - 2026-07-18 (on-box) — T65 DONE. Child-exited UI fixed end-to-end:
   removed the modal-and-return-true show_child_exited handler so the
   core's in-terminal UI shows (press-any-key notice on clean exits, rich

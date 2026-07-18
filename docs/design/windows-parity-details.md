@@ -2144,6 +2144,20 @@ it). Fix: in gotoSplit, if zoomed and the target differs — clear zoom
 ctrl+alt+arrow, assert the focused pane is visible for both config
 values.
 
+**DONE 2026-07-18.** gotoSplit's leaf arm now mirrors the GTK reference
+(`gtk/class/split_tree.zig` ~359): when `tree.zoomed != null`, clear the
+zoom (default) or `tree.zoom(dest_handle)` under
+`split-preserve-zoom = navigation`, then `layoutSplits()` before the
+deferred SetFocus so the target is visible when focus lands; also added
+GTK's same-target early-out (`dest_handle == handle`). Evidence: new
+`test/win32/split-zoom-nav.ps1` ALL PASS (16) on-box 2026-07-18 — two
+GUI launches (default + `--split-preserve-zoom=navigation` via CLI
+config arg, user config untouched): zoom B → ctrl+alt+up → default:
+zoom cleared, both visible, focus A; navigation: only A visible (zoom
+followed); in both, GetGUIThreadInfo-read focus is on a VISIBLE pane
+(the bug). ctrl+k positive control + no-crash guards included. Both
+test lanes + P1–P3 green.
+
 ## T78 — `window-title-font-family` (Phase I)
 
 Found by T51 (F14). Honored on Mac (TerminalController.swift:762); win32

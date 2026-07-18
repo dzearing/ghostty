@@ -1680,10 +1680,25 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
     };
 
     const dest_handle = (tree.goto(alloc, handle, target) catch return) orelse return;
+    if (dest_handle == handle) return;
 
     switch (tree.nodes[dest_handle.idx()]) {
         .leaf => |surface| {
             self.tab_active_surface[tab] = surface;
+
+            // Navigating away from a zoomed split must not focus a hidden
+            // pane (T77). Match Mac/GTK `split-preserve-zoom`: clear the
+            // zoom by default, or carry it to the target under
+            // `split-preserve-zoom = navigation`.
+            if (tree.zoomed != null) {
+                if (self.app.config.@"split-preserve-zoom".navigation) {
+                    tree.zoom(dest_handle);
+                } else {
+                    tree.zoom(null);
+                }
+                self.layoutSplits();
+            }
+
             if (surface.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
         },
         .split => {},
