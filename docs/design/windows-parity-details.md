@@ -2030,6 +2030,39 @@ dialog (`ChooseColorW`).
 *Validation:* `+new-window --color=#334455` tints; `+split
 --split-color=…` tints the pane; picker round-trips; P1–P3 stay green.
 
+**DONE 2026-07-18 (5bf9a65d6).** Four layers, all Mac-parity:
+
+- `color_math.zig` (pure, unit-tested in both lanes): hex parse
+  (`#rgb`/`#rrggbb`), Rec.601 luminance/isLight, HSB lighten/darken,
+  `shiftedTint` (5% — the shipping Mac `shiftedTint` uses 0.05, not the
+  design doc's worked 0.15 example), WCAG-4.5 CIELAB palette
+  binary-search (`adjustPaletteForContrast` port), `randomDark`.
+- `Surface.applyBackgroundTint`: sets terminal bg under the renderer
+  mutex; explicit colors (CLI/picker) also set a black/white contrast fg
+  + the 16 adjusted ANSI colors (Mac applyColorScheme); scrollbar theme
+  follows; renderer woken. `+list --json` leaves carry an additive
+  `background_tint` (#rrggbb, omitted when untinted — golden Mac shape
+  unchanged).
+- Verbs: `+new-window --color/--split-color`, `+split --color`, value
+  `random` (dark muted). Invalid hex never reaches the server — the
+  shared CLI rejects it (`error.InvalidValue`), same as the Mac; the
+  handler still silently ignores unparseable values from raw clients.
+  Plain splits (keyboard or IPC, local or remote) inherit the parent
+  pane's effective bg shifted, applied post-init in `newSplitAt` — an
+  explicit color overwrites it right after.
+- Context menu "Background Color…" → `ChooseColorW` (comdlg32, now
+  linked) seeded CC_RGBINIT with the pane's effective background;
+  OK applies the full scheme. Windows-native stand-in for the Mac's
+  live NSColorPanel (common dialog is modal; no live preview).
+
+Evidence: `test/win32/window-color.ps1` ALL PASS (14) ×3 — `+list`
+model asserts, screen-pixel probe (#334455 reads back 51,68,85 at the
+pane center), exact shift oracle #334455→#384b5e (pinned in a unit
+test too), inline `--split-color`, untinted-pane absence, `random`
+dark+well-formed, CLI reject, and menu→dialog→Enter automation
+(right-click → `B` mnemonic → #32770 appears → tint == configured bg).
+P1–P3, split-dim (23), hero-mode (60), both test lanes: green.
+
 ## T68 — Remote inheritance: `--from-focused` + New Window on remote (Phase G)
 
 Found by T51 (F4). Mac reuses the focused window's remote host for

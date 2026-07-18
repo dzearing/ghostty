@@ -18,6 +18,21 @@ background color to create visual depth.
 
 Colors are validated as 4- or 7-character hex strings (`#rgb` or `#rrggbb`).
 
+## Windows
+
+Windows implements the same feature natively (T67): the CLI flags and split
+inheritance behave identically; the context menu's "Background Color..."
+opens the Win32 common color dialog (`ChooseColorW`) seeded with the pane's
+effective background — modal, so no live preview. Explicit colors apply the
+background, a black/white contrast foreground, and the WCAG-adjusted ANSI
+palette directly to the terminal (there is no overlay layer on win32; the
+auto-shifted split tint also sets the terminal background, without touching
+the palette). `+list --json` panes report the tint as an additive
+`background_tint` field. Pure color math lives in
+`src/apprt/win32/color_math.zig`. Note the shipping shift amount is 5%
+(`shiftedTint`, matching the Mac code); the 15% figures below are the
+original design's worked example.
+
 ## Color Picker Behavior
 
 The macOS context menu exposes "Background Color..." which opens

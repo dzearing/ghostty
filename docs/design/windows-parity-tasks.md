@@ -133,7 +133,8 @@ Work these first, in order, before falling back to first-todo-in-table:
    relay-agent-death GUI hang found by its regression runs), ~~T81~~ (done
    2026-07-18: was a process-killing PANIC in the ws teardown + a remote
    transport leak on `+close`; filed T82 — pre-existing test-agent
-   failures on Windows), **T67 next**, then T70, T71, T66, T72, T78.
+   failures on Windows), ~~T67~~ (done 2026-07-18), **T70 next**, then
+   T71, T66, T72, T78.
    After that the priority queue is exhausted — fall back to
    first-todo-in-table / the order above.
 
@@ -221,7 +222,7 @@ One line per row. Full spec + validation + evidence per task:
 | T64 | FIX: SendInput-unicode (VK_PACKET) text injection silently dropped — screen readers/on-screen keyboards/automation typed nothing into panes (found by the T53b profiling harness; both input modes affected). See details | I | — | done | 3cb802605 |
 | T65 | FIX: show_child_exited suppressed the core fallback — done 2026-07-18: returns false (modal removed), core in-terminal UI shows; + 3 adjacent fixes found by validation (ConPTY late-frame notify delay in Exec.zig, GWLP_USERDATA wrong-type-cast keystroke crash in App.zig run loop, win32-input-mode close-on-keypress). `ipc-child-exited.ps1` ALL PASS x3 (T51 F1) | I | — | done | 0eebf126c |
 | T66 | FIX: reset_window_size hardcodes 800×600 — track the initial_size (window-width/height × cell size) per window and reset to that, Mac returnToDefaultSize parity (T51 F2) | I | — | todo | — |
-| T67 | Window/pane background tint: implement `--color`/`--split-color` (accepted-and-ignored in args.zig:115) + palette contrast shift + context-menu color picker per docs/design/window-color.md (T51 F3) | I | — | in-progress | — |
+| T67 | Window/pane background tint — done 2026-07-18: `--color`/`--split-color`/`random` end-to-end (bg + contrast fg + WCAG-4.5 palette), plain splits inherit shifted parent bg, "Background Color…" ChooseColorW menu entry, `+list` additive `background_tint`; `window-color.ps1` ALL PASS (14) ×3 (T51 F3) | I | — | done | 5bf9a65d6 |
 | T68 | Remote inheritance — done 2026-07-18: `--from-focused` on +new-window/+split; plain tabs/splits in a remote window reuse the connection + inherit command/live cwd (GET_CWD); ctrl+n re-dials the recorded machine; `remote-inherit.ps1` ALL PASS ×3 (T51 F4) | G | T21b | done | c8f1da16e |
 | T69 | Config-error UI — done 2026-07-18: startup + hard-reload diagnostics shown in a dark ConfirmDialog with "Open Config"/"Ignore" (custom captions + measured button width); `config-errors.ps1` ALL PASS (10) ×3 (T51 F5) | I | — | done | 9cef52567 |
 | T70 | CLI on PATH for installs: MSI Environment/PATH entry or runtime self-heal so `ghoztty` resolves from any shell (Mac CommandLineInstaller analog; distinct from T23) (T51 F6) | H | — | todo | — |

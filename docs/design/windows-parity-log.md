@@ -9,6 +9,19 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 12) — T67 DONE (5bf9a65d6). Background tint at
+  Mac parity: `--color`/`--split-color`/`random` set terminal bg +
+  contrast fg + WCAG-4.5-adjusted ANSI palette (pure `color_math.zig`,
+  unit-tested both lanes); plain splits now inherit the parent pane's
+  bg shifted 5% (visible depth, Mac newSplit behavior); context-menu
+  "Background Color…" opens ChooseColorW (comdlg32 newly linked);
+  `+list` panes gained additive `background_tint`. window-color.ps1
+  ALL PASS (14) ×3 incl. a pixel probe and menu→dialog automation
+  (`B` mnemonic executes the item). SURPRISES: the shared CLI already
+  validates `--color` (invalid hex exits nonzero, never reaches the
+  server — test expects rejection, not silent ignore); the shipping
+  Mac shift is 0.05, not window-color.md's 0.15 example. Next: T70.
+
 - 2026-07-18 (on-box, 11) — T81 DONE. The "GUI unresponsive after
   agent death" was a process-killing PANIC: ws teardown sent the WS
   close frame AFTER `shutdown(.both)`; Windows returns `WSAESHUTDOWN`,
