@@ -36,35 +36,86 @@ extension AppDelegate {
         for entry in entries where entry.tree == nil {
             SessionLayoutManifest.shared.remove(entry.id)
         }
-        let restorable = entries.filter { $0.tree != nil }
-        guard !restorable.isEmpty else { return }
+        let localRestorable = entries.filter { $0.tree != nil }
 
+        // We ALWAYS consult the agent, even when the local manifest is empty.
+        // The agent is the crash-durable authority: after an app crash it keeps
+        // running with every layout blob (design: sessions "survive app
+        // crashes"), while THIS app-local manifest can regress — a crash
+        // relaunch that rebuilt nothing then overwrote the file, dropping the
+        // windows it never brought back. Reconciling the two here is what makes
+        // agent-only windows — exactly the ones an app crash orphans — come
+        // back automatically on the next launch instead of only via a manual
+        // "Resume all". The agent is already warmed at launch (config load →
+        // LocalAgentManager.warmUp), so this dial adds no new spawn.
         hasPendingSessionRestore = true
 
         LocalAgentManager.shared.sharedConnectionAsync { [weak self] connection in
             guard let self else { return }
             guard let connection else {
-                // Agent unreachable: keep every entry untouched so the next
-                // launch retries; never alert from the restore path.
-                Self.logger.warning("session restore: local agent unreachable; keeping \(restorable.count) manifest entries for next launch")
+                // Agent unreachable: without a connection there is nothing to
+                // ATTACH to, so keep every local entry untouched for the next
+                // launch (the agent — and its live sessions — outlive this app,
+                // so a retry recovers them). Never alert from the restore path.
+                if !localRestorable.isEmpty {
+                    Self.logger.warning("session restore: local agent unreachable; keeping \(localRestorable.count) manifest entries for next launch")
+                }
                 self.sessionLayoutRestoreFinished()
                 return
             }
-            // Liveness-probe every leaf session off the main thread (GET_CWD
-            // by session id answers ok=false for a dead/unknown session,
-            // bounded timeout — same probe as the relay restore).
+            // Pull the agent's authoritative layout roster and reconcile it with
+            // the local entries, then liveness-probe every leaf off the main
+            // thread (GET_CWD by session id answers ok=false for a dead/unknown
+            // session, bounded timeout — same probe as the relay restore).
             DispatchQueue.global(qos: .userInitiated).async {
-                let probe = Self.probeSessions(entries: restorable, handle: connection.handle)
+                let agentEntries = (RemoteLayoutRoster.get(handle: connection.handle) ?? [])
+                    .compactMap(\.entry)
+                let merged = Self.reconcileLayoutEntries(
+                    local: localRestorable, agent: agentEntries)
+                let probe = Self.probeSessions(entries: merged, handle: connection.handle)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    // Adopt agent-only entries into the local manifest so
+                    // restore's in-place sync tracks them and they persist here
+                    // for the next launch (an id already local is left alone).
+                    let localIDs = Set(localRestorable.map(\.id))
+                    for entry in merged where !localIDs.contains(entry.id) {
+                        SessionLayoutManifest.shared.adopt(entry)
+                    }
                     self.presentRestoredSessionWindows(
-                        entries: restorable,
+                        entries: merged,
                         probe: probe,
                         connection: connection)
                     self.sessionLayoutRestoreFinished()
                 }
             }
         }
+    }
+
+    /// Union the app-local layout entries with the agent's authoritative
+    /// roster, keyed by manifest entry id. Local entries come first (preserving
+    /// manifest order) and WIN on an id collision — the local copy is written
+    /// before the agent push, so a crash can only make it fresher, never
+    /// staler. Agent-only entries (the windows an app crash orphaned, kept alive
+    /// by the ever-running agent) are appended in agent order. Entries without a
+    /// tree are skipped on both sides. Pure/static so it is unit-testable
+    /// without a live agent.
+    static func reconcileLayoutEntries(
+        local: [SessionLayoutManifest.Entry],
+        agent: [SessionLayoutManifest.Entry]
+    ) -> [SessionLayoutManifest.Entry] {
+        var byID: [UUID: SessionLayoutManifest.Entry] = [:]
+        var order: [UUID] = []
+        for entry in local where entry.tree != nil {
+            if byID[entry.id] == nil { order.append(entry.id) }
+            byID[entry.id] = entry
+        }
+        for entry in agent where entry.tree != nil {
+            guard byID[entry.id] == nil else { continue }
+            byID[entry.id] = entry
+            order.append(entry.id)
+        }
+        return order.compactMap { byID[$0] }
     }
 
     /// Restore is over (windows built, or nothing restorable). If it ended

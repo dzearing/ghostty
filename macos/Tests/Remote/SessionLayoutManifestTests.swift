@@ -315,4 +315,64 @@ struct SessionLayoutManifestTests {
         try Data("not json".utf8).write(to: url)
         #expect(SessionLayoutManifest(fileURL: url).allEntries().isEmpty)
     }
+
+    // MARK: Crash-recovery reconciliation (agent-authoritative restore)
+
+    /// An `Entry` with a single-leaf tree carrying `sid` — the minimal shape a
+    /// window layout takes for these reconciliation tests.
+    private func entry(id: UUID = UUID(), sid: String, tree hasTree: Bool = true)
+        -> SessionLayoutManifest.Entry {
+        SessionLayoutManifest.Entry(
+            id: id,
+            frame: .init(NSRect(x: 0, y: 0, width: 100, height: 100)),
+            ipcName: nil,
+            tabIndex: 0,
+            tree: hasTree ? .leaf(.init(sessionID: sid, title: sid, ipcName: nil)) : nil)
+    }
+
+    @Test func adoptInsertsAgentOnlyEntryAndKeepsLocalOnCollision() {
+        let url = tempFileURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+        let store = SessionLayoutManifest(fileURL: url)
+        let shared = UUID()
+        let local = entry(id: shared, sid: "local")
+        store.adopt(local)                       // agent-only insert
+        store.adopt(entry(sid: "agent-only"))    // second agent-only insert
+
+        // Adopting an id already present is a no-op — the local copy wins.
+        store.adopt(entry(id: shared, sid: "agent-stale"))
+
+        let reloaded = SessionLayoutManifest(fileURL: url).allEntries()
+        #expect(reloaded.count == 2)
+        let kept = try? #require(reloaded.first { $0.id == shared })
+        #expect(SessionLayoutManifest.leaves(of: kept!.tree!).first?.sessionID == "local")
+    }
+
+    @Test func reconcileUnionsAgentOnlyEntriesLocalWinsOnCollision() {
+        let shared = UUID()
+        let local = [
+            entry(id: shared, sid: "local-shared"),
+            entry(sid: "local-only"),
+        ]
+        let agent = [
+            entry(id: shared, sid: "agent-shared"),   // collides with local → dropped
+            entry(sid: "agent-only-1"),
+            entry(sid: "agent-only-2"),
+            entry(sid: "no-tree", tree: false),        // skipped (no tree)
+        ]
+
+        let merged = AppDelegate.reconcileLayoutEntries(local: local, agent: agent)
+        // Local entries first (in order), then agent-only entries (in order).
+        let sids = merged.map { SessionLayoutManifest.leaves(of: $0.tree!).first?.sessionID }
+        #expect(sids == ["local-shared", "local-only", "agent-only-1", "agent-only-2"])
+    }
+
+    @Test func reconcileFromEmptyLocalRecoversEveryAgentWindow() {
+        // The exact crash case: the local manifest regressed to empty while the
+        // agent kept every orphaned window. Reconcile must return them all.
+        let agent = [entry(sid: "w1"), entry(sid: "w2"), entry(sid: "w3")]
+        let merged = AppDelegate.reconcileLayoutEntries(local: [], agent: agent)
+        #expect(merged.map(\.id) == agent.map(\.id))
+    }
 }

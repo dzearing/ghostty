@@ -280,6 +280,27 @@ final class SessionLayoutManifest {
         notifyChanged(entries[idx])
     }
 
+    /// Adopt an entry pulled from the agent's authoritative layout roster into
+    /// the local manifest (crash-recovery reconciliation, T06). The agent is
+    /// the crash-durable authority — it keeps every layout blob across an app
+    /// crash while this local file can regress — so launch restore unions the
+    /// agent's entries with the local ones and adopts any the local file lost.
+    ///
+    /// Adopting makes the entry a first-class local entry so restore's in-place
+    /// `update`/`syncEntry` (which no-op on unknown ids) can track it and it
+    /// persists here for the next launch. An id already present locally is left
+    /// untouched — the local copy is authoritative on collision (it is written
+    /// before the agent push, so a crash can only make it fresher, never
+    /// staler). No change callback fires: the agent is the SOURCE of this
+    /// entry, so mirroring it straight back would be redundant.
+    func adopt(_ entry: Entry) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !entries.contains(where: { $0.id == entry.id }) else { return }
+        entries.append(entry)
+        saveLocked()
+    }
+
     /// Remove an entry (clean close). Removing an unknown id is a no-op.
     func remove(_ id: UUID) {
         lock.lock()
