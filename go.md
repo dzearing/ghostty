@@ -88,3 +88,12 @@ only the parts of files you need.
   (`D:\Users\David\Desktop\Ghoztty-portable-x64`), and the share copy
   (`\\homeassistant\share\ghoztty-windows`). A fix that only lives in
   zig-out does not exist as far as the user can tell (the T49 lesson).
+- **Never override `-ResumeCommand` on `scripts/upgrade-ghoztty-windows.ps1`**
+  (2026-07-18): the default (`claude --dangerously-skip-permissions
+  --continue "read go.md and go"`) is what re-enters this loop after the
+  kill/swap. A plain `claude` override relaunched a blank session and
+  stalled the loop for ~1.5 days (2026-07-17 02:32 → user return). The
+  script now substitutes the default for any --continue-less override
+  unless `-AllowPlainResume` is passed. Also finish the turn (commit,
+  tracker updated) BEFORE launching the script — it kills Claude after
+  `-DelaySeconds`.

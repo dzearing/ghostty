@@ -27,9 +27,16 @@ param(
     # conversation and then sits idle waiting for input (observed
     # 2026-07-14 -> "you stopped working"); the starter prompt re-enters
     # the go.md task loop immediately.
+    #
+    # Do NOT override this with a plain 'claude' — that relaunches a blank
+    # session with no continuation and the loop stalls until a human notices
+    # (observed 2026-07-15, 2026-07-16, and a ~1.5-day stall on 2026-07-17).
+    # A --continue-less override is replaced with the default unless
+    # -AllowPlainResume is passed.
     [string]$ResumeCommand = 'claude --dangerously-skip-permissions --continue "read go.md and go"',
     [int]$DelaySeconds = 3,
-    [switch]$NoResume
+    [switch]$NoResume,
+    [switch]$AllowPlainResume
 )
 
 $ErrorActionPreference = 'Continue'
@@ -37,6 +44,14 @@ $log = Join-Path $env:TEMP 'ghoztty-upgrade.log'
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content $log }
 
 Log "=== upgrade start (staging=$Staging)"
+
+# Guard against the resume-arg drop that stalled the loop on 2026-07-17:
+# a ResumeCommand without --continue relaunches a blank session that waits
+# forever. Substitute the default unless the caller explicitly opted out.
+if (-not $NoResume -and -not $AllowPlainResume -and $ResumeCommand -notlike '*--continue*') {
+    Log "WARNING: ResumeCommand lacks --continue ('$ResumeCommand'); substituting the default loop resume. Pass -AllowPlainResume to force a plain relaunch."
+    $ResumeCommand = 'claude --dangerously-skip-permissions --continue "read go.md and go"'
+}
 
 $newExe = Join-Path $Staging 'bin\ghoztty.exe'
 $oldExe = Join-Path $InstallDir 'ghoztty.exe'
