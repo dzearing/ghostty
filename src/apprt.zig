@@ -78,4 +78,7 @@ test {
 
     // Pure win32 tab accent-color logic (T72), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_color.zig");
+
+    // Pure win32 title-font face resolution (T78), same no-OS-imports deal.
+    _ = @import("apprt/win32/title_font.zig");
 }

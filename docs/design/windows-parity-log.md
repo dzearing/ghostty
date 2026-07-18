@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 17) — T78 DONE. `window-title-font-family` now
+  drives the owner-drawn tab bar font (and the resize overlay, which
+  shares the HFONT). Scoping call: the DWM caption font of a
+  standard-frame window is not app-controllable (Windows convention —
+  full parity would need a custom-draw titlebar), so the config applies
+  to the surfaces the app draws titles on; the audit's "design-level
+  backlog" tag only holds for the caption text itself. Face resolution
+  is pure title_font.zig (fallback/UTF-16/LF_FACESIZE truncation, unit
+  tests both lanes); config reload recreates the font live and re-pushes
+  WM_SETFONT so the overlay never holds a deleted HFONT. title-font.ps1
+  ALL PASS (9) ×3 — per-column raster signature: font change diff 430,
+  same-font diff exactly 0 (owner-drawn mem-DC rendering is fully
+  deterministic), live-reload path verified. P1–P3 + both lanes green.
+  The 2026-07-15 priority queue is now EXHAUSTED — next session falls
+  back to first-todo-in-table.
+
 - 2026-07-18 (on-box, 16) — T72 DONE. Tab accent colors (Mac
   TerminalTabColor parity): "Tab Color" submenu in the tab context menu
   (10 colors, anti-aliased DIB swatches via new pure tab_color.zig,

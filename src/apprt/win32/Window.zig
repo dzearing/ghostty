@@ -73,6 +73,7 @@ const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
 const color_math = @import("color_math.zig");
 const tab_color = @import("tab_color.zig");
+const title_font = @import("title_font.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -419,6 +420,47 @@ pub fn onConfigChange(self: *Window) void {
             _ = w32.ReleaseDC(hwnd, dc);
         }
     }
+    // Recreate the tab-bar font so window-title-font-family reloads live
+    // (T78).
+    self.createTabFont();
+    self.invalidateTabBar();
+}
+
+/// (Re)create the tab bar font at the current DPI scale, honoring
+/// `window-title-font-family` (T78). The DWM caption font of a
+/// standard-frame window is not app-controllable, so on Windows the config
+/// drives the owner-drawn tab bar (and the resize overlay, which shares the
+/// font — it is re-pushed here so a config reload never leaves it holding a
+/// deleted HFONT). GDI maps unknown face names to a usable fallback font.
+fn createTabFont(self: *Window) void {
+    if (self.tab_font) |font| {
+        _ = w32.DeleteObject(font);
+        self.tab_font = null;
+    }
+    var face: [title_font.face_cap]u16 = undefined;
+    title_font.faceName(self.app.config.@"window-title-font-family", &face);
+    const font_height: i32 = -@as(i32, @intFromFloat(16.0 * self.scale));
+    self.tab_font = w32.CreateFontW(
+        font_height, // cHeight (negative = character height)
+        0, // cWidth
+        0, // cEscapement
+        0, // cOrientation
+        w32.FW_NORMAL, // cWeight
+        0, // bItalic
+        0, // bUnderline
+        0, // bStrikeOut
+        w32.DEFAULT_CHARSET, // iCharSet
+        0, // iOutPrecision
+        0, // iClipPrecision
+        0, // iQuality
+        0, // iPitchAndFamily
+        @ptrCast(&face),
+    );
+    if (self.resize_overlay_hwnd) |h| {
+        if (self.tab_font) |f| {
+            _ = w32.SendMessageW(h, w32.WM_SETFONT, @intFromPtr(f), 1);
+        }
+    }
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -536,24 +578,8 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     }
 
-    // Create the tab bar font (Segoe UI, 12px at 96 DPI, scaled).
-    const font_height: i32 = -@as(i32, @intFromFloat(16.0 * self.scale));
-    self.tab_font = w32.CreateFontW(
-        font_height, // cHeight (negative = character height)
-        0, // cWidth
-        0, // cEscapement
-        0, // cOrientation
-        w32.FW_NORMAL, // cWeight
-        0, // bItalic
-        0, // bUnderline
-        0, // bStrikeOut
-        w32.DEFAULT_CHARSET, // iCharSet
-        0, // iOutPrecision
-        0, // iClipPrecision
-        0, // iQuality
-        0, // iPitchAndFamily
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-    );
+    // Create the tab bar font (window-title-font-family, scaled).
+    self.createTabFont();
 
     // Don't show the window yet — addTab() will show the child
     // surface which triggers ShowWindow on the parent as needed.
