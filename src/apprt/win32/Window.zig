@@ -12,6 +12,7 @@ const apprt = @import("../../apprt.zig");
 
 const App = @import("App.zig");
 const MachineChooser = @import("MachineChooser.zig");
+const ConfirmDialog = @import("ConfirmDialog.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
@@ -2809,15 +2810,20 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
     }
     if (!needs) return true;
 
-    const result = w32.MessageBoxW(
+    const refocus: ?w32.HWND = if (self.getActiveSurface()) |s| s.hwnd else null;
+    const result = ConfirmDialog.show(
+        self.app,
         self.hwnd,
-        std.unicode.utf8ToUtf16LeStringLiteral(
-            "Processes are still running in this window.\nClose anyway?",
-        ),
-        std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
-        w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
+        self.scale,
+        refocus,
+        .{
+            .title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
+            .text = std.unicode.utf8ToUtf16LeStringLiteral(
+                "Processes are still running in this window.\nClose anyway?",
+            ),
+        },
     );
-    return result == w32.IDOK;
+    return result == .ok;
 }
 
 /// Handle WM_CLOSE: clean up all tabs, then destroy the window.

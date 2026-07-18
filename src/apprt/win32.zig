@@ -10,6 +10,7 @@ const internal_os = @import("../os/main.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 test {
+    _ = @import("win32/ConfirmDialog.zig");
     _ = @import("win32/RenameDialog.zig");
     _ = @import("win32/MachineChooser.zig");
     _ = @import("win32/DarkMode.zig");

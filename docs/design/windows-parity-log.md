@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 4) — T80 DONE. Dark message boxes: new
+  `ConfirmDialog.zig` — a T50-pattern dark dialog with a *synchronous*
+  API (owner disabled + own nested message pump, the MessageBoxW shape
+  the T48 analysis blessed; WM_APP_SETFOCUS handling replicated) so all
+  four MessageBoxW sites kept their control flow: window/surface close
+  confirms, clipboard paste confirm, About box (OK-only + info icon).
+  MB_DEFBUTTON2 parity preserved (Enter on default = Cancel). New
+  `test/win32/confirm-dialogs.ps1` ALL PASS (20) ×3 — real ctrl+w /
+  WM_CLOSE / palette-"about" open it, interiors sample dark (39–45),
+  Escape + Enter-default cancel, Tab+Enter approves. P1–P3 +
+  ipc-child-exited + both lanes green. Next per T51 order: T74.
 - 2026-07-18 (on-box, 3) — T79 DONE. Dark context menus: new
   DarkMode.zig applies the undocumented uxtheme ordinals (#135
   SetPreferredAppMode, #136 FlushMenuThemes, #138 probed for the 1809

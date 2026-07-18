@@ -16,6 +16,7 @@ const internal_os = @import("../../os/main.zig");
 const remote_connection = @import("../../remote/connection.zig");
 
 const App = @import("App.zig");
+const ConfirmDialog = @import("ConfirmDialog.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
@@ -806,16 +807,19 @@ pub fn close(self: *Surface, process_active: bool) void {
     // bypasses needsConfirmQuit entirely (cmd.exe lacks OSC 133 so
     // the core would return process_active=true unconditionally).
     if (process_active) {
-        const parent_hwnd = self.parent_window.hwnd;
-        const result = w32.MessageBoxW(
-            parent_hwnd,
-            std.unicode.utf8ToUtf16LeStringLiteral(
-                "A process is still running in this terminal.\nClose anyway?",
-            ),
-            std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
-            w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
+        const result = ConfirmDialog.show(
+            self.app,
+            self.parent_window.hwnd,
+            self.parent_window.scale,
+            self.hwnd,
+            .{
+                .title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
+                .text = std.unicode.utf8ToUtf16LeStringLiteral(
+                    "A process is still running in this terminal.\nClose anyway?",
+                ),
+            },
         );
-        if (result != w32.IDOK) return;
+        if (result != .ok) return;
     }
     // Defer destruction to the message loop via PostMessage.
     // This avoids calling surface.deinit() from inside core_surface
@@ -846,14 +850,18 @@ fn confirmClipboard(
     comptime message: [:0]const u8,
     comptime title: [:0]const u8,
 ) bool {
-    const result = w32.MessageBoxW(
+    // default_cancel: an accidental Enter must not approve.
+    const result = ConfirmDialog.show(
+        self.app,
         self.parent_window.hwnd,
-        std.unicode.utf8ToUtf16LeStringLiteral(message),
-        std.unicode.utf8ToUtf16LeStringLiteral(title),
-        // Default to Cancel so an accidental Enter does not approve.
-        w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
+        self.parent_window.scale,
+        self.hwnd,
+        .{
+            .title = std.unicode.utf8ToUtf16LeStringLiteral(title),
+            .text = std.unicode.utf8ToUtf16LeStringLiteral(message),
+        },
     );
-    return result == w32.IDOK;
+    return result == .ok;
 }
 
 pub fn clipboardRequest(
@@ -1773,8 +1781,8 @@ pub fn executePaletteSelection(self: *Surface) void {
 }
 
 /// Show the About box: build provenance of THIS running instance (T52) —
-/// the same answer as the IPC `version` verb, one MessageBox away. The
-/// modal MessageBox pumps its own message loop, so this is WndProc-safe
+/// the same answer as the IPC `version` verb, one dialog away. The modal
+/// ConfirmDialog pumps its own message loop, so this is WndProc-safe
 /// (unlike a Condition.wait — the T48 lesson).
 pub fn showAboutDialog(self: *Surface) void {
     var arena_state = std.heap.ArenaAllocator.init(self.app.core_app.alloc);
@@ -1796,11 +1804,17 @@ pub fn showAboutDialog(self: *Surface) void {
         },
     ) catch return;
     const text_w = std.unicode.utf8ToUtf16LeAllocZ(arena, text) catch return;
-    _ = w32.MessageBoxW(
+    _ = ConfirmDialog.show(
+        self.app,
+        self.parent_window.hwnd,
+        self.parent_window.scale,
         self.hwnd,
-        text_w,
-        std.unicode.utf8ToUtf16LeStringLiteral("About Ghoztty"),
-        w32.MB_OK | w32.MB_ICONINFORMATION,
+        .{
+            .title = std.unicode.utf8ToUtf16LeStringLiteral("About Ghoztty"),
+            .text = text_w,
+            .style = .ok_only,
+            .icon = .info,
+        },
     );
 }
 

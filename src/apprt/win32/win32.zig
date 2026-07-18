@@ -334,6 +334,24 @@ pub extern "user32" fn LoadIconW(
     lpIconName: usize,
 ) callconv(.winapi) ?HICON;
 
+// Standard system icon IDs (MAKEINTRESOURCE values) for LoadIconW(null, ...).
+pub const IDI_WARNING: usize = 32515; // IDI_EXCLAMATION
+pub const IDI_INFORMATION: usize = 32516; // IDI_ASTERISK
+
+pub const DI_NORMAL: u32 = 0x0003;
+
+pub extern "user32" fn DrawIconEx(
+    hdc: HDC,
+    xLeft: i32,
+    yTop: i32,
+    hIcon: HICON,
+    cxWidth: i32,
+    cyWidth: i32,
+    istepIfAniCur: u32,
+    hbrFlickerFreeDraw: ?HBRUSH,
+    diFlags: u32,
+) callconv(.winapi) i32;
+
 // Standard cursor IDs (MAKEINTRESOURCE values)
 pub const IDC_ARROW: usize = 32512;
 pub const IDC_IBEAM: usize = 32513;
@@ -1195,9 +1213,14 @@ pub const SRCCOPY: u32 = 0x00CC0020;
 pub const TRANSPARENT: i32 = 1;
 pub const DT_LEFT: u32 = 0;
 pub const DT_VCENTER: u32 = 4;
+pub const DT_WORDBREAK: u32 = 0x10;
 pub const DT_SINGLELINE: u32 = 32;
+pub const DT_CALCRECT: u32 = 0x400;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;
 pub const DT_NOPREFIX: u32 = 0x800;
+
+// STATIC control styles.
+pub const SS_NOPREFIX: u32 = 0x80;
 
 pub extern "gdi32" fn ChoosePixelFormat(
     hdc: HDC,
