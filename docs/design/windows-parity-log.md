@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 8) — T75 DONE. `focus-follows-mouse` honored:
+  handleMouseMove now defers focus (T48 path) to the hovered unfocused
+  pane, gated on real SCREEN-coord motion (app-level last-pos guard, the
+  GTK "is_cursor_still" analog — a pane appearing under a stationary
+  cursor can't steal focus) and on the pane's window being the ACTIVE
+  window (no hover-raise, no stealing from palette/dialog popups). New
+  `test/win32/focus-follows-mouse.ps1` ALL PASS (10) ×3 (real
+  SetCursorPos glide B→A→B switches focus with no click; default-off run
+  proves no switch + click control); P1–P3 + both lanes green. Next per
+  T51 order: T69.
+
 - 2026-07-18 (on-box, 7) — T76 DONE. `window-inherit-font-size` honored:
   win32 Surface init captures the focused surface's live font points
   pre-init, applies post-init via setFontSize (embedded.zig parity —

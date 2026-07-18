@@ -97,6 +97,14 @@ msg_class_atom: u16 = 0,
 /// List of active Window containers (tabbed windows).
 windows: std.ArrayList(*Window) = .empty,
 
+/// Last mouse SCREEN position seen by any surface's WM_MOUSEMOVE (T75,
+/// focus-follows-mouse). Windows regenerates WM_MOUSEMOVE for a
+/// stationary cursor whenever the window under it changes (split
+/// created/closed, pane shown/hidden), so focus may only follow the
+/// mouse when the pointer physically moved — the win32 analog of the
+/// GTK surface's "is_cursor_still" guard.
+ffm_last_screen_pos: ?w32.POINT = null,
+
 /// Background brush created from the configured background color.
 /// Used by WM_ERASEBKGND to fill exposed areas during resize,
 /// matching the terminal background so the flash is invisible.

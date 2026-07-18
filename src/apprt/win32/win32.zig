@@ -888,6 +888,8 @@ pub extern "user32" fn SetFocus(
 
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 
+pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
+
 /// Enables or disables mouse and keyboard input to the window. Used for
 /// modal-ish dialogs: disable the owner while the dialog is open.
 pub extern "user32" fn EnableWindow(

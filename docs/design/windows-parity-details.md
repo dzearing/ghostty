@@ -2166,6 +2166,30 @@ Fix: when enabled and the surface under the cursor is unfocused, focus
 it (via the T48 deferred-SetFocus path). Validation: config on, two
 splits, hover switches focus without click; off → no change.
 
+**DONE 2026-07-18.** `Surface.handleMouseMove` now calls a new
+`focusFollowsMouse` when the config is set. Two guards before the
+`App.deferSetFocus` (T48 — never SetFocus inside a WndProc):
+(1) real-motion gate — the app tracks the last mouse SCREEN position
+(`App.ffm_last_screen_pos`, shared across surfaces so the guard holds
+when the message lands on a *different* pane than the last one); Windows
+delivers WM_MOUSEMOVE to whatever appears under a stationary cursor
+(split created/closed, pane shown), and without this a pane
+materializing under the mouse yanks focus from the pane being typed in —
+the win32 analog of the GTK surface's `is_cursor_still` guard.
+(2) active-window gate — `GetActiveWindow() == parent_window.hwnd`, so
+hovering an inactive window never raises it (Windows convention) and an
+open popup (command palette, rename/confirm dialog, machine chooser —
+all separate active windows) never has its focus stolen by a stray move
+over the terminal. WM_SETFOCUS then does the usual active-surface / hero
+/ dim-overlay bookkeeping, so no extra wiring was needed. Evidence: new
+`test/win32/focus-follows-mouse.ps1` ALL PASS (10) ×3 on-box
+2026-07-18 — run 1 (`--focus-follows-mouse=true`): real cursor glide
+(SetCursorPos steps) B→A moves focus to A with no click, glide back
+returns it to B; run 2 (default off): same glide leaves focus on B, then
+a real click on A still focuses it (positive control that the cursor
+genuinely traveled). ctrl+k/clear_screen keyboard control gates run 1.
+P1–P3 + both test lanes green at HEAD.
+
 ## T76 — Honor `window-inherit-font-size` (Phase I)
 
 Found by T51 (F12). embedded.zig:1427-1431 carries the focused surface's

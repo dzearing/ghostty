@@ -2654,12 +2654,51 @@ pub fn handleMouseMove(self: *Surface, lparam: isize) void {
     const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
 
+    if (self.app.config.@"focus-follows-mouse") self.focusFollowsMouse(lparam);
+
     // Pass modifiers so the core can detect Ctrl+hover for link highlighting.
     const mods = getModifiers();
 
     self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
         log.err("cursor pos callback error: {}", .{err});
     };
+}
+
+/// T75: `focus-follows-mouse` — focus the split pane under the pointer on
+/// mouse-move (Mac SurfaceView mouseMoved / GTK surface parity).
+fn focusFollowsMouse(self: *Surface, lparam: isize) void {
+    const hwnd = self.hwnd orelse return;
+
+    // Gate on real pointer motion in SCREEN coordinates: Windows delivers
+    // WM_MOUSEMOVE to whatever appears under a stationary cursor (split
+    // created/closed, pane shown), and a pane materializing under the
+    // mouse must not yank keyboard focus from the pane the user is
+    // typing in. Screen coords (not client) so the guard still holds
+    // when the message arrives at a DIFFERENT pane than the last one.
+    var pt: w32.POINT = .{
+        .x = @intCast(@as(i16, @truncate(@as(isize, lparam & 0xFFFF)))),
+        .y = @intCast(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF)))),
+    };
+    if (w32.ClientToScreen(hwnd, &pt) == 0) return;
+    const moved = if (self.app.ffm_last_screen_pos) |last|
+        pt.x != last.x or pt.y != last.y
+    else
+        // First event since launch: no motion proven — record only.
+        false;
+    self.app.ffm_last_screen_pos = pt;
+    if (!moved) return;
+
+    if (w32.GetFocus() == hwnd) return;
+
+    // Only move focus between panes of the ACTIVE window. Hovering an
+    // inactive window must not activate it (Windows convention: hover
+    // never raises), and an open popup — command palette, rename /
+    // confirm dialog, machine chooser, all separate active windows —
+    // must not have its focus stolen by a stray move over the terminal.
+    const parent_hwnd = self.parent_window.hwnd orelse return;
+    if (w32.GetActiveWindow() != parent_hwnd) return;
+
+    App.deferSetFocus(hwnd); // T48: never SetFocus inside a WndProc
 }
 
 /// Handle WM_DROPFILES — a file (or files) was dropped onto this
