@@ -223,7 +223,7 @@ One line per row. Full spec + validation + evidence per task:
 | T71 | Claude Code integration setup: detect `claude` CLI + offer ghoztty-claude-plugin install, first-run + palette entry (Mac ClaudeCodeIntegration.swift) (T51 F7) | I | — | todo | — |
 | T72 | Tab accent-color tagging in the custom tab bar (Mac TerminalTabColor, 10 named colors) — cosmetic (T51 F8) | I | — | todo | — |
 | T73 | Honor `split-divider-color` — paintDividerNode hardcodes a 0x808080 pen (Window.zig:1464) (T51 F9) | I | — | todo | — |
-| T74 | `unfocused-split-opacity`/`-fill` — done 2026-07-18: per-pane layered click-through dim popups (DimOverlay.zig + dim_math.zig, Mac-parity alpha), driven from layout/focus/move/config-reload; `split-dim.ps1` ALL PASS (23) ×3 (T51 F10) | I | — | done | (this commit) |
+| T74 | `unfocused-split-opacity`/`-fill` — done 2026-07-18: per-pane layered click-through dim popups (DimOverlay.zig + dim_math.zig, Mac-parity alpha), driven from layout/focus/move/config-reload; `split-dim.ps1` ALL PASS (23) ×3 (T51 F10) | I | — | done | 630f5fef0 |
 | T75 | Honor `focus-follows-mouse` for splits in WM_MOUSEMOVE (T51 F11) | I | — | todo | — |
 | T76 | Honor `window-inherit-font-size`: carry the focused surface's live (zoomed) font size into new window/tab/split configs (mirror embedded.zig newSurfaceOptions) (T51 F12) | I | — | todo | — |
 | T77 | FIX: gotoSplit while split-zoomed moves keyboard focus to a hidden pane — honor `split-preserve-zoom.navigation` (clear or follow zoom on navigation); `split-zoom-nav.ps1` ALL PASS (16) both config values (T51 F13) | I | — | done | 1e02507c1 |
