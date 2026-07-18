@@ -107,28 +107,58 @@ extension Ghostty {
                     .lineLimit(lineLimit)
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
+            case .heading(let str, let level):
+                Text(str)
+                    .font(.system(size: headingFontSize(level), weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
             case .table(let table):
+                let showHeader = table.hasVisibleHeader
                 Grid(alignment: .topLeading, horizontalSpacing: 18, verticalSpacing: 4) {
-                    GridRow {
-                        ForEach(Array(table.header.enumerated()), id: \.offset) { col, cell in
-                            Text(cell)
-                                .bold()
-                                .lineLimit(1)
-                                .gridColumnAlignment(horizontalAlignment(table.alignments[col]))
-                        }
-                    }
-                    // Unsized so the divider spans the header without
-                    // stretching the grid to the full banner width.
-                    Divider().gridCellUnsizedAxes(.horizontal)
-                    ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
+                    if showHeader {
                         GridRow {
-                            ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
+                            ForEach(Array(table.header.enumerated()), id: \.offset) { col, cell in
                                 Text(cell)
+                                    .bold()
                                     .lineLimit(1)
+                                    .gridColumnAlignment(horizontalAlignment(table.alignments[col]))
+                            }
+                        }
+                        // Unsized so the divider spans the header without
+                        // stretching the grid to the full banner width.
+                        Divider().gridCellUnsizedAxes(.horizontal)
+                    }
+                    ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIdx, row in
+                        GridRow {
+                            ForEach(Array(row.enumerated()), id: \.offset) { col, cell in
+                                // With no header row to carry it, the first
+                                // body row sets each column's alignment.
+                                if !showHeader && rowIdx == 0 {
+                                    Text(cell)
+                                        .lineLimit(1)
+                                        .gridColumnAlignment(horizontalAlignment(table.alignments[col]))
+                                } else {
+                                    Text(cell)
+                                        .lineLimit(1)
+                                }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        /// A gentle scale over the 12pt banner base: headings read as
+        /// slightly larger, never oversized (h1 tops out at 17pt).
+        private func headingFontSize(_ level: Int) -> CGFloat {
+            switch level {
+            case 1: return 17
+            case 2: return 16
+            case 3: return 15
+            case 4: return 14
+            case 5: return 13
+            default: return 12
             }
         }
 
@@ -153,12 +183,18 @@ extension Ghostty {
     ///   - `[text](url)` clickable links; the label may contain other styles
     ///   - `\` escapes the next character (e.g. `\*`, `\[`, `\\`, `\|`)
     ///
-    /// Block syntax: standard markdown pipe tables. A table starts at a line
+    /// Block syntax: ATX headings and standard markdown pipe tables. A
+    /// heading is a line of 1–6 leading `#` followed by a space and text
+    /// (`# Title` … `###### Title`), rendered bold at a size that grows
+    /// modestly as the level shrinks. A table starts at a line
     /// whose trimmed text begins with `|`, immediately followed by a
     /// separator row (`|---|---|`, optionally with `:` alignment markers)
     /// with the same column count; subsequent `|`-leading lines are body
     /// rows. Cells support the full inline syntax; `\|` puts a literal pipe
     /// in a cell. Ragged body rows are padded/truncated to the header width.
+    /// A header whose cells are all empty (e.g. `|  |  |`) is treated as a
+    /// layout scaffold for an aligned key/value grid: the view renders the
+    /// body rows only, with no header row and no divider above them.
     ///
     /// Styles nest (`**bold with [link](…)**`). Unterminated delimiters are
     /// rendered literally. We hand-roll this instead of using Foundation's
@@ -176,6 +212,14 @@ extension Ghostty {
             /// One entry per column; nil when the separator had no `:` markers.
             var alignments: [ColumnAlignment?]
             var rows: [[AttributedString]]
+
+            /// True when at least one header cell carries visible text. An
+            /// all-empty header (e.g. `|  |  |`) is a layout scaffold — a
+            /// caller wanting an aligned key/value grid with no column
+            /// titles — so the view skips rendering that blank row.
+            var hasVisibleHeader: Bool {
+                header.contains { !$0.characters.isEmpty }
+            }
         }
 
         enum Block: Equatable {
@@ -184,6 +228,9 @@ extension Ghostty {
             /// the extra headroom lets long lines soft-wrap like they always
             /// have without the total exceeding the banner cap).
             case text(AttributedString, lineLimit: Int)
+            /// An ATX heading (`# text` … `###### text`); `level` is 1–6.
+            /// Rendered bold at a size that grows as the level shrinks.
+            case heading(AttributedString, level: Int)
             case table(Table)
         }
 
@@ -213,6 +260,15 @@ extension Ghostty {
 
             var i = 0
             while i < lines.count {
+                if let (level, text) = headingLine(lines[i]) {
+                    flushText()
+                    if remaining > 0 {
+                        remaining -= 1
+                        blocks.append(.heading(parseInline(text), level: level))
+                    }
+                    i += 1
+                    continue
+                }
                 if isTableRow(lines[i]), i + 1 < lines.count, isTableRow(lines[i + 1]) {
                     let headerCells = splitCells(lines[i])
                     let sepCells = splitCells(lines[i + 1])
@@ -261,6 +317,22 @@ extension Ghostty {
         /// an (unescaped) pipe.
         private static func isTableRow(_ line: Substring) -> Bool {
             line.trimmingCharacters(in: .whitespaces).hasPrefix("|")
+        }
+
+        /// An ATX heading: 1–6 leading `#`, a required space, then non-empty
+        /// text (e.g. `## Title`). Returns the level and heading text, or nil.
+        private static func headingLine(_ line: Substring) -> (level: Int, text: Substring)? {
+            let trimmed = line.drop { $0 == " " }
+            var level = 0
+            var idx = trimmed.startIndex
+            while idx < trimmed.endIndex, trimmed[idx] == "#", level < 6 {
+                level += 1
+                idx = trimmed.index(after: idx)
+            }
+            guard level > 0, idx < trimmed.endIndex, trimmed[idx] == " " else { return nil }
+            let text = trimmed[trimmed.index(after: idx)...].drop { $0 == " " }
+            guard !text.isEmpty else { return nil }
+            return (level, text)
         }
 
         /// Split a table row into trimmed cell texts on unescaped `|`,

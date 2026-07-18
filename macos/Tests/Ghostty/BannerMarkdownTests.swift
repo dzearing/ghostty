@@ -24,6 +24,54 @@ struct BannerMarkdownTests {
         #expect(plain(Ghostty.BannerMarkdown.parse("a \\| b")) == "a | b")
     }
 
+    // MARK: Headings
+
+    @Test func headingParsesLevelAndText() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("#### Banner hook redesign")
+        #expect(blocks.count == 1)
+        guard case .heading(let str, let level) = blocks[0] else {
+            Issue.record("expected heading block, got \(blocks)")
+            return
+        }
+        #expect(level == 4)
+        #expect(plain(str) == "Banner hook redesign")
+    }
+
+    @Test func headingAboveTableIsSeparateBlock() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks(
+            "#### Title\n|  |  |\n|---|---|\n| **Goal** | x |"
+        )
+        #expect(blocks.count == 2)
+        guard case .heading(_, let level) = blocks[0],
+              case .table(let table) = blocks[1] else {
+            Issue.record("expected heading + table, got \(blocks)")
+            return
+        }
+        #expect(level == 4)
+        #expect(table.hasVisibleHeader == false)
+        #expect(table.rows.map { $0.map(plain) } == [["Goal", "x"]])
+    }
+
+    @Test func hashWithoutSpaceIsText() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("#notaheading")
+        #expect(blocks.count == 1)
+        guard case .text(let str, _) = blocks[0] else {
+            Issue.record("expected text block")
+            return
+        }
+        #expect(plain(str) == "#notaheading")
+    }
+
+    @Test func headingInlineStyles() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("## a [b](https://x.com)")
+        guard case .heading(let str, _) = blocks.first else {
+            Issue.record("expected heading block")
+            return
+        }
+        #expect(plain(str) == "a b")
+        #expect(str.runs.contains { $0.link != nil })
+    }
+
     // MARK: Block segmentation
 
     @Test func plainTextIsSingleBlock() {
@@ -131,6 +179,29 @@ struct BannerMarkdownTests {
         }
         #expect(table.header.map(plain) == ["a", "b"])
         #expect(table.rows.map { $0.map(plain) } == [["1", "2"]])
+    }
+
+    @Test func emptyHeaderIsScaffold() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks(
+            "|  |  |\n|---|---|\n| **Goal** | ship it |\n| **PR** | x |"
+        )
+        guard case .table(let table) = blocks.first else {
+            Issue.record("expected table block")
+            return
+        }
+        #expect(table.hasVisibleHeader == false)
+        #expect(table.rows.map { $0.map(plain) } == [["Goal", "ship it"], ["PR", "x"]])
+    }
+
+    @Test func nonEmptyHeaderIsVisible() {
+        let blocks = Ghostty.BannerMarkdown.parseBlocks(
+            "| Name | Count |\n|---|---|\n| foo | 1 |"
+        )
+        guard case .table(let table) = blocks.first else {
+            Issue.record("expected table block")
+            return
+        }
+        #expect(table.hasVisibleHeader == true)
     }
 
     // MARK: Not-a-table fallbacks
