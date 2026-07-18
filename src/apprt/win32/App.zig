@@ -1395,25 +1395,20 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        // Convert client size to window size (accounts for
-                        // title bar, borders, scrollbar).
-                        var rect = w32.RECT{
-                            .left = 0,
-                            .top = 0,
-                            .right = @intCast(value.width),
-                            .bottom = @intCast(value.height),
-                        };
-                        _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
-                        _ = w32.SetWindowPos(
-                            h,
-                            null,
-                            0,
-                            0,
-                            rect.right - rect.left,
-                            rect.bottom - rect.top,
-                            w32.SWP_NOZORDER | w32.SWP_NOMOVE,
-                        );
+                    const win = core_surface.rt_surface.parent_window;
+                    // Store as the window's default size — reset_window_size
+                    // returns to it, and font-size changes recompute it (T66).
+                    win.default_client_size = .{
+                        .width = value.width,
+                        .height = value.height,
+                    };
+                    // Apply live only at window setup. Later re-sends (a
+                    // font-zoom recompute, a new tab's surface init) are
+                    // store-only on Mac and GTK: they must not resize a
+                    // window the user is already working in.
+                    if (!win.initial_size_applied) {
+                        win.initial_size_applied = true;
+                        win.setClientSize(win.default_client_size.?);
                     }
                 },
             }
@@ -1550,25 +1545,12 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        // Reset to default 800x600
-                        var rect = w32.RECT{
-                            .left = 0,
-                            .top = 0,
-                            .right = 800,
-                            .bottom = 600,
-                        };
-                        _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
-                        _ = w32.SetWindowPos(
-                            h,
-                            null,
-                            0,
-                            0,
-                            rect.right - rect.left,
-                            rect.bottom - rect.top,
-                            w32.SWP_NOZORDER | w32.SWP_NOMOVE,
-                        );
-                    }
+                    const win = core_surface.rt_surface.parent_window;
+                    // Return to the configured default (window-width/height
+                    // × cell size, Mac returnToDefaultSize parity); 800×600
+                    // only when the config never set one (T66).
+                    win.setClientSize(win.default_client_size orelse
+                        .{ .width = 800, .height = 600 });
                 },
             }
             return true;

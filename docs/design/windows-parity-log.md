@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 15) — T66 DONE. `reset_window_size` now returns to
+  the stored `initial_size` (window-width/height × cell size; 800×600
+  only when unset) via new `Window.setClientSize` +
+  `default_client_size`; `initial_size` re-sends are store-only (Mac/GTK
+  parity — a font zoom no longer live-resizes the window, but reset
+  tracks the recomputed default). Palette gained "Reset Window Size".
+  reset-window-size.ps1 ALL PASS (10) ×3; P1–P3 + both lanes green.
+  SURPRISE: ctrl+alt+m is a system-global hotkey on this box (another
+  app's RegisterHotKey — keydown never reaches any ghoztty queue;
+  proven by message-loop tracing), so the script uses ctrl+alt+j/f9.
+  Next: T72 (tab accent colors).
+
 - 2026-07-18 (on-box, 14) — T71 DONE. Claude Code integration setup at
   Mac parity: `ClaudeIntegration.zig` (detect claude → one-time
   first-run offer via ConfirmDialog, canonical-install-gated; answer

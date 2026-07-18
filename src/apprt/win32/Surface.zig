@@ -1579,6 +1579,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Equalize Splits", .action = .equalize_splits },
     .{ .name = "Toggle Fullscreen", .action = .toggle_fullscreen },
     .{ .name = "Toggle Maximize", .action = .toggle_maximize },
+    .{ .name = "Reset Window Size", .action = .reset_window_size },
     .{ .name = "Toggle Window Decorations", .action = .toggle_window_decorations },
     .{ .name = "Toggle Background Opacity", .action = .toggle_background_opacity },
     .{ .name = "Toggle Quick Terminal", .action = .toggle_quick_terminal },

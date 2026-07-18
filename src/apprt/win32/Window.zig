@@ -63,6 +63,9 @@ pub const RemoteMachine = union(enum) {
         }
     }
 };
+/// A client-area size in pixels (see `default_client_size`, T66).
+pub const ClientSize = struct { width: u32, height: u32 };
+
 const w32 = @import("win32.zig");
 const DarkMode = @import("DarkMode.zig");
 const HeroCarousel = @import("HeroCarousel.zig");
@@ -203,6 +206,19 @@ min_track_w: i32 = 0,
 min_track_h: i32 = 0,
 max_track_w: i32 = 0,
 max_track_h: i32 = 0,
+
+/// Default client-area size in pixels for `reset_window_size` (T66):
+/// the core's `initial_size` action (window-width/height × cell size).
+/// Null when the config doesn't set both dimensions — reset then falls
+/// back to 800×600. Updated on every action (font-size changes recompute
+/// it, Mac parity) but applied live only once, at window setup.
+default_client_size: ?ClientSize = null,
+
+/// True once the window-setup `initial_size` has been applied live.
+/// Later re-sends (font-zoom recompute, a new tab's surface init) only
+/// update `default_client_size` — Mac and GTK both treat the action as
+/// store-only, so a re-send must not resize a window in use (T66).
+initial_size_applied: bool = false,
 
 /// Transient "columns × rows" overlay shown while resizing
 /// (resize-overlay config). Owned popup: destroyed with the window.
@@ -2480,6 +2496,29 @@ pub fn toggleFullscreen(self: *Window) void {
         _ = w32.SetWindowPos(hwnd, null, self.saved_rect.left, self.saved_rect.top, self.saved_rect.right - self.saved_rect.left, self.saved_rect.bottom - self.saved_rect.top, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
     }
     self.is_fullscreen = !self.is_fullscreen;
+}
+
+/// Resize so the CLIENT area is exactly `size` pixels, keeping position
+/// and z-order. Used to apply the window-setup `initial_size` and by
+/// `reset_window_size` (T66).
+pub fn setClientSize(self: *Window, size: ClientSize) void {
+    const hwnd = self.hwnd orelse return;
+    var rect = w32.RECT{
+        .left = 0,
+        .top = 0,
+        .right = @intCast(size.width),
+        .bottom = @intCast(size.height),
+    };
+    _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
+    _ = w32.SetWindowPos(
+        hwnd,
+        null,
+        0,
+        0,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        w32.SWP_NOZORDER | w32.SWP_NOMOVE,
+    );
 }
 
 /// Toggle window decorations (title bar + borders) on/off.

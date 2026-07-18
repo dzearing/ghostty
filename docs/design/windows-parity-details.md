@@ -2015,6 +2015,30 @@ the win32 apprt. Mac stores the initial-size action per window and
 *Validation:* set `window-width`/`window-height`, resize the window, run
 the reset keybind → returns to configured size, not 800×600.
 
+**DONE 2026-07-18.** `Window.default_client_size` (+ shared
+`Window.setClientSize`, which owns the AdjustWindowRectEx/SetWindowPos
+client-size math) is written on every `initial_size` action and read by
+`reset_window_size` (`orelse 800×600`). Semantics matched to Mac/GTK,
+which both treat the action as store-only (Mac stores
+`surfaceView.initialSize`, GTK `setDefaultSize`): win32 now applies the
+live resize only once per window (`initial_size_applied`), so the
+re-send from every font-size change (`setCellSize` →
+`recomputeInitialSize`) updates the stored default without resizing a
+window in use — previously ctrl+= with window-width set snapped the
+window back to the configured grid size. Command palette gained "Reset
+Window Size" (core command.zig has it; the static win32 list didn't —
+the T57 drift class).
+
+Evidence: `test/win32/reset-window-size.ps1` ALL PASS (10) ×3 —
+configured 120×20 launch applies (client 1158×422 ≠ 800×600), manual
+resize + ctrl+alt+f9 returns exactly, font zoom ×3 leaves the window
+un-resized then reset lands on the recomputed default (1446×534),
+no-config case resets to exactly 800×600; toggle_maximize positive
+control per T55. P1–P3 + both test lanes green. Gotcha for future key
+tests: ctrl+alt+m never reaches ghoztty — another app on the box owns
+it via RegisterHotKey (message-loop tracing showed the keydown absent
+from the queue while ctrl+alt+j/f9 arrive fine).
+
 ## T67 — Window/pane background tint (`--color`/`--split-color`) (Phase I)
 
 Found by T51 (F3). Mac implements per-window/pane background tint with
