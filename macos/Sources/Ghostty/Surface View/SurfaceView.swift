@@ -59,11 +59,25 @@ extension Ghostty {
         @EnvironmentObject private var ghostty: Ghostty.App
         @Environment(\.ghosttyLastFocusedSurface) private var lastFocusedSurface
 
-        /// The pane's effective background color: the surface's own color
-        /// when the pty changed it (macOS only), else the config default.
+        /// Opacity of the background tint overlay (IPC `--color` / the
+        /// inherited split-depth shade) drawn over the terminal surface.
+        /// Shared so the banner keys off the same composited color the user
+        /// actually sees.
+        static let tintOverlayOpacity: Double = 0.3
+
+        /// The pane's effective *visible* background color: the surface's own
+        /// color when the pty changed it (macOS only) else the config default,
+        /// with the translucent tint overlay composited in. The banner shades
+        /// off of this so it shares the pane's hue instead of the untinted
+        /// terminal background (which reads as flat grey once a tint is set).
         private var paneBackgroundColor: Color {
             #if canImport(AppKit)
-            surfaceView.backgroundColor ?? ghostty.config.backgroundColor
+            let base = surfaceView.backgroundColor ?? ghostty.config.backgroundColor
+            guard let tint = surfaceView.backgroundTint else { return base }
+            let baseNS = NSColor(base).resolvedSRGB
+            let tintNS = (surfaceView.backgroundTintNSColor ?? NSColor(tint)).resolvedSRGB
+            let composited = baseNS.blended(withFraction: Self.tintOverlayOpacity, of: tintNS)
+            return Color(composited ?? baseNS)
             #else
             ghostty.config.backgroundColor
             #endif
@@ -126,7 +140,7 @@ extension Ghostty {
 
                 // Background tint from IPC --color flag
                 if let tint = surfaceView.backgroundTint {
-                    tint.opacity(0.3)
+                    tint.opacity(Self.tintOverlayOpacity)
                         .allowsHitTesting(false)
                 }
 
