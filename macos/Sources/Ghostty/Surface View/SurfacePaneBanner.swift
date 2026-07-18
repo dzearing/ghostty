@@ -1,4 +1,11 @@
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+private typealias OSFont = NSFont
+#elseif canImport(UIKit)
+import UIKit
+private typealias OSFont = UIFont
+#endif
 
 extension Ghostty {
     /// Sticky banner rendered above the terminal content of a pane. Set via
@@ -21,6 +28,13 @@ extension Ghostty {
         /// plus a sliver of the next, which the fade mask dissolves to
         /// hint that there's more to view.
         private static let collapsedContentHeight: CGFloat = 24
+
+        /// The width a single table cell grows to before its content wraps
+        /// to the next line. Long cell text word-wraps within this bound and
+        /// the row height expands to fit, rather than being clipped to one
+        /// line — while a very long cell stops widening the table absurdly,
+        /// matching how a normal markdown renderer lays out table cells.
+        private static let maxCellWidth: CGFloat = 360
 
         /// Collapsed state is per-pane and ephemeral; it resets when the
         /// banner is cleared and set again.
@@ -129,32 +143,35 @@ extension Ghostty {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
+            case .rule:
+                // A full-width separator between blocks. The 8pt block gap
+                // above and below gives it breathing room without extra padding.
+                Divider()
             case .table(let table):
                 let showHeader = table.hasVisibleHeader
+                // Fixed per-column widths (content width, capped at
+                // `maxCellWidth`) let a long cell wrap at a known width while
+                // the Grid grows each row to its wrapped height — a greedy
+                // `frame(maxWidth:)` would instead fill the banner width, and
+                // a rigid `fixedSize` cell overflows its row instead of
+                // growing it.
+                let widths = columnWidths(for: table)
                 Grid(alignment: .topLeading, horizontalSpacing: 18, verticalSpacing: 4) {
                     if showHeader {
-                        GridRow {
+                        GridRow(alignment: .top) {
                             ForEach(Array(table.header.enumerated()), id: \.offset) { col, cell in
-                                inlineRow(cell)
+                                inlineRow(cell, width: widths[col], alignment: table.alignments[col])
                                     .bold()
-                                    .gridColumnAlignment(horizontalAlignment(table.alignments[col]))
                             }
                         }
                         // Unsized so the divider spans the header without
                         // stretching the grid to the full banner width.
                         Divider().gridCellUnsizedAxes(.horizontal)
                     }
-                    ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIdx, row in
-                        GridRow {
+                    ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
+                        GridRow(alignment: .top) {
                             ForEach(Array(row.enumerated()), id: \.offset) { col, cell in
-                                // With no header row to carry it, the first
-                                // body row sets each column's alignment.
-                                if !showHeader && rowIdx == 0 {
-                                    inlineRow(cell)
-                                        .gridColumnAlignment(horizontalAlignment(table.alignments[col]))
-                                } else {
-                                    inlineRow(cell)
-                                }
+                                inlineRow(cell, width: widths[col], alignment: table.alignments[col])
                             }
                         }
                     }
@@ -162,21 +179,53 @@ extension Ghostty {
             }
         }
 
-        /// Lay out one line of inline content — a table cell or a task-list
-        /// item — as a single non-wrapping row, drawing each `.checkbox`
-        /// segment as a native box (see `CheckboxMark`) and each `.text`
-        /// segment as styled text. Source spaces provide the gaps, so a
-        /// leading `[x] ` renders "☑ done" with the box vertically centered.
+        /// Lay out one row of inline content — a table cell or a task-list
+        /// item — drawing each `.checkbox` segment as a native box (see
+        /// `CheckboxMark`) and each `.text` segment as styled text. Source
+        /// spaces provide the gaps, so a leading `[x] ` renders "☑ done" with
+        /// the box vertically centered.
+        ///
+        /// List items pass no `width` and stay a single non-wrapping line. A
+        /// table cell passes its column's fixed `width`: a plain cell collapses
+        /// its inline runs into one `Text` that word-wraps at that width (the
+        /// Grid then grows the row to the wrapped height, instead of clipping
+        /// to one line with an ellipsis), while a checkbox-bearing cell stays a
+        /// single line — mixed native boxes and text can't reflow across each
+        /// other, and a checkbox cell is a short status marker, like a list
+        /// checkbox row. `alignment` (from the column's `:` markers) drives the
+        /// content's horizontal placement and multi-line text alignment.
         @ViewBuilder
-        private func inlineRow(_ segments: [BannerMarkdown.Inline]) -> some View {
-            HStack(alignment: .center, spacing: 0) {
-                ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
-                    switch seg {
-                    case .text(let str):
-                        Text(str).lineLimit(1)
-                    case .checkbox(let checked):
-                        CheckboxMark(checked: checked)
+        private func inlineRow(
+            _ segments: [BannerMarkdown.Inline],
+            width: CGFloat? = nil,
+            alignment: BannerMarkdown.ColumnAlignment? = nil
+        ) -> some View {
+            let hasCheckbox = segments.contains {
+                if case .checkbox = $0 { return true }
+                return false
+            }
+            if let width, !hasCheckbox {
+                Text(BannerMarkdown.attributed(segments))
+                    .multilineTextAlignment(textAlignment(alignment))
+                    // Vertical-only fixed size: wrap at the fixed column width,
+                    // take whatever height the wrapped text needs.
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: width, alignment: frameAlignment(alignment))
+            } else {
+                let row = HStack(alignment: .center, spacing: 0) {
+                    ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                        switch seg {
+                        case .text(let str):
+                            Text(str).lineLimit(1)
+                        case .checkbox(let checked):
+                            CheckboxMark(checked: checked)
+                        }
                     }
+                }
+                if let width {
+                    row.frame(width: width, alignment: frameAlignment(alignment))
+                } else {
+                    row
                 }
             }
         }
@@ -214,9 +263,68 @@ extension Ghostty {
             }
         }
 
-        private func horizontalAlignment(
+        /// The fixed width of each table column: the widest cell's natural
+        /// (single-line) content width, capped at `maxCellWidth` so a very long
+        /// cell wraps rather than stretching the table. Header cells measure
+        /// bold. Widths are exact (not a flexible max) so the Grid stays as
+        /// wide as its content and grows each row to the height its cells wrap
+        /// to.
+        private func columnWidths(for table: BannerMarkdown.Table) -> [CGFloat] {
+            let columns = table.header.count
+            guard columns > 0 else { return [] }
+            var widths = [CGFloat](repeating: 0, count: columns)
+            if table.hasVisibleHeader {
+                for (col, cell) in table.header.enumerated() where col < columns {
+                    widths[col] = max(widths[col], cellNaturalWidth(cell, bold: true))
+                }
+            }
+            for row in table.rows {
+                for (col, cell) in row.enumerated() where col < columns {
+                    widths[col] = max(widths[col], cellNaturalWidth(cell, bold: false))
+                }
+            }
+            // A hair of slack absorbs sub-pixel measurement differences so a
+            // cell that fits on one line isn't wrapped by rounding.
+            return widths.map { min($0 + 2, Self.maxCellWidth) }
+        }
+
+        /// The unwrapped width a cell's inline content occupies: the measured
+        /// width of its text runs plus a fixed box per checkbox.
+        private func cellNaturalWidth(
+            _ segments: [BannerMarkdown.Inline], bold: Bool
+        ) -> CGFloat {
+            segments.reduce(0) { acc, seg in
+                switch seg {
+                case .text(let a):
+                    return acc + Self.textWidth(String(a.characters), bold: bold)
+                case .checkbox:
+                    return acc + CheckboxMark.side
+                }
+            }
+        }
+
+        /// Width of `s` in the 12pt banner font (semibold for header cells),
+        /// used to size table columns. Matches SwiftUI's `.system(size: 12)`.
+        private static func textWidth(_ s: String, bold: Bool) -> CGFloat {
+            let font = OSFont.systemFont(ofSize: 12, weight: bold ? .semibold : .regular)
+            return ceil((s as NSString).size(withAttributes: [.font: font]).width)
+        }
+
+        /// How the wrapped lines of a table cell align to each other.
+        private func textAlignment(
             _ alignment: BannerMarkdown.ColumnAlignment?
-        ) -> HorizontalAlignment {
+        ) -> TextAlignment {
+            switch alignment {
+            case .center: return .center
+            case .trailing: return .trailing
+            case .leading, nil: return .leading
+            }
+        }
+
+        /// How a cell's content sits within its fixed column-width frame.
+        private func frameAlignment(
+            _ alignment: BannerMarkdown.ColumnAlignment?
+        ) -> Alignment {
             switch alignment {
             case .center: return .center
             case .trailing: return .trailing
@@ -231,7 +339,8 @@ extension Ghostty {
         private struct CheckboxMark: View {
             let checked: Bool
 
-            private static let side: CGFloat = 12
+            // `side` is read by the table column-width measurement.
+            static let side: CGFloat = 12
             private static let radius: CGFloat = 2
 
             var body: some View {
@@ -353,6 +462,10 @@ extension Ghostty {
             /// Rendered bold at a size that grows as the level shrinks.
             case heading(AttributedString, level: Int)
             case table(Table)
+            /// A thematic break (`---`, `***`, or `___`, 3+ of one character
+            /// on a line of its own). Rendered as a horizontal divider that
+            /// separates the blocks above and below it.
+            case rule
         }
 
         static func parse(_ source: String) -> AttributedString {
@@ -401,6 +514,15 @@ extension Ghostty {
                     if remaining > 0 {
                         remaining -= 1
                         blocks.append(.heading(parseInline(text), level: level))
+                    }
+                    i += 1
+                    continue
+                }
+                if isThematicBreak(lines[i]) {
+                    flushText()
+                    if remaining > 0 {
+                        remaining -= 1
+                        blocks.append(.rule)
                     }
                     i += 1
                     continue
@@ -474,6 +596,18 @@ extension Ghostty {
         /// an (unescaped) pipe.
         private static func isTableRow(_ line: Substring) -> Bool {
             line.trimmingCharacters(in: .whitespaces).hasPrefix("|")
+        }
+
+        /// A thematic break: a line of 3+ of the same `-`, `*`, or `_` with
+        /// nothing else but optional spaces (`---`, `***`, `___`, `- - -`).
+        /// Distinct from a `- `/`* ` bullet (those have non-marker content)
+        /// and from `**bold**` on its own line (mixed characters).
+        private static func isThematicBreak(_ line: Substring) -> Bool {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let first = trimmed.first,
+                  first == "-" || first == "*" || first == "_" else { return false }
+            let marks = trimmed.filter { $0 != " " }
+            return marks.count >= 3 && marks.allSatisfy { $0 == first }
         }
 
         /// An ATX heading: 1–6 leading `#`, a required space, then non-empty
