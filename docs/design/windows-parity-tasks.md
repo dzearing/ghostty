@@ -225,7 +225,7 @@ One line per row. Full spec + validation + evidence per task:
 | T74 | Implement `unfocused-split-opacity`/`-fill` dimming — NOT implemented; corrects the 2026-07-12 audit which wrongly listed it honored (T51 F10) | I | — | todo | — |
 | T75 | Honor `focus-follows-mouse` for splits in WM_MOUSEMOVE (T51 F11) | I | — | todo | — |
 | T76 | Honor `window-inherit-font-size`: carry the focused surface's live (zoomed) font size into new window/tab/split configs (mirror embedded.zig newSurfaceOptions) (T51 F12) | I | — | todo | — |
-| T77 | FIX: gotoSplit while split-zoomed moves keyboard focus to a hidden pane — honor `split-preserve-zoom.navigation` (clear or follow zoom on navigation); `split-zoom-nav.ps1` ALL PASS (16) both config values (T51 F13) | I | — | done | (this commit) |
+| T77 | FIX: gotoSplit while split-zoomed moves keyboard focus to a hidden pane — honor `split-preserve-zoom.navigation` (clear or follow zoom on navigation); `split-zoom-nav.ps1` ALL PASS (16) both config values (T51 F13) | I | — | done | 1e02507c1 |
 | T78 | `window-title-font-family` — needs custom-draw titlebar; design-level backlog like window-save-state (T51 F14) | I | — | todo | — |
 | T79 | Dark-mode context menus: terminal + tab-bar TrackPopupMenuEx menus render light on dark chrome — uxtheme SetPreferredAppMode/AllowDarkModeForWindow + FlushMenuThemes, or owner-draw (T51 F15) | I | — | todo | — |
 | T80 | Dark-mode message boxes: About / close-confirm ×2 / clipboard-confirm / child-exited MessageBoxW render light — TaskDialogIndirect or small custom dialogs per the T50 pattern (T51 F16) | I | — | todo | — |
