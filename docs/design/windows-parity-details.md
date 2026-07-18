@@ -2047,6 +2047,47 @@ flag is set or the keybind fires on a remote pane.
 open a remote window, ctrl+shift+n / `+new-window --from-focused` → the
 second window dials the same agent.
 
+**DONE 2026-07-18 (c8f1da16e).** Four layers, all Mac-parity
+(BaseTerminalController.newSplit / TerminalController.newWindowInheritingRemote,
+§WP4):
+
+- `args.zig` parses `--from-focused` (unit-tested both lanes).
+- **Tabs/splits stay remote:** `Window.addTab`/`newSplitAt` synthesize
+  `.remote` overrides when no IPC baton is pending and the window is
+  remote — fresh session on the SAME connection, inheriting the parent
+  pane's command (`remoteCommand()`) and LIVE cwd (`GET_CWD` RPC,
+  1.5s bound, on the GUI thread — the same synchronous-dial trade the
+  ≤10s remote open already makes on win32; failure ⇒ agent default cwd).
+- **`+split` on a remote window is never local:** explicit
+  `--command`/`--working-directory` forward REMOTE-native (no local
+  shell wrap; `-e` argv joined); with no explicit values the handler
+  passes no overrides so full inheritance applies. `+split/--new-window
+  --from-focused` mirror the keyboard paths (front window, no
+  name/target registration — Mac rule).
+- **New Window re-dials:** `Window.remote_machine` records the dialed
+  identity (host:port or relay base+device, owned dupes;
+  `RemoteOpenOptions.machine` plumbed from both dial paths + chooser).
+  ctrl+n / `+new-window --from-focused` on a remote window calls
+  `App.openRemoteWindowFrom`: snapshot command, bounded cwd query on the
+  parent's conn, then a FRESH dial (tcp or relay via `resolveToken`) —
+  win32 windows each own their transport (deviation from the Mac's
+  shared cross-window connection, matches the task's "dials the same
+  agent" contract). Failed re-dial ⇒ T80 ConfirmDialog (keybind) /
+  error response (IPC), never a silent local window. Win32 has no
+  per-host default shell store yet, so fresh sessions use the agent's
+  default shell (T22-era gap, unchanged).
+
+Evidence: `test/win32/remote-inherit.ps1` ALL PASS ×3 (+1 on the
+rebuilt binary) — loopback-agent harness with a marker-dir live-cwd
+oracle (cmd.exe emits no OSC 7, so only agent-side GET_CWD inheritance
+can land a pane in the cd'd dir), ctrl+t SendInput chord re-runs the
+parent's remote command in the new tab, `+new-window --from-focused`
+adds a second ESTABLISHED agent connection (netstat assert) and
+inherits, local-parent fall-through stays local (no extra connection),
+dead agent ⇒ nonzero exit naming the remote machine, app alive after.
+P1–P3, ipc-remote, both test lanes: green. ipc-relay ==6/==7 fails
+identically at pre-T68 a22134f44 → filed as T81 (pre-existing).
+
 ## T69 — Config-error UI on win32 (Phase I)
 
 Found by T51 (F5). A broken config only produces `log.err`
@@ -2345,3 +2386,32 @@ screenshot-sampled interiors dark (avg lum 45/42/39); Escape cancels;
 Enter-on-default cancels (window stays); Tab+Enter approves (window
 closes); About round-trip crash-free. P1–P3, ipc-child-exited, and both
 test lanes green at HEAD.
+
+## T81 — FIX: GUI unresponsive after agent death under a live relay window (Phase G)
+
+Found 2026-07-18 by the T68 regression sweep. `ipc-relay.ps1` ==6/==7
+now report 3 FAILURES: after `Stop-Process` on the relay-mode agent
+under a live relay window, `+list` does not answer within 15s ("+list
+still answers after agent death" FAIL), and although `+close
+--target=relwin` later succeeds (20s bound) the follow-up list no
+longer shows the base window ("app survived the teardown" FAIL).
+
+**PRE-EXISTING, not a T68 regression:** reproduced byte-identically at
+`a22134f44` (pre-T68 HEAD, detached-checkout rebuild) — same 3
+assertions fail, sections 1–5 all pass. The suite last ran green at
+T21b-era HEAD, so the break landed somewhere in the T48–T80 span
+(candidates: T48 SetFocus deferral, T62/T63 read/close paths, T65
+child-exited rework — bisect first).
+
+*Symptom shape:* GUI thread blocked >15s (not dead — it answers again
+by ==7), then the base window is missing from `+list`. Likely the
+link-down/teardown path for a dead relay connection stalls the GUI
+thread and/or tears down more than the one window. Related: T56 (win32
+remote reconnect, WP-D1) — a reconnect banner would change this flow
+anyway; fix the hang first, don't couple them.
+
+*Repro:* `powershell -NoProfile -File test\win32\ipc-relay.ps1` (needs
+Go for the local relay build) — sections ==6/==7.
+
+*Validation:* ipc-relay.ps1 back to ALL PASS ×3; P1–P3 +
+remote-inherit.ps1 stay green.

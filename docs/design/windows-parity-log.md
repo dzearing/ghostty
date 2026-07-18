@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 10) — T68 DONE (c8f1da16e). Remote inheritance:
+  `--from-focused` on +new-window/+split; plain tabs/splits (ctrl+t/
+  ctrl+d + IPC) in a remote window reuse the connection and inherit the
+  parent pane's command + live cwd (GET_CWD, 1.5s bound); +split
+  --target on a remote window is remote-native (was a local ConPTY
+  pane); ctrl+n re-dials the recorded machine (Window.remote_machine),
+  failure ⇒ T80 dialog. New `remote-inherit.ps1` ALL PASS ×3 (live-cwd
+  oracle, ctrl+t chord, netstat second-connection assert). SURPRISE:
+  ipc-relay.ps1 ==6/==7 (agent death under a live relay window) fails 3
+  assertions — reproduced identically at pre-T68 a22134f44, so
+  pre-existing → filed T81, queued FIRST (user-visible hang). P1–P3 +
+  ipc-remote + both lanes green. Next: T81.
 - 2026-07-18 (on-box, 9) — T69 DONE. Config-error UI: startup + hard
   reload_config now show parse diagnostics in a dark ConfirmDialog
   ("Open Config" opens the editor via the extracted openConfigFile

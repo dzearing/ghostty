@@ -129,10 +129,11 @@ Work these first, in order, before falling back to first-todo-in-table:
    2026-07-18), ~~T77~~ (done 2026-07-18), ~~T79~~ (done 2026-07-18),
    ~~T80~~ (done 2026-07-18), ~~T74~~ (done 2026-07-18), ~~T73~~ (done
    2026-07-18), ~~T76~~ (done 2026-07-18), ~~T75~~ (done 2026-07-18), ~~T69~~ (done
-   2026-07-18), T68, T67, T70,
-   T71, T66, T72, T78. With T51
-   done the priority queue is exhausted — fall back to
-   first-todo-in-table / the order above.
+   2026-07-18), ~~T68~~ (done 2026-07-18; filed T81 — pre-existing
+   relay-agent-death GUI hang found by its regression runs), **T81 next**
+   (user-visible hang beats the remaining feature/theming work), then
+   T67, T70, T71, T66, T72, T78. After that the priority queue is
+   exhausted — fall back to first-todo-in-table / the order above.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -219,7 +220,7 @@ One line per row. Full spec + validation + evidence per task:
 | T65 | FIX: show_child_exited suppressed the core fallback — done 2026-07-18: returns false (modal removed), core in-terminal UI shows; + 3 adjacent fixes found by validation (ConPTY late-frame notify delay in Exec.zig, GWLP_USERDATA wrong-type-cast keystroke crash in App.zig run loop, win32-input-mode close-on-keypress). `ipc-child-exited.ps1` ALL PASS x3 (T51 F1) | I | — | done | 0eebf126c |
 | T66 | FIX: reset_window_size hardcodes 800×600 — track the initial_size (window-width/height × cell size) per window and reset to that, Mac returnToDefaultSize parity (T51 F2) | I | — | todo | — |
 | T67 | Window/pane background tint: implement `--color`/`--split-color` (accepted-and-ignored in args.zig:115) + palette contrast shift + context-menu color picker per docs/design/window-color.md (T51 F3) | I | — | todo | — |
-| T68 | Remote inheritance: implement `--from-focused`, and New Window/split on a focused remote pane should reuse the remote host (Mac newWindowInheritingRemote, spec WP4) (T51 F4) | G | T21b | todo | — |
+| T68 | Remote inheritance — done 2026-07-18: `--from-focused` on +new-window/+split; plain tabs/splits in a remote window reuse the connection + inherit command/live cwd (GET_CWD); ctrl+n re-dials the recorded machine; `remote-inherit.ps1` ALL PASS ×3 (T51 F4) | G | T21b | done | c8f1da16e |
 | T69 | Config-error UI — done 2026-07-18: startup + hard-reload diagnostics shown in a dark ConfirmDialog with "Open Config"/"Ignore" (custom captions + measured button width); `config-errors.ps1` ALL PASS (10) ×3 (T51 F5) | I | — | done | 9cef52567 |
 | T70 | CLI on PATH for installs: MSI Environment/PATH entry or runtime self-heal so `ghoztty` resolves from any shell (Mac CommandLineInstaller analog; distinct from T23) (T51 F6) | H | — | todo | — |
 | T71 | Claude Code integration setup: detect `claude` CLI + offer ghoztty-claude-plugin install, first-run + palette entry (Mac ClaudeCodeIntegration.swift) (T51 F7) | I | — | todo | — |
@@ -232,6 +233,7 @@ One line per row. Full spec + validation + evidence per task:
 | T78 | `window-title-font-family` — needs custom-draw titlebar; design-level backlog like window-save-state (T51 F14) | I | — | todo | — |
 | T79 | Dark-mode context menus — done 2026-07-18: DarkMode.zig routes `window-theme` through uxtheme ordinals #135/#136 at init/config-reload/WM_SETTINGCHANGE; `dark-menus.ps1` ALL PASS (6) (T51 F15) | I | — | done | 3c0960d0d |
 | T80 | Dark-mode message boxes — done 2026-07-18: shared ConfirmDialog.zig (T50-pattern dark dialog, synchronous nested-pump API) replaces all 4 remaining MessageBoxW sites; `confirm-dialogs.ps1` ALL PASS (20) ×3 (T51 F16) | I | — | done | f3626ba2f |
+| T81 | FIX: GUI unresponsive after agent death under a live relay window — `ipc-relay.ps1` ==6/==7 now 3 FAILURES (+list no answer in 15s; base window missing from later list). PRE-EXISTING: reproduced identically at a22134f44 (pre-T68) during T68 regression runs 2026-07-18. Likely link-down handling; related to T56 (reconnect). See details | G | — | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.
