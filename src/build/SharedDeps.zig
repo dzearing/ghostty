@@ -616,6 +616,8 @@ pub fn add(
                     step.linkSystemLibrary2("imm32", .{});
                     step.linkSystemLibrary2("shell32", .{});
                     step.linkSystemLibrary2("wininet", .{});
+                    // T67: ChooseColorW ("Background Color…" picker).
+                    step.linkSystemLibrary2("comdlg32", .{});
                 }
             },
         }

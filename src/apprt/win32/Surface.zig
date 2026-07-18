@@ -22,6 +22,7 @@ const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const provenance = @import("provenance.zig");
+const color_math = @import("color_math.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -103,6 +104,12 @@ scrollbar: ?*Scrollbar = null,
 /// Created lazily on first dim (single-pane windows never pay for one).
 /// Driven by Window.updateDimOverlays.
 dim_overlay: ?*DimOverlay = null,
+
+/// Background tint (T67): explicit `--color`/`--split-color`/picker color,
+/// or the auto-shifted split-inheritance tint. Null ⇒ config background.
+/// The Mac stores this as backgroundTintNSColor; `+list --json` reports it
+/// additively as the pane's `background_tint`.
+background_tint: ?color_math.Rgb = null,
 
 /// The current mouse cursor. Cached so WM_SETCURSOR can restore it
 /// (DefWindowProc resets the cursor to the class cursor on every
@@ -2602,6 +2609,7 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     const CTX_SPLIT_RIGHT: usize = 4;
     const CTX_SPLIT_DOWN: usize = 5;
     const CTX_RESET: usize = 6;
+    const CTX_BG_COLOR: usize = 7;
 
     const menu = w32.CreatePopupMenu() orelse return;
     defer _ = w32.DestroyMenu(menu);
@@ -2614,6 +2622,8 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_RIGHT, std.unicode.utf8ToUtf16LeStringLiteral("Split Right"));
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, std.unicode.utf8ToUtf16LeStringLiteral("Split Down"));
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_BG_COLOR, std.unicode.utf8ToUtf16LeStringLiteral("Background Color..."));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_RESET, std.unicode.utf8ToUtf16LeStringLiteral("Reset Terminal"));
 
@@ -2639,6 +2649,10 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
         CTX_SPLIT_RIGHT => .{ .new_split = .right },
         CTX_SPLIT_DOWN => .{ .new_split = .down },
         CTX_RESET => .reset,
+        CTX_BG_COLOR => {
+            self.pickBackgroundColor();
+            return;
+        },
         else => null,
     };
     if (binding) |b| {
@@ -2646,6 +2660,90 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
             log.err("context menu action failed err={}", .{err});
         };
     }
+}
+
+/// The pane's effective background: the explicit/inherited tint when set,
+/// otherwise the configured terminal background (the Mac's
+/// `backgroundTintNSColor ?? derivedConfig.backgroundColor`).
+pub fn effectiveBackground(self: *Surface) color_math.Rgb {
+    if (self.background_tint) |tint| return tint;
+    const bg = self.app.config.background.toTerminalRGB();
+    return .{ .r = bg.r, .g = bg.g, .b = bg.b };
+}
+
+/// Apply a background tint to the live terminal (T67). Always sets the
+/// terminal background; with `adjust_palette` (explicit colors — CLI flag
+/// or picker) it also sets a black/white contrast foreground and shifts the
+/// ANSI 0–15 palette to keep WCAG 4.5:1 against the new background (the Mac
+/// applyColorScheme/applyPaletteForColor). Auto-shifted split inheritance
+/// passes false: bg only, default palette untouched (Mac parity — its
+/// auto-shift is an overlay that never touches terminal colors).
+pub fn applyBackgroundTint(
+    self: *Surface,
+    rgb: color_math.Rgb,
+    adjust_palette: bool,
+) void {
+    if (!self.core_surface_ready) return;
+    self.background_tint = rgb;
+
+    {
+        // Terminal color state is shared with the IO thread — mutate under
+        // the renderer mutex like every other GUI-thread terminal access.
+        self.core_surface.renderer_state.mutex.lock();
+        defer self.core_surface.renderer_state.mutex.unlock();
+        const t = &self.core_surface.io.terminal;
+        t.colors.background.set(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
+        if (adjust_palette) {
+            const fg = color_math.contrastForeground(rgb);
+            t.colors.foreground.set(.{ .r = fg.r, .g = fg.g, .b = fg.b });
+            for (color_math.adjustedPalette(rgb), 0..) |c, i| {
+                t.colors.palette.set(@intCast(i), .{ .r = c.r, .g = c.g, .b = c.b });
+            }
+            t.flags.dirty.palette = true;
+        }
+    }
+
+    // Keep the themed scrollbar in tune with the new background.
+    if (self.scrollbar) |sb| {
+        const fg = self.app.config.foreground.toTerminalRGB();
+        sb.setTheme(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b }, fg);
+    }
+
+    self.core_surface.renderer_thread.wakeup.notify() catch {};
+}
+
+/// Context menu "Background Color..." (T67): the common color dialog seeded
+/// with the pane's effective background; OK applies the full color scheme
+/// (bg + contrast fg + palette), the Windows-native analog of the Mac's
+/// NSColorPanel picker.
+fn pickBackgroundColor(self: *Surface) void {
+    // Dialog custom-color slots persist for the app session (statics — the
+    // common dialog expects caller-owned storage).
+    const S = struct {
+        var custom_colors: [16]u32 = @splat(0x00FFFFFF);
+    };
+    const current = self.effectiveBackground();
+    var cc: w32.CHOOSECOLORW = .{
+        .hwndOwner = self.hwnd,
+        .rgbResult = colorref(current),
+        .lpCustColors = &S.custom_colors,
+        .Flags = w32.CC_RGBINIT | w32.CC_FULLOPEN | w32.CC_ANYCOLOR,
+    };
+    if (w32.ChooseColorW(&cc) == 0) return; // cancelled
+    self.applyBackgroundTint(fromColorref(cc.rgbResult), true);
+}
+
+/// COLORREF is 0x00BBGGRR.
+fn colorref(rgb: color_math.Rgb) u32 {
+    return @as(u32, rgb.r) | (@as(u32, rgb.g) << 8) | (@as(u32, rgb.b) << 16);
+}
+
+fn fromColorref(cr: u32) color_math.Rgb {
+    return .{
+        .r = @truncate(cr & 0xFF),
+        .g = @truncate((cr >> 8) & 0xFF),
+        .b = @truncate((cr >> 16) & 0xFF),
+    };
 }
 
 /// Handle WM_MOUSEMOVE.

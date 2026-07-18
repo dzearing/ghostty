@@ -66,4 +66,7 @@ test {
 
     // Pure win32 unfocused-split dim logic (T74), same no-OS-imports deal.
     _ = @import("apprt/win32/dim_math.zig");
+
+    // Pure win32 background-tint color math (T67), same no-OS-imports deal.
+    _ = @import("apprt/win32/color_math.zig");
 }

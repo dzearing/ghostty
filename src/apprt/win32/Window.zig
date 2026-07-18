@@ -68,6 +68,7 @@ const DarkMode = @import("DarkMode.zig");
 const HeroCarousel = @import("HeroCarousel.zig");
 const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
+const color_math = @import("color_math.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -1801,6 +1802,13 @@ pub fn newSplitAt(
         self.pending_surface_overrides = null;
     };
 
+    // T67: every split inherits the parent pane's effective background
+    // shifted for visual depth (Mac newSplit parity: lighten dark parents,
+    // darken light ones). Captured before init; applied after so the core
+    // terminal exists. An explicit IPC `--color` overwrites this right
+    // after newSplitAt returns.
+    const inherited_tint = color_math.shiftedTint(at.effectiveBackground());
+
     // Create new surface.
     const new_surface = try alloc.create(Surface);
     errdefer {
@@ -1808,6 +1816,7 @@ pub fn newSplitAt(
         alloc.destroy(new_surface);
     }
     try new_surface.init(self.app, self, .split);
+    new_surface.applyBackgroundTint(inherited_tint, false);
 
     // Create a single-node tree for the new surface.
     var insert_tree = try SplitTree(Surface).init(alloc, new_surface);

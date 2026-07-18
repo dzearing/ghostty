@@ -34,6 +34,10 @@ pub const List = struct {
         focused: bool,
         /// null while the child is running.
         exit_code: ?i64,
+        /// Background tint as `#rrggbb` (T67). Additive and optional like
+        /// `build`: null omits the field, so the golden Mac shape below is
+        /// unchanged for untinted panes (the Mac server never sends it).
+        background_tint: ?[]const u8 = null,
     };
 
     pub const Node = union(enum) {
@@ -195,6 +199,10 @@ pub const List = struct {
         try jws.write(term.focused);
         try jws.objectField("exit_code");
         try jws.write(term.exit_code);
+        if (term.background_tint) |tint| {
+            try jws.objectField("background_tint");
+            try jws.write(tint);
+        }
         try jws.endObject();
     }
 };
@@ -229,6 +237,49 @@ test "List: empty tree serializes like the Mac server" {
     defer testing.allocator.free(json);
     try testing.expectEqualStrings(
         "{\"success\":true,\"data\":{\"windows\":[]}}",
+        json,
+    );
+}
+
+test "List: background_tint is additive (T67)" {
+    const testing = std.testing;
+
+    const tinted: List.Node = .{ .leaf = .{
+        .id = "11",
+        .title = "pwsh",
+        .working_directory = "",
+        .pid = 0,
+        .tty = "",
+        .name = "11",
+        .focused = true,
+        .exit_code = null,
+        .background_tint = "#334455",
+    } };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &tinted,
+    }};
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = null,
+        .focused = true,
+        .tabs = &tabs,
+    }};
+
+    const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings(
+        "{\"success\":true,\"data\":{\"windows\":[" ++
+            "{\"id\":\"1\",\"title\":\"pwsh\",\"target\":null,\"focused\":true,\"tabs\":[" ++
+            "{\"id\":\"0\",\"title\":\"pwsh\",\"index\":0,\"selected\":true,\"splits\":" ++
+            "{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"pwsh\"," ++
+            "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"11\"," ++
+            "\"focused\":true,\"exit_code\":null,\"background_tint\":\"#334455\"}}}]}]}}",
         json,
     );
 }

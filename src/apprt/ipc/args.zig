@@ -36,6 +36,12 @@ pub const VerbArgs = struct {
     /// `+list --pid=<pid>`: resolve the pane whose shell is an ancestor
     /// of this process id (Windows; the tty-less equivalent of --tty).
     pid: ?u32 = null,
+    /// `--color` / `--split-color` (T67): background tint for the new
+    /// window/pane and for `+new-window`'s inline split. Values are raw
+    /// strings here (`#rgb`, `#rrggbb`, or `random`) — resolution happens
+    /// in the handler so parse errors can be ignored Mac-style.
+    color: ?[]const u8 = null,
+    split_color: ?[]const u8 = null,
     no_activate: bool = false,
     /// `+new-window --from-focused` / `+split --from-focused`: mirror the
     /// keyboard "New Window"/split action on the focused window so the new
@@ -110,6 +116,10 @@ pub fn parseVerbArgs(
             result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
         } else if (dropPrefix(arg, "--split-percent=")) |v| {
             result.percent = std.fmt.parseInt(i64, v, 10) catch -1;
+        } else if (dropPrefix(arg, "--color=")) |v| {
+            result.color = v;
+        } else if (dropPrefix(arg, "--split-color=")) |v| {
+            result.split_color = v;
         } else if (dropPrefix(arg, "--env=")) |v| {
             if (std.mem.indexOfScalar(u8, v, '=')) |eq| {
                 try env.append(arena, .{
@@ -118,8 +128,7 @@ pub fn parseVerbArgs(
                 });
             }
         }
-        // Remaining Mac flags (--color, --split-color) are
-        // accepted-and-ignored until their features land (T67).
+        // Unknown flags are ignored, matching the Mac server's prefix table.
     }
 
     result.env = env.items;
@@ -282,7 +291,8 @@ test "parseVerbArgs: full flag set" {
         "--pane=logs",               "--percent=30",                "--lines=10",
         "--no-activate",             "--env=A=1",                   "--env=B=x=y",
         "--layout={\"pane\":\"a\"}", "--pid=4242",
-        "--from-focused",
+        "--from-focused",            "--color=#334455",
+        "--split-color=random",
     };
     const parsed = try parseVerbArgs(arena.allocator(), &args);
     try testing.expectEqualStrings("dev", parsed.target.?);
@@ -299,6 +309,8 @@ test "parseVerbArgs: full flag set" {
     try testing.expectEqual(@as(?i64, 10), parsed.lines);
     try testing.expect(parsed.no_activate);
     try testing.expect(parsed.from_focused);
+    try testing.expectEqualStrings("#334455", parsed.color.?);
+    try testing.expectEqualStrings("random", parsed.split_color.?);
     try testing.expectEqual(@as(usize, 2), parsed.env.len);
     try testing.expectEqualStrings("A", parsed.env[0].key);
     try testing.expectEqualStrings("1", parsed.env[0].value);

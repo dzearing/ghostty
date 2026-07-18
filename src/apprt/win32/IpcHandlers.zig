@@ -17,6 +17,7 @@ const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
 const w32 = @import("win32.zig");
+const color_math = @import("color_math.zig");
 const apprt = @import("../../apprt.zig");
 const termio = @import("../../termio.zig");
 const terminal = @import("../../terminal/main.zig");
@@ -135,6 +136,15 @@ fn focusTarget(entry: App.IpcTarget) void {
     }
 }
 
+/// Resolve a `--color`/`--split-color` value to a color: `#rgb`/`#rrggbb`
+/// hex or `random` (a dark muted color). Unparseable values are silently
+/// ignored (Mac rule: `NSColor(hex:)` failing just skips the tint).
+fn resolveColor(value: ?[]const u8) ?color_math.Rgb {
+    const v = value orelse return null;
+    if (std.mem.eql(u8, v, "random")) return color_math.randomDark(std.crypto.random);
+    return color_math.parseHex(v);
+}
+
 fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     const app = ctx.app;
 
@@ -213,6 +223,15 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     };
 
     if (args.title) |title| window.setTitleOverride(title);
+
+    // `--color` (T67): tint the window's first surface — background +
+    // contrast foreground + WCAG-adjusted palette (Mac applyColorScheme).
+    if (resolveColor(args.color)) |tint| {
+        if (window.tab_count > 0) {
+            window.tab_active_surface[window.active_tab].applyBackgroundTint(tint, true);
+        }
+    }
+
     if (args.no_activate) {
         // Window creation focused it within our app; at least don't keep it
         // raised over the previously-active window.
@@ -249,6 +268,9 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             break :blk null;
         };
         if (new_surface) |s| {
+            // `--split-color` (T67): explicit tint for the inline split
+            // (overwrites the auto-shifted inheritance newSplitAt applied).
+            if (resolveColor(args.split_color)) |tint| s.applyBackgroundTint(tint, true);
             if (args.name) |n| app.ipcRegister(n, .{ .pane = s }) catch {};
         }
     }
@@ -561,6 +583,10 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         log.warn("IPC split failed err={}", .{err});
         return try errorResponse(ctx.alloc, "failed to create split", .{});
     } orelse return try errorResponse(ctx.alloc, "failed to create split", .{});
+
+    // `--color` (T67): explicit tint for the new pane — bg + contrast fg +
+    // adjusted palette (overwrites newSplitAt's auto-shifted inheritance).
+    if (resolveColor(args.color)) |tint| new_surface.applyBackgroundTint(tint, true);
 
     if (args.name) |name| {
         app.ipcRegister(name, .{ .pane = new_surface }) catch {};
@@ -1170,6 +1196,10 @@ fn buildNode(
                     .name = name,
                     .focused = surface == active_surface,
                     .exit_code = null,
+                    .background_tint = if (surface.background_tint) |tint| tint: {
+                        const buf = try arena.alloc(u8, 7);
+                        break :tint color_math.hexString(tint, buf[0..7]);
+                    } else null,
                 },
             };
         },

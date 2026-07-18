@@ -1642,3 +1642,25 @@ pub const ITaskbarList3 = extern struct {
         _ = self.vtable.SetProgressValue(self, hwnd, completed, total);
     }
 };
+
+// --- Common color dialog (comdlg32) — T67 "Background Color…" picker ---
+
+/// CHOOSECOLORW for ChooseColorW. rgbResult/lpCustColors are COLORREF
+/// (0x00BBGGRR).
+pub const CHOOSECOLORW = extern struct {
+    lStructSize: u32 = @sizeOf(CHOOSECOLORW),
+    hwndOwner: ?HWND = null,
+    hInstance: ?HWND = null,
+    rgbResult: u32 = 0,
+    lpCustColors: ?*[16]u32 = null,
+    Flags: u32 = 0,
+    lCustData: usize = 0,
+    lpfnHook: ?*anyopaque = null,
+    lpTemplateName: ?[*:0]const u16 = null,
+};
+
+pub const CC_RGBINIT: u32 = 0x00000001;
+pub const CC_FULLOPEN: u32 = 0x00000002;
+pub const CC_ANYCOLOR: u32 = 0x00000100;
+
+pub extern "comdlg32" fn ChooseColorW(lpcc: *CHOOSECOLORW) callconv(.winapi) BOOL;
