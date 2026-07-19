@@ -90,6 +90,20 @@ as a new task with repro notes (which shell, which layout).
 If failures persist in this build, the bug is in the win32 key path
 (`handleKeyEvent`) — capture `%LOCALAPPDATA%\ghoztty\ghoztty.log`.
 
+*Evidence (done 2026-07-18):* verified on the box against a HEAD Debug
+build (not the July-12 ZIP — every install location already runs newer
+code, see T53b) with a new chord-injection acceptance script
+`test/win32/keybinds-t01.ps1` (kb-actions.ps1 mechanics + mouse
+double-click word-select; positive controls for typing and focus).
+Observed working: ctrl+t, ctrl+2/9 (+ctrl+1 after the T83 fix), ctrl+f4,
+ctrl+d, ctrl+shift+d, ctrl+w (close-confirm dialog approved by the
+harness), ctrl+shift+p (+Escape close), ctrl+c WITH selection (copy —
+clipboard verified), ctrl+v paste, ctrl+n. Two real bugs found and
+filed: **T83** goto_tab off-by-one (ctrl+1 selected tab 2; fixed same
+session) and **T84** ctrl+c without selection never interrupts a running
+console child (NOT a keybind bug — repros with `+send-keys C-c`; the
+script's SIGINT assert stays a known FAIL until T84 lands).
+
 ## T02 — Keybind gaps: ctrl+p, ctrl+f4 (Phase A)
 
 Add to the Windows mirror block in `Config.zig`: `ctrl+p` →
@@ -2658,3 +2672,52 @@ Failure inventory (agent-core aggregator `ghoztty-agent-core-test`,
 
 *Validation:* `zig build test-agent` exits 0 on the box, three runs in
 a row; the parity lanes + P1–P3 stay green.
+
+## T83 — FIX: goto_tab off-by-one on win32 (found by T01)
+
+`ctrl+1` selected tab 2, `ctrl+2` was a no-op with two tabs. Root cause:
+`Window.selectTab` treated the `GotoTab` payload as a 0-based index, but
+the configured value is 1-indexed (`goto_tab:1` = first tab) on Mac
+(`TerminalController.onGotoTab`: "The configured value is 1-indexed",
+out-of-range clamps to the last tab) and GTK. Fix in `Window.zig`
+`selectTab`: `_` arm now rejects `raw < 1` and selects
+`@min(raw - 1, tab_count - 1)`.
+
+*Validation:* `keybinds-t01.ps1` ctrl+1/ctrl+2/ctrl+9 assertions green on
+the box (selected-tab index via `+list --json`); both test lanes + GUI
+build green.
+
+*Evidence (done 2026-07-18):* fixed in the T01 session, same commit.
+Post-fix run: ctrl+1 selects tab 1, ctrl+2 selects tab 2, ctrl+9 selects
+the last tab.
+
+## T84 — FIX: ^C never signals the ConPTY child (found by T01)
+
+User impact: a runaway native command (`ping -t`, `type` of a huge file,
+any non-TUI child) cannot be interrupted with ctrl+c in a Windows shell
+pane. TUI apps (Claude Code, vim) are unaffected — they read raw 0x03
+themselves, which is why daily use never surfaced this.
+
+Findings from the T01 session (2026-07-18, all verified on the box):
+- Repro WITHOUT keybinds: `+send-keys --target=<pane> C-c` against a
+  cmd.exe pane running `ping -t 127.0.0.1` → ping keeps running (raw
+  0x03 IS written to the ConPTY input pipe — `normalizeConptyInput`
+  passes it through; typed echo commands through the same path land).
+- The keybind side is CORRECT: ctrl+c matches `copy_to_clipboard=.mixed`
+  (performable), core returns false with no selection, the event falls
+  through to encoding (win32-input mode or raw). With a selection, copy
+  works (clipboard verified).
+- `CommandCore.startWindows` does NOT pass `CREATE_NEW_PROCESS_GROUP`
+  (which would disable ^C for the tree) — flags are only
+  `CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT`.
+- `CreatePseudoConsole` is called with flags=0 (`src/pty.zig:430`).
+Open question: why doesn't conhost cook 0x03 (or the win32-input-mode
+ctrl+c sequence) into CTRL_C_EVENT? Next step: standalone probe — extend
+the `conpty_smoke.zig` pattern to spawn `cmd`, run `ping -t`, write
+0x03, observe; compare against a WT/openconsole reference. Also check
+whether the win32-input-mode encoding of ctrl+c (Uc=0x03, ctrl-state
+bits) matches Windows Terminal's byte-for-byte.
+
+*Validation:* `keybinds-t01.ps1` goes ALL PASS (its SIGINT assert is the
+regression oracle); manual ctrl+c on a real keyboard stops `ping -t` in
+cmd, PowerShell, and git-bash panes.

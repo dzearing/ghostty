@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-18 (on-box, 18) — T01 DONE (+T83 found+fixed, T84 filed).
+  Built a real chord-injection acceptance for the ctrl-mirror keybinds
+  (`keybinds-t01.ps1`: kb-actions mechanics + mouse double-click
+  word-select + typing/focus positive controls; 23 assertions). Verified
+  on HEAD Debug: ctrl+t/d/shift+d/w/f4/shift+p/n, ctrl+1/2/9, copy with
+  selection, paste. Bug 1 (T83, fixed): win32 `selectTab` treated the
+  1-indexed goto_tab payload as 0-based — ctrl+1 went to tab 2, ctrl+2
+  no-oped; now Mac-parity incl. out-of-range→last. Bug 2 (T84, todo,
+  jumps the queue): ^C never interrupts a running ConPTY child — repros
+  with `+send-keys C-c` vs `ping -t`, so NOT a keybind bug; binding
+  fallthrough verified correct, no CREATE_NEW_PROCESS_GROUP, ConPTY
+  flags=0; next step is a standalone conpty probe. Script is 22/23 (the
+  SIGINT assert is T84's regression oracle). Both lanes + P1–P3 green.
+
 - 2026-07-18 (on-box, 17) — T78 DONE. `window-title-font-family` now
   drives the owner-drawn tab bar font (and the resize overlay, which
   shares the HFONT). Scoping call: the DWM caption font of a

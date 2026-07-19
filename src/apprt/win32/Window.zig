@@ -2096,12 +2096,15 @@ pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
         .next => if (self.active_tab + 1 < self.tab_count) self.active_tab + 1 else 0,
         .last => self.tab_count - 1,
         _ => blk: {
-            // GotoTab carries a c_int; clamp non-negative before casting
-            // so a negative sentinel doesn't panic the @intCast.
+            // GotoTab carries a c_int; clamp positive before casting so a
+            // negative sentinel doesn't panic the @intCast. The configured
+            // value is 1-indexed (goto_tab:1 = first tab) and out-of-range
+            // selects the last tab, matching the Mac (TerminalController
+            // onGotoTab) and GTK behavior.
             const raw = @intFromEnum(target);
-            if (raw < 0) return false;
+            if (raw < 1) return false;
             const n: usize = @intCast(raw);
-            break :blk if (n < self.tab_count) n else return false;
+            break :blk @min(n - 1, self.tab_count - 1);
         },
     };
     self.selectTabIndex(idx);
