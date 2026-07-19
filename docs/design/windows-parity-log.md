@@ -20,6 +20,11 @@ next, any surprises>`.
   foreground — rewrote reset-window-size.ps1 (and built the new
   window-size-memory.ps1) on focus-free PostMessage'd bare-F-key
   bindings; validated the approach with an IsZoomed positive control.
+  DELIVERED (user-complaint fix): ReleaseFast gnu `-Dstrip=false` staged
+  to zig-out-release (`+14468054b`); Desktop portable + share refreshed
+  (exe+pdb, share\ mirrored, `.bak-20260719`); installed release swapped
+  via the detached upgrade script (resume = the go.md loop, doubling as
+  the context reset). Pre-swap windows run old code until relaunched.
   Next: priority queue empty again — first todo in table.
 - 2026-07-19 (on-box, 21) — T24 DONE. Windows release channel is live:
   win-vX.Y.Z GitHub releases beside the Mac ones (--latest=false; first
