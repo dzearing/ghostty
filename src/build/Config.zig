@@ -50,6 +50,7 @@ flatpak: bool = false,
 snap: bool = false,
 windows_console: bool = false,
 windows_file_version: [4]u16 = .{ 0, 1, 0, 0 },
+windows_update_check: bool = false,
 emit_bench: bool = false,
 emit_docs: bool = false,
 emit_exe: bool = false,
@@ -195,6 +196,15 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
             "pipeline (dist/windows-installer/build-msi.sh) passes its " ++
             "per-build number so MSI upgrades replace the exe (T23).",
     ));
+
+    config.windows_update_check = b.option(
+        bool,
+        "windows-update-check",
+        "On Windows, enable the in-app update check against the GitHub " ++
+            "win-v* release channel (T24). Default false so dev/portable " ++
+            "builds never phone home or nag; the MSI release pipeline " ++
+            "(dist/windows-installer/build-msi.sh --semver) sets it.",
+    ) orelse false;
 
     config.sentry = b.option(
         bool,
@@ -554,6 +564,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
+    step.addOption(bool, "windows_update_check", self.windows_update_check);
 
     // Our version. We also add the string version so we don't need
     // to do any allocations at runtime. This has to be long enough to

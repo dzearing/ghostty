@@ -183,7 +183,7 @@ One line per row. Full spec + validation + evidence per task:
 | T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | done | 7ec2c7119 |
 | T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | done | 4e7edfc9b |
 | T23 | MSI upgrade/uninstall fix — done 2026-07-19: root cause was wixl's EMPTY File.Version (packaged exe "unversioned" → costing skip + RExP delete = the 26.7.502 vanishing exe), NOT RExP placement. Fix: per-build FILEVERSION (`-Dwindows-file-version`) stamped into the exe + mirrored into the File table, MsiFileHash emptied, `wixl -a x64`, `--test-identity` throwaway E2E; `msi-upgrade.ps1` ALL PASS (33) ×3 incl. ghost-recovery; see details for the on-box 26.7.502 ghost note | H | — | done | 5edea9532 |
-| T24 | Windows release channel + update check | H | T23 | todo | — |
+| T24 | Windows release channel + update check | H | T23 | in-progress | — |
 | T25 | Full conformance checklist (spec §8) | — | T17,T19,T21a | todo | — |
 | T26 | OS color-scheme sync | I | — | done | see details |
 | T27 | PowerShell shell integration | I | — | done | see details |

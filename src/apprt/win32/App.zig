@@ -28,6 +28,7 @@ const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
+const update_check = @import("update_check.zig");
 const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -142,6 +143,12 @@ taskbar: ?*w32.ITaskbarList3 = null,
 /// A single id suffices: there is one NOTIF_DESKTOP_UID tray balloon and
 /// each new notification overwrites it.
 notif_desktop_surface_id: u64 = 0,
+
+/// Version text of the newest win-v release the update check found (heap,
+/// app allocator). A click on the update balloon opens that release's
+/// GitHub page. Null until an update notification has been shown.
+update_latest_ver: ?[]u8 = null,
+
 /// Whether CoInitializeEx has been called on the main thread.
 com_initialized: bool = false,
 
@@ -342,8 +349,9 @@ pub fn init(
     // Register global hotkey for quick terminal (if configured).
     self.registerGlobalHotkey();
 
-    // Check for updates in the background (non-blocking).
-    self.startUpdateCheck();
+    // Check for updates in the background (non-blocking). Only acts in
+    // -Dwindows-update-check channel builds (T24).
+    self.startUpdateCheck(.automatic);
 
     // Keep the `ghoztty` CLI resolvable from any shell (T70). Background
     // thread; only acts when running from the canonical install dir.
@@ -645,6 +653,11 @@ pub fn run(self: *App) !void {
 
 pub fn terminate(self: *App) void {
     self.stopQuitTimer();
+
+    if (self.update_latest_ver) |v| {
+        self.core_app.alloc.free(v);
+        self.update_latest_ver = null;
+    }
 
     // Unregister all global hotkeys.
     for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
@@ -1978,7 +1991,7 @@ pub fn performAction(
         },
 
         .check_for_updates => {
-            self.startUpdateCheck();
+            self.startUpdateCheck(.manual);
             return true;
         },
 
@@ -2250,18 +2263,32 @@ fn keyToVk(key: @import("../../input/key.zig").Key) ?u32 {
 // Update Checker
 // -----------------------------------------------------------------------
 
-/// GitHub releases API URL for this fork.
-const UPDATE_URL = "https://api.github.com/repos/InsipidPoint/ghostty-windows/releases/latest";
+/// GitHub releases-list API URL for this fork (newest-first). The update
+/// check scans it for the newest `win-v*` tag (update_check.zig) — Windows
+/// releases live beside the Mac `vX.Y.Z` releases in the same repo, so the
+/// list endpoint is used instead of /latest (which points at the Mac
+/// channel). Overridable via GHOZTTY_UPDATE_URL, which also force-enables
+/// the check in non-channel builds so test/win32/update-check.ps1 can point
+/// a plain Debug build at a local fake server.
+const UPDATE_URL = "https://api.github.com/repos/dzearing/ghoztty/releases?per_page=30";
 
 /// Custom message posted from the update thread to the message loop.
+/// wparam = heap ptr to the newer version text, lparam = its length.
+/// wparam == 0 carries manual-check feedback instead: lparam 0 = up to
+/// date, 1 = check failed (only posted for user-initiated checks).
 const WM_APP_UPDATE_AVAILABLE: u32 = w32.WM_APP + 2;
 
 /// Tray-icon notification callback (uCallbackMessage). The wparam is
 /// the tray icon's uID; lparam carries NIN_* events.
 const WM_APP_TRAY: u32 = w32.WM_APP + 3;
 
-/// User-facing GitHub releases page that the update balloon links to.
-const RELEASES_URL = "https://github.com/InsipidPoint/ghostty-windows/releases/latest";
+/// User-facing GitHub releases page — the update-balloon click fallback
+/// when no specific version is known.
+const RELEASES_URL = "https://github.com/dzearing/ghoztty/releases";
+
+/// Release page for a specific Windows build; the version text (e.g.
+/// "1.4.1") is appended to form .../releases/tag/win-v1.4.1.
+const RELEASE_TAG_URL_PREFIX = "https://github.com/dzearing/ghoztty/releases/tag/win-v";
 
 /// Tray icon and timer IDs for notifications. Distinct IDs mean the
 /// desktop and update balloons can coexist without one's auto-cleanup
@@ -2275,23 +2302,44 @@ const NOTIF_UPDATE_TIMER_ID: usize = 3;
 /// timestamp is persisted in %LOCALAPPDATA%/ghostty/update_check_at.
 const UPDATE_CHECK_INTERVAL_SECS: i64 = 60 * 60; // 1 hour
 
-/// Start a background thread to check for updates. Skips the actual
-/// fetch if we checked within the last UPDATE_CHECK_INTERVAL_SECS.
-/// Manual `.check_for_updates` actions force-refresh by setting
-/// `force=true`.
-fn startUpdateCheck(self: *App) void {
-    // Ghoztty beta: no update channel exists for the Windows build yet, so
-    // never phone home. Upgrades are "install a newer MSI" (see
-    // docs/design/windows-amd64-plan.md cut lines).
-    if (true) return;
+/// How an update check was requested. Automatic checks (app launch) are
+/// gated and throttled; manual checks (`check_for_updates` action) always
+/// run and report their outcome in a balloon.
+const UpdateTrigger = enum { automatic, manual };
 
-    if (!self.shouldRunUpdateCheck()) {
-        log.debug("skipping update check (last run within {d}s)", .{UPDATE_CHECK_INTERVAL_SECS});
-        return;
+/// Start a background thread to check for updates (T24, notify-only: the
+/// balloon links to the release page; nothing is downloaded or installed).
+///
+/// Automatic checks run ONLY in builds stamped with -Dwindows-update-check
+/// (the MSI release pipeline sets it) so dev/portable/script-refreshed
+/// builds never phone home or nag, honor `auto-update = off`, and are
+/// throttled to one fetch per UPDATE_CHECK_INTERVAL_SECS. The
+/// GHOZTTY_UPDATE_URL env override (acceptance-test hook) force-enables
+/// the automatic check and bypasses the throttle. Manual checks skip all
+/// gates: an explicit user action deserves an answer.
+fn startUpdateCheck(self: *App, trigger: UpdateTrigger) void {
+    if (trigger == .automatic) {
+        const overridden = envUpdateUrlIsSet(self.core_app.alloc);
+        if (!build_config.windows_update_check and !overridden) return;
+        if (self.config.@"auto-update") |au| if (au == .off) {
+            log.debug("update check disabled (auto-update = off)", .{});
+            return;
+        };
+        if (!overridden and !self.shouldRunUpdateCheck()) {
+            log.debug("skipping update check (last run within {d}s)", .{UPDATE_CHECK_INTERVAL_SECS});
+            return;
+        }
     }
-    _ = std.Thread.spawn(.{}, updateCheckThread, .{self}) catch |err| {
+    _ = std.Thread.spawn(.{}, updateCheckThread, .{ self, trigger }) catch |err| {
         log.warn("failed to start update check thread: {}", .{err});
     };
+}
+
+/// True if the GHOZTTY_UPDATE_URL test/debug override is present.
+fn envUpdateUrlIsSet(alloc: Allocator) bool {
+    const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_UPDATE_URL") catch return false;
+    defer alloc.free(v);
+    return v.len > 0;
 }
 
 /// Read the persisted "last checked at" timestamp; return true if
@@ -2326,72 +2374,110 @@ fn shouldRunUpdateCheck(self: *App) bool {
     return true;
 }
 
-/// Background thread: fetch latest release tag from GitHub, compare
-/// with current version, post a message if newer.
-fn updateCheckThread(app: *App) void {
-    const result = fetchLatestVersion() catch |err| {
-        log.debug("update check failed: {}", .{err});
-        return;
+/// Background thread: fetch the releases list from GitHub, find the newest
+/// win-v release, compare with the current version, post a message if
+/// newer. Manual checks also post their up-to-date/failed outcome.
+fn updateCheckThread(app: *App, trigger: UpdateTrigger) void {
+    const alloc = app.core_app.alloc;
+    const manual = trigger == .manual;
+
+    const latest_ver: []u8 = fetchLatestWinVersion(alloc) catch |err| switch (err) {
+        error.NoWinRelease => {
+            // No Windows release published (or a fake feed without win-v
+            // tags): nothing to offer, which for a manual check reads as
+            // "you're up to date".
+            log.info("update check: no win-v release found", .{});
+            if (manual) postUpdateFeedback(app, 0);
+            return;
+        },
+        else => {
+            log.warn("update check failed: {}", .{err});
+            if (manual) postUpdateFeedback(app, 1);
+            return;
+        },
     };
 
-    const latest = result.tag;
-    const latest_len = result.len;
-    if (latest_len == 0) return;
-
-    // Strip "win-v" or "v" prefix from tag
-    const latest_start: usize = if (std.mem.startsWith(u8, latest[0..latest_len], "win-v"))
-        5
-    else if (latest[0] == 'v')
-        1
-    else
-        0;
-    const latest_ver = latest[latest_start..latest_len];
-
-    // Compare against the binary's own version (set by build.zig from
-    // either build.zig.zon or the win-v git tag at build time).
+    // Compare against the binary's own version (from -Dversion-string,
+    // which the MSI release pipeline stamps with the win-v tag's semver).
     const current_sv = build_config.version;
-    const latest_sv = std.SemanticVersion.parse(latest_ver) catch {
-        log.debug("failed to parse remote version: {s}", .{latest_ver});
-        return;
-    };
-
-    // Only notify if the remote version is strictly newer
-    if (latest_sv.order(current_sv) != .gt) {
-        log.debug("up to date: current={d}.{d}.{d} latest={s}", .{
-            current_sv.major, current_sv.minor, current_sv.patch, latest_ver,
+    if (!update_check.isNewer(current_sv, latest_ver)) {
+        log.info("update check: up to date (current={s} latest=win-v{s})", .{
+            build_config.version_string, latest_ver,
         });
+        alloc.free(latest_ver);
+        if (manual) postUpdateFeedback(app, 0);
         return;
     }
-    log.info("update available: current={d}.{d}.{d} latest={s}", .{
-        current_sv.major, current_sv.minor, current_sv.patch, latest_ver,
+    log.info("update available: current={s} latest=win-v{s}", .{
+        build_config.version_string, latest_ver,
     });
 
-    const hwnd = app.msg_hwnd orelse return;
-
-    // Allocate a heap copy and hand ownership to the message handler via
-    // wparam/lparam. This avoids a static-buffer race between this worker
-    // thread writing the version and the message thread reading it.
-    const alloc = app.core_app.alloc;
-    const owned = alloc.dupe(u8, latest_ver) catch {
-        log.warn("oom allocating update version", .{});
+    const hwnd = app.msg_hwnd orelse {
+        alloc.free(latest_ver);
         return;
     };
-    const wparam: usize = @intFromPtr(owned.ptr);
-    const lparam: isize = @intCast(owned.len);
+
+    // Hand ownership of the heap version text to the message handler via
+    // wparam/lparam. This avoids a static-buffer race between this worker
+    // thread writing the version and the message thread reading it.
+    const wparam: usize = @intFromPtr(latest_ver.ptr);
+    const lparam: isize = @intCast(latest_ver.len);
     if (w32.PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, wparam, lparam) == 0) {
         // PostMessage failed (e.g., HWND already destroyed). Free the
         // buffer here since the handler will never run.
-        alloc.free(owned);
+        alloc.free(latest_ver);
     }
 }
 
-/// Show a notification balloon that an update is available. The handler
-/// owns `ver` (heap-allocated by updateCheckThread) and is responsible
-/// for freeing it.
+/// Post manual-check feedback to the GUI thread: code 0 = up to date,
+/// 1 = check failed (see WM_APP_UPDATE_AVAILABLE's encoding).
+fn postUpdateFeedback(app: *App, code: isize) void {
+    const hwnd = app.msg_hwnd orelse return;
+    _ = w32.PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, 0, code);
+}
+
+/// Show a notification balloon that an update is available. Remembers the
+/// version so a balloon click opens that release's GitHub page. The caller
+/// (message handler) still owns and frees `ver`.
 fn showUpdateNotification(self: *App, ver: []const u8) void {
-    const hwnd = self.msg_hwnd orelse return;
     if (ver.len == 0) return;
-    const ver_len = ver.len;
+    log.info("showing update balloon for win-v{s}", .{ver});
+
+    const alloc = self.core_app.alloc;
+    if (self.update_latest_ver) |old| alloc.free(old);
+    self.update_latest_ver = alloc.dupe(u8, ver) catch null;
+
+    var body_utf8: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        &body_utf8,
+        "Version {s} is available.\nClick to open the download page.",
+        .{ver},
+    ) catch return;
+    self.showUpdateBalloon("Ghoztty Update Available", body);
+}
+
+/// Show manual-check feedback: code 0 = up to date, anything else =
+/// check failed.
+fn showUpdateFeedback(self: *App, code: isize) void {
+    if (code == 0) {
+        var body_utf8: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(
+            &body_utf8,
+            "Ghoztty is up to date (version {s}).",
+            .{build_config.version_string},
+        ) catch return;
+        self.showUpdateBalloon("Ghoztty", body);
+    } else {
+        self.showUpdateBalloon("Ghoztty", "Could not check for updates.\nClick to open the releases page.");
+    }
+}
+
+/// Show a balloon on the update tray icon. A click is delivered as
+/// WM_APP_TRAY (NOTIF_UPDATE_UID) → opens the release page. Title/body
+/// must fit the NOTIFYICONDATAW limits (64/256 UTF-16 units incl. nul);
+/// longer text is dropped rather than truncated mid-rune.
+fn showUpdateBalloon(self: *App, title_utf8: []const u8, body_utf8: []const u8) void {
+    const hwnd = self.msg_hwnd orelse return;
 
     var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
     nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
@@ -2405,16 +2491,15 @@ fn showUpdateNotification(self: *App, ver: []const u8) void {
     nid.dwInfoFlags = w32.NIIF_INFO;
     nid.uVersion_or_uTimeout = 10000;
 
-    // Title
-    const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty Update Available");
-    @memcpy(nid.szInfoTitle[0..title.len], title);
-    nid.szInfoTitle[title.len] = 0;
+    var title_utf16: [64]u16 = undefined; // NOTIFYICONDATAW.szInfoTitle
+    if (title_utf8.len >= title_utf16.len) return;
+    const tlen = std.unicode.utf8ToUtf16Le(&title_utf16, title_utf8) catch return;
+    @memcpy(nid.szInfoTitle[0..tlen], title_utf16[0..tlen]);
+    nid.szInfoTitle[tlen] = 0;
 
-    // Body: "Version X.Y.Z is available. Visit GitHub to download."
-    var body_utf8: [256]u8 = undefined;
-    const body_len = std.fmt.bufPrint(&body_utf8, "Version {s} is available.\nVisit GitHub releases to download.", .{ver[0..ver_len]}) catch return;
-    var body_utf16: [256]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&body_utf16, body_len) catch 0;
+    var body_utf16: [256]u16 = undefined; // NOTIFYICONDATAW.szInfo
+    if (body_utf8.len >= body_utf16.len) return;
+    const wlen = std.unicode.utf8ToUtf16Le(&body_utf16, body_utf8) catch return;
     @memcpy(nid.szInfo[0..wlen], body_utf16[0..wlen]);
     nid.szInfo[wlen] = 0;
 
@@ -2427,49 +2512,68 @@ fn showUpdateNotification(self: *App, ver: []const u8) void {
     _ = w32.SetTimer(hwnd, NOTIF_UPDATE_TIMER_ID, 10000, null);
 }
 
-const VersionResult = struct { tag: [128]u8, len: usize };
+/// Response-size cap for the releases-list fetch. Release notes can be
+/// large; 30 releases with long bodies stay well under this.
+const UPDATE_RESPONSE_MAX: usize = 1024 * 1024;
 
-/// Fetch the latest release tag from GitHub. Returns the tag string.
-fn fetchLatestVersion() !VersionResult {
+/// Fetch the releases list from GitHub (or GHOZTTY_UPDATE_URL) and return
+/// the newest win-v release's version text (e.g. "1.4.1"), caller-owned.
+/// error.NoWinRelease if the feed has no win-v tag.
+fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
+    const url_owned: ?[]u8 = std.process.getEnvVarOwned(alloc, "GHOZTTY_UPDATE_URL") catch null;
+    defer if (url_owned) |u| alloc.free(u);
+    const url: []const u8 = if (url_owned) |u| (if (u.len > 0) u else UPDATE_URL) else UPDATE_URL;
+
+    // file:// overrides are read directly (WinINet's InternetOpenUrlW
+    // rejects them); this is the acceptance test's canned-feed path.
+    if (std.mem.startsWith(u8, url, "file://")) {
+        var path = url["file://".len..];
+        if (path.len > 2 and path[0] == '/') path = path[1..]; // file:///C:/…
+        const f = std.fs.openFileAbsolute(path, .{}) catch return error.ReadFailed;
+        defer f.close();
+        const data = f.readToEndAlloc(alloc, UPDATE_RESPONSE_MAX) catch return error.ReadFailed;
+        defer alloc.free(data);
+        const ver = update_check.findLatestWinVersion(data) orelse return error.NoWinRelease;
+        return try alloc.dupe(u8, ver);
+    }
+
     const agent = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty-UpdateCheck/1.0");
     const inet = w32.InternetOpenW(agent, w32.INTERNET_OPEN_TYPE_PRECONFIG, null, null, 0) orelse
         return error.InternetOpenFailed;
     defer _ = w32.InternetCloseHandle(inet);
 
     // Convert URL to UTF-16
-    var url_buf: [256]u16 = undefined;
-    const url_len = std.unicode.utf8ToUtf16Le(&url_buf, UPDATE_URL) catch return error.UrlTooLong;
+    var url_buf: [2048]u16 = undefined;
+    if (url.len >= url_buf.len) return error.UrlTooLong;
+    const url_len = std.unicode.utf8ToUtf16Le(&url_buf, url) catch return error.UrlTooLong;
     url_buf[url_len] = 0;
 
-    const flags = w32.INTERNET_FLAG_SECURE | w32.INTERNET_FLAG_NO_CACHE_WRITE | w32.INTERNET_FLAG_RELOAD;
+    // INTERNET_FLAG_SECURE is intentionally omitted: the scheme decides
+    // (https for the real channel; the test override serves plain http
+    // from 127.0.0.1).
+    const flags = w32.INTERNET_FLAG_NO_CACHE_WRITE | w32.INTERNET_FLAG_RELOAD;
     const conn = w32.InternetOpenUrlW(inet, @ptrCast(&url_buf), null, 0, flags, 0) orelse
         return error.InternetOpenUrlFailed;
     defer _ = w32.InternetCloseHandle(conn);
 
-    // Read response (we only need the first ~4KB for tag_name)
-    var response: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (total < response.len) {
+    // Read the whole response (heap; the releases list is far bigger than
+    // the old single-release response).
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    while (body.items.len < UPDATE_RESPONSE_MAX) {
+        try body.ensureUnusedCapacity(alloc, 16 * 1024);
+        const dst = body.unusedCapacitySlice();
         var bytes_read: u32 = 0;
-        if (w32.InternetReadFile(conn, response[total..].ptr, @intCast(response.len - total), &bytes_read) == 0) {
+        if (w32.InternetReadFile(conn, dst.ptr, @intCast(@min(dst.len, UPDATE_RESPONSE_MAX - body.items.len)), &bytes_read) == 0) {
             return error.ReadFailed;
         }
         if (bytes_read == 0) break;
-        total += bytes_read;
+        body.items.len += bytes_read;
     }
 
-    // Find "tag_name" in JSON response (simple string search, no JSON parser needed)
-    const json = response[0..total];
-    const needle = "\"tag_name\":\"";
-    const start = std.mem.indexOf(u8, json, needle) orelse return error.TagNotFound;
-    const tag_start = start + needle.len;
-    const tag_end = std.mem.indexOfPos(u8, json, tag_start, "\"") orelse return error.TagNotFound;
-    const tag = json[tag_start..tag_end];
-
-    var result: VersionResult = .{ .tag = undefined, .len = tag.len };
-    if (tag.len > 128) return error.TagTooLong;
-    @memcpy(result.tag[0..tag.len], tag);
-    return result;
+    const ver = update_check.findLatestWinVersion(body.items) orelse
+        return error.NoWinRelease;
+    return try alloc.dupe(u8, ver);
 }
 
 /// Start the quit timer. Called when the last surface closes.
@@ -3037,13 +3141,16 @@ fn msgWndProc(
 
     if (msg == WM_APP_UPDATE_AVAILABLE) {
         // wparam = heap pointer to the version string, lparam = length.
-        // We own the buffer and must free it after use.
+        // We own the buffer and must free it after use. wparam == 0 is
+        // manual-check feedback (lparam 0 = up to date, 1 = failed).
         if (wparam != 0 and lparam > 0) {
             const ptr: [*]u8 = @ptrFromInt(wparam);
             const len: usize = @intCast(lparam);
             const ver = ptr[0..len];
             defer app.core_app.alloc.free(ver);
             app.showUpdateNotification(ver);
+        } else if (wparam == 0) {
+            app.showUpdateFeedback(lparam);
         }
         return 0;
     }
@@ -3070,8 +3177,16 @@ fn msgWndProc(
             return 0;
         }
         if (wparam == NOTIF_UPDATE_UID and event == w32.NIN_BALLOONUSERCLICK) {
-            var url_buf: [256]u16 = undefined;
-            const url_len = std.unicode.utf8ToUtf16Le(&url_buf, RELEASES_URL) catch return 0;
+            // Open the specific win-v release page when a version is
+            // known (update balloon); the releases list otherwise
+            // (up-to-date / check-failed feedback balloons).
+            var url_utf8_buf: [256]u8 = undefined;
+            const url_utf8: []const u8 = if (app.update_latest_ver) |v|
+                std.fmt.bufPrint(&url_utf8_buf, RELEASE_TAG_URL_PREFIX ++ "{s}", .{v}) catch RELEASES_URL
+            else
+                RELEASES_URL;
+            var url_buf: [512]u16 = undefined;
+            const url_len = std.unicode.utf8ToUtf16Le(&url_buf, url_utf8) catch return 0;
             url_buf[url_len] = 0;
             _ = w32.ShellExecuteW(
                 null,

@@ -9,6 +9,7 @@
 # Usage:
 #   dist/windows-installer/build-msi.sh [--version <stamp>] [--build-num <N>]
 #                                       [--out <path>] [--skip-build]
+#                                       [--semver <X.Y.Z>]
 #                                       [--test-identity <Name>]
 #
 # Defaults:
@@ -19,9 +20,18 @@
 #              and MSI major upgrades fire.
 #   build-num  1 — same-day rebuild counter (bump when publishing twice in
 #              a day: same ProductVersion refuses to install over itself).
-#   out        zig-out/Ghoztty-<yy.m.dNN>-x64.msi
+#   out        zig-out/Ghoztty-<yy.m.dNN>-x64.msi (Ghoztty-<semver>-x64.msi
+#              when --semver is given: the release-asset name, T24).
+#   --semver <X.Y.Z>  release-channel build (T24): the zig build is stamped
+#              with -Dversion-string=X.Y.Z+<short-hash> (so the exe's
+#              semver matches the win-vX.Y.Z GitHub release tag the update
+#              check compares against) and -Dwindows-update-check=true
+#              (enables the in-app update check; dev builds never check).
 #   --skip-build  reuse zig-out/bin/ghoztty.exe + zig-out/share instead of
 #              running zig build (which needs the zig@0.15 PATH exports).
+#              NOTE with --semver the exe must already carry the matching
+#              -Dversion-string/-Dwindows-update-check (the on-box publish
+#              script builds natively, then runs this under Docker).
 #   --test-identity <Name>  build a THROWAWAY MSI under a distinct product
 #              identity (Name, install dir, UpgradeCode, registry key, and
 #              component-GUID namespace all derived from <Name>) so on-box
@@ -55,11 +65,14 @@ BUILD_NUM=1
 OUT=""
 SKIP_BUILD=0
 TEST_IDENTITY=""
+SEMVER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)     VERSION="${2:?--version needs a value}"; shift 2 ;;
     --version=*)   VERSION="${1#*=}"; shift ;;
+    --semver)      SEMVER="${2:?--semver needs a value}"; shift 2 ;;
+    --semver=*)    SEMVER="${1#*=}"; shift ;;
     --build-num)   BUILD_NUM="${2:?--build-num needs a value}"; shift 2 ;;
     --build-num=*) BUILD_NUM="${1#*=}"; shift ;;
     --out)         OUT="${2:?--out needs a value}"; shift 2 ;;
@@ -83,9 +96,16 @@ cd "$REPO_ROOT"
 FILE_VERSION="$(date +%-y).$(date +%-m).$(date +%-d).$BUILD_NUM"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-  echo "==> zig build (ReleaseFast, x86_64-windows-gnu, win32 apprt, FILEVERSION $FILE_VERSION)"
+  EXTRA_BUILD_ARGS=()
+  if [[ -n "$SEMVER" ]]; then
+    # Release-channel build: stamp the exe with the win-v tag's semver
+    # (+ commit for provenance) and enable the in-app update check.
+    EXTRA_BUILD_ARGS+=("-Dversion-string=$SEMVER+$(git rev-parse --short HEAD)")
+    EXTRA_BUILD_ARGS+=("-Dwindows-update-check=true")
+  fi
+  echo "==> zig build (ReleaseFast, x86_64-windows-gnu, win32 apprt, FILEVERSION $FILE_VERSION${SEMVER:+, semver $SEMVER})"
   zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast \
-    "-Dwindows-file-version=$FILE_VERSION"
+    "-Dwindows-file-version=$FILE_VERSION" ${EXTRA_BUILD_ARGS[@]+"${EXTRA_BUILD_ARGS[@]}"}
 fi
 
 EXE="$REPO_ROOT/zig-out/bin/ghoztty.exe"
@@ -121,7 +141,13 @@ fi
 YY="$(date +%y)"; M="$(date +%-m)"; D="$(date +%-d)"
 NN="$(printf '%02d' "$BUILD_NUM")"
 PRODUCT_VERSION="$YY.$M.$D$NN"
-[[ -n "$OUT" ]] || OUT="$REPO_ROOT/zig-out/Ghoztty-$PRODUCT_VERSION-x64.msi"
+if [[ -z "$OUT" ]]; then
+  if [[ -n "$SEMVER" ]]; then
+    OUT="$REPO_ROOT/zig-out/Ghoztty-$SEMVER-x64.msi"
+  else
+    OUT="$REPO_ROOT/zig-out/Ghoztty-$PRODUCT_VERSION-x64.msi"
+  fi
+fi
 
 echo "==> stamp:          $VERSION"
 echo "==> ProductVersion: $PRODUCT_VERSION"
