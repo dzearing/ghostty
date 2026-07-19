@@ -903,7 +903,13 @@ pub const Connection = struct {
     /// dial path today), so ALL client connections advertise them regardless of
     /// transport. Additive: the agent negotiates the intersection and an older
     /// agent that doesn't advertise `close_session` simply leaves it disabled.
-    pub const client_capabilities = [_][]const u8{protocol.capability.close_session};
+    /// `grid_snapshot` asks a modern agent to append a visible-screen repaint on
+    /// re-attach (FIX 2); an older agent that never advertises it just replays its
+    /// ring as before.
+    pub const client_capabilities = [_][]const u8{
+        protocol.capability.close_session,
+        protocol.capability.grid_snapshot,
+    };
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
     ///

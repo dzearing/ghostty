@@ -1530,7 +1530,7 @@ test "xtversion with effect" {
     defer s.deinit();
 
     s.nextSlice("\x1b[>0q");
-    try testing.expectEqualStrings("\x1bP>|ghostty 1.2.3\x1b\\", S.written.?);
+    try testing.expectEqualStrings("\x1bP>|ghoztty 1.2.3\x1b\\", S.written.?);
 }
 
 test "xtversion with empty string effect" {

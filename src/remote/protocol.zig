@@ -365,6 +365,25 @@ pub const capability = struct {
     /// this string (an unknown opcode is a fatal framing error), so an older peer
     /// that omits it keeps working over the channel-scoped `close` alone.
     pub const close_session = "close_session";
+
+    /// Re-attach **grid snapshot**: on ATTACH the agent, having tracked each
+    /// session's visible screen in a headless emulator, replays a self-contained
+    /// VT repaint of the current on-screen grid so the pane repaints EXACTLY and
+    /// is never blank — even when the paint predates the raw-output ring (deep
+    /// scrollback evicted, or a full-screen app whose alt-screen enter scrolled
+    /// out). See `src/remote/agent/grid_snapshot.zig`.
+    ///
+    /// Purely additive — there is NO new opcode: the snapshot rides ordinary
+    /// `DATA` frames (plain VT any emulator renders). This string only lets the
+    /// two sides NEGOTIATE the behavior:
+    ///   * the CLIENT advertises it to say "append a grid snapshot after your
+    ///     replay"; a client that doesn't (older app) gets today's ring-only
+    ///     replay,
+    ///   * the AGENT advertises it so a new client knows an old agent (which
+    ///     never sends one) will fall back to ring-only replay.
+    /// Gated on the INTERSECTION (`Negotiated.grid_snapshot`), so every skew
+    /// combination degrades gracefully to today's behavior — no garble, no wedge.
+    pub const grid_snapshot = "grid_snapshot";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -402,6 +421,12 @@ pub const Negotiated = struct {
     /// using the channel-scoped `close` and never emits an opcode the peer would
     /// treat as a fatal framing error.
     close_session: bool = false,
+
+    /// True iff BOTH peers advertised `capability.grid_snapshot` — i.e. the agent
+    /// should append a grid-snapshot repaint on ATTACH and the client wants it.
+    /// Additive: false against any older peer, so the agent falls back to today's
+    /// ring-only replay and the client just renders whatever DATA arrives.
+    grid_snapshot: bool = false,
 };
 
 /// True iff `caps` contains the capability string `name`.
@@ -428,6 +453,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
         .transfer_encoding = local.transfer_encoding,
         .close_session = hasCapability(local.capabilities, capability.close_session) and
             hasCapability(remote.capabilities, capability.close_session),
+        .grid_snapshot = hasCapability(local.capabilities, capability.grid_snapshot) and
+            hasCapability(remote.capabilities, capability.grid_snapshot),
     };
 }
 

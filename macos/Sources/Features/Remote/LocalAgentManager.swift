@@ -602,6 +602,20 @@ final class LocalAgentManager {
         return Connection(handle: handle, port: port, pid: record.pid)
     }
 
+    /// True iff the agent recorded in the info file is still a live process.
+    /// Used by `ensureLaunchAgentLoaded` (FIX 1a) to refuse a destructive
+    /// bootout of a running agent: an alive pid means live PTYs + children we
+    /// must not tombstone. Uses the SAME liveness probe as `dialExisting` (signal
+    /// 0; EPERM still means "exists"), but does NOT dial — a live-but-momentarily-
+    /// unresponsive agent (slow HELLO, socket backlog) must count as alive here so
+    /// we never restart it out from under its sessions.
+    private static func agentProcessAlive(paths: Paths) -> Bool {
+        guard let data = try? Data(contentsOf: paths.portFile),
+              let record = parsePortFile(data)
+        else { return false }
+        return kill(record.pid, 0) == 0 || errno == EPERM
+    }
+
     // MARK: - Spawn
 
     /// Spawn the bundled agent detached (own session, stdio to the log file)
@@ -690,7 +704,19 @@ final class LocalAgentManager {
 
         let plistURL = paths.launchAgentPlistURL
         let existing = try? Data(contentsOf: plistURL)
-        let changed = existing != desired
+        // Compare only the STABLE part of the plist. `launchAgentPlistData` bakes
+        // in PATH/SHELL/LANG inherited from the app's environment (FIX 1b), which
+        // drift between launches (Finder vs a terminal vs a different parent
+        // shell) even when nothing about the agent config really changed. If those
+        // volatile keys counted toward `changed`, an ordinary upgrade would flip
+        // it on nearly every launch and take the destructive reload path below —
+        // booting out the running agent and tombstoning its children. Normalize
+        // them out of BOTH sides so an unchanged agent config compares equal and
+        // no rebootstrap happens. (The plist we WRITE still carries the current
+        // env; we just don't treat env drift as a config change.)
+        let changed = existing.map {
+            Self.plistComparisonKey($0) != Self.plistComparisonKey(desired)
+        } ?? true
         if changed {
             do {
                 try FileManager.default.createDirectory(
@@ -707,14 +733,41 @@ final class LocalAgentManager {
         let service = "\(domain)/\(paths.launchAgentLabel)"
         let loaded = launchctl(["print", service]).status == 0
 
-        // Already loaded with an unchanged plist: just make sure it's running.
+        // Already loaded with an unchanged (stable) config: just make sure it's
+        // running.
         if loaded && !changed {
             _ = launchctl(["kickstart", service])
             return true
         }
 
-        // Changed plist (new bundle path/argv) → replace the stale job first so
-        // launchd re-reads it. `bootout` is best-effort (may already be gone).
+        // The stable config changed, or the job isn't loaded. We must get the new
+        // plist into launchd — but NEVER by booting out a LIVE agent (FIX 1a): a
+        // bootout kills the agent's children, which come back as dead tombstones
+        // (the past "everything came back tombstoned" upgrades). Per CLAUDE.md's
+        // mandated lazy / non-destructive upgrade, if the recorded agent is still
+        // alive we leave it — and its sessions — untouched. The new plist is
+        // already on disk, so the NEXT cold start (reboot, agent crash → KeepAlive
+        // respawn, or the user closing every session) picks it up. The argv
+        // (bundle-relative binary path + per-lineage socket/port/sessions paths)
+        // is stable across app upgrades, so a deferred reload loses nothing — a
+        // later respawn execs the upgraded binary at the same path.
+        //
+        // Note this path is normally only reachable after `dialExisting` already
+        // failed (connect:139), so "alive" here means a live agent that just
+        // wasn't answering the dial in that instant (slow HELLO, socket backlog,
+        // mid-GC). Restarting it then would be the exact destructive mistake; the
+        // caller's `pollDial` retries the dial for 5s instead, and if that still
+        // fails the window falls back to a plain exec surface — the live sessions
+        // are never reset.
+        if loaded && changed && Self.agentProcessAlive(paths: paths) {
+            logger.info("agent LaunchAgent config changed but a live agent (pid from \(paths.portFile.lastPathComponent, privacy: .public)) is running; deferring reload to next cold start (no bootout, sessions preserved)")
+            _ = launchctl(["kickstart", service])
+            return true
+        }
+
+        // Loaded+changed with NO live agent (a genuinely dead/absent agent), or
+        // not loaded at all → safe to (re)bootstrap so launchd re-reads the plist.
+        // `bootout` is best-effort (the job may already be gone).
         if loaded { _ = launchctl(["bootout", service]) }
 
         let (rc, out) = launchctl(["bootstrap", domain, plistURL.path])
@@ -784,6 +837,26 @@ final class LocalAgentManager {
         ]
         return try? PropertyListSerialization.data(
             fromPropertyList: plist, format: .xml, options: 0)
+    }
+
+    /// A comparison key for a LaunchAgent plist that ignores the VOLATILE baked
+    /// env (PATH/SHELL/LANG) so drift in those keys doesn't count as a config
+    /// change (FIX 1b). Parses the plist and strips those env subkeys, returning
+    /// an order-insensitive `NSDictionary` so two plists that differ only in the
+    /// volatile env compare equal. A plist that fails to parse returns nil, which
+    /// `ensureLaunchAgentLoaded` treats as "changed" (fail safe: an unreadable or
+    /// malformed existing plist should be rewritten). The keys stripped here are
+    /// exactly the ones `launchAgentPlistData` inherits from the app environment.
+    private static let volatileEnvKeys = ["PATH", "SHELL", "LANG"]
+    private static func plistComparisonKey(_ data: Data) -> NSDictionary? {
+        guard var plist = (try? PropertyListSerialization.propertyList(
+            from: data, options: [], format: nil)) as? [String: Any]
+        else { return nil }
+        if var env = plist["EnvironmentVariables"] as? [String: Any] {
+            for key in volatileEnvKeys { env.removeValue(forKey: key) }
+            plist["EnvironmentVariables"] = env
+        }
+        return plist as NSDictionary
     }
 
     /// Run `/bin/launchctl` with `args`, returning its exit status + combined
