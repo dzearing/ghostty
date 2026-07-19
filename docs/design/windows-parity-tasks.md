@@ -144,8 +144,10 @@ Work these first, in order, before falling back to first-todo-in-table:
 9. ~~T84~~ (done 2026-07-19: root cause was the inherited ignore-^C
    flag, not ConPTY — fixed by clearing it at App.init; keybinds-t01.ps1
    ALL PASS 23/23).
-10. **T85** — new-window size memory (user complaint 2026-07-19, filed
-   during T24). Work this FIRST before falling back to table order.
+10. ~~T85~~ — DONE 2026-07-19 (new-window size memory; placement
+   persisted on interactive resize/maximize, config > memory > default).
+   **The priority queue is exhausted again** — fall back to
+   first-todo-in-table (next: T25 or T29/T30 Mac-side, T35, T37…).
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -248,7 +250,7 @@ One line per row. Full spec + validation + evidence per task:
 | T81 | FIX: "GUI unresponsive" after agent death under a live relay window — done 2026-07-18: was a PANIC, not a hang (ws close-frame send after `shutdown(.both)` → `WSAESHUTDOWN` → std `unreachable` killed the process) + `onDestroy` leaked the remote transport on every `+close`. New `socket_rw.zig` panic-free socket Reader/Writer; `ipc-relay.ps1` ALL PASS ×3. See details | G | — | done | aeb856ebe |
 | T82 | FIX: `zig build test-agent` has never been green on Windows — 5 pre-existing agent-core integration failures (keepalive ×2, self_update ×3; harness uses `std.net.Stream.read` = `ReadFile`-on-overlapped-socket → GetLastError(87)) + a leaked-thread crash mis-attributed to socket_stream + a pty_child segfault. Found (and proven pre-existing at 52e1fd73b baseline) during T81. Not in the parity validation lanes; fix when Phase-G hardening resumes | G | — | todo | — |
 | T83 | FIX: goto_tab off-by-one on win32 — ctrl+1 selected tab 2, ctrl+2 no-op with 2 tabs; `Window.selectTab` treated the 1-indexed GotoTab payload as 0-based. Now `@min(raw-1, count-1)` w/ raw<1 rejected (Mac/GTK parity incl. out-of-range→last). Found+fixed by T01; validated by `keybinds-t01.ps1` | A | T01 | done | a18611ab5 |
-| T85 | FIX: new windows don't remember size — every window opens at the config/default (small) size (user, 2026-07-19: "why aren't you remembering the size of new windows"). Persist the last user-resized window's outer size (Windows-native: RegisterClass-style placement memory) and use it for new windows when `window-width/height` is unset; interplay with T66's stored initial_size + maximized state. USER-DIRECTED PRIORITY: work this next | I | — | todo | — |
+| T85 | FIX: new windows don't remember size — done 2026-07-19: outer size + maximized flag persisted on user-interactive changes only (WM_EXITSIZEMOVE + max/restore transitions) to `%LOCALAPPDATA%\ghoztty\window_placement` (`-debug` for Debug builds); creation uses config > memory (work-area-clamped) > 800×600; `maximize` config now honored; reset stays the escape hatch; `window-size-memory.ps1` ALL PASS (20) ×3, `reset-window-size.ps1` (focus-free rewrite) ALL PASS (10), P1–P3 + both lanes green | I | — | done | 67b0f24a5 |
 | T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | 3b085a661 |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

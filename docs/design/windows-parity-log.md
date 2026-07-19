@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 22) — T85 DONE (67b0f24a5). New windows now
+  remember the last user-chosen size: placement memory (outer size +
+  maximized) written only on interactive resize (WM_EXITSIZEMOVE) and
+  max/restore transitions; creation precedence config > memory
+  (work-area-clamped) > 800×600; `maximize` config newly honored on
+  win32; reset_window_size untouched-by-design (escape hatch). Debug
+  builds use a `-debug` file so tests never pollute the release memory.
+  Surprise: SendInput chord harnesses ABORT while the user holds
+  foreground — rewrote reset-window-size.ps1 (and built the new
+  window-size-memory.ps1) on focus-free PostMessage'd bare-F-key
+  bindings; validated the approach with an IsZoomed positive control.
+  Next: priority queue empty again — first todo in table.
 - 2026-07-19 (on-box, 21) — T24 DONE. Windows release channel is live:
   win-vX.Y.Z GitHub releases beside the Mac ones (--latest=false; first
   release win-v1.4.1 with the T23-fixed MSI, exe stamped 1.4.1+hash via

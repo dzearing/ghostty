@@ -830,6 +830,33 @@ Windows-native equivalent:
 remembered size; explicit config wins; reset_window_size still resets;
 acceptance script with 3 runs.
 
+*Evidence (done 2026-07-19):* New pure module
+`src/apprt/win32/window_memory.zig` (parse/format/clamp, unit tests in
+both lanes) + storage at `%LOCALAPPDATA%\ghoztty\window_placement`
+(`…-debug` for Debug builds — same coexistence pattern as the debug IPC
+pipe, so test/dev runs never pollute the release memory). Format:
+`<outer-w> <outer-h> <maximized 0|1>`. Persistence is
+user-interaction-only: `WM_EXITSIZEMOVE` (drag resize/move, reads
+GetWindowRect; aero-snap-to-maximize handled via IsZoomed) and
+maximize/restore TRANSITIONS in `WM_SIZE` (maximized stores the RESTORED
+size from `WINDOWPLACEMENT.rcNormalPosition`); programmatic resizes
+(`initial_size`, `reset_window_size`) never write it. Creation
+precedence: `window-width/height` config > memory (clamped to the
+primary work area, SPI_GETWORKAREA) > 800×600; first show honors the
+remembered maximized flag, and the `maximize` config is now honored on
+win32 too (SW_MAXIMIZE at first show). Decisions: position NOT
+persisted (cascade + `window-position-x/y` govern it);
+`reset_window_size` resets the current window only and leaves the
+memory untouched (escape hatch, T66 semantics intact). Validated:
+`test/win32/window-size-memory.ps1` ALL PASS (20) ×3 — fresh-default,
+drag-persist, relaunch-at-remembered, maximize persistence + restored
+size, open-maximized-from-memory, config-beats-memory, work-area clamp,
+corrupt-file fallback, reset-escape-hatch; `reset-window-size.ps1` ALL
+PASS (10; converted to focus-free posted-F-key injection because
+SendInput chords abort while the user holds foreground — PostMessage
+WM_KEYDOWN to the surface HWND dispatches bare-key bindings without
+focus, positive control retained); P1–P3 + both unit lanes green.
+
 ## T25 — Full conformance checklist, spec §8 end-to-end (final gate)
 
 Run spec §8 items 1–10 end-to-end on the box from a fresh start, including
