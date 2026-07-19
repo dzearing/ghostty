@@ -49,6 +49,7 @@ patch_rpath: ?[]const u8 = null,
 flatpak: bool = false,
 snap: bool = false,
 windows_console: bool = false,
+windows_file_version: [4]u16 = .{ 0, 1, 0, 0 },
 emit_bench: bool = false,
 emit_docs: bool = false,
 emit_exe: bool = false,
@@ -185,6 +186,15 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "windows-console",
         "On Windows, link with the Console subsystem instead of the Windows GUI subsystem so stderr/stdout are visible. Useful for debugging release builds. Default false (Windows subsystem) for non-Debug builds; debug builds always use Console.",
     ) orelse false;
+
+    config.windows_file_version = parseFileVersion(b.option(
+        []const u8,
+        "windows-file-version",
+        "4-part a.b.c.d FILEVERSION stamped into ghoztty.exe's VERSIONINFO " ++
+            "(Windows only). Defaults to 0.1.0.0 for dev builds; the MSI " ++
+            "pipeline (dist/windows-installer/build-msi.sh) passes its " ++
+            "per-build number so MSI upgrades replace the exe (T23).",
+    ));
 
     config.sentry = b.option(
         bool,
@@ -703,3 +713,19 @@ pub const ReleaseChannel = enum {
     /// Stable tagged releases.
     stable,
 };
+
+/// Parse a 4-part `a.b.c.d` Windows FILEVERSION string. Missing or
+/// malformed input falls back to the 0.1.0.0 dev baseline (VERSIONINFO
+/// numeric fields are u16s).
+fn parseFileVersion(raw: ?[]const u8) [4]u16 {
+    const dev: [4]u16 = .{ 0, 1, 0, 0 };
+    const s = raw orelse return dev;
+    var out: [4]u16 = dev;
+    var it = std.mem.splitScalar(u8, s, '.');
+    for (&out) |*part| {
+        const piece = it.next() orelse return dev;
+        part.* = std.fmt.parseInt(u16, piece, 10) catch return dev;
+    }
+    if (it.next() != null) return dev;
+    return out;
+}

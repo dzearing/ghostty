@@ -1,10 +1,14 @@
 # Ghoztty on Windows amd64 — port plan
 
 Status: **beta staged as a portable ZIP** — `Ghoztty-portable-x64.zip` is on
-`/Volumes/share/ghoztty-windows/` (extract, run `Ghoztty\ghoztty.exe`). The
-MSI installer is deferred: its major-upgrade path deletes the exe on
-re-install (see postmortems below). Awaiting on-box confirmation that the
-terminal window opens.
+`/Volumes/share/ghoztty-windows/` (extract, run `Ghoztty\ghoztty.exe`).
+The MSI upgrade path is FIXED as of 2026-07-19 (T23): wixl's empty
+File.Version made the packaged exe "unversioned", so file costing skipped
+the copy and RemoveExistingProducts deleted it (the postmortems below).
+build-msi.sh now stamps/mirrors a per-build FILEVERSION, empties
+MsiFileHash, and builds an x64 package; `test/win32/msi-upgrade.ps1`
+proves install → major upgrade → uninstall (+ ghost recovery) end to end.
+MSI rollout as the shipping installer is T24/T38.
 Branch: `users/dzearing/windows-amd64`
 Date started: 2026-07-05
 

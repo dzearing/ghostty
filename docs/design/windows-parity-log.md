@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 20) — T23 DONE. The 26.7.502 vanishing-exe root
+  cause was wixl leaving File.Version EMPTY (packaged exe read as
+  UNVERSIONED → costing skips the copy, early RExP deletes the old one);
+  RExP placement was never the bug. Fix set (build pipeline only):
+  per-build FILEVERSION `-Dwindows-file-version` → rc /d defines, PE
+  version mirrored into the File table post-compile, MsiFileHash
+  emptied (hash-skips = deletions for unchanged share files), wixl -a
+  x64 (was an x86 package registering under WOW6432Node), and a
+  `--test-identity` throwaway-product mode for safe on-box E2E. New
+  `test/win32/msi-upgrade.ps1` ALL PASS (33) ×3: install → major
+  upgrade (exe + all 526 files survive) → uninstall clean → ghost
+  recovery. Surprise: the broken 26.7.502 product is still REGISTERED
+  on the box; left in place deliberately (manual /x would delete live
+  files) — the first real fixed-MSI install majors over it, which is
+  exactly the validated ghost scenario. Next: T24 blocks on this.
+
 - 2026-07-19 (on-box, 19) — T84 DONE. Root cause: inherited ignore-^C
   flag (CREATE_NEW_PROCESS_GROUP up the launcher chain), NOT
   ConPTY/conhost — the cooking worked all along. Probe ladder

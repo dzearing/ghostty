@@ -696,6 +696,52 @@ sequence RExP after InstallFiles; distinct component GUID strategy per
 launches after upgrade; "Ghoztty" appears in Apps & Features; uninstall
 removes it cleanly.
 
+**DONE 2026-07-19.** Diagnosed by dumping the actual MSI tables (Docker
+`debian:stable` + msitools, the T70 recipe): **wixl leaves `File.Version`
+EMPTY** (it cannot read PE resources), so Windows Installer treated the
+packaged exe as UNVERSIONED vs the versioned installed exe (static
+0.1.0.0 rc), refused the overwrite at costing, and the early RExP then
+deleted the old copy — the 26.7.502 vanishing exe. RExP placement was
+never the bug (After="InstallValidate" since day one); costing simply runs
+before RExP removes files, so ANY skip becomes a deletion. Fixes, all in
+the build pipeline (no runtime code):
+
+- `-Dwindows-file-version=a.b.c.d` (Config.zig → GhosttyExe.zig → rc `/d`
+  defines in `dist/windows/ghostty.rc`) stamps a real per-build
+  FILEVERSION (`yy.m.d.NN`, strictly increasing); dev builds keep 0.1.0.0.
+- `build-msi.sh` reads the exe's ACTUAL PE version (VS_FIXEDFILEINFO
+  signature scan — authoritative even under `--skip-build`) and patches it
+  into the MSI File table post-compile (msiinfo export → edit → msibuild).
+- MsiFileHash table emptied: hash-match skips on unchanged unversioned
+  share/ files would also become deletions; without hashes the
+  created/modified-date rule always recopies MSI-installed files.
+- `wixl -a x64` (was an x86 "Intel" package → WOW6432Node registration).
+- New `--test-identity <Name>` builds a throwaway product (own name, dir,
+  UpgradeCode, registry key, component-GUID namespace) so on-box E2E never
+  touches the real product. Real-identity GUIDs unchanged.
+
+*Evidence:* `test/win32/msi-upgrade.ps1` ALL PASS (33) ×3 on-box
+2026-07-19 — v1 install (exe versioned, 526 files, ARP entry, PATH entry,
+`+version` runs), v2 major upgrade (exe PRESENT + version bumped, all 526
+files survive, zero "Disallowing installation" lines in the verbose log,
+single ARP entry with new ProductCode), clean uninstall (dir + ARP + PATH
+all gone), and a **ghost-recovery cycle** (registered product with files
+deleted behind the installer → v2 upgrade lays every file down fresh).
+Recipe: `zig build -Dapp-runtime=win32 -Doptimize=Debug
+-Dwindows-file-version=26.7.19.1` → `build-msi.sh --skip-build
+--test-identity GhozttyT23Test --build-num 1 --version t23v1 --out
+zig-out/t23-v1.msi` (Docker `msitools wixl python3 git` image), same with
+`.2`/`--build-num 2`; then `msi-upgrade.ps1`. Real-identity MSI verified
+x64 + versioned + hash-free. Both test lanes + P1–P3 green.
+
+**Box note:** the broken 26.7.502 "Ghoztty" product is still REGISTERED
+on this box (HKLM WOW6432Node ARP entry, files long gone). Do NOT
+`msiexec /x` it manually — its RemoveFiles would delete same-path files
+out of the live script-delivered `%LOCALAPPDATA%\Programs\Ghoztty`
+install. The first real fixed-MSI install (higher ProductVersion, same
+UpgradeCode) majors-upgrades over it and cleans it — exactly the
+validated ghost-recovery scenario. That rollout belongs to T24/T38.
+
 ## T24 — Windows release channel + enable update check (Phase H)
 
 Publish Windows builds as GitHub releases tagged `win-vX.Y.Z`; remove the

@@ -9,18 +9,28 @@ RT_MANIFEST 24 "ghostty.manifest"
 ID_ICON_GHOSTTY ICON "ghostty.ico"
 
 // Version info — shown in Explorer's Properties → Details and used by
-// installer tooling. The numbers here are baseline; the actual
-// build-time version comes from build_config.version, but the PE
-// resource needs static values at link time.
+// installer tooling. Release/MSI builds pass real per-build numbers via
+// rc /d defines (-Dwindows-file-version, see GhosttyExe.zig): the MSI
+// upgrade path REQUIRES a monotonically increasing FILEVERSION, or
+// Windows Installer's file-versioning rules skip the exe copy on major
+// upgrade while RemoveExistingProducts deletes the old one (the
+// 26.7.502 vanishing-exe postmortem, T23). Dev builds keep the 0.1
+// baseline.
 //
 // VS_VERSION_INFO must resolve to numeric resource ID 1; winres.h
 // normally defines it, but this file is compiled without it, so the
 // block would otherwise become a named resource that GetFileVersionInfo
 // and Explorer never find.
+#ifndef GHOZTTY_FILE_VER
+#define GHOZTTY_FILE_VER 0,1,0,0
+#endif
+#ifndef GHOZTTY_FILE_VER_STR
+#define GHOZTTY_FILE_VER_STR "0.1.0.0"
+#endif
 #define VS_VERSION_INFO 1
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION    0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION    GHOZTTY_FILE_VER
+PRODUCTVERSION GHOZTTY_FILE_VER
 FILEFLAGSMASK  0x3F
 FILEFLAGS      0x0
 FILEOS         0x40004 // VOS_NT_WINDOWS32
@@ -34,12 +44,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "dzearing"
             VALUE "FileDescription",  "Ghoztty terminal emulator (Windows beta)"
-            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "FileVersion",      GHOZTTY_FILE_VER_STR
             VALUE "InternalName",     "ghoztty"
             VALUE "LegalCopyright",   "Ghostty copyright Mitchell Hashimoto; Windows apprt from InsipidPoint/ghostty-windows; Ghoztty fork additions copyright David Zearing. MIT License."
             VALUE "OriginalFilename", "ghoztty.exe"
             VALUE "ProductName",      "Ghoztty"
-            VALUE "ProductVersion",   "0.1.0.0"
+            VALUE "ProductVersion",   GHOZTTY_FILE_VER_STR
         END
     END
     BLOCK "VarFileInfo"

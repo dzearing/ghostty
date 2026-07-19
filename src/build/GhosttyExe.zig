@@ -58,8 +58,20 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 .Console
             else
                 .Windows;
+            // Release/MSI builds stamp a real per-build FILEVERSION so MSI
+            // major upgrades replace the exe (file-versioning rules, T23);
+            // dev builds keep the rc's 0.1.0.0 baseline.
+            const file_ver = cfg.windows_file_version;
             exe.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
+                .flags = &.{
+                    "/d", b.fmt("GHOZTTY_FILE_VER={d},{d},{d},{d}", .{
+                        file_ver[0], file_ver[1], file_ver[2], file_ver[3],
+                    }),
+                    "/d", b.fmt("GHOZTTY_FILE_VER_STR=\"{d}.{d}.{d}.{d}\"", .{
+                        file_ver[0], file_ver[1], file_ver[2], file_ver[3],
+                    }),
+                },
             });
         },
 
