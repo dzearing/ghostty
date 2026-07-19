@@ -906,6 +906,14 @@ pub const Connection = struct {
     pub const client_capabilities = [_][]const u8{protocol.capability.close_session};
 
     /// `create` with explicit health/heartbeat tunables (increment 2).
+    ///
+    /// THREAD-SAFETY INVARIANT: `alloc` MUST be thread-safe. `start` spawns the
+    /// writer + two reader + heartbeat threads, and all of them (plus the caller's
+    /// own RPC calls) allocate/free through this same allocator with no additional
+    /// serialization. The GUI passes the app's thread-safe GPA/`c_allocator`. A CLI
+    /// dialer must NOT pass a bare `ArenaAllocator`/`FixedBufferAllocator` — wrap it
+    /// in a `std.heap.ThreadSafeAllocator` first (see `cli/sessions.zig`), or the
+    /// arena's bookkeeping races corrupt the heap and crash in `rpcCall`.
     pub fn createOpts(
         alloc: Allocator,
         control: Stream,
