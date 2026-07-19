@@ -96,7 +96,18 @@ fn runArgs(
 
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
-    const alloc = arena.allocator();
+    // The agent `Connection` we dial below spawns reader/writer/heartbeat threads
+    // that allocate through the allocator we hand it — concurrently with THIS
+    // thread's own allocations (requestSessions duping the roster, printJson/
+    // printTable, teardown). A bare `ArenaAllocator` is NOT thread-safe, so
+    // sharing it across those threads corrupts the arena's bookkeeping and yields
+    // a wild read/write (an `undefined`-poisoned `0xaa…` pointer) inside
+    // `rpcCall` / `failPendingRpcs` — an intermittent SIGSEGV/SIGBUS in short-lived
+    // CLI runs. Funnel EVERY allocation for this command through one
+    // `ThreadSafeAllocator` over the arena so all of them are serialized. (We keep
+    // the arena for free-all-at-once; the mutex only guards the bookkeeping.)
+    var tsa: std.heap.ThreadSafeAllocator = .{ .child_allocator = arena.allocator() };
+    const alloc = tsa.allocator();
 
     // Locate the local agent's info file and read what to dial.
     const info_path = agentInfoPath(alloc) catch {
