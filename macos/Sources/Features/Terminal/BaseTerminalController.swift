@@ -532,7 +532,22 @@ class BaseTerminalController: NSWindowController,
             effectiveConfig.connectionKeepAlive = remoteConnection
             // session_id stays nil: each split opens a fresh remote session on
             // the same machine/connection.
-            if effectiveConfig.command == nil,
+            //
+            // Command inheritance is for GENUINE remote machines ONLY. There,
+            // re-running the parent's command on a split is the intended §WP4
+            // behavior (e.g. the `+split --from-focused` rapid-remote-split path).
+            // It must NOT apply to the LOCAL session-persistence agent: every
+            // local window/tab/split routes through that agent (default-on), so
+            // inheriting the parent's explicit `-e`/`--command` would make a
+            // Cmd-D split of, say, a `--command="… cl …"` window RE-RUN that
+            // command instead of opening a plain shell — a regression from
+            // upstream Ghostty, where `-e`/`--command` is one-shot for the
+            // surface it was given to and splits always open the default shell.
+            // Gate on the machine being a real remote (the local agent's
+            // loopback machine is `isLocalMachine`), so local splits fall through
+            // with a nil command ⇒ the agent's default shell.
+            if !remoteConnection.machine.isLocalMachine,
+               effectiveConfig.command == nil,
                let parentCommand = Self.remoteInheritance(of: oldView).command {
                 effectiveConfig.command = parentCommand
                 // `wait-after-command` makes libghostty forward this as an EXPLICIT

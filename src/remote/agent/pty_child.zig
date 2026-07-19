@@ -45,6 +45,7 @@ const Allocator = std.mem.Allocator;
 
 const Pty = @import("../../pty.zig").Pty;
 const CommandCore = @import("../../CommandCore.zig");
+const internal_os = @import("../../os/main.zig");
 const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const server = @import("server.zig");
@@ -732,6 +733,29 @@ fn queryCwdWindows(handle: posix.pid_t, alloc: Allocator) ?[]u8 {
 // PtySpawner — turns an OPEN into a pty-backed child (the real `server.Spawner`)
 // -----------------------------------------------------------------------------
 
+/// Pure default-shell selection, extracted from `PtySpawner.spawn` so the
+/// precedence is unit-testable without a real pty spawn (see the test below):
+///   - POSIX:   open_shell → env_shell ($SHELL) → login_shell (getpwuid) → /bin/sh
+///   - Windows: open_shell → env_comspec (%COMSPEC%) → C:\Windows\System32\cmd.exe
+/// Empty candidates are treated as absent. `login_shell` is the launchd-safe
+/// fallback that fixes Bug 2: a LaunchAgent inherits no $SHELL, so without it a
+/// bare `$SHELL → /bin/sh` chain silently drops sessions into /bin/sh.
+fn resolveShellPath(
+    open_shell: ?[]const u8,
+    env_shell: ?[]const u8,
+    env_comspec: ?[]const u8,
+    login_shell: ?[]const u8,
+) []const u8 {
+    if (open_shell) |s| if (s.len > 0) return s;
+    if (is_windows) {
+        if (env_comspec) |s| if (s.len > 0) return s;
+        return "C:\\Windows\\System32\\cmd.exe";
+    }
+    if (env_shell) |s| if (s.len > 0) return s;
+    if (login_shell) |s| if (s.len > 0) return s;
+    return "/bin/sh";
+}
+
 /// Spawns a real pty-backed child per OPEN. The default shell is `$SHELL` (falling
 /// back to `/bin/sh`), invoked login+interactive (`-lic <command>`) when the OPEN
 /// carries a `command`, else just login+interactive (`-li`) for a plain shell —
@@ -833,18 +857,41 @@ pub const PtySpawner = struct {
         const pc = try self.alloc.create(PtyChild);
         errdefer self.alloc.destroy(pc);
 
-        // Resolve the default shell, per-OS:
-        //   - POSIX: OPEN.shell → $SHELL → /bin/sh.
-        //   - Windows: OPEN.shell → %COMSPEC% → C:\Windows\System32\cmd.exe.
-        const shell_path = blk: {
-            if (open.shell) |s| if (s.len > 0) break :blk s;
-            if (is_windows) {
-                if (self.env.get("COMSPEC")) |s| if (s.len > 0) break :blk s;
-                break :blk "C:\\Windows\\System32\\cmd.exe";
+        // POSIX only: the user's LOGIN shell (getpwuid `pw_shell`) is the correct
+        // default when no OPEN.shell and no $SHELL is present — NOT /bin/sh. The
+        // local agent runs as the user, but as a launchd LaunchAgent it inherits
+        // NO $SHELL in its environment, so a bare `$SHELL → /bin/sh` fallback
+        // silently drops interactive sessions (a plain split/tab, or a `--command`
+        // pane after its command exits) into `/bin/sh` instead of the user's real
+        // shell (e.g. zsh). Resolve it env-independently via `getpwuid` so the
+        // right shell is used no matter how the agent was launched. Owned; freed
+        // at function end. (Cross-machine agents forward an explicit OPEN.shell, so
+        // this only ever seeds the LOCAL agent's own default.)
+        var login_shell: ?[:0]const u8 = null;
+        defer if (login_shell) |s| self.alloc.free(s);
+        if (!is_windows and
+            (open.shell == null or open.shell.?.len == 0) and
+            (self.env.get("SHELL") == null or self.env.get("SHELL").?.len == 0))
+        {
+            if (internal_os.passwd.get(self.alloc)) |entry| {
+                login_shell = entry.shell;
+                // We only want the shell; free the other owned fields.
+                if (entry.home) |h| self.alloc.free(h);
+                if (entry.name) |n| self.alloc.free(n);
+            } else |err| {
+                log.warn("failed to resolve login shell, falling back: {}", .{err});
             }
-            if (self.env.get("SHELL")) |s| if (s.len > 0) break :blk s;
-            break :blk "/bin/sh";
-        };
+        }
+
+        // Resolve the default shell (see resolveShellPath), per-OS:
+        //   - POSIX: OPEN.shell → $SHELL → login shell (getpwuid) → /bin/sh.
+        //   - Windows: OPEN.shell → %COMSPEC% → C:\Windows\System32\cmd.exe.
+        const shell_path = resolveShellPath(
+            open.shell,
+            self.env.get("SHELL"),
+            self.env.get("COMSPEC"),
+            login_shell,
+        );
 
         // Build argv. `startCommand`/`startWindows` copies these before exec, so in
         // the PARENT they are dead after `start()` returns — we free them right
@@ -1046,6 +1093,23 @@ fn ptyPreExec(cmd: *Command) ?u8 {
 // =============================================================================
 
 const testing = std.testing;
+
+test "resolveShellPath: POSIX falls back to the login shell before /bin/sh (Bug 2)" {
+    if (is_windows) return error.SkipZigTest;
+
+    // The launchd-LaunchAgent path: no OPEN.shell and no $SHELL. The resolved
+    // default MUST be the login shell (getpwuid), NOT /bin/sh.
+    try testing.expectEqualStrings("/bin/zsh", resolveShellPath(null, null, null, "/bin/zsh"));
+    // Empty strings count as absent, same as null.
+    try testing.expectEqualStrings("/bin/zsh", resolveShellPath("", "", null, "/bin/zsh"));
+    // No login shell either → the last resort is still /bin/sh.
+    try testing.expectEqualStrings("/bin/sh", resolveShellPath(null, null, null, null));
+
+    // Precedence is preserved: OPEN.shell wins over everything, and $SHELL wins
+    // over the login shell (so a real $SHELL is never overridden by getpwuid).
+    try testing.expectEqualStrings("/bin/fish", resolveShellPath("/bin/fish", "/bin/bash", null, "/bin/zsh"));
+    try testing.expectEqualStrings("/bin/bash", resolveShellPath(null, "/bin/bash", null, "/bin/zsh"));
+}
 
 /// A thread-safe sink that captures the pty child's output bytes (it stands in
 /// for `Server.onChildOutput` → the session ring). The reader thread calls it.

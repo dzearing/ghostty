@@ -333,7 +333,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // Keep the connection owner alive across the new surface's deferred free
             // (channel detach). See SurfaceConfiguration.connectionKeepAlive.
             cfg.connectionKeepAlive = parentRemote
-            if cfg.command == nil, let command {
+            // Re-run the parent's explicit command ONLY for a genuine remote
+            // machine (§WP4). The local session-persistence agent is loopback
+            // (`isLocalMachine`); inheriting the command there would make a new
+            // window from a `--command` local window re-run that command instead
+            // of opening a shell — see the gate in BaseTerminalController.newSplit.
+            if !parentRemote.machine.isLocalMachine, cfg.command == nil, let command {
                 cfg.command = command
                 cfg.waitAfterCommand = true
             }
@@ -582,7 +587,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 // Keep the connection owner alive across the new surface's deferred
                 // free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
                 cfg.connectionKeepAlive = parentRemote
-                if cfg.command == nil, let command {
+                // Re-run the parent's explicit command ONLY for a genuine remote
+                // machine (§WP4) — never for the loopback local session-persistence
+                // agent, where it would make a new tab from a `--command` local
+                // window re-run that command instead of opening a shell. See the
+                // gate in BaseTerminalController.newSplit.
+                if !parentRemote.machine.isLocalMachine, cfg.command == nil, let command {
                     cfg.command = command
                     cfg.waitAfterCommand = true
                 }
