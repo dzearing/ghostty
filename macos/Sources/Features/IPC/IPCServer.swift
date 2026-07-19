@@ -2087,6 +2087,15 @@ class IPCServer {
         if let explicit, !explicit.isEmpty { return explicit }
         if let configShell = ghostty.config.commandShell { return configShell }
         if let envShell = ProcessInfo.processInfo.environment["SHELL"], !envShell.isEmpty { return envShell }
+        // Before the last-resort default, resolve the user's LOGIN shell from the
+        // passwd DB (getpwuid → pw_shell). This is env-independent, so it does the
+        // right thing for a non-zsh user even when $SHELL is absent — mirroring the
+        // agent's own getpwuid fallback in pty_child.zig. Hard-coding /bin/zsh only
+        // as the final resort keeps a sane default if passwd lookup fails.
+        if let pw = getpwuid(getuid()), let shellPtr = pw.pointee.pw_shell {
+            let loginShell = String(cString: shellPtr)
+            if !loginShell.isEmpty { return loginShell }
+        }
         return "/bin/zsh"
     }
 
