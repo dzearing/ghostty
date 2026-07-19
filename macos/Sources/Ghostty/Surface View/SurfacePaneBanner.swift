@@ -137,6 +137,14 @@ extension Ghostty {
                         }
                     }
                 }
+                // A checkbox-led first row draws a filled box whose hard top
+                // edge rises above where a text cap sits, so the 8pt block gap
+                // reads tighter above a checklist than above a table or a
+                // bullet/ordered list (whose first row leads with text and
+                // already clears the preceding line). Nudge a checkbox-led list
+                // down so its leading gap matches the paragraph→table gap. Only
+                // the checkbox case needs it; text-led lists already have parity.
+                .padding(.top, leadsWithCheckbox(items) ? 2 : 0)
             case .heading(let str, let level):
                 Text(str)
                     .font(.system(size: headingFontSize(level), weight: .semibold))
@@ -228,6 +236,15 @@ extension Ghostty {
                     row
                 }
             }
+        }
+
+        /// Whether a list block's first row leads with a checkbox marker. Such
+        /// a row draws a filled box whose top edge sits higher than a text cap,
+        /// so it needs extra leading padding to match the paragraph→table gap
+        /// (see the `.list` case). Bullet/ordered lists lead with text and don't.
+        private func leadsWithCheckbox(_ items: [BannerMarkdown.ListItem]) -> Bool {
+            if case .checkbox = items.first?.marker { return true }
+            return false
         }
 
         /// The leading marker of a list row, drawn in the shared gutter column.
