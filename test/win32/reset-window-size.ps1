@@ -9,12 +9,18 @@
 # Oracle: GetClientRect of the top-level GhozttyWindow (harness is
 # per-monitor-v2 DPI aware so pixels are physical).
 #
-# Positive control (T55 pattern): ctrl+alt+j=toggle_maximize with an
-# IsZoomed oracle proves chord injection works; if it fails the script
-# ABORTS (not a T66 verdict). Chord choice matters: ctrl+alt+m is
-# registered as a GLOBAL hotkey by another app on the dev box (the
-# keydown never reaches any ghoztty queue - verified by message-loop
-# tracing 2026-07-18), so this script uses ctrl+alt+j / ctrl+alt+f9.
+# NO focus stealing (converted during T85, 2026-07-19): the original
+# SendInput chords need foreground, which is denied while the user works
+# (the box is in active use - the script ABORTed every run). Actions are
+# now bound to bare F-keys and delivered via PostMessage WM_KEYDOWN/UP to
+# the surface HWND - handleKeyEvent reads the VK from wparam and mods
+# from GetKeyState (none held in the GUI thread's queue), so bindings
+# dispatch without focus. Positive control: f8=toggle_maximize with an
+# IsZoomed oracle proves posted-key dispatch works; if it fails the
+# script ABORTS (not a T66 verdict).
+#
+# LOCALAPPDATA is redirected to a throwaway dir so the T85 placement
+# memory (written by the maximize control) never leaks between tests.
 #
 # Only touches ghoztty processes running from this repo's zig-out*.
 param([string]$ExePath)
@@ -105,43 +111,21 @@ public class RszDrv {
         SetWindowPos(top, IntPtr.Zero, 0, 0, (r.right - r.left) + dw, (r.bottom - r.top) + dh, 0x0004 | 0x0002); // NOZORDER|NOMOVE
     }
 
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint mapType);
 
-    // Press ctrl(+alt)+<vk> `count` times with the pane focused.
-    public static string Chord(IntPtr top, IntPtr surface, ushort vk, int count, bool alt) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        bool fg = false;
-        for (int a = 0; a < 5 && !fg; a++) {
-            SetForegroundWindow(top);
-            Thread.Sleep(200);
-            fg = GetForegroundWindow() == top;
+    // Deliver a bare (modifier-less) key press to the surface HWND via
+    // posted WM_KEYDOWN/WM_KEYUP. No focus/foreground needed (T85).
+    public static void PostKey(IntPtr surface, ushort vk, int count) {
+        uint scan = MapVirtualKeyW(vk, 0); // MAPVK_VK_TO_VSC
+        IntPtr down = (IntPtr)(1 | (scan << 16));
+        IntPtr up = (IntPtr)unchecked((long)(1u | (scan << 16) | 0xC0000000u));
+        for (int n = 0; n < count; n++) {
+            PostMessageW(surface, 0x0100, (IntPtr)vk, down); // WM_KEYDOWN
+            Thread.Sleep(40);
+            PostMessageW(surface, 0x0101, (IntPtr)vk, up);   // WM_KEYUP
+            Thread.Sleep(80);
         }
-        if (!fg) return "ABORT: foreground owned by another window";
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            for (int n = 0; n < count; n++) {
-                Key(0x11, false);
-                if (alt) Key(0x12, false);
-                Thread.Sleep(20);
-                Key(vk, false); Thread.Sleep(20); Key(vk, true);
-                Thread.Sleep(20);
-                if (alt) Key(0x12, true);
-                Key(0x11, true);
-                Thread.Sleep(80);
-            }
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
     }
 }
 '@
@@ -158,6 +142,10 @@ function Kill-RepoInstances {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
 }
+
+# Throwaway LOCALAPPDATA: keeps the T85 placement memory out of real state.
+$script:fakeLocal = Join-Path $env:TEMP ("ghoztty-t66-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $script:fakeLocal | Out-Null
 
 # Poll until the client area equals "w,h" (exact) or times out; returns
 # the last observed "w,h".
@@ -176,10 +164,17 @@ function Wait-Client([IntPtr]$top, [string]$want, [int]$ms = 4000) {
 function Launch([string[]]$configArgs) {
     Kill-RepoInstances
     $cliArgs = @(
-        '--keybind=ctrl+alt+f9=reset_window_size'
-        '--keybind=ctrl+alt+j=toggle_maximize'
+        '--keybind=f9=reset_window_size'
+        '--keybind=f8=toggle_maximize'
+        '--keybind=f7=increase_font_size:1'
     ) + $configArgs
-    $p = Start-Process -FilePath $exe -ArgumentList $cliArgs -PassThru
+    $savedLocal = $env:LOCALAPPDATA
+    $env:LOCALAPPDATA = $script:fakeLocal
+    try {
+        $p = Start-Process -FilePath $exe -ArgumentList $cliArgs -PassThru
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+    }
     Start-Sleep -Seconds 3
     if ($p.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
     $tops = [RszDrv]::Tops([uint32]$p.Id)
@@ -201,39 +196,35 @@ Write-Host "INFO  configured initial client = $init"
 Assert ($initW -gt 0 -and $initH -gt 0) "cfg: initial client size readable ($init)"
 Assert (-not ($initW -eq 800 -and $initH -eq 600)) 'cfg: configured size is not the 800x600 fallback'
 
-# Positive control: ctrl+alt+j must maximize (chord injection works).
-$r = [RszDrv]::Chord($top, $pane, 0x4A, 1, $true)
-if ($r -ne 'SENT') { Write-Host "ABORT: control chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+# Positive control: posted f8 must maximize (posted-key dispatch works).
+[RszDrv]::PostKey($pane, 0x77, 1)   # VK_F8
 $zoomed = $false
 for ($t = 0; $t -lt 15; $t++) { Start-Sleep -Milliseconds 200; if ([RszDrv]::IsZoomed($top)) { $zoomed = $true; break } }
 if (-not $zoomed) {
-    Write-Host 'ABORT: ctrl+alt+j did not maximize - injection/keybind broken, not a T66 verdict'
+    Write-Host 'ABORT: posted f8 did not maximize - key injection/binding broken, not a T66 verdict'
     Stop-Process -Id $proc.Id -Force; exit 1
 }
-Write-Host 'OK    positive control: ctrl+alt+j maximized the window'
-$r = [RszDrv]::Chord($top, $pane, 0x4A, 1, $true)   # restore
+Write-Host 'OK    positive control: posted f8 maximized the window'
+[RszDrv]::PostKey($pane, 0x77, 1)   # restore
 Start-Sleep -Milliseconds 600
-Assert (-not [RszDrv]::IsZoomed($top)) 'cfg: ctrl+alt+j again restored the window'
+Assert (-not [RszDrv]::IsZoomed($top)) 'cfg: posted f8 again restored the window'
 
 # Resize away from the default, then reset must return EXACTLY to it.
 [RszDrv]::Resize($top, 240, 130)
 Start-Sleep -Milliseconds 400
 $stretched = [RszDrv]::Client($top)
 Assert ($stretched -ne $init) "cfg: manual resize changed the client area ($init -> $stretched)"
-$r = [RszDrv]::Chord($top, $pane, 0x78, 1, $true)   # ctrl+alt+f9
-if ($r -ne 'SENT') { Write-Host "ABORT: reset chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+[RszDrv]::PostKey($pane, 0x78, 1)   # VK_F9 = reset_window_size
 $after = Wait-Client $top $init
 Assert ($after -eq $init) "cfg: reset returned to configured size ($after == $init), not 800x600"
 
 # Font zoom: initial_size re-sends are STORE-ONLY - the window must not
 # live-resize - but reset afterwards goes to the recomputed default.
-$r = [RszDrv]::Chord($top, $pane, 0xBB, 3, $false)  # ctrl+= x3
-if ($r -ne 'SENT') { Write-Host "ABORT: zoom chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+[RszDrv]::PostKey($pane, 0x76, 3)   # VK_F7 = increase_font_size x3
 Start-Sleep -Milliseconds 900
 $afterZoom = [RszDrv]::Client($top)
 Assert ($afterZoom -eq $init) "cfg: font zoom did not live-resize the window ($afterZoom == $init)"
-$r = [RszDrv]::Chord($top, $pane, 0x78, 1, $true)
-if ($r -ne 'SENT') { Write-Host "ABORT: reset chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+[RszDrv]::PostKey($pane, 0x78, 1)   # VK_F9 = reset_window_size
 Start-Sleep -Milliseconds 1200
 $reset2 = [RszDrv]::Client($top)
 $r2W, $r2H = Parse-WH $reset2
@@ -251,12 +242,13 @@ if ($pane -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no terminal pane (case B
 [RszDrv]::Resize($top, 220, 140)
 Start-Sleep -Milliseconds 400
 $before = [RszDrv]::Client($top)
-$r = [RszDrv]::Chord($top, $pane, 0x78, 1, $true)
-if ($r -ne 'SENT') { Write-Host "ABORT: reset chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+[RszDrv]::PostKey($pane, 0x78, 1)   # VK_F9 = reset_window_size
 $after = Wait-Client $top '800,600'
 Assert ($after -eq '800,600') "fallback: reset with no configured size went to 800x600 (was $before, got $after)"
 Assert (-not $proc.HasExited) 'fallback: no crash'
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+Remove-Item -Recurse -Force $script:fakeLocal -ErrorAction SilentlyContinue
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }

@@ -74,6 +74,7 @@ const dim_math = @import("dim_math.zig");
 const color_math = @import("color_math.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
+const window_memory = @import("window_memory.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -233,6 +234,15 @@ resize_overlay_hwnd: ?w32.HWND = null,
 /// True once the initial WM_SIZE has been seen; resize-overlay =
 /// after-first suppresses the overlay for that first layout pass.
 resize_seen_first: bool = false,
+
+/// Show the window maximized on its first ShowWindow (T85): set when the
+/// remembered placement was maximized or the `maximize` config is on.
+start_maximized: bool = false,
+
+/// Tracks the maximized state across WM_SIZE so only real
+/// maximize/restore TRANSITIONS persist the placement memory (T85) —
+/// SIZE_RESTORED fires for every programmatic resize too.
+was_maximized: bool = false,
 
 /// IPC surface-config overrides consumed by the NEXT Surface.init in this
 /// window (see Surface.Overrides). Set immediately before addTab/newSplit
@@ -487,6 +497,39 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     const cascade_step: i32 = 30;
     var cx: i32 = w32.CW_USEDEFAULT;
     var cy: i32 = w32.CW_USEDEFAULT;
+
+    // Outer creation size (T85): explicit window-width/height config wins
+    // (the core sends `initial_size` which resizes after creation, so keep
+    // the plain default and let it), else the remembered last user-chosen
+    // size (clamped to the primary work area), else the built-in default.
+    var width: i32 = 800;
+    var height: i32 = 600;
+    if (!options.is_quick_terminal) {
+        const config_sized = app.config.@"window-width" > 0 and
+            app.config.@"window-height" > 0;
+        if (!config_sized) {
+            if (window_memory.load(app.core_app.alloc)) |remembered| {
+                var work: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                const clamped = if (w32.SystemParametersInfoW(
+                    w32.SPI_GETWORKAREA,
+                    0,
+                    @ptrCast(&work),
+                    0,
+                ) != 0) window_memory.clampToWorkArea(
+                    remembered,
+                    work.right - work.left,
+                    work.bottom - work.top,
+                ) else remembered;
+                width = clamped.width;
+                height = clamped.height;
+                self.start_maximized = remembered.maximized;
+            }
+        }
+        // `maximize` config: open maximized regardless of the memory
+        // (Mac/GTK honor it; the remembered/config size stays the restored
+        // size underneath).
+        if (app.config.maximize) self.start_maximized = true;
+    }
     // Honor an explicit configured window position; it takes precedence over
     // the cascade below. Only when BOTH coordinates are set — passing
     // CW_USEDEFAULT for one axis is not a valid literal coordinate (Win32
@@ -512,8 +555,8 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
                 cx = prev_rect.left + cascade_step;
                 cy = prev_rect.top + cascade_step;
                 // Reset the cascade if it would push off-screen.
-                if (cx + 800 > w32.GetSystemMetrics(0) or
-                    cy + 600 > w32.GetSystemMetrics(1))
+                if (cx + width > w32.GetSystemMetrics(0) or
+                    cy + height > w32.GetSystemMetrics(1))
                 {
                     cx = w32.CW_USEDEFAULT;
                     cy = w32.CW_USEDEFAULT;
@@ -533,8 +576,8 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         style,
         cx,
         cy,
-        800,
-        600,
+        width,
+        height,
         null,
         null,
         app.hinstance,
@@ -854,7 +897,13 @@ pub fn addTab(self: *Window) !*Surface {
         // Quick terminal windows are shown by QuickTerminal.animateIn() instead.
         if (!self.is_quick_terminal) {
             if (self.hwnd) |h| {
-                _ = w32.ShowWindow(h, w32.SW_SHOW);
+                // T85: first show honors the remembered/config maximized
+                // state. The pre-show size (remembered or initial_size)
+                // remains the restored size underneath.
+                _ = w32.ShowWindow(
+                    h,
+                    if (self.start_maximized) w32.SW_MAXIMIZE else w32.SW_SHOW,
+                );
                 _ = w32.UpdateWindow(h);
             }
         }
@@ -2611,6 +2660,38 @@ fn handleResize(self: *Window) void {
     self.showResizeOverlay();
 }
 
+/// Persist the window's outer size + maximized flag as the placement
+/// memory for future windows (T85). When maximized, the RESTORED size is
+/// stored (WINDOWPLACEMENT.rcNormalPosition, Windows convention) so a
+/// later un-maximized window opens at the last real user size.
+fn savePlacement(self: *Window, maximized: bool) void {
+    if (self.is_quick_terminal) return;
+    const hwnd = self.hwnd orelse return;
+
+    var w: i32 = 0;
+    var h: i32 = 0;
+    if (maximized) {
+        var wp: w32.WINDOWPLACEMENT = undefined;
+        wp.length = @sizeOf(w32.WINDOWPLACEMENT);
+        if (w32.GetWindowPlacement(hwnd, &wp) == 0) return;
+        w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+        h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+    } else {
+        var r: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        if (w32.GetWindowRect(hwnd, &r) == 0) return;
+        w = r.right - r.left;
+        h = r.bottom - r.top;
+    }
+    if (w < window_memory.MIN_DIM or h < window_memory.MIN_DIM) return;
+    if (w > window_memory.MAX_DIM or h > window_memory.MAX_DIM) return;
+
+    window_memory.save(self.app.core_app.alloc, .{
+        .width = w,
+        .height = h,
+        .maximized = maximized,
+    });
+}
+
 /// Show the transient "columns × rows" overlay during a resize, honoring
 /// the resize-overlay / -position / -duration config. Auto-hides via a
 /// timer that each subsequent resize re-arms.
@@ -3431,6 +3512,17 @@ pub fn windowWndProc(
             if (wparam == w32.SIZE_RESTORED or wparam == w32.SIZE_MAXIMIZED) {
                 window.setActiveTabVisible(true);
             }
+            // T85: persist maximize/restore TRANSITIONS only —
+            // SIZE_RESTORED also fires for every programmatic resize
+            // (initial_size, reset_window_size), which must not write
+            // the placement memory.
+            if (wparam == w32.SIZE_MAXIMIZED and !window.was_maximized) {
+                window.was_maximized = true;
+                window.savePlacement(true);
+            } else if (wparam == w32.SIZE_RESTORED and window.was_maximized) {
+                window.was_maximized = false;
+                window.savePlacement(false);
+            }
             window.handleResize();
             return 0;
         },
@@ -3478,6 +3570,13 @@ pub fn windowWndProc(
                 var it = window.tab_trees[window.active_tab].iterator();
                 while (it.next()) |entry| entry.view.in_live_resize = false;
             }
+            // T85: the user finished an interactive resize/move — remember
+            // the outer size. Drag-to-top ("aero snap" maximize) can zoom
+            // the window before this arrives, so read the live state and
+            // keep the WM_SIZE transition tracker in sync.
+            const zoomed = w32.IsZoomed(hwnd) != 0;
+            window.was_maximized = zoomed;
+            window.savePlacement(zoomed);
             return 0;
         },
         w32.WM_CLOSE => {

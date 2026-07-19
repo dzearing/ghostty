@@ -1204,6 +1204,24 @@ pub const NULL_BRUSH: i32 = 5;
 pub extern "user32" fn SystemParametersInfoW(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWinIni: u32) callconv(.winapi) i32;
 pub const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 
+// Window-placement memory (T85): primary-monitor work area + the restored
+// (normal) rect of a maximized window.
+pub const SPI_GETWORKAREA: u32 = 0x0030;
+
+pub const WINDOWPLACEMENT = extern struct {
+    length: u32,
+    flags: u32,
+    showCmd: u32,
+    ptMinPosition: POINT,
+    ptMaxPosition: POINT,
+    rcNormalPosition: RECT,
+};
+
+pub extern "user32" fn GetWindowPlacement(
+    hWnd: HWND,
+    lpwndpl: *WINDOWPLACEMENT,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn BeginPaint(hwnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
 pub extern "user32" fn EndPaint(hwnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) i32;
 

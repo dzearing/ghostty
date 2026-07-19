@@ -84,4 +84,8 @@ test {
 
     // Pure win32 update-check tag scan/compare (T24), same no-OS-imports deal.
     _ = @import("apprt/win32/update_check.zig");
+
+    // Pure win32 window-placement memory parse/format/clamp (T85), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/window_memory.zig");
 }
