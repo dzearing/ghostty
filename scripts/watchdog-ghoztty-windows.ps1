@@ -106,6 +106,16 @@ while ($true) {
         Start-Sleep -Seconds 2
 
         if (-not $NoResume) {
+            # Scrub Claude-harness env vars so the auto-launched GUI (and
+            # thus every future pane shell) doesn't inherit them — a
+            # watchdog started from a Claude tool shell carries NO_COLOR=1
+            # etc., which turned all Claude panes black-and-white (see
+            # upgrade-ghoztty-windows.ps1, same scrub).
+            $scrub = @('NO_COLOR', 'FORCE_COLOR', 'GIT_TERMINAL_PROMPT', 'CLAUDECODE', 'CLAUDE_PID', 'AI_AGENT') +
+                @(Get-ChildItem env: | Where-Object { $_.Name -like 'CLAUDE_CODE_*' } | ForEach-Object Name)
+            foreach ($v in $scrub) { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
+            Log "relaunch env scrubbed: $($scrub -join ', ')"
+
             $exe = Join-Path $InstallDir 'ghoztty.exe'
             & $exe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
                 ForEach-Object { Log "relaunch: $_" }

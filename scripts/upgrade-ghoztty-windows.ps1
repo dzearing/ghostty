@@ -105,6 +105,17 @@ if (Test-Path $stagingShare) {
 
 if ($NoResume) { Log 'UPGRADE OK (no-resume)'; exit 0 }
 
+# Scrub Claude-harness env vars before the relaunch. This script is
+# normally Start-Process'd from a Claude Code tool shell, whose env
+# carries NO_COLOR=1 and per-session CLAUDE_* markers; the +new-window
+# below auto-launches the GUI, which would inherit them and pass them to
+# EVERY future pane's shell (found live 2026-07-14: all Claude panes
+# rendered black-and-white because the GUI held NO_COLOR=1).
+$scrub = @('NO_COLOR', 'FORCE_COLOR', 'GIT_TERMINAL_PROMPT', 'CLAUDECODE', 'CLAUDE_PID', 'AI_AGENT') +
+    @(Get-ChildItem env: | Where-Object { $_.Name -like 'CLAUDE_CODE_*' } | ForEach-Object Name)
+foreach ($v in $scrub) { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
+Log "relaunch env scrubbed: $($scrub -join ', ')"
+
 # Auto-launches the freshly installed exe (the pipe owner died with the kill).
 & $oldExe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
     ForEach-Object { Log "relaunch: $_" }
