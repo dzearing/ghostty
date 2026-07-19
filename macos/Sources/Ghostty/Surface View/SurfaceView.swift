@@ -735,6 +735,14 @@ extension Ghostty {
         /// a different remote OS (the stall-fix invariant).
         var remoteShell: String?
 
+        /// WP-D3 fast re-attach: the persisted structured VT screen snapshot to
+        /// paint on ATTACH (raw bytes; base64-decoded from the layout manifest)
+        /// and the absolute agent-stream byte offset it reflects (the ATTACH
+        /// last_byte_offset). Set only on a session-layout restore of a remote
+        /// pane. nil/0 ⇒ full-ring replay (no snapshot, or a legacy manifest).
+        var remoteRestoreSnapshot: Data?
+        var remoteRestoreByteOffset: UInt64 = 0
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -849,6 +857,26 @@ extension Ghostty {
                                                 // agent's own default shell).
                                                 return try remoteShell.withCString { cRemoteShell in
                                                     config.remote_shell = cRemoteShell
+                                                    // WP-D3: hand the persisted
+                                                    // screen snapshot + offset to
+                                                    // the C config for a fast,
+                                                    // visually-correct re-attach.
+                                                    // Bytes stay valid for the
+                                                    // body call via withUnsafeBytes.
+                                                    config.restore_byte_offset =
+                                                        remoteRestoreByteOffset
+                                                    if let snap = remoteRestoreSnapshot,
+                                                       !snap.isEmpty {
+                                                        return try snap.withUnsafeBytes {
+                                                            (raw: UnsafeRawBufferPointer) in
+                                                            config.restore_snapshot =
+                                                                raw.bindMemory(to: CChar.self)
+                                                                    .baseAddress
+                                                            config.restore_snapshot_len =
+                                                                UInt(raw.count)
+                                                            return try body(&config)
+                                                        }
+                                                    }
                                                     return try body(&config)
                                                 }
                                             }

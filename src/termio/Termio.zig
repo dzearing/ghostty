@@ -752,6 +752,34 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.processOutputLocked(buf);
 }
 
+/// Like `processOutput` but also advances `applied` by `buf.len` while still
+/// holding the renderer mutex. Used by the remote drain path (WP-D3) so a
+/// concurrent snapshot reader — which holds the SAME mutex to serialize the
+/// grid — always observes the applied byte count and the grid it produced as
+/// one consistent pair. Without this the offset could be read a chunk ahead of
+/// or behind the grid, seaming the snapshot against the agent's delta replay.
+pub fn processOutputTracked(
+    self: *Termio,
+    buf: []const u8,
+    applied: *std.atomic.Value(u64),
+) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.processOutputLocked(buf);
+    _ = applied.fetchAdd(buf.len, .monotonic);
+}
+
+/// The absolute agent-stream byte offset this pane has applied to its terminal
+/// so far (WP-D3), or null for a non-remote backend. Read under the renderer
+/// mutex alongside a grid dump to persist a consistent (screen, offset) pair
+/// for a fast delta re-attach. See `Remote.appliedOffset`.
+pub fn remoteAppliedOffset(self: *const Termio) ?u64 {
+    return switch (self.backend) {
+        .remote => |*r| r.appliedOffset(),
+        else => null,
+    };
+}
+
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.

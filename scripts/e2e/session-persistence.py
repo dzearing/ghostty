@@ -1051,6 +1051,254 @@ def run_sigterm_check(args, baseline):
     return 0
 
 # ---------------------------------------------------------------------------
+# WP-D3: fast, visually-correct re-attach (structured snapshot + delta replay)
+# ---------------------------------------------------------------------------
+# The headline bug: on relaunch the app replayed the agent's whole ~2MB byte
+# ring and RE-PARSED it from scratch per pane. Measured on an M-series Mac:
+# empty ring 0.74s vs full ring 2.78s (scales with content, >10s with real
+# output). The fix persists the app's OWN parsed screen state on (graceful)
+# quit and re-attaches at the byte offset it reflects, so the agent replays only
+# the tiny gap. This check proves the ring size no longer drives restore time.
+def read_manifest():
+    """The persisted session-layout manifest (list of window entries), or []."""
+    try:
+        with open(MANIFEST) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def manifest_leaves():
+    """Flatten every leaf dict out of the manifest tree(s). Swift's Codable
+    encodes the `Node` enum as {"leaf": {"_0": Leaf}} / {"split": {"_0": Split}},
+    so the payload is under the "_0" key."""
+    def walk(node):
+        if node is None:
+            return []
+        if "leaf" in node:
+            return [node["leaf"].get("_0", node["leaf"])]
+        if "split" in node:
+            s = node["split"].get("_0", node["split"])
+            return walk(s.get("left")) + walk(s.get("right"))
+        return []
+    out = []
+    for entry in read_manifest():
+        out.extend(walk(entry.get("tree")))
+    return out
+
+_token_counter = 0
+def next_token(tag):
+    global _token_counter
+    _token_counter += 1
+    return f"{tag}{_token_counter:03d}"
+
+def send_echo_and_wait(pane, token, timeout):
+    """send-keys `echo <token>` into the pane's shell and wait for it to echo
+    back — proof the pane is a LIVE, interactive shell (accepting input), the
+    cleanest 'interactive' signal and immune to background-output timing."""
+    cli_ok(["+send-keys", f"--target={pane}", f"echo {token}", "Enter"])
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if token in read_pane(pane, 400):
+            return True
+        time.sleep(0.1)
+    return False
+
+def graceful_relaunch_measure(pane, timeout=25.0):
+    """Graceful-quit + relaunch. Return (gap_seconds, manifest_leaves). The gap
+    is from app-gone to the restored pane accepting input (a send-keys echo
+    round-trips) — i.e. re-attached AND interactive, the headline SLA metric.
+    Reads the manifest while the app is down so the caller can assert a snapshot
+    was captured. Uses send-keys (not a background tick) so the measurement is
+    NOT gated behind any in-pane command finishing."""
+    pids = app_pids()
+    if not pids:
+        raise E2EError("no app to quit")
+    graceful_quit(pids)
+    t_gone = time.time()
+    leaves = manifest_leaves()  # captured on quit, before we relaunch
+    launch_app()
+    wait_app_ready()
+    deadline = time.time() + timeout
+    while time.time() < deadline and pane not in all_leaf_names():
+        time.sleep(0.1)
+    tok = next_token("ALIVE")
+    if not send_echo_and_wait(pane, tok, timeout=max(2.0, deadline - time.time())):
+        raise E2EError(f"restored pane {pane} not interactive within {timeout}s")
+    return time.time() - t_gone, leaves
+
+def alive_session_pids():
+    """The set of alive child PIDs the agent reports (+sessions --json). Stable
+    across an app kill/relaunch when a session SURVIVES; a restart changes the
+    pid. Used for a survival check that does NOT depend on scrollback (the
+    PANE= marker scrolls out of a big-ring pane after restore)."""
+    rc, out, _ = run_cli(["+sessions", "--json"], timeout=10)
+    if rc != 0:
+        return set()
+    start = out.find("[")
+    if start < 0:
+        return set()
+    try:
+        sessions = json.loads(out[start:])
+    except json.JSONDecodeError:
+        return set()
+    return {obj.get("pid") for obj in sessions
+            if obj.get("alive", False) and obj.get("pid")}
+
+def wait_new_leaf(known, timeout=15.0):
+    """Poll until a leaf name NOT in `known` appears; return it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            new = [n for n in all_leaf_names() if n not in known]
+        except E2EError:
+            new = []
+        if len(new) == 1:
+            return new[0]
+        time.sleep(0.3)
+    raise E2EError(f"no new leaf appeared within {timeout}s (known={known})")
+
+def close_leaves(names):
+    deadline = time.time() + 12
+    while time.time() < deadline and any(n in all_leaf_names() for n in names):
+        for nm in names:
+            cli_ok(["+close", f"--target={nm}"])
+        time.sleep(0.5)
+
+def make_shell_window(target, known):
+    """Open a plain-shell window (default shell, no command) and return its new
+    pane's stable name (surface uuid — survives relaunch)."""
+    retry_cli(["+new-window", f"--target={target}"], f"new {target}")
+    return wait_new_leaf(known)
+
+def fill_ring(pane, landmark, chunks, chunk_lines=100):
+    """Fill the agent's ~2MB ring with PACED wide-line output, then a unique
+    sentinel. Produces `chunks` bursts of `chunk_lines` ~190-char lines with a
+    small sleep between them, so the app parses in real time and stays CAUGHT UP
+    (mirroring real interactive output) instead of building a multi-MB backlog a
+    one-shot dump would — the app's applied offset (the snapshot anchor) must
+    reach the agent's produced total for the delta re-attach to be tiny. Uses
+    `yes <bareword> | head` (NO quotes — quoted programs get mangled through
+    +send-keys, silently running only the trailing echo → a spurious pass). Wait
+    until the sentinel echoes back: the dump landed and the shell is idle again."""
+    wide = "x" * 190  # bare word: no zsh '=expansion' / glob / quote hazards
+    # ~240 KB/s: slower than the app's parse rate so it stays caught up in real
+    # time (the applied offset must reach the produced total for a tiny delta).
+    cmd = (f"i=0; while [ $i -lt {chunks} ]; do yes {wide} | head -n {chunk_lines}; "
+           f"i=$((i+1)); sleep 0.08; done; echo {landmark}")
+    cli_ok(["+send-keys", f"--target={pane}", cmd, "Enter"])
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if landmark in read_pane(pane, 300):
+            return True
+        time.sleep(0.5)
+    return False
+
+def run_fast_restore_check(args):
+    """WP-D3: relaunch→interactive time must stay near the empty-ring baseline
+    regardless of ring size, because the app restores its own parsed screen
+    snapshot and re-attaches at the offset it reflects (delta replay) instead of
+    re-parsing the whole ring. Measures a near-empty ring and a full (>2MB) ring
+    under GRACEFUL quit (the real upgrade/quit path that captures a snapshot) and
+    asserts the full-ring restore did NOT scale with content."""
+    failures = []
+    fill_chunks = 130               # 130 × 100 × ~191B ≈ 2.5MB paced → ring wrapped
+    landmark = "FILLDONE-9753124"   # distinctive tail line the snapshot must keep
+
+    launch_app(); wait_app_ready(); wait_window_count(1)
+    initial = set(all_leaf_names())
+
+    # --- EMPTY (baseline): one plain-shell window, tiny ring ---
+    log("[fast] EMPTY baseline: plain-shell window, graceful relaunch")
+    e_pane = make_shell_window("frE", initial)
+    close_leaves(initial)  # drop the blank initial window; leave only frE
+    wait_window_count(1)
+    if not send_echo_and_wait(e_pane, next_token("WARM"), 8):
+        failures.append("empty pane never became interactive before baseline measure")
+    gap_empty, _ = graceful_relaunch_measure(e_pane)
+    log(f"    gap_empty = {gap_empty:.2f}s")
+
+    # --- FULL: one plain-shell window whose ring is filled past 2MB ---
+    log(f"[fast] FULL: fill ring with {fill_chunks} paced chunks (>2MB), graceful relaunch")
+    keep = set(all_leaf_names())
+    f_pane = make_shell_window("frF", keep)
+    if not send_echo_and_wait(f_pane, next_token("WARM"), 8):
+        failures.append("full pane never became interactive before fill")
+    if not fill_ring(f_pane, landmark, fill_chunks):
+        failures.append(f"fill did not complete (landmark {landmark} never appeared)")
+    # Let the app finish draining/parsing the fill backlog so its applied offset
+    # (the snapshot anchor) catches up to the produced total. A one-shot sustained
+    # fill outruns the parser; in real interactive use output is paced and the app
+    # stays caught up between bursts — this idle settle reproduces that steady
+    # state. The offset assertion below verifies catch-up actually happened.
+    time.sleep(22.0)
+    pre_pids = alive_session_pids()
+    gap_full, leaves = graceful_relaunch_measure(f_pane)
+    post_pids = alive_session_pids()
+    f_text = read_pane(f_pane, 800)
+    log(f"    gap_full = {gap_full:.2f}s")
+
+    # 1) A snapshot WAS captured on quit for the FILLED pane, at a LARGE offset —
+    #    proving the ring was genuinely wrapped past 2MB (not a spurious pass on
+    #    an unfilled pane) AND that the app's applied offset caught up to it.
+    full_leaf = next((l for l in leaves
+                      if (l.get("surfaceID") or "").lower() == f_pane.lower()), None)
+    if full_leaf is None:
+        failures.append(f"filled pane {f_pane} not found in quit manifest by surfaceID")
+    else:
+        off = full_leaf.get("screenSnapshotOffset") or 0
+        snaplen = len(full_leaf.get("screenSnapshot") or "")
+        if snaplen == 0:
+            failures.append("filled pane's manifest leaf has no screenSnapshot "
+                            "(snapshot not captured → would fall back to full replay)")
+        elif off < 1_000_000:
+            failures.append(f"filled pane snapshot offset {off} < 1MB — the ring was NOT "
+                            f"actually filled (test would pass spuriously); check the fill")
+        else:
+            log(f"    ✓ filled pane snapshot captured: offset={off} (>2MB ring wrapped), "
+                f"snapshot={snaplen}B base64")
+
+    # 2) Restore stayed FAST: the >2MB ring did not scale restore time. Old code
+    #    added ~2s of re-parse (0.74s → 2.78s); the fix keeps full ≈ empty.
+    penalty = gap_full - gap_empty
+    if penalty >= 1.5:
+        failures.append(f"full-ring restore {gap_full:.2f}s is {penalty:.2f}s slower than "
+                        f"empty {gap_empty:.2f}s (ring size still drives restore → re-parse not avoided)")
+    else:
+        log(f"    ✓ ring-size penalty {penalty:.2f}s < 1.5s (restore does not scale with ring)")
+    if gap_full >= 4.0:
+        failures.append(f"full-ring restore {gap_full:.2f}s >= 4s (too slow)")
+
+    # 3) Visually correct: the restored pane still shows the tail landmark
+    #    (content painted from the snapshot, not lost).
+    if landmark not in f_text:
+        failures.append(f"restored pane missing tail landmark {landmark} "
+                        "(snapshot did not paint the visible content)")
+    else:
+        log(f"    ✓ restored pane shows tail landmark {landmark} (content correct)")
+
+    # 4) Process SURVIVED (re-attached, not restarted): every child pid alive
+    #    before the quit is still alive after restore.
+    if pre_pids and not pre_pids.issubset(post_pids):
+        failures.append(f"a child pid did not survive the relaunch "
+                        f"(pre={sorted(pre_pids)} post={sorted(post_pids)} — restarted, not re-attached)")
+    elif pre_pids:
+        log(f"    ✓ child pid(s) survived re-attach: {sorted(pre_pids & post_pids)}")
+
+    if not args.keep:
+        close_leaves([e_pane, f_pane])
+
+    log("=" * 70)
+    if failures:
+        log(f"RESULT: FAIL — {len(failures)} assertion(s) failed")
+        for f in failures:
+            log(f"    ✗ {f}")
+        return 1
+    log(f"RESULT: PASS — relaunch→interactive stayed fast with a >2MB ring "
+        f"(empty {gap_empty:.2f}s vs full {gap_full:.2f}s, penalty "
+        f"{gap_full-gap_empty:.2f}s); snapshot captured, content restored, process survived")
+    return 0
+
+# ---------------------------------------------------------------------------
 # Winsize / re-attach resize integrity (the "big window, small content" bug)
 # ---------------------------------------------------------------------------
 def agent_pane_ttys():
@@ -1106,6 +1354,16 @@ def ax_resize_all_windows(pid, width, height):
     if p.returncode != 0:
         raise E2EError(f"AX resize failed: {p.stderr.strip()}")
 
+def ax_available():
+    """True if we can drive windows via System Events (Automation permission).
+    Some environments authorize `tell application id ... to quit` but NOT
+    `tell application "System Events"` (error -1743), so AX-based window resizing
+    is unavailable there — the winsize check then falls back to an AX-free path."""
+    p = subprocess.run(
+        ["/usr/bin/osascript", "-e", 'tell application "System Events" to count processes'],
+        capture_output=True, text=True, timeout=15)
+    return p.returncode == 0
+
 def poll_sizes(ttys, pred, timeout=8.0):
     """Poll each tty's winsize until pred(sizes) or timeout; return last sizes."""
     deadline = time.time() + timeout
@@ -1160,23 +1418,35 @@ def run_winsize_check(args):
         raise E2EError("no app pid")
     pid = pids[0]
 
-    # Resize to a deliberate reference size WELL AWAY from the config default
-    # (a resize to the size the window already has produces no events at all)
-    # and capture the PTY sizes.
-    base = {n: stty_size(t) for n, t in ttys.items()}
-    log(f"[winsize] pre-resize PTY sizes: {base}")
-    ax_resize_all_windows(pid, 1000, 640)
-    ref = poll_sizes(ttys, lambda s: s != base)
-    if ref == base:
-        raise E2EError(f"pre-kill window resize never reached the PTYs: {ref}")
-    # Keep only the sessions that tracked the window resize: those are wsW/wsR.
-    # A just-closed session (the initial window; alive only until its undo
-    # window expires and the CLOSE lands) has no window and never resizes.
-    ttys = {n: t for n, t in ttys.items() if ref[n] != base[n]}
-    ref = {n: ref[n] for n in ttys}
-    if len(ttys) < 2:
-        raise E2EError(f"expected 2 live resizable panes, have {ttys}")
-    log(f"[winsize] reference PTY sizes @1280x820: {ref}")
+    have_ax = ax_available()
+    if not have_ax:
+        log("[winsize] AX/System-Events automation unavailable — using the DEFAULT "
+            "window PTY size as the reference (AX-free stty-shrink repro still runs)")
+
+    if have_ax:
+        # Resize to a deliberate reference size WELL AWAY from the config default
+        # (a resize to the size the window already has produces no events at all)
+        # and capture the PTY sizes.
+        base = {n: stty_size(t) for n, t in ttys.items()}
+        log(f"[winsize] pre-resize PTY sizes: {base}")
+        ax_resize_all_windows(pid, 1000, 640)
+        ref = poll_sizes(ttys, lambda s: s != base)
+        if ref == base:
+            raise E2EError(f"pre-kill window resize never reached the PTYs: {ref}")
+        # Keep only the sessions that tracked the window resize: those are wsW/wsR.
+        # A just-closed session (the initial window; alive only until its undo
+        # window expires and the CLOSE lands) has no window and never resizes.
+        ttys = {n: t for n, t in ttys.items() if ref[n] != base[n]}
+        ref = {n: ref[n] for n in ttys}
+        if len(ttys) < 2:
+            raise E2EError(f"expected 2 live resizable panes, have {ttys}")
+        log(f"[winsize] reference PTY sizes @1000x640: {ref}")
+    else:
+        # AX-free: the DEFAULT window geometry IS the reference. The stty-shrink
+        # repro below then proves the restore re-applies THIS geometry through the
+        # replay flood — no external resize needed to make the test meaningful.
+        ref = {n: stty_size(t) for n, t in ttys.items()}
+        log(f"[winsize] reference (default) PTY sizes: {ref}")
 
     # Let the (debounced) layout sync capture the frame before the hard kill.
     time.sleep(4)
@@ -1184,6 +1454,26 @@ def run_winsize_check(args):
     log("[winsize] SIGKILL app + relaunch")
     kill_pids(app_pids(), signal.SIGKILL)
     wait_gone(app_pids(), 8)
+
+    # Force the narrow/blank re-attach repro deterministically: with the app
+    # dead, SHRINK each surviving agent PTY to a deliberately wrong tiny size via
+    # stty. On restore the app MUST push an authoritative RESIZE through the
+    # re-attach replay flood to re-sync the PTY back to the window geometry. This
+    # is exactly the drop the mailbox backstop prevents (a RESIZE lost to the
+    # 64-slot queue during the flood would leave these tiny sizes stuck → the
+    # narrow/blank panes). Before the fix these PTYs stay ~24x10; after, they
+    # re-sync to `ref`.
+    for sid, tty in ttys.items():
+        try:
+            subprocess.run(["/bin/stty", "-f", tty, "rows", "10", "cols", "24"],
+                           capture_output=True, text=True, timeout=5)
+        except Exception as e:
+            vlog(f"stty shrink of {tty} failed (non-fatal): {e}")
+    shrunk = {n: stty_size(t) for n, t in ttys.items()}
+    log(f"[winsize] shrank PTYs to force re-sync: {shrunk}")
+    if all(shrunk[n] == ref[n] for n in shrunk):
+        vlog("stty shrink was a no-op (PTYs already matched ref?) — repro weakened")
+
     launch_app()
     wait_app_ready()
 
@@ -1196,27 +1486,46 @@ def run_winsize_check(args):
         raise E2EError(f"restored agent ttys changed: {restored} vs {ttys}")
 
     pid2 = app_pids()[0]
-    # Re-assert the reference frame (no-op if the restore already applied it),
-    # then the PTYs must agree with the reference sizes again. A stale ATTACH
-    # seed that never gets corrected fails here.
-    ax_resize_all_windows(pid2, 1000, 640)
-    post = poll_sizes(ttys, lambda s: s == ref, timeout=10.0)
     ok = True
-    if post != ref:
-        log(f"FAIL: PTY sizes after re-attach {post} != reference {ref} "
-            "(stale winsize after restore)")
-        ok = False
-    else:
-        log(f"[winsize] PASS: post-restore PTY sizes match reference: {post}")
 
-    # A LIVE resize after re-attach must still reach the agent PTYs.
-    ax_resize_all_windows(pid2, 1520, 940)
-    live = poll_sizes(ttys, lambda s: all(s[n] != ref[n] for n in s), timeout=10.0)
-    if any(live[n] == ref[n] for n in live):
-        log(f"FAIL: live resize after re-attach did not reach the PTYs: {live}")
+    # FIRST, WITHOUT any external resize: the RESTORE itself must have re-synced
+    # the deliberately-shrunk PTYs back to the window geometry, pushing its
+    # authoritative RESIZE through the re-attach replay flood. This is the core
+    # narrow/blank assertion — if the RESIZE were dropped by the bounded mailbox
+    # (the pre-backstop bug) these PTYs would stay ~24x10.
+    resync = poll_sizes(ttys, lambda s: s == ref, timeout=12.0)
+    if resync != ref:
+        log(f"FAIL: restore did NOT re-sync shrunk PTYs to reference "
+            f"(got {resync}, want {ref}) — RESIZE dropped during the re-attach flood")
         ok = False
     else:
-        log(f"[winsize] PASS: live post-restore resize reached the PTYs: {live}")
+        log(f"[winsize] PASS: restore re-synced shrunk PTYs to reference through "
+            f"the flood: {resync}")
+
+    if have_ax:
+        # Re-assert the reference frame (no-op if the restore already applied it),
+        # then the PTYs must agree with the reference sizes again. A stale ATTACH
+        # seed that never gets corrected fails here.
+        ax_resize_all_windows(pid2, 1000, 640)
+        post = poll_sizes(ttys, lambda s: s == ref, timeout=10.0)
+        if post != ref:
+            log(f"FAIL: PTY sizes after re-attach {post} != reference {ref} "
+                "(stale winsize after restore)")
+            ok = False
+        else:
+            log(f"[winsize] PASS: post-restore PTY sizes match reference: {post}")
+
+        # A LIVE resize after re-attach must still reach the agent PTYs.
+        ax_resize_all_windows(pid2, 1520, 940)
+        live = poll_sizes(ttys, lambda s: all(s[n] != ref[n] for n in s), timeout=10.0)
+        if any(live[n] == ref[n] for n in live):
+            log(f"FAIL: live resize after re-attach did not reach the PTYs: {live}")
+            ok = False
+        else:
+            log(f"[winsize] PASS: live post-restore resize reached the PTYs: {live}")
+    else:
+        log("[winsize] (skipped AX re-assert + live-resize checks — automation "
+            "unavailable; the AX-free shrink→re-sync assertion above is the core proof)")
 
     if not args.keep:
         cli_ok(["+close", "--target=wsR"])
@@ -1369,6 +1678,10 @@ def main():
     ap.add_argument("--winsize", action="store_true",
                     help="re-attach winsize integrity: PTY sizes must match the "
                          "restored window and live resizes must work after re-attach")
+    ap.add_argument("--fast-restore", action="store_true", dest="fast_restore",
+                    help="WP-D3: relaunch->interactive time must stay near the "
+                         "empty-ring baseline even with a >2MB ring (structured "
+                         "snapshot + delta replay), under graceful quit")
     ap.add_argument("--fallback", action="store_true",
                     help="agent-unavailable fallback (T19): default-on config with the local "
                          "agent forced unspawnable; assert windows open as usable exec surfaces "
@@ -1394,6 +1707,21 @@ def main():
         full_reset()
         try:
             return run_winsize_check(args)
+        finally:
+            if not args.keep:
+                ap2 = app_pids()
+                if ap2:
+                    kill_pids(ap2, signal.SIGKILL)
+                    wait_gone(ap2, 4)
+                launchagent_bootout()
+
+    if args.fast_restore:
+        log("=" * 70)
+        log("Ghoztty session-persistence E2E — WP-D3 FAST restore (snapshot + delta)")
+        log("=" * 70)
+        full_reset()
+        try:
+            return run_fast_restore_check(args)
         finally:
             if not args.keep:
                 ap2 = app_pids()
