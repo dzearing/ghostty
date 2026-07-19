@@ -2721,3 +2721,34 @@ bits) matches Windows Terminal's byte-for-byte.
 *Validation:* `keybinds-t01.ps1` goes ALL PASS (its SIGINT assert is the
 regression oracle); manual ctrl+c on a real keyboard stops `ping -t` in
 cmd, PowerShell, and git-bash panes.
+
+**RESOLVED 2026-07-19.** Root cause: the **inherited ignore-Ctrl-C
+flag**, not ConPTY/conhost. A process created with
+`CREATE_NEW_PROCESS_GROUP` starts with ^C delivery disabled
+(`SetConsoleCtrlHandler(NULL, TRUE)` semantics), and that flag is
+inherited by every descendant across `CreateProcess` — through GUI
+processes and into ConPTY children. The T01 session launched the GUI
+from an automation chain that had the flag set, so cmd/ping in every
+pane inherited ^C-disabled; conhost cooked 0x03 → CTRL_C_EVENT
+correctly all along. The same failure hits real users whenever the GUI
+is auto-launched by `+new-window` from a flagged chain (scripts, CI,
+Claude Code sessions — the common launch path on this box).
+
+Probe evidence (conpty_smoke, new `--ctrlc*` scenarios): raw 0x03 AND
+win32-input-encoded ^C failed in ghoztty's Pty, an anon-pipe ConPTY,
+classic `conhost --headless`, AND WT's OpenConsole with the same
+driver; a `--report-ctrlc` child with an armed handler observed the
+event is simply never delivered; `GenerateConsoleCtrlEvent` (no VT, no
+ConPTY, visible or hidden console) also failed → not a cooking bug.
+Clearing the flag in the spawning parent flipped every scenario to
+INTERRUPT OK / EVENT DELIVERED.
+
+Fix: `w32.SetConsoleCtrlHandler(null, 0)` at the top of win32
+`App.init` — children spawned by this instance inherit ^C enabled
+regardless of how the GUI was launched. Verified end-to-end from the
+worst-case chain: `+send-keys C-c` stops `ping -t` (the original
+repro), and `keybinds-t01.ps1` is ALL PASS (23/23) incl. SIGINT.
+
+Test-harness trap recorded for future probes: any interrupt-delivery
+test spawned from an automation harness MUST clear the ignore flag
+first or it false-negatives (conpty_smoke now does this in `main`).

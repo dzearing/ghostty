@@ -141,9 +141,9 @@ Work these first, in order, before falling back to first-todo-in-table:
    Tab Color submenu + accent stripe), ~~T78~~ (done 2026-07-18:
    tab-bar title font). **The priority queue is exhausted** — fall back
    to first-todo-in-table / the order above.
-9. **T84** — user-visible bug found by T01 (2026-07-18): ctrl+c can't
-   stop a runaway native command in any shell pane. Work this before
-   falling back to the table order.
+9. ~~T84~~ (done 2026-07-19: root cause was the inherited ignore-^C
+   flag, not ConPTY — fixed by clearing it at App.init; keybinds-t01.ps1
+   ALL PASS 23/23).
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -156,7 +156,7 @@ One line per row. Full spec + validation + evidence per task:
 
 | ID | Task | Phase | Deps | Status | Commits |
 |----|------|-------|------|--------|---------|
-| T01 | Verify keybinds on box — done 2026-07-18 via new `keybinds-t01.ps1` (chord injection + mouse word-select; positive controls). All checklist chords verified on HEAD Debug; 2 real bugs found → T83 (goto_tab off-by-one, fixed) + T84 (^C never signals ConPTY child, todo). Script's SIGINT assert stays a known FAIL until T84 | A | — | done | — |
+| T01 | Verify keybinds on box — done 2026-07-18 via new `keybinds-t01.ps1` (chord injection + mouse word-select; positive controls). All checklist chords verified on HEAD Debug; 2 real bugs found → T83 (goto_tab off-by-one, fixed) + T84 (inherited ignore-^C flag, fixed 2026-07-19). Script ALL PASS (23) since the T84 fix | A | — | done | — |
 | T02 | Keybind gaps: ctrl+p, ctrl+f4 | A | — | done | 82e096f4b |
 | T03 | Named-pipe client helper + CLI un-guard | B | — | done | 353d70abf.. |
 | T04 | Pipe server in win32 App + marshal + DACL | B | T03 | done | 1a44125de |
@@ -246,7 +246,7 @@ One line per row. Full spec + validation + evidence per task:
 | T81 | FIX: "GUI unresponsive" after agent death under a live relay window — done 2026-07-18: was a PANIC, not a hang (ws close-frame send after `shutdown(.both)` → `WSAESHUTDOWN` → std `unreachable` killed the process) + `onDestroy` leaked the remote transport on every `+close`. New `socket_rw.zig` panic-free socket Reader/Writer; `ipc-relay.ps1` ALL PASS ×3. See details | G | — | done | aeb856ebe |
 | T82 | FIX: `zig build test-agent` has never been green on Windows — 5 pre-existing agent-core integration failures (keepalive ×2, self_update ×3; harness uses `std.net.Stream.read` = `ReadFile`-on-overlapped-socket → GetLastError(87)) + a leaked-thread crash mis-attributed to socket_stream + a pty_child segfault. Found (and proven pre-existing at 52e1fd73b baseline) during T81. Not in the parity validation lanes; fix when Phase-G hardening resumes | G | — | todo | — |
 | T83 | FIX: goto_tab off-by-one on win32 — ctrl+1 selected tab 2, ctrl+2 no-op with 2 tabs; `Window.selectTab` treated the 1-indexed GotoTab payload as 0-based. Now `@min(raw-1, count-1)` w/ raw<1 rejected (Mac/GTK parity incl. out-of-range→last). Found+fixed by T01; validated by `keybinds-t01.ps1` | A | T01 | done | a18611ab5 |
-| T84 | FIX: ctrl+c (and raw 0x03) never interrupts a running ConPTY child — `ping -t` can't be stopped in any shell pane (TUI apps unaffected: they read 0x03 themselves). NOT a keybind bug: repros with `+send-keys C-c`; binding/fallthrough verified correct; no CREATE_NEW_PROCESS_GROUP; ConPTY flags=0. Next: standalone conpty_smoke-style probe. See details | I | — | todo | — |
+| T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 `skipped(<reason>)`.

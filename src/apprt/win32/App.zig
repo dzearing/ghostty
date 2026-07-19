@@ -166,6 +166,13 @@ pub fn init(
     const hinstance = w32.GetModuleHandleW(null) orelse
         return error.Win32Error;
 
+    // Clear the inherited ignore-Ctrl-C flag. A GUI launched from a chain
+    // that used CREATE_NEW_PROCESS_GROUP anywhere (scripts, CI, `+new-window`
+    // auto-launch from automation) starts with ^C delivery disabled, and the
+    // flag inherits into every ConPTY shell we spawn — ctrl+c then silently
+    // never interrupts native children in ANY pane of this instance (T84).
+    _ = w32.SetConsoleCtrlHandler(null, 0);
+
     // Load the configuration for this application.
     const alloc = core_app.alloc;
     var config = Config.load(alloc) catch |err| err: {

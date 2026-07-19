@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 19) — T84 DONE. Root cause: inherited ignore-^C
+  flag (CREATE_NEW_PROCESS_GROUP up the launcher chain), NOT
+  ConPTY/conhost — the cooking worked all along. Probe ladder
+  (conpty_smoke `--ctrlc*`): ghoztty Pty, anon-pipe ConPTY, classic
+  conhost --headless, and WT OpenConsole ALL failed identically;
+  `--report-ctrlc` handler-observer proved the event was never
+  delivered; GenerateConsoleCtrlEvent failed too (visible + hidden
+  consoles) — which pointed away from cooking to delivery; clearing
+  the flag in the spawner flipped everything green. Fix: clear the
+  flag at App.init. `+send-keys C-c` now stops `ping -t`;
+  keybinds-t01.ps1 ALL PASS 23/23 (SIGINT assert green). Surprise
+  worth remembering: automation-spawned interrupt tests false-negative
+  unless they clear the flag first — the T84 "bug" was 90% this trap,
+  but the fix is real (auto-launched GUIs from flagged chains had ^C
+  dead in every pane).
+
 - 2026-07-18 (on-box, 18) — T01 DONE (+T83 found+fixed, T84 filed).
   Built a real chord-injection acceptance for the ctrl-mirror keybinds
   (`keybinds-t01.ps1`: kb-actions mechanics + mouse double-click

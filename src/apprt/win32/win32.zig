@@ -567,6 +567,11 @@ pub extern "kernel32" fn GetProcAddress(
     lpProcName: ?[*:0]const u8,
 ) callconv(.winapi) ?*anyopaque;
 
+pub extern "kernel32" fn SetConsoleCtrlHandler(
+    HandlerRoutine: ?*const fn (u32) callconv(.winapi) i32,
+    Add: i32,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn ToUnicode(
     wVirtKey: u32,
     wScanCode: u32,
