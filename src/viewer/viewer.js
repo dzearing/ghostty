@@ -5,7 +5,13 @@
 
 (function () {
   const md = window.markdownit({
-    html: false,
+    // Emit raw inline/block HTML (e.g. the GitHub-style <h1>/<p align>/<img>
+    // header many READMEs use) instead of escaping it to literal text. This
+    // renders arbitrary local files AND remote sites, so the emitted HTML is
+    // always run through DOMPurify below before it touches the DOM — script,
+    // event handlers, and other active content are stripped, matching the
+    // sanitized-subset approach GitHub uses.
+    html: true,
     linkify: true,
     typographer: true,
     highlight: function (str, lang) {
@@ -31,7 +37,12 @@
    * re-rendering (live reload). */
   function setMarkdown(source) {
     const y = window.scrollY;
-    content.innerHTML = md.render(source);
+    // md.render emits raw HTML (html: true); sanitize before inserting so an
+    // opened file can't inject <script>, onerror=, javascript: URLs, etc. The
+    // default DOMPurify profile keeps the tags/attributes a README header needs
+    // (<h1>, <p align>, <img width>, <a href>, <br>) and highlight.js/task-list
+    // markup (<span class>, <input type=checkbox disabled>).
+    content.innerHTML = window.DOMPurify.sanitize(md.render(source));
     restoreScroll(y);
   }
 
