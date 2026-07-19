@@ -106,6 +106,15 @@ pub fn main() !void {
         std.process.exit(if (ok) 0 else 1);
     }
 
+    // Fast-iteration gate: run ONLY the dead-tombstone reap proof (Phase 5).
+    if (std.process.hasEnvVar(alloc, "GHOZTTY_E2E_ONLY_REAP") catch false) {
+        const ok = runReapProof(alloc, agent_path) catch |err| {
+            diag("[wp4-e2e] FAIL (reap): {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.process.exit(if (ok) 0 else 1);
+    }
+
     // Pick an ephemeral port the agent will bind. We bind+close to learn a free
     // port, then hand it to the agent (a tiny race window, acceptable for a test).
     const port = try freePort();
@@ -176,12 +185,19 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    if (restore_ok and state_ok and freeze_ok) {
+    // ---- Phase 5: dead-tombstone reap proof (reap-dead-sessions) ----
+    const reap_ok = runReapProof(alloc, agent_path) catch |err| {
+        diag("[wp4-e2e] FAIL (reap): {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    if (restore_ok and state_ok and freeze_ok and reap_ok) {
         const stdout = std.fs.File.stdout();
         stdout.writeAll("PASS: Connection.openChannel round-tripped '" ++ marker ++ "' over TCP against the real channel-authoritative agent\n") catch {};
         stdout.writeAll("PASS: WP-D2 restore — session survived the dropped connection; GET_CWD probe + ATTACH-by-UUID round-tripped '" ++ restore_marker ++ "' on re-dial\n") catch {};
         stdout.writeAll("PASS: WP-D1 status — agent death drove CONNECTED->RECONNECTING; retry-dial to a fresh agent handshook; a gone session probe failed cleanly (disconnected tier)\n") catch {};
         stdout.writeAll("PASS: WP-D1 freeze/thaw — frozen-agent dial failed within the handshake deadline; old link self-healed on thaw; re-ATTACH replayed pre-freeze content; stale DETACH did not wedge the re-attached session\n") catch {};
+        stdout.writeAll("PASS: reap-dead-sessions — a pinned session whose child exited was reaped on unbind (gone from LIST_SESSIONS + sessions file), stayed gone across an agent restart, while the alive pinned survivor came back as a resumable relaunchable tombstone\n") catch {};
         std.process.exit(0);
     } else {
         diag("[wp4-e2e] FAIL: see diagnostics above\n", .{});
@@ -672,6 +688,197 @@ fn runStateProof(
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Phase 5: dead-tombstone reap proof (reap-dead-sessions)
+// -----------------------------------------------------------------------------
+
+/// What a `LIST_SESSIONS` roster should say about a given session id.
+const SessionWant = enum { present_alive, present_dead, gone };
+
+/// Poll `LIST_SESSIONS` until the row for `id` matches `want` (or `timeout_ms`).
+fn waitForSession(
+    alloc: Allocator,
+    conn: *connection.Connection,
+    id: []const u8,
+    want: SessionWant,
+    timeout_ms: i64,
+) !bool {
+    _ = alloc;
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    var last_count: usize = 0;
+    var last_present = false;
+    var last_alive = false;
+    while (std.time.milliTimestamp() < deadline) {
+        var roster = try conn.requestSessions(5 * std.time.ns_per_s);
+        defer roster.deinit();
+        var found: ?connection.OwnedSession = null;
+        for (roster.sessions) |s| {
+            if (std.mem.eql(u8, s.id, id)) {
+                found = s;
+                break;
+            }
+        }
+        last_count = roster.sessions.len;
+        last_present = found != null;
+        last_alive = if (found) |f| f.alive else false;
+        const ok = switch (want) {
+            .gone => found == null,
+            .present_alive => found != null and found.?.alive,
+            .present_dead => found != null and !found.?.alive,
+        };
+        if (ok) return true;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    diag("[reap-e2e] waitForSession timeout: want={s} last(roster_len={d} present={} alive={})\n", .{ @tagName(want), last_count, last_present, last_alive });
+    return false;
+}
+
+/// True iff the file at `path` contains `needle` (the reboot-floor sessions file
+/// stores each session's hex id verbatim, so a substring match answers "is this
+/// session persisted?"). A missing file counts as "does not contain".
+fn fileContainsId(alloc: Allocator, path: []const u8, needle: []const u8) !bool {
+    const data = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer alloc.free(data);
+    return std.mem.indexOf(u8, data, needle) != null;
+}
+
+/// End-to-end proof for the tombstone-leak fix. A PINNED persistent session whose
+/// child EXITED must be reaped the instant its viewer DETACHES (unbind): gone from
+/// `LIST_SESSIONS`, excluded from the on-disk sessions file, and NOT
+/// re-materialized after an agent restart. Meanwhile an ALIVE pinned session must
+/// survive the restart as a resumable (relaunchable) reboot-floor tombstone.
+///
+/// Runs its OWN agent with a real `--sessions-file` (the shared phases don't
+/// persist) so the reboot-floor set on disk and across a restart is assertable.
+/// Isolated lock + a temp sessions file: never touches the user's real agents.
+fn runReapProof(alloc: Allocator, agent_path: []const u8) !bool {
+    const tmp = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const sessions_file = try std.fmt.allocPrint(
+        alloc,
+        "{s}/reap-e2e-sessions-{d}-{d}.json",
+        .{ std.mem.trimRight(u8, tmp, "/"), std.c.getpid(), std.time.nanoTimestamp() },
+    );
+    defer alloc.free(sessions_file);
+    std.fs.cwd().deleteFile(sessions_file) catch {};
+    defer std.fs.cwd().deleteFile(sessions_file) catch {};
+
+    const port = try freePort();
+    var addr_buf: [32]u8 = undefined;
+    const listen_arg = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
+    var child = try spawnAgentPersist(alloc, agent_path, listen_arg, sessions_file);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = child.kill() catch {};
+    };
+    try waitForListening(alloc, &child);
+
+    // 1. Two PINNED sessions (persistent local panes): `victim` (child will exit)
+    //    and `survivor` (stays alive across the restart).
+    var dialed = try tcp_dial.dial(alloc, "127.0.0.1", port, .raw);
+    defer dialed.deinit();
+    const victim = try dialed.conn.openChannel(.{
+        .rows = 24,
+        .cols = 80,
+        // `TERM=dumb`: a heavy interactive profile (p10k) skips instant-prompt and
+        // cursor-position queries under a dumb terminal, so the shell doesn't hang
+        // waiting on responses the headless harness never sends. It prints a
+        // minimal prompt then runs `exit 0` and exits — the output flows to the
+        // agent's sink whose reap-check `tryWait` catches the already-exited child
+        // → a DETERMINISTIC tombstone (the persistent-pane "child died" case).
+        .term = "dumb",
+        .pinned = true,
+        .command = "exit 0",
+    });
+    const victim_id = try alloc.dupe(u8, victim.session_id);
+    defer alloc.free(victim_id);
+    const survivor = try dialed.conn.openChannel(.{
+        .rows = 24,
+        .cols = 80,
+        .term = "xterm-ghostty",
+        .pinned = true,
+    });
+    const survivor_id = try alloc.dupe(u8, survivor.session_id);
+    defer alloc.free(survivor_id);
+    diag("[reap-e2e] opened pinned victim={s} (pid={d}) survivor={s}\n", .{ victim_id, victim.pid, survivor_id });
+
+    // 2. The victim's process exits on its own → the agent tombstones it while
+    //    STILL BOUND (viewer attached) — the `[process exited]` UX, which must
+    //    NOT be reaped yet (bound-tombstone path is preserved).
+    if (!try waitForSession(alloc, dialed.conn, victim_id, .present_dead, 10_000)) {
+        diag("[reap-e2e] FAIL: victim never became a dead-but-present tombstone\n", .{});
+        return false;
+    }
+    diag("[reap-e2e] victim is a dead+bound tombstone (still listed) — good\n", .{});
+
+    // 3. DETACH the victim (viewer closes / window gone) → unbind → immediate reap.
+    dialed.conn.detachChannel(victim);
+    if (!try waitForSession(alloc, dialed.conn, victim_id, .gone, 8_000)) {
+        diag("[reap-e2e] FAIL: dead+unbound victim was NOT reaped from LIST_SESSIONS\n", .{});
+        return false;
+    }
+    // The alive survivor must remain listed (pinned+alive is never reaped).
+    if (!try waitForSession(alloc, dialed.conn, survivor_id, .present_alive, 8_000)) {
+        diag("[reap-e2e] FAIL: alive survivor unexpectedly missing after the reap\n", .{});
+        return false;
+    }
+    diag("[reap-e2e] victim reaped on unbind; survivor still listed — good\n", .{});
+
+    // 4. The reap rewrote the reboot-floor file: victim excluded, survivor kept.
+    if (try fileContainsId(alloc, sessions_file, victim_id)) {
+        diag("[reap-e2e] FAIL: reaped victim still in sessions file (would re-materialize)\n", .{});
+        return false;
+    }
+    if (!try fileContainsId(alloc, sessions_file, survivor_id)) {
+        diag("[reap-e2e] FAIL: alive survivor missing from sessions file (won't restore)\n", .{});
+        return false;
+    }
+    diag("[reap-e2e] sessions file excludes the victim, keeps the survivor — good\n", .{});
+
+    // 5. Restart the agent against the SAME sessions file (reboot-floor reload).
+    _ = child.kill() catch {};
+    reaped = true;
+    _ = child.wait() catch {};
+
+    const port2 = try freePort();
+    var addr_buf2: [32]u8 = undefined;
+    const listen_arg2 = try std.fmt.bufPrint(&addr_buf2, "127.0.0.1:{d}", .{port2});
+    var child2 = try spawnAgentPersist(alloc, agent_path, listen_arg2, sessions_file);
+    var reaped2 = false;
+    defer if (!reaped2) {
+        _ = child2.kill() catch {};
+    };
+    try waitForListening(alloc, &child2);
+
+    var dialed2 = try tcp_dial.dial(alloc, "127.0.0.1", port2, .raw);
+    defer dialed2.deinit();
+
+    // 5a. The reaped victim must NOT reappear — ATTACH by its id is `.not_found`
+    //     (positively absent from the reloaded table).
+    var v_out = try dialed2.conn.attachChannel(victim_id, 24, 80, 0, false);
+    defer v_out.deinit();
+    if (v_out.status != .not_found) {
+        diag("[reap-e2e] FAIL: reaped victim came back after restart (attach status={s})\n", .{@tagName(v_out.status)});
+        return false;
+    }
+
+    // 5b. The survivor must reappear as a resumable reboot-floor tombstone —
+    //     ATTACH is `.dead` with `relaunchable == true` (the legitimate Resume).
+    var s_out = try dialed2.conn.attachChannel(survivor_id, 24, 80, 0, false);
+    defer s_out.deinit();
+    if (!(s_out.status == .dead and s_out.relaunchable)) {
+        diag("[reap-e2e] FAIL: survivor not resumable after restart (status={s} relaunchable={})\n", .{ @tagName(s_out.status), s_out.relaunchable });
+        return false;
+    }
+    diag("[reap-e2e] after restart: victim stays gone; survivor is a resumable relaunchable tombstone — good\n", .{});
+
+    _ = child2.kill() catch {};
+    reaped2 = true;
+    return true;
+}
+
 /// Spawn an agent process on `listen_arg` with the raw encoding pinned (like
 /// main's shared agent). The caller must `waitForListening` and kill/reap it.
 fn spawnAgent(
@@ -693,6 +900,32 @@ fn spawnAgent(
     child.env_map = &env;
     try child.spawn();
     // `spawn` consumed the env/argv; drop the dangling pointer for hygiene.
+    child.env_map = null;
+    return child;
+}
+
+/// Like `spawnAgent`, but with a `--sessions-file` so the agent persists its
+/// reboot-floor metadata (§5.4, T12) — needed to prove reap exclusion on disk and
+/// survival across an agent restart.
+fn spawnAgentPersist(
+    alloc: Allocator,
+    agent_path: []const u8,
+    listen_arg: []const u8,
+    sessions_file: []const u8,
+) !std.process.Child {
+    var child = std.process.Child.init(
+        &.{ agent_path, "--listen", listen_arg, "--sessions-file", sessions_file },
+        alloc,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try cloneEnv(alloc, &env);
+    try env.put("GHOZTTY_AGENT_ENCODING", "raw");
+    try putIsolatedLock(alloc, &env);
+    child.env_map = &env;
+    try child.spawn();
     child.env_map = null;
     return child;
 }

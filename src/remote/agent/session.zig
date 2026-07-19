@@ -1024,7 +1024,15 @@ pub const SessionStore = struct {
         while (it.next()) |sp| {
             const s = sp.*;
             if (s.bound) continue; // a live connection owns it; never reap
-            if (s.pinned) continue; // pinned (persistent local pane); never TTL-reap
+            // `pinned` shields only LIVE sessions from the idle-TTL reaper (a
+            // persistent local pane the viewer will re-ATTACH to). A pinned DEAD
+            // tombstone is NOT immortal: its child is gone, so nothing can
+            // re-attach to a running process — leaving it pinned made dead rows
+            // pile up in the chooser forever. Once dead, a pinned session falls
+            // back to the normal orphan-reap rules below (and the unbind path
+            // reaps a dead+unbound non-relaunchable tombstone immediately). A
+            // relaunchable reboot-floor tombstone stays (it is resumable).
+            if (s.pinned and s.alive) continue;
             if (s.last_activity_ms <= cutoff) {
                 victims.append(self.table.alloc, s.id) catch {};
             }
@@ -1045,6 +1053,50 @@ pub const SessionStore = struct {
         // Refresh the on-disk metadata if the alive set actually shrank (§5.4,
         // T12). No-op when persistence is disabled or nothing was reaped.
         if (unlinked.items.len > 0) self.persistMeta();
+    }
+
+    /// Reap a DEAD, UNBOUND, non-relaunchable tombstone IMMEDIATELY (not on the
+    /// idle-TTL clock). The moment a viewer detaches from a session whose child
+    /// already exited — window closed, app quit, `/wt-delete`, shell exit — the
+    /// record is pure garbage: nothing can re-attach to a gone process, and it is
+    /// not a pending reboot-floor relaunch. Left in the table it would show in the
+    /// chooser as a dead-end `exited` row and (if pinned) be written to
+    /// `sessions.json` and re-materialized after an agent restart. So we drop it
+    /// here the way `handleClose` does a clean teardown: two-phase (unlink under
+    /// the lock, free + delete the ring snapshot OUTSIDE it), then refresh the
+    /// reboot-floor metadata (so it can't be re-materialized) and reap any orphaned
+    /// layout blob it was the last referent of.
+    ///
+    /// Guarded + idempotent: re-checks `!alive and !bound and !relaunchable` under
+    /// the lock, so a race that re-ATTACHed or RELAUNCHed the session between the
+    /// caller unbinding it and this call leaves it untouched. Callers MUST NOT hold
+    /// `self.mutex` (this takes it and then frees a child outside it, following the
+    /// same discipline as `handleClose`/`reapIdle`).
+    pub fn reapUnboundTombstone(self: *SessionStore, id: u128) void {
+        self.mutex.lock();
+        const s = self.table.getById(id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        // Only a dead, orphaned, non-relaunchable session is garbage. A still-bound
+        // tombstone keeps its `[process exited]` pane; a relaunchable reboot-floor
+        // tombstone is the legitimate Resume case; an alive session obviously stays.
+        if (s.alive or s.bound or s.relaunchable) {
+            self.mutex.unlock();
+            return;
+        }
+        const unlinked = self.table.unlink(id);
+        self.mutex.unlock();
+        if (unlinked) |u| {
+            self.deleteRingSnapshot(u.idStr()); // discard any persisted scrollback
+            self.table.freeUnlinked(u);
+            // The alive set shrank — rewrite reboot-floor metadata so the tombstone
+            // is gone from `sessions.json` and can't be re-materialized on restart.
+            self.persistMeta();
+            // It may have been the last session a stored layout blob referenced —
+            // reap orphaned blobs so dead topology doesn't accumulate.
+            if (self.reapLayouts() > 0) self.persistLayouts();
+        }
     }
 
     /// Explicit CLOSE: unlink the session on `channel` under the lock and free it
@@ -1794,10 +1846,10 @@ const MutClock = struct {
     }
 };
 
-test "SessionStore.reapIdle: pinned survives fast-forward, unpinned is reaped" {
+test "SessionStore.reapIdle: pinned+ALIVE survives fast-forward, unpinned reaped, pinned+DEAD reaped" {
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xABCD);
-    var fakes: [2]FakeChild = .{ .{ .alloc = alloc }, .{ .alloc = alloc } };
+    var fakes: [3]FakeChild = .{ .{ .alloc = alloc }, .{ .alloc = alloc }, .{ .alloc = alloc } };
     defer for (&fakes) |*f| f.deinit();
 
     var clock: MutClock = .{ .ms = 0 };
@@ -1805,27 +1857,87 @@ test "SessionStore.reapIdle: pinned survives fast-forward, unpinned is reaped" {
     var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, ttl_ms);
     defer store.deinit();
 
-    // Two orphaned (bound=false, the create default) sessions born at t=0.
-    const pinned = try store.table.create(fakes[0].child(), 200, 24, 80, 1024, 0);
+    // Three orphaned (bound=false, the create default) sessions born at t=0:
+    //   pinned_alive — pinned + still alive → the persistent-pane case; immune.
+    //   plain        — unpinned, alive → reaped once idle past the TTL.
+    //   pinned_dead  — pinned but its child EXITED → a tombstone; `pinned` must NOT
+    //                  shield it any more (the leak this change fixes).
+    const pinned_alive = try store.table.create(fakes[0].child(), 200, 24, 80, 1024, 0);
     const plain = try store.table.create(fakes[1].child(), 201, 24, 80, 1024, 0);
-    pinned.pinned = true;
-    const pinned_id = pinned.id;
-    try testing.expectEqual(@as(usize, 2), store.table.count());
+    const pinned_dead = try store.table.create(fakes[2].child(), 202, 24, 80, 1024, 0);
+    pinned_alive.pinned = true;
+    pinned_dead.pinned = true;
+    pinned_dead.markExited(0, 0); // pinned but dead tombstone
+    const pinned_alive_id = pinned_alive.id;
+    try testing.expectEqual(@as(usize, 3), store.table.count());
 
     // Not yet idle: nothing reaped (cutoff = now - ttl = -1 < last_activity 0).
     clock.ms = ttl_ms - 1;
     store.reapIdle();
-    try testing.expectEqual(@as(usize, 2), store.table.count());
+    try testing.expectEqual(@as(usize, 3), store.table.count());
 
-    // Fast-forward well past the TTL: the unpinned orphan is reaped, the pinned
-    // one survives even though it is equally idle.
+    // Fast-forward well past the TTL: the unpinned orphan AND the pinned-but-dead
+    // tombstone are reaped; only the pinned+ALIVE session survives.
     clock.ms = ttl_ms * 100;
     store.reapIdle();
     try testing.expectEqual(@as(usize, 1), store.table.count());
-    try testing.expect(store.table.getById(pinned_id) != null);
-    try testing.expect(fakes[1].terminated); // plain child was terminated on reap
-    try testing.expect(!fakes[0].terminated); // pinned child untouched
+    try testing.expect(store.table.getById(pinned_alive_id) != null);
+    try testing.expect(fakes[1].terminated); // plain child terminated on reap
+    try testing.expect(fakes[2].terminated); // pinned-but-dead tombstone reaped too
+    try testing.expect(!fakes[0].terminated); // pinned+alive child untouched
     _ = plain;
+}
+
+test "SessionStore.reapUnboundTombstone: dead+unbound+non-relaunchable is reaped; live/bound/relaunchable survive" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7EAD);
+    var fakes: [4]FakeChild = .{
+        .{ .alloc = alloc }, .{ .alloc = alloc }, .{ .alloc = alloc }, .{ .alloc = alloc },
+    };
+    defer for (&fakes) |*f| f.deinit();
+
+    var clock: MutClock = .{ .ms = 0 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    // garbage      — dead, unbound, non-relaunchable → the exact leak: reaped NOW.
+    // alive        — still alive → not garbage, survives.
+    // bound        — dead but a viewer is still attached (`[process exited]`) → survives.
+    // relaunchable — dead reboot-floor tombstone (Resume case) → survives.
+    const garbage = try store.table.create(fakes[0].child(), 300, 24, 80, 1024, 0);
+    const alive = try store.table.create(fakes[1].child(), 301, 24, 80, 1024, 0);
+    const bound = try store.table.create(fakes[2].child(), 302, 24, 80, 1024, 0);
+    const relaunchable = try store.table.create(fakes[3].child(), 303, 24, 80, 1024, 0);
+    garbage.markExited(1, 0); // pinned OR not — irrelevant to the unbind reap
+    garbage.pinned = true;
+    bound.markExited(0, 0);
+    bound.bound = true;
+    relaunchable.markExited(0, 0);
+    relaunchable.relaunchable = true;
+    const garbage_id = garbage.id;
+    const alive_id = alive.id;
+    const bound_id = bound.id;
+    const relaunchable_id = relaunchable.id;
+    try testing.expectEqual(@as(usize, 4), store.table.count());
+
+    // Reaping the garbage id drops exactly that one, immediately (no TTL wait).
+    store.reapUnboundTombstone(garbage_id);
+    try testing.expectEqual(@as(usize, 3), store.table.count());
+    try testing.expect(store.table.getById(garbage_id) == null);
+    try testing.expect(fakes[0].terminated);
+
+    // The other three are NOT garbage — reaping their ids is a guarded no-op.
+    store.reapUnboundTombstone(alive_id);
+    store.reapUnboundTombstone(bound_id);
+    store.reapUnboundTombstone(relaunchable_id);
+    try testing.expectEqual(@as(usize, 3), store.table.count());
+    try testing.expect(store.table.getById(alive_id) != null);
+    try testing.expect(store.table.getById(bound_id) != null);
+    try testing.expect(store.table.getById(relaunchable_id) != null);
+
+    // Idempotent: reaping an already-gone id is a safe no-op.
+    store.reapUnboundTombstone(garbage_id);
+    try testing.expectEqual(@as(usize, 3), store.table.count());
 }
 
 test "SessionStore.setLayout/reapLayouts: stores blobs, reaps when sessions vanish (T18)" {

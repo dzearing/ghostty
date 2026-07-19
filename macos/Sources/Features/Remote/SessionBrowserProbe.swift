@@ -18,13 +18,42 @@ struct BrowsedSession: Identifiable, Hashable, Decodable {
     let createdAt: Int64
     let lastActivity: Int64
     let pinned: Bool
+    /// True when this is a DEAD reboot-floor tombstone the agent materialized from
+    /// disk and can bring back via `RELAUNCH` (the legitimate Resume case) — as
+    /// opposed to a child that genuinely exited (dead, not relaunchable), which is
+    /// a dead-end. Optional/defaulted so an older agent that omits the field
+    /// decodes as `false` (forward-compatible, cf. the agent-contract rule).
+    let relaunchable: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, alive, attached, activity, pid, cwd, argv, title, pinned
+        case id, alive, attached, activity, pid, cwd, argv, title, pinned, relaunchable
         case exitCode = "exit_code"
         case createdAt = "created_at"
         case lastActivity = "last_activity"
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        alive = try c.decodeIfPresent(Bool.self, forKey: .alive) ?? true
+        attached = try c.decodeIfPresent(Bool.self, forKey: .attached) ?? false
+        activity = try c.decodeIfPresent(String.self, forKey: .activity) ?? "idle"
+        pid = try c.decodeIfPresent(Int64.self, forKey: .pid) ?? 0
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        argv = try c.decodeIfPresent(String.self, forKey: .argv)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        exitCode = try c.decodeIfPresent(Int64.self, forKey: .exitCode)
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        lastActivity = try c.decodeIfPresent(Int64.self, forKey: .lastActivity) ?? 0
+        pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
+        relaunchable = try c.decodeIfPresent(Bool.self, forKey: .relaunchable) ?? false
+    }
+
+    /// A session worth showing in the chooser: still alive (resumable/showable) or
+    /// a relaunchable reboot-floor tombstone (resumable via RELAUNCH). A dead,
+    /// non-relaunchable tombstone is an unreconnectable dead-end — filtered out as
+    /// a client-side backstop to the agent's own immediate reap of such rows.
+    var isConnectable: Bool { alive || relaunchable }
 
     /// A human label for the row, most-current first:
     /// - `liveTitle`: the title of an OPEN pane bound to this session, read

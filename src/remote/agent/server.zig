@@ -407,8 +407,12 @@ pub const Server = struct {
     /// the orphaned session keeps ringing output but frames nothing to our dead
     /// writer. Does NOT terminate children (survival, §7.1). Idempotent.
     fn detachAll(self: *Server) void {
+        // Ids of sessions that just became DEAD + UNBOUND (a tombstone whose last
+        // viewer detached) — reaped AFTER we drop the store lock (reap frees a
+        // child; never under the lock, cf. reapIdle/handleClose two-phase rule).
+        var tombstones: std.ArrayListUnmanaged(u128) = .empty;
+        defer tombstones.deinit(self.alloc);
         self.store.mutex.lock();
-        defer self.store.mutex.unlock();
         for (self.bound_channels.items) |ch| {
             const s = self.store.table.getByChannel(ch) orelse continue;
             if (s.bridge_ctx == @as(?*anyopaque, self)) {
@@ -418,9 +422,15 @@ pub const Server = struct {
                 s.bound = false;
                 s.streaming = false;
                 s.last_activity_ms = self.clock.now();
+                // A dead, now-unbound, non-relaunchable session is unreconnectable
+                // garbage — mark it for immediate reaping below so it can't linger
+                // as a dead-end chooser row or be re-materialized after a restart.
+                if (!s.alive and !s.relaunchable) tombstones.append(self.alloc, s.id) catch {};
             }
         }
         self.bound_channels.clearRetainingCapacity();
+        self.store.mutex.unlock();
+        for (tombstones.items) |id| self.store.reapUnboundTombstone(id);
     }
 
     /// Free the server (must be shut down first). Frees per-connection state only;
@@ -970,15 +980,22 @@ pub const Server = struct {
         // `streaming` out from under the new owner and the freshly re-attached
         // window went permanently silent.
         self.store.mutex.lock();
-        defer self.store.mutex.unlock();
-        const s = self.store.table.getByChannel(channel) orelse return;
-        if (s.bridge_ctx != @as(?*anyopaque, self)) return; // stale: not ours
-        s.streaming = false;
-        s.bridge_ctx = null;
-        s.bridge_data = null;
-        s.bridge_exit = null;
-        s.bound = false;
-        s.last_activity_ms = self.clock.now();
+        const reap_id: ?u128 = blk: {
+            const s = self.store.table.getByChannel(channel) orelse break :blk null;
+            if (s.bridge_ctx != @as(?*anyopaque, self)) break :blk null; // stale: not ours
+            s.streaming = false;
+            s.bridge_ctx = null;
+            s.bridge_data = null;
+            s.bridge_exit = null;
+            s.bound = false;
+            s.last_activity_ms = self.clock.now();
+            // A dead, now-unbound, non-relaunchable session is unreconnectable
+            // garbage: reap it immediately (below, off the lock) so it can't linger
+            // as a dead-end chooser row or be re-materialized after a restart.
+            break :blk if (!s.alive and !s.relaunchable) s.id else null;
+        };
+        self.store.mutex.unlock();
+        if (reap_id) |id| self.store.reapUnboundTombstone(id);
     }
 
     fn handleClose(self: *Server, channel: u128) void {
