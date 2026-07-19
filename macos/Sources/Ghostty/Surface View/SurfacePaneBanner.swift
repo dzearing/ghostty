@@ -514,14 +514,20 @@ extension Ghostty {
 
             func flushText() {
                 defer { textLines = [] }
-                guard !textLines.isEmpty, remaining > 0 else { return }
-                let limit = remaining
-                let kept = textLines.prefix(remaining)
-                remaining -= kept.count
-                blocks.append(.text(
-                    parseInline(Substring(kept.joined(separator: "\n"))),
-                    lineLimit: limit
-                ))
+                // Each source line becomes its own text block so consecutive
+                // lines get the same 8pt inter-block gap as everything else
+                // (a run used to be a single multi-line Text, which spaced hard
+                // newlines with tight line spacing instead of the block gap).
+                // A long line still soft-wraps tight within its own block.
+                // Blank separator lines are dropped — the block gap now supplies
+                // the space they used to add.
+                for line in textLines {
+                    guard remaining > 0 else { return }
+                    if line.allSatisfy(\.isWhitespace) { continue }
+                    let limit = remaining
+                    remaining -= 1
+                    blocks.append(.text(parseInline(line), lineLimit: limit))
+                }
             }
 
             var i = 0
