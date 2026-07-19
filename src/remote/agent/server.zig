@@ -281,6 +281,7 @@ pub const Server = struct {
             protocol.capability.resync,
             protocol.capability.flow,
             protocol.capability.close_session,
+            protocol.capability.grid_snapshot,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -867,20 +868,31 @@ pub const Server = struct {
             .tty = if (s.tty) |t| t else null,
         }) catch {};
 
-        // Gap-fill / CATCH-UP (§7.3): replay everything the client missed while it
-        // was gone. If the client's last_byte_offset < S and the ring still retains
-        // `(last_byte_offset, S]`, replay it as DATA so reconnect has NO hole — this
-        // is the bytes the remote produced during the disconnect. If the requested
-        // start was evicted (deep scrollback overran the ring), replay what's
-        // retained from the ring base and prepend a clear truncation marker (v1
-        // honesty; the forthcoming grid snapshot makes the visible grid exact). Live
-        // DATA then resumes from offset > S via the store sink.
+        // Gap-fill / CATCH-UP (§7.3) + grid snapshot (FIX 2). Replay everything the
+        // client missed while it was gone; then, when the peer negotiated
+        // `grid_snapshot`, append a self-contained VT repaint of the CURRENT
+        // visible screen so the pane is exact and NEVER blank — even when the paint
+        // predates the ring (deep scrollback evicted, or a full-screen app whose
+        // `?1049h` enter-alt scrolled out). Live DATA then resumes from offset > S.
+        const want_snapshot = if (self.negotiated) |n| n.grid_snapshot else |_| false;
+
+        // On the ALTERNATE screen the raw ring tail is alt-screen paint written
+        // WITHOUT its (evicted) `?1049h` enter — replaying it onto the client's
+        // primary screen is exactly what smeared/blanked the pane. With a snapshot
+        // in hand we SKIP that replay for alt sessions and let the snapshot (which
+        // re-enters alt and repaints) stand alone. A primary session still gets its
+        // raw replay for scrollback continuity, with the snapshot then repainting
+        // the visible rows over it. Without a snapshot we keep today's replay for
+        // both (an older/ring-only peer).
+        const skip_replay = want_snapshot and s.gridOnAltScreen();
+
         if (att.last_byte_offset < snapshot_at) {
             const base = s.ring.base_offset;
             var replay_from = att.last_byte_offset;
             if (replay_from < base) {
-                // The exact resume point was evicted. Emit a marker, then replay from
-                // the oldest byte we still have.
+                // The exact resume point was evicted. Emit a marker for the
+                // genuinely-lost deep scrollback ABOVE the visible screen, then
+                // replay from the oldest byte we still have.
                 const lost = base - att.last_byte_offset;
                 var marker_buf: [96]u8 = undefined;
                 const marker = std.fmt.bufPrint(
@@ -891,13 +903,27 @@ pub const Server = struct {
                 if (marker.len > 0) self.sendData(s.channel, att.last_byte_offset, marker) catch {};
                 replay_from = base;
             }
-            const want: usize = @intCast(snapshot_at - replay_from);
-            if (want > 0) {
-                const tmp = self.alloc.alloc(u8, want) catch return;
-                defer self.alloc.free(tmp);
-                if (s.ring.slice(replay_from, snapshot_at, tmp)) |n| {
-                    self.sendData(s.channel, replay_from, tmp[0..n]) catch {};
+            if (!skip_replay) {
+                const want: usize = @intCast(snapshot_at - replay_from);
+                if (want > 0) {
+                    const tmp = self.alloc.alloc(u8, want) catch return;
+                    defer self.alloc.free(tmp);
+                    if (s.ring.slice(replay_from, snapshot_at, tmp)) |n| {
+                        self.sendData(s.channel, replay_from, tmp[0..n]) catch {};
+                    }
                 }
+            }
+        }
+
+        // Grid snapshot: a clean repaint of the visible screen AT offset S, sent as
+        // ordinary DATA (plain VT — no new opcode) at the live continuation point so
+        // the client renders it right before live output resumes. `gridSnapshotAlloc`
+        // returns null for a session that produced no output (no emulator yet), in
+        // which case the ring replay above already stands alone.
+        if (want_snapshot) {
+            if (s.gridSnapshotAlloc(self.alloc)) |snap| {
+                defer self.alloc.free(snap);
+                if (snap.len > 0) self.sendData(s.channel, snapshot_at, snap) catch {};
             }
         }
     }
@@ -2007,7 +2033,12 @@ const MockClient = struct {
         // Advertise the app-side capabilities so capability negotiation (e.g.
         // close_session) reflects a modern peer, like the real Connection client.
         const caps = [_][]const u8{protocol.capability.close_session};
-        const hello: protocol.Hello = .{ .transfer_encoding = self.encoding, .capabilities = &caps };
+        try self.handshakeCaps(&caps);
+    }
+    /// HELLO with an explicit capability set (for negotiation tests, e.g.
+    /// advertising — or withholding — `grid_snapshot`).
+    fn handshakeCaps(self: *MockClient, caps: []const []const u8) !void {
+        const hello: protocol.Hello = .{ .transfer_encoding = self.encoding, .capabilities = caps };
         const json = try hello.encode(self.alloc);
         defer self.alloc.free(json);
         try self.sendFrameOn(self.control, .{
@@ -2634,6 +2665,101 @@ test "ATTACH alive returns snapshot anchor and streams forward from > S" {
     const dp = try protocol.DataPayload.decode(d.?.payload);
     try testing.expectEqual(@as(u64, 11), dp.byte_offset);
     try testing.expectEqualSlices(u8, "!", dp.bytes);
+}
+
+test "ATTACH with grid_snapshot negotiated replays a visible-screen repaint (FIX 2)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(7);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // The client advertises grid_snapshot (a modern app).
+    try h.client.handshakeCaps(&.{
+        protocol.capability.close_session,
+        protocol.capability.grid_snapshot,
+    });
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.grid_snapshot);
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    // The blank-pane shape: enter the alt screen, then paint content. On the wire
+    // the `?1049h` is just early output that (in a real deep-scrollback session)
+    // would be evicted from the ring.
+    h.server.onChildOutput(o.channel, "\x1b[?1049h");
+    h.server.onChildOutput(o.channel, "SNAPSHOT-ME");
+    _ = try h.client.nextData(); // drain live DATA (chunk 1)
+    _ = try h.client.nextData(); // drain live DATA (chunk 2)
+
+    // A FRESH attach (last_byte_offset = 0), exactly like the GUI after an app
+    // relaunch/upgrade.
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+        .last_byte_offset = 0,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+    const s = ap.value.snapshot_at_offset;
+
+    // On the alt screen the raw ring replay is skipped; the ONLY post-attach DATA
+    // is the grid snapshot, sent at offset S. It must re-enter the alt screen and
+    // repaint the content so the pane is never blank.
+    const d = (try h.client.nextData()) orelse return error.NoSnapshot;
+    const dp = try protocol.DataPayload.decode(d.payload);
+    try testing.expectEqual(s, dp.byte_offset);
+    try testing.expect(std.mem.indexOf(u8, dp.bytes, "?1049h") != null);
+    try testing.expect(std.mem.indexOf(u8, dp.bytes, "SNAPSHOT-ME") != null);
+}
+
+test "ATTACH without grid_snapshot falls back to raw ring replay (skew safety, FIX 2)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(8);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // An OLDER client: advertises NOTHING (no grid_snapshot).
+    try h.client.handshakeCaps(&.{});
+    const neg = try h.server.waitHandshake();
+    try testing.expect(!neg.grid_snapshot);
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    h.server.onChildOutput(o.channel, "\x1b[?1049h");
+    h.server.onChildOutput(o.channel, "PLAINBYTES");
+    _ = try h.client.nextData();
+    _ = try h.client.nextData();
+
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+        .last_byte_offset = 0,
+    });
+    _ = try h.client.waitControl(.attached);
+
+    // No snapshot: the ONLY post-attach DATA is today's raw ring replay from the
+    // base (offset 0), byte-identical to what the child produced — no formatter
+    // repaint sequence.
+    const d = (try h.client.nextData()) orelse return error.NoReplay;
+    const dp = try protocol.DataPayload.decode(d.payload);
+    try testing.expectEqual(@as(u64, 0), dp.byte_offset);
+    try testing.expectEqualSlices(u8, "\x1b[?1049hPLAINBYTES", dp.bytes);
 }
 
 test "OPEN/ATTACH carry the child's pid+tty (wp3 getProcessInfo metadata)" {

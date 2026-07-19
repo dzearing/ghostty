@@ -47,6 +47,10 @@ const ring_snapshot = @import("ring_snapshot.zig");
 // Opaque layout-blob persistence (T18, §5.4 cross-machine "Resume all"). Like
 // `session_meta`, depends on nothing but `std`.
 const layout_meta = @import("layout_meta.zig");
+// Headless per-session terminal emulator for the re-attach grid snapshot (FIX 2).
+// Imports src/terminal — the only heavyweight dependency this module pulls; kept
+// behind an optional pointer so it costs nothing until a session produces output.
+const grid_snapshot = @import("grid_snapshot.zig");
 
 // -----------------------------------------------------------------------------
 // Caps (§7.1 "Resource caps & TTL")
@@ -401,6 +405,14 @@ pub const Session = struct {
     /// Recent raw child output for gap-fill/scrollback (§7.1/§7.3).
     ring: OutputRing,
 
+    /// Headless emulator mirroring this session's VISIBLE screen, fed the same
+    /// bytes as `ring` (FIX 2). Lazily created on first output so idle/tombstone
+    /// sessions never allocate a terminal. On ATTACH, `gridSnapshotAlloc`
+    /// serializes it to a VT repaint so the re-attached pane is never blank — even
+    /// when the paint predates the ring (deep scrollback evicted, or a full-screen
+    /// app whose alt-screen enter scrolled out). See `grid_snapshot.zig`.
+    emulator: ?*grid_snapshot.GridEmulator = null,
+
     /// The per-channel outbound byte offset (§4.2/§7.3). Every child→client DATA
     /// frame's `byte_offset` comes from `out_offset.advance(n)`; the SAME counter
     /// the client uses to discard already-applied DATA after a snapshot.
@@ -545,6 +557,7 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         self.ring.deinit();
+        if (self.emulator) |emu| emu.destroy();
         if (self.cwd) |c| self.alloc.free(c);
         if (self.title) |t| self.alloc.free(t);
         if (self.argv) |a| self.alloc.free(a);
@@ -570,8 +583,46 @@ pub const Session = struct {
     pub fn recordOutput(self: *Session, bytes: []const u8, now_ms: i64) u64 {
         const at = self.out_offset.advance(bytes.len);
         self.ring.append(at, bytes);
+        self.feedEmulator(bytes);
         self.last_activity_ms = now_ms;
         return at;
+    }
+
+    /// Mirror `bytes` into the headless grid emulator (FIX 2), lazily creating it
+    /// on first output and keeping it sized to the session's live geometry. All
+    /// best-effort: an allocation failure just leaves the emulator absent/stale so
+    /// this session falls back to ring-only replay — it never disturbs the ring or
+    /// the byte stream.
+    fn feedEmulator(self: *Session, bytes: []const u8) void {
+        const emu = self.emulator orelse blk: {
+            const created = grid_snapshot.GridEmulator.create(
+                self.alloc,
+                self.rows,
+                self.cols,
+            ) catch return;
+            self.emulator = created;
+            break :blk created;
+        };
+        emu.ensureSize(self.rows, self.cols);
+        emu.feed(bytes);
+    }
+
+    /// Serialize the current visible screen as a self-contained VT repaint owned
+    /// by `gpa` (caller frees), sized to the session's current geometry. Returns
+    /// null when there is no emulator yet (a session that produced no output) — the
+    /// caller then falls back to ring-only replay. See `grid_snapshot.zig`.
+    pub fn gridSnapshotAlloc(self: *Session, gpa: Allocator) ?[]u8 {
+        const emu = self.emulator orelse return null;
+        emu.ensureSize(self.rows, self.cols);
+        return emu.snapshotAlloc(gpa) catch null;
+    }
+
+    /// True when the emulator shows the child is on the ALTERNATE screen. False
+    /// when there is no emulator. The Server uses this to skip the raw ring replay
+    /// for alt-screen sessions (see `gridSnapshotAlloc`).
+    pub fn gridOnAltScreen(self: *const Session) bool {
+        const emu = self.emulator orelse return false;
+        return emu.onAlternateScreen();
     }
 
     /// Mark exited (tombstone): retain `code` + final state, drop alive. The child
