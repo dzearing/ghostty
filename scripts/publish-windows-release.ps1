@@ -59,8 +59,15 @@ $remoteHas = git branch -r --contains HEAD 2>$null
 if (-not $remoteHas) {
     throw "HEAD is not on any remote branch -- push first (the release tag must point at a pushed commit)"
 }
-$existing = gh release view $tag --repo dzearing/ghoztty --json tagName 2>$null
-if ($LASTEXITCODE -eq 0 -and $existing) {
+# Probe natives that talk on stderr with EAP relaxed: under Stop, PS 5.1
+# wraps their stderr in a terminating NativeCommandError.
+function Invoke-Probe([scriptblock]$block) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try { & $block *> $null } finally { $ErrorActionPreference = $prev }
+    return $LASTEXITCODE
+}
+if ((Invoke-Probe { gh release view $tag --repo dzearing/ghoztty --json tagName }) -eq 0) {
     throw "release $tag already exists -- bump -Version"
 }
 
@@ -90,16 +97,16 @@ Write-Host "exe reports $Version+$hash"
 
 # -- 2. MSI under Docker -------------------------------------------------
 if (-not (Test-Path $msi) -or -not $SkipBuild) {
-    docker info *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-Probe { docker info }) -ne 0) {
         Write-Host '== starting Docker Desktop =='
         Start-Process 'C:\Program Files\Docker\Docker\Docker Desktop.exe' | Out-Null
         $deadline = (Get-Date).AddSeconds(120)
+        $up = 1
         do {
             Start-Sleep -Seconds 5
-            docker info *> $null
-        } until ($LASTEXITCODE -eq 0 -or (Get-Date) -gt $deadline)
-        if ($LASTEXITCODE -ne 0) { throw 'Docker did not become ready in 120s' }
+            $up = Invoke-Probe { docker info }
+        } until ($up -eq 0 -or (Get-Date) -gt $deadline)
+        if ($up -ne 0) { throw 'Docker did not become ready in 120s' }
     }
     Write-Host '== build MSI (Docker msitools-local) =='
     $repoUnix = $repo -replace '\\', '/'

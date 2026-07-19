@@ -9,6 +9,21 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 21) — T24 DONE. Windows release channel is live:
+  win-vX.Y.Z GitHub releases beside the Mac ones (--latest=false; first
+  release win-v1.4.1 with the T23-fixed MSI, exe stamped 1.4.1+hash via
+  `build-msi.sh --semver`). In-app check enabled but gated to
+  -Dwindows-update-check channel builds (dev/portable/T36 builds never
+  nag — the daily driver runs ahead of the channel), notify-only (no
+  taskkill in the MSI → no auto-install), balloon → release page; manual
+  check gets up-to-date/failed balloons. Pure scan/compare in
+  update_check.zig; GHOZTTY_UPDATE_URL (+file://) test hook;
+  `publish-windows-release.ps1` for future releases. update-check.ps1
+  ALL PASS (12) ×3; P1–P3, ipc-version, both lanes green. Provenance
+  gained `update_check` everywhere. Surprise: WinINet rejects file://
+  (read directly); PS5.1 NativeCommandError on gh/docker stderr probes.
+  Mid-task the user flagged tiny new windows → filed T85 (window-size
+  memory), marked next.
 - 2026-07-19 (on-box, 20) — T23 DONE. The 26.7.502 vanishing-exe root
   cause was wixl leaving File.Version EMPTY (packaged exe read as
   UNVERSIONED → costing skips the copy, early RExP deletes the old one);

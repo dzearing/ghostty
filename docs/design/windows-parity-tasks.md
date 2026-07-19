@@ -144,6 +144,8 @@ Work these first, in order, before falling back to first-todo-in-table:
 9. ~~T84~~ (done 2026-07-19: root cause was the inherited ignore-^C
    flag, not ConPTY — fixed by clearing it at App.init; keybinds-t01.ps1
    ALL PASS 23/23).
+10. **T85** — new-window size memory (user complaint 2026-07-19, filed
+   during T24). Work this FIRST before falling back to table order.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -183,7 +185,7 @@ One line per row. Full spec + validation + evidence per task:
 | T22b | Zig relay device-directory client (`/v1/client/devices`) | G | T22a | done | 7ec2c7119 |
 | T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | done | 4e7edfc9b |
 | T23 | MSI upgrade/uninstall fix — done 2026-07-19: root cause was wixl's EMPTY File.Version (packaged exe "unversioned" → costing skip + RExP delete = the 26.7.502 vanishing exe), NOT RExP placement. Fix: per-build FILEVERSION (`-Dwindows-file-version`) stamped into the exe + mirrored into the File table, MsiFileHash emptied, `wixl -a x64`, `--test-identity` throwaway E2E; `msi-upgrade.ps1` ALL PASS (33) ×3 incl. ghost-recovery; see details for the on-box 26.7.502 ghost note | H | — | done | 5edea9532 |
-| T24 | Windows release channel + update check | H | T23 | in-progress | — |
+| T24 | Windows release channel + update check — done 2026-07-19: win-vX.Y.Z GitHub releases (--latest=false, MSI asset; win-v1.4.1 published live), notify-only in-app check gated to -Dwindows-update-check channel builds, `publish-windows-release.ps1`, provenance `update_check` field; `update-check.ps1` ALL PASS (12) ×3, P1–P3 + ipc-version + both lanes green | H | T23 | done | 3b0c3bbde.. |
 | T25 | Full conformance checklist (spec §8) | — | T17,T19,T21a | todo | — |
 | T26 | OS color-scheme sync | I | — | done | see details |
 | T27 | PowerShell shell integration | I | — | done | see details |
@@ -246,6 +248,7 @@ One line per row. Full spec + validation + evidence per task:
 | T81 | FIX: "GUI unresponsive" after agent death under a live relay window — done 2026-07-18: was a PANIC, not a hang (ws close-frame send after `shutdown(.both)` → `WSAESHUTDOWN` → std `unreachable` killed the process) + `onDestroy` leaked the remote transport on every `+close`. New `socket_rw.zig` panic-free socket Reader/Writer; `ipc-relay.ps1` ALL PASS ×3. See details | G | — | done | aeb856ebe |
 | T82 | FIX: `zig build test-agent` has never been green on Windows — 5 pre-existing agent-core integration failures (keepalive ×2, self_update ×3; harness uses `std.net.Stream.read` = `ReadFile`-on-overlapped-socket → GetLastError(87)) + a leaked-thread crash mis-attributed to socket_stream + a pty_child segfault. Found (and proven pre-existing at 52e1fd73b baseline) during T81. Not in the parity validation lanes; fix when Phase-G hardening resumes | G | — | todo | — |
 | T83 | FIX: goto_tab off-by-one on win32 — ctrl+1 selected tab 2, ctrl+2 no-op with 2 tabs; `Window.selectTab` treated the 1-indexed GotoTab payload as 0-based. Now `@min(raw-1, count-1)` w/ raw<1 rejected (Mac/GTK parity incl. out-of-range→last). Found+fixed by T01; validated by `keybinds-t01.ps1` | A | T01 | done | a18611ab5 |
+| T85 | FIX: new windows don't remember size — every window opens at the config/default (small) size (user, 2026-07-19: "why aren't you remembering the size of new windows"). Persist the last user-resized window's outer size (Windows-native: RegisterClass-style placement memory) and use it for new windows when `window-width/height` is unset; interplay with T66's stored initial_size + maximized state. USER-DIRECTED PRIORITY: work this next | I | — | todo | — |
 | T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | 3b085a661 |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

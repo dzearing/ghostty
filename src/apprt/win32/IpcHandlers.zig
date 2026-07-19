@@ -1028,6 +1028,8 @@ fn handleVersion(ctx: Context) Allocator.Error!?[]u8 {
         jws.write(prov.mode) catch break :write;
         jws.objectField("runtime") catch break :write;
         jws.write(prov.runtime) catch break :write;
+        jws.objectField("update_check") catch break :write;
+        jws.write(prov.update_check) catch break :write;
         jws.objectField("exe") catch break :write;
         jws.write(prov.exe) catch break :write;
         jws.objectField("exe_modified") catch break :write;
@@ -1146,6 +1148,7 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             .commit = prov.commit,
             .mode = prov.mode,
             .runtime = prov.runtime,
+            .update_check = prov.update_check,
             .exe = prov.exe,
             .exe_modified = prov.exe_modified,
             .pid = prov.pid,

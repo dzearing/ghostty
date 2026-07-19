@@ -752,6 +752,84 @@ vs auto-install and record here.
 *Validation:* box on older version + newer tag published → update prompt
 appears within the check interval; following it lands the new version.
 
+**Decisions (recorded 2026-07-19):**
+
+- **Channel:** GitHub releases on `dzearing/ghoztty` tagged `win-vX.Y.Z`,
+  created `--latest=false` so the Mac `releases/latest` flow is untouched;
+  asset `Ghoztty-X.Y.Z-x64.msi`. The check fetches the releases LIST
+  (newest-first) and scans for the first `win-v` tag — `/latest` points at
+  the Mac channel. Windows semver line starts at win-v1.4.1 (seeded from
+  the zon base 1.4.0); T38 may re-align with the Mac channel when the
+  release processes merge.
+- **Notify-only, no auto-install:** the MSI deliberately has no taskkill
+  action (T23), so installing over a running terminal hits files-in-use;
+  the balloon links to the specific release page instead. Manual
+  `check_for_updates` reports up-to-date/failed in a balloon too.
+- **Gating:** automatic checks run ONLY in builds stamped
+  `-Dwindows-update-check` (set by `build-msi.sh --semver`, i.e. MSI
+  channel builds). Dev/portable/T36-script-refreshed builds never phone
+  home or nag — the daily-driver install on this box runs ahead of the
+  channel and must not balloon hourly. `auto-update = off` disables auto
+  checks (`download` treated as `check`: notify-only); manual checks
+  bypass all gates. 1h throttle unchanged
+  (%LOCALAPPDATA%/ghoztty/update_check_at).
+- **Version identity:** release exes are stamped
+  `-Dversion-string=X.Y.Z+<short-hash>` so exe semver == tag semver
+  (compare is exact; build metadata ignored by semver order, and the hash
+  keeps `+version` provenance). MSI ProductVersion stays date-based
+  (`yy.m.dNN`, T23) — Windows-Installer upgrade ordering is independent
+  of the channel semver.
+- **Test hook:** `GHOZTTY_UPDATE_URL` overrides the feed URL, force-
+  enables the check in non-channel builds, and bypasses the throttle;
+  `file://` values are read directly (WinINet rejects file URLs).
+  Publishing: `scripts/publish-windows-release.ps1 -Version X.Y.Z`
+  (native ReleaseFast build → Docker msitools-local MSI → gh release).
+
+*Evidence (done 2026-07-19):* `win-v1.4.1` published live
+(https://github.com/dzearing/ghoztty/releases/tag/win-v1.4.1, asset
+`Ghoztty-1.4.1-x64.msi` 17.5MB, exe stamped `1.4.1+3b0c3bbde`, v1.17.0
+still holds the GitHub "Latest" flag). `test/win32/update-check.ps1`
+ALL PASS (12) ×3 on the Debug build: canned-feed newer→"update
+available"+balloon / mac-only→"no win-v release" / older→"up to date",
+dev-build gate (no override → silence), live-channel smoke (real API
+finds win-v1.4.1). The channel-build branch of the no-override scenario
+was additionally proven against the published ReleaseFast exe (auto check
+→ "up to date (current=1.4.1+3b0c3bbde latest=win-v1.4.1)"). Provenance
+grew an `update_check` field (version verb, `+list` data.build [golden
+updated], `+version` both sections) so any pane can ask "will this
+install notify me?" — ipc-version.ps1, P1–P3, and both test lanes green.
+The pre-fix bug that `fetchLatestVersion` compared against `/latest`
+(the MAC channel) is gone: the scan is win-v-prefix-only. Box note: the
+26.7.502 ghost ARP entry stays until the user installs a real channel
+MSI (ghost-recovery validated in T23); the T36 script flow is untouched.
+
+## T85 — FIX: new windows don't remember size (Phase I)
+
+User, 2026-07-19 (mid-T24, watching test windows open): "every windo you
+are opening is tiny. why aren't you remembering the size of new windows,
+they're all this silly small size." Root context: win32 sizes new windows
+from `window-width`/`window-height` config, else a hardcoded default —
+NOTHING persists the last user-chosen size. macOS gets frame memory from
+the OS (autosave); GTK persists via window-save-state. Implement the
+Windows-native equivalent:
+
+- Persist the outer window size (and per Windows convention likely the
+  maximized flag; decide on position) when the user finishes an
+  interactive resize/move (WM_EXITSIZEMOVE) — storage: same
+  UserDefaults-style area the win32 apprt already uses (registry or
+  %LOCALAPPDATA% file; follow the T66 initial_size pattern).
+- New windows use: explicit `window-width/height` config > remembered
+  size > current default. `reset_window_size` (T66) keeps resetting to
+  the CONFIG/default size, not the remembered one (it's the escape
+  hatch); decide + record.
+- Respect multi-monitor sanity (clamp to the target monitor's work
+  area).
+
+*Validation:* on box — resize a window, close it, open a new window
+(ctrl+shift+n / `+new-window` / app relaunch): new window matches the
+remembered size; explicit config wins; reset_window_size still resets;
+acceptance script with 3 runs.
+
 ## T25 — Full conformance checklist, spec §8 end-to-end (final gate)
 
 Run spec §8 items 1–10 end-to-end on the box from a fresh start, including

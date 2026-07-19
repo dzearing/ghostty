@@ -18,6 +18,8 @@ pub const List = struct {
         commit: []const u8,
         mode: []const u8,
         runtime: []const u8,
+        /// Whether this build checks the win-v update channel (T24).
+        update_check: bool = false,
         exe: []const u8,
         exe_modified: []const u8,
         pid: i64,
@@ -116,6 +118,8 @@ pub const List = struct {
         try jws.write(b.mode);
         try jws.objectField("runtime");
         try jws.write(b.runtime);
+        try jws.objectField("update_check");
+        try jws.write(b.update_check);
         try jws.objectField("exe");
         try jws.write(b.exe);
         try jws.objectField("exe_modified");
@@ -216,6 +220,7 @@ test "List: build provenance is additive (T52)" {
             .commit = "abc1234",
             .mode = "Debug",
             .runtime = "win32",
+            .update_check = true,
             .exe = "C:\\g\\ghoztty.exe",
             .exe_modified = "2026-07-17 09:31:40 UTC",
             .pid = 42,
@@ -225,7 +230,8 @@ test "List: build provenance is additive (T52)" {
     try testing.expectEqualStrings(
         "{\"success\":true,\"data\":{\"windows\":[]," ++
             "\"build\":{\"version\":\"1.2.0-main+abc1234\",\"commit\":\"abc1234\"," ++
-            "\"mode\":\"Debug\",\"runtime\":\"win32\",\"exe\":\"C:\\\\g\\\\ghoztty.exe\"," ++
+            "\"mode\":\"Debug\",\"runtime\":\"win32\",\"update_check\":true," ++
+            "\"exe\":\"C:\\\\g\\\\ghoztty.exe\"," ++
             "\"exe_modified\":\"2026-07-17 09:31:40 UTC\",\"pid\":42}}}",
         json,
     );

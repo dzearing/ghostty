@@ -35,6 +35,13 @@ pub fn run(alloc: Allocator) !u8 {
     try stdout.print("Version\n", .{});
     try stdout.print("  - version: {s}\n", .{build_config.version_string});
     try stdout.print("  - channel: {t}\n", .{build_config.release_channel});
+    if (comptime build_config.app_runtime == .win32) {
+        // Whether THIS exe checks the win-v update channel (T24): on for
+        // MSI release-pipeline builds, off for dev/portable builds.
+        try stdout.print("  - update check: {s}\n", .{
+            if (build_config.windows_update_check) "on (win-v channel)" else "off (dev build)",
+        });
+    }
 
     try stdout.print("Build Config\n", .{});
     try stdout.print("  - Zig version   : {s}\n", .{builtin.zig_version_string});
@@ -122,6 +129,7 @@ fn printRunningInstance(alloc: Allocator, stdout: *std.Io.Writer) !void {
                 commit: []const u8 = "",
                 mode: []const u8 = "",
                 runtime: []const u8 = "",
+                update_check: ?bool = null,
                 exe: []const u8 = "",
                 exe_modified: []const u8 = "",
                 pid: i64 = 0,
@@ -146,6 +154,9 @@ fn printRunningInstance(alloc: Allocator, stdout: *std.Io.Writer) !void {
     try stdout.print("  - commit  : {s}\n", .{data.commit});
     try stdout.print("  - mode    : {s}\n", .{data.mode});
     try stdout.print("  - runtime : {s}\n", .{data.runtime});
+    if (data.update_check) |uc| {
+        try stdout.print("  - update check: {s}\n", .{if (uc) "on (win-v channel)" else "off (dev build)"});
+    }
     try stdout.print("  - exe     : {s}\n", .{data.exe});
     try stdout.print("  - modified: {s}\n", .{data.exe_modified});
     try stdout.print("  - pid     : {d}\n", .{data.pid});

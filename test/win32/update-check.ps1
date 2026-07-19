@@ -14,7 +14,10 @@
 #   1. feed win-v9.9.9 among Mac tags -> "update available" + balloon log
 #   2. feed with Mac tags only        -> "no win-v release found"
 #   3. feed win-v0.0.1 (older)        -> "up to date"
-#   4. no env override (dev build)    -> NO update-check activity (gate)
+#   4. no env override -> flavor-dependent (probed via `+version`'s
+#      "update check: on/off" line): dev builds must stay silent (gate);
+#      channel builds (-Dwindows-update-check, e.g. zig-out right after a
+#      publish-windows-release.ps1 run) must check the real channel.
 #   5. real GitHub channel            -> check completes against the live
 #      releases list (available or up-to-date, whichever matches HEAD's
 #      version vs the published win-v tag)
@@ -59,11 +62,19 @@ function Run-Scenario([string]$label, [string]$updateUrl, [int]$waitSecs = 8) {
     # Isolated pipe so the launch can't forward to a live instance and exit.
     $env:GHOZTTY_PIPE_SUFFIX = '-t24test'
     try {
-        $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardError $errFile
-        $deadline = (Get-Date).AddSeconds($waitSecs)
-        while ((Get-Date) -lt $deadline -and -not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
+        # One retry on early exit: a launch racing a just-killed prior
+        # instance occasionally dies during startup.
+        $proc = $null
+        foreach ($attempt in 1, 2) {
+            $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardError $errFile
+            $deadline = (Get-Date).AddSeconds($waitSecs)
+            while ((Get-Date) -lt $deadline -and -not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
+            if (-not $proc.HasExited) { break }
+            Write-Host "NOTE ($label): GUI exited early (attempt $attempt)"
+            Start-Sleep -Seconds 2
+        }
         if ($proc.HasExited) {
-            Write-Host "SETUP FAIL ($label): GUI exited early (code $($proc.ExitCode))"
+            Write-Host "SETUP FAIL ($label): GUI exited early twice (code $($proc.ExitCode))"
             exit 1
         }
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
@@ -99,9 +110,30 @@ $log3 = Run-Scenario 'older' (New-Feed 'older.json' $feedOlder)
 Assert ($log3 -match 'update check: up to date \(current=\S+ latest=win-v0\.0\.1\)') 'older: up-to-date logged'
 Assert ($log3 -notmatch 'showing update balloon') 'older: no balloon'
 
-# -- 4. dev-build gate: no env override -> no check at all ---------------
+# -- 4. no env override: dev builds gated, channel builds check ----------
+# Probe the exe flavor from its own `+version` output (isolated pipe so
+# the "Running Instance" query finds nothing and only the CLI's own build
+# section prints).
+$env:GHOZTTY_PIPE_SUFFIX = '-t24probe'
+$verOut = Join-Path $env:TEMP 'ghoztty-t24-version.txt'
+$vp = Start-Process $exe -ArgumentList '+version' -RedirectStandardOutput $verOut -NoNewWindow -PassThru
+if (-not $vp.WaitForExit(15000)) { try { $vp.Kill() } catch {}; Write-Host 'SETUP FAIL: +version hung'; exit 1 }
+Remove-Item Env:GHOZTTY_PIPE_SUFFIX -ErrorAction SilentlyContinue
+$verText = [IO.File]::ReadAllText($verOut)
+$isChannel = $verText -match 'update check: on \(win-v channel\)'
+if (-not $isChannel -and $verText -notmatch 'update check: off \(dev build\)') {
+    Write-Host 'SETUP FAIL: +version printed no "update check" line'; exit 1
+}
+# Channel builds throttle automatic checks to one per hour via this
+# timestamp file; clear it so the scenario is deterministic.
+Remove-Item (Join-Path $env:LOCALAPPDATA 'ghoztty\update_check_at') -ErrorAction SilentlyContinue
 $log4 = Run-Scenario 'gated' ''
-Assert ($log4 -notmatch 'update available|up to date|no win-v release|update check failed') 'gated: dev build never checks'
+if ($isChannel) {
+    Assert ($log4 -match 'update available|update check: up to date') 'no-override: channel build checks the real channel'
+    Assert ($log4 -notmatch 'update check failed') 'no-override: channel check succeeded'
+} else {
+    Assert ($log4 -notmatch 'update available|up to date|no win-v release|update check failed') 'no-override: dev build never checks'
+}
 
 # -- 5. real channel smoke ------------------------------------------------
 $log5 = Run-Scenario 'live' 'https://api.github.com/repos/dzearing/ghoztty/releases?per_page=30' 12
