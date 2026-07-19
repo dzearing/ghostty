@@ -115,7 +115,10 @@ struct MachineChooserView: View {
         guard let target = resolvedSelection, let key = browseKey(for: target),
               browser.isExpanded(key), case .loaded(let sessions) = browser.states[key]
         else { return [] }
-        return sessions
+        // Only connectable rows are rendered (see `detailSessions`); keep the
+        // keyboard sub-cursor's index space identical so Return resumes the row
+        // the highlight is actually on.
+        return sessions.filter { $0.isConnectable }
     }
 
     /// Build the `resumeSession` target for `session` under its parent row
@@ -545,7 +548,13 @@ struct MachineChooserView: View {
             VStack(alignment: .leading, spacing: 6) {
                 if let key = browseKey(for: target) {
                     switch browser.states[key] {
-                    case .some(.loaded(let sessions)):
+                    case .some(.loaded(let allSessions)):
+                        // Defense-in-depth backstop to the agent's own immediate reap:
+                        // never render a dead, non-relaunchable tombstone (an
+                        // unreconnectable `exited` dead-end). Protects against an
+                        // OLDER agent that doesn't reap, and the brief window a
+                        // still-bound tombstone exists. Alive + relaunchable stay.
+                        let sessions = allSessions.filter { $0.isConnectable }
                         if sessions.isEmpty {
                             sessionsPlaceholder(icon: "moon.zzz", text: "No active sessions")
                         } else {
