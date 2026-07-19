@@ -282,22 +282,30 @@ extension Ghostty {
 
         /// The fixed width of each table column: the widest cell's natural
         /// (single-line) content width, capped at `maxCellWidth` so a very long
-        /// cell wraps rather than stretching the table. Header cells measure
-        /// bold. Widths are exact (not a flexible max) so the Grid stays as
-        /// wide as its content and grows each row to the height its cells wrap
-        /// to.
+        /// cell wraps rather than stretching the table. Widths are exact (not a
+        /// flexible max) so the Grid stays as wide as its content and grows each
+        /// row to the height its cells wrap to.
+        ///
+        /// Each run is measured at the weight/face it actually renders (bold
+        /// runs at bold, code runs monospaced); measuring bold body text as
+        /// regular under-sized the column and force-wrapped bold labels like
+        /// `**Prompt**` mid-word. Header cells render bold, so they force bold.
+        /// A cell whose content fits under the cap gets its exact width and so
+        /// never wraps at all; only content past the cap wraps, at word
+        /// boundaries (a lone word longer than the whole cap is the sole case
+        /// that can still break mid-character).
         private func columnWidths(for table: BannerMarkdown.Table) -> [CGFloat] {
             let columns = table.header.count
             guard columns > 0 else { return [] }
             var widths = [CGFloat](repeating: 0, count: columns)
             if table.hasVisibleHeader {
                 for (col, cell) in table.header.enumerated() where col < columns {
-                    widths[col] = max(widths[col], cellNaturalWidth(cell, bold: true))
+                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: true))
                 }
             }
             for row in table.rows {
                 for (col, cell) in row.enumerated() where col < columns {
-                    widths[col] = max(widths[col], cellNaturalWidth(cell, bold: false))
+                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: false))
                 }
             }
             // A hair of slack absorbs sub-pixel measurement differences so a
@@ -307,24 +315,43 @@ extension Ghostty {
 
         /// The unwrapped width a cell's inline content occupies: the measured
         /// width of its text runs plus a fixed box per checkbox.
-        private func cellNaturalWidth(
-            _ segments: [BannerMarkdown.Inline], bold: Bool
+        private static func cellNaturalWidth(
+            _ segments: [BannerMarkdown.Inline], forceBold: Bool
         ) -> CGFloat {
             segments.reduce(0) { acc, seg in
                 switch seg {
                 case .text(let a):
-                    return acc + Self.textWidth(String(a.characters), bold: bold)
+                    return acc + attrWidth(a, forceBold: forceBold)
                 case .checkbox:
                     return acc + CheckboxMark.side
                 }
             }
         }
 
-        /// Width of `s` in the 12pt banner font (semibold for header cells),
-        /// used to size table columns. Matches SwiftUI's `.system(size: 12)`.
-        private static func textWidth(_ s: String, bold: Bool) -> CGFloat {
-            let font = OSFont.systemFont(ofSize: 12, weight: bold ? .semibold : .regular)
-            return ceil((s as NSString).size(withAttributes: [.font: font]).width)
+        /// Width of an attributed run sequence in the 12pt banner font, each run
+        /// measured at the weight/face it renders. Matches SwiftUI's
+        /// `.system(size: 12)`. `forceBold` measures every run bold (header row).
+        private static func attrWidth(_ a: AttributedString, forceBold: Bool) -> CGFloat {
+            var total: CGFloat = 0
+            for run in a.runs {
+                let s = String(a[run.range].characters)
+                if s.isEmpty { continue }
+                total += ceil((s as NSString).size(withAttributes: [.font: runFont(run, forceBold: forceBold)]).width)
+            }
+            return total
+        }
+
+        /// The font a run renders in: bold for a strongly-emphasized run (or a
+        /// force-bold header), monospaced for a code run. SwiftUI draws the bold
+        /// presentation intent at full bold weight, so measure it there.
+        private static func runFont(
+            _ run: AttributedString.Runs.Run, forceBold: Bool
+        ) -> OSFont {
+            let intent = run.inlinePresentationIntent ?? []
+            let bold = forceBold || intent.contains(.stronglyEmphasized)
+            return intent.contains(.code)
+                ? OSFont.monospacedSystemFont(ofSize: 12, weight: bold ? .bold : .regular)
+                : OSFont.systemFont(ofSize: 12, weight: bold ? .bold : .regular)
         }
 
         /// How the wrapped lines of a table cell align to each other.
