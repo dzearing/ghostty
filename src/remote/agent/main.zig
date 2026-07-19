@@ -1447,7 +1447,7 @@ fn serveOne(
         mux.dataStream(),
         spawner,
         store,
-        .{ .encoding = encoding, .hostname = hostname, .ring_bytes = configured_ring_bytes },
+        .{ .encoding = encoding, .hostname = hostname, .ring_bytes = configured_ring_bytes, .build_version = agent_version },
     );
     defer srv.destroy(alloc);
 

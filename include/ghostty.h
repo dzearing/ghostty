@@ -1399,6 +1399,13 @@ GHOSTTY_API void ghostty_remote_connection_set_state_callback(
 GHOSTTY_API const char* ghostty_remote_connection_hostname(
     ghostty_remote_connection_t);
 
+// The agent's self-reported build stamp ("YYYYMMDD-<hash>") from its HELLO, or
+// NULL if the peer didn't send one (older agent) or the handshake hasn't
+// completed. Lets the app detect a stale local agent and lazily refresh it.
+// Owned by the connection, valid until _free; copy it immediately.
+GHOSTTY_API const char* ghostty_remote_connection_build_version(
+    ghostty_remote_connection_t);
+
 // Shut down and free the connection. Detaches all panes (sessions survive on
 // the remote for later re-attach by session_id). Caller must ensure no surface
 // still references this connection.

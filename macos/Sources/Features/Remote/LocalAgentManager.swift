@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import GhosttyKit
 import os
@@ -544,6 +545,136 @@ final class LocalAgentManager {
         }
     }
 
+    // MARK: - Non-destructive agent upgrade (staleness detection + lazy refresh)
+
+    /// The build stamp ("YYYYMMDD-<hash>") of the agent binary THIS app bundles,
+    /// learned once by invoking `<bundled agent> --version`. nil ⇒ can't be
+    /// determined ⇒ we never judge the running agent stale (fail safe). Cached
+    /// for the app's lifetime.
+    static let bundledAgentVersion: String? = computeBundledAgentVersion()
+
+    private static func computeBundledAgentVersion() -> String? {
+        guard let url = agentBinaryURL(),
+              FileManager.default.isExecutableFile(atPath: url.path) else { return nil }
+        let proc = Process()
+        proc.executableURL = url
+        proc.arguments = ["--version"]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        // Output form: "ghoztty-agent YYYYMMDD-<hash>\n" → the last token.
+        guard let line = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let stamp = line.split(whereSeparator: { $0 == " " || $0.isNewline }).last
+        else { return nil }
+        let s = String(stamp)
+        return s.isEmpty ? nil : s
+    }
+
+    /// True iff stamp `a` is a NEWER build than `b`, ordered by the `YYYYMMDD`
+    /// date prefix. Same date (or an unparseable prefix) ⇒ false, so an equal or
+    /// unknown date never *blocks* a refresh (the stamp-equality check decides
+    /// that), yet a genuinely newer running agent is never downgraded.
+    static func agentStampIsNewer(_ a: String, than b: String) -> Bool {
+        func datePrefix(_ s: String) -> Int { Int(s.prefix(while: { $0.isNumber })) ?? 0 }
+        return datePrefix(a) > datePrefix(b)
+    }
+
+    /// Is the connected agent an OLDER build than the one this app bundles?
+    /// `running == nil` ⇒ an agent too old to advertise a stamp ⇒ stale (it
+    /// predates this feature). Exact match ⇒ current. A running build NEWER than
+    /// bundled ⇒ NOT stale (never downgrade the agent out from under the app).
+    static func agentIsStale(running: String?, bundled: String) -> Bool {
+        guard let running else { return true }
+        if running == bundled { return false }
+        if agentStampIsNewer(running, than: bundled) { return false }
+        return true
+    }
+
+    /// Lazily adopt a newer bundled agent build, called ONLY at safe moments:
+    /// layout restore finished with no live panes, or the last persistent pane
+    /// just closed. Idle (`liveSessionCount == 0`) ⇒ restart silently — nothing
+    /// to lose — logged + a subtle notice. Live sessions ⇒ NEVER silent: a
+    /// mandatory confirmation before any destructive restart (CLAUDE.md's "never
+    /// silently reset live sessions"). No-op when the agent is already current,
+    /// the bundled build is unknown, or there is no shared connection.
+    @MainActor
+    func refreshLocalAgentIfStale(liveSessionCount: Int, reason: String) {
+        guard let bundled = Self.bundledAgentVersion else { return }
+        // Resolve the shared connection (reuse the warm one, or dial the running
+        // agent) so this works even on a no-session launch — the most common
+        // stale case — where `sharedOwner` isn't cached yet. Reusing an existing
+        // agent never spawns; a genuinely absent agent yields a fresh (current)
+        // one, which reads as not-stale.
+        sharedConnectionAsync { [weak self] owner in
+            guard let self, let owner else { return }
+            let running = owner.agentBuildVersion
+            guard Self.agentIsStale(running: running, bundled: bundled) else { return }
+            if liveSessionCount == 0 {
+                Self.logger.info("local agent stale (running \(running ?? "<pre-versioned>", privacy: .public) != bundled \(bundled, privacy: .public)); idle → refreshing [\(reason, privacy: .public)]")
+                self.forceRefreshLocalAgent(reconnect: false)
+                self.postAgentRefreshNotice(to: bundled)
+            } else {
+                self.promptAndRefreshLocalAgent(liveSessionCount: liveSessionCount, running: running, bundled: bundled)
+            }
+        }
+    }
+
+    /// Bootout + bootstrap the launchd job so it re-execs the newer bundled agent
+    /// binary, then drop the shared connection so the next use dials the fresh
+    /// agent. `reconnect` drives in-place session-layout recovery (used by the
+    /// destructive path so live windows rebind/relaunch); the idle path leaves
+    /// reconnection to the next warm-up. Caller MUST have established it is safe
+    /// (idle) or user-confirmed — the bootout ends any live agent children.
+    @MainActor
+    private func forceRefreshLocalAgent(reconnect: Bool) {
+        lock.lock()
+        let ok = Self.ensureLaunchAgentLoaded(paths: .current, force: true)
+        lock.unlock()
+        guard ok else {
+            Self.logger.error("force agent refresh failed to (re)load launchd job")
+            return
+        }
+        invalidateShared()
+        if reconnect {
+            onSharedConnectionDrop?()
+        } else {
+            warmUp()
+        }
+    }
+
+    /// The mandatory confirmation before a destructive agent restart while
+    /// sessions are live. On confirm → refresh (live windows recover/relaunch);
+    /// on defer → nothing (the agent refreshes automatically once idle).
+    @MainActor
+    private func promptAndRefreshLocalAgent(liveSessionCount n: Int, running: String?, bundled: String) {
+        let alert = NSAlert()
+        alert.messageText = "Update the background terminal agent?"
+        let sessions = "\(n) live terminal session\(n == 1 ? "" : "s")"
+        alert.informativeText = "A newer terminal agent is ready. Applying it now will close your \(sessions) — they can’t be carried across this update. You can also keep working: it will update automatically the next time no sessions are open."
+        alert.addButton(withTitle: "Update Now")
+        alert.addButton(withTitle: "Later")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            Self.logger.info("user deferred destructive agent refresh (\(n) live session(s))")
+            return
+        }
+        Self.logger.info("user confirmed destructive agent refresh (running \(running ?? "<pre-versioned>", privacy: .public) → bundled \(bundled, privacy: .public), \(n) live session(s))")
+        forceRefreshLocalAgent(reconnect: true)
+    }
+
+    /// The idle refresh is silent (no modal) but never fully invisible: it is
+    /// recorded to the unified log so an operator/user can confirm exactly when
+    /// the background agent was adopted. (A visible in-app toast is Phase-2
+    /// polish.)
+    @MainActor
+    private func postAgentRefreshNotice(to bundled: String) {
+        Self.logger.notice("local agent refreshed to bundled build \(bundled, privacy: .public) (idle, no sessions affected)")
+    }
+
     /// Strict parse of the info file body. Static + pure for tests. Accepts a
     /// UDS record (non-empty `socket`) OR a legacy TCP record (`port > 0`);
     /// either way `pid` must be positive. A record with neither a socket nor a
@@ -686,7 +817,14 @@ final class LocalAgentManager {
     /// Returns true once launchd is managing the job (so the caller can poll for
     /// the agent to bind); false when launchctl is unavailable or the load
     /// failed, signalling the caller to fall back to a detached spawn.
-    private static func ensureLaunchAgentLoaded(paths: Paths) -> Bool {
+    /// `force` = a DELIBERATE restart of the launchd job (bootout + bootstrap),
+    /// even when the plist is unchanged and the agent is alive. The normal
+    /// (force == false) path NEVER bootouts a live agent — it defers to the next
+    /// cold start to avoid tombstoning sessions. `force` is used only by the
+    /// non-destructive-upgrade path (`refreshLocalAgentIfStale`), which has
+    /// already established it is safe (agent idle) or user-confirmed (destructive)
+    /// to restart, so the agent can pick up a newer bundled binary now.
+    private static func ensureLaunchAgentLoaded(paths: Paths, force: Bool = false) -> Bool {
         // The agent binds sockets / writes the port + sessions files under this
         // directory; launchd won't create it, so ensure it exists first (0700 —
         // the UDS lives here and the same-uid gate assumes a private dir).
@@ -735,7 +873,7 @@ final class LocalAgentManager {
 
         // Already loaded with an unchanged (stable) config: just make sure it's
         // running.
-        if loaded && !changed {
+        if loaded && !changed && !force {
             _ = launchctl(["kickstart", service])
             return true
         }
@@ -759,7 +897,7 @@ final class LocalAgentManager {
         // caller's `pollDial` retries the dial for 5s instead, and if that still
         // fails the window falls back to a plain exec surface — the live sessions
         // are never reset.
-        if loaded && changed && Self.agentProcessAlive(paths: paths) {
+        if loaded && changed && !force && Self.agentProcessAlive(paths: paths) {
             logger.info("agent LaunchAgent config changed but a live agent (pid from \(paths.portFile.lastPathComponent, privacy: .public)) is running; deferring reload to next cold start (no bootout, sessions preserved)")
             _ = launchctl(["kickstart", service])
             return true

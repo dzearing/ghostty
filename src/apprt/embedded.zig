@@ -2626,6 +2626,19 @@ pub const CAPI = struct {
         return name.ptr;
     }
 
+    /// The agent's self-reported build stamp ("YYYYMMDD-<hash>") from its HELLO,
+    /// or null if the peer didn't send one (older agent) or the handshake hasn't
+    /// completed. The app compares this to the build it bundles to detect a stale
+    /// local agent and lazily refresh it. Same ownership/lifetime as
+    /// `ghostty_remote_connection_hostname` — copy it immediately.
+    export fn ghostty_remote_connection_build_version(
+        handle: *RemoteConnectionHandle,
+    ) ?[*:0]const u8 {
+        const conn = handle.conn() orelse return null;
+        const v = conn.peerBuildVersion() orelse return null;
+        return v.ptr;
+    }
+
     /// Shut down and free the connection handle. Detaches all panes (remote
     /// sessions survive for later re-attach by session_id). The caller must
     /// ensure no surface still references this handle.

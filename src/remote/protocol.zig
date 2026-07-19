@@ -397,6 +397,15 @@ pub const Hello = struct {
     /// pill). Optional: absent from older peers, and never load-bearing.
     hostname: ?[]const u8 = null,
 
+    /// The sender's build stamp ("YYYYMMDD-<git short hash>", the same string the
+    /// agent bakes as `agent_build_options.agent_version` and prints for
+    /// `--version`). Set by the AGENT so the app can detect at runtime that the
+    /// running agent is a different build than the one it bundles and lazily
+    /// refresh it (non-destructive agent upgrade). Additive/optional: older peers
+    /// omit it (→ null → "unknown build", never treated as stale), and readers
+    /// ignore it when absent. Never load-bearing for the protocol itself.
+    build_version: ?[]const u8 = null,
+
     /// Serialize to a JSON byte slice owned by `alloc`.
     pub fn encode(self: Hello, alloc: Allocator) Allocator.Error![]u8 {
         return std.json.Stringify.valueAlloc(alloc, self, .{});
@@ -1627,6 +1636,34 @@ test "HELLO parse ignores unknown fields (forward-compat)" {
     var parsed = try Hello.parse(alloc, json);
     defer parsed.deinit();
     try testing.expectEqual(TransferEncoding.raw, parsed.value.transfer_encoding);
+}
+
+test "HELLO build_version: additive + back-compat" {
+    const alloc = testing.allocator;
+
+    // A newer agent advertises its build stamp; it round-trips.
+    const newer: Hello = .{ .transfer_encoding = .raw, .build_version = "20260718-574fe0805" };
+    const nj = try newer.encode(alloc);
+    defer alloc.free(nj);
+    var np = try Hello.parse(alloc, nj);
+    defer np.deinit();
+    try testing.expectEqualStrings("20260718-574fe0805", np.value.build_version.?);
+
+    // An OLDER peer's HELLO has no build_version → decodes to null ("unknown
+    // build"), never a parse error. The app must treat null as not-stale.
+    const legacy =
+        \\{"proto_version":1,"transfer_encoding":"raw","capabilities":["rpc"]}
+    ;
+    var lp = try Hello.parse(alloc, legacy);
+    defer lp.deinit();
+    try testing.expect(lp.value.build_version == null);
+
+    // When null, the field is elided from the encoding (no wire bloat / a peer
+    // that never sends it is byte-compatible with today).
+    const bare: Hello = .{ .transfer_encoding = .raw };
+    const bj = try bare.encode(alloc);
+    defer alloc.free(bj);
+    try testing.expect(std.mem.indexOf(u8, bj, "build_version") == null);
 }
 
 test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
