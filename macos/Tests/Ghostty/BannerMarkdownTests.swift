@@ -21,6 +21,12 @@ struct BannerMarkdownTests {
         Ghostty.BannerMarkdown.attributed(segments)
     }
 
+    /// The plain text of a `.text` block (empty for any other block kind).
+    private func text(_ block: Block) -> String {
+        if case .text(let str, _) = block { return plain(str) }
+        return ""
+    }
+
     // MARK: Inline (existing subset still intact)
 
     @Test func inlineBold() {
@@ -86,14 +92,32 @@ struct BannerMarkdownTests {
 
     // MARK: Block segmentation
 
-    @Test func plainTextIsSingleBlock() {
+    @Test func plainTextLinesAreSeparateBlocks() {
+        // Consecutive text lines each become their own block so they get the
+        // standard inter-block gap (not tight line spacing within one Text).
         let blocks = Ghostty.BannerMarkdown.parseBlocks("hello\nworld")
-        #expect(blocks.count == 1)
-        guard case .text(let str, _) = blocks[0] else {
-            Issue.record("expected text block")
+        #expect(blocks.count == 2)
+        guard case .text(let first, _) = blocks[0],
+              case .text(let second, _) = blocks[1] else {
+            Issue.record("expected two text blocks")
             return
         }
-        #expect(plain(str) == "hello\nworld")
+        #expect(plain(first) == "hello")
+        #expect(plain(second) == "world")
+    }
+
+    @Test func blankLinesBetweenTextAreDropped() {
+        // A blank separator line adds no block — the inter-block gap already
+        // separates the two text lines.
+        let blocks = Ghostty.BannerMarkdown.parseBlocks("hello\n\nworld")
+        #expect(blocks.count == 2)
+        guard case .text(let first, _) = blocks[0],
+              case .text(let second, _) = blocks[1] else {
+            Issue.record("expected two text blocks")
+            return
+        }
+        #expect(plain(first) == "hello")
+        #expect(plain(second) == "world")
     }
 
     @Test func tableBetweenTextProducesThreeBlocks() {
@@ -219,35 +243,28 @@ struct BannerMarkdownTests {
     // MARK: Not-a-table fallbacks
 
     @Test func separatorColumnMismatchIsText() {
+        // Not a table: each line falls back to its own text block.
         let source = "| a | b |\n|---|\n| 1 | 2 |"
         let blocks = Ghostty.BannerMarkdown.parseBlocks(source)
-        #expect(blocks.count == 1)
-        guard case .text(let str, _) = blocks[0] else {
-            Issue.record("expected text block")
-            return
-        }
-        #expect(plain(str) == source)
+        #expect(blocks.count == 3)
+        #expect(blocks.allSatisfy { if case .text = $0 { return true }; return false })
+        #expect(blocks.map(text).joined(separator: "\n") == source)
     }
 
     @Test func missingSeparatorIsText() {
         let source = "| a | b |\n| 1 | 2 |"
         let blocks = Ghostty.BannerMarkdown.parseBlocks(source)
-        #expect(blocks.count == 1)
-        guard case .text = blocks[0] else {
-            Issue.record("expected text block")
-            return
-        }
+        #expect(blocks.count == 2)
+        #expect(blocks.allSatisfy { if case .text = $0 { return true }; return false })
     }
 
     @Test func pipeInsideTextLineIsNotATable() {
         let source = "a | b\nc | d"
         let blocks = Ghostty.BannerMarkdown.parseBlocks(source)
-        #expect(blocks.count == 1)
-        guard case .text(let str, _) = blocks[0] else {
-            Issue.record("expected text block")
-            return
-        }
-        #expect(plain(str) == source)
+        #expect(blocks.count == 2)
+        #expect(blocks.allSatisfy { if case .text = $0 { return true }; return false })
+        #expect(blocks.map(text).joined(separator: "\n") == source)
+        #expect(text(blocks[0]) == "a | b")
     }
 
     // MARK: Display cap
@@ -271,12 +288,16 @@ struct BannerMarkdownTests {
     @Test func maxLinesTruncatesTextLines() {
         let source = (1...20).map { "line\($0)" }.joined(separator: "\n")
         let blocks = Ghostty.BannerMarkdown.parseBlocks(source, maxLines: 3)
-        #expect(blocks.count == 1)
-        guard case .text(let str, let limit) = blocks[0] else {
-            Issue.record("expected text block")
+        // Each line is its own block; the cap keeps the first three.
+        #expect(blocks.count == 3)
+        #expect(blocks.allSatisfy { if case .text = $0 { return true }; return false })
+        guard case .text(let first, let limit) = blocks[0],
+              case .text(let third, _) = blocks[2] else {
+            Issue.record("expected text blocks")
             return
         }
-        #expect(plain(str) == "line1\nline2\nline3")
+        #expect(plain(first) == "line1")
+        #expect(plain(third) == "line3")
         #expect(limit == 3)
     }
 
@@ -285,11 +306,9 @@ struct BannerMarkdownTests {
             "one\ntwo\n| a |\n|---|\n| 1 |",
             maxLines: 2
         )
-        #expect(blocks.count == 1)
-        guard case .text = blocks[0] else {
-            Issue.record("expected only the text block")
-            return
-        }
+        // Two text lines consume the cap; the table past it is dropped.
+        #expect(blocks.count == 2)
+        #expect(blocks.allSatisfy { if case .text = $0 { return true }; return false })
     }
 
     // MARK: Task-list checkboxes
