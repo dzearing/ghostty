@@ -731,6 +731,17 @@ final class RemoteConnection {
         return v >= 0 ? v : nil
     }
 
+    /// The connected agent's self-reported build stamp ("YYYYMMDD-<hash>") from
+    /// its HELLO, or nil if the agent is too old to advertise one (predates the
+    /// build_version field) or the handshake hasn't completed. The app compares
+    /// this to the build it bundles to detect a stale local agent it can lazily
+    /// refresh. A nil here for a completed local connection means "an old agent."
+    var agentBuildVersion: String? {
+        ghostty_remote_connection_build_version(handle)
+            .flatMap { String(cString: $0) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     deinit {
         // Clear the state callback FIRST: this synchronizes with an in-flight
         // invocation (once it returns, no further callback can fire), so the

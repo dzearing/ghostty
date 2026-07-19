@@ -289,6 +289,10 @@ pub const Server = struct {
         /// This machine's hostname, advertised in the HELLO for client display
         /// (the window pill). Must outlive `start()` (encoded there). Optional.
         hostname: ?[]const u8 = null,
+        /// This agent's build stamp ("YYYYMMDD-<hash>"), advertised in the HELLO
+        /// so the app can detect it is running an older build than it bundles and
+        /// lazily refresh it. Must outlive `start()` (encoded there). Optional.
+        build_version: ?[]const u8 = null,
     };
 
     /// Stand up a per-connection Server over a SHARED daemon `store` (the registry
@@ -315,6 +319,7 @@ pub const Server = struct {
                 .transfer_encoding = opts.encoding,
                 .capabilities = opts.capabilities,
                 .hostname = opts.hostname,
+                .build_version = opts.build_version,
             },
             .clock = opts.clock orelse Clock.real(),
             .spawner = spawner,

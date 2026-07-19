@@ -130,6 +130,13 @@ extension AppDelegate {
             _ = TerminalController.newWindow(ghostty)
             undoManager.enableUndoRegistration()
         }
+        // Non-destructive agent upgrade: restore has settled, so this is a safe
+        // moment to adopt a newer bundled agent build. Idle (no live persistent
+        // windows) → silent refresh; otherwise a confirmation is shown. This is
+        // what un-sticks an agent that survived app upgrades on an old build.
+        let liveCount = TerminalController.all.filter { $0.sessionLayoutEntryID != nil }.count
+        LocalAgentManager.shared.refreshLocalAgentIfStale(
+            liveSessionCount: liveCount, reason: "launch restore finished")
     }
 
     /// The tri-state liveness of every recorded session id (T06b). Blocking

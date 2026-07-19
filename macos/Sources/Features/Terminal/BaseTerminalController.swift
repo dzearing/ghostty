@@ -2071,6 +2071,25 @@ class BaseTerminalController: NSWindowController,
                         SessionLayoutManifest.shared.scheduleSync(otherController)
                     }
                 }
+
+                // Non-destructive agent upgrade (idle trigger): if no OTHER live
+                // persistent window remains, the agent just went idle — a safe
+                // moment to adopt a newer bundled build. Deferred so this close
+                // fully settles first; the refresh re-checks liveness (0 live →
+                // silent refresh, so a stale agent self-heals the next quiet moment
+                // instead of waiting for a reboot).
+                let otherPersistent = TerminalController.all.contains {
+                    $0 !== self && $0.sessionLayoutEntryID != nil
+                }
+                if !otherPersistent {
+                    DispatchQueue.main.async {
+                        let live = TerminalController.all.filter {
+                            $0.sessionLayoutEntryID != nil
+                        }.count
+                        LocalAgentManager.shared.refreshLocalAgentIfStale(
+                            liveSessionCount: live, reason: "last persistent window closed")
+                    }
+                }
             } else {
                 SessionLayoutManifest.shared.updateWindowTitle(
                     entryID, windowTitle: titleOverride)

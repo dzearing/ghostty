@@ -738,6 +738,12 @@ pub const Connection = struct {
     /// it out directly. Owned by the connection, freed in `destroy`.
     peer_hostname: ?[:0]u8 = null,
 
+    /// The peer's self-reported build stamp ("YYYYMMDD-<hash>") from its HELLO
+    /// (null if the peer — an older agent — did not send one). Same write/read
+    /// ordering and ownership as `peer_hostname`. The app compares it to the
+    /// build it bundles to detect a stale local agent and lazily refresh it.
+    peer_build_version: ?[:0]u8 = null,
+
     /// Per-connection frame sequence (§4.2). Assigned by the writer thread at send
     /// time so seq order matches wire order, single-writer (no atomics needed).
     frame_seq: protocol.FrameSeq = .{},
@@ -1316,6 +1322,7 @@ pub const Connection = struct {
         self.write_queue.deinit(alloc);
         self.channels.deinit();
         if (self.peer_hostname) |h| alloc.free(h);
+        if (self.peer_build_version) |v| alloc.free(v);
         // Any panes still registered at destroy (the caller didn't close/detach
         // them) are freed here so the connection owns no leaks. Their channels were
         // already deregistered-or-irrelevant since all threads have joined.
@@ -2728,6 +2735,13 @@ pub const Connection = struct {
                 self.peer_hostname = self.alloc.dupeZ(u8, h) catch null;
             }
         }
+        // Same capture for the peer's build stamp (used by the app to detect a
+        // stale local agent). Best-effort; null when the peer is an older agent.
+        if (parsed.value.build_version) |v| {
+            if (v.len > 0 and self.peer_build_version == null) {
+                self.peer_build_version = self.alloc.dupeZ(u8, v) catch null;
+            }
+        }
         return protocol.negotiate(self.local_hello, parsed.value);
     }
 
@@ -2735,6 +2749,13 @@ pub const Connection = struct {
     /// after `waitHandshake` has returned successfully.
     pub fn peerHostname(self: *const Connection) ?[:0]const u8 {
         return self.peer_hostname;
+    }
+
+    /// The peer's self-reported build stamp ("YYYYMMDD-<hash>"), or null (an
+    /// older agent that doesn't advertise it). Only valid after `waitHandshake`
+    /// has returned successfully.
+    pub fn peerBuildVersion(self: *const Connection) ?[:0]const u8 {
+        return self.peer_build_version;
     }
 
     /// Store the handshake outcome and wake `waitHandshake`. First writer wins so
