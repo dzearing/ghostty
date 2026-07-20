@@ -88,4 +88,7 @@ test {
     // Pure win32 window-placement memory parse/format/clamp (T85), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/window_memory.zig");
+
+    // Pure win32 banner-markdown parser (T35), same no-OS-imports deal.
+    _ = @import("apprt/win32/banner_markdown.zig");
 }

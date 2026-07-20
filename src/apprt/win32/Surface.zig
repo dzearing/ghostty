@@ -22,6 +22,7 @@ const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
+const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
 
@@ -105,6 +106,12 @@ scrollbar: ?*Scrollbar = null,
 /// Created lazily on first dim (single-pane windows never pay for one).
 /// Driven by Window.updateDimOverlays.
 dim_overlay: ?*DimOverlay = null,
+
+/// Sticky pane banner (T35): overlay strip above the terminal content,
+/// plus the raw markdown source (owned) so the editor can prefill it and
+/// `+list --json` can report it. Both null while no banner is set.
+banner_overlay: ?*BannerOverlay = null,
+banner_text: ?[:0]u8 = null,
 
 /// Background tint (T67): explicit `--color`/`--split-color`/picker color,
 /// or the auto-shifted split-inheritance tint. Null ⇒ config background.
@@ -567,6 +574,23 @@ pub fn deinit(self: *Surface) void {
         self.dim_overlay = null;
     }
 
+    // Close an open banner editor targeting this pane (T35) — e.g. an IPC
+    // `+close` while the dialog is up; its surface pointer must not dangle.
+    if (self.parent_window.banner_dialog) |dlg| {
+        if (dlg.surface == self) dlg.cancel();
+    }
+
+    // Destroy the banner overlay before the surface HWND (its owner) is
+    // gone, and free the banner source (T35).
+    if (self.banner_overlay) |b| {
+        b.destroy();
+        self.banner_overlay = null;
+    }
+    if (self.banner_text) |t| {
+        self.app.core_app.alloc.free(t);
+        self.banner_text = null;
+    }
+
     // Destroy popup windows and their GDI resources.
     if (self.search_hwnd) |popup| {
         _ = w32.DestroyWindow(popup);
@@ -746,6 +770,64 @@ pub fn showDimOverlay(self: *Surface, color: u32, alpha: u8) void {
 /// Hide this pane's dim overlay if it exists.
 pub fn hideDimOverlay(self: *Surface) void {
     if (self.dim_overlay) |d| d.hide();
+}
+
+/// Set (or clear, with null/empty text) this pane's sticky banner (T35).
+/// Reached from the `.pane_banner` apprt action (OSC 7778 / core routing)
+/// and the `+set-banner` IPC verb. Stores the raw markdown source so the
+/// banner editor can prefill it, and drives the overlay strip.
+pub fn setPaneBanner(self: *Surface, text: ?[]const u8) void {
+    const alloc = self.app.core_app.alloc;
+
+    if (self.banner_text) |old| {
+        alloc.free(old);
+        self.banner_text = null;
+    }
+
+    const t = text orelse "";
+    if (t.len == 0) {
+        if (self.banner_overlay) |b| {
+            b.destroy();
+            self.banner_overlay = null;
+        }
+        return;
+    }
+
+    self.banner_text = alloc.dupeZ(u8, t) catch null;
+
+    const hwnd = self.hwnd orelse return;
+    if (self.banner_overlay == null) {
+        self.banner_overlay = BannerOverlay.create(
+            alloc,
+            hwnd,
+            self.app.hinstance,
+        ) catch |err| {
+            log.warn("banner overlay create failed err={}", .{err});
+            return;
+        };
+    }
+    const overlay = self.banner_overlay.?;
+    overlay.setText(t);
+    self.refreshBannerColors();
+    overlay.updatePosition(self.scale);
+}
+
+/// Re-derive the banner strip colors from the pane's effective background
+/// (per-pane tint or config background). Cheap and idempotent; called on
+/// set and from Window.updatePaneBanners so config reloads re-color live.
+pub fn refreshBannerColors(self: *Surface) void {
+    const overlay = self.banner_overlay orelse return;
+    const config = &self.app.config;
+    const pane_bg: color_math.Rgb = self.background_tint orelse .{
+        .r = config.background.r,
+        .g = config.background.g,
+        .b = config.background.b,
+    };
+    overlay.setColors(pane_bg, .{
+        .r = config.foreground.r,
+        .g = config.foreground.g,
+        .b = config.foreground.b,
+    });
 }
 
 // -----------------------------------------------------------------------
@@ -1590,6 +1672,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Copy URL to Clipboard", .action = .copy_url_to_clipboard },
     .{ .name = "Copy Title to Clipboard", .action = .copy_title_to_clipboard },
     .{ .name = "Rename Window", .action = .prompt_surface_title },
+    .{ .name = "Set Pane Banner…", .action = .prompt_surface_banner },
     .{ .name = "Select All", .action = .select_all },
     .{ .name = "Find", .action = .start_search },
     .{ .name = "Search Selection", .action = .search_selection },

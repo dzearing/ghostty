@@ -21,6 +21,7 @@ const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
 const RenameDialog = @import("RenameDialog.zig");
+const BannerDialog = @import("BannerDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
@@ -541,6 +542,12 @@ pub fn run(self: *App) !void {
             // children (their parent's GWLP_USERDATA is not a Surface),
             // and no global keybind bubbles out of a modal dialog.
             if (self.renameDialogOwning(msg.hwnd.?)) |dlg| {
+                if (dlg.handleKey(vk)) continue :loop;
+            } else if (self.bannerDialogOwning(msg.hwnd.?)) |dlg| {
+                // Modal "Set Pane Banner" editor (T35): Escape/Tab and
+                // Ctrl+Enter handled by our code; plain Enter falls through
+                // to the multi-line edit as a newline. Exclusive, same
+                // reasoning as the rename dialog above.
                 if (dlg.handleKey(vk)) continue :loop;
             } else if (self.machineChooserOwning(msg.hwnd.?)) |chooser| {
                 // Modal machine chooser: Enter/Escape/Tab/Up/Down handled by
@@ -1632,9 +1639,28 @@ pub fn performAction(
         .show_on_screen_keyboard, // GTK/mobile
         .inspector, // Not yet implemented (debug overlay)
         .render_inspector, // Not yet implemented (debug overlay)
-        .pane_banner, // Not yet implemented on Windows (tracker T35)
-        .prompt_banner, // Not yet implemented on Windows (tracker T35)
         => return true,
+
+        // Sticky pane banner (T35): OSC 7778 / `+set-banner` / the editor
+        // dialog all funnel through the core surface to here.
+        .pane_banner => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                const text: []const u8 = value.text;
+                core_surface.rt_surface.setPaneBanner(
+                    if (text.len == 0) null else text,
+                );
+                return true;
+            },
+        },
+
+        .prompt_banner => switch (target) {
+            .app => return false,
+            .surface => |core_surface| {
+                BannerDialog.open(core_surface.rt_surface);
+                return true;
+            },
+        },
 
         .renderer_health => {
             // Surface a warning when the GPU renderer degrades so a frozen
@@ -2057,6 +2083,18 @@ pub fn performAction(
 /// dialog itself or one of its controls), if any. Used by the message
 /// loop to route dialog keys and to keep dialog children away from the
 /// Surface-cast popup-edit intercepts.
+/// Returns the open "Set Pane Banner" editor owning the given HWND (the
+/// dialog itself or one of its controls), if any. Same routing job as
+/// renameDialogOwning (T35).
+fn bannerDialogOwning(self: *App, hwnd: w32.HWND) ?*BannerDialog {
+    for (self.windows.items) |win| {
+        if (win.banner_dialog) |dlg| {
+            if (dlg.ownsHwnd(hwnd)) return dlg;
+        }
+    }
+    return null;
+}
+
 fn renameDialogOwning(self: *App, hwnd: w32.HWND) ?*RenameDialog {
     for (self.windows.items) |win| {
         if (win.rename_dialog) |dlg| {

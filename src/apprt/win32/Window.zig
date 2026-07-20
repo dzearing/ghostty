@@ -14,6 +14,7 @@ const App = @import("App.zig");
 const MachineChooser = @import("MachineChooser.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const RenameDialog = @import("RenameDialog.zig");
+const BannerDialog = @import("BannerDialog.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
@@ -160,6 +161,11 @@ rename_tab: usize = 0,
 /// RenameDialog itself; this is a backreference for key routing and
 /// teardown.
 rename_dialog: ?*RenameDialog = null,
+
+/// The open "Set Pane Banner" editor (T35), or null. Same lifecycle deal
+/// as rename_dialog: owned by the BannerDialog itself, backreference for
+/// key routing and teardown.
+banner_dialog: ?*BannerDialog = null,
 
 /// The open "New Remote Window" machine chooser (T22c), or null. Modal to
 /// this window while open; a backreference for key routing and teardown.
@@ -652,6 +658,7 @@ pub fn deinit(self: *Window) void {
     // Close the rename dialog / machine chooser first (each re-enables and
     // refocuses this window's HWND, which must still be alive).
     if (self.rename_dialog) |dlg| dlg.cancel();
+    if (self.banner_dialog) |dlg| dlg.cancel();
     if (self.machine_chooser) |ch| ch.cancel();
 
     // Drop IPC names pointing at this window before the memory can be
@@ -1687,6 +1694,25 @@ pub fn updateDimOverlays(self: *Window) void {
             } else {
                 entry.view.hideDimOverlay();
             }
+        }
+    }
+
+    // Pane banners glue to the same layout/visibility/config events (T35).
+    self.updatePaneBanners();
+}
+
+/// Reposition/show/hide every pane's sticky banner strip (T35). Rides the
+/// dim-overlay triggers (layoutSplits, focus changes, WM_MOVE, tab switch,
+/// config reload) via updateDimOverlays. Idempotent and cheap — panes
+/// without a banner pay one null check.
+pub fn updatePaneBanners(self: *Window) void {
+    for (0..self.tab_count) |tab| {
+        var it = self.tab_trees[tab].iterator();
+        while (it.next()) |entry| {
+            const surface = entry.view;
+            const overlay = surface.banner_overlay orelse continue;
+            surface.refreshBannerColors();
+            overlay.updatePosition(surface.scale);
         }
     }
 }

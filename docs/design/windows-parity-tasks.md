@@ -149,8 +149,12 @@ Work these first, in order, before falling back to first-todo-in-table:
 11. ~~T25~~ — DONE 2026-07-19 (spec §8 conformance gate: `conformance.ps1`
    items 1–7 ALL PASS ×3 + hero/relay/skill evidence; spec §9 filled).
    Filed T86 (harness foreground hardening) + T87 (Mac seat: regression
-   build + merge to main). **Next on-box: T35 or T86** (T29/T30/T87 are
-   Mac-seat; T28's remainder is also open).
+   build + merge to main).
+12. ~~T35~~ — DONE 2026-07-19 (sticky pane banner: IPC + OSC 7778 + strip
+   overlay + ctrl+shift+b editor; `pane-banner.ps1` ALL PASS (30) ×3).
+   **Next on-box: T88 then T86** (T29/T30/T87 are Mac-seat; T28's
+   remainder is also open). T88 (filed 2026-07-19, user directive): sync
+   with latest main + analyze all incoming changes + file parity tasks.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -201,7 +205,7 @@ One line per row. Full spec + validation + evidence per task:
 | T32 | Split IpcServer.zig; pure logic + unit tests | J | — | done | 640457b0d.. |
 | T33 | Native win32 test lane | J | T32 | done | see details |
 | T34 | Windows shell types, first-class | J | — | done | see details |
-| T35 | Sticky pane banner on win32 | I | — | todo | — |
+| T35 | Sticky pane banner on win32 — done 2026-07-19: `+set-banner` verb + OSC 7778 + layered-popup strip (markdown subset via pure banner_markdown.zig, clickable links, per-pane) + ctrl+shift+b editor dialog + palette entry + `+list` additive `banner`; `pane-banner.ps1` ALL PASS (30) ×3 | I | — | done | (this commit) |
 | T36 | Release install refresh flow | H | — | in-progress | ae71b19b4.. |
 | T37 | CLAUDE.md symmetry mandate + dual-arch instructions | — | — | todo | — |
 | T38 | Windows build in the release process | H | T23,T24 | todo | — |
@@ -256,6 +260,7 @@ One line per row. Full spec + validation + evidence per task:
 | T85 | FIX: new windows don't remember size — done 2026-07-19: outer size + maximized flag persisted on user-interactive changes only (WM_EXITSIZEMOVE + max/restore transitions) to `%LOCALAPPDATA%\ghoztty\window_placement` (`-debug` for Debug builds); creation uses config > memory (work-area-clamped) > 800×600; `maximize` config now honored; reset stays the escape hatch; `window-size-memory.ps1` ALL PASS (20) ×3, `reset-window-size.ps1` (focus-free rewrite) ALL PASS (10), P1–P3 + both lanes green | I | — | done | 67b0f24a5 |
 | T86 | Harden foreground grab in the ~20 other kb-injection scripts (attach-to-fg-thread + Alt tap, the T25 hero-mode.ps1 fix) — unattended runs abort when a browser owns foreground | — | — | todo | — |
 | T87 | Mac seat: macOS regression build green + merge to main (T25 tail, per working agreements); natural moment for a live relay dial + T29/T30 | — | T25 | todo | — |
+| T88 | Rebase/merge latest origin/main into this branch; analyze EVERY incoming change (features, actions, config keys, IPC verbs, fixes) and file a parity task per gap so the Windows build tracks main (user directive 2026-07-19). Deliverable: branch on latest main, both lanes + P1–P3 green, new T-rows for each Mac-side feature Windows lacks | — | — | todo | — |
 | T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | 3b085a661 |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

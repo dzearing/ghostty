@@ -141,6 +141,47 @@ pub fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
     return null;
 }
 
+/// `+set-banner` arguments (T35), Mac handleSetBanner parity: `--target=`
+/// and `--clear` are flags; every other argument is banner text, joined
+/// with spaces. A literal `\n` becomes a line break so multi-line banners
+/// can be set from one shell argument; surrounding whitespace/newlines are
+/// trimmed (a stray trailing newline must not render as a blank line);
+/// empty text implies clear.
+pub const SetBannerArgs = struct {
+    target: ?[]const u8 = null,
+    /// Arena-allocated: joined, `\n`-unescaped, trimmed.
+    text: []const u8 = "",
+    clear: bool = false,
+};
+
+pub fn parseSetBannerArgs(
+    arena: Allocator,
+    arguments: ?[]const []const u8,
+) Allocator.Error!SetBannerArgs {
+    var result: SetBannerArgs = .{};
+    const args = arguments orelse {
+        result.clear = true;
+        return result;
+    };
+
+    var parts: std.ArrayList([]const u8) = .empty;
+    for (args) |arg| {
+        if (dropPrefix(arg, "--target=")) |v| {
+            result.target = v;
+        } else if (std.mem.eql(u8, arg, "--clear")) {
+            result.clear = true;
+        } else {
+            try parts.append(arena, arg);
+        }
+    }
+
+    const joined = try std.mem.join(arena, " ", parts.items);
+    const unescaped = try std.mem.replaceOwned(u8, arena, joined, "\\n", "\n");
+    result.text = std.mem.trim(u8, unescaped, " \t\r\n");
+    if (result.text.len == 0) result.clear = true;
+    return result;
+}
+
 /// The Windows shell-flavor table (spec, "Architecture decisions"): build
 /// the argv that runs `command` inside `shell`. The config Command
 /// `.direct` argv form is required on Windows — the `.shell` path
@@ -279,6 +320,36 @@ const testing = std.testing;
 
 fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(testing.allocator);
+}
+
+test "parseSetBannerArgs: text joined, \\n unescaped, trimmed" {
+    var arena = testArena();
+    defer arena.deinit();
+    const args = [_][]const u8{ "--target=dev", "**PR #1**", "ready\\nline2 " };
+    const parsed = try parseSetBannerArgs(arena.allocator(), &args);
+    try testing.expectEqualStrings("dev", parsed.target.?);
+    try testing.expectEqualStrings("**PR #1** ready\nline2", parsed.text);
+    try testing.expect(!parsed.clear);
+}
+
+test "parseSetBannerArgs: --clear, empty text implies clear, no args" {
+    var arena = testArena();
+    defer arena.deinit();
+
+    const cleared = try parseSetBannerArgs(arena.allocator(), &[_][]const u8{
+        "--target=dev", "--clear", "ignored text",
+    });
+    try testing.expect(cleared.clear);
+    try testing.expectEqualStrings("dev", cleared.target.?);
+
+    const empty = try parseSetBannerArgs(arena.allocator(), &[_][]const u8{
+        "--target=dev", "  ", "\\n",
+    });
+    try testing.expect(empty.clear);
+
+    const none = try parseSetBannerArgs(arena.allocator(), null);
+    try testing.expect(none.clear);
+    try testing.expect(none.target == null);
 }
 
 test "parseVerbArgs: full flag set" {

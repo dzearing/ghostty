@@ -40,6 +40,10 @@ pub const List = struct {
         /// `build`: null omits the field, so the golden Mac shape below is
         /// unchanged for untinted panes (the Mac server never sends it).
         background_tint: ?[]const u8 = null,
+        /// Sticky pane-banner source (T35). Additive and optional like
+        /// `background_tint`: null omits the field, keeping the golden Mac
+        /// shape unchanged for bannerless panes.
+        banner: ?[]const u8 = null,
     };
 
     pub const Node = union(enum) {
@@ -207,9 +211,56 @@ pub const List = struct {
             try jws.objectField("background_tint");
             try jws.write(tint);
         }
+        if (term.banner) |banner| {
+            try jws.objectField("banner");
+            try jws.write(banner);
+        }
         try jws.endObject();
     }
 };
+
+test "List: banner is additive (T35)" {
+    const testing = std.testing;
+
+    const bannered: List.Node = .{ .leaf = .{
+        .id = "11",
+        .title = "pwsh",
+        .working_directory = "",
+        .pid = 0,
+        .tty = "",
+        .name = "11",
+        .focused = true,
+        .exit_code = null,
+        .banner = "**PR #1**\nline2",
+    } };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &bannered,
+    }};
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = null,
+        .focused = true,
+        .tabs = &tabs,
+    }};
+
+    const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings(
+        "{\"success\":true,\"data\":{\"windows\":[" ++
+            "{\"id\":\"1\",\"title\":\"pwsh\",\"target\":null,\"focused\":true,\"tabs\":[" ++
+            "{\"id\":\"0\",\"title\":\"pwsh\",\"index\":0,\"selected\":true,\"splits\":" ++
+            "{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"pwsh\"," ++
+            "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"11\"," ++
+            "\"focused\":true,\"exit_code\":null,\"banner\":\"**PR #1**\\nline2\"}}}]}]}}",
+        json,
+    );
+}
 
 test "List: build provenance is additive (T52)" {
     const testing = std.testing;

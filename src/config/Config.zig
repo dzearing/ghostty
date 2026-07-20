@@ -6970,6 +6970,15 @@ pub const Keybinds = struct {
                 .toggle_command_palette,
             );
 
+            // Pane banner editor (mac: cmd+r). Plain ctrl+r belongs to the
+            // shell (reverse history search) and ctrl+shift+r is the
+            // cross-platform rename, so the banner takes ctrl+shift+b.
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .prompt_surface_banner = {} },
+            );
+
             // Windows convention: ctrl+f4 closes the current tab.
             try self.set.put(
                 alloc,

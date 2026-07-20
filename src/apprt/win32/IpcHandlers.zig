@@ -75,22 +75,10 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         return try handleNewRemoteWindow(ctx, request);
     } else if (std.mem.eql(u8, request.action, "version")) {
         return try handleVersion(ctx);
+    } else if (std.mem.eql(u8, request.action, "set-banner")) {
+        return try handleSetBanner(ctx, request);
     }
 
-    // Verbs the Mac server implements that are still pending on Windows
-    // (each is its own task in the parity tracker).
-    const known = [_][]const u8{
-        "set-banner", // T35
-    };
-    for (known) |k| {
-        if (std.mem.eql(u8, request.action, k)) {
-            return try errorResponse(
-                ctx.alloc,
-                "unimplemented action on Windows: {s}",
-                .{request.action},
-            );
-        }
-    }
     return try errorResponse(ctx.alloc, "unknown action: {s}", .{request.action});
 }
 
@@ -875,6 +863,31 @@ fn handleSetState(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
 }
 
+/// `+set-banner` (T35): set or clear the sticky banner of a named pane or
+/// window. Banners are per-pane; a window target applies to its focused
+/// pane (Mac handleSetBanner semantics).
+fn handleSetBanner(ctx: Context, request: Request) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try verb_args.parseSetBannerArgs(arena, request.arguments);
+    const target = args.target orelse
+        return try errorResponse(ctx.alloc, "--target is required for +set-banner", .{});
+
+    const entry = ctx.app.ipcLookup(target) orelse
+        return try errorResponse(ctx.alloc, "target '{s}' not found in registry", .{target});
+
+    const surface = switch (entry) {
+        .pane => |s| s,
+        .window => |w| w.getActiveSurface() orelse
+            return try errorResponse(ctx.alloc, "target '{s}' has no focused pane", .{target}),
+    };
+
+    surface.setPaneBanner(if (args.clear) null else args.text);
+    return try ctx.alloc.dupe(u8, "{\"success\":true}");
+}
+
 fn handleRename(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer arena_state.deinit();
@@ -1203,6 +1216,10 @@ fn buildNode(
                         const buf = try arena.alloc(u8, 7);
                         break :tint color_math.hexString(tint, buf[0..7]);
                     } else null,
+                    .banner = if (surface.banner_text) |t|
+                        try arena.dupe(u8, t)
+                    else
+                        null,
                 },
             };
         },

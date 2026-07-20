@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 24) — T35 DONE (sticky pane banner, full Mac
+  parity per-pane): pure banner_markdown.zig (14 tests) + BannerOverlay
+  layered strip (clickable links) + BannerDialog editor (ctrl+shift+b,
+  Ctrl+Enter saves) + IPC `set-banner` + additive `+list` banner field;
+  pane-banner.ps1 ALL PASS (30) ×3, P1–P3 + both lanes green.
+  Surprises (harness, not product): point-sampling the 39px strip needs
+  a DPI-aware probe process, CopyFromScreen-with-topmost-window (raw
+  GetPixel skips layered windows), and GetDC on an SLWA window knocks it
+  out of the DWM composite until repaint. Filed T88 (user directive):
+  rebase on latest main, analyze all incoming changes, file parity
+  tasks. Next: T88, then T86.
 - 2026-07-19 (on-box, 23) — T25 DONE (the spec §8 conformance gate). New
   `test/win32/conformance.ps1`: items 1–7 E2E from cold, CLAUDE.md
   three-pane example with git-bash vim/tail + powershell, ALL PASS ×3;

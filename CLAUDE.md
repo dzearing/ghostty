@@ -124,7 +124,7 @@ ghoztty +set-banner --target=dev "**PR #123** — _3 files_, +120/−45 — [vie
 ghoztty +set-banner --target=dev --clear
 ```
 
-Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels).
+Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels). On Windows the editor chord is Ctrl+Shift+B and Ctrl+Enter saves (plain Ctrl+R belongs to the shell); `+list --json` panes additionally carry the banner source as an additive `banner` field.
 
 ### `ghoztty +new-remote-window`
 

@@ -881,6 +881,10 @@ pub const EN_KILLFOCUS: u16 = 0x0200;
 
 // Edit control styles
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
+// Multi-line edit styles for the pane-banner editor (T35).
+pub const ES_MULTILINE: u32 = 0x0004;
+pub const ES_AUTOVSCROLL: u32 = 0x0040;
+pub const ES_WANTRETURN: u32 = 0x1000;
 
 // Window styles for child windows
 pub const WS_CHILD: u32 = 0x40000000;
@@ -1182,6 +1186,9 @@ pub extern "gdi32" fn BitBlt(hdcDest: HDC, x: i32, y: i32, cx: i32, cy: i32, hdc
 // declaration on gdi32 worked only because user32 was linked anyway.
 pub extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: i32, lprc: *RECT, format: u32) callconv(.winapi) i32;
 pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
+// Pane-banner run painting (T35): sequential styled text segments.
+pub extern "gdi32" fn TextOutW(hdc: HDC, x: i32, y: i32, lpString: [*]const u16, c: i32) callconv(.winapi) i32;
+pub extern "gdi32" fn GetTextExtentPoint32W(hdc: HDC, lpString: [*]const u16, c: i32, psizl: *SIZE) callconv(.winapi) i32;
 pub extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: ?*anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn LineTo(hdc: HDC, x: i32, y: i32) callconv(.winapi) i32;
