@@ -178,6 +178,10 @@ pub const WM_DPICHANGED: u32 = 0x02E0;
 
 // WM_SETCURSOR hit-test values
 pub const HTCLIENT: u16 = 1;
+pub const WM_NCHITTEST: u32 = 0x0084;
+/// WM_NCHITTEST return: pass the hit to the next window in the same
+/// thread (siblings below in z-order, then the parent).
+pub const HTTRANSPARENT: isize = -1;
 
 // IME messages
 pub const WM_IME_STARTCOMPOSITION: u32 = 0x010D;

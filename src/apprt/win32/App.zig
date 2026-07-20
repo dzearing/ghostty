@@ -3023,6 +3023,26 @@ fn surfaceWndProc(
             return 1;
         },
 
+        w32.WM_NCHITTEST => {
+            // T94: the split-divider grab band is ~9 DIP wide but the
+            // visual gap between panes is only ~5 DIP, so the band's
+            // outer edges lie over the pane surfaces. Fall through
+            // (HTTRANSPARENT) so those hits reach the parent Window,
+            // which owns divider drag + resize-cursor feedback.
+            if (is_surface_window and !surface.parent_window.dragging_split) {
+                var pt: w32.POINT = .{
+                    .x = @as(i16, @truncate(lparam & 0xFFFF)),
+                    .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+                };
+                if (surface.parent_window.hwnd) |parent_hwnd| {
+                    _ = w32.ScreenToClient(parent_hwnd, &pt);
+                    if (surface.parent_window.hitTestDivider(pt.x, pt.y) != null)
+                        return w32.HTTRANSPARENT;
+                }
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_MOUSEMOVE => {
             surface.handleMouseMove(lparam);
             return 0;

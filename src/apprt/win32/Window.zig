@@ -1818,7 +1818,12 @@ const DividerHit = struct {
     layout: SplitTree(Surface).Split.Layout,
 };
 
-fn hitTestDivider(self: *Window, x: i32, y: i32) ?DividerHit {
+/// Hit-test the split divider grab band at (x, y) in window client
+/// coords. The band is ~9 DIP wide (T94, Mac grab-handle parity) —
+/// wider than the ~5 DIP visual gap between panes, so surface children
+/// must fall through via WM_NCHITTEST/HTTRANSPARENT for the outer edges
+/// to be reachable (see App.surfaceWndProc).
+pub fn hitTestDivider(self: *Window, x: i32, y: i32) ?DividerHit {
     if (self.tab_count == 0) return null;
     // Hero mode ignores the tree layout, so tree dividers don't exist on
     // screen (the hero/carousel divider drag lands in T59b).
@@ -1843,7 +1848,9 @@ fn hitTestDividerNode(
         .leaf => return null,
         .split => |s| {
             const gap: i32 = @as(i32, @intFromFloat(@round(5.0 * self.scale)));
-            const hit_area: i32 = @max(@as(i32, @intFromFloat(@round(3.0 * self.scale))), 3);
+            // Half-width of the grab band: 4.5 DIP each side ≈ 9 DIP
+            // total, matching the Mac ~9pt grab handle (T94).
+            const hit_area: i32 = @max(@as(i32, @intFromFloat(@round(4.5 * self.scale))), 4);
 
             if (s.layout == .horizontal) {
                 const total_w = rect.right - rect.left;

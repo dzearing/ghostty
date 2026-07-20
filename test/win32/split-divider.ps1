@@ -1,4 +1,8 @@
 # T73 acceptance: split divider lines honor `split-divider-color`.
+# T94 acceptance (run 2 tail): the divider grab band is ~9 DIP wide with
+# SIZENS cursor feedback across it, and a real-input drag starting 4 DIP
+# off the line (over the pane surface, past the ~5 DIP visual gap) still
+# resizes — proving the WM_NCHITTEST/HTTRANSPARENT fall-through.
 #
 # paintDividerNode previously hardcoded a 0x808080 pen; it now uses the
 # config color (COLORREF from Config.Color RGB) with the same gray as the
@@ -115,6 +119,80 @@ public class DivDrv {
         return lines.ToArray();
     }
 
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO ci);
+    [DllImport("user32.dll")] public static extern IntPtr LoadCursorW(IntPtr inst, IntPtr name);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public int ptX, ptY; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MINPUT { public uint type; public MOUSEINPUT mi; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
+    [DllImport("user32.dll", EntryPoint = "SendInput")] public static extern uint SendMouseInput(uint n, MINPUT[] inputs, int size);
+
+    static void MouseBtn(bool up) {
+        var i = new MINPUT[1];
+        i[0].type = 0; // INPUT_MOUSE
+        i[0].mi.dwFlags = up ? 4u : 2u; // MOUSEEVENTF_LEFTUP : LEFTDOWN
+        SendMouseInput(1, i, Marshal.SizeOf(typeof(MINPUT)));
+    }
+
+    // The system cursor currently shown is the vertical-resize arrow.
+    public static bool CursorIsSizeNS() {
+        var ci = new CURSORINFO();
+        ci.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
+        if (!GetCursorInfo(ref ci)) return false;
+        return ci.hCursor == LoadCursorW(IntPtr.Zero, (IntPtr)32645); // IDC_SIZENS
+    }
+
+    // Park the cursor at (x, y) so WM_SETCURSOR fires for whatever is there.
+    public static void Park(int x, int y) {
+        SetCursorPos(x, y);
+        Thread.Sleep(200);
+    }
+
+    // Hardened foreground grab (T86/T25 hero-mode pattern): a background
+    // process may not steal foreground, so attach to the current owner's
+    // input thread and tap Alt to become the last-input source; retry on
+    // a busy desktop.
+    public static bool ForceForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
+    // Real-input vertical divider drag: press at (x, y0), move to (x, y1)
+    // in steps, release. Foreground-guarded like Chord.
+    public static string DragV(IntPtr top, int x, int y0, int y1) {
+        if (!ForceForeground(top)) return "ABORT: foreground owned by another window";
+        SetCursorPos(x, y0);
+        Thread.Sleep(150);
+        MouseBtn(false);
+        Thread.Sleep(100);
+        for (int i = 1; i <= 8; i++) {
+            SetCursorPos(x, y0 + (y1 - y0) * i / 8);
+            Thread.Sleep(40);
+        }
+        Thread.Sleep(100);
+        MouseBtn(true);
+        Thread.Sleep(250);
+        return "SENT";
+    }
+
     static void Key(ushort vk, bool up) {
         var i = new INPUT[1];
         i[0].type = 1;
@@ -126,8 +204,7 @@ public class DivDrv {
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        SetForegroundWindow(top);
-        Thread.Sleep(150);
+        if (!ForceForeground(top)) return "ABORT: foreground owned by another window";
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             SetFocus(surface);
@@ -268,12 +345,62 @@ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 # Run 2: no color set -> fallback gray 128,128,128.
 # ---------------------------------------------------------------------------
 $g = Start-Gui 'default' $common $false
-$proc = $g.Proc
+$proc = $g.Proc; $top = $g.Top
 $A = $g.Panes | Sort-Object Top | Select-Object -First 1
 $B = $g.Panes | Sort-Object Top | Select-Object -Last 1
 
 Assert (Divider-HasColor $A $B 128 128 128) 'default: divider gap has the fallback gray pixel'
 if (-not (Divider-HasColor $A $B 128 128 128)) { Dump-Strip $A $B 'default' }
+
+# ---------------------------------------------------------------------------
+# T94: grab-band hit target + cursor feedback. The band is ~9 DIP total
+# (4.5 DIP each side of the line) while the visual gap is ~5 DIP, so a
+# point 4 DIP off the line lies OVER a pane surface — reaching it proves
+# the WM_NCHITTEST/HTTRANSPARENT fall-through, not just the parent gap.
+# ---------------------------------------------------------------------------
+$dpi = [DivDrv]::GetDpiForWindow($top)
+$off4 = [int][math]::Round(4 * $dpi / 96)
+function Get-DividerLine {
+    $panes = @(Parse-Panes ([DivDrv]::Panes($top)) | Where-Object Visible)
+    $pa = $panes | Sort-Object Top | Select-Object -First 1
+    $pb = $panes | Sort-Object Top | Select-Object -Last 1
+    [pscustomobject]@{
+        A = $pa; B = $pb
+        X = [int](($pa.Left + $pa.Right) / 2)
+        Y = [int](($pa.Bottom + $pb.Top) / 2)
+    }
+}
+
+$d = Get-DividerLine
+if (-not [DivDrv]::ForceForeground($top)) {
+    Write-Host 'ABORT: foreground owned by another window - hit-target section is not a T94 verdict'
+    Stop-Process -Id $proc.Id -Force; exit 1
+}
+
+# Cursor feedback across the band (on the line, and 4 DIP either side).
+[DivDrv]::Park($d.X, $d.Y)
+Assert ([DivDrv]::CursorIsSizeNS()) 'T94: SIZENS cursor on the divider line'
+[DivDrv]::Park($d.X, $d.Y + $off4)
+Assert ([DivDrv]::CursorIsSizeNS()) 'T94: SIZENS cursor 4 DIP below the line (over the pane)'
+[DivDrv]::Park($d.X, $d.Y - $off4)
+Assert ([DivDrv]::CursorIsSizeNS()) 'T94: SIZENS cursor 4 DIP above the line (over the pane)'
+[DivDrv]::Park($d.X, [int](($d.B.Top + $d.B.Bottom) / 2))
+Assert (-not [DivDrv]::CursorIsSizeNS()) 'T94: no SIZENS cursor at pane center (band is bounded)'
+
+# Drag from +4 DIP below the line: divider follows the mouse down.
+$before = $d.Y
+$r = [DivDrv]::DragV($top, $d.X, $d.Y + $off4, $d.Y + $off4 + 80)
+if ($r -ne 'SENT') { Write-Host "ABORT: drag not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+$d = Get-DividerLine
+Assert ($d.Y -gt $before + 40) "T94: drag from +4 DIP resized (line $before -> $($d.Y))"
+
+# Drag from -4 DIP above the (moved) line: divider follows the mouse up.
+$before = $d.Y
+$r = [DivDrv]::DragV($top, $d.X, $d.Y - $off4, $d.Y - $off4 - 80)
+if ($r -ne 'SENT') { Write-Host "ABORT: drag not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+$d = Get-DividerLine
+Assert ($d.Y -lt $before - 40) "T94: drag from -4 DIP resized (line $before -> $($d.Y))"
+
 Assert (-not $proc.HasExited) 'default: no crash'
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 Remove-Item $conf -ErrorAction SilentlyContinue

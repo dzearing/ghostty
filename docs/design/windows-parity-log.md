@@ -9,6 +9,14 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 28) — T94 DONE: divider grab band ±3→±4.5 DIP (~9
+  DIP, Mac parity) — real fix was WM_NCHITTEST/HTTRANSPARENT fall-through
+  on surface children (pane HWNDs clipped the old band to the ~5 DIP
+  gap). split-divider.ps1 +6 asserts (SIZENS across band, ±4 DIP
+  real-input drags) ALL PASS (15) ×3; P1–P3 + both lanes green. Its
+  foreground grab hardened to the T86 pattern en route (plain grab
+  ABORTed with a browser focused — 1 of the ~20 scripts done). Next: T86.
+
 - 2026-07-19 (on-box, 27) — T92 DONE: three-level title model (window pin
   → tab pin → pane title, Mac parity). Surface user pane title w/
   remembered-terminal-title restore; per-tab pin (inline rename now pins,

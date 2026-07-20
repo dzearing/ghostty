@@ -3289,3 +3289,26 @@ feedback (SIZEWE/SIZENS) over the whole band.
 
 *Validation:* `split-divider.ps1` gains a hit-target assertion
 (drag from ±4 DIP off the divider line still resizes); ALL PASS ×3.
+
+*Done 2026-07-19.* Verified the old target was ±3 DIP AND effectively
+clipped to the ~5 DIP visual gap: pane child HWNDs cover everything
+outside the gap, so the parent never saw mouse input past ±2.5 DIP.
+Two-part fix:
+
+- `Window.hitTestDividerNode`: half-band 3.0 → 4.5 DIP (min 4 px),
+  ~9 DIP total per Mac `001834466`; `hitTestDivider` made pub.
+- `App.surfaceWndProc` WM_NCHITTEST (new w32 consts WM_NCHITTEST /
+  HTTRANSPARENT): if the screen point maps into the parent's divider
+  band, return HTTRANSPARENT so the hit falls through to the parent
+  Window, which already owns drag + SIZEWE/SIZENS cursor feedback
+  (WM_SETCURSOR → hitTestDivider). Suppressed during an active drag;
+  popups (search/palette) unaffected.
+
+Evidence: `split-divider.ps1` grew a T94 tail on the default-config run
+— SIZENS on the line and at ±4 DIP over the pane surfaces (proves the
+fall-through, not just the gap), no SIZENS at pane center (band
+bounded), and two real-input drags starting +4/−4 DIP off the line each
+moved the divider (1252→1336→1251 px). ALL PASS (15) ×3; P1–P3 ALL
+PASS; both test lanes green. Bonus: the script's foreground grab now
+uses the T86 hero-mode pattern (attach-to-fg-thread + Alt tap + retry)
+— the plain grab ABORTed on this box with a browser focused.
