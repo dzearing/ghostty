@@ -9,6 +9,32 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 42) — T89g DONE (tombstone RELAUNCH floor). The
+  materialize → ATTACH(dead+relaunchable) → RELAUNCH → ring-replay + divider
+  machinery is entirely OS-agnostic (agent `session`/`server`/`ring_snapshot` +
+  `termio/Remote`, no win32 branches). The ONE win32 gap: `restoreSessionLayout`
+  built its attach set from `sess.alive` only, so a relaunchable tombstone was
+  treated as dead → the leaf nulled its `session_id` and OPENed a fresh shell.
+  Fix: propagate the wire `relaunchable` field into `connection.OwnedSession`
+  (already on `protocol.SessionInfo`; agent `server.zig:1182` sets it) and
+  forward any **alive-or-relaunchable** id to ATTACH (`attach_set`, `alive`→
+  `attach` rename across the 5 restore helpers). termio then fires RELAUNCH per
+  `session-relaunch` (`.auto` immediately, `.prompt` on first keystroke). New
+  `session-relaunch.ps1` ALL PASS (19) ×3: kills BOTH app+agent (real reboot
+  path), a fresh agent re-materializes sessions.json → tombstones; A(auto) same
+  id RELAUNCHed + `--- session restarted ---` divider + pre-kill ring scrollback
+  precedes it; B(prompt) live tombstone + press-any-key affordance → keystroke
+  → deferred relaunch. Both lanes + test-agent + P1–P3 green. Surprises:
+  (1) em-dashes in the .ps1 mojibaked under PS5.1's ANSI read (the known trap) —
+  rewrote pure-ASCII; (2) A11 needed `+read --lines=2000` — the fresh shell's
+  restart banner wraps into many rows in the ultra-narrow minimized pane,
+  pushing the replayed marker past a 200-row window. Next on-box: T89h, gated on
+  T100 (build the agent exe via the gnu target). **User live-review (on-box)
+  filed T101** (banner overlay occludes terminal content — handleResize passes
+  full height, no top inset) + **T102** (right-click pastes instead of a
+  Mac-parity context menu) + a ghoztty-skill fix (banner title needs `#`);
+  banner heading SIZE was a non-bug (user's title lacked `#`; heading sizing
+  already matches Mac and pane-banner.ps1's heading-taller assert passes).
 - 2026-07-20 (on-box, 41) — T89f2 DONE (launch restore + ATTACH). Session
   re-attach now closes: `App.restoreSessionLayout` (run first in `run()`) loads
   the T89f1 manifest, find-or-spawns the local agent, probes `LIST_SESSIONS`

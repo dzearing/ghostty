@@ -660,6 +660,12 @@ pub const OwnedSession = struct {
     last_activity: i64,
     /// True when the session is pinned against idle-TTL reaping (§7.1, T11).
     pinned: bool,
+    /// True when the session is a relaunchable tombstone (materialized from disk
+    /// at agent start, §5.4 reboot floor / T12b): `alive == false` but the recorded
+    /// argv/cwd can revive it via RELAUNCH. A genuinely-exited child leaves this
+    /// false (it carries an `exit_code` instead). Additive/optional — older agents
+    /// omit the wire field, which decodes to false.
+    relaunchable: bool = false,
 };
 
 /// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
@@ -1625,6 +1631,7 @@ pub const Connection = struct {
                 .created_at = s.created_at,
                 .last_activity = s.last_activity,
                 .pinned = s.pinned,
+                .relaunchable = s.relaunchable,
             };
             filled = i + 1;
         }

@@ -4035,6 +4035,35 @@ gaps found (snapshot cadence on viewer disconnect, NTFS rename).
 *Validation:* new `test/win32/session-relaunch.ps1` — both config
 values E2E + snapshot-scrollback assert; ALL PASS ×3.
 
+*Evidence (done 2026-07-20):* The tombstone/RELAUNCH state machine is
+already OS-agnostic (`src/remote/agent/{session,server,ring_snapshot}.zig`
++ `src/termio/Remote.zig` — no win32 branches): a restarted agent
+`loadPersisted`s `sessions.json` into relaunchable tombstones
+(`alive=false`, `exit_code=null`, `relaunchable=true`) with the disk
+ring preloaded; ATTACH returns `dead+relaunchable`; termio fires
+RELAUNCH per `session-relaunch` (`.auto` immediately, `.prompt` deferred
+to the first keystroke), replaying the ring snapshot then the
+`--- session restarted ---` divider. **The one win32 gap:**
+`App.restoreSessionLayout` built its attach set from `alive == true`
+only, so a relaunchable tombstone was treated as dead → the leaf
+nulled its `session_id` and OPENed a fresh shell instead of RELAUNCHing.
+Fix (this commit): propagate the wire `relaunchable` field through
+`connection.OwnedSession` (already on `protocol.SessionInfo`, agent
+`server.zig:1182` sets it, ATTACH already carried it) and forward any
+**alive OR relaunchable** id to ATTACH (`attach_set`, the `alive`→
+`attach` param rename across the five restore helpers). The tri-state
+liveness rule is unchanged; only tombstones flipped from "drop/fresh" to
+"attach → relaunch". `session-relaunch.ps1` ALL PASS (19) ×3: **A**
+(auto) marks a named pane's scrollback, gates on the ring flushing to
+disk (mtime), kills BOTH app+agent, relaunches → the SAME session id is
+alive again (RELAUNCH not re-OPEN), the `--- session restarted ---`
+divider shows, and the pre-kill marker precedes it (ring-snapshot
+scrollback replay); **B** (prompt) proves the id stays a live tombstone
+(`alive=false`) with the `press any key to relaunch` affordance until a
+`+send-keys` keystroke fires the deferred RELAUNCH → alive + divider.
+Both app lanes + `test-agent` (with the `OwnedSession` change) +
+P1–P3 green.
+
 ## T89h — Autostart, upgrade guard, delivery
 
 HKCU Run key written/refreshed by the GUI when persistence engages

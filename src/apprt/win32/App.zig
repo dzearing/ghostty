@@ -1008,13 +1008,21 @@ const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
 /// a partial failure restores the windows it can and skips the rest.
 ///
 /// Liveness is TRI-STATE (design pin): a window is dropped ONLY when every one
-/// of its session-backed leaves is POSITIVELY dead (the agent answered and none
-/// of its ids are present). If the probe itself failed (agent reachable enough
-/// to dial but `LIST_SESSIONS` timed out) liveness is UNKNOWN and we still
-/// attempt ATTACH — never drop on transport failure. A leaf whose session is
-/// dead / has no id re-opens a FRESH agent-backed pane (the tree shape and the
-/// window are preserved), which is friendlier than a permanently-exited pane and
-/// keeps every restored pane persistable.
+/// of its session-backed leaves is POSITIVELY gone (the agent answered and none
+/// of its ids are present in the roster). If the probe itself failed (agent
+/// reachable enough to dial but `LIST_SESSIONS` timed out) liveness is UNKNOWN
+/// and we still attempt ATTACH — never drop on transport failure.
+///
+/// A leaf is ATTACHABLE when its session is alive (same-PID re-attach,
+/// gap-filled scrollback) OR a relaunchable TOMBSTONE (T89g): the agent
+/// restarted (reboot / agent upgrade) and materialized the session from disk as
+/// dead-but-relaunchable. ATTACHing a tombstone lets the shared termio path
+/// (`termio/Remote.zig`) fire RELAUNCH per `session-relaunch` (auto respawns
+/// in-place with a `--- session restarted ---` divider + ring-snapshot
+/// scrollback; prompt leaves a press-any-key pane). A leaf whose session is
+/// genuinely gone / has no id re-opens a FRESH agent-backed pane (the tree shape
+/// and the window are preserved), which is friendlier than a permanently-exited
+/// pane and keeps every restored pane persistable.
 pub fn restoreSessionLayout(self: *App) bool {
     if (!self.config.@"session-persistence") return false;
     const gpa = self.core_app.alloc;
@@ -1030,39 +1038,42 @@ pub fn restoreSessionLayout(self: *App) bool {
     if (file.windows.len == 0) return false;
 
     // Resolve (find-or-spawn) the local agent. Without a connection we cannot
-    // ATTACH anything, so fall back to a blank window. A cold reboot spawns a
-    // FRESH agent with no sessions — the probe below then finds every id dead
-    // and we drop everything (tombstone relaunch is T89g, not this task).
+    // ATTACH anything, so fall back to a blank window. A cold reboot spawns the
+    // agent fresh; it re-materializes the sessions from disk as relaunchable
+    // tombstones, so the probe below finds them attachable and each leaf
+    // RELAUNCHes per `session-relaunch` (T89g). Only sessions the agent truly no
+    // longer knows re-open fresh.
     const conn = self.local_agent.sharedConnection() orelse {
         log.info("session-restore: no local agent; opening a blank window", .{});
         return false;
     };
 
-    // Probe liveness. `alive` null ⇒ the probe failed (UNKNOWN); a present set
-    // holds only sessions the agent reports `alive == true` (tombstones are
-    // treated as dead → their leaves re-open fresh).
-    var alive_sessions: ?remote_connection.OwnedSessions = conn.requestSessions(
+    // Probe the roster. `attach_set` null ⇒ the probe failed (UNKNOWN — attempt
+    // every leaf); a present set holds every session we can ATTACH: alive
+    // (same-PID re-attach) OR a relaunchable tombstone (RELAUNCH per policy).
+    // Genuinely-exited/unknown ids are absent → their leaves re-open fresh.
+    var roster: ?remote_connection.OwnedSessions = conn.requestSessions(
         restore_probe_timeout_ns,
     ) catch |err| blk: {
         log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
         break :blk null;
     };
-    defer if (alive_sessions) |*s| s.deinit();
+    defer if (roster) |*s| s.deinit();
 
-    var alive_set: ?std.StringHashMap(void) = if (alive_sessions) |*s| set: {
+    var attach_set: ?std.StringHashMap(void) = if (roster) |*s| set: {
         var m = std.StringHashMap(void).init(gpa);
         for (s.sessions) |sess| {
-            if (sess.alive) m.put(sess.id, {}) catch {};
+            if (sess.alive or sess.relaunchable) m.put(sess.id, {}) catch {};
         }
         break :set m;
     } else null;
-    defer if (alive_set) |*m| m.deinit();
-    const alive_ptr: ?*const std.StringHashMap(void) = if (alive_set) |*m| m else null;
+    defer if (attach_set) |*m| m.deinit();
+    const attach_ptr: ?*const std.StringHashMap(void) = if (attach_set) |*m| m else null;
 
     var restored: usize = 0;
     for (file.windows) |win| {
-        if (!restoreWindowHasAttachableLeaf(win, alive_ptr)) continue;
-        self.restoreWindow(win, conn, alive_ptr) catch |err| {
+        if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
+        self.restoreWindow(win, conn, attach_ptr) catch |err| {
             log.warn("session-restore: window '{s}' failed err={}", .{ win.id, err });
             continue;
         };
@@ -1074,12 +1085,13 @@ pub fn restoreSessionLayout(self: *App) bool {
 }
 
 /// Whether the window has at least one leaf we will ATTACH or re-open — i.e. not
-/// EVERY session-backed leaf is positively dead. A window with no attachable
-/// leaf (all its recorded sessions are gone) is dropped rather than restored as
-/// a wall of exited panes.
+/// EVERY session-backed leaf is positively gone. A window with no attachable
+/// leaf (all its recorded sessions are gone from the roster) is dropped rather
+/// than restored as a wall of exited panes. A relaunchable tombstone counts as
+/// attachable (it RELAUNCHes), so a window of tombstones is kept (T89g).
 fn restoreWindowHasAttachableLeaf(
     win: session_layout.Window,
-    alive: ?*const std.StringHashMap(void),
+    attach: ?*const std.StringHashMap(void),
 ) bool {
     for (win.tabs) |tab| {
         for (tab.nodes) |node| {
@@ -1089,27 +1101,30 @@ fn restoreWindowHasAttachableLeaf(
                 // the window (its layout is intact) even if nothing attaches.
                 return true;
             };
-            // Alive, or liveness unknown (probe failed) ⇒ attachable.
-            if (alive) |a| {
+            // Attachable (alive or relaunchable tombstone), or roster unknown
+            // (probe failed) ⇒ attachable.
+            if (attach) |a| {
                 if (a.contains(sid)) return true;
             } else return true;
         }
     }
-    // No leaves at all, or every session-backed leaf positively dead.
+    // No leaves at all, or every session-backed leaf positively gone.
     return false;
 }
 
 /// The ATTACH override for one restored leaf: ride the local agent, and set
-/// `session_id` iff the session is alive (or liveness is unknown). A dead / id-less
-/// leaf gets a null session_id — the surface OPENs a fresh agent-backed pane.
+/// `session_id` iff the session is attachable — alive (same-PID re-attach) or a
+/// relaunchable tombstone (RELAUNCH per policy), or the roster is unknown. A
+/// genuinely-gone / id-less leaf gets a null session_id — the surface OPENs a
+/// fresh agent-backed pane.
 fn restoreAttachOverride(
     leaf: session_layout.Leaf,
     conn: *remote_connection.Connection,
-    alive: ?*const std.StringHashMap(void),
+    attach: ?*const std.StringHashMap(void),
 ) Surface.Overrides {
     const sid: ?[]const u8 = if (leaf.session_id) |s| blk: {
-        const live = if (alive) |a| a.contains(s) else true; // null set ⇒ unknown ⇒ attempt
-        break :blk if (live) s else null;
+        const ok = if (attach) |a| a.contains(s) else true; // null set ⇒ unknown ⇒ attempt
+        break :blk if (ok) s else null;
     } else null;
     return .{ .remote = .{
         .connection = conn,
@@ -1140,32 +1155,32 @@ fn restoreWindow(
     self: *App,
     win: session_layout.Window,
     conn: *remote_connection.Connection,
-    alive: ?*const std.StringHashMap(void),
+    attach: ?*const std.StringHashMap(void),
 ) !void {
     if (win.tabs.len == 0) return error.CorruptLayout;
 
     // Tab 0's first surface is created by createWindow's initial addTab; hand it
     // that leaf's ATTACH override up front. `ov0` must outlive createWindow.
     const first_leaf = restoreFirstLeaf(win.tabs[0].nodes, 0) orelse return error.CorruptLayout;
-    var ov0 = restoreAttachOverride(first_leaf, conn, alive);
+    var ov0 = restoreAttachOverride(first_leaf, conn, attach);
     const window = try self.createWindow(.{
         .surface_overrides = &ov0,
         .ipc_name = win.ipc_name,
     });
-    try self.restoreTab(window, 0, win.tabs[0], conn, alive);
+    try self.restoreTab(window, 0, win.tabs[0], conn, attach);
 
     // Remaining tabs, appended in manifest order (addTab activates each new tab,
     // so consecutive inserts keep the recorded order regardless of
     // window-new-tab-position).
     for (win.tabs[1..], 1..) |tab, ti| {
         const lf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
-        var ov = restoreAttachOverride(lf, conn, alive);
+        var ov = restoreAttachOverride(lf, conn, attach);
         window.pending_surface_overrides = &ov;
         _ = window.addTab() catch |err| {
             window.pending_surface_overrides = null;
             return err;
         };
-        try self.restoreTab(window, ti, tab, conn, alive);
+        try self.restoreTab(window, ti, tab, conn, attach);
     }
 
     // Window-level presentation: title pin, active tab, outer placement.
@@ -1185,11 +1200,11 @@ fn restoreTab(
     tab_index: usize,
     tab: session_layout.Tab,
     conn: *remote_connection.Connection,
-    alive: ?*const std.StringHashMap(void),
+    attach: ?*const std.StringHashMap(void),
 ) !void {
     if (tab.nodes.len == 0) return error.CorruptLayout;
     const first_surface = window.tab_active_surface[tab_index];
-    try self.restoreBuildSubtree(window, tab.nodes, 0, first_surface, conn, alive, 0);
+    try self.restoreBuildSubtree(window, tab.nodes, 0, first_surface, conn, attach, 0);
 
     if (tab.color) |c| {
         if (std.meta.stringToEnum(tab_color.TabColor, c)) |tc| window.tab_colors[tab_index] = tc;
@@ -1211,7 +1226,7 @@ fn restoreBuildSubtree(
     idx: usize,
     anchor: *Surface,
     conn: *remote_connection.Connection,
-    alive: ?*const std.StringHashMap(void),
+    attach: ?*const std.StringHashMap(void),
     depth: usize,
 ) !void {
     if (depth > nodes.len or idx >= nodes.len) return error.CorruptLayout;
@@ -1227,7 +1242,7 @@ fn restoreBuildSubtree(
     // The NEW surface takes the right/bottom position — attach it to the first
     // leaf of the right subtree.
     const right_leaf = restoreFirstLeaf(nodes, sp.right) orelse return error.CorruptLayout;
-    var ov = restoreAttachOverride(right_leaf, conn, alive);
+    var ov = restoreAttachOverride(right_leaf, conn, attach);
     window.pending_surface_overrides = &ov;
 
     // `.right`/`.down` put the OLD (anchor) surface on the left/top with `ratio`
@@ -1243,8 +1258,8 @@ fn restoreBuildSubtree(
         return error.CorruptLayout;
     };
 
-    try self.restoreBuildSubtree(window, nodes, sp.left, anchor, conn, alive, depth + 1);
-    try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, conn, alive, depth + 1);
+    try self.restoreBuildSubtree(window, nodes, sp.left, anchor, conn, attach, depth + 1);
+    try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, conn, attach, depth + 1);
 }
 
 /// Apply the restored outer placement. Non-maximized: SetWindowPos to the exact
