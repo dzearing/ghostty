@@ -73,6 +73,7 @@
                 <outlet property="menuUndo" destination="r83-CV-syt" id="bU9-0b-xgQ"/>
                 <outlet property="menuUseAsDefault" destination="TrB-O8-g8H" id="af4-Jh-2HU"/>
                 <outlet property="menuZoomSplit" destination="oPd-mn-IEH" id="wTu-jK-egI"/>
+                <outlet property="menuHeroMode" destination="hRm-Tg-001" id="hRm-Tg-003"/>
             </connections>
         </customObject>
         <customObject id="YLy-65-1bz" customClass="NSFontManager"/>
@@ -432,6 +433,12 @@
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <connections>
                                     <action selector="splitZoom:" target="-1" id="g0e-Ls-D7L"/>
+                                </connections>
+                            </menuItem>
+                            <menuItem title="Toggle Hero Mode" id="hRm-Tg-001">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="toggleHeroMode:" target="-1" id="hRm-Tg-002"/>
                                 </connections>
                             </menuItem>
                             <menuItem title="Select Previous Split" id="Lic-px-1wg">

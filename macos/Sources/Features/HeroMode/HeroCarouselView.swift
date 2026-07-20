@@ -1,8 +1,9 @@
 import SwiftUI
+import WebKit
 import GhosttyKit
 
 struct HeroCarouselView: View {
-    let leaves: [Ghostty.SurfaceView]
+    let leaves: [PaneView]
     @ObservedObject var state: HeroModeState
     let heroAspectRatio: CGFloat
 
@@ -16,7 +17,7 @@ struct HeroCarouselView: View {
 }
 
 struct HeroCarouselRepresentable: NSViewRepresentable {
-    let leaves: [Ghostty.SurfaceView]
+    let leaves: [PaneView]
     @ObservedObject var state: HeroModeState
     let heroAspectRatio: CGFloat
 
@@ -43,7 +44,7 @@ class HeroCarouselContainer: NSView {
     private let gap: CGFloat = 8
     private var heroAspectRatio: CGFloat = 1.5
     private weak var state: HeroModeState?
-    private var currentLeaves: [Ghostty.SurfaceView] = []
+    private var currentLeaves: [PaneView] = []
     private var snapshotTimer: Timer?
     private var needsInitialSnapshot = false
     private var isScrolling = false
@@ -79,7 +80,7 @@ class HeroCarouselContainer: NSView {
         }
     }
 
-    func update(leaves: [Ghostty.SurfaceView], state: HeroModeState, heroAspectRatio: CGFloat) {
+    func update(leaves: [PaneView], state: HeroModeState, heroAspectRatio: CGFloat) {
         self.state = state
         self.heroAspectRatio = heroAspectRatio
 
@@ -126,33 +127,33 @@ class HeroCarouselContainer: NSView {
     }
 
     @discardableResult
-    private func rebuildTiles(leaves: [Ghostty.SurfaceView]) -> Bool {
-        let oldSurfaces = currentLeaves
-        guard oldSurfaces != leaves else {
+    private func rebuildTiles(leaves: [PaneView]) -> Bool {
+        let oldPanes = currentLeaves
+        guard oldPanes != leaves else {
             for (i, tile) in tiles.enumerated() {
                 tile.isSelected = i == (state?.selectedIndex ?? 0)
             }
             return false
         }
 
-        var tilesBySurface: [ObjectIdentifier: CarouselTile] = [:]
+        var tilesByPane: [ObjectIdentifier: CarouselTile] = [:]
         for tile in tiles {
-            tilesBySurface[ObjectIdentifier(tile.surfaceView)] = tile
+            tilesByPane[ObjectIdentifier(tile.pane)] = tile
         }
 
         var newTiles: [CarouselTile] = []
-        for surface in leaves {
-            let id = ObjectIdentifier(surface)
-            if let existing = tilesBySurface.removeValue(forKey: id) {
+        for pane in leaves {
+            let id = ObjectIdentifier(pane)
+            if let existing = tilesByPane.removeValue(forKey: id) {
                 newTiles.append(existing)
             } else {
-                let tile = CarouselTile(surfaceView: surface)
+                let tile = CarouselTile(pane: pane)
                 strip.addSubview(tile)
                 newTiles.append(tile)
             }
         }
 
-        for (_, tile) in tilesBySurface {
+        for (_, tile) in tilesByPane {
             tile.removeFromSuperview()
         }
 
@@ -284,10 +285,14 @@ private class CarouselStrip: NSView {
 }
 
 private class CarouselTile: NSView {
-    let surfaceView: Ghostty.SurfaceView
+    let pane: PaneView
     var onTap: (() -> Void)?
     private let imageView = NSImageView()
     private let borderLayer = CAShapeLayer()
+
+    /// True while an async WKWebView snapshot is being taken (viewer panes),
+    /// so the repeating snapshot timer doesn't pile up overlapping captures.
+    private var snapshotInFlight = false
 
     private let selectedColor = NSColor(red: 0.416, green: 0.416, blue: 1.0, alpha: 1.0)
     private let hoverColor = NSColor(red: 0.545, green: 0.361, blue: 0.965, alpha: 1.0)
@@ -299,8 +304,8 @@ private class CarouselTile: NSView {
 
     private var isHovered = false
 
-    init(surfaceView: Ghostty.SurfaceView) {
-        self.surfaceView = surfaceView
+    init(pane: PaneView) {
+        self.pane = pane
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 6
@@ -342,6 +347,17 @@ private class CarouselTile: NSView {
     }
 
     func refreshSnapshot() {
+        switch pane.content {
+        case .terminal(let surfaceView):
+            refreshTerminalSnapshot(surfaceView)
+        case .viewer(let viewerView):
+            refreshViewerSnapshot(viewerView)
+        }
+    }
+
+    /// Terminal thumbnails render the surface's CALayer directly (in-process
+    /// Metal layer, cheap and synchronous).
+    private func refreshTerminalSnapshot(_ surfaceView: Ghostty.SurfaceView) {
         guard let surfaceLayer = surfaceView.layer else { return }
         let size = surfaceView.bounds.size
         guard size.width > 0, size.height > 0 else { return }
@@ -372,6 +388,26 @@ private class CarouselTile: NSView {
         let image = NSImage(size: size)
         image.addRepresentation(bitmapRep)
         imageView.image = image
+    }
+
+    /// Viewer thumbnails must go through WKWebView.takeSnapshot: web content
+    /// renders out-of-process, so rendering the view's layer (the terminal
+    /// path above) would capture a blank rectangle. The call is async; an
+    /// in-flight guard keeps the repeating snapshot timer from stacking
+    /// captures, and the previous image stays up until the new one lands.
+    private func refreshViewerSnapshot(_ viewerView: ViewerView) {
+        guard !snapshotInFlight else { return }
+        let webView = viewerView.webView!
+        guard webView.bounds.width > 0, webView.bounds.height > 0 else { return }
+
+        snapshotInFlight = true
+        webView.takeSnapshot(with: nil) { [weak self] image, _ in
+            guard let self else { return }
+            self.snapshotInFlight = false
+            if let image {
+                self.imageView.image = image
+            }
+        }
     }
 
     override func mouseDown(with event: NSEvent) {}

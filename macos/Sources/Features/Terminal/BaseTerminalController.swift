@@ -1453,14 +1453,21 @@ class BaseTerminalController: NSWindowController,
 
     @objc private func ghosttyDidToggleHeroMode(_ notification: Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard surfaceTree.root?.node(view: target) != nil else { return }
+        guard let pane = surfaceTree.first(where: { $0.surfaceView === target }) else { return }
+        toggleHeroMode(target: pane)
+    }
 
+    /// Toggle hero mode with `pane` becoming the hero on activation. Reached
+    /// two ways: the core keybind action for terminal panes (notification
+    /// above), and the menu accelerator (`toggleHeroMode(_:)` IBAction) when
+    /// a viewer pane has focus.
+    private func toggleHeroMode(target pane: PaneView) {
         if heroModeState.isActive {
-            let previousSurface = heroSurfaceForCurrentSelection()
+            let previousPane = heroPaneForCurrentSelection()
             heroModeState.deactivate()
-            if let surface = previousSurface {
+            if let previousPane {
                 DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: surface)
+                    Ghostty.moveFocus(to: previousPane)
                 }
             }
         } else {
@@ -1472,23 +1479,23 @@ class BaseTerminalController: NSWindowController,
             let leaves = surfaceTree.root?.leaves() ?? []
             guard leaves.count > 1 else { return }
 
-            let focusedIndex = leaves.firstIndex(where: { $0.surfaceView === target }) ?? 0
+            let focusedIndex = leaves.firstIndex(of: pane) ?? 0
             heroModeState.activate(focusedIndex: focusedIndex, leafCount: leaves.count)
         }
 
         window?.makeKeyAndOrderFront(nil)
     }
 
-    private func heroSurfaceForCurrentSelection() -> Ghostty.SurfaceView? {
+    private func heroPaneForCurrentSelection() -> PaneView? {
         let leaves = surfaceTree.root?.leaves() ?? []
         guard heroModeState.selectedIndex < leaves.count else { return nil }
-        return leaves[heroModeState.selectedIndex].surfaceView
+        return leaves[heroModeState.selectedIndex]
     }
 
     private func heroSelectionDidChange(to index: Int) {
         guard heroModeState.isActive else { return }
-        if let surface = heroSurfaceForCurrentSelection() {
-            Ghostty.moveFocus(to: surface)
+        if let pane = heroPaneForCurrentSelection() {
+            Ghostty.moveFocus(to: pane)
         }
     }
 
@@ -3133,6 +3140,19 @@ class BaseTerminalController: NSWindowController,
         }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.splitToggleZoom(surface: surface)
+    }
+
+    @IBAction func toggleHeroMode(_ sender: Any) {
+        // Menu path. The core keybind needs a focused terminal surface, so a
+        // window whose focused pane is a viewer only reaches the toggle here,
+        // via the menu accelerator (synced from the same keybind). Terminal
+        // panes consume the key equivalent before the menu sees it, so this
+        // and the notification path never double-fire.
+        let pane = focusedViewerPane
+            ?? surfaceTree.first(where: { $0.surfaceView === focusedSurface })
+            ?? surfaceTree.root?.leaves().first
+        guard let pane else { return }
+        toggleHeroMode(target: pane)
     }
 
     @IBAction func splitMoveFocusPrevious(_ sender: Any) {
