@@ -140,7 +140,7 @@ public class TtlDrv {
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        bool fg = false;
+        bool fg = (GetForegroundWindow() == top);
         for (int attempt = 0; attempt < 5 && !fg; attempt++) {
             IntPtr curFg = GetForegroundWindow();
             uint fgTid = 0;

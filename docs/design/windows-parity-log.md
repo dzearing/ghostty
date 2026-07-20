@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 29) — T86 DONE: GrabForeground (already-fg guard +
+  attach-to-fg-thread + Alt tap, retried) in all 20 remaining kb-injection
+  scripts + guard retrofitted to hero-mode/window-title/split-divider.
+  Surprise 1: the unguarded Alt tap self-latches menu mode when the target
+  is already fg — broke chooser-Escape/About-box/copy until guarded.
+  Surprise 2: keybinds-t01's copy assert fails since T85 (tall windows put
+  the center click below the X block) — fixed w/ row-probe loop, filed
+  T95 for its ×3. Surprise 3 (box, not code): GameInputSvc wedged the
+  input stack mid-session (unbeatable fg lock + SendInput swallowed);
+  unelevated fix impossible — needs elevated `Restart-Service
+  GameInputSvc`. 19/20 scripts validated ALL PASS vs live foreign fg.
+  Next: T95 (if box recovered) → T93.
 - 2026-07-19 (on-box, 28) — T94 DONE: divider grab band ±3→±4.5 DIP (~9
   DIP, Mac parity) — real fix was WM_NCHITTEST/HTTRANSPARENT fall-through
   on surface children (pane HWNDs clipped the old band to the ~5 DIP

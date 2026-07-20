@@ -153,11 +153,32 @@ public class DimDrv {
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
 
+    // T86-hardened foreground grab: attach to the current foreground
+    // owner's thread + an Alt tap (last-input source), retried - a
+    // background process may not steal foreground otherwise.
+    public static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        SetForegroundWindow(top);
-        Thread.Sleep(150);
+        GrabForeground(top);
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             SetFocus(surface);
@@ -327,8 +348,8 @@ if ($ov.Count -eq 1) {
     # Blend check: red fill at 50% over a black terminal background reads
     # back as dark red. Bring the window to front, sample below the pane
     # center (away from the prompt line at the top).
-    [DimDrv]::SetForegroundWindow($top) | Out-Null
-    Start-Sleep -Milliseconds 500
+    [DimDrv]::GrabForeground($top) | Out-Null
+    Start-Sleep -Milliseconds 200
     $cx = [int](($A.Left + $A.Right) / 2)
     $cy = [int](($A.Top + $A.Bottom) / 2) + 30
     $px = ([DimDrv]::ScreenPixel($cx, $cy)) -split ','

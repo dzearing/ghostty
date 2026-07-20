@@ -289,8 +289,8 @@ function Start-Gui([string]$label, [string[]]$extraArgs, [bool]$control) {
     $panes = @(Parse-Panes ([DivDrv]::Panes($top)) | Where-Object Visible)
     Assert ($panes.Count -eq 2) "$label setup: 2 visible panes"
     if ($panes.Count -ne 2) { Stop-Process -Id $proc.Id -Force; exit 1 }
-    [DivDrv]::SetForegroundWindow($top) | Out-Null
-    Start-Sleep -Milliseconds 500
+    [DivDrv]::ForceForeground($top) | Out-Null
+    Start-Sleep -Milliseconds 200
     [pscustomobject]@{ Proc = $proc; Top = $top; Panes = $panes }
 }
 

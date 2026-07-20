@@ -113,14 +113,35 @@ public class T01Drv {
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
 
+    // T86-hardened foreground grab: attach to the current foreground
+    // owner's thread + an Alt tap (last-input source), retried - a
+    // background process may not steal foreground otherwise.
+    static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
     // Send mods+vk to the window's focused control (surface). Passing
     // IntPtr.Zero for `focus` keeps whatever the window last focused
     // (correct after tab/split changes where the surface HWND is new).
     public static string Chord(IntPtr top, IntPtr focus, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        SetForegroundWindow(top);
-        Thread.Sleep(150);
+        GrabForeground(top);
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             if (focus != IntPtr.Zero) SetFocus(focus);
@@ -140,8 +161,7 @@ public class T01Drv {
     public static string TypePlain(IntPtr top, string text) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        SetForegroundWindow(top);
-        Thread.Sleep(150);
+        GrabForeground(top);
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             Thread.Sleep(60);
@@ -184,8 +204,7 @@ public class T01Drv {
 
     // Double-click at a screen point (word-select in the terminal).
     public static string DoubleClick(IntPtr top, int sx, int sy) {
-        SetForegroundWindow(top);
-        Thread.Sleep(150);
+        GrabForeground(top);
         if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
         MouseAt(sx, sy, 0);
         Thread.Sleep(80);
@@ -436,15 +455,25 @@ Set-Clipboard -Value 'T01_CLIP_SENTINEL'
 $rc = New-Object T01Drv+RECT
 [T01Drv]::GetWindowRect($top, [ref]$rc) | Out-Null
 $cx = [int](($rc.L + $rc.R) / 2)
-$cy = [int](($rc.T + $rc.B) / 2)
-$r = [T01Drv]::DoubleClick($top, $cx, $cy)
-if ($r -like 'ABORT*') { Write-Host "SKIP ctrl+c-copy: $r" }
-else {
+# The X block sits at the TOP of the screen (cls + 10 echo pairs). A fixed
+# center click stopped landing on it once T85 placement memory made new
+# windows much taller than the old 800x600 default, so probe a few
+# upper-screen rows until the clipboard proves a word-select happened
+# (prompt rows between the X rows make any single fixed row a coin flip).
+$r = 'NOT ATTEMPTED'; $ok = $false; $clip = ''
+foreach ($frac in 0.08, 0.13, 0.18, 0.23, 0.28) {
+    $cy = [int]($rc.T + ($rc.B - $rc.T) * $frac)
+    $r = [T01Drv]::DoubleClick($top, $cx, $cy)
+    if ($r -like 'ABORT*') { break }
     Start-Sleep -Milliseconds 400
     $r2 = [T01Drv]::Chord($top, [IntPtr]::Zero, @([uint16]0x11), 0x43)
     Start-Sleep -Milliseconds 700
     $clip = (Get-Clipboard -Raw -ErrorAction SilentlyContinue) -join ''
     $ok = $clip -match 'X{20}'
+    if ($ok) { break }
+}
+if ($r -like 'ABORT*') { Write-Host "SKIP ctrl+c-copy: $r" }
+else {
     Assert $ok 'ctrl+c with selection copies to clipboard'
     if (-not $ok) {
         $clipShow = if ($clip.Length -gt 80) { $clip.Substring(0, 80) + '...' } else { $clip }

@@ -96,19 +96,34 @@ public class FontDrv {
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
 
+    // T86-hardened foreground grab: attach to the current foreground
+    // owner's thread + an Alt tap (last-input source), retried - a
+    // background process may not steal foreground otherwise (e.g. when a
+    // browser owns foreground, or the previous run's window is closing).
+    static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
     // Press ctrl+<vk> `count` times with the target pane focused.
     public static string Chord(IntPtr top, IntPtr surface, ushort vk, int count) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        // Foreground can be stolen transiently (e.g. the previous run's
-        // window closing) — retry acquisition before declaring an abort.
-        bool fg = false;
-        for (int a = 0; a < 5 && !fg; a++) {
-            SetForegroundWindow(top);
-            Thread.Sleep(200);
-            fg = GetForegroundWindow() == top;
-        }
-        if (!fg) return "ABORT: foreground owned by another window";
+        if (!GrabForeground(top)) return "ABORT: foreground owned by another window";
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             SetFocus(surface);

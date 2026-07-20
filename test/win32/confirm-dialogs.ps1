@@ -127,17 +127,33 @@ public class CfmDrv {
         Key(vk, false); Thread.Sleep(30); Key(vk, true);
     }
 
+    // T86-hardened foreground grab: attach to the current foreground
+    // owner's thread + an Alt tap (last-input source), retried - a
+    // background process may not steal foreground otherwise.
+    static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
     // Send mods+vk with focus on `surface`. Returns "SENT" or a reason.
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        bool fg = false;
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            SetForegroundWindow(top);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        if (!fg) return "ABORT: could not foreground";
+        if (!GrabForeground(top)) return "ABORT: could not foreground";
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             SetFocus(surface);

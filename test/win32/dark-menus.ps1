@@ -52,6 +52,8 @@ public class MenuDrv {
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
     [StructLayout(LayoutKind.Sequential)]
@@ -123,6 +125,35 @@ public class MenuDrv {
         i[0].u.kbFlags = 2; // KEYUP
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
+
+    static void Key(ushort vk, bool up) {
+        var i = new INPUT[1];
+        i[0].type = 1; i[0].u.wVk = vk;
+        i[0].u.kbFlags = up ? 2u : 0u;
+        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    // T86-hardened foreground grab: attach to the current foreground
+    // owner's thread + an Alt tap (last-input source), retried - a
+    // background process may not steal foreground otherwise.
+    public static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
 }
 '@
 [void][MenuDrv]::SetProcessDPIAware()
@@ -190,8 +221,7 @@ function Run-Case([string]$label, [string]$themeArg, [bool]$expectDark) {
     $surface = [MenuDrv]::FindChild($top, 'GhozttyTerminal')
     if ($surface -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): surface not found"; exit 1 }
 
-    [void][MenuDrv]::SetForegroundWindow($top)
-    Start-Sleep -Milliseconds 300
+    [void][MenuDrv]::GrabForeground($top)
     if ([MenuDrv]::GetForegroundWindow() -ne $top) {
         Write-Host "SETUP FAIL ($label): could not foreground the GUI"; Stop-Process -Id $proc.Id -Force; exit 1
     }

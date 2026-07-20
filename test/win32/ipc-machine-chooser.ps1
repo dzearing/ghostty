@@ -90,12 +90,33 @@ public class McDrv {
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
 
+    // T86-hardened foreground grab: attach to the current foreground
+    // owner's thread + an Alt tap (last-input source), retried - a
+    // background process may not steal foreground otherwise.
+    static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
     // Send mods+vk to the surface. Returns "SENT" or an ABORT reason.
     public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        SetForegroundWindow(top);
-        Thread.Sleep(150);
+        GrabForeground(top);
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         try {
             SetFocus(surface);
@@ -113,8 +134,7 @@ public class McDrv {
 
     // Best-effort single key to whatever the foreground window has focused.
     public static void PressForeground(IntPtr win, ushort vk) {
-        SetForegroundWindow(win);
-        Thread.Sleep(80);
+        GrabForeground(win);
         Key(vk, false); Thread.Sleep(20); Key(vk, true);
         Thread.Sleep(60);
     }

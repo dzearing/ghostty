@@ -200,13 +200,32 @@ public class BannerDrv {
         for (int i = mods.Length - 1; i >= 0; i--) { Thread.Sleep(20); Key(mods[i], true); }
     }
 
+    // T86-hardened foreground grab: attach to the current foreground
+    // owner's thread + an Alt tap (last-input source), retried - a
+    // background process may not steal foreground otherwise.
+    static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
     public static string Foreground(IntPtr top) {
         uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
         uint cur = GetCurrentThreadId();
-        // Alt tap frees the foreground lock for cross-process grabs (T25).
-        Key(0x12, false); Key(0x12, true);
-        SetForegroundWindow(top);
-        Thread.Sleep(200);
+        GrabForeground(top);
         if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
         AttachThreadInput(cur, tid, false);
         if (GetForegroundWindow() != top) return "NOT FOREGROUND";

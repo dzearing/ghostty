@@ -2987,6 +2987,57 @@ grep for `SetForegroundWindow(top);`).
 `Start-Process notepad` + focus it), each ported script still reaches its
 positive control and passes; scripts stay ALL PASS in the normal case.
 
+*Evidence (2026-07-19):* `GrabForeground` ported into all 20 remaining
+scripts (every C# grab site + the PS-side sites in tab-color, split-dim,
+focus-follows-mouse, dark-menus, split-divider; dark-menus gained the
+missing AttachThreadInput/Key declares). All 22 Add-Type blocks compile
+clean. **Critical addition over the hero-mode original: an already-fg
+guard** (`fg = (GetForegroundWindow() == top)` before the loop, the
+split-divider `ForceForeground` form). Without it, the loop always fires
+one Alt tap; when the target is *already* foreground the tap lands in the
+target and latches Win32 menu mode — reproducibly broke chooser-Escape
+(ipc-machine-chooser), the palette About-box chord (ipc-version), and the
+copy chord (keybinds-t01) until guarded. Guard also added to
+hero-mode/window-title (they shipped the unguarded form).
+Full-suite run with a foreign window launched+alive per script: 17/20
+ALL PASS pre-guard, then post-guard chooser ×3 + ipc-version ×3 ALL PASS
+and spot-checks window-color/split-divider/dark-menus/window-title(46)/
+hero-mode(60) ALL PASS — 19/20 green, several runs with a browser
+(msedge) or GameInputSvc genuinely owning fg at grab time. The old
+(unhardened) keybinds-t01 under the same contention skipped 7/11
+injection sections; the hardened one reaches all 23 asserts — the T86
+failure mode is gone. Its one failing assert is a pre-existing T85
+content-drift bug, split to T95 (box wedge blocked the ×3).
+
+## T95 — keybinds-t01 copy-click fix: pending ×3 (box GameInputSvc wedge)
+
+Found during T86 validation. `ctrl+c with selection copies to clipboard`
+fails on every run since T85: the test double-clicks the WINDOW CENTER to
+word-select an X-run, but the X block (cls + 10 echo pairs) sits at the
+top of the screen, and T85's placement memory now opens ~1460px-tall
+windows (vs the old 800×600 whose center row was inside the block).
+Instrumented run proved NO selection exists after the dclick (ctrl+shift+c
+also copies nothing), while a fresh-window probe of dclick+ctrl+c,
+dclick+ctrl+shift+c, and drag+ctrl+c all copy correctly — product is
+fine; the test's click target drifted. Fix (in the T86 commit): probe
+rows at 0.08/0.13/0.18/0.23/0.28 of window height, clipboard-verified
+per attempt (prompt rows interleave the X rows, so any fixed row is a
+coin flip).
+
+Remaining: run `keybinds-t01.ps1` ×3 ALL PASS (23). Blocked 2026-07-19:
+the box's GameInput service (`GameInputSvc`, session-1 SYSTEM process,
+`GameInputServiceWindow`) wedged the input stack — it holds an
+unbeatable foreground lock (AttachThreadInput denied, SwitchToThisWindow
+and real injected caption clicks all fail) AND swallows SendInput mouse
+moves system-wide. Unelevated remediation impossible (Stop-Process
+denied). Remedy when elevated: `Restart-Service GameInputSvc` (or
+reboot). The wedge also degrades the user's desktop (focus stealing) —
+flag it. A 60-min recovery watcher was left polling; scripts abort
+safely (foreground check) while wedged, so nothing leaks keystrokes.
+
+*Validation:* `keybinds-t01.ps1` ALL PASS (23) ×3 on a recovered box,
+ideally with a foreign window foregrounded first (the T86 condition).
+
 ## T87 — Mac seat: macOS regression build + merge to main (T25 tail)
 
 The working agreements require the Mac regression build
