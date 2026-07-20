@@ -507,6 +507,13 @@ class AppDelegate: NSObject,
         // tab-group snapshot. Harmless if the quit is cancelled below.
         SessionLayoutManifest.shared.flushPendingSyncs()
 
+        // WP-D3: force a FRESH snapshot capture of every tracked pane now, so
+        // the persisted screen snapshot + byte offset reflect the state AT quit
+        // (a session that changed only via output never tripped the debounced
+        // sync above). This is what keeps the agent's delta replay tiny on the
+        // next relaunch/upgrade — the fast, non-smeary restore path.
+        SessionLayoutManifest.shared.syncAllTrackedNow()
+
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
 

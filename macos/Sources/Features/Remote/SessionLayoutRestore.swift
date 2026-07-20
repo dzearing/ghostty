@@ -412,6 +412,16 @@ extension AppDelegate {
             cfg.remoteConnection = connection.handle
             cfg.connectionKeepAlive = connection
             cfg.remoteSessionId = leaf.sessionID
+            // WP-D3: seed the persisted structured screen snapshot + byte offset
+            // so the pane paints instantly at the correct size and the agent
+            // replays only the gap since detach. Both required together — an
+            // undecodable/absent snapshot leaves offset 0 → full-ring replay.
+            if let b64 = leaf.screenSnapshot,
+               let offset = leaf.screenSnapshotOffset,
+               let data = Data(base64Encoded: b64), !data.isEmpty {
+                cfg.remoteRestoreSnapshot = data
+                cfg.remoteRestoreByteOffset = offset
+            }
             // Recreate the pane under its PERSISTED surface uuid (wp3 pane
             // identity) so `+list` ids and the shell's baked GHOZTTY_PANE_ID
             // stay valid across the relaunch. Nil (older manifest) mints fresh.

@@ -175,6 +175,26 @@ tty_name_ptr: std.atomic.Value(?[*:0]const u8) = .init(null),
 /// `child_pid`, which is also the correct answer for a fresh shell.
 fg_pid: std.atomic.Value(i64) = .init(0),
 
+/// WP-D3 fast, visually-correct re-attach. `restore_snapshot` is the app's OWN
+/// structured VT repaint of the pane's screen (palette + modes + styles +
+/// cursor + bounded scrollback) captured when the session was last persisted,
+/// and `attach_offset` is the absolute agent-stream byte offset that snapshot
+/// reflects. On ATTACH we (a) paint the snapshot directly for an instant,
+/// correctly-sized frame and (b) pass `attach_offset` as the ATTACH
+/// `last_byte_offset` so the agent replays ONLY the small gap produced while we
+/// were detached, instead of re-parsing its whole ~2MB retained ring (the slow,
+/// smeary path). Both null/0 for a normal OPEN or a legacy restore, which falls
+/// back to the full-ring replay. `restore_snapshot` is duped into `arena`.
+restore_snapshot: ?[]const u8 = null,
+
+/// The absolute agent-stream byte offset the terminal has applied. Seeded from
+/// the restore offset in `init`; advanced by `drainRing` (via
+/// `Termio.processOutputTracked`) as replayed/live bytes are fed to the parser.
+/// `appliedOffset()` = `attach_offset + applied_bytes`. Persisted on quit as the
+/// next restore's `last_byte_offset`.
+attach_offset: u64 = 0,
+applied_bytes: std.atomic.Value(u64) = .init(0),
+
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
 /// machinery here (that all lives on the agent side), but the connection handle
@@ -242,6 +262,13 @@ pub const Config = struct {
     /// against an unrelated local tty. Set from the same
     /// `local_shell_integration` signal as `pinned`.
     local: bool = false,
+
+    /// WP-D3: the persisted structured VT screen snapshot to paint on ATTACH,
+    /// and the absolute byte offset it reflects (used as the ATTACH
+    /// `last_byte_offset`). Default null/0 → full-ring replay (pre-WP-D3
+    /// behavior). `restore_snapshot` is borrowed; `init` dupes it into the arena.
+    restore_snapshot: ?[]const u8 = null,
+    restore_offset: u64 = 0,
 };
 
 /// What a restored pane does when its ATTACH target comes back as a
@@ -267,6 +294,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
     const working_directory = if (cfg.working_directory) |w| try aa.dupe(u8, w) else null;
     const shell = if (cfg.shell) |s| try aa.dupe(u8, s) else null;
     const term = try aa.dupe(u8, cfg.term);
+    const restore_snapshot = if (cfg.restore_snapshot) |s| try aa.dupe(u8, s) else null;
 
     // Dupe the forwarded env allowlist (keys and values) into our arena so it
     // is stable for the backend's lifetime (the caller only lends it).
@@ -296,8 +324,20 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .pinned = cfg.pinned,
         .local = cfg.local,
         .relaunch_policy = cfg.relaunch_policy,
+        .restore_snapshot = restore_snapshot,
+        // The offset is only meaningful WITH a snapshot: attaching at offset>0
+        // without painting the prior content would leave the screen blank above
+        // the gap-fill. No snapshot ⇒ offset 0 ⇒ full-ring replay.
+        .attach_offset = if (restore_snapshot != null) cfg.restore_offset else 0,
         .arena = arena,
     };
+}
+
+/// The absolute agent-stream byte offset applied to the terminal so far (WP-D3):
+/// the offset we attached at plus everything drained since. Persisted on quit
+/// so the next re-attach replays only the gap. Lock-free.
+pub fn appliedOffset(self: *const Remote) u64 {
+    return self.attach_offset + self.applied_bytes.load(.monotonic);
 }
 
 pub fn deinit(self: *Remote) void {
@@ -405,9 +445,12 @@ pub fn threadEnter(
             sid,
             rows,
             cols,
-            // We have no locally-applied byte offset yet (fresh attach from a new
-            // GUI process); the agent replays its retained ring from 0 (§7.3).
-            0,
+            // WP-D3: attach at the byte offset our persisted screen snapshot
+            // reflects (0 on a legacy/fresh attach) so the agent gap-fills ONLY
+            // the bytes produced while we were detached (§7.3) instead of
+            // re-parsing its whole retained ring. The snapshot painted below in
+            // `threadEnter` supplies everything at/below this offset.
+            self.attach_offset,
             false,
             &self.canceller,
         );
@@ -424,7 +467,7 @@ pub fn threadEnter(
         {
             outcome.deinit();
             log.info("attach: session attached elsewhere; reclaiming with force=true", .{});
-            outcome = try self.conn.attachChannelCancellable(sid, rows, cols, 0, true, &self.canceller);
+            outcome = try self.conn.attachChannelCancellable(sid, rows, cols, self.attach_offset, true, &self.canceller);
         }
         defer outcome.deinit();
         if (outcome.pane) |p| break :pane p;
@@ -617,6 +660,21 @@ pub fn threadEnter(
     const live_rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
     const reflow_replay = relaunch_replayed and replay_cols != 0 and replay_cols != live_cols;
     if (reflow_replay) io.reflowLocalGrid(replay_cols, live_rows);
+
+    // WP-D3: paint the persisted structured snapshot for an instant, correctly
+    // sized frame BEFORE the agent's delta replay lands on top. Applied only on
+    // the normal live re-attach path (not a relaunch / awaiting-relaunch, which
+    // stream a fresh shell and print their own divider) and only when we
+    // attached at a real offset (`attach_offset > 0`), so the snapshot and the
+    // agent's `(attach_offset, S]` gap-fill meet exactly with no double-paint.
+    // This is our OWN clean VT repaint (palette+modes+styles+cursor+bounded
+    // scrollback), NOT the agent's raw in-place-redraw ring, so it reflows to
+    // the live width without smearing and parses in well under a frame.
+    if (!did_relaunch and !self.awaiting_relaunch and self.attach_offset > 0) {
+        if (self.restore_snapshot) |snap| {
+            if (snap.len > 0) @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
+        }
+    }
 
     // Drain once immediately in case DATA landed in the ring between registration
     // and arming the wait (the agent may stream a snapshot right after OPENED).
@@ -946,7 +1004,14 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
         const res = ch.pop(&buf);
         if (res.read == 0) break;
 
-        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, buf[0..res.read] });
+        // WP-D3: feed via the tracked path so `applied_bytes` advances under the
+        // renderer mutex in lockstep with the parse — a snapshot reader then sees
+        // a consistent (grid, offset) pair. This counts every byte fed to the
+        // terminal (the agent's `(attach_offset, S]` gap-fill and then live DATA),
+        // so `appliedOffset()` tracks the true absolute stream position.
+        @call(.always_inline, termio.Termio.processOutputTracked, .{
+            rd.io, buf[0..res.read], &rd.io.backend.remote.applied_bytes,
+        });
 
         if (res.send_resume) rd.conn.sendFlowResume(ch.id) catch |err|
             log.warn("error sending FLOW resume err={}", .{err});

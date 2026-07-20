@@ -867,6 +867,14 @@ pub const Surface = struct {
     /// null. NEVER true for a cross-machine window.
     remote_local_shell_integration: bool = false,
 
+    /// WP-D3 fast re-attach: the persisted structured VT screen snapshot (as a
+    /// slice) + the absolute byte offset it reflects, copied from
+    /// `Options.restore_snapshot`/`.restore_byte_offset`. Borrowed for the
+    /// duration of `CoreSurface.init` only (the remote backend dupes the bytes),
+    /// so we retain just the raw pointer/len here. Read by `remoteBackend()`.
+    remote_restore_snapshot: ?[]const u8 = null,
+    remote_restore_offset: u64 = 0,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -953,6 +961,21 @@ pub const Surface = struct {
         ///
         /// C type: `bool`.
         remote_local_shell_integration: bool = false,
+
+        /// WP-D3 fast re-attach: the app's persisted structured VT screen
+        /// snapshot to paint on ATTACH, captured on quit via
+        /// `ghostty_surface_session_snapshot` and stored in the session-layout
+        /// manifest. `restore_byte_offset` is the absolute agent-stream byte
+        /// offset it reflects, passed as the ATTACH `last_byte_offset` so the
+        /// agent replays only the gap since detach. Null/0 ⇒ full-ring replay
+        /// (no snapshot, or a legacy manifest). Borrowed for the duration of
+        /// `CoreSurface.init` only (the remote backend dupes the bytes). Ignored
+        /// when `connection` or `session_id` is null.
+        ///
+        /// C type: `const char*` + `uintptr_t` + `uint64_t`.
+        restore_snapshot: ?[*]const u8 = null,
+        restore_snapshot_len: usize = 0,
+        restore_byte_offset: u64 = 0,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -975,6 +998,13 @@ pub const Surface = struct {
             .remote_working_directory = opts.remote_working_directory,
             .remote_shell = opts.remote_shell,
             .remote_local_shell_integration = opts.remote_local_shell_integration,
+            // WP-D3: the persisted screen snapshot + offset for a fast restore.
+            // Recorded as a slice (borrowed until `core_surface.init` returns).
+            .remote_restore_snapshot = if (opts.restore_snapshot) |p|
+                p[0..opts.restore_snapshot_len]
+            else
+                null,
+            .remote_restore_offset = opts.restore_byte_offset,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1511,6 +1541,13 @@ pub const Surface = struct {
             } else null,
             // Only the LOCAL agent gets ghostty shell integration injected (T04b).
             .local_shell_integration = self.remote_local_shell_integration,
+            // WP-D3: forward the persisted snapshot + offset (empty ⇒ null so a
+            // stray zero-length blob never triggers the snapshot paint path).
+            .restore_snapshot = if (self.remote_restore_snapshot) |s|
+                (if (s.len > 0) s else null)
+            else
+                null,
+            .restore_offset = self.remote_restore_offset,
         };
     }
 
@@ -2274,6 +2311,50 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
+    }
+
+    /// C type: `ghostty_session_snapshot_s`. A WP-D3 session snapshot: a
+    /// structured VT repaint of the pane's screen (`data`/`data_len`) plus the
+    /// absolute agent-stream byte offset it reflects (`byte_offset`). The app
+    /// persists both in its session-layout manifest on quit and passes them back
+    /// via `Surface.Options.restore_snapshot`/`.restore_byte_offset` on restore.
+    const SessionSnapshotC = extern struct {
+        data: ?[*]const u8 = null,
+        data_len: usize = 0,
+        byte_offset: u64 = 0,
+    };
+
+    /// Capture a WP-D3 session snapshot of `surface` for a fast, visually-correct
+    /// re-attach. Returns true and fills `result` for an agent-backed remote pane
+    /// that has applied output; false (leaving `result` zeroed) for a local exec
+    /// pane, a fresh pane with nothing applied, or on error — the caller then
+    /// falls back to the pre-WP-D3 full-ring replay. Free with
+    /// `ghostty_surface_free_session_snapshot`.
+    export fn ghostty_surface_session_snapshot(
+        surface: *Surface,
+        result: *SessionSnapshotC,
+    ) bool {
+        result.* = .{};
+        const snap = surface.core_surface.sessionSnapshot(global.alloc) catch |err| {
+            log.warn("error capturing session snapshot err={}", .{err});
+            return false;
+        } orelse return false;
+        result.* = .{
+            .data = snap.data.ptr,
+            .data_len = snap.data.len,
+            .byte_offset = snap.byte_offset,
+        };
+        return true;
+    }
+
+    export fn ghostty_surface_free_session_snapshot(
+        _: *Surface,
+        result: *SessionSnapshotC,
+    ) void {
+        if (result.data) |ptr| {
+            if (result.data_len > 0) global.alloc.free(ptr[0..result.data_len]);
+        }
+        result.* = .{};
     }
 
     // -------------------------------------------------------------------------

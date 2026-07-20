@@ -421,6 +421,18 @@ typedef struct {
   uintptr_t text_len;
 } ghostty_text_s;
 
+// A WP-D3 session snapshot: a structured VT repaint of a pane's screen
+// (`data`/`data_len`, NOT NUL-terminated) plus the absolute agent-stream byte
+// offset it reflects (`byte_offset`). Produced by
+// ghostty_surface_session_snapshot; persist both in the session-layout manifest
+// and pass them back on restore via ghostty_surface_config_s.restore_snapshot /
+// .restore_byte_offset. Free with ghostty_surface_free_session_snapshot.
+typedef struct {
+  const char* data;
+  uintptr_t data_len;
+  uint64_t byte_offset;
+} ghostty_session_snapshot_s;
+
 typedef enum {
   GHOSTTY_POINT_ACTIVE,
   GHOSTTY_POINT_VIEWPORT,
@@ -524,6 +536,21 @@ typedef struct {
   // is meaningless (and breaks the shell) on a different-OS agent. Ignored when
   // `connection` is NULL.
   bool remote_local_shell_integration;
+
+  // WP-D3 fast, visually-correct re-attach. `restore_snapshot` is the app's
+  // persisted structured VT screen repaint (from a prior
+  // `ghostty_surface_session_snapshot`), `restore_snapshot_len` its byte length
+  // (the bytes are NOT NUL-terminated), and `restore_byte_offset` the absolute
+  // agent-stream byte offset it reflects — passed as the ATTACH last_byte_offset
+  // so the agent replays only the gap produced while the app was down instead
+  // of re-parsing its whole retained ring. On restore the pane paints the
+  // snapshot directly for an instant, correctly-sized frame. NULL/0 ⇒ full-ring
+  // replay (no snapshot, or a legacy manifest). Borrowed for the duration of the
+  // surface-construction call only. Ignored when `connection` or `session_id`
+  // is NULL.
+  const char* restore_snapshot;
+  uintptr_t restore_snapshot_len;
+  uint64_t restore_byte_offset;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1294,6 +1321,8 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_session_snapshot(ghostty_surface_t, ghostty_session_snapshot_s*);
+GHOSTTY_API void ghostty_surface_free_session_snapshot(ghostty_surface_t, ghostty_session_snapshot_s*);
 
 // Remote machines (remote-machines design §3.5/§3.2). A connection is keyed by
 // (host, user, port, jump-chain) and multiplexes N remote panes/sessions. The

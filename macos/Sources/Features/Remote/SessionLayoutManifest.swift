@@ -73,6 +73,16 @@ final class SessionLayoutManifest {
         /// Optional/additive: older manifests decode with nil (restore then
         /// mints a fresh uuid, today's behavior).
         var surfaceID: String?
+        /// WP-D3 fast re-attach: the pane's structured VT screen snapshot at
+        /// last sync, base64-encoded, and the absolute agent-stream byte offset
+        /// it reflects. On restore the pane paints this snapshot for an instant,
+        /// correctly-sized frame and ATTACHes at `screenSnapshotOffset` so the
+        /// agent replays only the gap since — instead of re-parsing its whole
+        /// retained ring (slow + smeary). Optional/additive: older manifests and
+        /// panes that never produced output decode with nil → full-ring replay
+        /// (the pre-WP-D3 behavior). Always nil for viewer leaves.
+        var screenSnapshot: String?
+        var screenSnapshotOffset: UInt64?
 
         var isViewer: Bool { kind == "viewer" }
     }
@@ -461,6 +471,25 @@ final class SessionLayoutManifest {
         }
     }
 
+    /// Force a FRESH sync of every currently-tracked controller (not just the
+    /// pending debounced ones), capturing each pane's LATEST screen snapshot +
+    /// byte offset (WP-D3). Called at quit: a session that changed only via
+    /// output (the common case) never triggers the debounced sync, so without
+    /// this the persisted snapshot would be stale and the agent's delta replay
+    /// large — defeating the fast-restore. Cheap (≤600-row VT dump per pane,
+    /// main-thread, while every window is still alive).
+    @MainActor
+    func syncAllTrackedNow() {
+        var synced = Set<UUID>()
+        for window in NSApplication.shared.windows {
+            guard let controller = window.windowController as? BaseTerminalController,
+                  let entryID = controller.sessionLayoutEntryID,
+                  synced.insert(entryID).inserted
+            else { continue }
+            syncEntry(controller)
+        }
+    }
+
     /// Sync now, then retry every 0.5s (up to ~30s) while any leaf still
     /// lacks its agent session id — the termio thread publishes ids only
     /// after OPEN completes (async). Same shape as
@@ -523,6 +552,10 @@ final class SessionLayoutManifest {
                         surfaceID: nil)
                 }
                 let view = pane.surfaceView
+                // WP-D3: capture a fresh structured screen snapshot + byte
+                // offset so restore paints instantly and the agent replays only
+                // the gap. Nil for a fresh/exec pane → full-ring replay.
+                let snap = view.flatMap { Self.liveScreenSnapshot(of: $0) }
                 return Leaf(
                     // Fall back to the id the surface was CREATED to attach
                     // when the live id is unavailable — surface creation can
@@ -532,7 +565,9 @@ final class SessionLayoutManifest {
                     sessionID: view.flatMap { Self.liveSessionID(of: $0) ?? $0.expectedRemoteSessionID },
                     title: pane.title,
                     ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) },
-                    surfaceID: view?.id.uuidString)
+                    surfaceID: view?.id.uuidString,
+                    screenSnapshot: snap?.snapshot,
+                    screenSnapshotOffset: snap?.offset)
             }
         }
 
@@ -577,6 +612,24 @@ final class SessionLayoutManifest {
         let s = Ghostty.AllocatedString(
             ghostty_surface_remote_session_id(surface)).string
         return s.isEmpty ? nil : s
+    }
+
+    /// WP-D3: capture the surface's structured VT screen snapshot (base64) and
+    /// the absolute agent-stream byte offset it reflects, for a fast,
+    /// visually-correct re-attach. Nil for a local exec pane, a fresh pane with
+    /// nothing applied, or on error — the pane then restores via the pre-WP-D3
+    /// full-ring replay.
+    @MainActor
+    static func liveScreenSnapshot(
+        of view: Ghostty.SurfaceView
+    ) -> (snapshot: String, offset: UInt64)? {
+        guard let surface = view.surface else { return nil }
+        var out = ghostty_session_snapshot_s()
+        guard ghostty_surface_session_snapshot(surface, &out) else { return nil }
+        defer { ghostty_surface_free_session_snapshot(surface, &out) }
+        guard let ptr = out.data, out.data_len > 0 else { return nil }
+        let data = Data(bytes: ptr, count: Int(out.data_len))
+        return (data.base64EncodedString(), out.byte_offset)
     }
 
     @MainActor

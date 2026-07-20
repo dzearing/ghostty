@@ -99,6 +99,16 @@ pub const RemoteBackend = struct {
     /// a macOS resources path / ZDOTDIR is meaningless (and breaks the shell) on
     /// a different-OS agent. Set by the apprt from `Machine.isLocalMachine`.
     local_shell_integration: bool = false,
+
+    /// WP-D3 fast re-attach: the app's persisted structured VT screen snapshot
+    /// to paint on ATTACH, and the absolute agent-stream byte offset it reflects
+    /// (passed as the ATTACH `last_byte_offset`). Captured on quit via
+    /// `Surface.sessionSnapshot` and stored in the session-layout manifest; on
+    /// restore the apprt threads them back down here. Null/0 ⇒ full-ring replay
+    /// (a hard crash with no snapshot, or a legacy manifest). `restore_snapshot`
+    /// is borrowed for the construction call only (duped by `termio.Remote.init`).
+    restore_snapshot: ?[]const u8 = null,
+    restore_offset: u64 = 0,
 };
 
 /// Unique ID used to identify this surface for IPC purposes. It is
@@ -1046,6 +1056,10 @@ pub fn init(
                         .auto => .auto,
                         .prompt => .prompt,
                     },
+                    // WP-D3: the persisted screen snapshot + offset for a fast,
+                    // visually-correct re-attach (null/0 ⇒ full-ring replay).
+                    .restore_snapshot = rb.restore_snapshot,
+                    .restore_offset = rb.restore_offset,
                 });
                 break :backend .{ .remote = io_remote };
             }
@@ -2401,6 +2415,85 @@ pub const Text = struct {
 /// selection state.
 ///
 /// The returned value contains allocated data and must be deinitialized.
+/// A WP-D3 session snapshot: a structured VT repaint of the pane's current
+/// screen plus the absolute agent-stream byte offset it reflects. Persisted on
+/// quit and replayed on re-attach for a fast, visually-correct restore.
+pub const SessionSnapshot = struct {
+    /// A clean, structured VT repaint (palette, modes, styles, cursor, bounded
+    /// scrollback) of the current screen. Owned by the caller; free with the
+    /// same allocator passed to `sessionSnapshot`.
+    data: []const u8,
+
+    /// The absolute agent-stream byte offset `data` reflects — the ATTACH
+    /// `last_byte_offset` for the delta re-attach.
+    byte_offset: u64,
+};
+
+/// Maximum rows (viewport + scrollback) captured in a session snapshot. Bounds
+/// the persisted blob (structured VT, base64'd into the layout manifest) while
+/// giving the restored pane its visible frame plus a little scroll-up history;
+/// the agent's delta replay supplies everything produced after the snapshot.
+const session_snapshot_max_rows: usize = 600;
+
+/// Capture a WP-D3 session snapshot for a fast, visually-correct re-attach:
+/// serialize the current screen as a clean, structured VT repaint (NOT the
+/// agent's raw in-place-redraw ring — this reflows to the live width without
+/// smearing and parses in well under a frame) plus the absolute child-byte
+/// offset it reflects. Returns null for a non-remote (exec) pane — only
+/// agent-backed sessions re-attach — or when nothing has been applied yet. The
+/// (grid, offset) pair is read under ONE hold of the renderer mutex so it stays
+/// consistent with the drain path (`Termio.processOutputTracked`).
+pub fn sessionSnapshot(self: *Surface, alloc: Allocator) !?SessionSnapshot {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    // Only agent-backed remote panes re-attach from the manifest.
+    const offset = self.io.remoteAppliedOffset() orelse return null;
+    // Nothing applied yet ⇒ nothing worth snapshotting. A 0-offset restore would
+    // make the agent replay from the start AND double-paint the snapshot, so the
+    // ATTACH path only honors a snapshot when the offset is > 0; skip it here too.
+    if (offset == 0) return null;
+
+    const t = &self.io.terminal;
+    const screen = t.screens.active;
+
+    // Bound the region to the last N rows (viewport + a little scrollback).
+    const br = screen.pages.getBottomRight(.screen) orelse return null;
+    const total = screen.pages.total_rows;
+    const tl = if (total <= session_snapshot_max_rows)
+        screen.pages.getTopLeft(.screen)
+    else
+        screen.pages.pin(.{ .screen = .{
+            .x = 0,
+            .y = @intCast(total - session_snapshot_max_rows),
+        } }) orelse screen.pages.getTopLeft(.screen);
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // emit=.vt + Extra.all reconstructs the screen state as closely as possible:
+    // palette, differing modes (incl. alt-screen enter for TUIs), scrolling
+    // region, tabstops, pwd, per-cell SGR styles, hyperlinks, and a final cursor
+    // position. unwrap=false preserves the rendered row layout so it re-wraps
+    // naturally at the live width.
+    var formatter: terminal.formatter.TerminalFormatter = .init(t, .{
+        .emit = .vt,
+        .unwrap = false,
+        .trim = true,
+    });
+    formatter.content = .{ .selection = terminal.Selection.init(tl, br, false) };
+    formatter.extra = .all;
+    formatter.format(&builder.writer) catch |err| {
+        log.warn("error building session snapshot err={}", .{err});
+        return null;
+    };
+
+    return .{
+        .data = try builder.toOwnedSlice(),
+        .byte_offset = offset,
+    };
+}
+
 pub fn dumpText(
     self: *Surface,
     alloc: Allocator,
