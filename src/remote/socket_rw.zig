@@ -155,6 +155,22 @@ pub fn sendOnce(fd: posix.socket_t, bytes: []const u8) SendError!usize {
     }
 }
 
+/// `std.net.Stream.read` replacement for loopback TEST HARNESSES (T89b): std's
+/// `Stream.read` goes through `windows.ReadFile` on Windows, which fails with
+/// `ERROR_INVALID_PARAMETER` (87) on the OVERLAPPED sockets std creates —
+/// `recv` is the correct call on a socket regardless of its overlapped flag.
+/// 0 == EOF, like `Stream.read`.
+pub fn readStream(stream: std.net.Stream, buf: []u8) RecvError!usize {
+    return recvOnce(stream.handle, buf);
+}
+
+/// `std.net.Stream.writeAll` replacement for loopback TEST HARNESSES (T89b):
+/// same overlapped-socket problem as `readStream`, on the `WriteFile` side.
+pub fn writeAllStream(stream: std.net.Stream, bytes: []const u8) SendError!void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try sendOnce(stream.handle, bytes[off..]);
+}
+
 /// A buffered `std.Io.Reader` over a socket fd — the panic-free stand-in for
 /// `std.net.Stream.Reader` (same field/method shape: pinned `interface_state`,
 /// `interface()`, `getError()`). Heap-pin it: the interface uses
@@ -295,6 +311,27 @@ test "Reader/Writer: round-trip through the std.Io interfaces" {
     var got: [8]u8 = undefined;
     const n = try r.interface().readSliceShort(&got);
     try testing.expectEqualStrings("hello-io", got[0..n]);
+}
+
+test "readStream/writeAllStream: round-trip + EOF over std.net.Stream (T89b)" {
+    const pair = try loopbackPair();
+    const a: std.net.Stream = .{ .handle = pair.a };
+    const b: std.net.Stream = .{ .handle = pair.b };
+    defer closeSock(pair.b);
+
+    try writeAllStream(a, "harness-bytes");
+    var got: [64]u8 = undefined;
+    var total: usize = 0;
+    while (total < "harness-bytes".len) {
+        const n = try readStream(b, got[total..]);
+        try testing.expect(n != 0);
+        total += n;
+    }
+    try testing.expectEqualStrings("harness-bytes", got[0..total]);
+
+    // Peer close → EOF (0), the same contract Stream.read gives on POSIX.
+    closeSock(pair.a);
+    try testing.expectEqual(@as(usize, 0), try readStream(b, &got));
 }
 
 test "Writer: flush after shutdown(.both) is an error, not a panic (T81)" {

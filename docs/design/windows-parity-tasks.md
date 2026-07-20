@@ -178,7 +178,12 @@ Work these first, in order, before falling back to first-todo-in-table:
 15. ~~T90a~~ — DONE 2026-07-19 (viewer-panes Windows design: loader-less
    WebView2 + PaneView retype + Mac-parity contracts; T90 split into
    T90b–T90h, T90b–T90g independent of the T89 series, T90h needs
-   T89f). Next on-box: **T89b**.
+   T89f).
+16. ~~T89b~~ — DONE 2026-07-19 (`zig build test-agent` green ×3, now part
+   of the standing validation set; overlapped-socket harness reads →
+   socket_rw + http_client PRODUCTION fix + PtyChild teardown deadlock
+   fix + per-OS pty tests; T82 folded in and closed). Next on-box:
+   **T89c**.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -287,7 +292,7 @@ One line per row. Full spec + validation + evidence per task:
 | T88 | Merge latest origin/main — done 2026-07-19: merged 8bb5d9845 (154 commits: session persistence, viewer panes, banner markdown, brokered OAuth, window titles) as 74322cf05; 3 post-merge Windows fixes (362d1d4bc: .powershell in the new shell-integration switch, u128-atomic → mutex in connection.zig test agent, Hello.encode null-elision — that test was red on main itself, flag to Mac seat); both lanes + Debug GUI + P1–P3 green; parity gaps filed as T89a–T94 | — | — | done | 74322cf05.. |
 | T89a | Session persistence on Windows: DESIGN — done 2026-07-19: 3-way survey (Mac design + agent core + win32 app); decided: named-pipe listener (`--listen-pipe`, IpcServer DACL pattern, pipe-backed Stream, additive port.json `pipe`), separate local-agent instance under `%LOCALAPPDATA%\ghoztty\local-agent[-debug]`, Zig LocalAgent find-or-spawn w/ 2s bound + exec fallback, close-sends-CLOSE vs quit-keeps-sessions (new quit action + WM_ENDSESSION), viewer-side layout manifest + ATTACH re-attach, HKCU Run key autostart, T82 as the T89b floor; split T89 → T89b–T89i. Full design in details §T89a | K | T88 | done | (this commit) |
 | T89 | Session persistence on Windows: IMPLEMENT — umbrella; split by T89a into T89b–T89i (agent-owned ConPTYs survive app quit/crash/upgrade w/ same-PID re-attach, reboot relaunch, +sessions; lazy agent upgrade stays deferred as on Mac) | K | T89a | skipped(split → T89b–T89i) | — |
-| T89b | Agent test floor: `zig build test-agent` green on Windows — harness socket reads → socket_rw (keepalive ×2, self_update ×3), leaked-thread crash, pty_child segfault (folds in T82) | K | T89a | todo | — |
+| T89b | Agent test floor — done 2026-07-19: `zig build test-agent` green ×3. Harness `std.net.Stream` reads = ReadFile-on-overlapped-socket → err 87 (keepalive/link_control/self_update loopback servers → new `socket_rw.readStream`/`writeAllStream`); PRODUCTION fix: http_client's std reader/writer had the same bug (http + the TCP layer under TLS) → socket_rw; PtyChild terminate DEADLOCK (pty.deinit's CloseHandle-before-ClosePseudoConsole blocks forever on the reader's in-flight sync ReadFile) → two-phase `pty.closeConsole`/`deinitAfterReader`; pty tests: defer-order UAF (sink freed before reader join = the T82 "segfault"), POSIX-only commands → per-OS variants, 15.6ms-tick spin waits → wall-clock; link_control test: stale-`connected` reconnect race + leaked loop thread on failure. Lanes + GUI + P1–P3 green | K | T89a | done | (this commit) |
 | T89c | Agent `--listen-pipe` mode (byte-mode pipe, owner DACL, pipe Stream impl, port.json `pipe`, local-agent storage dir, graceful-stop snapshot hook) + `+sessions` Windows dial (`dialPipe`); `agent-pipe.ps1` | K | T89b | todo | — |
 | T89d | Win32 surfaces OPEN under local agent: LocalAgent.zig find-or-spawn (2s bound, 15s cooldown, exec fallback), consume session-persistence, remote_conn injection (pinned, env, T84 ^C flag); `session-open.ps1` | K | T89c | todo | — |
 | T89e | Close-vs-quit semantics: user close ⇒ CLOSE, quit paths keep sessions ("Quit Ghoztty (keep sessions)" + WM_ENDSESSION), confirm carve-out per Mac 853ec3168; `session-close.ps1` | K | T89d | todo | — |

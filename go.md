@@ -72,8 +72,9 @@ only the parts of files you need.
   IpcServer/IpcHandlers/IpcRegistry and `src/apprt/ipc/args.zig`).
 - **Everything gets tests.** Pure logic → unit tests in the none-runtime
   lane; behavior → an on-box validation script. Both test lanes
-  (`-Dapp-runtime=none` and `-Dapp-runtime=win32`) must be green, and the
-  P1–P3 acceptance scripts in `test/win32/` must stay ALL PASS.
+  (`-Dapp-runtime=none` and `-Dapp-runtime=win32`) must be green, `zig build
+  test-agent` must be green (agent floor, T89b), and the P1–P3 acceptance
+  scripts in `test/win32/` must stay ALL PASS.
 - **Reliable and fast under long-context use** (2026-07-15): no crashes,
   no slowdowns, tuned for hours-long Claude Code sessions (T53 tracks the
   soak/tuning pass). Windows UI affordances should look Windows-native,

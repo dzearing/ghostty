@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Certificate = std.crypto.Certificate;
 const tls = std.crypto.tls;
+const socket_rw = @import("socket_rw.zig");
 
 /// TLS record buffers must be at least `tls.max_ciphertext_record_len` (~16645);
 /// 32 KiB gives headroom (mirrors `ws_client.zig`). Also used as the plain-TCP
@@ -155,8 +156,14 @@ fn request(
     const tcp_write_buf = try alloc.alloc(u8, buf_len);
     defer alloc.free(tcp_write_buf);
 
-    var tcp_reader = socket.reader(tcp_read_buf);
-    var tcp_writer = socket.writer(tcp_write_buf);
+    // socket_rw, not `socket.reader`/`.writer` (T89b): std's Stream I/O uses
+    // ReadFile/WriteFile on Windows, which fail with ERROR_INVALID_PARAMETER
+    // on the overlapped sockets std creates — every plain-http request (and
+    // the TCP layer under TLS) died on first read. Same swap ws_client made
+    // in T81; socket_rw's Reader/Writer are shape-compatible stand-ins.
+    socket_rw.disableSigpipe(socket.handle);
+    var tcp_reader = socket_rw.Reader.init(socket.handle, tcp_read_buf);
+    var tcp_writer = socket_rw.Writer.init(socket.handle, tcp_write_buf);
 
     switch (u.scheme) {
         .http => {

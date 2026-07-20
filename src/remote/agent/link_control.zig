@@ -439,6 +439,11 @@ fn isOffline(link: *LinkControl) bool {
 fn isConnected(link: *LinkControl) bool {
     return link.display() == .connected;
 }
+/// The loop has OBSERVED the connection end (not just the desired-state flip
+/// that `isOffline` reports) — see the disconnect/reconnect race note (T89b).
+fn isDisconnected(link: *LinkControl) bool {
+    return !link.connected.load(.acquire);
+}
 
 test "disconnect closes the live link exactly once and suspends redial" {
     var fake = FakeTransport{};
@@ -580,6 +585,7 @@ test "stopLoop exits cleanly while connected" {
 // -----------------------------------------------------------------------------
 
 const ws_client = @import("../ws_client.zig");
+const socket_rw = @import("../socket_rw.zig");
 
 /// Minimal loopback WebSocket server: accept serially, perform the RFC 6455
 /// upgrade, then go SILENT (read-and-discard until the client goes away) —
@@ -621,12 +627,14 @@ const LoopbackWs = struct {
     }
 
     fn handleConn(self: *LoopbackWs, stream: std.net.Stream) void {
-        // Read the upgrade request until CRLFCRLF.
+        // Read the upgrade request until CRLFCRLF. Reads/writes go through
+        // socket_rw (T89b): std's Stream.read/writeAll fail with error 87 on
+        // Windows' overlapped sockets (see keepalive.zig's TestWsServer).
         var req_buf: [4096]u8 = undefined;
         var req_len: usize = 0;
         while (std.mem.indexOf(u8, req_buf[0..req_len], "\r\n\r\n") == null) {
             if (req_len == req_buf.len) return;
-            const n = stream.read(req_buf[req_len..]) catch return;
+            const n = socket_rw.readStream(stream, req_buf[req_len..]) catch return;
             if (n == 0) return; // includes the stop() wake-up connection
             req_len += n;
         }
@@ -649,12 +657,12 @@ const LoopbackWs = struct {
         // Count BEFORE writing: the client's connect returns on reading the
         // 101 and tests assert on this counter right after.
         _ = self.upgrades.fetchAdd(1, .monotonic);
-        stream.writeAll(resp) catch return;
+        socket_rw.writeAllStream(stream, resp) catch return;
 
         // SILENT: read-and-discard until the client goes away (never writes).
         var sink: [512]u8 = undefined;
         while (true) {
-            const n = stream.read(&sink) catch break;
+            const n = socket_rw.readStream(stream, &sink) catch break;
             if (n == 0) break;
         }
     }
@@ -722,6 +730,14 @@ test "integration: disconnect closes the real WsClient (unblocking its read); re
     // 60s backoff: any post-disconnect promptness below is REAL, not a lucky
     // backoff expiry.
     const t = try std.Thread.spawn(.{}, runLoop, .{ &link, tr.transport(), 60_000 });
+    // Stop the loop + join even when an assertion below fails: without this a
+    // FAILED run leaked the loop thread, which kept redialing a freed `url`
+    // and segfaulted the whole test binary minutes later — attributed to
+    // whatever unrelated test was then executing (T89b).
+    defer {
+        link.stopLoop();
+        t.join();
+    }
 
     try poll(10_000, &link, isConnected);
     try testing.expectEqual(@as(u32, 1), srv.upgrades.load(.monotonic));
@@ -731,14 +747,18 @@ test "integration: disconnect closes the real WsClient (unblocking its read); re
     // park the loop offline.
     link.disconnect();
     try poll(10_000, &link, isOffline);
+    // `display()` reports .offline from `desired` ALONE, so the poll above
+    // passes before the loop thread has necessarily observed the close. Wait
+    // for the loop to actually clear `connected` too: on Windows the aborted
+    // recv wakes a few ms later, and an immediate reconnect() below would
+    // otherwise see the STALE connected=true and pass its poll without any
+    // second dial ("expected 2, found 1", T89b).
+    try poll(10_000, &link, isDisconnected);
 
     // The tray's Reconnect: redials immediately (well inside the 60s backoff).
     link.reconnect();
     try poll(10_000, &link, isConnected);
     try testing.expectEqual(@as(u32, 2), srv.upgrades.load(.monotonic));
-
-    link.stopLoop();
-    t.join();
 }
 
 // -----------------------------------------------------------------------------

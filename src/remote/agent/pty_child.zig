@@ -529,11 +529,21 @@ pub const PtyChild = struct {
 
         // Tear down the pty BEFORE joining the reader (the smoke-proven ordering):
         //   - POSIX: closing the master fd hangs up the slave and EOFs the reader's
-        //     `read`.
-        //   - Windows: `pty.deinit` calls `ClosePseudoConsole`, which is what gives
-        //     the reader's blocked `ReadFile(out_pipe)` its EOF. Closing it AFTER
-        //     the join would deadlock (see `conpty_smoke.zig`'s teardown note).
-        self.pty.deinit();
+        //     `read`, so `pty.deinit` up front is correct.
+        //   - Windows (T89b): must NOT call `pty.deinit` here — its
+        //     `CloseHandle(out_pipe)` comes before `ClosePseudoConsole`, and
+        //     CloseHandle on a SYNCHRONOUS handle with the reader's ReadFile
+        //     in flight blocks until that read completes: terminate deadlocked
+        //     forever against its own reader. Instead `closeConsole` closes
+        //     our write-side dup + the pseudoconsole (conhost exits, the last
+        //     write end goes away, the blocked ReadFile completes with
+        //     BROKEN_PIPE = EOF), the join below reaps the reader, and
+        //     `deinitAfterReader` frees the now-quiescent handles.
+        if (is_windows) {
+            self.pty.closeConsole();
+        } else {
+            self.pty.deinit();
+        }
 
         // Join the reader (now unblocked by EOF). Ensure it was at least allowed to
         // run (attach may never have fired for an instantly-failed session).
@@ -542,6 +552,8 @@ pub const PtyChild = struct {
             t.join();
             self.reader = null;
         }
+
+        if (is_windows) self.pty.deinitAfterReader();
 
         // Reap the child to avoid a zombie (best-effort; ignore if already reaped).
         self.mutex.lock();
@@ -1136,12 +1148,22 @@ const CaptureSink = struct {
 };
 
 /// Spin (async reader thread) until the sink has captured `needle`, or fail.
+/// Wall-clock bounded, NOT spin-counted: `Thread.sleep(100µs)` rounds up to
+/// the ~15.6ms timer tick on Windows, so 30k spins was ~8 MINUTES of timeout
+/// per miss there (T89b). On timeout, dump what WAS captured so a mismatch is
+/// diagnosable from the test log.
 fn waitContains(cap: *CaptureSink, needle: []const u8) !void {
-    var spins: usize = 0;
-    while (spins < 30_000) : (spins += 1) {
+    const deadline = std.time.milliTimestamp() + 30_000;
+    while (std.time.milliTimestamp() < deadline) {
         if (cap.contains(needle)) return;
-        std.Thread.sleep(100 * std.time.ns_per_us);
+        std.Thread.sleep(std.time.ns_per_ms);
     }
+    cap.mutex.lock();
+    defer cap.mutex.unlock();
+    std.debug.print(
+        "waitContains: needle \"{s}\" not seen; captured {d} bytes: {s}\n",
+        .{ needle, cap.buf.items.len, cap.buf.items },
+    );
     return error.TimedOutWaitingForOutput;
 }
 
@@ -1157,20 +1179,43 @@ test "PtyChild: OPEN.env reaches the child and does not leak between spawns" {
     const key = "T04A_TEST_VAR_9q2";
     const marker = "T04A_MARKER_7f3a";
 
+    // Per-OS command syntax (T89b): the default shell is cmd.exe on Windows,
+    // so the POSIX `printf "$VAR"; sleep` line can never run there. cmd
+    // expands `%VAR%` (leaving it LITERAL when unset — the "unset" needle
+    // below differs per OS for that reason) and `ping -n 31 >nul` is the
+    // keep-alive stand-in for `sleep 30`.
+    const cmd_a = if (is_windows)
+        "echo A=[%" ++ key ++ "%] & ping -n 31 127.0.0.1 >nul"
+    else
+        "printf 'A=[%s]\\n' \"$" ++ key ++ "\"; sleep 30";
+    const cmd_b = if (is_windows)
+        "echo B=[%" ++ key ++ "%] & ping -n 31 127.0.0.1 >nul"
+    else
+        "printf 'B=[%s]\\n' \"$" ++ key ++ "\"; sleep 30";
+    const needle_b = if (is_windows) "B=[%" ++ key ++ "%]" else "B=[]";
+
+    // The capture sinks are declared BEFORE each child's terminate defer so
+    // the LIFO unwind on a FAILED assertion joins the reader thread (inside
+    // terminate) before freeing the sink buffer — the old order deinit'd the
+    // sink first and the still-running reader turned every test failure into
+    // an Invalid free crash that took the whole test binary down (T89b).
+    var cap_a: CaptureSink = .{ .alloc = alloc };
+    defer cap_a.deinit();
+    var cap_b: CaptureSink = .{ .alloc = alloc };
+    defer cap_b.deinit();
+
     // Child A: forward the var (T04a env parity) and echo its shell-expanded
     // value back through the pty.
     const pairs = [_]protocol.Open.EnvPair{.{ .key = key, .value = marker }};
     const pc_a = try spawner.spawnChild(.{
         .rows = 24,
         .cols = 80,
-        .command = "printf 'A=[%s]\\n' \"$" ++ key ++ "\"; sleep 30",
+        .command = cmd_a,
         .env = &pairs,
     });
     var term_a = false;
     defer if (!term_a) pc_a.child().terminate();
 
-    var cap_a: CaptureSink = .{ .alloc = alloc };
-    defer cap_a.deinit();
     pc_a.child().attach(&cap_a, CaptureSink.sink, 1);
     try waitContains(&cap_a, "A=[" ++ marker ++ "]");
 
@@ -1180,15 +1225,13 @@ test "PtyChild: OPEN.env reaches the child and does not leak between spawns" {
     const pc_b = try spawner.spawnChild(.{
         .rows = 24,
         .cols = 80,
-        .command = "printf 'B=[%s]\\n' \"$" ++ key ++ "\"; sleep 30",
+        .command = cmd_b,
     });
     var term_b = false;
     defer if (!term_b) pc_b.child().terminate();
 
-    var cap_b: CaptureSink = .{ .alloc = alloc };
-    defer cap_b.deinit();
     pc_b.child().attach(&cap_b, CaptureSink.sink, 2);
-    try waitContains(&cap_b, "B=[]");
+    try waitContains(&cap_b, needle_b);
     try testing.expect(!cap_b.contains(marker));
 
     pc_a.child().terminate();
@@ -1198,6 +1241,11 @@ test "PtyChild: OPEN.env reaches the child and does not leak between spawns" {
 }
 
 test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {
+    // The explicit-argv path is POSIX-only BY DESIGN (spawnChild gates
+    // `open.argv` behind `!is_windows` — a Windows agent never receives it),
+    // so there is nothing to exercise here on Windows (T89b).
+    if (is_windows) return error.SkipZigTest;
+
     const alloc = testing.allocator;
 
     var spawner = try PtySpawner.init(alloc);
@@ -1215,6 +1263,10 @@ test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {
         "-c",
         "printf '" ++ marker ++ "\\n'; sleep 30",
     };
+    // Sink declared before the terminate defer: the unwind must join the
+    // reader before freeing the sink buffer (see the OPEN.env test, T89b).
+    var capture: CaptureSink = .{ .alloc = alloc };
+    defer capture.deinit();
     const pc = try spawner.spawnChild(.{
         .rows = 24,
         .cols = 80,
@@ -1224,8 +1276,6 @@ test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {
     var terminated = false;
     defer if (!terminated) pc.child().terminate();
 
-    var capture: CaptureSink = .{ .alloc = alloc };
-    defer capture.deinit();
     pc.child().attach(&capture, CaptureSink.sink, 0x5b8c);
     try waitContains(&capture, marker);
 
@@ -1239,43 +1289,57 @@ test "PtyChild: real pty spawn → input echoes back → exit/tombstone" {
     var spawner = try PtySpawner.init(alloc);
     defer spawner.deinit();
 
-    // Spawn `sh -lic 'cat; exit 7'`-equivalent: a plain interactive shell. We feed
-    // a command and observe its echo, then exit.
-    const pc = try spawner.spawnChild(.{ .rows = 24, .cols = 80, .command = "cat" });
-    var terminated = false;
-    defer if (!terminated) pc.child().terminate();
-
+    // Sink declared before the terminate defer: the unwind must join the
+    // reader before freeing the sink buffer (see the OPEN.env test, T89b).
     var capture: CaptureSink = .{ .alloc = alloc };
     defer capture.deinit();
+
+    // POSIX: spawn `cat` — every written line echoes straight back, then EOF
+    // (Ctrl-D) exits it with 0. Windows (T89b): `cat` isn't a given on PATH,
+    // so drive the default INTERACTIVE shell (cmd.exe) instead — type an
+    // `echo`, watch it come back through the ConPTY, then type `exit 7` and
+    // assert the child exited with THAT code (proof the shell PROCESSED our
+    // input, stronger than the console's own input echo).
+    const pc = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .command = if (is_windows) null else "cat",
+    });
+    var terminated = false;
+    defer if (!terminated) pc.child().terminate();
 
     // Attach the sink (this also starts the reader thread).
     pc.child().attach(&capture, CaptureSink.sink, 0xABCD);
 
-    // Write a line; `cat` echoes it straight back to the pty.
-    try pc.child().writeAll("hello-pty-roundtrip\n");
-
-    // Spin until the echoed bytes reach the sink (the reader thread is async).
-    var spins: usize = 0;
-    while (spins < 20_000) : (spins += 1) {
-        if (capture.contains("hello-pty-roundtrip")) break;
-        std.Thread.yield() catch {};
-        std.Thread.sleep(100 * std.time.ns_per_us);
+    // Write a line and wait for it to come back out of the pty.
+    if (is_windows) {
+        try pc.child().writeAll("echo hello-pty-roundtrip\r");
+    } else {
+        try pc.child().writeAll("hello-pty-roundtrip\n");
     }
-    try testing.expect(capture.contains("hello-pty-roundtrip"));
 
-    // Send EOF to `cat` so it exits cleanly (Ctrl-D), then reap.
-    try pc.child().writeAll(&.{0x04});
+    // Wait until the echoed bytes reach the sink (the reader thread is async).
+    try waitContains(&capture, "hello-pty-roundtrip");
+
+    // Exit the child cleanly, then reap: EOF (Ctrl-D) for `cat` → 0; a typed
+    // `exit 7` for cmd.exe → 7.
+    const want_code: i64 = if (is_windows) 7 else 0;
+    if (is_windows) {
+        try pc.child().writeAll("exit 7\r");
+    } else {
+        try pc.child().writeAll(&.{0x04});
+    }
     var reaped: ?i64 = null;
-    spins = 0;
-    while (spins < 20_000) : (spins += 1) {
+    const reap_deadline = std.time.milliTimestamp() + 30_000;
+    while (std.time.milliTimestamp() < reap_deadline) {
         if (pc.child().tryWait()) |code| {
             reaped = code;
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_us);
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     try testing.expect(reaped != null);
-    try testing.expectEqual(@as(i64, 0), reaped.?); // cat exits 0 on EOF
+    try testing.expectEqual(want_code, reaped.?);
 
     // terminate is idempotent + frees the child (and joins the reader).
     pc.child().terminate();
@@ -1288,15 +1352,23 @@ test "PtyChild: SIGNAL terminates the child via its process group" {
     var spawner = try PtySpawner.init(alloc);
     defer spawner.deinit();
 
-    // `sleep 30` so it stays alive until we signal it.
-    const pc = try spawner.spawnChild(.{ .rows = 24, .cols = 80, .command = "sleep 30" });
+    // Sink declared before the terminate defer: the unwind must join the
+    // reader before freeing the sink buffer (see the OPEN.env test, T89b).
+    var capture: CaptureSink = .{ .alloc = alloc };
+    defer capture.deinit();
+
+    // A long-lived child so it stays alive until we signal it. Windows has no
+    // `sleep` in cmd.exe; `ping -n 31 >nul` is the standing stand-in (T89b).
+    const pc = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .command = if (is_windows) "ping -n 31 127.0.0.1 >nul" else "sleep 30",
+    });
     // Free the child even if an assertion below fails (no leak under the test
     // allocator). terminate() is idempotent with a later explicit call.
     var terminated = false;
     defer if (!terminated) pc.child().terminate();
 
-    var capture: CaptureSink = .{ .alloc = alloc };
-    defer capture.deinit();
     pc.child().attach(&capture, CaptureSink.sink, 1);
 
     // Give the child a beat to complete `setsid` (its pre_exec) so it is the leader
@@ -1307,17 +1379,18 @@ test "PtyChild: SIGNAL terminates the child via its process group" {
     try pc.child().signal("KILL");
 
     var reaped: ?i64 = null;
-    var spins: usize = 0;
-    while (spins < 100_000) : (spins += 1) {
+    const reap_deadline = std.time.milliTimestamp() + 30_000;
+    while (std.time.milliTimestamp() < reap_deadline) {
         if (pc.child().tryWait()) |code| {
             reaped = code;
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_us);
+        std.Thread.sleep(std.time.ns_per_ms);
     }
     try testing.expect(reaped != null);
-    // Killed by SIGKILL → 128 + SIGKILL(9) = 137 (our shell-convention mapping).
-    try testing.expectEqual(@as(i64, 128 + 9), reaped.?);
+    // POSIX: killed by SIGKILL → 128 + 9 = 137 (shell-convention mapping).
+    // Windows: KILL maps to `TerminateProcess(hProcess, 1)` → exit code 1.
+    try testing.expectEqual(@as(i64, if (is_windows) 1 else 128 + 9), reaped.?);
 
     pc.child().terminate();
     terminated = true;

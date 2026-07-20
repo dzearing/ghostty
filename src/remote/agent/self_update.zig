@@ -43,6 +43,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const http_client = @import("../http_client.zig");
+const socket_rw = @import("../socket_rw.zig");
 const session = @import("session.zig");
 
 /// Manifest location under the relay base (public CDN path).
@@ -708,11 +709,14 @@ const TestServer = struct {
     }
 
     fn serveOne(self: *TestServer, stream: std.net.Stream) !void {
-        // Read until the header terminator (GETs have no body).
+        // Read until the header terminator (GETs have no body). Reads/writes
+        // go through socket_rw (T89b): std's Stream.read/writeAll fail with
+        // error 87 on Windows' overlapped sockets, so this server never
+        // answered and all three integration tests failed their fetch.
         var req: [4096]u8 = undefined;
         var len: usize = 0;
         while (std.mem.indexOf(u8, req[0..len], "\r\n\r\n") == null) {
-            const n = try stream.read(req[len..]);
+            const n = try socket_rw.readStream(stream, req[len..]);
             if (n == 0) break;
             len += n;
         }
@@ -732,10 +736,10 @@ const TestServer = struct {
         var hdr_buf: [256]u8 = undefined;
         if (body) |b| {
             const hdr = try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{b.len});
-            try stream.writeAll(hdr);
-            try stream.writeAll(b);
+            try socket_rw.writeAllStream(stream, hdr);
+            try socket_rw.writeAllStream(stream, b);
         } else {
-            try stream.writeAll("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            try socket_rw.writeAllStream(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
     }
 };

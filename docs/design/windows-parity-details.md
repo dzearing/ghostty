@@ -3323,6 +3323,53 @@ spawn vs teardown (conpty_smoke patterns are the reference). Add
 *Validation:* `zig build test-agent` ALL green ×3 on-box; both
 existing lanes still green.
 
+*Evidence (done 2026-07-19):* `zig build test-agent` exit 0 ×3; both
+lanes + full GUI build + P1–P3 ALL PASS. Five distinct root causes:
+
+1. **Harness reads** (keepalive ×2, self_update ×3, per T82): the
+   loopback servers read with `std.net.Stream.read` = `ReadFile` on
+   the OVERLAPPED sockets std creates → `ERROR_INVALID_PARAMETER`
+   (87). Writes (`Stream.writeAll` = `WriteFile`) had the same bug.
+   Fix: new `socket_rw.readStream`/`writeAllStream` (recv/send-based,
+   unit-tested) used by keepalive's TestWsServer, link_control's
+   LoopbackWs, and self_update's TestServer.
+2. **PRODUCTION `http_client.zig`**: same std reader/writer bug on the
+   client side — every plain-http request AND the TCP layer under
+   `https://` died on first read on Windows (agent enroll/self-update
+   never worked natively). Swapped to `socket_rw.Reader/Writer` (the
+   T81 shape-compatible stand-ins) + `disableSigpipe`.
+3. **PtyChild terminate DEADLOCK** (the real T82 "segfault at
+   0xffff…" class): `Pty.deinit` closes `out_pipe` BEFORE
+   `ClosePseudoConsole`, and `CloseHandle` on a synchronous handle
+   with the reader's `ReadFile` in flight blocks until that I/O
+   completes — terminate deadlocked against its own reader thread
+   (the old defer-order UAF crashed the binary before ever reaching
+   it). Fix: two-phase `WindowsPty.closeConsole` (close our
+   write-side dup + pseudoconsole FIRST → conhost exits → blocked
+   ReadFile completes BROKEN_PIPE = EOF) → join reader →
+   `deinitAfterReader`. `Pty.deinit` itself is untouched (GUI path).
+4. **pty_child tests**: capture sinks were deinit'd BEFORE the
+   terminate defer joined the reader (LIFO) → any assert failure
+   became an Invalid-free crash killing the whole binary; commands
+   were POSIX-only (`printf "$VAR"`, `cat`, `sleep`, `/bin/sh`) →
+   per-OS variants (cmd.exe `echo %VAR%`, `ping -n 31 >nul`,
+   interactive cmd + typed `exit 7`; argv-verbatim test SkipZigTest on
+   Windows — that path is POSIX-only by design); spin-count waits
+   (100µs sleeps = 15.6ms ticks on Windows → ~8 min per miss) →
+   wall-clock 30s deadlines, dumping the captured bytes on timeout.
+5. **link_control integration test**: `display()` turns .offline on
+   `desired` alone, so disconnect→reconnect could observe the STALE
+   `connected=true` before the loop thread's aborted recv woke (a few
+   ms on Windows) → "expected 2, found 1" with no second dial, plus a
+   leaked runLoop thread on the failure path that later segfaulted
+   dialing a freed URL. Fix: poll the loop-observed `connected` flag
+   before reconnecting + `defer stopLoop/join`.
+
+Box note: `zig build` needs `ZIG_GLOBAL_CACHE_DIR=D:\zig-global-cache`
+(cross-drive build-runner assert, see windows-zig-build-setup memory);
+without it test-agent dies in the CONFIGURE phase with `convertPathArg`
+panics. `test-agent` is now in the standing validation set (go.md).
+
 ## T89c — Agent named-pipe listener + `+sessions` Windows dial
 
 `--listen-pipe` mode in agent main.zig: byte-mode named pipe

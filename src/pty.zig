@@ -449,6 +449,29 @@ const WindowsPty = struct {
         self.* = undefined;
     }
 
+    /// Begin teardown for an owner that pumps `out_pipe` with a BLOCKING
+    /// synchronous `ReadFile` on another thread (the agent's PtyChild, T89b).
+    /// Closes OUR dup of the ConPTY's write side, then the pseudoconsole, so
+    /// once conhost exits every write end of the out pipe is gone and the
+    /// blocked `ReadFile` completes with BROKEN_PIPE — the reader's EOF.
+    /// Deliberately does NOT touch `out_pipe`: `CloseHandle` on a synchronous
+    /// handle with an in-flight `ReadFile` BLOCKS until that read completes,
+    /// so the `deinit` order (handles first, console last) deadlocks such an
+    /// owner. Join the reader, then call `deinitAfterReader`.
+    pub fn closeConsole(self: *Pty) void {
+        _ = windows.CloseHandle(self.out_pipe_pty);
+        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+    }
+
+    /// Second half of the `closeConsole` teardown: free the remaining handles
+    /// once the reader thread has observed EOF and been joined.
+    pub fn deinitAfterReader(self: *Pty) void {
+        _ = windows.CloseHandle(self.in_pipe_pty);
+        _ = windows.CloseHandle(self.in_pipe);
+        _ = windows.CloseHandle(self.out_pipe);
+        self.* = undefined;
+    }
+
     pub const GetSizeError = error{};
 
     /// Return the size of the pty.

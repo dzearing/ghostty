@@ -53,6 +53,7 @@
 
 const std = @import("std");
 const ws_client = @import("../ws_client.zig");
+const socket_rw = @import("../socket_rw.zig");
 
 /// Timing knobs. Defaults are the production values; tests shrink them.
 pub const Config = struct {
@@ -358,11 +359,15 @@ const TestWsServer = struct {
 
     fn handleConn(self: *TestWsServer, stream: std.net.Stream) void {
         // --- Read the upgrade request until CRLFCRLF -------------------------
+        // All reads/writes go through socket_rw (T89b): std's Stream.read/
+        // writeAll use ReadFile/WriteFile on Windows, which fail with error 87
+        // on the overlapped sockets std creates — the upgrade was never
+        // answered and both integration tests failed dial.
         var req_buf: [4096]u8 = undefined;
         var req_len: usize = 0;
         while (std.mem.indexOf(u8, req_buf[0..req_len], "\r\n\r\n") == null) {
             if (req_len == req_buf.len) return;
-            const n = stream.read(req_buf[req_len..]) catch return;
+            const n = socket_rw.readStream(stream, req_buf[req_len..]) catch return;
             if (n == 0) return; // includes the stop() wake-up connection
             req_len += n;
         }
@@ -391,7 +396,7 @@ const TestWsServer = struct {
         // returns as soon as it reads the 101, and the test asserts on this
         // counter right after — incrementing after the write would race it.
         _ = self.upgrades.fetchAdd(1, .monotonic);
-        stream.writeAll(resp) catch return;
+        socket_rw.writeAllStream(stream, resp) catch return;
 
         // --- Optional heartbeat writer (the healthy-relay case) ---------------
         var writer_thread: ?std.Thread = null;
@@ -405,7 +410,7 @@ const TestWsServer = struct {
         // relay whose peer state died while we slept — total inbound silence.)
         var sink: [512]u8 = undefined;
         while (true) {
-            const n = stream.read(&sink) catch break;
+            const n = socket_rw.readStream(stream, &sink) catch break;
             if (n == 0) break;
         }
         conn_done.store(true, .monotonic);
@@ -416,7 +421,7 @@ const TestWsServer = struct {
         // Unmasked, empty server ping: FIN|opcode 0x9, len 0.
         const ping_frame = [_]u8{ 0x89, 0x00 };
         while (!done.load(.monotonic)) {
-            stream.writeAll(&ping_frame) catch return;
+            socket_rw.writeAllStream(stream, &ping_frame) catch return;
             std.Thread.sleep(every_ms * std.time.ns_per_ms);
         }
     }

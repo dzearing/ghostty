@@ -9,6 +9,23 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 33) — T89b DONE: `zig build test-agent` green ×3
+  (first time ever on Windows), added to the standing validation set.
+  Five root causes: harness loopback servers read via std Stream.read =
+  ReadFile-on-overlapped-socket → err 87 (→ new socket_rw.readStream/
+  writeAllStream); the SAME bug in production http_client (http AND
+  under-TLS reads — agent enroll/self-update never worked natively on
+  Windows); a PtyChild terminate deadlock (Pty.deinit closes out_pipe
+  before ClosePseudoConsole; CloseHandle blocks on the reader's in-
+  flight sync ReadFile → new two-phase closeConsole/deinitAfterReader,
+  GUI deinit untouched); pty tests had a defer-order sink UAF (= T82's
+  "segfault"), POSIX-only commands (per-OS cmd.exe variants now), and
+  100µs spin waits that are 15.6ms ticks on Windows (~8 min per miss →
+  wall-clock deadlines); link_control test raced display()'s desired-
+  based .offline vs the loop's stale `connected` + leaked its runLoop
+  thread on failure. Surprise: two early bg runs died on the
+  ZIG_GLOBAL_CACHE_DIR cross-drive assert — env var required in every
+  shell. Lanes + GUI + P1–P3 green. T82 closed. Next: T89c.
 - 2026-07-19 (on-box, 32) — T90a DONE: viewer-panes Windows design via 3
   parallel surveys (Mac viewer impl, win32 structure, WebView2 external
   research). Pinned: loader-less WebView2 (registry probe +
