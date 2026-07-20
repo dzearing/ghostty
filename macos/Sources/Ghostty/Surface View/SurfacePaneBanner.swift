@@ -96,7 +96,7 @@ extension Ghostty {
             .font(.system(size: 12))
             .padding(Self.innerPadding)
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .modifier(GlassCardBackground(fallbackFill: fallbackFill))
+            .modifier(GlassCardBackground(fallbackFill: fallbackFill, tint: shadedBackground))
             .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
             .onTapGesture {
                 guard collapsible else { return }
@@ -155,14 +155,21 @@ extension Ghostty {
             collapsed.toggle()
         }
 
-        /// Card fill for OSes without Liquid Glass: a shade deviated from the
-        /// pane background (lighter when dark, darker when light); falls back
-        /// to the translucent material when the background isn't known.
-        private var fallbackFill: AnyShapeStyle {
-            guard let background else { return AnyShapeStyle(.ultraThinMaterial) }
+        /// A shade deviated from the pane background: lighter when the pane
+        /// is dark, darker when it's light — so the card visibly stands off
+        /// the terminal behind it. Nil when the background isn't known.
+        private var shadedBackground: Color? {
+            guard let background else { return nil }
             let os = OSColor(background)
             let shaded = os.isLightColor ? os.darken(by: 0.06) : os.lighten(by: 0.1)
-            return AnyShapeStyle(Color(shaded))
+            return Color(shaded)
+        }
+
+        /// Card fill for OSes without Liquid Glass: the shaded pane color,
+        /// or the translucent material when the background isn't known.
+        private var fallbackFill: AnyShapeStyle {
+            guard let shaded = shadedBackground else { return AnyShapeStyle(.ultraThinMaterial) }
+            return AnyShapeStyle(shaded)
         }
 
         /// The floating card's material. On macOS 26+ this is genuine Liquid
@@ -172,6 +179,11 @@ extension Ghostty {
         /// stroke standing in for the glass rim, and a soft shadow for depth.
         private struct GlassCardBackground: ViewModifier {
             let fallbackFill: AnyShapeStyle
+
+            /// Tint applied to the glass itself: the shaded pane color, so
+            /// the material reads lighter than a dark pane and darker than a
+            /// light one instead of hovering at the backdrop's own tone.
+            let tint: Color?
 
             private var shape: RoundedRectangle {
                 RoundedRectangle(
@@ -189,7 +201,7 @@ extension Ghostty {
                     // sample so legibility doesn't depend on what happens to
                     // sit behind the card.
                     content
-                        .glassEffect(.regular, in: shape)
+                        .glassEffect(.regular.tint(tint), in: shape)
                         .background(
                             shape.fill(fallbackFill)
                                 .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
