@@ -151,23 +151,34 @@ extension Ghostty {
                 // scrolling and screen clears. Hit-testable so links are
                 // clickable.
                 if let banner = surfaceView.paneBanner {
-                    VStack(spacing: 0) {
-                        SurfacePaneBanner(text: banner, background: paneBackgroundColor)
-                            .onGeometryChange(for: CGFloat.self) { proxy in
-                                proxy.size.height
-                            } action: { height in
-                                // Never let an ambient animation interpolate
-                                // this — an animated inset drags the terminal
-                                // surface through per-frame resizes.
-                                var tx = Transaction()
-                                tx.disablesAnimations = true
-                                withTransaction(tx) {
-                                    bannerHeight = height
+                    // The GeometryReader hands the banner the pane's current
+                    // width top-down, so its table columns size to the pane in
+                    // the same layout pass. The banner must never learn its
+                    // width by measuring its own content — that feedback loop
+                    // let an overflowing banner pin the pane's minimum width
+                    // (the pane couldn't be dragged narrower than a long
+                    // unwrappable table cell).
+                    GeometryReader { geo in
+                        VStack(spacing: 0) {
+                            SurfacePaneBanner(
+                                text: banner,
+                                background: paneBackgroundColor,
+                                paneWidth: geo.size.width)
+                                .onGeometryChange(for: CGFloat.self) { proxy in
+                                    proxy.size.height
+                                } action: { height in
+                                    // Never let an ambient animation interpolate
+                                    // this — an animated inset drags the terminal
+                                    // surface through per-frame resizes.
+                                    var tx = Transaction()
+                                    tx.disablesAnimations = true
+                                    withTransaction(tx) {
+                                        bannerHeight = height
+                                    }
                                 }
-                            }
-                        Spacer()
+                            Spacer(minLength: 0)
+                        }
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .zIndex(1)
                 }
 
