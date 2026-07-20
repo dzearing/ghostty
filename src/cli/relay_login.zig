@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
@@ -7,18 +8,21 @@ const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const google_oauth = @import("../remote/google_oauth.zig");
 const relay_account = @import("../remote/relay_account.zig");
+const relay_directory = @import("../remote/relay_directory.zig");
+const relay_session = @import("../remote/relay_session.zig");
 const enroll = @import("../remote/agent/enroll.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
 
-    /// The Google OAuth Desktop-app client id. Falls back to
-    /// `GHOSTTY_GOOGLE_CLIENT_ID`.
+    /// The Google OAuth client id (public — it appears in the browser URL).
+    /// Falls back to `GHOSTTY_GOOGLE_CLIENT_ID`, then the id baked into this
+    /// build via `-Dgoogle-client-id`.
     @"client-id": ?[:0]const u8 = null,
-    /// The client secret (Desktop clients are issued one). Falls back to
-    /// `GHOSTTY_GOOGLE_CLIENT_SECRET`.
-    @"client-secret": ?[:0]const u8 = null,
+    /// The relay to sign in to (the brokered `/oauth/exchange` endpoint host).
+    /// Falls back to `GHOSTTY_RELAY_BASE`, then the built-in default relay.
+    relay: ?[:0]const u8 = null,
     /// Don't open a browser — just print the sign-in URL and wait for the
     /// loopback redirect. For headless/automated flows and the E2E.
     @"no-browser": bool = false,
@@ -34,19 +38,24 @@ pub const Options = struct {
     }
 };
 
-/// Sign in to a Google account for relay authentication (T21a). Runs the
-/// authorization-code + PKCE flow for a Desktop-app OAuth client entirely in
-/// THIS process — no IPC to the GUI: it opens the system browser, catches the
-/// redirect on a loopback listener, exchanges the code for tokens, and stores
-/// the refresh token (+ client config + email) DPAPI-encrypted at
-/// `%LOCALAPPDATA%\ghoztty\account.dat`. The GUI only READS that store.
+/// Sign in to a Google account for relay authentication via the relay-brokered
+/// (BFF) OAuth flow (T21a origin, T93 brokered model). Runs entirely in THIS
+/// process — no IPC to the GUI: it opens the system browser (PKCE +
+/// authorization code), catches the redirect on a loopback listener, hands the
+/// code to the RELAY's `/oauth/exchange` (the relay holds the client secret
+/// and talks to Google server-side), and stores the returned relay session
+/// token + expiry + email DPAPI-encrypted at
+/// `%LOCALAPPDATA%\ghoztty\account.dat`. The GUI only READS that store, and
+/// renews the session at the same relay as it nears expiry. No Google token
+/// or client secret ever touches this machine.
 ///
-/// The OAuth client id/secret come from `--client-id=`/`--client-secret=` or
-/// the `GHOSTTY_GOOGLE_CLIENT_ID`/`GHOSTTY_GOOGLE_CLIENT_SECRET` env, and are
-/// PERSISTED with the credential so GUI-side token refreshes need no env.
+/// The OAuth client id comes from `--client-id=`, the
+/// `GHOSTTY_GOOGLE_CLIENT_ID` env, or the id baked into the build
+/// (`-Dgoogle-client-id`). The relay comes from `--relay=`,
+/// `GHOSTTY_RELAY_BASE`, or the built-in default.
 ///
-/// Endpoints are `.google` in production; the E2E injects a fake issuer via
-/// `GHOSTTY_OAUTH_TOKEN_ENDPOINT` (test-only).
+/// The E2E injects a fake authorize endpoint via `GHOSTTY_OAUTH_AUTH_ENDPOINT`
+/// (test-only) and a fake relay via `--relay=`.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -78,18 +87,21 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype, stderr: *std.Io.Writer) !u8 
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
 
-    // Resolve the OAuth client: flag first, then env.
-    const client_id = nonEmpty(opts.@"client-id") orelse envOwned(alloc, "GHOSTTY_GOOGLE_CLIENT_ID") orelse {
+    // Resolve the OAuth client id: flag, then env, then the build-time bake.
+    const client_id = nonEmpty(opts.@"client-id") orelse
+        envOwned(alloc, "GHOSTTY_GOOGLE_CLIENT_ID") orelse
+        bakedClientID() orelse
+    {
         try stderr.print(
-            "Error: no Google OAuth client id. Pass --client-id= or set GHOSTTY_GOOGLE_CLIENT_ID.\n" ++
-                "See docs/design/relay-oidc-setup.md.\n",
+            "Error: no Google OAuth client id. This build was made without -Dgoogle-client-id;\n" ++
+                "pass --client-id= or set GHOSTTY_GOOGLE_CLIENT_ID.\n",
             .{},
         );
         return 1;
     };
-    const client_secret = nonEmpty(opts.@"client-secret") orelse envOwned(alloc, "GHOSTTY_GOOGLE_CLIENT_SECRET");
 
-    const endpoints = resolveEndpoints(alloc);
+    // The relay that will broker the exchange (and later renew/signout).
+    const relay_base = nonEmpty(opts.relay) orelse try relay_directory.resolveBase(alloc);
 
     // Start the loopback listener BEFORE building the URL (its port is the
     // redirect target).
@@ -110,9 +122,11 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype, stderr: *std.Io.Writer) !u8 
     var challenge_buf: [google_oauth.PKCE.challenge_len]u8 = undefined;
     google_oauth.PKCE.challenge(verifier, &challenge_buf);
 
+    const auth_endpoint = envOwned(alloc, "GHOSTTY_OAUTH_AUTH_ENDPOINT") orelse
+        google_oauth.google_authorization_endpoint;
     const url = try google_oauth.authorizationURL(
         alloc,
-        endpoints,
+        auth_endpoint,
         client_id,
         redirect_uri,
         state,
@@ -132,8 +146,8 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype, stderr: *std.Io.Writer) !u8 
         stdout.flush() catch {};
     }
 
-    // Block until the browser redirect lands (the user completes sign-in), then
-    // exchange the code for tokens.
+    // Block until the browser redirect lands (the user completes sign-in),
+    // then hand the code to the relay — the brokered exchange (T93).
     const code = receiver.waitForCode(300_000) catch |err| {
         switch (err) {
             error.Denied => try stderr.print("Sign-in was not completed.\n", .{}),
@@ -144,46 +158,32 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype, stderr: *std.Io.Writer) !u8 
         return 1;
     };
 
-    const client: google_oauth.TokenClient = .{
-        .alloc = alloc,
-        .endpoints = endpoints,
-        .client_id = client_id,
-        .client_secret = client_secret,
-    };
-    var tokens = client.exchange(code, redirect_uri, verifier) catch |err| {
-        try stderr.print("Token exchange failed: {}\n", .{err});
+    var session = relay_session.exchange(alloc, relay_base, code, verifier, redirect_uri) catch |err| {
+        switch (err) {
+            error.Unauthorized => try stderr.print(
+                "The relay rejected the sign-in (not on the allowlist?).\n",
+                .{},
+            ),
+            error.Unavailable => try stderr.print(
+                "The relay at {s} has no brokered sign-in configured.\n",
+                .{relay_base},
+            ),
+            else => try stderr.print("Token exchange failed: {}\n", .{err}),
+        }
         return 1;
     };
-    defer tokens.deinit();
-
-    const refresh_token = tokens.value.refresh_token orelse {
-        try stderr.print("Google did not return a refresh token (needs access_type=offline + prompt=consent).\n", .{});
-        return 1;
-    };
-    const id_token = tokens.value.id_token orelse {
-        try stderr.print("Google did not return an ID token.\n", .{});
-        return 1;
-    };
-
-    var claims = google_oauth.parseIDTokenClaims(alloc, id_token) catch {
-        try stderr.print("Could not parse the Google ID token.\n", .{});
-        return 1;
-    };
-    defer claims.deinit();
-    const email = claims.value.email orelse {
-        try stderr.print("The Google ID token had no email claim.\n", .{});
-        return 1;
-    };
+    defer session.deinit();
 
     const path = relay_account.accountPath(alloc) catch {
         try stderr.print("Could not resolve the account store path.\n", .{});
         return 1;
     };
     relay_account.save(alloc, path, .{
-        .client_id = client_id,
-        .client_secret = client_secret,
-        .refresh_token = refresh_token,
-        .email = email,
+        .session_token = session.value.session_token,
+        .expiry = session.value.expiry,
+        .email = session.value.email,
+        .relay_base = relay_base,
+        .picture = session.value.picture,
     }) catch |err| {
         try stderr.print("Could not save the account: {}\n", .{err});
         return 1;
@@ -193,7 +193,7 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype, stderr: *std.Io.Writer) !u8 
         var out_buf: [1024]u8 = undefined;
         var out_writer = std.fs.File.stdout().writerStreaming(&out_buf);
         const stdout = &out_writer.interface;
-        try stdout.print("Signed in as {s}\n", .{email});
+        try stdout.print("Signed in as {s}\n", .{session.value.email});
         stdout.flush() catch {};
     }
     return 0;
@@ -209,13 +209,11 @@ fn envOwned(alloc: Allocator, name: []const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
-/// Endpoints: `.google` in production; `GHOSTTY_OAUTH_TOKEN_ENDPOINT` /
-/// `GHOSTTY_OAUTH_AUTH_ENDPOINT` inject a fake issuer for the E2E (test-only).
-fn resolveEndpoints(alloc: Allocator) google_oauth.Endpoints {
-    var ep = google_oauth.Endpoints.google;
-    if (envOwned(alloc, "GHOSTTY_OAUTH_TOKEN_ENDPOINT")) |t| ep.token = t;
-    if (envOwned(alloc, "GHOSTTY_OAUTH_AUTH_ENDPOINT")) |a| ep.authorization = a;
-    return ep;
+/// The client id baked at build time (`-Dgoogle-client-id`, or the dev-local
+/// `macos/google-client-id.txt`). Null when the build carries none.
+fn bakedClientID() ?[]const u8 {
+    const id = build_config.google_client_id;
+    return if (id.len == 0) null else id;
 }
 
 /// Open `url` in the default browser (best-effort). Reuses the enroll flow's

@@ -1,13 +1,16 @@
-//! The client-side signed-in Google account for relay auth on Windows (T21a —
-//! the Zig analog of `macos/Sources/Features/Remote/RelayAccount.swift`, which
-//! uses the macOS Keychain).
+//! The client-side signed-in relay account on Windows (T21a store + T93
+//! brokered model — the Zig analog of
+//! `macos/Sources/Features/Remote/RelayAccount.swift`, which uses the macOS
+//! Keychain).
 //!
 //! ## What it stores
 //! A single account blob at `%LOCALAPPDATA%\ghoztty\account.dat`:
-//! `{client_id, client_secret?, refresh_token, email}`. The OAuth **client**
-//! id/secret are persisted alongside the credential (they come from the
-//! `GHOSTTY_GOOGLE_CLIENT_ID`/`_SECRET` env or `--client-id=`/`--client-secret=`
-//! flags at login) so a GUI-side token refresh needs no environment.
+//! `{session_token, expiry, email, relay_base, picture?}` — the opaque relay
+//! **session token** minted by the relay's brokered `/oauth/exchange` (T93).
+//! No Google token or OAuth client credential ever touches this store; the
+//! confidential client secret and the Google refresh token live only on the
+//! relay. `relay_base` records which relay minted the session so renew and
+//! sign-out dial the same one.
 //!
 //! ## At rest
 //! The blob is DPAPI-encrypted per-user (`CryptProtectData`) on Windows, so it
@@ -19,32 +22,57 @@
 //! so the module compiles and the pure round-trip test runs off-box.
 //!
 //! ## The token-resolution seam
-//! `resolveIdToken` mints a fresh ID token from the stored refresh grant — the
-//! account tier the win32 GUI consults after an explicit `--token` and before
-//! the `GHOSTTY_RELAY_TOKEN` env fallback (T21a completes the tiering T21b
-//! started).
+//! `resolveSessionToken` returns the stored session token while it has >60s of
+//! life left, else renews it at the stored relay (`/oauth/renew` rotates the
+//! token; the rotation is persisted). This is the account tier the win32 GUI
+//! consults after an explicit `--token` and before the `GHOSTTY_RELAY_TOKEN`
+//! env fallback.
+//!
+//! ## Legacy stores
+//! A pre-T93 account.dat held `{client_id, client_secret?, refresh_token,
+//! email}` (the direct-Google flow). The brokered relay no longer accepts raw
+//! Google ID tokens as client bearers, so a legacy credential cannot mint
+//! anything useful — `load` surfaces it as `Error.Legacy` and the user signs
+//! in once more (`+relay-login`), which overwrites the store in the new shape.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const google_oauth = @import("google_oauth.zig");
+const relay_session = @import("relay_session.zig");
 const win_acl = @import("win_acl.zig");
+
+const log = std.log.scoped(.relay_account);
+
+/// Seconds of remaining session-token life below which `resolveSessionToken`
+/// renews instead of returning the cached token, so relay calls never race the
+/// expiry (Mac `RelayAccount` uses the same 60s leeway).
+pub const refresh_leeway_s: i64 = 60;
 
 /// The persisted account. Slices are owned when returned from `load` (freed by
 /// `deinit`); borrowed when passed to `save`.
 pub const Account = struct {
-    client_id: []const u8,
-    client_secret: ?[]const u8 = null,
-    refresh_token: []const u8,
+    /// The opaque relay session token (the Bearer for every relay call).
+    session_token: []const u8,
+    /// Absolute token expiry, unix seconds (the relay's `expiry`).
+    expiry: i64,
     email: []const u8,
+    /// The relay base URL the session was minted at (renew/signout target).
+    relay_base: []const u8,
+    picture: ?[]const u8 = null,
 
     /// Free an owned account (as returned by `load`).
     pub fn deinit(self: *Account, alloc: Allocator) void {
-        alloc.free(self.client_id);
-        if (self.client_secret) |s| alloc.free(s);
-        alloc.free(self.refresh_token);
+        alloc.free(self.session_token);
         alloc.free(self.email);
+        alloc.free(self.relay_base);
+        if (self.picture) |p| alloc.free(p);
         self.* = undefined;
+    }
+
+    /// Whether the stored token still has more than the refresh leeway of
+    /// life left at `now_unix`. Pure (now passed in for testability).
+    pub fn isFresh(self: Account, now_unix: i64) bool {
+        return self.expiry - now_unix > refresh_leeway_s;
     }
 };
 
@@ -53,6 +81,9 @@ pub const Error = error{
     SignedOut,
     /// The file exists but couldn't be decrypted or parsed.
     Corrupt,
+    /// A pre-T93 direct-Google store (refresh token, no session token). The
+    /// only remedy is one fresh `+relay-login` (see the file header).
+    Legacy,
 };
 
 /// Resolve the account.dat path:
@@ -82,22 +113,28 @@ pub fn accountPath(alloc: Allocator) ![]u8 {
     }
 }
 
-/// The JSON shape persisted inside the (encrypted) blob.
+/// The JSON shape persisted inside the (encrypted) blob. Every field optional
+/// at parse time so one struct probes both the current and the legacy shape
+/// (`refresh_token` present + `session_token` absent ⇒ pre-T93 store).
 const Stored = struct {
-    client_id: []const u8,
-    client_secret: ?[]const u8 = null,
-    refresh_token: []const u8,
-    email: []const u8,
+    session_token: ?[]const u8 = null,
+    expiry: ?i64 = null,
+    email: ?[]const u8 = null,
+    relay_base: ?[]const u8 = null,
+    picture: ?[]const u8 = null,
+    // Legacy (pre-T93) marker — never written anymore.
+    refresh_token: ?[]const u8 = null,
 };
 
 /// Encrypt + write `account` at `path` atomically, then tighten its DACL.
 /// Parent directories are created. On POSIX the temp file is mode 0600.
 pub fn save(alloc: Allocator, path: []const u8, account: Account) !void {
-    const json = try std.json.Stringify.valueAlloc(alloc, Stored{
-        .client_id = account.client_id,
-        .client_secret = account.client_secret,
-        .refresh_token = account.refresh_token,
+    const json = try std.json.Stringify.valueAlloc(alloc, .{
+        .session_token = account.session_token,
+        .expiry = account.expiry,
         .email = account.email,
+        .relay_base = account.relay_base,
+        .picture = account.picture,
     }, .{});
     defer alloc.free(json);
 
@@ -127,7 +164,8 @@ pub fn save(alloc: Allocator, path: []const u8, account: Account) !void {
 }
 
 /// Read + decrypt + parse the account at `path`. Returns an owned `Account`
-/// (caller `deinit`s). `error.SignedOut` when the file is absent.
+/// (caller `deinit`s). `error.SignedOut` when the file is absent;
+/// `error.Legacy` for a pre-T93 refresh-token store.
 pub fn load(alloc: Allocator, path: []const u8) !Account {
     const blob = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch |err| switch (err) {
         error.FileNotFound => return Error.SignedOut,
@@ -146,15 +184,22 @@ pub fn load(alloc: Allocator, path: []const u8) !Account {
     ) catch return Error.Corrupt;
     defer parsed.deinit();
 
+    const token = parsed.value.session_token orelse {
+        // No session token: a pre-T93 store if it carries the old credential,
+        // otherwise plain corruption.
+        return if (parsed.value.refresh_token != null) Error.Legacy else Error.Corrupt;
+    };
+
     // Copy out of the parsed arena into caller-owned slices.
     var acct: Account = .{
-        .client_id = try alloc.dupe(u8, parsed.value.client_id),
-        .client_secret = null,
-        .refresh_token = try alloc.dupe(u8, parsed.value.refresh_token),
-        .email = try alloc.dupe(u8, parsed.value.email),
+        .session_token = try alloc.dupe(u8, token),
+        .expiry = parsed.value.expiry orelse 0,
+        .email = try alloc.dupe(u8, parsed.value.email orelse ""),
+        .relay_base = try alloc.dupe(u8, parsed.value.relay_base orelse ""),
+        .picture = null,
     };
     errdefer acct.deinit(alloc);
-    if (parsed.value.client_secret) |s| acct.client_secret = try alloc.dupe(u8, s);
+    if (parsed.value.picture) |p| acct.picture = try alloc.dupe(u8, p);
     return acct;
 }
 
@@ -170,39 +215,39 @@ pub fn isSignedIn(alloc: Allocator, path: []const u8) bool {
     return true;
 }
 
-/// Mint a fresh relay bearer (Google ID token) from the stored account's
-/// refresh grant, using the persisted client config. This is the GUI's
-/// account tier. Returns an owned token (caller frees). `error.SignedOut`
-/// when no account is stored; other errors bubble from the token endpoint.
-pub fn resolveIdToken(alloc: Allocator, endpoints: google_oauth.Endpoints, path: []const u8) ![]u8 {
+/// Resolve a live relay bearer from the stored account: the cached session
+/// token while it has >60s of life left, else a renewed (rotated) one from the
+/// stored relay's `/oauth/renew` — the rotation is persisted before returning
+/// (the old token is dead server-side the moment renew succeeds). This is the
+/// GUI's account tier. Returns an owned token (caller frees).
+/// `error.SignedOut` / `error.Legacy` when no usable account is stored;
+/// `error.Unauthorized` when the relay refused the renewal (sign in again).
+pub fn resolveSessionToken(alloc: Allocator, path: []const u8) ![]u8 {
     var account = try load(alloc, path);
     defer account.deinit(alloc);
 
-    const client: google_oauth.TokenClient = .{
-        .alloc = alloc,
-        .endpoints = endpoints,
-        .client_id = account.client_id,
-        .client_secret = account.client_secret,
-    };
-    var parsed = try client.refresh(account.refresh_token);
-    defer parsed.deinit();
-
-    const id_token = parsed.value.id_token orelse return google_oauth.TokenError.BadResponse;
-    const owned = try alloc.dupe(u8, id_token);
-
-    // Google may rotate the refresh token on a refresh grant; persist the new
-    // one so the next refresh doesn't fail. Best-effort — a failed re-save
-    // doesn't invalidate the token we just minted.
-    if (parsed.value.refresh_token) |new_rt| {
-        if (!std.mem.eql(u8, new_rt, account.refresh_token)) {
-            save(alloc, path, .{
-                .client_id = account.client_id,
-                .client_secret = account.client_secret,
-                .refresh_token = new_rt,
-                .email = account.email,
-            }) catch {};
-        }
+    if (account.isFresh(std.time.timestamp())) {
+        return alloc.dupe(u8, account.session_token);
     }
+
+    var renewed = try relay_session.renew(alloc, account.relay_base, account.session_token);
+    defer renewed.deinit();
+
+    const owned = try alloc.dupe(u8, renewed.value.session_token);
+    errdefer alloc.free(owned);
+
+    // Persist the rotation. A failed re-save is logged but does not fail this
+    // resolution — the minted token is valid for this call; only the NEXT
+    // resolve would find a stale store (and land in Unauthorized → re-login).
+    save(alloc, path, .{
+        .session_token = renewed.value.session_token,
+        .expiry = renewed.value.expiry,
+        .email = renewed.value.email,
+        .relay_base = account.relay_base,
+        .picture = renewed.value.picture,
+    }) catch |err| {
+        log.warn("account: persisting rotated session token failed: {}", .{err});
+    };
     return owned;
 }
 
@@ -287,44 +332,51 @@ const dpapi = struct {
 
 const testing = std.testing;
 
-test "account store: save then load round-trips (with and without secret)" {
+fn tmpAccountPath(alloc: Allocator, tmp: *testing.TmpDir, name: []const u8) ![]u8 {
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    return std.fs.path.join(alloc, &.{ dir_path, name });
+}
+
+test "account store: save then load round-trips (with and without picture)" {
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir_path);
-    const path = try std.fs.path.join(alloc, &.{ dir_path, "account.dat" });
+    const path = try tmpAccountPath(alloc, &tmp, "account.dat");
     defer alloc.free(path);
 
-    // With a client secret.
+    // With a picture.
     try save(alloc, path, .{
-        .client_id = "client-123",
-        .client_secret = "secret-xyz",
-        .refresh_token = "rt-abc",
+        .session_token = "sess-123",
+        .expiry = 1893456000,
         .email = "user@example.com",
+        .relay_base = "https://relay.example.com",
+        .picture = "https://x/y.png",
     });
     {
         var got = try load(alloc, path);
         defer got.deinit(alloc);
-        try testing.expectEqualStrings("client-123", got.client_id);
-        try testing.expectEqualStrings("secret-xyz", got.client_secret.?);
-        try testing.expectEqualStrings("rt-abc", got.refresh_token);
+        try testing.expectEqualStrings("sess-123", got.session_token);
+        try testing.expectEqual(@as(i64, 1893456000), got.expiry);
         try testing.expectEqualStrings("user@example.com", got.email);
+        try testing.expectEqualStrings("https://relay.example.com", got.relay_base);
+        try testing.expectEqualStrings("https://x/y.png", got.picture.?);
     }
 
-    // Overwrite without a secret (public client): round-trips as null.
+    // Overwrite without a picture: round-trips as null.
     try save(alloc, path, .{
-        .client_id = "client-123",
-        .client_secret = null,
-        .refresh_token = "rt-def",
+        .session_token = "sess-456",
+        .expiry = 1,
         .email = "user@example.com",
+        .relay_base = "https://relay.example.com",
+        .picture = null,
     });
     {
         var got = try load(alloc, path);
         defer got.deinit(alloc);
-        try testing.expect(got.client_secret == null);
-        try testing.expectEqualStrings("rt-def", got.refresh_token);
+        try testing.expect(got.picture == null);
+        try testing.expectEqualStrings("sess-456", got.session_token);
     }
 }
 
@@ -332,33 +384,76 @@ test "account store: load on a missing file is SignedOut" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir_path);
-    const path = try std.fs.path.join(alloc, &.{ dir_path, "nope.dat" });
+    const path = try tmpAccountPath(alloc, &tmp, "nope.dat");
     defer alloc.free(path);
 
     try testing.expect(!isSignedIn(alloc, path));
     try testing.expectError(Error.SignedOut, load(alloc, path));
 }
 
+test "account store: a pre-T93 refresh-token store is Legacy" {
+    // Off-Windows the DPAPI seam is identity, so a raw legacy JSON file IS a
+    // valid legacy blob; on Windows this test writes through `protect` the
+    // same way the old code did — either way `load` must classify, not parse.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpAccountPath(alloc, &tmp, "account.dat");
+    defer alloc.free(path);
+
+    const legacy_json =
+        \\{"client_id":"cid","client_secret":"sec","refresh_token":"rt","email":"e@x.com"}
+    ;
+    const blob = try protect(alloc, legacy_json);
+    defer alloc.free(blob);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = blob });
+
+    try testing.expect(isSignedIn(alloc, path)); // file presence only
+    try testing.expectError(Error.Legacy, load(alloc, path));
+}
+
+test "account store: garbage without either token shape is Corrupt" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpAccountPath(alloc, &tmp, "account.dat");
+    defer alloc.free(path);
+
+    const blob = try protect(alloc, "{\"email\":\"only\"}");
+    defer alloc.free(blob);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = blob });
+    try testing.expectError(Error.Corrupt, load(alloc, path));
+}
+
 test "account store: delete removes the file (idempotent)" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir_path);
-    const path = try std.fs.path.join(alloc, &.{ dir_path, "account.dat" });
+    const path = try tmpAccountPath(alloc, &tmp, "account.dat");
     defer alloc.free(path);
 
     try save(alloc, path, .{
-        .client_id = "c",
-        .refresh_token = "r",
+        .session_token = "s",
+        .expiry = 0,
         .email = "e",
+        .relay_base = "b",
     });
     try testing.expect(isSignedIn(alloc, path));
     delete(path);
     try testing.expect(!isSignedIn(alloc, path));
     delete(path); // idempotent: no error on a second delete
+}
+
+test "isFresh honors the 60s leeway" {
+    const acct: Account = .{
+        .session_token = "s",
+        .expiry = 1000,
+        .email = "e",
+        .relay_base = "b",
+    };
+    try testing.expect(acct.isFresh(900)); // 100s left
+    try testing.expect(!acct.isFresh(950)); // 50s left — within leeway
+    try testing.expect(!acct.isFresh(2000)); // expired
 }
 
 test {

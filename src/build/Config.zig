@@ -40,10 +40,11 @@ exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 lib_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 
-/// The Google OAuth client id baked into the macOS app (Info.plist
-/// `GhosttyGoogleClientID`), used to build the browser authorize URL for the
-/// relay-brokered sign-in. Public (it appears in the browser URL); the
-/// confidential client secret lives only on the relay. Sourced from
+/// The Google OAuth client id baked into the app — macOS via Info.plist
+/// `GhosttyGoogleClientID`, Windows via the `build_config.google_client_id`
+/// build option (`+relay-login`, T93) — used to build the browser authorize
+/// URL for the relay-brokered sign-in. Public (it appears in the browser
+/// URL); the confidential client secret lives only on the relay. Sourced from
 /// `-Dgoogle-client-id` (CI secret for releases) or, when unset, a git-ignored
 /// `macos/google-client-id.txt` for dev builds. Empty in a build with neither.
 google_client_id: []const u8 = "",
@@ -596,6 +597,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
     step.addOption(bool, "windows_update_check", self.windows_update_check);
+    step.addOption([]const u8, "google_client_id", self.google_client_id);
 
     // Our version. We also add the string version so we don't need
     // to do any allocations at runtime. This has to be long enough to

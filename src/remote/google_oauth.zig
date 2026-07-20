@@ -1,45 +1,29 @@
-//! The Google OAuth 2.0 authorization-code + PKCE flow for the client account
-//! (T21a — the Zig port of `macos/Sources/Features/Remote/GoogleOAuth.swift`).
+//! The browser-facing half of the Google OAuth 2.0 authorization-code + PKCE
+//! flow (T21a origin; slimmed by T93 — the Zig analog of
+//! `macos/Sources/Features/Remote/GoogleOAuth.swift`).
 //!
 //! This is the headlessly-testable machinery a `+relay-login` CLI drives:
 //!
 //! - PKCE verifier/challenge generation (RFC 7636, S256)
-//! - the authorization URL builder
+//! - the authorization URL builder (the browser still goes to Google)
 //! - a loopback redirect receiver (`http://127.0.0.1:<random port>` — the
 //!   redirect style Google supports for **Desktop app** OAuth clients, no
 //!   registered redirect URI needed)
-//! - the token-endpoint client (code exchange + refresh) over the shared
-//!   `http_client.zig` (system-root TLS for `https://`, plaintext for the
-//!   `http://` fake issuer a test uses)
-//! - ID-token (JWT) claims decode + expiry math
 //!
-//! Endpoints are injectable at construction time only (the relay's `IssuerURL`
-//! pattern: tests point at a local fake; production always uses `.google`).
-//! The client does NOT verify the ID-token signature — the token arrives over
-//! TLS straight from Google's token endpoint and the RELAY is the enforcement
-//! point (it verifies signature, `aud`, `exp`, allowlist). The claims we read
-//! are display/cache hints only.
+//! Since T93 (relay-brokered OAuth) the flow STOPS at the authorization code:
+//! the code + PKCE verifier go to the relay's `/oauth/exchange`
+//! (`relay_session.zig`), which holds the client secret, talks to Google's
+//! token endpoint server-side, and mints an opaque relay session token. No
+//! Google token ever reaches this client.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const http_client = @import("http_client.zig");
 
-// =============================================================================
-// Endpoints
-// =============================================================================
-
-/// The OAuth endpoints in use. Injectable for tests only; production always
-/// passes `.google`.
-pub const Endpoints = struct {
-    authorization: []const u8,
-    token: []const u8,
-
-    pub const google: Endpoints = .{
-        .authorization = "https://accounts.google.com/o/oauth2/v2/auth",
-        .token = "https://oauth2.googleapis.com/token",
-    };
-};
+/// Google's authorization endpoint — where the sign-in browser tab goes. The
+/// E2E injects a fake via `GHOSTTY_OAUTH_AUTH_ENDPOINT` (resolved by the CLI,
+/// not here).
+pub const google_authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth";
 
 // =============================================================================
 // PKCE (RFC 7636)
@@ -88,30 +72,18 @@ pub fn base64UrlEncode(dst: []u8, src: []const u8) []const u8 {
     return std.base64.url_safe_no_pad.Encoder.encode(dst, src);
 }
 
-/// Decode unpadded base64url `src` into a freshly allocated buffer (caller
-/// frees). base64url-with-padding is also accepted (padding ignored).
-pub fn base64UrlDecodeAlloc(alloc: Allocator, src: []const u8) ![]u8 {
-    // Trim any padding so the no-pad decoder accepts padded JWTs too.
-    const trimmed = std.mem.trimRight(u8, src, "=");
-    const dec = std.base64.url_safe_no_pad.Decoder;
-    const len = try dec.calcSizeForSlice(trimmed);
-    const out = try alloc.alloc(u8, len);
-    errdefer alloc.free(out);
-    try dec.decode(out, trimmed);
-    return out;
-}
-
 // =============================================================================
 // Authorization URL
 // =============================================================================
 
-/// Build the browser sign-in URL: Google's authorization endpoint with the
-/// code+PKCE parameters. `access_type=offline` + `prompt=consent` guarantee a
-/// refresh token on every (re-)sign-in. Scope is the fixed
-/// `openid email profile`. Caller frees.
+/// Build the browser sign-in URL: the authorization endpoint (Google's, or a
+/// test fake) with the code+PKCE parameters. `access_type=offline` +
+/// `prompt=consent` guarantee the RELAY receives a refresh token on every
+/// (re-)sign-in exchange. Scope is the fixed `openid email profile`. Caller
+/// frees.
 pub fn authorizationURL(
     alloc: Allocator,
-    endpoints: Endpoints,
+    authorization_endpoint: []const u8,
     client_id: []const u8,
     redirect_uri: []const u8,
     state: []const u8,
@@ -121,10 +93,10 @@ pub fn authorizationURL(
     errdefer buf.deinit(alloc);
     const w = buf.writer(alloc);
 
-    try w.writeAll(endpoints.authorization);
+    try w.writeAll(authorization_endpoint);
     // The authorization endpoint may already carry a query (test fakes do not,
     // but be safe): pick '?' or '&' for the first param.
-    try w.writeByte(if (std.mem.indexOfScalar(u8, endpoints.authorization, '?') == null) '?' else '&');
+    try w.writeByte(if (std.mem.indexOfScalar(u8, authorization_endpoint, '?') == null) '?' else '&');
 
     try writeParam(w, "client_id", client_id, false);
     try writeParam(w, "redirect_uri", redirect_uri, true);
@@ -144,192 +116,6 @@ fn writeParam(w: anytype, key: []const u8, value: []const u8, leading_amp: bool)
     try formEscapeWrite(w, key);
     try w.writeByte('=');
     try formEscapeWrite(w, value);
-}
-
-// =============================================================================
-// Token response + ID-token claims
-// =============================================================================
-
-/// Google's token-endpoint response (both the code exchange and the refresh
-/// grant). Snake-case keys per OAuth.
-pub const TokenResponse = struct {
-    access_token: ?[]const u8 = null,
-    expires_in: ?f64 = null,
-    id_token: ?[]const u8 = null,
-    refresh_token: ?[]const u8 = null,
-    scope: ?[]const u8 = null,
-    token_type: ?[]const u8 = null,
-};
-
-/// The ID-token (JWT) claims we read. Display/cache hints only (unverified —
-/// see the file header). `email` is required for a usable sign-in; the rest
-/// are best-effort.
-pub const IDTokenClaims = struct {
-    email: ?[]const u8 = null,
-    email_verified: ?bool = null,
-    exp: ?f64 = null,
-    sub: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    picture: ?[]const u8 = null,
-};
-
-pub const ClaimsError = error{Malformed};
-
-/// Parse (without verifying) the claims segment of a JWT. Returns a
-/// `std.json.Parsed(IDTokenClaims)` — call `.deinit()` when done; the claim
-/// slices borrow the parsed arena.
-pub fn parseIDTokenClaims(alloc: Allocator, id_token: []const u8) !std.json.Parsed(IDTokenClaims) {
-    var it = std.mem.splitScalar(u8, id_token, '.');
-    _ = it.next() orelse return ClaimsError.Malformed; // header
-    const payload_b64 = it.next() orelse return ClaimsError.Malformed;
-    _ = it.next() orelse return ClaimsError.Malformed; // signature
-    if (it.next() != null) return ClaimsError.Malformed; // exactly 3 segments
-
-    const payload = base64UrlDecodeAlloc(alloc, payload_b64) catch return ClaimsError.Malformed;
-    defer alloc.free(payload);
-
-    // `alloc_always`: the returned Parsed outlives `payload` (freed above), so
-    // its string claims must be copied into the parse arena, not borrowed.
-    return std.json.parseFromSlice(
-        IDTokenClaims,
-        alloc,
-        payload,
-        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-    ) catch ClaimsError.Malformed;
-}
-
-// =============================================================================
-// Expiry math
-// =============================================================================
-
-/// The window (seconds) before an ID token's `exp` at which it is considered
-/// stale, so relay calls never race the expiry.
-pub const refresh_leeway_s: f64 = 60;
-
-/// An ID token's absolute expiry (unix seconds), resolved in order: the JWT
-/// `exp` claim (authoritative), else `expires_in` relative to `now_unix`,
-/// else "already stale" (forces a refresh on next use). `now_unix` is passed
-/// in so the math is pure/testable.
-pub fn expiryUnix(alloc: Allocator, id_token: []const u8, expires_in: ?f64, now_unix: f64) f64 {
-    if (parseIDTokenClaims(alloc, id_token)) |parsed| {
-        defer parsed.deinit();
-        if (parsed.value.exp) |exp| return exp;
-    } else |_| {}
-    if (expires_in) |ttl| return now_unix + ttl;
-    return now_unix;
-}
-
-/// Whether a token with absolute `expiry_unix` still has more than the refresh
-/// leeway of life left at `now_unix`.
-pub fn isFresh(expiry_unix: f64, now_unix: f64) bool {
-    return expiry_unix - now_unix > refresh_leeway_s;
-}
-
-// =============================================================================
-// Token-endpoint client
-// =============================================================================
-
-pub const TokenError = error{
-    /// Non-2xx from the token endpoint; the detail is logged, not carried.
-    Http,
-    /// The response body couldn't be parsed as a token response.
-    BadResponse,
-};
-
-/// Client for the token endpoint: authorization-code exchange and
-/// refresh-token grant. `client_secret` is required by Google at the token
-/// endpoint for Desktop-app clients even though it is not confidential.
-pub const TokenClient = struct {
-    alloc: Allocator,
-    endpoints: Endpoints,
-    client_id: []const u8,
-    client_secret: ?[]const u8,
-
-    /// Exchange an authorization code (+ PKCE verifier) for tokens. Returns a
-    /// `std.json.Parsed(TokenResponse)` — call `.deinit()`; the token slices
-    /// borrow the parsed arena.
-    pub fn exchange(
-        self: TokenClient,
-        code: []const u8,
-        redirect_uri: []const u8,
-        code_verifier: []const u8,
-    ) !std.json.Parsed(TokenResponse) {
-        var fields: [6]FormField = undefined;
-        var n: usize = 0;
-        fields[n] = .{ "grant_type", "authorization_code" };
-        n += 1;
-        fields[n] = .{ "code", code };
-        n += 1;
-        fields[n] = .{ "client_id", self.client_id };
-        n += 1;
-        fields[n] = .{ "redirect_uri", redirect_uri };
-        n += 1;
-        fields[n] = .{ "code_verifier", code_verifier };
-        n += 1;
-        if (self.client_secret) |s| {
-            fields[n] = .{ "client_secret", s };
-            n += 1;
-        }
-        return self.post(fields[0..n]);
-    }
-
-    /// Redeem a refresh token for a fresh ID token.
-    pub fn refresh(self: TokenClient, refresh_token: []const u8) !std.json.Parsed(TokenResponse) {
-        var fields: [4]FormField = undefined;
-        var n: usize = 0;
-        fields[n] = .{ "grant_type", "refresh_token" };
-        n += 1;
-        fields[n] = .{ "refresh_token", refresh_token };
-        n += 1;
-        fields[n] = .{ "client_id", self.client_id };
-        n += 1;
-        if (self.client_secret) |s| {
-            fields[n] = .{ "client_secret", s };
-            n += 1;
-        }
-        return self.post(fields[0..n]);
-    }
-
-    fn post(self: TokenClient, fields: []const FormField) !std.json.Parsed(TokenResponse) {
-        const body = try formEncode(self.alloc, fields);
-        defer self.alloc.free(body);
-
-        var resp = try http_client.postForm(self.alloc, self.endpoints.token, body);
-        defer resp.deinit(self.alloc);
-
-        if (resp.status < 200 or resp.status >= 300) {
-            // Surface the OAuth error detail in the log; the CLI turns the
-            // returned error into a user-facing "sign-in failed" line.
-            std.log.warn("google_oauth: token endpoint HTTP {d}: {s}", .{ resp.status, resp.body });
-            return TokenError.Http;
-        }
-
-        // `alloc_always`: the returned Parsed outlives `resp.body` (freed
-        // above), so token strings must be copied into the parse arena.
-        return std.json.parseFromSlice(
-            TokenResponse,
-            self.alloc,
-            resp.body,
-            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-        ) catch TokenError.BadResponse;
-    }
-};
-
-const FormField = struct { []const u8, []const u8 };
-
-/// `application/x-www-form-urlencoded` encoding of `fields`, in the given
-/// order. Caller frees.
-pub fn formEncode(alloc: Allocator, fields: []const FormField) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
-    for (fields, 0..) |f, i| {
-        if (i > 0) try w.writeByte('&');
-        try formEscapeWrite(w, f[0]);
-        try w.writeByte('=');
-        try formEscapeWrite(w, f[1]);
-    }
-    return buf.toOwnedSlice(alloc);
 }
 
 /// Percent-encode `s`, passing the RFC 3986 unreserved set through unescaped.
@@ -628,22 +414,20 @@ test "PKCE: challenge matches a known S256 vector" {
     try testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", &c);
 }
 
-test "base64url round-trips arbitrary bytes (incl. padding case)" {
-    const alloc = testing.allocator;
+test "base64url encodes without padding" {
     const raw = [_]u8{ 0xff, 0x00, 0x10, 0xab, 0xcd };
     var enc_buf: [PKCE.base64UrlLen(raw.len)]u8 = undefined;
     const enc = base64UrlEncode(&enc_buf, &raw);
     try testing.expect(std.mem.indexOfScalar(u8, enc, '=') == null);
-    const dec = try base64UrlDecodeAlloc(alloc, enc);
-    defer alloc.free(dec);
-    try testing.expectEqualSlices(u8, &raw, dec);
+    try testing.expect(std.mem.indexOfScalar(u8, enc, '+') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, enc, '/') == null);
 }
 
 test "authorizationURL carries the expected params" {
     const alloc = testing.allocator;
     const url = try authorizationURL(
         alloc,
-        Endpoints.google,
+        google_authorization_endpoint,
         "client-abc",
         "http://127.0.0.1:54321",
         "state-xyz",
@@ -661,63 +445,6 @@ test "authorizationURL carries the expected params" {
     try testing.expect(std.mem.indexOf(u8, url, "state=state-xyz") != null);
     try testing.expect(std.mem.indexOf(u8, url, "access_type=offline") != null);
     try testing.expect(std.mem.indexOf(u8, url, "prompt=consent") != null);
-}
-
-test "formEncode escapes reserved characters, preserves order" {
-    const alloc = testing.allocator;
-    const body = try formEncode(alloc, &.{
-        .{ "grant_type", "authorization_code" },
-        .{ "code", "a b/c+d" },
-    });
-    defer alloc.free(body);
-    try testing.expectEqualStrings("grant_type=authorization_code&code=a%20b%2Fc%2Bd", body);
-}
-
-test "parseIDTokenClaims decodes email/exp/picture from a JWT payload" {
-    const alloc = testing.allocator;
-    // header.payload.signature — payload is base64url(JSON). Signature is
-    // ignored (unverified), so any non-empty segment works.
-    const payload_json =
-        "{\"email\":\"a@b.com\",\"email_verified\":true,\"exp\":1893456000," ++
-        "\"sub\":\"123\",\"name\":\"A B\",\"picture\":\"https://x/y.png\"}";
-    var payload_b64: [512]u8 = undefined;
-    const payload_enc = base64UrlEncode(&payload_b64, payload_json);
-    const jwt = try std.fmt.allocPrint(alloc, "aGVhZA.{s}.c2ln", .{payload_enc});
-    defer alloc.free(jwt);
-
-    var parsed = try parseIDTokenClaims(alloc, jwt);
-    defer parsed.deinit();
-    try testing.expectEqualStrings("a@b.com", parsed.value.email.?);
-    try testing.expectEqual(true, parsed.value.email_verified.?);
-    try testing.expectEqual(@as(f64, 1893456000), parsed.value.exp.?);
-    try testing.expectEqualStrings("https://x/y.png", parsed.value.picture.?);
-}
-
-test "parseIDTokenClaims rejects a non-3-segment token" {
-    const alloc = testing.allocator;
-    try testing.expectError(ClaimsError.Malformed, parseIDTokenClaims(alloc, "onlyone"));
-    try testing.expectError(ClaimsError.Malformed, parseIDTokenClaims(alloc, "a.b"));
-    try testing.expectError(ClaimsError.Malformed, parseIDTokenClaims(alloc, "a.b.c.d"));
-}
-
-test "expiry math: exp claim wins, then expires_in, then now" {
-    const alloc = testing.allocator;
-    const now: f64 = 1000;
-    // JWT with exp=5000.
-    const payload_json = "{\"exp\":5000}";
-    var payload_b64: [64]u8 = undefined;
-    const payload_enc = base64UrlEncode(&payload_b64, payload_json);
-    const jwt = try std.fmt.allocPrint(alloc, "h.{s}.s", .{payload_enc});
-    defer alloc.free(jwt);
-    try testing.expectEqual(@as(f64, 5000), expiryUnix(alloc, jwt, 300, now));
-
-    // Opaque token (no parseable exp) → now + expires_in.
-    try testing.expectEqual(@as(f64, 1300), expiryUnix(alloc, "opaque", 300, now));
-    // No exp, no ttl → now (already stale).
-    try testing.expectEqual(now, expiryUnix(alloc, "opaque", null, now));
-
-    try testing.expect(isFresh(5000, now)); // > 60s away
-    try testing.expect(!isFresh(1030, now)); // within leeway
 }
 
 test "parseRedirectTarget: extracts + percent-decodes code/state/error" {

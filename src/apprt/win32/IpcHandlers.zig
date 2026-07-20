@@ -12,7 +12,6 @@ const ProcessTree = @import("ProcessTree.zig");
 const provenance = @import("provenance.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_account = @import("../../remote/relay_account.zig");
-const google_oauth = @import("../../remote/google_oauth.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
@@ -278,9 +277,9 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 /// deadline), exactly like the Mac menu/IPC path; `--name` registers the
 /// window for later targeting.
 ///
-/// Relay token tiers (T21a/T21b): explicit `--token` wins (the CLI already
-/// forwards its own GHOSTTY_RELAY_TOKEN env as `--token`), then the signed-in
-/// account (a fresh ID token minted from the stored refresh grant — Mac
+/// Relay token tiers (T21a/T21b/T93): explicit `--token` wins (the CLI
+/// already forwards its own GHOSTTY_RELAY_TOKEN env as `--token`), then the
+/// signed-in account (its relay session token, renewed as needed — Mac
 /// `RelayAccount.resolveToken()` parity), then this GUI process's
 /// GHOSTTY_RELAY_TOKEN.
 ///
@@ -336,9 +335,9 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     };
 
     if (use_relay) {
-        // Token tiers: explicit --token, then the signed-in account (refresh
-        // grant), then the GUI's env. A tokenless relay dial is a guaranteed
-        // 401 — refuse BEFORE dialing (Mac rule).
+        // Token tiers: explicit --token, then the signed-in account (relay
+        // session token), then the GUI's env. A tokenless relay dial is a
+        // guaranteed 401 — refuse BEFORE dialing (Mac rule).
         const token = nonEmpty(args.token) orelse resolveAccountToken(arena) orelse resolveEnvToken(arena) orelse {
             return try errorResponse(
                 ctx.alloc,
@@ -388,23 +387,24 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
     return if (s.len > 0) s else null;
 }
 
-/// The account tier of relay token resolution (T21a): if an account is signed
-/// in (`account.dat` exists), mint a fresh ID token from its stored refresh
-/// grant. A missing account or a failed refresh returns null so resolution
-/// falls through to the env token (graceful — Mac `resolveToken` behavior).
-/// Allocated on `arena`. Endpoints are `.google` unless a test injects a fake
-/// issuer via `GHOSTTY_OAUTH_TOKEN_ENDPOINT`.
+/// The account tier of relay token resolution (T21a; brokered per T93): if an
+/// account is signed in (`account.dat` exists), return its relay session
+/// token — renewed (and rotated) at the stored relay when it nears expiry. A
+/// missing account, a legacy pre-T93 store, or a refused renewal returns null
+/// so resolution falls through to the env token (graceful — Mac
+/// `resolveToken` behavior). Allocated on `arena`.
 pub fn resolveAccountToken(arena: Allocator) ?[]const u8 {
     const path = relay_account.accountPath(arena) catch return null;
     if (!relay_account.isSignedIn(arena, path)) return null;
 
-    var endpoints = google_oauth.Endpoints.google;
-    if (std.process.getEnvVarOwned(arena, "GHOSTTY_OAUTH_TOKEN_ENDPOINT")) |t| {
-        if (t.len > 0) endpoints.token = t;
-    } else |_| {}
-
-    return relay_account.resolveIdToken(arena, endpoints, path) catch |err| {
-        log.warn("IPC new-remote-window: account token refresh failed err={}", .{err});
+    return relay_account.resolveSessionToken(arena, path) catch |err| {
+        switch (err) {
+            error.Legacy => log.warn(
+                "account store predates the brokered sign-in — run `ghoztty +relay-login` once to migrate",
+                .{},
+            ),
+            else => log.warn("IPC new-remote-window: account session renew failed err={}", .{err}),
+        }
         return null;
     };
 }
@@ -417,8 +417,8 @@ pub fn resolveEnvToken(arena: Allocator) ?[]const u8 {
 }
 
 /// Combined relay bearer-token resolution shared by the `+new-remote-window`
-/// verb and the machine chooser (T22c): the signed-in account first (a fresh
-/// ID token minted from the stored refresh grant), then `GHOSTTY_RELAY_TOKEN`.
+/// verb and the machine chooser (T22c): the signed-in account first (its
+/// relay session token, renewed as needed), then `GHOSTTY_RELAY_TOKEN`.
 /// Null ⇒ no credential — the chooser shows an empty list + a sign-in hint,
 /// never an error. (`--token` is a per-call override the IPC verb applies
 /// ahead of this.) Allocated on `arena`.

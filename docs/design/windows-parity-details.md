@@ -3330,6 +3330,47 @@ re-login with a clear message — decide in-task).
 *Validation:* extend `ipc-relay-login.ps1` fake-issuer harness with
 brokered endpoints; ALL PASS ×3.
 
+*Done 2026-07-19.* Ported the full BFF model:
+
+- New `src/remote/relay_session.zig` — brokered client for
+  `POST /oauth/exchange|renew|signout` (wire shapes byte-matched to
+  `relay/oauth.go` `sessionResponse`); status→error mapping and JSON
+  parse pure + unit-tested in both lanes.
+- `relay_account.zig` store is now `{session_token, expiry, email,
+  relay_base, picture?}` (DPAPI/atomic-write/DACL unchanged);
+  `resolveSessionToken` returns the cached token while >60s of life
+  remains, else renews at the STORED relay and persists the rotation
+  before returning (the old token is dead server-side). **Legacy
+  decision:** a pre-T93 refresh-token store surfaces as `Error.Legacy`
+  → treated as signed out with a "run +relay-login once" log; reading
+  it would only mint Google ID tokens the brokered relay no longer
+  accepts as client bearers.
+- `google_oauth.zig` slimmed to the browser half (PKCE, authorize URL,
+  loopback receiver); the Google `TokenClient`, ID-token claim parsing,
+  and expiry math are deleted (the relay owns all of it now).
+- `+relay-login`: client id from `--client-id` → `GHOSTTY_GOOGLE_CLIENT_ID`
+  → baked `-Dgoogle-client-id` (now exposed through `build_config.zig`,
+  the Windows analog of the Mac Info.plist bake); `--client-secret` is
+  GONE; new `--relay=` (env `GHOSTTY_RELAY_BASE` → default) recorded in
+  the store so renew/signout dial the right relay. `+relay-logout`
+  best-effort `POST /oauth/signout` before deleting (never blocks on
+  the network; tolerates legacy/corrupt stores).
+- `IpcHandlers.resolveAccountToken` is session-token backed; the
+  `+new-remote-window` tier order is unchanged (explicit `--token` →
+  account → `GHOSTTY_RELAY_TOKEN`), and the chooser path
+  (`resolveToken`) got the change for free.
+
+Evidence: `ipc-relay-login.ps1` rewritten for the brokered model (31
+asserts): fake-relay exchange login E2E (DPAPI blob non-plaintext),
+logout revokes with the session bearer, dead-relay exchange failure,
+id-less build error message, legacy-store handling (logout tolerates;
+GUI account tier refuses "not signed in"), near-expiry renew (renew hit
+carries the OLD bearer; rotated token verified persisted by DPAPI
+round-trip), and the live account-tier open vs the real Go relay
+(DEV_CLIENT_TOKEN = minted session token) + agent. ALL PASS ×3. P1–P3
+ALL PASS; both test lanes + full win32 GUI build green. CLAUDE.md
+`+relay-login` section rewritten for the brokered flow.
+
 ## T94 — Split divider grab-handle hit target (Phase I)
 
 Mac replaced the hairline divider hit area with a real ~9pt AppKit

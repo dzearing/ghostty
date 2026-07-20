@@ -9,6 +9,18 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 30) — T93 DONE: relay sign-in ported to the Mac's
+  brokered (BFF) OAuth. New relay_session.zig (exchange/renew/signout wire
+  client), account.dat now stores the relay session token + expiry +
+  relay_base (no Google token/client secret on the machine), GUI account
+  tier renews + persists rotation, `--client-secret` removed, client id
+  bakeable via -Dgoogle-client-id → build_config, logout revokes at the
+  relay. Legacy stores force one clear re-login (brokered relay rejects
+  raw Google ID tokens anyway). ipc-relay-login.ps1 rewritten (31 asserts,
+  incl. renew-rotation + legacy + live account-tier E2E) ALL PASS ×3;
+  P1–P3 + both lanes + GUI build green. T95 probe at session start: box
+  still wedged (fg=GameInputServiceWindow, SendInput dead); an old
+  watcher saw it clear at 21:34 — it flaps, re-probe next session.
 - 2026-07-19 (on-box, 29) — T86 DONE: GrabForeground (already-fg guard +
   attach-to-fg-thread + Alt tap, retried) in all 20 remaining kb-injection
   scripts + guard retrofitted to hero-mode/window-title/split-divider.

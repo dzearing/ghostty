@@ -5,6 +5,7 @@ const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const relay_account = @import("../remote/relay_account.zig");
+const relay_session = @import("../remote/relay_session.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
@@ -21,10 +22,13 @@ pub const Options = struct {
     }
 };
 
-/// Sign out of the relay Google account (T21a): delete the DPAPI-encrypted
-/// account store at `%LOCALAPPDATA%\ghoztty\account.dat`. Runs entirely in
-/// this process (no IPC). Signing out when already signed out succeeds
-/// silently — the account tier just falls back to `GHOSTTY_RELAY_TOKEN`.
+/// Sign out of the relay Google account (T21a; brokered per T93): best-effort
+/// revoke the relay session (`POST /oauth/signout` at the stored relay — the
+/// relay also destroys its stored Google refresh token), then delete the
+/// DPAPI-encrypted account store at `%LOCALAPPDATA%\ghoztty\account.dat`.
+/// Runs entirely in this process (no IPC). Signing out when already signed
+/// out succeeds silently — the account tier just falls back to
+/// `GHOSTTY_RELAY_TOKEN`. An unreachable relay never blocks local sign-out.
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -61,6 +65,17 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype, stderr: *std.Io.Writer) !u8 
         return 1;
     };
     const was_signed_in = relay_account.isSignedIn(alloc, path);
+
+    // Revoke the relay session before deleting the store (best-effort — a
+    // legacy/corrupt store or an unreachable relay still signs out locally).
+    if (relay_account.load(alloc, path)) |acct| {
+        var account = acct;
+        defer account.deinit(alloc);
+        if (account.relay_base.len > 0) {
+            relay_session.signout(alloc, account.relay_base, account.session_token);
+        }
+    } else |_| {}
+
     relay_account.delete(path);
 
     var out_buf: [256]u8 = undefined;

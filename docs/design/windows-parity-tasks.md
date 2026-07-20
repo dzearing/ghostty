@@ -163,9 +163,12 @@ Work these first, in order, before falling back to first-todo-in-table:
    grab is now T86-hardened, one script down). ~~T86~~ (done 2026-07-19:
    GrabForeground in all 20 remaining scripts + already-fg guard
    everywhere; 19/20 validated vs live foreign fg; filed T95 for the
-   keybinds-t01 tail, blocked on the box's GameInputSvc wedge). **Next
-   on-box, in order: T95 (if box recovered) → T93 → T89a → T90a** (small
-   user-visible parity first, then the two big design+port series;
+   keybinds-t01 tail, blocked on the box's GameInputSvc wedge). ~~T93~~
+   (done 2026-07-19: brokered OAuth port — see row; box still wedged at
+   session start, T95 skipped; a detached watcher later saw the wedge
+   clear once ~21:34, it flaps — re-probe before T95). **Next on-box, in
+   order: T95 (probe the wedge first) → T89a → T90a** (then the two big
+   design+port series;
    T29/T30/T87 are Mac-seat; T28's remainder and T82 fold into T89a). Flag for the Mac seat: main's
    `Hello.encode`/build_version elision test was red on main itself —
    fixed on this branch (362d1d4bc), needs to flow back via T87.
@@ -281,7 +284,7 @@ One line per row. Full spec + validation + evidence per task:
 | T90 | Viewer panes on Windows: IMPLEMENT (split by T90a) — --view markdown/text/website panes per CLAUDE.md | K | T90a | todo | — |
 | T91 | Banner markdown parity — done 2026-07-19: block parser rewrite (parseBlocks: headings, `---` rules, marker-gutter lists, GFM+headerless tables w/ `:` alignment + `\|`, native checkboxes, 10-line cap) + overlay measure/draw walker (bold-measured capped column widths, cell word-wrap, green RoundRect checkboxes, chevron collapse w/ fade, 12dip padding); `pane-banner.ps1` grown to 37 asserts ALL PASS ×3, P1–P3 + both lanes green | I | T88 | done | (this commit) |
 | T92 | Window-level titles — done 2026-07-19: three-level model (window pin → tab pin → pane title); `.prompt_title` branches on payload into a 3-level RenameDialog (Mac captions), Surface user-title w/ terminal-title restore, per-tab pin, `+rename --title=""`/empty-commit clears, 3 palette entries; `window-title.ps1` ALL PASS (46) ×3 | I | T88 | done | (this commit) |
-| T93 | Brokered OAuth for Windows relay sign-in: exchange at relay, session token in DPAPI, no client secret, -Dgoogle-client-id bake, /signout on logout | G | T88 | todo | — |
+| T93 | Brokered OAuth for Windows relay sign-in — done 2026-07-19: new relay_session.zig (/oauth/exchange|renew|signout), account store = session token + expiry + relay_base (DPAPI), renew rotates + persists, no client secret anywhere, -Dgoogle-client-id via build_config, logout revokes, legacy store ⇒ one re-login; `ipc-relay-login.ps1` rewritten (31) ALL PASS ×3, P1–P3 + both lanes + GUI build green | G | T88 | done | (this commit) |
 | T94 | Split divider grab-handle hit target — done 2026-07-19: band widened ±3→±4.5 DIP (~9 DIP, Mac `001834466` parity) + WM_NCHITTEST/HTTRANSPARENT fall-through on surface children (the ~5 DIP visual gap no longer clips the band); SIZENS/SIZEWE feedback across it; `split-divider.ps1` +6 T94 asserts (real-input ±4 DIP drags) + T86-hardened foreground grab, ALL PASS (15) ×3 | I | T88 | done | (this commit) |
 | T95 | keybinds-t01 copy-click fix needs its ×3: T85 placement memory made new windows tall, so the copy test's window-CENTER dclick landed below the X block (pre-existing since T85, NOT a grab issue — probe: fresh-window dclick+ctrl+c copies fine). Fixed via upper-row probe loop (0.08–0.28 height, clipboard-verified). Re-run ×3 once the box's GameInputSvc wedge clears (SendInput swallowed + unbeatable fg lock, unelevated fix impossible — elevated `Restart-Service GameInputSvc`) | — | T86 | todo | — |
 | T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | 3b085a661 |
