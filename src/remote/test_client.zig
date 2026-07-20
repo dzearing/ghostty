@@ -61,6 +61,9 @@ pub fn main() !void {
     defer if (opts.open_cwd) |c| alloc.free(c);
     defer if (opts.spawn) |c| alloc.free(c);
 
+    defer if (opts.pipe) |p| alloc.free(p);
+    defer if (opts.close_session) |c| alloc.free(c);
+
     const encoding = encodingFromEnv(alloc);
 
     if (opts.catchup_demo) {
@@ -71,10 +74,21 @@ pub fn main() !void {
         return;
     }
 
-    diag("connecting to {s}:{d} (encoding={s}) ...\n", .{ opts.host, opts.port, @tagName(encoding) });
-    var dialed = tcp_dial.dial(alloc, opts.host, opts.port, encoding) catch |err| {
-        diag("dial failed: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+    // Dial over a Windows named pipe (`--pipe=<\\.\pipe\name>`, T89c) or a TCP
+    // socket (`<host> <port>`). The pipe path is the local-agent transport on
+    // Windows; the rest of this tool (OPEN/DATA/hold) is transport-agnostic.
+    var dialed = if (opts.pipe) |name| blk: {
+        diag("connecting to pipe {s} (encoding={s}) ...\n", .{ name, @tagName(encoding) });
+        break :blk tcp_dial.dialPipe(alloc, name, encoding) catch |err| {
+            diag("pipe dial failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else blk: {
+        diag("connecting to {s}:{d} (encoding={s}) ...\n", .{ opts.host, opts.port, @tagName(encoding) });
+        break :blk tcp_dial.dial(alloc, opts.host, opts.port, encoding) catch |err| {
+            diag("dial failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
     };
     defer dialed.deinit();
     diag("handshake ok: proto_version={d} encoding={s}\n", .{
@@ -107,6 +121,19 @@ pub fn main() !void {
         return;
     }
 
+    // `--close-session=<id>` (T89c): session-scoped CLOSE by id — end a session
+    // that no local pane is attached to (the "kill it" side of the +sessions
+    // lifecycle). Needs no OPEN.
+    if (opts.close_session) |sid| {
+        const ok = dialed.conn.closeSession(sid, 10 * std.time.ns_per_s) catch |err| {
+            diag("close-session failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        diag("close-session {s}: ok={}\n", .{ sid, ok });
+        if (!ok) std.process.exit(1);
+        return;
+    }
+
     // OPEN a shell session and learn the agent-chosen data channel + session id.
     // When `--open-command` is set, the command rides in the OPEN payload (the
     // GUI inheritance path), otherwise the agent opens its default shell.
@@ -115,10 +142,23 @@ pub fn main() !void {
         diag("open failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    defer sess.deinit(dialed.conn);
+    // `--hold` detaches (session SURVIVES); every other path CLOSEs on exit.
+    var detached = false;
+    defer if (!detached) sess.deinit(dialed.conn) else sess.dropLocal(dialed.conn);
     diag("session opened: id={s} channel=0x{x} pid={d}\n", .{ sess.session_id, sess.channel, sess.pid });
 
-    if (opts.open_command != null or opts.open_cwd != null) {
+    if (opts.hold_secs) |secs| {
+        // Hold the session open for <secs> seconds without draining/relaying —
+        // the T89c scratch-client path: keep a real agent session alive so a
+        // concurrent `+sessions` (dialing the same pipe) can enumerate it, then
+        // detach cleanly (session SURVIVES a detach — only CLOSE ends it).
+        diag("holding session {s} open for {d}s ...\n", .{ sess.session_id, secs });
+        std.fs.File.stdout().writeAll(sess.session_id) catch {};
+        std.fs.File.stdout().writeAll("\n") catch {};
+        std.Thread.sleep(secs * std.time.ns_per_s);
+        diag("hold elapsed; detaching (session survives)\n", .{});
+        detached = true;
+    } else if (opts.open_command != null or opts.open_cwd != null) {
         // Drain the OPEN command's output to prove it ran on the remote.
         diag("open-command: draining output (idle timeout {d}s)...\n", .{opts.timeout_secs});
         try drainOutput(dialed.conn, &sess, opts.timeout_secs);
@@ -835,10 +875,18 @@ fn runInteractive(conn: *connection.Connection, sess: *Session) !void {
 }
 
 // -----------------------------------------------------------------------------
-// Raw terminal mode (POSIX termios)
+// Raw terminal mode (POSIX termios). Windows has no termios; the interactive
+// relay is a POSIX-host tool, so the Windows build (T89c: --pipe/--hold/
+// --close-session scripted modes only) gets a no-op stub that keeps the file
+// compiling — `runInteractive` is never reached in the scripted flows.
 // -----------------------------------------------------------------------------
 
-const RawMode = struct {
+const RawMode = if (builtin.os.tag == .windows) struct {
+    fn enable(_: posix.fd_t) !RawMode {
+        return error.Unsupported;
+    }
+    fn disable(_: *RawMode) void {}
+} else struct {
     fd: posix.fd_t,
     orig: posix.termios,
 
@@ -907,23 +955,50 @@ const Opts = struct {
     /// `--kill=<pid>`: ask the agent to terminate <pid> (default TERM). Drives the
     /// inc-4 process-kill path.
     kill: ?i64 = null,
+    /// `--pipe=<\\.\pipe\name>` (T89c): dial the agent over a Windows named pipe
+    /// instead of TCP (the local-agent transport). When set, `<host> <port>`
+    /// positionals are optional/ignored. Owned (duped from argv).
+    pipe: ?[]u8 = null,
+    /// `--hold=<secs>` (T89c): OPEN a session, print its id, keep it open for
+    /// <secs>, then DETACH (the session survives — only CLOSE ends it). The
+    /// scratch-client path for the +sessions lifecycle test.
+    hold_secs: ?u64 = null,
+    /// `--close-session=<id>` (T89c): send a session-scoped CLOSE for <id> and
+    /// exit (no OPEN). Owned (duped from argv).
+    close_session: ?[]u8 = null,
 };
 
 fn parseArgs(alloc: Allocator) !Opts {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    if (args.len < 3) return error.Usage;
+    // `--pipe=<name>` dials a named pipe, so `<host> <port>` are optional there;
+    // pre-scan for it to decide whether positionals are required. A TCP dial
+    // still needs both.
+    var has_pipe = false;
+    for (args[1..]) |a| {
+        if (std.mem.startsWith(u8, a, "--pipe=")) has_pipe = true;
+    }
 
-    const host = try alloc.dupe(u8, args[1]);
-    errdefer alloc.free(host);
-    const port = std.fmt.parseInt(u16, args[2], 10) catch return error.Usage;
-
-    var opts: Opts = .{ .host = host, .port = port };
-    var i: usize = 3;
+    var opts: Opts = .{ .host = try alloc.dupe(u8, ""), .port = 0 };
+    errdefer alloc.free(opts.host);
+    var i: usize = 1;
+    if (!has_pipe) {
+        if (args.len < 3) return error.Usage;
+        alloc.free(opts.host);
+        opts.host = try alloc.dupe(u8, args[1]);
+        opts.port = std.fmt.parseInt(u16, args[2], 10) catch return error.Usage;
+        i = 3;
+    }
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--exec")) {
+        if (std.mem.startsWith(u8, a, "--pipe=")) {
+            opts.pipe = try alloc.dupe(u8, a["--pipe=".len..]);
+        } else if (std.mem.startsWith(u8, a, "--hold=")) {
+            opts.hold_secs = std.fmt.parseInt(u64, a["--hold=".len..], 10) catch return error.Usage;
+        } else if (std.mem.startsWith(u8, a, "--close-session=")) {
+            opts.close_session = try alloc.dupe(u8, a["--close-session=".len..]);
+        } else if (std.mem.eql(u8, a, "--exec")) {
             i += 1;
             if (i >= args.len) return error.Usage;
             opts.exec = try alloc.dupe(u8, args[i]);
@@ -971,6 +1046,9 @@ fn usage() void {
         \\  remote-test-client <host> <port> --spawn="<cmd>"      spawn <cmd> detached on the remote; print the pid
         \\  remote-test-client <host> <port> --kill=<pid>         terminate <pid> on the remote (default TERM)
         \\  remote-test-client <host> <port> --catchup-demo       close-laptop catch-up demo (PASS/FAIL)
+        \\  remote-test-client --pipe=\\.\pipe\<name> [opts]      dial a Windows named-pipe agent (T89c; host/port omitted)
+        \\  remote-test-client --pipe=<name> --hold=<secs>        OPEN a session, print its id, hold <secs>, then DETACH (survives)
+        \\  remote-test-client --pipe=<name> --close-session=<id> session-scoped CLOSE of <id>, then exit
         \\
     , .{});
 }
@@ -986,12 +1064,16 @@ fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
 const Dims = struct { rows: u16, cols: u16 };
 
 /// Query the local stdout TTY window size; fall back to 24x80 if not a tty.
+/// Windows has no `TIOCGWINSZ`; the Windows build always uses the 24x80 default
+/// (the scripted --pipe/--hold modes don't care about local tty geometry).
 fn ttyDims() Dims {
-    var ws: posix.winsize = undefined;
-    const fd = std.fs.File.stdout().handle;
-    const rc = posix.system.ioctl(fd, posix.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (posix.errno(rc) == .SUCCESS and ws.row > 0 and ws.col > 0) {
-        return .{ .rows = ws.row, .cols = ws.col };
+    if (builtin.os.tag != .windows) {
+        var ws: posix.winsize = undefined;
+        const fd = std.fs.File.stdout().handle;
+        const rc = posix.system.ioctl(fd, posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        if (posix.errno(rc) == .SUCCESS and ws.row > 0 and ws.col > 0) {
+            return .{ .rows = ws.row, .cols = ws.col };
+        }
     }
     return .{ .rows = 24, .cols = 80 };
 }

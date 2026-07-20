@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
@@ -32,14 +33,17 @@ pub const Options = struct {
     }
 };
 
-/// The agent's `--port-file` info body (written by `runListenUnix`/`runListen`).
-/// A UDS agent writes `{"port":0,"pid":P,"socket":"<path>",...}`; a legacy TCP
-/// agent omits `socket` and sets a real `port`. Unknown fields (e.g. `startedAt`)
-/// are ignored.
+/// The agent's `--port-file` info body (written by `runListenUnix`/
+/// `runListenPipe`/`runListen`). A UDS agent writes
+/// `{"port":0,"pid":P,"socket":"<path>",...}`; a Windows named-pipe agent
+/// writes `{"port":0,"pid":P,"pipe":"<name>",...}` (T89c); a legacy TCP agent
+/// omits both and sets a real `port`. Unknown fields (e.g. `startedAt`) are
+/// ignored — both endpoint fields are additive per the agent-contract rules.
 const InfoFile = struct {
     port: u16 = 0,
     pid: i64 = 0,
     socket: ?[]const u8 = null,
+    pipe: ?[]const u8 = null,
 };
 
 /// List the terminal sessions owned by the local `ghoztty-agent` (the daemon that
@@ -146,11 +150,17 @@ fn runArgs(
 
 /// `~/.config/ghoztty/local-agent[-debug]/port.json` — the same path
 /// `LocalAgentManager` writes (debug lineage gets its own directory so debug and
-/// release agents never share state).
+/// release agents never share state). On Windows the local agent's state dir is
+/// `%LOCALAPPDATA%\ghoztty\local-agent[-debug]\` instead (T89a decision 2).
 fn agentInfoPath(alloc: Allocator) ![]const u8 {
+    const dir = if (build_config.is_debug) "local-agent-debug" else "local-agent";
+    if (comptime builtin.os.tag == .windows) {
+        const local = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return error.NoHome;
+        defer alloc.free(local);
+        return std.fmt.allocPrint(alloc, "{s}\\ghoztty\\{s}\\port.json", .{ local, dir });
+    }
     var home_buf: [std.fs.max_path_bytes]u8 = undefined;
     const home = (try homedir.home(&home_buf)) orelse return error.NoHome;
-    const dir = if (build_config.is_debug) "local-agent-debug" else "local-agent";
     return std.fmt.allocPrint(alloc, "{s}/.config/ghoztty/{s}/port.json", .{ home, dir });
 }
 
@@ -160,15 +170,21 @@ fn readInfoFile(alloc: Allocator, path: []const u8) !InfoFile {
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    // Return a copy whose `socket` string lives in the arena (parsed owns its own).
+    // Return a copy whose `socket`/`pipe` strings live in the arena (parsed
+    // owns its own).
     return .{
         .port = parsed.value.port,
         .pid = parsed.value.pid,
         .socket = if (parsed.value.socket) |s| try alloc.dupe(u8, s) else null,
+        .pipe = if (parsed.value.pipe) |p| try alloc.dupe(u8, p) else null,
     };
 }
 
 fn dialAgent(alloc: Allocator, info: InfoFile) !tcp_dial.Dialed {
+    // Windows named pipe (T89c) — the local agent's endpoint on Windows.
+    if (info.pipe) |name| {
+        if (name.len > 0) return tcp_dial.dialPipe(alloc, name, .raw);
+    }
     if (info.socket) |sock| {
         if (sock.len > 0) return tcp_dial.dialUnix(alloc, sock, .raw);
     }

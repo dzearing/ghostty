@@ -23,7 +23,16 @@
 //!      port that ANY local uid can connect to, only this user can reach the
 //!      shell. A stale socket node from a prior run is unlinked only after a
 //!      connect-probe confirms nothing live is listening. This is what the macOS
-//!      app spawns for local persistent windows (Windows uses a named pipe).
+//!      app spawns for local persistent windows (Windows uses 2c below).
+//!
+//!   2c. **Named-pipe listen daemon** (`--listen-pipe <\\.\pipe\name>`,
+//!      Windows-only, T89c): the SECURE local transport on Windows — the same
+//!      accept→serve→loop core, bound to a named pipe created with an
+//!      owner-only DACL (the stand-in for 2b's same-uid peercred gate) +
+//!      PIPE_REJECT_REMOTE_CLIENTS. FILE_FLAG_FIRST_PIPE_INSTANCE makes the
+//!      bind double as the stale/live probe (a dead holder's pipe name simply
+//!      stops existing). This is what the Windows app spawns for local
+//!      persistent windows.
 //!
 //!   3. **Relay daemon** (`--relay <url>`): the single-binary rendezvous path (no
 //!      Go sidecar, no inbound port). Hold an authenticated `wss://` control
@@ -111,6 +120,7 @@ const session = @import("session.zig");
 const pty_child = @import("pty_child.zig");
 const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
+const pipe_stream = @import("../pipe_stream.zig");
 const ws_client = @import("../ws_client.zig");
 const tray = @import("tray.zig");
 const tray_account = @import("tray_account.zig");
@@ -190,6 +200,20 @@ pub fn main() !void {
             var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
             defer lock.release();
             try runListenUnix(alloc, encoding, l.path, l.headless, l.port_file, l.sessions_file);
+        },
+        .listen_pipe => |l| {
+            defer alloc.free(l.name);
+            defer if (l.port_file) |pf| alloc.free(pf);
+            defer if (l.sessions_file) |sf| alloc.free(sf);
+            // Named-pipe listen is Windows-only (the POSIX local transport is
+            // --listen-unix); listenPipeMode rejects it at parse time, and this
+            // comptime gate keeps the pipe daemon code out of POSIX analysis.
+            if (builtin.os.tag != .windows) unreachable;
+            // DAEMON mode: single-instance BEFORE the bind (a losing instance
+            // must not race the winner for the pipe name).
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
+            defer lock.release();
+            try runListenPipe(alloc, encoding, l.name, l.headless, l.port_file, l.sessions_file);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
@@ -398,6 +422,7 @@ const Mode = union(enum) {
     stdio,
     listen: Listen,
     listen_unix: ListenUnix,
+    listen_pipe: ListenPipe,
     relay: Relay,
     enroll: Enroll,
 };
@@ -461,6 +486,31 @@ const ListenUnix = struct {
     /// supervisor that spawned us can pid-liveness-check a pre-existing agent
     /// and learn the socket path to dial (a UDS has no ephemeral port to
     /// publish). Owned (duped from argv).
+    port_file: ?[]const u8 = null,
+    /// `--sessions-file=<path>`: the reboot-floor metadata store (§5.4, T12) —
+    /// see `Listen.sessions_file`. Owned (duped from argv). Null ⇒ no persistence.
+    sessions_file: ?[]const u8 = null,
+};
+
+/// Windows-named-pipe listen-daemon parameters (`--listen-pipe=<name>`, T89c).
+/// The SECURE local transport on Windows (design §5.2) — the named-pipe analog
+/// of `--listen-unix`: the pipe is created with an owner-only DACL (only this
+/// user can open it; the DACL stands in for the unix listener's peercred gate)
+/// and FILE_FLAG_FIRST_PIPE_INSTANCE (binding doubles as the liveness probe —
+/// a taken name means a live agent already serves it). Windows-only.
+/// `headless`/`force_replace` mirror `Listen`; a named pipe is never
+/// network-reachable (PIPE_REJECT_REMOTE_CLIENTS on top).
+const ListenPipe = struct {
+    /// Full pipe path to bind (`\\.\pipe\ghoztty-agent[-debug]-<user>`; owned —
+    /// duped from argv so it outlives `argsFree`).
+    name: []const u8,
+    headless: bool = false,
+    force_replace: bool = false,
+    /// `--port-file=<path>`: after the pipe binds, atomically write a JSON
+    /// info file `{"port":0,"pid":P,"pipe":"<name>","startedAt":MS}` so the
+    /// supervisor that spawned us can pid-liveness-check a pre-existing agent
+    /// and learn the pipe name to dial (additive `pipe` field — an old reader
+    /// ignores it, per the agent-contract rules). Owned (duped from argv).
     port_file: ?[]const u8 = null,
     /// `--sessions-file=<path>`: the reboot-floor metadata store (§5.4, T12) —
     /// see `Listen.sessions_file`. Owned (duped from argv). Null ⇒ no persistence.
@@ -594,6 +644,15 @@ fn parseArgs(alloc: Allocator) !Mode {
             return listenUnixMode(alloc, args[i], headless, force_replace, port_file_arg, sessions_file_arg);
         } else if (std.mem.startsWith(u8, a, "--listen-unix=")) {
             return listenUnixMode(alloc, a["--listen-unix=".len..], headless, force_replace, port_file_arg, sessions_file_arg);
+        } else if (std.mem.eql(u8, a, "--listen-pipe")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("ghoztty-agent: --listen-pipe requires <name>\n", .{});
+                return error.InvalidArgs;
+            }
+            return listenPipeMode(alloc, args[i], headless, force_replace, port_file_arg, sessions_file_arg);
+        } else if (std.mem.startsWith(u8, a, "--listen-pipe=")) {
+            return listenPipeMode(alloc, a["--listen-pipe=".len..], headless, force_replace, port_file_arg, sessions_file_arg);
         } else if (std.mem.eql(u8, a, "--relay")) {
             i += 1;
             if (i >= args.len) {
@@ -685,6 +744,40 @@ fn listenUnixMode(alloc: Allocator, path: []const u8, headless: bool, force_repl
     return .{ .listen_unix = .{ .path = path_owned, .headless = headless, .force_replace = force_replace, .port_file = pf_owned, .sessions_file = sf_owned } };
 }
 
+/// Build a `.listen_pipe` mode (T89c). Validates a non-empty, full
+/// `\\.\pipe\...` name and rejects it on non-Windows (the POSIX local
+/// transport is `--listen-unix` — the exact mirror of `listenUnixMode`'s
+/// Windows rejection). `name` is duped here (argv is freed when parseArgs
+/// returns).
+fn listenPipeMode(alloc: Allocator, name: []const u8, headless: bool, force_replace: bool, port_file: ?[]const u8, sessions_file: ?[]const u8) !Mode {
+    if (name.len == 0) {
+        std.debug.print("ghoztty-agent: --listen-pipe requires a non-empty <name>\n", .{});
+        return error.InvalidArgs;
+    }
+    if (builtin.os.tag != .windows) {
+        std.debug.print("ghoztty-agent: --listen-pipe is only supported on Windows (use --listen-unix)\n", .{});
+        return error.InvalidArgs;
+    }
+    if (!std.mem.startsWith(u8, name, "\\\\.\\pipe\\")) {
+        std.debug.print("ghoztty-agent: --listen-pipe requires a full \\\\.\\pipe\\<name> path, got '{s}'\n", .{name});
+        return error.InvalidArgs;
+    }
+    if (port_file) |pf| if (pf.len == 0) {
+        std.debug.print("ghoztty-agent: --port-file requires a non-empty <path>\n", .{});
+        return error.InvalidArgs;
+    };
+    if (sessions_file) |sf| if (sf.len == 0) {
+        std.debug.print("ghoztty-agent: --sessions-file requires a non-empty <path>\n", .{});
+        return error.InvalidArgs;
+    };
+    const name_owned = try alloc.dupe(u8, name);
+    errdefer alloc.free(name_owned);
+    const pf_owned: ?[]const u8 = if (port_file) |pf| try alloc.dupe(u8, pf) else null;
+    errdefer if (pf_owned) |p| alloc.free(p);
+    const sf_owned: ?[]const u8 = if (sessions_file) |sf| try alloc.dupe(u8, sf) else null;
+    return .{ .listen_pipe = .{ .name = name_owned, .headless = headless, .force_replace = force_replace, .port_file = pf_owned, .sessions_file = sf_owned } };
+}
+
 /// Whether `addr` is a loopback address (127.0.0.0/8 or ::1) — the only binds
 /// that don't expose the unauthenticated listener beyond this machine.
 fn isLoopbackAddr(addr: std.net.Address) bool {
@@ -717,6 +810,13 @@ fn printUsage() void {
         \\                                  with a same-uid peercred gate (the SECURE local
         \\                                  transport — only this user can reach it). Used by
         \\                                  the app's session-persistence local agent.
+        \\  ghoztty-agent --listen-pipe=\\.\pipe\<name>
+        \\                                  Local session daemon over an owner-only-DACL
+        \\                                  named pipe (the SECURE local transport on
+        \\                                  Windows — only this user can open it). Used by
+        \\                                  the app's session-persistence local agent.
+        \\                                  --port-file publishes {"port":0,"pid":P,
+        \\                                  "pipe":"<name>",...} (atomic).
         \\  ghoztty-agent --listen=127.0.0.1:<port>
         \\                                  UNAUTHENTICATED TCP shell, loopback only.
         \\                                  Port 0 binds an ephemeral port; add
@@ -932,8 +1032,11 @@ fn runListen(
             // No relay link/account/updater in listen mode → null (no
             // Disconnect/Reconnect, Sign in/out, or self-update items).
             if (tray.run(&store, agent_version, null, null, null)) {
-                // User chose Exit: a clean process exit tears down the (still-running)
-                // accept loop + reaper daemon threads.
+                // User chose Exit: flush any dirty output rings first (the tray
+                // Exit is a graceful stop — T89a decision 7, the SIGTERM-watcher
+                // analog), then a clean process exit tears down the
+                // (still-running) accept loop + reaper daemon threads.
+                store.snapshotRings();
                 std.process.exit(0);
             }
             // Tray setup FAILED — never kill the daemon just because the UI couldn't
@@ -1071,6 +1174,205 @@ fn runListenUnix(
     try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener, true);
 }
 
+// -----------------------------------------------------------------------------
+// Windows-named-pipe listen daemon (`--listen-pipe=<name>`, T89c): the SECURE
+// local transport on Windows (design §5.2). Same store/serve semantics as the
+// unix path, but bound to an owner-only-DACL named pipe: only this user can
+// open the pipe, standing in for the unix listener's same-uid peercred gate.
+// Windows-only; parseArgs already rejected this mode elsewhere.
+// -----------------------------------------------------------------------------
+
+fn runListenPipe(
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    name: []const u8,
+    headless: bool,
+    port_file: ?[]const u8,
+    sessions_file: ?[]const u8,
+) !void {
+    // The LOCAL agent is a background daemon (the LaunchAgent analog): no tray
+    // icon — the relay agent owns the visible tray. Reserved for symmetry.
+    _ = headless;
+
+    // Bind claims the name via FILE_FLAG_FIRST_PIPE_INSTANCE, which doubles as
+    // the liveness probe (`probeUnixAlive` analog): a taken name means a live
+    // agent owns it — refuse rather than fight over instances. A DEAD holder
+    // needs no unlink step: a Windows pipe name vanishes with its last handle.
+    var listener = pipe_stream.PipeListener.bind(alloc, name) catch |err| {
+        if (err == error.AlreadyListening) {
+            std.debug.print("ghoztty-agent: a live agent already listens at {s}; exiting\n", .{name});
+            return error.AlreadyListening;
+        }
+        std.debug.print("ghoztty-agent: failed to bind pipe {s}: {s}\n", .{ name, @errorName(err) });
+        return err;
+    };
+    defer listener.deinit();
+
+    // Publish the info file for the supervisor that spawned us. A pipe has no
+    // ephemeral port, so the body carries the ADDITIVE `pipe` field:
+    // {"port":0,"pid":P,"pipe":"<name>","startedAt":MS} — an old reader
+    // ignores the unknown field (agent-contract rules). Written AFTER the bind
+    // succeeds, atomically. Fatal on failure, as on the unix path.
+    if (port_file) |pf| {
+        writePipeFile(alloc, pf, name) catch |err| {
+            std.debug.print("ghoztty-agent: failed to write --port-file {s}: {s}\n", .{ pf, @errorName(err) });
+            return err;
+        };
+    }
+
+    // DAEMON-SCOPED shared session store + spawner — identical lifetime rules to
+    // the TCP/unix paths (sessions outlive each connection; the reaper evicts
+    // orphans past the idle-TTL).
+    const seed = blk: {
+        var s: u64 = 0;
+        std.crypto.random.bytes(std.mem.asBytes(&s));
+        break :blk s;
+    };
+    var rng = std.Random.DefaultPrng.init(seed);
+
+    var spawner = try pty_child.PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    var store = session.SessionStore.init(
+        alloc,
+        rng.random(),
+        undefined,
+        realNow,
+        session.default_idle_ttl_ms,
+    );
+    // Reboot-floor metadata store (§5.4, T12) — borrowed; outlives `store`.
+    store.meta_path = sessions_file;
+    // Reboot scrollback (§5.4, T13): ring snapshots in a `rings/` subdir beside it.
+    const rings_dir = ringsDirFor(alloc, sessions_file);
+    defer if (rings_dir) |d| alloc.free(d);
+    store.rings_dir = rings_dir;
+    // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
+    const layouts_file = layoutsFileFor(alloc, sessions_file);
+    defer if (layouts_file) |f| alloc.free(f);
+    store.layouts_path = layouts_file;
+    defer store.deinit();
+    // Reboot-floor materialization (§5.4, T12b): re-create the persisted roster as
+    // dead, relaunchable tombstones before accepting connections + starting the reaper.
+    const materialized = store.loadPersisted(configured_ring_bytes);
+    store.loadLayouts();
+    // Self-heal: drop any loaded blob whose sessions did not materialize (truly
+    // gone), so a stale layouts.json never advertises unattachable windows.
+    if (store.reapLayouts() > 0) store.persistLayouts();
+    if (materialized > 0) std.log.info("reboot floor: materialized {d} session(s) from disk", .{materialized});
+    // Graceful stop → flush dirty rings before exit: the console-ctrl handler is
+    // the Windows analog of the POSIX SIGTERM watcher (T13b). It covers Ctrl-C/
+    // Ctrl-Break from a console, console-window close, and logoff/shutdown
+    // (WM_ENDSESSION territory — Windows grants ~5s, and the 2MB-bounded rings
+    // fit; §5.4 risk (c)).
+    startConsoleCtrlWatcher(&store);
+    try store.startReaper();
+
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on pipe:{s}\n", .{ agent_version, name }) catch "ghoztty-agent: listening\n") catch {};
+
+    // Accept loop: same serve-each-connection-on-its-own-thread core as the
+    // socket paths, over pipe instances. The DACL already gated admission (only
+    // this user can open the pipe), so there is no per-connection uid check.
+    while (true) {
+        const handle = listener.accept() catch |err| {
+            // Transient accept failures (e.g. an instance re-create hiccup)
+            // must not kill the daemon; brief backoff and keep serving.
+            std.debug.print("ghoztty-agent: pipe accept error: {s}\n", .{@errorName(err)});
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        const worker = PipeConnWorker.create(alloc, encoding, &store, spawner.spawner(), handle) catch |err| {
+            std.debug.print("ghoztty-agent: failed to start pipe worker: {s}\n", .{@errorName(err)});
+            std.os.windows.CloseHandle(handle);
+            continue;
+        };
+        const t = std.Thread.spawn(.{}, PipeConnWorker.run, .{worker}) catch |err| {
+            std.debug.print("ghoztty-agent: failed to spawn pipe worker thread: {s}\n", .{@errorName(err)});
+            std.os.windows.CloseHandle(handle);
+            worker.destroy();
+            continue;
+        };
+        t.detach();
+    }
+}
+
+/// A per-connection worker over one connected pipe instance: the named-pipe
+/// mirror of `ConnWorker` (owns the handle, builds a `Mux` + `Server` sharing
+/// the daemon `store`, runs until the pipe EOFs, DETACHes — never terminates —
+/// its sessions, frees itself). Heap-allocated for its detached thread.
+const PipeConnWorker = struct {
+    alloc: Allocator,
+    encoding: protocol.TransferEncoding,
+    store: *session.SessionStore,
+    spawner: server.Spawner,
+    handle: std.os.windows.HANDLE,
+
+    fn create(
+        alloc: Allocator,
+        encoding: protocol.TransferEncoding,
+        store: *session.SessionStore,
+        spawner: server.Spawner,
+        handle: std.os.windows.HANDLE,
+    ) !*PipeConnWorker {
+        const self = try alloc.create(PipeConnWorker);
+        self.* = .{
+            .alloc = alloc,
+            .encoding = encoding,
+            .store = store,
+            .spawner = spawner,
+            .handle = handle,
+        };
+        return self;
+    }
+
+    fn destroy(self: *PipeConnWorker) void {
+        self.alloc.destroy(self);
+    }
+
+    fn run(self: *PipeConnWorker) void {
+        var ps = pipe_stream.PipeStream.init(self.handle);
+        serveOne(self.alloc, self.encoding, self.store, self.spawner, ps.serverStream()) catch |err| {
+            std.debug.print("ghoztty-agent: pipe connection error: {s}\n", .{@errorName(err)});
+        };
+        // serveOne's mux closed the pipe handle already (mux.close → ps.close).
+        self.destroy();
+    }
+};
+
+/// The store the Windows console-ctrl handler flushes on a graceful stop. Set
+/// once (single-threaded, before the handler registers) and read-only after —
+/// the handler runs on a fresh console-control thread in ORDINARY context, so
+/// the store mutex + file I/O inside `snapshotRings` are safe there (unlike a
+/// POSIX signal handler).
+var console_ctrl_store: ?*session.SessionStore = null;
+
+/// Register the Windows graceful-stop hook (the `startSigtermWatcher` analog):
+/// Ctrl-C/Ctrl-Break, console-window close, and logoff/shutdown all flush any
+/// dirty output rings to disk, then exit cleanly. Windows-only no-op elsewhere.
+fn startConsoleCtrlWatcher(store: *session.SessionStore) void {
+    if (builtin.os.tag != .windows) return;
+    console_ctrl_store = store;
+    if (SetConsoleCtrlHandler(consoleCtrlHandler, std.os.windows.TRUE) == 0) {
+        std.debug.print("ghoztty-agent: SetConsoleCtrlHandler failed; on-stop ring snapshot disabled\n", .{});
+    }
+}
+
+const SetConsoleCtrlHandler = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn SetConsoleCtrlHandler(
+        HandlerRoutine: ?*const fn (std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
+        Add: std.os.windows.BOOL,
+    ) callconv(.winapi) std.os.windows.BOOL;
+}.SetConsoleCtrlHandler else struct {};
+
+fn consoleCtrlHandler(ctrl_type: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
+    // Every event (CTRL_C/BREAK/CLOSE/LOGOFF/SHUTDOWN) is a stop for a daemon:
+    // snapshot and exit(0) — never return, so the default handler can't
+    // TerminateProcess us mid-flush on the events that would.
+    _ = ctrl_type;
+    if (console_ctrl_store) |s| s.snapshotRings();
+    std.process.exit(0);
+}
+
 /// Whether a live peer answers at the AF_UNIX `path` (a successful connect ⇒
 /// something is listening; ECONNREFUSED / ENOENT / anything else ⇒ not live).
 /// Used to decide whether a leftover socket node is safe to unlink+rebind.
@@ -1118,7 +1420,7 @@ fn shouldServe(enforce_same_uid: bool, peer_uid: ?posix.uid_t, our_uid: posix.ui
 /// `{"port":N,"pid":P,"startedAt":MS}` to `path`. Thin wrapper over
 /// `writeInfoFile` with no socket path (the endpoint is a port).
 fn writePortFile(alloc: Allocator, path: []const u8, port: u16) !void {
-    return writeInfoFile(alloc, path, port, null);
+    return writeInfoFile(alloc, path, port, null, null);
 }
 
 /// The ring-snapshot directory for a given `--sessions-file`: a `rings/` subdir
@@ -1148,7 +1450,16 @@ fn layoutsFileFor(alloc: Allocator, sessions_file: ?[]const u8) ?[]u8 {
 /// no port to advertise, so the supervisor dials the socket path instead; `pid`
 /// still lets it liveness-check a pre-existing agent.
 fn writeSocketFile(alloc: Allocator, path: []const u8, socket: []const u8) !void {
-    return writeInfoFile(alloc, path, 0, socket);
+    return writeInfoFile(alloc, path, 0, socket, null);
+}
+
+/// Atomically publish the named-pipe listener's pipe name for a supervisor:
+/// write `{"port":0,"pid":P,"pipe":"<name>","startedAt":MS}` to `path` (T89c).
+/// The `pipe` field is ADDITIVE next to the unix path's `socket` — an old
+/// reader ignores it and sees a portless, socketless record it treats as
+/// no-endpoint, degrading gracefully per the agent-contract rules.
+fn writePipeFile(alloc: Allocator, path: []const u8, pipe: []const u8) !void {
+    return writeInfoFile(alloc, path, 0, null, pipe);
 }
 
 /// Atomically write the agent info file to `path` via the same-directory
@@ -1156,9 +1467,9 @@ fn writeSocketFile(alloc: Allocator, path: []const u8, socket: []const u8) !void
 /// as needed. `pid` lets the reader liveness-check the writer; `startedAt`
 /// (unix ms) lets it spot a stale file from a previous boot; `socket` (when
 /// set) carries the UDS path to dial.
-fn writeInfoFile(alloc: Allocator, path: []const u8, port: u16, socket: ?[]const u8) !void {
+fn writeInfoFile(alloc: Allocator, path: []const u8, port: u16, socket: ?[]const u8, pipe: ?[]const u8) !void {
     if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
-    const content = try formatInfoFile(alloc, port, currentPid(), std.time.milliTimestamp(), socket);
+    const content = try formatInfoFile(alloc, port, currentPid(), std.time.milliTimestamp(), socket, pipe);
     defer alloc.free(content);
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
@@ -1180,19 +1491,31 @@ fn writeInfoFile(alloc: Allocator, path: []const u8, port: u16, socket: ?[]const
 
 /// The TCP info-file JSON body (pure — separated from the I/O for tests).
 fn formatPortFile(alloc: Allocator, port: u16, pid: i64, started_at_ms: i64) ![]u8 {
-    return formatInfoFile(alloc, port, pid, started_at_ms, null);
+    return formatInfoFile(alloc, port, pid, started_at_ms, null, null);
 }
 
 /// The info-file JSON body (pure — separated from the I/O for tests). With a
 /// `socket` path the body gains a `"socket":"<escaped>"` field (the UDS
-/// endpoint); without one it is the original TCP `{port,pid,startedAt}` shape.
-fn formatInfoFile(alloc: Allocator, port: u16, pid: i64, started_at_ms: i64, socket: ?[]const u8) ![]u8 {
+/// endpoint); with a `pipe` name it gains `"pipe":"<escaped>"` (the Windows
+/// named-pipe endpoint, T89c); without either it is the original TCP
+/// `{port,pid,startedAt}` shape. Both fields are additive — old readers
+/// ignore the one they don't know.
+fn formatInfoFile(alloc: Allocator, port: u16, pid: i64, started_at_ms: i64, socket: ?[]const u8, pipe: ?[]const u8) ![]u8 {
     if (socket) |s| {
         const esc = try jsonEscape(alloc, s);
         defer alloc.free(esc);
         return std.fmt.allocPrint(
             alloc,
             "{{\"port\":{d},\"pid\":{d},\"socket\":\"{s}\",\"startedAt\":{d}}}\n",
+            .{ port, pid, esc, started_at_ms },
+        );
+    }
+    if (pipe) |p| {
+        const esc = try jsonEscape(alloc, p);
+        defer alloc.free(esc);
+        return std.fmt.allocPrint(
+            alloc,
+            "{{\"port\":{d},\"pid\":{d},\"pipe\":\"{s}\",\"startedAt\":{d}}}\n",
             .{ port, pid, esc, started_at_ms },
         );
     }
@@ -2124,7 +2447,7 @@ test "listen-unix: bind creates a 0600 socket node (umask), probeUnixAlive sees 
 
 test "socket info file: JSON body carries port:0/pid/socket/startedAt" {
     const alloc = std.testing.allocator;
-    const body = try formatInfoFile(alloc, 0, 987, 1770000000000, "/tmp/agent.sock");
+    const body = try formatInfoFile(alloc, 0, 987, 1770000000000, "/tmp/agent.sock", null);
     defer alloc.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -2141,12 +2464,28 @@ test "socket info file: path with quote/backslash stays well-formed JSON" {
     // A pathological path (quotes/backslashes are legal in POSIX filenames):
     // the escaper must keep the body parseable and the value byte-exact.
     const weird = "/tmp/a\"b\\c.sock";
-    const body = try formatInfoFile(alloc, 0, 1, 2, weird);
+    const body = try formatInfoFile(alloc, 0, 1, 2, weird, null);
     defer alloc.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(weird, parsed.value.object.get("socket").?.string);
+}
+
+test "pipe info file: JSON body carries port:0/pid/pipe/startedAt (T89c)" {
+    const alloc = std.testing.allocator;
+    const body = try formatInfoFile(alloc, 0, 987, 1770000000000, null, "\\\\.\\pipe\\ghoztty-agent-test");
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    // Port is 0 (a pipe has no port); the supervisor keys off `pipe` instead.
+    // The backslashes in the pipe path MUST round-trip through the escaper.
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("port").?.integer);
+    try std.testing.expectEqual(@as(i64, 987), parsed.value.object.get("pid").?.integer);
+    try std.testing.expectEqualStrings("\\\\.\\pipe\\ghoztty-agent-test", parsed.value.object.get("pipe").?.string);
+    try std.testing.expectEqual(@as(i64, 1770000000000), parsed.value.object.get("startedAt").?.integer);
+    try std.testing.expect(parsed.value.object.get("socket") == null);
 }
 
 test "socket info file: bind unix socket → write file → read back pid+socket" {

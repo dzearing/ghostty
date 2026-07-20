@@ -170,7 +170,7 @@ pub fn build(b: *std.Build) !void {
     // the orchestrator's tool for cross-machine end-to-end tests. Built on demand
     // via `zig build remote-test-client`.
     {
-        const client = try buildpkg.GhosttyRemoteTestClient.init(b, &config);
+        const client = try buildpkg.GhosttyRemoteTestClient.init(b, &config, &deps);
         remote_test_client_step.dependOn(&client.install_step.step);
     }
 

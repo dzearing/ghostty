@@ -20,4 +20,5 @@ test {
     _ = @import("agent/self_update.zig");
     _ = @import("socket_stream.zig");
     _ = @import("socket_rw.zig");
+    _ = @import("pipe_stream.zig");
 }

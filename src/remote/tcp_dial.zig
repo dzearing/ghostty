@@ -20,23 +20,33 @@
 //! The socket fd itself is closed by the mux's `close` (→ `SocketStream.close`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const client_mux = @import("client_mux.zig");
 const socket_stream = @import("socket_stream.zig");
+const pipe_stream = @import("pipe_stream.zig");
 
-/// A fully stood-up, handshaked client connection over a TCP socket. The caller
-/// drives `conn` (openChannel / writeInput / attachChannel / ...) and tears it all
-/// down with `deinit`.
+/// A fully stood-up, handshaked client connection over a TCP socket, AF_UNIX
+/// socket, or Windows named pipe. The caller drives `conn` (openChannel /
+/// writeInput / attachChannel / ...) and tears it all down with `deinit`.
 pub const Dialed = struct {
     alloc: Allocator,
-    sock: *socket_stream.SocketStream,
+    transport: Transport,
     mux: *client_mux.ClientMux,
     conn: *connection.Connection,
     /// The negotiated parameters from the HELLO handshake.
     negotiated: protocol.Negotiated,
+
+    /// The owned transport wrapper under the mux. The underlying fd/handle is
+    /// closed by the mux's `close` (→ the stream's own `close`); deinit only
+    /// frees the wrapper.
+    pub const Transport = union(enum) {
+        sock: *socket_stream.SocketStream,
+        pipe: *pipe_stream.PipeStream,
+    };
 
     /// Tear everything down in the strict order (see the module doc). Idempotent on
     /// the connection (its `shutdown` is). Safe to call once.
@@ -45,7 +55,10 @@ pub const Dialed = struct {
         self.mux.joinPump();
         self.conn.destroy(self.alloc);
         self.mux.destroy();
-        self.alloc.destroy(self.sock);
+        switch (self.transport) {
+            .sock => |s| self.alloc.destroy(s),
+            .pipe => |p| self.alloc.destroy(p),
+        }
         self.* = undefined;
     }
 };
@@ -100,7 +113,7 @@ pub fn dialTimeout(
     sock.* = socket_stream.SocketStream.init(stream.handle);
     // `dialConnected` takes ownership of `sock` (closes + destroys it on any
     // failure), so no errdefer here.
-    return dialConnected(alloc, sock, encoding, handshake_timeout_ns);
+    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns);
 }
 
 /// Default deadline shared by `dialUnix`; the same rationale as
@@ -151,28 +164,72 @@ pub fn dialUnixTimeout(
     sock.* = socket_stream.SocketStream.init(fd);
     // `dialConnected` takes ownership of `sock` (closes + destroys it on any
     // failure) — cancel the raw-fd errdefer above by returning through it.
-    return dialConnected(alloc, sock, encoding, handshake_timeout_ns);
+    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns);
 }
 
-/// Shared post-connect core for every transport (TCP, AF_UNIX): given an already
-/// heap-allocated `SocketStream` wrapping a connected fd, fold the two logical
-/// lanes through a `ClientMux`, stand up + start a `Connection`, and block until
-/// the HELLO handshake completes (bounded by `handshake_timeout_ns`). Takes
-/// OWNERSHIP of `sock`: on any failure it closes the fd + destroys `sock` and
-/// returns the error; on success the returned `Dialed` owns it.
+/// Connect to a Windows named pipe at `name` (a full `\\.\pipe\...` path) —
+/// the local `ghoztty-agent --listen-pipe` transport (T89c), the Windows
+/// analogue of `dialUnix`. Windows-only: returns `error.PipeUnsupported`
+/// elsewhere.
+pub fn dialPipe(
+    alloc: Allocator,
+    name: []const u8,
+    encoding: protocol.TransferEncoding,
+) !Dialed {
+    return dialPipeTimeout(alloc, name, encoding, default_handshake_timeout_ns);
+}
+
+/// `dialPipe` with an explicit HELLO-handshake deadline (ns). Connect the pipe
+/// (PIPE_BUSY retried inside `pipe_stream.dialHandle`), then hand the handle to
+/// the SAME `dialConnected` core (mux → Connection → HELLO) as every other
+/// transport.
+pub fn dialPipeTimeout(
+    alloc: Allocator,
+    name: []const u8,
+    encoding: protocol.TransferEncoding,
+    handshake_timeout_ns: u64,
+) !Dialed {
+    // Comptime gate: keeps the Windows pipe code out of POSIX analysis (the
+    // same pattern as the agent's --listen-unix gate, mirrored).
+    if (comptime builtin.os.tag != .windows) return error.PipeUnsupported;
+
+    const handle = try pipe_stream.dialHandle(alloc, name);
+    // We own the handle from here; hand it to a PipeStream immediately so
+    // teardown is uniform (same discipline as the TCP/AF_UNIX paths).
+    const pipe = alloc.create(pipe_stream.PipeStream) catch |e| {
+        std.os.windows.CloseHandle(handle);
+        return e;
+    };
+    pipe.* = pipe_stream.PipeStream.init(handle);
+    // `dialConnected` takes ownership of `pipe` (closes + destroys it on any
+    // failure).
+    return dialConnected(alloc, .{ .pipe = pipe }, pipe.connectionStream(), encoding, handshake_timeout_ns);
+}
+
+/// Shared post-connect core for every transport (TCP, AF_UNIX, named pipe):
+/// given an already heap-allocated transport wrapper and its connection-side
+/// stream, fold the two logical lanes through a `ClientMux`, stand up + start a
+/// `Connection`, and block until the HELLO handshake completes (bounded by
+/// `handshake_timeout_ns`). Takes OWNERSHIP of `transport`: on any failure it
+/// closes the stream + destroys the wrapper and returns the error; on success
+/// the returned `Dialed` owns it.
 fn dialConnected(
     alloc: Allocator,
-    sock: *socket_stream.SocketStream,
+    transport: Dialed.Transport,
+    stream: connection.Stream,
     encoding: protocol.TransferEncoding,
     handshake_timeout_ns: u64,
 ) !Dialed {
     errdefer {
-        sock.connectionStream().close(); // closes the fd
-        alloc.destroy(sock);
+        stream.close(); // closes the fd/handle
+        switch (transport) {
+            .sock => |s| alloc.destroy(s),
+            .pipe => |p| alloc.destroy(p),
+        }
     }
 
-    // 2. Fold the two logical lanes onto the single socket via the client mux.
-    const mux = client_mux.ClientMux.create(alloc, sock.connectionStream(), encoding) catch |e| {
+    // 2. Fold the two logical lanes onto the single transport via the client mux.
+    const mux = client_mux.ClientMux.create(alloc, stream, encoding) catch |e| {
         return e;
     };
     errdefer mux.destroy();
@@ -211,7 +268,7 @@ fn dialConnected(
 
     return .{
         .alloc = alloc,
-        .sock = sock,
+        .transport = transport,
         .mux = mux,
         .conn = conn,
         .negotiated = negotiated,
@@ -235,14 +292,19 @@ const MiniAgent = struct {
     err: ?anyerror = null,
 
     fn run(self: *MiniAgent) void {
-        self.runInner() catch |e| {
+        var ss = socket_stream.SocketStream.init(self.fd);
+        self.runStream(ss.connectionStream());
+    }
+
+    /// Transport-agnostic body: serve HELLO/OPEN/DATA over any connected
+    /// `connection.Stream` (socket or named pipe). Closes the stream on exit.
+    fn runStream(self: *MiniAgent, stream: connection.Stream) void {
+        self.runInner(stream) catch |e| {
             self.err = e;
         };
     }
 
-    fn runInner(self: *MiniAgent) !void {
-        var ss = socket_stream.SocketStream.init(self.fd);
-        const stream = ss.connectionStream();
+    fn runInner(self: *MiniAgent, stream: connection.Stream) !void {
         defer stream.close();
 
         var reader = protocol.Reader.init(self.alloc, self.encoding);
@@ -423,6 +485,73 @@ test "dialUnix: stands up a Connection over a real AF_UNIX socket, OPEN + DATA r
     try testing.expect(agent.err == null);
 }
 
+test "dialPipe: stands up a Connection over a real named pipe, OPEN + DATA round-trip" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const enc: protocol.TransferEncoding = .raw;
+
+    var nbuf: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&nbuf, "\\\\.\\pipe\\gztt-t89c-dial-{d}", .{
+        std.os.windows.GetCurrentProcessId(),
+    });
+
+    // Bind a pipe listener and run the mini agent over the accepted instance.
+    var listener = try pipe_stream.PipeListener.bind(alloc, name);
+    defer listener.deinit();
+
+    const Accepter = struct {
+        listener: *pipe_stream.PipeListener,
+        agent: *MiniAgent,
+        fn run(self: *@This()) void {
+            const h = self.listener.accept() catch return;
+            var ps = pipe_stream.PipeStream.init(h);
+            self.agent.runStream(ps.connectionStream());
+        }
+    };
+    var agent = MiniAgent{ .fd = undefined, .alloc = alloc, .encoding = enc };
+    var accepter = Accepter{ .listener = &listener, .agent = &agent };
+    const agent_thread = try std.Thread.spawn(.{}, Accepter.run, .{&accepter});
+
+    // Dial the pipe (the T89c path).
+    var dialed = try dialPipe(alloc, name, enc);
+    try testing.expectEqual(enc, dialed.negotiated.transfer_encoding);
+
+    // OPEN a session.
+    const pane = try dialed.conn.openChannel(.{ .rows = 24, .cols = 80 });
+    try testing.expectEqualStrings("mini-1", pane.session_id);
+
+    // DATA round-trip: input → agent echo → pane ring.
+    try dialed.conn.writeInput(pane, "ping");
+    var buf: [64]u8 = undefined;
+    var total: usize = 0;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (total < "ping".len) {
+        const r = pane.ring.pop(buf[total..]);
+        if (r.read > 0) {
+            total += r.read;
+        } else {
+            if (std.time.milliTimestamp() > deadline) return error.Timeout;
+            std.Thread.yield() catch {};
+        }
+    }
+    try testing.expectEqualStrings("ping", buf[0..total]);
+
+    dialed.conn.closeChannel(pane);
+    dialed.deinit();
+    agent_thread.join();
+    try testing.expect(agent.err == null);
+}
+
+test "dialPipe: connecting to a nonexistent pipe fails cleanly (no leak)" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var nbuf: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&nbuf, "\\\\.\\pipe\\gztt-t89c-nope-{d}", .{
+        std.os.windows.GetCurrentProcessId(),
+    });
+    try testing.expectError(error.FileNotFound, dialPipe(testing.allocator, name, .raw));
+}
+
 test "dialUnix: connect to a nonexistent path fails cleanly (no leak)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
@@ -435,4 +564,8 @@ test "dialUnix: connect to a nonexistent path fails cleanly (no leak)" {
 
 test {
     testing.refAllDecls(@This());
+    // Ride the pipe transport's own unit tests along wherever tcp_dial's
+    // tests run (both app lanes + test-agent) — `pipe_stream` is a private
+    // import, so refAllDecls alone would not pull them in.
+    _ = pipe_stream;
 }

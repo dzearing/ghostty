@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 34) — T89c DONE: agent `--listen-pipe` + `+sessions`
+  pipe dial. New `pipe_stream.zig` (overlapped named-pipe PipeStream/
+  PipeListener/dialHandle; owner-only DACL = the peercred-gate analog;
+  CancelIoEx-on-close so a blocked read unblocks — dodges the T89b
+  synchronous-CloseHandle deadlock). Agent grew the `--listen-pipe`
+  daemon (2c beside --listen-unix) + a console-ctrl graceful-stop
+  snapshot; port.json gained the additive `pipe` field; `tcp_dial.dialPipe`
+  + `cli/sessions.zig` dial it (LOCALAPPDATA state dir). Surprise 1: the
+  GUI-subsystem agent exe only links native-gnu, not native-msvc
+  (undefined WinMain — the T36 log note), and the RTC/wp4-e2e harnesses
+  NEVER built on Windows (rooted at src/remote/, but socket_stream→
+  agent/server→…→../../terminal escapes that module path). Fixed the RTC
+  by re-rooting at src/ via a shim + shared deps (mirrors the agent), then
+  added `--pipe`/`--hold`/`--close-session` for a real scratch client.
+  Surprise 2: `close_session` RPC times out ~10s over BOTH pipe and TCP —
+  the agent unlinks the session then hangs in the production `Pty.deinit`
+  tearing down the ConPTY (T89b fixed only the TEST teardown) → RESULT
+  never sent. Session IS removed; only one serving thread wedges. Filed
+  T96. Also noted: the per-user single-instance mutex is mode-independent,
+  so local-pipe + relay agents can't coexist yet → folded into T89d.
+  `agent-pipe.ps1` ALL PASS (25) ×3; both lanes + test-agent ×3 + P1–P3
+  green. Next: T89d.
 - 2026-07-19 (on-box, 33) — T89b DONE: `zig build test-agent` green ×3
   (first time ever on Windows), added to the standing validation set.
   Five root causes: harness loopback servers read via std Stream.read =
