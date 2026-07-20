@@ -146,8 +146,11 @@ Work these first, in order, before falling back to first-todo-in-table:
    ALL PASS 23/23).
 10. ~~T85~~ — DONE 2026-07-19 (new-window size memory; placement
    persisted on interactive resize/maximize, config > memory > default).
-   **The priority queue is exhausted again** — fall back to
-   first-todo-in-table (next: T25 or T29/T30 Mac-side, T35, T37…).
+11. ~~T25~~ — DONE 2026-07-19 (spec §8 conformance gate: `conformance.ps1`
+   items 1–7 ALL PASS ×3 + hero/relay/skill evidence; spec §9 filled).
+   Filed T86 (harness foreground hardening) + T87 (Mac seat: regression
+   build + merge to main). **Next on-box: T35 or T86** (T29/T30/T87 are
+   Mac-seat; T28's remainder is also open).
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -188,7 +191,7 @@ One line per row. Full spec + validation + evidence per task:
 | T22c | win32 machine chooser dialog + ctrl+shift+n + palette entry | G | T22b | done | 4e7edfc9b |
 | T23 | MSI upgrade/uninstall fix — done 2026-07-19: root cause was wixl's EMPTY File.Version (packaged exe "unversioned" → costing skip + RExP delete = the 26.7.502 vanishing exe), NOT RExP placement. Fix: per-build FILEVERSION (`-Dwindows-file-version`) stamped into the exe + mirrored into the File table, MsiFileHash emptied, `wixl -a x64`, `--test-identity` throwaway E2E; `msi-upgrade.ps1` ALL PASS (33) ×3 incl. ghost-recovery; see details for the on-box 26.7.502 ghost note | H | — | done | 5edea9532 |
 | T24 | Windows release channel + update check — done 2026-07-19: win-vX.Y.Z GitHub releases (--latest=false, MSI asset; win-v1.4.1 published live), notify-only in-app check gated to -Dwindows-update-check channel builds, `publish-windows-release.ps1`, provenance `update_check` field; `update-check.ps1` ALL PASS (12) ×3, P1–P3 + ipc-version + both lanes green | H | T23 | done | 3b0c3bbde.. |
-| T25 | Full conformance checklist (spec §8) | — | T17,T19,T21a | todo | — |
+| T25 | Full conformance checklist (spec §8) — done 2026-07-19: new `conformance.ps1` (items 1–7 E2E from cold, CLAUDE.md three-pane w/ documented Windows equivalents) ALL PASS ×3; item 8 hero-mode.ps1 (60) after harness foreground fix, item 9 fake-relay E2E, item 10 per T17; spec §9 filled; Mac regression + merge → T87; harness gap → T86 | — | T17,T19,T21a | done | (this commit) |
 | T26 | OS color-scheme sync | I | — | done | see details |
 | T27 | PowerShell shell integration | I | — | done | see details |
 | T28 | Minor action no-ops cleanup | I | — | in-progress | see details |
@@ -251,6 +254,8 @@ One line per row. Full spec + validation + evidence per task:
 | T82 | FIX: `zig build test-agent` has never been green on Windows — 5 pre-existing agent-core integration failures (keepalive ×2, self_update ×3; harness uses `std.net.Stream.read` = `ReadFile`-on-overlapped-socket → GetLastError(87)) + a leaked-thread crash mis-attributed to socket_stream + a pty_child segfault. Found (and proven pre-existing at 52e1fd73b baseline) during T81. Not in the parity validation lanes; fix when Phase-G hardening resumes | G | — | todo | — |
 | T83 | FIX: goto_tab off-by-one on win32 — ctrl+1 selected tab 2, ctrl+2 no-op with 2 tabs; `Window.selectTab` treated the 1-indexed GotoTab payload as 0-based. Now `@min(raw-1, count-1)` w/ raw<1 rejected (Mac/GTK parity incl. out-of-range→last). Found+fixed by T01; validated by `keybinds-t01.ps1` | A | T01 | done | a18611ab5 |
 | T85 | FIX: new windows don't remember size — done 2026-07-19: outer size + maximized flag persisted on user-interactive changes only (WM_EXITSIZEMOVE + max/restore transitions) to `%LOCALAPPDATA%\ghoztty\window_placement` (`-debug` for Debug builds); creation uses config > memory (work-area-clamped) > 800×600; `maximize` config now honored; reset stays the escape hatch; `window-size-memory.ps1` ALL PASS (20) ×3, `reset-window-size.ps1` (focus-free rewrite) ALL PASS (10), P1–P3 + both lanes green | I | — | done | 67b0f24a5 |
+| T86 | Harden foreground grab in the ~20 other kb-injection scripts (attach-to-fg-thread + Alt tap, the T25 hero-mode.ps1 fix) — unattended runs abort when a browser owns foreground | — | — | todo | — |
+| T87 | Mac seat: macOS regression build green + merge to main (T25 tail, per working agreements); natural moment for a live relay dial + T29/T30 | — | T25 | todo | — |
 | T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | 3b085a661 |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 23) — T25 DONE (the spec §8 conformance gate). New
+  `test/win32/conformance.ps1`: items 1–7 E2E from cold, CLAUDE.md
+  three-pane example with git-bash vim/tail + powershell, ALL PASS ×3;
+  hero-mode.ps1 (60) + fake-relay E2E + T17 skill evidence cover 8–10;
+  P1–P3 + both lanes green at HEAD; spec §9 table finally filled in.
+  Surprises: msys `tail -f`'s handle denies PowerShell `Add-Content` (use
+  `cmd >>`); a foregrounded browser silently vetoes `SetForegroundWindow`
+  from the harness — fixed in hero-mode.ps1 (attach-to-fg-thread + Alt
+  tap); the same weakness in ~20 other scripts is filed as new T86. T87 filed for the Mac-seat
+  tail (regression build + merge to main). Next on-box: T35 or T86.
+
 - 2026-07-19 (on-box, 22) — T85 DONE (67b0f24a5). New windows now
   remember the last user-chosen size: placement memory (outer size +
   maximized) written only on interactive resize (WM_EXITSIZEMOVE) and

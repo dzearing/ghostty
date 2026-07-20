@@ -202,7 +202,21 @@ public class HeroDrv {
         uint cur = GetCurrentThreadId();
         bool fg = false;
         for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            // A background process may not steal foreground: attach to the
+            // current foreground owner's input thread for the grab, or the
+            // request is silently ignored (unattended box with a browser
+            // left focused aborted every chord, T25).
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            // An injected Alt tap makes this process the last-input source,
+            // which is the other half of the foreground-permission rules.
+            Key(0x12, false); Key(0x12, true);
             SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
             Thread.Sleep(150 + attempt * 200);
             fg = (GetForegroundWindow() == top);
         }

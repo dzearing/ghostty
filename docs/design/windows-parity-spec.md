@@ -243,10 +243,20 @@ Run on the Windows box, debug build, from a fresh app start:
 
 | Phase | Status | Commit(s) | Acceptance run |
 |---|---|---|---|
-| P0 bootstrap | not started | — | — |
-| P1 transport + verbs | not started | — | — |
-| P2 panes | not started | — | — |
-| P3 read/state/rearrange | not started | — | — |
-| P4 skill conformance | not started | — | — |
-| P5 hero/swap | not started | — | — |
-| P6 remote | not started | — | — |
+| P0 bootstrap | done | env only (details doc "Bootstrap & environment") | native Debug build green on box |
+| P1 transport + verbs | done (T03–T08) | 353d70abf..e80e32d39 | ipc-p1.ps1 ALL PASS (re-run at HEAD 2026-07-19) |
+| P2 panes | done (T09–T12) | 72943724a.. | ipc-p2.ps1 ALL PASS (re-run at HEAD 2026-07-19) |
+| P3 read/state/rearrange | done (T13–T16) | 1aac69e91, fee87d441.. | ipc-p3.ps1 ALL PASS (re-run at HEAD 2026-07-19) |
+| P4 skill conformance | done (T17, 2026-07-12) | doc only | full skill-driven session, zero skill modifications |
+| P5 hero/swap | done (T18/T19; TRUE port T58/T59a/T59b/T61) | a859c9976, 5a10762ed.. | hero-mode.ps1 ALL PASS (60) 2026-07-19 |
+| P6 remote | done on-box (T20/T21a/T21b/T22a–c) | 2ed989866, 64c4329c2, 89e31b7fb, 7ec2c7119, 4e7edfc9b | ipc-relay.ps1 + ipc-relay-login.ps1 + ipc-machine-chooser.ps1 ALL PASS; live Mac-device dial = Mac-seat step (T87); reconnect T56 / remote env T42 open |
+
+**§8 conformance run (T25, 2026-07-19):** `test/win32/conformance.ps1`
+executes items 1–7 end-to-end from a cold start — including the CLAUDE.md
+three-pane example (Windows equivalents: git-bash `vim`/`tail`,
+`powershell` for `zsh`) — ALL PASS ×3 at HEAD. Item 8 via hero-mode.ps1
+(60 assertions), item 9 via the fake-relay E2E (live Mac dial pending the
+Mac seat), item 10 per T17 plus the same skill flows re-executed by items
+1–6. Both unit-test lanes green the same day. Remaining before merge to
+main: the macOS regression build on the Mac seat (T87), per the working
+agreements above.

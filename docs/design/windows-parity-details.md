@@ -864,6 +864,28 @@ the CLAUDE.md three-pane example verbatim. Update spec §9 status table.
 Then: macOS regression build green, merge to main per the working
 agreements.
 
+*Evidence (done, on-box scope, 2026-07-19):* new
+`test/win32/conformance.ps1` runs §8 items 1–7 end-to-end from a cold
+start: auto-launch + idempotent `ide` window really running the editor
+(netrw asserted via `+read`), the CLAUDE.md three-pane layout (Windows
+equivalents documented in the script: git-bash `vim`/`tail`, `powershell`
+for `zsh`; git usr\bin prepended to PATH so the commands run verbatim),
+`+read --lines=5` byte-accurate against a live `tail -f` (appender must be
+`cmd >>` — msys tail's handle denies PowerShell `Add-Content`), send-keys
+echo + C-c interrupt (post-T84) + `a\tb\n` expansion proven by a
+`[Console]::In.ReadLine()` comparer pane, set-state aggregation + OSC 7777
+round-trip, rename override, rearrange to 30/70 named-pane layout,
+second-GUI-launch forwarding, per-target teardown + silent missing-target
+close. **ALL PASS ×3.** Item 8: `hero-mode.ps1` ALL PASS (60) — after
+fixing the harness foreground grab (attach-to-foreground-thread + Alt tap;
+unattended box had a browser foreground; same weakness filed for the other
+scripts as T86). Item 9: `ipc-relay.ps1` ALL PASS (fake-relay E2E; a live
+Mac-device dial needs the Mac seat). Item 10: T17's zero-modification
+skill session stands, and items 1–6 re-execute those same skill flows
+verbatim. P1–P3 ALL PASS and both test lanes green at HEAD the same day.
+Spec §9 table filled in. Remaining tail (Mac seat, filed as T87): macOS
+regression build green, then merge to main per the working agreements.
+
 ## T26 — OS color-scheme sync (Phase I)
 
 win32 never calls `core_surface.colorSchemeCallback` (zero call sites), so
@@ -2903,3 +2925,37 @@ repro), and `keybinds-t01.ps1` is ALL PASS (23/23) incl. SIGINT.
 Test-harness trap recorded for future probes: any interrupt-delivery
 test spawned from an automation harness MUST clear the ignore flag
 first or it false-negatives (conpty_smoke now does this in `main`).
+
+## T86 — Harden foreground grab across kb-injection test scripts
+
+Found by T25: with a browser window foreground on the unattended box,
+`SetForegroundWindow` from a background process is silently ignored, so
+every chord-injection script aborts its positive control ("foreground
+owned by another window"). The fix (proven in `hero-mode.ps1`, 2026-07-19)
+is two-part, inside the grab retry loop: (1) `AttachThreadInput` to the
+*current foreground owner's* thread for the duration of the grab, and
+(2) inject an Alt tap via `SendInput` first so this process is the
+last-input source — both halves of the Win32 foreground-permission rules.
+Port that loop to the other ~20 scripts that call
+`SetForegroundWindow(top)` (keybinds-t01, kb-actions, profile-latency,
+split-*, tab-color, title-font, window-color, font-inherit, ipc-version,
+ipc-machine-chooser, ipc-child-exited, focus-follows-mouse,
+confirm-dialogs, config-errors, claude-integration, remote-inherit, …
+grep for `SetForegroundWindow(top);`).
+
+*Validation:* with a non-ghoztty window deliberately foregrounded (e.g.
+`Start-Process notepad` + focus it), each ported script still reaches its
+positive control and passes; scripts stay ALL PASS in the normal case.
+
+## T87 — Mac seat: macOS regression build + merge to main (T25 tail)
+
+The working agreements require the Mac regression build
+(`zig build -Doptimize=Debug` with the Mac toolchain) green before any
+merge to main. T25's on-box conformance is complete (see T25 evidence);
+this task is the Mac-side remainder: run the regression build, then merge
+`users/dzearing/windows-amd64` to main. Also the natural moment for a
+live relay dial to a real Mac device (§8 item 9's only untested leg) and
+the T29/T30 Mac-side fixes.
+
+*Validation:* Mac build green; merge lands; post-merge `+list` smoke on
+both OSes.
