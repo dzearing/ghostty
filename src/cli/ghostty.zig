@@ -30,6 +30,7 @@ const read = @import("read.zig");
 const send_keys = @import("send_keys.zig");
 const set_state = @import("set_state.zig");
 const set_banner = @import("set_banner.zig");
+const reload = @import("reload.zig");
 const new_remote_window = @import("new_remote_window.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
@@ -114,6 +115,9 @@ pub const Action = enum {
     // Use IPC to set or clear the sticky banner of a named pane or window.
     @"set-banner",
 
+    // Use IPC to reload a named viewer pane's content in place.
+    reload,
+
     // Use IPC to open a remote-machine terminal window (dials the agent
     // over TCP). Drives the same flow as the Cmd-Shift-N menu action.
     @"new-remote-window",
@@ -146,6 +150,7 @@ pub const Action = enum {
             .@"send-keys" => "Send text input to a named pane via IPC",
             .@"set-state" => "Set the activity state of a pane or window via IPC",
             .@"set-banner" => "Set or clear the sticky banner of a pane or window via IPC",
+            .reload => "Reload a viewer pane's content in place via IPC",
             .@"new-remote-window" => "Open a remote-machine terminal window via IPC",
         };
     }
@@ -239,6 +244,7 @@ pub const Action = enum {
             .@"send-keys" => try send_keys.run(alloc),
             .@"set-state" => try set_state.run(alloc),
             .@"set-banner" => try set_banner.run(alloc),
+            .reload => try reload.run(alloc),
             .@"new-remote-window" => try new_remote_window.run(alloc),
         };
     }
@@ -290,6 +296,7 @@ pub const Action = enum {
                 .@"send-keys" => send_keys.Options,
                 .@"set-state" => set_state.Options,
                 .@"set-banner" => set_banner.Options,
+                .reload => reload.Options,
                 .@"new-remote-window" => new_remote_window.Options,
             };
         }

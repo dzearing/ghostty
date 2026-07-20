@@ -1183,6 +1183,12 @@ typedef struct {
   const char** arguments;
 } ghostty_ipc_action_set_banner_s;
 
+typedef struct {
+  // null terminated list of arguments, it will be null itself if there are
+  // no arguments
+  const char** arguments;
+} ghostty_ipc_action_reload_s;
+
 typedef union {
   ghostty_ipc_action_new_window_s new_window;
   ghostty_ipc_action_split_s split;
@@ -1192,6 +1198,7 @@ typedef union {
   ghostty_ipc_action_send_keys_s send_keys;
   ghostty_ipc_action_set_state_s set_state;
   ghostty_ipc_action_set_banner_s set_banner;
+  ghostty_ipc_action_reload_s reload;
 } ghostty_ipc_action_u;
 
 // apprt.ipc.Action.Key
@@ -1204,6 +1211,7 @@ typedef enum {
   GHOSTTY_IPC_ACTION_SEND_KEYS,
   GHOSTTY_IPC_ACTION_SET_STATE,
   GHOSTTY_IPC_ACTION_SET_BANNER,
+  GHOSTTY_IPC_ACTION_RELOAD,
 } ghostty_ipc_action_tag_e;
 
 //-------------------------------------------------------------------

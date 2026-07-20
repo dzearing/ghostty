@@ -163,6 +163,9 @@ pub const Action = union(enum) {
     /// Set or clear the sticky banner of a named pane or window.
     set_banner: SetBanner,
 
+    /// Reload a named viewer pane's content in place.
+    reload: Reload,
+
     pub const NewWindow = struct {
         /// A list of command arguments to launch in the new window. If this is
         /// `null` the command configured in the config or the user's default
@@ -418,6 +421,35 @@ pub const Action = union(enum) {
         }
     };
 
+    pub const Reload = struct {
+        arguments: ?[][:0]const u8,
+
+        pub const C = extern struct {
+            arguments: ?[*]?[*:0]const u8,
+
+            pub fn deinit(self: *Reload.C, alloc: Allocator) void {
+                if (self.arguments) |arguments| alloc.free(arguments);
+            }
+        };
+
+        pub fn cval(self: *Reload, alloc: Allocator) Allocator.Error!Reload.C {
+            var result: Reload.C = undefined;
+
+            if (self.arguments) |arguments| {
+                result.arguments = try alloc.alloc([*:0]const u8, arguments.len + 1);
+
+                for (arguments, 0..) |argument, i|
+                    result.arguments[i] = argument.ptr;
+
+                result.arguments[arguments.len] = null;
+            } else {
+                result.arguments = null;
+            }
+
+            return result;
+        }
+    };
+
     /// Sync with: ghostty_ipc_action_tag_e
     pub const Key = enum(c_int) {
         new_window,
@@ -428,6 +460,7 @@ pub const Action = union(enum) {
         send_keys,
         set_state,
         set_banner,
+        reload,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_IPC_ACTION_");

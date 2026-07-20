@@ -153,6 +153,27 @@ ghoztty +set-banner --target=dev --clear
 
 Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels).
 
+### `ghoztty +reload`
+
+Reload a named **viewer pane** (see Viewer Panes below) in place — no
+close/reopen. Website viewers re-fetch the page from origin (bypassing
+caches); file viewers re-render the file preserving scroll position (they
+already live-reload on their own, so this mainly matters for URL viewers).
+
+```
+ghoztty +reload --target=<name>
+```
+
+- `--target`: Named window or pane (or a pane id). Required. For a window
+  target the reload applies to its focused pane.
+- Targeting a terminal pane fails with `... is a terminal pane, nothing to
+  reload` (exit 1), mirroring how terminal-only commands reject viewer panes.
+
+```bash
+ghoztty +split --target=dev --name=preview --view=http://localhost:3000
+ghoztty +reload --target=preview
+```
+
 ### `ghoztty +new-remote-window`
 
 Open a terminal window whose shell runs on a remote machine via a `ghoztty-agent`
