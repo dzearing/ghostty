@@ -29,12 +29,19 @@ extension Ghostty {
         /// hint that there's more to view.
         private static let collapsedContentHeight: CGFloat = 24
 
-        /// The width a single table cell grows to before its content wraps
-        /// to the next line. Long cell text word-wraps within this bound and
-        /// the row height expands to fit, rather than being clipped to one
-        /// line — while a very long cell stops widening the table absurdly,
-        /// matching how a normal markdown renderer lays out table cells.
+        /// Fallback per-column cap used ONLY before the banner's real width is
+        /// measured (the very first layout pass, when `availableWidth` is still
+        /// 0). Once the width is known, columns size to the available space
+        /// instead (see `columnWidths(for:available:)`), so a row uses the full
+        /// pane width before wrapping rather than wrapping at this fixed bound
+        /// with the pane half-empty.
         private static let maxCellWidth: CGFloat = 360
+
+        /// The banner's measured inner width (content area, inside padding),
+        /// fed back from a background `GeometryReader`. Drives table column
+        /// sizing so cells wrap only when they genuinely exceed the pane width.
+        /// 0 until the first layout pass measures it.
+        @State private var availableWidth: CGFloat = 0
 
         /// Collapsed state is per-pane and ephemeral; it resets when the
         /// banner is cleared and set again.
@@ -46,13 +53,18 @@ extension Ghostty {
             // chevron and ignore background clicks.
             let collapsible = text.contains("\n")
 
+            // Width the content column may use for table layout: the measured
+            // inner width, less the HStack's spacing to the trailing spacer and
+            // the collapse chevron (when present). 0 until first measured.
+            let contentBudget = max(0, availableWidth - 8 - (collapsible ? 26 : 0))
+
             HStack(alignment: .top, spacing: 8) {
                 // Paragraph-style gap between blocks (text runs, tables);
                 // lines within a text run stay tight since a run is a
                 // single Text.
                 let content = VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                        blockView(block)
+                        blockView(block, budget: contentBudget)
                     }
                 }
                 if collapsed {
@@ -84,6 +96,16 @@ extension Ghostty {
                     .help(collapsed ? "Expand banner" : "Collapse banner")
                 }
             }
+            // Measure the inner content width (the HStack fills it via the
+            // trailing Spacer) and feed it back for table column sizing. A
+            // preference key delivers the value outside the view-update pass,
+            // so it never triggers "modifying state during update".
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(key: BannerWidthKey.self, value: proxy.size.width)
+                }
+            )
+            .onPreferenceChange(BannerWidthKey.self) { availableWidth = $0 }
             .font(.system(size: 12))
             .padding(12)
             .background(backgroundStyle)
@@ -114,7 +136,7 @@ extension Ghostty {
         }
 
         @ViewBuilder
-        private func blockView(_ block: BannerMarkdown.Block) -> some View {
+        private func blockView(_ block: BannerMarkdown.Block, budget: CGFloat) -> some View {
             switch block {
             case .text(let str, let lineLimit):
                 Text(str)
@@ -157,13 +179,12 @@ extension Ghostty {
                 Divider()
             case .table(let table):
                 let showHeader = table.hasVisibleHeader
-                // Fixed per-column widths (content width, capped at
-                // `maxCellWidth`) let a long cell wrap at a known width while
-                // the Grid grows each row to its wrapped height — a greedy
-                // `frame(maxWidth:)` would instead fill the banner width, and
-                // a rigid `fixedSize` cell overflows its row instead of
-                // growing it.
-                let widths = columnWidths(for: table)
+                // Fixed per-column widths (sized to the available banner width)
+                // let a long cell wrap at a known width while the Grid grows
+                // each row to its wrapped height — a greedy `frame(maxWidth:)`
+                // would collapse layout, and a rigid `fixedSize` cell overflows
+                // its row instead of growing it.
+                let widths = columnWidths(for: table, available: budget)
                 Grid(alignment: .topLeading, horizontalSpacing: 18, verticalSpacing: 4) {
                     if showHeader {
                         GridRow(alignment: .top) {
@@ -280,37 +301,71 @@ extension Ghostty {
             }
         }
 
-        /// The fixed width of each table column: the widest cell's natural
-        /// (single-line) content width, capped at `maxCellWidth` so a very long
-        /// cell wraps rather than stretching the table. Widths are exact (not a
+        /// The fixed width of each table column. Widths are exact (not a
         /// flexible max) so the Grid stays as wide as its content and grows each
         /// row to the height its cells wrap to.
+        ///
+        /// Sizing policy, given the banner's `available` inner width:
+        /// - If every column's natural (single-line) width fits within
+        ///   `available`, each column gets its exact natural width and nothing
+        ///   wraps — so a row uses the full pane width it needs, no more.
+        /// - If the natural widths together exceed `available`, columns share
+        ///   the space max-min fair: narrow columns (e.g. the `**Goal**` label)
+        ///   keep their natural width, and wide columns split the remainder, so
+        ///   each column wraps only at the width the pane can actually give it —
+        ///   never at a fixed cap that leaves the pane half-empty.
+        /// - Before the width is known (`available <= 0`, first layout pass),
+        ///   fall back to the fixed `maxCellWidth` cap so the initial render is
+        ///   never absurdly wide.
         ///
         /// Each run is measured at the weight/face it actually renders (bold
         /// runs at bold, code runs monospaced); measuring bold body text as
         /// regular under-sized the column and force-wrapped bold labels like
         /// `**Prompt**` mid-word. Header cells render bold, so they force bold.
-        /// A cell whose content fits under the cap gets its exact width and so
-        /// never wraps at all; only content past the cap wraps, at word
-        /// boundaries (a lone word longer than the whole cap is the sole case
-        /// that can still break mid-character).
-        private func columnWidths(for table: BannerMarkdown.Table) -> [CGFloat] {
+        private func columnWidths(for table: BannerMarkdown.Table, available: CGFloat) -> [CGFloat] {
             let columns = table.header.count
             guard columns > 0 else { return [] }
-            var widths = [CGFloat](repeating: 0, count: columns)
+            var natural = [CGFloat](repeating: 0, count: columns)
             if table.hasVisibleHeader {
                 for (col, cell) in table.header.enumerated() where col < columns {
-                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: true))
+                    natural[col] = max(natural[col], Self.cellNaturalWidth(cell, forceBold: true))
                 }
             }
             for row in table.rows {
                 for (col, cell) in row.enumerated() where col < columns {
-                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: false))
+                    natural[col] = max(natural[col], Self.cellNaturalWidth(cell, forceBold: false))
                 }
             }
             // A hair of slack absorbs sub-pixel measurement differences so a
             // cell that fits on one line isn't wrapped by rounding.
-            return widths.map { min($0 + 2, Self.maxCellWidth) }
+            natural = natural.map { $0 + 2 }
+
+            // Budget for cell content = available width minus the inter-column
+            // spacing the Grid inserts (18pt between adjacent columns).
+            let budget = available - 18 * CGFloat(max(0, columns - 1))
+
+            // First layout pass (unmeasured) or a degenerate budget: fixed cap.
+            guard budget > 0 else { return natural.map { min($0, Self.maxCellWidth) } }
+
+            // Everything fits on one line: exact natural widths, no wrapping.
+            if natural.reduce(0, +) <= budget { return natural }
+
+            // Overflow: max-min fair share. Process columns narrowest-first —
+            // a column that fits its equal share of the remaining budget takes
+            // its natural width and hands the slack to the wider columns still
+            // to be sized; a column that doesn't fit takes its fair share and
+            // wraps there.
+            var result = [CGFloat](repeating: 0, count: columns)
+            var remaining = budget
+            var left = columns
+            for col in (0..<columns).sorted(by: { natural[$0] < natural[$1] }) {
+                let share = remaining / CGFloat(left)
+                let w = min(natural[col], share)
+                result[col] = w
+                remaining -= w
+                left -= 1
+            }
+            return result
         }
 
         /// The unwrapped width a cell's inline content occupies: the measured
@@ -953,5 +1008,15 @@ extension Ghostty {
                 str[run.range].inlinePresentationIntent = combined
             }
         }
+    }
+}
+
+/// Carries the banner's measured inner width up from a background
+/// `GeometryReader` to the view, so table columns can size to the available
+/// space. Reduce keeps the largest reported width (there is only one reader).
+private struct BannerWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
