@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 32) — T90a DONE: viewer-panes Windows design via 3
+  parallel surveys (Mac viewer impl, win32 structure, WebView2 external
+  research). Pinned: loader-less WebView2 (registry probe +
+  EmbeddedBrowserWebView.dll internal export, error-card degrade — no
+  binary vendored), PaneView `{terminal,viewer}` retype (cheaper than
+  Mac's: win32 split ops are already pure Zig, no per-action bypass),
+  WebResourceRequested 3-tier resolver for the already-shipped viewer
+  assets, Mac-parity IPC error strings + additive list `type`/`url`
+  (CLI renderer already done), interim explicit `--view` error (today it
+  silently opens a terminal), v1 gaps pinned (FFM + T94 band over
+  Chromium children, hero excludes viewers). Found a CLI bug for T90b:
+  resolveViewArgument's absolute check is POSIX-only. T90 split →
+  T90b–T90h; T89f must reserve manifest `kind`/`viewer_location`.
+  Doc-only, no code. Next: T89b.
 - 2026-07-19 (on-box, 31) — T89a DONE: session-persistence Windows design
   via 3 parallel scouts (Mac design doc, agent core, win32 app). Big
   finding: the agent already owns ConPTYs cross-platform (pty_child.zig

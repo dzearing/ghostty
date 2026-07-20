@@ -3445,14 +3445,258 @@ beats silently opening a terminal — pin in design).
 
 *Validation:* design section + T90 split into sized subtasks; no code.
 
+*Evidence (done 2026-07-19):* 3-way survey (Mac viewer implementation +
+win32 app structure + WebView2 external research, parallel agents).
+Mac's design is approved-and-shipped (`docs/design/viewer-panes.md`,
+"do not re-litigate") — this design is a PORT of it, adapted to win32
+facts. Decisions pinned below; T90 split → T90b–T90h.
+
+### T90a design (pinned)
+
+1. **Engine: WebView2**, loader-less. Detect the Evergreen runtime via
+   the registry (`pv > 0.0.0.0` under `HKLM\SOFTWARE\WOW6432Node\
+   Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`
+   and the HKCU twin), locate its install dir, `LoadLibrary`
+   `EmbeddedBrowserWebView.dll`, call its
+   `CreateWebViewEnvironmentWithOptionsInternal` export — the
+   webview/webview + go-webview2 approach (de-facto stable for years;
+   undocumented, so every step degrades to the native error card, never
+   a crash). No WebView2Loader.dll binary vendored into the repo, no
+   NuGet step; COM vtables hand-declared in Zig (`webview2.zig`),
+   feature-gated by QueryInterface (`ICoreWebView2_3`, `_13`, …) per the
+   COM versioning contract — never assume by SDK header.
+2. **Runtime absent / create failed** → native owner-painted **error
+   card** child window ("Viewer requires the Microsoft Edge WebView2
+   Runtime" + short install hint; dark-mode aware). Same card renders
+   file-missing/non-UTF8 errors before the web engine is up. The pane
+   stays a normal split-tree citizen (resize/close/focus).
+3. **`SplitTree(Surface)` → `SplitTree(PaneView)` retype** —
+   `src/apprt/win32/PaneView.zig`, tagged union
+   `{ terminal: *Surface, viewer: *ViewerPane }` with duck-typed
+   `ref/unref/eql`, plus accessors the tree call sites need (`.hwnd`,
+   `.title`, `.setVisible`, close/confirm hooks). Mirrors Mac's
+   approved PaneView; win32 gets it cheaper because split
+   management is already pure Zig tree ops (`layoutNode`, dividers,
+   zoom, equalize, goto/swap are leaf-kind-agnostic — no
+   per-action bypass pattern like Mac's BaseTerminalController).
+   `IpcRegistry.Target` keeps two variants; `.pane` just becomes
+   `*PaneView` (no separate `.viewerPane` case — the union carries the
+   kind; simpler than Mac's registry, pinned here).
+4. **ViewerPane.zig**: own child-window class `GhozttyViewer` (no
+   CS_OWNDC/WGL), hosts an `ICoreWebView2Controller`. **One shared
+   `ICoreWebView2Environment`** per app, created lazily on first
+   viewer, user-data folder `%LOCALAPPDATA%\ghoztty\EBWebView[-debug]`
+   (shared UDF ⇒ shared browser process tree across all panes).
+   Controller creation is async (completed handlers on the GUI thread —
+   the message pump already runs); until ready the pane paints the
+   window background. Bounds via `put_Bounds` (physical px) from
+   `layoutNode`; `put_IsVisible` mirrors `setVisible`;
+   `NotifyParentWindowPositionChanged` on WM_MOVE;
+   `ShouldDetectMonitorScaleChanges=FALSE` + push `RasterizationScale`
+   from the window's DPI handling (per-monitor-v2 house rule).
+5. **Modes** (Mac parity, same extension table): markdown
+   (`md/markdown/mdown/mkd/mdwn`) / code (any other file) / web
+   (`http://`/`https://`). Web mode navigates the real URL directly.
+6. **Offline renderer**: the shared assets already install on Windows
+   (`GhosttyResources.zig` → `share/ghostty/viewer`, found via
+   `resourcesDir()` — zero build work). File modes navigate to
+   `https://ghoztty-viewer/viewer.html` and serve EVERYTHING through
+   `AddWebResourceRequestedFilter` + `WebResourceRequested`,
+   re-implementing Mac's `ViewerSchemeHandler` 3-tier resolution
+   (bundled assets dir → viewed file's dir for relative images →
+   `/`-prefixed absolute) with the same canonicalize+prefix
+   directory-escape guard. Chosen over
+   `SetVirtualHostNameToFolderMapping` because the 3-tier fallback is
+   not expressible as one host→folder map (mapping stays the fallback
+   if interception proves flaky). Content injection is Mac-parity:
+   after `NavigationCompleted`, `ExecuteScript`
+   `window.__viewer.setMarkdown/setCode/setError(...)` with
+   JSON-escaped literals; scroll preservation is already in viewer.js.
+7. **Live reload**: overlapped `ReadDirectoryChangesW` on the file's
+   parent directory (directory-level watch survives atomic
+   save/rename), 100ms debounce, completion posted to the GUI thread
+   as `WM_APP_VIEWER_RELOAD` (house WM_APP pattern), re-read +
+   re-inject.
+8. **Link routing** (file modes): `NavigationStarting` cancels any
+   navigation off the viewer page — `http(s)` → ShellExecute default
+   browser; `https://ghoztty-viewer/...` relative link → resolve via
+   the 3-tier resolver, `.md` → new viewer split (direction right,
+   Mac parity), other local files → ShellExecute default app. Web
+   mode allows in-pane navigation. Both modes: `NewWindowRequested`
+   → `Handled=TRUE` + default browser. (Cancel-blank gotcha noted:
+   only cross-page navigations are cancelled.)
+9. **IPC contract**: add `view: ?[]const u8` to `VerbArgs`
+   (unit-testable in both lanes); `--view` + `--command`/`-e` →
+   `--view cannot be combined with --command/-e` (Mac string).
+   Terminal-only verbs (`+read`/`+send-keys`/`+set-state`/
+   `+set-banner`) reject viewers right after target resolution:
+   `target '<name>' is a viewer pane, not a terminal` (exact Mac
+   string; CLI already just prints server `error` + exits 1).
+   `+close` keeps working — win32's IPC close already bypasses
+   confirmation. `+list`: extend `apprt/ipc/list.zig` `List.Terminal`
+   with **additive** `pane_type` (JSON key `"type"`, default
+   `"terminal"`) + `url` — the Zig CLI renderer (`src/cli/list.zig`)
+   already consumes exactly this shape (`view:` prefix), so the gap is
+   server-side only. Mac golden text/JSON shape stays untouched for
+   terminals. CLI bug found by survey, fix in T90b: `resolveViewArgument`
+   (new_window.zig/split.zig) treats only `/`-prefixed paths as
+   absolute — use `std.fs.path.isAbsolute` so `C:\…`/UNC skip the
+   rewrite.
+10. **Interim behavior (until T90d)**: `--view` on win32 currently
+    falls into the unknown-flag drop and silently opens a terminal.
+    T90b makes it an explicit error:
+    `viewers are not yet supported on Windows` (exit 1). Pinned:
+    explicit failure beats silent wrong behavior.
+11. **Focus/keyboard**: viewer HWND rides the T48 `deferSetFocus`
+    path unchanged; on WM_SETFOCUS the pane calls
+    `MoveFocus(PROGRAMMATIC)` into the controller.
+    `add_AcceleratorKeyPressed` (fires while Chromium has focus for
+    Ctrl/Alt/F-key combos, before the page) checks the app keybind
+    table; bound chords → `Handled=TRUE` + dispatch to the Window, so
+    ctrl+shift+p / split nav / close keep working with a viewer
+    focused. Handler must stay non-blocking (synchronous
+    browser-process wait).
+12. **Known input-routing gaps (pinned, v1)**: Chromium's child
+    windows consume `WM_MOUSEMOVE`/`WM_NCHITTEST` before the host
+    WndProc, so (a) **focus-follows-mouse does not focus viewer
+    panes** in v1 (T75 hover needs surfaceWndProc mouse-move; Mac
+    needed its own WKWebView workaround), and (b) the **T94 ±4.5 DIP
+    grab band does not extend INTO a viewer pane** — divider grabs
+    over a viewer work only in the visual gap. Both documented,
+    follow-up task if they hurt in practice.
+13. **Hero mode**: viewer leaves are **excluded** from the carousel
+    and hero selection (Mac parity — `compactMap(\.surfaceView)`;
+    no GL framebuffer exists to snapshot, and `HeroCarousel` already
+    paints nothing for a leaf without a snapshot). Entering hero in a
+    tab with only viewers is a no-op.
+14. **Dark mode**: on controller ready + `reportColorScheme` (T26
+    path) → QI `ICoreWebView2_13` → Profile →
+    `put_PreferredColorScheme(LIGHT|DARK)` from
+    `Window.systemColorScheme()`; drives the CSS
+    `prefers-color-scheme` the shared viewer.css/hljs themes key on.
+    Older runtime without `_13` → AUTO (follows OS) — acceptable
+    degrade.
+15. **Titles/chrome integration**: viewer `.title` = file basename
+    (file modes) or `DocumentTitleChanged` (web mode), feeding the
+    T92 pane-title level. Activity state: viewers are constant
+    `.idle` (and `+set-state` rejects, §9). T74 dim overlay works
+    unchanged (HWND-generic) once the update walk is PaneView-aware.
+    T67 tint: not applied to viewer content (Mac parity); T35
+    banner: rejected verb, no strip. Terminal splits created FROM a
+    viewer inherit the viewed file's directory as cwd (Mac
+    `splitConfigFromViewer` parity).
+16. **Session persistence**: T89f's manifest must reserve **additive**
+    per-leaf `kind` (absent ⇒ terminal) + `viewer_location` fields
+    when it lands so T90h populates them without a format break (Mac
+    Leaf schema parity). Viewer leaves never touch the agent, count
+    as always-restorable (a mixed tree is never "all dead"), restore
+    by re-opening the location; a missing file restores as the error
+    card.
+17. **File association / open commands**: installer/file-association
+    wiring stays out of scope (interim pin, matches the task brief).
+    Ship the two Mac palette commands: "Viewer: Open File in Pane…"
+    (`GetOpenFileNameW`) and "Viewer: Open URL in Pane…" (prompt
+    dialog, auto-`https://`), both opening a viewer split beside the
+    focused pane.
+18. **Validation vehicle**: one `test/win32/viewer-panes.ps1` grown
+    across T90d–T90h (pane-banner.ps1 model): interim-error assert
+    (T90b) is folded in and flipped when viewers land; asserts for
+    web/md/code panes, +list shape, verb rejections, live reload
+    (rewrite file, assert re-render via +read of a neighbor probe or
+    window title), link-routing policy, palette entries. Unit tests
+    in both lanes for VerbArgs.view, list.zig additive fields, the
+    3-tier resolver path logic, and mode-by-extension.
+
 ## T90 — Viewer panes on Windows: implement (Phase K)
 
-Placeholder; T90a splits it. End state: `+new-window --view` /
-`+split --view` render markdown/text/websites in win32 panes per
-CLAUDE.md, with live reload, link routing, IPC contract, and palette
-commands; validated by a `viewer-panes.ps1` acceptance script.
+Umbrella; split by T90a into T90b–T90h. End state: `+new-window
+--view` / `+split --view` render markdown/text/websites in win32
+panes per CLAUDE.md, with live reload, link routing, IPC contract,
+and palette commands; validated by `viewer-panes.ps1`.
 
-*Validation:* `viewer-panes.ps1` ALL PASS ×3; P1–P3 + both lanes green.
+*Validation:* superseded by the per-subtask validations below.
+
+## T90b — Viewer IPC/CLI floor + interim error (Phase K)
+
+`VerbArgs.view` + mutual-exclusion error (design §9); explicit
+`viewers are not yet supported on Windows` from `+new-window`/`+split`
+when `--view` present (design §10, replaces today's silent terminal);
+additive `pane_type`/`url` in `apprt/ipc/list.zig` (emitted for
+terminals as `"type":"terminal"`, golden Mac shape untouched);
+`resolveViewArgument` Windows-absolute fix (`std.fs.path.isAbsolute`).
+Seed `viewer-panes.ps1` with the interim-error + list-shape asserts.
+
+*Validation:* unit tests both lanes; `viewer-panes.ps1` ALL PASS ×3;
+P1–P3 green (list shape unchanged for terminals).
+
+## T90c — PaneView retype (pure refactor) (Phase K)
+
+Introduce `PaneView.zig` (design §3) and retype
+`SplitTree(Surface)` → `SplitTree(PaneView)` across Window.zig
+(~25 sites), IpcHandlers.zig (~10), IpcRegistry.zig `Target.pane`,
+HeroCarousel.zig, dim/banner update walks. Terminal-only behavior
+byte-identical; no viewer construction yet.
+
+*Validation:* regression only — both lanes, P1–P3, hero-mode.ps1,
+pane-banner.ps1, split-divider.ps1, window-title.ps1 ALL PASS.
+
+## T90d — WebView2 host floor: web-mode viewer panes (Phase K)
+
+`webview2.zig` COM decls + loader-less runtime probe (design §1),
+shared environment + UDF, `ViewerPane.zig` HWND/controller lifecycle
+(bounds/visibility/DPI/focus, §4/§11), native error card (§2),
+`--view=<url>` end-to-end for windows AND splits (web mode only),
+`NewWindowRequested` → browser. Verb rejections land here with the
+first live viewers (§9).
+
+*Validation:* `viewer-panes.ps1` grown (web pane opens/resizes/
+closes; +read/+send-keys/+set-state/+set-banner reject exit 1;
++close silent; runtime-absent path unit-faked) ALL PASS ×3; P1–P3 +
+both lanes green.
+
+## T90e — File viewers: offline markdown/code rendering (Phase K)
+
+Mode-by-extension (§5), WebResourceRequested 3-tier resolver with
+escape guard (§6), `window.__viewer` injection, `+list`
+`"type":"viewer"`/`url` populated (§9), dark-mode
+PreferredColorScheme sync (§14), file-missing/non-UTF8 error card,
+relative-image resolution.
+
+*Validation:* `viewer-panes.ps1` grown (md + code + missing-file
+panes, list JSON/`view:` text, dark/light toggle probe) ALL PASS ×3;
+resolver unit tests both lanes.
+
+## T90f — Live reload + link routing (Phase K)
+
+ReadDirectoryChangesW watcher + debounce + WM_APP_VIEWER_RELOAD
+(§7), scroll preservation E2E, NavigationStarting policy (§8):
+http(s)→browser, relative `.md`→viewer split, other file→default
+app; web-mode in-pane navigation preserved.
+
+*Validation:* `viewer-panes.ps1` grown (atomic-save rewrite
+re-renders; link-click routing faked via ExecuteScript-driven click)
+ALL PASS ×3.
+
+## T90g — Viewer chrome & command integration (Phase K)
+
+Titles → T92 pane level (§15), DocumentTitleChanged, hero exclusion
+(§13), accelerator forwarding for app chords (§11), dim-overlay walk,
+split-from-viewer cwd inheritance, palette "Viewer: Open File/URL in
+Pane…" (§17).
+
+*Validation:* `viewer-panes.ps1` grown (tab title, ctrl+shift+p from
+focused viewer, hero no-op tab, palette entries) ALL PASS ×3;
+hero-mode.ps1 regression green.
+
+## T90h — Viewer session-persistence restore + E2E hardening (Phase K)
+
+Populate the reserved manifest fields (§16), restore-by-reopen,
+missing-file error-card restore, mixed-tree never-all-dead rule;
+full `viewer-panes.ps1` pass ×3 + P1–P3 + both lanes at HEAD.
+
+*Validation:* `viewer-panes.ps1` (full) ALL PASS ×3; a
+restore-cycle assert (quit app, relaunch, viewer pane back). Deps:
+T89f landed.
 
 ## T91 — Banner markdown parity with Mac (Phase I)
 

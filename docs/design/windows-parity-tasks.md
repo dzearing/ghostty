@@ -170,11 +170,15 @@ Work these first, in order, before falling back to first-todo-in-table:
 14. ~~T89a~~ — DONE 2026-07-19 (session-persistence Windows design +
    T89 split into T89b–T89i; T95 re-probed at session start: still
    wedged — SendInput swallowed, session unelevated, stays blocked).
-   **Next on-box, in order: T90a → T89b → T89c…T89i** (then the T90
-   implement series; T29/T30/T87 are Mac-seat; T28's remainder and
-   T82 fold into T89b). Flag for the Mac seat: main's
+   **Next on-box, in order: ~~T90a~~ → T89b → T89c…T89i** (then the
+   T90b–T90h implement series; T29/T30/T87 are Mac-seat; T28's
+   remainder and T82 fold into T89b). Flag for the Mac seat: main's
    `Hello.encode`/build_version elision test was red on main itself —
    fixed on this branch (362d1d4bc), needs to flow back via T87.
+15. ~~T90a~~ — DONE 2026-07-19 (viewer-panes Windows design: loader-less
+   WebView2 + PaneView retype + Mac-parity contracts; T90 split into
+   T90b–T90h, T90b–T90g independent of the T89 series, T90h needs
+   T89f). Next on-box: **T89b**.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -291,8 +295,15 @@ One line per row. Full spec + validation + evidence per task:
 | T89g | Tombstone relaunch floor on win32: agent-restart/reboot, session-relaunch auto|prompt E2E, ring-snapshot scrollback + divider; `session-relaunch.ps1` | K | T89f | todo | — |
 | T89h | Autostart (HKCU Run key) + upgrade-script agent guard + agent in release zip/MSI + delivery to all 3 install locations + docs un-gate | K | T89g | todo | — |
 | T89i | E2E hardening: PS port of session-persistence.py (incl. --winsize), crash-kill re-attach, persistence-on soak + flood-during-reattach; `session-persistence.ps1` | K | T89h | todo | — |
-| T90a | Viewer panes on Windows: DESIGN (WebView2 rec., split-tree viewer leaf, offline renderer scheme, live reload, link routing, IPC contract, interim --view error) + split T90 | K | T88 | todo | — |
-| T90 | Viewer panes on Windows: IMPLEMENT (split by T90a) — --view markdown/text/website panes per CLAUDE.md | K | T90a | todo | — |
+| T90a | Viewer panes on Windows: DESIGN — done 2026-07-19: 3-way survey (Mac viewer impl + win32 structure + WebView2 research); pinned: loader-less WebView2 (registry probe + internal create export, error-card degrade), PaneView retype `{terminal,viewer}`, WebResourceRequested 3-tier resolver, Mac-parity IPC strings + additive list `type`/`url`, interim explicit `--view` error, FFM/T94-band/hero exclusions, T89f manifest reserves `kind`/`viewer_location`; split T90 → T90b–T90h. Design in details §T90a | K | T88 | done | (this commit) |
+| T90 | Viewer panes on Windows: IMPLEMENT — umbrella; split by T90a into T90b–T90h | K | T90a | skipped(split → T90b–T90h) | — |
+| T90b | Viewer IPC/CLI floor: VerbArgs.view + mutual-exclusion, interim "viewers are not yet supported on Windows" error, additive list.zig `pane_type`/`url`, resolveViewArgument isAbsolute fix; seed `viewer-panes.ps1` | K | T90a | todo | — |
+| T90c | PaneView retype (pure refactor): SplitTree(Surface)→SplitTree(PaneView) across Window/IpcHandlers/IpcRegistry/HeroCarousel + overlay walks; regression-validated only | K | T90b | todo | — |
+| T90d | WebView2 host floor: webview2.zig COM decls + loader-less probe, shared env/UDF, ViewerPane HWND/controller lifecycle, native error card, web-mode `--view` E2E, verb rejections | K | T90c | todo | — |
+| T90e | File viewers: mode-by-extension, WebResourceRequested 3-tier resolver, __viewer injection, +list viewer fields populated, PreferredColorScheme dark sync, error card | K | T90d | todo | — |
+| T90f | Viewer live reload (ReadDirectoryChangesW + debounce) + link routing (browser / .md→viewer split / default app) | K | T90e | todo | — |
+| T90g | Viewer chrome & commands: T92 titles, hero exclusion, accelerator forwarding, dim walk, split-from-viewer cwd, palette Open File/URL in Pane | K | T90f | todo | — |
+| T90h | Viewer session-persistence restore (T89f manifest fields) + full viewer-panes.ps1 hardening ×3 | K | T90g,T89f | todo | — |
 | T91 | Banner markdown parity — done 2026-07-19: block parser rewrite (parseBlocks: headings, `---` rules, marker-gutter lists, GFM+headerless tables w/ `:` alignment + `\|`, native checkboxes, 10-line cap) + overlay measure/draw walker (bold-measured capped column widths, cell word-wrap, green RoundRect checkboxes, chevron collapse w/ fade, 12dip padding); `pane-banner.ps1` grown to 37 asserts ALL PASS ×3, P1–P3 + both lanes green | I | T88 | done | (this commit) |
 | T92 | Window-level titles — done 2026-07-19: three-level model (window pin → tab pin → pane title); `.prompt_title` branches on payload into a 3-level RenameDialog (Mac captions), Surface user-title w/ terminal-title restore, per-tab pin, `+rename --title=""`/empty-commit clears, 3 palette entries; `window-title.ps1` ALL PASS (46) ×3 | I | T88 | done | (this commit) |
 | T93 | Brokered OAuth for Windows relay sign-in — done 2026-07-19: new relay_session.zig (/oauth/exchange|renew|signout), account store = session token + expiry + relay_base (DPAPI), renew rotates + persists, no client secret anywhere, -Dgoogle-client-id via build_config, logout revokes, legacy store ⇒ one re-login; `ipc-relay-login.ps1` rewritten (31) ALL PASS ×3, P1–P3 + both lanes + GUI build green | G | T88 | done | (this commit) |
