@@ -273,6 +273,15 @@ remote_dialed: ?RemoteDialed = null,
 /// (set via `setRemoteMachine`, freed in `deinit`). Null for local windows.
 remote_machine: ?RemoteMachine = null,
 
+/// The shared LOCAL session-persistence agent connection this window's
+/// surfaces ride (T89d), or null when persistence is off / unavailable / this
+/// is a cross-machine remote window. BORROWED — owned by `App.local_agent`
+/// (app lifetime), NOT torn down in `deinit`. Set at createWindow time so the
+/// initial surface AND all tabs/splits inherit it (via `buildRemoteInherit`),
+/// exactly like `remote_dialed` for a cross-machine window. Mutually exclusive
+/// with `remote_dialed`.
+local_agent_conn: ?*remote_connection.Connection = null,
+
 /// The window-level title pin (`+new-window --title`, `+rename`, the
 /// "Change Window Title" prompt) — mirrors the Mac windowTitleOverride.
 /// When set, the titlebar shows this over every tab/pane title until
@@ -810,8 +819,16 @@ const RemoteInherit = struct {
 /// command/cwd inheritance and opens the agent's default shell in its
 /// default cwd.
 fn buildRemoteInherit(self: *Window, parent: ?*Surface) ?RemoteInherit {
-    const dialed = self.remote_dialed orelse return null;
-    const conn = dialed.conn();
+    // Two flavors ride the same inheritance seam: a cross-machine
+    // `remote_dialed` transport (T68), or the LOCAL session-persistence agent
+    // (T89d, `local_agent = true`). They are mutually exclusive.
+    const conn: *remote_connection.Connection, const is_local_agent: bool =
+        if (self.remote_dialed) |dialed|
+            .{ dialed.conn(), false }
+        else if (self.local_agent_conn) |c|
+            .{ c, true }
+        else
+            return null;
 
     var command: ?[]const u8 = null;
     var cwd: ?[]u8 = null;
@@ -831,6 +848,7 @@ fn buildRemoteInherit(self: *Window, parent: ?*Surface) ?RemoteInherit {
             // No per-host default shell store on win32 (yet): a fresh session
             // uses the agent's default shell, like the Mac with no override.
             .command = command,
+            .local_agent = is_local_agent,
         } },
         .cwd = cwd,
     };

@@ -27,6 +27,7 @@ const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
+const LocalAgent = @import("LocalAgent.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
@@ -162,6 +163,12 @@ ipc_server: ?IpcServer = null,
 /// to the live window list and app allocator.
 ipc_registry: IpcRegistry = .{},
 
+/// Find-or-spawn manager for the local session-persistence agent (T89d).
+/// Owns the ONE shared connection every persistent window/tab/split rides
+/// (mirrors the Mac `LocalAgentManager.sharedOwner`). Bounded + non-fatal:
+/// see `LocalAgent.sharedConnection`.
+local_agent: LocalAgent = undefined,
+
 pub const IpcTarget = IpcRegistry.Target;
 
 pub fn init(
@@ -236,6 +243,7 @@ pub fn init(
         .config = config,
         .hinstance = hinstance,
         .bg_brush = bg_brush,
+        .local_agent = LocalAgent.init(alloc),
     };
 
     // Register the window container class (GDI painting, no CS_OWNDC).
@@ -472,13 +480,10 @@ fn showConfigErrorsIfAny(
 }
 
 pub fn run(self: *App) !void {
-    // Create the initial Window container with one tab.
-    const alloc = self.core_app.alloc;
-    const window = try alloc.create(Window);
-    errdefer alloc.destroy(window);
-    try window.init(self, .{});
-    try self.windows.append(alloc, window);
-    _ = try window.addTab();
+    // Create the initial Window container with one tab. Route through
+    // createWindow so the session-persistence injection (T89d) applies to the
+    // startup window exactly as it does to every later `new_window`.
+    const window = try self.createWindow(.{});
 
     // Surface config load diagnostics once at startup (T69). After the
     // first window exists so the dialog has an owner to center on; the
@@ -706,6 +711,12 @@ pub fn terminate(self: *App) void {
     }
     self.windows.deinit(alloc);
 
+    // Tear down the shared local-agent connection AFTER every window (and its
+    // surfaces) that borrowed it is gone. This is a pipe disconnect, not a
+    // CLOSE — the agent keeps its pinned sessions + snapshots rings so they
+    // re-attach on the next launch (T89d; the close-vs-quit split is T89e).
+    self.local_agent.deinit();
+
     // Free the IPC target registry (keys are owned).
     self.ipc_registry.deinit(alloc);
 
@@ -774,6 +785,19 @@ pub fn createWindow(self: *App, opts: Window.InitOptions) !*Window {
     errdefer alloc.destroy(window);
     try window.init(self, opts);
     errdefer window.deinit();
+
+    // Session persistence (T89d): route a fresh LOCAL window's surfaces through
+    // the local agent so their processes survive this app (quit/crash/upgrade)
+    // and can be re-attached (T89f). Only for a NON-remote window (a
+    // `+new-remote-window` carries `surface_overrides.remote`, and its
+    // tabs/splits inherit that cross-machine connection instead). Bounded +
+    // non-fatal: a broken/unspawnable agent yields null and the window opens as
+    // plain exec surfaces (`buildRemoteInherit` returns null → local ConPTY).
+    const is_remote = if (opts.surface_overrides) |ov| ov.remote != null else false;
+    if (!is_remote and self.config.@"session-persistence") {
+        window.local_agent_conn = self.local_agent.sharedConnection();
+    }
+
     try self.windows.append(alloc, window);
     errdefer _ = self.windows.pop();
     _ = try window.addTab();

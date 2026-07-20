@@ -145,6 +145,16 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
+    // Clear the inherited ignore-Ctrl-C flag (T84 / T89d). The Windows local
+    // agent is spawned DETACHED with CREATE_NEW_PROCESS_GROUP, which disables
+    // ^C delivery for this process AND every child — so every ConPTY session
+    // the agent opens would inherit a shell where ctrl+c never interrupts
+    // native children. Re-enable it here, before any session child is spawned,
+    // exactly as the GUI does at `App.init`. A NULL handler with Add=FALSE
+    // removes the "ignore" entry without disturbing the graceful-stop handler
+    // registered later (`startConsoleCtrlWatcher`).
+    if (builtin.os.tag == .windows) _ = SetConsoleCtrlHandler(null, std.os.windows.FALSE);
+
     // The transfer encoding is fixed at construction (the client pins it in HELLO).
     // Default to raw; `GHOZTTY_AGENT_ENCODING` overrides it (deterministic tests).
     const encoding = encodingFromEnv(alloc);

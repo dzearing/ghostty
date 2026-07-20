@@ -3190,6 +3190,36 @@ as the repo), zig 0.15.2's build runner panics in `convertPathArg`
 `test-agent` before any ssh-cache test runs. Set the env var (it is documented
 in the build-setup memory) before diagnosing a red agent floor.
 
+## T98 — FIX: local-agent session pid reads as a system pid on Windows
+
+Found by T89d (2026-07-20). For a LOCAL session-persistence pane, both
+`+sessions` and (presumably) `+list` report a bogus child pid — a probe of the
+initial agent-backed window showed `sess.pid = 428` ("Secure System", a
+low system pid), not the ConPTY shell's pid. Walking `ParentProcessId` from 428
+reaches only `System`(4)→(0), never the agent. So the agent's recorded
+per-session child pid does NOT track the real shell process.
+
+Likely cause: the agent captures a wrong/uninitialized pid for a ConPTY child
+(ConPTY reparents the child under an OpenConsole/conhost host, and
+`PROCESS_INFORMATION.dwProcessId` vs the pseudoconsole host pid may be confused
+in the agent's `pty_child` spawn path). This is PRE-EXISTING agent behavior
+(T89b/T89c), NOT introduced by T89d — T89d merely surfaced it and worked around
+it in `session-open.ps1` by proving agent-ownership via **survives-app-quit**
+(kill the GUI, the agent still lists the session alive) instead of pid ancestry,
+which is a stronger claim anyway.
+
+Impact: `+list --pid` self-identification on agent-backed panes (a process
+inside the pane can't find its pane by pid), and any pid-based tooling. Bounded:
+does not affect the session's function, typing, or persistence. Not in the
+parity validation lanes.
+
+*Fix (candidate):* audit the agent's ConPTY child-pid capture — record the real
+`PROCESS_INFORMATION.dwProcessId` of the spawned shell and thread it through the
+session roster's pid field; add a `+sessions --json` pid assertion once fixed.
+
+*Validation:* extend `session-open.ps1` to assert the session pid is a live,
+agent-descended process once the capture is fixed (the assertion T89d dropped).
+
 ## T89a — Session persistence on Windows: design (Phase K)
 
 Port the session-persistence feature (CLAUDE.md "Session Persistence"
@@ -3606,6 +3636,87 @@ agent (`+sessions` shows it, pid parented to agent), typing works,
 `session-persistence=off` restores plain exec, agent-unavailable
 falls back to exec within 2s; ALL PASS ×3; P1–P3 green (they must
 pass with persistence ON — it's the default).
+
+### T89d DONE (2026-07-20)
+
+Implementation (five pieces):
+
+1. **`src/apprt/win32/LocalAgent.zig`** (new, ~300 lines) — the Windows
+   find-or-spawn manager, the Zig analog of the Mac `LocalAgentManager`.
+   `sharedConnection()` returns a BORROWED `*connection.Connection` (owned by
+   the App for its lifetime, every persistent window/tab/split rides the ONE
+   connection) or null. Fast path: a warm cached `tcp_dial.Dialed` whose
+   `conn.state() != .dead`. Else: **find** (read `%LOCALAPPDATA%\ghoztty\
+   local-agent[-debug]\port.json` → `dialPipeTimeout` the recorded `pipe`; the
+   dial + HELLO IS the health check, and a dead agent's pipe name has already
+   vanished so the dial fails fast) → **spawn** (`CreateProcessW` DETACHED_PROCESS
+   | CREATE_NEW_PROCESS_GROUP, no handle inheritance, inherited env — the agent
+   never self-updates in `--listen-pipe` mode and the single-instance guard is
+   mode-keyed, T89d1 — with `--listen-pipe=\\.\pipe\ghoztty-agent[-debug]-<user>
+   --port-file --sessions-file`) → poll the info file for a dial, bounded to
+   **2s**. A resolve failure records a **15s cooldown** (`last_failure_ms`) so an
+   unspawnable agent falls straight back to exec instead of re-beachballing every
+   window. `GHOSTTY_LOCAL_AGENT_BIN` overrides the binary (tests/dev); default is
+   `ghoztty-agent.exe` next to `ghoztty.exe`. Windows-only (POSIX returns null /
+   compile-clean stubs). One composer unit test (both lanes).
+
+2. **App wiring** — `App.local_agent: LocalAgent` initialized in `App.init`,
+   torn down in `terminate` AFTER every window/surface that borrowed it is gone
+   (a pipe disconnect, NOT a CLOSE: the agent keeps its pinned sessions +
+   snapshots rings, so they re-attach next launch — T89d; the close-vs-quit
+   split is T89e). `createWindow` gained the injection: for a NON-remote window
+   (`surface_overrides.remote == null`) with `session-persistence` on, set
+   `window.local_agent_conn = local_agent.sharedConnection()`. **`App.run` now
+   routes the STARTUP window through `createWindow`** (it built it inline before,
+   bypassing the injection — the bug the first validation run caught).
+
+3. **Window inheritance** — `Window.local_agent_conn: ?*Connection` (BORROWED,
+   NOT freed in deinit — the App owns it; mutually exclusive with the
+   cross-machine `remote_dialed`). `buildRemoteInherit` now yields the local
+   agent connection with `local_agent = true` when there's no `remote_dialed`,
+   so the initial surface AND every tab/split inherits it through the SAME seam
+   the cross-machine T68 path uses — one choke point covers all three.
+
+4. **Surface backend branch** — `Overrides.Remote.local_agent: bool` →
+   `Surface.remote_is_local_agent` → `remoteBackend()` returns
+   `local_shell_integration = self.remote_is_local_agent`. That one flag drives
+   the core's whole local-agent contract (src/Surface.zig:916+): inject ghoztty
+   shell integration + the per-pane GHOSTTY_* env an exec pane sets, `pinned =
+   true` (survive the viewer quitting), local tty reporting. cwd forwards via the
+   existing `working_directory` seam (a local path is valid — the agent IS this
+   machine); env/pane-id ride the OPEN as on Mac. No core changes were needed —
+   the local-agent path (T04b) already existed cross-platform.
+
+5. **Agent `^C` flag (T84)** — `agent/main.zig` clears the inherited ignore-^C
+   flag (`SetConsoleCtrlHandler(null, FALSE)`) at the top of `main`, before any
+   session child is spawned. The local agent is spawned with
+   CREATE_NEW_PROCESS_GROUP (which disables ^C for the process AND every child),
+   so without this every ConPTY session would inherit a shell where ctrl+c never
+   interrupts native children — exactly the T84 failure, one layer down.
+
+*Evidence:* `test/win32/session-open.ps1` ALL PASS (18) ×3 — (A) persistence ON:
+the GUI stands up the agent (port.json{pipe} written, agent alive), `+sessions`
+lists exactly one alive+attached+**pinned** session, typing round-trips
+(send-keys → +read echo), and after killing ONLY the GUI the agent still runs
+and `+sessions` (app closed) still lists the session alive+**detached** — the
+definitive proof it is agent-owned and outlives the app; (B) persistence OFF: a
+plain exec pane, NO agent spawned (no port.json), `+sessions` finds no session;
+(C) agent binary unreachable: the window still opens promptly and typing works
+(exec fallback within the bounded wait), no session. Both test lanes +
+`test-agent` ×3 + P1–P3 (persistence ON) green.
+
+Design deviations from the T89a plan, all deliberate:
+- **A7 uses survives-app-quit, not pid-ancestry.** The `+sessions` pid for a
+  local ConPTY session reads as a system pid (428 "Secure System") — ConPTY
+  reparents children away from the agent, so ancestry can't prove ownership.
+  Survival of the GUI being killed is the stronger, direct proof. Filed **T98**
+  for the bogus session-pid reporting (pre-existing agent behavior, affects
+  `+list --pid` self-ID on agent-backed panes; not T89d-blocking).
+- **IPC-created windows with explicit overrides stay exec.** A `+new-window`
+  that sets `pending_surface_overrides` (e.g. `--command`) bypasses
+  `buildRemoteInherit`, so it opens a plain exec pane, not agent-backed. The
+  interactive path (fresh windows/tabs/splits) — the common case — is the T89d
+  deliverable; merging local overrides into the agent OPEN is a follow-up.
 
 ## T89e — Close vs quit semantics + confirm carve-out
 

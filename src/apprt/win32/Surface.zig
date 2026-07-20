@@ -203,6 +203,12 @@ palette_filtered: [palette_entries.len + MAX_USER_PALETTE_ENTRIES]u16 = undefine
 /// every surface riding on it has been deinitialized.
 remote_conn: ?*remote_connection.Connection = null,
 
+/// True ⇒ `remote_conn` is the LOCAL session-persistence agent (T89d), so
+/// `remoteBackend()` returns `local_shell_integration = true` (inject shell
+/// integration + GHOSTTY_* env, pin the session). False for a cross-machine
+/// remote window. Set from `Overrides.Remote.local_agent` at init.
+remote_is_local_agent: bool = false,
+
 /// The REMOTE working directory / shell for the OPEN-new session, borrowed
 /// from the IPC request arena for the duration of `core_surface.init` ONLY
 /// (`termio.Remote.init` dupes them). Cleared right after init returns so
@@ -286,15 +292,26 @@ pub const Overrides = struct {
     pub const EnvVar = apprt.ipc.args.EnvVar;
 
     pub const Remote = struct {
-        /// Already dialed + handshake-complete. Owned by the parent Window.
+        /// Already dialed + handshake-complete. Owned by the parent Window
+        /// (cross-machine) or by the App's `LocalAgent` (local persistence,
+        /// `local_agent = true`).
         connection: *remote_connection.Connection,
-        /// cwd ON THE REMOTE MACHINE, or null for the agent's default.
+        /// cwd ON THE REMOTE MACHINE, or null for the agent's default. For the
+        /// LOCAL agent (`local_agent = true`) the agent IS this machine, so a
+        /// local path is valid here.
         working_directory: ?[]const u8 = null,
         /// Shell ON THE REMOTE MACHINE, or null for the agent's default.
         shell: ?[]const u8 = null,
         /// Command to run instead of an interactive shell (runs through the
         /// resolved remote shell, agent-side). Null ⇒ interactive shell.
         command: ?[]const u8 = null,
+        /// True ⇒ this connection is the LOCAL session-persistence agent (same
+        /// machine + same Ghoztty build), so the core injects ghoztty shell
+        /// integration + the per-pane GHOSTTY_* env an exec pane would set, and
+        /// pins the session against the idle-TTL reaper (T89d). The Windows
+        /// analog of the Mac `Machine.isLocalMachine` signal. NEVER set for a
+        /// cross-machine window.
+        local_agent: bool = false,
     };
 };
 
@@ -452,6 +469,7 @@ pub fn init(
             // Recorded BEFORE core_surface.init so remoteBackend() branches
             // the termio backend to `.remote` (remote-machines design §3.2).
             self.remote_conn = r.connection;
+            self.remote_is_local_agent = r.local_agent;
             self.remote_working_directory = r.working_directory;
             self.remote_shell = r.shell;
             // An explicit remote command travels through the same surface
@@ -3602,6 +3620,12 @@ pub fn remoteBackend(self: *Surface) ?CoreSurface.RemoteBackend {
         // T20 always OPENs a new agent session; ATTACH (session restore)
         // is a later Phase G increment.
         .session_id = null,
+        // LOCAL agent (T89d): inject ghoztty shell integration + per-pane
+        // GHOSTTY_* env, pin the session (survives the viewer quitting). The
+        // core keys pinned/local/tty-reporting off this flag; a cross-machine
+        // window leaves it false (a macOS/other-OS resources path is
+        // meaningless there).
+        .local_shell_integration = self.remote_is_local_agent,
         // Empty ⇒ null so a stray empty string never forwards a cwd/shell.
         .working_directory = if (self.remote_working_directory) |w|
             (if (w.len > 0) w else null)

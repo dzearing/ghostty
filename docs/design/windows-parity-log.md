@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 37) — T89d DONE: win32 surfaces open under the local
+  session-persistence agent. New `LocalAgent.zig` find-or-spawn (dial
+  port.json{pipe} → CreateProcessW DETACHED spawn → 2s-bounded poll; 15s
+  failure cooldown; exec fallback; `GHOSTTY_LOCAL_AGENT_BIN` override), owned by
+  `App.local_agent`; `createWindow` injects the shared conn into non-remote
+  windows when `session-persistence` is on. Reused the existing seams: one flag
+  (`Overrides.Remote.local_agent` → `remoteBackend().local_shell_integration`)
+  turns on the core's whole local-agent contract (shell-integration + GHOSTTY_*
+  env + `pinned`), and `buildRemoteInherit` (the T68 cross-machine inheritance
+  path) now also carries the local agent so the initial surface + every
+  tab/split inherit it from ONE choke point — almost no new surface/core code.
+  Agent clears the inherited ignore-^C flag at init (T84, one layer down: the
+  agent is spawned with CREATE_NEW_PROCESS_GROUP). Two surprises during
+  validation: (1) the STARTUP window was built inline in `App.run`, bypassing
+  the `createWindow` injection — routed it through `createWindow` (first run
+  caught this: agent never spawned). (2) the `+sessions` pid for a local ConPTY
+  session reads as a system pid (428 "Secure System") — ConPTY reparents the
+  child, so I dropped the pid-ancestry assertion for the STRONGER
+  survives-app-quit proof (kill the GUI, the agent still lists the session
+  alive+detached) and filed T98 for the bogus pid. `session-open.ps1` ALL PASS
+  (18) ×3; P1–P3 (persistence ON, default) + both lanes + test-agent ×3 green.
+  Next: T89e (close-vs-quit; folds with T96's production pty-teardown fix).
 - 2026-07-20 (on-box, 36) — T97 DONE (test-agent floor un-flaked). Picked
   T97 over the queued T89d because a flaky agent floor reds every task's
   "test-agent green ×3" bar, including T89d's own validation — worth clearing
