@@ -105,38 +105,6 @@ extension Ghostty {
             .padding(.horizontal, Self.outerMargin)
             .padding(.top, Self.outerMargin * 0.8)
             .padding(.bottom, Self.outerMargin)
-            // A hidden, animation-free copy of the same content measures the
-            // height the banner is headed for and publishes it as the banner's
-            // target height. The host insets the terminal from this — one
-            // exact step per toggle — instead of chasing the visible card's
-            // animated frame through intermediate sizes.
-            .background(alignment: .top) {
-                cardContent(
-                    title: title, rest: rest, collapsible: collapsible,
-                    titleBudget: titleBudget, bodyBudget: bodyBudget
-                )
-                .font(.system(size: 12))
-                .frame(width: availableWidth > 0 ? availableWidth : nil, alignment: .topLeading)
-                .fixedSize(horizontal: false, vertical: true)
-                .transaction { $0.animation = nil }
-                .hidden()
-                .allowsHitTesting(false)
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: BannerTargetHeightKey.self,
-                            value: proxy.size.height + Self.chromeHeight
-                        )
-                    }
-                )
-            }
-        }
-
-        /// Vertical chrome around the banner content: inner card padding plus
-        /// the card's outer margins. Added to the measured content height to
-        /// produce the banner's total (target) height.
-        private static var chromeHeight: CGFloat {
-            innerPadding * 2 + outerMargin * 0.8 + outerMargin
         }
 
         /// The card's inner content: the title row (first block + collapse
@@ -178,10 +146,13 @@ extension Ghostty {
             }
         }
 
+        /// Instant, deliberately unanimated: the terminal below is inset by
+        /// the banner's measured height, so an animated card height would
+        /// drag the Metal surface through per-frame resizes (visible flicker)
+        /// or force a transient gap/overlap. One state change → card and
+        /// terminal inset move together in a single atomic step.
         private func toggleCollapsed() {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                collapsed.toggle()
-            }
+            collapsed.toggle()
         }
 
         /// Card fill for OSes without Liquid Glass: a shade deviated from the
@@ -1116,18 +1087,6 @@ extension Ghostty {
 /// `GeometryReader` to the view, so table columns can size to the available
 /// space. Reduce keeps the largest reported width (there is only one reader).
 private struct BannerWidthKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-/// The banner's total target height — the height the card will occupy once
-/// any collapse/expand animation settles, measured off a hidden animation-free
-/// copy of the content. The host insets the terminal below the banner from
-/// this value so the scroll area moves in one exact step per state change
-/// instead of tracking the animated frame.
-struct BannerTargetHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
