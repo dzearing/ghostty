@@ -9,6 +9,17 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 31) — T89a DONE: session-persistence Windows design
+  via 3 parallel scouts (Mac design doc, agent core, win32 app). Big
+  finding: the agent already owns ConPTYs cross-platform (pty_child.zig
+  via shared CommandCore) and the win32 `.remote` backend already has the
+  session_id ATTACH path (hardcoded null today) — the port is local
+  wiring: `--listen-pipe` transport, LocalAgent find-or-spawn, close-vs-
+  quit CLOSE semantics, and a viewer-side layout manifest (the largest
+  new piece). T89 split → T89b–T89i (T82 folds into T89b); doc-only, no
+  code. T95 probe at session start: still wedged (SendInput swallowed,
+  rel+abs moves all no-op, session unelevated) — row moved to blocked;
+  needs elevated GameInputSvc restart or reboot. Next: T90a.
 - 2026-07-19 (on-box, 30) — T93 DONE: relay sign-in ported to the Mac's
   brokered (BFF) OAuth. New relay_session.zig (exchange/renew/signout wire
   client), account.dat now stores the relay session token + expiry +

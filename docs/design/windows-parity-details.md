@@ -3168,18 +3168,257 @@ starting points:
 *Validation:* design section written here + T89 split into sized
 subtask rows; no code.
 
+### T89a DESIGN (decided 2026-07-19)
+
+Basis: 3-way survey (Mac design doc + shared agent core + win32 app).
+Headline: **most of the feature already exists cross-platform.** The
+agent (`src/remote/agent/`) already owns ConPTYs on Windows
+(`pty_child.zig` spawns via the same `CommandCore.startWindows` as the
+GUI's termio, Job-Object kill-on-close), the wire protocol
+(`src/remote/protocol.zig`: OPEN/ATTACH/gap-fill/RELAUNCH/
+LIST_SESSIONS, HELLO capability negotiation) is transport-agnostic, and
+the win32 app already has the `.remote` termio backend with a
+`session_id` ATTACH path (`src/termio/Remote.zig`; win32
+`Surface.remoteBackend()` hardcodes `session_id=null` today —
+src/apprt/win32/Surface.zig:3602). What's missing is local wiring +
+the viewer-side layout manifest. Decisions:
+
+1. **Transport: named pipe** `\\.\pipe\ghoztty-agent[-debug]-<username>`
+   (mirrors the app-IPC pipe naming), owner-only DACL via the
+   IpcServer.zig SDDL pattern; DACL stands in for the Mac's
+   SO_PEERCRED same-uid check. Agent grows a `--listen-pipe` mode
+   beside the POSIX-only `--listen-unix` (main.zig:668 already rejects
+   UDS on Windows and says "use a named pipe"). Implementation = a
+   pipe-backed `socket_stream.Stream` vtable impl (byte-mode pipe,
+   overlapped I/O); framing/protocol untouched. `port.json` gains an
+   **additive** `pipe` field (`port:0` + `pipe` ⇒ named pipe); old
+   readers ignore it per the agent-contract rules. No protocol/frame
+   changes anywhere — HELLO version/capabilities are already enough.
+2. **Local agent instance = separate from the relay agent** (Mac
+   parity): its own storage dir `%LOCALAPPDATA%\ghoztty\
+   local-agent[-debug]\` (port.json, sessions.json, rings\,
+   agent.lock/heartbeat, agent.log — session_meta/ring_snapshot/
+   layout_meta are std-only tmp+rename+fsync and portable; verify
+   rename-over-existing on NTFS). Debug/release isolation by dir +
+   pipe suffix, like the Mac's `-debug` split.
+3. **Find-or-spawn (win32 LocalAgentManager analog), in Zig**: new
+   `src/apprt/win32/LocalAgent.zig` — read port.json → pid-liveness →
+   dial pipe (HELLO completing IS the health check); else spawn the
+   agent detached (`proc_spawn.zig`; single_instance.zig makes a
+   losing racer exit cleanly) and re-dial with backoff. Mac's bounded
+   wait (2s) + 15s failure cooldown + **fallback to plain `.exec`**
+   carry over verbatim — persistence must never block window opens.
+   Agent binary ships next to ghoztty.exe (`ghoztty-agent.exe`);
+   `GHOSTTY_LOCAL_AGENT_BIN` override kept for dev.
+4. **Surface wiring**: at the existing choke point
+   (`Surface.remoteBackend()` / `remote_conn`), when
+   `session-persistence=on` and the surface has no explicit remote
+   target, inject the shared local-agent connection with
+   `session_id=null` (OPEN, `pinned=true`) and resolved
+   shell/cwd/env (`GHOZTTY_PANE_ID` etc. ride the OPEN env as on
+   Mac). Config fields already parse on Windows (Config.zig:1219,
+   :1237 — unconsumed, no OS gate); `session-relaunch` plumbing is
+   Zig-side only and comes free once surfaces are agent-backed.
+   T84 lesson: the agent clears the inherited ignore-^C flag at init
+   like the GUI does.
+5. **Close vs quit semantics** (the design wrinkle Windows adds: no
+   Mac-style app-vs-window quit split — closing the last window exits
+   the process). Sessions die ONLY on explicit CLOSE frames, so:
+   user closes pane/tab/window → send CLOSE (undo-window analog: none
+   on win32 today — CLOSE sends immediately after the existing
+   confirm); app-exit paths send NOTHING (pipe disconnect ⇒ agent
+   keeps sessions + snapshots rings — the agent's default). Quit
+   paths that keep sessions: new "Quit Ghoztty (keep sessions)"
+   palette/menu action, WM_ENDSESSION (logoff/reboot), upgrade-script
+   process kill, crash. Close-confirm carve-out: `Window.
+   confirmCloseIfNeeded` (Window.zig:3382) and `Surface.close`
+   (Surface.zig:964) prompt on "process running" — for agent-backed
+   surfaces the quit-path wording/no-dialog rule mirrors Mac
+   `853ec3168` (only windows with NO live agent connection gate the
+   dialog; window-close still warns since it truly ends sessions).
+6. **Viewer-side layout manifest + restore** (largest new piece; T85's
+   window_memory.zig is size-only): `%LOCALAPPDATA%\ghoztty\
+   session-layout[-debug].json`, atomic tmp+rename; per window:
+   placement, title pins, tab order/colors, split tree with ratios,
+   per-leaf `{session_id, title, ipc_name, cwd}` — the Mac
+   SessionLayoutManifest schema adapted to win32's tab model. Write:
+   debounced on layout/title change + flush at quit. Restore at
+   launch (before the default window opens): dial agent → probe each
+   leaf (positive-dead via `found`, not cwd truthiness — Mac T06b
+   lesson) → rebuild windows/tabs/splits natively → ATTACH by
+   recorded session id (wire `remoteBackend().session_id`) → gap-fill
+   replay restores scrollback, same PIDs. Drop a manifest entry only
+   when every leaf is positively dead.
+7. **Reboot/agent-restart floor**: tombstone materialization +
+   RELAUNCH + ring-snapshot preload are all shared code already;
+   Windows needs the graceful-stop snapshot hook on its own shutdown
+   paths (tray Exit + service-control/console-ctrl analog of the Mac
+   SIGTERM watcher, which is `if windows return;`-gated today) and
+   `session-relaunch auto|prompt` E2E-verified in win32 panes.
+8. **Autostart: HKCU Run key**, written/refreshed by the GUI when
+   persistence first engages (Mac parity: app writes the LaunchAgent
+   plist). Run key = no console flicker, no schtasks dependency;
+   find-or-spawn already covers crash-restart while the app runs, and
+   after reboot sessions are tombstones regardless. Scheduled-task
+   KeepAlive explicitly rejected for v1 (flicker + the MSI CA lesson).
+9. **Upgrade flow**: app upgrades already kill/swap only the GUI —
+   sessions survive by design (agent untouched, pipe disconnect).
+   Agent lazy upgrade stays deferred exactly as on Mac (HELLO
+   negotiation + additive-only evolution is the compat story; the
+   version-skew rules in CLAUDE.md apply verbatim). The upgrade
+   script must NOT kill ghoztty-agent.exe — add an explicit guard.
+10. **`+sessions` CLI**: `src/cli/sessions.zig` dial path learns the
+    port.json `pipe` field → `dialPipe` front-end on
+    `tcp_dial.dialConnected` (same shape as `dialUnix`); docs get the
+    Windows pipe path. Works with the app closed, as on Mac.
+11. **Out of scope**: cross-machine browse/move (Mac T16–T18 open),
+    agent self-update for the local instance, viewer-pane restore
+    (lands with T90), undo-close window.
+
+Risks pinned: (a) ConPTY children die with the agent (Job Object
+kill-on-close is intentional) — tombstone+relaunch is the recovery,
+same as Mac agent-death; (b) `std.fs.Dir.rename` overwrite semantics
+on NTFS need a unit check before trusting sessions.json atomicity;
+(c) WM_ENDSESSION gives ~5s — ring snapshot must be bounded (2MB/
+session, already is); (d) the T62 renderer-batching lessons apply to
+the Remote backend's inbound ring on win32 (watch for starvation
+under flood in T89i's soak).
+
+Split: T89b–T89i (see state-table rows + sections below). Order:
+b (test floor) → c (agent pipe) → d (open under agent) → e (close/
+quit) → f (manifest+re-attach) → g (relaunch floor) → h (autostart+
+upgrade+delivery) → i (E2E hardening). T89 row itself becomes the
+umbrella (skipped(split)).
+
+*Evidence:* this section; subtask rows landed in the state table;
+no code (per task definition).
+
 ## T89 — Session persistence on Windows: implement (Phase K)
 
-Placeholder for the implementation series; T89a will split it. End
-state: parity with CLAUDE.md "Session Persistence" — new local
-windows/tabs/splits run under a Windows `ghoztty-agent`, survive app
-quit/crash/upgrade with same-PID re-attach (layout, titles, cwd,
-scrollback), reboot relaunch per `session-relaunch`, `+sessions` works,
-agent upgrade is lazy + non-destructive, and the E2E harness
-(`scripts/e2e/session-persistence.py` or a PS port) passes on-box.
+Split by T89a (2026-07-19) into T89b–T89i; this row stays as the
+umbrella. End state unchanged: parity with CLAUDE.md "Session
+Persistence" — new local windows/tabs/splits run under a Windows
+`ghoztty-agent`, survive app quit/crash/upgrade with same-PID
+re-attach (layout, titles, cwd, scrollback), reboot relaunch per
+`session-relaunch`, `+sessions` works, and the E2E harness passes
+on-box.
 
 *Validation:* per-subtask scripts + an on-box kill/upgrade/reboot E2E;
 both lanes + P1–P3 stay green.
+
+## T89b — Agent test floor: `zig build test-agent` green on Windows (T82)
+
+Fix the 5 pre-existing agent integration-test failures + 2 crashes
+(see T82): keepalive ×2 and self_update ×3 share one root cause — the
+TEST HARNESS reads sockets via `std.net.Stream.read` (= `ReadFile` on
+an overlapped socket → `GetLastError(87)`); switch harness reads to
+the overlapped-safe `socket_rw` helpers (T81's panic-free
+Reader/Writer) incl. the `http_client` reader used by self_update.
+Then the leaked-thread exit-3 crash should stop reproducing
+(mis-attributed to socket_stream); the `pty_child: real pty spawn`
+segfault in `ghoztty-agent-test` is a separate root cause — bisect
+spawn vs teardown (conpty_smoke patterns are the reference). Add
+`test-agent` to the standing validation set alongside the two lanes.
+
+*Validation:* `zig build test-agent` ALL green ×3 on-box; both
+existing lanes still green.
+
+## T89c — Agent named-pipe listener + `+sessions` Windows dial
+
+`--listen-pipe` mode in agent main.zig: byte-mode named pipe
+`\\.\pipe\ghoztty-agent[-debug]-<user>`, owner-only DACL (IpcServer
+SDDL pattern), overlapped accept loop, pipe-backed `socket_stream.
+Stream` impl; storage dir `%LOCALAPPDATA%\ghoztty\local-agent
+[-debug]\`; port.json additive `pipe` field; single-instance guard
+verified on Windows; graceful-stop ring-snapshot hook on tray Exit /
+console-ctrl (the SIGTERM-watcher analog). CLI: `sessions.zig` +
+`tcp_dial.dialPipe` so `+sessions` enumerates with the app closed.
+Unit tests for pipe stream + port.json parsing in both lanes.
+
+*Validation:* new `test/win32/agent-pipe.ps1` — start agent, OPEN a
+session via a scratch client, `+sessions` lists it (text + --json),
+kill viewer, session survives, CLOSE removes it; ALL PASS ×3.
+
+## T89d — Win32 surfaces OPEN under the local agent
+
+`src/apprt/win32/LocalAgent.zig` find-or-spawn (port.json → pid check
+→ dial+HELLO; else detached spawn + backoff; 2s bounded wait; 15s
+failure cooldown; `.exec` fallback). Consume `session-persistence` in
+win32; new local windows/tabs/splits inject the shared connection at
+the `remote_conn`/`remoteBackend()` choke point (OPEN, pinned=true,
+resolved shell/cwd/env incl. GHOZTTY_PANE_ID); agent clears the
+inherited ignore-^C flag (T84). `+list` unchanged (panes look local).
+
+*Validation:* new `test/win32/session-open.ps1` — window opens under
+agent (`+sessions` shows it, pid parented to agent), typing works,
+`session-persistence=off` restores plain exec, agent-unavailable
+falls back to exec within 2s; ALL PASS ×3; P1–P3 green (they must
+pass with persistence ON — it's the default).
+
+## T89e — Close vs quit semantics + confirm carve-out
+
+User close of pane/tab/window sends CLOSE (session ends); app-exit
+paths send nothing (sessions survive): "Quit Ghoztty (keep sessions)"
+action + palette/menu entry, WM_ENDSESSION, process kill. Carve-out in
+`Window.confirmCloseIfNeeded`/`Surface.close`/`close_all_windows`:
+agent-backed surfaces follow the Mac `853ec3168` rule (quit paths
+never scare about processes that survive; window-close still warns
+because it truly kills). Dialog wording per the Mac split.
+
+*Validation:* new `test/win32/session-close.ps1` — close pane ⇒
+session gone from `+sessions`; quit action ⇒ session alive; ALL PASS
+×3.
+
+## T89f — Layout manifest + same-PID re-attach restore
+
+Viewer-side manifest `%LOCALAPPDATA%\ghoztty\session-layout[-debug].
+json` (placement, title pins, tab order/colors, split tree + ratios,
+per-leaf session id/title/ipc name/cwd; atomic write, debounced sync,
+flush on quit). Launch-time restore: probe leaves (positive-dead via
+`found`), rebuild windows/tabs/splits, ATTACH by session id (wire
+`remoteBackend().session_id`), gap-fill replay; drop entries only
+when all leaves positively dead; suppress the default blank window
+when restoring. Pure manifest logic unit-tested in both lanes.
+
+*Validation:* new `test/win32/session-reattach.ps1` — build 2-window/
+3-pane layout, record child PIDs, quit-keep-sessions, relaunch,
+assert same PIDs + layout + scrollback text + titles; ALL PASS ×3.
+
+## T89g — Tombstone relaunch floor (agent restart / reboot)
+
+Verify shared tombstone materialization + RELAUNCH + ring-snapshot
+preload on win32: kill agent w/ live sessions → relaunch app →
+`session-relaunch=auto` respawns in-place with the `--- session
+restarted ---` divider; `prompt` leaves the press-any-key pane; ring
+snapshot scrollback precedes the divider. Fix any Windows-specific
+gaps found (snapshot cadence on viewer disconnect, NTFS rename).
+
+*Validation:* new `test/win32/session-relaunch.ps1` — both config
+values E2E + snapshot-scrollback assert; ALL PASS ×3.
+
+## T89h — Autostart, upgrade guard, delivery
+
+HKCU Run key written/refreshed by the GUI when persistence engages
+(debug builds: no Run key — find-or-spawn only); upgrade-ghoztty-
+windows.ps1 gains an explicit "never kill ghoztty-agent.exe" guard +
+a sessions-survive-upgrade assert; agent binary added to the release
+zip/MSI + all 3 install locations; CLAUDE.md/config docs un-gate
+"(macOS)" wording.
+
+*Validation:* upgrade script run on-box with a live session ⇒ session
+re-attaches post-swap; reboot ⇒ agent auto-starts, sessions come back
+as tombstones per config; MSI install/uninstall E2E still green.
+
+## T89i — E2E hardening + soak
+
+PS port of `scripts/e2e/session-persistence.py` (incl. `--winsize`
+PTY-geometry integrity) as `test/win32/session-persistence.ps1`;
+crash-kill (taskkill /f) re-attach; ipc-under-load + a bounded soak
+with persistence on (watch the Remote inbound ring for T62-style
+starvation); flood-during-reattach gap-fill correctness.
+
+*Validation:* `session-persistence.ps1` ALL PASS ×3; soak clean;
+P1–P3 + both lanes + test-agent green at HEAD.
 
 ## T90a — Viewer panes on Windows: design (Phase K)
 
