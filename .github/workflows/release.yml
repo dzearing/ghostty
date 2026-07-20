@@ -33,8 +33,14 @@ jobs:
           echo "DMG_NAME=$DMG_NAME" >> $GITHUB_ENV
 
       - name: Build macOS app
+        env:
+          # Public Google OAuth client id, baked into Info.plist
+          # (GhosttyGoogleClientID) via the -Dgoogle-client-id build option so
+          # the shipped app can start the relay-brokered sign-in. The
+          # confidential client secret lives only on the relay, never here.
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
         run: |
-          zig build -Doptimize=ReleaseFast -Demit-macos-app -Dxcframework-target=native -Dversion-string="$VERSION"
+          zig build -Doptimize=ReleaseFast -Demit-macos-app -Dxcframework-target=native -Dversion-string="$VERSION" -Dgoogle-client-id="$GOOGLE_CLIENT_ID"
 
       - name: Verify release build mode
         run: |
@@ -50,6 +56,23 @@ jobs:
             exit 1
           fi
           echo "✅ Verified ReleaseFast build."
+
+      - name: Embed ghoztty-agent
+        run: |
+          # The zig build embeds the session-persistence agent only into the
+          # zig-out copy of the bundle (src/build/GhosttyXcodebuild.zig); the
+          # DMG below packages the xcodebuild output, which does not get it.
+          # Copy the agent in before codesign so the nested binary gets a
+          # hardened-runtime signature and is covered by the bundle seal.
+          # Without it session-persistence silently degrades to plain
+          # non-persistent windows (v1.13.0 shipped that way).
+          AGENT="zig-out/Ghoztty.app/Contents/MacOS/ghoztty-agent"
+          if [ ! -x "$AGENT" ]; then
+            echo "::error::ghoztty-agent missing from zig-out bundle; refusing to ship a release without session persistence."
+            exit 1
+          fi
+          cp -f "$AGENT" "macos/build/ReleaseLocal/Ghoztty.app/Contents/MacOS/ghoztty-agent"
+          echo "✅ Embedded ghoztty-agent into release bundle."
 
       - name: Codesign app bundle
         env:
@@ -72,8 +95,15 @@ jobs:
           /usr/bin/codesign --verbose -f -s "$MACOS_CERTIFICATE_NAME" -o runtime "macos/build/ReleaseLocal/Ghoztty.app/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app"
           /usr/bin/codesign --verbose -f -s "$MACOS_CERTIFICATE_NAME" -o runtime "macos/build/ReleaseLocal/Ghoztty.app/Contents/Frameworks/Sparkle.framework"
           /usr/bin/codesign --verbose -f -s "$MACOS_CERTIFICATE_NAME" -o runtime "macos/build/ReleaseLocal/Ghoztty.app/Contents/PlugIns/DockTilePlugin.plugin"
+          /usr/bin/codesign --verbose -f -s "$MACOS_CERTIFICATE_NAME" -o runtime "macos/build/ReleaseLocal/Ghoztty.app/Contents/MacOS/ghoztty-agent"
 
           /usr/bin/codesign --verbose -f -s "$MACOS_CERTIFICATE_NAME" -o runtime --entitlements "macos/Ghostty.entitlements" macos/build/ReleaseLocal/Ghoztty.app
+
+          # Strict verify of the sealed bundle (covers the nested agent) so a
+          # broken seal fails here instead of at notarization.
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "macos/build/ReleaseLocal/Ghoztty.app"
+
+          test -x "macos/build/ReleaseLocal/Ghoztty.app/Contents/MacOS/ghoztty-agent" || { echo "::error::ghoztty-agent missing from signed bundle"; exit 1; }
 
       - name: Create DMG
         env:

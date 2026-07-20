@@ -67,7 +67,7 @@ struct TerminalCommandPaletteView: View {
             sections.append(CommandPaletteSection(title: nil, options: updates))
         }
 
-        let rest = jumpOptions + terminalOptions + setupOptions + remoteOptions
+        let rest = jumpOptions + terminalOptions + setupOptions + remoteOptions + viewerOptions
 
         let defaultSorted = rest.sorted { a, b in
             let aNormalized = a.title.replacingOccurrences(of: ":", with: "\t")
@@ -188,6 +188,27 @@ struct TerminalCommandPaletteView: View {
             RemoteActivityMonitor.openFromPalette(surfaceView: surfaceView)
         })
         return options
+    }
+
+    /// Viewer pane commands: open a rendered file or website as a split
+    /// beside the current pane (same as the CLI `+split --view=...`).
+    private var viewerOptions: [CommandOption] {
+        [
+            CommandOption(
+                title: "Viewer: Open File in Pane…",
+                description: "Render a markdown or text file beside this pane",
+                leadingIcon: "doc.richtext"
+            ) {
+                ViewerCommands.openFileFromPalette(surfaceView: surfaceView)
+            },
+            CommandOption(
+                title: "Viewer: Open URL in Pane…",
+                description: "Open a website beside this pane",
+                leadingIcon: "globe"
+            ) {
+                ViewerCommands.openURLFromPalette(surfaceView: surfaceView)
+            },
+        ]
     }
 
     /// Commands for jumping to other terminal surfaces.

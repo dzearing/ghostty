@@ -28,6 +28,16 @@ func main() {
 		logger.Warn("DEV_AUTH enabled — not for production")
 	}
 
+	// Brokered-OAuth (BFF) readiness: the /oauth/exchange + /oauth/renew flow
+	// needs SESSION_ENC_KEY (to encrypt Google refresh tokens at rest). Without
+	// it those endpoints answer 503, so the macOS app can't sign in — surface
+	// that loudly at startup instead of failing silently at first sign-in.
+	if cfg.GoogleClientID != "" && len(cfg.SessionEncKey) != 32 {
+		logger.Warn("SESSION_ENC_KEY unset or invalid — brokered OAuth (/oauth/exchange) disabled; the macOS app cannot sign in")
+	} else if len(cfg.SessionEncKey) == 32 {
+		logger.Info("brokered OAuth enabled (/oauth/exchange, /oauth/renew, /oauth/signout)")
+	}
+
 	// OIDC discovery happens here; give it a bounded window at startup.
 	initCtx, cancelInit := context.WithTimeout(context.Background(), 30*time.Second)
 	auth, err := NewAuthenticator(initCtx, cfg, logger)

@@ -506,8 +506,16 @@ pub const Pane = struct {
     /// The agent-assigned session id (duped, connection-owned). Empty for a pane
     /// whose attach did not yield one (e.g. `not_found`).
     session_id: []u8,
-    /// The child pid reported by OPENED (0 for an attach, which doesn't report it).
+    /// The child pid reported by OPENED / ATTACHED(alive) / RELAUNCHED (0 when
+    /// the agent pre-dates the ATTACHED.pid field or the session has no child).
     pid: i64,
+    /// The child's PTY slave path on the AGENT'S machine (wp3), duped and
+    /// connection-owned (freed in `teardownPane`). Null when the agent didn't
+    /// report one (older agent, Windows ConPTY, or a childless pane). NOTE: for
+    /// a cross-machine connection this names a REMOTE tty — callers deciding to
+    /// surface it locally (e.g. `+list --tty` matching) must gate on the
+    /// connection being the local agent.
+    tty: ?[]u8 = null,
     /// The inbound ring the pane's consumer drains. Connection-owned; registered in
     /// the channel table for the pane's lifetime.
     ring: *ring.Channel,
@@ -548,6 +556,17 @@ pub const AttachOutcome = struct {
     attached_elsewhere: bool,
     /// Present iff `status == .dead` (tombstone exit code, §7.1/§7.4).
     exit_code: ?i64,
+    /// Set (with `status == .dead`) when the dead session is a RELAUNCHABLE
+    /// tombstone the agent materialized from disk at start (§5.4 reboot floor,
+    /// T12b) — the recorded argv/cwd can respawn it via `relaunchChannel`. A
+    /// genuinely-exited child leaves this false. The caller uses it to decide
+    /// whether to auto-relaunch (T12c) instead of showing an exited overlay.
+    relaunchable: bool = false,
+    /// The agent-authoritative session channel the `ATTACHED` reply arrived on
+    /// (`rpc.channel`). Retained even for a dead attach (where no pane/ring is
+    /// kept) so the caller can address a follow-up `relaunchChannel` at the
+    /// SAME channel the agent will stream the respawned session on.
+    channel: u128 = 0,
     rows: u16,
     cols: u16,
     /// Duped from the reply and owned here (null when the reply omitted them).
@@ -562,6 +581,33 @@ pub const AttachOutcome = struct {
         if (self.title) |t| self.alloc.free(t);
         self.* = undefined;
     }
+};
+
+/// The outcome of `relaunchChannel` (§5.4 reboot floor, T12c). A `RELAUNCH`
+/// respawns a dead-but-relaunchable session in place and streams FRESH output
+/// from offset 0, so a live pane (`ok == true`) comes back with no resync
+/// watermark (unlike an attach, which gap-fills a retained ring).
+pub const RelaunchOutcome = struct {
+    /// The live pane on `ok == true`; null otherwise. Torn down via
+    /// `detachChannel`/`closeChannel` like any other pane.
+    pane: ?*Pane,
+    /// The session is alive under `pid` and streaming on its channel.
+    ok: bool,
+    /// The agent still has the session id. `ok == false, found == false` ⇒
+    /// reaped/unknown (the caller may fall back to a fresh OPEN); `ok == false,
+    /// found == true` ⇒ present but not relaunchable, or the respawn failed.
+    found: bool,
+    /// The respawned child pid (0 when `!ok`).
+    pid: i64,
+    /// The agent already replayed pre-restart scrollback + the restart divider from
+    /// a ring disk snapshot (§5.4 reboot scrollback, T13); the caller should NOT
+    /// print its own divider. False when the agent had no snapshot (blank relaunch).
+    replayed: bool = false,
+    /// The width/height the replayed scrollback was drawn at (0 = unknown). The
+    /// caller replays at this width then reflows to the live pane so in-place
+    /// prompt redraws in the raw stream don't smear (§5.4).
+    replay_cols: u16 = 0,
+    replay_rows: u16 = 0,
 };
 
 /// A caller-owned, deep copy of a `PROC_SNAPSHOT` reply (§9.3 process view). The
@@ -591,6 +637,47 @@ pub const OwnedProcSnapshot = struct {
             if (p.cmd) |c| self.alloc.free(@constCast(c));
         }
         self.alloc.free(self.procs);
+        self.* = undefined;
+    }
+};
+
+/// One session row from a `LIST_SESSIONS` RPC (T10), deep-copied out of the
+/// transient parsed-JSON arena into caller memory. Mirrors `protocol.SessionInfo`
+/// but owns every string (freed by `OwnedSessions.deinit`).
+pub const OwnedSession = struct {
+    id: []const u8,
+    alive: bool,
+    exit_code: ?i64,
+    attached: bool,
+    /// idle | busy | needs_input (owned).
+    activity: []const u8,
+    pid: i64,
+    /// Owned; null when the agent had no title/cwd/argv for the session.
+    title: ?[]const u8,
+    cwd: ?[]const u8,
+    argv: ?[]const u8,
+    created_at: i64,
+    last_activity: i64,
+    /// True when the session is pinned against idle-TTL reaping (§7.1, T11).
+    pinned: bool,
+};
+
+/// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
+/// strings are duped into `alloc` so the roster outlives the parsed-JSON arena.
+/// Free with `deinit`.
+pub const OwnedSessions = struct {
+    sessions: []OwnedSession,
+    alloc: Allocator,
+
+    pub fn deinit(self: *OwnedSessions) void {
+        for (self.sessions) |s| {
+            self.alloc.free(@constCast(s.id));
+            self.alloc.free(@constCast(s.activity));
+            if (s.title) |t| self.alloc.free(@constCast(t));
+            if (s.cwd) |c| self.alloc.free(@constCast(c));
+            if (s.argv) |a| self.alloc.free(@constCast(a));
+        }
+        self.alloc.free(self.sessions);
         self.* = undefined;
     }
 };
@@ -650,6 +737,12 @@ pub const Connection = struct {
     /// set/wait pair orders the write). Sentinel-terminated so the C API can hand
     /// it out directly. Owned by the connection, freed in `destroy`.
     peer_hostname: ?[:0]u8 = null,
+
+    /// The peer's self-reported build stamp ("YYYYMMDD-<hash>") from its HELLO
+    /// (null if the peer — an older agent — did not send one). Same write/read
+    /// ordering and ownership as `peer_hostname`. The app compares it to the
+    /// build it bundles to detect a stale local agent and lazily refresh it.
+    peer_build_version: ?[:0]u8 = null,
 
     /// Per-connection frame sequence (§4.2). Assigned by the writer thread at send
     /// time so seq order matches wire order, single-writer (no atomics needed).
@@ -811,7 +904,28 @@ pub const Connection = struct {
         return createOpts(alloc, control, data, local_hello, .{});
     }
 
+    /// The capabilities this app-side client advertises in its HELLO. Injected in
+    /// `createOpts` when the caller left `local_hello.capabilities` empty (every
+    /// dial path today), so ALL client connections advertise them regardless of
+    /// transport. Additive: the agent negotiates the intersection and an older
+    /// agent that doesn't advertise `close_session` simply leaves it disabled.
+    /// `grid_snapshot` asks a modern agent to append a visible-screen repaint on
+    /// re-attach (FIX 2); an older agent that never advertises it just replays its
+    /// ring as before.
+    pub const client_capabilities = [_][]const u8{
+        protocol.capability.close_session,
+        protocol.capability.grid_snapshot,
+    };
+
     /// `create` with explicit health/heartbeat tunables (increment 2).
+    ///
+    /// THREAD-SAFETY INVARIANT: `alloc` MUST be thread-safe. `start` spawns the
+    /// writer + two reader + heartbeat threads, and all of them (plus the caller's
+    /// own RPC calls) allocate/free through this same allocator with no additional
+    /// serialization. The GUI passes the app's thread-safe GPA/`c_allocator`. A CLI
+    /// dialer must NOT pass a bare `ArenaAllocator`/`FixedBufferAllocator` — wrap it
+    /// in a `std.heap.ThreadSafeAllocator` first (see `cli/sessions.zig`), or the
+    /// arena's bookkeeping races corrupt the heap and crash in `rpcCall`.
     pub fn createOpts(
         alloc: Allocator,
         control: Stream,
@@ -821,12 +935,17 @@ pub const Connection = struct {
     ) !*Connection {
         const self = try alloc.create(Connection);
         errdefer alloc.destroy(self);
+        // Advertise the app-side capabilities. Preserve any the caller set
+        // explicitly; otherwise inject the client default so every dial path
+        // (tcp/ssh/relay/mux) negotiates `close_session` with a modern agent.
+        var hello = local_hello;
+        if (hello.capabilities.len == 0) hello.capabilities = &client_capabilities;
         self.* = .{
             .alloc = alloc,
             .control = control,
             .data = data,
-            .local_hello = local_hello,
-            .encoding = local_hello.transfer_encoding,
+            .local_hello = hello,
+            .encoding = hello.transfer_encoding,
             .channels = ring.ChannelTable.init(alloc),
             .clock = opts.clock,
             .heartbeat_interval_ms = opts.heartbeat_interval_ms,
@@ -1203,6 +1322,7 @@ pub const Connection = struct {
         self.write_queue.deinit(alloc);
         self.channels.deinit();
         if (self.peer_hostname) |h| alloc.free(h);
+        if (self.peer_build_version) |v| alloc.free(v);
         // Any panes still registered at destroy (the caller didn't close/detach
         // them) are freed here so the connection owns no leaks. Their channels were
         // already deregistered-or-irrelevant since all threads have joined.
@@ -1277,6 +1397,8 @@ pub const Connection = struct {
 
         const session_id = try self.alloc.dupe(u8, parsed.value.session_id);
         errdefer self.alloc.free(session_id);
+        const tty: ?[]u8 = if (parsed.value.tty) |t| try self.alloc.dupe(u8, t) else null;
+        errdefer if (tty) |t| self.alloc.free(t);
 
         const pane = try self.alloc.create(Pane);
         errdefer self.alloc.destroy(pane);
@@ -1284,6 +1406,7 @@ pub const Connection = struct {
             .id = id,
             .session_id = session_id,
             .pid = parsed.value.pid,
+            .tty = tty,
             .ring = ch,
         };
         try self.trackPane(pane);
@@ -1326,6 +1449,46 @@ pub const Connection = struct {
         const path = parsed.value.path orelse return error.CwdUnavailable;
         if (path.len == 0) return error.CwdUnavailable;
         return self.alloc.dupe(u8, path);
+    }
+
+    /// Tri-state result of a session liveness probe (T06b). The distinction
+    /// matters for session-restore drop policy: only `.dead` (the agent
+    /// POSITIVELY reported the id absent from its table) may forget a persisted
+    /// layout entry; `.unknown` (RPC failure/timeout, malformed reply, or an
+    /// older agent that can't disambiguate) must keep it.
+    pub const SessionProbe = enum { alive, dead, unknown };
+
+    /// Probe whether the agent still knows `session_id` (T06b). Rides the same
+    /// GET_CWD/CWD same-channel RPC as `queryCwdTimeout` but interprets the
+    /// reply's existence signal instead of its path:
+    ///   - `ok == true`  ⇒ `.alive` (session exists; cwd even resolved)
+    ///   - `found == true`  ⇒ `.alive` (exists/attachable; cwd read failed —
+    ///     e.g. the child exited but the session ring is retained)
+    ///   - `found == false` ⇒ `.dead` (positively absent from the table)
+    ///   - anything else (timeout, transport error, malformed reply, older
+    ///     agent without `found`) ⇒ `.unknown`
+    /// Never returns an error: probe failures are themselves a result.
+    pub fn probeSessionTimeout(
+        self: *Connection,
+        session_id: []const u8,
+        timeout_ns: u64,
+    ) SessionProbe {
+        const req_channel = std.crypto.random.int(u128);
+        const get: protocol.GetCwd = .{ .session_id = session_id };
+        const json = protocol.encodeJson(self.alloc, get) catch return .unknown;
+        defer self.alloc.free(json);
+
+        const rpc = self.rpcCall(req_channel, .get_cwd, .cwd, json, timeout_ns, null) catch
+            return .unknown;
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Cwd, self.alloc, rpc.payload) catch
+            return .unknown;
+        defer parsed.deinit();
+
+        if (parsed.value.ok) return .alive;
+        const found = parsed.value.found orelse return .unknown;
+        return if (found) .alive else .dead;
     }
 
     /// Request the remote host's process table (§9.3 process view). Sends
@@ -1401,6 +1564,126 @@ pub const Connection = struct {
             .agent_pid = parsed.value.agent_pid,
             .alloc = self.alloc,
         };
+    }
+
+    /// Enumerate the agent's sessions (T10). Sends `LIST_SESSIONS{}` and awaits
+    /// `SESSIONS{sessions:[...]}`, returning a caller-owned DEEP COPY
+    /// (`OwnedSessions`): every row + its strings are duped into `self.alloc` so the
+    /// result outlives the transient parsed-JSON arena (freed before this returns).
+    /// Free with `OwnedSessions.deinit`.
+    ///
+    /// Same-channel RPC (mirrors `requestProcSnapshot`): a fresh request channel, the
+    /// agent echoes `SESSIONS` on it, correlated via the `pending` map. Bounded by
+    /// `timeout_ns` — a missing/late reply returns `error.Timeout` rather than
+    /// hanging.
+    pub fn requestSessions(self: *Connection, timeout_ns: u64) !OwnedSessions {
+        const req_channel = std.crypto.random.int(u128);
+        const json = try protocol.encodeJson(self.alloc, protocol.ListSessions{});
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .list_sessions, .sessions, json, timeout_ns, null);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Sessions, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+
+        const src = parsed.value.sessions;
+        var out = try self.alloc.alloc(OwnedSession, src.len);
+        // On a mid-copy failure, free everything duped so far (no leak).
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |s| {
+                self.alloc.free(@constCast(s.id));
+                self.alloc.free(@constCast(s.activity));
+                if (s.title) |t| self.alloc.free(@constCast(t));
+                if (s.cwd) |c| self.alloc.free(@constCast(c));
+                if (s.argv) |a| self.alloc.free(@constCast(a));
+            }
+            self.alloc.free(out);
+        }
+        for (src, 0..) |s, i| {
+            const id = try self.alloc.dupe(u8, s.id);
+            errdefer self.alloc.free(id);
+            const activity = try self.alloc.dupe(u8, s.activity);
+            errdefer self.alloc.free(activity);
+            const title: ?[]const u8 = if (s.title) |t| try self.alloc.dupe(u8, t) else null;
+            errdefer if (title) |t| self.alloc.free(t);
+            const cwd: ?[]const u8 = if (s.cwd) |c| try self.alloc.dupe(u8, c) else null;
+            errdefer if (cwd) |c| self.alloc.free(c);
+            const argv: ?[]const u8 = if (s.argv) |a| try self.alloc.dupe(u8, a) else null;
+            out[i] = .{
+                .id = id,
+                .alive = s.alive,
+                .exit_code = s.exit_code,
+                .attached = s.attached,
+                .activity = activity,
+                .pid = s.pid,
+                .title = title,
+                .cwd = cwd,
+                .argv = argv,
+                .created_at = s.created_at,
+                .last_activity = s.last_activity,
+                .pinned = s.pinned,
+            };
+            filled = i + 1;
+        }
+
+        return .{ .sessions = out, .alloc = self.alloc };
+    }
+
+    /// Push (or, with `delete`, remove) an OPAQUE per-window layout blob to the
+    /// agent (§5.4 cross-machine "Resume all", T18). Sends `SET_LAYOUT{key, blob,
+    /// session_ids, delete}` and awaits `SET_LAYOUT_RESULT{ok}`. Same-channel RPC
+    /// (mirrors `queryCwdTimeout`), bounded by `timeout_ns`. Returns
+    /// `error.SetLayoutFailed` when the agent reports `ok == false`.
+    pub fn setLayout(
+        self: *Connection,
+        key: []const u8,
+        blob: ?[]const u8,
+        session_ids: []const []const u8,
+        delete: bool,
+        timeout_ns: u64,
+    ) !void {
+        const req_channel = std.crypto.random.int(u128);
+        const set: protocol.SetLayout = .{
+            .key = key,
+            .blob = blob,
+            .session_ids = session_ids,
+            .delete = delete,
+        };
+        const json = try protocol.encodeJson(self.alloc, set);
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .set_layout, .set_layout_result, json, timeout_ns, null);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.SetLayoutResult, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        if (!parsed.value.ok) return error.SetLayoutFailed;
+    }
+
+    /// Fetch every stored layout blob (§5.4 "Resume all", T18). Sends
+    /// `GET_LAYOUTS{}` and awaits `LAYOUTS{layouts:[...]}`, returning the RAW reply
+    /// payload JSON duped into `self.alloc` (the caller — the Swift resumer —
+    /// decodes the `{layouts:[{key,blob}]}` shape and the opaque blobs itself, so
+    /// there is no need to deep-copy into an `Owned*` struct here). Caller frees.
+    /// Same-channel RPC, bounded by `timeout_ns`.
+    pub fn requestLayouts(self: *Connection, timeout_ns: u64) ![]u8 {
+        const req_channel = std.crypto.random.int(u128);
+        const json = try protocol.encodeJson(self.alloc, protocol.GetLayouts{});
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .get_layouts, .layouts, json, timeout_ns, null);
+        // Validate it parses (a malformed reply is an error, not a passthrough),
+        // but hand back the raw bytes for the caller to decode.
+        var parsed = protocol.parseJson(protocol.Layouts, self.alloc, rpc.payload) catch {
+            self.alloc.free(rpc.payload);
+            return error.MalformedReply;
+        };
+        parsed.deinit();
+        return rpc.payload;
     }
 
     /// Kill a remote process by pid (§9.3 process control, inc 4). Sends
@@ -1569,6 +1852,8 @@ pub const Connection = struct {
             .snapshot_at_offset = a.snapshot_at_offset,
             .attached_elsewhere = a.attached_elsewhere,
             .exit_code = a.exit_code,
+            .relaunchable = a.relaunchable,
+            .channel = id,
             .rows = a.rows,
             .cols = a.cols,
             .cwd = cwd,
@@ -1589,12 +1874,17 @@ pub const Connection = struct {
 
         const sid = try self.alloc.dupe(u8, session_id);
         errdefer self.alloc.free(sid);
+        const pane_tty: ?[]u8 = if (a.tty) |t| try self.alloc.dupe(u8, t) else null;
+        errdefer if (pane_tty) |t| self.alloc.free(t);
         const pane = try self.alloc.create(Pane);
         errdefer self.alloc.destroy(pane);
         pane.* = .{
             .id = id,
             .session_id = sid,
-            .pid = 0, // an attach does not report a pid (OPENED does)
+            // pid/tty ride ATTACHED for a live session (wp3); 0/null from an
+            // older agent that pre-dates the fields.
+            .pid = a.pid,
+            .tty = pane_tty,
             .ring = ch,
             // §7.3 resync discard, anchored at what THIS CLIENT already applied
             // (`last_byte_offset` = next byte we expect), NOT at the agent's
@@ -1612,6 +1902,206 @@ pub const Connection = struct {
         keep_channel = true; // the pane now owns the registered ring
         outcome.pane = pane;
         return outcome;
+    }
+
+    /// Respawn-fidelity payload for a `RELAUNCH` (wp3): the viewer's live copy
+    /// of what the agent's on-disk record lacks — the forwarded env allowlist
+    /// (GHOZTTY_PANE_ID / GHOZTTY_WINDOW_NAME / shell-integration vars), the
+    /// TERM value, and the explicit shell-integration argv rewrite. Borrowed
+    /// for the duration of the call. All optional: `.{}` sends none (an older
+    /// agent ignores them anyway).
+    pub const RelaunchFidelity = struct {
+        env: []const protocol.Open.EnvPair = &.{},
+        term: ?[]const u8 = null,
+        argv: ?[]const []const u8 = null,
+    };
+
+    /// Respawn a dead-but-relaunchable session on its known `channel` (§5.4 reboot
+    /// floor, T12c) and, on success, register the inbound ring + return a live pane.
+    ///
+    /// `channel` MUST be the agent-authoritative session channel a prior dead
+    /// `ATTACHED` reply arrived on (`AttachOutcome.channel`): the agent echoes
+    /// `RELAUNCHED` — and then streams the respawned session's DATA — on that same
+    /// channel. We PRE-REGISTER the ring on it before sending `RELAUNCH` (the note in
+    /// `attachChannelCancellable`) so no early output is dropped in the window
+    /// between the reply and ring registration, then keep it only on `ok`.
+    ///
+    /// A relaunch is a FRESH stream: the pane is created with `discard_below = 0`
+    /// and `resync_active = false` (no gap-fill replay, unlike an attach) so the
+    /// caller applies the respawned session's output from byte 0.
+    pub fn relaunchChannel(
+        self: *Connection,
+        session_id: []const u8,
+        channel: u128,
+        rows: u16,
+        cols: u16,
+        px_w: u16,
+        px_h: u16,
+    ) !RelaunchOutcome {
+        return self.relaunchChannelCancellable(session_id, channel, rows, cols, px_w, px_h, .{}, null);
+    }
+
+    /// `relaunchChannel` with an optional cancellation token (see `RpcCanceller`),
+    /// so surface teardown can wake a pane's IO thread out of a parked `RELAUNCH`.
+    ///
+    /// This is the `.auto` policy's one-shot path: prepare the pane, send `RELAUNCH`,
+    /// and return the live pane (or null + torn-down channel on a non-ok reply). The
+    /// `.prompt` policy (T12c2) instead splits these across a user consent step,
+    /// calling `prepareRelaunchPane` up front and `sendRelaunchOnPane` on a keystroke.
+    pub fn relaunchChannelCancellable(
+        self: *Connection,
+        session_id: []const u8,
+        channel: u128,
+        rows: u16,
+        cols: u16,
+        px_w: u16,
+        px_h: u16,
+        fidelity: RelaunchFidelity,
+        canceller: ?*const RpcCanceller,
+    ) !RelaunchOutcome {
+        const pane = try self.prepareRelaunchPane(session_id, channel);
+        // Any failure below (a transport/RPC error) returns the pre-registered ring
+        // + pane to a clean state so the channel table is not left dangling.
+        errdefer self.teardownPane(pane);
+        const res = try self.sendRelaunchOnPane(pane, rows, cols, px_w, px_h, fidelity, canceller);
+        if (!res.ok) {
+            // Not respawned (reaped, not relaunchable, or spawn failed): keep no pane
+            // and tear the pre-registered channel back down (a value return does not
+            // fire the `errdefer` above).
+            self.teardownPane(pane);
+            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows };
+        }
+        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows };
+    }
+
+    /// Register the inbound ring + a `Pane` for a session about to be relaunched,
+    /// WITHOUT sending `RELAUNCH` yet. The pane has no live child (pid 0) until a
+    /// later `sendRelaunchOnPane` succeeds. Used by the `.prompt` relaunch policy
+    /// (T12c2): the client brings up a live-but-childless pane showing an
+    /// "awaiting relaunch" prompt, then respawns the recorded process only once the
+    /// user consents with a keystroke. Pre-registering the ring on the agent's known
+    /// session channel means the respawned session's first DATA frames (the fresh
+    /// shell prompt) are not dropped in the gap between `RELAUNCHED` and ring
+    /// registration. Tear down via `detachChannel`/`closeChannel` (or
+    /// `sendRelaunchOnPane`'s failure handling) like any other pane.
+    pub fn prepareRelaunchPane(
+        self: *Connection,
+        session_id: []const u8,
+        channel: u128,
+    ) !*Pane {
+        const ch = try self.alloc.create(ring.Channel);
+        errdefer self.alloc.destroy(ch);
+        ch.* = try ring.Channel.init(self.alloc, channel, .{});
+        errdefer ch.deinit(self.alloc);
+        try self.registerChannel(ch);
+        errdefer self.deregisterChannel(channel);
+
+        const sid = try self.alloc.dupe(u8, session_id);
+        errdefer self.alloc.free(sid);
+        const pane = try self.alloc.create(Pane);
+        errdefer self.alloc.destroy(pane);
+        pane.* = .{
+            .id = channel,
+            .session_id = sid,
+            // No child yet; `sendRelaunchOnPane` fills the pid on a successful respawn.
+            .pid = 0,
+            .ring = ch,
+            // A relaunch streams from offset 0 — no resync watermark, keep every byte.
+            .discard_below = 0,
+            .resync_active = false,
+        };
+        try self.trackPane(pane);
+        return pane;
+    }
+
+    /// The result of `sendRelaunchOnPane`: whether the respawn succeeded, whether the
+    /// agent still had the session, and the (respawned) child pid. Unlike
+    /// `RelaunchOutcome` this carries no pane — `sendRelaunchOnPane` operates on a pane
+    /// the caller already prepared and still owns.
+    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64, replayed: bool = false, replay_cols: u16 = 0, replay_rows: u16 = 0 };
+
+    /// Send `RELAUNCH` for an already-prepared pane (see `prepareRelaunchPane`) and
+    /// await `RELAUNCHED`. On `ok`, the recorded process is respawned and streaming on
+    /// the pane's channel (the pane's `pid` is updated). On `!ok` the pane is left
+    /// intact (still childless) so the caller can surface a "relaunch failed" note and
+    /// tear it down on threadExit. Correlates on the pane's channel (the agent replies
+    /// RELAUNCHED on the session's own channel, which is the one we send on). Cancellable
+    /// so surface teardown can wake the IO thread out of a parked `RELAUNCH`.
+    pub fn sendRelaunchOnPane(
+        self: *Connection,
+        pane: *Pane,
+        rows: u16,
+        cols: u16,
+        px_w: u16,
+        px_h: u16,
+        fidelity: RelaunchFidelity,
+        canceller: ?*const RpcCanceller,
+    ) !RelaunchResult {
+        const req: protocol.Relaunch = .{
+            .session_id = pane.session_id,
+            .rows = rows,
+            .cols = cols,
+            .px_w = px_w,
+            .px_h = px_h,
+            .env = fidelity.env,
+            .term = fidelity.term,
+            .argv = fidelity.argv,
+        };
+        const json = try protocol.encodeJson(self.alloc, req);
+        defer self.alloc.free(json);
+        const rpc = try self.rpcCall(pane.id, .relaunch, .relaunched, json, self.rpc_open_timeout_ns, canceller);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.Relaunched, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        const r = parsed.value;
+        if (r.ok) {
+            pane.pid = r.pid;
+            // A relaunch opened a FRESH pty (wp3): replace any stale tty with the
+            // reported one (null from an older agent leaves the field cleared —
+            // the old path is definitely wrong now).
+            const new_tty: ?[]u8 = if (r.tty) |t| self.alloc.dupe(u8, t) catch null else null;
+            if (pane.tty) |t| self.alloc.free(t);
+            pane.tty = new_tty;
+        }
+        return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed, .replay_cols = r.replay_cols, .replay_rows = r.replay_rows };
+    }
+
+    /// True iff the negotiated peer advertised the `close_session` capability —
+    /// i.e. `closeSession` is safe to send (the agent understands the opcode). An
+    /// older agent (or a not-yet-completed / failed handshake) reports false, so
+    /// the caller falls back rather than emitting an opcode the peer would treat as
+    /// a fatal framing error.
+    pub fn supportsCloseSession(self: *Connection) bool {
+        if (self.negotiated) |n| return n.close_session else |_| return false;
+    }
+
+    /// End a session on the agent BY SESSION ID (the session-scoped equivalent of
+    /// the channel-scoped pane `CLOSE`): terminate + free the remote session even
+    /// when no local pane is attached to it (the chooser's "Kill" of a browsed
+    /// session). Sends `CLOSE_SESSION{session_id}` and awaits
+    /// `CLOSE_SESSION_RESULT{ok, found}` on a fresh request channel (same-channel
+    /// RPC, mirrors `requestSessions`/`relaunch`), bounded by `timeout_ns`. Returns
+    /// the agent's `ok` (true ⇒ the session was closed). Returns `error.Unsupported`
+    /// when the peer never advertised the capability (gate the opcode: never send it
+    /// to a peer that can't decode it).
+    pub fn closeSession(self: *Connection, session_id: []const u8, timeout_ns: u64) !bool {
+        if (!self.supportsCloseSession()) return error.Unsupported;
+
+        const req_channel = std.crypto.random.int(u128);
+        const json = try protocol.encodeJson(self.alloc, protocol.CloseSession{
+            .session_id = session_id,
+        });
+        defer self.alloc.free(json);
+
+        const rpc = try self.rpcCall(req_channel, .close_session, .close_session_result, json, timeout_ns, null);
+        defer self.alloc.free(rpc.payload);
+
+        var parsed = protocol.parseJson(protocol.CloseSessionResult, self.alloc, rpc.payload) catch
+            return error.MalformedReply;
+        defer parsed.deinit();
+        return parsed.value.ok;
     }
 
     /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote
@@ -1698,6 +2188,7 @@ pub const Connection = struct {
         pane.ring.deinit(self.alloc);
         self.alloc.destroy(pane.ring);
         self.alloc.free(pane.session_id);
+        if (pane.tty) |t| self.alloc.free(t);
         self.alloc.destroy(pane);
     }
 
@@ -2078,10 +2569,31 @@ pub const Connection = struct {
                 // request channel. Dropped if no caller is parked (late reply).
                 _ = self.deliverRpcReply(frame);
             },
+            .sessions => {
+                // Reply to a LIST_SESSIONS RPC (T10). Same-channel correlation, like
+                // CWD/PROC_SNAPSHOT: the agent echoes SESSIONS on the request channel.
+                // Dropped if no caller is parked (a late reply after a timeout).
+                _ = self.deliverRpcReply(frame);
+            },
             .proc_kill_result, .proc_spawn_result => {
                 // Replies to PROC_KILL / PROC_SPAWN RPCs (§9.3 process control, inc
                 // 4+5). Same-channel correlation, like PROC_SNAPSHOT. Dropped if no
                 // caller is parked (a late reply after a timeout).
+                _ = self.deliverRpcReply(frame);
+            },
+            .set_layout_result, .layouts => {
+                // Replies to SET_LAYOUT / GET_LAYOUTS RPCs (§5.4 "Resume all",
+                // T18). Same-channel correlation, like CWD/SESSIONS: the agent
+                // echoes the reply on the request channel. Dropped if no caller
+                // is parked (a late reply after a timeout).
+                _ = self.deliverRpcReply(frame);
+            },
+            .relaunched => {
+                // Reply to a RELAUNCH RPC (§5.4 reboot floor, T12c). The agent echoes
+                // RELAUNCHED on the SESSION's channel (the relaunchable path), which is
+                // exactly the channel the client sent RELAUNCH on, so `deliverRpcReply`
+                // matches it via the `pending` map keyed by `frame.channel`. Dropped if
+                // no caller is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
             .pong => {
@@ -2128,6 +2640,26 @@ pub const Connection = struct {
                     ExitSig{ .code = parsed.value.code, .runtime_ms = parsed.value.runtime_ms },
                     ExitSig.apply,
                 );
+            },
+            .meta => {
+                // Session metadata push. Today the routed payload is the live
+                // foreground pid (wp3 `tcgetpgrp` sampling): signal it on the
+                // pane's inbound ring under the channel-table lock (the same
+                // `withChannel` discipline as `.exit` — the ring can't be freed
+                // mid-call, and an unknown/late channel is dropped silently).
+                // The pane's IO thread republishes it on the stable Remote
+                // backend for GUI reads. Additive: the user `ctrl_handler`
+                // still observes the frame afterward in `controlReaderLoop`.
+                var parsed = protocol.parseJson(protocol.Meta, self.alloc, frame.payload) catch return;
+                defer parsed.deinit();
+                const fg = parsed.value.foreground_pid orelse return;
+                const FgSig = struct {
+                    pid: i64,
+                    fn apply(self_sig: @This(), ch: *ring.Channel) void {
+                        ch.signalForegroundPid(self_sig.pid);
+                    }
+                };
+                _ = self.channels.withChannel(frame.channel, FgSig{ .pid = fg }, FgSig.apply);
             },
             .detached => {
                 // Server-initiated eviction / steal (§5.3): terminal DEAD.
@@ -2203,6 +2735,13 @@ pub const Connection = struct {
                 self.peer_hostname = self.alloc.dupeZ(u8, h) catch null;
             }
         }
+        // Same capture for the peer's build stamp (used by the app to detect a
+        // stale local agent). Best-effort; null when the peer is an older agent.
+        if (parsed.value.build_version) |v| {
+            if (v.len > 0 and self.peer_build_version == null) {
+                self.peer_build_version = self.alloc.dupeZ(u8, v) catch null;
+            }
+        }
         return protocol.negotiate(self.local_hello, parsed.value);
     }
 
@@ -2210,6 +2749,13 @@ pub const Connection = struct {
     /// after `waitHandshake` has returned successfully.
     pub fn peerHostname(self: *const Connection) ?[:0]const u8 {
         return self.peer_hostname;
+    }
+
+    /// The peer's self-reported build stamp ("YYYYMMDD-<hash>"), or null (an
+    /// older agent that doesn't advertise it). Only valid after `waitHandshake`
+    /// has returned successfully.
+    pub fn peerBuildVersion(self: *const Connection) ?[:0]const u8 {
+        return self.peer_build_version;
     }
 
     /// Store the handshake outcome and wake `waitHandshake`. First writer wins so
@@ -2272,7 +2818,10 @@ pub const Connection = struct {
         // dropped. On a high-water crossing, emit a single FLOW{pause}.
         const res = self.channels.pushTo(channel, to_push);
         switch (res) {
-            .unknown => {},
+            // `.unknown` (dropped) can no longer occur for a live-but-unregistered
+            // channel: `pushTo` buffers those in the pre-registration buffer
+            // (`.buffered`) and `register` flushes them (T06c). Both need no FLOW.
+            .unknown, .buffered => {},
             .routed => |push| {
                 if (push.send_pause) {
                     var buf: [protocol.Flow.encoded_len]u8 = undefined;
@@ -3431,6 +3980,9 @@ const LifecycleAgent = struct {
     // OPENED reply contents.
     session_id: []const u8 = "sess-1",
     pid: i64 = 4242,
+    /// Reported as the child's pty slave path in OPENED, alive ATTACHED, and ok
+    /// RELAUNCHED (wp3). Null models an older/Windows agent that omits it.
+    tty: ?[]const u8 = null,
     /// When true, each OPEN gets a fresh, unique session id (so N concurrent
     /// OPENs produce N distinct panes). The id buffers are owned by the agent and
     /// freed on `deinit` via `session_buf`.
@@ -3443,6 +3995,9 @@ const LifecycleAgent = struct {
     snapshot_at_offset: u64 = 0,
     attached_elsewhere_first: bool = false, // true → first ATTACH reports stolen
     exit_code: ?i64 = null,
+    /// Reported in ATTACHED (T12c): a dead session materialized from disk that
+    /// can be respawned via RELAUNCH. Set alongside `attach_status = .dead`.
+    attach_relaunchable: bool = false,
     /// When true the agent receives OPEN but NEVER replies OPENED (models a remote
     /// session whose command/cwd failed to spawn). Exercises the RPC timeout so a
     /// silent agent can't wedge the caller (the pane IO thread) forever.
@@ -3451,7 +4006,10 @@ const LifecycleAgent = struct {
     // GET_CWD reply contents. `cwd_reply == null` ⇒ reply CWD{ok=false}; else
     // reply CWD{ok=true, path}. When `silent_cwd` is true the agent receives
     // GET_CWD but never replies (exercises the queryCwd RPC timeout).
+    // `cwd_found` is the CWD reply's existence signal (T06b): null models an
+    // OLDER agent that predates the field.
     cwd_reply: ?[]const u8 = "/private/tmp",
+    cwd_found: ?bool = null,
     silent_cwd: bool = false,
 
     // METRICS push contents. On `.metrics_sub` the agent pushes `metrics_push_count`
@@ -3462,6 +4020,16 @@ const LifecycleAgent = struct {
     saw_metrics_sub: std.atomic.Value(bool) = .{ .raw = false },
     saw_metrics_unsub: std.atomic.Value(bool) = .{ .raw = false },
     saw_proc_list: std.atomic.Value(bool) = .{ .raw = false },
+
+    // RELAUNCH reply config (T12c). A RELAUNCH gets RELAUNCHED on the SAME
+    // channel with these values; `saw_relaunch` records that one arrived and
+    // `relaunch_channel` the channel it came in on (must equal the dead ATTACHED
+    // channel the client re-uses).
+    relaunch_ok: bool = true,
+    relaunch_found: bool = true,
+    relaunch_pid: i64 = 5555,
+    saw_relaunch: std.atomic.Value(bool) = .{ .raw = false },
+    relaunch_channel: std.atomic.Value(u128) = .{ .raw = 0 },
 
     // PROC_KILL / PROC_SPAWN reply config (inc 4+5). A PROC_KILL for `kill_fail_pid`
     // replies ok=false (models no-such-pid); any other pid succeeds. PROC_SPAWN
@@ -3523,6 +4091,7 @@ const LifecycleAgent = struct {
                     try self.ctrl.sendJson(.opened, frame.channel, protocol.Opened{
                         .session_id = sid,
                         .pid = self.pid,
+                        .tty = self.tty,
                     });
                 },
                 .attach => {
@@ -3541,6 +4110,25 @@ const LifecycleAgent = struct {
                         .snapshot_at_offset = self.snapshot_at_offset,
                         .exit_code = self.exit_code,
                         .attached_elsewhere = elsewhere,
+                        .relaunchable = self.attach_relaunchable,
+                        .pid = if (self.attach_status == .alive) self.pid else 0,
+                        .tty = if (self.attach_status == .alive) self.tty else null,
+                    });
+                },
+                .relaunch => {
+                    // Reply RELAUNCHED on the SAME channel (the relaunchable path),
+                    // as the real agent does when the tombstone is respawnable.
+                    self.saw_relaunch.store(true, .monotonic);
+                    self.relaunch_channel.store(frame.channel, .monotonic);
+                    var parsed = protocol.parseJson(protocol.Relaunch, self.alloc, frame.payload) catch continue;
+                    defer parsed.deinit();
+                    const sid = parsed.value.session_id;
+                    try self.ctrl.sendJson(.relaunched, frame.channel, protocol.Relaunched{
+                        .session_id = sid,
+                        .ok = self.relaunch_ok,
+                        .pid = if (self.relaunch_ok) self.relaunch_pid else 0,
+                        .found = self.relaunch_found,
+                        .tty = if (self.relaunch_ok) self.tty else null,
                     });
                 },
                 .get_cwd => {
@@ -3553,6 +4141,7 @@ const LifecycleAgent = struct {
                         .session_id = sid,
                         .path = self.cwd_reply,
                         .ok = self.cwd_reply != null,
+                        .found = self.cwd_found,
                     });
                 },
                 .close => {
@@ -3721,6 +4310,7 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
     const a = h.configure();
     a.session_id = "session-abc";
     a.pid = 9001;
+    a.tty = "/dev/ttys014";
     try h.start();
 
     const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
@@ -3728,9 +4318,10 @@ test "openChannel: returns a pane with the agent's session_id/pid and routes DAT
     // The agent received a well-formed OPEN on the pane's channel id.
     a.saw_request.wait();
     try testing.expectEqual(pane.id, a.seenChannel());
-    // The pane carries the agent-assigned identity.
+    // The pane carries the agent-assigned identity (incl. the wp3 tty).
     try testing.expectEqualStrings("session-abc", pane.session_id);
     try testing.expectEqual(@as(i64, 9001), pane.pid);
+    try testing.expectEqualStrings("/dev/ttys014", pane.tty.?);
 
     // Subsequent agent DATA on that channel lands in the pane's ring.
     try agentSendData(&h.data_agent, pane.id, 0, "hello from the agent");
@@ -3782,6 +4373,41 @@ test "EXIT frame: signals the pane's ring so the consumer can close the pane" {
     h.conn.closeChannel(pane);
 }
 
+test "META foreground_pid: routed to the pane's ring; unknown channel dropped (wp3)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.session_id = "sess-fg";
+    try h.start();
+
+    const pane = try h.conn.openChannel(.{ .rows = 24, .cols = 80, .command = "bash" });
+    a.saw_request.wait();
+    try testing.expectEqual(@as(i64, 0), pane.ring.foregroundPid());
+
+    // The agent pushes META{foreground_pid} on the session channel when the pty
+    // foreground group changes; the control reader signals the pane's ring.
+    try h.ctrl_agent.sendJson(.meta, pane.id, protocol.Meta{ .foreground_pid = 7777 });
+    const RingWait = struct {
+        ring: *ring.Channel,
+        fn done(self: *@This()) bool {
+            return self.ring.foregroundPid() == 7777;
+        }
+    };
+    var rw: RingWait = .{ .ring = pane.ring };
+    try spinUntil(RingWait, &rw, RingWait.done);
+
+    // A META with NO foreground_pid (title/cwd-only, or an older agent) must not
+    // disturb the cached value; an unknown channel is dropped silently.
+    try h.ctrl_agent.sendJson(.meta, pane.id, protocol.Meta{ .title = "hi" });
+    try h.ctrl_agent.sendJson(.meta, 0xDEADBEEF, protocol.Meta{ .foreground_pid = 1 });
+
+    // The link stays healthy: input still round-trips after those frames.
+    try testing.expectEqual(@as(i64, 7777), pane.ring.foregroundPid());
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
 test "EXIT frame: an unknown channel id is dropped without crashing" {
     const alloc = testing.allocator;
     const h = try LifecycleHarness.create(alloc);
@@ -3820,6 +4446,75 @@ test "queryCwd: agent reporting ok=false surfaces CwdUnavailable (no hang)" {
     try h.start();
 
     try testing.expectError(error.CwdUnavailable, h.conn.queryCwd("sess-1"));
+}
+
+test "probeSession: tri-state — ok=true is alive regardless of found" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    h.configure().cwd_reply = "/private/tmp/work"; // ok=true
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.alive,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: found=true with a failed cwd read is still alive (attachable)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.cwd_reply = null; // ok=false (cwd read failed)…
+    a.cwd_found = true; // …but the session exists
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.alive,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: found=false is POSITIVE dead" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.cwd_reply = null;
+    a.cwd_found = false;
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.dead,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: an older agent (no found field) is INCONCLUSIVE, never dead" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    h.configure().cwd_reply = null; // ok=false, found omitted (old agent)
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.unknown,
+        h.conn.probeSessionTimeout("sess-1", std.time.ns_per_s),
+    );
+}
+
+test "probeSession: a silent agent times out as unknown (no error, no hang)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.createWithTimeout(alloc, 50 * std.time.ns_per_ms);
+    defer h.destroy();
+    h.configure().silent_cwd = true;
+    try h.start();
+
+    try testing.expectEqual(
+        Connection.SessionProbe.unknown,
+        h.conn.probeSessionTimeout("sess-1", 50 * std.time.ns_per_ms),
+    );
 }
 
 test "queryCwd: a silent agent (no CWD reply) times out instead of deadlocking" {
@@ -4248,6 +4943,7 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     const a = h.configure();
     a.attach_status = .alive;
     a.snapshot_at_offset = 10;
+    a.tty = "/dev/ttys020";
     try h.start();
 
     // The client already APPLIED absolute bytes [0,11) (last_byte_offset = 11 =
@@ -4261,6 +4957,9 @@ test "attachChannel: resumed attach — byte-accurate resync discard anchored at
     const pane = outcome.pane orelse return error.NoPane;
     try testing.expectEqualStrings("/home/me", outcome.cwd.?);
     try testing.expectEqualStrings("remote", outcome.title.?);
+    // pid/tty ride the alive ATTACHED (wp3) — the app-relaunch recovery path.
+    try testing.expectEqual(@as(i64, 4242), pane.pid);
+    try testing.expectEqualStrings("/dev/ttys020", pane.tty.?);
 
     h.agent.saw_request.wait();
     const ch = pane.id;
@@ -4336,6 +5035,168 @@ test "attachChannel: dead status surfaces exit_code; no pane" {
     try testing.expectEqual(protocol.Attached.AttachStatus.dead, outcome.status);
     try testing.expectEqual(@as(i64, 137), outcome.exit_code.?);
     try testing.expect(outcome.pane == null);
+}
+
+test "attachChannel: dead+relaunchable surfaces relaunchable + the session channel (T12c)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true; // a disk-materialized tombstone, no exit_code
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("reboot-floor", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.dead, outcome.status);
+    try testing.expect(outcome.relaunchable);
+    try testing.expect(outcome.pane == null);
+    // The channel the ATTACHED arrived on is retained so a follow-up RELAUNCH can
+    // target the same channel the agent will stream the respawned session on.
+    a.saw_request.wait();
+    try testing.expectEqual(a.seenChannel(), outcome.channel);
+    try testing.expect(outcome.channel != 0);
+}
+
+test "relaunchChannel: revives a dead session → live pane, fresh stream routes DATA (T12c)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = true;
+    a.relaunch_pid = 31337;
+    try h.start();
+
+    // 1) Dead attach learns the session channel.
+    var outcome = try h.conn.attachChannel("sess-reboot", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expect(outcome.pane == null);
+    const channel = outcome.channel;
+
+    // 2) RELAUNCH on that channel → a live pane streaming from offset 0.
+    const r = try h.conn.relaunchChannel("sess-reboot", channel, 24, 80, 0, 0);
+    try testing.expect(r.ok);
+    try testing.expect(r.found);
+    try testing.expectEqual(@as(i64, 31337), r.pid);
+    const pane = r.pane orelse return error.NoPane;
+    try testing.expectEqual(channel, pane.id);
+    try testing.expectEqualStrings("sess-reboot", pane.session_id);
+
+    // The RELAUNCH went out on the SAME channel the dead ATTACHED came in on.
+    try testing.expect(a.saw_relaunch.load(.monotonic));
+    try testing.expectEqual(channel, a.relaunch_channel.load(.monotonic));
+
+    // Fresh output on the channel (offset 0, no resync discard) lands in the ring.
+    try agentSendData(&h.data_agent, pane.id, 0, "back after reboot");
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, "back after reboot".len);
+    try testing.expectEqualStrings("back after reboot", got.items);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "relaunchChannel: ok=false found=false → no pane, channel torn down (T12c)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = false; // agent reaped the tombstone between attach and relaunch
+    a.relaunch_found = false;
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("sess-gone", 24, 80, 0, false);
+    defer outcome.deinit();
+    const channel = outcome.channel;
+
+    const r = try h.conn.relaunchChannel("sess-gone", channel, 24, 80, 0, 0);
+    try testing.expect(!r.ok);
+    try testing.expect(!r.found);
+    try testing.expect(r.pane == null);
+    // The pre-registered channel was deregistered: later DATA on it is dropped
+    // without crashing (no pane owns it).
+    try agentSendData(&h.data_agent, channel, 0, "should be dropped");
+    try testing.expect(a.err == null);
+}
+
+test "prompt relaunch: prepareRelaunchPane holds a childless pane; sendRelaunchOnPane revives it (T12c2)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = true;
+    a.relaunch_pid = 4242;
+    a.tty = "/dev/ttys021";
+    try h.start();
+
+    // 1) Dead attach learns the session channel (the viewer's prompt-policy path).
+    var outcome = try h.conn.attachChannel("sess-prompt", 24, 80, 0, false);
+    defer outcome.deinit();
+    try testing.expect(outcome.pane == null);
+    const channel = outcome.channel;
+
+    // 2) Prepare a live-but-childless pane WITHOUT sending RELAUNCH (awaiting user
+    //    consent). The ring is registered but no respawn has happened yet.
+    const pane = try h.conn.prepareRelaunchPane("sess-prompt", channel);
+    try testing.expectEqual(channel, pane.id);
+    try testing.expectEqualStrings("sess-prompt", pane.session_id);
+    try testing.expectEqual(@as(i64, 0), pane.pid); // no child yet
+    try testing.expect(pane.tty == null); // no pty yet either
+    try testing.expect(!a.saw_relaunch.load(.monotonic)); // no RELAUNCH sent yet
+
+    // 3) User consents (a keystroke) → send RELAUNCH on the pane's channel.
+    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, .{}, null);
+    try testing.expect(res.ok);
+    try testing.expect(res.found);
+    try testing.expectEqual(@as(i64, 4242), res.pid);
+    try testing.expectEqual(@as(i64, 4242), pane.pid); // pid filled in on success
+    try testing.expectEqualStrings("/dev/ttys021", pane.tty.?); // fresh pty's tty too (wp3)
+    try testing.expect(a.saw_relaunch.load(.monotonic));
+    try testing.expectEqual(channel, a.relaunch_channel.load(.monotonic));
+
+    // 4) Fresh output on the (already-registered) channel lands in the ring.
+    try agentSendData(&h.data_agent, pane.id, 0, "prompt back");
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try drainChannel(pane.ring, &got, alloc, "prompt back".len);
+    try testing.expectEqualStrings("prompt back", got.items);
+
+    try testing.expect(a.err == null);
+    h.conn.closeChannel(pane);
+}
+
+test "prompt relaunch: sendRelaunchOnPane ok=false leaves the pane childless + detachable (T12c2)" {
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+    const a = h.configure();
+    a.attach_status = .dead;
+    a.attach_relaunchable = true;
+    a.relaunch_ok = false; // reaped between prepare and consent
+    a.relaunch_found = false;
+    try h.start();
+
+    var outcome = try h.conn.attachChannel("sess-prompt-gone", 24, 80, 0, false);
+    defer outcome.deinit();
+    const channel = outcome.channel;
+
+    const pane = try h.conn.prepareRelaunchPane("sess-prompt-gone", channel);
+    const res = try h.conn.sendRelaunchOnPane(pane, 24, 80, 0, 0, .{}, null);
+    try testing.expect(!res.ok);
+    try testing.expect(!res.found);
+    // The pane is NOT torn down by a failed send (unlike the auto RelaunchOutcome
+    // path) — the prompt path keeps it so the surface can show a note, and threadExit
+    // detaches it cleanly. No child was ever installed.
+    try testing.expectEqual(@as(i64, 0), pane.pid);
+    try testing.expect(a.err == null);
+    h.conn.detachChannel(pane);
 }
 
 test "attachChannel: not_found surfaces; no pane" {

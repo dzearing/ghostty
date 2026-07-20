@@ -46,8 +46,10 @@ pub const Options = struct {
 /// The banner is rendered above the terminal content and persists
 /// (survives scrolling and screen clears) until it is changed or
 /// cleared. The text supports a small markdown subset: `**bold**`,
-/// `*italic*` or `_italic_`, `__underline__`, `` `code` ``, and
-/// `[text](url)` links (clickable).
+/// `*italic*` or `_italic_`, `__underline__`, `` `code` ``,
+/// `[text](url)` links (clickable), and pipe tables (`| a | b |`
+/// header, `|---|---|` separator, then body rows) rendered as an
+/// aligned grid.
 ///
 /// Flags:
 ///

@@ -87,6 +87,20 @@ pub const FrameType = enum(u8) {
     get_cwd = 0x22, // C→A  {session_id}  on-demand "what is this session's cwd?"
     cwd = 0x23, // A→C  {session_id, path?, ok}  reply to GET_CWD
 
+    list_sessions = 0x24, // C→A  {}  enumerate every session this agent owns
+    sessions = 0x25, // A→C  {sessions:[SessionInfo]}  reply to LIST_SESSIONS
+
+    relaunch = 0x26, // C→A  {session_id, rows, cols}  respawn a loaded/dead session
+    relaunched = 0x27, // A→C  {session_id, ok, pid, found}  reply to RELAUNCH
+
+    set_layout = 0x28, // C→A  {key, blob?, session_ids, delete}  store/remove a layout blob
+    set_layout_result = 0x29, // A→C  {ok}  reply to SET_LAYOUT
+    get_layouts = 0x2a, // C→A  {}  fetch every stored layout blob
+    layouts = 0x2b, // A→C  {layouts:[{key, blob}]}  reply to GET_LAYOUTS
+
+    close_session = 0x2c, // C→A  {session_id}  end a session BY ID (session-scoped CLOSE)
+    close_session_result = 0x2d, // A→C  {session_id, ok, found}  reply to CLOSE_SESSION
+
     rpc = 0x30, // C→A  JSON-RPC 2.0 request (§9.5)
     rpc_result = 0x31, // A→C  JSON-RPC 2.0 response / subscription notification
 
@@ -345,6 +359,31 @@ pub const capability = struct {
     pub const rpc = "rpc";
     /// Port-forward tunneling (§8) supported.
     pub const tunnel = "tunnel";
+    /// Session-scoped `CLOSE_SESSION` (0x2c) — end a session BY SESSION ID even
+    /// when no local pane is attached to it (the chooser's "Kill" action). Gated:
+    /// a peer sends the `close_session` opcode ONLY when the other side advertised
+    /// this string (an unknown opcode is a fatal framing error), so an older peer
+    /// that omits it keeps working over the channel-scoped `close` alone.
+    pub const close_session = "close_session";
+
+    /// Re-attach **grid snapshot**: on ATTACH the agent, having tracked each
+    /// session's visible screen in a headless emulator, replays a self-contained
+    /// VT repaint of the current on-screen grid so the pane repaints EXACTLY and
+    /// is never blank — even when the paint predates the raw-output ring (deep
+    /// scrollback evicted, or a full-screen app whose alt-screen enter scrolled
+    /// out). See `src/remote/agent/grid_snapshot.zig`.
+    ///
+    /// Purely additive — there is NO new opcode: the snapshot rides ordinary
+    /// `DATA` frames (plain VT any emulator renders). This string only lets the
+    /// two sides NEGOTIATE the behavior:
+    ///   * the CLIENT advertises it to say "append a grid snapshot after your
+    ///     replay"; a client that doesn't (older app) gets today's ring-only
+    ///     replay,
+    ///   * the AGENT advertises it so a new client knows an old agent (which
+    ///     never sends one) will fall back to ring-only replay.
+    /// Gated on the INTERSECTION (`Negotiated.grid_snapshot`), so every skew
+    /// combination degrades gracefully to today's behavior — no garble, no wedge.
+    pub const grid_snapshot = "grid_snapshot";
 };
 
 /// The `HELLO` (0x00) payload, serialized as JSON so it is forward-compatible
@@ -357,6 +396,15 @@ pub const Hello = struct {
     /// The sender's machine hostname, for display (e.g. the client's window
     /// pill). Optional: absent from older peers, and never load-bearing.
     hostname: ?[]const u8 = null,
+
+    /// The sender's build stamp ("YYYYMMDD-<git short hash>", the same string the
+    /// agent bakes as `agent_build_options.agent_version` and prints for
+    /// `--version`). Set by the AGENT so the app can detect at runtime that the
+    /// running agent is a different build than the one it bundles and lazily
+    /// refresh it (non-destructive agent upgrade). Additive/optional: older peers
+    /// omit it (→ null → "unknown build", never treated as stale), and readers
+    /// ignore it when absent. Never load-bearing for the protocol itself.
+    build_version: ?[]const u8 = null,
 
     /// Serialize to a JSON byte slice owned by `alloc`.
     pub fn encode(self: Hello, alloc: Allocator) Allocator.Error![]u8 {
@@ -376,18 +424,46 @@ pub const Hello = struct {
 pub const Negotiated = struct {
     proto_version: u16,
     transfer_encoding: TransferEncoding,
+    /// True iff BOTH peers advertised `capability.close_session` in their HELLO —
+    /// i.e. the session-scoped `close_session` RPC is safe to send. Additive: an
+    /// older peer that never advertises it leaves this false, so the app keeps
+    /// using the channel-scoped `close` and never emits an opcode the peer would
+    /// treat as a fatal framing error.
+    close_session: bool = false,
+
+    /// True iff BOTH peers advertised `capability.grid_snapshot` — i.e. the agent
+    /// should append a grid-snapshot repaint on ATTACH and the client wants it.
+    /// Additive: false against any older peer, so the agent falls back to today's
+    /// ring-only replay and the client just renders whatever DATA arrives.
+    grid_snapshot: bool = false,
 };
+
+/// True iff `caps` contains the capability string `name`.
+fn hasCapability(caps: []const []const u8, name: []const u8) bool {
+    for (caps) |c| {
+        if (std.mem.eql(u8, c, name)) return true;
+    }
+    return false;
+}
 
 /// Negotiate the local and remote `HELLO`s. v1 policy is strict: both sides must
 /// agree on the exact `proto_version` and `transfer_encoding` (the encoding is
 /// chosen by the side that knows the hop is a Windows hop and proposed in its
 /// `HELLO`; the other side echoes it). A mismatch is fatal (§4.2 "mismatch → drop").
+///
+/// Capabilities evolve additively ON TOP of the pinned `proto_version`: each
+/// negotiated capability flag is the INTERSECTION of both peers' advertised
+/// capability strings, so a behavior is only enabled when both sides support it.
 pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
     if (local.proto_version != remote.proto_version) return error.Incompatible;
     if (local.transfer_encoding != remote.transfer_encoding) return error.Incompatible;
     return .{
         .proto_version = local.proto_version,
         .transfer_encoding = local.transfer_encoding,
+        .close_session = hasCapability(local.capabilities, capability.close_session) and
+            hasCapability(remote.capabilities, capability.close_session),
+        .grid_snapshot = hasCapability(local.capabilities, capability.grid_snapshot) and
+            hasCapability(remote.capabilities, capability.grid_snapshot),
     };
 }
 
@@ -410,6 +486,32 @@ pub const Open = struct {
     px_h: u16 = 0,
     name: ?[]const u8 = null,
 
+    /// Explicit shell argv to exec VERBATIM instead of the agent's synthesized
+    /// `<shell> -lic/-li <command>` convention (§ local shell integration, T04c).
+    /// Carries the argv-rewrite that `shell_integration.setup()` produces for
+    /// shells that need one (bash → `<shell> --posix`, nushell → `<shell>
+    /// --execute 'use ghostty *'`) so an agent-backed local pane running those
+    /// shells activates ghostty integration (prompt marks / OSC 7 / title) —
+    /// env-only shells (zsh/fish/elvish) never set this (their integration rides
+    /// `OPEN.env` alone). Set ONLY by the LOCAL-agent client for a plain
+    /// interactive shell (no user `command`); a cross-machine window leaves it
+    /// null. When present and non-empty the agent (POSIX) execs it as-is, using
+    /// its own resolved shell path as the binary and this array as argv; when
+    /// null the agent keeps the `-lic/-li` synthesis. Additive/optional: older
+    /// agents ignore the field (unknown-field-tolerant parser) and fall back to
+    /// the default invocation. `argv[0]` is conventionally the shell path.
+    argv: ?[]const []const u8 = null,
+
+    /// Pin this session so the agent's idle-TTL reaper NEVER evicts it while
+    /// orphaned (§7.1, T11). The LOCAL-agent client sets this for every
+    /// persistent local pane: the viewer's session-layout manifest (T05)
+    /// references the session, so it must survive the viewer quitting until a
+    /// restore re-ATTACHes it — a 24 h idle-TTL would still reap an overnight
+    /// laptop-closed session before the next launch. Cross-machine windows leave
+    /// it false and keep the idle-TTL. Additive/optional: older agents ignore
+    /// the field (unknown-field-tolerant parser) and fall back to TTL reaping.
+    pinned: bool = false,
+
     pub const EnvPair = struct { key: []const u8, value: []const u8 };
 };
 
@@ -417,6 +519,14 @@ pub const Open = struct {
 pub const Opened = struct {
     session_id: []const u8,
     pid: i64,
+
+    /// The PTY slave path of the spawned child ON THE AGENT'S MACHINE (e.g.
+    /// `/dev/ttys014`), so a viewer pane can answer `getProcessInfo(.tty_name)`
+    /// (the `+list --tty` self-lookup path). POSIX agents report it; the Windows
+    /// ConPTY agent has no tty name and leaves it null. Additive/optional:
+    /// older agents omit it (unknown-field-tolerant parser → null) and the
+    /// client degrades to its pre-field behavior (no tty).
+    tty: ?[]const u8 = null,
 };
 
 /// `ATTACH` (0x03). `last_byte_offset` anchors the sequence-anchored resync
@@ -445,6 +555,25 @@ pub const Attached = struct {
     /// Set when the session already had an attached bridge (§5.3); the client may
     /// retry with `force = true` to steal.
     attached_elsewhere: bool = false,
+
+    /// Set (with `status == .dead`) when this dead session is a RELAUNCHABLE
+    /// tombstone materialized from the agent's on-disk metadata at start (§5.4
+    /// reboot floor, T12b) — NOT a child that exited this run. The viewer uses it
+    /// to decide whether to auto-fire `RELAUNCH` (T12c) rather than just showing an
+    /// exited overlay. A genuinely-exited child leaves this false (it carries an
+    /// `exit_code` instead). Additive/optional (older agents omit it → false).
+    relaunchable: bool = false,
+
+    /// The live child pid (set with `status == .alive`; 0 otherwise). ATTACH is
+    /// the path that matters for `getProcessInfo` — the app relaunch re-attaches
+    /// every persistence pane, and `OPENED.pid` from the original open is gone
+    /// with the old app process. Additive/optional (older agents omit it → 0,
+    /// today's behavior).
+    pid: i64 = 0,
+
+    /// The child's PTY slave path on the agent's machine (set with `status ==
+    /// .alive`; see `Opened.tty`). Additive/optional (older agents omit it).
+    tty: ?[]const u8 = null,
 
     pub const AttachStatus = enum { alive, dead, not_found };
 };
@@ -475,6 +604,15 @@ pub const Meta = struct {
     title: ?[]const u8 = null,
     listening_ports: ?[]const u16 = null,
     foreground_cmd: ?[]const u8 = null,
+
+    /// The session's current FOREGROUND pid (`tcgetpgrp` on the pty master),
+    /// pushed by the agent whenever it changes (sampled on the agent's 1 s
+    /// tick) so `getProcessInfo(.foreground_pid)` has live Exec parity for
+    /// agent-backed panes (wp3). Absent on Windows (ConPTY has no foreground
+    /// process group — matching WindowsPty, which returns null locally too)
+    /// and from older agents; the client then falls back to the child pid.
+    /// Additive/optional both ways (unknown-field-tolerant parsers).
+    foreground_pid: ?i64 = null,
 };
 
 /// `GET_CWD` (0x22). On-demand request for a session's child working directory.
@@ -491,10 +629,201 @@ pub const GetCwd = struct {
 /// `CWD` (0x23). Reply to `GET_CWD`. `ok == false` (and `path == null`) when the
 /// query failed (session gone, or the OS cwd read failed); the client then opens
 /// the new pane with no cwd hint rather than failing.
+///
+/// `found` (additive, T06b) disambiguates the two `ok == false` causes: `false`
+/// means the agent POSITIVELY does not have this session id in its table (it is
+/// gone for good — safe to forget); `true` means the session exists (attachable)
+/// but the cwd read failed. `null` ⇒ an older agent that predates the field, so
+/// an `ok == false` reply stays INCONCLUSIVE — session-restore liveness probes
+/// must not treat it as dead (losing a persisted layout on a transient probe
+/// failure is worse than keeping a stale entry).
 pub const Cwd = struct {
     session_id: []const u8,
     path: ?[]const u8 = null,
     ok: bool = false,
+    found: ?bool = null,
+};
+
+/// `LIST_SESSIONS` (0x24). Enumerate every session this agent owns (live +
+/// tombstoned). No arguments today (a future increment may add filters); an empty
+/// `{}` payload keeps it additive/HELLO-compatible. Correlated by `Frame.channel`
+/// (same-channel RPC, like `GET_CWD`): the agent echoes `SESSIONS` on that channel.
+pub const ListSessions = struct {};
+
+/// One row of a `SESSIONS` reply (design §5's `{id, state, title, cwd, argv,
+/// attached, created_at, exit_code?}`). Strings borrow the agent's session
+/// storage until the reply is encoded (the agent holds the store lock across the
+/// snapshot+encode). `activity` is the idle/busy/needs_input state as a string so
+/// this wire type need not import the agent's `ActivityState` enum. `alive == false`
+/// is a tombstone (a dead session, still listed until reaped) — `exit_code` is set
+/// then. `attached` is true while a viewer is currently bound to the stream.
+pub const SessionInfo = struct {
+    id: []const u8,
+    alive: bool = true,
+    exit_code: ?i64 = null,
+    attached: bool = false,
+    activity: []const u8 = "idle",
+    pid: i64 = 0,
+    title: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    argv: ?[]const u8 = null,
+    created_at: i64 = 0,
+    last_activity: i64 = 0,
+    /// True when the session is pinned against idle-TTL reaping (§7.1, T11) — a
+    /// persistent local pane the viewer's session-layout manifest references.
+    /// Surfaced so `+sessions` can show which sessions survive indefinitely.
+    /// Additive/optional (defaults false; older agents omit it).
+    pinned: bool = false,
+    /// True when this is a DEAD session materialized from the agent's on-disk
+    /// metadata at start and not yet relaunched (§5.4 reboot floor, T12b) — i.e.
+    /// `alive == false` but the recorded argv/cwd can bring it back via `RELAUNCH`.
+    /// A genuinely-exited child (`alive == false`, `exit_code` set) leaves this
+    /// false. Additive/optional (defaults false; older agents omit it).
+    relaunchable: bool = false,
+};
+
+/// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty
+/// roster encodes as `{"sessions":[]}` (a healthy agent with no sessions), never
+/// elided — so the client can distinguish "answered, none" from "no reply".
+pub const Sessions = struct {
+    sessions: []const SessionInfo = &.{},
+};
+
+/// `SET_LAYOUT` (0x28). Store (or, with `delete`, remove) an OPAQUE per-window
+/// layout blob keyed by `key` (the owning viewer's manifest-entry id — a
+/// window/tab-group identity). The agent NEVER parses `blob`; it persists it
+/// verbatim beside the session metadata (§5.4, T18) so a viewer on ANOTHER
+/// machine can pull the full window/tab/split topology and rebuild it, attaching
+/// each leaf to its live session. `session_ids` lists the sessions the blob
+/// references so the agent can REAP the blob once none of them exist any more
+/// (the agent stays topology-agnostic — it never inspects the blob to learn
+/// this). `delete == true` removes `key` (a clean window close); `blob`/
+/// `session_ids` are then ignored. Correlated by `Frame.channel` (same-channel
+/// RPC, like `GET_CWD`): the agent echoes `SET_LAYOUT_RESULT` on that channel.
+/// Additive/HELLO-compatible.
+pub const SetLayout = struct {
+    key: []const u8,
+    blob: ?[]const u8 = null,
+    session_ids: []const []const u8 = &.{},
+    delete: bool = false,
+};
+
+/// `SET_LAYOUT_RESULT` (0x29). Reply to `SET_LAYOUT`: `ok` is true when the
+/// upsert/remove was applied (a store failure — OOM, disk write — yields false).
+pub const SetLayoutResult = struct {
+    ok: bool = false,
+};
+
+/// `GET_LAYOUTS` (0x2a). Fetch EVERY stored layout blob this agent holds (the
+/// resumer wants a machine's whole set of windows). No arguments today; an empty
+/// `{}` payload keeps it additive/HELLO-compatible. Correlated by `Frame.channel`
+/// (same-channel RPC): the agent echoes `LAYOUTS` on that channel.
+pub const GetLayouts = struct {};
+
+/// One stored layout in a `LAYOUTS` reply: the opaque `blob` and the `key` it was
+/// stored under. `session_ids` are NOT echoed back (the resumer reads the leaf
+/// session ids out of the blob it decodes).
+pub const LayoutBlob = struct {
+    key: []const u8,
+    blob: []const u8,
+};
+
+/// `LAYOUTS` (0x2b). Reply to `GET_LAYOUTS`: every stored layout. An empty set
+/// encodes as `{"layouts":[]}` (a healthy agent with no stored layouts), never
+/// elided — so the client can distinguish "answered, none" from "no reply".
+pub const Layouts = struct {
+    layouts: []const LayoutBlob = &.{},
+};
+
+/// `CLOSE_SESSION` (0x2c). End a session BY SESSION ID — the session-scoped
+/// equivalent of `CLOSE` (0x14). `CLOSE` is CHANNEL-scoped (the agent looks the
+/// session up by the frame's channel), so it can only target a session a local
+/// pane is attached to. The chooser's "Kill" action must end a BROWSED session
+/// that has no local pane (hence no channel), so it addresses the session by id:
+/// the agent unlinks + terminates + frees the session container (the same core as
+/// `handleClose`). Correlated by `Frame.channel` (same-channel RPC, like
+/// `GET_CWD`): the agent echoes `CLOSE_SESSION_RESULT` on that channel.
+/// Additive/HELLO-compatible — gated on the `close_session` capability so the
+/// opcode is NEVER sent to a peer that didn't advertise support (an unknown
+/// opcode is a fatal framing error for the receiver).
+pub const CloseSession = struct {
+    session_id: []const u8,
+};
+
+/// `CLOSE_SESSION_RESULT` (0x2d). Reply to `CLOSE_SESSION`. `found` = whether a
+/// session with that id existed in the agent's table; `ok` = it was closed
+/// successfully (unlinked + terminated + freed). An unknown id yields
+/// `{found = false, ok = false}` — a definitive "already gone" answer.
+/// Additive/HELLO-compatible.
+pub const CloseSessionResult = struct {
+    session_id: []const u8,
+    ok: bool = false,
+    found: bool = false,
+};
+
+/// `RELAUNCH` (0x26). Ask the agent to respawn a DEAD session — a relaunchable
+/// tombstone materialized from disk at agent start (§5.4 reboot floor, T12b), or
+/// (idempotently) an already-alive one. The agent respawns the child under the
+/// session's recorded argv/cwd, re-keys it into the SAME session id + data channel
+/// (so the viewer's layout manifest reference and the already-known channel stay
+/// valid), flips the tombstone to alive, and streams fresh output. `rows`/`cols`
+/// carry the attaching viewer's current geometry so the respawned pty is sized
+/// correctly. Correlated by `session_id` in the reply (the agent echoes
+/// `RELAUNCHED` on the session's data channel). Additive/HELLO-compatible.
+pub const Relaunch = struct {
+    session_id: []const u8,
+    rows: u16,
+    cols: u16,
+    px_w: u16 = 0,
+    px_h: u16 = 0,
+
+    /// Respawn fidelity (wp3): the agent's on-disk session record keeps only
+    /// argv-label/cwd, so a synthesized relaunch OPEN used to lose the pane's
+    /// forwarded environment (GHOZTTY_PANE_ID / GHOZTTY_WINDOW_NAME / shell
+    /// integration vars), its TERM, and any explicit shell-integration argv
+    /// rewrite. RELAUNCH is always viewer-initiated, and the viewer still holds
+    /// all three — so it sends them and the agent applies them to the respawn
+    /// exactly like an original OPEN. All additive/optional: an older agent
+    /// ignores them (env-less respawn, today's behavior); an older client omits
+    /// them and a new agent falls back to the recorded metadata alone.
+    env: []const Open.EnvPair = &.{},
+    term: ?[]const u8 = null,
+    argv: ?[]const []const u8 = null,
+};
+
+/// `RELAUNCHED` (0x27). Reply to `RELAUNCH`. `ok == true` ⇒ the session is now
+/// alive under `pid` and live output is streaming on the reply frame's channel
+/// (the client resets its applied-offset baseline to 0 — a relaunch is a FRESH
+/// stream, not a resync). `ok == false` distinguishes two failures via `found`:
+/// `found == false` means the agent has no such session id (reaped/closed — the
+/// client should fall back to a fresh `OPEN`); `found == true` means the session
+/// exists but is not relaunchable (a genuinely-exited child with no recorded
+/// metadata) or the respawn itself failed.
+pub const Relaunched = struct {
+    session_id: []const u8,
+    ok: bool = false,
+    pid: i64 = 0,
+    found: bool = false,
+    /// True when the agent already replayed pre-restart scrollback + the "session
+    /// restarted" divider from a ring disk snapshot (§5.4 reboot scrollback, T13).
+    /// The client then SUPPRESSES its own snapshot-less divider so there is exactly
+    /// one marker. Additive/defaulted → older agents (never set it) and older
+    /// clients (ignore it) interoperate unchanged.
+    replayed: bool = false,
+
+    /// The width/height the replayed scrollback (`replayed == true`) was drawn at
+    /// — the snapshot's capture geometry (§5.4). 0 = unknown (blank relaunch, or a
+    /// legacy GRS1 snapshot with no width). The client replays the raw stream at
+    /// this width and then reflows to the live pane, so in-place prompt redraws
+    /// don't smear when the restored pane is a different size. Additive/defaulted →
+    /// an older agent sends 0 and the client falls back to live-width replay.
+    replay_cols: u16 = 0,
+    replay_rows: u16 = 0,
+
+    /// The respawned child's PTY slave path (set with `ok == true`; a relaunch
+    /// opens a FRESH pty, so any previously-reported tty is stale). See
+    /// `Opened.tty`. Additive/optional (older agents omit it).
+    tty: ?[]const u8 = null,
 };
 
 /// `TUNNEL` (0x40). `-R`/`-D` are forbidden from in-pane RPC (§9.5); enforcement
@@ -1003,6 +1332,12 @@ fn sampleFrames(alloc: Allocator) ![]Frame {
     try list.append(alloc, .{ .type = .meta, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .get_cwd, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .cwd, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .set_layout, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .set_layout_result, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .get_layouts, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .layouts, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .close_session, .channel = control_channel, .seq = 12, .payload = "{}" });
+    try list.append(alloc, .{ .type = .close_session_result, .channel = control_channel, .seq = 12, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc, .channel = control_channel, .seq = 13, .payload = "{}" });
     try list.append(alloc, .{ .type = .rpc_result, .channel = control_channel, .seq = 14, .payload = "{}" });
     try list.append(alloc, .{ .type = .tunnel, .channel = control_channel, .seq = 15, .payload = "{}" });
@@ -1256,6 +1591,43 @@ test "HELLO encode / parse / negotiate" {
     ));
 }
 
+test "negotiate: close_session capability is the intersection of both HELLOs" {
+    const both = [_][]const u8{capability.close_session};
+    const other = [_][]const u8{capability.rpc};
+
+    // Both advertise → enabled.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(n.close_session);
+    }
+    // Only one side, or neither → disabled (never enable a one-sided capability).
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+        );
+        try testing.expect(!n.close_session);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &other },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(!n.close_session);
+    }
+    {
+        // Older peers advertise no capabilities at all.
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw },
+            .{ .transfer_encoding = .raw },
+        );
+        try testing.expect(!n.close_session);
+    }
+}
+
 test "HELLO parse ignores unknown fields (forward-compat)" {
     const alloc = testing.allocator;
     const json =
@@ -1266,18 +1638,94 @@ test "HELLO parse ignores unknown fields (forward-compat)" {
     try testing.expectEqual(TransferEncoding.raw, parsed.value.transfer_encoding);
 }
 
+test "HELLO build_version: additive + back-compat" {
+    const alloc = testing.allocator;
+
+    // A newer agent advertises its build stamp; it round-trips.
+    const newer: Hello = .{ .transfer_encoding = .raw, .build_version = "20260718-574fe0805" };
+    const nj = try newer.encode(alloc);
+    defer alloc.free(nj);
+    var np = try Hello.parse(alloc, nj);
+    defer np.deinit();
+    try testing.expectEqualStrings("20260718-574fe0805", np.value.build_version.?);
+
+    // An OLDER peer's HELLO has no build_version → decodes to null ("unknown
+    // build"), never a parse error. The app must treat null as not-stale.
+    const legacy =
+        \\{"proto_version":1,"transfer_encoding":"raw","capabilities":["rpc"]}
+    ;
+    var lp = try Hello.parse(alloc, legacy);
+    defer lp.deinit();
+    try testing.expect(lp.value.build_version == null);
+
+    // When null, the field is elided from the encoding (no wire bloat / a peer
+    // that never sends it is byte-compatible with today).
+    const bare: Hello = .{ .transfer_encoding = .raw };
+    const bj = try bare.encode(alloc);
+    defer alloc.free(bj);
+    try testing.expect(std.mem.indexOf(u8, bj, "build_version") == null);
+}
+
 test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     const alloc = testing.allocator;
 
     const open: Open = .{ .rows = 24, .cols = 80, .command = "vim" };
     const oj = try encodeJson(alloc, open);
     defer alloc.free(oj);
-    // null optionals (cwd, shell, name) are elided.
+    // null optionals (cwd, shell, name, argv) are elided.
     try testing.expect(std.mem.indexOf(u8, oj, "cwd") == null);
+    try testing.expect(std.mem.indexOf(u8, oj, "argv") == null);
     var op = try parseJson(Open, alloc, oj);
     defer op.deinit();
     try testing.expectEqual(@as(u16, 24), op.value.rows);
     try testing.expectEqualStrings("vim", op.value.command.?);
+    // env defaults to an empty slice (encoded as an empty array, harmless).
+    try testing.expectEqual(@as(usize, 0), op.value.env.len);
+    // argv defaults to null (no explicit shell integration argv rewrite, T04c).
+    try testing.expect(op.value.argv == null);
+    // pinned defaults to false (cross-machine / non-persistent, T11).
+    try testing.expect(!op.value.pinned);
+
+    // An OPEN pinning its session (T11, persistent local pane) round-trips true.
+    const open_pin: Open = .{ .rows = 24, .cols = 80, .pinned = true };
+    const pj = try encodeJson(alloc, open_pin);
+    defer alloc.free(pj);
+    try testing.expect(std.mem.indexOf(u8, pj, "\"pinned\":true") != null);
+    var pp = try parseJson(Open, alloc, pj);
+    defer pp.deinit();
+    try testing.expect(pp.value.pinned);
+
+    // An OPEN carrying an explicit shell argv (T04c) round-trips: the elements
+    // survive encode→decode intact and in order (bash rewrite `<shell> --posix`).
+    const argv = [_][]const u8{ "/opt/homebrew/bin/bash", "--posix" };
+    const open_argv: Open = .{ .rows = 24, .cols = 80, .argv = &argv };
+    const gj = try encodeJson(alloc, open_argv);
+    defer alloc.free(gj);
+    try testing.expect(std.mem.indexOf(u8, gj, "--posix") != null);
+    var gp = try parseJson(Open, alloc, gj);
+    defer gp.deinit();
+    try testing.expect(gp.value.argv != null);
+    try testing.expectEqual(@as(usize, 2), gp.value.argv.?.len);
+    try testing.expectEqualStrings("/opt/homebrew/bin/bash", gp.value.argv.?[0]);
+    try testing.expectEqualStrings("--posix", gp.value.argv.?[1]);
+
+    // An OPEN carrying a forwarded env allowlist (T04a) round-trips: the pairs
+    // survive encode→decode with keys/values intact and in order.
+    const pairs = [_]Open.EnvPair{
+        .{ .key = "GHOZTTY_WINDOW_NAME", .value = "0x00000000deadbeef" },
+        .{ .key = "GHOZTTY_PANE_NAME", .value = "logs" },
+    };
+    const open_env: Open = .{ .rows = 24, .cols = 80, .env = &pairs };
+    const ej = try encodeJson(alloc, open_env);
+    defer alloc.free(ej);
+    try testing.expect(std.mem.indexOf(u8, ej, "GHOZTTY_WINDOW_NAME") != null);
+    var ep = try parseJson(Open, alloc, ej);
+    defer ep.deinit();
+    try testing.expectEqual(@as(usize, 2), ep.value.env.len);
+    try testing.expectEqualStrings("GHOZTTY_WINDOW_NAME", ep.value.env[0].key);
+    try testing.expectEqualStrings("0x00000000deadbeef", ep.value.env[0].value);
+    try testing.expectEqualStrings("GHOZTTY_PANE_NAME", ep.value.env[1].key);
+    try testing.expectEqualStrings("logs", ep.value.env[1].value);
 
     const att: Attached = .{ .status = .alive, .rows = 24, .cols = 80, .snapshot_at_offset = 42 };
     const aj = try encodeJson(alloc, att);
@@ -1286,6 +1734,101 @@ test "OPEN/ATTACHED JSON payloads round-trip with null elision" {
     defer ap.deinit();
     try testing.expectEqual(Attached.AttachStatus.alive, ap.value.status);
     try testing.expectEqual(@as(u64, 42), ap.value.snapshot_at_offset);
+    // pid/tty default when omitted (an older agent's ATTACHED) — no error, no tty.
+    try testing.expectEqual(@as(i64, 0), ap.value.pid);
+    try testing.expect(ap.value.tty == null);
+}
+
+test "OPENED/ATTACHED/RELAUNCHED pid+tty round-trip and default when omitted" {
+    const alloc = testing.allocator;
+
+    // OPENED with tty (a POSIX agent) round-trips.
+    const opened: Opened = .{ .session_id = "abc123", .pid = 4242, .tty = "/dev/ttys014" };
+    const oj = try encodeJson(alloc, opened);
+    defer alloc.free(oj);
+    var op = try parseJson(Opened, alloc, oj);
+    defer op.deinit();
+    try testing.expectEqual(@as(i64, 4242), op.value.pid);
+    try testing.expectEqualStrings("/dev/ttys014", op.value.tty.?);
+
+    // OPENED without tty (a Windows or pre-field agent): null tty is elided on
+    // encode and defaults to null on parse — version skew degrades cleanly.
+    const opened_old: Opened = .{ .session_id = "abc123", .pid = 4242 };
+    const yj = try encodeJson(alloc, opened_old);
+    defer alloc.free(yj);
+    try testing.expect(std.mem.indexOf(u8, yj, "tty") == null);
+    var yp = try parseJson(Opened, alloc, yj);
+    defer yp.deinit();
+    try testing.expect(yp.value.tty == null);
+
+    // ATTACHED alive carries pid + tty (the app-relaunch re-attach path).
+    const att: Attached = .{ .status = .alive, .rows = 24, .cols = 80, .pid = 777, .tty = "/dev/ttys020" };
+    const aj = try encodeJson(alloc, att);
+    defer alloc.free(aj);
+    var ap = try parseJson(Attached, alloc, aj);
+    defer ap.deinit();
+    try testing.expectEqual(@as(i64, 777), ap.value.pid);
+    try testing.expectEqualStrings("/dev/ttys020", ap.value.tty.?);
+
+    // RELAUNCHED carries the fresh pty's tty on ok; defaults null when omitted.
+    const rel: Relaunched = .{ .session_id = "abc123", .ok = true, .pid = 99, .found = true, .tty = "/dev/ttys021" };
+    const rj = try encodeJson(alloc, rel);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunched, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqualStrings("/dev/ttys021", rp.value.tty.?);
+    const rel_old: Relaunched = .{ .session_id = "abc123", .ok = true, .pid = 99, .found = true };
+    const sj = try encodeJson(alloc, rel_old);
+    defer alloc.free(sj);
+    var sp = try parseJson(Relaunched, alloc, sj);
+    defer sp.deinit();
+    try testing.expect(sp.value.tty == null);
+}
+
+test "META foreground_pid and RELAUNCH env/term/argv round-trip with skew defaults (wp3)" {
+    const alloc = testing.allocator;
+
+    // META{foreground_pid} round-trips; omitted (older agent) defaults null.
+    const meta: Meta = .{ .foreground_pid = 4321 };
+    const mj = try encodeJson(alloc, meta);
+    defer alloc.free(mj);
+    var mp = try parseJson(Meta, alloc, mj);
+    defer mp.deinit();
+    try testing.expectEqual(@as(i64, 4321), mp.value.foreground_pid.?);
+    var op = try parseJson(Meta, alloc, "{\"title\":\"hi\"}");
+    defer op.deinit();
+    try testing.expect(op.value.foreground_pid == null);
+
+    // RELAUNCH respawn-fidelity fields round-trip.
+    const pairs = [_]Open.EnvPair{
+        .{ .key = "GHOZTTY_PANE_ID", .value = "ABC-123" },
+    };
+    const argv = [_][]const u8{ "/bin/bash", "--posix" };
+    const rel: Relaunch = .{
+        .session_id = "s1",
+        .rows = 24,
+        .cols = 80,
+        .env = &pairs,
+        .term = "xterm-256color",
+        .argv = &argv,
+    };
+    const rj = try encodeJson(alloc, rel);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunch, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqual(@as(usize, 1), rp.value.env.len);
+    try testing.expectEqualStrings("GHOZTTY_PANE_ID", rp.value.env[0].key);
+    try testing.expectEqualStrings("ABC-123", rp.value.env[0].value);
+    try testing.expectEqualStrings("xterm-256color", rp.value.term.?);
+    try testing.expectEqual(@as(usize, 2), rp.value.argv.?.len);
+
+    // An OLD client's RELAUNCH (no fidelity fields) parses with empty/null
+    // defaults — the agent then falls back to recorded metadata alone.
+    var old = try parseJson(Relaunch, alloc, "{\"session_id\":\"s1\",\"rows\":24,\"cols\":80}");
+    defer old.deinit();
+    try testing.expectEqual(@as(usize, 0), old.value.env.len);
+    try testing.expect(old.value.term == null);
+    try testing.expect(old.value.argv == null);
 }
 
 test "METRICS/HostMetrics JSON round-trips with null optional elision" {
@@ -1414,6 +1957,228 @@ test "PROC_KILL / PROC_SPAWN JSON payloads round-trip (incl. null elision)" {
     try testing.expect(srp.value.ok);
     try testing.expectEqual(@as(i64, 4242), srp.value.pid.?);
     try testing.expect(srp.value.@"error" == null);
+}
+
+test "CLOSE_SESSION / CLOSE_SESSION_RESULT JSON payloads round-trip" {
+    const alloc = testing.allocator;
+
+    // Request carries just the session id.
+    const req: CloseSession = .{ .session_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    const rj = try encodeJson(alloc, req);
+    defer alloc.free(rj);
+    var rp = try parseJson(CloseSession, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", rp.value.session_id);
+
+    // A found + closed result.
+    const ok: CloseSessionResult = .{ .session_id = "s1", .ok = true, .found = true };
+    const oj = try encodeJson(alloc, ok);
+    defer alloc.free(oj);
+    var op = try parseJson(CloseSessionResult, alloc, oj);
+    defer op.deinit();
+    try testing.expectEqualStrings("s1", op.value.session_id);
+    try testing.expect(op.value.ok);
+    try testing.expect(op.value.found);
+
+    // An unknown-id result: found=false, ok=false (defaults), round-trips intact.
+    const gone: CloseSessionResult = .{ .session_id = "s2" };
+    const gj = try encodeJson(alloc, gone);
+    defer alloc.free(gj);
+    var gp = try parseJson(CloseSessionResult, alloc, gj);
+    defer gp.deinit();
+    try testing.expect(!gp.value.ok);
+    try testing.expect(!gp.value.found);
+}
+
+test "LIST_SESSIONS / SESSIONS JSON payloads round-trip (T10)" {
+    const alloc = testing.allocator;
+
+    // LIST_SESSIONS is an empty object today.
+    const req: ListSessions = .{};
+    const rj = try encodeJson(alloc, req);
+    defer alloc.free(rj);
+    try testing.expectEqualStrings("{}", rj);
+
+    // A populated roster: alive + dead rows survive with all fields intact and in
+    // order. `argv`/`title` null on the dead row are elided; `exit_code` present.
+    const rows = [_]SessionInfo{
+        .{
+            .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .alive = true,
+            .attached = true,
+            .activity = "busy",
+            .pid = 4242,
+            .cwd = "/home/dev",
+            .argv = "vim .",
+            .title = "editor",
+            .created_at = 1000,
+            .last_activity = 2000,
+            .pinned = true,
+        },
+        .{
+            .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .alive = false,
+            .exit_code = 137,
+            .activity = "idle",
+            .pid = 99,
+        },
+    };
+    const sessions: Sessions = .{ .sessions = &rows };
+    const sj = try encodeJson(alloc, sessions);
+    defer alloc.free(sj);
+    var sp = try parseJson(Sessions, alloc, sj);
+    defer sp.deinit();
+    try testing.expectEqual(@as(usize, 2), sp.value.sessions.len);
+
+    const a = sp.value.sessions[0];
+    try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", a.id);
+    try testing.expect(a.alive and a.attached);
+    try testing.expectEqualStrings("busy", a.activity);
+    try testing.expectEqual(@as(i64, 4242), a.pid);
+    try testing.expectEqualStrings("/home/dev", a.cwd.?);
+    try testing.expectEqualStrings("vim .", a.argv.?);
+    try testing.expectEqualStrings("editor", a.title.?);
+    try testing.expect(a.pinned); // pinned round-trips (T11)
+
+    const b = sp.value.sessions[1];
+    try testing.expect(!b.alive);
+    try testing.expectEqual(@as(?i64, 137), b.exit_code);
+    try testing.expect(b.argv == null and b.title == null and b.cwd == null);
+    try testing.expect(!b.pinned); // defaults false when omitted
+
+    // An empty roster still encodes the array key (never elided) so the client can
+    // tell "answered, none" from "no reply".
+    const empty: Sessions = .{};
+    const ej = try encodeJson(alloc, empty);
+    defer alloc.free(ej);
+    try testing.expectEqualStrings("{\"sessions\":[]}", ej);
+
+    // A relaunchable dead tombstone (T12b) round-trips its marker.
+    const reln = [_]SessionInfo{.{
+        .id = "cccccccccccccccccccccccccccccccc",
+        .alive = false,
+        .pinned = true,
+        .relaunchable = true,
+        .argv = "sleep 600",
+    }};
+    const rjs = try encodeJson(alloc, Sessions{ .sessions = &reln });
+    defer alloc.free(rjs);
+    var rsp = try parseJson(Sessions, alloc, rjs);
+    defer rsp.deinit();
+    try testing.expect(!rsp.value.sessions[0].alive);
+    try testing.expect(rsp.value.sessions[0].relaunchable);
+    try testing.expect(rsp.value.sessions[0].exit_code == null);
+}
+
+test "SET_LAYOUT / LAYOUTS JSON payloads round-trip (T18)" {
+    const alloc = testing.allocator;
+
+    // A SET_LAYOUT upsert: opaque blob + the sessions it references, null
+    // `delete` elided (default false), `session_ids` array in order.
+    const ids = [_][]const u8{
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    };
+    const set: SetLayout = .{
+        .key = "11111111-2222-3333-4444-555555555555",
+        .blob = "{\"tree\":\"opaque\"}",
+        .session_ids = &ids,
+    };
+    const setj = try encodeJson(alloc, set);
+    defer alloc.free(setj);
+    // `delete` defaults false; the wire omits nothing important but `blob`/
+    // `session_ids` must survive a round-trip in order.
+    var setp = try parseJson(SetLayout, alloc, setj);
+    defer setp.deinit();
+    try testing.expectEqualStrings("11111111-2222-3333-4444-555555555555", setp.value.key);
+    try testing.expectEqualStrings("{\"tree\":\"opaque\"}", setp.value.blob.?);
+    try testing.expectEqual(@as(usize, 2), setp.value.session_ids.len);
+    try testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", setp.value.session_ids[0]);
+    try testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", setp.value.session_ids[1]);
+    try testing.expect(!setp.value.delete);
+
+    // A delete carries no blob; the blob key is elided (null optional).
+    const del: SetLayout = .{ .key = "gone", .delete = true };
+    const delj = try encodeJson(alloc, del);
+    defer alloc.free(delj);
+    try testing.expect(std.mem.indexOf(u8, delj, "\"blob\"") == null);
+    var delp = try parseJson(SetLayout, alloc, delj);
+    defer delp.deinit();
+    try testing.expect(delp.value.delete);
+    try testing.expect(delp.value.blob == null);
+
+    // SET_LAYOUT_RESULT.
+    const okj = try encodeJson(alloc, SetLayoutResult{ .ok = true });
+    defer alloc.free(okj);
+    var okp = try parseJson(SetLayoutResult, alloc, okj);
+    defer okp.deinit();
+    try testing.expect(okp.value.ok);
+
+    // GET_LAYOUTS is an empty object.
+    const gj = try encodeJson(alloc, GetLayouts{});
+    defer alloc.free(gj);
+    try testing.expectEqualStrings("{}", gj);
+
+    // A populated LAYOUTS reply round-trips key+blob in order.
+    const blobs = [_]LayoutBlob{
+        .{ .key = "w1", .blob = "{\"a\":1}" },
+        .{ .key = "w2", .blob = "{\"b\":2}" },
+    };
+    const lj = try encodeJson(alloc, Layouts{ .layouts = &blobs });
+    defer alloc.free(lj);
+    var lp = try parseJson(Layouts, alloc, lj);
+    defer lp.deinit();
+    try testing.expectEqual(@as(usize, 2), lp.value.layouts.len);
+    try testing.expectEqualStrings("w1", lp.value.layouts[0].key);
+    try testing.expectEqualStrings("{\"a\":1}", lp.value.layouts[0].blob);
+    try testing.expectEqualStrings("w2", lp.value.layouts[1].key);
+
+    // An empty layout set keeps the array key (never elided).
+    const empty = try encodeJson(alloc, Layouts{});
+    defer alloc.free(empty);
+    try testing.expectEqualStrings("{\"layouts\":[]}", empty);
+}
+
+test "RELAUNCH / RELAUNCHED JSON payloads round-trip (T12b)" {
+    const alloc = testing.allocator;
+
+    // Request carries the session id + the attaching viewer's geometry.
+    const req: Relaunch = .{ .session_id = "0123456789abcdef0123456789abcdef", .rows = 40, .cols = 120 };
+    const rj = try encodeJson(alloc, req);
+    defer alloc.free(rj);
+    var rp = try parseJson(Relaunch, alloc, rj);
+    defer rp.deinit();
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", rp.value.session_id);
+    try testing.expectEqual(@as(u16, 40), rp.value.rows);
+    try testing.expectEqual(@as(u16, 120), rp.value.cols);
+
+    // A successful reply carries the fresh pid; found/ok both true.
+    const ok_reply: Relaunched = .{ .session_id = req.session_id, .ok = true, .pid = 7777, .found = true };
+    const oj = try encodeJson(alloc, ok_reply);
+    defer alloc.free(oj);
+    var op = try parseJson(Relaunched, alloc, oj);
+    defer op.deinit();
+    try testing.expect(op.value.ok and op.value.found);
+    try testing.expectEqual(@as(i64, 7777), op.value.pid);
+    try testing.expect(!op.value.replayed); // defaults false; absent → false
+
+    // A reboot-scrollback reply sets replayed=true (T13) so the client suppresses
+    // its own divider; it round-trips.
+    const replayed_reply: Relaunched = .{ .session_id = req.session_id, .ok = true, .pid = 42, .found = true, .replayed = true };
+    const pj = try encodeJson(alloc, replayed_reply);
+    defer alloc.free(pj);
+    var pp = try parseJson(Relaunched, alloc, pj);
+    defer pp.deinit();
+    try testing.expect(pp.value.replayed);
+
+    // A "no such session" reply: ok=false, found=false, pid defaults 0.
+    const gone: Relaunched = .{ .session_id = req.session_id };
+    const gj = try encodeJson(alloc, gone);
+    defer alloc.free(gj);
+    var gp = try parseJson(Relaunched, alloc, gj);
+    defer gp.deinit();
+    try testing.expect(!gp.value.ok and !gp.value.found);
+    try testing.expectEqual(@as(i64, 0), gp.value.pid);
 }
 
 test "JSON-RPC request/response envelope" {

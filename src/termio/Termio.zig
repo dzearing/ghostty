@@ -81,6 +81,18 @@ thread_enter_state: ?*ThreadEnterState = null,
 /// thread if it's the only consumer).
 closing: std.atomic.Value(bool) = .init(false),
 
+/// Latest-wins resize slot. RESIZE is control state where only the FINAL
+/// geometry matters, so — unlike write DATA — it must never be dropped by the
+/// bounded `mailbox`. A session re-attach floods that mailbox with replayed
+/// output; a `.resize` pushed during the flood used to be dropped (see
+/// mailbox.zig's 50ms give-up), leaving the pty at a stale width so re-attached
+/// panes rendered narrow/blank until a manual resize. `queueMessage` now stashes
+/// the newest geometry here instead of enqueueing it, and the IO thread applies
+/// it on every drain, so a full data queue can never crowd it out. Guarded by
+/// `pending_resize_mutex`; null = nothing pending.
+pending_resize: ?renderer.Size = null,
+pending_resize_mutex: std.Thread.Mutex = .{},
+
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
 const ThreadEnterState = struct {
@@ -394,6 +406,19 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
+/// Mark whether backend teardown should CLOSE the remote session (terminate
+/// the agent-side child and free the session) instead of the default DETACH
+/// (keep-alive for a later re-attach). Set when the user explicitly closes a
+/// pane/window; never set on app quit. No-op for the exec backend, whose child
+/// dies with the surface anyway. Safe to call from the GUI thread: the write
+/// is atomic and strictly precedes the surface free that joins the IO thread.
+pub fn setSessionCloseIntent(self: *Termio, close_on_exit: bool) void {
+    switch (self.backend) {
+        .remote => |*remote| remote.close_on_exit.store(close_on_exit, .release),
+        else => {},
+    }
+}
+
 /// Signal the IO backend to abort any blocking work so the IO thread can be
 /// joined promptly. Safe to call from another thread (the GUI thread calls it
 /// from `Surface.deinit` right before joining the IO thread). See
@@ -423,11 +448,40 @@ pub fn queueMessage(
     msg: termio.Message,
     mutex: MutexState,
 ) void {
+    // RESIZE bypasses the bounded data mailbox: it is latest-wins control
+    // state that MUST survive a full queue (a re-attach replay flood otherwise
+    // drops it → stale pty winsize → narrow/blank re-attached panes). Stash the
+    // newest geometry in a dedicated slot and wake the writer to apply it; the
+    // write DATA in the queue can never crowd it out, and we never block, so the
+    // teardown deadlock the mailbox drop guards against can't happen here.
+    switch (msg) {
+        .resize => |size| {
+            self.pending_resize_mutex.lock();
+            self.pending_resize = size;
+            self.pending_resize_mutex.unlock();
+            self.mailbox.notify();
+            return;
+        },
+        else => {},
+    }
+
     self.mailbox.send(msg, switch (mutex) {
         .locked => self.renderer_state.mutex,
         .unlocked => null,
     });
     self.mailbox.notify();
+}
+
+/// Atomically take and clear the latest pending resize (see `pending_resize`).
+/// Called by the IO thread on each mailbox drain so a coalesced RESIZE is
+/// applied even when the bounded data mailbox is saturated. Null = nothing
+/// pending.
+pub fn takePendingResize(self: *Termio) ?renderer.Size {
+    self.pending_resize_mutex.lock();
+    defer self.pending_resize_mutex.unlock();
+    const v = self.pending_resize;
+    self.pending_resize = null;
+    return v;
 }
 
 /// Queue a write directly to the pty.
@@ -529,6 +583,27 @@ pub fn resize(
 
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    self.renderer_wakeup.notify() catch {};
+}
+
+/// Reflow ONLY the local terminal grid to `cols`x`rows` — no pty/agent RESIZE and
+/// no change to `self.size`. Used to replay reboot-scrollback (§5.4) at the width
+/// it was captured at and then reflow to the live pane width: a raw byte stream
+/// full of in-place prompt redraws (`\r` + erase-to-end) only lands cleanly at its
+/// original width, so we render it there, then reflow. Caller MUST leave the grid
+/// back at the live size (== `self.size.grid()`) when done, so a later real resize
+/// stays consistent. Same locking as `resize`; notifies the renderer.
+pub fn reflowLocalGrid(self: *Termio, cols: u16, rows: u16) void {
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.terminal.resize(self.alloc, cols, rows) catch |err| {
+            log.warn("reflowLocalGrid resize failed err={}", .{err});
+            return;
+        };
+        self.terminal.modes.set(.synchronized_output, false);
+    }
+    _ = self.renderer_mailbox.push(.{ .resize = self.size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -676,6 +751,34 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     self.processOutputLocked(buf);
+}
+
+/// Like `processOutput` but also advances `applied` by `buf.len` while still
+/// holding the renderer mutex. Used by the remote drain path (WP-D3) so a
+/// concurrent snapshot reader — which holds the SAME mutex to serialize the
+/// grid — always observes the applied byte count and the grid it produced as
+/// one consistent pair. Without this the offset could be read a chunk ahead of
+/// or behind the grid, seaming the snapshot against the agent's delta replay.
+pub fn processOutputTracked(
+    self: *Termio,
+    buf: []const u8,
+    applied: *std.atomic.Value(u64),
+) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.processOutputLocked(buf);
+    _ = applied.fetchAdd(buf.len, .monotonic);
+}
+
+/// The absolute agent-stream byte offset this pane has applied to its terminal
+/// so far (WP-D3), or null for a non-remote backend. Read under the renderer
+/// mutex alongside a grid dump to persist a consistent (screen, offset) pair
+/// for a fast delta re-attach. See `Remote.appliedOffset`.
+pub fn remoteAppliedOffset(self: *const Termio) ?u64 {
+    return switch (self.backend) {
+        .remote => |*r| r.appliedOffset(),
+        else => null,
+    };
 }
 
 /// Process output from readdata but the lock is already held.

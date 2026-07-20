@@ -305,6 +305,17 @@ fn drainMailbox(
     // expectation is that all our message handlers will be non-blocking
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
+
+    // Apply the latest coalesced resize BEFORE draining DATA. RESIZE bypasses
+    // the bounded queue (queueMessage stores it in a latest-wins slot on the
+    // Termio) precisely so a replay flood that fills the queue can't drop it;
+    // consume it here on every wake, regardless of queue pressure, so the pty
+    // winsize always tracks the window (fixes narrow/blank re-attached panes).
+    if (io.takePendingResize()) |size| {
+        redraw = true;
+        self.handleResize(cb, size);
+    }
+
     while (mailbox.pop()) |message| {
         // If we have a message we always redraw
         redraw = true;

@@ -147,6 +147,18 @@ extension Ghostty {
             return ghostty_surface_process_exited(surface)
         }
 
+        /// Mark whether freeing this surface should CLOSE its agent session
+        /// (terminate the remote child) instead of the default DETACH
+        /// (keep-alive for re-attach). Set true when the user closes the
+        /// pane/tab/window; cleared when the view is (re)adopted into a live
+        /// surface tree (undo restore). Never set on app quit, so persistent
+        /// sessions survive quit for the next launch's restore. No-op for
+        /// local exec surfaces.
+        func setSessionCloseIntent(_ closeOnFree: Bool) {
+            guard let surface = self.surface else { return }
+            ghostty_surface_set_session_close_intent(surface, closeOnFree)
+        }
+
         // Returns the inspector instance for this surface, or nil if the
         // surface has been closed or no inspector is active.
         var inspector: Ghostty.Inspector? {
@@ -207,6 +219,14 @@ extension Ghostty {
         // the terminal title as the main title property. If the title is set manually
         // by the user, this is set to the prior value (which may be empty, but non-nil).
         private var titleFromTerminal: String?
+
+        // The agent session id this surface was ASKED to attach (from its
+        // creation config), independent of whether surface creation succeeded.
+        // Session-layout sync falls back to this when the live session id is
+        // unavailable (`ghostty_surface_new` failed — e.g. the known dark-wake
+        // OutOfMemory — or the termio thread hasn't published yet), so a failed
+        // restore can never wipe a manifest entry's recorded session ids (T06b).
+        private(set) var expectedRemoteSessionID: String?
 
         // The cached contents of the screen.
         private(set) var cachedScreenContents: CachedValue<String>
@@ -349,7 +369,18 @@ extension Ghostty {
             ) { [weak self] event in self?.localEventHandler(event) }
 
             // Setup our surface. This will also initialize all the terminal IO.
-            let surface_cfg = baseConfig ?? SurfaceConfiguration()
+            var surface_cfg = baseConfig ?? SurfaceConfiguration()
+            // Stable pane identity (wp3): bake this surface's UUID into the
+            // pane's environment as GHOZTTY_PANE_ID so any process inside the
+            // pane can address its own pane reliably (`+send-keys/+set-banner
+            // --target=$GHOZTTY_PANE_ID`) without pid/tty matching — pids/ttys
+            // are per-machine and break for remote panes. Every creation path
+            // funnels through this init, and the restore paths pass the
+            // PERSISTED uuid back in (session-layout manifest / window state /
+            // reconnect swap), so the baked value never goes stale: the same
+            // id fronts the pane for its whole life, across app relaunches.
+            surface_cfg.environmentVariables["GHOZTTY_PANE_ID"] = self.id.uuidString
+            self.expectedRemoteSessionID = surface_cfg.remoteSessionId
             self.backgroundTint = surface_cfg.backgroundTint
             self.backgroundTintNSColor = surface_cfg.backgroundTintNSColor
                 ?? surface_cfg.backgroundTint.map { NSColor($0).resolvedSRGB }
@@ -558,7 +589,7 @@ extension Ghostty {
         func promptTitle() {
             // Create an alert dialog
             let alert = NSAlert()
-            alert.messageText = "Change Terminal Title"
+            alert.messageText = "Change Pane Title"
             alert.informativeText = "Leave blank to restore the default."
             alert.alertStyle = .informational
 
@@ -1647,7 +1678,7 @@ extension Ghostty {
             menu.addItem(.separator())
             item = menu.addItem(withTitle: "Change Tab Title...", action: #selector(BaseTerminalController.changeTabTitle(_:)), keyEquivalent: "")
             item.setImageIfDesired(systemSymbolName: "pencil.line")
-            item = menu.addItem(withTitle: "Change Terminal Title...", action: #selector(changeTitle(_:)), keyEquivalent: "")
+            item = menu.addItem(withTitle: "Change Pane Title...", action: #selector(changeTitle(_:)), keyEquivalent: "")
 
             return menu
         }
@@ -1804,6 +1835,18 @@ extension Ghostty {
         }
 
         @objc private func backgroundColorDidChange(_ sender: NSColorPanel) {
+            // The shared NSColorPanel stays wired to this surface as its
+            // target/action after the user opens the background-color picker,
+            // and we never unbind it. AppKit can then invoke this action via
+            // the responder chain even when the panel is hidden — e.g. opening
+            // the pane banner editor (Cmd+R) or a title prompt makes a text
+            // field first responder and the panel re-sends changeColor: with
+            // the *system* text color, which resolves to white in dark mode.
+            // Applying that silently flips the pane to white long after the
+            // user was done picking. Only honor callbacks from a live edit in
+            // the visible panel; a real pick is always `isVisible`.
+            guard sender.isVisible else { return }
+
             let color = sender.color
             let srgbColor = color.usingColorSpace(.sRGB) ?? color
             backgroundTintNSColor = srgbColor

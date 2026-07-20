@@ -860,6 +860,21 @@ pub const Surface = struct {
     /// invariant as `remote_working_directory`.
     remote_shell: ?[*:0]const u8 = null,
 
+    /// True ⇒ the remote connection is the LOCAL agent (same machine + bundle),
+    /// so `remoteBackend()` requests ghostty shell integration + the per-pane
+    /// GHOSTTY_* env for the pane (T04b). Copied from
+    /// `Options.remote_local_shell_integration`. Ignored when `connection` is
+    /// null. NEVER true for a cross-machine window.
+    remote_local_shell_integration: bool = false,
+
+    /// WP-D3 fast re-attach: the persisted structured VT screen snapshot (as a
+    /// slice) + the absolute byte offset it reflects, copied from
+    /// `Options.restore_snapshot`/`.restore_byte_offset`. Borrowed for the
+    /// duration of `CoreSurface.init` only (the remote backend dupes the bytes),
+    /// so we retain just the raw pointer/len here. Read by `remoteBackend()`.
+    remote_restore_snapshot: ?[]const u8 = null,
+    remote_restore_offset: u64 = 0,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -936,6 +951,31 @@ pub const Surface = struct {
         ///
         /// C type: `const char*`.
         remote_shell: ?[*:0]const u8 = null,
+
+        /// True ⇒ the connection is the LOCAL agent (same machine + same Ghostty
+        /// bundle as this viewer), so it is safe to inject ghostty shell
+        /// integration and the per-pane GHOSTTY_* env for the pane (T04b). The
+        /// apprt sets this from `Machine.isLocalMachine`. Ignored when
+        /// `connection` is null; NEVER set for a cross-machine window (a macOS
+        /// resources path / ZDOTDIR is meaningless on a different-OS agent).
+        ///
+        /// C type: `bool`.
+        remote_local_shell_integration: bool = false,
+
+        /// WP-D3 fast re-attach: the app's persisted structured VT screen
+        /// snapshot to paint on ATTACH, captured on quit via
+        /// `ghostty_surface_session_snapshot` and stored in the session-layout
+        /// manifest. `restore_byte_offset` is the absolute agent-stream byte
+        /// offset it reflects, passed as the ATTACH `last_byte_offset` so the
+        /// agent replays only the gap since detach. Null/0 ⇒ full-ring replay
+        /// (no snapshot, or a legacy manifest). Borrowed for the duration of
+        /// `CoreSurface.init` only (the remote backend dupes the bytes). Ignored
+        /// when `connection` or `session_id` is null.
+        ///
+        /// C type: `const char*` + `uintptr_t` + `uint64_t`.
+        restore_snapshot: ?[*]const u8 = null,
+        restore_snapshot_len: usize = 0,
+        restore_byte_offset: u64 = 0,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -957,6 +997,14 @@ pub const Surface = struct {
             .remote_session_id = opts.session_id,
             .remote_working_directory = opts.remote_working_directory,
             .remote_shell = opts.remote_shell,
+            .remote_local_shell_integration = opts.remote_local_shell_integration,
+            // WP-D3: the persisted screen snapshot + offset for a fast restore.
+            // Recorded as a slice (borrowed until `core_surface.init` returns).
+            .remote_restore_snapshot = if (opts.restore_snapshot) |p|
+                p[0..opts.restore_snapshot_len]
+            else
+                null,
+            .remote_restore_offset = opts.restore_byte_offset,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1491,6 +1539,15 @@ pub const Surface = struct {
                 const s = std.mem.sliceTo(sh, 0);
                 break :sh if (s.len > 0) s else null;
             } else null,
+            // Only the LOCAL agent gets ghostty shell integration injected (T04b).
+            .local_shell_integration = self.remote_local_shell_integration,
+            // WP-D3: forward the persisted snapshot + offset (empty ⇒ null so a
+            // stray zero-length blob never triggers the snapshot paint path).
+            .restore_snapshot = if (self.remote_restore_snapshot) |s|
+                (if (s.len > 0) s else null)
+            else
+                null,
+            .restore_offset = self.remote_restore_offset,
         };
     }
 
@@ -2090,6 +2147,17 @@ pub const CAPI = struct {
     ) ?*Surface {
         return surface_new_(app, opts) catch |err| {
             log.err("error initializing surface err={}", .{err});
+            // Log the error-return trace addresses (T06b diagnostics): a live
+            // incident produced a persistent, unexplained error.OutOfMemory
+            // from this path; if it recurs these addresses attribute the
+            // failing `try` (symbolicate offline with atos against this
+            // binary). Debug builds only (release strips the trace).
+            if (@errorReturnTrace()) |trace| {
+                const n = @min(trace.index, trace.instruction_addresses.len);
+                for (trace.instruction_addresses[0..n], 0..) |addr, i| {
+                    log.err("surface init error trace[{d}] addr=0x{x}", .{ i, addr });
+                }
+            }
             return null;
         };
     }
@@ -2108,6 +2176,15 @@ pub const CAPI = struct {
     /// Returns the userdata associated with the surface.
     export fn ghostty_surface_userdata(surface: *Surface) ?*anyopaque {
         return surface.userdata;
+    }
+
+    /// Sets (or, with null, clears) the userdata associated with the surface.
+    /// The apprt clears it when the host view backing the surface is torn down
+    /// but the surface's own free is deferred: a callback (e.g. SET_TITLE)
+    /// delivered on the host's run loop during that window would otherwise
+    /// resurrect the freed host object via a stale `userdata` back-pointer.
+    export fn ghostty_surface_set_userdata(surface: *Surface, ud: ?*anyopaque) void {
+        surface.userdata = ud;
     }
 
     /// Returns the app associated with a surface.
@@ -2137,6 +2214,17 @@ pub const CAPI = struct {
     /// Returns true if the surface needs to confirm quitting.
     export fn ghostty_surface_needs_confirm_quit(surface: *Surface) bool {
         return surface.core_surface.needsConfirmQuit();
+    }
+
+    /// Mark whether freeing this surface should CLOSE its remote/agent session
+    /// (terminate the child + free it agent-side) instead of the default DETACH
+    /// (keep-alive for re-attach). Set on user-initiated close; never on quit.
+    /// No-op for local exec surfaces.
+    export fn ghostty_surface_set_session_close_intent(
+        surface: *Surface,
+        close_on_exit: bool,
+    ) void {
+        surface.core_surface.setSessionCloseIntent(close_on_exit);
     }
 
     /// Returns true if the surface process has exited.
@@ -2223,6 +2311,50 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
+    }
+
+    /// C type: `ghostty_session_snapshot_s`. A WP-D3 session snapshot: a
+    /// structured VT repaint of the pane's screen (`data`/`data_len`) plus the
+    /// absolute agent-stream byte offset it reflects (`byte_offset`). The app
+    /// persists both in its session-layout manifest on quit and passes them back
+    /// via `Surface.Options.restore_snapshot`/`.restore_byte_offset` on restore.
+    const SessionSnapshotC = extern struct {
+        data: ?[*]const u8 = null,
+        data_len: usize = 0,
+        byte_offset: u64 = 0,
+    };
+
+    /// Capture a WP-D3 session snapshot of `surface` for a fast, visually-correct
+    /// re-attach. Returns true and fills `result` for an agent-backed remote pane
+    /// that has applied output; false (leaving `result` zeroed) for a local exec
+    /// pane, a fresh pane with nothing applied, or on error — the caller then
+    /// falls back to the pre-WP-D3 full-ring replay. Free with
+    /// `ghostty_surface_free_session_snapshot`.
+    export fn ghostty_surface_session_snapshot(
+        surface: *Surface,
+        result: *SessionSnapshotC,
+    ) bool {
+        result.* = .{};
+        const snap = surface.core_surface.sessionSnapshot(global.alloc) catch |err| {
+            log.warn("error capturing session snapshot err={}", .{err});
+            return false;
+        } orelse return false;
+        result.* = .{
+            .data = snap.data.ptr,
+            .data_len = snap.data.len,
+            .byte_offset = snap.byte_offset,
+        };
+        return true;
+    }
+
+    export fn ghostty_surface_free_session_snapshot(
+        _: *Surface,
+        result: *SessionSnapshotC,
+    ) void {
+        if (result.data) |ptr| {
+            if (result.data_len > 0) global.alloc.free(ptr[0..result.data_len]);
+        }
+        result.* = .{};
     }
 
     // -------------------------------------------------------------------------
@@ -2354,6 +2486,64 @@ pub const CAPI = struct {
         errdefer alloc.destroy(dialed);
         dialed.* = tcp_dial.dial(alloc, host_slice, port, .raw) catch |err| {
             log.err("ghostty_remote_connection_new_tcp: tcp dial failed err={}", .{err});
+            return null;
+        };
+
+        handle.tcp = dialed;
+        return handle;
+    }
+
+    /// Create a remote connection by dialing a `ghoztty-agent` listening on a
+    /// local AF_UNIX stream socket at `path` (session-persistence hardening
+    /// §5.2 / T09b). The unix analogue of `_new_tcp`: `tcp_dial.dialUnix`
+    /// connects the 0600 socket, folds the two lanes through a `ClientMux`,
+    /// stands up the `Connection`, AND blocks through the HELLO handshake before
+    /// returning — so the returned handle is FULLY ESTABLISHED (a subsequent
+    /// `_start` is a no-op; `_wait_handshake` returns true immediately). The
+    /// established transport is stored in the SAME `handle.tcp` `Dialed` slot
+    /// (it is transport-agnostic — a `Dialed` over an AF_UNIX socket behaves
+    /// identically), so `conn()`/`remoteBackend`/`_wait_handshake`/`_latency_ms`/
+    /// `_free` all read it with no other changes.
+    ///
+    /// The agent enforces a same-uid peercred gate on the unix socket (T09), so
+    /// this only succeeds for the current user's own agent. Returns null on a
+    /// null/empty `path` or any connect/handshake failure. The encoding is
+    /// pinned to `.raw` (a clean local pipe, matching the agent's default).
+    export fn ghostty_remote_connection_new_unix(
+        path: [*:0]const u8,
+    ) ?*RemoteConnectionHandle {
+        const path_slice = std.mem.sliceTo(path, 0);
+        if (path_slice.len == 0) {
+            log.warn("ghostty_remote_connection_new_unix: path is empty", .{});
+            return null;
+        }
+
+        const alloc = global.alloc;
+
+        // Record the socket path in the handle's `host` slot (the dial-parameter
+        // string) with port 0 so the handle is uniform with the TCP/SSH ones.
+        // No user/jump for a local unix dial.
+        const handle = RemoteConnectionHandle.create(
+            alloc,
+            path_slice,
+            null,
+            0,
+            null,
+        ) catch |err| {
+            log.err("ghostty_remote_connection_new_unix: handle alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer handle.destroy();
+
+        // Dial: connect + mux + Connection + HELLO handshake (blocks). On any
+        // failure the handle is destroyed (no transport was attached).
+        const dialed = alloc.create(tcp_dial.Dialed) catch |err| {
+            log.err("ghostty_remote_connection_new_unix: Dialed alloc failed err={}", .{err});
+            return null;
+        };
+        errdefer alloc.destroy(dialed);
+        dialed.* = tcp_dial.dialUnix(alloc, path_slice, .raw) catch |err| {
+            log.err("ghostty_remote_connection_new_unix: unix dial failed err={}", .{err});
             return null;
         };
 
@@ -2517,6 +2707,19 @@ pub const CAPI = struct {
         return name.ptr;
     }
 
+    /// The agent's self-reported build stamp ("YYYYMMDD-<hash>") from its HELLO,
+    /// or null if the peer didn't send one (older agent) or the handshake hasn't
+    /// completed. The app compares this to the build it bundles to detect a stale
+    /// local agent and lazily refresh it. Same ownership/lifetime as
+    /// `ghostty_remote_connection_hostname` — copy it immediately.
+    export fn ghostty_remote_connection_build_version(
+        handle: *RemoteConnectionHandle,
+    ) ?[*:0]const u8 {
+        const conn = handle.conn() orelse return null;
+        const v = conn.peerBuildVersion() orelse return null;
+        return v.ptr;
+    }
+
     /// Shut down and free the connection handle. Detaches all panes (remote
     /// sessions survive for later re-attach by session_id). The caller must
     /// ensure no surface still references this handle.
@@ -2554,6 +2757,38 @@ pub const CAPI = struct {
         return queryCwdImpl(handle, session_id, ns);
     }
 
+    /// Probe whether the agent still knows `session_id` (T06b session-restore
+    /// liveness). Same GET_CWD RPC as `_query_cwd_timeout`, different contract:
+    /// the result is TRI-STATE so the caller can apply a conservative drop
+    /// policy. Returns:
+    ///   -  1 ⇒ alive (the agent has the session; it is attachable)
+    ///   -  0 ⇒ POSITIVELY dead (the agent replied and does not have it)
+    ///   - -1 ⇒ inconclusive (timeout/transport failure, connection not
+    ///          established, or an agent too old to disambiguate)
+    /// Callers must only forget persisted state on 0 — never on -1.
+    /// `timeout_ms == 0` ⇒ the default RPC bound. Blocking; call off the main
+    /// thread.
+    export fn ghostty_remote_connection_probe_session(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ms: u32,
+    ) c_int {
+        const conn = handle.conn() orelse return -1;
+        const sid = std.mem.sliceTo(session_id, 0);
+        if (sid.len == 0) return -1;
+
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            10 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        return switch (conn.probeSessionTimeout(sid, timeout_ns)) {
+            .alive => 1,
+            .dead => 0,
+            .unknown => -1,
+        };
+    }
+
     fn queryCwdImpl(
         handle: *RemoteConnectionHandle,
         session_id: [*:0]const u8,
@@ -2573,6 +2808,147 @@ pub const CAPI = struct {
         defer handle.alloc.free(path);
         // Re-dupe into the C-API allocator (matching `ghostty_string_free`).
         const copy = handle.alloc.dupeZ(u8, path) catch return .empty;
+        return .fromSlice(copy);
+    }
+
+    /// Enumerate every session the connected agent owns (T16 cross-machine
+    /// session browse). Runs the same LIST_SESSIONS RPC the `+sessions` CLI
+    /// uses, but against ANY dialed connection — local agent OR a relay
+    /// machine — because the transport is resolved through `handle.conn()`.
+    /// Returns a JSON array string (each element:
+    /// `{id, alive, exit_code, attached, activity, pid, cwd, argv, title,
+    /// created_at, last_activity, pinned}`), freed with `ghostty_string_free`.
+    /// Returns `.empty` on any failure (no connection, timeout, malformed
+    /// reply). `timeout_ms == 0` ⇒ the 5s default. BLOCKING; call off the main
+    /// thread (mirror the `_proc_list` / `_query_cwd_timeout` usage).
+    export fn ghostty_remote_connection_list_sessions(
+        handle: *RemoteConnectionHandle,
+        timeout_ms: u32,
+    ) String {
+        const conn = handle.conn() orelse return .empty;
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        var roster = conn.requestSessions(timeout_ns) catch |err| {
+            log.debug("remote list_sessions failed err={}", .{err});
+            return .empty;
+        };
+        defer roster.deinit();
+
+        // Serialize into a stable JSON shape (every key emitted, matching the
+        // `+sessions --json` row) so the Swift side has a predictable decode.
+        const SessionJsonRow = struct {
+            id: []const u8,
+            alive: bool,
+            exit_code: ?i64,
+            attached: bool,
+            activity: []const u8,
+            pid: i64,
+            cwd: ?[]const u8,
+            argv: ?[]const u8,
+            title: ?[]const u8,
+            created_at: i64,
+            last_activity: i64,
+            pinned: bool,
+        };
+
+        const rows = handle.alloc.alloc(SessionJsonRow, roster.sessions.len) catch return .empty;
+        defer handle.alloc.free(rows);
+        for (roster.sessions, 0..) |s, i| {
+            rows[i] = .{
+                .id = s.id,
+                .alive = s.alive,
+                .exit_code = s.exit_code,
+                .attached = s.attached,
+                .activity = s.activity,
+                .pid = s.pid,
+                .cwd = s.cwd,
+                .argv = s.argv,
+                .title = s.title,
+                .created_at = s.created_at,
+                .last_activity = s.last_activity,
+                .pinned = s.pinned,
+            };
+        }
+
+        const json = std.json.Stringify.valueAlloc(handle.alloc, rows, .{}) catch return .empty;
+        defer handle.alloc.free(json);
+        const copy = handle.alloc.dupeZ(u8, json) catch return .empty;
+        return .fromSlice(copy);
+    }
+
+    /// Push (or, with `delete == true`, remove) an OPAQUE per-window layout blob
+    /// to the connected agent (§5.4 cross-machine "Resume all", T18). `key` is the
+    /// owning viewer's manifest-entry id; `blob` is the opaque layout JSON (empty
+    /// / ignored when deleting); `session_ids` is a NEWLINE-separated list of the
+    /// 32-hex session ids the blob references (used by the agent only to reap the
+    /// blob once its sessions are gone). Returns 1 on success, 0 on any failure
+    /// (no connection, RPC timeout, agent reported not-ok). `timeout_ms == 0` ⇒
+    /// the 5s default. BLOCKING; call off the main thread.
+    export fn ghostty_remote_connection_set_layout(
+        handle: *RemoteConnectionHandle,
+        key: [*:0]const u8,
+        blob: [*:0]const u8,
+        session_ids: [*:0]const u8,
+        delete: bool,
+        timeout_ms: u32,
+    ) c_int {
+        const conn = handle.conn() orelse return 0;
+        const key_slice = std.mem.sliceTo(key, 0);
+        if (key_slice.len == 0) return 0;
+        const blob_slice = std.mem.sliceTo(blob, 0);
+        const ids_raw = std.mem.sliceTo(session_ids, 0);
+
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        // Split the newline-separated id list into a slice of slices (skipping
+        // empty tokens). Bounded scratch owned by the C-API allocator.
+        var ids: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer ids.deinit(handle.alloc);
+        if (!delete and ids_raw.len > 0) {
+            var it = std.mem.splitScalar(u8, ids_raw, '\n');
+            while (it.next()) |tok| {
+                if (tok.len == 0) continue;
+                ids.append(handle.alloc, tok) catch return 0;
+            }
+        }
+
+        const blob_arg: ?[]const u8 = if (delete) null else blob_slice;
+        conn.setLayout(key_slice, blob_arg, ids.items, delete, timeout_ns) catch |err| {
+            log.debug("remote set_layout failed err={}", .{err});
+            return 0;
+        };
+        return 1;
+    }
+
+    /// Fetch every stored layout blob from the connected agent (§5.4 "Resume
+    /// all", T18) as a JSON object string `{"layouts":[{"key":...,"blob":...}]}`,
+    /// freed with `ghostty_string_free`. The Swift resumer decodes it and the
+    /// opaque blobs (each a `SessionLayoutManifest.Entry` JSON). Returns `.empty`
+    /// on any failure. `timeout_ms == 0` ⇒ the 5s default. BLOCKING; call off the
+    /// main thread.
+    export fn ghostty_remote_connection_get_layouts(
+        handle: *RemoteConnectionHandle,
+        timeout_ms: u32,
+    ) String {
+        const conn = handle.conn() orelse return .empty;
+        const timeout_ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        const payload = conn.requestLayouts(timeout_ns) catch |err| {
+            log.debug("remote get_layouts failed err={}", .{err});
+            return .empty;
+        };
+        defer conn.alloc.free(payload);
+        // Re-dupe into the C-API allocator (matching `ghostty_string_free`).
+        const copy = handle.alloc.dupeZ(u8, payload) catch return .empty;
         return .fromSlice(copy);
     }
 
@@ -2759,6 +3135,31 @@ pub const CAPI = struct {
         };
         defer out.deinit();
         return out.ok;
+    }
+
+    /// Close (end) a session on the agent BY SESSION ID (the session-scoped
+    /// equivalent of the pane CLOSE). SYNCHRONOUS: blocks on the RPC reply up to
+    /// `timeout_ms` (0 => default 5s); run OFF the main thread. Returns true iff the
+    /// agent confirmed the session was closed. Returns false when the peer agent
+    /// does not advertise the `close_session` capability (older agent), on no
+    /// connection, timeout, agent error, or an unknown session id.
+    export fn ghostty_remote_connection_close_session(
+        handle: *RemoteConnectionHandle,
+        session_id: [*:0]const u8,
+        timeout_ms: u32,
+    ) bool {
+        const conn = handle.conn() orelse return false;
+        const id = std.mem.sliceTo(session_id, 0);
+        const ns: u64 = if (timeout_ms == 0)
+            5 * std.time.ns_per_s
+        else
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        const ok = conn.closeSession(id, ns) catch |err| {
+            log.debug("remote close_session failed err={}", .{err});
+            return false;
+        };
+        return ok;
     }
 
     /// Spawn a DETACHED process on the REMOTE host (§9.3 process control, inc 5).

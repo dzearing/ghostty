@@ -38,3 +38,7 @@ macos/macos/
 # Ephemeral git worktrees created by Claude Code subagents
 .claude/worktrees/
 .dumps/
+
+# Local Google OAuth client id for dev builds (never commit; injected via
+# -Dgoogle-client-id in CI). The id is public but managed as build config.
+macos/google-client-id.txt

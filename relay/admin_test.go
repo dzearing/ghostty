@@ -84,6 +84,7 @@ func newAdminOIDCServer(t *testing.T, f *fakeIssuer, mutate func(*Config)) (*htt
 		GoogleClientSecret: "test-client-secret",
 		IssuerURL:          f.srv.URL,
 		RelayBaseURL:       "https://relay.test",
+		SessionEncKey:      testKey(t), // enable the brokered /oauth/exchange flow
 	}
 	if mutate != nil {
 		mutate(cfg)
@@ -210,11 +211,12 @@ func TestAdminVerifiedUserNotAdmin403OIDC(t *testing.T) {
 	})
 	userToken := mint(t, f.key, f.validClaims()) // allowlisted user, sub testSub
 
-	// Works on the user surface...
-	resp := doJSON(t, http.MethodGet, ts.URL+"/v1/client/devices", userToken, "")
+	// Works on the user surface (a session minted via the brokered exchange)...
+	userSession := sessionToken(t, ts, f, f.validClaims())
+	resp := doJSON(t, http.MethodGet, ts.URL+"/v1/client/devices", userSession, "")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("user token on user surface status = %d, want 200", resp.StatusCode)
+		t.Fatalf("user session on user surface status = %d, want 200", resp.StatusCode)
 	}
 
 	// ...but is 403 (not 401) on the admin surface.

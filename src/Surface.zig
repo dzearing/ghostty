@@ -32,6 +32,8 @@ const Command = @import("Command.zig");
 const exit_diagnostics = @import("exit_diagnostics.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
+const build_config = @import("build_config.zig");
+const shell_integration = @import("termio/shell_integration.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
@@ -88,6 +90,25 @@ pub const RemoteBackend = struct {
     /// shell config must never reach a remote agent. Null ⇒ the agent resolves
     /// its own default shell. Borrowed for the construction call only.
     shell: ?[]const u8 = null,
+
+    /// True ⇒ this remote backend is the LOCAL agent (same machine + same
+    /// Ghostty bundle as this viewer), so it is safe to inject ghostty shell
+    /// integration and the per-pane GHOSTTY_* env an exec pane would set — the
+    /// resources dir, terminfo, ZDOTDIR etc. all resolve on the agent's machine
+    /// because it IS this machine (T04b). NEVER set for a cross-machine window:
+    /// a macOS resources path / ZDOTDIR is meaningless (and breaks the shell) on
+    /// a different-OS agent. Set by the apprt from `Machine.isLocalMachine`.
+    local_shell_integration: bool = false,
+
+    /// WP-D3 fast re-attach: the app's persisted structured VT screen snapshot
+    /// to paint on ATTACH, and the absolute agent-stream byte offset it reflects
+    /// (passed as the ATTACH `last_byte_offset`). Captured on quit via
+    /// `Surface.sessionSnapshot` and stored in the session-layout manifest; on
+    /// restore the apprt threads them back down here. Null/0 ⇒ full-ring replay
+    /// (a hard crash with no snapshot, or a legacy manifest). `restore_snapshot`
+    /// is borrowed for the construction call only (duped by `termio.Remote.init`).
+    restore_snapshot: ?[]const u8 = null,
+    restore_offset: u64 = 0,
 };
 
 /// Unique ID used to identify this surface for IPC purposes. It is
@@ -499,6 +520,187 @@ const DerivedConfig = struct {
     }
 };
 
+/// Build the ghostty shell-integration + GHOSTTY_* environment for a LOCAL
+/// agent-backed pane and append it to `remote_env` (forwarded via `OPEN.env`,
+/// T04b). This mirrors the env half of `Exec.Subprocess.init`: the same
+/// GHOSTTY_RESOURCES_DIR / TERM / TERMINFO / GHOSTTY_BIN_DIR / TERM_PROGRAM /
+/// GHOSTTY_SHELL_FEATURES / ZDOTDIR (etc.) an exec pane sets, so an agent-backed
+/// pane on THIS machine reaches shell-integration parity with an exec pane.
+///
+/// ONLY valid for the LOCAL agent (same OS + same bundle resources as this
+/// viewer); a cross-machine window must never call this (a macOS resources path
+/// / ZDOTDIR is meaningless — and breaks the shell — on a different-OS agent).
+///
+/// `scratch` is a caller-owned, initially-empty `EnvMap` that MUST outlive the
+/// `OPEN` construction: the appended pairs borrow its key/value strings until
+/// `Remote.init` dupes them. Env-only shells (zsh/fish/elvish) get FULL
+/// integration this way and this returns null. bash/nushell additionally need
+/// an argv rewrite (bash → `<shell> --posix`, nushell → `<shell> --execute 'use
+/// ghostty *'`); for them this RETURNS that argv (duped into `alloc`, owned by
+/// the caller) so it can be forwarded to the agent via `OPEN.argv` (T04c). The
+/// GHOSTTY_* vars are set for every shell regardless. `shell_path` is the shell
+/// the agent will spawn (the caller's `rb.shell` or the inherited `$SHELL`),
+/// used to detect which integration to inject; null falls back to the zsh
+/// default. The returned argv is only meaningful for a plain interactive shell
+/// (no user command) — the caller drops it when a command is present.
+fn appendLocalShellIntegrationEnv(
+    alloc: Allocator,
+    scratch: *std.process.EnvMap,
+    remote_env: *std.ArrayListUnmanaged(termio.Remote.EnvPair),
+    config: *const configpkg.Config,
+    surface_id_str: []const u8,
+    shell_path: ?[]const u8,
+) !?[]const []const u8 {
+    const resources_dir = global_state.resources_dir.host() orelse {
+        log.warn("no resources dir set; local shell integration disabled", .{});
+        return null;
+    };
+
+    // Per-pane surface id: an exec pane sets this, but the remote branch dropped
+    // the local env map that carried it (Surface init), so forward it here.
+    try scratch.put("GHOSTTY_SURFACE_ID", surface_id_str);
+
+    // GHOSTTY_* + TERM machinery, mirroring Exec.Subprocess.init's env block.
+    try scratch.put("GHOSTTY_RESOURCES_DIR", resources_dir);
+    try scratch.put("TERM", config.term);
+    try scratch.put("COLORTERM", "truecolor");
+    {
+        // The terminfo db is adjacent to the resources dir (…/terminfo).
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.path.dirname(resources_dir)) |parent| {
+            if (std.fmt.bufPrint(&buf, "{s}/terminfo", .{parent})) |dir| {
+                try scratch.put("TERMINFO", dir);
+            } else |err| log.warn("error building TERMINFO path err={}", .{err});
+        }
+    }
+    try scratch.put("TERM_PROGRAM", "ghostty");
+    try scratch.put("TERM_PROGRAM_VERSION", build_config.version_string);
+
+    // GHOSTTY_BIN_DIR so scripts can find the ghoztty CLI. Our exe dir is the
+    // bundle's MacOS dir — the same dir the agent binary lives in — so the CLI
+    // is reachable there for the agent-spawned shell too.
+    {
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExePath(&exe_buf)) |exe_path| {
+            if (std.fs.path.dirname(exe_path)) |exe_dir| {
+                try scratch.put("GHOSTTY_BIN_DIR", exe_dir);
+            }
+        } else |err| log.warn("failed to get exe path for GHOSTTY_BIN_DIR err={}", .{err});
+    }
+
+    // On macOS, export the bundle's data dir so fish/elvish integration (and man
+    // pages) resolve — mirrors Exec's darwin block (XDG_DATA_DIRS).
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{s}/..", .{resources_dir})) |data_dir| {
+            const base = scratch.get("XDG_DATA_DIRS") orelse "/usr/local/share:/usr/share";
+            const joined = try internal_os.appendEnv(alloc, base, data_dir);
+            defer alloc.free(joined);
+            try scratch.put("XDG_DATA_DIRS", joined);
+        } else |err| log.warn("error building XDG_DATA_DIRS err={}", .{err});
+    }
+
+    // Shell features (GHOSTTY_SHELL_FEATURES), used by both automatic and manual
+    // integrations.
+    try shell_integration.setupFeatures(
+        scratch,
+        config.@"shell-integration-features",
+        config.@"cursor-style-blink" orelse true,
+    );
+
+    // Inject the shell-specific integration (ZDOTDIR for zsh, XDG for
+    // fish/elvish; argv rewrite for bash/nushell). `break :integrate null` on any
+    // non-injectable case still forwards the GHOSTTY_* vars accumulated above and
+    // yields no argv (the agent keeps its `-li` default). A local arena backs the
+    // `setup()` call so its temporaries + the returned command (which we only
+    // need until we copy the argv out below) don't leak into `alloc`; the env
+    // side effects are duped into `scratch` (its own allocator) and survive it.
+    const result_argv: ?[]const []const u8 = integrate: {
+        const force: ?shell_integration.Shell = switch (config.@"shell-integration") {
+            .none => {
+                log.info("shell integration disabled by configuration", .{});
+                break :integrate null;
+            },
+            .detect => null,
+            .bash => .bash,
+            .elvish => .elvish,
+            .fish => .fish,
+            .nushell => .nushell,
+            .zsh => .zsh,
+        };
+
+        var setup_arena = std.heap.ArenaAllocator.init(alloc);
+        defer setup_arena.deinit();
+        const sa = setup_arena.allocator();
+
+        // `config.Command.shell` is a sentinel-terminated string; dupe into a
+        // `[:0]u8` (works for both `shell_path` and the literal default).
+        const shell_z = try sa.dupeZ(u8, shell_path orelse "/bin/zsh");
+        const integration = (shell_integration.setup(
+            sa,
+            resources_dir,
+            .{ .shell = shell_z },
+            scratch,
+            force,
+        ) catch |err| {
+            log.warn("local shell integration setup error err={}", .{err});
+            break :integrate null;
+        }) orelse {
+            log.warn("shell could not be detected; no local shell integration injected", .{});
+            break :integrate null;
+        };
+
+        switch (integration.shell) {
+            // Env-only shells are fully integrated by the env we just built; the
+            // agent's default `<shell> -li` invocation is exactly right for them,
+            // so forward no argv (a rewrite would strip login/interactive flags).
+            .zsh, .fish, .elvish => {
+                log.info(
+                    "local shell integration injected shell={s}",
+                    .{@tagName(integration.shell)},
+                );
+                break :integrate null;
+            },
+            // bash/nushell need an argv rewrite (bash → `<shell> --posix` so it
+            // sources $ENV=ghostty.bash; nushell → `--execute 'use ghostty *'`).
+            // Split the rewritten command into an argv array (duped into `alloc`,
+            // owned by the caller) so it rides `OPEN.argv` to the agent (T04c).
+            .bash, .nushell => {
+                var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+                errdefer {
+                    for (argv.items) |a| alloc.free(a);
+                    argv.deinit(alloc);
+                }
+                var arg_it = try integration.command.argIterator(sa);
+                defer arg_it.deinit();
+                while (arg_it.next()) |a| {
+                    try argv.append(alloc, try alloc.dupe(u8, a));
+                }
+                if (argv.items.len == 0) {
+                    argv.deinit(alloc);
+                    break :integrate null;
+                }
+                log.info(
+                    "local shell integration injected shell={s} via argv rewrite ({d} args)",
+                    .{ @tagName(integration.shell), argv.items.len },
+                );
+                break :integrate try argv.toOwnedSlice(alloc);
+            },
+        }
+    };
+
+    // Append everything accumulated in `scratch` to the forwarded env list. The
+    // pairs borrow `scratch`'s strings (stable until it is deinited, after
+    // Remote.init dupes them).
+    var it = scratch.iterator();
+    while (it.next()) |entry| try remote_env.append(alloc, .{
+        .key = entry.key_ptr.*,
+        .value = entry.value_ptr.*,
+    });
+
+    return result_argv;
+}
+
 /// Create a new surface. This must be called from the main thread. The
 /// pointer to the memory for the surface must be provided and must be
 /// stable due to interfacing with various callbacks.
@@ -714,6 +916,18 @@ pub fn init(
                 // borrowed (caller-owned). Env, shell-integration, and the
                 // resources-dir all live on the agent side, so the local env
                 // map is not consumed by this backend — free it here.
+                //
+                // First, for the LOCAL agent, capture the inherited $SHELL before
+                // we free the env: the local agent resolves the SAME $SHELL (same
+                // user/host), so we integrate shell-integration for it (T04b).
+                // Duped because `env` is freed on the next line.
+                const inherited_shell: ?[]const u8 =
+                    if (rb.local_shell_integration)
+                        (if (env.get("SHELL")) |s| try alloc.dupe(u8, s) else null)
+                    else
+                        null;
+                defer if (inherited_shell) |s| alloc.free(s);
+
                 env.deinit();
                 env_owned = false;
 
@@ -734,6 +948,75 @@ pub fn init(
                 }
                 errdefer if (remote_command) |rc| alloc.free(rc);
 
+                // Forward the surface's env OVERRIDES to the agent (OPEN.env,
+                // T04a). These are the explicit `environmentVariables` the apprt
+                // set — GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME (window/pane
+                // self-identification) and IPC-set vars, plus any user `env`
+                // config — the same small set an exec pane applies LAST via
+                // `env_override`. We forward ONLY these overrides, NEVER the local
+                // inherited env map (already freed above): the agent has its own
+                // environment, and shipping a macOS PATH/HOME to a possibly
+                // different-OS agent would be wrong. `Remote.init` dupes each pair
+                // immediately, so this temporary list is freed as the block exits.
+                var remote_env: std.ArrayListUnmanaged(termio.Remote.EnvPair) = .empty;
+                defer remote_env.deinit(alloc);
+
+                // LOCAL agent only (T04b): inject ghostty shell integration +
+                // the per-pane GHOSTTY_* env an exec pane sets (resources dir,
+                // terminfo, ZDOTDIR, GHOSTTY_SURFACE_ID, TERM_PROGRAM, …). This
+                // is appended FIRST so the user/apprt overrides below win on any
+                // key collision, mirroring exec's env_override-applied-last order.
+                // `integ_env` owns the strings the appended pairs borrow, so it
+                // must outlive `Remote.init` (which dupes them) — it is deinited at
+                // block exit, after `break :backend`. Never runs for a
+                // cross-machine window (`local_shell_integration` is false there).
+                var integ_env = std.process.EnvMap.init(alloc);
+                defer integ_env.deinit();
+                // The bash/nushell argv rewrite (T04c) returned by the injector,
+                // forwarded to the agent via `OPEN.argv`. Owned here (elements +
+                // slice on `alloc`); freed at block exit AFTER `Remote.init` dupes
+                // it. Null for env-only shells / no-integration / cross-machine.
+                var integ_argv: ?[]const []const u8 = null;
+                defer if (integ_argv) |argv| {
+                    for (argv) |a| alloc.free(a);
+                    alloc.free(argv);
+                };
+                if (rb.local_shell_integration) {
+                    const shell_for_integration = rb.shell orelse inherited_shell;
+                    integ_argv = appendLocalShellIntegrationEnv(
+                        alloc,
+                        &integ_env,
+                        &remote_env,
+                        config,
+                        surface_id_str,
+                        shell_for_integration,
+                    ) catch |err| argv: {
+                        log.warn(
+                            "local shell integration setup failed err={}",
+                            .{err},
+                        );
+                        break :argv null;
+                    };
+                }
+
+                // The argv rewrite is the FULL interactive-shell invocation, so it
+                // must not coexist with an explicit user command (it would run the
+                // shell instead of the command). Drop it when a command is present
+                // — that pane keeps the agent's `-lic <command>` path (integration
+                // for a command-running bash/nushell pane is out of scope, T04c).
+                const forwarded_argv: ?[]const []const u8 =
+                    if (remote_command == null) integ_argv else null;
+
+                // User/apprt env overrides applied LAST (they win over the
+                // integration env above, mirroring exec's `env_override`).
+                {
+                    var env_it = config.env.iterator();
+                    while (env_it.next()) |entry| try remote_env.append(alloc, .{
+                        .key = entry.key_ptr.*,
+                        .value = entry.value_ptr.*,
+                    });
+                }
+
                 // Working directory (§WP4): we must NEVER forward the LOCAL
                 // `config.@"working-directory"` — by default Ghostty inherits the
                 // launching surface's pwd (e.g. a macOS path), which does not
@@ -751,6 +1034,32 @@ pub fn init(
                     .working_directory = rb.working_directory,
                     .shell = rb.shell,
                     .term = config.term,
+                    .env = remote_env.items,
+                    .argv = forwarded_argv,
+                    // Pin persistent LOCAL-agent sessions against the agent's
+                    // idle-TTL reaper (T11): the viewer's session-layout manifest
+                    // references them, so they must survive the viewer quitting
+                    // until a restore re-ATTACHes. `local_shell_integration` is
+                    // the "this is the local agent" signal (set from
+                    // Machine.isLocalMachine); cross-machine windows leave it
+                    // false and keep the idle-TTL.
+                    .pinned = rb.local_shell_integration,
+                    // Only a LOCAL-agent pane surfaces the agent-reported tty
+                    // via `getProcessInfo` (wp3): a cross-machine tty names a
+                    // remote device and could false-match local `+list --tty`
+                    // self-lookups. Same signal as `pinned`.
+                    .local = rb.local_shell_integration,
+                    // Reboot-floor policy (T12c): if this ATTACH target comes
+                    // back dead-but-relaunchable (the agent restarted), `auto`
+                    // respawns it in place; `prompt` shows the exited overlay.
+                    .relaunch_policy = switch (config.@"session-relaunch") {
+                        .auto => .auto,
+                        .prompt => .prompt,
+                    },
+                    // WP-D3: the persisted screen snapshot + offset for a fast,
+                    // visually-correct re-attach (null/0 ⇒ full-ring replay).
+                    .restore_snapshot = rb.restore_snapshot,
+                    .restore_offset = rb.restore_offset,
                 });
                 break :backend .{ .remote = io_remote };
             }
@@ -1087,6 +1396,15 @@ pub fn needsConfirmQuit(self: *Surface) bool {
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
     };
+}
+
+/// Mark whether this surface's remote/agent session should be CLOSEd
+/// (terminate the child, free the session) rather than DETACHed (keep-alive)
+/// when the surface is freed. The apprt sets this when the USER closes the
+/// pane/window — never on app quit — so persistent sessions end on explicit
+/// close but survive a quit for re-attach. No-op for local exec surfaces.
+pub fn setSessionCloseIntent(self: *Surface, close_on_exit: bool) void {
+    self.io.setSessionCloseIntent(close_on_exit);
 }
 
 /// The LIVE remote agent session id for this surface, or null if this is a local
@@ -2112,6 +2430,85 @@ pub const Text = struct {
 /// selection state.
 ///
 /// The returned value contains allocated data and must be deinitialized.
+/// A WP-D3 session snapshot: a structured VT repaint of the pane's current
+/// screen plus the absolute agent-stream byte offset it reflects. Persisted on
+/// quit and replayed on re-attach for a fast, visually-correct restore.
+pub const SessionSnapshot = struct {
+    /// A clean, structured VT repaint (palette, modes, styles, cursor, bounded
+    /// scrollback) of the current screen. Owned by the caller; free with the
+    /// same allocator passed to `sessionSnapshot`.
+    data: []const u8,
+
+    /// The absolute agent-stream byte offset `data` reflects — the ATTACH
+    /// `last_byte_offset` for the delta re-attach.
+    byte_offset: u64,
+};
+
+/// Maximum rows (viewport + scrollback) captured in a session snapshot. Bounds
+/// the persisted blob (structured VT, base64'd into the layout manifest) while
+/// giving the restored pane its visible frame plus a little scroll-up history;
+/// the agent's delta replay supplies everything produced after the snapshot.
+const session_snapshot_max_rows: usize = 600;
+
+/// Capture a WP-D3 session snapshot for a fast, visually-correct re-attach:
+/// serialize the current screen as a clean, structured VT repaint (NOT the
+/// agent's raw in-place-redraw ring — this reflows to the live width without
+/// smearing and parses in well under a frame) plus the absolute child-byte
+/// offset it reflects. Returns null for a non-remote (exec) pane — only
+/// agent-backed sessions re-attach — or when nothing has been applied yet. The
+/// (grid, offset) pair is read under ONE hold of the renderer mutex so it stays
+/// consistent with the drain path (`Termio.processOutputTracked`).
+pub fn sessionSnapshot(self: *Surface, alloc: Allocator) !?SessionSnapshot {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    // Only agent-backed remote panes re-attach from the manifest.
+    const offset = self.io.remoteAppliedOffset() orelse return null;
+    // Nothing applied yet ⇒ nothing worth snapshotting. A 0-offset restore would
+    // make the agent replay from the start AND double-paint the snapshot, so the
+    // ATTACH path only honors a snapshot when the offset is > 0; skip it here too.
+    if (offset == 0) return null;
+
+    const t = &self.io.terminal;
+    const screen = t.screens.active;
+
+    // Bound the region to the last N rows (viewport + a little scrollback).
+    const br = screen.pages.getBottomRight(.screen) orelse return null;
+    const total = screen.pages.total_rows;
+    const tl = if (total <= session_snapshot_max_rows)
+        screen.pages.getTopLeft(.screen)
+    else
+        screen.pages.pin(.{ .screen = .{
+            .x = 0,
+            .y = @intCast(total - session_snapshot_max_rows),
+        } }) orelse screen.pages.getTopLeft(.screen);
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // emit=.vt + Extra.all reconstructs the screen state as closely as possible:
+    // palette, differing modes (incl. alt-screen enter for TUIs), scrolling
+    // region, tabstops, pwd, per-cell SGR styles, hyperlinks, and a final cursor
+    // position. unwrap=false preserves the rendered row layout so it re-wraps
+    // naturally at the live width.
+    var formatter: terminal.formatter.TerminalFormatter = .init(t, .{
+        .emit = .vt,
+        .unwrap = false,
+        .trim = true,
+    });
+    formatter.content = .{ .selection = terminal.Selection.init(tl, br, false) };
+    formatter.extra = .all;
+    formatter.format(&builder.writer) catch |err| {
+        log.warn("error building session snapshot err={}", .{err});
+        return null;
+    };
+
+    return .{
+        .data = try builder.toOwnedSlice(),
+        .byte_offset = offset,
+    };
+}
+
 pub fn dumpText(
     self: *Surface,
     alloc: Allocator,
@@ -5606,6 +6003,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .{ .surface = self },
             .prompt_title,
             .tab,
+        ),
+
+        .prompt_window_title => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_title,
+            .window,
         ),
 
         .prompt_surface_banner => return try self.rt_app.performAction(

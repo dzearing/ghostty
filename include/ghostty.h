@@ -421,6 +421,18 @@ typedef struct {
   uintptr_t text_len;
 } ghostty_text_s;
 
+// A WP-D3 session snapshot: a structured VT repaint of a pane's screen
+// (`data`/`data_len`, NOT NUL-terminated) plus the absolute agent-stream byte
+// offset it reflects (`byte_offset`). Produced by
+// ghostty_surface_session_snapshot; persist both in the session-layout manifest
+// and pass them back on restore via ghostty_surface_config_s.restore_snapshot /
+// .restore_byte_offset. Free with ghostty_surface_free_session_snapshot.
+typedef struct {
+  const char* data;
+  uintptr_t data_len;
+  uint64_t byte_offset;
+} ghostty_session_snapshot_s;
+
 typedef enum {
   GHOSTTY_POINT_ACTIVE,
   GHOSTTY_POINT_VIEWPORT,
@@ -514,6 +526,31 @@ typedef struct {
   // (POSIX $SHELL / /bin/sh, Windows %COMSPEC% / cmd.exe). Ignored when
   // `connection` is NULL.
   const char* remote_shell;
+
+  // True when `connection` is the LOCAL agent (same machine + same Ghostty
+  // bundle as this viewer). When set, the pane is constructed with ghostty
+  // shell integration and the per-pane GHOSTTY_* environment an exec pane would
+  // set (resources dir, terminfo, ZDOTDIR, GHOSTTY_SURFACE_ID, TERM_PROGRAM …),
+  // since those all resolve on the agent's machine because it IS this machine.
+  // NEVER set this for a cross-machine window: a macOS resources path / ZDOTDIR
+  // is meaningless (and breaks the shell) on a different-OS agent. Ignored when
+  // `connection` is NULL.
+  bool remote_local_shell_integration;
+
+  // WP-D3 fast, visually-correct re-attach. `restore_snapshot` is the app's
+  // persisted structured VT screen repaint (from a prior
+  // `ghostty_surface_session_snapshot`), `restore_snapshot_len` its byte length
+  // (the bytes are NOT NUL-terminated), and `restore_byte_offset` the absolute
+  // agent-stream byte offset it reflects — passed as the ATTACH last_byte_offset
+  // so the agent replays only the gap produced while the app was down instead
+  // of re-parsing its whole retained ring. On restore the pane paints the
+  // snapshot directly for an instant, correctly-sized frame. NULL/0 ⇒ full-ring
+  // replay (no snapshot, or a legacy manifest). Borrowed for the duration of the
+  // surface-construction call only. Ignored when `connection` or `session_id`
+  // is NULL.
+  const char* restore_snapshot;
+  uintptr_t restore_snapshot_len;
+  uint64_t restore_byte_offset;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -709,6 +746,7 @@ typedef struct {
 typedef enum {
   GHOSTTY_PROMPT_TITLE_SURFACE,
   GHOSTTY_PROMPT_TITLE_TAB,
+  GHOSTTY_PROMPT_TITLE_WINDOW,
 } ghostty_action_prompt_title_e;
 
 // apprt.action.PaneBanner.C
@@ -1216,10 +1254,12 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_set_userdata(ghostty_surface_t, void*);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_set_session_close_intent(ghostty_surface_t, bool);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
@@ -1281,6 +1321,8 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_session_snapshot(ghostty_surface_t, ghostty_session_snapshot_s*);
+GHOSTTY_API void ghostty_surface_free_session_snapshot(ghostty_surface_t, ghostty_session_snapshot_s*);
 
 // Remote machines (remote-machines design §3.5/§3.2). A connection is keyed by
 // (host, user, port, jump-chain) and multiplexes N remote panes/sessions. The
@@ -1313,6 +1355,18 @@ GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new(
 // TCP/Tailscale hop). Free with ghostty_remote_connection_free.
 GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_tcp(
     const char* host, uint16_t port);
+
+// Create a remote connection by dialing a ghoztty-agent listening on a local
+// AF_UNIX stream socket at path (session-persistence hardening, T09b). The unix
+// analogue of _new_tcp: connects the 0600 socket and BLOCKS through the HELLO
+// handshake before returning, so the handle is fully established (a subsequent
+// _start is a no-op and _wait_handshake returns true immediately). The agent
+// enforces a same-uid peercred gate, so this only succeeds for the current
+// user's own agent. Returns NULL on a NULL/empty path or any connect/handshake
+// failure. The transport encoding is raw. Free with
+// ghostty_remote_connection_free.
+GHOSTTY_API ghostty_remote_connection_t ghostty_remote_connection_new_unix(
+    const char* path);
 
 // Create a remote connection by dialing a remote ghoztty-agent THROUGH a
 // rendezvous relay. The relay-connect byte-pipe helper opens an authenticated
@@ -1374,6 +1428,13 @@ GHOSTTY_API void ghostty_remote_connection_set_state_callback(
 GHOSTTY_API const char* ghostty_remote_connection_hostname(
     ghostty_remote_connection_t);
 
+// The agent's self-reported build stamp ("YYYYMMDD-<hash>") from its HELLO, or
+// NULL if the peer didn't send one (older agent) or the handshake hasn't
+// completed. Lets the app detect a stale local agent and lazily refresh it.
+// Owned by the connection, valid until _free; copy it immediately.
+GHOSTTY_API const char* ghostty_remote_connection_build_version(
+    ghostty_remote_connection_t);
+
 // Shut down and free the connection. Detaches all panes (sessions survive on
 // the remote for later re-attach by session_id). Caller must ensure no surface
 // still references this connection.
@@ -1392,6 +1453,42 @@ GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd(
 // so a new remote frame's cwd inheritance never blocks the main thread.
 GHOSTTY_API ghostty_string_s ghostty_remote_connection_query_cwd_timeout(
     ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
+
+// Tri-state session liveness probe (session-restore drop policy). Returns:
+//   1  => alive (the agent has the session; it is attachable)
+//   0  => POSITIVELY dead (the agent replied and does not have it)
+//   -1 => inconclusive (timeout/transport failure, or an agent too old to
+//         disambiguate) — callers must only forget persisted state on 0.
+// timeout_ms 0 => default 10s bound. Blocking; call off the main thread.
+GHOSTTY_API int ghostty_remote_connection_probe_session(
+    ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
+
+// Enumerate every session the connected agent owns (cross-machine session
+// browse). Runs the same LIST_SESSIONS RPC as `ghoztty +sessions`, but against
+// any dialed connection (local agent or a relay machine). Returns a JSON array
+// string, each element {id, alive, exit_code, attached, activity, pid, cwd,
+// argv, title, created_at, last_activity, pinned}; free with ghostty_string_free.
+// Empty string on failure. timeout_ms==0 uses a 5s default. Blocking; call off
+// the main thread.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_list_sessions(
+    ghostty_remote_connection_t, uint32_t timeout_ms);
+
+// Push (remove_layout==true removes) an opaque per-window layout blob to the
+// connected agent (cross-machine "Resume all"). key is the viewer's
+// manifest-entry id; blob is the opaque layout JSON (ignored when deleting);
+// session_ids is a newline-separated list of the 32-hex session ids the blob
+// references. Returns 1 on success, 0 on failure. timeout_ms==0 uses a 5s
+// default. Blocking; call off the main thread.
+GHOSTTY_API int ghostty_remote_connection_set_layout(
+    ghostty_remote_connection_t, const char* key, const char* blob,
+    const char* session_ids, bool remove_layout, uint32_t timeout_ms);
+
+// Fetch every stored layout blob from the connected agent (cross-machine
+// "Resume all") as a JSON object string {"layouts":[{"key":...,"blob":...}]};
+// free with ghostty_string_free. Empty string on failure. timeout_ms==0 uses a
+// 5s default. Blocking; call off the main thread.
+GHOSTTY_API ghostty_string_s ghostty_remote_connection_get_layouts(
+    ghostty_remote_connection_t, uint32_t timeout_ms);
 
 // A host-metrics snapshot pushed by the remote agent (activity monitor). Mirrors
 // the wire HostMetrics. uptime_s is 0 when the remote OS doesn't expose uptime;
@@ -1479,6 +1576,16 @@ GHOSTTY_API void ghostty_remote_connection_proc_list_free(
 GHOSTTY_API bool ghostty_remote_connection_proc_kill(
     ghostty_remote_connection_t, int64_t pid, const char* signal,
     uint32_t timeout_ms);
+
+// Close (end) a session on the agent BY SESSION ID (the session-scoped equivalent
+// of the pane CLOSE): terminate + free the remote session even when no local pane
+// is attached to it (the session chooser's "Kill" action). SYNCHRONOUS: blocks on
+// the RPC reply up to timeout_ms (0 => default 5s); run OFF the main thread.
+// Returns true iff the agent confirmed the session was closed; false when the peer
+// agent does not advertise the close_session capability (older agent), on no
+// connection / timeout / agent error / unknown session id.
+GHOSTTY_API bool ghostty_remote_connection_close_session(
+    ghostty_remote_connection_t, const char* session_id, uint32_t timeout_ms);
 
 // Spawn a DETACHED process on the REMOTE host (run through the remote platform
 // shell, no pty). SYNCHRONOUS: blocks on the RPC reply up to timeout_ms (0 =>

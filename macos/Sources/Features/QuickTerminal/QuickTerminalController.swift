@@ -268,7 +268,7 @@ class QuickTerminalController: BaseTerminalController {
         animateIn()
     }
 
-    override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+    override func surfaceTreeDidChange(from: SplitTree<PaneView>, to: SplitTree<PaneView>) {
         super.surfaceTreeDidChange(from: from, to: to)
 
         // If our surface tree is nil then we animate the window out. We
@@ -288,7 +288,7 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     override func closeSurface(
-        _ node: SplitTree<Ghostty.SurfaceView>.Node,
+        _ node: SplitTree<PaneView>.Node,
         withConfirmation: Bool = true
     ) {
         // If this isn't the root then we're dealing with a split closure.
@@ -357,13 +357,14 @@ class QuickTerminalController: BaseTerminalController {
            let ghostty_app = ghostty.app {
             if let tree = restorationState?.surfaceTree, !tree.isEmpty {
                 surfaceTree = tree
-                let view = tree.first(where: { $0.id.uuidString == restorationState?.focusedSurface }) ?? tree.first!
+                let pane = tree.first(where: { $0.id.uuidString == restorationState?.focusedSurface }) ?? tree.first!
+                let view = pane.surfaceView
                 focusedSurface = view
                 // Add a short delay to check if the correct surface is focused.
                 // Each SurfaceWrapper defaults its FocusedValue to itself; without this delay,
                 // the tree often focuses the first surface instead of the intended one.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if !view.focused {
+                    if let view, !view.focused {
                         self.focusedSurface = view
                         self.makeWindowKey(window)
                     }

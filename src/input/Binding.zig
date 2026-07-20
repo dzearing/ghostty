@@ -602,6 +602,14 @@ pub const Action = union(enum) {
     /// and persists across focus changes within the tab.
     prompt_tab_title,
 
+    /// Change the title of the current window via a pop-up prompt. The
+    /// title set via this prompt pins the window titlebar: it overrides
+    /// any tab or terminal title until cleared, surviving pane focus
+    /// changes and terminal-set titles. Leave the prompt empty to clear
+    /// it and fall back to the active tab's title, then the active
+    /// terminal's title.
+    prompt_window_title,
+
     /// Set or edit the sticky banner of the current focused surface via
     /// a pop-up prompt. The banner is rendered above the terminal content
     /// and supports a small markdown subset (bold, italic, underline,
@@ -1387,6 +1395,7 @@ pub const Action = union(enum) {
             .set_font_size,
             .prompt_surface_title,
             .prompt_tab_title,
+            .prompt_window_title,
             .prompt_surface_banner,
             .set_surface_title,
             .set_tab_title,

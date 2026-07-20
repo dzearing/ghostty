@@ -63,7 +63,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     init(_ ghostty: Ghostty.App,
          withBaseConfig base: Ghostty.SurfaceConfiguration? = nil,
-         withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
+         withSurfaceTree tree: SplitTree<PaneView>? = nil,
          parent: NSWindow? = nil
     ) {
         // The window we manage is not restorable if we've specified a command
@@ -76,7 +76,50 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Setup our initial derived config based on the current app config
         self.derivedConfig = DerivedConfig(ghostty.config)
 
+        // Session persistence: route the initial surface of a fresh, non-remote
+        // window through the LOCAL agent so its process survives this app
+        // process (quit, crash, upgrade) and can be re-attached. Tabs and
+        // splits then inherit the shared connection through `remoteConnection`
+        // exactly like a remote window's. An existing tree carries
+        // already-built surfaces, so there is nothing to route.
+        //
+        // Default-on (T19): the connection resolve is bounded and non-fatal —
+        // when the local agent can't be found/spawned/dialed in time,
+        // `sharedConnectionForNewSurface` returns nil and this window opens as a
+        // plain exec surface instead of hanging or failing.
+        var base = base
+        var localAgent: RemoteConnection?
+        if tree == nil,
+           base?.remoteConnection == nil,
+           ghostty.config.sessionPersistence,
+           let agent = LocalAgentManager.shared.sharedConnectionForNewSurface() {
+            var cfg = base ?? Ghostty.SurfaceConfiguration()
+            cfg.remoteMachine = agent.machine
+            cfg.remoteConnection = agent.handle
+            cfg.connectionKeepAlive = agent
+            // An explicit command is only forwarded to the agent's OPEN when
+            // marked explicit via wait-after-command (Surface.zig's remote
+            // backend drops an unmarked command as a local default shell).
+            if cfg.command != nil { cfg.waitAfterCommand = true }
+            // The agent runs on THIS machine, so a local working directory is
+            // valid there — forward it (the remote backend ignores the local
+            // `workingDirectory` field).
+            if cfg.remoteWorkingDirectory == nil {
+                cfg.remoteWorkingDirectory = cfg.workingDirectory
+            }
+            base = cfg
+            localAgent = agent
+        }
+
         super.init(ghostty, baseConfig: base, surfaceTree: tree)
+
+        // Carry the strong connection owner + machine so tabs/splits inherit
+        // the agent connection and the reconnect ladder watches it. The
+        // loopback machine is "local", so no remote pill shows.
+        if let localAgent {
+            self.remoteConnection = localAgent
+            self.remoteMachine = localAgent.machine
+        }
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default
@@ -168,7 +211,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     // MARK: Base Controller Overrides
 
-    override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+    override func surfaceTreeDidChange(from: SplitTree<PaneView>, to: SplitTree<PaneView>) {
         super.surfaceTreeDidChange(from: from, to: to)
 
         // Whenever our surface tree changes in any way (new split, close split, etc.)
@@ -187,7 +230,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     override func replaceSurfaceTree(
-        _ newTree: SplitTree<Ghostty.SurfaceView>,
+        _ newTree: SplitTree<PaneView>,
         moveFocusTo newView: Ghostty.SurfaceView? = nil,
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
         undoAction: String? = nil
@@ -290,7 +333,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // Keep the connection owner alive across the new surface's deferred free
             // (channel detach). See SurfaceConfiguration.connectionKeepAlive.
             cfg.connectionKeepAlive = parentRemote
-            if cfg.command == nil, let command {
+            // Re-run the parent's explicit command ONLY for a genuine remote
+            // machine (§WP4). The local session-persistence agent is loopback
+            // (`isLocalMachine`); inheriting the command there would make a new
+            // window from a `--command` local window re-run that command instead
+            // of opening a shell — see the gate in BaseTerminalController.newSplit.
+            if !parentRemote.machine.isLocalMachine, cfg.command == nil, let command {
                 cfg.command = command
                 cfg.waitAfterCommand = true
             }
@@ -407,7 +455,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     ///               If nil, the window will cascade from the last cascade point.
     static func newWindow(
         _ ghostty: Ghostty.App,
-        tree: SplitTree<Ghostty.SurfaceView>,
+        tree: SplitTree<PaneView>,
         position: NSPoint? = nil,
         confirmUndo: Bool = true,
     ) -> TerminalController {
@@ -464,16 +512,34 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         return c
     }
 
+    /// - Parameter completion: Invoked (on the main actor, always asynchronously)
+    ///   with the controller that was actually built, or nil on genuine failure.
+    ///   This exists because the remote/local-agent path builds the tab AFTER an
+    ///   off-main cwd resolve, so the synchronous return value is nil even on
+    ///   success. Callers that need the real result (e.g. the AppleScript
+    ///   `new tab` handler) should use this instead of the return value.
+    @discardableResult
     static func newTab(
         _ ghostty: Ghostty.App,
         from parent: NSWindow? = nil,
-        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil
+        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil,
+        completion: ((TerminalController?) -> Void)? = nil
     ) -> TerminalController? {
+        // Fire `completion` on a later main-runloop turn so callers that suspend
+        // work (NSScriptCommand) always resume AFTER this function returns, even
+        // on the synchronous paths below.
+        func finish(_ controller: TerminalController?) {
+            guard let completion else { return }
+            DispatchQueue.main.async { completion(controller) }
+        }
+
         // Making sure that we're dealing with a TerminalController. If not,
         // then we just create a new window.
         guard let parent,
               let parentController = parent.windowController as? TerminalController else {
-            return newWindow(ghostty, withBaseConfig: baseConfig, withParent: parent)
+            let created = newWindow(ghostty, withBaseConfig: baseConfig, withParent: parent)
+            finish(created)
+            return created
         }
 
         // If our parent is in non-native fullscreen, then new tabs do not work.
@@ -486,6 +552,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             alert.addButton(withTitle: "OK")
             alert.alertStyle = .warning
             alert.beginSheetModal(for: parent)
+            finish(nil)
             return nil
         }
 
@@ -507,6 +574,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // rule as `newWindowInheritingRemote`.
             if parentRemote.machine.isRelay && !RelayAccount.hasCredentials {
                 AppDelegate.presentSignInRequiredAlert()
+                finish(nil)
                 return nil
             }
             BaseTerminalController.resolveRemoteInheritance(
@@ -519,7 +587,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 // Keep the connection owner alive across the new surface's deferred
                 // free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
                 cfg.connectionKeepAlive = parentRemote
-                if cfg.command == nil, let command {
+                // Re-run the parent's explicit command ONLY for a genuine remote
+                // machine (§WP4) — never for the loopback local session-persistence
+                // agent, where it would make a new tab from a `--command` local
+                // window re-run that command instead of opening a shell. See the
+                // gate in BaseTerminalController.newSplit.
+                if !parentRemote.machine.isLocalMachine, cfg.command == nil, let command {
                     cfg.command = command
                     cfg.waitAfterCommand = true
                 }
@@ -531,22 +604,25 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 if cfg.remoteShell == nil {
                     cfg.remoteShell = parentRemote.machine.settings.shell
                 }
-                _ = buildTab(
+                let built = buildTab(
                     ghostty,
                     parent: parent,
                     parentController: parentController,
                     baseConfig: cfg,
                     undoBaseConfig: baseConfig)
+                finish(built)
             }
             return nil
         }
 
-        return buildTab(
+        let built = buildTab(
             ghostty,
             parent: parent,
             parentController: parentController,
             baseConfig: baseConfig,
             undoBaseConfig: baseConfig)
+        finish(built)
+        return built
     }
 
     /// Build the new-tab window and attach it to `parent`'s tab group. Split out
@@ -795,7 +871,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     /// This is called anytime a node in the surface tree is being removed.
     override func closeSurface(
-        _ node: SplitTree<Ghostty.SurfaceView>.Node,
+        _ node: SplitTree<PaneView>.Node,
         withConfirmation: Bool = true
     ) {
         // If this isn't the root then we're dealing with a split closure.
@@ -1081,7 +1157,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard let confirmWindow = all
             .first(where: { $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })?
             .surfaceTree.first(where: { $0.needsConfirmQuit })?
-            .window
+            .contentView.window
         else {
             closeAllWindowsImmediately()
             return
@@ -1116,7 +1192,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// The state that we require to recreate a TerminalController from an undo.
     struct UndoState {
         let frame: NSRect
-        let surfaceTree: SplitTree<Ghostty.SurfaceView>
+        let surfaceTree: SplitTree<PaneView>
         let focusedSurface: UUID?
         let tabIndex: Int?
         weak var tabGroup: NSWindowTabGroup?
@@ -1155,12 +1231,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 DispatchQueue.main.async {
                     Ghostty.moveFocus(to: focusTarget, from: nil)
                 }
-            } else if let focusedSurface = surfaceTree.first {
+            } else if let focusedPane = surfaceTree.first {
                 // No prior focused surface or we can't find it, let's focus
                 // the first.
-                self.focusedSurface = focusedSurface
+                self.focusedSurface = focusedPane.surfaceView
                 DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: focusedSurface, from: nil)
+                    Ghostty.moveFocus(to: focusedPane, from: nil)
                 }
             }
         }
@@ -1196,6 +1272,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // use whatever the latest app-level config is.
         let config = ghostty.config
 
+        // Session persistence: agent-backed windows must NOT also be saved
+        // by AppKit state restoration — the SessionLayoutManifest restores
+        // them re-ATTACHed to their live sessions (T06); AppKit would
+        // recreate them as fresh exec-backed duplicates. The entry id is
+        // always set before the window loads (fresh window: init; tab:
+        // buildTab; restore: presentRestoredSessionWindow — all assign
+        // `remoteConnection` before first touching `window`).
+        if sessionLayoutEntryID != nil { restorable = false }
+
         // Setting all three of these is required for restoration to work.
         window.isRestorable = restorable
         if restorable {
@@ -1208,7 +1293,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if case let .leaf(view) = surfaceTree.root {
             // If this is our first surface then our focused surface will be nil
             // so we force the focused surface to the leaf.
-            focusedSurface = view
+            focusedSurface = view.surfaceView
         }
 
         // Initialize our content view to the SwiftUI root
@@ -1392,6 +1477,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     // Called when the window will be encoded. We handle the data encoding here in the
     // window controller.
     func window(_ window: NSWindow, willEncodeRestorableState state: NSCoder) {
+        // Session persistence: never encode a manifest-tracked window even
+        // if AppKit asks (final backstop behind the isRestorable gates) —
+        // decoding it would duplicate the window as exec-backed surfaces.
+        guard sessionLayoutEntryID == nil else { return }
         let data = TerminalRestorableState(from: self)
         data.encode(with: state)
     }

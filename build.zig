@@ -91,10 +91,11 @@ pub fn build(b: *std.Build) !void {
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
 
     // Ghoztty remote-machines agent (WP2). A standalone, GUI-free daemon exe
-    // built on demand via `zig build agent`. It is not part of the default
-    // install graph this increment (daemonization/packaging is deferred).
+    // built via `zig build agent`, and embedded into the macOS app bundle
+    // (Contents/MacOS/ghoztty-agent) so the app can spawn its local
+    // session-persistence agent.
+    const agent = try buildpkg.GhosttyAgent.init(b, &config, &deps);
     {
-        const agent = try buildpkg.GhosttyAgent.init(b, &config, &deps);
         agent_step.dependOn(&agent.install_step.step);
         if (agent.ca_dll_install_step) |ca| agent_step.dependOn(&ca.step);
 
@@ -115,6 +116,18 @@ pub fn build(b: *std.Build) !void {
         // main.zig's `@import("agent_build_options")` — reuse the exe's module.
         agent_test.root_module.addImport("agent_build_options", agent.version_module);
         if (!config.emit_lib_vt) _ = try deps.add(agent_test);
+        // src/terminal (reached both via pty.zig and, for the grid snapshot, via
+        // grid_snapshot.zig) has test blocks verifying enums against the
+        // libghostty C header (`lib.checkGhosttyHEnum`), so the agent test binary
+        // needs the same `ghostty.h` module the main test build wires.
+        agent_test.root_module.addImport(
+            "ghostty.h",
+            b.addTranslateC(.{
+                .root_source_file = b.path("include/ghostty.h"),
+                .target = config.baselineTarget(),
+                .optimize = .Debug,
+            }).createModule(),
+        );
         const agent_test_run = b.addRunArtifact(agent_test);
         test_agent_step.dependOn(&agent_test_run.step);
 
@@ -126,12 +139,28 @@ pub fn build(b: *std.Build) !void {
             .name = "ghoztty-agent-core-test",
             .filters = test_filters,
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/remote/agent_test.zig"),
+                // Rooted at `src/agent_core_test.zig` (a thin wrapper around
+                // `remote/agent_test.zig`) so the module root is `src/`, letting
+                // the session store's grid-snapshot emulator reach src/terminal
+                // via its relative import (grid_snapshot.zig).
+                .root_source_file = b.path("src/agent_core_test.zig"),
                 .target = config.target,
                 .optimize = .Debug,
             }),
             .use_llvm = true,
         });
+        // The grid-snapshot emulator pulls src/terminal into this aggregator, so
+        // it needs the shared terminal deps (terminal_options, unicode tables,
+        // simd) and the `ghostty.h` module the terminal enum-vs-header tests use.
+        if (!config.emit_lib_vt) _ = try deps.add(agent_core_test);
+        agent_core_test.root_module.addImport(
+            "ghostty.h",
+            b.addTranslateC(.{
+                .root_source_file = b.path("include/ghostty.h"),
+                .target = config.baselineTarget(),
+                .optimize = .Debug,
+            }).createModule(),
+        );
         const agent_core_test_run = b.addRunArtifact(agent_core_test);
         test_agent_step.dependOn(&agent_core_test_run.step);
     }
@@ -323,6 +352,7 @@ pub fn build(b: *std.Build) !void {
                 .docs = &docs,
                 .i18n = if (i18n) |v| &v else null,
                 .resources = &resources,
+                .agent = &agent,
             },
         );
         if (config.emit_macos_app) {
@@ -370,6 +400,7 @@ pub fn build(b: *std.Build) !void {
                     .docs = &docs,
                     .i18n = if (i18n) |v| &v else null,
                     .resources = &resources,
+                    .agent = &agent,
                 },
             );
 

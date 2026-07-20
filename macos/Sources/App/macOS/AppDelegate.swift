@@ -71,6 +71,7 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuResetFontSize: NSMenuItem?
     @IBOutlet private var menuChangeTitle: NSMenuItem?
     @IBOutlet private var menuChangeTabTitle: NSMenuItem?
+    @IBOutlet private var menuChangeWindowTitle: NSMenuItem?
     @IBOutlet private var menuReadonly: NSMenuItem?
     @IBOutlet private var menuQuickTerminal: NSMenuItem?
     @IBOutlet private var menuTerminalInspector: NSMenuItem?
@@ -107,8 +108,26 @@ class AppDelegate: NSObject,
     /// This is the current configuration from the Ghostty configuration that we need.
     private var derivedConfig: DerivedConfig = DerivedConfig()
 
-    private lazy var ipcServer = IPCServer(ghostty: ghostty)
+    /// Internal (not private) so the session layout manifest can look up a
+    /// window/pane's registered IPC target name when persisting layouts.
+    private(set) lazy var ipcServer = IPCServer(ghostty: ghostty)
     private var hasPendingIpc = false
+
+    /// Session persistence (T06): true while the launch-time layout restore
+    /// is in flight (or has restored windows), so `applicationDidBecomeActive`
+    /// does not ALSO open the initial window on top of the restored layout.
+    /// Set synchronously in `restoreSessionLayoutWindows()` before the agent
+    /// dial; cleared only if the restore ends with nothing on screen (see
+    /// `sessionLayoutRestoreFinished`). Internal so the restore extension
+    /// (SessionLayoutRestore.swift) can manage it.
+    var hasPendingSessionRestore = false
+
+    /// True while an in-place recovery of local-agent windows is running (T12e:
+    /// the shared connection dropped, we are re-dialing the launchd-restarted
+    /// agent and rebuilding open windows). Guards against a `reconnecting→dead`
+    /// double-fire kicking two concurrent recoveries. Internal so the restore
+    /// extension (SessionLayoutRestore.swift) can manage it. Main only.
+    var isRecoveringSessionLayout = false
 
     /// The ghostty global state. Only one per process.
     let ghostty: Ghostty.App
@@ -270,6 +289,35 @@ class AppDelegate: NSObject,
             // the app last quit (background dials; failures never alert).
             restoreRemoteWindows()
 
+            // Session persistence (T18): mirror every layout change to the local
+            // agent so a viewer on ANOTHER machine can pull the topology and
+            // "Resume all". Only entries with at least one captured session id
+            // are pushable (nothing else could be attached elsewhere).
+            SessionLayoutManifest.shared.onEntryChanged = { entry in
+                guard let (blob, ids) = SessionLayoutManifest.layoutBlob(for: entry) else { return }
+                LocalAgentManager.shared.pushLayout(
+                    key: entry.id.uuidString, blob: blob, sessionIDs: ids)
+            }
+            SessionLayoutManifest.shared.onEntryRemoved = { id in
+                LocalAgentManager.shared.deleteLayout(key: id.uuidString)
+            }
+
+            // Session persistence (T06): rebuild the local-agent-backed
+            // windows recorded in the layout manifest, re-ATTACHing every
+            // pane to its still-running agent session (background dial +
+            // probes; failures never alert).
+            restoreSessionLayoutWindows()
+
+            // Session persistence (T12e): if the shared local-agent connection's
+            // transport drops (the agent crashed and launchd is restarting it),
+            // recover every open local window IN PLACE — re-dial the restarted
+            // agent once and rebuild each window's split tree (re-ATTACH +
+            // auto-RELAUNCH), no app relaunch. Set once; each shared connection
+            // fires it at most once (recovery installs a fresh one).
+            LocalAgentManager.shared.onSharedConnectionDrop = { [weak self] in
+                self?.recoverSessionLayoutInPlace()
+            }
+
             // Warm the machine chooser: touching `MachineRegistry.shared`
             // seeds it from the persisted device cache, and the quiet refresh
             // starts resolving live online status NOW — the first fetch can
@@ -282,6 +330,21 @@ class AppDelegate: NSObject,
             // load, so this cannot race it into a false "signed out" purge.
             Task { @MainActor in
                 await MachineRegistry.shared.refreshFromRelay(quiet: true)
+            }
+
+            // Test seam: exercise the local-agent find-or-spawn path without
+            // any window plumbing (session persistence is not wired to
+            // surfaces yet). Logs the outcome; the orchestrator asserts via
+            // the unified log + the agent port file + ps.
+            if ProcessInfo.processInfo.environment["GHOSTTY_TEST_LOCAL_AGENT"] == "1" {
+                DispatchQueue.global(qos: .utility).async {
+                    if let conn = LocalAgentManager.shared.connect() {
+                        Self.logger.info("local-agent test seam: connected, agent pid \(conn.pid) port \(conn.port)")
+                        ghostty_remote_connection_free(conn.handle)
+                    } else {
+                        Self.logger.error("local-agent test seam: connect() failed")
+                    }
+                }
             }
         }
 
@@ -419,7 +482,8 @@ class AppDelegate: NSObject,
             // is possible to have other windows in a few scenarios:
             //   - if we're opening a URL since `application(_:openFile:)` is called before this.
             //   - if we're restoring from persisted state
-            if TerminalController.all.isEmpty && derivedConfig.initialWindow && !hasPendingIpc {
+            if TerminalController.all.isEmpty && derivedConfig.initialWindow
+                && !hasPendingIpc && !hasPendingSessionRestore {
                 undoManager.disableUndoRegistration()
                 _ = TerminalController.newWindow(ghostty)
                 undoManager.enableUndoRegistration()
@@ -436,6 +500,19 @@ class AppDelegate: NSObject,
         // keep their restore-manifest entries. Reset on the (single) cancel
         // path below.
         isQuitting = true
+
+        // Session persistence (T05): run any debounced layout syncs while
+        // every window is still fully alive — windowWillClose during quit
+        // sees sibling tabs already closing, too late for a faithful
+        // tab-group snapshot. Harmless if the quit is cancelled below.
+        SessionLayoutManifest.shared.flushPendingSyncs()
+
+        // WP-D3: force a FRESH snapshot capture of every tracked pane now, so
+        // the persisted screen snapshot + byte offset reflect the state AT quit
+        // (a session that changed only via output never tripped the debounced
+        // sync above). This is what keeps the agent's delta replay tiny on the
+        // next relaunch/upgrade — the fast, non-smeary restore path.
+        SessionLayoutManifest.shared.syncAllTrackedNow()
 
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
@@ -475,13 +552,33 @@ class AppDelegate: NSObject,
             }
         }
 
-        // If our app says we don't need to confirm, we can exit now.
-        if !ghostty.needsConfirmQuit { return .terminateNow }
+        // Agent-backed windows (remoteConnection != nil — both true remote
+        // machines and local session-persistence windows) survive the quit:
+        // their sessions DETACH and re-attach on the next launch. Only windows
+        // withOUT a live agent connection can actually lose a running process,
+        // so only those gate the confirmation. The libghostty aggregate
+        // (`ghostty.needsConfirmQuit`) can't make this distinction — it only
+        // sees "is a command running", which is true for exactly the sessions
+        // that would survive.
+        let terminatedOnQuit = NSApp.windows.compactMap { window in
+            window.windowController as? BaseTerminalController
+        }.filter { controller in
+            controller.remoteConnection == nil &&
+                controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
+        }
+        if terminatedOnQuit.isEmpty { return .terminateNow }
 
         // We have some visible window. Show an app-wide modal to confirm quitting.
+        // Mention persistence only when it's actually in play (mixed case);
+        // with no agent-backed windows the classic wording stays accurate.
+        let anyPersistent = NSApp.windows.contains { window in
+            (window.windowController as? BaseTerminalController)?.remoteConnection != nil
+        }
         let alert = NSAlert()
         alert.messageText = "Quit Ghoztty?"
-        alert.informativeText = "All terminal sessions will be terminated."
+        alert.informativeText = anyPersistent
+            ? "Some terminals are not persistent and have running processes that will be terminated. Persistent sessions keep running and re-attach on the next launch."
+            : "All terminal sessions will be terminated."
         alert.addButton(withTitle: "Close Ghoztty")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
@@ -536,6 +633,20 @@ class AppDelegate: NSObject,
 
         var isDirectory = ObjCBool(true)
         guard FileManager.default.fileExists(atPath: filename, isDirectory: &isDirectory) else { return false }
+
+        // Markdown files open as a viewer pane in a new window (File → Open,
+        // dock drops, `open -a`), not as an executed terminal command. Other
+        // extensions keep the terminal behavior below.
+        if !isDirectory.boolValue,
+           ["md", "markdown", "mdown", "mkd", "mdwn"]
+               .contains((filename as NSString).pathExtension.lowercased()) {
+            let pane = PaneView(viewer: ViewerView(location: filename))
+            let controller = TerminalController.newWindow(
+                ghostty,
+                tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
+            controller.titleOverride = pane.title
+            return true
+        }
 
         // Set to true if confirmation is required before starting up the
         // new terminal.
@@ -841,6 +952,14 @@ class AppDelegate: NSObject,
         // Update the config we need to store
         self.derivedConfig = DerivedConfig(config)
 
+        // Session persistence: warm the local-agent connection in the
+        // background so the first persistent window doesn't block the main
+        // thread on the agent spawn/dial. Never from a test host — spawning
+        // agents is real shared machine state.
+        if config.sessionPersistence && !Self.isTestHost {
+            LocalAgentManager.shared.warmUp()
+        }
+
         // Depending on the "window-save-state" setting we have to set the NSQuitAlwaysKeepsWindows
         // configuration. This is the only way to carefully control whether macOS invokes the
         // state restoration system.
@@ -997,8 +1116,8 @@ class AppDelegate: NSObject,
 
     func findSurface(forUUID uuid: UUID) -> Ghostty.SurfaceView? {
         for c in TerminalController.all {
-            for view in c.surfaceTree where view.id == uuid {
-                return view
+            for pane in c.surfaceTree where pane.id == uuid {
+                return pane.surfaceView
             }
         }
 
@@ -1042,29 +1161,20 @@ class AppDelegate: NSObject,
         _ = TerminalController.newWindow(ghostty)
     }
 
-    /// New Window with target picker (Cmd-Shift-N): always shows a chooser
-    /// listing "Local" plus every registered remote machine whenever at least
-    /// one machine is registered (even a single machine — no auto-skip).
-    /// Selecting "Local" opens a normal local window; selecting a machine dials
-    /// it over TCP and opens a window whose terminal runs on that machine
-    /// (splits/tabs inherit the same machine + connection). With zero machines
-    /// registered, this just opens a local window.
+    /// New Window with target picker (Cmd-Shift-N): ALWAYS shows a chooser
+    /// listing "Local" plus every registered remote machine, plus a sign-in
+    /// footer (sign-in is always possible, so there is no auto-skip to a plain
+    /// local window). Selecting "Local" opens a normal local window; selecting
+    /// a machine dials it (relay or TCP) and opens a window whose terminal runs
+    /// on that machine (splits/tabs inherit the same machine + connection).
     @IBAction func newRemoteWindow(_ sender: Any?) {
         let registry = MachineRegistry.shared
 
-        // Nothing remote to choose — no registered machine, no relay account,
-        // AND no Google client to sign in with — so just open a normal local
-        // window. The Google-client check matters when SIGNED OUT at zero
-        // machines: the chooser is the only sign-in surface, so it must open
-        // (showing just "Local" + the sign-in footer) or sign-in is
-        // unreachable from the UI.
-        guard !registry.machines.isEmpty || registry.hasRelayAccount
-            || RelayAccount.isConfigured
-        else {
-            _ = TerminalController.newWindow(ghostty)
-            return
-        }
-
+        // Sign-in is always possible now (the Google client id is baked into
+        // the build), so ⌘⇧N ALWAYS presents the chooser — "Local" + any
+        // registered machines + the sign-in/out footer. It must never silently
+        // open a plain local window (that made the app look broken when signed
+        // out with zero machines).
         MachineChooser.present(registry: registry) { [weak self] selected in
             guard let self, let target = selected else { return }
             switch target {
@@ -1072,9 +1182,9 @@ class AppDelegate: NSObject,
                 _ = TerminalController.newWindow(self.ghostty)
             case .remote(let machine):
                 // Relay machines dial through the rendezvous relay; the bearer
-                // comes from the WP-B2 token-resolution seam (signed-in Google
-                // account first, dev env token fallback — never hardcoded).
-                // TCP machines use the direct host:port dial.
+                // comes from the token-resolution seam (the signed-in account's
+                // relay session token — never hardcoded). TCP machines use the
+                // direct host:port dial.
                 if let base = machine.relayBase, let device = machine.deviceID {
                     Task { @MainActor in
                         // Check the token seam BEFORE dialing: signed out with
@@ -1105,7 +1215,157 @@ class AppDelegate: NSObject,
                         entry.relayBase == base && entry.deviceID == device
                     }
                 }
+            case .resumeSession(let machine, let session):
+                // Cross-machine resume (T17): open a local viewer window that
+                // re-ATTACHes to a browsed session over its host's transport.
+                // The process keeps running on its host agent; only the viewer
+                // is local. `machine == nil` ⇒ the local agent.
+                self.resumeBrowsedSession(machine: machine, session: session)
+            case .resumeAll(let machine):
+                // Cross-machine "Resume all" (T18): rebuild the machine's full
+                // window/tab/split topology locally from its agent-owned layout
+                // blobs, ATTACHing each leaf to its live session.
+                self.resumeAllSessions(machine: machine)
             }
+        }
+    }
+
+    /// Resume ONE browsed session (T17): present a local window that
+    /// re-`ATTACH`es to `session` over its host machine's transport (relay/TCP
+    /// for a remote `machine`, the shared local-agent connection when `machine`
+    /// is nil). The session's child keeps running on its host agent — this only
+    /// binds a local viewer to it. Closing the window later just detaches.
+    ///
+    /// Attached-elsewhere: if the browse roster reported the session as already
+    /// attached, confirm the steal with the user first (the ATTACH path force-
+    /// reclaims, so we must not do it silently).
+    @MainActor
+    func resumeBrowsedSession(machine: Machine?, session: BrowsedSession) {
+        // A dead session has no live pane to attach — the browser renders it
+        // non-interactive, but guard here too.
+        guard session.alive else { return }
+
+        // Local, and we already hold it in an open window: just raise that
+        // window. No steal, no dialog — the "attached" flag is our own bridge.
+        if machine == nil,
+           let existing = TerminalController.all.first(where: {
+               controllerHoldsLocalSession($0, sessionID: session.id)
+           }) {
+            existing.window?.makeKeyAndOrderFront(self)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        // Attached elsewhere (another viewer / another machine): the ATTACH path
+        // force-reclaims, so confirm the steal rather than doing it silently.
+        if session.attached {
+            let alert = NSAlert()
+            alert.messageText = "Resume “\(session.displayLabel)” here?"
+            alert.informativeText = "This session is currently attached to another window. Resuming it here will detach it there. The session keeps running either way."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Resume Here")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        if let machine {
+            resumeRemoteSession(machine: machine, session: session)
+        } else {
+            resumeLocalSession(session: session)
+        }
+    }
+
+    /// Resume a LOCAL-agent session: build a single-leaf `.remote` window that
+    /// ATTACHes `session.id` over the shared local-agent connection. (The
+    /// already-open-window case is handled by the caller, which focuses the
+    /// existing window instead.) The `remoteConnection` didSet registers the
+    /// window in the SessionLayoutManifest (machine.isLocalMachine), so the
+    /// resumed window is itself restorable.
+    @MainActor
+    private func resumeLocalSession(session: BrowsedSession) {
+        LocalAgentManager.shared.sharedConnectionAsync { [weak self] connection in
+            guard let self else { return }
+            guard let connection else {
+                let alert = NSAlert()
+                alert.messageText = "Couldn't resume session"
+                alert.informativeText = "The local session agent is not reachable."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                return
+            }
+            var cfg = Ghostty.SurfaceConfiguration()
+            cfg.remoteMachine = connection.machine
+            cfg.remoteConnection = connection.handle
+            cfg.connectionKeepAlive = connection
+            cfg.remoteSessionId = session.id
+            let controller = TerminalController.newWindow(self.ghostty, withBaseConfig: cfg)
+            controller.remoteMachine = connection.machine
+            controller.remoteConnection = connection
+            if let title = session.title, !title.isEmpty {
+                controller.titleOverride = title
+            }
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Whether `controller` is a local-agent window whose layout tree contains a
+    /// leaf attached to `sessionID` (used to focus-instead-of-steal on resume).
+    @MainActor
+    private func controllerHoldsLocalSession(_ controller: TerminalController, sessionID: String) -> Bool {
+        guard let entryID = controller.sessionLayoutEntryID,
+              let entry = SessionLayoutManifest.shared.allEntries().first(where: { $0.id == entryID }),
+              let tree = entry.tree
+        else { return false }
+        return SessionLayoutManifest.leaves(of: tree).contains { $0.sessionID == sessionID }
+    }
+
+    /// Resume a session that lives on a remote `machine`: dial the machine
+    /// (relay or direct TCP) and present a window ATTACHed to `session.id`. The
+    /// dial blocks through the handshake, so it runs off the main thread (no
+    /// beachball); a failed dial surfaces an alert (this is user-initiated, so
+    /// an alert is appropriate — cf. the unattended-dial wedge rule).
+    @MainActor
+    private func resumeRemoteSession(machine: Machine, session: BrowsedSession) {
+        if let base = machine.relayBase, let device = machine.deviceID {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let token = await RelayAccount.resolveToken() else {
+                    Self.presentSignInRequiredAlert()
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let handle = Self.dialRelay(base: base, device: device, token: token)
+                    DispatchQueue.main.async {
+                        guard let self else {
+                            if let handle { ghostty_remote_connection_free(handle) }
+                            return
+                        }
+                        guard let handle else {
+                            let alert = NSAlert()
+                            alert.messageText = "Couldn't connect to \(machine.name)"
+                            alert.informativeText = "Failed to reach \(device) via the relay. Make sure the Ghoztty agent is running and the relay is reachable."
+                            alert.alertStyle = .warning
+                            alert.addButton(withTitle: "OK")
+                            alert.runModal()
+                            return
+                        }
+                        self.presentRemoteWindow(
+                            handle: handle,
+                            relay: base,
+                            device: device,
+                            fallbackName: machine.name,
+                            namePinned: machine.namePinned,
+                            sessionID: session.id,
+                            windowTitle: session.title,
+                            ipcName: nil)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                }
+            }
+        } else {
+            // Direct-TCP machine: dial + present with the session id (ATTACH).
+            _ = openRemoteWindow(on: machine, attachSessionID: session.id, windowTitle: session.title)
         }
     }
 
@@ -1175,7 +1435,7 @@ class AppDelegate: NSObject,
         // "couldn't connect" alert. Refuse with the sign-in message instead.
         guard !token.isEmpty else {
             Self.presentSignInRequiredAlert()
-            return "not signed in: sign in (or set GHOSTTY_RELAY_TOKEN) to open relay windows"
+            return "not signed in: sign in to open relay windows"
         }
 
         // Dial the agent through the relay. This blocks through the handshake and
@@ -1242,6 +1502,7 @@ class AppDelegate: NSObject,
         namePinned: Bool = false,
         sessionID: String?,
         windowTitle: String? = nil,
+        windowTitleOverride: String? = nil,
         ipcName: String? = nil,
         workingDirectory: String? = nil,
         shell: String? = nil,
@@ -1330,6 +1591,13 @@ class AppDelegate: NSObject,
         // the original rename did.
         if let windowTitle, !windowTitle.isEmpty {
             controller.titleOverride = windowTitle
+        }
+
+        // The user-set WINDOW-level title (pins the titlebar over any
+        // tab/pane title). Set AFTER `remoteManifestEntryID` above so the
+        // didSet re-persists it into the fresh (replacing) manifest entry.
+        if let windowTitleOverride, !windowTitleOverride.isEmpty {
+            controller.windowTitleOverride = windowTitleOverride
         }
 
         return controller
@@ -1531,6 +1799,7 @@ class AppDelegate: NSObject,
                         namePinned: entry.namePinned == true,
                         sessionID: sessionID,
                         windowTitle: entry.windowTitle,
+                        windowTitleOverride: entry.windowTitleOverride,
                         ipcName: entry.ipcName,
                         replacingManifestEntry: entry.id)
                 }
@@ -1549,6 +1818,8 @@ class AppDelegate: NSObject,
         workingDirectory: String? = nil,
         shell: String? = nil,
         command: String? = nil,
+        attachSessionID: String? = nil,
+        windowTitle: String? = nil,
         onOpen: ((TerminalController) -> Void)? = nil
     ) -> String? {
         // Dial the agent over TCP. This blocks through the handshake and returns
@@ -1579,18 +1850,24 @@ class AppDelegate: NSObject,
         // Retain the connection owner on the surface so it outlives the surface's
         // deferred free (channel detach). See SurfaceConfiguration.connectionKeepAlive.
         cfg.connectionKeepAlive = connection
-        cfg.remoteSessionId = nil
-        // Per-host defaults (cwd/shell), overridden by explicit CLI flags. This
-        // is an OPEN-new (session_id nil), so the OPEN fields apply.
-        machine.applyOpenDefaults(
-            to: &cfg,
-            workingDirectory: workingDirectory,
-            shell: shell,
-            command: command)
+        cfg.remoteSessionId = attachSessionID
+        // Per-host defaults (cwd/shell) + explicit CLI flags apply only to an
+        // OPEN-new window (session_id nil). A resume (T17) re-ATTACHes an
+        // existing session whose shell/cwd were fixed when it was first opened.
+        if attachSessionID == nil {
+            machine.applyOpenDefaults(
+                to: &cfg,
+                workingDirectory: workingDirectory,
+                shell: shell,
+                command: command)
+        }
 
         let controller = TerminalController.newWindow(ghostty, withBaseConfig: cfg)
         controller.remoteMachine = machine
         controller.remoteConnection = connection
+        if let windowTitle, !windowTitle.isEmpty {
+            controller.titleOverride = windowTitle
+        }
         onOpen?(controller)
         return nil
     }
@@ -1760,6 +2037,7 @@ extension AppDelegate {
         self.menuCommandPalette?.setImageIfDesired(systemSymbolName: "filemenu.and.selection")
         self.menuQuickTerminal?.setImageIfDesired(systemSymbolName: "apple.terminal")
         self.menuChangeTabTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
+        self.menuChangeWindowTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
         self.menuTerminalInspector?.setImageIfDesired(systemSymbolName: "scope")
         self.menuReadonly?.setImageIfDesired(systemSymbolName: "eye.fill")
         self.menuSetAsDefaultTerminal?.setImageIfDesired(systemSymbolName: "star.fill")
@@ -1835,6 +2113,7 @@ extension AppDelegate {
         syncMenuShortcut(config, action: "reset_font_size", menuItem: self.menuResetFontSize)
         syncMenuShortcut(config, action: "prompt_surface_title", menuItem: self.menuChangeTitle)
         syncMenuShortcut(config, action: "prompt_tab_title", menuItem: self.menuChangeTabTitle)
+        syncMenuShortcut(config, action: "prompt_window_title", menuItem: self.menuChangeWindowTitle)
         syncMenuShortcut(config, action: "toggle_quick_terminal", menuItem: self.menuQuickTerminal)
         syncMenuShortcut(config, action: "toggle_visibility", menuItem: self.menuToggleVisibility)
         syncMenuShortcut(config, action: "toggle_window_float_on_top", menuItem: self.menuFloatOnTop)

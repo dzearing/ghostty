@@ -52,6 +52,10 @@ final class RemoteSessionManifest {
         /// so manifests persisted before this field decode fine (missing key
         /// ⇒ nil, same as `Machine.hostname`).
         var windowTitle: String? = nil
+        /// The USER-set WINDOW-level title (`windowTitleOverride`) that pins
+        /// the titlebar over any tab/pane title. Optional so older manifests
+        /// decode fine (missing key ⇒ nil).
+        var windowTitleOverride: String? = nil
         /// True when `name` was explicitly supplied by the caller (IPC
         /// `+new-remote-window --name=...`, see `Machine.namePinned`).
         /// Account renames (`updateName`) skip pinned entries so a restore
@@ -160,6 +164,18 @@ final class RemoteSessionManifest {
         guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
         guard entries[idx].windowTitle != windowTitle else { return }
         entries[idx].windowTitle = windowTitle
+        saveLocked()
+    }
+
+    /// Record the user-set WINDOW-level title (nil ⇒ cleared). Called from
+    /// the `windowTitleOverride` seam in `BaseTerminalController`, same
+    /// contract as `updateWindowTitle`. Unknown ids are a no-op.
+    func updateWindowTitleOverride(_ id: UUID, title: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
+        guard entries[idx].windowTitleOverride != title else { return }
+        entries[idx].windowTitleOverride = title
         saveLocked()
     }
 
@@ -329,8 +345,8 @@ final class RemoteSessionManifest {
 
         let sid: String? = controller.surfaceTree
             .first(where: { _ in true })
-            .flatMap { (view: Ghostty.SurfaceView) -> String? in
-                guard let surface = view.surface else { return nil }
+            .flatMap { (pane: PaneView) -> String? in
+                guard let surface = pane.surface else { return nil }
                 let s = Ghostty.AllocatedString(
                     ghostty_surface_remote_session_id(surface)).string
                 return s.isEmpty ? nil : s

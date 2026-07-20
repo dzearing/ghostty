@@ -41,7 +41,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     /// The tree of splits within this terminal window.
-    @Published var surfaceTree: SplitTree<Ghostty.SurfaceView> = .init() {
+    @Published var surfaceTree: SplitTree<PaneView> = .init() {
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
@@ -113,7 +113,71 @@ class BaseTerminalController: NSWindowController,
                 RemoteSessionManifest.shared.updateWindowTitle(
                     remoteManifestEntryID, windowTitle: titleOverride)
             }
+
+            // Session persistence (T05): same contract for local
+            // agent-backed windows in the layout manifest.
+            if let sessionLayoutEntryID {
+                SessionLayoutManifest.shared.updateWindowTitle(
+                    sessionLayoutEntryID, windowTitle: titleOverride)
+            }
         }
+    }
+
+    /// A window-level title override set by the user (Change Window Title
+    /// prompt, `+new-window --title=`, `+rename`). When set, it pins the
+    /// window titlebar for the whole window — all tabs, regardless of pane
+    /// focus or terminal-set titles — until cleared. Stored on ONE
+    /// controller of a native tab group (see `effectiveWindowTitleOverride`);
+    /// use `setWindowTitle(_:)` to change it so the single-holder invariant
+    /// holds.
+    var windowTitleOverride: String? {
+        didSet {
+            // Same persistence contract as `titleOverride`: this is the
+            // choke point every window-rename path funnels through.
+            if let remoteManifestEntryID {
+                RemoteSessionManifest.shared.updateWindowTitleOverride(
+                    remoteManifestEntryID, title: windowTitleOverride)
+            }
+            if let sessionLayoutEntryID {
+                SessionLayoutManifest.shared.updateWindowTitleOverride(
+                    sessionLayoutEntryID, title: windowTitleOverride)
+            }
+
+            // The override affects the titlebar of every tab in the group.
+            applyTitleToWindow()
+            guard let window else { return }
+            for w in window.tabGroup?.windows ?? [] where w !== window {
+                (w.windowController as? BaseTerminalController)?.applyTitleToWindow()
+            }
+        }
+    }
+
+    /// The window title pinning this controller's titlebar, if any: this
+    /// controller's own override, or the override held by any other tab in
+    /// the same native tab group.
+    var effectiveWindowTitleOverride: String? {
+        if let windowTitleOverride { return windowTitleOverride }
+        guard let window else { return nil }
+        for w in window.tabGroup?.windows ?? [] where w !== window {
+            if let title = (w.windowController as? BaseTerminalController)?.windowTitleOverride {
+                return title
+            }
+        }
+        return nil
+    }
+
+    /// Set (or clear, with nil) the window title for this window and its tab
+    /// group, keeping exactly one controller in the group as the holder.
+    func setWindowTitle(_ newTitle: String?) {
+        if let window {
+            for w in window.tabGroup?.windows ?? [] where w !== window {
+                if let c = w.windowController as? BaseTerminalController,
+                   c.windowTitleOverride != nil {
+                    c.windowTitleOverride = nil
+                }
+            }
+        }
+        windowTitleOverride = newTitle
     }
 
     var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
@@ -137,7 +201,10 @@ class BaseTerminalController: NSWindowController,
     /// A successful WP-D1 reconnect REPLACES this with a freshly-dialed
     /// connection (the old one is released once its last surface deallocates).
     var remoteConnection: RemoteConnection? {
-        didSet { bindRemoteConnectionStateObserver() }
+        didSet {
+            bindRemoteConnectionStateObserver()
+            registerSessionLayoutIfNeeded()
+        }
     }
 
     /// WP-D1: this window's connection status (reconnect state machine output).
@@ -205,6 +272,14 @@ class BaseTerminalController: NSWindowController,
     /// the window is restored (re-`ATTACH`ed) on the next launch.
     var remoteManifestEntryID: UUID?
 
+    /// Session persistence (T05): this window's entry in the
+    /// `SessionLayoutManifest`, when it is a LOCAL-agent-backed persistent
+    /// window tracked for restore-on-relaunch. Registered in
+    /// `remoteConnection`'s didSet (the one choke point every persistent
+    /// window/tab passes through); a clean close removes the entry (see
+    /// `windowWillClose`); app quit leaves it so T06 can rebuild the window.
+    var sessionLayoutEntryID: UUID?
+
     private static var _nextWindowId: Int = 0
     private static func nextWindowId() -> Int {
         _nextWindowId += 1
@@ -246,7 +321,7 @@ class BaseTerminalController: NSWindowController,
 
     init(_ ghostty: Ghostty.App,
          baseConfig base: Ghostty.SurfaceConfiguration? = nil,
-         surfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil
+         surfaceTree tree: SplitTree<PaneView>? = nil
     ) {
         self.ghostty = ghostty
         self.derivedConfig = DerivedConfig(ghostty.config)
@@ -262,6 +337,14 @@ class BaseTerminalController: NSWindowController,
             initialConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
         }
         self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: initialConfig))
+
+        // A passed-in tree re-adopts existing surfaces (undo of a window
+        // close, moves between windows): they are alive again, so clear any
+        // pending CLOSE-on-free intent. (didSet does not fire for this init
+        // assignment, so the surfaceTreeDidChange clearing doesn't run here.)
+        if tree != nil {
+            for view in surfaceTree { view.setSessionCloseIntent(false) }
+        }
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
@@ -400,9 +483,10 @@ class BaseTerminalController: NSWindowController,
     @discardableResult
     func newSplit(
         at oldView: Ghostty.SurfaceView,
-        direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
+        direction: SplitTree<PaneView>.NewDirection,
         baseConfig config: Ghostty.SurfaceConfiguration? = nil,
-        ratio: Double = 0.5
+        ratio: Double = 0.5,
+        onCreate: ((Ghostty.SurfaceView) -> Void)? = nil
     ) -> Ghostty.SurfaceView? {
         // We can only create new splits for surfaces in our tree.
         guard surfaceTree.root?.node(view: oldView) != nil else { return nil }
@@ -448,7 +532,22 @@ class BaseTerminalController: NSWindowController,
             effectiveConfig.connectionKeepAlive = remoteConnection
             // session_id stays nil: each split opens a fresh remote session on
             // the same machine/connection.
-            if effectiveConfig.command == nil,
+            //
+            // Command inheritance is for GENUINE remote machines ONLY. There,
+            // re-running the parent's command on a split is the intended §WP4
+            // behavior (e.g. the `+split --from-focused` rapid-remote-split path).
+            // It must NOT apply to the LOCAL session-persistence agent: every
+            // local window/tab/split routes through that agent (default-on), so
+            // inheriting the parent's explicit `-e`/`--command` would make a
+            // Cmd-D split of, say, a `--command="… cl …"` window RE-RUN that
+            // command instead of opening a plain shell — a regression from
+            // upstream Ghostty, where `-e`/`--command` is one-shot for the
+            // surface it was given to and splits always open the default shell.
+            // Gate on the machine being a real remote (the local agent's
+            // loopback machine is `isLocalMachine`), so local splits fall through
+            // with a nil command ⇒ the agent's default shell.
+            if !remoteConnection.machine.isLocalMachine,
+               effectiveConfig.command == nil,
                let parentCommand = Self.remoteInheritance(of: oldView).command {
                 effectiveConfig.command = parentCommand
                 // `wait-after-command` makes libghostty forward this as an EXPLICIT
@@ -472,22 +571,112 @@ class BaseTerminalController: NSWindowController,
                 guard let self else { return }
                 var cfg = effectiveConfig
                 if !alreadyHasCwd, let cwd { cfg.remoteWorkingDirectory = cwd }
-                _ = self.finishSplit(
+                if let newView = self.finishSplit(
                     config: cfg,
                     at: oldView,
                     direction: direction,
                     ratio: ratio,
-                    hasExplicitTint: hasExplicitTint)
+                    hasExplicitTint: hasExplicitTint) {
+                    onCreate?(newView)
+                }
             }
             return nil
         }
 
-        return finishSplit(
+        let newView = finishSplit(
             config: effectiveConfig,
             at: oldView,
             direction: direction,
             ratio: ratio,
             hasExplicitTint: hasExplicitTint)
+        if let newView { onCreate?(newView) }
+        return newView
+    }
+
+    /// Create a new viewer split: a non-terminal pane rendering a file or URL.
+    /// Unlike `newSplit` this never touches PTY/agent plumbing — the pane has
+    /// no process. Focus stays where it was.
+    @discardableResult
+    func newViewerSplit(
+        at oldView: Ghostty.SurfaceView,
+        direction: SplitTree<PaneView>.NewDirection,
+        viewer: ViewerView,
+        ratio: Double = 0.5
+    ) -> PaneView? {
+        guard let oldPane = surfaceTree.pane(for: oldView) else { return nil }
+        return newViewerSplit(atPane: oldPane, direction: direction, viewer: viewer, ratio: ratio)
+    }
+
+    /// Viewer split anchored at any existing pane (terminal or viewer).
+    @discardableResult
+    func newViewerSplit(
+        atPane oldPane: PaneView,
+        direction: SplitTree<PaneView>.NewDirection,
+        viewer: ViewerView,
+        ratio: Double = 0.5
+    ) -> PaneView? {
+        guard surfaceTree.root?.node(view: oldPane) != nil else { return nil }
+
+        let pane = PaneView(viewer: viewer)
+        let newTree: SplitTree<PaneView>
+        do {
+            newTree = try surfaceTree.inserting(
+                view: pane,
+                at: oldPane,
+                direction: direction,
+                ratio: ratio)
+        } catch {
+            Ghostty.logger.warning("failed to insert viewer split: \(error)")
+            return nil
+        }
+
+        replaceSurfaceTree(
+            newTree,
+            moveFocusTo: nil,
+            moveFocusFrom: oldPane.surfaceView,
+            undoAction: "New Split")
+
+        return pane
+    }
+
+    /// Terminal split anchored at a VIEWER pane. The regular `newSplit`
+    /// inherits tint/remote context from its anchor surface; a viewer has
+    /// neither, so this creates a plain local surface from the given config.
+    @discardableResult
+    func newTerminalSplit(
+        atPane oldPane: PaneView,
+        direction: SplitTree<PaneView>.NewDirection,
+        baseConfig config: Ghostty.SurfaceConfiguration? = nil,
+        ratio: Double = 0.5
+    ) -> Ghostty.SurfaceView? {
+        guard surfaceTree.root?.node(view: oldPane) != nil else { return nil }
+        guard let ghostty_app = ghostty.app else { return nil }
+
+        var effectiveConfig = config ?? Ghostty.SurfaceConfiguration()
+        if effectiveConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] == nil {
+            effectiveConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
+        }
+
+        let newView = Ghostty.SurfaceView(ghostty_app, baseConfig: effectiveConfig)
+        let newTree: SplitTree<PaneView>
+        do {
+            newTree = try surfaceTree.inserting(
+                view: PaneView(surface: newView),
+                at: oldPane,
+                direction: direction,
+                ratio: ratio)
+        } catch {
+            Ghostty.logger.warning("failed to insert split: \(error)")
+            return nil
+        }
+
+        replaceSurfaceTree(
+            newTree,
+            moveFocusTo: newView,
+            moveFocusFrom: focusedSurface,
+            undoAction: "New Split")
+
+        return newView
     }
 
     /// Build the new surface, insert it into the tree, and finalize focus/undo.
@@ -497,7 +686,7 @@ class BaseTerminalController: NSWindowController,
     private func finishSplit(
         config effectiveConfig: Ghostty.SurfaceConfiguration,
         at oldView: Ghostty.SurfaceView,
-        direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
+        direction: SplitTree<PaneView>.NewDirection,
         ratio: Double,
         hasExplicitTint: Bool
     ) -> Ghostty.SurfaceView? {
@@ -510,7 +699,7 @@ class BaseTerminalController: NSWindowController,
         let newView = Ghostty.SurfaceView(ghostty_app, baseConfig: effectiveConfig)
 
         // Do the split
-        let newTree: SplitTree<Ghostty.SurfaceView>
+        let newTree: SplitTree<PaneView>
         do {
             newTree = try surfaceTree.inserting(
                 view: newView,
@@ -667,10 +856,34 @@ class BaseTerminalController: NSWindowController,
     /// Called when the surfaceTree variable changed.
     ///
     /// Subclasses should call super first.
-    func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+    func surfaceTreeDidChange(from: SplitTree<PaneView>, to: SplitTree<PaneView>) {
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
             focusedSurface = nil
+        }
+
+        // Session close intent: a leaf that LEFT the tree was closed by the
+        // user (removeSurfaceNode, or a redo of a close) — its agent session
+        // must actually END when the view is eventually freed (after the undo
+        // window expires), not linger detached in the agent forever. A leaf
+        // PRESENT in the tree is alive — clear any pending intent, which is
+        // what un-marks a view brought back by undo (the undo restore assigns
+        // the old tree directly, landing here).
+        let toLeaves = to.root?.leaves() ?? []
+        for view in toLeaves { view.setSessionCloseIntent(false) }
+        if let fromLeaves = from.root?.leaves(), !fromLeaves.isEmpty {
+            let toSet = Set(toLeaves.map { ObjectIdentifier($0) })
+            for view in fromLeaves where !toSet.contains(ObjectIdentifier(view)) {
+                view.setSessionCloseIntent(true)
+            }
+        }
+
+        // Session persistence (T05): the split topology is the heart of the
+        // layout manifest — re-sync on every tree change (new split, close,
+        // resize-equalize, ...). Debounced; each sync also restarts the
+        // per-leaf session-id capture for freshly-opened panes.
+        if sessionLayoutEntryID != nil {
+            SessionLayoutManifest.shared.scheduleSync(self)
         }
 
         if heroModeState.isActive {
@@ -694,13 +907,14 @@ class BaseTerminalController: NSWindowController,
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
     /// what surface is focused. This must be called whenever a surface OR window changes focus.
     func syncFocusToSurfaceTree() {
-        for surfaceView in surfaceTree {
+        for pane in surfaceTree {
             // Our focus state requires that this window is key and our currently
-            // focused surface is the surface in this view.
+            // focused surface is the surface in this view. Note the pane itself
+            // is never in the responder chain; its content view is.
             let focused: Bool = (window?.isKeyWindow ?? false) &&
-                surfaceView == focusedSurface &&
-                surfaceView.isFirstResponder
-            surfaceView.focusDidChange(focused)
+                pane.surfaceView === focusedSurface &&
+                pane.contentIsFirstResponder
+            pane.focusDidChange(focused)
         }
     }
 
@@ -709,8 +923,55 @@ class BaseTerminalController: NSWindowController,
         // We need to update our saved frame information in case of monitor
         // changes (see didChangeScreenParameters notification).
         savedFrame = nil
+
+        // Session persistence (T05): a persistent window's frame is part of
+        // its restore manifest (debounced — drags fire this continuously).
+        if sessionLayoutEntryID != nil {
+            SessionLayoutManifest.shared.scheduleSync(self)
+        }
+
         guard let window, let screen = window.screen else { return }
         savedFrame = .init(window: window.frame, screen: screen.visibleFrame)
+    }
+
+    /// Session persistence (T05): start tracking this window in the
+    /// `SessionLayoutManifest` the moment it binds to the LOCAL agent's
+    /// connection — the one choke point every persistent window passes
+    /// through (fresh window in `TerminalController.init`, tab and
+    /// new-window-from-parent inheritance). Gated on the config flag so
+    /// flag-off behavior is untouched (a manual loopback remote window must
+    /// not suddenly persist), and on the machine being local so relay/remote
+    /// windows keep using `RemoteSessionManifest`. A reconnect replaces
+    /// `remoteConnection` on an already-tracked window: entry stays.
+    private func registerSessionLayoutIfNeeded() {
+        guard sessionLayoutEntryID == nil,
+              self is TerminalController,
+              let remoteConnection,
+              remoteConnection.machine.isLocalMachine,
+              ghostty.config.sessionPersistence
+        else { return }
+        sessionLayoutEntryID = SessionLayoutManifest.shared.register()
+        SessionLayoutManifest.shared.scheduleSync(self)
+        disableAppKitRestorationForSessionLayout()
+    }
+
+    /// Session persistence: a manifest-tracked window must NOT also be saved
+    /// by AppKit state restoration — after a crash/kill relaunch AppKit would
+    /// recreate it as a fresh exec-backed DUPLICATE alongside the manifest
+    /// restore's re-attached window. The window frequently loads DURING
+    /// `TerminalController.init` (the surface-tree observer touches
+    /// `self.window`), i.e. before the entry id binds, so the gate is applied
+    /// from BOTH directions: here when the entry binds (window may already be
+    /// loaded) and in `TerminalController.windowDidLoad` (entry may already
+    /// be bound). Verified live: with only the windowDidLoad gate, restored
+    /// windows were re-encoded by AppKit and duplicated on every relaunch.
+    func disableAppKitRestorationForSessionLayout() {
+        guard sessionLayoutEntryID != nil else { return }
+        // isWindowLoaded first: the `window` getter would force-load the nib
+        // (this can run inside init); the not-yet-loaded case is covered by
+        // the windowDidLoad-side gate.
+        guard isWindowLoaded, let window else { return }
+        window.isRestorable = false
     }
 
     func confirmClose(
@@ -782,6 +1043,34 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    /// Prompt the user to change the window title. The title set here pins
+    /// the titlebar for the whole window (all tabs) until cleared.
+    func promptWindowTitle() {
+        guard let window else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Change Window Title"
+        alert.informativeText = "Leave blank to follow the active tab or pane title."
+        alert.alertStyle = .informational
+
+        let textField = PromptTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
+        textField.stringValue = effectiveWindowTitleOverride ?? ""
+        alert.accessoryView = textField
+
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+
+        alert.window.initialFirstResponder = textField
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .alertFirstButtonReturn else { return }
+
+            let newTitle = textField.stringValue
+            self.setWindowTitle(newTitle.isEmpty ? nil : newTitle)
+        }
+    }
+
     /// Close a surface from a view.
     func closeSurface(
         _ view: Ghostty.SurfaceView,
@@ -795,7 +1084,7 @@ class BaseTerminalController: NSWindowController,
     ///
     /// This will also insert the proper undo stack information in.
     func closeSurface(
-        _ node: SplitTree<Ghostty.SurfaceView>.Node,
+        _ node: SplitTree<PaneView>.Node,
         withConfirmation: Bool = true
     ) {
         // This node must be part of our tree
@@ -826,10 +1115,10 @@ class BaseTerminalController: NSWindowController,
 
     /// Find the next surface to focus when a node is being closed.
     /// Goes to previous split unless we're the leftmost leaf, then goes to next.
-    private func findNextFocusTargetAfterClosing(node: SplitTree<Ghostty.SurfaceView>.Node) -> Ghostty.SurfaceView? {
+    private func findNextFocusTargetAfterClosing(node: SplitTree<PaneView>.Node) -> PaneView? {
         guard let root = surfaceTree.root else { return nil }
 
-        // If we're the leftmost, then we move to the next surface after closing.
+        // If we're the leftmost, then we move to the next pane after closing.
         // Otherwise, we move to the previous.
         if root.leftmostLeaf() == node.leftmostLeaf() {
             return surfaceTree.focusTarget(for: .next, from: node)
@@ -843,26 +1132,31 @@ class BaseTerminalController: NSWindowController,
     /// This also updates the undo manager to support restoring this node.
     ///
     /// This does no confirmation and assumes confirmation is already done.
-    private func removeSurfaceNode(_ node: SplitTree<Ghostty.SurfaceView>.Node) {
-        // Move focus if the closed surface was focused and we have a next target
-        let nextFocus: Ghostty.SurfaceView? = if node.contains(
-            where: { $0 == focusedSurface }
-        ) {
-            findNextFocusTargetAfterClosing(node: node)
-        } else {
-            nil
-        }
+    private func removeSurfaceNode(_ node: SplitTree<PaneView>.Node) {
+        // Move focus if the closed node held focus (a focused terminal OR a
+        // focused viewer pane) and we have a next target. The target may be
+        // a viewer pane, which replaceSurfaceTree's surface-based focus move
+        // can't express — hand it focus explicitly afterwards.
+        let closedHadFocus = node.contains(where: { $0.surfaceView === focusedSurface })
+            || focusedViewerPane.map { pane in node.contains(where: { $0 === pane }) } ?? false
+        let nextFocus: PaneView? = closedHadFocus
+            ? findNextFocusTargetAfterClosing(node: node)
+            : nil
 
         replaceSurfaceTree(
             surfaceTree.removing(node),
-            moveFocusTo: nextFocus,
+            moveFocusTo: nextFocus?.surfaceView,
             moveFocusFrom: focusedSurface,
             undoAction: "Close Terminal"
         )
+
+        if let nextFocus, nextFocus.surfaceView == nil {
+            DispatchQueue.main.async { Ghostty.moveFocus(to: nextFocus) }
+        }
     }
 
     func replaceSurfaceTree(
-        _ newTree: SplitTree<Ghostty.SurfaceView>,
+        _ newTree: SplitTree<PaneView>,
         moveFocusTo newView: Ghostty.SurfaceView? = nil,
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
         undoAction: String? = nil
@@ -999,7 +1293,7 @@ class BaseTerminalController: NSWindowController,
         // Determine our desired direction
         guard let directionAny = notification.userInfo?["direction"] else { return }
         guard let direction = directionAny as? ghostty_action_split_direction_e else { return }
-        let splitDirection: SplitTree<Ghostty.SurfaceView>.NewDirection
+        let splitDirection: SplitTree<PaneView>.NewDirection
         switch direction {
         case GHOSTTY_SPLIT_DIRECTION_RIGHT: splitDirection = .right
         case GHOSTTY_SPLIT_DIRECTION_LEFT: splitDirection = .left
@@ -1076,7 +1370,7 @@ class BaseTerminalController: NSWindowController,
 
         guard let targetNode = surfaceTree.root?.node(view: target) else { return }
 
-        let focusDirection: SplitTree<Ghostty.SurfaceView>.FocusDirection = direction.toSplitTreeFocusDirection()
+        let focusDirection: SplitTree<PaneView>.FocusDirection = direction.toSplitTreeFocusDirection()
         guard let neighborView = surfaceTree.focusTarget(for: focusDirection, from: targetNode) else {
             return
         }
@@ -1148,7 +1442,7 @@ class BaseTerminalController: NSWindowController,
             let leaves = surfaceTree.root?.leaves() ?? []
             guard leaves.count > 1 else { return }
 
-            let focusedIndex = leaves.firstIndex(where: { $0 === target }) ?? 0
+            let focusedIndex = leaves.firstIndex(where: { $0.surfaceView === target }) ?? 0
             heroModeState.activate(focusedIndex: focusedIndex, leafCount: leaves.count)
         }
 
@@ -1158,7 +1452,7 @@ class BaseTerminalController: NSWindowController,
     private func heroSurfaceForCurrentSelection() -> Ghostty.SurfaceView? {
         let leaves = surfaceTree.root?.leaves() ?? []
         guard heroModeState.selectedIndex < leaves.count else { return nil }
-        return leaves[heroModeState.selectedIndex]
+        return leaves[heroModeState.selectedIndex].surfaceView
     }
 
     private func heroSelectionDidChange(to index: Int) {
@@ -1181,7 +1475,7 @@ class BaseTerminalController: NSWindowController,
         guard let amount = amountAny as? UInt16 else { return }
 
         // Convert Ghostty.SplitResizeDirection to SplitTree.Spatial.Direction
-        let spatialDirection: SplitTree<Ghostty.SurfaceView>.Spatial.Direction
+        let spatialDirection: SplitTree<PaneView>.Spatial.Direction
         switch direction {
         case .up: spatialDirection = .up
         case .down: spatialDirection = .down
@@ -1228,14 +1522,14 @@ class BaseTerminalController: NSWindowController,
         // keep track of our old one so undo sends focus back to the right place.
         let oldFocusedSurface = focusedSurface
         if focusedSurface == target {
-            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)
+            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)?.surfaceView
         }
 
         // Remove the surface from our tree
         let removedTree = surfaceTree.removing(targetNode)
 
         // Create a new tree with the dragged surface and open a new window
-        let newTree = SplitTree<Ghostty.SurfaceView>(view: target)
+        let newTree = SplitTree<PaneView>(view: target)
 
         // Treat our undo below as a full group.
         undoManager?.beginUndoGrouping()
@@ -1265,13 +1559,13 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func localEventFlagsChanged(_ event: NSEvent) -> NSEvent? {
-        var surfaces: [Ghostty.SurfaceView] = surfaceTree.map { $0 }
+        var surfaces: [Ghostty.SurfaceView] = surfaceTree.compactMap { $0.surfaceView }
 
         // If we're the main window receiving key input, then we want to avoid
         // calling this on our focused surface because that'll trigger a double
         // flagsChanged call.
         if NSApp.mainWindow == window {
-            surfaces = surfaces.filter { $0 != focusedSurface }
+            surfaces = surfaces.filter { $0 !== focusedSurface }
         }
 
         for surface in surfaces {
@@ -1322,21 +1616,30 @@ class BaseTerminalController: NSWindowController,
         applyTitleToWindow()
     }
 
-    private func applyTitleToWindow() {
+    func applyTitleToWindow() {
         guard let window else { return }
 
-        var title: String
+        // The tab-level title: the user's tab rename if set, else the
+        // focused pane's computed title.
+        var tabTitle: String
         if let titleOverride {
-            title = computeTitle(
+            tabTitle = computeTitle(
                 title: titleOverride,
                 bell: focusedSurface?.bell ?? false)
         } else {
-            title = lastComputedTitle
+            tabTitle = lastComputedTitle
         }
+
+        // Titlebar fallback order: window title if set, else the tab's
+        // title (which itself falls back to the active pane's title).
+        let windowOverride = effectiveWindowTitleOverride
+        var title = windowOverride ?? tabTitle
 
         if let termWindow = window as? TerminalWindow,
            termWindow.activityState != .idle {
-            title += " (\(termWindow.activityState.rawValue))"
+            let suffix = " (\(termWindow.activityState.rawValue))"
+            title += suffix
+            tabTitle += suffix
         }
 
         // The remote machine name is shown as a titlebar pill (see
@@ -1344,6 +1647,11 @@ class BaseTerminalController: NSWindowController,
         // plain title suffix, so it is intentionally not appended here.
 
         window.title = title
+
+        // When a window title pins the titlebar, keep the tab bar labels
+        // showing each tab's own title. An empty tab title restores the
+        // default behavior of following `window.title`.
+        window.tab.title = windowOverride != nil ? tabTitle : ""
     }
 
     func pwdDidChange(to: URL?) {
@@ -1375,7 +1683,7 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
-    private func splitDidResize(node: SplitTree<Ghostty.SurfaceView>.Node, to newRatio: Double) {
+    private func splitDidResize(node: SplitTree<PaneView>.Node, to newRatio: Double) {
         let resizedNode = node.resizing(to: newRatio)
         do {
             surfaceTree = try surfaceTree.replacing(node: node, with: resizedNode)
@@ -1390,7 +1698,7 @@ class BaseTerminalController: NSWindowController,
         zone: TerminalSplitDropZone
     ) {
         // Map drop zone to split direction
-        let direction: SplitTree<Ghostty.SurfaceView>.NewDirection = switch zone {
+        let direction: SplitTree<PaneView>.NewDirection = switch zone {
         case .top: .up
         case .bottom: .down
         case .left: .left
@@ -1401,7 +1709,7 @@ class BaseTerminalController: NSWindowController,
         if let sourceNode = surfaceTree.root?.node(view: source) {
             // Source is in our tree - same window move
             let treeWithoutSource = surfaceTree.removing(sourceNode)
-            let newTree: SplitTree<Ghostty.SurfaceView>
+            let newTree: SplitTree<PaneView>
             do {
                 newTree = try treeWithoutSource.inserting(view: source, at: destination, direction: direction)
             } catch {
@@ -1419,7 +1727,7 @@ class BaseTerminalController: NSWindowController,
 
         // Source is not in our tree - search other windows
         var sourceController: BaseTerminalController?
-        var sourceNode: SplitTree<Ghostty.SurfaceView>.Node?
+        var sourceNode: SplitTree<PaneView>.Node?
         for window in NSApp.windows {
             guard let controller = window.windowController as? BaseTerminalController else { continue }
             guard controller !== self else { continue }
@@ -1438,7 +1746,7 @@ class BaseTerminalController: NSWindowController,
         // Remove from source controller's tree and add it to our tree.
         // We do this first because if there is an error then we can
         // abort.
-        let newTree: SplitTree<Ghostty.SurfaceView>
+        let newTree: SplitTree<PaneView>
         do {
             newTree = try surfaceTree.inserting(view: source, at: destination, direction: direction)
         } catch {
@@ -1708,6 +2016,19 @@ class BaseTerminalController: NSWindowController,
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
 
+        // User-initiated window/tab close (NOT app quit, NOT sign-out): the
+        // agent sessions of every pane in this window must actually END —
+        // mark them CLOSE-on-free. Quit and sign-out keep sessions alive for
+        // restore (same gate as the manifest-entry removal below). If the
+        // close is undone, the restore path re-adopts the views into a tree
+        // and clears the intent.
+        do {
+            let delegate = NSApp.delegate as? AppDelegate
+            if delegate?.isQuitting != true && delegate?.isSigningOut != true {
+                for view in surfaceTree { view.setSessionCloseIntent(true) }
+            }
+        }
+
         // WP-D1: cancel any in-flight reconnect retry loop and stop observing
         // link-state changes — the window is going away.
         remoteReconnectGeneration += 1
@@ -1734,6 +2055,58 @@ class BaseTerminalController: NSWindowController,
                 // already keeps this in sync on every rename, so this is a
                 // last-moment belt-and-braces sync at the preservation point.
                 RemoteSessionManifest.shared.updateWindowTitle(
+                    entryID, windowTitle: titleOverride)
+            }
+        }
+
+        // Session persistence (T05): same contract for local agent-backed
+        // windows — a clean close removes the layout entry, an app quit
+        // preserves it for the T06 launch restore. (Sign-out doesn't apply:
+        // local-agent windows aren't account-backed.) No full re-sync here:
+        // during a quit, sibling tabs are already closing, so live tab-group
+        // state is unreliable — `flushPendingSyncs` at quit-begin captured
+        // the faithful snapshot; only the title is belt-and-braces synced.
+        if let entryID = sessionLayoutEntryID {
+            if (NSApp.delegate as? AppDelegate)?.isQuitting != true {
+                SessionLayoutManifest.shared.remove(entryID)
+
+                // Surviving tabs of this window's group have a changed
+                // membership (`tabGroupID`/`tabIndex`) but get no sync
+                // trigger of their own — and by now AppKit has already
+                // detached this window from the shared group (seen live:
+                // `window.tabGroup` here is a solo group of just the closing
+                // window), so the siblings can't be found through it.
+                // Refresh every other persistent window instead; the sync
+                // is a no-op for entries whose snapshot didn't change.
+                for other in NSApp.windows {
+                    if let otherController =
+                        other.windowController as? BaseTerminalController,
+                        otherController !== self,
+                        otherController.sessionLayoutEntryID != nil {
+                        SessionLayoutManifest.shared.scheduleSync(otherController)
+                    }
+                }
+
+                // Non-destructive agent upgrade (idle trigger): if no OTHER live
+                // persistent window remains, the agent just went idle — a safe
+                // moment to adopt a newer bundled build. Deferred so this close
+                // fully settles first; the refresh re-checks liveness (0 live →
+                // silent refresh, so a stale agent self-heals the next quiet moment
+                // instead of waiting for a reboot).
+                let otherPersistent = TerminalController.all.contains {
+                    $0 !== self && $0.sessionLayoutEntryID != nil
+                }
+                if !otherPersistent {
+                    DispatchQueue.main.async {
+                        let live = TerminalController.all.filter {
+                            $0.sessionLayoutEntryID != nil
+                        }.count
+                        LocalAgentManager.shared.refreshLocalAgentIfStale(
+                            liveSessionCount: live, reason: "last persistent window closed")
+                    }
+                }
+            } else {
+                SessionLayoutManifest.shared.updateWindowTitle(
                     entryID, windowTitle: titleOverride)
             }
         }
@@ -1860,6 +2233,18 @@ class BaseTerminalController: NSWindowController,
     ///                                    └─ session gone/evicted ─► disconnected
     private func remoteLinkStateDidChange(_ connection: RemoteConnection) {
         guard connection === remoteConnection else { return }
+        // Local-agent windows (session persistence, T12e) do NOT use the
+        // per-window remote reconnect ladder: it re-dials the loopback
+        // `Machine` over TCP (there is no port — the local transport is a
+        // 0600 UDS) and, even if it dialed, `completeRemoteReconnect`
+        // collapses the window to a single ROOT pane, losing the split
+        // topology. Local link-drop recovery is instead centralized in
+        // `LocalAgentManager` → `AppDelegate.recoverSessionLayoutInPlace`,
+        // which re-dials the launchd-restarted agent ONCE for all windows and
+        // rebuilds each window's FULL split tree in place (re-ATTACH +
+        // auto-RELAUNCH). The machine pill is hidden for `isLocalMachine`, so
+        // there is no per-window UI to drive here either.
+        if connection.machine.isLocalMachine { return }
         // This is the FIRST line read when tracing a reconnect: it must persist
         // (.warning maps to OSLog error level) and be readable — os_log redacts
         // string interpolation by default, so every field is tagged .public
@@ -2453,12 +2838,17 @@ class BaseTerminalController: NSWindowController,
         cfg.remoteSessionId = sessionID
         cfg.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
 
+        // Preserve the replaced pane's STABLE surface uuid (wp3 pane identity):
+        // the swap is the same logical pane on a fresh transport, so the
+        // `+list` id and the shell's baked GHOZTTY_PANE_ID must not change.
+        let preservedID = focusedSurface?.id ?? surfaceTree.root?.leaves().first?.id
+
         // Debug-build-only deterministic failure hook: skips creating the
         // real view so the guard below takes the failure path (the orchestrator
         // can't force a real surface-alloc OOM). See debugShouldFailReconnectSwap.
         let newView: Ghostty.SurfaceView? = Self.debugShouldFailReconnectSwap()
             ? nil
-            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg)
+            : Ghostty.SurfaceView(ghosttyApp, baseConfig: cfg, uuid: preservedID)
 
         guard let newView, newView.error == nil else {
             // `ghostty_surface_new` FAILED (seen in production: OutOfMemory
@@ -2601,7 +2991,42 @@ class BaseTerminalController: NSWindowController,
 
     // MARK: First Responder
 
+    /// The viewer pane containing the window's current first responder, if
+    /// any. Keybind/menu actions route through `focusedSurface` (a terminal),
+    /// which goes stale when a viewer has keyboard focus — actions that
+    /// should operate on "the focused pane" must check this first.
+    var focusedViewerPane: PaneView? {
+        guard let responder = window?.firstResponder as? NSView else { return nil }
+        return surfaceTree.first(where: {
+            $0.viewerView != nil && responder.isDescendant(of: $0.contentView)
+        })
+    }
+
+    /// Config for a terminal split created FROM a viewer pane: inherit the
+    /// viewed file's directory as the working directory.
+    private func splitConfigFromViewer(_ pane: PaneView) -> Ghostty.SurfaceConfiguration {
+        var config = Ghostty.SurfaceConfiguration()
+        if let dir = pane.viewerView?.fileURL?.deletingLastPathComponent().path {
+            config.workingDirectory = dir
+        }
+        return config
+    }
+
     @IBAction func close(_ sender: Any) {
+        // When keyboard focus is inside a VIEWER pane, close that pane —
+        // `focusedSurface` still points at the last terminal, and closing
+        // that out from under the user is wrong. Viewers have no process,
+        // so no confirmation.
+        if let pane = focusedViewerPane,
+           let node = surfaceTree.root?.node(view: pane) {
+            let next = findNextFocusTargetAfterClosing(node: node)
+            closeSurface(node, withConfirmation: false)
+            if let next {
+                DispatchQueue.main.async { Ghostty.moveFocus(to: next) }
+            }
+            return
+        }
+
         guard let surface = focusedSurface?.surface else { return }
         ghostty.requestClose(surface: surface)
     }
@@ -2609,6 +3034,10 @@ class BaseTerminalController: NSWindowController,
     @IBAction func closeWindow(_ sender: Any) {
         guard let window = window else { return }
         window.performClose(sender)
+    }
+
+    @IBAction func changeWindowTitle(_ sender: Any) {
+        promptWindowTitle()
     }
 
     @IBAction func changeTabTitle(_ sender: Any) {
@@ -2627,26 +3056,51 @@ class BaseTerminalController: NSWindowController,
     }
 
     @IBAction func splitRight(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .right, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_RIGHT)
     }
 
     @IBAction func splitLeft(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .left, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_LEFT)
     }
 
     @IBAction func splitDown(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .down, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_DOWN)
     }
 
     @IBAction func splitUp(_ sender: Any) {
+        if let pane = focusedViewerPane {
+            newTerminalSplit(atPane: pane, direction: .up, baseConfig: splitConfigFromViewer(pane))
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_UP)
     }
 
     @IBAction func splitZoom(_ sender: Any) {
+        if let pane = focusedViewerPane,
+           let node = surfaceTree.root?.node(view: pane) {
+            if surfaceTree.zoomed == node {
+                surfaceTree = SplitTree(root: surfaceTree.root, zoomed: nil)
+            } else if surfaceTree.isSplit {
+                surfaceTree = SplitTree(root: surfaceTree.root, zoomed: node)
+            }
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.splitToggleZoom(surface: surface)
     }
@@ -2676,6 +3130,10 @@ class BaseTerminalController: NSWindowController,
     }
 
     @IBAction func equalizeSplits(_ sender: Any) {
+        if focusedViewerPane != nil {
+            surfaceTree = surfaceTree.equalized()
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.splitEqualize(surface: surface)
     }
@@ -2701,6 +3159,18 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func splitMoveFocus(direction: Ghostty.SplitFocusDirection) {
+        // Navigate FROM a focused viewer pane directly on the tree —
+        // libghostty can only navigate from a terminal surface.
+        if let pane = focusedViewerPane,
+           let node = surfaceTree.root?.node(view: pane) {
+            if let next = surfaceTree.focusTarget(
+                for: direction.toSplitTreeFocusDirection(),
+                from: node
+            ) {
+                DispatchQueue.main.async { Ghostty.moveFocus(to: next) }
+            }
+            return
+        }
         guard let surface = focusedSurface?.surface else { return }
         ghostty.splitMoveFocus(surface: surface, direction: direction)
     }
@@ -2904,9 +3374,9 @@ extension BaseTerminalController {
     /// The publisher emits a dictionary of surface IDs to values whenever the tree changes
     /// or any surface publishes a new value for the key path.
     func surfaceValuesPublisher<Value>(
-        valueKeyPath: KeyPath<Ghostty.SurfaceView, Value>,
-        publisherKeyPath: KeyPath<Ghostty.SurfaceView, Published<Value>.Publisher>
-    ) -> AnyPublisher<[Ghostty.SurfaceView.ID: Value], Never> {
+        valueKeyPath: KeyPath<PaneView, Value>,
+        publisherKeyPath: KeyPath<PaneView, Published<Value>.Publisher>
+    ) -> AnyPublisher<[PaneView.ID: Value], Never> {
         // `surfaceTree` can be replaced entirely when splits are added/removed/closed.
         // For each tree snapshot we build a fresh publisher that watches all surfaces
         // in that snapshot.

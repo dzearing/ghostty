@@ -2,13 +2,14 @@ import SwiftUI
 import GhosttyKit
 
 struct HeroModeView: View {
-    let tree: SplitTree<Ghostty.SurfaceView>
+    let tree: SplitTree<PaneView>
     @ObservedObject var state: HeroModeState
 
     @State private var keyMonitor: Any? = nil
 
     var body: some View {
-        let leaves = tree.root?.leaves() ?? []
+        // Hero mode presents terminal surfaces only; viewer panes are skipped.
+        let leaves = (tree.root?.leaves() ?? []).compactMap(\.surfaceView)
 
         GeometryReader { geo in
             let carouselWidth = geo.size.width * state.carouselRatio
@@ -52,7 +53,7 @@ struct HeroModeView: View {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard state.isActive else { return event }
-            let leaves = tree.root?.leaves() ?? []
+            let leaves = (tree.root?.leaves() ?? []).compactMap(\.surfaceView)
             guard leaves.count > 1 else { return event }
 
             let hasShiftCmd = event.modifierFlags.contains([.shift, .command])

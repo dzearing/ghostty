@@ -159,6 +159,11 @@ pub const Spawner = struct {
     pub const Result = struct {
         child: session.Child,
         pid: i64,
+        /// The child's PTY slave path (wp3), or null when unavailable (Windows
+        /// ConPTY, or the tty-name query failed). BORROWS storage owned by the
+        /// child (stable until `terminate`); consumers must copy before any
+        /// window where the child could be torn down.
+        tty: ?[]const u8 = null,
     };
 
     /// Result of a detached spawn (mirrors `proc_spawn.SpawnOutcome` but defined
@@ -275,6 +280,8 @@ pub const Server = struct {
         capabilities: []const []const u8 = &.{
             protocol.capability.resync,
             protocol.capability.flow,
+            protocol.capability.close_session,
+            protocol.capability.grid_snapshot,
         },
         /// Per-session raw-output ring size (§7.1). Lowered in tests.
         ring_bytes: usize = session.default_ring_bytes,
@@ -282,6 +289,10 @@ pub const Server = struct {
         /// This machine's hostname, advertised in the HELLO for client display
         /// (the window pill). Must outlive `start()` (encoded there). Optional.
         hostname: ?[]const u8 = null,
+        /// This agent's build stamp ("YYYYMMDD-<hash>"), advertised in the HELLO
+        /// so the app can detect it is running an older build than it bundles and
+        /// lazily refresh it. Must outlive `start()` (encoded there). Optional.
+        build_version: ?[]const u8 = null,
     };
 
     /// Stand up a per-connection Server over a SHARED daemon `store` (the registry
@@ -308,6 +319,7 @@ pub const Server = struct {
                 .transfer_encoding = opts.encoding,
                 .capabilities = opts.capabilities,
                 .hostname = opts.hostname,
+                .build_version = opts.build_version,
             },
             .clock = opts.clock orelse Clock.real(),
             .spawner = spawner,
@@ -369,6 +381,12 @@ pub const Server = struct {
     /// could never make progress and the join would hang, wedging the accept loop.
     pub fn shutdown(self: *Server) void {
         self.detachAll();
+        // Reboot scrollback (T13, §5.4): a viewer disconnecting is the moment its
+        // sessions become vulnerable to a subsequent reboot (the agent could be
+        // killed before the next periodic snapshot). Flush dirty rings to disk now
+        // so a restart can replay the scrollback up to this instant. No-op when
+        // ring snapshots are disabled or nothing is dirty; best-effort.
+        self.store.snapshotRings();
         // Stop + join the metrics pump BEFORE the streams close path completes: it
         // is a per-connection thread that frames onto our writer, so it must never
         // outlive the Server (the just-fixed UAF class). Signalling stop wakes its
@@ -395,8 +413,12 @@ pub const Server = struct {
     /// the orphaned session keeps ringing output but frames nothing to our dead
     /// writer. Does NOT terminate children (survival, §7.1). Idempotent.
     fn detachAll(self: *Server) void {
+        // Ids of sessions that just became DEAD + UNBOUND (a tombstone whose last
+        // viewer detached) — reaped AFTER we drop the store lock (reap frees a
+        // child; never under the lock, cf. reapIdle/handleClose two-phase rule).
+        var tombstones: std.ArrayListUnmanaged(u128) = .empty;
+        defer tombstones.deinit(self.alloc);
         self.store.mutex.lock();
-        defer self.store.mutex.unlock();
         for (self.bound_channels.items) |ch| {
             const s = self.store.table.getByChannel(ch) orelse continue;
             if (s.bridge_ctx == @as(?*anyopaque, self)) {
@@ -406,9 +428,15 @@ pub const Server = struct {
                 s.bound = false;
                 s.streaming = false;
                 s.last_activity_ms = self.clock.now();
+                // A dead, now-unbound, non-relaunchable session is unreconnectable
+                // garbage — mark it for immediate reaping below so it can't linger
+                // as a dead-end chooser row or be re-materialized after a restart.
+                if (!s.alive and !s.relaunchable) tombstones.append(self.alloc, s.id) catch {};
             }
         }
         self.bound_channels.clearRetainingCapacity();
+        self.store.mutex.unlock();
+        for (tombstones.items) |id| self.store.reapUnboundTombstone(id);
     }
 
     /// Free the server (must be shut down first). Frees per-connection state only;
@@ -499,6 +527,15 @@ pub const Server = struct {
         self.sendJson(.exit, channel, protocol.Exit{
             .code = code,
             .runtime_ms = runtime_ms,
+        }) catch {};
+    }
+
+    /// Push the session's changed foreground pid as `META{foreground_pid}` on
+    /// its channel (wp3 live-fg sampling; see `SessionStore.sampleForegroundPids`).
+    fn bridgeFgPid(ctx: *anyopaque, channel: u128, fg_pid: i64) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.sendJson(.meta, channel, protocol.Meta{
+            .foreground_pid = fg_pid,
         }) catch {};
     }
 
@@ -654,7 +691,12 @@ pub const Server = struct {
             .signal => self.handleSignal(frame.channel, frame.payload),
             .detach => self.handleDetach(frame.channel),
             .close => self.handleClose(frame.channel),
+            .close_session => self.handleCloseSession(frame.channel, frame.payload),
             .get_cwd => self.handleGetCwd(frame.channel, frame.payload),
+            .list_sessions => self.handleListSessions(frame.channel),
+            .set_layout => self.handleSetLayout(frame.channel, frame.payload),
+            .get_layouts => self.handleGetLayouts(frame.channel),
+            .relaunch => self.handleRelaunch(frame.payload),
             .ping => self.handlePing(frame.payload),
             .flow => self.handleFlow(frame.payload),
             .metrics_sub => self.handleMetricsSub(frame.payload),
@@ -677,6 +719,16 @@ pub const Server = struct {
         // agent would reply with an error META (out of scope).
         const spawned = self.spawner.spawn(open) catch return;
 
+        // Stable copy of the child's tty path (wp3): `Result.tty` borrows storage
+        // the child frees on terminate, so copy it before any window where an
+        // exit/teardown could race the OPENED send below.
+        var tty_buf: [128]u8 = undefined;
+        const tty_copy: ?[]const u8 = if (spawned.tty) |t| blk: {
+            const n = @min(t.len, tty_buf.len);
+            @memcpy(tty_buf[0..n], t[0..n]);
+            break :blk tty_buf[0..n];
+        } else null;
+
         self.store.mutex.lock();
         const s = self.store.table.create(
             spawned.child,
@@ -692,6 +744,20 @@ pub const Server = struct {
             spawned.child.terminate();
             return;
         };
+        // Record a human-readable command label for LIST_SESSIONS (T10): the
+        // explicit command if the client asked for one, else the resolved shell.
+        // Best-effort (setArgv swallows OOM) — a missing label just lists as null.
+        if (open.command) |cmd| {
+            s.setArgv(cmd);
+        } else if (open.shell) |sh| {
+            s.setArgv(sh);
+        }
+        // Pin persistent local sessions so the idle-TTL reaper never evicts them
+        // while orphaned (§7.1, T11). Set by the local-agent client for panes the
+        // viewer's session-layout manifest references; false for cross-machine.
+        s.pinned = open.pinned;
+        // Record the pty slave path (wp3) so a later ATTACH can re-report it.
+        s.setTty(tty_copy);
         // Bind the new session to THIS connection: install the outbound bridge so
         // live output frames to our writer, mark it bound (so the idle reaper leaves
         // it alone), and track its channel so disconnect detaches just our sessions.
@@ -711,7 +777,13 @@ pub const Server = struct {
         self.sendJson(.opened, channel, protocol.Opened{
             .session_id = id_copy[0..],
             .pid = pid,
+            .tty = tty_copy,
         }) catch {};
+
+        // A new session entered the alive set — durably record the reboot-floor
+        // metadata (§5.4, T12). Runs after our unlock; no-op when persistence is
+        // disabled (meta_path null, e.g. every test + non-persistent serve path).
+        self.store.persistMeta();
     }
 
     /// Bind session `s` to this connection: point its outbound bridge at us, mark it
@@ -721,6 +793,11 @@ pub const Server = struct {
         s.bridge_ctx = self;
         s.bridge_data = bridgeData;
         s.bridge_exit = bridgeExit;
+        s.bridge_fgpid = bridgeFgPid;
+        // Reset the sampler baseline so a freshly-(re)bound viewer receives the
+        // CURRENT foreground pid on the next tick even if it hasn't changed —
+        // the previous viewer's pushes died with its connection (wp3).
+        s.fg_pid = 0;
         s.bound = true;
         s.streaming = true;
         // Track the channel once (avoid dupes across re-attach within one conn).
@@ -746,10 +823,13 @@ pub const Server = struct {
         };
 
         if (!s.alive) {
-            // Tombstone → dead + exit_code (§7.1/§7.4).
+            // Tombstone → dead + exit_code (§7.1/§7.4). `relaunchable` distinguishes
+            // a session materialized from disk (T12b, no exit_code, RELAUNCH-able)
+            // from a child that genuinely exited this run.
             self.sendJson(.attached, s.channel, protocol.Attached{
                 .status = .dead,
                 .exit_code = s.exit_code,
+                .relaunchable = s.relaunchable,
                 .rows = s.rows,
                 .cols = s.cols,
             }) catch {};
@@ -770,6 +850,12 @@ pub const Server = struct {
         s.cols = att.cols;
         s.last_activity_ms = now;
         s.child.resize(att.rows, att.cols, 0, 0) catch {};
+        // Re-attach repaint: the geometry restored here is only the pre-layout
+        // seed; the client sends an authoritative RESIZE once the pane is live
+        // (threadEnter, 106dcdc9c). Latch a one-shot SIGWINCH onto that RESIZE so
+        // alt-screen apps repaint even when the restored size is byte-identical
+        // (else they stay blank until a manual resize). See winch_on_next_resize.
+        s.winch_on_next_resize = true;
         const snapshot_at = s.snapshotOffset();
 
         self.sendJson(.attached, s.channel, protocol.Attached{
@@ -779,22 +865,39 @@ pub const Server = struct {
             .cwd = if (s.cwd) |c| c else null,
             .title = if (s.title) |t| t else null,
             .snapshot_at_offset = snapshot_at,
+            // pid/tty (wp3): re-attach is how an app relaunch recovers every
+            // persistence pane, so `getProcessInfo` metadata must ride ATTACHED
+            // too (OPENED went to the previous app process). Sent under the
+            // store lock, so borrowing the session's strings is safe.
+            .pid = s.pid,
+            .tty = if (s.tty) |t| t else null,
         }) catch {};
 
-        // Gap-fill / CATCH-UP (§7.3): replay everything the client missed while it
-        // was gone. If the client's last_byte_offset < S and the ring still retains
-        // `(last_byte_offset, S]`, replay it as DATA so reconnect has NO hole — this
-        // is the bytes the remote produced during the disconnect. If the requested
-        // start was evicted (deep scrollback overran the ring), replay what's
-        // retained from the ring base and prepend a clear truncation marker (v1
-        // honesty; the forthcoming grid snapshot makes the visible grid exact). Live
-        // DATA then resumes from offset > S via the store sink.
+        // Gap-fill / CATCH-UP (§7.3) + grid snapshot (FIX 2). Replay everything the
+        // client missed while it was gone; then, when the peer negotiated
+        // `grid_snapshot`, append a self-contained VT repaint of the CURRENT
+        // visible screen so the pane is exact and NEVER blank — even when the paint
+        // predates the ring (deep scrollback evicted, or a full-screen app whose
+        // `?1049h` enter-alt scrolled out). Live DATA then resumes from offset > S.
+        const want_snapshot = if (self.negotiated) |n| n.grid_snapshot else |_| false;
+
+        // On the ALTERNATE screen the raw ring tail is alt-screen paint written
+        // WITHOUT its (evicted) `?1049h` enter — replaying it onto the client's
+        // primary screen is exactly what smeared/blanked the pane. With a snapshot
+        // in hand we SKIP that replay for alt sessions and let the snapshot (which
+        // re-enters alt and repaints) stand alone. A primary session still gets its
+        // raw replay for scrollback continuity, with the snapshot then repainting
+        // the visible rows over it. Without a snapshot we keep today's replay for
+        // both (an older/ring-only peer).
+        const skip_replay = want_snapshot and s.gridOnAltScreen();
+
         if (att.last_byte_offset < snapshot_at) {
             const base = s.ring.base_offset;
             var replay_from = att.last_byte_offset;
             if (replay_from < base) {
-                // The exact resume point was evicted. Emit a marker, then replay from
-                // the oldest byte we still have.
+                // The exact resume point was evicted. Emit a marker for the
+                // genuinely-lost deep scrollback ABOVE the visible screen, then
+                // replay from the oldest byte we still have.
                 const lost = base - att.last_byte_offset;
                 var marker_buf: [96]u8 = undefined;
                 const marker = std.fmt.bufPrint(
@@ -805,36 +908,75 @@ pub const Server = struct {
                 if (marker.len > 0) self.sendData(s.channel, att.last_byte_offset, marker) catch {};
                 replay_from = base;
             }
-            const want: usize = @intCast(snapshot_at - replay_from);
-            if (want > 0) {
-                const tmp = self.alloc.alloc(u8, want) catch return;
-                defer self.alloc.free(tmp);
-                if (s.ring.slice(replay_from, snapshot_at, tmp)) |n| {
-                    self.sendData(s.channel, replay_from, tmp[0..n]) catch {};
+            if (!skip_replay) {
+                const want: usize = @intCast(snapshot_at - replay_from);
+                if (want > 0) {
+                    const tmp = self.alloc.alloc(u8, want) catch return;
+                    defer self.alloc.free(tmp);
+                    if (s.ring.slice(replay_from, snapshot_at, tmp)) |n| {
+                        self.sendData(s.channel, replay_from, tmp[0..n]) catch {};
+                    }
                 }
+            }
+        }
+
+        // Grid snapshot: a clean repaint of the visible screen AT offset S, sent as
+        // ordinary DATA (plain VT — no new opcode) at the live continuation point so
+        // the client renders it right before live output resumes. `gridSnapshotAlloc`
+        // returns null for a session that produced no output (no emulator yet), in
+        // which case the ring replay above already stands alone.
+        if (want_snapshot) {
+            if (s.gridSnapshotAlloc(self.alloc)) |snap| {
+                defer self.alloc.free(snap);
+                if (snap.len > 0) self.sendData(s.channel, snapshot_at, snap) catch {};
             }
         }
     }
 
     fn handleResize(self: *Server, channel: u128, payload: []const u8) void {
-        var parsed = protocol.parseJson(protocol.Resize, self.alloc, payload) catch return;
+        var parsed = protocol.parseJson(protocol.Resize, self.alloc, payload) catch {
+            std.log.warn("RESIZE parse failed ch={x} payload={s}", .{ channel, payload });
+            return;
+        };
         defer parsed.deinit();
         const rz = parsed.value;
+        std.log.debug("RESIZE recv ch={x} rows={} cols={}", .{ channel, rz.rows, rz.cols });
         // Update dims + snapshot the child under the lock; do the (potentially
         // blocking) ConPTY resize OUTSIDE it — never hold the global store lock
         // across child I/O (see handleInboundData).
         self.store.mutex.lock();
+        var winch_after = false;
         const child: ?session.Child = blk: {
-            const s = self.store.table.getByChannel(channel) orelse break :blk null;
-            if (!s.alive) break :blk null;
+            const s = self.store.table.getByChannel(channel) orelse {
+                std.log.warn("RESIZE: no session for ch={x}", .{channel});
+                break :blk null;
+            };
+            if (!s.alive) {
+                std.log.warn("RESIZE: session for ch={x} not alive", .{channel});
+                break :blk null;
+            }
             s.rows = rz.rows;
             s.cols = rz.cols;
             s.px_w = rz.px_w;
             s.px_h = rz.px_h;
+            // First authoritative RESIZE after an ATTACH/RELAUNCH: deliver one
+            // SIGWINCH after applying the size so alt-screen apps repaint even
+            // when the geometry is unchanged (TIOCSWINSZ alone raises SIGWINCH
+            // only on a delta). One-shot — cleared here so live resizes don't
+            // pay for a redundant signal.
+            winch_after = s.winch_on_next_resize;
+            s.winch_on_next_resize = false;
             break :blk s.child;
         };
         self.store.mutex.unlock();
-        if (child) |c| c.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch {};
+        if (child) |c| {
+            c.resize(rz.rows, rz.cols, rz.px_w, rz.px_h) catch |err| {
+                std.log.warn("RESIZE: child.resize failed err={}", .{err});
+            };
+            // Ordered AFTER the resize: the app re-queries winsize on SIGWINCH,
+            // so the child must already see the final dimensions.
+            if (winch_after) c.signal("WINCH") catch {};
+        }
     }
 
     fn handleSignal(self: *Server, channel: u128, payload: []const u8) void {
@@ -869,15 +1011,22 @@ pub const Server = struct {
         // `streaming` out from under the new owner and the freshly re-attached
         // window went permanently silent.
         self.store.mutex.lock();
-        defer self.store.mutex.unlock();
-        const s = self.store.table.getByChannel(channel) orelse return;
-        if (s.bridge_ctx != @as(?*anyopaque, self)) return; // stale: not ours
-        s.streaming = false;
-        s.bridge_ctx = null;
-        s.bridge_data = null;
-        s.bridge_exit = null;
-        s.bound = false;
-        s.last_activity_ms = self.clock.now();
+        const reap_id: ?u128 = blk: {
+            const s = self.store.table.getByChannel(channel) orelse break :blk null;
+            if (s.bridge_ctx != @as(?*anyopaque, self)) break :blk null; // stale: not ours
+            s.streaming = false;
+            s.bridge_ctx = null;
+            s.bridge_data = null;
+            s.bridge_exit = null;
+            s.bound = false;
+            s.last_activity_ms = self.clock.now();
+            // A dead, now-unbound, non-relaunchable session is unreconnectable
+            // garbage: reap it immediately (below, off the lock) so it can't linger
+            // as a dead-end chooser row or be re-materialized after a restart.
+            break :blk if (!s.alive and !s.relaunchable) s.id else null;
+        };
+        self.store.mutex.unlock();
+        if (reap_id) |id| self.store.reapUnboundTombstone(id);
     }
 
     fn handleClose(self: *Server, channel: u128) void {
@@ -889,7 +1038,68 @@ pub const Server = struct {
         const s = self.store.table.getByChannel(channel);
         const unlinked = if (s) |sess| self.store.table.unlink(sess.id) else null;
         self.store.mutex.unlock();
-        if (unlinked) |u| self.store.table.freeUnlinked(u);
+        if (unlinked) |u| {
+            self.store.table.freeUnlinked(u);
+            // The alive set shrank — refresh the reboot-floor metadata (§5.4,
+            // T12). No-op when persistence is disabled or the channel was stale.
+            self.store.persistMeta();
+            // A closed session may have been the last one a stored layout blob
+            // referenced (§5.4 "Resume all", T18) — reap orphaned blobs and
+            // rewrite the layout file so it doesn't accumulate dead topology.
+            if (self.store.reapLayouts() > 0) self.store.persistLayouts();
+        }
+    }
+
+    /// `CLOSE_SESSION` (0x2c): end a session BY SESSION ID — the session-scoped
+    /// equivalent of `handleClose`, for the chooser's "Kill" action on a BROWSED
+    /// session that has no local pane (hence no channel to address `CLOSE` at).
+    /// Resolves the session by id, then reuses the EXACT two-phase lock discipline
+    /// of `handleClose` (UNLINK under the lock, then terminate+free OUTSIDE it, so
+    /// the pty reader's sink — which takes this very lock — can't deadlock). Replies
+    /// `CLOSE_SESSION_RESULT{session_id, ok, found}` on the request `channel`
+    /// (same-channel RPC, like `handleGetCwd`). `found` = a session with that id
+    /// existed; `ok` = it was closed.
+    fn handleCloseSession(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.CloseSession, self.alloc, payload) catch {
+            // Malformed request: we can't extract an id, but still give the client a
+            // definitive answer (found=false, ok=false) rather than a silent hang.
+            self.sendJson(.close_session_result, channel, protocol.CloseSessionResult{
+                .session_id = "",
+                .ok = false,
+                .found = false,
+            }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        // Stable copy of the session id for the reply (the parsed value is freed by
+        // the trailing defer before sendJson runs through the writer queue).
+        var id_buf: [64]u8 = undefined;
+        const id_len = @min(req.session_id.len, id_buf.len);
+        @memcpy(id_buf[0..id_len], req.session_id[0..id_len]);
+        const id_copy = id_buf[0..id_len];
+
+        // Phase 1: UNLINK under the lock (mirrors handleClose, but resolved by id).
+        self.store.mutex.lock();
+        const s = self.store.table.getByIdStr(req.session_id);
+        const found = s != null;
+        const unlinked = if (s) |sess| self.store.table.unlink(sess.id) else null;
+        self.store.mutex.unlock();
+
+        // Phase 2: terminate+free OUTSIDE the lock, then refresh reboot-floor
+        // metadata and reap orphaned layout blobs — EXACTLY like handleClose.
+        if (unlinked) |u| {
+            self.store.table.freeUnlinked(u);
+            self.store.persistMeta();
+            if (self.store.reapLayouts() > 0) self.store.persistLayouts();
+        }
+
+        self.sendJson(.close_session_result, channel, protocol.CloseSessionResult{
+            .session_id = id_copy,
+            .ok = unlinked != null,
+            .found = found,
+        }) catch {};
     }
 
     /// `GET_CWD` (§WP4): on-demand "what is this session's child cwd?". Looks the
@@ -929,7 +1139,322 @@ pub const Server = struct {
             .session_id = id_copy,
             .path = cwd,
             .ok = cwd != null,
+            // POSITIVE existence signal (T06b): restore probes must be able to
+            // tell "this session id is gone from the table" (safe to forget the
+            // layout entry) apart from "the session exists but the cwd read
+            // failed / child exited" (keep the entry; it is still attachable).
+            .found = s != null,
         }) catch {};
+    }
+
+    /// `LIST_SESSIONS`: snapshot the entire session roster and reply with `SESSIONS`
+    /// on the request channel. We build the reply array AND encode it while holding
+    /// the store lock so the borrowed session strings (id/title/cwd/argv) stay valid
+    /// through JSON encoding; `sendJson` only enqueues (the store→write_mutex lock
+    /// order is the SAME one `bridgeData` already takes under the store lock, so
+    /// there is no new deadlock risk). A pure in-memory snapshot — no OS I/O — so
+    /// holding the lock across it is cheap (unlike `handleGetCwd`, which must query
+    /// the OS and therefore unlocks first).
+    fn handleListSessions(self: *Server, channel: u128) void {
+        self.store.mutex.lock();
+        defer self.store.mutex.unlock();
+
+        var infos: std.ArrayListUnmanaged(protocol.SessionInfo) = .empty;
+        defer infos.deinit(self.alloc);
+
+        var it = self.store.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            // On OOM, stop and send what we have rather than dropping the reply.
+            infos.append(self.alloc, .{
+                .id = s.id_str[0..],
+                .alive = s.alive,
+                .exit_code = s.exit_code,
+                .attached = s.bound,
+                .activity = @tagName(s.state),
+                .pid = s.pid,
+                .title = if (s.title) |t| t else null,
+                .cwd = if (s.cwd) |c| c else null,
+                .argv = if (s.argv) |a| a else null,
+                .created_at = s.created_ms,
+                .last_activity = s.last_activity_ms,
+                .pinned = s.pinned,
+                .relaunchable = s.relaunchable,
+            }) catch break;
+        }
+
+        self.sendJson(.sessions, channel, protocol.Sessions{
+            .sessions = infos.items,
+        }) catch {};
+    }
+
+    /// `SET_LAYOUT` (§5.4 cross-machine "Resume all", T18): store (or, with
+    /// `delete`, remove) an OPAQUE per-window layout blob keyed by the owning
+    /// viewer's manifest-entry id. The agent never parses the blob; it persists
+    /// it verbatim so a viewer on another machine can pull it and rebuild the
+    /// window topology. Reply `SET_LAYOUT_RESULT{ok}` on the request channel.
+    fn handleSetLayout(self: *Server, channel: u128, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.SetLayout, self.alloc, payload) catch {
+            self.sendJson(.set_layout_result, channel, protocol.SetLayoutResult{ .ok = false }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        var ok = true;
+        if (req.delete) {
+            self.store.removeLayout(req.key);
+        } else if (req.blob) |blob| {
+            self.store.setLayout(req.key, blob, req.session_ids) catch {
+                ok = false;
+            };
+        } else {
+            // No blob and not a delete: nothing to store.
+            ok = false;
+        }
+
+        // Persist the updated set (best-effort; no-op when disabled). Runs after
+        // the in-memory mutation so a subsequent agent restart re-materializes it.
+        if (ok) self.store.persistLayouts();
+
+        self.sendJson(.set_layout_result, channel, protocol.SetLayoutResult{ .ok = ok }) catch {};
+    }
+
+    /// `GET_LAYOUTS` (§5.4, T18): reply with every stored layout blob on the
+    /// request channel. Snapshots owned copies under the store lock, then encodes
+    /// + enqueues OUTSIDE it (the blobs can be large; unlike `handleListSessions`
+    /// we don't hold the lock across encode).
+    fn handleGetLayouts(self: *Server, channel: u128) void {
+        const recs = self.store.snapshotLayouts(self.alloc) catch {
+            // On OOM, still answer (empty) so the client gets a reply, not a timeout.
+            self.sendJson(.layouts, channel, protocol.Layouts{}) catch {};
+            return;
+        };
+        defer session.freeLayoutRecords(self.alloc, recs);
+
+        var blobs: std.ArrayListUnmanaged(protocol.LayoutBlob) = .empty;
+        defer blobs.deinit(self.alloc);
+        for (recs) |r| {
+            blobs.append(self.alloc, .{ .key = r.key, .blob = r.blob }) catch break;
+        }
+
+        self.sendJson(.layouts, channel, protocol.Layouts{
+            .layouts = blobs.items,
+        }) catch {};
+    }
+
+    /// `RELAUNCH` (§5.4 reboot floor, T12b): respawn a DEAD, relaunchable session
+    /// (materialized from disk at start) — or idempotently rebind an already-alive
+    /// one — under its recorded `argv`/`cwd`, re-keyed into the SAME session id +
+    /// data channel, then stream fresh output and reply `RELAUNCHED` on that channel.
+    ///
+    /// Locking/spawn discipline mirrors `handleOpen`: validate + snapshot the
+    /// relaunch inputs (argv/cwd copies, channel) UNDER the store lock, drop the
+    /// lock, spawn the child OUTSIDE it (fork+exec must never run under the mutex
+    /// that serializes every output chunk), then re-lock, re-find (the reaper could
+    /// have evicted it during the spawn), install the child, and revive.
+    fn handleRelaunch(self: *Server, payload: []const u8) void {
+        var parsed = protocol.parseJson(protocol.Relaunch, self.alloc, payload) catch return;
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        // Stable copy of the session id for the reply/re-lookup (the parsed value is
+        // freed by the trailing defer before the reply runs through the writer queue).
+        var id_buf: [64]u8 = undefined;
+        const id_len = @min(req.session_id.len, id_buf.len);
+        @memcpy(id_buf[0..id_len], req.session_id[0..id_len]);
+        const id_copy = id_buf[0..id_len];
+
+        // Phase 1: validate + snapshot under the lock.
+        self.store.mutex.lock();
+        const s0 = self.store.table.getByIdStr(req.session_id);
+        if (s0 == null) {
+            self.store.mutex.unlock();
+            // No such session — the client should fall back to a fresh OPEN.
+            self.sendJson(.relaunched, protocol.control_channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = false,
+            }) catch {};
+            return;
+        }
+        const s = s0.?;
+        const channel = s.channel;
+
+        if (s.alive) {
+            // Already running (double RELAUNCH / a race): rebind to us + reply ok,
+            // no respawn. The child reader is already attached to the store sink.
+            self.bindLocked(s);
+            const pid = s.pid;
+            // Stable copy of the tty (wp3): the reply is sent after unlock, where
+            // the session's string could be replaced/freed by a racing setTty.
+            var tty_buf: [128]u8 = undefined;
+            const tty_copy: ?[]const u8 = if (s.tty) |t| blk: {
+                const n = @min(t.len, tty_buf.len);
+                @memcpy(tty_buf[0..n], t[0..n]);
+                break :blk tty_buf[0..n];
+            } else null;
+            self.store.mutex.unlock();
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = true,
+                .pid = pid,
+                .found = true,
+                .tty = tty_copy,
+            }) catch {};
+            return;
+        }
+
+        if (!s.relaunchable) {
+            // A genuinely-exited tombstone with no relaunch metadata: found but not
+            // relaunchable. The client shows the exited overlay (no auto-relaunch).
+            self.store.mutex.unlock();
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = true,
+            }) catch {};
+            return;
+        }
+
+        // Snapshot the relaunch inputs into owned buffers so the spawn (unlocked)
+        // can't race a concurrent free of the session's strings.
+        const argv_copy: ?[]u8 = if (s.argv) |a| (self.alloc.dupe(u8, a) catch null) else null;
+        defer if (argv_copy) |a| self.alloc.free(a);
+        const cwd_copy: ?[]u8 = if (s.cwd) |c| (self.alloc.dupe(u8, c) catch null) else null;
+        defer if (cwd_copy) |c| self.alloc.free(c);
+        const pinned = s.pinned;
+        self.store.mutex.unlock();
+
+        // Phase 2: spawn the child OUTSIDE the lock. Synthesize an OPEN from the
+        // recorded metadata (the recorded argv is treated as the command to run;
+        // null → a plain login shell, the agent resolves its own default $SHELL)
+        // PLUS the respawn-fidelity fields the viewer sent on the RELAUNCH (wp3):
+        // env (GHOZTTY_PANE_ID & co.), TERM, and an explicit shell-integration
+        // argv rewrite. When the viewer supplies argv (a plain interactive shell
+        // with an argv-rewrite) it IS the full invocation, so the recorded
+        // command label must not also run (same exclusivity as an original
+        // OPEN). Older clients send none of these — recorded metadata alone,
+        // the pre-wp3 behavior. `req`'s borrowed slices outlive the synchronous
+        // spawn (parsed is freed at function exit).
+        const open: protocol.Open = .{
+            .command = if (req.argv != null) null else argv_copy,
+            .cwd = cwd_copy,
+            .rows = req.rows,
+            .cols = req.cols,
+            .px_w = req.px_w,
+            .px_h = req.px_h,
+            .pinned = pinned,
+            .env = req.env,
+            .term = req.term orelse "xterm-ghostty",
+            .argv = req.argv,
+        };
+        const spawned = self.spawner.spawn(open) catch {
+            // Spawn failed — the session stays a relaunchable tombstone; report
+            // found-but-not-ok so the client can retry or show the overlay.
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = true,
+            }) catch {};
+            return;
+        };
+
+        // Phase 3: re-lock, re-find (the reaper could have evicted the tombstone
+        // during the spawn), install the fresh child, and revive the session.
+        self.store.mutex.lock();
+        const s2 = self.store.table.getByIdStr(id_copy);
+        if (s2 == null or s2.?.channel != channel or s2.?.alive) {
+            // Gone, re-keyed, or already revived by a racing RELAUNCH — drop the
+            // fresh child OUTSIDE the lock (terminate joins its reader).
+            self.store.mutex.unlock();
+            spawned.child.terminate();
+            self.sendJson(.relaunched, channel, protocol.Relaunched{
+                .session_id = id_copy,
+                .ok = false,
+                .found = s2 != null,
+            }) catch {};
+            return;
+        }
+        const rs = s2.?;
+        rs.child = spawned.child; // replace the inert deadChild placeholder
+        rs.pid = spawned.pid;
+        rs.alive = true;
+        rs.relaunchable = false;
+        rs.exit_code = null;
+        rs.last_activity_ms = self.clock.now();
+        // Fresh pty ⇒ fresh tty path (wp3); stable stack copy for the
+        // after-unlock reply (`Result.tty` borrows child-owned storage).
+        var tty_buf: [128]u8 = undefined;
+        const tty_copy: ?[]const u8 = if (spawned.tty) |t| blk: {
+            const n = @min(t.len, tty_buf.len);
+            @memcpy(tty_buf[0..n], t[0..n]);
+            break :blk tty_buf[0..n];
+        } else null;
+        rs.setTty(tty_copy);
+        // Bind to THIS connection so live output frames flow to our writer.
+        self.bindLocked(rs);
+        // Same re-attach repaint latch as ATTACH: the client re-asserts geometry
+        // with an authoritative RESIZE right after RELAUNCH; fire one SIGWINCH on
+        // it so a relaunched full-screen program paints against the final size.
+        rs.winch_on_next_resize = true;
+        const pid = rs.pid;
+        // Capture the replayed-scrollback capture geometry under the lock so the
+        // reply (sent after unlock) can tell the viewer what width to replay at.
+        const replay_cols = rs.replay_cols;
+        const replay_rows = rs.replay_rows;
+        const child = rs.child; // value copy of the vtable handle
+
+        // Reboot scrollback (T13, §5.4): a session materialized from disk has its
+        // pre-restart ring snapshot + the restart divider PRELOADED into the ring
+        // (loadPersisted → preloadRingSnapshot), sitting at offsets
+        // `[base, out_offset)`. The fresh child hasn't produced output yet (its
+        // reader is attached below, after the unlock), so `out_offset` still marks
+        // the end of that preloaded content. Copy it now (under the lock, ring
+        // stable) and replay it to the reattaching viewer BEFORE the child's live
+        // output — the client sees pre-restart scrollback → divider → fresh output,
+        // with no offset hole (its relaunch pane keeps every byte from offset 0).
+        const replay_lo = rs.ring.base_offset;
+        const replay_len = rs.ring.len;
+        var replay_buf: ?[]u8 = null;
+        var replay_n: usize = 0;
+        if (replay_len > 0) {
+            if (self.alloc.alloc(u8, replay_len)) |rb| {
+                replay_buf = rb;
+                replay_n = rs.ring.copyRetained(rb);
+            } else |_| {}
+        }
+        self.store.mutex.unlock();
+
+        // Replay the preloaded scrollback + divider first (outside the lock), so
+        // its DATA frames are queued ahead of any live child output.
+        if (replay_buf) |rb| {
+            defer self.alloc.free(rb);
+            if (replay_n > 0) self.sendData(channel, replay_lo, rb[0..replay_n]) catch {};
+        }
+
+        // Start the real child's reader routing output to the STORE sink on our
+        // channel (done after unlock — the sink takes the store lock).
+        child.attach(self.store, session.SessionStore.onChildOutputTrampoline, channel);
+
+        self.sendJson(.relaunched, channel, protocol.Relaunched{
+            .session_id = id_copy,
+            .ok = true,
+            .pid = pid,
+            .found = true,
+            // Tell the client we already replayed scrollback + the divider so it
+            // suppresses its own snapshot-less divider (no double marker).
+            .replayed = replay_n > 0,
+            // Width the replayed bytes were drawn at (0 when unknown) so the client
+            // can replay at that width then reflow — see Relaunched.replay_cols.
+            .replay_cols = if (replay_n > 0) replay_cols else 0,
+            .replay_rows = if (replay_n > 0) replay_rows else 0,
+            .tty = tty_copy,
+        }) catch {};
+
+        // The alive set changed (a tombstone became alive) — refresh the on-disk
+        // metadata so a subsequent restart re-materializes it.
+        self.store.persistMeta();
     }
 
     fn handlePing(self: *Server, payload: []const u8) void {
@@ -1294,6 +1819,9 @@ const FakeChild = struct {
     /// When set, `queryCwd` returns a copy of this (models the OS cwd read). When
     /// null the vtable's `queryCwd` is still wired but returns null (query failed).
     fake_cwd: ?[]const u8 = null,
+    /// When nonzero, `queryForegroundPid` reports this (models `tcgetpgrp` on the
+    /// pty master, wp3). Zero → null (Windows / query failed / no fg tracking).
+    fake_fg_pid: i64 = 0,
     /// Optional write gate (wedge test): when both are set, `write` signals
     /// `gate_entered` and then BLOCKS on `gate_release` before sinking the bytes —
     /// modeling a stalled ConPTY input pipe whose `WriteFile` never returns. Lets a
@@ -1314,11 +1842,19 @@ const FakeChild = struct {
         .tryWait = tw,
         .terminate = tm,
         .queryCwd = qcwd,
+        .queryForegroundPid = qfg,
     };
     fn qcwd(ctx: *anyopaque, alloc: Allocator) ?[]u8 {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
         const c = self.fake_cwd orelse return null;
         return alloc.dupe(u8, c) catch null;
+    }
+    fn qfg(ctx: *anyopaque) ?i64 {
+        const self: *FakeChild = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.fake_fg_pid == 0) return null;
+        return self.fake_fg_pid;
     }
     fn wr(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *FakeChild = @ptrCast(@alignCast(ctx));
@@ -1370,16 +1906,49 @@ const FakeSpawner = struct {
     children: []*FakeChild,
     next: usize = 0,
     pid_base: i64 = 1000,
+    /// Reported as `Result.tty` (wp3) — the fake analogue of the real spawner's
+    /// pty-slave path. Null models a Windows/no-tty spawn.
+    tty: ?[]const u8 = null,
+
+    /// Captured from the LAST spawn's OPEN (owned fixed-buffer copies — the
+    /// OPEN's memory is freed when the handler returns), so relaunch-fidelity
+    /// tests (wp3) can assert the viewer-sent env/TERM reached the respawn.
+    last_env_count: usize = 0,
+    last_env_key_buf: [64]u8 = undefined,
+    last_env_key_len: usize = 0,
+    last_env_val_buf: [64]u8 = undefined,
+    last_env_val_len: usize = 0,
+    last_term_buf: [32]u8 = undefined,
+    last_term_len: usize = 0,
+
+    fn lastEnvKey(self: *const FakeSpawner) []const u8 {
+        return self.last_env_key_buf[0..self.last_env_key_len];
+    }
+    fn lastEnvValue(self: *const FakeSpawner) []const u8 {
+        return self.last_env_val_buf[0..self.last_env_val_len];
+    }
+    fn lastTerm(self: *const FakeSpawner) []const u8 {
+        return self.last_term_buf[0..self.last_term_len];
+    }
 
     fn spawner(self: *FakeSpawner) Spawner {
         return .{ .ctx = self, .spawnFn = spawn, .spawnDetachedFn = spawnDetached };
     }
-    fn spawn(ctx: *anyopaque, _: protocol.Open) anyerror!Spawner.Result {
+    fn spawn(ctx: *anyopaque, open: protocol.Open) anyerror!Spawner.Result {
         const self: *FakeSpawner = @ptrCast(@alignCast(ctx));
         if (self.next >= self.children.len) return error.NoMoreChildren;
+        self.last_env_count = open.env.len;
+        if (open.env.len > 0) {
+            self.last_env_key_len = @min(open.env[0].key.len, self.last_env_key_buf.len);
+            @memcpy(self.last_env_key_buf[0..self.last_env_key_len], open.env[0].key[0..self.last_env_key_len]);
+            self.last_env_val_len = @min(open.env[0].value.len, self.last_env_val_buf.len);
+            @memcpy(self.last_env_val_buf[0..self.last_env_val_len], open.env[0].value[0..self.last_env_val_len]);
+        }
+        self.last_term_len = @min(open.term.len, self.last_term_buf.len);
+        @memcpy(self.last_term_buf[0..self.last_term_len], open.term[0..self.last_term_len]);
         const fc = self.children[self.next];
         self.next += 1;
-        return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)) };
+        return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)), .tty = self.tty };
     }
     /// REAL detached spawn so the `PROC_SPAWN`→`PROC_KILL` round-trip test
     /// exercises a genuine OS process. Uses `std.process.Child` directly (std-only,
@@ -1466,7 +2035,15 @@ const MockClient = struct {
 
     /// Send the client HELLO and consume the agent's HELLO reply.
     fn handshake(self: *MockClient) !void {
-        const hello: protocol.Hello = .{ .transfer_encoding = self.encoding };
+        // Advertise the app-side capabilities so capability negotiation (e.g.
+        // close_session) reflects a modern peer, like the real Connection client.
+        const caps = [_][]const u8{protocol.capability.close_session};
+        try self.handshakeCaps(&caps);
+    }
+    /// HELLO with an explicit capability set (for negotiation tests, e.g.
+    /// advertising — or withholding — `grid_snapshot`).
+    fn handshakeCaps(self: *MockClient, caps: []const []const u8) !void {
+        const hello: protocol.Hello = .{ .transfer_encoding = self.encoding, .capabilities = caps };
         const json = try hello.encode(self.alloc);
         defer self.alloc.free(json);
         try self.sendFrameOn(self.control, .{
@@ -1621,6 +2198,7 @@ test "GET_CWD→CWD: agent replies with the child's queried cwd on the request c
     try testing.expect(parsed.value.path != null);
     try testing.expectEqualStrings("/private/tmp", parsed.value.path.?);
     try testing.expectEqualStrings(opened.id[0..], parsed.value.session_id);
+    try testing.expectEqual(@as(?bool, true), parsed.value.found);
 }
 
 test "WEDGE: a session's blocking child write must NOT hold the global store lock" {
@@ -1693,6 +2271,154 @@ test "GET_CWD→CWD: unknown session replies ok=false (graceful, no crash)" {
     defer parsed.deinit();
     try testing.expect(!parsed.value.ok);
     try testing.expect(parsed.value.path == null);
+    // POSITIVE not-found (T06b): an unknown id must report found=false so a
+    // restore probe may safely forget it (vs. a transient cwd-read failure).
+    try testing.expectEqual(@as(?bool, false), parsed.value.found);
+}
+
+test "LIST_SESSIONS→SESSIONS: agent enumerates its sessions on the request channel" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc0: FakeChild = .{ .alloc = alloc };
+    var fc1: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    defer fc1.deinit();
+    var kids = [_]*FakeChild{ &fc0, &fc1 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(11);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Open two sessions: one with an explicit command AND pinned (persistent
+    // local pane, T11), one falling back to shell and unpinned (cross-machine).
+    const o0 = try doOpen(&h, .{ .rows = 24, .cols = 80, .command = "run-marker-0", .pinned = true });
+    const o1 = try doOpen(&h, .{ .rows = 30, .cols = 100, .shell = "/bin/zsh" });
+
+    // LIST_SESSIONS on a fresh request channel; the agent echoes SESSIONS on it.
+    const req_ch: u128 = 0x5E5510;
+    try h.client.sendControlJson(.list_sessions, req_ch, protocol.ListSessions{});
+    const reply = try h.client.waitControl(.sessions);
+    try testing.expectEqual(req_ch, reply.channel);
+
+    var parsed = try protocol.parseJson(protocol.Sessions, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.sessions.len);
+
+    // The roster is unordered (hash-map iteration); find each opened session and
+    // assert its argv label + that it is alive and attached (this connection is
+    // bound to both).
+    var seen0 = false;
+    var seen1 = false;
+    for (parsed.value.sessions) |s| {
+        try testing.expect(s.alive);
+        try testing.expect(s.attached);
+        try testing.expectEqualStrings("idle", s.activity);
+        if (std.mem.eql(u8, s.id, o0.id[0..])) {
+            seen0 = true;
+            try testing.expect(s.argv != null);
+            try testing.expectEqualStrings("run-marker-0", s.argv.?);
+            try testing.expect(s.pinned); // OPEN.pinned reached the session + roster
+        } else if (std.mem.eql(u8, s.id, o1.id[0..])) {
+            seen1 = true;
+            try testing.expect(s.argv != null);
+            try testing.expectEqualStrings("/bin/zsh", s.argv.?);
+            try testing.expect(!s.pinned); // unpinned by default
+        }
+    }
+    try testing.expect(seen0 and seen1);
+}
+
+test "LIST_SESSIONS→SESSIONS: empty roster is answered with an empty array" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(12);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.list_sessions, 0xABCD, protocol.ListSessions{});
+    const reply = try h.client.waitControl(.sessions);
+    var parsed = try protocol.parseJson(protocol.Sessions, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.value.sessions.len);
+}
+
+test "SET_LAYOUT stores a blob; GET_LAYOUTS returns it; delete removes it (T18)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc0: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    var kids = [_]*FakeChild{&fc0};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(41);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o0 = try doOpen(&h, .{ .rows = 24, .cols = 80, .command = "run-marker" });
+
+    // A GET_LAYOUTS on a fresh agent answers with an empty (present) array.
+    try h.client.sendControlJson(.get_layouts, 0x1000, protocol.GetLayouts{});
+    {
+        const reply = try h.client.waitControl(.layouts);
+        var parsed = try protocol.parseJson(protocol.Layouts, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 0), parsed.value.layouts.len);
+    }
+
+    // Push a layout blob keyed "win-1" referencing the open session.
+    const ids = [_][]const u8{o0.id[0..]};
+    const set_ch: u128 = 0x1A;
+    try h.client.sendControlJson(.set_layout, set_ch, protocol.SetLayout{
+        .key = "win-1",
+        .blob = "{\"tree\":\"opaque\"}",
+        .session_ids = &ids,
+    });
+    {
+        const reply = try h.client.waitControl(.set_layout_result);
+        try testing.expectEqual(set_ch, reply.channel);
+        var parsed = try protocol.parseJson(protocol.SetLayoutResult, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expect(parsed.value.ok);
+    }
+
+    // GET_LAYOUTS now returns the stored blob verbatim on the request channel.
+    const get_ch: u128 = 0x2B;
+    try h.client.sendControlJson(.get_layouts, get_ch, protocol.GetLayouts{});
+    {
+        const reply = try h.client.waitControl(.layouts);
+        try testing.expectEqual(get_ch, reply.channel);
+        var parsed = try protocol.parseJson(protocol.Layouts, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 1), parsed.value.layouts.len);
+        try testing.expectEqualStrings("win-1", parsed.value.layouts[0].key);
+        try testing.expectEqualStrings("{\"tree\":\"opaque\"}", parsed.value.layouts[0].blob);
+    }
+
+    // A delete removes the blob; the next GET_LAYOUTS is empty again.
+    try h.client.sendControlJson(.set_layout, 0x1B, protocol.SetLayout{
+        .key = "win-1",
+        .delete = true,
+    });
+    _ = try h.client.waitControl(.set_layout_result);
+    try h.client.sendControlJson(.get_layouts, 0x2C, protocol.GetLayouts{});
+    {
+        const reply = try h.client.waitControl(.layouts);
+        var parsed = try protocol.parseJson(protocol.Layouts, alloc, reply.payload);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 0), parsed.value.layouts.len);
+    }
 }
 
 test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {
@@ -1946,6 +2672,208 @@ test "ATTACH alive returns snapshot anchor and streams forward from > S" {
     try testing.expectEqualSlices(u8, "!", dp.bytes);
 }
 
+test "ATTACH with grid_snapshot negotiated replays a visible-screen repaint (FIX 2)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(7);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // The client advertises grid_snapshot (a modern app).
+    try h.client.handshakeCaps(&.{
+        protocol.capability.close_session,
+        protocol.capability.grid_snapshot,
+    });
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.grid_snapshot);
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    // The blank-pane shape: enter the alt screen, then paint content. On the wire
+    // the `?1049h` is just early output that (in a real deep-scrollback session)
+    // would be evicted from the ring.
+    h.server.onChildOutput(o.channel, "\x1b[?1049h");
+    h.server.onChildOutput(o.channel, "SNAPSHOT-ME");
+    _ = try h.client.nextData(); // drain live DATA (chunk 1)
+    _ = try h.client.nextData(); // drain live DATA (chunk 2)
+
+    // A FRESH attach (last_byte_offset = 0), exactly like the GUI after an app
+    // relaunch/upgrade.
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+        .last_byte_offset = 0,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+    const s = ap.value.snapshot_at_offset;
+
+    // On the alt screen the raw ring replay is skipped; the ONLY post-attach DATA
+    // is the grid snapshot, sent at offset S. It must re-enter the alt screen and
+    // repaint the content so the pane is never blank.
+    const d = (try h.client.nextData()) orelse return error.NoSnapshot;
+    const dp = try protocol.DataPayload.decode(d.payload);
+    try testing.expectEqual(s, dp.byte_offset);
+    try testing.expect(std.mem.indexOf(u8, dp.bytes, "?1049h") != null);
+    try testing.expect(std.mem.indexOf(u8, dp.bytes, "SNAPSHOT-ME") != null);
+}
+
+test "ATTACH without grid_snapshot falls back to raw ring replay (skew safety, FIX 2)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(8);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // An OLDER client: advertises NOTHING (no grid_snapshot).
+    try h.client.handshakeCaps(&.{});
+    const neg = try h.server.waitHandshake();
+    try testing.expect(!neg.grid_snapshot);
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    h.server.onChildOutput(o.channel, "\x1b[?1049h");
+    h.server.onChildOutput(o.channel, "PLAINBYTES");
+    _ = try h.client.nextData();
+    _ = try h.client.nextData();
+
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+        .last_byte_offset = 0,
+    });
+    _ = try h.client.waitControl(.attached);
+
+    // No snapshot: the ONLY post-attach DATA is today's raw ring replay from the
+    // base (offset 0), byte-identical to what the child produced — no formatter
+    // repaint sequence.
+    const d = (try h.client.nextData()) orelse return error.NoReplay;
+    const dp = try protocol.DataPayload.decode(d.payload);
+    try testing.expectEqual(@as(u64, 0), dp.byte_offset);
+    try testing.expectEqualSlices(u8, "\x1b[?1049hPLAINBYTES", dp.bytes);
+}
+
+test "OPEN/ATTACH carry the child's pid+tty (wp3 getProcessInfo metadata)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids, .tty = "/dev/ttys014" };
+    var prng = std.Random.DefaultPrng.init(41);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // OPENED carries the spawner-reported tty (and the pid, as before).
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+    try testing.expectEqual(@as(i64, 1001), op.value.pid);
+    try testing.expectEqualStrings("/dev/ttys014", op.value.tty.?);
+    var id: [32]u8 = undefined;
+    @memcpy(&id, op.value.session_id[0..32]);
+
+    // ATTACHED (alive) re-reports pid + tty — the app-relaunch recovery path,
+    // where OPENED's metadata died with the previous app process.
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id[0..],
+        .rows = 24,
+        .cols = 80,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+    try testing.expectEqual(@as(i64, 1001), ap.value.pid);
+    try testing.expectEqualStrings("/dev/ttys014", ap.value.tty.?);
+}
+
+test "foreground-pid sampling pushes META on change only (wp3)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(43);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // The shell puts a program in the foreground → next tick pushes META.
+    fc.mutex.lock();
+    fc.fake_fg_pid = 4321;
+    fc.mutex.unlock();
+    h.server.store.sampleForegroundPids();
+
+    // Unchanged fg on later ticks must NOT re-push; then a change pushes again.
+    h.server.store.sampleForegroundPids();
+    fc.mutex.lock();
+    fc.fake_fg_pid = 4322;
+    fc.mutex.unlock();
+    h.server.store.sampleForegroundPids();
+
+    // Exactly two METAs arrive, in order (a spurious duplicate would make the
+    // second read observe 4321 again — `waitControl` skips nothing here since
+    // no other control frames are in flight).
+    const m1 = try h.client.waitControl(.meta);
+    try testing.expectEqual(o.channel, m1.channel);
+    var p1 = try protocol.parseJson(protocol.Meta, alloc, m1.payload);
+    defer p1.deinit();
+    try testing.expectEqual(@as(i64, 4321), p1.value.foreground_pid.?);
+
+    const m2 = try h.client.waitControl(.meta);
+    var p2 = try protocol.parseJson(protocol.Meta, alloc, m2.payload);
+    defer p2.deinit();
+    try testing.expectEqual(@as(i64, 4322), p2.value.foreground_pid.?);
+}
+
+test "OPEN with a tty-less spawner elides tty (Windows / older-agent shape)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids }; // tty = null
+    var prng = std.Random.DefaultPrng.init(42);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{ .rows = 24, .cols = 80 });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+    try testing.expect(op.value.tty == null);
+}
+
 test "ATTACH gap-fills retained ring bytes in (L, S]" {
     const alloc = testing.allocator;
     var clock: TestClock = .{};
@@ -2065,6 +2993,267 @@ test "child exit emits EXIT after final DATA; reattach → dead+exit_code; CLOSE
     try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
     h.server.store.mutex.unlock();
     try testing.expect(fc.terminated);
+}
+
+test "CLOSE_SESSION by id: frees the session + terminates the child; unknown id → found=false" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 500 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(11);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+
+    // The agent advertises the close_session capability; with the mock client also
+    // advertising it, the negotiated intersection is true (a new app can gate on it).
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.close_session);
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+
+    // CLOSE_SESSION addressed BY ID on a distinct request channel (NOT the session
+    // channel — this is the chooser's "Kill" of a session with no local pane). The
+    // reply rides the request channel.
+    const req_channel: u128 = 0xC0FFEE;
+    try h.client.sendControlJson(.close_session, req_channel, protocol.CloseSession{
+        .session_id = o.id[0..],
+    });
+    const rf = try h.client.waitControl(.close_session_result);
+    try testing.expectEqual(req_channel, rf.channel);
+    var rp = try protocol.parseJson(protocol.CloseSessionResult, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.found);
+    try testing.expect(rp.value.ok);
+    try testing.expectEqualStrings(o.id[0..], rp.value.session_id);
+
+    // The session is gone and the child was terminated (same as a CLOSE).
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        h.server.store.mutex.lock();
+        const gone = h.server.store.table.getByChannel(o.channel) == null;
+        h.server.store.mutex.unlock();
+        if (gone) break;
+        std.Thread.yield() catch {};
+    }
+    h.server.store.mutex.lock();
+    try testing.expect(h.server.store.table.getByChannel(o.channel) == null);
+    h.server.store.mutex.unlock();
+    try testing.expect(fc.terminated);
+
+    // CLOSE_SESSION for an unknown id → found=false, ok=false (definitive answer).
+    const bogus = "ffffffffffffffffffffffffffffffff";
+    try h.client.sendControlJson(.close_session, req_channel, protocol.CloseSession{
+        .session_id = bogus,
+    });
+    const rf2 = try h.client.waitControl(.close_session_result);
+    var rp2 = try protocol.parseJson(protocol.CloseSessionResult, alloc, rf2.payload);
+    defer rp2.deinit();
+    try testing.expect(!rp2.value.found);
+    try testing.expect(!rp2.value.ok);
+}
+
+test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH revives it" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids, .tty = "/dev/ttys099" };
+    var prng = std.Random.DefaultPrng.init(0xB0B);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Materialize a dead, relaunchable session directly in the store (simulating a
+    // load-at-start from sessions.json). Recorded id is fixed so we can target it.
+    const rec_id = "abcabcabcabcabcabcabcabcabcabcab";
+    h.server.store.mutex.lock();
+    _ = (h.server.store.table.materialize(.{
+        .id = rec_id,
+        .argv = "sleep 600",
+        .pinned = true,
+        .created_ms = 50,
+    }, 4096, h.clock.ms) catch unreachable).?;
+    h.server.store.mutex.unlock();
+
+    // ATTACH → dead + relaunchable (no exit_code); reply rides the session channel.
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.dead, ap.value.status);
+    try testing.expect(ap.value.relaunchable);
+    try testing.expect(ap.value.exit_code == null);
+    const channel = af.channel; // the session's data channel
+
+    // RELAUNCH → the agent spawns the child, revives the session, and replies ok.
+    // The viewer sends its live env/TERM (respawn fidelity, wp3): the agent must
+    // apply them to the synthesized OPEN so the respawned shell keeps its
+    // GHOZTTY_PANE_ID & co. and TERM.
+    const relaunch_env = [_]protocol.Open.EnvPair{
+        .{ .key = "GHOZTTY_PANE_ID", .value = "0BAD-CAFE" },
+    };
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+        .env = &relaunch_env,
+        .term = "xterm-256color",
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    try testing.expectEqual(channel, rf.channel);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    try testing.expect(rp.value.pid != 0);
+    // The fresh spawn's tty rides RELAUNCHED (wp3).
+    try testing.expectEqualStrings("/dev/ttys099", rp.value.tty.?);
+    // The respawn's OPEN carried the viewer-sent env + TERM (wp3 fidelity).
+    try testing.expectEqual(@as(usize, 1), sp.last_env_count);
+    try testing.expectEqualStrings("GHOZTTY_PANE_ID", sp.lastEnvKey());
+    try testing.expectEqualStrings("0BAD-CAFE", sp.lastEnvValue());
+    try testing.expectEqualStrings("xterm-256color", sp.lastTerm());
+
+    // The session is now alive + not relaunchable, and streams fresh output.
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByChannel(channel).?;
+    try testing.expect(s.alive and !s.relaunchable);
+    h.server.store.mutex.unlock();
+
+    h.server.onChildOutput(channel, "back!");
+    const d = try h.client.nextData();
+    const dp = try protocol.DataPayload.decode(d.?.payload);
+    try testing.expectEqual(@as(u64, 0), dp.byte_offset); // fresh stream from 0
+    try testing.expectEqualSlices(u8, "back!", dp.bytes);
+}
+
+test "RELAUNCH: reboot ring snapshot is replayed (scrollback + divider) before live output" {
+    const ring_snapshot = @import("ring_snapshot.zig");
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xD1CE);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 1 << 16, prng.random());
+
+    // Point the store's reboot-floor state at a temp dir and seed BOTH files a real
+    // agent restart would find: sessions.json (the roster) + rings/<id>.ring (the
+    // pre-restart scrollback snapshot). Then loadPersisted materializes the session
+    // AND preloads its ring — exactly the reboot path.
+    var tmp = testing.tmpDir(.{});
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    h.store.meta_path = meta;
+    h.store.rings_dir = rings;
+    // Ordered teardown (one defer, not several). The store only BORROWS
+    // meta_path/rings_dir, and the server's reader threads touch them AFTER acking a
+    // frame: handleRelaunch sends .relaunched and THEN calls persistMeta on the control
+    // thread, and shutdown() calls snapshotRings. h.deinit() is what joins those
+    // threads, so the borrowed paths and the temp dir must outlive it. Splitting these
+    // into separate `defer`s frees the paths (LIFO) BEFORE h.deinit() joins the
+    // threads, so a still-running persistMeta/snapshotRings writes through the freed
+    // slices into the deleted dir — a use-after-free that surfaces as a garbage path
+    // and a spurious EILSEQ/Unexpected snapshot-write warning. Deinit-then-free here
+    // guarantees the writers are quiesced first.
+    defer {
+        h.deinit();
+        alloc.free(rings);
+        alloc.free(meta);
+        alloc.free(dir_path);
+        tmp.cleanup();
+    }
+
+    const rec_id = "abcabcabcabcabcabcabcabcabcabcab";
+    const scrollback = "PANE=3 PID=4242\r\ntick-3-0\r\ntick-3-1\r\n";
+    {
+        const recs = [_]@import("session_meta.zig").Record{.{ .id = rec_id, .argv = "sleep 600", .pinned = true, .created_ms = 50 }};
+        const body = try @import("session_meta.zig").serialize(alloc, &recs);
+        defer alloc.free(body);
+        try @import("session_meta.zig").writeAtomic(alloc, meta, body);
+        const rp = try ring_snapshot.pathFor(alloc, rings, rec_id);
+        defer alloc.free(rp);
+        try ring_snapshot.writeAtomic(alloc, rp, 0, 80, 24, scrollback);
+    }
+    try testing.expectEqual(@as(usize, 1), h.store.loadPersisted(1 << 16));
+
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // ATTACH → dead + relaunchable.
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+    });
+    const af = try h.client.waitControl(.attached);
+    const channel = af.channel;
+
+    // RELAUNCH → reply carries replayed=true; the agent replays [scrollback][divider]
+    // as one DATA frame at offset 0 BEFORE any live output.
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 40,
+        .cols = 120,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    try testing.expect(rp.value.replayed); // scrollback was replayed
+
+    // First DATA frame: the replayed scrollback + divider at offset 0.
+    const d0 = (try h.client.nextData()).?;
+    const dp0 = try protocol.DataPayload.decode(d0.payload);
+    try testing.expectEqual(@as(u64, 0), dp0.byte_offset);
+    const want = scrollback ++ session.reboot_divider;
+    try testing.expectEqualSlices(u8, want, dp0.bytes);
+
+    // Live output continues immediately AFTER the replayed content (no offset hole).
+    h.server.onChildOutput(channel, "fresh-prompt$ ");
+    const d1 = (try h.client.nextData()).?;
+    const dp1 = try protocol.DataPayload.decode(d1.payload);
+    try testing.expectEqual(@as(u64, want.len), dp1.byte_offset);
+    try testing.expectEqualSlices(u8, "fresh-prompt$ ", dp1.bytes);
+}
+
+test "RELAUNCH: unknown session id → not found (client falls back to OPEN)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var sp: FakeSpawner = .{ .children = &.{} };
+    var prng = std.Random.DefaultPrng.init(0xF00D);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = "ffffffffffffffffffffffffffffffff",
+        .rows = 24,
+        .cols = 80,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(!rp.value.ok and !rp.value.found);
 }
 
 test "RESIZE and SIGNAL are recorded on the child" {

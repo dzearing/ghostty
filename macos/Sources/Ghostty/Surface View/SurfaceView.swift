@@ -47,6 +47,10 @@ extension Ghostty {
         // Maintain whether our window has focus (is key) or not
         @State private var windowFocus: Bool = true
 
+        // Measured height of the sticky pane banner, used to inset the
+        // terminal surface so content isn't covered by the overlay.
+        @State private var bannerHeight: CGFloat = 0
+
         #if canImport(AppKit)
         // Observe SecureInput to detect when its enabled
         @ObservedObject private var secureInput = SecureInput.shared
@@ -54,6 +58,30 @@ extension Ghostty {
 
         @EnvironmentObject private var ghostty: Ghostty.App
         @Environment(\.ghosttyLastFocusedSurface) private var lastFocusedSurface
+
+        /// Opacity of the background tint overlay (IPC `--color` / the
+        /// inherited split-depth shade) drawn over the terminal surface.
+        /// Shared so the banner keys off the same composited color the user
+        /// actually sees.
+        static let tintOverlayOpacity: Double = 0.3
+
+        /// The pane's effective *visible* background color: the surface's own
+        /// color when the pty changed it (macOS only) else the config default,
+        /// with the translucent tint overlay composited in. The banner shades
+        /// off of this so it shares the pane's hue instead of the untinted
+        /// terminal background (which reads as flat grey once a tint is set).
+        private var paneBackgroundColor: Color {
+            #if canImport(AppKit)
+            let base = surfaceView.backgroundColor ?? ghostty.config.backgroundColor
+            guard let tint = surfaceView.backgroundTint else { return base }
+            let baseNS = NSColor(base).resolvedSRGB
+            let tintNS = (surfaceView.backgroundTintNSColor ?? NSColor(tint)).resolvedSRGB
+            let composited = baseNS.blended(withFraction: Self.tintOverlayOpacity, of: tintNS)
+            return Color(composited ?? baseNS)
+            #else
+            ghostty.config.backgroundColor
+            #endif
+        }
 
         private var isFocusedSurface: Bool {
             surfaceFocus || lastFocusedSurface?.value === surfaceView
@@ -104,11 +132,15 @@ extension Ghostty {
 
                     }
                 }
+                // Inset the terminal below the sticky banner so the
+                // scrollable content ends under it instead of being
+                // covered by it.
+                .padding(.top, surfaceView.paneBanner != nil ? bannerHeight : 0)
                 .ghosttySurfaceView(surfaceView)
 
                 // Background tint from IPC --color flag
                 if let tint = surfaceView.backgroundTint {
-                    tint.opacity(0.3)
+                    tint.opacity(Self.tintOverlayOpacity)
                         .allowsHitTesting(false)
                 }
 
@@ -118,7 +150,12 @@ extension Ghostty {
                 // clickable.
                 if let banner = surfaceView.paneBanner {
                     VStack(spacing: 0) {
-                        SurfacePaneBanner(text: banner)
+                        SurfacePaneBanner(text: banner, background: paneBackgroundColor)
+                            .onGeometryChange(for: CGFloat.self) { proxy in
+                                proxy.size.height
+                            } action: { height in
+                                bannerHeight = height
+                            }
                         Spacer()
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -698,6 +735,14 @@ extension Ghostty {
         /// a different remote OS (the stall-fix invariant).
         var remoteShell: String?
 
+        /// WP-D3 fast re-attach: the persisted structured VT screen snapshot to
+        /// paint on ATTACH (raw bytes; base64-decoded from the layout manifest)
+        /// and the absolute agent-stream byte offset it reflects (the ATTACH
+        /// last_byte_offset). Set only on a session-layout restore of a remote
+        /// pane. nil/0 ⇒ full-ring replay (no snapshot, or a legacy manifest).
+        var remoteRestoreSnapshot: Data?
+        var remoteRestoreByteOffset: UInt64 = 0
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -793,6 +838,14 @@ extension Ghostty {
                                     // backend. session_id == NULL ⇒ new session.
                                     if let remoteConnection {
                                         config.connection = remoteConnection
+                                        // Only the LOCAL agent (same machine +
+                                        // bundle) gets ghostty shell integration
+                                        // + per-pane GHOSTTY_* env injected (T04b).
+                                        // A cross-machine window must NOT — a macOS
+                                        // resources path / ZDOTDIR is meaningless on
+                                        // a different-OS agent.
+                                        config.remote_local_shell_integration =
+                                            remoteMachine?.isLocalMachine ?? false
                                         return try remoteSessionId.withCString { cSessionId in
                                             config.session_id = cSessionId
                                             // Explicit REMOTE cwd (split/tab
@@ -804,6 +857,26 @@ extension Ghostty {
                                                 // agent's own default shell).
                                                 return try remoteShell.withCString { cRemoteShell in
                                                     config.remote_shell = cRemoteShell
+                                                    // WP-D3: hand the persisted
+                                                    // screen snapshot + offset to
+                                                    // the C config for a fast,
+                                                    // visually-correct re-attach.
+                                                    // Bytes stay valid for the
+                                                    // body call via withUnsafeBytes.
+                                                    config.restore_byte_offset =
+                                                        remoteRestoreByteOffset
+                                                    if let snap = remoteRestoreSnapshot,
+                                                       !snap.isEmpty {
+                                                        return try snap.withUnsafeBytes {
+                                                            (raw: UnsafeRawBufferPointer) in
+                                                            config.restore_snapshot =
+                                                                raw.bindMemory(to: CChar.self)
+                                                                    .baseAddress
+                                                            config.restore_snapshot_len =
+                                                                UInt(raw.count)
+                                                            return try body(&config)
+                                                        }
+                                                    }
                                                     return try body(&config)
                                                 }
                                             }

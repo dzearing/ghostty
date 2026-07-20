@@ -116,6 +116,12 @@ pub const Options = struct {
 ///     inherits the SAME machine/connection plus the parent's command and
 ///     cwd (full remote inheritance). Ignores `--command`/`--name`/`--target`.
 ///
+///   * `--view=<path-or-url>`: Open a VIEWER pane instead of a terminal:
+///     a rendered markdown file, a syntax-highlighted text/code file, or a
+///     website (http/https URL). Relative paths resolve against
+///     `--working-directory` if given, else the caller's cwd. Mutually
+///     exclusive with `--command`/`-e`.
+///
 ///   * `--command=<command>`: The command to run in the split pane.
 ///
 ///   * `--shell=<path>`: The shell to use when running `--command`.
@@ -167,6 +173,8 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    try resolveViewArgument(alloc, opts._arguments.items);
+
     if (apprt.App.performIpc(
         alloc,
         .detect,
@@ -189,4 +197,27 @@ fn runArgs(
     // sendIpc already printed the server's error text (if any) to stderr.
     try stderr.print("+split failed.\n", .{});
     return 1;
+}
+
+/// Rewrite a relative `--view=` path to an absolute one, resolved against
+/// `--working-directory=` when present (else the caller's cwd). The app
+/// process can't know the caller's cwd, so this must happen CLI-side.
+/// URLs (containing "://") and absolute paths pass through untouched.
+fn resolveViewArgument(alloc: Allocator, arguments: [][:0]const u8) !void {
+    for (arguments, 0..) |arg, i| {
+        const rest = lib.cutPrefix(u8, arg, "--view=") orelse continue;
+        if (rest.len == 0) return;
+        if (rest[0] == '/') return;
+        if (std.mem.indexOf(u8, rest, "://") != null) return;
+
+        var base: ?[]const u8 = null;
+        for (arguments) |a| {
+            if (lib.cutPrefix(u8, a, "--working-directory=")) |wd| base = wd;
+        }
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = base orelse try std.fs.cwd().realpath(".", &buf);
+        const resolved = try std.fs.path.resolve(alloc, &.{ cwd, rest });
+        arguments[i] = try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{resolved}, 0);
+        return;
+    }
 }

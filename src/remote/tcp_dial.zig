@@ -98,6 +98,74 @@ pub fn dialTimeout(
         return e;
     };
     sock.* = socket_stream.SocketStream.init(stream.handle);
+    // `dialConnected` takes ownership of `sock` (closes + destroys it on any
+    // failure), so no errdefer here.
+    return dialConnected(alloc, sock, encoding, handshake_timeout_ns);
+}
+
+/// Default deadline shared by `dialUnix`; the same rationale as
+/// `default_handshake_timeout_ns` (a peer that accepts but never speaks must not
+/// park the dial forever).
+pub fn dialUnix(
+    alloc: Allocator,
+    path: []const u8,
+    encoding: protocol.TransferEncoding,
+) !Dialed {
+    return dialUnixTimeout(alloc, path, encoding, default_handshake_timeout_ns);
+}
+
+/// `dialUnix` with an explicit HELLO-handshake deadline (ns). The AF_UNIX
+/// analogue of `dialTimeout`: connect a stream socket at `path`, then hand the
+/// fd to the SAME `dialConnected` core (mux → Connection → HELLO). Used for the
+/// local-agent 0600 unix socket (T09/T09b); `SocketStream` is fd-based and
+/// transport-agnostic so recv/send/shutdown work verbatim on AF_UNIX.
+pub fn dialUnixTimeout(
+    alloc: Allocator,
+    path: []const u8,
+    encoding: protocol.TransferEncoding,
+    handshake_timeout_ns: u64,
+) !Dialed {
+    // 1. Connect an AF_UNIX stream socket at `path` (mirrors the CLI's
+    //    connectUnixSocket). We own the fd from here; on each pre-`sock` error
+    //    path we close it explicitly (no errdefer, so `dialConnected`'s own
+    //    teardown can't double-close it) — same discipline as the TCP path.
+    const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+
+    var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
+    if (path.len >= addr.path.len) {
+        std.posix.close(fd);
+        return error.NameTooLong;
+    }
+    @memcpy(addr.path[0..path.len], path);
+    addr.path[path.len] = 0;
+    std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |e| {
+        std.posix.close(fd);
+        return e;
+    };
+
+    // Hand the fd to a SocketStream immediately so teardown is uniform.
+    const sock = alloc.create(socket_stream.SocketStream) catch |e| {
+        std.posix.close(fd);
+        return e;
+    };
+    sock.* = socket_stream.SocketStream.init(fd);
+    // `dialConnected` takes ownership of `sock` (closes + destroys it on any
+    // failure) — cancel the raw-fd errdefer above by returning through it.
+    return dialConnected(alloc, sock, encoding, handshake_timeout_ns);
+}
+
+/// Shared post-connect core for every transport (TCP, AF_UNIX): given an already
+/// heap-allocated `SocketStream` wrapping a connected fd, fold the two logical
+/// lanes through a `ClientMux`, stand up + start a `Connection`, and block until
+/// the HELLO handshake completes (bounded by `handshake_timeout_ns`). Takes
+/// OWNERSHIP of `sock`: on any failure it closes the fd + destroys `sock` and
+/// returns the error; on success the returned `Dialed` owns it.
+fn dialConnected(
+    alloc: Allocator,
+    sock: *socket_stream.SocketStream,
+    encoding: protocol.TransferEncoding,
+    handshake_timeout_ns: u64,
+) !Dialed {
     errdefer {
         sock.connectionStream().close(); // closes the fd
         alloc.destroy(sock);
@@ -292,6 +360,77 @@ test "dial: stands up a Connection over a real loopback socket, OPEN + DATA roun
     agent_thread.join();
     listener.deinit();
     try testing.expect(agent.err == null);
+}
+
+test "dialUnix: stands up a Connection over a real AF_UNIX socket, OPEN + DATA round-trip" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const enc: protocol.TransferEncoding = .raw;
+
+    // A short, unique socket path (sun_path is only ~104 bytes on macOS, so a
+    // nested tmpDir realpath can overflow it — keep it under /tmp).
+    var pbuf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "/tmp/gztt-t09b-dial-{d}.sock", .{std.c.getpid()});
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    // Bind an AF_UNIX listener and start the mini agent on the accepted socket.
+    const addr = try std.net.Address.initUnix(path);
+    var listener = try addr.listen(.{});
+
+    const Accepter = struct {
+        listener: *std.net.Server,
+        agent: *MiniAgent,
+        fn run(self: *@This()) void {
+            const c = self.listener.accept() catch return;
+            self.agent.fd = c.stream.handle;
+            self.agent.run();
+        }
+    };
+    var agent = MiniAgent{ .fd = undefined, .alloc = alloc, .encoding = enc };
+    var accepter = Accepter{ .listener = &listener, .agent = &agent };
+    const agent_thread = try std.Thread.spawn(.{}, Accepter.run, .{&accepter});
+
+    // Dial the unix socket (the T09b path).
+    var dialed = try dialUnix(alloc, path, enc);
+    try testing.expectEqual(enc, dialed.negotiated.transfer_encoding);
+
+    // OPEN a session.
+    const pane = try dialed.conn.openChannel(.{ .rows = 24, .cols = 80 });
+    try testing.expectEqualStrings("mini-1", pane.session_id);
+
+    // DATA round-trip: input → agent echo → pane ring.
+    try dialed.conn.writeInput(pane, "ping");
+    var buf: [64]u8 = undefined;
+    var total: usize = 0;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (total < "ping".len) {
+        const r = pane.ring.pop(buf[total..]);
+        if (r.read > 0) {
+            total += r.read;
+        } else {
+            if (std.time.milliTimestamp() > deadline) return error.Timeout;
+            std.Thread.yield() catch {};
+        }
+    }
+    try testing.expectEqualStrings("ping", buf[0..total]);
+
+    dialed.conn.closeChannel(pane);
+    dialed.deinit();
+    agent_thread.join();
+    listener.deinit();
+    try testing.expect(agent.err == null);
+}
+
+test "dialUnix: connect to a nonexistent path fails cleanly (no leak)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var pbuf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "/tmp/gztt-t09b-nope-{d}.sock", .{std.c.getpid()});
+    std.fs.cwd().deleteFile(path) catch {};
+    // No listener bound → connect must fail (ENOENT/ECONNREFUSED) and free the fd.
+    try testing.expectError(error.FileNotFound, dialUnix(alloc, path, .raw));
 }
 
 test {

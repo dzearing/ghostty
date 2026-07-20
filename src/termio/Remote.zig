@@ -75,6 +75,36 @@ shell: ?[]const u8,
 /// The TERM value advertised in `OPEN` (§4.2). Duped into `arena`.
 term: []const u8,
 
+/// Environment variables sent as the `OPEN.env` allowlist (§4.2) for an
+/// open-new session. For the LOCAL agent these forward the surface's env
+/// overrides (GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME set by the apprt + IPC,
+/// plus any user `env` config) so an agent-backed pane reaches env parity with
+/// an exec pane (T04a). Empty for a cross-machine remote window (env is
+/// agent-side there). Each pair's key/value is duped into `arena`.
+env: []const protocol.Open.EnvPair,
+
+/// Explicit shell argv to exec verbatim (§ local shell integration, T04c), or
+/// null to let the agent synthesize `<shell> -lic/-li`. Carries the
+/// `shell_integration.setup()` argv-rewrite for bash/nushell so those shells
+/// activate ghostty integration on the LOCAL agent. Null for cross-machine
+/// windows and for env-only shells. Each element is duped into `arena`.
+argv: ?[]const []const u8,
+
+/// Pin this session against the agent's idle-TTL reaper (§7.1, T11). True only
+/// for a persistent LOCAL-agent pane; sent in `OPEN.pinned`. Ignored on ATTACH.
+pinned: bool,
+
+/// True when the connection is the LOCAL agent (see `Config.local`). Gates
+/// publishing the agent-reported tty for `getProcessInfo(.tty_name)` (wp3).
+local: bool,
+
+/// What to do when an ATTACH finds the session a DEAD-but-relaunchable tombstone
+/// (the agent itself restarted and materialized it from disk, §5.4 reboot floor,
+/// T12c). `.auto` respawns it in place (`RELAUNCH`) and shows a restarted
+/// divider; `.prompt` leaves the pane in its exited state for the user to decide.
+/// Only meaningful for the LOCAL-agent ATTACH path; irrelevant on OPEN-new.
+relaunch_policy: RelaunchPolicy,
+
 /// Current grid/screen size, seeded by `initTerminal` and updated by `resize`.
 /// Sent in `OPEN`/`RESIZE` (rows/cols + pixel geometry, §6.5).
 grid_size: renderer.GridSize = .{},
@@ -83,6 +113,23 @@ screen_size: renderer.ScreenSize = .{ .width = 1, .height = 1 },
 /// Cached exit code from an `EXIT` frame, surfaced by `childExitedAbnormally`.
 /// Null until the agent reports the session exited.
 exit_code: ?u32 = null,
+
+/// True while a `.prompt`-policy pane is a dead-but-relaunchable tombstone waiting
+/// for the user to consent to a respawn (T12c2). Set by `threadEnter` when it brings
+/// up a live-but-childless pane (via `prepareRelaunchPane`) and shows an
+/// "awaiting relaunch" prompt; the first keystroke in `queueWrite` clears it and
+/// fires the deferred `RELAUNCH`. Touched only on the IO thread (threadEnter →
+/// queueWrite), so no synchronization is needed.
+awaiting_relaunch: bool = false,
+
+/// When true, `threadExit` sends `CLOSE` (terminate the remote child + free the
+/// session) instead of the default `DETACH` (keep-alive for re-attach). Set via
+/// `Surface.setSessionCloseIntent` when the USER closes the pane/window — an
+/// app quit never sets it, so quit keeps sessions alive for restore while an
+/// explicit close actually ends the process (no orphaned pinned sessions
+/// accumulating in the agent). Atomic: written on the GUI thread (before the
+/// surface free joins the IO thread), read on the IO thread in `threadExit`.
+close_on_exit: std.atomic.Value(bool) = .init(false),
 
 /// Owns the duped config strings for this backend's lifetime.
 arena: std.heap.ArenaAllocator,
@@ -106,6 +153,47 @@ canceller: connection.RpcCanceller = .{},
 /// query right after, well before any teardown).
 live_session_id: std.atomic.Value(?[*]const u8) = .init(null),
 live_session_id_len: std.atomic.Value(usize) = .init(0),
+
+/// Agent-reported process info for `getProcessInfo` (wp3): the child pid and
+/// PTY slave path from `OPENED`/`ATTACHED`/`RELAUNCHED`, published by the IO
+/// thread (`threadEnter` / relaunch) and read lock-free from the GUI thread
+/// (`ghostty_surface_foreground_pid` / `ghostty_surface_tty_name`, which power
+/// the IPC `+list` pid/tty fields). The tty is a single NUL-terminated pointer
+/// (its length is derived at read time, so there is no two-atomic tear), duped
+/// into `arena` (never freed until backend deinit) so a published pointer stays
+/// valid even when a relaunch publishes a replacement. 0/null until the agent
+/// reports them (older agent ⇒ never: `getProcessInfo` then returns null, the
+/// pre-wp3 behavior).
+child_pid: std.atomic.Value(i64) = .init(0),
+tty_name_ptr: std.atomic.Value(?[*:0]const u8) = .init(null),
+
+/// The LIVE foreground pid pushed by the agent (`META{foreground_pid}`, wp3):
+/// the agent samples `tcgetpgrp` on its pty every second and pushes changes;
+/// the control reader signals the pane's ring and the IO thread copies the
+/// value here (see `drainRing`) for lock-free GUI reads. 0 = never reported
+/// (older agent / Windows ConPTY) — `getProcessInfo` then falls back to
+/// `child_pid`, which is also the correct answer for a fresh shell.
+fg_pid: std.atomic.Value(i64) = .init(0),
+
+/// WP-D3 fast, visually-correct re-attach. `restore_snapshot` is the app's OWN
+/// structured VT repaint of the pane's screen (palette + modes + styles +
+/// cursor + bounded scrollback) captured when the session was last persisted,
+/// and `attach_offset` is the absolute agent-stream byte offset that snapshot
+/// reflects. On ATTACH we (a) paint the snapshot directly for an instant,
+/// correctly-sized frame and (b) pass `attach_offset` as the ATTACH
+/// `last_byte_offset` so the agent replays ONLY the small gap produced while we
+/// were detached, instead of re-parsing its whole ~2MB retained ring (the slow,
+/// smeary path). Both null/0 for a normal OPEN or a legacy restore, which falls
+/// back to the full-ring replay. `restore_snapshot` is duped into `arena`.
+restore_snapshot: ?[]const u8 = null,
+
+/// The absolute agent-stream byte offset the terminal has applied. Seeded from
+/// the restore offset in `init`; advanced by `drainRing` (via
+/// `Termio.processOutputTracked`) as replayed/live bytes are fed to the parser.
+/// `appliedOffset()` = `attach_offset + applied_bytes`. Persisted on quit as the
+/// next restore's `last_byte_offset`.
+attach_offset: u64 = 0,
+applied_bytes: std.atomic.Value(u64) = .init(0),
 
 /// Configuration for a remote backend. Mirrors the subset of `Exec.Config` that
 /// makes sense for a remote pane: there is no env/shell-integration/resources-dir
@@ -140,7 +228,58 @@ pub const Config = struct {
     /// "terminal is not fully functional" on Windows). `xterm-256color` is
     /// understood everywhere and matches our VT emulation closely.
     term: []const u8 = "xterm-256color",
+
+    /// Environment variables for an open-new session (the `OPEN.env` allowlist).
+    /// Empty for cross-machine remote windows (env lives agent-side there);
+    /// populated for the LOCAL agent to forward GHOZTTY_*/IPC/user vars (T04a).
+    /// Borrowed from the caller; `init` dupes each pair into the backend arena.
+    env: []const protocol.Open.EnvPair = &.{},
+
+    /// Explicit shell argv to exec verbatim instead of the agent's synthesized
+    /// `<shell> -lic/-li` (§ local shell integration, T04c). Set ONLY by the
+    /// LOCAL-agent client for a plain interactive bash/nushell pane (the
+    /// argv-rewrite `shell_integration.setup()` returns); null everywhere else
+    /// (env-only shells, user-command panes, cross-machine windows). Borrowed
+    /// from the caller; `init` dupes each element into the backend arena.
+    argv: ?[]const []const u8 = null,
+
+    /// Pin this session against the agent's idle-TTL reaper (§7.1, T11). Set true
+    /// ONLY by the LOCAL-agent client for a persistent local pane the viewer's
+    /// session-layout manifest (T05) references, so it survives the viewer
+    /// quitting until a restore re-ATTACHes. False for cross-machine windows
+    /// (they keep the idle-TTL). Sent in `OPEN.pinned`; irrelevant on ATTACH
+    /// (the session was pinned at its original OPEN).
+    pinned: bool = false,
+
+    /// Relaunch policy for a dead-but-relaunchable ATTACH target (T12c). See the
+    /// `relaunch_policy` field doc. Defaults to `.auto`.
+    relaunch_policy: RelaunchPolicy = .auto,
+
+    /// True when `conn` dials the LOCAL agent (same machine, UDS) — the
+    /// session-persistence path. Gates surfacing the agent-reported tty from
+    /// `getProcessInfo(.tty_name)` (wp3): a cross-machine agent's tty names a
+    /// REMOTE device, and exposing it locally could false-match `+list --tty`
+    /// against an unrelated local tty. Set from the same
+    /// `local_shell_integration` signal as `pinned`.
+    local: bool = false,
+
+    /// WP-D3: the persisted structured VT screen snapshot to paint on ATTACH,
+    /// and the absolute byte offset it reflects (used as the ATTACH
+    /// `last_byte_offset`). Default null/0 → full-ring replay (pre-WP-D3
+    /// behavior). `restore_snapshot` is borrowed; `init` dupes it into the arena.
+    restore_snapshot: ?[]const u8 = null,
+    restore_offset: u64 = 0,
 };
+
+/// What a restored pane does when its ATTACH target comes back as a
+/// dead-but-relaunchable tombstone across an agent restart (§5.4, T12c). Mirrors
+/// `config.SessionRelaunch`; kept local so this backend need not import config.
+pub const RelaunchPolicy = enum { auto, prompt };
+
+/// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
+/// (`Surface.zig`) can build the forwarded env list without importing the wire
+/// protocol module directly.
+pub const EnvPair = protocol.Open.EnvPair;
 
 /// Initialize the remote backend state. Like `Exec.init`, this does NOT touch the
 /// wire — it only records what `threadEnter` will need. It does NOT open/attach a
@@ -155,6 +294,23 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
     const working_directory = if (cfg.working_directory) |w| try aa.dupe(u8, w) else null;
     const shell = if (cfg.shell) |s| try aa.dupe(u8, s) else null;
     const term = try aa.dupe(u8, cfg.term);
+    const restore_snapshot = if (cfg.restore_snapshot) |s| try aa.dupe(u8, s) else null;
+
+    // Dupe the forwarded env allowlist (keys and values) into our arena so it
+    // is stable for the backend's lifetime (the caller only lends it).
+    const env = try aa.alloc(protocol.Open.EnvPair, cfg.env.len);
+    for (cfg.env, 0..) |pair, i| env[i] = .{
+        .key = try aa.dupe(u8, pair.key),
+        .value = try aa.dupe(u8, pair.value),
+    };
+
+    // Dupe the explicit shell argv (if any) into our arena, element by element,
+    // so it is stable for the backend's lifetime (the caller only lends it).
+    const argv: ?[]const []const u8 = if (cfg.argv) |src| argv: {
+        const dst = try aa.alloc([]const u8, src.len);
+        for (src, 0..) |a, i| dst[i] = try aa.dupe(u8, a);
+        break :argv dst;
+    } else null;
 
     return .{
         .conn = cfg.conn,
@@ -163,8 +319,25 @@ pub fn init(alloc: Allocator, cfg: Config) !Remote {
         .working_directory = working_directory,
         .shell = shell,
         .term = term,
+        .env = env,
+        .argv = argv,
+        .pinned = cfg.pinned,
+        .local = cfg.local,
+        .relaunch_policy = cfg.relaunch_policy,
+        .restore_snapshot = restore_snapshot,
+        // The offset is only meaningful WITH a snapshot: attaching at offset>0
+        // without painting the prior content would leave the screen blank above
+        // the gap-fill. No snapshot ⇒ offset 0 ⇒ full-ring replay.
+        .attach_offset = if (restore_snapshot != null) cfg.restore_offset else 0,
         .arena = arena,
     };
+}
+
+/// The absolute agent-stream byte offset applied to the terminal so far (WP-D3):
+/// the offset we attached at plus everything drained since. Persisted on quit
+/// so the next re-attach replays only the gap. Lock-free.
+pub fn appliedOffset(self: *const Remote) u64 {
+    return self.attach_offset + self.applied_bytes.load(.monotonic);
 }
 
 pub fn deinit(self: *Remote) void {
@@ -249,6 +422,20 @@ pub fn threadEnter(
 ) !void {
     _ = alloc;
 
+    // Set true when the pane below came back via RELAUNCH (a dead-but-relaunchable
+    // session respawned across an agent restart) rather than a live attach/open —
+    // used after bring-up to print a "session restarted" divider (T12c).
+    var did_relaunch = false;
+    // Set true when the agent ALREADY replayed pre-restart scrollback + the restart
+    // divider from a ring disk snapshot (§5.4, T13) — the client then suppresses its
+    // own snapshot-less divider so there is exactly one marker.
+    var relaunch_replayed = false;
+    // The width/height the replayed scrollback was drawn at (0 = unknown). Used to
+    // replay at that width and reflow to the live pane so in-place prompt redraws
+    // don't smear (§5.4). Only meaningful with `relaunch_replayed`.
+    var replay_cols: u16 = 0;
+    var replay_rows: u16 = 0;
+
     // Open a new session or attach to an existing one to obtain our pane.
     const pane: *connection.Pane = if (self.session_id) |sid| pane: {
         // ATTACH: re-attach to an existing agent session (§3.3 / §7.3).
@@ -258,9 +445,12 @@ pub fn threadEnter(
             sid,
             rows,
             cols,
-            // We have no locally-applied byte offset yet (fresh attach from a new
-            // GUI process); the agent replays its retained ring from 0 (§7.3).
-            0,
+            // WP-D3: attach at the byte offset our persisted screen snapshot
+            // reflects (0 on a legacy/fresh attach) so the agent gap-fills ONLY
+            // the bytes produced while we were detached (§7.3) instead of
+            // re-parsing its whole retained ring. The snapshot painted below in
+            // `threadEnter` supplies everything at/below this offset.
+            self.attach_offset,
             false,
             &self.canceller,
         );
@@ -277,20 +467,84 @@ pub fn threadEnter(
         {
             outcome.deinit();
             log.info("attach: session attached elsewhere; reclaiming with force=true", .{});
-            outcome = try self.conn.attachChannelCancellable(sid, rows, cols, 0, true, &self.canceller);
+            outcome = try self.conn.attachChannelCancellable(sid, rows, cols, self.attach_offset, true, &self.canceller);
         }
         defer outcome.deinit();
-        const p = outcome.pane orelse {
-            // .dead / .not_found / attached_elsewhere(!force): nothing registered.
-            // The caller (4b) decides recovery tier (§7.4); for now this is fatal
-            // to the pane bring-up. (`defer outcome.deinit()` frees it once.)
+        if (outcome.pane) |p| break :pane p;
+
+        // No live pane. A DEAD-but-relaunchable tombstone means the AGENT itself
+        // restarted (a reboot or an agent upgrade) and materialized this session
+        // from its on-disk metadata (§5.4 reboot floor, T12b) — the recorded
+        // argv/cwd can bring the process back. With the `auto` policy (the
+        // default), RELAUNCH it in place on the SAME channel the dead ATTACHED
+        // arrived on and stream fresh output; `prompt` falls through to the
+        // exited overlay so the user decides.
+        if (outcome.status == .dead and outcome.relaunchable and
+            self.relaunch_policy == .auto)
+        {
+            const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
+            const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
+            const r = self.conn.relaunchChannelCancellable(
+                sid,
+                outcome.channel,
+                rows,
+                cols,
+                px_w,
+                px_h,
+                // Respawn fidelity (wp3): the agent's on-disk record has no
+                // env/TERM/argv, so send our live copies — the respawned shell
+                // keeps GHOZTTY_PANE_ID & co. and its shell integration.
+                .{ .env = self.env, .term = self.term, .argv = self.argv },
+                &self.canceller,
+            ) catch |err| {
+                log.warn("relaunch of dead session failed err={}", .{err});
+                return error.RemoteAttachFailed;
+            };
+            if (r.pane) |p| {
+                log.info(
+                    "relaunched dead session pid={} ok={} found={} replayed={}",
+                    .{ r.pid, r.ok, r.found, r.replayed },
+                );
+                did_relaunch = true;
+                relaunch_replayed = r.replayed;
+                replay_cols = r.replay_cols;
+                replay_rows = r.replay_rows;
+                break :pane p;
+            }
             log.warn(
-                "attach did not yield a live pane status={} attached_elsewhere={}",
-                .{ outcome.status, outcome.attached_elsewhere },
+                "relaunch did not yield a live pane ok={} found={}",
+                .{ r.ok, r.found },
             );
             return error.RemoteAttachFailed;
-        };
-        break :pane p;
+        }
+
+        // Same dead-but-relaunchable tombstone under the `prompt` policy (T12c2):
+        // do NOT respawn the process yet — the user must consent. Bring up a
+        // live-but-childless pane on the session's channel (ring pre-registered so
+        // the eventual respawn's first DATA is not dropped) and mark it awaiting;
+        // `threadEnter` prints a prompt below and `queueWrite` fires the deferred
+        // `RELAUNCH` on the first keystroke.
+        if (outcome.status == .dead and outcome.relaunchable and
+            self.relaunch_policy == .prompt)
+        {
+            const p = self.conn.prepareRelaunchPane(sid, outcome.channel) catch |err| {
+                log.warn("prepare relaunch pane failed err={}", .{err});
+                return error.RemoteAttachFailed;
+            };
+            self.awaiting_relaunch = true;
+            log.info("dead relaunchable session under prompt policy; awaiting user keystroke to relaunch", .{});
+            break :pane p;
+        }
+
+        // .dead(!relaunchable) / .not_found / attached_elsewhere(!force): nothing
+        // registered. The caller (4b) decides
+        // recovery tier (§7.4); for now this is fatal to the pane bring-up.
+        // (`defer outcome.deinit()` frees it once.)
+        log.warn(
+            "attach did not yield a live pane status={} relaunchable={} attached_elsewhere={}",
+            .{ outcome.status, outcome.relaunchable, outcome.attached_elsewhere },
+        );
+        return error.RemoteAttachFailed;
     } else pane: {
         // OPEN-new: start a brand-new remote session (§3.3 open-new).
         const open: protocol.Open = .{
@@ -298,6 +552,9 @@ pub fn threadEnter(
             .cwd = self.working_directory,
             .shell = self.shell,
             .term = self.term,
+            .env = self.env,
+            .argv = self.argv,
+            .pinned = self.pinned,
             .rows = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
             .cols = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
             .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
@@ -309,6 +566,21 @@ pub fn threadEnter(
     // §3.3) so the remote session survives for a later re-attach.
     errdefer self.conn.detachChannel(pane);
 
+    // Re-assert the winsize now that the pane is live. ATTACH carries only
+    // rows/cols (the agent zeroes the pixel geometry), and a forced-reclaim
+    // retry above re-applies the same possibly-stale seed — so send one
+    // authoritative RESIZE with the full current geometry. Harmless when it
+    // matches what ATTACH/OPEN already applied; it guarantees the agent PTY
+    // and the client grid agree at bring-up (WP-D2 restore: "big window,
+    // small content").
+    self.conn.sendResize(
+        pane,
+        @intCast(@min(self.grid_size.rows, std.math.maxInt(u16))),
+        @intCast(@min(self.grid_size.columns, std.math.maxInt(u16))),
+        @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
+        @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
+    ) catch |err| log.warn("post-attach RESIZE re-assert failed err={}", .{err});
+
     // Publish the resolved live session id on the STABLE backend so the GUI thread
     // can read it for an on-demand cwd query (§WP4). `pane.session_id` is stable
     // for the pane's lifetime; we publish the pointer + len with release ordering
@@ -318,6 +590,11 @@ pub fn threadEnter(
         self.live_session_id.store(sid.ptr, .release);
         self.live_session_id_len.store(sid.len, .release);
     }
+
+    // Publish the agent-reported pid/tty for `getProcessInfo` (wp3). All three
+    // bring-up paths land here: OPEN-new (OPENED), re-attach (ATTACHED), and
+    // auto-relaunch (RELAUNCHED) — each filled `pane.pid`/`pane.tty`.
+    self.publishProcessInfo(pane);
 
     // The async handle the demux thread notifies to wake THIS pane's IO thread.
     // It is registered on this thread's xev loop; its callback drains the ring.
@@ -351,9 +628,63 @@ pub fn threadEnter(
         ringReady,
     );
 
+    // A relaunched session (T12c) streams a FRESH shell. When the agent had a ring
+    // disk snapshot (T13) it already replayed pre-restart scrollback + the divider
+    // ahead of the fresh output (`relaunch_replayed`), so we print nothing — doing
+    // so would double the divider AND land it BEFORE the replayed scrollback (our
+    // inject is synchronous; the replay drains async from the channel ring). Only
+    // when there was NO snapshot (blank relaunch) do we print the divider ourselves,
+    // so the restart is visible rather than looking like a spontaneous new prompt.
+    if (did_relaunch and !relaunch_replayed) {
+        const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ io, divider });
+    } else if (self.awaiting_relaunch) {
+        // Prompt policy (T12c2): the pane is a dead tombstone with no child. Show
+        // an interactive affordance — `queueWrite` respawns it on the first key.
+        const prompt =
+            "\r\n\x1b[1m[ Session ended ]\x1b[0m \x1b[2m— press any key to relaunch\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ io, prompt });
+    }
+
+    // §5.4 smear fix: replay the reboot-scrollback at the width it was CAPTURED
+    // at, then reflow to the live pane. The raw byte stream is full of in-place
+    // prompt redraws (`\r` + erase-to-end) that only land cleanly at their
+    // original width; drained straight into a narrower grid, each redraw wraps and
+    // the erase can't reclaim the row it already pushed to scrollback, so the
+    // prompts stack (the visible "spam"). Rendered at the capture width every
+    // redraw self-erases to one prompt; the trailing reflow re-wraps that single
+    // logical line to the live width. Guarded to the relaunch-replayed case with a
+    // known capture width that actually differs from the live grid (0 = an older
+    // agent or a legacy GRS1 snapshot → fall back to today's live-width replay).
+    const live_cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
+    const live_rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
+    const reflow_replay = relaunch_replayed and replay_cols != 0 and replay_cols != live_cols;
+    if (reflow_replay) io.reflowLocalGrid(replay_cols, live_rows);
+
+    // WP-D3: paint the persisted structured snapshot for an instant, correctly
+    // sized frame BEFORE the agent's delta replay lands on top. Applied only on
+    // the normal live re-attach path (not a relaunch / awaiting-relaunch, which
+    // stream a fresh shell and print their own divider) and only when we
+    // attached at a real offset (`attach_offset > 0`), so the snapshot and the
+    // agent's `(attach_offset, S]` gap-fill meet exactly with no double-paint.
+    // This is our OWN clean VT repaint (palette+modes+styles+cursor+bounded
+    // scrollback), NOT the agent's raw in-place-redraw ring, so it reflows to
+    // the live width without smearing and parses in well under a frame.
+    if (!did_relaunch and !self.awaiting_relaunch and self.attach_offset > 0) {
+        if (self.restore_snapshot) |snap| {
+            if (snap.len > 0) @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
+        }
+    }
+
     // Drain once immediately in case DATA landed in the ring between registration
     // and arming the wait (the agent may stream a snapshot right after OPENED).
     drainRing(td);
+
+    // Reflow the just-replayed scrollback back to the live width. Leaves the grid
+    // at `self.size.grid()` so later real resizes stay consistent. Fresh child
+    // output (produced at the live width — the authoritative RESIZE above set the
+    // agent pty) then continues to land at the live width.
+    if (reflow_replay) io.reflowLocalGrid(live_cols, live_rows);
 }
 
 pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
@@ -363,17 +694,22 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     // §3.4 teardown order (use-after-free guard): this IS the consumer thread, and
     // by the time `threadExit` runs the xev loop has stopped, so no further
     // `drainRing`/`ringReady` will run — the consumer has stopped draining. We may
-    // now DETACH, which deregisters the channel under the connection's table lock
-    // (after which no in-flight demux `pushTo` can touch the ring) and frees the
-    // ring + pane. DETACH keeps the remote session alive for a later re-attach
-    // (NOT CLOSE — a `+close` would route through a different path, §3.3).
+    // now DETACH or CLOSE, which deregisters the channel under the connection's
+    // table lock (after which no in-flight demux `pushTo` can touch the ring) and
+    // frees the ring + pane. DETACH (the default) keeps the remote session alive
+    // for a later re-attach; CLOSE (user closed the pane/window — see
+    // `close_on_exit`) terminates the child and frees the agent session.
     // Un-publish the live session id BEFORE the pane (and its `session_id`
-    // backing) is freed by detach, so the GUI thread never reads a dangling
-    // slice. Clear the len first, then the ptr (mirror of the publish order).
+    // backing) is freed, so the GUI thread never reads a dangling slice. Clear
+    // the len first, then the ptr (mirror of the publish order).
     self.live_session_id_len.store(0, .release);
     self.live_session_id.store(null, .release);
 
-    self.conn.detachChannel(rd.pane);
+    if (self.close_on_exit.load(.acquire)) {
+        self.conn.closeChannel(rd.pane);
+    } else {
+        self.conn.detachChannel(rd.pane);
+    }
     rd.pane = undefined;
 }
 
@@ -417,6 +753,9 @@ pub fn resize(
     const td_live = td orelse return;
     assert(td_live.backend == .remote);
     const rd = &td_live.backend.remote;
+    log.debug("RESIZE send rows={} cols={} ch={x}", .{
+        grid_size.rows, grid_size.columns, rd.pane.id,
+    });
     rd.conn.sendResize(
         rd.pane,
         @intCast(@min(grid_size.rows, std.math.maxInt(u16))),
@@ -433,13 +772,23 @@ pub fn queueWrite(
     data: []const u8,
     linefeed: bool,
 ) !void {
-    _ = self;
     _ = alloc;
     assert(td.backend == .remote);
     const rd = &td.backend.remote;
 
     // If the agent reported the session exited we stop sending input.
     if (rd.exited) return;
+
+    // Prompt policy (T12c2): a dead-but-relaunchable pane is showing the
+    // "press any key to relaunch" affordance. The first keystroke consents to the
+    // respawn — fire the deferred RELAUNCH and swallow the triggering byte(s) (there
+    // is no child yet to receive them). An empty write (e.g. a focus report) is
+    // ignored so it does not spuriously relaunch.
+    if (self.awaiting_relaunch) {
+        if (data.len == 0) return;
+        self.performAwaitedRelaunch(td);
+        return;
+    }
 
     if (!linefeed) {
         // Fast path: enqueue the bytes as a single DATA frame (§3.4). The pane
@@ -471,6 +820,60 @@ pub fn queueWrite(
     }
 }
 
+/// Fire the deferred `RELAUNCH` for a `.prompt`-policy pane once the user consents
+/// with a keystroke (T12c2). Runs on the IO thread (from `queueWrite`), which parks
+/// on the RPC exactly like `threadEnter`'s `.auto` relaunch — `shutdown` cancels the
+/// canceller so a doomed relaunch under teardown wakes immediately. On success the
+/// pane's child is live and streaming on its already-armed ring; we print the
+/// "restarted" divider above the fresh output. On failure the pane stays childless
+/// and we print a note (the pane still tears down cleanly on threadExit).
+fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
+    assert(td.backend == .remote);
+    const rd = &td.backend.remote;
+
+    // Clear the flag first so a second keystroke racing in cannot double-fire.
+    self.awaiting_relaunch = false;
+
+    const rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
+    const cols: u16 = @intCast(@min(self.grid_size.columns, std.math.maxInt(u16)));
+    const px_w: u16 = @intCast(@min(self.screen_size.width, std.math.maxInt(u16)));
+    const px_h: u16 = @intCast(@min(self.screen_size.height, std.math.maxInt(u16)));
+
+    const res = rd.conn.sendRelaunchOnPane(
+        rd.pane,
+        rows,
+        cols,
+        px_w,
+        px_h,
+        // Respawn fidelity (wp3): same live env/TERM/argv as the auto path.
+        .{ .env = self.env, .term = self.term, .argv = self.argv },
+        &self.canceller,
+    ) catch |err| {
+        log.warn("awaited relaunch failed err={}", .{err});
+        const note = "\r\n\x1b[2m--- relaunch failed ---\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, note });
+        return;
+    };
+    if (!res.ok) {
+        log.warn("awaited relaunch not ok found={}", .{res.found});
+        const note = "\r\n\x1b[2m--- relaunch failed (session no longer available) ---\x1b[0m\r\n";
+        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, note });
+        return;
+    }
+
+    log.info("relaunched dead session on keystroke pid={}", .{res.pid});
+    // The respawned child has a fresh pid + pty; re-publish for `getProcessInfo`
+    // (`sendRelaunchOnPane` updated the pane's pid/tty on ok).
+    self.publishProcessInfo(rd.pane);
+    const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
+    @call(.always_inline, termio.Termio.processOutput, .{ rd.io, divider });
+
+    // The respawned session's DATA arrives on the ring (armed since threadEnter);
+    // drain once immediately in case it landed while we were parked on the RPC (the
+    // async notify is coalesced, so ringReady will also run, but this is prompt).
+    drainRing(td);
+}
+
 pub fn childExitedAbnormally(
     self: *Remote,
     gpa: Allocator,
@@ -493,12 +896,51 @@ pub fn childExitedAbnormally(
 }
 
 pub fn getProcessInfo(self: *Remote, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
-    _ = self;
-    // §3.3: "cached agent metadata or null". The agent reports pid/tty/foreground
-    // info via `META`/`OPENED` frames; until that metadata is plumbed through to
-    // the backend (a later increment) we return null, which all callers handle.
-    // TODO(wp3): return cached foreground pid from agent metadata.
-    return null;
+    // §3.3: cached agent metadata or null (wp3). The metadata is published by
+    // the IO thread from `OPENED`/`ATTACHED`/`RELAUNCHED` replies (see
+    // `publishProcessInfo`); an older agent never reports it and every caller
+    // handles the null. Callable from any thread (the GUI reads it for the IPC
+    // `+list` pid/tty fields).
+    return switch (info) {
+        // Prefer the LIVE foreground pid the agent samples via `tcgetpgrp`
+        // (pushed as `META{foreground_pid}` on change — full Exec parity);
+        // fall back to the child pid when the agent has not reported one
+        // (older agent, Windows ConPTY, or a fresh shell where they are the
+        // same process anyway).
+        .foreground_pid => pid: {
+            const fg = self.fg_pid.load(.acquire);
+            if (fg > 0) break :pid @intCast(fg);
+            const pid = self.child_pid.load(.acquire);
+            if (pid <= 0) break :pid null;
+            break :pid @intCast(pid);
+        },
+        .tty_name => tty: {
+            const ptr = self.tty_name_ptr.load(.acquire) orelse break :tty null;
+            break :tty std.mem.sliceTo(ptr, 0);
+        },
+    };
+}
+
+/// Publish the pane's agent-reported pid/tty for `getProcessInfo` (wp3). Runs on
+/// the IO thread (`threadEnter`, and again after an in-place relaunch replaces
+/// the child). The tty is duped into `arena` so previously-published pointers
+/// remain valid for racing readers; only LOCAL-agent connections publish it (a
+/// cross-machine tty names a remote device and could false-match local
+/// `+list --tty` lookups — see `Config.local`).
+fn publishProcessInfo(self: *Remote, pane: *const connection.Pane) void {
+    if (pane.pid > 0) self.child_pid.store(pane.pid, .release);
+
+    // A (re)published pane means a fresh child or a fresh viewer binding: any
+    // previously-cached live foreground pid is stale (the agent re-pushes the
+    // current one within a tick of the rebind — `bindLocked` resets its sampler
+    // baseline). Until then the child pid above is the correct fallback.
+    self.fg_pid.store(0, .release);
+
+    if (!self.local) return;
+    const tty = pane.tty orelse return;
+    if (tty.len == 0) return;
+    const copy = self.arena.allocator().dupeZ(u8, tty) catch return;
+    self.tty_name_ptr.store(copy.ptr, .release);
 }
 
 // -----------------------------------------------------------------------------
@@ -562,7 +1004,14 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
         const res = ch.pop(&buf);
         if (res.read == 0) break;
 
-        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, buf[0..res.read] });
+        // WP-D3: feed via the tracked path so `applied_bytes` advances under the
+        // renderer mutex in lockstep with the parse — a snapshot reader then sees
+        // a consistent (grid, offset) pair. This counts every byte fed to the
+        // terminal (the agent's `(attach_offset, S]` gap-fill and then live DATA),
+        // so `appliedOffset()` tracks the true absolute stream position.
+        @call(.always_inline, termio.Termio.processOutputTracked, .{
+            rd.io, buf[0..res.read], &rd.io.backend.remote.applied_bytes,
+        });
 
         if (res.send_resume) rd.conn.sendFlowResume(ch.id) catch |err|
             log.warn("error sending FLOW resume err={}", .{err});
@@ -586,6 +1035,13 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
     // re-arms and may wake again. This reuses `Surface.childExited`'s existing
     // close / `wait-after-command` logic, so a remote shell `exit` closes the
     // pane just like a local one — no special remote close path.
+    // Republish the agent's live foreground pid (wp3): the control reader
+    // signaled it on the ring (`signalForegroundPid`, which also woke us);
+    // copy it onto the STABLE Remote backend so GUI-thread `getProcessInfo`
+    // reads never touch the pane/ring (which die at threadExit).
+    const fg = ch.foregroundPid();
+    if (fg > 0) rd.io.backend.remote.fg_pid.store(fg, .release);
+
     if (!rd.exited and ch.isExited()) {
         rd.exited = true;
         // Coerce the agent's i64 exit code to the surface message's u32. A negative

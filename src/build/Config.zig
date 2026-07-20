@@ -40,6 +40,14 @@ exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 lib_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 
+/// The Google OAuth client id baked into the macOS app (Info.plist
+/// `GhosttyGoogleClientID`), used to build the browser authorize URL for the
+/// relay-brokered sign-in. Public (it appears in the browser URL); the
+/// confidential client secret lives only on the relay. Sourced from
+/// `-Dgoogle-client-id` (CI secret for releases) or, when unset, a git-ignored
+/// `macos/google-client-id.txt` for dev builds. Empty in a build with neither.
+google_client_id: []const u8 = "",
+
 /// Binary properties
 pie: bool = false,
 strip: bool = false,
@@ -256,6 +264,16 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
 
     //---------------------------------------------------------------
     // Ghostty Exe Properties
+
+    // Google OAuth client id baked into the macOS app (public; the confidential
+    // secret lives only on the relay). CI passes -Dgoogle-client-id from a
+    // secret; dev builds fall back to a git-ignored local file so a developer's
+    // build "just works" without exporting anything.
+    config.google_client_id = b.option(
+        []const u8,
+        "google-client-id",
+        "Google OAuth client id baked into the macOS app (Info.plist GhosttyGoogleClientID).",
+    ) orelse readDevGoogleClientID(b);
 
     const version_string = b.option(
         []const u8,
@@ -545,6 +563,19 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     }
 
     return config;
+}
+
+/// readDevGoogleClientID reads a git-ignored local file with the Google OAuth
+/// client id for dev builds, so `-Dgoogle-client-id` need not be passed by
+/// hand. Returns "" when the file is absent (a build with no client id —
+/// sign-in is simply unavailable until one is provided).
+fn readDevGoogleClientID(b: *std.Build) []const u8 {
+    const data = b.build_root.handle.readFileAlloc(
+        b.allocator,
+        "macos/google-client-id.txt",
+        4096,
+    ) catch return "";
+    return std.mem.trim(u8, data, &std.ascii.whitespace);
 }
 
 /// Configure the build options with our values.

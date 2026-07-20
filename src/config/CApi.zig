@@ -262,7 +262,7 @@ test "ghostty_config_trigger: default keybind" {
         try testing.expectEqual(@as(u32, ','), trigger.key.unicode);
     }
     {
-        const trigger = try config_trigger_(&cfg, "prompt_surface_title");
+        const trigger = try config_trigger_(&cfg, "prompt_window_title");
         try testing.expectEqual(.unicode, trigger.tag);
         try testing.expectEqual(@as(u32, 'r'), trigger.key.unicode);
         try testing.expect(trigger.mods.shift);
@@ -272,7 +272,7 @@ test "ghostty_config_trigger: default keybind" {
     {
         var cloned = try cfg.clone(testing.allocator);
         defer cloned.deinit();
-        const trigger = try config_trigger_(&cloned, "prompt_surface_title");
+        const trigger = try config_trigger_(&cloned, "prompt_window_title");
         try testing.expectEqual(.unicode, trigger.tag);
         try testing.expectEqual(@as(u32, 'r'), trigger.key.unicode);
     }

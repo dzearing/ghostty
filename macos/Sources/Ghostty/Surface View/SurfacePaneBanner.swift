@@ -1,4 +1,11 @@
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+private typealias OSFont = NSFont
+#elseif canImport(UIKit)
+import UIKit
+private typealias OSFont = UIFont
+#endif
 
 extension Ghostty {
     /// Sticky banner rendered above the terminal content of a pane. Set via
@@ -8,40 +15,719 @@ extension Ghostty {
         /// Raw banner source text in the banner markdown subset.
         let text: String
 
+        /// The pane's terminal background color, when known. The banner
+        /// renders as a shade off of it — lighter on dark backgrounds,
+        /// darker on light — so it reads as a distinct sticky region.
+        var background: Color?
+
+        /// Total display cap in lines. Table rows (including the header)
+        /// each count as one line; the separator row never renders.
+        static let maxDisplayLines = 10
+
+        /// Content height when collapsed: the first line fully visible
+        /// plus a sliver of the next, which the fade mask dissolves to
+        /// hint that there's more to view.
+        private static let collapsedContentHeight: CGFloat = 24
+
+        /// The width a single table cell grows to before its content wraps
+        /// to the next line. Long cell text word-wraps within this bound and
+        /// the row height expands to fit, rather than being clipped to one
+        /// line — while a very long cell stops widening the table absurdly,
+        /// matching how a normal markdown renderer lays out table cells.
+        private static let maxCellWidth: CGFloat = 360
+
+        /// Collapsed state is per-pane and ephemeral; it resets when the
+        /// banner is cleared and set again.
+        @State private var collapsed = false
+
         var body: some View {
-            HStack(spacing: 0) {
-                Text(BannerMarkdown.parse(text))
-                    .font(.system(size: 12))
-                    .lineLimit(6)
-                    .truncationMode(.tail)
-                    .fixedSize(horizontal: false, vertical: true)
+            let blocks = BannerMarkdown.parseBlocks(text, maxLines: Self.maxDisplayLines)
+            // Single-line banners have nothing to collapse; hide the
+            // chevron and ignore background clicks.
+            let collapsible = text.contains("\n")
+
+            HStack(alignment: .top, spacing: 8) {
+                // Paragraph-style gap between blocks (text runs, tables);
+                // lines within a text run stay tight since a run is a
+                // single Text.
+                let content = VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                        blockView(block)
+                    }
+                }
+                if collapsed {
+                    content
+                        .frame(height: Self.collapsedContentHeight, alignment: .topLeading)
+                        .clipped()
+                        .mask {
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .black, location: 0),
+                                    .init(color: .black, location: 0.55),
+                                    .init(color: .clear, location: 1),
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        }
+                } else {
+                    content
+                }
                 Spacer(minLength: 0)
+                if collapsible {
+                    Button(action: toggleCollapsed) {
+                        Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(collapsed ? "Expand banner" : "Collapse banner")
+                }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(.ultraThinMaterial)
+            .font(.system(size: 12))
+            .padding(12)
+            .background(backgroundStyle)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard collapsible else { return }
+                toggleCollapsed()
+            }
             .overlay(alignment: .bottom) {
                 Divider()
             }
         }
+
+        private func toggleCollapsed() {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                collapsed.toggle()
+            }
+        }
+
+        /// A shade deviated from the pane background (lighter when dark,
+        /// darker when light); falls back to the translucent material
+        /// when the background isn't known.
+        private var backgroundStyle: AnyShapeStyle {
+            guard let background else { return AnyShapeStyle(.ultraThinMaterial) }
+            let os = OSColor(background)
+            let shaded = os.isLightColor ? os.darken(by: 0.06) : os.lighten(by: 0.1)
+            return AnyShapeStyle(Color(shaded))
+        }
+
+        @ViewBuilder
+        private func blockView(_ block: BannerMarkdown.Block) -> some View {
+            switch block {
+            case .text(let str, let lineLimit):
+                Text(str)
+                    .lineLimit(lineLimit)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .list(let items):
+                // A two-column grid: markers share the first (auto-sized)
+                // column so every item's content left-aligns in the second,
+                // with table-like row spacing.
+                Grid(alignment: .leading, horizontalSpacing: 6, verticalSpacing: 4) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                        GridRow {
+                            listMarkerView(item.marker)
+                                // Center every marker in the shared gutter so a
+                                // bullet dot sits under the middle of a checkbox
+                                // rather than at the column's left edge.
+                                .gridColumnAlignment(.center)
+                            inlineRow(item.content)
+                        }
+                    }
+                }
+                // A checkbox-led first row draws a filled box whose hard top
+                // edge rises above where a text cap sits, so the 8pt block gap
+                // reads tighter above a checklist than above a table or a
+                // bullet/ordered list (whose first row leads with text and
+                // already clears the preceding line). Nudge a checkbox-led list
+                // down so its leading gap matches the paragraph→table gap. Only
+                // the checkbox case needs it; text-led lists already have parity.
+                .padding(.top, leadsWithCheckbox(items) ? 2 : 0)
+            case .heading(let str, let level):
+                Text(str)
+                    .font(.system(size: headingFontSize(level), weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .rule:
+                // A full-width separator between blocks. The 8pt block gap
+                // above and below gives it breathing room without extra padding.
+                Divider()
+            case .table(let table):
+                let showHeader = table.hasVisibleHeader
+                // Fixed per-column widths (content width, capped at
+                // `maxCellWidth`) let a long cell wrap at a known width while
+                // the Grid grows each row to its wrapped height — a greedy
+                // `frame(maxWidth:)` would instead fill the banner width, and
+                // a rigid `fixedSize` cell overflows its row instead of
+                // growing it.
+                let widths = columnWidths(for: table)
+                Grid(alignment: .topLeading, horizontalSpacing: 18, verticalSpacing: 4) {
+                    if showHeader {
+                        GridRow(alignment: .top) {
+                            ForEach(Array(table.header.enumerated()), id: \.offset) { col, cell in
+                                inlineRow(cell, width: widths[col], alignment: table.alignments[col])
+                                    .bold()
+                            }
+                        }
+                        // Unsized so the divider spans the header without
+                        // stretching the grid to the full banner width.
+                        Divider().gridCellUnsizedAxes(.horizontal)
+                    }
+                    ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
+                        GridRow(alignment: .top) {
+                            ForEach(Array(row.enumerated()), id: \.offset) { col, cell in
+                                inlineRow(cell, width: widths[col], alignment: table.alignments[col])
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Lay out one row of inline content — a table cell or a task-list
+        /// item — drawing each `.checkbox` segment as a native box (see
+        /// `CheckboxMark`) and each `.text` segment as styled text. Source
+        /// spaces provide the gaps, so a leading `[x] ` renders "☑ done" with
+        /// the box vertically centered.
+        ///
+        /// List items pass no `width` and stay a single non-wrapping line. A
+        /// table cell passes its column's fixed `width`: a plain cell collapses
+        /// its inline runs into one `Text` that word-wraps at that width (the
+        /// Grid then grows the row to the wrapped height, instead of clipping
+        /// to one line with an ellipsis), while a checkbox-bearing cell stays a
+        /// single line — mixed native boxes and text can't reflow across each
+        /// other, and a checkbox cell is a short status marker, like a list
+        /// checkbox row. `alignment` (from the column's `:` markers) drives the
+        /// content's horizontal placement and multi-line text alignment.
+        @ViewBuilder
+        private func inlineRow(
+            _ segments: [BannerMarkdown.Inline],
+            width: CGFloat? = nil,
+            alignment: BannerMarkdown.ColumnAlignment? = nil
+        ) -> some View {
+            let hasCheckbox = segments.contains {
+                if case .checkbox = $0 { return true }
+                return false
+            }
+            if let width, !hasCheckbox {
+                Text(BannerMarkdown.attributed(segments))
+                    .multilineTextAlignment(textAlignment(alignment))
+                    // Vertical-only fixed size: wrap at the fixed column width,
+                    // take whatever height the wrapped text needs.
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: width, alignment: frameAlignment(alignment))
+            } else {
+                let row = HStack(alignment: .center, spacing: 0) {
+                    ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                        switch seg {
+                        case .text(let str):
+                            Text(str).lineLimit(1)
+                        case .checkbox(let checked):
+                            CheckboxMark(checked: checked)
+                        }
+                    }
+                }
+                if let width {
+                    row.frame(width: width, alignment: frameAlignment(alignment))
+                } else {
+                    row
+                }
+            }
+        }
+
+        /// Whether a list block's first row leads with a checkbox marker. Such
+        /// a row draws a filled box whose top edge sits higher than a text cap,
+        /// so it needs extra leading padding to match the paragraph→table gap
+        /// (see the `.list` case). Bullet/ordered lists lead with text and don't.
+        private func leadsWithCheckbox(_ items: [BannerMarkdown.ListItem]) -> Bool {
+            if case .checkbox = items.first?.marker { return true }
+            return false
+        }
+
+        /// The leading marker of a list row, drawn in the shared gutter column.
+        @ViewBuilder
+        private func listMarkerView(_ marker: BannerMarkdown.ListMarker) -> some View {
+            switch marker {
+            case .checkbox(let checked):
+                CheckboxMark(checked: checked)
+            case .bullet:
+                // A drawn dot reads more evenly than the "•" glyph and sizes
+                // predictably relative to the 12pt box.
+                Circle()
+                    .fill(Color.secondary)
+                    .frame(width: 5, height: 5)
+            case .ordered(let number):
+                Text(verbatim: "\(number).")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+        }
+
+        /// A gentle scale over the 12pt banner base: headings read as
+        /// slightly larger, never oversized (h1 tops out at 17pt).
+        private func headingFontSize(_ level: Int) -> CGFloat {
+            switch level {
+            case 1: return 17
+            case 2: return 16
+            case 3: return 15
+            case 4: return 14
+            case 5: return 13
+            default: return 12
+            }
+        }
+
+        /// The fixed width of each table column: the widest cell's natural
+        /// (single-line) content width, capped at `maxCellWidth` so a very long
+        /// cell wraps rather than stretching the table. Widths are exact (not a
+        /// flexible max) so the Grid stays as wide as its content and grows each
+        /// row to the height its cells wrap to.
+        ///
+        /// Each run is measured at the weight/face it actually renders (bold
+        /// runs at bold, code runs monospaced); measuring bold body text as
+        /// regular under-sized the column and force-wrapped bold labels like
+        /// `**Prompt**` mid-word. Header cells render bold, so they force bold.
+        /// A cell whose content fits under the cap gets its exact width and so
+        /// never wraps at all; only content past the cap wraps, at word
+        /// boundaries (a lone word longer than the whole cap is the sole case
+        /// that can still break mid-character).
+        private func columnWidths(for table: BannerMarkdown.Table) -> [CGFloat] {
+            let columns = table.header.count
+            guard columns > 0 else { return [] }
+            var widths = [CGFloat](repeating: 0, count: columns)
+            if table.hasVisibleHeader {
+                for (col, cell) in table.header.enumerated() where col < columns {
+                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: true))
+                }
+            }
+            for row in table.rows {
+                for (col, cell) in row.enumerated() where col < columns {
+                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: false))
+                }
+            }
+            // A hair of slack absorbs sub-pixel measurement differences so a
+            // cell that fits on one line isn't wrapped by rounding.
+            return widths.map { min($0 + 2, Self.maxCellWidth) }
+        }
+
+        /// The unwrapped width a cell's inline content occupies: the measured
+        /// width of its text runs plus a fixed box per checkbox.
+        private static func cellNaturalWidth(
+            _ segments: [BannerMarkdown.Inline], forceBold: Bool
+        ) -> CGFloat {
+            segments.reduce(0) { acc, seg in
+                switch seg {
+                case .text(let a):
+                    return acc + attrWidth(a, forceBold: forceBold)
+                case .checkbox:
+                    return acc + CheckboxMark.side
+                }
+            }
+        }
+
+        /// Width of an attributed run sequence in the 12pt banner font, each run
+        /// measured at the weight/face it renders. Matches SwiftUI's
+        /// `.system(size: 12)`. `forceBold` measures every run bold (header row).
+        private static func attrWidth(_ a: AttributedString, forceBold: Bool) -> CGFloat {
+            var total: CGFloat = 0
+            for run in a.runs {
+                let s = String(a[run.range].characters)
+                if s.isEmpty { continue }
+                total += ceil((s as NSString).size(withAttributes: [.font: runFont(run, forceBold: forceBold)]).width)
+            }
+            return total
+        }
+
+        /// The font a run renders in: bold for a strongly-emphasized run (or a
+        /// force-bold header), monospaced for a code run. SwiftUI draws the bold
+        /// presentation intent at full bold weight, so measure it there.
+        private static func runFont(
+            _ run: AttributedString.Runs.Run, forceBold: Bool
+        ) -> OSFont {
+            let intent = run.inlinePresentationIntent ?? []
+            let bold = forceBold || intent.contains(.stronglyEmphasized)
+            return intent.contains(.code)
+                ? OSFont.monospacedSystemFont(ofSize: 12, weight: bold ? .bold : .regular)
+                : OSFont.systemFont(ofSize: 12, weight: bold ? .bold : .regular)
+        }
+
+        /// How the wrapped lines of a table cell align to each other.
+        private func textAlignment(
+            _ alignment: BannerMarkdown.ColumnAlignment?
+        ) -> TextAlignment {
+            switch alignment {
+            case .center: return .center
+            case .trailing: return .trailing
+            case .leading, nil: return .leading
+            }
+        }
+
+        /// How a cell's content sits within its fixed column-width frame.
+        private func frameAlignment(
+            _ alignment: BannerMarkdown.ColumnAlignment?
+        ) -> Alignment {
+            switch alignment {
+            case .center: return .center
+            case .trailing: return .trailing
+            case .leading, nil: return .leading
+            }
+        }
+
+        /// A task-list checkbox drawn as a small native control rather than a
+        /// glyph: a rounded (2pt-radius) box with a thin border, filled with a
+        /// tinted wash and a colored check when checked. Sized to sit inline
+        /// with the 12pt banner text like a character.
+        private struct CheckboxMark: View {
+            let checked: Bool
+
+            // `side` is read by the table column-width measurement.
+            static let side: CGFloat = 12
+            private static let radius: CGFloat = 2
+
+            var body: some View {
+                RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                    .fill(checked ? Color.green.opacity(0.16) : Color.clear)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                            .strokeBorder(
+                                checked ? Color.green.opacity(0.55)
+                                        : Color.secondary.opacity(0.55),
+                                lineWidth: 1
+                            )
+                    )
+                    .overlay {
+                        if checked {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(Color.green)
+                        }
+                    }
+                    .frame(width: Self.side, height: Self.side)
+                    .accessibilityLabel(checked ? "checked" : "unchecked")
+            }
+        }
     }
 
-    /// Minimal, well-specified inline markdown parser for pane banners.
+    /// Minimal, well-specified markdown parser for pane banners.
     ///
-    /// Supported syntax:
+    /// Supported inline syntax:
     ///   - `**bold**`
     ///   - `*italic*` or `_italic_`
     ///   - `__underline__` (differs from CommonMark, which treats `__` as bold)
     ///   - `` `code` `` (monospaced, contents not further parsed)
     ///   - `[text](url)` clickable links; the label may contain other styles
-    ///   - `\` escapes the next character (e.g. `\*`, `\[`, `\\`)
+    ///   - `\` escapes the next character (e.g. `\*`, `\[`, `\\`, `\|`)
+    ///
+    /// Block syntax: ATX headings and standard markdown pipe tables. A
+    /// heading is a line of 1–6 leading `#` followed by a space and text
+    /// (`# Title` … `###### Title`), rendered bold at a size that grows
+    /// modestly as the level shrinks. A table starts at a line
+    /// whose trimmed text begins with `|`, immediately followed by a
+    /// separator row (`|---|---|`, optionally with `:` alignment markers)
+    /// with the same column count; subsequent `|`-leading lines are body
+    /// rows. Cells support the full inline syntax; `\|` puts a literal pipe
+    /// in a cell. Ragged body rows are padded/truncated to the header width.
+    /// A header whose cells are all empty (e.g. `|  |  |`) is treated as a
+    /// layout scaffold for an aligned key/value grid: the view renders the
+    /// body rows only, with no header row and no divider above them.
     ///
     /// Styles nest (`**bold with [link](…)**`). Unterminated delimiters are
     /// rendered literally. We hand-roll this instead of using Foundation's
     /// markdown parser because the latter has no underline syntax.
     enum BannerMarkdown {
+        /// How a table column aligns, from `:` markers in the separator row.
+        enum ColumnAlignment: Equatable {
+            case leading
+            case center
+            case trailing
+        }
+
+        /// One piece of inline content. Text spans are pre-styled
+        /// `AttributedString`; a `checkbox` is a task-list mark that the view
+        /// draws natively (a rounded box with a colored check) rather than a
+        /// glyph, so it reads as a real control instead of plaintext.
+        enum Inline: Equatable {
+            case text(AttributedString)
+            case checkbox(Bool)
+        }
+
+        /// The leading marker of a list item, drawn in a shared gutter so all
+        /// item content aligns regardless of marker kind.
+        enum ListMarker: Equatable {
+            /// `[x]`/`[ ]` — a native checkbox (`- [x]` marker also lands here).
+            case checkbox(Bool)
+            /// `- ` or `* ` — an unordered bullet.
+            case bullet
+            /// `1.`, `2.`, … — an ordered item; the associated value is the
+            /// parsed number, rendered verbatim (source numbering is kept).
+            case ordered(Int)
+        }
+
+        struct ListItem: Equatable {
+            var marker: ListMarker
+            var content: [Inline]
+        }
+
+        struct Table: Equatable {
+            var header: [[Inline]]
+            /// One entry per column; nil when the separator had no `:` markers.
+            var alignments: [ColumnAlignment?]
+            var rows: [[[Inline]]]
+
+            /// True when at least one header cell carries visible content. An
+            /// all-empty header (e.g. `|  |  |`) is a layout scaffold — a
+            /// caller wanting an aligned key/value grid with no column
+            /// titles — so the view skips rendering that blank row.
+            var hasVisibleHeader: Bool {
+                header.contains { cell in cell.contains { seg in
+                    if case .text(let a) = seg { return !a.characters.isEmpty }
+                    return true // a checkbox is visible content
+                } }
+            }
+        }
+
+        enum Block: Equatable {
+            /// `lineLimit` is the display-line budget the view should allow
+            /// this block (source lines were already truncated to the cap;
+            /// the extra headroom lets long lines soft-wrap like they always
+            /// have without the total exceeding the banner cap).
+            case text(AttributedString, lineLimit: Int)
+            /// A run of consecutive list lines — bullets (`- `/`* `), ordered
+            /// items (`1.`), and task-list checkboxes (`[x]`/`[ ]`, optionally
+            /// after a `- `/`* ` marker), in any mix. Rendered as evenly spaced
+            /// rows whose markers share a gutter so every item's content aligns,
+            /// separate from `.text` so lists get table-like vertical rhythm
+            /// instead of tight line spacing.
+            case list([ListItem])
+            /// An ATX heading (`# text` … `###### text`); `level` is 1–6.
+            /// Rendered bold at a size that grows as the level shrinks.
+            case heading(AttributedString, level: Int)
+            case table(Table)
+            /// A thematic break (`---`, `***`, or `___`, 3+ of one character
+            /// on a line of its own). Rendered as a horizontal divider that
+            /// separates the blocks above and below it.
+            case rule
+        }
+
         static func parse(_ source: String) -> AttributedString {
             parseInline(Substring(source))
+        }
+
+        /// Flatten inline segments to a single `AttributedString`, rendering a
+        /// checkbox as its box glyph (`☑`/`☐`). Used for the plain-text
+        /// fallback (a checkbox mid-paragraph), heading text, and tests.
+        static func attributed(_ segments: [Inline]) -> AttributedString {
+            var result = AttributedString()
+            for seg in segments {
+                switch seg {
+                case .text(let a): result.append(a)
+                case .checkbox(let checked):
+                    result.append(AttributedString(checked ? "\u{2611}" : "\u{2610}"))
+                }
+            }
+            return result
+        }
+
+        /// Parse banner source into displayable blocks, truncated to at most
+        /// `maxLines` display lines (table rows count as one line each).
+        static func parseBlocks(_ source: String, maxLines: Int = Int.max) -> [Block] {
+            let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+            var blocks: [Block] = []
+            var textLines: [Substring] = []
+            var remaining = maxLines
+
+            func flushText() {
+                defer { textLines = [] }
+                // Each source line becomes its own text block so consecutive
+                // lines get the same 8pt inter-block gap as everything else
+                // (a run used to be a single multi-line Text, which spaced hard
+                // newlines with tight line spacing instead of the block gap).
+                // A long line still soft-wraps tight within its own block.
+                // Blank separator lines are dropped — the block gap now supplies
+                // the space they used to add.
+                for line in textLines {
+                    guard remaining > 0 else { return }
+                    if line.allSatisfy(\.isWhitespace) { continue }
+                    let limit = remaining
+                    remaining -= 1
+                    blocks.append(.text(parseInline(line), lineLimit: limit))
+                }
+            }
+
+            var i = 0
+            while i < lines.count {
+                if let (level, text) = headingLine(lines[i]) {
+                    flushText()
+                    if remaining > 0 {
+                        remaining -= 1
+                        blocks.append(.heading(parseInline(text), level: level))
+                    }
+                    i += 1
+                    continue
+                }
+                if isThematicBreak(lines[i]) {
+                    flushText()
+                    if remaining > 0 {
+                        remaining -= 1
+                        blocks.append(.rule)
+                    }
+                    i += 1
+                    continue
+                }
+                if isTableRow(lines[i]), i + 1 < lines.count, isTableRow(lines[i + 1]) {
+                    let headerCells = splitCells(lines[i])
+                    let sepCells = splitCells(lines[i + 1])
+                    if !headerCells.isEmpty,
+                       sepCells.count == headerCells.count,
+                       sepCells.allSatisfy(isSeparatorCell) {
+                        flushText()
+
+                        var rawRows: [[String]] = []
+                        var j = i + 2
+                        while j < lines.count, isTableRow(lines[j]) {
+                            rawRows.append(splitCells(lines[j]))
+                            j += 1
+                        }
+
+                        if remaining > 0 {
+                            let keptRows = rawRows.prefix(max(0, remaining - 1))
+                            remaining -= 1 + keptRows.count
+                            let columns = headerCells.count
+                            blocks.append(.table(Table(
+                                header: headerCells.map { segments(Substring($0)) },
+                                alignments: sepCells.map(columnAlignment),
+                                rows: keptRows.map { row in
+                                    (0..<columns).map { col in
+                                        col < row.count
+                                            ? segments(Substring(row[col]))
+                                            : []
+                                    }
+                                }
+                            )))
+                        }
+
+                        i = j
+                        continue
+                    }
+                }
+
+                // A run of list lines (bullets, ordered items, checkboxes)
+                // becomes its own block so the items get table-like vertical
+                // rhythm and a shared marker gutter, instead of tight text
+                // line spacing.
+                if listItem(lines[i]) != nil {
+                    flushText()
+                    var items: [ListItem] = []
+                    while i < lines.count, let item = listItem(lines[i]) {
+                        if remaining > 0 {
+                            items.append(ListItem(
+                                marker: item.marker,
+                                content: segments(item.content)
+                            ))
+                            remaining -= 1
+                        }
+                        i += 1
+                    }
+                    if !items.isEmpty { blocks.append(.list(items)) }
+                    continue
+                }
+
+                textLines.append(lines[i])
+                i += 1
+            }
+            flushText()
+            return blocks
+        }
+
+        /// A line participates in a table when its trimmed text starts with
+        /// an (unescaped) pipe.
+        private static func isTableRow(_ line: Substring) -> Bool {
+            line.trimmingCharacters(in: .whitespaces).hasPrefix("|")
+        }
+
+        /// A thematic break: a line of 3+ of the same `-`, `*`, or `_` with
+        /// nothing else but optional spaces (`---`, `***`, `___`, `- - -`).
+        /// Distinct from a `- `/`* ` bullet (those have non-marker content)
+        /// and from `**bold**` on its own line (mixed characters).
+        private static func isThematicBreak(_ line: Substring) -> Bool {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let first = trimmed.first,
+                  first == "-" || first == "*" || first == "_" else { return false }
+            let marks = trimmed.filter { $0 != " " }
+            return marks.count >= 3 && marks.allSatisfy { $0 == first }
+        }
+
+        /// An ATX heading: 1–6 leading `#`, a required space, then non-empty
+        /// text (e.g. `## Title`). Returns the level and heading text, or nil.
+        private static func headingLine(_ line: Substring) -> (level: Int, text: Substring)? {
+            let trimmed = line.drop { $0 == " " }
+            var level = 0
+            var idx = trimmed.startIndex
+            while idx < trimmed.endIndex, trimmed[idx] == "#", level < 6 {
+                level += 1
+                idx = trimmed.index(after: idx)
+            }
+            guard level > 0, idx < trimmed.endIndex, trimmed[idx] == " " else { return nil }
+            let text = trimmed[trimmed.index(after: idx)...].drop { $0 == " " }
+            guard !text.isEmpty else { return nil }
+            return (level, text)
+        }
+
+        /// Split a table row into trimmed cell texts on unescaped `|`,
+        /// dropping the empty segments produced by the structural leading
+        /// and trailing pipes.
+        private static func splitCells(_ line: Substring) -> [String] {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            var cells: [String] = []
+            var current = ""
+            var i = trimmed.startIndex
+            while i < trimmed.endIndex {
+                let c = trimmed[i]
+                if c == "\\" {
+                    let next = trimmed.index(after: i)
+                    if next < trimmed.endIndex {
+                        current.append(c)
+                        current.append(trimmed[next])
+                        i = trimmed.index(after: next)
+                        continue
+                    }
+                }
+                if c == "|" {
+                    cells.append(current)
+                    current = ""
+                } else {
+                    current.append(c)
+                }
+                i = trimmed.index(after: i)
+            }
+            cells.append(current)
+            if let first = cells.first, first.trimmingCharacters(in: .whitespaces).isEmpty {
+                cells.removeFirst()
+            }
+            if let last = cells.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
+                cells.removeLast()
+            }
+            return cells.map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+
+        /// `---`, `:---`, `---:`, or `:---:` (at least one dash).
+        private static func isSeparatorCell(_ cell: String) -> Bool {
+            var body = Substring(cell)
+            if body.hasPrefix(":") { body.removeFirst() }
+            if body.hasSuffix(":") { body.removeLast() }
+            return !body.isEmpty && body.allSatisfy { $0 == "-" }
+        }
+
+        private static func columnAlignment(_ cell: String) -> ColumnAlignment? {
+            let leading = cell.hasPrefix(":")
+            let trailing = cell.hasSuffix(":") && cell.count > 1
+            if leading && trailing { return .center }
+            if trailing { return .trailing }
+            if leading { return .leading }
+            return nil
         }
 
         /// Delimiters checked in order: two-character ones must win over
@@ -54,15 +740,35 @@ extension Ghostty {
             ("`", .code),
         ]
 
+        /// Parse inline markdown into a flat `AttributedString`, rendering any
+        /// checkbox as its box glyph. Used for nested contexts (link labels,
+        /// styled spans), heading text, and the wrapping-text fallback.
         private static func parseInline(_ s: Substring) -> AttributedString {
-            var result = AttributedString()
+            attributed(segments(s))
+        }
+
+        /// Parse inline markdown into ordered segments, emitting a native
+        /// `.checkbox` for each top-level `[x]`/`[X]`/`[ ]` token (optionally
+        /// after a leading `- `/`* ` marker) and `.text` for everything else.
+        /// A checkbox nested inside a link/bold/italic span stays a glyph (via
+        /// the `parseInline` recursion) — native boxes are a top-level affair.
+        static func segments(_ s: Substring) -> [Inline] {
+            var out: [Inline] = []
+            var run = AttributedString()
             var literal = ""
             var i = s.startIndex
 
             func flushLiteral() {
                 guard !literal.isEmpty else { return }
-                result.append(AttributedString(literal))
+                run.append(AttributedString(literal))
                 literal = ""
+            }
+            func flushRun() {
+                flushLiteral()
+                if !run.characters.isEmpty {
+                    out.append(.text(run))
+                    run = AttributedString()
+                }
             }
 
             while i < s.endIndex {
@@ -78,6 +784,28 @@ extension Ghostty {
                     }
                 }
 
+                // Task-list list marker: a leading "- "/"* " directly before a
+                // checkbox token is consumed so "- [x] done" renders "☑ done"
+                // instead of leaving a stray dash. Only fires at the very start
+                // and only when a checkbox follows.
+                if i == s.startIndex,
+                   s.hasPrefix("- ") || s.hasPrefix("* "),
+                   checkboxToken(in: s, at: s.index(i, offsetBy: 2)) != nil {
+                    i = s.index(i, offsetBy: 2)
+                    continue
+                }
+
+                // Task-list checkbox → native segment. Runs before the link
+                // parser so a bare [x] isn't swallowed by the [text](url) path;
+                // a [x](url) token (checkbox NOT matched because "(" follows)
+                // falls through and stays a link.
+                if let (checked, after) = checkboxToken(in: s, at: i) {
+                    flushRun()
+                    out.append(.checkbox(checked))
+                    i = after
+                    continue
+                }
+
                 // Links: [text](url)
                 if c == "[",
                    let closeBracket = find("]", in: s, from: s.index(after: i)),
@@ -90,7 +818,7 @@ extension Ghostty {
                     var linked = parseInline(s[s.index(after: i)..<closeBracket])
                     linked.link = url
                     linked.underlineStyle = Text.LineStyle.single
-                    result.append(linked)
+                    run.append(linked)
                     i = s.index(after: closeParen)
                     continue
                 }
@@ -110,7 +838,7 @@ extension Ghostty {
                         } else {
                             styled.underlineStyle = Text.LineStyle.single
                         }
-                        result.append(styled)
+                        run.append(styled)
                         i = s.index(close, offsetBy: delim.count)
                         continue
                     }
@@ -120,8 +848,75 @@ extension Ghostty {
                 i = s.index(after: i)
             }
 
-            flushLiteral()
-            return result
+            flushRun()
+            return out
+        }
+
+        /// Classify `line` as a list item, returning its marker and the content
+        /// that follows (leading spaces stripped so item content aligns in the
+        /// gutter). Returns nil when the line isn't a list item.
+        ///
+        /// Recognized: `- `/`* ` bullets, `1.`/`2.`… ordered items, and
+        /// `[x]`/`[X]`/`[ ]` checkboxes (a `- `/`* ` before a checkbox is the
+        /// checkbox's marker, not a separate bullet).
+        static func listItem(_ line: Substring) -> (marker: ListMarker, content: Substring)? {
+            let trimmed = line.drop { $0 == " " }
+            guard !trimmed.isEmpty else { return nil }
+
+            // A leading "- "/"* " may introduce a checkbox or a plain bullet.
+            var afterDash = trimmed
+            let hadDash = trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ")
+            if hadDash { afterDash = trimmed.dropFirst(2) }
+
+            if let (checked, after) = checkboxToken(in: afterDash, at: afterDash.startIndex) {
+                return (.checkbox(checked), afterDash[after...].drop { $0 == " " })
+            }
+            if hadDash {
+                return (.bullet, afterDash.drop { $0 == " " })
+            }
+            if let (number, rest) = orderedPrefix(trimmed) {
+                return (.ordered(number), rest.drop { $0 == " " })
+            }
+            return nil
+        }
+
+        /// Match a leading `<digits>. ` (period then a required space, so a
+        /// decimal like `1.5` isn't a list). Returns the number and the rest.
+        private static func orderedPrefix(_ s: Substring) -> (number: Int, rest: Substring)? {
+            var idx = s.startIndex
+            while idx < s.endIndex, s[idx] >= "0", s[idx] <= "9" {
+                idx = s.index(after: idx)
+            }
+            guard idx > s.startIndex, let number = Int(s[s.startIndex..<idx]) else { return nil }
+            guard idx < s.endIndex, s[idx] == "." else { return nil }
+            let afterDot = s.index(after: idx)
+            guard afterDot < s.endIndex, s[afterDot] == " " else { return nil }
+            return (number, s[afterDot...])
+        }
+
+        /// If a task-list checkbox token (`[x]`, `[X]`, or `[ ]`) begins at
+        /// `at`, return whether it's checked and the index just past the token.
+        /// Returns nil when the token isn't a checkbox, or when a `(` follows
+        /// the closing `]` (then it's a `[text](url)` link, not a checkbox).
+        private static func checkboxToken(
+            in s: Substring,
+            at index: Substring.Index
+        ) -> (checked: Bool, after: Substring.Index)? {
+            guard index < s.endIndex, s[index] == "[" else { return nil }
+            let i1 = s.index(after: index)
+            guard i1 < s.endIndex else { return nil }
+            let i2 = s.index(after: i1)
+            guard i2 < s.endIndex, s[i2] == "]" else { return nil }
+            let checked: Bool
+            switch s[i1] {
+            case "x", "X": checked = true
+            case " ": checked = false
+            default: return nil
+            }
+            let after = s.index(after: i2)
+            // A trailing "(" means this is link text, e.g. [x](https://…).
+            if after < s.endIndex, s[after] == "(" { return nil }
+            return (checked, after)
         }
 
         /// Find the next unescaped occurrence of `needle` at or after `from`.

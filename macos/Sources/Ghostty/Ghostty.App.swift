@@ -1212,7 +1212,7 @@ extension Ghostty {
                     // Check if a split actually exists in the target direction before
                     // returning true. This ensures performable keybinds only consume
                     // the key event when we actually perform navigation.
-                    let focusDirection: SplitTree<Ghostty.SurfaceView>.FocusDirection = splitDirection.toSplitTreeFocusDirection()
+                    let focusDirection: SplitTree<PaneView>.FocusDirection = splitDirection.toSplitTreeFocusDirection()
                     guard controller.surfaceTree.focusTarget(for: focusDirection, from: targetNode) != nil else {
                         return false
                     }
@@ -1254,7 +1254,7 @@ extension Ghostty {
 
                     guard let targetNode = controller.surfaceTree.root?.node(view: surfaceView) else { return false }
 
-                    let focusDirection: SplitTree<Ghostty.SurfaceView>.FocusDirection = splitDirection.toSplitTreeFocusDirection()
+                    let focusDirection: SplitTree<PaneView>.FocusDirection = splitDirection.toSplitTreeFocusDirection()
                     guard controller.surfaceTree.focusTarget(for: focusDirection, from: targetNode) != nil else {
                         return false
                     }
@@ -1815,6 +1815,29 @@ extension Ghostty {
                           let controller = window.windowController as? BaseTerminalController
                     else { return false }
                     controller.promptTabTitle()
+                    return true
+
+                default:
+                    assertionFailure()
+                    return false
+                }
+
+            case .window:
+                switch target.tag {
+                case GHOSTTY_TARGET_APP:
+                    guard let window = NSApp.mainWindow ?? NSApp.keyWindow,
+                          let controller = window.windowController as? BaseTerminalController
+                    else { return false }
+                    controller.promptWindowTitle()
+                    return true
+
+                case GHOSTTY_TARGET_SURFACE:
+                    guard let surface = target.target.surface else { return false }
+                    guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                    guard let window = surfaceView.window,
+                          let controller = window.windowController as? BaseTerminalController
+                    else { return false }
+                    controller.promptWindowTitle()
                     return true
 
                 default:

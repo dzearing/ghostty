@@ -658,10 +658,11 @@ pub const MouseVisibility = enum(c_int) {
     }
 };
 
-/// Whether to prompt for the surface title or tab title.
+/// Whether to prompt for the surface title, tab title, or window title.
 pub const PromptTitle = enum(c_int) {
     surface,
     tab,
+    window,
 
     test "ghostty.h PromptTitle" {
         try lib.checkGhosttyHEnum(PromptTitle, "GHOSTTY_PROMPT_TITLE_");

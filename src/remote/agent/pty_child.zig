@@ -45,6 +45,7 @@ const Allocator = std.mem.Allocator;
 
 const Pty = @import("../../pty.zig").Pty;
 const CommandCore = @import("../../CommandCore.zig");
+const internal_os = @import("../../os/main.zig");
 const protocol = @import("../protocol.zig");
 const session = @import("session.zig");
 const server = @import("server.zig");
@@ -254,6 +255,7 @@ pub const PtyChild = struct {
         .tryWait = tryWaitFn,
         .terminate = terminateFn,
         .queryCwd = queryCwdFn,
+        .queryForegroundPid = queryForegroundPidFn,
     };
 
     // --- attach: publish channel + sink, start the reader ---------------------
@@ -464,6 +466,40 @@ pub const PtyChild = struct {
             .windows => queryCwdWindows(self.pid, alloc),
             else => null,
         };
+    }
+
+    /// The pty's CURRENT foreground pid: `tcgetpgrp` on the master fd (the same
+    /// call local Exec's `PosixPty.getProcessInfo(.foreground_pid)` makes), so a
+    /// viewer's `getProcessInfo` tracks the running program live (wp3). Windows:
+    /// null — ConPTY has no foreground process group, matching `WindowsPty`.
+    /// A single non-blocking syscall, per the vtable contract (called under the
+    /// store mutex so the child can't be freed mid-query).
+    fn queryForegroundPidFn(ctx: *anyopaque) ?i64 {
+        if (is_windows) return null;
+        const self: *PtyChild = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        const dead = self.reaped or self.closed;
+        self.mutex.unlock();
+        if (dead) return null;
+
+        // Same per-OS arms as `PosixPty.getProcessInfo(.foreground_pid)`.
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                var pgrp: i32 = undefined;
+                const rc = linux.tcgetpgrp(self.pty.master, &pgrp);
+                switch (linux.E.init(rc)) {
+                    .SUCCESS => return @intCast(pgrp),
+                    else => return null,
+                }
+            },
+            else => {
+                const c = @import("pty-c");
+                const rc = c.tcgetpgrp(self.pty.master);
+                if (rc < 0) return null;
+                return @intCast(rc);
+            },
+        }
     }
 
     // --- terminate: SIGKILL + reap + join + free -------------------------------
@@ -697,6 +733,29 @@ fn queryCwdWindows(handle: posix.pid_t, alloc: Allocator) ?[]u8 {
 // PtySpawner — turns an OPEN into a pty-backed child (the real `server.Spawner`)
 // -----------------------------------------------------------------------------
 
+/// Pure default-shell selection, extracted from `PtySpawner.spawn` so the
+/// precedence is unit-testable without a real pty spawn (see the test below):
+///   - POSIX:   open_shell → env_shell ($SHELL) → login_shell (getpwuid) → /bin/sh
+///   - Windows: open_shell → env_comspec (%COMSPEC%) → C:\Windows\System32\cmd.exe
+/// Empty candidates are treated as absent. `login_shell` is the launchd-safe
+/// fallback that fixes Bug 2: a LaunchAgent inherits no $SHELL, so without it a
+/// bare `$SHELL → /bin/sh` chain silently drops sessions into /bin/sh.
+fn resolveShellPath(
+    open_shell: ?[]const u8,
+    env_shell: ?[]const u8,
+    env_comspec: ?[]const u8,
+    login_shell: ?[]const u8,
+) []const u8 {
+    if (open_shell) |s| if (s.len > 0) return s;
+    if (is_windows) {
+        if (env_comspec) |s| if (s.len > 0) return s;
+        return "C:\\Windows\\System32\\cmd.exe";
+    }
+    if (env_shell) |s| if (s.len > 0) return s;
+    if (login_shell) |s| if (s.len > 0) return s;
+    return "/bin/sh";
+}
+
 /// Spawns a real pty-backed child per OPEN. The default shell is `$SHELL` (falling
 /// back to `/bin/sh`), invoked login+interactive (`-lic <command>`) when the OPEN
 /// carries a `command`, else just login+interactive (`-li`) for a plain shell —
@@ -737,7 +796,12 @@ pub const PtySpawner = struct {
         // is the integer pid; on Windows it is the process HANDLE (a pointer), so we
         // surface its integer value (the OS process id is not separately tracked).
         const pid_i64: i64 = if (is_windows) @intCast(@intFromPtr(pc.pid)) else @intCast(pc.pid);
-        return .{ .child = pc.child(), .pid = pid_i64 };
+        // The PTY slave path (wp3): `Pty.getProcessInfo` resolves it per-OS
+        // (macOS TIOCPTYGNAME / Linux ptsname_r, cached in the pty struct inside
+        // the heap-owned PtyChild — stable until terminate) and returns null on
+        // Windows (ConPTY has no tty name), so no comptime gate is needed here.
+        const tty: ?[]const u8 = pc.pty.getProcessInfo(.tty_name);
+        return .{ .child = pc.child(), .pid = pid_i64, .tty = tty };
     }
 
     /// Matches `server.Spawner.spawnDetachedFn`: launch a detached process for
@@ -764,27 +828,70 @@ pub const PtySpawner = struct {
         });
         errdefer pty.deinit();
 
+        // Build THIS child's environment: a clone of the agent's inherited env
+        // (`self.env`) plus per-session overrides. We clone rather than mutate
+        // `self.env` so one child's forwarded vars (e.g. GHOZTTY_WINDOW_NAME)
+        // never leak into the NEXT child's environment. The clone only needs to
+        // outlive the synchronous `cmd.start()` below (fork+exec copies the
+        // environment into the child), so it is freed on return from spawnChild.
+        var child_env = try cloneEnvMap(self.alloc, self.env);
+        defer child_env.deinit();
+
         // Set TERM for the child. COLORTERM signals 24-bit color support to
         // apps that don't trust TERM alone (the emulating end is Ghostty, which
         // renders truecolor regardless of the advertised TERM).
-        try self.env.put("TERM", open.term);
-        try self.env.put("COLORTERM", "truecolor");
+        try child_env.put("TERM", open.term);
+        try child_env.put("COLORTERM", "truecolor");
+
+        // Apply the forwarded env allowlist (OPEN.env, T04a). For the LOCAL
+        // agent these carry GHOZTTY_WINDOW_NAME/GHOZTTY_PANE_NAME + IPC/user
+        // vars so an agent-backed pane reaches env parity with an exec pane.
+        // Applied AFTER TERM/COLORTERM to mirror exec's env-override-wins order
+        // (empty keys are ignored — a malformed pair must not create a bare
+        // "=value" entry). `open.env` is empty for a cross-machine window.
+        for (open.env) |pair| {
+            if (pair.key.len == 0) continue;
+            try child_env.put(pair.key, pair.value);
+        }
 
         const pc = try self.alloc.create(PtyChild);
         errdefer self.alloc.destroy(pc);
 
-        // Resolve the default shell, per-OS:
-        //   - POSIX: OPEN.shell → $SHELL → /bin/sh.
-        //   - Windows: OPEN.shell → %COMSPEC% → C:\Windows\System32\cmd.exe.
-        const shell_path = blk: {
-            if (open.shell) |s| if (s.len > 0) break :blk s;
-            if (is_windows) {
-                if (self.env.get("COMSPEC")) |s| if (s.len > 0) break :blk s;
-                break :blk "C:\\Windows\\System32\\cmd.exe";
+        // POSIX only: the user's LOGIN shell (getpwuid `pw_shell`) is the correct
+        // default when no OPEN.shell and no $SHELL is present — NOT /bin/sh. The
+        // local agent runs as the user, but as a launchd LaunchAgent it inherits
+        // NO $SHELL in its environment, so a bare `$SHELL → /bin/sh` fallback
+        // silently drops interactive sessions (a plain split/tab, or a `--command`
+        // pane after its command exits) into `/bin/sh` instead of the user's real
+        // shell (e.g. zsh). Resolve it env-independently via `getpwuid` so the
+        // right shell is used no matter how the agent was launched. Owned; freed
+        // at function end. (Cross-machine agents forward an explicit OPEN.shell, so
+        // this only ever seeds the LOCAL agent's own default.)
+        var login_shell: ?[:0]const u8 = null;
+        defer if (login_shell) |s| self.alloc.free(s);
+        if (!is_windows and
+            (open.shell == null or open.shell.?.len == 0) and
+            (self.env.get("SHELL") == null or self.env.get("SHELL").?.len == 0))
+        {
+            if (internal_os.passwd.get(self.alloc)) |entry| {
+                login_shell = entry.shell;
+                // We only want the shell; free the other owned fields.
+                if (entry.home) |h| self.alloc.free(h);
+                if (entry.name) |n| self.alloc.free(n);
+            } else |err| {
+                log.warn("failed to resolve login shell, falling back: {}", .{err});
             }
-            if (self.env.get("SHELL")) |s| if (s.len > 0) break :blk s;
-            break :blk "/bin/sh";
-        };
+        }
+
+        // Resolve the default shell (see resolveShellPath), per-OS:
+        //   - POSIX: OPEN.shell → $SHELL → login shell (getpwuid) → /bin/sh.
+        //   - Windows: OPEN.shell → %COMSPEC% → C:\Windows\System32\cmd.exe.
+        const shell_path = resolveShellPath(
+            open.shell,
+            self.env.get("SHELL"),
+            self.env.get("COMSPEC"),
+            login_shell,
+        );
 
         // Build argv. `startCommand`/`startWindows` copies these before exec, so in
         // the PARENT they are dead after `start()` returns — we free them right
@@ -804,22 +911,41 @@ pub const PtySpawner = struct {
             for (args_list.items) |a| self.alloc.free(a);
             args_list.deinit(self.alloc);
         }
-        // argv[0] is the shell path (a fresh dupe so freeing the list frees it).
-        try args_list.append(self.alloc, try self.alloc.dupeZ(u8, shell_path));
-        if (is_windows) {
-            if (open.command) |cmd| if (cmd.len > 0) {
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, windowsCommandArg(shell_path)));
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
-            };
-        } else if (open.command) |cmd| {
-            if (cmd.len > 0) {
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-lic"));
-                try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
+        // POSIX only: an explicit `OPEN.argv` (the local-agent shell-integration
+        // argv-rewrite for bash/nushell, T04c) is exec'd VERBATIM in place of the
+        // synthesized `-lic`/`-li` convention. The binary is still our resolved
+        // `shell_path` (always absolute); `open.argv` supplies argv (argv[0] is
+        // conventionally the shell, the rest are the integration flags, e.g.
+        // `--posix`). Set only by the local-agent client for a plain interactive
+        // shell, so it never coexists with a user `open.command`. A Windows agent
+        // never receives it (the client leaves it null cross-platform), but gate
+        // to POSIX defensively so a stray value can't bypass the ConPTY path.
+        const explicit_argv: ?[]const []const u8 =
+            if (!is_windows) open.argv else null;
+
+        if (explicit_argv) |argv| if (argv.len > 0) {
+            for (argv) |a| try args_list.append(self.alloc, try self.alloc.dupeZ(u8, a));
+        };
+
+        // Fall back to the default `<shell> …` synthesis when no explicit argv.
+        if (args_list.items.len == 0) {
+            // argv[0] is the shell path (a fresh dupe so freeing the list frees it).
+            try args_list.append(self.alloc, try self.alloc.dupeZ(u8, shell_path));
+            if (is_windows) {
+                if (open.command) |cmd| if (cmd.len > 0) {
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, windowsCommandArg(shell_path)));
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
+                };
+            } else if (open.command) |cmd| {
+                if (cmd.len > 0) {
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-lic"));
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, cmd));
+                } else {
+                    try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-li"));
+                }
             } else {
                 try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-li"));
             }
-        } else {
-            try args_list.append(self.alloc, try self.alloc.dupeZ(u8, "-li"));
         }
         const args = args_list.items;
 
@@ -836,7 +962,7 @@ pub const PtySpawner = struct {
                 .cmd = .{
                     .path = shell_z,
                     .args = args,
-                    .env = self.env,
+                    .env = &child_env,
                     .cwd = open.cwd,
                     .stdin = null,
                     .stdout = null,
@@ -868,7 +994,7 @@ pub const PtySpawner = struct {
             .cmd = .{
                 .path = shell_z,
                 .args = args,
-                .env = self.env,
+                .env = &child_env,
                 .cwd = open.cwd,
                 .stdin = slave_file,
                 .stdout = slave_file,
@@ -888,6 +1014,19 @@ pub const PtySpawner = struct {
         return pc;
     }
 };
+
+/// Shallow-clone an `EnvMap` into a fresh map owned by `alloc`. `EnvMap.put`
+/// dupes keys/values, so the result is fully independent of `src` (mutating one
+/// never affects the other). Used to give each spawned child its own env so
+/// per-session overrides (OPEN.env) don't leak between children of the shared
+/// spawner env.
+fn cloneEnvMap(alloc: Allocator, src: *const std.process.EnvMap) !std.process.EnvMap {
+    var out = std.process.EnvMap.init(alloc);
+    errdefer out.deinit();
+    var it = src.iterator();
+    while (it.next()) |entry| try out.put(entry.key_ptr.*, entry.value_ptr.*);
+    return out;
+}
 
 /// The argv flag that makes a WINDOWS shell run a single command string, chosen
 /// by the shell's basename (case-insensitive, `.exe` optional, full paths ok):
@@ -955,6 +1094,23 @@ fn ptyPreExec(cmd: *Command) ?u8 {
 
 const testing = std.testing;
 
+test "resolveShellPath: POSIX falls back to the login shell before /bin/sh (Bug 2)" {
+    if (is_windows) return error.SkipZigTest;
+
+    // The launchd-LaunchAgent path: no OPEN.shell and no $SHELL. The resolved
+    // default MUST be the login shell (getpwuid), NOT /bin/sh.
+    try testing.expectEqualStrings("/bin/zsh", resolveShellPath(null, null, null, "/bin/zsh"));
+    // Empty strings count as absent, same as null.
+    try testing.expectEqualStrings("/bin/zsh", resolveShellPath("", "", null, "/bin/zsh"));
+    // No login shell either → the last resort is still /bin/sh.
+    try testing.expectEqualStrings("/bin/sh", resolveShellPath(null, null, null, null));
+
+    // Precedence is preserved: OPEN.shell wins over everything, and $SHELL wins
+    // over the login shell (so a real $SHELL is never overridden by getpwuid).
+    try testing.expectEqualStrings("/bin/fish", resolveShellPath("/bin/fish", "/bin/bash", null, "/bin/zsh"));
+    try testing.expectEqualStrings("/bin/bash", resolveShellPath(null, "/bin/bash", null, "/bin/zsh"));
+}
+
 /// A thread-safe sink that captures the pty child's output bytes (it stands in
 /// for `Server.onChildOutput` → the session ring). The reader thread calls it.
 const CaptureSink = struct {
@@ -978,6 +1134,104 @@ const CaptureSink = struct {
         self.buf.deinit(self.alloc);
     }
 };
+
+/// Spin (async reader thread) until the sink has captured `needle`, or fail.
+fn waitContains(cap: *CaptureSink, needle: []const u8) !void {
+    var spins: usize = 0;
+    while (spins < 30_000) : (spins += 1) {
+        if (cap.contains(needle)) return;
+        std.Thread.sleep(100 * std.time.ns_per_us);
+    }
+    return error.TimedOutWaitingForOutput;
+}
+
+test "PtyChild: OPEN.env reaches the child and does not leak between spawns" {
+    const alloc = testing.allocator;
+
+    var spawner = try PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    // Use a PRIVATE var name that is not in the ambient environment (a real
+    // GHOZTTY_* name would be inherited by this test process when run inside a
+    // Ghoztty pane, contaminating the "unset" assertion below).
+    const key = "T04A_TEST_VAR_9q2";
+    const marker = "T04A_MARKER_7f3a";
+
+    // Child A: forward the var (T04a env parity) and echo its shell-expanded
+    // value back through the pty.
+    const pairs = [_]protocol.Open.EnvPair{.{ .key = key, .value = marker }};
+    const pc_a = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .command = "printf 'A=[%s]\\n' \"$" ++ key ++ "\"; sleep 30",
+        .env = &pairs,
+    });
+    var term_a = false;
+    defer if (!term_a) pc_a.child().terminate();
+
+    var cap_a: CaptureSink = .{ .alloc = alloc };
+    defer cap_a.deinit();
+    pc_a.child().attach(&cap_a, CaptureSink.sink, 1);
+    try waitContains(&cap_a, "A=[" ++ marker ++ "]");
+
+    // Child B: NO env forwarded. The var must be UNSET — proof that A's override
+    // was applied to A's OWN cloned env and never leaked into the shared spawner
+    // env that B also clones from.
+    const pc_b = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .command = "printf 'B=[%s]\\n' \"$" ++ key ++ "\"; sleep 30",
+    });
+    var term_b = false;
+    defer if (!term_b) pc_b.child().terminate();
+
+    var cap_b: CaptureSink = .{ .alloc = alloc };
+    defer cap_b.deinit();
+    pc_b.child().attach(&cap_b, CaptureSink.sink, 2);
+    try waitContains(&cap_b, "B=[]");
+    try testing.expect(!cap_b.contains(marker));
+
+    pc_a.child().terminate();
+    term_a = true;
+    pc_b.child().terminate();
+    term_b = true;
+}
+
+test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {
+    const alloc = testing.allocator;
+
+    var spawner = try PtySpawner.init(alloc);
+    defer spawner.deinit();
+
+    // No `command` → the default synthesis would spawn a SILENT interactive shell
+    // (`<shell> -li`) that prints nothing. Supplying an explicit `argv` (the shell
+    // integration rewrite path, T04c) must instead exec exactly this argv, which
+    // prints a marker. Observing the marker proves argv-verbatim, not `-li`. We
+    // route through `/bin/sh -c` (universally present) as a stand-in for the
+    // bash `<shell> --posix` rewrite the client actually forwards.
+    const marker = "ARGV_VERBATIM_OK_5b8c";
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf '" ++ marker ++ "\\n'; sleep 30",
+    };
+    const pc = try spawner.spawnChild(.{
+        .rows = 24,
+        .cols = 80,
+        .shell = "/bin/sh",
+        .argv = &argv,
+    });
+    var terminated = false;
+    defer if (!terminated) pc.child().terminate();
+
+    var capture: CaptureSink = .{ .alloc = alloc };
+    defer capture.deinit();
+    pc.child().attach(&capture, CaptureSink.sink, 0x5b8c);
+    try waitContains(&capture, marker);
+
+    pc.child().terminate();
+    terminated = true;
+}
 
 test "PtyChild: real pty spawn → input echoes back → exit/tombstone" {
     const alloc = testing.allocator;

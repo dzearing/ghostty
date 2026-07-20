@@ -12,6 +12,9 @@
 test {
     _ = @import("agent/server.zig");
     _ = @import("agent/session.zig");
+    _ = @import("agent/grid_snapshot.zig");
+    _ = @import("agent/session_meta.zig");
+    _ = @import("agent/ring_snapshot.zig");
     _ = @import("agent/metrics.zig");
     _ = @import("agent/keepalive.zig");
     _ = @import("agent/self_update.zig");
