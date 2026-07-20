@@ -31,6 +31,7 @@ const LocalAgent = @import("LocalAgent.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
+const session_layout = @import("session_layout.zig");
 const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -66,6 +67,27 @@ pub const WM_APP_SETFOCUS: u32 = w32.WM_APP + 5;
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
+/// Timer ID (on `msg_hwnd`) for the debounced session-layout manifest write
+/// (T89f). `markLayoutDirty` (re)arms it; a mutation storm collapses into one
+/// write ~`LAYOUT_SYNC_DEBOUNCE_MS` after the last change. Distinct from the
+/// notification/quit/quick-terminal timer ids (1–3).
+const LAYOUT_SYNC_TIMER_ID: usize = 4;
+
+/// Debounce window for the session-layout write (Mac `scheduleSync` uses the
+/// same 250ms). Window-frame changes are already coalesced to drag-end by
+/// `persistPlacement` (WM_EXITSIZEMOVE), so this mainly collapses the several
+/// array shifts a single tab/split close produces.
+const LAYOUT_SYNC_DEBOUNCE_MS: u32 = 250;
+
+/// A fresh agent-backed pane publishes its session id asynchronously (after the
+/// OPEN round-trips), so the first debounced capture can miss it. When that
+/// happens the write re-arms after this interval, up to `MAX_RETRIES` times, so
+/// a follow-up capture records the id — the win32 analog of the Mac
+/// `syncAndCaptureSessionIDs` retry, bounded so a pane that never connects can't
+/// re-arm forever (~40 × 400ms ≈ 16s ceiling).
+const LAYOUT_SYNC_RETRY_MS: u32 = 400;
+const LAYOUT_SYNC_MAX_RETRIES: u16 = 40;
+
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWindow");
 
@@ -94,6 +116,12 @@ msg_hwnd: ?w32.HWND = null,
 /// IPC requests answer "server not ready", deferred SetFocus and hero
 /// snapshots get dropped (found by the T53a soak).
 wakeup_pending: std.atomic.Value(bool) = .init(false),
+
+/// Bounded retry counter for the session-layout write (T89f) while an
+/// agent-backed pane hasn't published its session id yet (the OPEN reply is
+/// async). Incremented each pending re-arm, reset to 0 once a capture finds
+/// every agent-backed leaf resolved (or the ceiling is hit).
+layout_sid_retries: u16 = 0,
 
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
@@ -666,6 +694,13 @@ pub fn run(self: *App) !void {
 pub fn terminate(self: *App) void {
     self.stopQuitTimer();
 
+    // Flush the session-layout manifest while every window/surface is still
+    // alive (T89f). Quit DETACHES sessions (they survive under the agent), so
+    // the topology we capture here is exactly what the next launch re-attaches.
+    // Kill any pending debounce timer first so it can't fire mid-teardown.
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
+    self.syncSessionLayout();
+
     if (self.update_latest_ver) |v| {
         self.core_app.alloc.free(v);
         self.update_latest_ver = null;
@@ -775,6 +810,171 @@ pub fn ipcNameOf(self: *App, target: IpcTarget) ?[]const u8 {
 /// Drop every registration pointing at `target`. See IpcRegistry.forget.
 pub fn ipcForget(self: *App, target: IpcTarget) void {
     self.ipc_registry.forget(self.core_app.alloc, target);
+}
+
+/// (Re)arm the debounced session-layout write (T89f). Called from the layout
+/// mutation sites (add/close tab, add/close split, rename, tab color, frame
+/// change). No-op when persistence is off or the message window isn't up yet
+/// (early startup; `terminate`/quit does a final sync regardless). `SetTimer`
+/// with an existing id restarts it, giving the 250ms debounce for free.
+pub fn markLayoutDirty(self: *App) void {
+    if (!self.config.@"session-persistence") return;
+    const hwnd = self.msg_hwnd orelse return;
+    // A real mutation gets the full pending-sid retry budget again.
+    self.layout_sid_retries = 0;
+    _ = w32.SetTimer(hwnd, LAYOUT_SYNC_TIMER_ID, LAYOUT_SYNC_DEBOUNCE_MS, null);
+}
+
+/// Capture the live window/tab/split topology and atomically persist it to the
+/// session-layout manifest (T89f). Best-effort. When persistence is off the
+/// stale manifest is deleted so a later launch never restores it.
+pub fn syncSessionLayout(self: *App) void {
+    const gpa = self.core_app.alloc;
+    if (!self.config.@"session-persistence") {
+        session_layout.clear(gpa);
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var pending = false;
+    const file = self.captureSessionLayout(arena_state.allocator(), &pending) catch |err| {
+        log.warn("session-layout capture failed err={}", .{err});
+        return;
+    };
+    session_layout.write(gpa, file);
+
+    // If an agent-backed pane hasn't published its session id yet, the manifest
+    // just written has a null session_id for it (not re-attachable). Re-arm a
+    // bounded retry so a follow-up capture records the id once the OPEN reply
+    // lands; reset the counter once nothing is pending (or the ceiling is hit).
+    if (pending and self.layout_sid_retries < LAYOUT_SYNC_MAX_RETRIES) {
+        self.layout_sid_retries += 1;
+        if (self.msg_hwnd) |hwnd|
+            _ = w32.SetTimer(hwnd, LAYOUT_SYNC_TIMER_ID, LAYOUT_SYNC_RETRY_MS, null);
+    } else {
+        self.layout_sid_retries = 0;
+    }
+}
+
+const FrameCapture = struct {
+    frame: ?session_layout.Frame = null,
+    maximized: bool = false,
+};
+
+/// Read a window's outer rect + maximized flag (T89f). For a maximized window
+/// this is the RESTORED rect (`rcNormalPosition`) so restore comes back to a
+/// sane size before re-maximizing — the same split `persistPlacement` (T85)
+/// uses. Null frame ⇒ the query failed / no hwnd; restore falls back to config.
+fn captureFrame(hwnd_opt: ?w32.HWND) FrameCapture {
+    const hwnd = hwnd_opt orelse return .{};
+    const maximized = w32.IsZoomed(hwnd) != 0;
+    var r: w32.RECT = undefined;
+    if (maximized) {
+        var wp: w32.WINDOWPLACEMENT = undefined;
+        wp.length = @sizeOf(w32.WINDOWPLACEMENT);
+        if (w32.GetWindowPlacement(hwnd, &wp) == 0) return .{ .maximized = maximized };
+        r = wp.rcNormalPosition;
+    } else {
+        if (w32.GetWindowRect(hwnd, &r) == 0) return .{};
+    }
+    return .{
+        .frame = .{ .x = r.left, .y = r.top, .w = r.right - r.left, .h = r.bottom - r.top },
+        .maximized = maximized,
+    };
+}
+
+/// Capture one leaf's restore metadata: the agent session id to re-ATTACH to
+/// (null when the pane is not agent-backed — it restores as an exited pane),
+/// the current title, and any registered IPC name. `kind`/`viewer_location`
+/// stay null (reserved for viewer panes, T90h). Strings dupe into `arena`.
+fn captureLeaf(self: *App, arena: Allocator, surface: *Surface) !session_layout.Leaf {
+    const sid: ?[]const u8 = if (surface.core_surface_ready)
+        surface.core_surface.remoteSessionId()
+    else
+        null;
+    const ipc_name = self.ipcNameOf(.{ .pane = surface });
+    return .{
+        .session_id = if (sid) |s| try arena.dupe(u8, s) else null,
+        .title = if (surface.getTitle()) |t| try arena.dupe(u8, t) else null,
+        .ipc_name = if (ipc_name) |n| try arena.dupe(u8, n) else null,
+    };
+}
+
+/// A pinned tab title (T92) as UTF-8, or null when there is none to record.
+fn captureTabTitle(arena: Allocator, win: *Window, ti: usize) !?[]const u8 {
+    const len = win.tab_title_lens[ti];
+    if (len == 0) return null;
+    return try std.unicode.utf16LeToUtf8Alloc(arena, win.tab_titles[ti][0..len]);
+}
+
+/// Build the manifest `File` from live state into `arena` (T89f). Excludes
+/// cross-machine (`remote_dialed`) windows — those are the remote-reconnect
+/// path (T56), not local re-attach — and quick terminals (not restorable). The
+/// flat `nodes` array is a 1:1 copy of the `SplitTree` node array, so child
+/// handles carry over as indices unchanged. Caller frees `arena` after writing.
+fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_layout.File {
+    var windows: std.ArrayList(session_layout.Window) = .empty;
+    for (self.windows.items, 0..) |win, wi| {
+        if (win.is_quick_terminal) continue;
+        if (win.remote_dialed != null) continue;
+        if (win.tab_count == 0) continue;
+
+        const tabs = try arena.alloc(session_layout.Tab, win.tab_count);
+        for (0..win.tab_count) |ti| {
+            const tree = &win.tab_trees[ti];
+            const nodes = try arena.alloc(session_layout.Node, tree.nodes.len);
+            for (tree.nodes, 0..) |node, ni| {
+                nodes[ni] = switch (node) {
+                    .leaf => |surface| leaf: {
+                        const leaf = try self.captureLeaf(arena, surface);
+                        // No id yet but this leaf is EXPECTED to be agent-backed
+                        // (its window rides the local agent, or the surface's
+                        // remote backend is already wired) ⇒ the OPEN is still in
+                        // flight; ask syncSessionLayout to retry so the id gets
+                        // recorded. `local_agent_conn` is set before the first
+                        // surface/capture, so this catches the startup pane whose
+                        // remote_conn isn't attached at the very first write.
+                        if (leaf.session_id == null and
+                            (surface.remote_conn != null or win.local_agent_conn != null))
+                            pending.* = true;
+                        break :leaf .{ .leaf = leaf };
+                    },
+                    .split => |sp| .{ .split = .{
+                        .layout = @tagName(sp.layout),
+                        .ratio = @floatCast(sp.ratio),
+                        .left = @intFromEnum(sp.left),
+                        .right = @intFromEnum(sp.right),
+                    } },
+                };
+            }
+            const color = win.tab_colors[ti];
+            tabs[ti] = .{
+                .nodes = nodes,
+                .color = if (color == .none) null else @tagName(color),
+                .hero_ratio = win.tab_hero_ratio[ti],
+                .title = if (win.tab_title_pinned[ti])
+                    try captureTabTitle(arena, win, ti)
+                else
+                    null,
+                .active = ti == win.active_tab,
+            };
+        }
+
+        const frame_max = captureFrame(win.hwnd);
+        try windows.append(arena, .{
+            .id = if (win.ipc_name) |n|
+                try arena.dupe(u8, n)
+            else
+                try std.fmt.allocPrint(arena, "win-{d}", .{wi}),
+            .frame = frame_max.frame,
+            .maximized = frame_max.maximized,
+            .title_override = if (win.title_override) |t| try arena.dupe(u8, t) else null,
+            .ipc_name = if (win.ipc_name) |n| try arena.dupe(u8, n) else null,
+            .active_tab = @intCast(win.active_tab),
+            .tabs = tabs,
+        });
+    }
+    return .{ .windows = try windows.toOwnedSlice(arena) };
 }
 
 /// Create, track, and populate a new Window (with its first tab). Shared by
@@ -3307,6 +3507,14 @@ fn msgWndProc(
         app.quit_timer_state = .expired;
         app.quit_requested = true;
         w32.PostQuitMessage(0);
+        return 0;
+    }
+
+    // Debounced session-layout write (T89f): the timer fired after the last
+    // layout/frame/title mutation settled — capture the topology and persist.
+    if (msg == w32.WM_TIMER and wparam == LAYOUT_SYNC_TIMER_ID) {
+        _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
+        app.syncSessionLayout();
         return 0;
     }
 

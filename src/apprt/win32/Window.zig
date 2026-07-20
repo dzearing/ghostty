@@ -953,6 +953,7 @@ pub fn addTab(self: *Window) !*Surface {
         self.selectTabIndex(pos);
     }
     self.updateTabBarVisibility();
+    self.app.markLayoutDirty(); // T89f: tab added → re-persist the layout
     return surface;
 }
 
@@ -1004,6 +1005,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     }
     self.selectTabIndex(self.active_tab);
     self.updateTabBarVisibility();
+    self.app.markLayoutDirty(); // T89f: tab removed → re-persist the layout
 }
 
 /// Close tabs based on mode: this (current), other (all but current), right (all after current).
@@ -1089,6 +1091,7 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
         self.tab_active_surface[tab] = ns;
         self.heroOnTreeChanged(tab);
         self.layoutSplits();
+        self.app.markLayoutDirty(); // T89f: split closed → re-persist the layout
         if (ns.hwnd) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     } else {
         log.debug("closeSplitSurface: no next surface, closing tab", .{});
@@ -2030,6 +2033,7 @@ pub fn newSplitAt(
         // background tab, so hide it until its tab is selected.
         if (new_surface.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
     }
+    self.app.markLayoutDirty(); // T89f: split added → re-persist the layout
     return new_surface;
 }
 
@@ -2355,6 +2359,7 @@ pub fn setTitleOverride(self: *Window, title: ?[]const u8) void {
     if (self.title_override) |old| alloc.free(old);
     self.title_override = copy;
     self.updateWindowTitle();
+    self.app.markLayoutDirty(); // T89f: window title pin changed → re-persist
 }
 
 /// Called when a pane's title changes. Updates the stored tab title
@@ -2413,6 +2418,7 @@ pub fn setTabTitlePin(self: *Window, tab_idx: usize, title: ?[]const u8) void {
     }
     if (tab_idx == self.active_tab) self.updateWindowTitle();
     self.invalidateTabBar();
+    self.app.markLayoutDirty(); // T89f: tab title pin changed → re-persist
 }
 
 /// Update tab bar visibility based on config and tab count.
@@ -2815,6 +2821,7 @@ fn savePlacement(self: *Window, maximized: bool) void {
         .height = h,
         .maximized = maximized,
     });
+    self.app.markLayoutDirty(); // T89f: window frame changed → re-persist layout
 }
 
 /// Show the transient "columns × rows" overlay during a resize, honoring
@@ -3007,6 +3014,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
 
     self.active_tab = to;
     self.invalidateTabBar();
+    self.app.markLayoutDirty(); // T89f: tab reordered → re-persist the layout
 }
 
 /// Handle mouse movement over the tab bar for hover effects.
@@ -3160,6 +3168,7 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
                     self.tab_colors[tab] = @enumFromInt(c - TAB_CTX_COLOR_BASE);
                     log.debug("tab {} color set to {}", .{ tab, self.tab_colors[tab] });
                     self.invalidateTabBar();
+                    self.app.markLayoutDirty(); // T89f: tab color changed → re-persist
                 }
             }
         },
@@ -3369,6 +3378,7 @@ pub fn finishTabRename(self: *Window) void {
         self.refreshTabTitle(tab_idx);
         if (tab_idx == self.active_tab) self.updateWindowTitle();
     }
+    self.app.markLayoutDirty(); // T89f: inline tab rename → re-persist
 
     // Clear our state BEFORE DestroyWindow: the Edit synchronously emits
     // EN_KILLFOCUS as it's torn down, which re-enters this function via
@@ -3519,6 +3529,11 @@ fn onDestroy(self: *Window) void {
             break;
         }
     }
+
+    // T89f: this window is gone → re-persist the layout so it drops from the
+    // manifest (a no-op during app-quit teardown, where msg_hwnd is already
+    // down and terminate() did the authoritative capture first).
+    app.markLayoutDirty();
 
     // Drop IPC names before the allocation is freed below (deinit() is not
     // called on this path).
@@ -3770,8 +3785,10 @@ pub fn windowWndProc(
         w32.WM_ENDSESSION => {
             // The session is ending; the process is about to die. Sessions
             // survive because the agent owns the PTYs and we sent no CLOSE.
-            // (T89f will flush the layout manifest here so re-attach restores
-            // the window geometry after the reboot.)
+            // Flush the layout manifest NOW (synchronously — there may be no
+            // more message pump) so re-attach restores the window geometry
+            // after the logoff/reboot (T89f).
+            window.app.syncSessionLayout();
             return 0;
         },
         w32.WM_DESTROY => {

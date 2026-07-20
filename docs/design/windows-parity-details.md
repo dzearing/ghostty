@@ -3867,20 +3867,110 @@ CLI-reachable until T99). The close-intent wiring is transport-agnostic
 and already runs (no-op) on the exec panes T99 leaves behind, so T99 is
 independent of T89e's correctness.
 
-## T89f — Layout manifest + same-PID re-attach restore
+## T89f — Same-PID re-attach restore (umbrella; split → T89f1 + T89f2)
 
-Viewer-side manifest `%LOCALAPPDATA%\ghoztty\session-layout[-debug].
-json` (placement, title pins, tab order/colors, split tree + ratios,
-per-leaf session id/title/ipc name/cwd; atomic write, debounced sync,
-flush on quit). Launch-time restore: probe leaves (positive-dead via
-`found`), rebuild windows/tabs/splits, ATTACH by session id (wire
-`remoteBackend().session_id`), gap-fill replay; drop entries only
-when all leaves positively dead; suppress the default blank window
-when restoring. Pure manifest logic unit-tested in both lanes.
+Viewer-side manifest `%LOCALAPPDATA%\ghoztty\session-layout[-debug].json`
+(placement, title pins, tab order/colors, split tree + ratios, per-leaf
+session id/title/ipc name) written as the layout changes, then a launch-time
+restore that rebuilds windows/tabs/splits and re-ATTACHes each leaf to the
+agent session the local `ghoztty-agent` kept alive. Too big for one context,
+so split 2026-07-20 into the WRITE half (T89f1) and the RESTORE half (T89f2).
+The cross-platform ATTACH machinery already exists — `Connection.attachChannel`
+(session_id/rows/cols/last_byte_offset) and the termio `Remote` backend that
+switches OPEN↔ATTACH purely on `cfg.session_id`, with `restore_snapshot`/
+`restore_offset` for gap-fill — so the win32 work is entirely viewer-side.
 
-*Validation:* new `test/win32/session-reattach.ps1` — build 2-window/
-3-pane layout, record child PIDs, quit-keep-sessions, relaunch,
-assert same PIDs + layout + scrollback text + titles; ALL PASS ×3.
+## T89f1 — Session-layout manifest + capture/debounced-atomic-write
+
+The WRITE half: capture the live window/tab/split topology into the manifest
+and persist it atomically as it changes, so T89f2 has an accurate blueprint.
+
+Pieces:
+
+1. **`src/apprt/win32/session_layout.zig`** (new, pure `std`-only, unit-tested
+   in both lanes via the `apprt.zig` test aggregator). Schema mirrors the Mac
+   `SessionLayoutManifest` adapted to win32 facts: `File{version, windows:
+   []Window}`; `Window{id, frame?, maximized, title_override?, ipc_name?,
+   active_tab, tabs}`; `Tab{nodes, color?, hero_ratio?, title?, active}`;
+   `Node{leaf?: Leaf, split?: Split}` (two mutually-exclusive optionals, NOT a
+   tagged union — plain-object JSON, no union-tag handling); `Leaf{session_id?,
+   title?, ipc_name?, kind?, viewer_location?}` (kind/viewer_location RESERVED
+   for viewer panes, T90h). The tree is stored FLAT (`nodes[]`, index 0 = root,
+   split `left`/`right` = indices) — a 1:1 mirror of `SplitTree(V).nodes`, so
+   capture is an index copy and restore an index rebuild. `serialize`/`parse`
+   (ignore_unknown + alloc_always) / `writeAtomic` (tmp+fsync+rename, copied
+   from `layout_meta.writeAtomic`) / `load` (FileNotFound → null) / `layoutPath`
+   (`%LOCALAPPDATA%\ghoztty\session-layout[-debug].json`, debug-suffixed like
+   `window_memory`) / `write` (empty windows ⇒ delete the file) / `clear`.
+   Snake_case keys: this is win32's PRIVATE local file, never decoded by the Mac
+   app, so there's no cross-lineage key constraint — only the within-win32
+   additive one (readers tolerate unknown + absent fields).
+
+2. **`App` capture walk** (`captureSessionLayout` + `captureLeaf` +
+   `captureFrame` + `captureTabTitle`): walks `self.windows` skipping quick
+   terminals and cross-machine (`remote_dialed`) windows (that's the T56
+   reconnect path, not local re-attach). Per window: outer frame via
+   `IsZoomed`/`GetWindowPlacement`/`GetWindowRect` (restored rect for a
+   maximized window, T85 parity) + maximized + `title_override` + `ipc_name` +
+   `active_tab`. Per tab: color (`@tagName`, null for `.none`), `hero_ratio`,
+   pinned tab title (UTF-16→UTF-8), active flag. Per leaf:
+   `core_surface.remoteSessionId()` (null if not ready / not agent-backed),
+   `getTitle()`, and the registered IPC name via `IpcRegistry.nameOf`. Split
+   nodes copy layout(`@tagName`)/ratio(f16→f32)/left/right(handle→u16). Built
+   into an arena, serialized, written, arena freed.
+
+3. **Debounced write** (`markLayoutDirty` → 250ms `WM_TIMER` on `msg_hwnd` →
+   `syncSessionLayout`; SetTimer-same-id restarts = free debounce, Mac
+   `scheduleSync` parity). Armed from every capture-relevant mutation:
+   `addTab`, `closeTabByIndex`, `newSplitAt`, `closeSplitSurface` (survivor
+   branch), window-frame `persistPlacement`, `onDestroy` (window closed →
+   drops from the manifest), window title-pin set, tab-color set, both
+   tab-title-pin commits, and tab reorder (`moveTab`).
+
+4. **Pending-sid retry** — a fresh agent-backed pane publishes its session id
+   AFTER the async OPEN round-trips, so the first debounced capture can miss it.
+   When a leaf has no id but its window rides the local agent (or its
+   `remote_conn` is wired), `syncSessionLayout` re-arms a bounded retry
+   (`layout_sid_retries`, ≤40 × 400ms ≈ 16s) so a follow-up capture records the
+   id — the win32 analog of the Mac `syncAndCaptureSessionIDs` retry. A real
+   mutation resets the budget. Verified: a startup-only launch (no further
+   action) has the session_id in the manifest within ~2s.
+
+5. **Flush on exit** — `App.terminate()` (graceful quit) flushes synchronously
+   BEFORE windows are freed (quit DETACHES sessions, so the captured topology is
+   exactly what re-attaches), killing any pending debounce timer first; the
+   `WM_ENDSESSION` handler (logoff/reboot) flushes synchronously too (there may
+   be no more message pump). Persistence OFF ⇒ `syncSessionLayout` deletes the
+   stale manifest so a later launch never restores it.
+
+*Validation (done 2026-07-20):* `session_layout.zig` unit tests (round-trip
+incl. nested tree/ratios/order, empty set, writeAtomic+load, unknown-field/
+absent-optional tolerance) green in BOTH lanes. New
+`test/win32/session-reattach.ps1` (write half) drives a hermetic agent-backed
+GUI and asserts the on-disk manifest reflects: startup window's leaf session_id
+== the live agent session; `+split` → a split node (layout + in-range ratio) +
+two leaves whose ids are both live sessions; `+new-window --target=second` → a
+second captured window carrying its IPC name; `+rename --title` → the captured
+`title_override`; every window a real frame + boolean maximized. ALL PASS ×3.
+Both test lanes + `test-agent` + P1–P3 green.
+
+## T89f2 — Launch restore + ATTACH + suppress blank window
+
+The RESTORE half (next). Launch-time: gate on `session-persistence`; load the
+manifest; probe each unique session id for liveness (tri-state alive/dead/
+unknown via the connection probe — drop an entry ONLY when every leaf is
+positively dead, keep on unknown, never drop on transport failure); suppress
+the default blank startup window while a restore is pending; rebuild each
+window/tab/split, threading the manifest `session_id` through a NEW
+`Overrides.Remote.session_id` field → `Surface.remoteBackend()` (which today
+hardcodes `.session_id = null` at Surface.zig:3643) → core `RemoteBackend.
+session_id` so the termio backend ATTACHes instead of OPENs; gap-fill replay;
+re-apply frame/title pins/tab colors; re-register IPC names. Folds with T96's
+production pty teardown on the close path.
+
+*Validation:* `test/win32/session-reattach.ps1` grows section F onward — build
+a 2-window / 3-pane layout, record child PIDs, quit-keep-sessions, relaunch,
+assert SAME PIDs + layout + scrollback text + titles come back; ALL PASS ×3.
 
 ## T89g — Tombstone relaunch floor (agent restart / reboot)
 

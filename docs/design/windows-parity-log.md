@@ -9,6 +9,31 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 40) — T89f split + T89f1 DONE. T89f (same-PID re-attach
+  restore) was too big for one context, so it was split into T89f1 (manifest +
+  capture/debounced-atomic-write) and T89f2 (launch restore + ATTACH + suppress
+  blank window); implemented f1 this session. New pure `session_layout.zig`
+  (flat-node schema mirroring `SplitTree.nodes`, snake_case JSON, atomic write,
+  `%LOCALAPPDATA%` path, both-lane unit tests) + an `App` capture walk (window
+  frame/maximized, tab order/color/hero-ratio/title-pin, split tree + per-leaf
+  session_id/title/ipc-name; excludes remote + quick-terminal windows) + a 250ms
+  WM_TIMER debounce armed from every layout/title/color/frame/reorder mutation +
+  a bounded pending-sid retry (agent-backed panes publish the session id AFTER
+  the async OPEN, so the first capture misses it; retry ≤40×400ms, Mac
+  `syncAndCaptureSessionIDs` analog) + a synchronous flush on `terminate()` and
+  `WM_ENDSESSION`. Two surprises during validation, both script-side (the
+  capture code was correct from the first manual manifest dump): PowerShell
+  unwraps a 1-element array to a scalar (so `Leaf-Sids`'s single sid indexed as a
+  char — fixed with a unary-comma return), and `$x = if(c){@(pipe)}else{@()}`
+  did NOT capture the array (fixed by assigning the pipeline directly). The
+  next-most-useful finding: startup-only (no mutation) now lands the session_id
+  in the manifest within ~2s thanks to the retry — the case a user who opens and
+  immediately reboots depends on. `session-reattach.ps1` (write half) ALL PASS
+  ×3; both test lanes (none 3038 / win32 3106) + `test-agent` 6267 + P1–P3 green.
+  Next on-box: T89f2 (thread `session_id` through `Overrides.Remote` →
+  `remoteBackend()` → core ATTACH, positive-dead probe, suppress blank window,
+  grow the script's restore/same-PID half).
+
 - 2026-07-20 (on-box, 39) — T99 DONE: IPC-created surfaces are now agent-backed
   on a local persistence window. `+new-window` (first pane), its inline
   `--split`, and `+split` each gained a `local_agent_conn` branch mirroring the
