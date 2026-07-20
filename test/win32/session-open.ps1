@@ -106,7 +106,12 @@ function Test-Typing($tmp, $paneId, $timeoutSec = 15) {
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 600
         Run-Cli "+read --name=$paneId --lines=40" "$tmp\read.txt" 10 | Out-Null
-        if ((Out-Text "$tmp\read.txt") -match $mark) { return $true }
+        # A very narrow pane (e.g. a split inside a MINIMIZED test window, which
+        # has a near-zero client rect) wraps output one glyph per line, so strip
+        # ALL whitespace before matching the marker. The mark has no spaces, so
+        # this stays exact for normal-width panes.
+        $hay = (Out-Text "$tmp\read.txt") -replace '\s', ''
+        if ($hay -match $mark) { return $true }
     }
     return $false
 }
@@ -220,6 +225,58 @@ $code = Run-Cli '+sessions --json' "$($c.Tmp)\sess.json"
 $rowsC = $null
 try { $rowsC = Out-Text "$($c.Tmp)\sess.json" | ConvertFrom-Json } catch {}
 Assert "C4 no agent-backed session (spawn failed, fell back)" ($code -ne 0 -or ($null -ne $rowsC -and @($rowsC).Count -eq 0))
+
+# ============================================================================
+"== D: IPC-created surfaces are agent-backed (T99)"
+# ============================================================================
+# With persistence ON, a +split and a +new-window must EACH open under the
+# local agent (a new +sessions row), not as a plain exec pane. Pre-T99 only the
+# startup pane was agent-backed; +split / +new-window opened plain ConPTY panes
+# (real user pids, no +sessions row). The definitive signal is the alive-session
+# count on the ONE shared agent, which all IPC surfaces ride.
+function Session-Count($tmp, $tag) {
+    $code = Run-Cli '+sessions --json' "$tmp\sess-$tag.json" 12
+    if ($code -ne 0) { return 0 }
+    $r = $null
+    try { $r = Out-Text "$tmp\sess-$tag.json" | ConvertFrom-Json } catch {}
+    if ($null -eq $r) { return 0 }
+    return @($r | Where-Object { $_.alive -eq $true }).Count
+}
+function Wait-SessionCount($tmp, $tag, $target, $timeoutSec = 15) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $last = -1
+    while ((Get-Date) -lt $deadline) {
+        $last = Session-Count $tmp $tag
+        if ($last -ge $target) { return $last }
+        Start-Sleep -Milliseconds 500
+    }
+    return $last
+}
+
+# Section C left its GUI running (only cleanup stops it); the app-facing IPC
+# pipe is per-user, so a stray GUI would answer our CLI. Start D from a clean
+# slate.
+Stop-TestProcs
+$d = Start-Gui 'ipc' $AgentExe @()
+$pane = Wait-FirstPane $d.Tmp 25
+Assert "D1 GUI opened its initial pane" ($null -ne $pane)
+$before = Wait-SessionCount $d.Tmp 'before' 1 18
+Assert "D2 exactly one agent session before any IPC open" ($before -eq 1)
+
+# A split of the focused window -> a SECOND agent session.
+Run-Cli '+split --direction=right --name=t99split' "$($d.Tmp)\split.txt" 15 | Out-Null
+$afterSplit = Wait-SessionCount $d.Tmp 'split' 2 15
+Assert "D3 +split added an agent-backed session (2 alive)" ($afterSplit -eq 2)
+
+# A new window -> a THIRD agent session (its first pane, T99 createWindow path).
+Run-Cli '+new-window --target=t99win' "$($d.Tmp)\nw.txt" 15 | Out-Null
+$afterWin = Wait-SessionCount $d.Tmp 'win' 3 15
+Assert "D4 +new-window added an agent-backed session (3 alive)" ($afterWin -eq 3)
+
+# The split pane is real (registered + typing round-trips through the agent).
+Assert "D5 +split pane typing round-trips through the agent" (Test-Typing $d.Tmp 't99split' 18)
+
+Stop-TestProcs
 
 # ============================================================================
 "== cleanup"

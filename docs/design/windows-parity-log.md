@@ -9,6 +9,27 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 39) — T99 DONE: IPC-created surfaces are now agent-backed
+  on a local persistence window. `+new-window` (first pane), its inline
+  `--split`, and `+split` each gained a `local_agent_conn` branch mirroring the
+  cross-machine `remote_dialed` one: no explicit cmd/cwd ⇒ null baton so
+  `buildRemoteInherit` injects the local agent (splits inherit the parent's cwd
+  via GET_CWD); else a `.remote{local_agent=true}` override carrying the
+  agent-native command + the window/pane-name env. The unblocker was
+  `App.createWindow`'s `is_remote` guard, which now excludes a `local_agent`
+  override so a `+new-window`'s window still gets `local_agent_conn` and its
+  later tabs/splits inherit the same agent. `session-open.ps1` grew section D
+  (+split → 2 sessions, +new-window → 3, split typing round-trips, `+list` pid 0)
+  and `session-close.ps1` grew section D (close ONE pane of a 2-pane window ⇒
+  only that session ends, sibling survives — the scenario T99 unblocks). One
+  harness fix: `Test-Typing` strips whitespace before matching, because a split
+  inside a MINIMIZED test window has a ~0 client rect and wraps output one glyph
+  per line (a test-window artifact — the agent session/echo/stream are all
+  live). Both ALL PASS ×3; both lanes + test-agent + P1–P3 green. Two inserted
+  sections needed a leading `Stop-TestProcs` (a prior section's leftover
+  GUI/agent holds the per-user IPC pipe + single-instance guard). Left open
+  (pre-existing): T98 (agent pane pid reads as a system pid). Next on-box: T89f
+  (same-PID re-attach restore), which these agent-backed splits were blocking.
 - 2026-07-20 (on-box, 38) — T89e DONE: close-vs-quit session semantics. Wired
   the core's `close_on_exit` (Remote backend's CLOSE-vs-DETACH atomic, reached
   via new win32 `Surface.setSessionCloseIntent`) into the user-close paths:

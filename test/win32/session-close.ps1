@@ -4,11 +4,10 @@
 # (graceful quit, crash, upgrade, logoff kill) LEAVES sessions alive so they
 # re-attach on the next launch (DETACH — the agent keeps its pinned PTYs).
 #
-# Each scenario is its own hermetic GUI launch whose single startup window is
-# agent-backed (T89d). (IPC-created windows/tabs/splits are NOT yet agent-backed
-# — that gap is tracked as T99 — so every scenario uses exactly the one
-# startup session; there is no reliable way to stand up a second agent-backed
-# pane via the CLI until T99 lands.)
+# Each scenario is its own hermetic GUI launch whose startup window is
+# agent-backed (T89d); T99 made IPC-created splits/windows agent-backed too, so
+# scenario D can stand up a SECOND session over the CLI and prove a single-pane
+# close ends only that session.
 #
 #   A. +close the startup PANE by id -> the session ENDS. Exercises
 #      closeSplitSurface -> closeTab -> closeTabByIndex's close-intent wiring.
@@ -20,6 +19,9 @@
 #      action shares this outcome via Window.deinit's no-mark teardown; a hard
 #      kill is the deterministic, GUI-input-free proxy the design groups in the
 #      same keep-sessions class.)
+#   D. +split -> two agent sessions, then +close ONE pane -> only that session
+#      ends; the sibling survives (the close-intent wiring is per-surface). This
+#      scenario is what T99 (agent-backed IPC splits) unblocks.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Fully hermetic: a
 # per-run $env:LOCALAPPDATA + per-run GHOSTTY_LOCAL_AGENT_BIN, and it ONLY ever
@@ -191,6 +193,28 @@ Assert "C2 the session survived the app exit (still alive)" ((Count-Alive $rowsC
 $survC = @($rowsC | Where-Object { $_.id -eq $sidC }) | Select-Object -First 1
 Assert "C3 same session id survived, now detached (no viewer)" (
     $null -ne $survC -and $survC.alive -eq $true -and $survC.attached -eq $false)
+
+# ============================================================================
+"== D: +close ONE pane of a 2-pane window ends only that session (T99)"
+# ============================================================================
+# Section C deliberately left its agent running (Stop-GuiOnly). That agent
+# holds the per-user pipe + single-instance guard, so a fresh GUI would fail to
+# stand up its own agent. Clear it before D.
+Stop-TestProcs
+$d = Start-Backed 'close-split'
+Assert "D1 startup pane is agent-backed (one live session)" $d.Ok
+# A CLI split now opens under the SAME agent (T99): a second live session.
+Run-Cli '+split --direction=right --name=t99sib' "$($d.Tmp)\split.txt" 15 | Out-Null
+$rows2 = Wait-AliveCount $d.Tmp 'split' 2 15
+Assert "D2 +split opened a second agent-backed session (2 alive)" ((Count-Alive $rows2) -eq 2)
+# Close ONLY the split pane -> its session ENDS; the startup sibling SURVIVES.
+Run-Cli "+close --target=t99sib" "$($d.Tmp)\closesplit.txt" 12 | Out-Null
+$rows1 = Wait-AliveCount $d.Tmp 'after' 1 15
+Assert "D3 exactly one session survives the single-pane close" ((Count-Alive $rows1) -eq 1)
+$survD = @($rows1 | Where-Object { $_.alive -eq $true }) | Select-Object -First 1
+Assert "D4 the survivor is the startup sibling, not the closed split" (
+    $null -ne $survD -and $survD.id -eq $d.SessId)
+Stop-TestProcs
 
 # ============================================================================
 "== cleanup"

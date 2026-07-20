@@ -793,7 +793,16 @@ pub fn createWindow(self: *App, opts: Window.InitOptions) !*Window {
     // tabs/splits inherit that cross-machine connection instead). Bounded +
     // non-fatal: a broken/unspawnable agent yields null and the window opens as
     // plain exec surfaces (`buildRemoteInherit` returns null → local ConPTY).
-    const is_remote = if (opts.surface_overrides) |ov| ov.remote != null else false;
+    // A CROSS-MACHINE remote window carries a `.remote` override with
+    // `local_agent = false`; its tabs/splits inherit that connection, so it must
+    // NOT also get a local agent. A LOCAL-agent first-pane override (T99, the
+    // IPC `+new-window` path) has `local_agent = true` and does NOT count as
+    // remote here — the window still needs `local_agent_conn` set so its later
+    // tabs/splits inherit the same agent via `buildRemoteInherit`.
+    const is_remote = if (opts.surface_overrides) |ov|
+        (ov.remote != null and !ov.remote.?.local_agent)
+    else
+        false;
     if (!is_remote and self.config.@"session-persistence") {
         window.local_agent_conn = self.local_agent.sharedConnection();
     }

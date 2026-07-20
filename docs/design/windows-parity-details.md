@@ -3265,6 +3265,54 @@ the deferred split scenario (close ONE pane of a 2-pane window ⇒ only that
 session ends, sibling survives) that T99 unblocks. Both lanes + test-agent +
 P1–P3 green.
 
+### T99 DONE (2026-07-20)
+
+Three sites, all mirroring the existing cross-machine `remote_dialed` branch so
+local persistence rides the exact same inheritance seam:
+
+- **`handleNewWindow` first pane** (`IpcHandlers.zig`): resolve
+  `app.local_agent.sharedConnection()` up-front when `session-persistence` is on
+  (the bounded/cached call `createWindow` also makes). Non-null ⇒ build a
+  `.remote{connection, local_agent=true, command=<agent-native>, working_directory}`
+  first-pane override carrying the window/pane-name env; null (persistence off
+  or the agent unreachable) ⇒ the previous plain-exec override, so window
+  creation never hangs on a broken agent. The command is the raw string / joined
+  `-e` argv (the agent applies its own shell's convention) — never locally
+  shell-wrapped.
+- **`handleNewWindow` inline split** (`--split=`): a `window.local_agent_conn`
+  branch — no `--split-command` ⇒ a null baton so `newSplit`'s
+  `buildRemoteInherit` injects the agent + inherits the first pane's cwd; else a
+  `.remote{local_agent}` override with the command + pane-name env.
+- **`handleSplit`** (`+split`): an `else if (window.local_agent_conn)` branch
+  added after the `remote_dialed` one, same null-baton-vs-`.remote{local_agent}`
+  rule keyed on an explicit command/cwd. Shared `-e` joining factored into
+  `joinArgv`.
+
+The enabling change in `App.createWindow`: the `is_remote` guard (which decides
+whether to set `window.local_agent_conn` for later tabs/splits) now excludes a
+`local_agent=true` override — a cross-machine `.remote` still counts as remote
+(its tabs inherit that connection), but a local-agent first-pane override does
+NOT, so the window still gets `local_agent_conn` and its subsequent
+tabs/splits inherit the same agent via `buildRemoteInherit`.
+
+Env threading in the null-baton (pure-inherit) path matches `remote_dialed`
+exactly — the name env is not re-threaded there, but the pane is still
+registered in the IPC registry by name, so targeting is unaffected.
+
+**Evidence.** `session-open.ps1` section D: with persistence on, `+sessions`
+alive-count 1 → 2 after `+split` → 3 after `+new-window`; `+list` reports pid 0
+for the agent-backed panes; the split pane's typing round-trips through the
+agent. `session-close.ps1` section D: `+split` → 2 sessions, `+close` of the ONE
+split pane leaves exactly 1 alive and it is the startup sibling (per-surface
+close intent). Both scripts ALL PASS ×3. A harness fix landed with it:
+`Test-Typing` now strips whitespace before matching, because a split inside a
+MINIMIZED test window has a near-zero client rect and wraps output one glyph per
+line (a test-window artifact, not a product bug — the agent session, echo, and
+output stream are all live). Both test lanes + `test-agent` + P1–P3 green.
+
+**Left open (pre-existing, not T99):** T98 — an agent-backed pane's pid reads as
+a system pid in `+sessions` (0 in `+list`) via the ConPTY reparent.
+
 ## T89a — Session persistence on Windows: design (Phase K)
 
 Port the session-persistence feature (CLAUDE.md "Session Persistence"

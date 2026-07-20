@@ -11,6 +11,7 @@ const App = @import("App.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const provenance = @import("provenance.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
+const remote_connection = @import("../../remote/connection.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
@@ -190,7 +191,37 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         try env.append(arena, .{ .key = "GHOZTTY_PANE_NAME", .value = t });
     }
 
-    const overrides: Surface.Overrides = .{
+    // T99: with `session-persistence` on, route the first pane through the
+    // local agent so its process survives this app (quit/crash/upgrade) and can
+    // re-attach — exactly like the startup window. Resolve the shared
+    // connection up-front (bounded + cached; the same call createWindow makes to
+    // set `window.local_agent_conn` for later tabs/splits). A null result
+    // (persistence off, or an unreachable/unspawnable agent) falls back to a
+    // plain exec pane, so window creation never hangs on a broken agent.
+    const agent_conn: ?*remote_connection.Connection = if (app.config.@"session-persistence")
+        app.local_agent.sharedConnection()
+    else
+        null;
+
+    const overrides: Surface.Overrides = if (agent_conn) |conn| ov: {
+        // Agent-backed: the command is a REMOTE-native string the agent's shell
+        // runs (never locally shell-wrapped), and the cwd is a local path the
+        // same-machine agent honors. The window/pane-name env rides the OPEN.
+        const remote_command: ?[]const u8 = if (args.e_args.len > 0)
+            try joinArgv(arena, args.e_args)
+        else
+            nonEmpty(args.command);
+        break :ov .{
+            .remote = .{
+                .connection = conn,
+                .working_directory = nonEmpty(args.working_directory),
+                .shell = nonEmpty(args.shell),
+                .command = remote_command,
+                .local_agent = true,
+            },
+            .env = env.items,
+        };
+    } else .{
         .command_argv = if (args.e_args.len > 0)
             args.e_args
         else if (args.command) |cmd|
@@ -244,14 +275,30 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         if (args.name) |n| {
             try split_env.append(arena, .{ .key = "GHOZTTY_PANE_NAME", .value = n });
         }
-        const split_overrides: Surface.Overrides = .{
+        // T99: the inline split inherits the window's agent-backing. Mirror
+        // handleSplit — no explicit `--split-command` ⇒ a null baton so
+        // newSplit's `buildRemoteInherit` injects the agent and inherits the
+        // first pane's cwd; otherwise a `.remote{local_agent}` override carrying
+        // the agent-native command plus the pane-name env.
+        const split_cmd = nonEmpty(args.split_command);
+        const split_overrides: ?Surface.Overrides = if (window.local_agent_conn) |conn| ov: {
+            if (split_cmd == null) break :ov null;
+            break :ov .{
+                .remote = .{
+                    .connection = conn,
+                    .command = split_cmd,
+                    .local_agent = true,
+                },
+                .env = split_env.items,
+            };
+        } else .{
             .command_argv = if (args.split_command) |cmd|
                 try wrapCommandArgv(ctx, arena, args.shell, cmd)
             else
                 null,
             .env = split_env.items,
         };
-        window.pending_surface_overrides = &split_overrides;
+        if (split_overrides) |*ov| window.pending_surface_overrides = ov;
         defer window.pending_surface_overrides = null;
         const new_surface = window.newSplit(dir) catch |err| blk: {
             log.warn("IPC inline split failed err={}", .{err});
@@ -385,6 +432,20 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 fn nonEmpty(v: ?[]const u8) ?[]const u8 {
     const s = v orelse return null;
     return if (s.len > 0) s else null;
+}
+
+/// Join a `-e arg...` argv into a single command line for a remote/agent shell,
+/// which runs ONE command string rather than an argv (the agent applies its own
+/// shell's convention). Space-separated; the values never contain embedded
+/// quotes in practice. Null ⇒ no `-e` argv was given. Allocated in `arena`.
+fn joinArgv(arena: Allocator, argv: []const []const u8) Allocator.Error!?[]const u8 {
+    if (argv.len == 0) return null;
+    var joined: std.ArrayList(u8) = .empty;
+    for (argv, 0..) |a, i| {
+        if (i > 0) try joined.append(arena, ' ');
+        try joined.appendSlice(arena, a);
+    }
+    return joined.items;
 }
 
 /// The account tier of relay token resolution (T21a; brokered per T93): if an
@@ -536,14 +597,10 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // a `-e` argv is joined into one command line for the agent's shell.
     // With no explicit values we pass NO overrides at all, so newSplitAt's
     // inheritance (parent pane's command + cwd) applies, like the Mac.
-    const remote_command: ?[]const u8 = if (args.e_args.len > 0) cmd: {
-        var joined: std.ArrayList(u8) = .empty;
-        for (args.e_args, 0..) |a, i| {
-            if (i > 0) try joined.append(arena, ' ');
-            try joined.appendSlice(arena, a);
-        }
-        break :cmd joined.items;
-    } else nonEmpty(command);
+    const remote_command: ?[]const u8 = if (args.e_args.len > 0)
+        try joinArgv(arena, args.e_args)
+    else
+        nonEmpty(command);
 
     const overrides: ?Surface.Overrides = if (window.remote_dialed) |dialed| ov: {
         if (remote_command == null and nonEmpty(args.working_directory) == null)
@@ -554,6 +611,25 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .working_directory = nonEmpty(args.working_directory),
                 .shell = nonEmpty(args.shell),
                 .command = remote_command,
+            },
+            .env = env.items,
+        };
+    } else if (window.local_agent_conn) |conn| ov: {
+        // T99: a split in a LOCAL persistence window opens a fresh AGENT session
+        // (survives the app), never a plain ConPTY — mirrors the remote_dialed
+        // branch. No explicit command/cwd ⇒ a null baton so newSplitAt's
+        // `buildRemoteInherit` injects the agent and inherits the split-parent
+        // pane's cwd; otherwise a `.remote{local_agent}` override carrying the
+        // agent-native command + the name env.
+        if (remote_command == null and nonEmpty(args.working_directory) == null)
+            break :ov null;
+        break :ov .{
+            .remote = .{
+                .connection = conn,
+                .working_directory = nonEmpty(args.working_directory),
+                .shell = nonEmpty(args.shell),
+                .command = remote_command,
+                .local_agent = true,
             },
             .env = env.items,
         };
