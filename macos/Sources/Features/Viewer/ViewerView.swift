@@ -42,9 +42,11 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private var reloadDebounce: DispatchWorkItem?
     private var reloadNeedsRearm = false
 
-    // Browser chrome state (web mode). The chrome bar is a SwiftUI overlay
+    // Browser chrome state. The chrome bar is a SwiftUI overlay
     // (WebChromeBar) that appears when the mouse moves near the top of the
-    // pane and auto-hides after inactivity so content keeps the space.
+    // pane and auto-hides after inactivity so content keeps the space. It
+    // shows an editable URL + nav controls for web, and a read-only file://
+    // address for markdown/code files.
     @Published private(set) var chromeVisible = false
     @Published private(set) var currentURL: String = ""
     @Published private(set) var canGoBack = false
@@ -148,6 +150,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 baseDirectory: url.deletingLastPathComponent())
             config.setURLSchemeHandler(handler, forURLScheme: ViewerSchemeHandler.scheme)
             self.schemeHandler = handler
+            // Surface the file:// URL in the address bar (read-only — a file
+            // viewer never navigates, so this is set once and never changes).
+            self.currentURL = url.absoluteString
         case .web:
             break
         }
@@ -249,14 +254,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// responder on the last terminal even after a click lands in web
     /// content. One app-local event monitor solves both: clicks inside the
     /// pane claim keyboard focus for the web view, and mouse movement near
-    /// the pane top reveals the chrome bar (web mode).
+    /// the pane top reveals the chrome bar (all viewer modes — the bar shows
+    /// an editable URL for web and a read-only file:// address for files).
     private func installEventMonitor() {
         guard chromeMonitor == nil else { return }
         chromeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] event in
             guard let self else { return event }
             switch event.type {
             case .leftMouseDown: self.handleMouseDown(event)
-            case .mouseMoved: if self.isWebURL { self.handleChromeMouseMoved(event) }
+            case .mouseMoved: self.handleChromeMouseMoved(event)
             default: break
             }
             return event

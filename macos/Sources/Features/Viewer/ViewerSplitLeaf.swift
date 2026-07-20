@@ -1,10 +1,11 @@
 import SwiftUI
 
-/// SwiftUI leaf for a viewer pane inside the split tree. Web panes get a
-/// floating browser chrome bar (back/forward/reload + URL field) mounted by
-/// ViewerView itself as an NSHostingView above the web view — it reveals on
-/// mouse-over near the top of the pane and auto-hides after inactivity so
-/// the content keeps the space.
+/// SwiftUI leaf for a viewer pane inside the split tree. Every viewer pane
+/// gets a floating chrome bar mounted by ViewerView itself as an NSHostingView
+/// above the web view — it reveals on mouse-over near the top of the pane and
+/// auto-hides after inactivity so the content keeps the space. Web panes show
+/// back/forward/reload + an editable URL field; file panes (markdown/code) show
+/// a read-only, selectable file:// address.
 struct ViewerSplitLeaf: View {
     @ObservedObject var viewerView: ViewerView
 
@@ -26,12 +27,13 @@ private struct ViewerRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: ViewerView, context: Context) {}
 }
 
-/// Browser toolbar for web viewer panes: anchored flush to the pane top,
-/// stretched full width — buttons left, the URL field filling the rest.
-/// Uses Liquid Glass on macOS 26+ (translucent material fallback) so it
-/// feels native. Hosted by ViewerView in an NSHostingView layered above
-/// the WKWebView; revealed on mouse-over near the pane top, auto-hidden
-/// after inactivity.
+/// Chrome bar for viewer panes: anchored flush to the pane top, stretched
+/// full width. Uses Liquid Glass on macOS 26+ (translucent material fallback)
+/// so it feels native. Hosted by ViewerView in an NSHostingView layered above
+/// the WKWebView; revealed on mouse-over near the pane top, auto-hidden after
+/// inactivity. Web panes get an interactive toolbar (back/forward/reload + an
+/// editable URL field); file panes (markdown/code) get a read-only, selectable
+/// file:// address so the pane reads like any other page — just not navigable.
 struct WebChromeBar: View {
     @ObservedObject var viewerView: ViewerView
 
@@ -39,6 +41,23 @@ struct WebChromeBar: View {
     @FocusState private var urlFocused: Bool
 
     var body: some View {
+        Group {
+            if viewerView.isWebURL {
+                webChrome
+            } else {
+                fileChrome
+            }
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity)
+        .modifier(ChromeBarBackground())
+        .onHover { viewerView.holdChrome($0) }
+    }
+
+    /// Web: back/forward/reload + an editable, submittable URL field.
+    private var webChrome: some View {
         HStack(spacing: 4) {
             Button(action: { viewerView.goBack() }) {
                 Image(systemName: "chevron.left")
@@ -77,17 +96,34 @@ struct WebChromeBar: View {
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
                 .padding(.leading, 4)
         }
-        .buttonStyle(.borderless)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity)
-        .modifier(ChromeBarBackground())
         .onAppear { urlText = viewerView.currentURL }
         .onChange(of: viewerView.currentURL) { newValue in
             if !urlFocused { urlText = newValue }
         }
-        .onHover { viewerView.holdChrome($0) }
         .onChange(of: urlFocused) { viewerView.holdChrome($0) }
+    }
+
+    /// File (markdown/code): a read-only, selectable file:// address with a
+    /// leading document glyph — no navigation controls (a file viewer never
+    /// browses). Long paths truncate in the middle so the filename stays legible.
+    private var fileChrome: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "doc.text")
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 24)
+
+            Text(viewerView.currentURL)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
+                .padding(.leading, 4)
+                .help(viewerView.currentURL)
+        }
     }
 }
 
