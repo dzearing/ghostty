@@ -9,6 +9,29 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 38) — T89e DONE: close-vs-quit session semantics. Wired
+  the core's `close_on_exit` (Remote backend's CLOSE-vs-DETACH atomic, reached
+  via new win32 `Surface.setSessionCloseIntent`) into the user-close paths:
+  `closeSplitSurface` marks the removed leaf, `closeTabByIndex` the whole tab,
+  `Window.close` all tabs (new `markAllSessionsClose`) — all BEFORE the deinit
+  that frees the surfaces and reads the flag, so `+close`/X/Alt+F4/close_window
+  END the agent session. `Window.deinit` (the `.quit`→PostQuitMessage→terminate
+  teardown) deliberately does NOT mark, and new WM_QUERYENDSESSION/WM_ENDSESSION
+  handlers allow logoff without a CLOSE, so app-exit paths DETACH (sessions
+  survive, re-attach next launch). Palette "Quit" → "Quit Ghoztty (keep
+  sessions)" when persistence on. Confirm carve-out was a no-op: win32 quit has
+  no dialog (so "quit never scares" already holds), and the close-confirm is now
+  ACCURATE since closing truly ends the session. `session-close.ps1` ALL PASS
+  (9) ×3 — A: `+close` pane ⇒ 0 alive; B: `+close` window ⇒ 0 alive; C: hard-
+  kill GUI ⇒ session survives alive+detached. Both lanes + test-agent + P1–P3
+  green. SURPRISE that became **T99**: IPC-created windows/tabs/splits aren't
+  agent-backed — only the STARTUP window is. `+new-window`/`+split` panes report
+  real pids + add no `+sessions` row because the IPC override baton (env/name
+  vars, non-null even with no command) suppresses `buildRemoteInherit`'s local-
+  agent injection in `addTab`/`newSplitAt` (the `remote_dialed` branch handles
+  cross-machine, but no `local_agent_conn` branch exists). T89d-lineage gap;
+  forced `session-close.ps1` onto the single startup session. Next on-box: T99
+  (then T89f re-attach, which needs agent-backed IPC surfaces).
 - 2026-07-20 (on-box, 37) — T89d DONE: win32 surfaces open under the local
   session-persistence agent. New `LocalAgent.zig` find-or-spawn (dial
   port.json{pipe} → CreateProcessW DETACHED spawn → 2s-bounded poll; 15s

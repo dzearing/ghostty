@@ -969,6 +969,14 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     // Cancel any in-progress rename (the edit control may belong to this tab).
     self.cancelTabRename();
     var tree = self.tab_trees[idx];
+    // T89e: user closed this tab → every pane's agent session must END
+    // (CLOSE), not detach. Mark before deinit; the flag is read as each
+    // surface tears down its termio backend. App-quit teardown
+    // (Window.deinit) never runs this path, so quitting keeps sessions.
+    {
+        var it = tree.iterator();
+        while (it.next()) |entry| entry.view.setSessionCloseIntent(true);
+    }
     tree.deinit(); // This unrefs all surfaces → Surface.unref frees when ref_count=0
     var i: usize = idx;
     while (i + 1 < self.tab_count) : (i += 1) {
@@ -1064,6 +1072,13 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
         return;
     };
     log.debug("closeSplitSurface: remove returned, new_tree nodes={}", .{new_tree.nodes.len});
+
+    // T89e: user closed this one pane → END its agent session (CLOSE), not
+    // detach. The surviving panes in `new_tree` keep their default (detach)
+    // intent; only the removed `surface` is marked. old_tree.deinit() below
+    // unrefs `surface` to zero, freeing it and reading this flag as its
+    // termio backend tears down.
+    surface.setSessionCloseIntent(true);
 
     var old_tree = self.tab_trees[tab];
     old_tree.deinit();
@@ -3434,6 +3449,14 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
 /// because Win32 destroys child HWNDs during DestroyWindow and the
 /// OpenGL driver crashes if contexts are still active on destroyed windows.
 pub fn close(self: *Window) void {
+    // T89e: this is a USER window-close (title-bar X, Alt+F4, close_window,
+    // close_all_windows, +close window). Every pane's agent session must END
+    // (CLOSE), not detach. Mark before cleanupAllSurfaces reads the flag.
+    // The app-quit teardown path is Window.deinit (which also calls
+    // cleanupAllSurfaces but deliberately does NOT mark), so quitting keeps
+    // sessions alive for re-attach.
+    self.markAllSessionsClose();
+
     // First, cleanly shut down all surfaces (renderer/IO threads, WGL, DC).
     self.cleanupAllSurfaces();
 
@@ -3454,6 +3477,19 @@ fn cleanupAllSurfaces(self: *Window) void {
         tree.* = .empty;
     }
     self.tab_count = 0;
+}
+
+/// Mark every pane in every tab to END its agent session (CLOSE) rather than
+/// DETACH when freed (T89e). Called from the user window-close path
+/// (Window.close) BEFORE the surfaces are torn down. The app-quit teardown
+/// (Window.deinit) deliberately does NOT call this, so app quit / logoff /
+/// crash / upgrade leave sessions alive for the next launch. No-op for local
+/// exec panes (session-persistence off) — setSessionCloseIntent no-ops there.
+fn markAllSessionsClose(self: *Window) void {
+    for (self.tab_trees[0..self.tab_count]) |*tree| {
+        var it = tree.iterator();
+        while (it.next()) |entry| entry.view.setSessionCloseIntent(true);
+    }
 }
 
 /// Handle WM_DESTROY: remove this window from the App's list,
@@ -3718,8 +3754,24 @@ pub fn windowWndProc(
         w32.WM_CLOSE => {
             // Title-bar X / Alt+F4 / close_all_windows land here. Confirm
             // once for the whole window if any tab has a running process.
+            // window.close() then marks every pane's session CLOSE (T89e).
             if (!window.confirmCloseIfNeeded()) return 0;
             window.close();
+            return 0;
+        },
+        w32.WM_QUERYENDSESSION => {
+            // Logoff / shutdown / reboot (T89e): allow it (return TRUE). This
+            // is an app-EXIT path, NOT a user window-close — we deliberately
+            // do NOT mark sessions CLOSE here, so the local agent keeps its
+            // pinned sessions + ring snapshots and they re-attach on the next
+            // launch. (WM_QUERYENDSESSION never routes through window.close.)
+            return 1;
+        },
+        w32.WM_ENDSESSION => {
+            // The session is ending; the process is about to die. Sessions
+            // survive because the agent owns the PTYs and we sent no CLOSE.
+            // (T89f will flush the layout manifest here so re-attach restores
+            // the window geometry after the reboot.)
             return 0;
         },
         w32.WM_DESTROY => {

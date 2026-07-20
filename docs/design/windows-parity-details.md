@@ -3220,6 +3220,51 @@ session roster's pid field; add a `+sessions --json` pid assertion once fixed.
 *Validation:* extend `session-open.ps1` to assert the session pid is a live,
 agent-descended process once the capture is fixed (the assertion T89d dropped).
 
+## T99 — FIX: IPC-created windows/tabs/splits are not agent-backed on a local persistence window
+
+Found by T89e (2026-07-20). With `session-persistence=on`, only the **startup**
+window's initial pane is agent-backed (a session in `+sessions`, `+list` pid 0
+via the ConPTY reparent). Every surface created through the IPC server —
+`+new-window`, `+split`, `+new-window --split`, and (by the same path) tabs —
+opens as a **plain local exec pane** instead: proven on-box, a `+new-window`
+pane and a `+split` pane both report real user-range pids in `+list` and add
+NO row to `+sessions`.
+
+Root cause: `App.createWindow` DOES set `window.local_agent_conn`, but the
+initial surface is created by `Window.addTab`, which only runs
+`buildRemoteInherit` (the local-agent/remote injection seam) **when
+`pending_surface_overrides == null`**. The IPC handlers always hand a NON-null
+override baton — `handleNewWindow` and `handleSplit`/inline-split build a
+`Surface.Overrides` that carries the `GHOSTTY_WINDOW_NAME`/`GHOSTTY_PANE_NAME`
+env even when the user passed no `--command`/`--working-directory`, so the baton
+is never null and `buildRemoteInherit` is skipped. The `remote_dialed`
+(cross-machine) branch already special-cases "no explicit command/cwd ⇒ pass
+null so inheritance runs"; the analogous `local_agent_conn` case does not exist,
+so local persistence windows fall through to the exec `else` branch.
+
+Impact: agents/automation drive `+split`/`+new-window` heavily; their panes
+silently do NOT persist (they die with the app, never re-attach), contradicting
+the "everything local runs under the agent" contract T89d established. Also
+blocks any multi-agent-backed-pane test (T89e's `session-close.ps1` had to use
+the single startup session). NOT in the app test lanes.
+
+*Fix:* give `handleSplit` (+ inline split in `handleNewWindow`) and
+`handleNewWindow` a `local_agent_conn` branch mirroring `remote_dialed`: when
+the window is local-agent-backed and there is no explicit command/cwd/`-e`
+argv, pass a **null** baton (so `buildRemoteInherit` injects the local agent),
+and otherwise build a `.remote` override with `connection = local_agent_conn`,
+`local_agent = true`, plus the command/cwd — threading the env/name vars
+through that remote override so they still reach the new session's OPEN. A
+T89d-lineage gap (T89d's "all tabs/splits inherit" claim held only for the GUI
+new_tab/new_split actions, which set no baton).
+
+*Validation:* extend `session-open.ps1` (or a new `session-ipc-open.ps1`) to
+assert a `+split` and a `+new-window` each add an agent-backed session
+(`+sessions` count grows, `+list` pid 0); then extend `session-close.ps1` with
+the deferred split scenario (close ONE pane of a 2-pane window ⇒ only that
+session ends, sibling survives) that T99 unblocks. Both lanes + test-agent +
+P1–P3 green.
+
 ## T89a — Session persistence on Windows: design (Phase K)
 
 Port the session-persistence feature (CLAUDE.md "Session Persistence"
@@ -3731,6 +3776,48 @@ because it truly kills). Dialog wording per the Mac split.
 *Validation:* new `test/win32/session-close.ps1` — close pane ⇒
 session gone from `+sessions`; quit action ⇒ session alive; ALL PASS
 ×3.
+
+*Evidence (done 2026-07-20):* `close_on_exit` (the core Remote-backend
+atomic that picks CLOSE vs DETACH on teardown, `Surface.
+setSessionCloseIntent` → `Termio.setSessionCloseIntent`, no-op for exec)
+is now set true on the win32 user-close paths and left false on app
+exit:
+- `Surface.setSessionCloseIntent` win32 helper (gated on
+  `core_surface_ready`) forwards to the core.
+- `Window.closeSplitSurface` marks the removed leaf; `closeTabByIndex`
+  marks the whole tab; `Window.close` calls new `markAllSessionsClose`
+  (all tabs) — covering pane / tab / window closes AND the `+close`
+  IPC (which routes through the same two). All run BEFORE the
+  deinit/`cleanupAllSurfaces` that frees the surfaces and reads the flag.
+- `Window.deinit` (the app-quit teardown that `App.terminate` runs after
+  `.quit` → `PostQuitMessage`) deliberately does NOT mark, so quit
+  detaches. New `WM_QUERYENDSESSION`/`WM_ENDSESSION` handlers allow
+  logoff/reboot and likewise send no CLOSE (T89f will flush the manifest
+  in WM_ENDSESSION).
+- Command-palette "Quit" becomes "Quit Ghoztty (keep sessions)" when
+  `session-persistence` is on (new `quit_keep` flag on PaletteEntry +
+  persistence-aware `paletteEntryName`).
+- Confirm carve-out: no code change needed. win32 quit has no
+  confirmation dialog, so the "quit paths never scare" half of Mac
+  `853ec3168` is already satisfied; the close-confirm sites
+  (`confirmCloseIfNeeded`/`Surface.close`) keep warning, which is now
+  ACCURATE because closing truly ends the agent session ("window-close
+  still warns because it truly kills").
+
+`session-close.ps1` ALL PASS ×3 (A: `+close` pane ⇒ 0 alive sessions;
+B: `+close` window ⇒ 0 alive; C: hard-kill GUI ⇒ session survives alive
++ detached). Both test lanes + `test-agent` + P1–P3 green; GUI Debug
+build clean.
+
+Validation surfaced **T99**: IPC-created windows/tabs/splits are NOT
+agent-backed on a local persistence window (only the startup window is)
+— the IPC override baton (env/name vars, non-null even with no command)
+suppresses `buildRemoteInherit`'s local-agent injection in
+`addTab`/`newSplitAt`. A T89d-lineage gap; it forced `session-close.ps1`
+to use the single startup session (no second agent-backed pane is
+CLI-reachable until T99). The close-intent wiring is transport-agnostic
+and already runs (no-op) on the exec panes T99 leaves behind, so T99 is
+independent of T89e's correctness.
 
 ## T89f — Layout manifest + same-PID re-attach restore
 

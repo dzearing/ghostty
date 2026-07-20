@@ -1011,6 +1011,17 @@ pub fn close(self: *Surface, process_active: bool) void {
     }
 }
 
+/// Mark whether this surface's agent session should CLOSE (terminate the
+/// child + free the session) rather than DETACH (keep-alive for re-attach)
+/// when the surface is eventually freed (T89e). Set true on user-initiated
+/// pane/tab/window close paths BEFORE the surface is deinitialized; never on
+/// app-quit teardown (Window.deinit), so quitting leaves sessions alive for
+/// the next launch. No-op for local exec surfaces (the child dies with the
+/// surface anyway) and before core-surface init.
+pub fn setSessionCloseIntent(self: *Surface, intent: bool) void {
+    if (self.core_surface_ready) self.core_surface.setSessionCloseIntent(intent);
+}
+
 pub fn supportsClipboard(
     self: *const Surface,
     clipboard_type: apprt.Clipboard,
@@ -1658,6 +1669,10 @@ const PaletteEntry = struct {
     about: bool = false,
     /// Local-only like `about` (T71): runs the Claude Code plugin install.
     claude: bool = false,
+    /// The Quit entry (T89e): its display name becomes "Quit Ghoztty (keep
+    /// sessions)" when session-persistence is on, to signal that quitting
+    /// detaches persistent sessions for re-attach rather than ending them.
+    quit_keep: bool = false,
 };
 
 /// Cap on user-configured command-palette-entry commands shown in the
@@ -1667,7 +1682,13 @@ pub const MAX_USER_PALETTE_ENTRIES = 64;
 /// Palette indexes >= palette_entries.len refer to user-configured
 /// command-palette-entry commands from the config, in order.
 fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
-    if (idx < palette_entries.len) return palette_entries[idx].name;
+    if (idx < palette_entries.len) {
+        const entry = palette_entries[idx];
+        // T89e: signal that quitting keeps persistent sessions alive.
+        if (entry.quit_keep and self.app.config.@"session-persistence")
+            return "Quit Ghoztty (keep sessions)";
+        return entry.name;
+    }
     const user = self.app.config.@"command-palette-entry".value.items;
     const uidx = idx - palette_entries.len;
     if (uidx >= user.len) return "";
@@ -1754,7 +1775,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Reload Config", .action = .reload_config },
     .{ .name = "About Ghoztty", .action = .new_window, .about = true },
     .{ .name = "Install Claude Code Integration", .action = .new_window, .claude = true },
-    .{ .name = "Quit", .action = .quit },
+    .{ .name = "Quit", .action = .quit, .quit_keep = true },
 };
 
 /// Toggle the command palette visibility.

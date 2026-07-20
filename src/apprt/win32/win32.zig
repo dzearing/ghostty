@@ -128,6 +128,8 @@ pub const WM_USER: u32 = 0x0400;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_QUIT: u32 = 0x0012;
 pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_QUERYENDSESSION: u32 = 0x0011;
+pub const WM_ENDSESSION: u32 = 0x0016;
 pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_SIZE: u32 = 0x0005;
 // WM_SIZE wParam values.
