@@ -63,6 +63,11 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
     const stamp = try versionString(b);
     const version_opts = b.addOptions();
     version_opts.addOption([]const u8, "agent_version", stamp);
+    // Debug vs release lineage (T89d1): the local session-persistence agent's
+    // single-instance guard splits by lineage so a debug and a release local
+    // agent don't fight (their dirs + pipe suffixes are already split per T89a
+    // decision 2). The `test-agent` build reuses this module and is `.Debug`.
+    version_opts.addOption(bool, "is_debug", cfg.optimize == .Debug);
     const version_module = version_opts.createModule();
     exe.root_module.addImport("agent_build_options", version_module);
 

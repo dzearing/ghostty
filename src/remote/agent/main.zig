@@ -179,7 +179,10 @@ pub fn main() !void {
             blockSigterm();
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
             // (bind, banner, tray icon). Exits the process on conflict.
-            var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
+            // TCP listen keeps the legacy (relay) guard identity — only the
+            // local persistence transport (`--listen-pipe`) takes a distinct
+            // instance key (T89d1).
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, .relay);
             defer lock.release();
             try runListen(alloc, encoding, l.addr, l.headless, l.public, l.port_file, l.sessions_file);
         },
@@ -196,8 +199,11 @@ pub fn main() !void {
             // thread BEFORE any daemon thread is spawned (see the `.listen` arm).
             blockSigterm();
             // DAEMON mode: single-instance BEFORE the bind (a losing instance
-            // must not clobber the winner's socket node).
-            var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
+            // must not clobber the winner's socket node). POSIX `--listen-unix`
+            // stays on the legacy guard for now — the analogous local/relay
+            // collision is a latent Mac bug flagged for the Mac seat (T89d1);
+            // this branch's lane is Windows.
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, .relay);
             defer lock.release();
             try runListenUnix(alloc, encoding, l.path, l.headless, l.port_file, l.sessions_file);
         },
@@ -210,16 +216,20 @@ pub fn main() !void {
             // comptime gate keeps the pipe daemon code out of POSIX analysis.
             if (builtin.os.tag != .windows) unreachable;
             // DAEMON mode: single-instance BEFORE the bind (a losing instance
-            // must not race the winner for the pipe name).
-            var lock = acquireDaemonLockOrExit(alloc, l.force_replace);
+            // must not race the winner for the pipe name). This is THE local
+            // session-persistence agent, so it takes the DISTINCT `local[-debug]`
+            // guard (T89d1) — it must coexist with a `--relay` agent, which
+            // holds the legacy guard.
+            var lock = acquireDaemonLockOrExit(alloc, l.force_replace, local_instance);
             defer lock.release();
             try runListenPipe(alloc, encoding, l.name, l.headless, l.port_file, l.sessions_file);
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
             // before the tray could flash an icon — and before a first-run
-            // auto-enroll could pop a browser from a doomed duplicate).
-            var lock = acquireDaemonLockOrExit(alloc, r.force_replace);
+            // auto-enroll could pop a browser from a doomed duplicate). The
+            // relay agent keeps the legacy guard identity (unchanged by T89d1).
+            var lock = acquireDaemonLockOrExit(alloc, r.force_replace, .relay);
             defer lock.release();
             // The device token authenticates the relay WebSockets. Required.
             // Precedence: the GHOSTTY_DEVICE_TOKEN env var wins; otherwise fall
@@ -302,8 +312,8 @@ const DaemonLock = struct {
 ///     policy as tray failures).
 /// Called BEFORE any user-visible daemon setup (bind / banner / tray icon), so
 /// a losing instance never flashes a tray icon or steals the port.
-fn acquireDaemonLockOrExit(alloc: Allocator, force_replace: bool) DaemonLock {
-    const guard = single_instance.acquireWithTakeover(alloc, force_replace) catch |err| switch (err) {
+fn acquireDaemonLockOrExit(alloc: Allocator, force_replace: bool, instance: single_instance.Instance) DaemonLock {
+    const guard = single_instance.acquireWithTakeover(alloc, force_replace, instance) catch |err| switch (err) {
         error.AlreadyRunning => {
             // std.debug.print writes stderr, which the supervisors (installer
             // launcher / deploy watcher) redirect to agent.err.log — visible
@@ -317,9 +327,22 @@ fn acquireDaemonLockOrExit(alloc: Allocator, force_replace: bool) DaemonLock {
         },
     };
     // We are THE daemon: announce liveness. A heartbeat failure only costs
-    // challenger-side takeover diagnostics, never the daemon.
-    return .{ .guard = guard, .heartbeat = single_instance.Heartbeat.start(alloc) };
+    // challenger-side takeover diagnostics, never the daemon. The heartbeat is
+    // keyed to the SAME instance as the guard so a future challenger consults
+    // the right holder's beat.
+    return .{ .guard = guard, .heartbeat = single_instance.Heartbeat.start(alloc, instance) };
 }
+
+/// The local session-persistence agent's single-instance identity: distinct
+/// from the relay/TCP-listen singleton (T89d1) so `--listen-pipe` (the Windows
+/// local agent, spawned by the app's find-or-spawn) coexists with a `--relay`
+/// agent. Debug and release lineages are separate instances too (own dir + pipe
+/// suffix per T89a decision 2), so the guard splits by `is_debug` as well.
+const local_instance: single_instance.Instance =
+    if (@import("agent_build_options").is_debug)
+        single_instance.Instance.local_debug
+    else
+        single_instance.Instance.local;
 
 /// How relay-daemon startup obtains its device credential — a PURE decision
 /// seam so the policy is unit-testable without env vars or files. Precedence:

@@ -3130,6 +3130,37 @@ trivial (.gitignore both-added, CLAUDE.md both-added bullets under
 P1/P2/P3 ALL PASS on-box. Tracker rows T89a–T94 filed with details
 sections; log entry appended.
 
+## T97 — FIX: `test-agent` red from upstream ssh-cache AtomicFile on Windows
+
+Found by T89d1 (2026-07-20). `zig build test-agent` fails exactly 4 tests, all
+`cli.ssh-cache.DiskCache` — `disk cache operations` and `disk cache cleans up
+temp files`, in both the `ghoztty-agent-test` and `ghoztty-agent-core-test`
+binaries (the CLI ssh-cache graph rides into both via `remote/agent_test.zig`).
+The failure is `renameatW → ACCESS_DENIED` inside `std.fs.AtomicFile.finish()`
+(`DiskCache.writeCacheFile` → `dir.atomicFile(...).finish()`,
+DiskCache.zig:250/263) — the classic Windows tmp+rename-replace flake where an
+AV/indexer handle on the just-written temp file makes the replacing rename fail.
+
+PROVEN pre-existing and unrelated to T89d1: git-stashing the T89d1 diff and
+re-running `-Dtest-filter="disk cache"` reproduces the identical failures on the
+baseline. Origin is the T88 upstream merge (`5423d64c6` "ssh-cache: use
+AtomicFile to write the cache file" + `d29e1cc13` "windows: use explicit error
+sets to work around lack of file locking"). T89c's "test-agent green ×3"
+(2026-07-20) predates whatever tipped this from a quiet flake into a
+deterministic fail on the box (Defender scan timing).
+
+Impact: blocks the standing "`zig build test-agent` green" bar for EVERY future
+on-box task. Both app lanes (`-Dapp-runtime=none`/`win32`) are green — they
+don't pull the ssh-cache DiskCache tests, so parity work is unblocked, but the
+agent floor needs this cleared. Candidate fixes: (a) retry `AtomicFile.finish()`
+on `error.AccessDenied` a few times with a short backoff (Windows rename-replace
+is racy under AV) — smallest, upstream-alignable; (b) exclude the CLI ssh-cache
+tests from the agent test graph (they're not agent code); (c) a Defender
+exclusion on the build's temp dirs (box config, not a code fix). Upstream code,
+so a natural Mac-seat item.
+
+*Validation (when fixed):* `zig build test-agent` ALL green ×3 on the box.
+
 ## T89a — Session persistence on Windows: design (Phase K)
 
 Port the session-persistence feature (CLAUDE.md "Session Persistence"
@@ -3475,6 +3506,61 @@ Box note: the GUI-subsystem agent exe fails to link native-msvc
 (`undefined symbol: WinMain`) — build it (and the RTC) with
 `-Dtarget=x86_64-windows-gnu`, per the T36 log note; `ZIG_GLOBAL_CACHE_DIR
 =D:\zig-global-cache` still required.
+
+## T89d1 — Agent single-instance mode-keyed identity
+
+Split out of T89d (2026-07-20) — the note T89c filed: the per-user
+single-instance guard (`single_instance.zig`) was **mode-independent**, so the
+local session-persistence agent (`--listen-pipe`) and a relay agent
+(`--relay`) both took the SAME `Global\GhozttyAgentDaemon-<sid>` mutex (and the
+same `agent.heartbeat`) — whichever started second exited 183. Find-or-spawn
+(T89d) can't stand up a local agent while a relay agent runs without this.
+T89a decision 2 makes them SEPARATE instances (own dir + pipe suffix already);
+this gives them separate GUARDS to match.
+
+### T89d1 DONE (2026-07-20)
+
+Design: **key the guard by instance, changing the LEAST.** The relay/TCP-listen
+singleton keeps its EXACT legacy names (empty key) so a shipped relay agent's
+guard is byte-for-byte unchanged across the upgrade; only the Windows
+`--listen-pipe` local agent gets a distinct `local[-debug]` key. Scope is
+deliberately Windows-only — the analogous POSIX `--listen-unix` vs `--relay`
+flock collision is a *latent Mac bug* left as-is and flagged for the Mac seat
+(fixing it would move the Mac local agent's lock path, a Mac-behavior change
+outside this branch's lane).
+
+Implementation:
+
+1. **`single_instance.Instance`** (new): a `{ key: []const u8 }` struct with
+   `relay` (`""` — legacy), `local` (`"local"`), `local_debug`
+   (`"local-debug"`). Threaded through `acquire`, `acquireWithTakeover`,
+   `Heartbeat.start`, `lockFilePath`, `heartbeatPath`, and both mutex-name
+   composers. Empty key reproduces every legacy name verbatim (no double dash,
+   `agent.lock`/`agent.heartbeat`, `Local\GhozttyAgentDaemon`); a non-empty key
+   inserts a segment (`Global\GhozttyAgentDaemon-local-<sid>`,
+   `agent-local.lock`, `agent-local.heartbeat`, `Local\GhozttyAgentDaemon-local`).
+2. **Pure composers, unit-tested off-Windows**: `composeGlobalMutexName(buf,
+   key, user_id)` and the new `composeLocalMutexName(buf, key)` (and the
+   `agent[-<key>]` lock/heartbeat filename helper) sanitize `\`/control chars
+   in both key and id to `_`, and error on overflow rather than truncating.
+3. **`is_debug` added to `agent_build_options`** (GhosttyAgent.zig:
+   `version_opts.addOption(bool, "is_debug", cfg.optimize == .Debug)`), reused
+   by the agent-test build. `main.zig` picks the instance per mode:
+   `.listen_pipe` → `local`/`local_debug` (by `is_debug`); `.listen`,
+   `.listen_unix`, `.relay` → `relay` (legacy, unchanged). `acquireDaemonLockOrExit`
+   takes the instance and passes it down.
+
+*Validation:* the T89d1 single-instance tests (composer + takeover/heartbeat
+matrix) pass — `-Dtest-filter` to them exits 0. Both app lanes
+(`-Dapp-runtime=none` + `-Dapp-runtime=win32`) green (my change touches only
+agent + build files, never the app graph). `zig build test-agent` has exactly
+**4 failures across 3 full runs, ALL `cli.ssh-cache.DiskCache`** (renameatW
+ACCESS_DENIED from `AtomicFile.finish()`), 0 others — PROVEN pre-existing by
+re-running on the git-stashed baseline (identical failures) and filed as
+**T97** (upstream Windows atomic-rename flake from the T88 merge; blocks the
+standing test-agent bar independent of this change). Flagged to the Mac seat:
+the POSIX `--listen-unix` vs `--relay` flock collision is the same latent bug,
+unkeyed here on purpose.
 
 ## T89d — Win32 surfaces OPEN under the local agent
 

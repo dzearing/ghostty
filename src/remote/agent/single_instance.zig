@@ -100,6 +100,28 @@ const Allocator = std.mem.Allocator;
 /// reads the same in any supervisor's log.
 pub const already_running_exit_code: u8 = 183;
 
+/// Which daemon instance a guard is for. The local session-persistence agent
+/// (`--listen-pipe`, T89d) and the relay agent (`--relay`) are SEPARATE daemons
+/// that must coexist on one box (T89a decision 2), so each takes a distinctly
+/// NAMED guard + heartbeat. The relay / TCP-listen singleton keeps the LEGACY
+/// names (empty key) so a running relay agent's guard is byte-for-byte
+/// unchanged across this upgrade; only the local agent gets a distinct key.
+pub const Instance = struct {
+    /// Name segment inserted into the mutex name and the lock/heartbeat
+    /// filenames. Empty ⇒ the legacy singleton names (relay / TCP listen);
+    /// non-empty ⇒ a distinct instance. Sanitized defensively by the composers,
+    /// but keep it filesystem- and mutex-name-safe by construction.
+    key: []const u8 = "",
+
+    /// The relay / TCP-listen daemon: legacy names, unchanged.
+    pub const relay: Instance = .{ .key = "" };
+    /// The local session-persistence agent (release lineage).
+    pub const local: Instance = .{ .key = "local" };
+    /// The local session-persistence agent (debug lineage — its own dir/pipe
+    /// suffix per T89a decision 2, so its own guard too).
+    pub const local_debug: Instance = .{ .key = "local-debug" };
+};
+
 pub const AcquireError = error{
     /// Another daemon instance holds the guard in this user session.
     AlreadyRunning,
@@ -135,9 +157,9 @@ pub const Guard = struct {
 /// Acquire the per-user daemon guard. See the module doc for the
 /// platform mechanisms. `alloc` is only used transiently (path resolution on
 /// POSIX); the returned `Guard` owns no heap memory.
-pub fn acquire(alloc: Allocator) AcquireError!Guard {
-    if (builtin.os.tag == .windows) return acquireWindows();
-    const path = lockFilePath(alloc) catch return error.GuardUnavailable;
+pub fn acquire(alloc: Allocator, instance: Instance) AcquireError!Guard {
+    if (builtin.os.tag == .windows) return acquireWindows(instance);
+    const path = lockFilePath(alloc, instance) catch return error.GuardUnavailable;
     defer alloc.free(path);
     return acquirePath(path);
 }
@@ -153,37 +175,72 @@ pub fn acquire(alloc: Allocator) AcquireError!Guard {
 /// guard. Public so the name composition is unit-testable off-Windows.
 pub const global_mutex_name_prefix = "Global\\GhozttyAgentDaemon-";
 
-/// Legacy pre-SID name, kept verbatim as the last-resort fallback (`Local\` =
+/// UTF-8 prefix of the legacy per-logon-session fallback name (`Local\` =
 /// per-logon-session namespace — see the module doc for why that's too weak
 /// as the primary): sandboxed contexts without Global\ access still get
-/// today's per-session guard rather than none at all.
-const local_mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\GhozttyAgentDaemon");
+/// today's per-session guard rather than none at all. The instance key (if
+/// any) is appended as `-<key>` by `composeLocalMutexName`.
+pub const local_mutex_name_base = "Local\\GhozttyAgentDaemon";
 
-/// Compose `Global\GhozttyAgentDaemon-<user_id>` into `buf`. The id is
-/// sanitized: backslashes (illegal in a mutex name anywhere past the
-/// namespace prefix) and control characters become `_`. Pure — testable on
-/// any host; the Windows path converts the result to UTF-16 for CreateMutexW.
-pub fn composeGlobalMutexName(buf: []u8, user_id: []const u8) error{NameTooLong}![]const u8 {
-    const total = global_mutex_name_prefix.len + user_id.len;
+/// Compose `Global\GhozttyAgentDaemon-[<key>-]<user_id>` into `buf`. Both the
+/// instance key and the id are sanitized: backslashes (illegal in a mutex name
+/// anywhere past the namespace prefix) and control characters become `_`. An
+/// empty key reproduces the LEGACY `Global\GhozttyAgentDaemon-<user_id>` name
+/// verbatim (no double dash). Pure — testable on any host; the Windows path
+/// converts the result to UTF-16 for CreateMutexW.
+pub fn composeGlobalMutexName(buf: []u8, key: []const u8, user_id: []const u8) error{NameTooLong}![]const u8 {
+    const key_len = if (key.len == 0) 0 else key.len + 1; // "<key>-"
+    const total = global_mutex_name_prefix.len + key_len + user_id.len;
     if (total > buf.len) return error.NameTooLong;
     @memcpy(buf[0..global_mutex_name_prefix.len], global_mutex_name_prefix);
-    for (user_id, global_mutex_name_prefix.len..) |c, i| {
+    var i = global_mutex_name_prefix.len;
+    if (key.len != 0) {
+        for (key) |c| {
+            buf[i] = if (c == '\\' or c < 0x20) '_' else c;
+            i += 1;
+        }
+        buf[i] = '-';
+        i += 1;
+    }
+    for (user_id) |c| {
         buf[i] = if (c == '\\' or c < 0x20) '_' else c;
+        i += 1;
     }
     return buf[0..total];
 }
 
-fn acquireWindows() AcquireError!Guard {
+/// Compose the `Local\` fallback name `Local\GhozttyAgentDaemon[-<key>]` into
+/// `buf`. Empty key reproduces the LEGACY literal exactly. Same sanitization as
+/// the global composer. Pure; unit-tested off-Windows.
+pub fn composeLocalMutexName(buf: []u8, key: []const u8) error{NameTooLong}![]const u8 {
+    const key_len = if (key.len == 0) 0 else key.len + 1; // "-<key>"
+    const total = local_mutex_name_base.len + key_len;
+    if (total > buf.len) return error.NameTooLong;
+    @memcpy(buf[0..local_mutex_name_base.len], local_mutex_name_base);
+    var i = local_mutex_name_base.len;
+    if (key.len != 0) {
+        buf[i] = '-';
+        i += 1;
+        for (key) |c| {
+            buf[i] = if (c == '\\' or c < 0x20) '_' else c;
+            i += 1;
+        }
+    }
+    return buf[0..total];
+}
+
+fn acquireWindows(instance: Instance) AcquireError!Guard {
     if (builtin.os.tag != .windows) unreachable;
 
-    // Preferred: Global\ + per-user id (SID, else username). Any failure on
-    // this path degrades to the legacy Local\ guard — never below it.
+    // Preferred: Global\ + [instance key +] per-user id (SID, else username).
+    // Any failure on this path degrades to the legacy Local\ guard — never
+    // below it.
     var id_buf: [768]u8 = undefined; // UNLEN=256 UTF-16 units ≤ 768 UTF-8 bytes
     if (windowsUserId(&id_buf)) |id| global: {
-        var name8: [800]u8 = undefined;
-        const name = composeGlobalMutexName(&name8, id) catch break :global;
-        var name16: [801]u16 = undefined;
-        const n16 = std.unicode.utf8ToUtf16Le(name16[0..800], name) catch break :global;
+        var name8: [832]u8 = undefined;
+        const name = composeGlobalMutexName(&name8, instance.key, id) catch break :global;
+        var name16: [833]u16 = undefined;
+        const n16 = std.unicode.utf8ToUtf16Le(name16[0..832], name) catch break :global;
         name16[n16] = 0;
         switch (tryCreateMutex(name16[0..n16 :0])) {
             .acquired => |h| return .{ .impl = .{ .handle = h } },
@@ -201,8 +258,14 @@ fn acquireWindows() AcquireError!Guard {
         );
     }
 
-    // Fallback: the legacy per-logon-session guard (today's behavior).
-    return switch (tryCreateMutex(local_mutex_name)) {
+    // Fallback: the legacy per-logon-session guard (today's behavior), keyed to
+    // the instance so local and relay don't share it either.
+    var local8: [128]u8 = undefined;
+    const local_name = composeLocalMutexName(&local8, instance.key) catch return error.GuardUnavailable;
+    var local16: [129]u16 = undefined;
+    const ln16 = std.unicode.utf8ToUtf16Le(local16[0..128], local_name) catch return error.GuardUnavailable;
+    local16[ln16] = 0;
+    return switch (tryCreateMutex(local16[0..ln16 :0])) {
         .acquired => |h| .{ .impl = .{ .handle = h } },
         .already_running => error.AlreadyRunning,
         .namespace_unavailable => error.GuardUnavailable,
@@ -360,25 +423,52 @@ const win32 = if (builtin.os.tag == .windows) struct {
 // POSIX: flock on a per-user lock file
 // -----------------------------------------------------------------------------
 
+/// Compose the per-instance state filename `agent[-<key>]<ext>` into `buf`:
+/// `agent.lock`/`agent.heartbeat` for the legacy singleton (empty key),
+/// `agent-<key>.lock` etc. otherwise. The key is sanitized ('\'/'/'/control →
+/// '_') so it can never smuggle a path separator into a filename. Pure;
+/// unit-tested. `ext` includes the dot (e.g. ".lock").
+pub fn composeStateFileName(buf: []u8, key: []const u8, ext: []const u8) error{NameTooLong}![]const u8 {
+    const base = "agent";
+    const key_len = if (key.len == 0) 0 else key.len + 1; // "-<key>"
+    const total = base.len + key_len + ext.len;
+    if (total > buf.len) return error.NameTooLong;
+    @memcpy(buf[0..base.len], base);
+    var i = base.len;
+    if (key.len != 0) {
+        buf[i] = '-';
+        i += 1;
+        for (key) |c| {
+            buf[i] = if (c == '\\' or c == '/' or c < 0x20) '_' else c;
+            i += 1;
+        }
+    }
+    @memcpy(buf[i .. i + ext.len], ext);
+    return buf[0..total];
+}
+
 /// Resolve the lock-file path (POSIX only):
 ///   1. `GHOSTTY_AGENT_LOCK` (explicit full-path override; tests use this),
-///   2. `$XDG_CONFIG_HOME/ghoztty/agent.lock`,
-///   3. `$HOME/.config/ghoztty/agent.lock`.
-/// Same directory family as `enroll.relayEnvPath` so all agent state cohabits.
-/// Owned by the caller.
-pub fn lockFilePath(alloc: Allocator) ![]u8 {
+///   2. `$XDG_CONFIG_HOME/ghoztty/agent[-<key>].lock`,
+///   3. `$HOME/.config/ghoztty/agent[-<key>].lock`.
+/// Same directory family as `enroll.relayEnvPath` so all agent state cohabits;
+/// the instance key separates the local persistence agent from the relay agent
+/// (empty key ⇒ the legacy `agent.lock`). Owned by the caller.
+pub fn lockFilePath(alloc: Allocator, instance: Instance) ![]u8 {
     if (std.process.getEnvVarOwned(alloc, "GHOSTTY_AGENT_LOCK")) |p| {
         if (p.len > 0) return p;
         alloc.free(p);
     } else |_| {}
 
+    var name_buf: [64]u8 = undefined;
+    const name = try composeStateFileName(&name_buf, instance.key, ".lock");
     if (std.process.getEnvVarOwned(alloc, "XDG_CONFIG_HOME")) |xdg| {
         defer alloc.free(xdg);
-        if (xdg.len > 0) return std.fs.path.join(alloc, &.{ xdg, "ghoztty", "agent.lock" });
+        if (xdg.len > 0) return std.fs.path.join(alloc, &.{ xdg, "ghoztty", name });
     } else |_| {}
     const home = try std.process.getEnvVarOwned(alloc, "HOME");
     defer alloc.free(home);
-    return std.fs.path.join(alloc, &.{ home, ".config", "ghoztty", "agent.lock" });
+    return std.fs.path.join(alloc, &.{ home, ".config", "ghoztty", name });
 }
 
 /// Open (creating as needed) `path` and take an exclusive, non-blocking
@@ -471,21 +561,23 @@ pub fn takeoverVerdict(
 /// heartbeat and either yield (`error.AlreadyRunning`), or kill a stuck /
 /// force-replaced holder and take the guard. This is what the daemon modes
 /// call; `acquire` remains the raw primitive.
-pub fn acquireWithTakeover(alloc: Allocator, force: bool) AcquireError!Guard {
-    if (acquire(alloc)) |g| return g else |err| switch (err) {
+pub fn acquireWithTakeover(alloc: Allocator, force: bool, instance: Instance) AcquireError!Guard {
+    if (acquire(alloc, instance)) |g| return g else |err| switch (err) {
         error.AlreadyRunning => {},
         error.GuardUnavailable => return error.GuardUnavailable,
     }
 
-    // Probe the holder: heartbeat (PID + age) and what that PID runs today.
-    const hb = readHeartbeatDefault(alloc);
+    // Probe the holder: heartbeat (PID + age) and what that PID runs today. The
+    // heartbeat is keyed to the SAME instance as the guard, so a local
+    // challenger reads the local holder's beat (never the relay agent's).
+    const hb = readHeartbeatDefault(alloc, instance);
     const image: ImageCheck = if (hb) |h| checkPidImage(h.pid) else .unavailable;
 
     // Re-probe the guard right before deciding: (a) the holder may have
     // exited since the first attempt — then we just take over, no kill —
     // and (b) it upholds takeoverVerdict's "guard genuinely still held"
     // contract for the unverifiable-image kill.
-    if (acquire(alloc)) |g| return g else |err| switch (err) {
+    if (acquire(alloc, instance)) |g| return g else |err| switch (err) {
         error.AlreadyRunning => {},
         error.GuardUnavailable => return error.GuardUnavailable,
     }
@@ -517,7 +609,7 @@ pub fn acquireWithTakeover(alloc: Allocator, force: bool) AcquireError!Guard {
             var attempt: usize = 0;
             while (attempt < takeover_retry_attempts) : (attempt += 1) {
                 std.Thread.sleep(takeover_retry_delay_ms * std.time.ns_per_ms);
-                if (acquire(alloc)) |g| {
+                if (acquire(alloc, instance)) |g| {
                     std.debug.print("ghoztty-agent: single-instance: takeover complete (replaced pid {d})\n", .{holder.pid});
                     return g;
                 } else |err| switch (err) {
@@ -537,28 +629,32 @@ pub fn acquireWithTakeover(alloc: Allocator, force: bool) AcquireError!Guard {
 // --- Heartbeat file ----------------------------------------------------------
 
 /// Resolve the heartbeat path: `GHOSTTY_AGENT_HEARTBEAT` override (tests),
-/// else `agent.heartbeat` next to the rest of the per-user agent state
+/// else `agent[-<key>].heartbeat` next to the rest of the per-user agent state
 /// (`%LOCALAPPDATA%\ghoztty\` on Windows — same dir as relay.env — and
 /// `$XDG_CONFIG_HOME|~/.config/ghoztty/` on POSIX — same dir as agent.lock).
-/// Owned by the caller.
-pub fn heartbeatPath(alloc: Allocator) ![]u8 {
+/// Keyed to the instance so a local challenger and a relay challenger consult
+/// DISTINCT heartbeats (empty key ⇒ the legacy `agent.heartbeat`). Owned by the
+/// caller.
+pub fn heartbeatPath(alloc: Allocator, instance: Instance) ![]u8 {
     if (std.process.getEnvVarOwned(alloc, "GHOSTTY_AGENT_HEARTBEAT")) |p| {
         if (p.len > 0) return p;
         alloc.free(p);
     } else |_| {}
 
+    var name_buf: [64]u8 = undefined;
+    const name = try composeStateFileName(&name_buf, instance.key, ".heartbeat");
     if (builtin.os.tag == .windows) {
         const local = try std.process.getEnvVarOwned(alloc, "LOCALAPPDATA");
         defer alloc.free(local);
-        return std.fs.path.join(alloc, &.{ local, "ghoztty", "agent.heartbeat" });
+        return std.fs.path.join(alloc, &.{ local, "ghoztty", name });
     }
     if (std.process.getEnvVarOwned(alloc, "XDG_CONFIG_HOME")) |xdg| {
         defer alloc.free(xdg);
-        if (xdg.len > 0) return std.fs.path.join(alloc, &.{ xdg, "ghoztty", "agent.heartbeat" });
+        if (xdg.len > 0) return std.fs.path.join(alloc, &.{ xdg, "ghoztty", name });
     } else |_| {}
     const home = try std.process.getEnvVarOwned(alloc, "HOME");
     defer alloc.free(home);
-    return std.fs.path.join(alloc, &.{ home, ".config", "ghoztty", "agent.heartbeat" });
+    return std.fs.path.join(alloc, &.{ home, ".config", "ghoztty", name });
 }
 
 /// One heartbeat tick: (re)write the file with our PID. The WRITE is the
@@ -594,8 +690,8 @@ pub fn readHeartbeat(path: []const u8) ?HeartbeatInfo {
     return .{ .pid = pid, .age_ms = age_ms };
 }
 
-fn readHeartbeatDefault(alloc: Allocator) ?HeartbeatInfo {
-    const path = heartbeatPath(alloc) catch return null;
+fn readHeartbeatDefault(alloc: Allocator, instance: Instance) ?HeartbeatInfo {
+    const path = heartbeatPath(alloc, instance) catch return null;
     defer alloc.free(path);
     return readHeartbeat(path);
 }
@@ -614,8 +710,8 @@ pub const Heartbeat = struct {
     /// Resolve the default path, write the first beat synchronously (so the
     /// file exists the moment the daemon is up), and spawn the ticker. Null
     /// (with a log) when any of that fails.
-    pub fn start(alloc: Allocator) ?*Heartbeat {
-        const path = heartbeatPath(alloc) catch |err| {
+    pub fn start(alloc: Allocator, instance: Instance) ?*Heartbeat {
+        const path = heartbeatPath(alloc, instance) catch |err| {
             std.debug.print("ghoztty-agent: heartbeat path unavailable ({s}); takeover-by-challenger disabled\n", .{@errorName(err)});
             return null;
         };
@@ -841,22 +937,42 @@ test "heartbeat writer: first beat is synchronous, ticker recreates a deleted fi
     try std.testing.expectEqual(@as(?HeartbeatInfo, null), readHeartbeat(path_copy));
 }
 
-test "global mutex name: SID suffix composes verbatim" {
+test "global mutex name: empty key (relay) composes the legacy name verbatim" {
     var buf: [256]u8 = undefined;
-    const name = try composeGlobalMutexName(&buf, "S-1-5-21-3623811015-3361044348-30300820-1013");
+    const name = try composeGlobalMutexName(&buf, Instance.relay.key, "S-1-5-21-3623811015-3361044348-30300820-1013");
     try std.testing.expectEqualStrings(
         "Global\\GhozttyAgentDaemon-S-1-5-21-3623811015-3361044348-30300820-1013",
         name,
     );
 }
 
-test "global mutex name: username fallback — backslash and control chars sanitized" {
-    // A mutex name may not contain '\' past the namespace prefix; a
-    // DOMAIN\user-shaped id must not smuggle one in (it would silently
-    // create the object under a nested name).
+test "global mutex name: instance key (local) inserts a distinct segment" {
+    // The whole point of T89d1: local and relay never collide. A non-empty key
+    // sits between the prefix and the user id with a single hyphen separator.
     var buf: [256]u8 = undefined;
-    const name = try composeGlobalMutexName(&buf, "CORP\\dzearing\x01");
-    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-CORP_dzearing_", name);
+    const relay = try composeGlobalMutexName(&buf, Instance.relay.key, "S-1-5-21-1");
+    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-S-1-5-21-1", relay);
+
+    var buf2: [256]u8 = undefined;
+    const local = try composeGlobalMutexName(&buf2, Instance.local.key, "S-1-5-21-1");
+    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-local-S-1-5-21-1", local);
+
+    var buf3: [256]u8 = undefined;
+    const dbg = try composeGlobalMutexName(&buf3, Instance.local_debug.key, "S-1-5-21-1");
+    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-local-debug-S-1-5-21-1", dbg);
+
+    // Distinct names ⇒ distinct kernel objects ⇒ coexistence.
+    try std.testing.expect(!std.mem.eql(u8, relay, local));
+    try std.testing.expect(!std.mem.eql(u8, local, dbg));
+}
+
+test "global mutex name: username fallback — backslash and control chars sanitized (key + id)" {
+    // A mutex name may not contain '\' past the namespace prefix; neither a
+    // DOMAIN\user-shaped id NOR a stray key may smuggle one in (it would
+    // silently create the object under a nested name).
+    var buf: [256]u8 = undefined;
+    const name = try composeGlobalMutexName(&buf, "ke\\y\x02", "CORP\\dzearing\x01");
+    try std.testing.expectEqualStrings("Global\\GhozttyAgentDaemon-ke_y_-CORP_dzearing_", name);
     // Exactly one backslash total: the Global\ namespace separator.
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -867,7 +983,48 @@ test "global mutex name: username fallback — backslash and control chars sanit
 test "global mutex name: oversized id errors instead of truncating" {
     var buf: [64]u8 = undefined;
     const long_id = "S-1-5-21-" ++ "9" ** 100;
-    try std.testing.expectError(error.NameTooLong, composeGlobalMutexName(&buf, long_id));
+    try std.testing.expectError(error.NameTooLong, composeGlobalMutexName(&buf, "", long_id));
+    try std.testing.expectError(error.NameTooLong, composeGlobalMutexName(&buf, "local", long_id));
+}
+
+test "local mutex name: empty key is the legacy literal; a key appends a segment" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Local\\GhozttyAgentDaemon",
+        try composeLocalMutexName(&buf, Instance.relay.key),
+    );
+    var buf2: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Local\\GhozttyAgentDaemon-local",
+        try composeLocalMutexName(&buf2, Instance.local.key),
+    );
+    var buf3: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Local\\GhozttyAgentDaemon-local-debug",
+        try composeLocalMutexName(&buf3, Instance.local_debug.key),
+    );
+    // Must match the legacy compile-time literal byte-for-byte (no regression
+    // for sandboxed relay agents that fall back to Local\).
+    var legacy16: [64]u16 = undefined;
+    const legacy_name = try composeLocalMutexName(&buf, "");
+    const n = try std.unicode.utf8ToUtf16Le(&legacy16, legacy_name);
+    const literal = std.unicode.utf8ToUtf16LeStringLiteral("Local\\GhozttyAgentDaemon");
+    try std.testing.expectEqualSlices(u16, literal, legacy16[0..n]);
+}
+
+test "state filename: legacy vs keyed, separator sanitized" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("agent.lock", try composeStateFileName(&buf, "", ".lock"));
+    try std.testing.expectEqualStrings("agent.heartbeat", try composeStateFileName(&buf, "", ".heartbeat"));
+    try std.testing.expectEqualStrings("agent-local.lock", try composeStateFileName(&buf, "local", ".lock"));
+    try std.testing.expectEqualStrings(
+        "agent-local-debug.heartbeat",
+        try composeStateFileName(&buf, "local-debug", ".heartbeat"),
+    );
+    // A key must never inject a path separator into a filename.
+    try std.testing.expectEqualStrings("agent-a_b.lock", try composeStateFileName(&buf, "a/b", ".lock"));
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.NameTooLong, composeStateFileName(&tiny, "local", ".lock"));
 }
 
 test "flock guard: second acquire fails, release frees it" {

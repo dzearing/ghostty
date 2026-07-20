@@ -9,6 +9,27 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 35) — T89d SPLIT + T89d1 DONE. T89d ("open under the
+  local agent") was too big for one context (new LocalAgent find-or-spawn +
+  App/Surface wiring + a ~250-line session-open.ps1 + several slow Windows
+  builds), so I carved out the folded-in T89c note — the mode-independent
+  single-instance guard — as **T89d1** and did it while single_instance.zig
+  was already loaded. Fix: a `single_instance.Instance` key threaded through
+  acquire/takeover/heartbeat/lock-path; `--listen-pipe` (THE Windows local
+  persistence agent) now takes a distinct `local[-debug]` guard (mutex
+  `Global\GhozttyAgentDaemon-local[-debug]-<sid>` + `agent-local[-debug]`
+  lock/heartbeat) so it coexists with a legacy-keyed `--relay` agent;
+  `.listen`/`.listen-unix`/`.relay` unchanged (empty key = byte-identical
+  legacy names — zero risk to a shipped relay agent). `is_debug` added to
+  agent_build_options. Pure composers unit-tested. **Surprise:** `zig build
+  test-agent` is red on the box — but from 4 pre-existing upstream
+  `ssh-cache.DiskCache` renameatW/AtomicFile failures (proven identical on the
+  git-stashed baseline; came in via the T88 merge). Filed **T97** — a
+  validation-bar blocker that gates test-agent for every future task (both app
+  lanes are green; my change touches only agent+build files). Flagged to the
+  Mac seat: the POSIX `--listen-unix` vs `--relay` flock collision is the same
+  latent bug, left unkeyed here. Next on-box: T89d (find-or-spawn + wiring),
+  then T97 to restore the agent floor.
 - 2026-07-20 (on-box, 34) — T89c DONE: agent `--listen-pipe` + `+sessions`
   pipe dial. New `pipe_stream.zig` (overlapped named-pipe PipeStream/
   PipeListener/dialHandle; owner-only DACL = the peercred-gate analog;
