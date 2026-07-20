@@ -161,7 +161,7 @@ extension Ghostty {
         private var shadedBackground: Color? {
             guard let background else { return nil }
             let os = OSColor(background)
-            let shaded = os.isLightColor ? os.darken(by: 0.06) : os.lighten(by: 0.1)
+            let shaded = os.isLightColor ? os.darken(by: 0.04) : os.lighten(by: 0.06)
             return Color(shaded)
         }
 
@@ -192,6 +192,60 @@ extension Ghostty {
                 )
             }
 
+            /// Specular sheen: not a straight linear band but an ellipse of
+            /// light centered above the card, so the highlight bulges down
+            /// into the top in a curve and falls away toward the corners —
+            /// plus a faint darkening along the bottom edge to ground the
+            /// card. Attached as a background of the content so it renders
+            /// above the material but below the text (an overlay would wash
+            /// the glyphs too).
+            private var sheen: some View {
+                ZStack {
+                    shape.fill(
+                        EllipticalGradient(
+                            stops: [
+                                .init(color: .white.opacity(0.10), location: 0),
+                                .init(color: .white.opacity(0.03), location: 0.6),
+                                .init(color: .clear, location: 1),
+                            ],
+                            center: UnitPoint(x: 0.5, y: -0.5),
+                            startRadiusFraction: 0,
+                            endRadiusFraction: 1.15
+                        )
+                    )
+                    shape.fill(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.75),
+                                .init(color: .black.opacity(0.05), location: 1),
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                }
+                .allowsHitTesting(false)
+            }
+
+            /// Specular rim: a hairline border lit by the same overhead
+            /// ellipse — brightest at the top-center, softening around the
+            /// upper corners, nearly gone along the bottom.
+            private var rim: some View {
+                shape.strokeBorder(
+                    EllipticalGradient(
+                        stops: [
+                            .init(color: .white.opacity(0.28), location: 0),
+                            .init(color: .white.opacity(0.10), location: 0.7),
+                            .init(color: .white.opacity(0.04), location: 1),
+                        ],
+                        center: UnitPoint(x: 0.5, y: -0.5),
+                        startRadiusFraction: 0,
+                        endRadiusFraction: 1.3
+                    ),
+                    lineWidth: 1
+                )
+                .allowsHitTesting(false)
+            }
+
             func body(content: Content) -> some View {
                 if #available(macOS 26.0, iOS 26.0, *) {
                     // The filled shape behind the glass serves two jobs: it
@@ -201,20 +255,23 @@ extension Ghostty {
                     // sample so legibility doesn't depend on what happens to
                     // sit behind the card.
                     content
+                        .background(sheen)
                         .glassEffect(.regular.tint(tint), in: shape)
                         .background(
                             shape.fill(fallbackFill)
                                 .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
                         )
+                        .overlay(rim)
                 } else {
                     // Shadow on the shape (not the content) so translucent
                     // fills don't give every text glyph its own shadow.
                     content
+                        .background(sheen)
                         .background(
                             shape.fill(fallbackFill)
                                 .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
                         )
-                        .overlay(shape.strokeBorder(.white.opacity(0.09), lineWidth: 1))
+                        .overlay(rim)
                 }
             }
         }
