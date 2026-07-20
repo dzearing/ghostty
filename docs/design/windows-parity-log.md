@@ -9,6 +9,16 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 27) — T92 DONE: three-level title model (window pin
+  → tab pin → pane title, Mac parity). Surface user pane title w/
+  remembered-terminal-title restore; per-tab pin (inline rename now pins,
+  empty clears); RenameDialog generalized to 3 levels w/ Mac captions;
+  .prompt_title branches on payload; +rename --title="" clears; palette
+  gains the 3 "Change … Title" entries. New window-title.ps1 ALL PASS
+  (46) ×3; P1–P3 + hero-mode (60) + both lanes green. Surprise:
+  kb-actions.ps1 skipped itself entirely (un-hardened foreground grab,
+  0 assertions) — more weight behind T86. Next: T94.
+
 - 2026-07-19 (on-box, 26) — T91 DONE: banner markdown parity with the Mac.
   banner_markdown.zig rewritten to the Mac's block model (headings, rules,
   marker-gutter lists, GFM+headerless tables, native checkboxes, 10-line

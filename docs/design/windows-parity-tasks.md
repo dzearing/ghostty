@@ -154,8 +154,12 @@ Work these first, in order, before falling back to first-todo-in-table:
    overlay + ctrl+shift+b editor; `pane-banner.ps1` ALL PASS (30) ×3).
 13. ~~T88~~ — DONE 2026-07-19 (merged main 8bb5d9845; gaps filed as
    T89a–T94). ~~T91~~ (done 2026-07-19: banner markdown parity — block
-   parser + overlay renderer, pane-banner.ps1 37 asserts ×3). **Next
-   on-box, in order: T92 → T94 → T86 → T93 → T89a → T90a** (small
+   parser + overlay renderer, pane-banner.ps1 37 asserts ×3). ~~T92~~
+   (done 2026-07-19: three-level title model — window pin → tab pin →
+   pane title; `window-title.ps1` ALL PASS (46) ×3; kb-actions.ps1's
+   un-hardened chord grab skipped its whole run during regression —
+   T86's case grew stronger). **Next
+   on-box, in order: T94 → T86 → T93 → T89a → T90a** (small
    user-visible parity first, then the two big design+port series;
    T29/T30/T87 are Mac-seat; T28's remainder and T82 fold into T89a). Flag for the Mac seat: main's
    `Hello.encode`/build_version elision test was red on main itself —
@@ -271,7 +275,7 @@ One line per row. Full spec + validation + evidence per task:
 | T90a | Viewer panes on Windows: DESIGN (WebView2 rec., split-tree viewer leaf, offline renderer scheme, live reload, link routing, IPC contract, interim --view error) + split T90 | K | T88 | todo | — |
 | T90 | Viewer panes on Windows: IMPLEMENT (split by T90a) — --view markdown/text/website panes per CLAUDE.md | K | T90a | todo | — |
 | T91 | Banner markdown parity — done 2026-07-19: block parser rewrite (parseBlocks: headings, `---` rules, marker-gutter lists, GFM+headerless tables w/ `:` alignment + `\|`, native checkboxes, 10-line cap) + overlay measure/draw walker (bold-measured capped column widths, cell word-wrap, green RoundRect checkboxes, chevron collapse w/ fade, 12dip padding); `pane-banner.ps1` grown to 37 asserts ALL PASS ×3, P1–P3 + both lanes green | I | T88 | done | (this commit) |
-| T92 | Window-level titles: PromptTitle payload branch (pane/tab/window prompts), pin precedence window→tab→pane, empty/+rename --title="" clears pin, palette entries | I | T88 | todo | — |
+| T92 | Window-level titles — done 2026-07-19: three-level model (window pin → tab pin → pane title); `.prompt_title` branches on payload into a 3-level RenameDialog (Mac captions), Surface user-title w/ terminal-title restore, per-tab pin, `+rename --title=""`/empty-commit clears, 3 palette entries; `window-title.ps1` ALL PASS (46) ×3 | I | T88 | done | (this commit) |
 | T93 | Brokered OAuth for Windows relay sign-in: exchange at relay, session token in DPAPI, no client secret, -Dgoogle-client-id bake, /signout on logout | G | T88 | todo | — |
 | T94 | Split divider grab-handle hit target (~9 DIP band + cursor feedback) parity check | I | T88 | todo | — |
 | T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | 3b085a661 |

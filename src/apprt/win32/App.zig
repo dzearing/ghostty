@@ -2007,10 +2007,17 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    // Keybind rename opens the real "Rename Window" dialog
-                    // (T50); commits via titleOverride, the +rename path.
-                    // Inline tab rename stays on tab double-click.
-                    core_surface.rt_surface.parent_window.promptRenameWindow();
+                    // T92: branch on the PromptTitle payload — the pane,
+                    // tab, and window prompts edit different levels of
+                    // the title model (window pin → tab title → pane
+                    // title). All three open the T50-style dialog.
+                    const rt_surface = core_surface.rt_surface;
+                    const window = rt_surface.parent_window;
+                    switch (value) {
+                        .surface => window.promptPaneTitle(rt_surface),
+                        .tab => window.promptTabTitle(rt_surface),
+                        .window => window.promptRenameWindow(),
+                    }
                 },
             }
             return true;
@@ -3118,6 +3125,10 @@ fn surfaceWndProc(
             // Update the active surface for this tab when a split pane gains focus.
             const tab = surface.parent_window.active_tab;
             surface.parent_window.tab_active_surface[tab] = surface;
+            // T92: the tab label / titlebar follow the focused pane's
+            // title (no-op when the tab title is user-pinned or the
+            // title is unchanged).
+            surface.parent_window.refreshTabTitle(tab);
             surface.parent_window.heroOnSurfaceFocused(surface);
             // Dim the pane that lost the active slot, undim this one (T74).
             surface.parent_window.updateDimOverlays();

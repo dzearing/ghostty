@@ -210,7 +210,10 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         return try errorResponse(ctx.alloc, "failed to create window", .{});
     };
 
-    if (args.title) |title| window.setTitleOverride(title);
+    // T92: an empty `--title=` means "no pin", not "pin empty".
+    if (args.title) |title| {
+        if (title.len > 0) window.setTitleOverride(title);
+    }
 
     // `--color` (T67): tint the window's first surface — background +
     // contrast foreground + WCAG-adjusted palette (Mac applyColorScheme).
@@ -908,7 +911,9 @@ fn handleRename(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 
     // titleOverride semantics: the override wins over terminal-reported
     // titles until cleared (Mac BaseTerminalController.titleOverride).
-    window.setTitleOverride(title);
+    // T92: `--title=""` CLEARS the pin (Mac fixed the same in 9c7665354)
+    // instead of pinning an empty string.
+    window.setTitleOverride(if (title.len == 0) null else title);
     return try ctx.alloc.dupe(u8, "{\"success\":true}");
 }
 

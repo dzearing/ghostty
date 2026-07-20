@@ -1,17 +1,21 @@
-//! Modal-ish "Rename Window" dialog for the win32 apprt (T50).
+//! Modal-ish title-prompt dialog for the win32 apprt (T50, extended for
+//! the three-level title model in T92).
 //!
-//! The keybind rename (ctrl+shift+r -> prompt_title) used to reuse the
-//! inline tab-rename Edit control, which with a hidden tab bar degraded to
-//! a bare borderless box (no label, no buttons - not obviously a dialog).
-//! This is a real owner-centered dialog: caption, label, prefilled edit,
-//! OK/Cancel. The owner window is disabled while it is open (modal to the
-//! window), but the app message loop keeps running, so the renderer thread
-//! and the IPC server stay live.
+//! One dialog serves all three PromptTitle levels ("Change Pane Title",
+//! "Change Tab Title", "Change Window Title") — a real owner-centered
+//! dialog: caption, label, prefilled edit, OK/Cancel. The owner window is
+//! disabled while it is open (modal to the window), but the app message
+//! loop keeps running, so the renderer thread and the IPC server stay
+//! live.
 //!
-//! Commit path: OK applies the text via `Window.setTitleOverride`, the
-//! same path as the `+rename` IPC verb - the override beats
-//! terminal-reported titles until cleared (T10 precedence). An empty text
-//! clears the override, reverting the title to the terminal-reported one.
+//! Commit paths (empty text always clears the level's pin/override):
+//! - window: `Window.setTitleOverride`, the same path as the `+rename`
+//!   IPC verb — pins the titlebar over tab/pane titles (T10 precedence).
+//! - tab: `Window.setTabTitlePin` — pins the tab label against
+//!   pane-driven updates.
+//! - pane: `Surface.setUserTitle` — holds the pane title against
+//!   terminal (OSC) updates, remembering the last terminal title for
+//!   restore-on-clear.
 //!
 //! Enter/Escape/Tab never reach the native controls: the main message
 //! loop routes them here via `handleKey` (see the WM_KEYDOWN intercept in
@@ -22,6 +26,7 @@ const RenameDialog = @This();
 const std = @import("std");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const Surface = @import("Surface.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -35,6 +40,34 @@ edit: w32.HWND,
 ok_btn: w32.HWND,
 cancel_btn: w32.HWND,
 font: ?*anyopaque = null,
+/// Which title level this dialog edits (T92).
+level: Level = .window,
+/// The pane anchoring a pane- or tab-level prompt. Resolved back to a
+/// live tab/pane at commit time (findTabIndex compares addresses only),
+/// so a pane closed via IPC while the dialog is open degrades to a
+/// silent no-op instead of a use-after-free.
+target_surface: ?*Surface = null,
+
+/// The three title levels a prompt can edit (Mac PromptTitle parity).
+pub const Level = enum { pane, tab, window };
+
+/// Dialog caption per level, matching the Mac prompt titles.
+pub fn caption(level: Level) [:0]const u16 {
+    return switch (level) {
+        .pane => std.unicode.utf8ToUtf16LeStringLiteral("Change Pane Title"),
+        .tab => std.unicode.utf8ToUtf16LeStringLiteral("Change Tab Title"),
+        .window => std.unicode.utf8ToUtf16LeStringLiteral("Change Window Title"),
+    };
+}
+
+/// Edit-field label per level.
+pub fn fieldLabel(level: Level) [:0]const u16 {
+    return switch (level) {
+        .pane => std.unicode.utf8ToUtf16LeStringLiteral("Pane title (empty restores the default):"),
+        .tab => std.unicode.utf8ToUtf16LeStringLiteral("Tab title (empty restores the default):"),
+        .window => std.unicode.utf8ToUtf16LeStringLiteral("Window title (empty restores the default):"),
+    };
+}
 
 /// Dialog colors (dark chrome, matching the command palette and the
 /// tab bar's dark styling).
@@ -94,9 +127,11 @@ fn px(v: f32, scale: f32) i32 {
     return @intFromFloat(@round(v * scale));
 }
 
-/// Open the rename dialog for a window. Idempotent: if the window already
-/// has one open, it is focused instead.
-pub fn open(window: *Window) void {
+/// Open the title-prompt dialog for a window at the given level (T92).
+/// `target` anchors pane/tab prompts (null for window level, which
+/// defaults to the active surface's context). Idempotent: if the window
+/// already has one open, it is focused instead.
+pub fn open(window: *Window, level: Level, target: ?*Surface) void {
     if (window.rename_dialog) |existing| {
         _ = w32.SetForegroundWindow(existing.hwnd);
         _ = w32.SetFocus(existing.edit);
@@ -133,7 +168,7 @@ pub fn open(window: *Window) void {
     const hwnd = w32.CreateWindowExW(
         ex_style,
         CLASS_NAME,
-        std.unicode.utf8ToUtf16LeStringLiteral("Rename Window"),
+        caption(level),
         style,
         x,
         y,
@@ -161,7 +196,7 @@ pub fn open(window: *Window) void {
     const label = w32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
-        std.unicode.utf8ToUtf16LeStringLiteral("Window title:"),
+        fieldLabel(level),
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
         l.label.left,
         l.label.top,
@@ -173,16 +208,32 @@ pub fn open(window: *Window) void {
         null,
     );
 
-    // Edit, prefilled with the current effective title (the override when
-    // set, else the active tab's terminal-reported title).
+    // Edit, prefilled with the level's current effective title.
     var title_buf: [257]u16 = undefined;
     var title_len: usize = 0;
-    if (window.title_override) |t| {
-        title_len = std.unicode.utf8ToUtf16Le(title_buf[0..256], t) catch 0;
-    } else if (window.tab_count > 0) {
-        const tlen = window.tab_title_lens[window.active_tab];
-        @memcpy(title_buf[0..tlen], window.tab_titles[window.active_tab][0..tlen]);
-        title_len = tlen;
+    switch (level) {
+        // Window: the pin when set, else the active tab's title.
+        .window => if (window.title_override) |t| {
+            title_len = std.unicode.utf8ToUtf16Le(title_buf[0..256], t) catch 0;
+        } else if (window.tab_count > 0) {
+            const tlen = window.tab_title_lens[window.active_tab];
+            @memcpy(title_buf[0..tlen], window.tab_titles[window.active_tab][0..tlen]);
+            title_len = tlen;
+        },
+        // Tab: the target tab's current (possibly pinned) title.
+        .tab => if (target) |s| {
+            if (window.findTabIndex(s)) |tab_idx| {
+                const tlen = window.tab_title_lens[tab_idx];
+                @memcpy(title_buf[0..tlen], window.tab_titles[tab_idx][0..tlen]);
+                title_len = tlen;
+            }
+        },
+        // Pane: the pane's current effective title.
+        .pane => if (target) |s| {
+            if (s.title) |t| {
+                title_len = std.unicode.utf8ToUtf16Le(title_buf[0..256], t) catch 0;
+            }
+        },
     }
     title_buf[title_len] = 0;
 
@@ -255,6 +306,8 @@ pub fn open(window: *Window) void {
         .edit = edit,
         .ok_btn = ok_btn,
         .cancel_btn = cancel_btn,
+        .level = level,
+        .target_surface = target,
     };
 
     // DPI-scaled dialog font for all controls.
@@ -439,18 +492,31 @@ pub fn handleKey(self: *RenameDialog, vk: u16) bool {
     }
 }
 
-/// Commit: apply the edit text as the window's title override (the
-/// `+rename` path - wins over terminal titles per T10). Empty clears the
-/// override, reverting to terminal-reported titles.
+/// Commit: apply the edit text at the dialog's level (T92). Empty
+/// clears the level's pin/override, reverting to the derived title.
 pub fn finish(self: *RenameDialog) void {
     var wbuf: [256]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(self.edit, &wbuf, wbuf.len));
     var utf8_buf: [1024]u8 = undefined;
     const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
+    const title: ?[]const u8 = if (utf8_len > 0) utf8_buf[0..utf8_len] else null;
 
     const window = self.window;
+    const level = self.level;
+    const target = self.target_surface;
     self.close();
-    window.setTitleOverride(if (utf8_len > 0) utf8_buf[0..utf8_len] else null);
+    switch (level) {
+        .window => window.setTitleOverride(title),
+        .tab => if (target) |s| {
+            // Address-only liveness resolve; a pane closed while the
+            // dialog was open simply no-ops.
+            if (window.findTabIndex(s)) |tab_idx|
+                window.setTabTitlePin(tab_idx, title);
+        },
+        .pane => if (target) |s| {
+            if (window.findTabIndex(s) != null) s.setUserTitle(title);
+        },
+    }
 }
 
 /// Dismiss without applying.
@@ -517,6 +583,18 @@ test "layout: buttons right-aligned, OK left of Cancel, no overlap" {
     try testing.expect(l.ok.right < l.cancel.left);
     try testing.expectEqual(l.edit.right, l.cancel.right);
     try testing.expectEqual(l.ok.top, l.cancel.top);
+}
+
+test "caption/fieldLabel: distinct non-empty strings per level (T92)" {
+    inline for ([_]Level{ .pane, .tab, .window }) |level| {
+        try testing.expect(caption(level).len > 0);
+        try testing.expect(fieldLabel(level).len > 0);
+    }
+    try testing.expect(!std.mem.eql(u16, caption(.pane), caption(.tab)));
+    try testing.expect(!std.mem.eql(u16, caption(.tab), caption(.window)));
+    try testing.expect(!std.mem.eql(u16, caption(.pane), caption(.window)));
+    try testing.expect(!std.mem.eql(u16, fieldLabel(.pane), fieldLabel(.tab)));
+    try testing.expect(!std.mem.eql(u16, fieldLabel(.tab), fieldLabel(.window)));
 }
 
 test "layout: scales with DPI" {

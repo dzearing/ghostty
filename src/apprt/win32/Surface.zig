@@ -128,6 +128,12 @@ current_cursor: ?w32.HCURSOR = null,
 /// `+list` tree can report a per-pane title. Null until the first set.
 title: ?[:0]u8 = null,
 
+/// Non-null while the user has manually set this pane's title ("Change
+/// Pane Title…" prompt, T92). Holds the last terminal-reported title so
+/// clearing the manual title restores it; while set, setTitle updates
+/// this instead of `title` (Mac SurfaceView.titleFromTerminal parity).
+title_from_terminal: ?[:0]u8 = null,
+
 /// Activity state of this pane (`+set-state` IPC / OSC 7777). Aggregated
 /// per-window (needs_input > busy > idle) into a title suffix.
 activity_state: terminal.osc.Command.ActivityState = .idle,
@@ -515,6 +521,11 @@ pub fn deinit(self: *Surface) void {
     if (self.title) |t| {
         self.app.core_app.alloc.free(t);
         self.title = null;
+    }
+
+    if (self.title_from_terminal) |t| {
+        self.app.core_app.alloc.free(t);
+        self.title_from_terminal = null;
     }
 
     if (self.core_surface_initialized) {
@@ -1189,14 +1200,48 @@ pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
     return env;
 }
 
-/// Set the window title. Called from performAction(.set_title).
+/// Set the pane title. Called from performAction(.set_title) — the
+/// terminal-reported (OSC 0/2) path. While the user holds a manual pane
+/// title (setUserTitle), terminal titles are remembered for
+/// restore-on-clear but do not displace it (T92).
 pub fn setTitle(self: *Surface, title: [:0]const u8) void {
     const alloc = self.app.core_app.alloc;
-    if (alloc.dupeZ(u8, title)) |copy| {
+    const copy = alloc.dupeZ(u8, title) catch return;
+    if (self.title_from_terminal) |old| {
+        alloc.free(old);
+        self.title_from_terminal = copy;
+        return;
+    }
+    if (self.title) |old| alloc.free(old);
+    self.title = copy;
+    self.parent_window.onTabTitleChanged(self, title);
+}
+
+/// Set (or clear, with null) the user's manual pane title ("Change Pane
+/// Title…" prompt, T92). While set, terminal-reported titles are
+/// remembered but don't displace it; clearing restores the last
+/// terminal-reported title.
+pub fn setUserTitle(self: *Surface, title: ?[]const u8) void {
+    const alloc = self.app.core_app.alloc;
+    if (title) |t| {
+        const copy = alloc.dupeZ(u8, t) catch return;
+        if (self.title_from_terminal == null) {
+            // First manual set: the current (terminal) title becomes the
+            // remembered restore value. Ownership moves; no copy.
+            self.title_from_terminal = self.title orelse
+                (alloc.dupeZ(u8, "") catch null);
+            self.title = null;
+        }
         if (self.title) |old| alloc.free(old);
         self.title = copy;
-    } else |_| {}
-    self.parent_window.onTabTitleChanged(self, title);
+    } else {
+        // No manual title active: nothing to clear.
+        const remembered = self.title_from_terminal orelse return;
+        self.title_from_terminal = null;
+        if (self.title) |old| alloc.free(old);
+        self.title = remembered;
+    }
+    if (self.title) |t| self.parent_window.onTabTitleChanged(self, t);
 }
 
 /// Toggle fullscreen mode. Delegates to the parent Window.
@@ -1671,7 +1716,9 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Paste from Clipboard", .action = .paste_from_clipboard },
     .{ .name = "Copy URL to Clipboard", .action = .copy_url_to_clipboard },
     .{ .name = "Copy Title to Clipboard", .action = .copy_title_to_clipboard },
-    .{ .name = "Rename Window", .action = .prompt_surface_title },
+    .{ .name = "Change Window Title…", .action = .prompt_window_title },
+    .{ .name = "Change Tab Title…", .action = .prompt_tab_title },
+    .{ .name = "Change Pane Title…", .action = .prompt_surface_title },
     .{ .name = "Set Pane Banner…", .action = .prompt_surface_banner },
     .{ .name = "Select All", .action = .select_all },
     .{ .name = "Find", .action = .start_search },

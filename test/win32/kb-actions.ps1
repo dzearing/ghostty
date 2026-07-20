@@ -225,7 +225,9 @@ else {
     Assert (-not $proc.HasExited) 'T50 no crash after ctrl+shift+r (single tab)'
     $dlg = [KbDrv]::FindDialog()
     if ($dlg -ne [IntPtr]::Zero) {
-        Assert ([KbDrv]::WindowText($dlg) -eq 'Rename Window') 'T50 dialog caption is "Rename Window"'
+        # T92: ctrl+shift+r is prompt_window_title; the T50 dialog caption
+        # follows the Mac prompt naming.
+        Assert ([KbDrv]::WindowText($dlg) -eq 'Change Window Title') 'T50 dialog caption is "Change Window Title"'
         $edit = [KbDrv]::ChildByClass($dlg, 'Edit')
         $okBtn = [KbDrv]::FindWindowExW($dlg, [IntPtr]::Zero, 'BUTTON', 'OK')
         $cancelBtn = [KbDrv]::FindWindowExW($dlg, [IntPtr]::Zero, 'BUTTON', 'Cancel')

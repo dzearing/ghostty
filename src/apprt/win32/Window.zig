@@ -177,6 +177,12 @@ tab_titles: [64][256]u16 = undefined,
 /// Length of each tab title in UTF-16 code units.
 tab_title_lens: [64]u16 = undefined,
 
+/// True while the user has pinned a tab's title ("Change Tab Title…"
+/// prompt or the inline tab rename, T92). A pinned tab title ignores
+/// pane-driven updates until cleared with an empty rename (Mac
+/// BaseTerminalController.titleOverride parity).
+tab_title_pinned: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
+
 /// User-assigned accent color per tab (T72, Mac TerminalTabColor parity).
 /// Set from the tab context menu; painted as a stripe in the tab bar.
 tab_colors: [MAX_TABS]tab_color.TabColor = [_]tab_color.TabColor{.none} ** MAX_TABS,
@@ -267,9 +273,12 @@ remote_dialed: ?RemoteDialed = null,
 /// (set via `setRemoteMachine`, freed in `deinit`). Null for local windows.
 remote_machine: ?RemoteMachine = null,
 
-/// When set, the title bar shows this instead of terminal-reported titles
-/// (`+new-window --title`, `+rename`) — mirrors the Mac titleOverride
-/// precedence. Owned. Tab labels still track terminal titles.
+/// The window-level title pin (`+new-window --title`, `+rename`, the
+/// "Change Window Title" prompt) — mirrors the Mac windowTitleOverride.
+/// When set, the titlebar shows this over every tab/pane title until
+/// cleared (empty title / `+rename --title=""`); precedence is window
+/// pin → active tab title → active pane title (T92). Owned. Tab labels
+/// still track their own (possibly pinned) tab titles.
 title_override: ?[:0]u8 = null,
 
 /// This window's canonical IPC name: `+new-window --target` when given,
@@ -879,6 +888,7 @@ pub fn addTab(self: *Window) !*Surface {
         self.tab_active_surface[i] = self.tab_active_surface[i - 1];
         self.tab_titles[i] = self.tab_titles[i - 1];
         self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+        self.tab_title_pinned[i] = self.tab_title_pinned[i - 1];
         self.tab_colors[i] = self.tab_colors[i - 1];
         self.tab_hero_active[i] = self.tab_hero_active[i - 1];
         self.tab_hero_index[i] = self.tab_hero_index[i - 1];
@@ -887,6 +897,7 @@ pub fn addTab(self: *Window) !*Surface {
     }
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
+    self.tab_title_pinned[pos] = false;
     self.tab_colors[pos] = .none;
     self.tab_hero_active[pos] = false;
     self.tab_hero_index[pos] = 0;
@@ -947,6 +958,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_active_surface[i] = self.tab_active_surface[i + 1];
         self.tab_titles[i] = self.tab_titles[i + 1];
         self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+        self.tab_title_pinned[i] = self.tab_title_pinned[i + 1];
         self.tab_colors[i] = self.tab_colors[i + 1];
         self.tab_hero_active[i] = self.tab_hero_active[i + 1];
         self.tab_hero_index[i] = self.tab_hero_index[i + 1];
@@ -2200,6 +2212,7 @@ pub fn moveTab(self: *Window, amount: isize) void {
     std.mem.swap(*Surface, &self.tab_active_surface[self.active_tab], &self.tab_active_surface[new_index]);
     std.mem.swap([256]u16, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
     std.mem.swap(u16, &self.tab_title_lens[self.active_tab], &self.tab_title_lens[new_index]);
+    std.mem.swap(bool, &self.tab_title_pinned[self.active_tab], &self.tab_title_pinned[new_index]);
     std.mem.swap(tab_color.TabColor, &self.tab_colors[self.active_tab], &self.tab_colors[new_index]);
     // Hero state travels with the tab too (was missed when hero mode
     // landed — moveTabTo already handles it; this path didn't).
@@ -2290,12 +2303,13 @@ pub fn updateWindowTitle(self: *Window) void {
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
 }
 
-/// Set (or clear, with null) the title override. Owned copy; wins over
-/// terminal-reported titles until cleared, like the Mac titleOverride.
+/// Set (or clear, with null) the window title pin. Owned copy; wins over
+/// tab/pane titles until cleared, like the Mac windowTitleOverride. An
+/// empty title clears too (T92) — "pin empty" is never meaningful.
 pub fn setTitleOverride(self: *Window, title: ?[]const u8) void {
     const alloc = self.app.core_app.alloc;
     const copy: ?[:0]u8 = if (title) |t|
-        alloc.dupeZ(u8, t) catch return
+        (if (t.len == 0) null else alloc.dupeZ(u8, t) catch return)
     else
         null;
     if (self.title_override) |old| alloc.free(old);
@@ -2303,15 +2317,60 @@ pub fn setTitleOverride(self: *Window, title: ?[]const u8) void {
     self.updateWindowTitle();
 }
 
-/// Called when a tab's title changes. Updates the stored title
-/// and refreshes the window title bar / tab bar if needed.
+/// Called when a pane's title changes. Updates the stored tab title
+/// and refreshes the window title bar / tab bar if needed. T92: a
+/// user-pinned tab title ignores pane-driven updates, and only the
+/// tab's focused pane drives the tab title (Mac parity — background
+/// panes keep their own pane title without relabeling the tab).
 pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) void {
     const tab_idx = self.findTabIndex(surface) orelse return;
+    if (self.tab_title_pinned[tab_idx]) return;
+    if (self.tab_active_surface[tab_idx] != surface) return;
     var wbuf: [256]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title) catch 0;
     const len: u16 = @intCast(@min(wlen, 255));
     @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
     self.tab_title_lens[tab_idx] = len;
+    if (tab_idx == self.active_tab) self.updateWindowTitle();
+    self.invalidateTabBar();
+}
+
+/// Re-derive a tab's title from its focused pane (no-op while the tab
+/// title is user-pinned). Called when the focused pane within a tab
+/// changes so the tab label / titlebar follow the active pane (T92).
+pub fn refreshTabTitle(self: *Window, tab_idx: usize) void {
+    if (tab_idx >= self.tab_count) return;
+    if (self.tab_title_pinned[tab_idx]) return;
+    const title = self.tab_active_surface[tab_idx].title orelse return;
+    var wbuf: [256]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title) catch 0;
+    const len: u16 = @intCast(@min(wlen, 255));
+    if (len == self.tab_title_lens[tab_idx] and
+        std.mem.eql(u16, self.tab_titles[tab_idx][0..len], wbuf[0..len]))
+        return;
+    @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
+    self.tab_title_lens[tab_idx] = len;
+    if (tab_idx == self.active_tab) self.updateWindowTitle();
+    self.invalidateTabBar();
+}
+
+/// Set (or clear, with null) the user's pinned tab title ("Change Tab
+/// Title…" prompt / inline tab rename, T92). While pinned, pane-driven
+/// title updates leave the tab title alone; clearing re-derives it from
+/// the tab's focused pane.
+pub fn setTabTitlePin(self: *Window, tab_idx: usize, title: ?[]const u8) void {
+    if (tab_idx >= self.tab_count) return;
+    if (title) |t| {
+        var wbuf: [256]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, t) catch 0;
+        const len: u16 = @intCast(@min(wlen, 255));
+        @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
+        self.tab_title_lens[tab_idx] = len;
+        self.tab_title_pinned[tab_idx] = true;
+    } else {
+        self.tab_title_pinned[tab_idx] = false;
+        self.refreshTabTitle(tab_idx);
+    }
     if (tab_idx == self.active_tab) self.updateWindowTitle();
     self.invalidateTabBar();
 }
@@ -2855,6 +2914,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     const saved_surface = self.tab_active_surface[from];
     const saved_title = self.tab_titles[from];
     const saved_title_len = self.tab_title_lens[from];
+    const saved_title_pinned = self.tab_title_pinned[from];
     const saved_color = self.tab_colors[from];
     const saved_hero_active = self.tab_hero_active[from];
     const saved_hero_index = self.tab_hero_index[from];
@@ -2869,6 +2929,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i + 1];
             self.tab_titles[i] = self.tab_titles[i + 1];
             self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+            self.tab_title_pinned[i] = self.tab_title_pinned[i + 1];
             self.tab_colors[i] = self.tab_colors[i + 1];
             self.tab_hero_active[i] = self.tab_hero_active[i + 1];
             self.tab_hero_index[i] = self.tab_hero_index[i + 1];
@@ -2883,6 +2944,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_active_surface[i] = self.tab_active_surface[i - 1];
             self.tab_titles[i] = self.tab_titles[i - 1];
             self.tab_title_lens[i] = self.tab_title_lens[i - 1];
+            self.tab_title_pinned[i] = self.tab_title_pinned[i - 1];
             self.tab_colors[i] = self.tab_colors[i - 1];
             self.tab_hero_active[i] = self.tab_hero_active[i - 1];
             self.tab_hero_index[i] = self.tab_hero_index[i - 1];
@@ -2896,6 +2958,7 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_active_surface[to] = saved_surface;
     self.tab_titles[to] = saved_title;
     self.tab_title_lens[to] = saved_title_len;
+    self.tab_title_pinned[to] = saved_title_pinned;
     self.tab_colors[to] = saved_color;
     self.tab_hero_active[to] = saved_hero_active;
     self.tab_hero_index[to] = saved_hero_index;
@@ -3127,11 +3190,25 @@ fn handleTabBarMouseLeave(self: *Window) void {
 /// Rename edit control child ID.
 const RENAME_EDIT_ID: u16 = 300;
 
-/// Open the "Rename Window" dialog (ctrl+shift+r / prompt_title). The
-/// inline tab-rename Edit remains the double-click affordance on visible
-/// tabs; the keybind path gets a real dialog (T50).
+/// Open the "Change Window Title" dialog (ctrl+shift+r /
+/// prompt_window_title). The title set here pins the titlebar for the
+/// whole window until cleared with an empty commit (T50 dialog, T92
+/// semantics). The inline tab-rename Edit remains the double-click
+/// affordance on visible tabs.
 pub fn promptRenameWindow(self: *Window) void {
-    RenameDialog.open(self);
+    RenameDialog.open(self, .window, null);
+}
+
+/// Open the "Change Tab Title" dialog for the tab containing `surface`
+/// (prompt_tab_title, T92). Commits via setTabTitlePin.
+pub fn promptTabTitle(self: *Window, surface: *Surface) void {
+    RenameDialog.open(self, .tab, surface);
+}
+
+/// Open the "Change Pane Title" dialog for `surface`
+/// (prompt_surface_title, T92). Commits via Surface.setUserTitle.
+pub fn promptPaneTitle(self: *Window, surface: *Surface) void {
+    RenameDialog.open(self, .pane, surface);
 }
 
 /// Open the "New Remote Window" machine chooser (ctrl+shift+n / palette).
@@ -3239,9 +3316,17 @@ pub fn finishTabRename(self: *Window) void {
     var wbuf: [256]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(edit, &wbuf, 256));
     if (wlen > 0) {
+        // T92: a user rename pins the tab title against pane-driven
+        // updates until cleared with an empty rename.
         const len: u16 = @intCast(@min(wlen, 255));
         @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
         self.tab_title_lens[tab_idx] = len;
+        self.tab_title_pinned[tab_idx] = true;
+        if (tab_idx == self.active_tab) self.updateWindowTitle();
+    } else {
+        // Empty clears the pin and restores the pane-driven title (T92).
+        self.tab_title_pinned[tab_idx] = false;
+        self.refreshTabTitle(tab_idx);
         if (tab_idx == self.active_tab) self.updateWindowTitle();
     }
 

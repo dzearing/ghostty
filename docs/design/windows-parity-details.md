@@ -3225,6 +3225,40 @@ prompts funnel to the same window-level override.
 clears, tab/pane prompts set their own levels, `+rename` empty-title
 clear; ALL PASS ×3.
 
+**DONE 2026-07-19.** Implementation:
+
+- `Surface.zig`: `title_from_terminal` field — non-null while a manual
+  pane title is held; `setTitle` (OSC path) then updates the remembered
+  terminal title instead of displacing the user's; `setUserTitle`
+  sets/clears, clearing restores the remembered title (Mac
+  `SurfaceView.titleFromTerminal` parity). Freed in deinit.
+- `Window.zig`: `tab_title_pinned[MAX_TABS]` (mirrored through every
+  tab shift/swap/move site); `onTabTitleChanged` skips pinned tabs AND
+  non-focused panes (tab title = focused pane's title, Mac parity);
+  `refreshTabTitle` re-derives on pane focus change (hooked in App.zig
+  WM_SETFOCUS); `setTabTitlePin`; inline tab rename now pins (empty
+  clears); `setTitleOverride` treats empty as clear; prompt helpers
+  `promptTabTitle`/`promptPaneTitle`.
+- `RenameDialog.zig`: `Level = {pane,tab,window}` — per-level caption
+  ("Change Pane/Tab/Window Title"), label, prefill, and commit path
+  (`setUserTitle` / `setTabTitlePin` / `setTitleOverride`); pane/tab
+  targets resolved at commit via address-only `findTabIndex` so an
+  IPC-closed pane no-ops. Pure caption/label unit tests added.
+- `App.zig`: `.prompt_title` branches on the PromptTitle payload
+  (surface/tab/window) instead of always opening the window dialog.
+- `IpcHandlers.zig`: `+rename --title=""` and `+new-window --title=`
+  clear/skip the pin instead of pinning an empty string (Mac 9c7665354).
+- Palette: "Rename Window" replaced by "Change Window Title…" /
+  "Change Tab Title…" / "Change Pane Title…" (command.zig naming).
+- kb-actions.ps1 caption assert updated ("Change Window Title").
+
+*Evidence:* `window-title.ps1` ALL PASS (46) ×3 (S1 OSC baseline, S2
+IPC pin+clear, S3 ctrl+shift+r dialog E2E, S4 pane prompt incl.
+remembered-title restore, S5 tab pin vs OSC, S6 three-level peel);
+ipc-p1/p2/p3 ALL PASS; hero-mode.ps1 ALL PASS (60) (palette
+regression); both unit-test lanes green. kb-actions.ps1 self-skipped
+(un-hardened foreground grab, pre-existing — T86).
+
 ## T93 — Brokered OAuth (BFF) for Windows relay sign-in (Phase G)
 
 Mac moved to relay-brokered OAuth: the app never holds the Google
