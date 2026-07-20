@@ -1659,7 +1659,14 @@ class IPCServer {
     @MainActor
     func registerRestoredRemoteWindow(name: String, controller: TerminalController) {
         pruneStaleTargets()
-        guard targetRegistry[name] == nil else {
+        // A live window can hold the name without being in the registry yet
+        // (fresh windows are only lazily registered on +list / first
+        // targeting) — check both, or the restored window would become a
+        // second holder of the same target name.
+        let heldByLiveWindow = TerminalController.all.contains {
+            $0 !== controller && $0.windowName == name
+        }
+        guard targetRegistry[name] == nil, !heldByLiveWindow else {
             Self.logger.info("IPC: restored remote window not re-registered — target '\(name)' already in use")
             return
         }

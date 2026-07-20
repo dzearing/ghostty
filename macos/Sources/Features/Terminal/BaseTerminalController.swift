@@ -180,7 +180,9 @@ class BaseTerminalController: NSWindowController,
         windowTitleOverride = newTitle
     }
 
-    var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
+    var windowName: String = BaseTerminalController.mintWindowName() {
+        didSet { Self.reserveWindowName(windowName) }
+    }
 
     /// The remote machine this window's terminals run on, if any. When set, the
     /// window title is suffixed with the machine name and new splits/tabs inherit
@@ -281,9 +283,28 @@ class BaseTerminalController: NSWindowController,
     var sessionLayoutEntryID: UUID?
 
     private static var _nextWindowId: Int = 0
-    private static func nextWindowId() -> Int {
+
+    /// Mint the next auto window name ("window-1", "window-2", …).
+    static func mintWindowName() -> String {
         _nextWindowId += 1
-        return _nextWindowId
+        return "window-\(_nextWindowId)"
+    }
+
+    /// Reserve a window name a controller ADOPTED rather than minted — a
+    /// persisted session-restore name, a `GHOZTTY_WINDOW_NAME` inherited at
+    /// spawn, or an explicit `+new-window --target=`. If it matches the auto
+    /// pattern "window-N", advance the allocator past N so a later mint can
+    /// never repeat it: the allocator restarts at zero every app launch while
+    /// session restore re-adopts names minted by a PREVIOUS run (e.g.
+    /// "window-3"), and without the reservation the third fresh window of the
+    /// new run would mint "window-3" again — two windows holding one target
+    /// name, with +close/+split/+rename routed to whichever registered first.
+    static func reserveWindowName(_ name: String) {
+        guard name.hasPrefix("window-"),
+              let n = Int(name.dropFirst("window-".count)),
+              n > 0
+        else { return }
+        _nextWindowId = max(_nextWindowId, n)
     }
 
     /// The last computed title from the focused surface (without the override).
@@ -333,6 +354,9 @@ class BaseTerminalController: NSWindowController,
         var initialConfig = base ?? Ghostty.SurfaceConfiguration()
         if let existingName = initialConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] {
             self.windowName = existingName
+            // didSet does not fire during init — reserve explicitly so the
+            // allocator can never re-mint this adopted name.
+            Self.reserveWindowName(existingName)
         } else {
             initialConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
         }
