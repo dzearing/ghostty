@@ -1316,3 +1316,12 @@ test-agent ×3 + P1–P3 green. Cleaned probe debris (debug agent store +
 session-layout-debug.json). Notable: raw `?1002h` from a ConPTY child does
 NOT propagate outward — only console-API mouse mode does; CLI bools reject
 `on/off`.
+
+## 2026-07-20 — delivery: T101+T102 to all 3 install locations
+
+Built HEAD (7653b1590) ReleaseFast staging via the T100 gnu-target
+workaround. Desktop portable + share copy refreshed via the established
+.bak rename-swap (running windows keep old code until relaunched);
+installed release swapped via the detached upgrade script (kill/swap/
+resume, default -ResumeCommand). Next task: T100 (agent exe), then T89h
+per the item-20 publish queue.
