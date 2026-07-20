@@ -260,7 +260,40 @@ fn writeCacheFile(
         try kv.value_ptr.format(&atomic_file.file_writer.interface);
     }
 
-    try atomic_file.finish();
+    // `finish` = flush + rename-into-place. On Windows the rename can spuriously
+    // fail with `error.AccessDenied` when an antivirus/indexer briefly holds a
+    // handle on the just-written temp file (or the destination) — std documents
+    // exactly this window on `renameIntoPlace`. Flush once, then retry only the
+    // rename with a short backoff so a background scanner racing the write
+    // doesn't drop the cache update (and doesn't flake `zig build test-agent`
+    // on the box — see windows-parity task T97).
+    try atomic_file.flush();
+    try renameWithRetry(&atomic_file);
+}
+
+/// Rename the atomic temp file into place, retrying on Windows when a
+/// transient `error.AccessDenied` (an AV/indexer holding the temp or
+/// destination handle) blocks the rename-replace. On non-Windows the loop
+/// makes a single attempt — `AccessDenied` there is a genuine permission error.
+fn renameWithRetry(atomic_file: *std.fs.AtomicFile) std.fs.AtomicFile.RenameIntoPlaceError!void {
+    // Backoff schedule 1,2,4,8,16 ms before the final attempt (~31ms worst
+    // case) — long enough for a scanner's handle to close, short enough to be
+    // invisible on the happy path (attempt 1 almost always succeeds).
+    const max_attempts = 6;
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        // Safe to re-call: after a failed rename `file_exists` stays true and
+        // `file_open` is already false, so this just re-issues the `renameat`.
+        atomic_file.renameIntoPlace() catch |err| switch (err) {
+            error.AccessDenied => {
+                if (builtin.os.tag != .windows or attempt >= max_attempts) return err;
+                std.Thread.sleep(@as(u64, std.time.ns_per_ms) << @intCast(attempt - 1));
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
 }
 
 /// List all entries in the cache.
@@ -505,6 +538,43 @@ test "disk cache cleans up temp files" {
         try testing.expectEqualStrings("cache", entry.name);
     }
     try testing.expectEqual(1, count);
+}
+
+// Repeatedly rewriting the cache goes through the atomic rename-replace path
+// that `renameWithRetry` guards (T97: on Windows an AV/indexer can transiently
+// AccessDeny the rename). This hammers that path over an existing destination
+// and asserts every write lands with intact content.
+test "disk cache repeated rewrites replace atomically" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+    const path = try std.fs.path.join(alloc, &.{ tmp_path, "cache" });
+    defer alloc.free(path);
+
+    const cache: DiskCache = .{ .path = path };
+
+    // Many rewrites: each add after the first replaces the existing cache file.
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        _ = try cache.add(alloc, "example.com");
+        _ = try cache.add(alloc, "example.org");
+    }
+
+    // Both hosts survive the churn, and no temp files are left behind.
+    try testing.expect(try cache.contains(alloc, "example.com"));
+    try testing.expect(try cache.contains(alloc, "example.org"));
+
+    var count: usize = 0;
+    var iter = tmp.dir.iterate();
+    while (try iter.next()) |entry| : (count += 1) {
+        try testing.expectEqualStrings("cache", entry.name);
+    }
+    try testing.expectEqual(@as(usize, 1), count);
 }
 
 test isValidHost {

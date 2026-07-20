@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 36) — T97 DONE (test-agent floor un-flaked). Picked
+  T97 over the queued T89d because a flaky agent floor reds every task's
+  "test-agent green ×3" bar, including T89d's own validation — worth clearing
+  first. Fix (a): `DiskCache.writeCacheFile` flushes then `renameWithRetry`,
+  retrying `renameIntoPlace` on `error.AccessDenied` (Windows only,
+  1/2/4/8/16ms backoff) so an AV/indexer racing the atomic rename no longer
+  drops the write; new "repeated rewrites replace atomically" test. Surprise:
+  the failure that *looked* like T97 in my fresh shell was actually the
+  cross-drive cache panic (`convertPathArg` assert) — my Bash shell lacked
+  `ZIG_GLOBAL_CACHE_DIR`; test-agent was already green once the env var was
+  set. So T97 is a genuine flake (Defender timing), now hardened, not a hard
+  fail. Validation: test-agent green ×3, `-Dtest-filter="disk cache"` green,
+  both app lanes green. Not delivered to install locations (test-floor
+  robustness, not a user-facing feature). Next: T89d.
 - 2026-07-20 (on-box, 35) — T89d SPLIT + T89d1 DONE. T89d ("open under the
   local agent") was too big for one context (new LocalAgent find-or-spawn +
   App/Surface wiring + a ~250-line session-open.ps1 + several slow Windows

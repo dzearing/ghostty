@@ -3161,6 +3161,35 @@ so a natural Mac-seat item.
 
 *Validation (when fixed):* `zig build test-agent` ALL green ×3 on the box.
 
+### T97 DONE (2026-07-20)
+
+Fix (a) — the smallest, upstream-alignable one. `DiskCache.writeCacheFile`
+(`src/cli/ssh-cache/DiskCache.zig`) no longer calls `atomic_file.finish()`
+directly; it flushes once, then calls a new private `renameWithRetry` that
+retries `atomic_file.renameIntoPlace()` on `error.AccessDenied` with a
+1/2/4/8/16ms backoff (6 attempts, ~31ms worst case). Retry is Windows-gated
+(`builtin.os.tag == .windows`); on POSIX `AccessDenied` is a genuine permission
+error so the loop makes a single attempt. Re-calling `renameIntoPlace` is safe:
+after a failed rename `file_exists` stays true and `file_open` is already
+false, so it just re-issues the `renameat` on the same temp file; if every
+attempt fails, the deferred `deinit` still deletes the temp. New test
+"disk cache repeated rewrites replace atomically" hammers the rename-replace
+path over an existing destination (16 rewrites) and asserts both hosts survive
+with no temp files left behind (the happy path is also already exercised by
+"disk cache operations" / "cleans up temp files").
+
+*Evidence:* `zig build test-agent` green ×3; `-Dtest-filter="disk cache"`
+green; both app lanes (`-Dapp-runtime=none`/`win32`) green.
+
+**On-box gotcha uncovered while validating this:** the failure that looks like
+T97 in a fresh shell is usually the *cross-drive cache panic*, not the
+ssh-cache flake. Without `ZIG_GLOBAL_CACHE_DIR=D:\zig-global-cache` (same drive
+as the repo), zig 0.15.2's build runner panics in `convertPathArg`
+(`assert(!isAbsolute(child_cwd_rel))`, std `Run.zig`) because
+`std.fs.path.relative` returns an absolute path across drives — this aborts
+`test-agent` before any ssh-cache test runs. Set the env var (it is documented
+in the build-setup memory) before diagnosing a red agent floor.
+
 ## T89a — Session persistence on Windows: design (Phase K)
 
 Port the session-persistence feature (CLAUDE.md "Session Persistence"
