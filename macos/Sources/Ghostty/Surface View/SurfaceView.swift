@@ -48,7 +48,9 @@ extension Ghostty {
         @State private var windowFocus: Bool = true
 
         // Measured height of the sticky pane banner, used to inset the
-        // terminal surface so content isn't covered by the overlay.
+        // terminal surface so content isn't covered by the overlay. Banner
+        // height changes are unanimated (collapse/expand is an instant
+        // toggle), so this moves in a single step per state change.
         @State private var bannerHeight: CGFloat = 0
 
         #if canImport(AppKit)
@@ -154,7 +156,14 @@ extension Ghostty {
                             .onGeometryChange(for: CGFloat.self) { proxy in
                                 proxy.size.height
                             } action: { height in
-                                bannerHeight = height
+                                // Never let an ambient animation interpolate
+                                // this — an animated inset drags the terminal
+                                // surface through per-frame resizes.
+                                var tx = Transaction()
+                                tx.disablesAnimations = true
+                                withTransaction(tx) {
+                                    bannerHeight = height
+                                }
                             }
                         Spacer()
                     }

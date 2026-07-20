@@ -24,10 +24,21 @@ extension Ghostty {
         /// each count as one line; the separator row never renders.
         static let maxDisplayLines = 10
 
-        /// Content height when collapsed: the first line fully visible
-        /// plus a sliver of the next, which the fade mask dissolves to
-        /// hint that there's more to view.
-        private static let collapsedContentHeight: CGFloat = 24
+        /// Corner radius of the floating banner card.
+        private static let cornerRadius: CGFloat = 14
+
+        /// Uniform inner padding of the card. Equal on all sides so the
+        /// collapsed card — which shows only the title row — is vertically
+        /// centered around a title that hasn't moved from its expanded spot.
+        private static let innerPadding: CGFloat = 12
+
+        /// Margin between the card and the pane edges (the card floats,
+        /// Liquid Glass style, instead of running edge to edge). Sized so the
+        /// card's elevation shadow has room to render instead of being cut at
+        /// the pane edge. The bottom margin is part of the banner's measured
+        /// height, so the terminal content below always starts a breath under
+        /// the card — content is never hidden behind it.
+        private static let outerMargin: CGFloat = 14
 
         /// Fallback per-column cap used ONLY before the banner's real width is
         /// measured (the very first layout pass, when `availableWidth` is still
@@ -45,58 +56,34 @@ extension Ghostty {
 
         /// Collapsed state is per-pane and ephemeral; it resets when the
         /// banner is cleared and set again.
-        @State private var collapsed = false
+        @State private var collapsed: Bool
+
+        init(text: String, background: Color? = nil, initiallyCollapsed: Bool = false) {
+            self.text = text
+            self.background = background
+            self._collapsed = State(initialValue: initiallyCollapsed)
+        }
 
         var body: some View {
             let blocks = BannerMarkdown.parseBlocks(text, maxLines: Self.maxDisplayLines)
-            // Single-line banners have nothing to collapse; hide the
-            // chevron and ignore background clicks.
-            let collapsible = text.contains("\n")
+            // The first block is the title row; everything after it is the
+            // collapsible body. A banner with nothing after the title has
+            // nothing to collapse: hide the chevron, ignore background clicks.
+            let title = blocks.first
+            let rest = blocks.dropFirst()
+            let collapsible = !rest.isEmpty
 
-            // Width the content column may use for table layout: the measured
-            // inner width, less the HStack's spacing to the trailing spacer and
-            // the collapse chevron (when present). 0 until first measured.
-            let contentBudget = max(0, availableWidth - 8 - (collapsible ? 26 : 0))
+            // Width budget for table layout, from the measured inner width
+            // (0 until first measured). The title row shares its line with
+            // the chevron column; body blocks get the full width.
+            let titleBudget = max(0, availableWidth - 8 - (collapsible ? 26 : 0))
+            let bodyBudget = max(0, availableWidth)
 
-            HStack(alignment: .top, spacing: 8) {
-                // Paragraph-style gap between blocks (text runs, tables);
-                // lines within a text run stay tight since a run is a
-                // single Text.
-                let content = VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                        blockView(block, budget: contentBudget)
-                    }
-                }
-                if collapsed {
-                    content
-                        .frame(height: Self.collapsedContentHeight, alignment: .topLeading)
-                        .clipped()
-                        .mask {
-                            LinearGradient(
-                                stops: [
-                                    .init(color: .black, location: 0),
-                                    .init(color: .black, location: 0.55),
-                                    .init(color: .clear, location: 1),
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        }
-                } else {
-                    content
-                }
-                Spacer(minLength: 0)
-                if collapsible {
-                    Button(action: toggleCollapsed) {
-                        Image(systemName: collapsed ? "chevron.down" : "chevron.up")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(collapsed ? "Expand banner" : "Collapse banner")
-                }
-            }
-            // Measure the inner content width (the HStack fills it via the
+            cardContent(
+                title: title, rest: rest, collapsible: collapsible,
+                titleBudget: titleBudget, bodyBudget: bodyBudget
+            )
+            // Measure the inner content width (the title row fills it via its
             // trailing Spacer) and feed it back for table column sizing. A
             // preference key delivers the value outside the view-update pass,
             // so it never triggers "modifying state during update".
@@ -107,32 +94,186 @@ extension Ghostty {
             )
             .onPreferenceChange(BannerWidthKey.self) { availableWidth = $0 }
             .font(.system(size: 12))
-            .padding(12)
-            .background(backgroundStyle)
-            .contentShape(Rectangle())
+            .padding(Self.innerPadding)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .modifier(GlassCardBackground(fallbackFill: fallbackFill, tint: shadedBackground))
+            .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
             .onTapGesture {
                 guard collapsible else { return }
                 toggleCollapsed()
             }
-            .overlay(alignment: .bottom) {
-                Divider()
+            .padding(.horizontal, Self.outerMargin)
+            .padding(.top, Self.outerMargin * 0.8)
+            .padding(.bottom, Self.outerMargin)
+        }
+
+        /// The card's inner content: the title row (first block + collapse
+        /// chevron) with the body blocks below it.
+        @ViewBuilder
+        private func cardContent(
+            title: BannerMarkdown.Block?,
+            rest: ArraySlice<BannerMarkdown.Block>,
+            collapsible: Bool,
+            titleBudget: CGFloat,
+            bodyBudget: CGFloat
+        ) -> some View {
+            VStack(alignment: .leading, spacing: 8) {
+                // Title row. The chevron is center-aligned against the title
+                // in both states — collapsing removes the body below this row
+                // and nothing in the row itself moves.
+                HStack(alignment: .center, spacing: 8) {
+                    if let title {
+                        blockView(title, budget: titleBudget)
+                    }
+                    Spacer(minLength: 0)
+                    if collapsible {
+                        Button(action: toggleCollapsed) {
+                            Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(collapsed ? "Expand banner" : "Collapse banner")
+                    }
+                }
+                // Body blocks, with a paragraph-style gap between them (lines
+                // within a text run stay tight since a run is a single Text).
+                if !(collapsed && collapsible) {
+                    ForEach(Array(rest.enumerated()), id: \.offset) { _, block in
+                        blockView(block, budget: bodyBudget)
+                    }
+                }
             }
         }
 
+        /// Instant, deliberately unanimated: the terminal below is inset by
+        /// the banner's measured height, so an animated card height would
+        /// drag the Metal surface through per-frame resizes (visible flicker)
+        /// or force a transient gap/overlap. One state change → card and
+        /// terminal inset move together in a single atomic step.
         private func toggleCollapsed() {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                collapsed.toggle()
-            }
+            collapsed.toggle()
         }
 
-        /// A shade deviated from the pane background (lighter when dark,
-        /// darker when light); falls back to the translucent material
-        /// when the background isn't known.
-        private var backgroundStyle: AnyShapeStyle {
-            guard let background else { return AnyShapeStyle(.ultraThinMaterial) }
+        /// A shade deviated from the pane background: lighter when the pane
+        /// is dark, darker when it's light — so the card visibly stands off
+        /// the terminal behind it. Nil when the background isn't known.
+        private var shadedBackground: Color? {
+            guard let background else { return nil }
             let os = OSColor(background)
-            let shaded = os.isLightColor ? os.darken(by: 0.06) : os.lighten(by: 0.1)
-            return AnyShapeStyle(Color(shaded))
+            let shaded = os.isLightColor ? os.darken(by: 0.04) : os.lighten(by: 0.06)
+            return Color(shaded)
+        }
+
+        /// Card fill for OSes without Liquid Glass: the shaded pane color,
+        /// or the translucent material when the background isn't known.
+        private var fallbackFill: AnyShapeStyle {
+            guard let shaded = shadedBackground else { return AnyShapeStyle(.ultraThinMaterial) }
+            return AnyShapeStyle(shaded)
+        }
+
+        /// The floating card's material. On macOS 26+ this is genuine Liquid
+        /// Glass — adaptive translucency with the system's specular edge
+        /// treatment, sampling whatever sits behind the card. Earlier OSes
+        /// get a rounded translucent card: the shaded pane fill, a hairline
+        /// stroke standing in for the glass rim, and a soft shadow for depth.
+        private struct GlassCardBackground: ViewModifier {
+            let fallbackFill: AnyShapeStyle
+
+            /// Tint applied to the glass itself: the shaded pane color, so
+            /// the material reads lighter than a dark pane and darker than a
+            /// light one instead of hovering at the backdrop's own tone.
+            let tint: Color?
+
+            private var shape: RoundedRectangle {
+                RoundedRectangle(
+                    cornerRadius: SurfacePaneBanner.cornerRadius,
+                    style: .continuous
+                )
+            }
+
+            /// Specular sheen: not a straight linear band but an ellipse of
+            /// light centered above the card, so the highlight bulges down
+            /// into the top in a curve and falls away toward the corners —
+            /// plus a faint darkening along the bottom edge to ground the
+            /// card. Attached as a background of the content so it renders
+            /// above the material but below the text (an overlay would wash
+            /// the glyphs too).
+            private var sheen: some View {
+                ZStack {
+                    shape.fill(
+                        EllipticalGradient(
+                            stops: [
+                                .init(color: .white.opacity(0.10), location: 0),
+                                .init(color: .white.opacity(0.03), location: 0.6),
+                                .init(color: .clear, location: 1),
+                            ],
+                            center: UnitPoint(x: 0.5, y: -0.5),
+                            startRadiusFraction: 0,
+                            endRadiusFraction: 1.15
+                        )
+                    )
+                    shape.fill(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.75),
+                                .init(color: .black.opacity(0.05), location: 1),
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                }
+                .allowsHitTesting(false)
+            }
+
+            /// Specular rim: a hairline border lit by the same overhead
+            /// ellipse — brightest at the top-center, softening around the
+            /// upper corners, nearly gone along the bottom.
+            private var rim: some View {
+                shape.strokeBorder(
+                    EllipticalGradient(
+                        stops: [
+                            .init(color: .white.opacity(0.28), location: 0),
+                            .init(color: .white.opacity(0.10), location: 0.7),
+                            .init(color: .white.opacity(0.04), location: 1),
+                        ],
+                        center: UnitPoint(x: 0.5, y: -0.5),
+                        startRadiusFraction: 0,
+                        endRadiusFraction: 1.3
+                    ),
+                    lineWidth: 1
+                )
+                .allowsHitTesting(false)
+            }
+
+            func body(content: Content) -> some View {
+                if #available(macOS 26.0, iOS 26.0, *) {
+                    // The filled shape behind the glass serves two jobs: it
+                    // casts the card's elevation shadow (a shadow on the glass
+                    // content itself would also shadow every text glyph), and
+                    // it gives the glass a stable, pane-hued backdrop to
+                    // sample so legibility doesn't depend on what happens to
+                    // sit behind the card.
+                    content
+                        .background(sheen)
+                        .glassEffect(.regular.tint(tint), in: shape)
+                        .background(
+                            shape.fill(fallbackFill)
+                                .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+                        )
+                        .overlay(rim)
+                } else {
+                    // Shadow on the shape (not the content) so translucent
+                    // fills don't give every text glyph its own shadow.
+                    content
+                        .background(sheen)
+                        .background(
+                            shape.fill(fallbackFill)
+                                .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+                        )
+                        .overlay(rim)
+                }
+            }
         }
 
         @ViewBuilder
