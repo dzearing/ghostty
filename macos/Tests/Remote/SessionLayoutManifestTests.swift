@@ -52,7 +52,9 @@ struct SessionLayoutManifestTests {
         .split(.init(
             direction: .horizontal,
             ratio: 0.3,
-            left: .leaf(.init(sessionID: "s-left", title: "left", ipcName: "ide")),
+            left: .leaf(.init(
+                sessionID: "s-left", title: "left", ipcName: "ide",
+                banner: "**build** ok\n| a | b |")),
             right: .split(.init(
                 direction: .vertical,
                 ratio: 0.62,
@@ -67,6 +69,20 @@ struct SessionLayoutManifestTests {
         let data = try JSONEncoder().encode(tree)
         let decoded = try JSONDecoder().decode(SessionLayoutManifest.Node.self, from: data)
         #expect(decoded == tree)
+    }
+
+    /// A manifest persisted before the banner field existed must decode with
+    /// nil banners (additive evolution — same contract as surfaceID etc.).
+    @Test func preBannerLeafDecodesWithNilBanner() throws {
+        let json = #"{"leaf":{"_0":{"sessionID":"s1","title":"t","ipcName":"n"}}}"#
+        let decoded = try JSONDecoder().decode(
+            SessionLayoutManifest.Node.self, from: Data(json.utf8))
+        guard case .leaf(let leaf) = decoded else {
+            Issue.record("expected a leaf")
+            return
+        }
+        #expect(leaf.banner == nil)
+        #expect(leaf.sessionID == "s1")
     }
 
     @Test func entryRoundTripsThroughJSON() throws {

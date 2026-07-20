@@ -95,6 +95,9 @@ class BaseTerminalController: NSWindowController,
     /// Cancellable for aggregating activity state across all surfaces in this controller.
     private var activityStateCancellable: AnyCancellable?
 
+    /// Cancellable for the pane-banner manifest sync (session persistence).
+    private var paneBannerCancellable: AnyCancellable?
+
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
     var titleOverride: String? {
@@ -375,6 +378,9 @@ class BaseTerminalController: NSWindowController,
 
         // Setup activity state aggregation for the window
         setupActivityStatePublisher()
+
+        // Keep the session-layout manifest current with pane banner changes
+        setupPaneBannerSyncPublisher()
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default
@@ -3390,6 +3396,24 @@ extension BaseTerminalController {
                     NSApp.requestUserAttention(.informationalRequest)
                 }
             }
+        }
+    }
+
+    /// Session persistence: a pane's sticky banner is part of the layout
+    /// manifest (it is app-side overlay state the agent's PTY replay cannot
+    /// bring back), so re-sync the manifest whenever any pane's banner
+    /// changes — a crash after +set-banner must not lose the banner to the
+    /// quit-time-only sync.
+    private func setupPaneBannerSyncPublisher() {
+        paneBannerCancellable = surfaceValuesPublisher(
+            valueKeyPath: \.paneBanner,
+            publisherKeyPath: \.$paneBanner
+        )
+        .removeDuplicates()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            guard let self, self.sessionLayoutEntryID != nil else { return }
+            SessionLayoutManifest.shared.scheduleSync(self)
         }
     }
 

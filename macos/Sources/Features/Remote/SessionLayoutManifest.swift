@@ -83,6 +83,13 @@ final class SessionLayoutManifest {
         /// (the pre-WP-D3 behavior). Always nil for viewer leaves.
         var screenSnapshot: String?
         var screenSnapshotOffset: UInt64?
+        /// The pane's sticky banner (raw markdown-subset source text, set via
+        /// +set-banner / OSC 7778 / Cmd+R). App-side overlay state — not part
+        /// of the PTY output the agent replays — so it must ride the layout
+        /// manifest to survive a relaunch. Optional/additive: older manifests
+        /// decode with nil. Always nil for viewer leaves (banners are
+        /// terminal-only).
+        var banner: String?
 
         var isViewer: Bool { kind == "viewer" }
     }
@@ -567,7 +574,8 @@ final class SessionLayoutManifest {
                     ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) },
                     surfaceID: view?.id.uuidString,
                     screenSnapshot: snap?.snapshot,
-                    screenSnapshotOffset: snap?.offset)
+                    screenSnapshotOffset: snap?.offset,
+                    banner: view?.paneBanner)
             }
         }
 

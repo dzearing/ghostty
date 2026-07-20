@@ -80,11 +80,14 @@ enum IPCData: Encodable {
         var pane_type: String = "terminal"
         /// The viewed file path or URL (viewer panes only).
         var url: String? = nil
+        /// The pane's sticky banner text (terminal panes only; nil when none).
+        var banner: String? = nil
 
         private enum CodingKeys: String, CodingKey {
             case id, title, working_directory, pid, tty, name, focused, exit_code
             case pane_type = "type"
             case url
+            case banner
         }
 
         func encode(to encoder: Encoder) throws {
@@ -99,6 +102,7 @@ enum IPCData: Encodable {
             try container.encode(exit_code, forKey: .exit_code)
             try container.encode(pane_type, forKey: .pane_type)
             try container.encode(url, forKey: .url)
+            try container.encodeIfPresent(banner, forKey: .banner)
         }
     }
 
