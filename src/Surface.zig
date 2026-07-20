@@ -661,11 +661,13 @@ fn appendLocalShellIntegrationEnv(
                 );
                 break :integrate null;
             },
-            // bash/nushell need an argv rewrite (bash → `<shell> --posix` so it
-            // sources $ENV=ghostty.bash; nushell → `--execute 'use ghostty *'`).
-            // Split the rewritten command into an argv array (duped into `alloc`,
-            // owned by the caller) so it rides `OPEN.argv` to the agent (T04c).
-            .bash, .nushell => {
+            // bash/nushell/powershell need an argv rewrite (bash → `<shell>
+            // --posix` so it sources $ENV=ghostty.bash; nushell → `--execute
+            // 'use ghostty *'`; powershell → `-NoExit -Command` dot-sourcing
+            // ghostty.ps1, T27). Split the rewritten command into an argv array
+            // (duped into `alloc`, owned by the caller) so it rides
+            // `OPEN.argv` to the agent (T04c).
+            .bash, .nushell, .powershell => {
                 var argv: std.ArrayListUnmanaged([]const u8) = .empty;
                 errdefer {
                     for (argv.items) |a| alloc.free(a);

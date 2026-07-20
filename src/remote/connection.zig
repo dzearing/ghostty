@@ -4029,7 +4029,8 @@ const LifecycleAgent = struct {
     relaunch_found: bool = true,
     relaunch_pid: i64 = 5555,
     saw_relaunch: std.atomic.Value(bool) = .{ .raw = false },
-    relaunch_channel: std.atomic.Value(u128) = .{ .raw = 0 },
+    // u128 has no x86_64 atomics; guarded by `seen_channel_mtx` like `seen_channel`.
+    relaunch_channel: u128 = 0,
 
     // PROC_KILL / PROC_SPAWN reply config (inc 4+5). A PROC_KILL for `kill_fail_pid`
     // replies ok=false (models no-such-pid); any other pid succeeds. PROC_SPAWN
@@ -4067,6 +4068,18 @@ const LifecycleAgent = struct {
         self.seen_channel_mtx.lock();
         defer self.seen_channel_mtx.unlock();
         return self.seen_channel;
+    }
+
+    fn setRelaunchChannel(self: *LifecycleAgent, ch: u128) void {
+        self.seen_channel_mtx.lock();
+        defer self.seen_channel_mtx.unlock();
+        self.relaunch_channel = ch;
+    }
+
+    fn relaunchChannel(self: *LifecycleAgent) u128 {
+        self.seen_channel_mtx.lock();
+        defer self.seen_channel_mtx.unlock();
+        return self.relaunch_channel;
     }
 
     fn body(self: *LifecycleAgent) !void {
@@ -4119,7 +4132,7 @@ const LifecycleAgent = struct {
                     // Reply RELAUNCHED on the SAME channel (the relaunchable path),
                     // as the real agent does when the tombstone is respawnable.
                     self.saw_relaunch.store(true, .monotonic);
-                    self.relaunch_channel.store(frame.channel, .monotonic);
+                    self.setRelaunchChannel(frame.channel);
                     var parsed = protocol.parseJson(protocol.Relaunch, self.alloc, frame.payload) catch continue;
                     defer parsed.deinit();
                     const sid = parsed.value.session_id;
@@ -5086,7 +5099,7 @@ test "relaunchChannel: revives a dead session → live pane, fresh stream routes
 
     // The RELAUNCH went out on the SAME channel the dead ATTACHED came in on.
     try testing.expect(a.saw_relaunch.load(.monotonic));
-    try testing.expectEqual(channel, a.relaunch_channel.load(.monotonic));
+    try testing.expectEqual(channel, a.relaunchChannel());
 
     // Fresh output on the channel (offset 0, no resync discard) lands in the ring.
     try agentSendData(&h.data_agent, pane.id, 0, "back after reboot");
@@ -5159,7 +5172,7 @@ test "prompt relaunch: prepareRelaunchPane holds a childless pane; sendRelaunchO
     try testing.expectEqual(@as(i64, 4242), pane.pid); // pid filled in on success
     try testing.expectEqualStrings("/dev/ttys021", pane.tty.?); // fresh pty's tty too (wp3)
     try testing.expect(a.saw_relaunch.load(.monotonic));
-    try testing.expectEqual(channel, a.relaunch_channel.load(.monotonic));
+    try testing.expectEqual(channel, a.relaunchChannel());
 
     // 4) Fresh output on the (already-registered) channel lands in the ring.
     try agentSendData(&h.data_agent, pane.id, 0, "prompt back");
