@@ -237,10 +237,22 @@ Work these first, in order, before falling back to first-todo-in-table:
    + agent in release zip/MSI + delivery) — needs the AGENT exe, so **T100**
    (build agent via `-Dtarget=x86_64-windows-gnu`, or a wWinMain shim) is the
    real blocker to clear first. T96 still folds with the close path.
-   T29/T30/T87 remain Mac-seat. **User-reported live-review items
-   (2026-07-20):** T101 (banner overlay occludes terminal content),
-   T102 (win32 right-click context menu parity), and a ghoztty-skill fix
-   (banner title needs a `#` heading) are queued from an on-box review.
+   T29/T30/T87 remain Mac-seat.
+19. **USER LIVE-REVIEW ITEMS (2026-07-20) — do these FIRST, in order**, ahead
+    of T89h (the user surfaced them on-box and is waiting): **(a)** ghoztty-
+    skill banner-title fix — the skill sets a banner title WITHOUT a leading
+    `#`, so it renders body-size; prefix the title line with `# ` (quick; skill
+    lives in the marketplace repo + plugin cache, not this repo). **(b) T101** —
+    banner overlay occludes terminal content: `Surface.handleResize` passes the
+    FULL pane height to `core_surface.sizeCallback` (Surface.zig:2387), so the
+    grid fills the whole pane UNDER the floating layered banner. Inset the
+    terminal drawable from the top by the banner strip height, dynamic on
+    set/grow/collapse/clear + DPI. **(c) T102** — right-click pastes instead of
+    a Mac-parity context menu (Copy/Paste/Split/Change Title/Background Color…);
+    build a native `TrackPopupMenu` (T79 dark-mode) wired to the palette
+    actions. NOTE: banner heading SIZE was a NON-bug (the user's title lacked
+    `#`; sizing already matches Mac — pane-banner.ps1's heading-taller assert
+    passes).
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
