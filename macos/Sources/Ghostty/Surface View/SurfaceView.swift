@@ -47,9 +47,17 @@ extension Ghostty {
         // Maintain whether our window has focus (is key) or not
         @State private var windowFocus: Bool = true
 
-        // Measured height of the sticky pane banner, used to inset the
-        // terminal surface so content isn't covered by the overlay.
+        // Target height of the sticky pane banner (the height its card
+        // settles at after any collapse/expand animation), used to inset the
+        // terminal surface so content isn't covered by the overlay. Applied
+        // in one step per banner state change — growing immediately, and
+        // shrinking only once the banner's collapse animation has finished —
+        // so the scroll area never chases animated intermediate frames.
         @State private var bannerHeight: CGFloat = 0
+
+        // The most recently published banner target height. Guards the
+        // delayed shrink application against a quick re-expand in between.
+        @State private var bannerTargetHeight: CGFloat = 0
 
         #if canImport(AppKit)
         // Observe SecureInput to detect when its enabled
@@ -151,10 +159,23 @@ extension Ghostty {
                 if let banner = surfaceView.paneBanner {
                     VStack(spacing: 0) {
                         SurfacePaneBanner(text: banner, background: paneBackgroundColor)
-                            .onGeometryChange(for: CGFloat.self) { proxy in
-                                proxy.size.height
-                            } action: { height in
-                                bannerHeight = height
+                            .onPreferenceChange(BannerTargetHeightKey.self) { target in
+                                bannerTargetHeight = target
+                                if target >= bannerHeight {
+                                    // Growing: inset immediately so terminal
+                                    // content is never covered while the card
+                                    // expands into the space.
+                                    bannerHeight = target
+                                } else {
+                                    // Shrinking: wait out the collapse
+                                    // animation, then reclaim the space in one
+                                    // step — unless a re-expand superseded us.
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                                        if bannerTargetHeight == target {
+                                            bannerHeight = target
+                                        }
+                                    }
+                                }
                             }
                         Spacer()
                     }
