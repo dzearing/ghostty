@@ -333,6 +333,8 @@ class IPCServer {
             return handleSetState(request)
         case "set-banner":
             return handleSetBanner(request)
+        case "reload":
+            return handleReload(request)
         case "new-remote-window":
             return handleNewRemoteWindow(request)
         default:
@@ -1081,6 +1083,77 @@ class IPCServer {
         }
 
         Self.logger.info("IPC: \(clear ? "cleared" : "set") banner for '\(target)'")
+
+        return .ok
+    }
+
+    /// Reload a named viewer pane's content in place (`+reload`). Website
+    /// viewers re-fetch from origin (bypassing caches); file viewers
+    /// re-render the file preserving scroll. For a window target the reload
+    /// applies to its focused pane. A terminal target is an error — there
+    /// is nothing to reload.
+    private func handleReload(_ request: IPCRequest) -> IPCResponse {
+        var target: String?
+        for arg in request.arguments ?? [] {
+            if let value = arg.dropPrefix("--target=") {
+                target = String(value)
+            }
+        }
+
+        guard let target else {
+            return IPCResponse(success: false, error: "--target is required for +reload")
+        }
+
+        pruneStaleTargets()
+
+        guard let entry = resolveTarget(target) else {
+            return IPCResponse(success: false, error: "target '\(target)' not found in registry")
+        }
+
+        var reloadError: String?
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            defer { semaphore.signal() }
+
+            let viewer: ViewerView?
+            switch entry {
+            case .viewerPane(_, let paneRef):
+                viewer = paneRef.value?.viewerView
+            case .pane:
+                reloadError = "target '\(target)' is a terminal pane, nothing to reload"
+                return
+            case .window(let ref):
+                guard let controller = ref.value else {
+                    reloadError = "target '\(target)' is no longer alive"
+                    return
+                }
+                let panes = Array(controller.surfaceTree)
+                if let pane = controller.focusedViewerPane {
+                    viewer = pane.viewerView
+                } else if controller.focusedSurface == nil,
+                          panes.count == 1, panes.first?.viewerView != nil {
+                    // A never-focused window (e.g. opened --no-activate) has
+                    // no first responder; a lone viewer pane is unambiguous.
+                    viewer = panes.first?.viewerView
+                } else {
+                    reloadError = "focused pane of '\(target)' is a terminal pane, nothing to reload"
+                    return
+                }
+            }
+
+            guard let viewer else {
+                reloadError = "target '\(target)' is no longer alive"
+                return
+            }
+            viewer.reloadContent()
+        }
+        semaphore.wait()
+
+        if let reloadError {
+            return IPCResponse(success: false, error: reloadError)
+        }
+
+        Self.logger.info("IPC: reloaded viewer '\(target)'")
 
         return .ok
     }

@@ -205,6 +205,30 @@ final class ViewerView: NSView, Codable, ObservableObject {
     func goForward() { webView.goForward() }
     func reloadPage() { webView.reload() }
 
+    /// Explicit on-demand reload (the `+reload` IPC command). Websites
+    /// re-fetch from origin, bypassing caches — the point of an explicit
+    /// reload is to pick up server-side changes. File modes re-render the
+    /// file in place (scroll preserved) and re-arm the watcher in case an
+    /// atomic-save event was missed. Either mode falls back to a full
+    /// load when the initial page load never completed.
+    func reloadContent() {
+        switch mode {
+        case .web:
+            if webView.url == nil {
+                load()
+            } else {
+                webView.reloadFromOrigin()
+            }
+        case .markdown, .code:
+            if pageLoaded {
+                startWatchingFile()
+                renderFileContent()
+            } else {
+                load()
+            }
+        }
+    }
+
     /// Navigate from the chrome URL field. A bare host gets https://.
     func navigate(to input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
