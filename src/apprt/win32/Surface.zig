@@ -216,6 +216,13 @@ remote_is_local_agent: bool = false,
 remote_working_directory: ?[]const u8 = null,
 remote_shell: ?[]const u8 = null,
 
+/// Non-null ⇒ ATTACH to this existing agent session instead of OPENing a new
+/// one (session re-attach restore, T89f2). Set from `Overrides.Remote.session_id`
+/// at init; borrowed for the duration of `core_surface.init` ONLY (the same
+/// lifetime contract as `remote_working_directory` — `termio.Remote.init` dupes
+/// what it keeps and `remoteBackend()` is called exactly once, during init).
+remote_session_id: ?[]const u8 = null,
+
 /// Hero-mode thumbnail snapshot pipeline (T58 design / T59a). The renderer
 /// thread captures its own presented frame (blit of the offscreen render
 /// target — never an HWND capture, which can't see hidden panes) into
@@ -312,6 +319,11 @@ pub const Overrides = struct {
         /// analog of the Mac `Machine.isLocalMachine` signal. NEVER set for a
         /// cross-machine window.
         local_agent: bool = false,
+        /// Non-null ⇒ ATTACH to this existing agent session id instead of
+        /// OPENing a fresh one — session re-attach restore (T89f2). Borrowed;
+        /// must outlive the consuming `Surface.init` (the manifest `Parsed`
+        /// that owns it stays alive for the whole restore). Null ⇒ OPEN new.
+        session_id: ?[]const u8 = null,
     };
 };
 
@@ -472,6 +484,8 @@ pub fn init(
             self.remote_is_local_agent = r.local_agent;
             self.remote_working_directory = r.working_directory;
             self.remote_shell = r.shell;
+            // Non-null ⇒ ATTACH to a restored session (T89f2) rather than OPEN.
+            self.remote_session_id = r.session_id;
             // An explicit remote command travels through the same surface
             // config seam Exec uses; the core only forwards it into the
             // agent OPEN when `wait-after-command` marks it as explicitly
@@ -3638,9 +3652,10 @@ pub fn remoteBackend(self: *Surface) ?CoreSurface.RemoteBackend {
     const conn = self.remote_conn orelse return null;
     return .{
         .connection = conn,
-        // T20 always OPENs a new agent session; ATTACH (session restore)
-        // is a later Phase G increment.
-        .session_id = null,
+        // Non-null ⇒ ATTACH to this restored session (T89f2); null ⇒ OPEN a
+        // fresh one (the T20 new-window / T89d new-pane path). Borrowed for
+        // this construction call only (termio.Remote.init dupes it).
+        .session_id = self.remote_session_id,
         // LOCAL agent (T89d): inject ghoztty shell integration + per-pane
         // GHOSTTY_* env, pin the session (survives the viewer quitting). The
         // core keys pinned/local/tty-reporting off this flag; a cross-machine

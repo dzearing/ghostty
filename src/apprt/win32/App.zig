@@ -28,6 +28,8 @@ const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const LocalAgent = @import("LocalAgent.zig");
+const remote_connection = @import("../../remote/connection.zig");
+const tab_color = @import("tab_color.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
@@ -508,16 +510,26 @@ fn showConfigErrorsIfAny(
 }
 
 pub fn run(self: *App) !void {
+    // Session re-attach (T89f2): if a layout manifest survives and its agent
+    // sessions are still alive, rebuild those windows and SUPPRESS the default
+    // blank window. Any failure (no manifest, persistence off, agent gone,
+    // all-dead) returns false and we open one blank window as usual.
+    const restored = self.restoreSessionLayout();
+
     // Create the initial Window container with one tab. Route through
     // createWindow so the session-persistence injection (T89d) applies to the
-    // startup window exactly as it does to every later `new_window`.
-    const window = try self.createWindow(.{});
+    // startup window exactly as it does to every later `new_window`. Skipped
+    // when restore already opened at least one window.
+    const startup_window: ?*Window = if (restored) null else try self.createWindow(.{});
 
     // Surface config load diagnostics once at startup (T69). After the
     // first window exists so the dialog has an owner to center on; the
     // dialog pumps its own modal loop, so startup messages (paints, IPC)
-    // keep flowing while it is up.
-    self.showConfigErrorsIfAny(&self.config, window);
+    // keep flowing while it is up. Owner is the blank startup window, or the
+    // first restored window when restore suppressed it.
+    const diag_owner: ?*Window = startup_window orelse
+        (if (self.windows.items.len > 0) self.windows.items[0] else null);
+    if (diag_owner) |w| self.showConfigErrorsIfAny(&self.config, w);
 
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
@@ -975,6 +987,287 @@ fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_l
         });
     }
     return .{ .windows = try windows.toOwnedSlice(arena) };
+}
+
+/// Bounded wall-clock budget for the launch-time liveness probe (`LIST_SESSIONS`
+/// on the local agent). A healthy agent answers in single-digit ms; a wedged one
+/// times out and restore proceeds treating liveness as UNKNOWN (attempt ATTACH,
+/// never drop) rather than hanging startup.
+const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
+
+/// Launch-time session re-attach (T89f2, the RESTORE half of T89f). Loads the
+/// session-layout manifest T89f1 wrote, probes the local agent for which of its
+/// sessions are still alive, and rebuilds every restorable window/tab/split —
+/// each leaf ATTACHing to the agent session the `ghoztty-agent` kept alive
+/// across this app's quit/crash/upgrade (same PID, gap-filled scrollback).
+///
+/// Returns TRUE iff at least one window was restored, in which case the caller
+/// (`run`) SUPPRESSES the default blank startup window. Any failure — no
+/// manifest, persistence off, agent unreachable, an all-dead layout — returns
+/// false so the normal single blank window opens instead. Best-effort by design;
+/// a partial failure restores the windows it can and skips the rest.
+///
+/// Liveness is TRI-STATE (design pin): a window is dropped ONLY when every one
+/// of its session-backed leaves is POSITIVELY dead (the agent answered and none
+/// of its ids are present). If the probe itself failed (agent reachable enough
+/// to dial but `LIST_SESSIONS` timed out) liveness is UNKNOWN and we still
+/// attempt ATTACH — never drop on transport failure. A leaf whose session is
+/// dead / has no id re-opens a FRESH agent-backed pane (the tree shape and the
+/// window are preserved), which is friendlier than a permanently-exited pane and
+/// keeps every restored pane persistable.
+pub fn restoreSessionLayout(self: *App) bool {
+    if (!self.config.@"session-persistence") return false;
+    const gpa = self.core_app.alloc;
+
+    const path = session_layout.layoutPath(gpa) orelse return false;
+    defer gpa.free(path);
+    var parsed = (session_layout.load(gpa, path) catch |err| {
+        log.warn("session-restore: manifest load failed err={}", .{err});
+        return false;
+    }) orelse return false;
+    defer parsed.deinit();
+    const file = parsed.value;
+    if (file.windows.len == 0) return false;
+
+    // Resolve (find-or-spawn) the local agent. Without a connection we cannot
+    // ATTACH anything, so fall back to a blank window. A cold reboot spawns a
+    // FRESH agent with no sessions — the probe below then finds every id dead
+    // and we drop everything (tombstone relaunch is T89g, not this task).
+    const conn = self.local_agent.sharedConnection() orelse {
+        log.info("session-restore: no local agent; opening a blank window", .{});
+        return false;
+    };
+
+    // Probe liveness. `alive` null ⇒ the probe failed (UNKNOWN); a present set
+    // holds only sessions the agent reports `alive == true` (tombstones are
+    // treated as dead → their leaves re-open fresh).
+    var alive_sessions: ?remote_connection.OwnedSessions = conn.requestSessions(
+        restore_probe_timeout_ns,
+    ) catch |err| blk: {
+        log.warn("session-restore: liveness probe failed err={} (treating as unknown)", .{err});
+        break :blk null;
+    };
+    defer if (alive_sessions) |*s| s.deinit();
+
+    var alive_set: ?std.StringHashMap(void) = if (alive_sessions) |*s| set: {
+        var m = std.StringHashMap(void).init(gpa);
+        for (s.sessions) |sess| {
+            if (sess.alive) m.put(sess.id, {}) catch {};
+        }
+        break :set m;
+    } else null;
+    defer if (alive_set) |*m| m.deinit();
+    const alive_ptr: ?*const std.StringHashMap(void) = if (alive_set) |*m| m else null;
+
+    var restored: usize = 0;
+    for (file.windows) |win| {
+        if (!restoreWindowHasAttachableLeaf(win, alive_ptr)) continue;
+        self.restoreWindow(win, conn, alive_ptr) catch |err| {
+            log.warn("session-restore: window '{s}' failed err={}", .{ win.id, err });
+            continue;
+        };
+        restored += 1;
+    }
+    if (restored == 0) return false;
+    log.info("session-restore: restored {d} window(s)", .{restored});
+    return true;
+}
+
+/// Whether the window has at least one leaf we will ATTACH or re-open — i.e. not
+/// EVERY session-backed leaf is positively dead. A window with no attachable
+/// leaf (all its recorded sessions are gone) is dropped rather than restored as
+/// a wall of exited panes.
+fn restoreWindowHasAttachableLeaf(
+    win: session_layout.Window,
+    alive: ?*const std.StringHashMap(void),
+) bool {
+    for (win.tabs) |tab| {
+        for (tab.nodes) |node| {
+            const leaf = node.leaf orelse continue;
+            const sid = leaf.session_id orelse {
+                // A leaf with no session id re-opens fresh — a reason to keep
+                // the window (its layout is intact) even if nothing attaches.
+                return true;
+            };
+            // Alive, or liveness unknown (probe failed) ⇒ attachable.
+            if (alive) |a| {
+                if (a.contains(sid)) return true;
+            } else return true;
+        }
+    }
+    // No leaves at all, or every session-backed leaf positively dead.
+    return false;
+}
+
+/// The ATTACH override for one restored leaf: ride the local agent, and set
+/// `session_id` iff the session is alive (or liveness is unknown). A dead / id-less
+/// leaf gets a null session_id — the surface OPENs a fresh agent-backed pane.
+fn restoreAttachOverride(
+    leaf: session_layout.Leaf,
+    conn: *remote_connection.Connection,
+    alive: ?*const std.StringHashMap(void),
+) Surface.Overrides {
+    const sid: ?[]const u8 = if (leaf.session_id) |s| blk: {
+        const live = if (alive) |a| a.contains(s) else true; // null set ⇒ unknown ⇒ attempt
+        break :blk if (live) s else null;
+    } else null;
+    return .{ .remote = .{
+        .connection = conn,
+        .local_agent = true,
+        .session_id = sid,
+    } };
+}
+
+/// The first (leftmost-deepest) leaf reachable from `idx` in a flat manifest
+/// node array — the leaf whose session the surface occupying that subtree's
+/// position ATTACHes to. Null on a corrupt array (out-of-range index or a cycle).
+fn restoreFirstLeaf(nodes: []const session_layout.Node, idx: usize) ?session_layout.Leaf {
+    var i = idx;
+    var guard: usize = 0;
+    while (guard <= nodes.len) : (guard += 1) {
+        if (i >= nodes.len) return null;
+        if (nodes[i].leaf) |lf| return lf;
+        const sp = nodes[i].split orelse return null;
+        i = sp.left;
+    }
+    return null; // cycle guard tripped
+}
+
+/// Rebuild ONE manifest window (its tabs, split trees, per-leaf ATTACH, and
+/// presentation state) as a live `Window`. Errors propagate so the caller skips
+/// just this window.
+fn restoreWindow(
+    self: *App,
+    win: session_layout.Window,
+    conn: *remote_connection.Connection,
+    alive: ?*const std.StringHashMap(void),
+) !void {
+    if (win.tabs.len == 0) return error.CorruptLayout;
+
+    // Tab 0's first surface is created by createWindow's initial addTab; hand it
+    // that leaf's ATTACH override up front. `ov0` must outlive createWindow.
+    const first_leaf = restoreFirstLeaf(win.tabs[0].nodes, 0) orelse return error.CorruptLayout;
+    var ov0 = restoreAttachOverride(first_leaf, conn, alive);
+    const window = try self.createWindow(.{
+        .surface_overrides = &ov0,
+        .ipc_name = win.ipc_name,
+    });
+    try self.restoreTab(window, 0, win.tabs[0], conn, alive);
+
+    // Remaining tabs, appended in manifest order (addTab activates each new tab,
+    // so consecutive inserts keep the recorded order regardless of
+    // window-new-tab-position).
+    for (win.tabs[1..], 1..) |tab, ti| {
+        const lf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
+        var ov = restoreAttachOverride(lf, conn, alive);
+        window.pending_surface_overrides = &ov;
+        _ = window.addTab() catch |err| {
+            window.pending_surface_overrides = null;
+            return err;
+        };
+        try self.restoreTab(window, ti, tab, conn, alive);
+    }
+
+    // Window-level presentation: title pin, active tab, outer placement.
+    if (win.title_override) |t| window.setTitleOverride(t);
+    if (window.tab_count > 0) {
+        const active: usize = @min(@as(usize, win.active_tab), window.tab_count - 1);
+        window.selectTabIndex(active);
+    }
+    applyRestoreFrame(window, win.frame, win.maximized);
+}
+
+/// Rebuild one tab: replay the split tree onto its (already-created) first
+/// surface, then reapply the tab's color / hero ratio / pinned title.
+fn restoreTab(
+    self: *App,
+    window: *Window,
+    tab_index: usize,
+    tab: session_layout.Tab,
+    conn: *remote_connection.Connection,
+    alive: ?*const std.StringHashMap(void),
+) !void {
+    if (tab.nodes.len == 0) return error.CorruptLayout;
+    const first_surface = window.tab_active_surface[tab_index];
+    try self.restoreBuildSubtree(window, tab.nodes, 0, first_surface, conn, alive, 0);
+
+    if (tab.color) |c| {
+        if (std.meta.stringToEnum(tab_color.TabColor, c)) |tc| window.tab_colors[tab_index] = tc;
+    }
+    if (tab.hero_ratio) |r| window.tab_hero_ratio[tab_index] = r;
+    if (tab.title) |t| window.setTabTitlePin(tab_index, t);
+}
+
+/// Recursively reproduce a manifest subtree by splitting. `anchor` is the live
+/// surface currently occupying this subtree's whole region (the first leaf of
+/// the subtree). A leaf node registers its IPC pane name on `anchor`; a split
+/// node creates the right subtree's first surface via `newSplitAt` (ATTACHing it
+/// to that subtree's first leaf), then recurses into both children. Bounded by
+/// `nodes.len` against a corrupt (cyclic / out-of-range) manifest.
+fn restoreBuildSubtree(
+    self: *App,
+    window: *Window,
+    nodes: []const session_layout.Node,
+    idx: usize,
+    anchor: *Surface,
+    conn: *remote_connection.Connection,
+    alive: ?*const std.StringHashMap(void),
+    depth: usize,
+) !void {
+    if (depth > nodes.len or idx >= nodes.len) return error.CorruptLayout;
+    const node = nodes[idx];
+    if (node.leaf) |lf| {
+        if (lf.ipc_name) |n| self.ipcRegister(n, .{ .pane = anchor }) catch |err|
+            log.warn("session-restore: pane IPC register '{s}' failed err={}", .{ n, err });
+        return;
+    }
+    const sp = node.split orelse return error.CorruptLayout;
+    if (sp.left >= nodes.len or sp.right >= nodes.len) return error.CorruptLayout;
+
+    // The NEW surface takes the right/bottom position — attach it to the first
+    // leaf of the right subtree.
+    const right_leaf = restoreFirstLeaf(nodes, sp.right) orelse return error.CorruptLayout;
+    var ov = restoreAttachOverride(right_leaf, conn, alive);
+    window.pending_surface_overrides = &ov;
+
+    // `.right`/`.down` put the OLD (anchor) surface on the left/top with `ratio`
+    // as its share — the exact inverse of the capture (which stored the left
+    // child's ratio). horizontal → right, vertical → down.
+    const dir: SplitTree(Surface).Split.Direction =
+        if (std.mem.eql(u8, sp.layout, "vertical")) .down else .right;
+    const new_surface = window.newSplitAt(anchor, dir, @floatCast(sp.ratio)) catch |err| {
+        window.pending_surface_overrides = null;
+        return err;
+    } orelse {
+        window.pending_surface_overrides = null;
+        return error.CorruptLayout;
+    };
+
+    try self.restoreBuildSubtree(window, nodes, sp.left, anchor, conn, alive, depth + 1);
+    try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, conn, alive, depth + 1);
+}
+
+/// Apply the restored outer placement. Non-maximized: SetWindowPos to the exact
+/// screen rect the capture recorded. Maximized: set the (restored-down) rect,
+/// then maximize over it — matching T85's remembered-maximized behavior. Null
+/// frame ⇒ leave the created position (config/cascade) as-is.
+fn applyRestoreFrame(window: *Window, frame: ?session_layout.Frame, maximized: bool) void {
+    const hwnd = window.hwnd orelse return;
+    if (frame) |f| {
+        _ = w32.SetWindowPos(
+            hwnd,
+            null,
+            f.x,
+            f.y,
+            f.w,
+            f.h,
+            w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
+        );
+    }
+    if (maximized) {
+        window.start_maximized = true;
+        _ = w32.ShowWindow(hwnd, w32.SW_MAXIMIZE);
+    }
 }
 
 /// Create, track, and populate a new Window (with its first tab). Shared by

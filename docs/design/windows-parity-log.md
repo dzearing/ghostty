@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 41) — T89f2 DONE (launch restore + ATTACH). Session
+  re-attach now closes: `App.restoreSessionLayout` (run first in `run()`) loads
+  the T89f1 manifest, find-or-spawns the local agent, probes `LIST_SESSIONS`
+  liveness (tri-state — drop a window only when every session-backed leaf is
+  positively dead; unknown/probe-fail attempts ATTACH; no agent ⇒ blank window),
+  and rebuilds each window/tab/split by replaying `newSplitAt` over the flat node
+  array. NEW `Overrides.Remote.session_id` + `Surface.remote_session_id` thread
+  the leaf id through `remoteBackend()` (was hardcoded null) → core ATTACH; blank
+  startup window suppressed when ≥1 window restores. Presentation reapplied
+  (title pin, tab color, hero ratio, active tab, frame/maximized) + pane IPC
+  names re-registered. `session-reattach.ps1` grew §F (kill app only → relaunch →
+  2 windows/3 panes, SAME 3 sessions ATTACHed not re-OPENed, scrollback + IPC
+  name + title pin back), ALL PASS ×3; both lanes + test-agent + P1–P3 green.
+  Surprises: (1) narrow minimized panes wrap the scrollback marker per-glyph —
+  used the T99 whitespace-stripped match; (2) F9 flaked on `Wait-Manifest`
+  racing the atomic rewrite — a direct re-read poll is race-robust; (3) filed
+  **T100** — `zig build agent` EXE fails to link on the box (WinMain/subsystem,
+  pre-existing since my diff is app-only), blocks T89h delivery. Windows PID
+  identity proven via session-id reuse + survives-kill (T98 bogus local pid).
+  Next on-box: T89g (tombstone relaunch floor). T96 folds with the close path.
 - 2026-07-20 (on-box, 40) — T89f split + T89f1 DONE. T89f (same-PID re-attach
   restore) was too big for one context, so it was split into T89f1 (manifest +
   capture/debounced-atomic-write) and T89f2 (launch restore + ATTACH + suppress

@@ -3956,21 +3956,72 @@ Both test lanes + `test-agent` + P1–P3 green.
 
 ## T89f2 — Launch restore + ATTACH + suppress blank window
 
-The RESTORE half (next). Launch-time: gate on `session-persistence`; load the
-manifest; probe each unique session id for liveness (tri-state alive/dead/
-unknown via the connection probe — drop an entry ONLY when every leaf is
-positively dead, keep on unknown, never drop on transport failure); suppress
-the default blank startup window while a restore is pending; rebuild each
-window/tab/split, threading the manifest `session_id` through a NEW
-`Overrides.Remote.session_id` field → `Surface.remoteBackend()` (which today
-hardcodes `.session_id = null` at Surface.zig:3643) → core `RemoteBackend.
-session_id` so the termio backend ATTACHes instead of OPENs; gap-fill replay;
-re-apply frame/title pins/tab colors; re-register IPC names. Folds with T96's
-production pty teardown on the close path.
+The RESTORE half. Launch-time (`App.restoreSessionLayout`, called first in
+`run()`): gate on `session-persistence`; load the manifest; find-or-spawn the
+local agent; probe each session id for liveness (tri-state via
+`Connection.requestSessions` — the `LIST_SESSIONS` RPC, 2s bound); rebuild each
+restorable window/tab/split; and return whether ≥1 window was restored so `run()`
+SUPPRESSES the default blank startup window.
 
-*Validation:* `test/win32/session-reattach.ps1` grows section F onward — build
-a 2-window / 3-pane layout, record child PIDs, quit-keep-sessions, relaunch,
-assert SAME PIDs + layout + scrollback text + titles come back; ALL PASS ×3.
+Pieces (done 2026-07-20):
+
+1. **ATTACH plumbing.** NEW `Surface.Overrides.Remote.session_id` +
+   `Surface.remote_session_id` field, set from the override in `Surface.init`
+   and returned by `remoteBackend()` (which hardcoded `.session_id = null`) →
+   core `RemoteBackend.session_id`, so a non-null id makes termio ATTACH instead
+   of OPEN. Same borrowed-lifetime contract as `remote_working_directory` (read
+   once during `core_surface.init`; the manifest `Parsed` outlives the restore).
+   Gap-fill is FULL-RING replay (`restore_snapshot`/`restore_offset` stay null/0
+   — the manifest doesn't persist snapshots; that's T89g), which the agent's
+   per-session output ring supplies.
+
+2. **Tri-state liveness.** `alive` set = the agent's `alive == true` session ids
+   (tombstones treated dead). A window is DROPPED only when EVERY session-backed
+   leaf is positively dead; a probe that fails entirely (agent dialed but
+   `LIST_SESSIONS` timed out) ⇒ `alive` = null ⇒ UNKNOWN ⇒ attempt ATTACH, never
+   drop. No agent at all ⇒ return false ⇒ blank window (a cold reboot spawns a
+   fresh, session-less agent → every id dead → drop all → blank; tombstone
+   relaunch is T89g).
+
+3. **Tree rebuild by replay.** `restoreWindow` creates the window via
+   `createWindow` (first leaf's ATTACH override in `InitOptions.surface_overrides`
+   + `ipc_name`), then `restoreTab` per tab (extra tabs via `addTab` with the
+   pending-override baton). `restoreBuildSubtree` walks the flat manifest node
+   array recursively: a split node splits its anchor via `newSplitAt`
+   (horizontal→`.right`, vertical→`.down`, `ratio` = the left/top child's share,
+   the exact inverse of capture), attaching the new surface to the RIGHT
+   subtree's first leaf; then recurses left (same anchor) + right (new surface).
+   `restoreFirstLeaf` finds the leftmost-deepest leaf; recursion + indices are
+   bounded against a corrupt/cyclic manifest (`error.CorruptLayout` → skip that
+   window). A dead / id-less leaf re-opens a FRESH agent-backed pane (tree shape
+   preserved) rather than an exited one.
+
+4. **Presentation reapply.** Per tab: color (`std.meta.stringToEnum`), hero
+   ratio, pinned title (`setTabTitlePin`). Per leaf: IPC pane name re-register
+   (`ipcRegister`). Per window: `title_override` (`setTitleOverride`), active
+   tab (`selectTabIndex`), and outer frame via `applyRestoreFrame` (SetWindowPos
+   to the screen rect; ShowWindow(SW_MAXIMIZE) for a maximized window — applied
+   AFTER the surfaces so it wins over `initial_size`).
+
+5. **Blank-window suppression.** `run()` calls `restoreSessionLayout` first; the
+   default `createWindow(.{})` is skipped when it returns true. Config-error
+   diagnostics attach to the blank window, or the first restored window.
+
+Note T96 (production pty teardown on close) still folds in independently.
+
+*Validation (done 2026-07-20):* `test/win32/session-reattach.ps1` grew **section
+F**: with the A–E hermetic 2-window / 3-pane layout live (window 1 = startup
+pane + a `+split --name=f89sib`; window `second` = title `HelloTitle`), plant a
+whitespace-tolerant scrollback marker in the split pane, record the 3 live agent
+session ids, KILL ONLY `ghoztty.exe` (the detached agent keeps every PTY),
+relaunch, and assert: exactly 2 windows restored with NO extra blank (F5); all 3
+panes (F6); the SAME 3 sessions still alive — proving ATTACH, not a fresh OPEN
+per pane (F7); the split pane keeps its IPC name + pre-quit scrollback via
+gap-fill (F8); and the window title pin came back (F9). ALL PASS ×3. Both test
+lanes (`none` + `win32`) + `test-agent` + P1–P3 green at HEAD. Windows-only PID
+identity is proven via session-id re-use + survives-app-kill rather than the
+child pid (T98: local agent-backed pids read bogus). Validation surfaced **T100**
+(the `zig build agent` exe fails to link on the box — pre-existing, blocks T89h).
 
 ## T89g — Tombstone relaunch floor (agent restart / reboot)
 

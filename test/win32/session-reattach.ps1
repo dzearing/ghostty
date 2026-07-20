@@ -1,13 +1,12 @@
-# Session-layout manifest capture (tracker T89f1 — the WRITE half of same-PID
-# re-attach restore). Proves the win32 viewer-side manifest
-# (%LOCALAPPDATA%\ghoztty\session-layout[-debug].json) is captured and
-# atomically written as the live window/tab/split topology changes, so a later
-# launch (T89f2) has an accurate blueprint to rebuild + re-ATTACH from.
+# Session-layout re-attach (tracker T89f — same-PID restore). The WRITE half
+# (T89f1) proves the win32 viewer-side manifest
+# (%LOCALAPPDATA%\ghoztty\session-layout[-debug].json) is captured + atomically
+# written as the topology changes; the RESTORE half (T89f2, section F) proves a
+# relaunch rebuilds those windows and re-ATTACHes each pane to the session the
+# ghoztty-agent kept alive across the app's death.
 #
-# This is the DEBOUNCED-WRITE path: each mutation arms a 250ms timer on the GUI
+# A-E are the DEBOUNCED-WRITE path: each mutation arms a 250ms timer on the GUI
 # thread; the assertions poll the on-disk manifest until it reflects the change.
-# The RESTORE side (relaunch, same PIDs, scrollback, titles) is T89f2, which
-# grows this script's section F onward.
 #
 #   A. Startup window -> manifest has one window / one tab / one leaf whose
 #      session_id matches the single live agent session (+sessions).
@@ -18,6 +17,11 @@
 #      carries its IPC name.
 #   D. +rename --title -> the target window's title_override is captured.
 #   E. Every captured window has a real frame (w/h > 0) and a boolean maximized.
+#   F. RESTORE (T89f2): with the A-E 2-window/3-pane layout live, mark the split
+#      pane's scrollback, KILL ONLY the app (the detached agent keeps every
+#      PTY), relaunch, and assert restore rebuilt exactly 2 windows / 3 panes,
+#      re-ATTACHed the SAME 3 sessions (no new OPENs), and brought back the
+#      pane's IPC name + scrollback and the window title pin.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Fully hermetic: a
 # per-run $env:LOCALAPPDATA + per-run GHOSTTY_LOCAL_AGENT_BIN, and it ONLY ever
@@ -47,6 +51,15 @@ function Stop-TestProcs {
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     }
     Start-Sleep -Milliseconds 700
+}
+
+# Kill ONLY the zig-out ghoztty APP (leave ghoztty-agent alive so its PTYs
+# survive — the crash/upgrade re-attach scenario the restore half tests).
+function Stop-AppOnly {
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
+        Where-Object { $_.CommandLine -like '*zig-out*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 900
 }
 
 # Run a zig-out ghoztty +command with a hard timeout; stdout+stderr -> $out.
@@ -164,6 +177,63 @@ function Count-Splits($win) {
     return $c
 }
 
+# Union of every leaf session_id across ALL windows of a manifest, in order.
+# Built inline (not via Leaf-Sids) so there is no nested protective-comma array;
+# callers wrap in @() to strip the single protective wrap.
+function All-Sids($m) {
+    $ids = @()
+    foreach ($w in @($m.windows)) {
+        foreach ($t in @($w.tabs)) {
+            foreach ($n in @($t.nodes)) {
+                if ($null -ne $n.leaf -and $n.leaf.session_id) { $ids += $n.leaf.session_id }
+            }
+        }
+    }
+    return , $ids
+}
+
+# Count top-level windows in a +list --json tree (-1 on CLI failure).
+function Count-Windows($tmp, $tag) {
+    $code = Run-Cli '+list --json' "$tmp\lw-$tag.json" 10
+    if ($code -ne 0) { return -1 }
+    $tree = $null
+    try { $tree = Out-Text "$tmp\lw-$tag.json" | ConvertFrom-Json } catch {}
+    if ($null -eq $tree) { return -1 }
+    $windows = if ($null -ne $tree.data) { $tree.data.windows } else { $tree.windows }
+    return @($windows).Count
+}
+function Wait-Windows($tmp, $tag, $target, $timeoutSec = 25) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $n = -1
+    while ((Get-Date) -lt $deadline) {
+        $n = Count-Windows $tmp $tag
+        if ($n -eq $target) { return $n }
+        Start-Sleep -Milliseconds 500
+    }
+    return $n
+}
+
+# Count terminal leaves across every window/tab in a +list --json tree.
+function Count-Leaves($tmp, $tag) {
+    $code = Run-Cli '+list --json' "$tmp\ll-$tag.json" 10
+    if ($code -ne 0) { return -1 }
+    $tree = $null
+    try { $tree = Out-Text "$tmp\ll-$tag.json" | ConvertFrom-Json } catch {}
+    if ($null -eq $tree) { return -1 }
+    $windows = if ($null -ne $tree.data) { $tree.data.windows } else { $tree.windows }
+    $c = 0
+    foreach ($w in @($windows)) {
+        foreach ($t in @($w.tabs)) { $c += (Count-Leaf-Nodes $t.splits) }
+    }
+    return $c
+}
+function Count-Leaf-Nodes($node) {
+    if ($null -eq $node) { return 0 }
+    if ($node.type -eq 'leaf') { return 1 }
+    if ($node.type -eq 'split') { return (Count-Leaf-Nodes $node.left) + (Count-Leaf-Nodes $node.right) }
+    return 0
+}
+
 # One hermetic GUI launch (fresh LOCALAPPDATA + agent-bin override).
 function Start-Backed($label, $title) {
     $tmp = Join-Path $root $label
@@ -260,6 +330,97 @@ if ($null -ne $mE) {
 } else { $framesOk = $false; $maxOk = $false }
 Assert "E1 every window records a frame with positive width/height" $framesOk
 Assert "E2 every window records a boolean maximized flag" $maxOk
+
+# ============================================================================
+"== F: quit-keep-sessions then relaunch re-ATTACHes the whole layout"
+# ============================================================================
+# Reuse the A-E state: window 1 (startup pane + the f89sib split) + window
+# 'second' (title 'HelloTitle') = a 2-window / 3-pane layout with 3 live
+# agent sessions. Mark scrollback in the split pane, record the live session
+# ids, KILL ONLY THE APP (the agent keeps every PTY), relaunch, and prove the
+# same sessions come back in the same layout with their scrollback + titles.
+# A single space-free token: send-keys concatenates positional args (and cmd's
+# /c nesting would collapse a quoted space anyway), so a bare marker + Enter is
+# the robust way to plant text. cmd echoes it + errors ("'MARKER' is not
+# recognized..."), both landing the token in scrollback. The minimized window's
+# client area is a few columns wide, so cmd's line WRAPS the marker across rows —
+# match with all whitespace stripped (the T99 section-D narrow-pane technique).
+$marker = "REATTACHMARKER$($PID)XYZ"  # no separators: survives per-glyph wrapping
+function Read-HasMarker($f) { return ((Out-Text $f) -replace '\s', '') -match $marker }
+Run-Cli "+send-keys --target=f89sib $marker Enter" "$tmp\mark.txt" 12 | Out-Null
+# Poll +read until the marker shows (the shell printed it) pre-quit.
+$preOk = $false
+$deadline = (Get-Date).AddSeconds(20)
+while ((Get-Date) -lt $deadline) {
+    Run-Cli '+read --name=f89sib --lines=200' "$tmp\read-pre.txt" 10 | Out-Null
+    if (Read-HasMarker "$tmp\read-pre.txt") { $preOk = $true; break }
+    Start-Sleep -Milliseconds 500
+}
+Assert "F1 marker is in the split pane's scrollback before quit" $preOk
+
+# The live session ids the agent is keeping (must all come back on re-attach).
+$beforeIds = @(Alive-Ids (Wait-AliveCount $tmp 'f-before' 3 15))
+Assert "F2 three agent sessions are alive before quit" ($beforeIds.Count -eq 3)
+
+# Manifest must already reflect the full 2-window layout (debounced write) so
+# the abrupt app kill loses nothing.
+$mPre = Wait-Manifest $tmp {
+    param($m)
+    @($m.windows).Count -eq 2 -and (All-Sids $m).Count -eq 3
+} 10
+Assert "F3 manifest holds the full 2-window / 3-session layout pre-quit" (
+    $null -ne $mPre -and @($mPre.windows).Count -eq 2 -and (All-Sids $mPre).Count -eq 3)
+
+# Kill ONLY ghoztty.exe; the detached agent survives with all 3 PTYs.
+Stop-AppOnly
+$agentIds = @(Alive-Ids (Wait-AliveCount $tmp 'f-agent' 3 15))
+Assert "F4 the agent kept all 3 sessions alive after the app died" (
+    $agentIds.Count -eq 3 -and ($beforeIds | Where-Object { $agentIds -contains $_ }).Count -eq 3)
+
+# Relaunch (same LOCALAPPDATA + agent bin). Restore must suppress the blank
+# startup window and rebuild both windows by re-ATTACHing.
+$env:LOCALAPPDATA = $tmp
+$env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+Start-Process -FilePath $Exe -WindowStyle Minimized | Out-Null
+
+$winCount = Wait-Windows $tmp 'f-post' 2 30
+Assert "F5 relaunch restored exactly two windows (no extra blank)" ($winCount -eq 2)
+$leafCount = Count-Leaves $tmp 'f-post'
+Assert "F6 relaunch restored all three panes" ($leafCount -eq 3)
+
+# ATTACH proof: the agent still has EXACTLY the same 3 sessions alive (a fresh
+# OPEN per pane would have spawned new ones on top of the survivors).
+$afterIds = @(Alive-Ids (Wait-AliveCount $tmp 'f-after' 3 20))
+Assert "F7 the same 3 sessions are alive after relaunch (ATTACH, not re-OPEN)" (
+    $afterIds.Count -eq 3 -and ($beforeIds | Where-Object { $afterIds -contains $_ }).Count -eq 3)
+
+# The restored split pane kept its IPC name (re-registered on restore) AND its
+# scrollback (gap-fill replay from the agent ring). Whitespace-stripped match,
+# same narrow-pane wrapping as F1.
+$postOk = $false
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline) {
+    $code = Run-Cli '+read --name=f89sib --lines=200' "$tmp\read-post.txt" 10
+    if ($code -eq 0 -and (Read-HasMarker "$tmp\read-post.txt")) { $postOk = $true; break }
+    Start-Sleep -Milliseconds 700
+}
+Assert "F8 restored pane keeps its IPC name and its pre-quit scrollback" $postOk
+
+# The window title pin survived the round-trip (rewritten manifest post-restore).
+# Direct poll (not Wait-Manifest): the manifest is rewritten atomically as the
+# restored panes publish their session ids, so a single racy read can miss it —
+# re-read until the 'second' window shows its restored title_override.
+$f9 = $false
+$deadline = (Get-Date).AddSeconds(20)
+while ((Get-Date) -lt $deadline) {
+    $m = Read-Manifest $tmp
+    if ($null -ne $m) {
+        $w = @($m.windows | Where-Object { $_.ipc_name -eq 'second' })
+        if ($w.Count -eq 1 -and $w[0].title_override -eq 'HelloTitle') { $f9 = $true; break }
+    }
+    Start-Sleep -Milliseconds 400
+}
+Assert "F9 the restored window's title pin came back" $f9
 
 # ============================================================================
 if ($script:failures -gt 0) {
