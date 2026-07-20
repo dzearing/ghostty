@@ -117,7 +117,7 @@ extension Ghostty {
             .font(.system(size: 12))
             .padding(Self.innerPadding)
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .modifier(GlassCardBackground(fallbackFill: fallbackFill, tint: shadedBackground))
+            .modifier(GlassCardBackground(fill: cardFill))
             .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
             .onTapGesture {
                 guard collapsible else { return }
@@ -181,35 +181,34 @@ extension Ghostty {
             collapsed.toggle()
         }
 
-        /// A shade deviated from the pane background: lighter when the pane
-        /// is dark, darker when it's light — so the card visibly stands off
-        /// the terminal behind it. Nil when the background isn't known.
-        private var shadedBackground: Color? {
-            guard let background else { return nil }
-            let os = OSColor(background)
-            let shaded = os.isLightColor ? os.darken(by: 0.04) : os.lighten(by: 0.06)
-            return Color(shaded)
+        /// The card's fill: a translucent wash over whatever sits behind the
+        /// card — white on a dark pane, black on a light one. Compositing
+        /// white at 6% is exactly `lighten(by: 0.06)` of the color behind
+        /// (black at 4% is `darken(by: 0.04)`), so the card reads as a shade
+        /// off the pane background without ever holding a color of its own:
+        /// when the pane color changes, only the single element behind the
+        /// banner repaints and the card follows in the same paint pass. The
+        /// known `background` is consulted only for the light/dark direction.
+        /// Falls back to the translucent material when the background isn't
+        /// known.
+        private var cardFill: AnyShapeStyle {
+            guard let background else { return AnyShapeStyle(.ultraThinMaterial) }
+            return OSColor(background).isLightColor
+                ? AnyShapeStyle(Color.black.opacity(0.04))
+                : AnyShapeStyle(Color.white.opacity(0.06))
         }
 
-        /// Card fill for OSes without Liquid Glass: the shaded pane color,
-        /// or the translucent material when the background isn't known.
-        private var fallbackFill: AnyShapeStyle {
-            guard let shaded = shadedBackground else { return AnyShapeStyle(.ultraThinMaterial) }
-            return AnyShapeStyle(shaded)
-        }
-
-        /// The floating card's material. On macOS 26+ this is genuine Liquid
-        /// Glass — adaptive translucency with the system's specular edge
-        /// treatment, sampling whatever sits behind the card. Earlier OSes
-        /// get a rounded translucent card: the shaded pane fill, a hairline
-        /// stroke standing in for the glass rim, and a soft shadow for depth.
+        /// The floating card's glass look, drawn by hand: a translucent
+        /// wash fill, an elliptical specular sheen, a hairline rim, and a
+        /// soft elevation shadow. Deliberately NOT the system `glassEffect` —
+        /// its material re-renders when the window's key state changes
+        /// (the backdrop flips `windowServerAware` and its vibrancy layer
+        /// turns off on resign), so the card visibly shifted color on every
+        /// window switch, and its frost washed the pane hue toward grey.
+        /// Hand-drawn overlays are deterministic: the card stays the pane's
+        /// own color no matter which window is focused.
         private struct GlassCardBackground: ViewModifier {
-            let fallbackFill: AnyShapeStyle
-
-            /// Tint applied to the glass itself: the shaded pane color, so
-            /// the material reads lighter than a dark pane and darker than a
-            /// light one instead of hovering at the backdrop's own tone.
-            let tint: Color?
+            let fill: AnyShapeStyle
 
             private var shape: RoundedRectangle {
                 RoundedRectangle(
@@ -272,33 +271,34 @@ extension Ghostty {
                 .allowsHitTesting(false)
             }
 
+            /// Elevation shadow as its own element. The card's fill is a
+            /// near-transparent wash, so a `.shadow` on it would be scaled
+            /// down by the fill's alpha to nothing — instead blur a dark
+            /// copy of the shape, and mask the card's own interior out of it
+            /// so the wash isn't darkened from behind.
+            private var dropShadow: some View {
+                shape
+                    .fill(Color.black.opacity(0.3))
+                    .blur(radius: 8)
+                    .offset(y: 4)
+                    .mask {
+                        ZStack {
+                            Rectangle().fill(.white).padding(-24)
+                            shape.fill(.black).blendMode(.destinationOut)
+                        }
+                        .compositingGroup()
+                    }
+                    .allowsHitTesting(false)
+            }
+
             func body(content: Content) -> some View {
-                if #available(macOS 26.0, iOS 26.0, *) {
-                    // The filled shape behind the glass serves two jobs: it
-                    // casts the card's elevation shadow (a shadow on the glass
-                    // content itself would also shadow every text glyph), and
-                    // it gives the glass a stable, pane-hued backdrop to
-                    // sample so legibility doesn't depend on what happens to
-                    // sit behind the card.
-                    content
-                        .background(sheen)
-                        .glassEffect(.regular.tint(tint), in: shape)
-                        .background(
-                            shape.fill(fallbackFill)
-                                .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
-                        )
-                        .overlay(rim)
-                } else {
-                    // Shadow on the shape (not the content) so translucent
-                    // fills don't give every text glyph its own shadow.
-                    content
-                        .background(sheen)
-                        .background(
-                            shape.fill(fallbackFill)
-                                .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
-                        )
-                        .overlay(rim)
-                }
+                // Backgrounds stack front-to-back: sheen over the wash fill
+                // over the drop shadow.
+                content
+                    .background(sheen)
+                    .background(shape.fill(fill))
+                    .background(dropShadow)
+                    .overlay(rim)
             }
         }
 
@@ -687,17 +687,29 @@ extension Ghostty {
         private struct CheckboxMark: View {
             let checked: Bool
 
+            /// The banner renders inside a window whose appearance follows
+            /// the pane background, so the environment scheme tracks pane
+            /// lightness. System green reads well on dark washes but sits
+            /// too close to a light one — use a deeper green there.
+            @Environment(\.colorScheme) private var colorScheme
+
             // `side` is read by the table column-width measurement.
             static let side: CGFloat = 12
             private static let radius: CGFloat = 2
 
+            private var green: Color {
+                colorScheme == .light
+                    ? Color(red: 0.11, green: 0.44, blue: 0.16)
+                    : Color.green
+            }
+
             var body: some View {
                 RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
-                    .fill(checked ? Color.green.opacity(0.16) : Color.clear)
+                    .fill(checked ? green.opacity(0.16) : Color.clear)
                     .overlay(
                         RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
                             .strokeBorder(
-                                checked ? Color.green.opacity(0.55)
+                                checked ? green.opacity(colorScheme == .light ? 0.7 : 0.55)
                                         : Color.secondary.opacity(0.55),
                                 lineWidth: 1
                             )
@@ -706,7 +718,7 @@ extension Ghostty {
                         if checked {
                             Image(systemName: "checkmark")
                                 .font(.system(size: 8, weight: .bold))
-                                .foregroundStyle(Color.green)
+                                .foregroundStyle(green)
                         }
                     }
                     .frame(width: Self.side, height: Self.side)

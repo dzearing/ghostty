@@ -3466,25 +3466,107 @@ pub const CAPI = struct {
         b: u8,
     ) void {
         const color: terminal.color.RGB = .{ .r = r, .g = g, .b = b };
-        var t = &surface.core_surface.io.terminal;
-        switch (kind) {
-            0 => {
-                t.colors.palette.set(index, color);
-                t.flags.dirty.palette = true;
-            },
-            1 => t.colors.foreground.set(color),
-            2 => t.colors.background.set(color),
-            else => return,
+        const core = &surface.core_surface;
+        {
+            core.renderer_state.mutex.lock();
+            defer core.renderer_state.mutex.unlock();
+            var t = &core.io.terminal;
+            switch (kind) {
+                0 => {
+                    t.colors.palette.set(index, color);
+                    t.flags.dirty.palette = true;
+                },
+                1 => t.colors.foreground.set(color),
+                2 => t.colors.background.set(color),
+                else => return,
+            }
         }
+
+        // Wake the renderer so the new color paints now. Without this the
+        // change sits until the next natural frame (new output, cursor
+        // blink), which reads as the terminal background lagging visibly
+        // behind the rest of the pane during a color pick.
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of color change err={}", .{err});
+        };
     }
 
     /// Reset all dynamic colors on the surface back to their defaults.
     export fn ghostty_surface_reset_colors(surface: *Surface) void {
-        var t = &surface.core_surface.io.terminal;
-        t.colors.palette.resetAll();
-        t.colors.foreground.reset();
-        t.colors.background.reset();
-        t.flags.dirty.palette = true;
+        const core = &surface.core_surface;
+        {
+            core.renderer_state.mutex.lock();
+            defer core.renderer_state.mutex.unlock();
+            var t = &core.io.terminal;
+            t.colors.palette.resetAll();
+            t.colors.foreground.reset();
+            t.colors.background.reset();
+            t.flags.dirty.palette = true;
+        }
+
+        // Wake the renderer so the reset paints now (see set_color above).
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of color reset err={}", .{err});
+        };
+    }
+
+    /// Regenerate palette indices 16–255 (the 6×6×6 color cube and the
+    /// grayscale ramp) from the terminal's current base-16 palette and its
+    /// current default background/foreground, using the same CIELAB
+    /// interpolation as the `palette-generate` config option. `harmonious`
+    /// mirrors `palette-harmonious`: when true the generated colors keep
+    /// their contrast relative to the background (readable on light and
+    /// dark backgrounds alike) instead of their absolute dark-to-light
+    /// ordering.
+    ///
+    /// Called after a runtime background change so 256-color content
+    /// (prompt greys, cube colors) stays legible on the new background.
+    export fn ghostty_surface_regenerate_palette(
+        surface: *Surface,
+        harmonious: bool,
+    ) void {
+        const core = &surface.core_surface;
+        {
+            core.renderer_state.mutex.lock();
+            defer core.renderer_state.mutex.unlock();
+            var t = &core.io.terminal;
+            const bg = t.colors.background.get() orelse t.colors.palette.current[0];
+            const fg = t.colors.foreground.get() orelse t.colors.palette.current[15];
+            const generated = terminal.color.generate256Color(
+                t.colors.palette.current,
+                .initEmpty(),
+                bg,
+                fg,
+                harmonious,
+            );
+            // Adopt only the cube/ramp; the base 16 stay as-is.
+            @memcpy(t.colors.palette.current[16..], generated[16..]);
+            t.flags.dirty.palette = true;
+        }
+
+        // Wake the renderer so the new palette paints now (see set_color).
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of palette regen err={}", .{err});
+        };
+    }
+
+    /// Set the minimum WCAG contrast ratio (1–21) the renderer enforces
+    /// between every cell's foreground and background. Unlike the palette
+    /// APIs this reaches truecolor content too: the shader adjusts any
+    /// under-contrast foreground at draw time. The renderer clamps the
+    /// value so it never weakens the configured `minimum-contrast`.
+    ///
+    /// Called after a runtime background change so foregrounds chosen by
+    /// programs for the old background (e.g. a dark-theme TUI's light
+    /// greys once the background goes light) remain readable.
+    export fn ghostty_surface_set_min_contrast(surface: *Surface, ratio: f64) void {
+        const core = &surface.core_surface;
+        _ = core.renderer_thread.mailbox.push(.{
+            .min_contrast = @floatCast(@min(21.0, @max(1.0, ratio))),
+        }, .{ .forever = {} });
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of min contrast err={}", .{err});
+        };
     }
 
     /// Update the content scale of the surface.

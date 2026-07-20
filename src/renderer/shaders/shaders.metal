@@ -103,24 +103,55 @@ float contrast_ratio(float3 color1, float3 color2) {
 }
 
 // Return the fg if the contrast ratio is greater than min, otherwise
-// return a color that satisfies the contrast ratio. Currently, the color
-// is always white or black, whichever has the highest contrast ratio.
+// return the fg adjusted to satisfy the ratio while PRESERVING ITS HUE:
+// the color is scaled darker (a light yellow becomes a dark yellow, not
+// black) or blended toward white, targeting the exact luminance that
+// meets the ratio against this bg. Only when the target is unreachable
+// in the fg's own direction does it flip to the other side of the bg,
+// and only when neither side can reach the ratio does it fall back to
+// whichever of black/white contrasts most.
 //
 // Takes colors in linear RGB space. If your colors are gamma
 // encoded, linearize them before using them with this function.
 float4 contrasted_color(float min, float4 fg, float4 bg) {
   float ratio = contrast_ratio(fg.rgb, bg.rgb);
-  if (ratio < min) {
-    float white_ratio = contrast_ratio(float3(1.0f), bg.rgb);
-    float black_ratio = contrast_ratio(float3(0.0f), bg.rgb);
-    if (white_ratio > black_ratio) {
-      return float4(1.0f);
-    } else {
-      return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    }
+  if (ratio >= min) {
+    return fg;
   }
 
-  return fg;
+  float l_bg = luminance(bg.rgb);
+  float l_fg = luminance(fg.rgb);
+
+  // Luminance the fg needs to reach the ratio on each side of the bg.
+  // The 1.01 safety factor lands us slightly past the ratio so float
+  // rounding can't leave the result just under it.
+  float l_dark = (l_bg + 0.05f) / (min * 1.01f) - 0.05f;
+  float l_light = (min * 1.01f) * (l_bg + 0.05f) - 0.05f;
+  bool can_darken = l_dark >= 0.0f;
+  bool can_lighten = l_light <= 1.0f;
+
+  // Prefer the side of the bg the fg already sits on.
+  bool darken = (l_fg <= l_bg) ? can_darken : !can_lighten;
+
+  if (darken && can_darken) {
+    // Scaling the color scales its luminance linearly, keeping hue and
+    // saturation: a too-light yellow becomes a dark yellow.
+    return float4(fg.rgb * (l_dark / max(l_fg, 1e-4f)), fg.a);
+  }
+  if (can_lighten) {
+    // Blend toward white: luminance is affine in the blend factor.
+    float t = clamp((l_light - l_fg) / max(1.0f - l_fg, 1e-4f), 0.0f, 1.0f);
+    return float4(mix(fg.rgb, float3(1.0f), t), fg.a);
+  }
+
+  // Neither side can meet the ratio (extreme min on a mid-tone bg):
+  // fall back to the strongest of black/white.
+  float white_ratio = contrast_ratio(float3(1.0f), bg.rgb);
+  float black_ratio = contrast_ratio(float3(0.0f), bg.rgb);
+  if (white_ratio > black_ratio) {
+    return float4(1.0f);
+  }
+  return float4(0.0f, 0.0f, 0.0f, 1.0f);
 }
 
 // Load a 4 byte RGBA non-premultiplied color and linearize

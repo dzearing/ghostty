@@ -94,19 +94,42 @@ float contrast_ratio(vec3 color1, vec3 color2) {
 //
 // Takes colors in linear RGB space. If your colors are gamma
 // encoded, linearize them before using them with this function.
+// Mirrors the Metal implementation: adjust an under-contrast fg while
+// preserving its hue (scale darker or blend toward white to the exact
+// luminance that meets the ratio), flipping sides of the bg only when the
+// fg's own side can't reach it, and falling back to black/white only when
+// neither side can.
 vec4 contrasted_color(float min_ratio, vec4 fg, vec4 bg) {
     float ratio = contrast_ratio(fg.rgb, bg.rgb);
-    if (ratio < min_ratio) {
-        float white_ratio = contrast_ratio(vec3(1.0, 1.0, 1.0), bg.rgb);
-        float black_ratio = contrast_ratio(vec3(0.0, 0.0, 0.0), bg.rgb);
-        if (white_ratio > black_ratio) {
-            return vec4(1.0);
-        } else {
-            return vec4(0.0, 0.0, 0.0, 1.0);
-        }
+    if (ratio >= min_ratio) {
+        return fg;
     }
 
-    return fg;
+    float l_bg = luminance(bg.rgb);
+    float l_fg = luminance(fg.rgb);
+
+    float l_dark = (l_bg + 0.05) / (min_ratio * 1.01) - 0.05;
+    float l_light = (min_ratio * 1.01) * (l_bg + 0.05) - 0.05;
+    bool can_darken = l_dark >= 0.0;
+    bool can_lighten = l_light <= 1.0;
+
+    bool darken = (l_fg <= l_bg) ? can_darken : !can_lighten;
+
+    if (darken && can_darken) {
+        return vec4(fg.rgb * (l_dark / max(l_fg, 1e-4)), fg.a);
+    }
+    if (can_lighten) {
+        float t = clamp((l_light - l_fg) / max(1.0 - l_fg, 1e-4), 0.0, 1.0);
+        return vec4(mix(fg.rgb, vec3(1.0), t), fg.a);
+    }
+
+    float white_ratio = contrast_ratio(vec3(1.0, 1.0, 1.0), bg.rgb);
+    float black_ratio = contrast_ratio(vec3(0.0, 0.0, 0.0), bg.rgb);
+    if (white_ratio > black_ratio) {
+        return vec4(1.0);
+    } else {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
 }
 
 // Converts a color from sRGB gamma encoding to linear.

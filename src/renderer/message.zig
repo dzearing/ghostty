@@ -61,6 +61,14 @@ pub const Message = union(enum) {
     /// no match currently.
     search_selected_match: ?SearchMatch,
 
+    /// Set the minimum contrast ratio (WCAG, 1–21) enforced between cell
+    /// foreground and background at render time. Used after runtime
+    /// background changes so foregrounds that were chosen for the old
+    /// background stay legible (works for truecolor, which no palette
+    /// adjustment can reach). The renderer clamps this to at least the
+    /// configured `minimum-contrast` so it can only strengthen it.
+    min_contrast: f32,
+
     /// Activate or deactivate the inspector.
     inspector: bool,
 

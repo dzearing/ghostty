@@ -85,6 +85,18 @@ extension Ghostty {
             #endif
         }
 
+        /// The pane's base background color (no tint compositing): what the
+        /// terminal surface itself clears to. The banner strip is painted
+        /// with this so it matches the surface exactly — the translucent
+        /// tint overlay then draws over both alike.
+        private var basePaneBackgroundColor: Color {
+            #if canImport(AppKit)
+            surfaceView.backgroundColor ?? ghostty.config.backgroundColor
+            #else
+            ghostty.config.backgroundColor
+            #endif
+        }
+
         private var isFocusedSurface: Bool {
             surfaceFocus || lastFocusedSurface?.value === surfaceView
         }
@@ -93,6 +105,27 @@ extension Ghostty {
             let center = NotificationCenter.default
 
             ZStack {
+                // The terminal surface is inset below the sticky banner, so
+                // the strip the banner card floats over would otherwise show
+                // the window background (a grey that also changes with window
+                // focus). This rect — the pane's base background at the
+                // surface's opacity — is the single color-carrying element
+                // behind that strip: the tint overlay draws over it exactly
+                // as it does over the terminal, and the banner card itself is
+                // a translucent wash, so a background color change repaints
+                // one element per region in one pass instead of several
+                // elements on their own schedules.
+                if surfaceView.paneBanner != nil {
+                    VStack(spacing: 0) {
+                        Rectangle()
+                            .fill(basePaneBackgroundColor)
+                            .opacity(ghostty.config.backgroundOpacity)
+                            .frame(height: bannerHeight)
+                        Spacer(minLength: 0)
+                    }
+                    .allowsHitTesting(false)
+                }
+
                 // We use a GeometryReader to get the frame bounds so that our metal surface
                 // is up to date. See TerminalSurfaceView for why we don't use the NSView
                 // resize callback.
