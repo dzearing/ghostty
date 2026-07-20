@@ -9,6 +9,15 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 26) — T91 DONE: banner markdown parity with the Mac.
+  banner_markdown.zig rewritten to the Mac's block model (headings, rules,
+  marker-gutter lists, GFM+headerless tables, native checkboxes, 10-line
+  cap, pure wrapTokens); BannerOverlay.zig rewritten as one measure/draw
+  walker (bold-width capped columns w/ cell wrap, green RoundRect
+  checkboxes, chevron collapse + AlphaBlend fade, 12dip padding).
+  pane-banner.ps1 30→37 asserts ALL PASS ×3; both lanes + P1–P3 green.
+  Next: T92 (window-level titles).
+
 - 2026-07-19 (on-box, 25) — T88 DONE: merged origin/main 8bb5d9845 (154
   commits — session persistence, viewer panes, banner markdown upgrades,
   brokered OAuth, window-level titles) as 74322cf05; 3 trivial conflicts.

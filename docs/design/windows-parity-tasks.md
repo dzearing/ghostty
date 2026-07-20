@@ -153,10 +153,11 @@ Work these first, in order, before falling back to first-todo-in-table:
 12. ~~T35~~ — DONE 2026-07-19 (sticky pane banner: IPC + OSC 7778 + strip
    overlay + ctrl+shift+b editor; `pane-banner.ps1` ALL PASS (30) ×3).
 13. ~~T88~~ — DONE 2026-07-19 (merged main 8bb5d9845; gaps filed as
-   T89a–T94). **Next on-box, in order: T91 → T92 → T94 → T86 → T93 →
-   T89a → T90a** (small user-visible parity first, then the two big
-   design+port series; T29/T30/T87 are Mac-seat; T28's remainder and
-   T82 fold into T89a). Flag for the Mac seat: main's
+   T89a–T94). ~~T91~~ (done 2026-07-19: banner markdown parity — block
+   parser + overlay renderer, pane-banner.ps1 37 asserts ×3). **Next
+   on-box, in order: T92 → T94 → T86 → T93 → T89a → T90a** (small
+   user-visible parity first, then the two big design+port series;
+   T29/T30/T87 are Mac-seat; T28's remainder and T82 fold into T89a). Flag for the Mac seat: main's
    `Hello.encode`/build_version elision test was red on main itself —
    fixed on this branch (362d1d4bc), needs to flow back via T87.
 
@@ -269,7 +270,7 @@ One line per row. Full spec + validation + evidence per task:
 | T89 | Session persistence on Windows: IMPLEMENT (split by T89a) — agent-owned ConPTYs survive app quit/crash/upgrade w/ same-PID re-attach, reboot relaunch, +sessions, lazy agent upgrade | K | T89a | todo | — |
 | T90a | Viewer panes on Windows: DESIGN (WebView2 rec., split-tree viewer leaf, offline renderer scheme, live reload, link routing, IPC contract, interim --view error) + split T90 | K | T88 | todo | — |
 | T90 | Viewer panes on Windows: IMPLEMENT (split by T90a) — --view markdown/text/website panes per CLAUDE.md | K | T90a | todo | — |
-| T91 | Banner markdown parity: headings, tables (headerless/bold-width/wrap), checkboxes, aligned lists, hr, padding/inset, tint-hue bg, collapse toggle in banner_markdown.zig + strip | I | T88 | todo | — |
+| T91 | Banner markdown parity — done 2026-07-19: block parser rewrite (parseBlocks: headings, `---` rules, marker-gutter lists, GFM+headerless tables w/ `:` alignment + `\|`, native checkboxes, 10-line cap) + overlay measure/draw walker (bold-measured capped column widths, cell word-wrap, green RoundRect checkboxes, chevron collapse w/ fade, 12dip padding); `pane-banner.ps1` grown to 37 asserts ALL PASS ×3, P1–P3 + both lanes green | I | T88 | done | (this commit) |
 | T92 | Window-level titles: PromptTitle payload branch (pane/tab/window prompts), pin precedence window→tab→pane, empty/+rename --title="" clears pin, palette entries | I | T88 | todo | — |
 | T93 | Brokered OAuth for Windows relay sign-in: exchange at relay, session token in DPAPI, no client secret, -Dgoogle-client-id bake, /signout on logout | G | T88 | todo | — |
 | T94 | Split divider grab-handle hit target (~9 DIP band + cursor feedback) parity check | I | T88 | todo | — |

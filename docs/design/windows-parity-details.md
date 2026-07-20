@@ -3181,6 +3181,31 @@ need revisiting for tables/collapse).
 *Validation:* extend `pane-banner.ps1` (table/checkbox/heading/hr/
 collapse assertions) ALL PASS ×3; unit tests green in both lanes.
 
+*Evidence (done 2026-07-19):* `banner_markdown.zig` rewritten as a block
+parser mirroring the Mac `BannerMarkdown` enum: `parseBlocks` →
+text/heading/rule/list/table blocks, native `.checkbox` inline segments
+(glyph fallback in nested spans and mid-paragraph, `[x](url)` stays a
+link), ATX headings (7-hash/no-space stay text), `- - -` thematic
+breaks, mixed-marker list runs (`- `/`* `/`1. `/`[x]`, decimal `1.5`
+excluded), GFM tables (escaped `\|`, `:` alignment, ragged-row
+pad/truncate, all-empty header = headerless), display cap 6→10 with
+Mac's exact row accounting, plus a pure `wrapTokens` greedy word-wrap
+for layout tests. `BannerOverlay.zig` rewritten as a shared
+measure/draw walker (one code path for height + paint): 12dip padding,
+8dip block gaps, heading sizes 17–12pt-equivalent, full-width rule
+divider, marker-gutter lists (drawn dot, secondary ordered numbers,
+RoundRect native checkboxes — green wash/border/check via
+strip-bg blends), tables with bold-measured column widths (+2 slack,
+360dip cap), per-cell word wrap growing row height, `:` alignment,
+header divider; collapse toggle on click for multi-line banners
+(chevron up/down, 30dip first-line sliver with an AlphaBlend
+alpha-ramp fade, single-line banners keep click-to-focus). Strip bg
+already keyed off the pane tint (T67 path). Validation: pane-banner.ps1
+grown 30→37 asserts (10-line cap arithmetic, h1 taller than text, hr
+thinner than a text row, 4-source-line table renders 3 rows, ScanGreen
+finds native green check pixels, PostMessage click collapse/expand
+round-trip) ALL PASS ×3; both unit lanes green; P1–P3 ALL PASS.
+
 ## T92 — Window-level titles: three-level model + pin semantics (Phase I)
 
 Port the Mac window-title model: `prompt_window_title` (ctrl+shift+r —

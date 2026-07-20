@@ -1,15 +1,24 @@
-# T35 acceptance: sticky pane banner — `+set-banner` IPC, OSC 7778,
-# banner overlay strip on the glass, `+list` additive `banner` field, and
-# the ctrl+shift+b "Set Pane Banner" editor dialog.
+# T35/T91 acceptance: sticky pane banner — `+set-banner` IPC, OSC 7778,
+# banner overlay strip on the glass, `+list` additive `banner` field, the
+# ctrl+shift+b "Set Pane Banner" editor dialog, and the T91 markdown
+# parity blocks (headings, rules, tables, native checkboxes, collapse).
 #
 # Oracles:
 #   - `+list --json` panes carry an additive `banner` field with the raw
 #     markdown source when set (absent otherwise).
 #   - A visible GhozttyBannerOverlay popup is glued to the pane's top edge
-#     and full width; its height grows with `\n` line breaks (capped at 6).
+#     and full width; its height grows with `\n` line breaks (capped at
+#     10 display lines).
 #   - A screen-pixel probe inside the strip is BRIGHTER than the dark pane
 #     background while the banner is up and reverts after --clear (proves
 #     the strip reaches the glass, not just the data model).
+#   - A heading is taller than a plain line; an `---` rule line is thinner
+#     than a text line; a pipe table renders 3 display rows from 4 source
+#     lines (the separator row never renders).
+#   - A checked task-list box paints real green pixels (native box), not
+#     a plaintext glyph.
+#   - A multi-line banner collapses to a first-line sliver on click and
+#     expands back on a second click.
 #   - OSC 7778 emitted from inside the pane round-trips into +list.
 #   - The editor dialog (GhozttyBannerDialog) opens on ctrl+shift+b,
 #     commits on ctrl+enter, cancels on Escape.
@@ -129,6 +138,30 @@ public class BannerDrv {
         uint c = GetPixel(dc, x, y);
         ReleaseDC(h, dc);
         return (c & 0xFF) + "," + ((c >> 8) & 0xFF) + "," + ((c >> 16) & 0xFF);
+    }
+
+    // Count clearly-green pixels (native checked-box stroke) in a client
+    // rect of the window's own surface. One GetDC for the whole scan.
+    public static int ScanGreen(IntPtr h, int x0, int y0, int x1, int y1) {
+        IntPtr dc = GetDC(h);
+        int hits = 0;
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                uint c = GetPixel(dc, x, y); // COLORREF 0x00BBGGRR
+                int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)((c >> 16) & 0xFF);
+                if (g - r > 60 && g - b > 60) hits++;
+            }
+        }
+        ReleaseDC(h, dc);
+        return hits;
+    }
+
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+
+    // Post a synthetic left-click (WM_LBUTTONUP is what the banner strip
+    // acts on) at client coords — foreground-independent and exact.
+    public static void ClickClient(IntPtr h, int x, int y) {
+        PostMessageW(h, 0x0202, IntPtr.Zero, (IntPtr)((y << 16) | (x & 0xFFFF)));
     }
 
     // Visible GhozttyTerminal children of a top-level: same line format.
@@ -318,7 +351,7 @@ if ($ov) {
     $script:fail += 3
 }
 
-# --- 4. multi-line: \n grows the strip; 6-line display cap ----------------
+# --- 4. multi-line: \n grows the strip; 10-line display cap ---------------
 & $exe +set-banner --target=bw "line1\nline2\nline3" | Out-Null
 $b = Wait-Banner 'bw' 0 "line1`nline2`nline3"
 Assert ($b -ceq "line1`nline2`nline3") 'multi-line: +list carries real newlines'
@@ -327,13 +360,15 @@ $threeLineH = 0
 if ($ov3) { $r = $ov3 -split ','; $threeLineH = [int]$r[3] - [int]$r[1] }
 Assert ($threeLineH -gt $oneLineH + 10) "3-line strip taller than 1-line ($oneLineH -> $threeLineH px)"
 
-& $exe +set-banner --target=bw "a\nb\nc\nd\ne\nf\ng\nh\ni" | Out-Null
+# 12 source lines must clamp to 10 display lines: between 9 and 10 lines'
+# height (a 2-line pair adds $twoLines px = 2 * (line height + block gap)).
+& $exe +set-banner --target=bw "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl" | Out-Null
 Start-Sleep -Milliseconds 800
 $ovCap = Get-Overlay $pid32 $paneRect
 $capH = 0
 if ($ovCap) { $r = $ovCap -split ','; $capH = [int]$r[3] - [int]$r[1] }
-$perLine = $threeLineH - $oneLineH  # 2 extra lines
-Assert ($capH -gt 0 -and $capH -le ($oneLineH + 3 * $perLine + 8)) "9-line source capped at 6 display lines ($capH px)"
+$twoLines = $threeLineH - $oneLineH
+Assert ($capH -gt ($oneLineH + 4 * $twoLines) -and $capH -le ($oneLineH + 4.5 * $twoLines + 8)) "12-line source capped at 10 display lines ($capH px)"
 
 # --- 5. --clear removes model + glass, reverts the pixel ------------------
 & $exe +set-banner --target=bw --clear | Out-Null
@@ -351,6 +386,89 @@ $b = Wait-Banner 'bw' 0 'NONE'
 Assert ($b -eq '(absent)') 'empty text clears'
 & $exe +set-banner --target=bw --clear | Out-Null
 Assert ($LASTEXITCODE -eq 0) 'clearing an already-clear banner succeeds'
+
+# --- 6b. T91: heading renders taller than a plain text line ----------------
+& $exe +set-banner --target=bw "# Big title" | Out-Null
+$null = Wait-Banner 'bw' 0 '# Big title'
+$ovH = Get-Overlay $pid32 $paneRect
+$headH = 0
+if ($ovH) { $r = $ovH -split ','; $headH = [int]$r[3] - [int]$r[1] }
+Assert ($headH -gt ($oneLineH + 4)) "h1 heading strip taller than plain line ($oneLineH -> $headH px)"
+
+# --- 6c. T91: --- thematic break renders as a thin rule row ----------------
+# text + rule + text sits between a 2-line and a 3-line text banner: the
+# rule row is a 1px line, thinner than a text line.
+& $exe +set-banner --target=bw "top\n---\nbottom" | Out-Null
+$null = Wait-Banner 'bw' 0 "top`n---`nbottom"
+$ovR = Get-Overlay $pid32 $paneRect
+$hrH = 0
+if ($ovR) { $r = $ovR -split ','; $hrH = [int]$r[3] - [int]$r[1] }
+$twoLineH = $oneLineH + [int]($twoLines / 2)
+Assert ($hrH -gt $twoLineH -and $hrH -lt $threeLineH) "hr row is thinner than a text row ($twoLineH < $hrH < $threeLineH)"
+
+# --- 6d. T91: pipe table renders (separator row dropped) -------------------
+& $exe +set-banner --target=bw "| Job | State |\n|---|---:|\n| lint | ok |\n| tests | **3 failed** |" | Out-Null
+$null = Wait-Banner 'bw' 0 "| Job | State |`n|---|---:|`n| lint | ok |`n| tests | **3 failed** |"
+$ovT = Get-Overlay $pid32 $paneRect
+$tblH = 0
+if ($ovT) { $r = $ovT -split ','; $tblH = [int]$r[3] - [int]$r[1] }
+# 4 source lines -> 3 display rows (header + 2 body; separator dropped):
+# taller than 2 text lines, no taller than ~3 text lines + header divider.
+Assert ($tblH -gt $twoLineH -and $tblH -le ($threeLineH + 10)) "table: 4 source lines render 3 rows ($tblH px)"
+Assert (-not $proc.HasExited) 'table banner: GUI alive after paint'
+
+# --- 6e. T91: checked task-list box paints native green --------------------
+& $exe +set-banner --target=bw "[x] done\n[ ] todo" | Out-Null
+$null = Wait-Banner 'bw' 0 "[x] done`n[ ] todo"
+Start-Sleep -Milliseconds 400
+$ovC = Get-Overlay $pid32 $paneRect
+if ($ovC) {
+    $r = $ovC -split ','
+    $ovhH = [IntPtr]([int64]$r[4])
+    # First list row's marker gutter sits just inside the 12dip padding.
+    $green = [BannerDrv]::ScanGreen($ovhH, 5, 5, 45, 45)
+    Assert ($green -ge 3) "checked box paints green check pixels ($green found)"
+    # Force a repaint so the own-DC read doesn't leave a stale composite.
+    & $exe +set-banner --target=bw "[x] done\n[ ] todo" | Out-Null
+} else {
+    $script:fail++
+    Write-Host 'FAIL  checkbox overlay not found' -ForegroundColor Red
+}
+
+# --- 6f. T91: multi-line banner collapses on click, expands on click -------
+& $exe +set-banner --target=bw "head\nrow2\nrow3" | Out-Null
+$null = Wait-Banner 'bw' 0 "head`nrow2`nrow3"
+Start-Sleep -Milliseconds 400
+$ovE = Get-Overlay $pid32 $paneRect
+if ($ovE) {
+    $r = $ovE -split ','
+    $expandH = [int]$r[3] - [int]$r[1]
+    $ovhH = [IntPtr]([int64]$r[4])
+    $midX = [int](([int]$r[2] - [int]$r[0]) / 2)
+    [BannerDrv]::ClickClient($ovhH, $midX, [int]($oneLineH / 2))
+    $collapseH = $expandH
+    for ($t = 0; $t -lt 20; $t++) {
+        Start-Sleep -Milliseconds 150
+        $ov2 = Get-Overlay $pid32 $paneRect
+        if ($ov2) { $r2 = $ov2 -split ','; $collapseH = [int]$r2[3] - [int]$r2[1] }
+        if ($collapseH -lt $expandH) { break }
+    }
+    Assert ($collapseH -lt ($expandH - 20) -and $collapseH -gt 20) "click collapses the banner ($expandH -> $collapseH px)"
+    [BannerDrv]::ClickClient($ovhH, $midX, [int]($collapseH / 2))
+    $reH = $collapseH
+    for ($t = 0; $t -lt 20; $t++) {
+        Start-Sleep -Milliseconds 150
+        $ov2 = Get-Overlay $pid32 $paneRect
+        if ($ov2) { $r2 = $ov2 -split ','; $reH = [int]$r2[3] - [int]$r2[1] }
+        if ($reH -eq $expandH) { break }
+    }
+    Assert ($reH -eq $expandH) "second click expands back ($collapseH -> $reH px)"
+} else {
+    $script:fail += 2
+    Write-Host 'FAIL  collapse overlay not found' -ForegroundColor Red
+}
+& $exe +set-banner --target=bw --clear | Out-Null
+$null = Wait-Banner 'bw' 0 'NONE'
 
 # --- 7. per-pane: named split pane gets its own banner ---------------------
 & $exe +split --target=bw --name=bp1 --direction=down | Out-Null
