@@ -96,7 +96,7 @@ extension Ghostty {
             .font(.system(size: 12))
             .padding(Self.innerPadding)
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .modifier(GlassCardBackground(fallbackFill: fallbackFill, tint: shadedBackground))
+            .modifier(GlassCardBackground(fill: cardFill))
             .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
             .onTapGesture {
                 guard collapsible else { return }
@@ -165,25 +165,24 @@ extension Ghostty {
             return Color(shaded)
         }
 
-        /// Card fill for OSes without Liquid Glass: the shaded pane color,
-        /// or the translucent material when the background isn't known.
-        private var fallbackFill: AnyShapeStyle {
+        /// The card's fill: the shaded pane color, or the translucent
+        /// material when the background isn't known.
+        private var cardFill: AnyShapeStyle {
             guard let shaded = shadedBackground else { return AnyShapeStyle(.ultraThinMaterial) }
             return AnyShapeStyle(shaded)
         }
 
-        /// The floating card's material. On macOS 26+ this is genuine Liquid
-        /// Glass — adaptive translucency with the system's specular edge
-        /// treatment, sampling whatever sits behind the card. Earlier OSes
-        /// get a rounded translucent card: the shaded pane fill, a hairline
-        /// stroke standing in for the glass rim, and a soft shadow for depth.
+        /// The floating card's glass look, drawn by hand: the shaded pane
+        /// fill, an elliptical specular sheen, a hairline rim, and a soft
+        /// elevation shadow. Deliberately NOT the system `glassEffect` —
+        /// its material re-renders when the window's key state changes
+        /// (the backdrop flips `windowServerAware` and its vibrancy layer
+        /// turns off on resign), so the card visibly shifted color on every
+        /// window switch, and its frost washed the pane hue toward grey.
+        /// Hand-drawn overlays are deterministic: the card stays the pane's
+        /// own color no matter which window is focused.
         private struct GlassCardBackground: ViewModifier {
-            let fallbackFill: AnyShapeStyle
-
-            /// Tint applied to the glass itself: the shaded pane color, so
-            /// the material reads lighter than a dark pane and darker than a
-            /// light one instead of hovering at the backdrop's own tone.
-            let tint: Color?
+            let fill: AnyShapeStyle
 
             private var shape: RoundedRectangle {
                 RoundedRectangle(
@@ -247,32 +246,15 @@ extension Ghostty {
             }
 
             func body(content: Content) -> some View {
-                if #available(macOS 26.0, iOS 26.0, *) {
-                    // The filled shape behind the glass serves two jobs: it
-                    // casts the card's elevation shadow (a shadow on the glass
-                    // content itself would also shadow every text glyph), and
-                    // it gives the glass a stable, pane-hued backdrop to
-                    // sample so legibility doesn't depend on what happens to
-                    // sit behind the card.
-                    content
-                        .background(sheen)
-                        .glassEffect(.regular.tint(tint), in: shape)
-                        .background(
-                            shape.fill(fallbackFill)
-                                .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
-                        )
-                        .overlay(rim)
-                } else {
-                    // Shadow on the shape (not the content) so translucent
-                    // fills don't give every text glyph its own shadow.
-                    content
-                        .background(sheen)
-                        .background(
-                            shape.fill(fallbackFill)
-                                .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
-                        )
-                        .overlay(rim)
-                }
+                // Shadow on the shape (not the content) so translucent
+                // fills don't give every text glyph its own shadow.
+                content
+                    .background(sheen)
+                    .background(
+                        shape.fill(fill)
+                            .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+                    )
+                    .overlay(rim)
             }
         }
 
