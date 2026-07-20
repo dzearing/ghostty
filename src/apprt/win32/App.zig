@@ -3536,29 +3536,29 @@ fn surfaceWndProc(
             // an active sibling popup edit (tab rename, search, palette)
             // keeps focus and the click never commits/dismisses it.
             deferSetFocus(hwnd);
-            surface.handleMouseButton(.left, .press, lparam);
+            surface.handleMouseButton(.left, .press, wparam, lparam);
             return 0;
         },
         w32.WM_LBUTTONUP => {
-            surface.handleMouseButton(.left, .release, lparam);
+            surface.handleMouseButton(.left, .release, wparam, lparam);
             return 0;
         },
         w32.WM_RBUTTONDOWN => {
             deferSetFocus(hwnd);
-            surface.handleMouseButton(.right, .press, lparam);
+            surface.handleMouseButton(.right, .press, wparam, lparam);
             return 0;
         },
         w32.WM_RBUTTONUP => {
-            surface.handleMouseButton(.right, .release, lparam);
+            surface.handleMouseButton(.right, .release, wparam, lparam);
             return 0;
         },
         w32.WM_MBUTTONDOWN => {
             deferSetFocus(hwnd);
-            surface.handleMouseButton(.middle, .press, lparam);
+            surface.handleMouseButton(.middle, .press, wparam, lparam);
             return 0;
         },
         w32.WM_MBUTTONUP => {
-            surface.handleMouseButton(.middle, .release, lparam);
+            surface.handleMouseButton(.middle, .release, wparam, lparam);
             return 0;
         },
         w32.WM_XBUTTONDOWN => {
@@ -3567,14 +3567,21 @@ fn surfaceWndProc(
             deferSetFocus(hwnd);
             const btn: input.MouseButton =
                 if ((wparam >> 16) & 0xFFFF == w32.XBUTTON2) .five else .four;
-            surface.handleMouseButton(btn, .press, lparam);
+            surface.handleMouseButton(btn, .press, wparam, lparam);
             return 1; // TRUE: handled; suppresses the default WM_APPCOMMAND.
         },
         w32.WM_XBUTTONUP => {
             const btn: input.MouseButton =
                 if ((wparam >> 16) & 0xFFFF == w32.XBUTTON2) .five else .four;
-            surface.handleMouseButton(btn, .release, lparam);
+            surface.handleMouseButton(btn, .release, wparam, lparam);
             return 1;
+        },
+        w32.WM_CONTEXTMENU => {
+            // Keyboard-invoked (VK_APPS / Shift+F10 via DefWindowProc, or
+            // automation). Mouse right-clicks never get here — the RBUTTON
+            // handlers above consume them.
+            surface.showContextMenuKeyboard();
+            return 0;
         },
 
         w32.WM_NCHITTEST => {

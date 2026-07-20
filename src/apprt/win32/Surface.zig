@@ -24,6 +24,7 @@ const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
 const banner_layout = @import("banner_layout.zig");
+const context_menu = @import("context_menu.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
 
@@ -2736,18 +2737,24 @@ pub fn handleCharEvent(self: *Surface, wparam: usize) void {
 }
 
 /// Handle WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN /
-/// WM_LBUTTONUP / WM_RBUTTONUP / WM_MBUTTONUP.
+/// WM_LBUTTONUP / WM_RBUTTONUP / WM_MBUTTONUP. `wparam` is the mouse
+/// message's MK_* modifier word: shift/ctrl come from it (queue-synchronized
+/// with the click, and honored for posted/synthetic messages that GetKeyState
+/// can never see) while alt/super still come from getModifiers().
 pub fn handleMouseButton(
     self: *Surface,
     button: input.MouseButton,
     action: input.MouseButtonState,
+    wparam: usize,
     lparam: isize,
 ) void {
     if (!self.core_surface_ready) return;
     const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
 
-    const mods = getModifiers();
+    var mods = getModifiers();
+    mods.shift = (wparam & w32.MK_SHIFT) != 0;
+    mods.ctrl = (wparam & w32.MK_CONTROL) != 0;
 
     // Capture mouse on the first pressed button; release only when all
     // buttons are up. Otherwise a right-click in the middle of a left-
@@ -2794,11 +2801,10 @@ pub fn handleMouseButton(
 }
 
 /// Show the surface right-click context menu at the given client coords
-/// (packed in lparam like a mouse message). Items dispatch through the
-/// core's binding actions, mirroring the macOS surface menu.
+/// (packed in lparam like a mouse message). Press-path entry: cleans up
+/// mouse capture and synthesizes the right-button release before the modal
+/// menu loop.
 fn showContextMenu(self: *Surface, lparam: isize) void {
-    const hwnd = self.hwnd orelse return;
-
     // The press handler took mouse capture; release it and clear the mask
     // before the modal menu loop, otherwise the pending button-up is
     // captured and immediately dismisses the menu.
@@ -2815,34 +2821,50 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
         log.err("mouse button callback error: {}", .{err});
     };
 
-    const CTX_COPY: usize = 1;
-    const CTX_PASTE: usize = 2;
-    const CTX_SELECT_ALL: usize = 3;
-    const CTX_SPLIT_RIGHT: usize = 4;
-    const CTX_SPLIT_DOWN: usize = 5;
-    const CTX_RESET: usize = 6;
-    const CTX_BG_COLOR: usize = 7;
+    self.openContextMenu(
+        @intCast(@as(i16, @truncate(@as(isize, lparam & 0xFFFF)))),
+        @intCast(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF)))),
+    );
+}
+
+/// Keyboard-invoked context menu (WM_CONTEXTMENU: VK_APPS / Shift+F10
+/// falling through to DefWindowProc, or automation). Opens at the pane
+/// center — there is no click point.
+pub fn showContextMenuKeyboard(self: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    var rc: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rc) == 0) return;
+    self.openContextMenu(
+        @divTrunc(rc.right - rc.left, 2),
+        @divTrunc(rc.bottom - rc.top, 2),
+    );
+}
+
+/// Build + track the context menu at the given client point and dispatch
+/// the chosen command. Items and flags come from the pure context_menu
+/// model (Mac surface-menu parity, T102); dispatch goes through the same
+/// binding actions as the command palette.
+fn openContextMenu(self: *Surface, client_x: i32, client_y: i32) void {
+    const hwnd = self.hwnd orelse return;
 
     const menu = w32.CreatePopupMenu() orelse return;
     defer _ = w32.DestroyMenu(menu);
 
-    const has_sel = self.core_surface.hasSelection();
-    _ = w32.AppendMenuW(menu, if (has_sel) w32.MF_STRING else w32.MF_GRAYED, CTX_COPY, std.unicode.utf8ToUtf16LeStringLiteral("Copy"));
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_PASTE, std.unicode.utf8ToUtf16LeStringLiteral("Paste"));
-    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SELECT_ALL, std.unicode.utf8ToUtf16LeStringLiteral("Select All"));
-    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_RIGHT, std.unicode.utf8ToUtf16LeStringLiteral("Split Right"));
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, std.unicode.utf8ToUtf16LeStringLiteral("Split Down"));
-    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_BG_COLOR, std.unicode.utf8ToUtf16LeStringLiteral("Background Color..."));
-    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_RESET, std.unicode.utf8ToUtf16LeStringLiteral("Reset Terminal"));
-
-    var pt = w32.POINT{
-        .x = @intCast(@as(i16, @truncate(@as(isize, lparam & 0xFFFF)))),
-        .y = @intCast(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF)))),
+    const items = context_menu.build(.{
+        .has_selection = self.core_surface.hasSelection(),
+        .readonly = self.core_surface.readonly,
+    });
+    for (items) |item| switch (item) {
+        .separator => _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null),
+        .cmd => |c| {
+            var flags: u32 = w32.MF_STRING;
+            if (!c.enabled) flags |= w32.MF_GRAYED;
+            if (c.checked) flags |= w32.MF_CHECKED;
+            _ = w32.AppendMenuW(menu, flags, @intFromEnum(c.id), c.title.ptr);
+        },
     };
+
+    var pt = w32.POINT{ .x = client_x, .y = client_y };
     _ = w32.ClientToScreen(hwnd, &pt);
 
     const cmd = w32.TrackPopupMenuEx(
@@ -2854,24 +2876,30 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
         null,
     );
 
-    const binding: ?input.Binding.Action = switch (@as(usize, @intCast(cmd))) {
-        CTX_COPY => .{ .copy_to_clipboard = .mixed },
-        CTX_PASTE => .paste_from_clipboard,
-        CTX_SELECT_ALL => .select_all,
-        CTX_SPLIT_RIGHT => .{ .new_split = .right },
-        CTX_SPLIT_DOWN => .{ .new_split = .down },
-        CTX_RESET => .reset,
-        CTX_BG_COLOR => {
+    const id = std.meta.intToEnum(
+        context_menu.Id,
+        @as(usize, @intCast(cmd)),
+    ) catch return; // 0 = dismissed without choosing
+    const binding: input.Binding.Action = switch (id) {
+        .copy => .{ .copy_to_clipboard = .mixed },
+        .paste => .paste_from_clipboard,
+        .select_all => .select_all,
+        .split_right => .{ .new_split = .right },
+        .split_left => .{ .new_split = .left },
+        .split_down => .{ .new_split = .down },
+        .split_up => .{ .new_split = .up },
+        .reset => .reset,
+        .readonly => .toggle_readonly,
+        .tab_title => .prompt_tab_title,
+        .pane_title => .prompt_surface_title,
+        .bg_color => {
             self.pickBackgroundColor();
             return;
         },
-        else => null,
     };
-    if (binding) |b| {
-        _ = self.core_surface.performBindingAction(b) catch |err| {
-            log.err("context menu action failed err={}", .{err});
-        };
-    }
+    _ = self.core_surface.performBindingAction(binding) catch |err| {
+        log.err("context menu action failed err={}", .{err});
+    };
 }
 
 /// The pane's effective background: the explicit/inherited tint when set,

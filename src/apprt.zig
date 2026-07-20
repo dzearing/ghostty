@@ -95,6 +95,9 @@ test {
     // Pure win32 banner strip-inset clamp (T101), same no-OS-imports deal.
     _ = @import("apprt/win32/banner_layout.zig");
 
+    // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
+    _ = @import("apprt/win32/context_menu.zig");
+
     // Pure win32 session-layout manifest schema + JSON I/O (T89f1), same
     // no-OS-imports deal (LOCALAPPDATA path resolution degrades cleanly off
     // Windows / in the none lane).

@@ -175,6 +175,12 @@ pub const XBUTTON1: usize = 0x0001; // "Back"
 pub const XBUTTON2: usize = 0x0002; // "Forward"
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_MOUSEHWHEEL: u32 = 0x020E;
+pub const WM_CONTEXTMENU: u32 = 0x007B;
+// Mouse-message wparam modifier bits (queue-synchronized key state — the
+// authoritative mods for that click, unlike GetKeyState which reads the
+// thread's current state and never sees posted/synthetic messages).
+pub const MK_SHIFT: usize = 0x0004;
+pub const MK_CONTROL: usize = 0x0008;
 pub const WM_SETCURSOR: u32 = 0x0020;
 pub const WM_DPICHANGED: u32 = 0x02E0;
 

@@ -1298,3 +1298,21 @@ next, any surprises>`.
   up. Findings that seeded T01/T02: old zip provenance unverifiable;
   ctrl+p/ctrl+f4 never bound anywhere. Next: T01 (needs the box) or T03
   (pure Mac-side) are both unblocked.
+
+## 2026-07-20 — T102: Mac-parity right-click context menu
+
+Root-caused the user's "right-click pastes": Claude Code enables mouse
+reporting (SetConsoleMode → conhost emits DECSET outward), the core
+consumes the press and reports it — Claude Code pastes. Mac-identical
+semantics; the menu itself existed since Jul 5. Fixed the real gaps: menu
+grown to full Mac parity via pure `context_menu.zig` (+ unit tests, both
+lanes), mouse mods now from wparam MK_ bits (makes the Mac shift+right-click
+reporting bypass reliable + automatable), WM_CONTEXTMENU/VK_APPS keyboard
+path. Default stays context-menu; `right-click-action=paste` is the WT-style
+opt-in. New `context-menu.ps1` ALL PASS (19) ×3 — fully PostMessage-driven,
+so it runs clean under the GameInputSvc SendInput wedge (which was active
+all session; sudo disabled, service restart unavailable). Lanes +
+test-agent ×3 + P1–P3 green. Cleaned probe debris (debug agent store +
+session-layout-debug.json). Notable: raw `?1002h` from a ConPTY child does
+NOT propagate outward — only console-API mouse mode does; CLI bools reject
+`on/off`.
