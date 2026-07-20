@@ -1852,15 +1852,33 @@ extension Ghostty {
             backgroundTintNSColor = srgbColor
             backgroundTint = Color(srgbColor)
 
+            // Apply the background/foreground in the SAME runloop turn as
+            // the tint publish above: the terminal surface, the banner
+            // strip, and every color derived from the pane background all
+            // move in one visual step. A delayed application repaints the
+            // pane in staggered passes — visible jank on every pick. Only
+            // the full-palette contrast adjustment stays debounced; it's
+            // the expensive part and only matters once the user settles.
+            applyBackgroundForColor(srgbColor)
+
             colorUpdateTimer?.invalidate()
             colorUpdateTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
-                self?.applyPaletteForColor(srgbColor)
+                guard let self, let surface = self.surface else { return }
+                Self.adjustPaletteForContrast(surface: surface, background: srgbColor.resolvedSRGB)
             }
         }
 
-        func applyPaletteForColor(_ color: NSColor) {
+        /// Set the palette's background (and a legible foreground) to
+        /// `color`, and publish it as the surface's background color. The
+        /// publish matters: the core only posts color-change notifications
+        /// for pty-driven (OSC 11) changes, so without it every view
+        /// deriving from the pane color (banner strip, banner card) keeps
+        /// compositing off the stale pre-pick background.
+        func applyBackgroundForColor(_ color: NSColor) {
             guard let surface = self.surface else { return }
             let resolved = color.resolvedSRGB
+
+            backgroundColor = Color(resolved)
 
             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
             resolved.getRed(&r, green: &g, blue: &b, alpha: &a)
@@ -1871,7 +1889,19 @@ extension Ghostty {
                 ? (0, 0, 0) : (255, 255, 255)
             ghostty_surface_set_color(surface, 1, 0, fg.0, fg.1, fg.2)
 
-            Self.adjustPaletteForContrast(surface: surface, background: resolved)
+            // Programs pick their colors for the background they saw at
+            // startup — truecolor especially can't be re-mapped by any
+            // palette work when the background changes underneath them
+            // (light-theme greys/yellows vanish on a light pick). Have the
+            // renderer enforce a minimum contrast per cell at draw time;
+            // it only ever strengthens the configured `minimum-contrast`.
+            ghostty_surface_set_min_contrast(surface, 3.0)
+        }
+
+        func applyPaletteForColor(_ color: NSColor) {
+            guard let surface = self.surface else { return }
+            applyBackgroundForColor(color)
+            Self.adjustPaletteForContrast(surface: surface, background: color.resolvedSRGB)
         }
 
         // Actual Ghoztty default palette from src/terminal/color.zig
@@ -2012,6 +2042,15 @@ extension Ghostty {
 
                 ghostty_surface_set_color(surface, 0, UInt8(i), finalR, finalG, finalB)
             }
+
+            // The 16 base colors above are now readable, but 256-color
+            // content (prompt greys from the grayscale ramp, cube colors)
+            // still carries the old theme's lightness. Regenerate indices
+            // 16–255 from the adjusted base palette and the new bg/fg.
+            // `harmonious` keeps each entry's contrast relative to the
+            // background, so a dark-theme prompt stays legible when the
+            // background goes light.
+            ghostty_surface_regenerate_palette(surface, true)
         }
 
         @IBAction func changeTitle(_ sender: Any) {
