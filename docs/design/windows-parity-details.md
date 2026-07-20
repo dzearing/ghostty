@@ -4555,3 +4555,88 @@ moved the divider (1252→1336→1251 px). ALL PASS (15) ×3; P1–P3 ALL
 PASS; both test lanes green. Bonus: the script's foreground grab now
 uses the T86 hero-mode pattern (attach-to-fg-thread + Alt tap + retry)
 — the plain grab ABORTed on this box with a browser focused.
+
+## T101 — Banner overlay occludes terminal content (Phase I)
+
+User live review 2026-07-20: the sticky banner strip floats OVER the top
+rows of the grid — the terminal keeps rendering the full pane height
+underneath the layered popup (Mac reserves the space via the SwiftUI
+VStack: banner above terminal, never over it).
+
+Root cause (deeper than the T101 filing's sizeCallback theory): on win32
+the renderer IGNORES the apprt-reported size — `OpenGL.surfaceSize()`
+queries the surface HWND's real client rect every frame and resets
+`glViewport` from it (OpenGL.zig `surfaceSize`), so shrinking the height
+passed to `core_surface.sizeCallback` would only blank the BOTTOM of the
+pane (grid anchors top), never the strip band at the top. The only
+correct inset is the HWND itself.
+
+Fix (Mac VStack parity, done 2026-07-20):
+
+- New pure `banner_layout.zig` — `clampInset(strip_h, slot_h)`: the full
+  strip height when it fits, capped at 3/4 of the slot in degenerate
+  short panes (terminal always keeps ≥1/4; the strip bottom-clips
+  instead). Unit tests in both lanes (registered in apprt.zig).
+- `Surface.bannerLayoutInset(slot_h)` — computes the reservation and
+  records it on the overlay (`BannerOverlay.inset`).
+- All THREE surface-positioning paths in `Window.zig` reserve the band:
+  `layoutNode` leaves, the zoomed branch of `layoutSplits`, and
+  `layoutHero` (hidden leaves get the same inset so thumbnail aspect
+  matches selection). The surface HWND is moved down/shrunk by the
+  inset, so grid size, GL viewport, and mouse coordinates all follow
+  automatically from the real client rect.
+- `BannerOverlay.updatePosition` now glues the strip INTO the vacated
+  band (`owner.top - inset`, height = inset) instead of over the owner
+  top; `insetHeight(scale)` is the public strip-height measure with the
+  DPI scale sync. `inset == 0` (no layout pass yet) falls back to the
+  old overlap gluing so a strip is never lost.
+- Relayout triggers: `setPaneBanner` set/clear call
+  `parent_window.layoutSplits()`; collapse/expand toggle calls new
+  `App.relayoutOwnerWindow(owner)` (resolves the Surface via
+  GWLP_USERDATA with the surfaceWndProc guard). DPI changes re-measure
+  via the scale sync inside `insetHeight`.
+
+*Validation:* `pane-banner.ps1` rewritten for the new geometry: the
+overlay matcher now REQUIRES the strip's bottom to meet the live pane
+top (every later assert re-proves the band), plus new asserts — pane
+top moves down by exactly the strip height (pre-banner snapshot), pane
+bottom unchanged, `--clear` gives the band back (371px cap case),
+collapse returns exactly the collapsed delta to the grid, and the band
+also reserves inside a split slot (geometric pane index 1).
+
+Evidence (2026-07-20): T101 asserts stable across 3 runs (34/33/34
+passed); both test lanes + GUI Debug build + `test-agent` + P1–P3 ALL
+PASS. The runs' only failures are the four PRE-EXISTING box/oracle
+issues proven at the pre-T101 baseline via git-stash (identical
+failures there, 28 passed) — filed as T103.
+
+## T103 — pane-banner.ps1 pixel oracles + editor chord red on the box (pre-existing)
+
+Found during T101 validation (2026-07-20), PROVEN pre-existing at the
+pre-T101 baseline (git-stash + rebuild: identical failures):
+
+- `composited strip is the alpha-blended fill` and `strip surface is
+  lighten(bg, 0.09) exactly` — both the CopyFromScreen composite AND
+  the own-DC GetPixel read return the pane bg (16,16,20) instead of the
+  strip fill (33,33,41). A scanline sweep across the strip midline
+  found ONLY bg-family colors, and after the harness's topmost window
+  move the strip rect did not re-glue in one manual probe. Banners DO
+  render in interactive use (the user's live review saw them — that's
+  how T101 was filed), so this is probe-context-specific: suspects are
+  the topmost/owned-popup z-order interplay, GetPixel-on-layered-DC
+  semantics changing, or box state (the flapping GameInputSvc wedge
+  era). T91's ALL PASS ×3 was 2026-07-19; the breakage crept in
+  between then and 2026-07-20 with no banner-code change in that
+  window.
+- `checked box paints green check pixels` — same own-DC read path.
+- `ctrl+shift+b opens the banner editor` — SendInput chord swallowed;
+  matches the T95 GameInputSvc wedge signature (re-probe after an
+  elevated `Restart-Service GameInputSvc` or reboot, then rerun ×3).
+- `window target hits the focused pane` flaked once at baseline and
+  once on the T101 build (focus-dependent; same wedge family).
+
+Fix path: re-probe once the box wedge clears; if the pixel oracles are
+still red, rework them (UpdateLayeredWindow-style capture or a
+PrintWindow-based read) and pin down the z-order behavior after the
+topmost move. The T101 geometry asserts are unaffected (window-rect
+based, stable ×3).

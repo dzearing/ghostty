@@ -419,6 +419,19 @@ pub fn deferSetFocus(hwnd: w32.HWND) void {
     _ = w32.PostMessageW(hwnd, WM_APP_SETFOCUS, 0, 0);
 }
 
+/// Re-run the split layout of the window owning the given terminal-surface
+/// HWND — used when a pane's banner strip height changed (T101 collapse/
+/// expand) so the terminal band under the strip grows/shrinks to match.
+/// Resolves the Surface via GWLP_USERDATA with the same guard as
+/// surfaceWndProc; silently no-ops for anything else.
+pub fn relayoutOwnerWindow(hwnd: w32.HWND) void {
+    const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+    if (userdata == 0) return;
+    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
+    if (surface.hwnd == null or surface.hwnd.? != hwnd) return;
+    surface.parent_window.layoutSplits();
+}
+
 /// Open the config file in the default editor.
 fn openConfigFile(self: *App) void {
     const config_path = configpkg.preferredDefaultFilePath(

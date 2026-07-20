@@ -9,6 +9,27 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 43) — T101 DONE (banner occlusion; user live-review
+  item b). Key discovery: the filed root cause (sizeCallback full height)
+  was WRONG in a load-bearing way — the win32 renderer re-reads the HWND
+  client rect every frame (`OpenGL.surfaceSize`) and resets glViewport
+  from it, so lying to sizeCallback would only blank the pane BOTTOM. The
+  correct fix is Mac-VStack-parity at the HWND level: all 3 surface
+  positioning paths (layoutNode / zoomed / layoutHero) reserve the strip
+  band via new pure `banner_layout.clampInset` (unit tests both lanes) +
+  `Surface.bannerLayoutInset`; the overlay glues INTO the vacated band;
+  set/clear/collapse/DPI all relayout (new `App.relayoutOwnerWindow` for
+  the collapse toggle, GWLP_USERDATA-guarded). Grid size, GL viewport,
+  and mouse coords follow the real client rect for free. pane-banner.ps1
+  matcher now REQUIRES strip-bottom == live pane top + 5 new band asserts
+  (top shift == strip height, bottom unchanged, clear/collapse give the
+  band back, split-slot band); stable ×3. Surprise: 4 failures during
+  validation turned out ALL PRE-EXISTING (proven by git-stash baseline
+  rebuild: identical failures, incl. BOTH pixel-read oracles returning
+  pane bg and the ctrl+shift+b chord swallowed = T95 wedge signature) →
+  filed T103 instead of chasing box state. Lanes + test-agent + P1–P3
+  green. Next: T102 (right-click context menu), then the item-20 publish
+  queue (T100 → T89h → …).
 - 2026-07-20 (on-box, 42) — T89g DONE (tombstone RELAUNCH floor). The
   materialize → ATTACH(dead+relaunchable) → RELAUNCH → ring-replay + divider
   machinery is entirely OS-agnostic (agent `session`/`server`/`ring_snapshot` +

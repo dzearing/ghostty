@@ -1644,7 +1644,11 @@ fn layoutHero(self: *Window, rect: w32.RECT) void {
         // Renderer stays awake even for hidden leaves (thumbnail source).
         entry.view.setVisible(true);
         if (entry.view.hwnd) |h| {
-            _ = w32.MoveWindow(h, split.hero.left, split.hero.top, @intCast(hero_w), @intCast(hero_h), 1);
+            // Banner strip band above the hero-sized terminal (T101);
+            // hidden leaves get the same inset so their thumbnail aspect
+            // matches what selection will show.
+            const inset = entry.view.bannerLayoutInset(hero_h);
+            _ = w32.MoveWindow(h, split.hero.left, split.hero.top + inset, @intCast(hero_w), @intCast(@max(hero_h - inset, 1)), 1);
             _ = w32.ShowWindow(h, if (leaf_i == hero_index) w32.SW_SHOW else w32.SW_HIDE);
         }
     }
@@ -1686,9 +1690,11 @@ pub fn layoutSplits(self: *Window) void {
             if (entry.handle == zoomed_handle) {
                 entry.view.setVisible(true);
                 if (entry.view.hwnd) |h| {
+                    // Banner strip band above the zoomed terminal (T101).
+                    const inset = entry.view.bannerLayoutInset(rect.bottom - rect.top);
                     const w = @max(rect.right - rect.left, 1);
-                    const ht = @max(rect.bottom - rect.top, 1);
-                    _ = w32.MoveWindow(h, rect.left, rect.top, @intCast(w), @intCast(ht), 1);
+                    const ht = @max(rect.bottom - rect.top - inset, 1);
+                    _ = w32.MoveWindow(h, rect.left, rect.top + inset, @intCast(w), @intCast(ht), 1);
                     _ = w32.ShowWindow(h, w32.SW_SHOW);
                 }
             } else {
@@ -1771,9 +1777,12 @@ fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface
         .leaf => |view| {
             view.setVisible(true);
             if (view.hwnd) |h| {
+                // Reserve the sticky-banner strip band above the terminal
+                // (T101): the grid starts below the strip, never under it.
+                const inset = view.bannerLayoutInset(rect.bottom - rect.top);
                 const w = @max(rect.right - rect.left, 1);
-                const ht = @max(rect.bottom - rect.top, 1);
-                _ = w32.MoveWindow(h, rect.left, rect.top, @intCast(w), @intCast(ht), 1);
+                const ht = @max(rect.bottom - rect.top - inset, 1);
+                _ = w32.MoveWindow(h, rect.left, rect.top + inset, @intCast(w), @intCast(ht), 1);
                 _ = w32.ShowWindow(h, w32.SW_SHOW);
             }
         },

@@ -92,6 +92,9 @@ test {
     // Pure win32 banner-markdown parser (T35), same no-OS-imports deal.
     _ = @import("apprt/win32/banner_markdown.zig");
 
+    // Pure win32 banner strip-inset clamp (T101), same no-OS-imports deal.
+    _ = @import("apprt/win32/banner_layout.zig");
+
     // Pure win32 session-layout manifest schema + JSON I/O (T89f1), same
     // no-OS-imports deal (LOCALAPPDATA path resolution degrades cleanly off
     // Windows / in the none lane).

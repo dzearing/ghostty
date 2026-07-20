@@ -82,6 +82,14 @@ pub const BannerOverlay = struct {
     /// -1 means stale (recompute on next use).
     content_h: i32 = -1,
 
+    /// Height the window layout reserved for this strip ABOVE the owner
+    /// pane (T101). The layout shrinks/offsets the owner HWND by this and
+    /// `updatePosition` glues the strip into the vacated band, so the
+    /// terminal grid starts below the banner instead of under it. 0 until
+    /// a layout pass ran (then the strip falls back to overlapping the
+    /// owner top so it is never lost).
+    inset: i32 = 0,
+
     scale: f32 = 1.0,
     bg: u32 = 0, // COLORREF strip fill
     bg_rgb: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 },
@@ -202,36 +210,51 @@ pub const BannerOverlay = struct {
         _ = w32.InvalidateRect(self.hwnd, null, 1);
     }
 
-    /// Glue the strip to the top of the owner pane (screen coordinates).
-    /// Hides when the owner is not visible (hidden split, other tab, hero
-    /// carousel). Idempotent — doubles as the reposition call.
+    /// Glue the strip into the band the window layout reserved above the
+    /// owner pane (T101; screen coordinates). Hides when the owner is not
+    /// visible (hidden split, other tab, hero carousel). Idempotent —
+    /// doubles as the reposition call.
     pub fn updatePosition(self: *BannerOverlay, scale: f32) void {
         if (w32.IsWindowVisible_(self.owner) == 0) {
             self.hide();
             return;
         }
-        if (scale != self.scale) {
-            self.scale = scale;
-            self.clearFonts();
-            self.content_h = -1;
-            _ = w32.InvalidateRect(self.hwnd, null, 1);
-        }
+        const strip = self.insetHeight(scale);
         if (!self.alpha_set) {
             _ = w32.SetLayeredWindowAttributes(self.hwnd, 0, STRIP_ALPHA, w32.LWA_ALPHA);
             self.alpha_set = true;
         }
         var rect: w32.RECT = undefined;
         if (w32.GetWindowRect(self.owner, &rect) == 0) return;
-        const height = self.stripHeight();
+        // `inset` > 0: the layout moved the owner down by that much; the
+        // strip fills the vacated band exactly (bottom-clipped when the
+        // clamp engaged in a degenerate short pane). `inset` == 0: no
+        // layout pass ran yet — fall back to overlapping the owner top so
+        // the strip is never lost.
+        const height = if (self.inset > 0) @min(self.inset, strip) else strip;
+        const top = rect.top - @max(self.inset, 0);
         _ = w32.SetWindowPos(
             self.hwnd,
             null,
             rect.left,
-            rect.top,
+            top,
             @max(rect.right - rect.left, 1),
-            height,
+            @max(height, 1),
             w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
         );
+    }
+
+    /// The strip's natural height at `scale`, for the window layout to
+    /// reserve above the owner pane (T101). Syncs the overlay's scale
+    /// first so a DPI change measures with the right fonts.
+    pub fn insetHeight(self: *BannerOverlay, scale: f32) i32 {
+        if (scale != self.scale) {
+            self.scale = scale;
+            self.clearFonts();
+            self.content_h = -1;
+            _ = w32.InvalidateRect(self.hwnd, null, 1);
+        }
+        return self.stripHeight();
     }
 
     pub fn hide(self: *BannerOverlay) void {
@@ -883,7 +906,10 @@ pub const BannerOverlay = struct {
     fn toggleCollapsed(self: *BannerOverlay) void {
         if (!self.collapsible) return;
         self.collapsed = !self.collapsed;
-        self.updatePosition(self.scale);
+        // The strip height changed: re-run the owning window's layout so
+        // the terminal band under the strip grows/shrinks to match (T101).
+        // The layout pass repositions this popup via updatePaneBanners.
+        App.relayoutOwnerWindow(self.owner);
         _ = w32.InvalidateRect(self.hwnd, null, 1);
     }
 

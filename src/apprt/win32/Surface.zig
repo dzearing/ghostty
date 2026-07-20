@@ -23,6 +23,7 @@ const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
+const banner_layout = @import("banner_layout.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
 
@@ -832,6 +833,8 @@ pub fn setPaneBanner(self: *Surface, text: ?[]const u8) void {
         if (self.banner_overlay) |b| {
             b.destroy();
             self.banner_overlay = null;
+            // Give the vacated strip band back to the terminal (T101).
+            self.parent_window.layoutSplits();
         }
         return;
     }
@@ -852,7 +855,21 @@ pub fn setPaneBanner(self: *Surface, text: ?[]const u8) void {
     const overlay = self.banner_overlay.?;
     overlay.setText(t);
     self.refreshBannerColors();
-    overlay.updatePosition(self.scale);
+    // Re-run the split layout so the terminal band shrinks by the strip
+    // height (T101 — the strip must sit ABOVE the grid, not over it).
+    // The layout pass repositions the overlay via updatePaneBanners.
+    self.parent_window.layoutSplits();
+}
+
+/// Height the window layout must reserve above this pane's terminal for
+/// the sticky banner strip (T101), clamped to the pane slot. Records the
+/// reservation on the overlay so updatePosition glues the strip into the
+/// reserved band. 0 when no banner is set.
+pub fn bannerLayoutInset(self: *Surface, slot_h: i32) i32 {
+    const overlay = self.banner_overlay orelse return 0;
+    const inset = banner_layout.clampInset(overlay.insetHeight(self.scale), slot_h);
+    overlay.inset = inset;
+    return inset;
 }
 
 /// Re-derive the banner strip colors from the pane's effective background

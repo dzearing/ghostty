@@ -6,9 +6,12 @@
 # Oracles:
 #   - `+list --json` panes carry an additive `banner` field with the raw
 #     markdown source when set (absent otherwise).
-#   - A visible GhozttyBannerOverlay popup is glued to the pane's top edge
-#     and full width; its height grows with `\n` line breaks (capped at
-#     10 display lines).
+#   - A visible GhozttyBannerOverlay popup is glued ABOVE the pane (its
+#     bottom meets the pane HWND's top — T101: the strip band is reserved
+#     by the window layout, so the grid starts below the banner, never
+#     under it) and spans the pane width; its height grows with `\n` line
+#     breaks (capped at 10 display lines). Setting/clearing/collapsing a
+#     banner moves the pane top by exactly the strip height.
 #   - A screen-pixel probe inside the strip is BRIGHTER than the dark pane
 #     background while the banner is up and reverts after --clear (proves
 #     the strip reaches the glass, not just the data model).
@@ -282,13 +285,26 @@ function Wait-Banner($target, [int]$i, [string]$expect) {
     return '(absent)'
 }
 
-# The banner overlay glued to a pane rect (same left/top), or $null.
-function Get-Overlay([uint32]$procId, $paneRect) {
-    $c = $paneRect -split ','
+# Live pane rect #$i of window $top, sorted top-then-left so index is
+# geometric (0 = topmost pane), or $null.
+function Get-Pane([IntPtr]$top, [int]$i = 0) {
+    $panes = @([BannerDrv]::Panes($top)) | Sort-Object { [int](($_ -split ',')[1]) }, { [int](($_ -split ',')[0]) }
+    if (@($panes).Count -le $i) { return $null }
+    return @($panes)[$i]
+}
+
+# The banner overlay glued ABOVE live pane #$i (same left edge; overlay
+# BOTTOM meets the pane's current top — T101 reserves the strip band above
+# the terminal, so the grid starts below the banner, never under it), or
+# $null. Queries the pane fresh: the pane top moves as strips come and go.
+function Get-Overlay([uint32]$procId, [IntPtr]$top, [int]$i = 0) {
+    $p = Get-Pane $top $i
+    if (-not $p) { return $null }
+    $c = $p -split ','
     foreach ($o in @([BannerDrv]::ByClass($procId, 'GhozttyBannerOverlay'))) {
         $r = $o -split ','
         if ([math]::Abs([int]$r[0] - [int]$c[0]) -le 2 -and
-            [math]::Abs([int]$r[1] - [int]$c[1]) -le 2) { return $o }
+            [math]::Abs([int]$r[3] - [int]$c[1]) -le 2) { return $o }
     }
     return $null
 }
@@ -311,18 +327,24 @@ if (-not $bwWin) { Write-Host 'SETUP FAIL: bw window not registered'; exit 1 }
 # window hosting the 'bw' pane (not the initial launch window).
 $top = [IntPtr]([int64]$bwWin.id)
 
+# Pre-banner pane snapshot for the T101 band asserts: the pane HWND must
+# shrink from the top by exactly the strip height once a banner is up.
+$panePre = $null
+for ($t = 0; $t -lt 20 -and -not $panePre; $t++) { $panePre = Get-Pane $top 0; if (-not $panePre) { Start-Sleep -Milliseconds 200 } }
+if (-not $panePre) { Write-Host 'SETUP FAIL: no pane HWND in bw'; exit 1 }
+
 # --- 1. +set-banner sets the model (additive +list field) -----------------
 & $exe +set-banner --target=bw "**PR #123** - ready [view](https://example.com/pr/123)" | Out-Null
 $b = Wait-Banner 'bw' 0 '**PR #123** - ready [view](https://example.com/pr/123)'
 Assert ($b -ceq '**PR #123** - ready [view](https://example.com/pr/123)') "+set-banner: +list reports banner source (got $b)"
 
-# --- 2. overlay strip on the glass: glued to pane top, full width ---------
+# --- 2. overlay strip on the glass: glued above the pane, full width ------
 $panes = @([BannerDrv]::Panes($top))
 Assert ($panes.Count -ge 1) "pane HWND found ($($panes.Count))"
-$paneRect = $panes[0]
 $ov = $null
-for ($t = 0; $t -lt 20 -and -not $ov; $t++) { $ov = Get-Overlay $pid32 $paneRect; if (-not $ov) { Start-Sleep -Milliseconds 200 } }
-Assert ($null -ne $ov) 'overlay visible and glued to the pane top-left'
+for ($t = 0; $t -lt 20 -and -not $ov; $t++) { $ov = Get-Overlay $pid32 $top; if (-not $ov) { Start-Sleep -Milliseconds 200 } }
+Assert ($null -ne $ov) 'overlay visible and glued above the pane (bottom meets grid top)'
+$paneRect = Get-Pane $top 0
 $oneLineH = 0
 if ($ov) {
     $r = $ov -split ','; $c = $paneRect -split ','
@@ -330,6 +352,16 @@ if ($ov) {
     Assert (([int]$r[2] - [int]$r[0]) -eq ([int]$c[2] - [int]$c[0])) 'overlay spans the pane width'
     Assert ($oneLineH -gt 0 -and $oneLineH -lt 80) "one-line strip height sane ($oneLineH px)"
 }
+
+# --- 2b. T101: the strip band is RESERVED — grid starts below the banner ---
+# The pane HWND top moved down by exactly the strip height (vs the
+# pre-banner snapshot) and the pane bottom is unchanged: the terminal
+# genuinely shrank into the band below the strip instead of being covered.
+if ($ov) {
+    $c = $paneRect -split ','; $pre = $panePre -split ','
+    Assert (([int]$c[1] - [int]$pre[1]) -eq $oneLineH) "pane top moved down by the strip height ($($pre[1]) -> $($c[1]), strip $oneLineH)"
+    Assert (([int]$c[3]) -eq ([int]$pre[3])) 'pane bottom unchanged (terminal shrank, not shifted)'
+} else { $script:fail += 2 }
 
 # --- 3. strip paints the exact lightened color; composites to the glass ---
 # Own-DC read is deterministic (z-order/overlap immune): the strip fill is
@@ -341,9 +373,9 @@ if ($ov) {
     # (WM_MOVE -> updatePaneBanners re-glues the strip).
     [BannerDrv]::SetWindowPos($top, [IntPtr](-1), 100, 100, 0, 0, 0x0051) | Out-Null
     Start-Sleep -Milliseconds 900
-    $paneRect = @([BannerDrv]::Panes($top))[0]
-    $ov = Get-Overlay $pid32 $paneRect
-    Assert ($null -ne $ov) 'overlay re-glued to the pane after a window move'
+    $paneRect = Get-Pane $top 0
+    $ov = Get-Overlay $pid32 $top
+    Assert ($null -ne $ov) 'overlay re-glued above the pane after a window move'
     if ($ov) {
         $r = $ov -split ','
         $sx = [int]$r[0] + [int](([int]$r[2] - [int]$r[0]) * 0.9)
@@ -374,7 +406,7 @@ if ($ov) {
 & $exe +set-banner --target=bw "line1\nline2\nline3" | Out-Null
 $b = Wait-Banner 'bw' 0 "line1`nline2`nline3"
 Assert ($b -ceq "line1`nline2`nline3") 'multi-line: +list carries real newlines'
-$ov3 = Get-Overlay $pid32 $paneRect
+$ov3 = Get-Overlay $pid32 $top
 $threeLineH = 0
 if ($ov3) { $r = $ov3 -split ','; $threeLineH = [int]$r[3] - [int]$r[1] }
 Assert ($threeLineH -gt $oneLineH + 10) "3-line strip taller than 1-line ($oneLineH -> $threeLineH px)"
@@ -383,19 +415,23 @@ Assert ($threeLineH -gt $oneLineH + 10) "3-line strip taller than 1-line ($oneLi
 # height (a 2-line pair adds $twoLines px = 2 * (line height + block gap)).
 & $exe +set-banner --target=bw "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl" | Out-Null
 Start-Sleep -Milliseconds 800
-$ovCap = Get-Overlay $pid32 $paneRect
+$ovCap = Get-Overlay $pid32 $top
 $capH = 0
 if ($ovCap) { $r = $ovCap -split ','; $capH = [int]$r[3] - [int]$r[1] }
 $twoLines = $threeLineH - $oneLineH
 Assert ($capH -gt ($oneLineH + 4 * $twoLines) -and $capH -le ($oneLineH + 4.5 * $twoLines + 8)) "12-line source capped at 10 display lines ($capH px)"
 
 # --- 5. --clear removes model + glass, reverts the pixel ------------------
+$paneWithCap = (Get-Pane $top 0) -split ','   # capped banner still up (T101)
 & $exe +set-banner --target=bw --clear | Out-Null
 $b = Wait-Banner 'bw' 0 'NONE'
 Assert ($b -eq '(absent)') '--clear: banner absent from +list'
 Start-Sleep -Milliseconds 500
-Assert ($null -eq (Get-Overlay $pid32 $paneRect)) '--clear: overlay gone'
+Assert ($null -eq (Get-Overlay $pid32 $top)) '--clear: overlay gone'
 Assert (@([BannerDrv]::ByClass($pid32, 'GhozttyBannerOverlay')).Count -eq 0) '--clear: no overlay windows remain on the glass'
+# T101: the vacated strip band went back to the terminal.
+$paneCleared = (Get-Pane $top 0) -split ','
+Assert (([int]$paneWithCap[1] - [int]$paneCleared[1]) -eq $capH) "--clear: grid grew back by the strip height ($capH px)"
 
 # --- 6. empty text equals clear; clearing when clear succeeds -------------
 & $exe +set-banner --target=bw "again" | Out-Null
@@ -409,7 +445,7 @@ Assert ($LASTEXITCODE -eq 0) 'clearing an already-clear banner succeeds'
 # --- 6b. T91: heading renders taller than a plain text line ----------------
 & $exe +set-banner --target=bw "# Big title" | Out-Null
 $null = Wait-Banner 'bw' 0 '# Big title'
-$ovH = Get-Overlay $pid32 $paneRect
+$ovH = Get-Overlay $pid32 $top
 $headH = 0
 if ($ovH) { $r = $ovH -split ','; $headH = [int]$r[3] - [int]$r[1] }
 Assert ($headH -gt ($oneLineH + 4)) "h1 heading strip taller than plain line ($oneLineH -> $headH px)"
@@ -419,7 +455,7 @@ Assert ($headH -gt ($oneLineH + 4)) "h1 heading strip taller than plain line ($o
 # rule row is a 1px line, thinner than a text line.
 & $exe +set-banner --target=bw "top\n---\nbottom" | Out-Null
 $null = Wait-Banner 'bw' 0 "top`n---`nbottom"
-$ovR = Get-Overlay $pid32 $paneRect
+$ovR = Get-Overlay $pid32 $top
 $hrH = 0
 if ($ovR) { $r = $ovR -split ','; $hrH = [int]$r[3] - [int]$r[1] }
 $twoLineH = $oneLineH + [int]($twoLines / 2)
@@ -428,7 +464,7 @@ Assert ($hrH -gt $twoLineH -and $hrH -lt $threeLineH) "hr row is thinner than a 
 # --- 6d. T91: pipe table renders (separator row dropped) -------------------
 & $exe +set-banner --target=bw "| Job | State |\n|---|---:|\n| lint | ok |\n| tests | **3 failed** |" | Out-Null
 $null = Wait-Banner 'bw' 0 "| Job | State |`n|---|---:|`n| lint | ok |`n| tests | **3 failed** |"
-$ovT = Get-Overlay $pid32 $paneRect
+$ovT = Get-Overlay $pid32 $top
 $tblH = 0
 if ($ovT) { $r = $ovT -split ','; $tblH = [int]$r[3] - [int]$r[1] }
 # 4 source lines -> 3 display rows (header + 2 body; separator dropped):
@@ -440,7 +476,7 @@ Assert (-not $proc.HasExited) 'table banner: GUI alive after paint'
 & $exe +set-banner --target=bw "[x] done\n[ ] todo" | Out-Null
 $null = Wait-Banner 'bw' 0 "[x] done`n[ ] todo"
 Start-Sleep -Milliseconds 400
-$ovC = Get-Overlay $pid32 $paneRect
+$ovC = Get-Overlay $pid32 $top
 if ($ovC) {
     $r = $ovC -split ','
     $ovhH = [IntPtr]([int64]$r[4])
@@ -458,26 +494,32 @@ if ($ovC) {
 & $exe +set-banner --target=bw "head\nrow2\nrow3" | Out-Null
 $null = Wait-Banner 'bw' 0 "head`nrow2`nrow3"
 Start-Sleep -Milliseconds 400
-$ovE = Get-Overlay $pid32 $paneRect
+$ovE = Get-Overlay $pid32 $top
 if ($ovE) {
     $r = $ovE -split ','
     $expandH = [int]$r[3] - [int]$r[1]
+    $paneExp = (Get-Pane $top 0) -split ','
     $ovhH = [IntPtr]([int64]$r[4])
     $midX = [int](([int]$r[2] - [int]$r[0]) / 2)
     [BannerDrv]::ClickClient($ovhH, $midX, [int]($oneLineH / 2))
     $collapseH = $expandH
     for ($t = 0; $t -lt 20; $t++) {
         Start-Sleep -Milliseconds 150
-        $ov2 = Get-Overlay $pid32 $paneRect
+        $ov2 = Get-Overlay $pid32 $top
         if ($ov2) { $r2 = $ov2 -split ','; $collapseH = [int]$r2[3] - [int]$r2[1] }
         if ($collapseH -lt $expandH) { break }
     }
     Assert ($collapseH -lt ($expandH - 20) -and $collapseH -gt 20) "click collapses the banner ($expandH -> $collapseH px)"
+    # T101: the terminal band grew by exactly the collapsed delta (the
+    # Get-Overlay matcher already proves the strip re-glued above the
+    # moved pane top; this pins the magnitude).
+    $paneCol = (Get-Pane $top 0) -split ','
+    Assert ((([int]$paneExp[1]) - ([int]$paneCol[1])) -eq ($expandH - $collapseH)) "collapse gave the band back to the grid ($expandH -> $collapseH strip, pane top $($paneExp[1]) -> $($paneCol[1]))"
     [BannerDrv]::ClickClient($ovhH, $midX, [int]($collapseH / 2))
     $reH = $collapseH
     for ($t = 0; $t -lt 20; $t++) {
         Start-Sleep -Milliseconds 150
-        $ov2 = Get-Overlay $pid32 $paneRect
+        $ov2 = Get-Overlay $pid32 $top
         if ($ov2) { $r2 = $ov2 -split ','; $reH = [int]$r2[3] - [int]$r2[1] }
         if ($reH -eq $expandH) { break }
     }
@@ -495,6 +537,11 @@ Start-Sleep -Seconds 1
 & $exe +set-banner --target=bp1 "split banner" | Out-Null
 $b = Wait-Banner 'bw' 1 'split banner'
 Assert ($b -ceq 'split banner') "pane target: split pane banner set (got $b)"
+# T101: the strip band reserves the top of the SPLIT pane's slot too
+# (geometric pane index 1 = the lower pane of the down-split).
+$ovS = $null
+for ($t = 0; $t -lt 15 -and -not $ovS; $t++) { $ovS = Get-Overlay $pid32 $top 1; if (-not $ovS) { Start-Sleep -Milliseconds 200 } }
+Assert ($null -ne $ovS) 'split pane: strip glued above the split pane (T101 band inside a split slot)'
 $b = Wait-Banner 'bw' 0 'NONE'
 Assert ($b -eq '(absent)') 'pane target: first pane untouched'
 
