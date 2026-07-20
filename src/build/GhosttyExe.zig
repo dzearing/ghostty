@@ -3,6 +3,7 @@ const Ghostty = @This();
 const std = @import("std");
 const Config = @import("Config.zig");
 const SharedDeps = @import("SharedDeps.zig");
+const setMsvcGuiEntry = @import("win32_entry.zig").setMsvcGuiEntry;
 
 /// The primary Ghostty executable.
 exe: *std.Build.Step.Compile,
@@ -58,6 +59,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 .Console
             else
                 .Windows;
+            if (exe.subsystem == .Windows) setMsvcGuiEntry(exe);
             // Release/MSI builds stamp a real per-build FILEVERSION so MSI
             // major upgrades replace the exe (file-versioning rules, T23);
             // dev builds keep the rc's 0.1.0.0 baseline.

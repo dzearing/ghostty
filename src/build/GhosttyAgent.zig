@@ -14,6 +14,7 @@ const std = @import("std");
 const Config = @import("Config.zig");
 const GitVersion = @import("GitVersion.zig");
 const SharedDeps = @import("SharedDeps.zig");
+const setMsvcGuiEntry = @import("win32_entry.zig").setMsvcGuiEntry;
 
 /// The agent executable.
 exe: *std.Build.Step.Compile,
@@ -81,6 +82,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
     var ca_dll_install_step: ?*std.Build.Step.InstallArtifact = null;
     if (cfg.target.result.os.tag == .windows) {
         exe.subsystem = .Windows;
+        setMsvcGuiEntry(exe);
         // The MSI custom-action DLL ships alongside the agent exe. Pure Win32,
         // no shared deps — keep it that way so msiexec loads it instantly.
         const ca_dll = b.addLibrary(.{

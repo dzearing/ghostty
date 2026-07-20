@@ -9,6 +9,16 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 44) — T100 DONE (native-msvc GUI-subsystem link,
+  the T89h delivery blocker). Root cause pinned against zig 0.15.2
+  std/start.zig: MSVC libc + `pub fn main` exports only C `main`, and the
+  Windows subsystem makes lld-link enter via libcmt's WinMainCRTStartup →
+  undefined WinMain. Fix: explicit `mainCRTStartup` entry (subsystem stays
+  GUI) via new `src/build/win32_entry.zig`, wired into agent + app
+  release; gnu path untouched. Agent builds+runs (agent-pipe ×3),
+  ReleaseFast msvc app links again, standing bar green. One stale pre-fix
+  debug agent (held the zig-out exe lock) had to be killed. Next: T89h.
+
 - 2026-07-20 (on-box, 43) — T101 DONE (banner occlusion; user live-review
   item b). Key discovery: the filed root cause (sizeCallback full height)
   was WRONG in a load-bearing way — the win32 renderer re-reads the HWND
