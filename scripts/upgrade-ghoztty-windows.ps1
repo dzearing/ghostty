@@ -62,11 +62,28 @@ if (-not (Test-Path $oldExe)) { Log "ABORT: installed exe not found: $oldExe"; e
 # before its terminal is killed.
 Start-Sleep -Seconds $DelaySeconds
 
-# Kill only release instances (running from the install dir). Debug/test
-# instances under zig-out keep running.
+# T89h: capture the live session ids BEFORE the kill so we can assert they
+# survive the swap. `+sessions` dials the agent directly (not the app), so it
+# works on both sides of the GUI kill. No agent/no sessions => skip assert.
+$preSessions = @()
+try {
+    $preRaw = & $oldExe +sessions --json 2>$null
+    if ($LASTEXITCODE -eq 0 -and $preRaw) {
+        $preSessions = @($preRaw | Where-Object { $_ -match '^\s*\{' } |
+            ForEach-Object { ($_ | ConvertFrom-Json).id })
+    }
+} catch {}
+Log "pre-kill agent sessions: $($preSessions.Count) ($($preSessions -join ', '))"
+
+# Kill only release GUI instances (running from the install dir). Debug/test
+# instances under zig-out keep running. NEVER kill ghoztty-agent.exe — it owns
+# the persistent session PTYs; killing it is exactly what session persistence
+# exists to avoid (T89h). Get-Process 'ghoztty' already matches only the GUI
+# process name, but keep an explicit belt-and-braces filter so a future edit
+# can't widen this into the agent.
 $victims = @(Get-Process ghoztty -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -like "$InstallDir*" })
-Log "killing $($victims.Count) release ghoztty process(es): $($victims.Id -join ', ')"
+    Where-Object { $_.ProcessName -eq 'ghoztty' -and $_.Path -like "$InstallDir*" })
+Log "killing $($victims.Count) release ghoztty process(es): $($victims.Id -join ', ') (ghoztty-agent.exe is never killed)"
 $victims | Stop-Process -Force -ErrorAction SilentlyContinue
 
 # Wait for the exe to unlock, then swap. Keep one .bak for rollback.
@@ -95,12 +112,61 @@ if (Test-Path $newPdb) {
     Log 'WARNING: no ghoztty.pdb in staging (built with strip?); dumps from this build will be unsymbolized'
 }
 
+# T89h: swap ghoztty-agent.exe too, WITHOUT killing the running agent. A
+# running exe's file can be RENAMED (the image stays mapped), just not
+# overwritten — so move the old one aside and copy the new one in. The old
+# agent keeps running with every PTY attached (lazy upgrade, as on Mac); the
+# next cold start — reboot autostart or find-or-spawn after it exits — picks
+# up the new binary.
+$newAgent = Join-Path $Staging 'bin\ghoztty-agent.exe'
+$oldAgent = Join-Path $InstallDir 'ghoztty-agent.exe'
+if (Test-Path $newAgent) {
+    try {
+        if (Test-Path $oldAgent) {
+            Remove-Item "$oldAgent.bak" -Force -ErrorAction SilentlyContinue
+            Move-Item $oldAgent "$oldAgent.bak" -Force -ErrorAction Stop
+        }
+        Copy-Item $newAgent $oldAgent -Force -ErrorAction Stop
+        Log 'agent exe swapped (running agent untouched; new binary on next agent start)'
+        $newAgentPdb = Join-Path $Staging 'bin\ghoztty-agent.pdb'
+        if (Test-Path $newAgentPdb) {
+            Copy-Item $newAgentPdb (Join-Path $InstallDir 'ghoztty-agent.pdb') -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Log "WARNING: agent exe swap failed: $($_.Exception.Message)"
+    }
+} else {
+    Log 'no ghoztty-agent.exe in staging; kept existing'
+}
+
 $stagingShare = Join-Path $Staging 'share'
 if (Test-Path $stagingShare) {
     robocopy $stagingShare (Join-Path $InstallDir 'share') /MIR /NFL /NDL /NJH /NJS | Out-Null
     Log "share\ mirrored (robocopy exit $LASTEXITCODE)"
 } else {
     Log 'no share\ in staging; kept existing'
+}
+
+# T89h: assert the agent's sessions survived the GUI kill + exe swap. The
+# relaunched app re-attaches to exactly these ids (T89f2), so a shrunken set
+# here means the upgrade lost someone's shell — log it loudly.
+if ($preSessions.Count -gt 0) {
+    $postSessions = @()
+    try {
+        $postRaw = & $oldExe +sessions --json 2>$null
+        if ($LASTEXITCODE -eq 0 -and $postRaw) {
+            $postSessions = @($postRaw | Where-Object { $_ -match '^\s*\{' } |
+                ForEach-Object { ($_ | ConvertFrom-Json).id })
+        }
+    } catch {}
+    $lost = @($preSessions | Where-Object { $postSessions -notcontains $_ })
+    if ($lost.Count -eq 0) {
+        Log "SESSIONS-SURVIVE OK: all $($preSessions.Count) session(s) still owned by the agent"
+    } else {
+        Log "SESSIONS-SURVIVE FAIL: lost $($lost.Count) of $($preSessions.Count) session(s): $($lost -join ', ')"
+    }
+} else {
+    Log 'SESSIONS-SURVIVE SKIP: no agent sessions before the kill'
 }
 
 if ($NoResume) { Log 'UPGRADE OK (no-resume)'; exit 0 }

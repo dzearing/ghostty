@@ -1206,7 +1206,7 @@ command: ?Command = null,
 /// `/bin/sh` on other platforms.
 @"command-shell": ?[:0]const u8 = null,
 
-/// Session persistence (macOS): when `true`, new local windows, tabs, and
+/// Session persistence (macOS and Windows): when `true`, new local windows, tabs, and
 /// splits run their shells under the local `ghoztty-agent` (found or spawned
 /// on demand) instead of directly under the app process. The processes then
 /// survive the app exiting — including crashes and binary upgrades — and can
@@ -1218,7 +1218,8 @@ command: ?Command = null,
 /// never hangs or fails on an unavailable agent.
 @"session-persistence": bool = true,
 
-/// Session relaunch policy (macOS, requires `session-persistence`): controls what
+/// Session relaunch policy (macOS and Windows, requires `session-persistence`):
+/// controls what
 /// a restored window does when a pane's persisted session comes back from the
 /// agent as a DEAD-but-relaunchable tombstone — i.e. the agent itself restarted
 /// (a reboot, an agent upgrade) and materialized the session's recorded

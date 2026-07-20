@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 45) — T89h DONE (session-persistence ships): HKCU
+  Run autostart (`GhozttyAgent[-debug]`, exact spawn command via shared
+  `agentCommandLine`, release-gated w/ force hook), agent exe now a
+  required sibling in default build + MSI (File-table version-lie to dodge
+  the T23 vanish rule) + publish script, upgrade script never kills the
+  agent + rename-swaps its exe + SESSIONS-SURVIVE log assert, docs
+  un-gated to macOS+Windows. New agent-autostart.ps1 ALL PASS ×3 (incl.
+  reboot proxy: verbatim Run command via Win32_Process.Create → session
+  back as tombstone); msi-upgrade (35) incl. agent asserts; standing bar
+  green. Surprise: test-agent flaked exit=-1 ×3 early (no failure text,
+  gone across 5 logged runs — watch in T89i soak); msi-upgrade's
+  -V2ProductVer default encodes the DATE (pass current, e.g. 26.7.2002).
+  Delivery launched at boundary (first time the installed release gets an
+  agent at all). Next: T89i; resumed session checks ghoztty-upgrade.log.
 - 2026-07-20 (on-box, 44) — T100 DONE (native-msvc GUI-subsystem link,
   the T89h delivery blocker). Root cause pinned against zig 0.15.2
   std/start.zig: MSVC libc + `pub fn main` exports only C `main`, and the

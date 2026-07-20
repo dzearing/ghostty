@@ -324,7 +324,7 @@ Terminal processes can be made independent of the GUI app so they survive app
 crashes, quits, and binary upgrades (and relaunch across reboots / agent
 crashes). It is **on by default** (disable with `session-persistence = off`).
 
-- `session-persistence = off|on` (macOS, default `on`). When `on`, new local
+- `session-persistence = off|on` (macOS + Windows, default `on`). When `on`, new local
   windows/tabs/splits run their shell under the local `ghoztty-agent` (found or
   spawned on demand) instead of directly under the app process, so the child
   processes outlive the app. On next launch the app re-attaches: layout, split
@@ -350,7 +350,13 @@ snapshotted to disk for reboot scrollback), persists session metadata to
 after a crash/reboot. The app dials it over a 0600 AF_UNIX socket
 (`~/.config/ghoztty/local-agent[-debug]/agent.sock`) with a same-uid peercred
 check. Use `+sessions` (above) to enumerate live sessions directly from the
-agent, even when the app is not running. Design + measured E2E results:
+agent, even when the app is not running. On Windows the same design holds
+with native swaps: the agent (`ghoztty-agent.exe`, shipped as a required
+sibling of `ghoztty.exe`) owns ConPTYs, is dialed over the owner-only-DACL
+named pipe (see `+sessions`), keeps its state under
+`%LOCALAPPDATA%\ghoztty\local-agent[-debug]\`, and the reboot-comeback analog
+of the LaunchAgent is an HKCU Run entry (`GhozttyAgent`) the GUI
+writes/refreshes when persistence engages. Design + measured E2E results:
 `docs/design/session-persistence.md`; E2E harness: `scripts/e2e/session-persistence.py`.
 
 Cross-machine session *move* (browse another machine's live sessions from the

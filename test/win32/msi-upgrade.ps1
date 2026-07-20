@@ -107,6 +107,7 @@ $v1Ver = ''
 if (Test-Path $exePath) { $v1Ver = (Get-Item $exePath).VersionInfo.FileVersionRaw.ToString() }
 Assert ($v1Ver -eq $V1FileVer) "v1: exe FileVersion $v1Ver == $V1FileVer"
 Assert (Test-Path (Join-Path $installDir 'share\terminfo\ghostty.terminfo')) 'v1: terminfo sentinel present'
+Assert (Test-Path (Join-Path $installDir 'ghoztty-agent.exe')) 'v1: session-persistence agent exe present (T89h)'
 $v1Count = 0
 if (Test-Path $installDir) { $v1Count = @(Get-ChildItem $installDir -Recurse -File).Count }
 Assert ($v1Count -gt 400) "v1: file count sane ($v1Count files)"
@@ -124,6 +125,7 @@ $v2Ver = ''
 if (Test-Path $exePath) { $v2Ver = (Get-Item $exePath).VersionInfo.FileVersionRaw.ToString() }
 Assert ($v2Ver -eq $V2FileVer) "v2: exe FileVersion $v2Ver == $V2FileVer (new exe copied)"
 Assert (Test-Path (Join-Path $installDir 'share\terminfo\ghostty.terminfo')) 'v2: terminfo sentinel survived upgrade'
+Assert (Test-Path (Join-Path $installDir 'ghoztty-agent.exe')) 'v2: agent exe STILL PRESENT after major upgrade (T89h vanishing-file class)'
 $v2Count = 0
 if (Test-Path $installDir) { $v2Count = @(Get-ChildItem $installDir -Recurse -File).Count }
 Assert ($v2Count -eq $v1Count) "v2: all files survived upgrade ($v2Count == $v1Count)"

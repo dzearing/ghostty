@@ -4077,6 +4077,56 @@ zip/MSI + all 3 install locations; CLAUDE.md/config docs un-gate
 re-attaches post-swap; reboot ⇒ agent auto-starts, sessions come back
 as tombstones per config; MSI install/uninstall E2E still green.
 
+*Evidence (done 2026-07-20):*
+
+- **Autostart**: `LocalAgent.ensureAutostart` writes/refreshes HKCU
+  `...\CurrentVersion\Run` value `GhozttyAgent` (debug lineage:
+  `GhozttyAgent-debug`) after the FIRST successful agent resolve of the
+  run, with the byte-identical command line the on-demand spawn uses
+  (extracted `agentCommandLine`, unit-tested in both lanes: 4 quoted
+  tokens, `--listen-pipe`/`--port-file`/`--sessions-file`). Gates:
+  release-only (debug needs `GHOZTTY_AGENT_AUTOSTART=force`, the
+  PathInstaller-style test hook); `=0`/`off` disables; best-effort
+  (registry failure logs, never blocks the session).
+- **Packaging**: default `zig build` installs `ghoztty-agent.exe` next to
+  `ghoztty.exe` on Windows targets (build.zig, T89h comment); build-msi.sh
+  hard-requires it, packages it, and mirrors the APP exe's
+  strictly-increasing FILEVERSION into its File-table row (deliberate
+  version-lie: the agent's own PE carries the release semver, which can
+  repeat across builds — equal/lower table version would re-trigger the
+  T23 vanish rule); publish-windows-release.ps1 adds
+  `-Dagent-semver=$Version` + a presence check.
+- **Upgrade guard**: upgrade-ghoztty-windows.ps1 explicitly never kills
+  `ghoztty-agent.exe` (belt-and-braces ProcessName filter + comment),
+  rename-swaps the agent exe while it runs (old image stays mapped; next
+  agent start picks the new binary — the lazy-upgrade default), and logs
+  `SESSIONS-SURVIVE OK/FAIL/SKIP` comparing `+sessions --json` ids across
+  the GUI kill + swap.
+- **Docs**: CLAUDE.md Session Persistence un-gated (macOS + Windows, with
+  the Windows swaps: named pipe, `%LOCALAPPDATA%` state, Run-key analog of
+  the LaunchAgent); Config.zig `session-persistence`/`session-relaunch`
+  doc comments un-gated.
+- **Validated**: new `test/win32/agent-autostart.ps1` ALL PASS ×3 —
+  A: Run-key written on engage with correct exe/pipe/state paths;
+  B: reboot proxy (kill GUI+agent, exec the Run value VERBATIM via
+  `Win32_Process.Create` — the raw-CreateProcess treatment winlogon gives
+  Run entries) ⇒ fresh agent, pre-kill session id back as a DEAD
+  tombstone; C: debug build without the hook writes nothing.
+  `msi-upgrade.ps1` ALL PASS (35) with new v1/v2 agent-present asserts
+  (`-V2ProductVer 26.7.2002` — the default param encodes the build DATE,
+  pass the current one on future runs). session-open + session-reattach +
+  P1–P3 + both lanes green; test-agent green ×5 after three transient
+  exit=-1 runs (no failure text captured; did not reproduce across 5
+  logged runs — watch under T89i's soak).
+- **Delivery**: ReleaseFast(gnu, -Dstrip=false) staged to zig-out-release
+  (now incl. the agent) and the upgrade script launched at the task
+  boundary — installed release + Desktop portable + share copy all gain
+  `ghoztty-agent.exe` for the first time (until now the installed release
+  silently fell back to exec panes: no agent sibling existed). Resumed
+  session: verify `%TEMP%\ghoztty-upgrade.log` (agent swap line +
+  SESSIONS-SURVIVE line; SKIP expected on this first pass — the pre-swap
+  release had no agent).
+
 ## T89i — E2E hardening + soak
 
 PS port of `scripts/e2e/session-persistence.py` (incl. `--winsize`

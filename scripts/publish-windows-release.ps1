@@ -75,9 +75,13 @@ if ((Invoke-Probe { gh release view $tag --repo dzearing/ghoztty --json tagName 
 if (-not $SkipBuild) {
     Write-Host "== zig build (ReleaseFast, x86_64-windows-gnu, semver $Version) =="
     if (-not $env:ZIG_GLOBAL_CACHE_DIR) { $env:ZIG_GLOBAL_CACHE_DIR = 'D:\zig-cache' }
+    # The default install also produces zig-out\bin\ghoztty-agent.exe on
+    # Windows (T89h); -Dagent-semver stamps its VERSIONINFO with the release
+    # semver so Explorer/Details matches the tag.
     zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast `
         "-Dwindows-file-version=$fileVer" `
         "-Dversion-string=$Version+$hash" `
+        "-Dagent-semver=$Version" `
         "-Dwindows-update-check=true"
     if ($LASTEXITCODE -ne 0) { throw "zig build failed" }
 }
@@ -86,6 +90,10 @@ if (-not $SkipBuild) {
 # zig-out under -SkipBuild and any stamping regression).
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { throw "$exe missing" }
+# Session persistence needs the agent sibling in every shipped layout (T89h);
+# build-msi.sh also hard-requires it, but fail here first with a clear message.
+$agentExe = Join-Path $repo 'zig-out\bin\ghoztty-agent.exe'
+if (-not (Test-Path $agentExe)) { throw "$agentExe missing — the release must carry the session-persistence agent (T89h)" }
 $verOut = Join-Path $env:TEMP 'ghoztty-publish-version.txt'
 $p = Start-Process $exe -ArgumentList '+version' -RedirectStandardOutput $verOut -NoNewWindow -PassThru
 if (-not $p.WaitForExit(15000)) { try { $p.Kill() } catch {}; throw '+version hung' }

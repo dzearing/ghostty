@@ -298,6 +298,13 @@ pub fn build(b: *std.Build) !void {
             exe.install();
             resources.install();
             if (i18n) |v| v.install();
+
+            // Windows: install ghoztty-agent.exe as a SIBLING of ghoztty.exe.
+            // Session persistence (T89d) spawns it by that relative location
+            // (LocalAgent.agentBinary), so every install layout — zig-out,
+            // the MSI, the portable zip — must carry the pair together
+            // (T89h). macOS instead embeds the agent inside the app bundle.
+            if (config.target.result.os.tag == .windows) agent.install();
         }
     } else if (!config.emit_lib_vt) {
         // The macOS Ghostty Library

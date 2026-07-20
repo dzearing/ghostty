@@ -42,6 +42,7 @@ const tcp_dial = @import("../../remote/tcp_dial.zig");
 const connection = @import("../../remote/connection.zig");
 const build_config = @import("../../build_config.zig");
 const protocol = @import("../../remote/protocol.zig");
+const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_local_agent);
 
@@ -76,6 +77,10 @@ shared: ?tcp_dial.Dialed = null,
 /// Timestamp (ms) of the last find-or-spawn failure, or null. Guards the
 /// cooldown so a broken agent falls back to exec immediately.
 last_failure_ms: ?i64 = null,
+
+/// Whether this app run already wrote/refreshed the HKCU Run autostart entry
+/// (T89h). Once per run: the value only changes when the install moves.
+autostart_done: bool = false,
 
 pub fn init(alloc: Allocator) LocalAgent {
     return .{ .alloc = alloc };
@@ -121,7 +126,83 @@ pub fn sharedConnection(self: *LocalAgent) ?*connection.Connection {
     self.shared = dialed;
     self.last_failure_ms = null;
     log.info("shared local-agent connection ready", .{});
+
+    // Persistence just engaged: make sure the agent also comes back after a
+    // reboot, so sessions rematerialize as relaunchable tombstones (T89h).
+    self.ensureAutostart();
+
     return self.shared.?.conn;
+}
+
+/// Write/refresh the HKCU Run autostart entry for the local agent (T89h) —
+/// the Windows analog of the Mac's per-user LaunchAgent. At sign-in the agent
+/// starts, reads `sessions.json`, and materializes each recorded session as a
+/// relaunchable tombstone, so the app's launch restore (T89f2/T89g) can bring
+/// panes back per `session-relaunch` after a reboot.
+///
+/// Runs only after persistence actually ENGAGED (a successful agent resolve),
+/// once per app run, and refreshes the command in place so the entry tracks
+/// the install the user actually runs. Debug builds never write the release
+/// entry: they use a lineage-suffixed value name and only under the explicit
+/// `GHOZTTY_AGENT_AUTOSTART=force` test hook (mirroring PathInstaller's
+/// gating pattern). `GHOZTTY_AGENT_AUTOSTART=0`/`off` disables entirely.
+/// Best-effort: a registry failure logs and never affects the session.
+fn ensureAutostart(self: *LocalAgent) void {
+    if (comptime builtin.os.tag != .windows) return;
+    if (self.autostart_done) return;
+    self.autostart_done = true;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const gate: ?[]const u8 =
+        std.process.getEnvVarOwned(arena, "GHOZTTY_AGENT_AUTOSTART") catch null;
+    if (gate) |v| {
+        if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off")) return;
+    }
+    const force = if (gate) |v| std.ascii.eqlIgnoreCase(v, "force") else false;
+    if (build_config.is_debug and !force) return;
+
+    self.writeAutostart(arena) catch |err| {
+        log.warn("agent autostart Run-key write failed err={}", .{err});
+        return;
+    };
+    log.info("agent autostart Run key refreshed ({s})", .{autostartValueName()});
+}
+
+/// `GhozttyAgent` for release, `GhozttyAgent-debug` for the debug lineage —
+/// so the force-hook test path can never clobber the user's real entry.
+fn autostartValueName() []const u8 {
+    return if (build_config.is_debug) "GhozttyAgent-debug" else "GhozttyAgent";
+}
+
+fn writeAutostart(self: *LocalAgent, arena: Allocator) !void {
+    const cmd = try self.agentCommandLine(arena);
+
+    var key: w32.HKEY = undefined;
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    );
+    if (w32.RegOpenKeyExW(
+        w32.HKEY_CURRENT_USER,
+        subkey,
+        0,
+        w32.KEY_SET_VALUE,
+        &key,
+    ) != w32.ERROR_SUCCESS) return error.RegOpenFailed;
+    defer _ = w32.RegCloseKey(key);
+
+    const name_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, autostartValueName());
+    const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, cmd);
+    if (w32.RegSetValueExW(
+        key,
+        name_w,
+        0,
+        w32.REG_SZ,
+        @ptrCast(cmd_w.ptr),
+        @intCast((cmd_w.len + 1) * 2),
+    ) != w32.ERROR_SUCCESS) return error.RegSetFailed;
 }
 
 /// Find an existing agent (dial its recorded pipe) or spawn one and poll until
@@ -205,18 +286,7 @@ fn spawnAgent(self: *LocalAgent) !void {
         return error.AgentBinaryNotFound;
     };
 
-    const port_file = try std.fmt.allocPrint(arena, "{s}\\port.json", .{dir});
-    const sessions_file = try std.fmt.allocPrint(arena, "{s}\\sessions.json", .{dir});
-    const pipe = try self.pipeName(arena);
-
-    // Build the command line. Every token is quoted so a path with spaces
-    // (e.g. a roaming profile) survives CreateProcessW's parsing; the values
-    // never contain embedded quotes.
-    const cmd_utf8 = try std.fmt.allocPrint(
-        arena,
-        "\"{s}\" \"--listen-pipe={s}\" \"--port-file={s}\" \"--sessions-file={s}\"",
-        .{ exe, pipe, port_file, sessions_file },
-    );
+    const cmd_utf8 = try self.agentCommandLine(arena);
     const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, cmd_utf8);
 
     var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
@@ -240,6 +310,23 @@ fn spawnAgent(self: *LocalAgent) !void {
     windows.CloseHandle(pi.hProcess);
     windows.CloseHandle(pi.hThread);
     log.info("spawned local agent: {s}", .{cmd_utf8});
+}
+
+/// The full daemon command line — the ONE way this app starts its local
+/// agent, used verbatim by both the on-demand spawn and the HKCU Run
+/// autostart entry (T89h) so reboot and find-or-spawn can never drift apart.
+/// Every token is quoted so a path with spaces (e.g. a roaming profile)
+/// survives CreateProcessW's parsing; the values never contain embedded
+/// quotes.
+fn agentCommandLine(self: *LocalAgent, arena: Allocator) ![]const u8 {
+    const exe = try self.agentBinary(arena);
+    const dir = try self.agentDir(arena);
+    const pipe = try self.pipeName(arena);
+    return std.fmt.allocPrint(
+        arena,
+        "\"{s}\" \"--listen-pipe={s}\" \"--port-file={s}\\port.json\" \"--sessions-file={s}\\sessions.json\"",
+        .{ exe, pipe, dir, dir },
+    );
 }
 
 /// `%LOCALAPPDATA%\ghoztty\local-agent[-debug]` — the per-lineage state dir.
@@ -286,6 +373,23 @@ fn agentBinary(self: *LocalAgent, arena: Allocator) ![]const u8 {
     } else |_| {}
     const exe_dir = try std.fs.selfExeDirPathAlloc(arena);
     return std.fmt.allocPrint(arena, "{s}\\ghoztty-agent.exe", .{exe_dir});
+}
+
+test "agentCommandLine quotes every token and pins the daemon flags" {
+    // The autostart Run key and the on-demand spawn share this composition
+    // (T89h); its shape is load-bearing for both.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var la = LocalAgent.init(std.testing.allocator);
+    const cmd = try la.agentCommandLine(arena.allocator());
+    try std.testing.expect(cmd.len > 0 and cmd[0] == '"' and cmd[cmd.len - 1] == '"');
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "ghoztty-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "\"--listen-pipe=\\\\.\\pipe\\ghoztty-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "\\port.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "\\sessions.json\"") != null);
+    // Exactly 4 quoted tokens => 8 quotes; no embedded quoting surprises.
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, cmd, "\""));
 }
 
 test "pipeName is a valid pipe path and lineage-suffixed" {
