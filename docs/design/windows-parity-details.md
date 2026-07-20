@@ -2999,3 +2999,234 @@ the T29/T30 Mac-side fixes.
 
 *Validation:* Mac build green; merge lands; post-merge `+list` smoke on
 both OSes.
+
+## T88 — Merge latest origin/main + parity analysis (user directive 2026-07-19)
+
+Merged origin/main `8bb5d9845` (154 commits, 137 files, +28k lines) into
+`users/dzearing/windows-amd64` (merge `74322cf05`). Three conflicts, all
+trivial (.gitignore both-added, CLAUDE.md both-added bullets under
+`--shell`, connection.zig test using this branch's mutex-guarded
+`seenChannel()` vs main's u128 atomic). Three post-merge Windows fixes
+(`362d1d4bc`):
+
+- `src/Surface.zig` — the new session-persistence shell-integration
+  switch didn't handle the T27 `.powershell` flavor (compile error);
+  added to the argv-rewrite arm (powershell integration IS an argv
+  rewrite: `-NoExit -Command` dot-sourcing ghostty.ps1).
+- `src/remote/connection.zig` — main's new `relaunch_channel:
+  std.atomic.Value(u128)` doesn't compile on x86_64 (no 128-bit
+  atomics); converted to the same mutex-guarded pattern as
+  `seen_channel`.
+- `src/remote/protocol.zig` — `Hello.encode` used default stringify
+  options, which EMIT null optionals on zig 0.15.2, so main's own new
+  back-compat test ("null build_version is elided") was red; encode now
+  passes `.emit_null_optional_fields = false` (matches `encodeJson` and
+  the documented additive-field contract). This test was failing on main
+  itself — flag to the Mac seat.
+
+**Incoming feature clusters and their Windows disposition:**
+
+1. **Session persistence** (~60 commits; `src/remote/agent/*`,
+   `src/cli/sessions.zig`, macOS LocalAgentManager/manifests/restore,
+   config `session-persistence`/`session-relaunch`, `+sessions`,
+   CLAUDE.md "Session Persistence" + agent-contract sections) → gap:
+   entire feature is macOS-gated (AF_UNIX agent socket, LaunchAgent,
+   peercred). Filed **T89a/T89**.
+2. **Viewer panes** (~15 commits; `--view` on +new-window/+split,
+   src/viewer/* vendored offline renderer assets, macOS WKWebView
+   feature set, `+list` `view:`/`type:viewer` marks, viewer IPC error
+   contract) → gap: no win32 viewer. Filed **T90a/T90**. Note the
+   CLI-side `--view` plumbing and `+list` formatter changes are shared
+   and already on this branch post-merge; win32 IpcHandlers must reject
+   `--view` gracefully until T90 (currently it forwards the arg — the
+   server ignores unknown args, so behavior is "opens a terminal";
+   acceptable until T90, but T90a should pin the interim error).
+3. **Banner markdown upgrades** (Mac `SurfacePaneBanner.swift`:
+   headings, tables incl. headerless + bold-width columns + cell wrap,
+   task-list checkboxes, aligned bullet/ordered lists, `---` rules,
+   block gaps, symmetric padding/content inset, shaded bg sharing the
+   pane tint hue, collapse toggle) → win32 `banner_markdown.zig` +
+   strip overlay support a smaller subset. Filed **T91**.
+4. **Window-level titles** (core `prompt_window_title` action +
+   `PromptTitle.window`; ctrl/cmd+shift+r REBOUND from
+   prompt_surface_title to prompt_window_title; Mac adds separate
+   Change Pane/Tab/Window Title commands; `+rename --title=""` clears
+   the pin; titlebar falls back window → tab → pane) → win32
+   `.prompt_title` handler ignores the payload and always opens the T50
+   window-rename dialog, so ctrl+shift+r still works post-merge (no
+   regression), but the three-level title model + empty-clears-pin need
+   a real port. Filed **T92**.
+5. **Brokered OAuth (BFF)** (relay /oauth/exchange, /renew, /signout +
+   session tokens; Mac client drops the client secret; build-time
+   `-Dgoogle-client-id`) → win32 `+relay-login` still runs the
+   Desktop-app + client-secret flow against Google directly. Filed
+   **T93**.
+6. **Split divider grab handle** (Mac: real ~9pt AppKit hit target) →
+   win32 divider hit target unverified. Filed **T94**.
+7. **Shared-core improvements Windows gets for free** (verify, no port
+   needed): termio RESIZE routed around the bounded mailbox
+   (`eb1876f09`), `+sessions`/CLI arena race fix (`f014f4dc7`),
+   remote-core structured snapshot + delta replay & HELLO
+   hostname/build_version/capability negotiation (used by win32 remote
+   windows too — T56 reconnect should build on `grid_snapshot`),
+   login-shell resolution in IPC resolveShell (`646651574`, POSIX
+   branch only — win32 has its own flavor logic).
+8. **Mac-only platform integration** (AppleScript, App Intents,
+   QuickTerminal restoration, `open -a` / dock drop): no Windows
+   analog planned; viewer file-association piece is folded into T90.
+
+*Validation:* merge committed; Debug GUI build + both test lanes green;
+P1/P2/P3 ALL PASS on-box. Tracker rows T89a–T94 filed with details
+sections; log entry appended.
+
+## T89a — Session persistence on Windows: design (Phase K)
+
+Port the session-persistence feature (CLAUDE.md "Session Persistence"
+section; `docs/design/session-persistence.md`) to Windows. T89a is the
+design pass; it must produce a decided architecture + a split of T89
+into right-sized implementation tasks (the Mac effort took ~60 commits —
+expect T89b..T89x). Design questions to settle, with recommended
+starting points:
+
+- **Transport**: the agent's app-facing socket is 0600 AF_UNIX +
+  SO_PEERCRED. Windows: named pipe (`ghoztty-agent-<user>`) with an
+  owner-only DACL (the IpcServer.zig pattern) OR localhost TCP +
+  token. Named pipe is the natural fit; the agent core already
+  comptime-gates UDS (`c7b372892`).
+- **PTY ownership**: agent owns ConPTY pseudoconsoles; app re-attaches
+  by streaming the agent's ring + grid snapshot (the `grid_snapshot`
+  capability landed in remote-core and is transport-agnostic). The
+  inherited-ignore-^C lesson (T84) applies to agent-spawned children.
+- **Autostart**: LaunchAgent analog = HKCU Run key or per-user
+  scheduled task (survives reboot; scheduled task can restart-on-crash).
+- **Storage**: `%LOCALAPPDATA%\ghoztty\local-agent[-debug]\`
+  (sessions.json, ring snapshots) mirroring the Mac layout.
+- **Config**: honor `session-persistence` / `session-relaunch` on
+  win32 (docs currently say "macOS"; un-gate once the agent works).
+- **Scope order**: local persistence first (survive app quit/upgrade/
+  crash), then reboot scrollback (ring snapshots), then agent lazy
+  upgrade + the wire-contract rules (CLAUDE.md "Agent contract"), then
+  cross-machine browse (Mac T16–T18 are also still open).
+- **Quit flow**: quit must not threaten sessions that survive
+  (`853ec3168`); win32 close-confirm logic needs the same carve-out.
+- **`+sessions`**: the CLI verb is shared; it needs the Windows dial
+  path (named pipe) + `--pid`-style docs.
+- **T82 cleanup** (agent-core tests red on Windows) is a natural
+  prerequisite — fold its fix into the first implementation task.
+
+*Validation:* design section written here + T89 split into sized
+subtask rows; no code.
+
+## T89 — Session persistence on Windows: implement (Phase K)
+
+Placeholder for the implementation series; T89a will split it. End
+state: parity with CLAUDE.md "Session Persistence" — new local
+windows/tabs/splits run under a Windows `ghoztty-agent`, survive app
+quit/crash/upgrade with same-PID re-attach (layout, titles, cwd,
+scrollback), reboot relaunch per `session-relaunch`, `+sessions` works,
+agent upgrade is lazy + non-destructive, and the E2E harness
+(`scripts/e2e/session-persistence.py` or a PS port) passes on-box.
+
+*Validation:* per-subtask scripts + an on-box kill/upgrade/reboot E2E;
+both lanes + P1–P3 stay green.
+
+## T90a — Viewer panes on Windows: design (Phase K)
+
+Port viewer panes (CLAUDE.md "Viewer Panes") to win32. Mac uses
+WKWebView + a bundled offline renderer (`src/viewer/viewer.html` +
+vendored markdown-it/highlight.js/DOMPurify — already shared assets on
+this branch). Windows: **WebView2** is the recommended engine (ships on
+Win11; runtime detection + graceful fallback error pane when absent).
+Design must cover: PaneView-equivalent in the win32 split tree (panes
+are currently all terminal surfaces — the SplitTree leaf needs a
+viewer variant, mirroring Mac's `SplitTree<PaneView>` retype); the
+custom-scheme/virtual-host mapping for the offline renderer; `--view`
+resolution (shared CLI already rewrites relative paths); live-reload
+file watcher (ReadDirectoryChangesW, atomic-save survival); link
+routing policy; `+list` `view:` prefix + `"type":"viewer"`/`"url"`
+JSON; `+read`/`+send-keys`/`+set-state`/`+set-banner` → "is a viewer
+pane, not a terminal" exit 1; `+close` never prompts; focus/zoom/
+equalize/nav keybinds with viewer focus; session-persistence restore
+(depends T89 ordering — viewers restore by re-opening); `.md` file
+association (interim: skip installer wiring, palette + CLI only);
+palette open-in-pane commands; interim behavior for `--view` before
+T90 lands (explicit "viewers not yet supported on Windows" error
+beats silently opening a terminal — pin in design).
+
+*Validation:* design section + T90 split into sized subtasks; no code.
+
+## T90 — Viewer panes on Windows: implement (Phase K)
+
+Placeholder; T90a splits it. End state: `+new-window --view` /
+`+split --view` render markdown/text/websites in win32 panes per
+CLAUDE.md, with live reload, link routing, IPC contract, and palette
+commands; validated by a `viewer-panes.ps1` acceptance script.
+
+*Validation:* `viewer-panes.ps1` ALL PASS ×3; P1–P3 + both lanes green.
+
+## T91 — Banner markdown parity with Mac (Phase I)
+
+Mac's pane banner grew: headings; tables (GFM + headerless, columns
+sized to BOLD render width, long-cell wrap); task-list checkboxes
+(native look); aligned bullet/ordered lists (incl. checkbox-led list
+leading gap + consistent text-line block gaps); `---` horizontal-rule
+separators; symmetric padding + content inset; shaded background that
+shares the pane tint hue (T67 tint exists on win32); a collapse
+toggle. Win32 (`src/apprt/win32/banner_markdown.zig` + the T35 strip
+overlay) supports bold/italic/underline/code/links/multi-line only.
+Port the delta into the pure zig parser + owner-drawn strip (unit
+tests in both lanes for parsing/layout math;6-line display cap may
+need revisiting for tables/collapse).
+
+*Validation:* extend `pane-banner.ps1` (table/checkbox/heading/hr/
+collapse assertions) ALL PASS ×3; unit tests green in both lanes.
+
+## T92 — Window-level titles: three-level model + pin semantics (Phase I)
+
+Port the Mac window-title model: `prompt_window_title` (ctrl+shift+r —
+the default bind CHANGED upstream from prompt_surface_title) pins the
+window titlebar over tab/pane titles until cleared (empty input
+clears); titlebar precedence window-pin → active tab title → active
+pane title; separate palette commands "Change Window Title…",
+"Change Tab Title…", "Change Pane Title…" (win32 palette currently
+only has the T50 "Rename Window"); `+rename --title=""` must CLEAR
+the pin (verify win32 IpcHandlers — Mac fixed this in `9c7665354`);
+win32 `.prompt_title` must branch on the `PromptTitle` payload
+(surface/tab/window) instead of ignoring it. Post-merge state: no
+regression (ctrl+shift+r still opens the T50 dialog), but all three
+prompts funnel to the same window-level override.
+
+*Validation:* new `window-title.ps1` — pin wins over OSC title, empty
+clears, tab/pane prompts set their own levels, `+rename` empty-title
+clear; ALL PASS ×3.
+
+## T93 — Brokered OAuth (BFF) for Windows relay sign-in (Phase G)
+
+Mac moved to relay-brokered OAuth: the app never holds the Google
+client secret; it exchanges the auth code at the relay
+(`/oauth/exchange`), stores an opaque session token, renews via
+`/renew`, signs out via `/signout`; the Google client id is baked at
+build time (`-Dgoogle-client-id`, release workflow bakes it into the
+DMG). Win32 `+relay-login` still does the direct Desktop-app +
+client-secret flow and DPAPI-stores the refresh token. Port: reuse
+the loopback-redirect browser flow but exchange at the relay;
+DPAPI-store the session token + email; token-resolution order in
+`+new-remote-window` unchanged (explicit `--token` → account →
+`GHOSTTY_RELAY_TOKEN`); `+relay-logout` calls `/signout`; bake the
+client id via the existing build option on Windows release builds;
+keep reading legacy DPAPI refresh-token stores (or force one
+re-login with a clear message — decide in-task).
+
+*Validation:* extend `ipc-relay-login.ps1` fake-issuer harness with
+brokered endpoints; ALL PASS ×3.
+
+## T94 — Split divider grab-handle hit target (Phase I)
+
+Mac replaced the hairline divider hit area with a real ~9pt AppKit
+grab handle (`001834466`). Verify the win32 split divider drag hit
+target (regular splits, not hero) and widen to a comparable
+DPI-scaled band (~9 DIP) if it's hairline-width today; cursor
+feedback (SIZEWE/SIZENS) over the whole band.
+
+*Validation:* `split-divider.ps1` gains a hit-target assertion
+(drag from ±4 DIP off the divider line still resizes); ALL PASS ×3.

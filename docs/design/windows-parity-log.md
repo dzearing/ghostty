@@ -9,6 +9,19 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-19 (on-box, 25) — T88 DONE: merged origin/main 8bb5d9845 (154
+  commits — session persistence, viewer panes, banner markdown upgrades,
+  brokered OAuth, window-level titles) as 74322cf05; 3 trivial conflicts.
+  Post-merge fixes (362d1d4bc): .powershell arm in the new
+  shell-integration switch, u128 atomic → mutex in connection.zig's test
+  agent, Hello.encode null-elision (that test is RED ON MAIN — flag for
+  the Mac seat via T87). Both lanes + Debug GUI + P1–P3 ALL PASS. Parity
+  gaps filed: T89a/T89 (session persistence port), T90a/T90 (viewer
+  panes port), T91 (banner markdown), T92 (window-level titles), T93
+  (brokered OAuth), T94 (divider hit target). Surprise: ctrl+shift+r was
+  rebound upstream to prompt_window_title, but win32 ignores the
+  PromptTitle payload so the T50 dialog still opens — no regression.
+  Next: T91.
 - 2026-07-19 (on-box, 24) — T35 DONE (sticky pane banner, full Mac
   parity per-pane): pure banner_markdown.zig (14 tests) + BannerOverlay
   layered strip (clickable links) + BannerDialog editor (ctrl+shift+b,

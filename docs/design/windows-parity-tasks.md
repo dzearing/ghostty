@@ -152,9 +152,13 @@ Work these first, in order, before falling back to first-todo-in-table:
    build + merge to main).
 12. ~~T35~~ — DONE 2026-07-19 (sticky pane banner: IPC + OSC 7778 + strip
    overlay + ctrl+shift+b editor; `pane-banner.ps1` ALL PASS (30) ×3).
-   **Next on-box: T88 then T86** (T29/T30/T87 are Mac-seat; T28's
-   remainder is also open). T88 (filed 2026-07-19, user directive): sync
-   with latest main + analyze all incoming changes + file parity tasks.
+13. ~~T88~~ — DONE 2026-07-19 (merged main 8bb5d9845; gaps filed as
+   T89a–T94). **Next on-box, in order: T91 → T92 → T94 → T86 → T93 →
+   T89a → T90a** (small user-visible parity first, then the two big
+   design+port series; T29/T30/T87 are Mac-seat; T28's remainder and
+   T82 fold into T89a). Flag for the Mac seat: main's
+   `Hello.encode`/build_version elision test was red on main itself —
+   fixed on this branch (362d1d4bc), needs to flow back via T87.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -260,7 +264,15 @@ One line per row. Full spec + validation + evidence per task:
 | T85 | FIX: new windows don't remember size — done 2026-07-19: outer size + maximized flag persisted on user-interactive changes only (WM_EXITSIZEMOVE + max/restore transitions) to `%LOCALAPPDATA%\ghoztty\window_placement` (`-debug` for Debug builds); creation uses config > memory (work-area-clamped) > 800×600; `maximize` config now honored; reset stays the escape hatch; `window-size-memory.ps1` ALL PASS (20) ×3, `reset-window-size.ps1` (focus-free rewrite) ALL PASS (10), P1–P3 + both lanes green | I | — | done | 67b0f24a5 |
 | T86 | Harden foreground grab in the ~20 other kb-injection scripts (attach-to-fg-thread + Alt tap, the T25 hero-mode.ps1 fix) — unattended runs abort when a browser owns foreground | — | — | todo | — |
 | T87 | Mac seat: macOS regression build green + merge to main (T25 tail, per working agreements); natural moment for a live relay dial + T29/T30 | — | T25 | todo | — |
-| T88 | Rebase/merge latest origin/main into this branch; analyze EVERY incoming change (features, actions, config keys, IPC verbs, fixes) and file a parity task per gap so the Windows build tracks main (user directive 2026-07-19). Deliverable: branch on latest main, both lanes + P1–P3 green, new T-rows for each Mac-side feature Windows lacks | — | — | in-progress | — |
+| T88 | Merge latest origin/main — done 2026-07-19: merged 8bb5d9845 (154 commits: session persistence, viewer panes, banner markdown, brokered OAuth, window titles) as 74322cf05; 3 post-merge Windows fixes (362d1d4bc: .powershell in the new shell-integration switch, u128-atomic → mutex in connection.zig test agent, Hello.encode null-elision — that test was red on main itself, flag to Mac seat); both lanes + Debug GUI + P1–P3 green; parity gaps filed as T89a–T94 | — | — | done | 74322cf05.. |
+| T89a | Session persistence on Windows: DESIGN (agent transport = named pipe rec., ConPTY ownership, Run-key/task autostart, storage layout, config un-gating, quit-flow carve-out, +sessions dial, T82 fold-in) + split T89 into sized subtasks | K | T88 | todo | — |
+| T89 | Session persistence on Windows: IMPLEMENT (split by T89a) — agent-owned ConPTYs survive app quit/crash/upgrade w/ same-PID re-attach, reboot relaunch, +sessions, lazy agent upgrade | K | T89a | todo | — |
+| T90a | Viewer panes on Windows: DESIGN (WebView2 rec., split-tree viewer leaf, offline renderer scheme, live reload, link routing, IPC contract, interim --view error) + split T90 | K | T88 | todo | — |
+| T90 | Viewer panes on Windows: IMPLEMENT (split by T90a) — --view markdown/text/website panes per CLAUDE.md | K | T90a | todo | — |
+| T91 | Banner markdown parity: headings, tables (headerless/bold-width/wrap), checkboxes, aligned lists, hr, padding/inset, tint-hue bg, collapse toggle in banner_markdown.zig + strip | I | T88 | todo | — |
+| T92 | Window-level titles: PromptTitle payload branch (pane/tab/window prompts), pin precedence window→tab→pane, empty/+rename --title="" clears pin, palette entries | I | T88 | todo | — |
+| T93 | Brokered OAuth for Windows relay sign-in: exchange at relay, session token in DPAPI, no client secret, -Dgoogle-client-id bake, /signout on logout | G | T88 | todo | — |
+| T94 | Split divider grab-handle hit target (~9 DIP band + cursor feedback) parity check | I | T88 | todo | — |
 | T84 | FIX: ctrl+c never interrupted ConPTY children — root cause: the GUI process inherited the ignore-^C flag (set by CREATE_NEW_PROCESS_GROUP anywhere up the launcher chain — scripts, CI, `+new-window` auto-launch from automation) and every ConPTY shell inherited it in turn; conhost's 0x03→CTRL_C_EVENT cooking was never broken. Fix: clear the flag at App.init via `SetConsoleCtrlHandler(null, 0)`. Probe scenarios added to conpty_smoke (`--ctrlc`/`--ctrlc-win32`/`--ctrlc-anon`/`--ctrlc-mode`/`--ctrlc-host`/`--ctrlc-self`/`--report-ctrlc`). `keybinds-t01.ps1` ALL PASS (23) incl. the SIGINT assert. See details | I | — | done | 3b085a661 |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
