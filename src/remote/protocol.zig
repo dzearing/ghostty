@@ -579,6 +579,17 @@ pub const Attached = struct {
     /// .alive`; see `Opened.tty`). Additive/optional (older agents omit it).
     tty: ?[]const u8 = null,
 
+    /// The geometry the session's retained ring tail was drawn at BEFORE this
+    /// attach resized the pty to the client's seed (set with `status == .alive`;
+    /// 0 = unknown). The raw ring replay is geometry-bound VT — conhost/pty
+    /// paints with in-place redraws and bottom-row scrolls that only land
+    /// correctly at the size they were emitted at — so the client replays at
+    /// THIS geometry and then reflows to the live pane (T106; mirrors
+    /// `Relaunched.replay_cols`). Additive/optional (older agents omit them →
+    /// 0 → the client keeps today's live-width replay).
+    replay_rows: u16 = 0,
+    replay_cols: u16 = 0,
+
     pub const AttachStatus = enum { alive, dead, not_found };
 };
 

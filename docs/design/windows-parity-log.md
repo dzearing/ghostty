@@ -9,6 +9,20 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 47) — T106 DONE (visible relaunch lost re-attached
+  scrollback). Root cause was NOT the suspected repaint race: byte dumps
+  proved visible/minimized relaunches feed IDENTICAL streams; the loss was
+  parse geometry (raw ring replay is geometry-bound VT; at the restored
+  window's transient grid the recorded scrolls never fire, so conhost's
+  post-attach ESC[2J erases everything). Fix: additive
+  `Attached.replay_rows/cols` (agent reports pre-attach geometry) + client
+  replay-at-capture-geometry with reflow-to-live exactly at
+  `snapshot_at_offset`, + `captureFrame` uses rcNormalPosition for iconic
+  windows (manifest recorded the −32000 stub). session-reattach F5 flipped
+  to VISIBLE (real-world style; F8 was the RED oracle) ALL PASS ×3; lanes +
+  test-agent ×3 + P1–P3 + session-relaunch/open/close green. Filed T109
+  (mixed-geometry ring → WP-D3 persisted snapshots endgame). Next per
+  item-20 queue: T89i.
 - 2026-07-20 (on-box, 46) — T105 DONE (restore focus ping-pong live-lock,
   user-hit on the delivered release; an earlier session left the fix
   uncommitted — this session validated + landed it). T89h delivery

@@ -569,6 +569,12 @@ pub const AttachOutcome = struct {
     channel: u128 = 0,
     rows: u16,
     cols: u16,
+    /// The geometry the session's ring tail was drawn at before this attach
+    /// resized it (0 = unknown / older agent). The caller replays the gap-fill
+    /// at this geometry and then reflows to the live pane so the geometry-bound
+    /// raw ring bytes land correctly (T106; mirrors `RelaunchOutcome.replay_cols`).
+    replay_rows: u16 = 0,
+    replay_cols: u16 = 0,
     /// Duped from the reply and owned here (null when the reply omitted them).
     cwd: ?[]u8,
     title: ?[]u8,
@@ -1863,6 +1869,8 @@ pub const Connection = struct {
             .channel = id,
             .rows = a.rows,
             .cols = a.cols,
+            .replay_rows = a.replay_rows,
+            .replay_cols = a.replay_cols,
             .cwd = cwd,
             .title = title,
             .alloc = self.alloc,

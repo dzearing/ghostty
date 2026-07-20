@@ -512,10 +512,16 @@ Assert "F4 the agent kept all 3 sessions alive after the app died" (
     $agentIds.Count -eq 3 -and ($beforeIds | Where-Object { $agentIds -contains $_ }).Count -eq 3)
 
 # Relaunch (same LOCALAPPDATA + agent bin). Restore must suppress the blank
-# startup window and rebuild both windows by re-ATTACHing.
+# startup window and rebuild both windows by re-ATTACHing. VISIBLE relaunch on
+# purpose (T106): real relaunches are visible, and pre-T106 the replayed
+# scrollback only survived a minimized cycle (the raw ring replay parsed at the
+# restored window's transient/live grid instead of the geometry it was drawn
+# at, so the recorded scrolls never pushed content into scrollback and
+# conhost's post-attach ESC[2J fresh-paint erased it). F8 is the oracle:
+# baseline-proven RED on a visible relaunch pre-fix, green post-fix.
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-$relaunched = Start-Process -FilePath $Exe -WindowStyle Minimized -PassThru
+$relaunched = Start-Process -FilePath $Exe -PassThru
 
 $winCount = Wait-Windows $tmp 'f-post' 2 30
 Assert "F5 relaunch restored exactly two windows (no extra blank)" ($winCount -eq 2)
@@ -565,9 +571,8 @@ Assert "F9 the restored window's title pin came back" $f9
 # pre-fix, 0/0 post-fix). Do a SECOND app-only kill + relaunch, this time
 # visible, grabbing foreground onto the first restored window the moment it
 # exists, and sample before any Run-Cli cmd.exe perturbs activation. The
-# scrollback asserts stay in the minimized F5-F9 cycle above: a visible
-# relaunch currently loses the replayed scrollback (pre-existing, tracked as
-# T106) — THIS cycle asserts focus stability only.
+# scrollback asserts live in the F5-F9 cycle above (visible since T106) —
+# THIS cycle asserts focus stability only.
 Stop-AppOnly
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe

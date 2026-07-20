@@ -844,8 +844,12 @@ pub const Server = struct {
 
         // Capture the snapshot anchor S (= current outbound offset; a real grid
         // snapshot is `// TODO(snapshot)`). Resume the session's dims to the
-        // attaching client's geometry.
+        // attaching client's geometry — but FIRST record the geometry the ring
+        // tail was drawn at, so the reply can tell the client what size to
+        // replay at (T106; see protocol.Attached.replay_rows).
         const now = self.clock.now();
+        const replay_rows = s.rows;
+        const replay_cols = s.cols;
         s.rows = att.rows;
         s.cols = att.cols;
         s.last_activity_ms = now;
@@ -871,6 +875,8 @@ pub const Server = struct {
             // store lock, so borrowing the session's strings is safe.
             .pid = s.pid,
             .tty = if (s.tty) |t| t else null,
+            .replay_rows = replay_rows,
+            .replay_cols = replay_cols,
         }) catch {};
 
         // Gap-fill / CATCH-UP (§7.3) + grid snapshot (FIX 2). Replay everything the
@@ -2906,6 +2912,47 @@ test "ATTACH gap-fills retained ring bytes in (L, S]" {
     const dp = try protocol.DataPayload.decode(d.?.payload);
     try testing.expectEqual(@as(u64, 4), dp.byte_offset);
     try testing.expectEqualSlices(u8, "EFGHIJ", dp.bytes);
+}
+
+test "ATTACHED reports the pre-attach capture geometry (replay_rows/cols, T106)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(11);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // Open at 5x20 — the geometry the retained ring bytes are drawn at.
+    const o = try doOpen(&h, .{ .rows = 5, .cols = 20 });
+    h.server.onChildOutput(o.channel, "hello");
+    _ = try h.client.nextData(); // drain live
+
+    // Re-attach with a DIFFERENT seed geometry: `rows`/`cols` echo the new
+    // seed (the attach applied it), while `replay_rows`/`replay_cols` carry
+    // the pre-attach geometry so the client can replay the geometry-bound
+    // ring bytes at the size they were drawn at (T106).
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 40,
+        .cols = 120,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+    try testing.expectEqual(@as(u16, 40), ap.value.rows);
+    try testing.expectEqual(@as(u16, 120), ap.value.cols);
+    try testing.expectEqual(@as(u16, 5), ap.value.replay_rows);
+    try testing.expectEqual(@as(u16, 20), ap.value.replay_cols);
+    _ = try h.client.nextData(); // drain the full-ring gap-fill replay
 }
 
 test "ATTACH to unknown session → not_found" {

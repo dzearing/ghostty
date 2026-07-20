@@ -4869,26 +4869,63 @@ scrollback), T107 (focus-defer tail reds).
 
 ## T106 — FIX: visible relaunch loses re-attached scrollback
 
-Found by T105 validation, 2026-07-20; PRE-EXISTING (identical on pre/post
-T105 binaries, with and without any foreground grab). With the exact same
-manifest and agent state: minimized relaunch → F8 finds the pre-quit marker
-in the re-attached split pane (ring replay lands); visible relaunch → the
-pane's terminal is EMPTY (`+read --lines=2000` returns just a prompt;
-7 bytes) even though F7 proves the same sessions ATTACHed (no re-OPEN) and
-`+sessions` shows them attached. Users always relaunch visible → real
-scrollback loss the minimized harness cycle can't see.
+DONE 2026-07-20. Found by T105 validation; PRE-EXISTING (identical on
+pre/post T105 binaries).
 
-Suspects (unverified): the visible restore path resizes/repaints the pane
-after (or racing) the ring replay — ConPTY repaint emitting erase
-sequences that wipe the just-replayed core scrollback, a transient
-default-size → manifest-frame double resize, or replay ordered before the
-surface reaches its final geometry. Note the manifest frame itself was
-captured from a minimized window (x/y −32000, 199×104 observed) — the
-capture-normal-rect question is part of this task.
+**Root cause (byte-dump proven, not the suspected repaint race):** an
+env-gated instrumentation dump of every byte the Remote backend feeds the
+parser showed the visible and minimized relaunches receive an IDENTICAL
+stream — full ring replay (marker present) followed by conhost's post-attach
+fresh-paint (`ESC[H ESC[2J` + viewport redraw; no ED3/RIS anywhere). The
+outcome differs only by the GRID GEOMETRY at parse time. The agent's raw
+ring bytes are geometry-bound VT: conhost paints with `ESC[H` re-homes and
+bottom-row line feeds whose scroll semantics only hold at the geometry they
+were emitted at. Minimized relaunch parsed the replay at the capture
+geometry (1×1 in the harness) → the recorded scrolls replayed faithfully →
+content reached scrollback → the later ED2 only cleared the screen (the
+pre-kill state, exactly). Visible relaunch parsed the same bytes at the
+restored window's transient ~21×64 grid → the re-homed paints never reached
+the bottom row, nothing ever scrolled into scrollback → the ED2 fresh-paint
+erased everything (7-byte `+read`).
 
-Repro: flip `session-reattach.ps1`'s F5 relaunch from `-WindowStyle
-Minimized` to visible and watch F8 fail. Fix should make F8 pass in BOTH
-styles — then make the visible style the default cycle.
+**Fix (mirrors the §5.4 relaunch smear fix; additive protocol per the
+agent-contract rules):**
+- Agent: `handleAttach` records the session's rows/cols BEFORE applying the
+  client seed and returns them as NEW additive `Attached.replay_rows/
+  replay_cols` (old app ignores them; old agent omits them → 0 → client
+  keeps today's live-width replay). Agent-floor test: "ATTACHED reports the
+  pre-attach capture geometry".
+- Client (`Remote.zig`): on a full-ring attach (`attach_offset == 0`,
+  the win32 restore path) with a known, differing capture geometry,
+  `threadEnter` reflows the local grid to the capture geometry before the
+  first drain and arms `ThreadData.attach_reflow_target =
+  snapshot_at_offset`; `drainRing` reflows back to the live grid exactly
+  when `applied_bytes` crosses that target (splitting a straddling chunk at
+  the boundary), so replay parses at capture geometry and conhost's
+  post-attach repaint + live output parse at the live grid. Known caveat:
+  with an evicted ring head (base > 0) the completion lags by the evicted
+  span (applied counts fed bytes only) — transient, self-corrects on the
+  next output/resize.
+- Manifest capture-normal-rect fix (`App.captureFrame`): an iconic window
+  now records `GetWindowPlacement().rcNormalPosition` instead of the
+  −32000,−32000 caption-stub `GetWindowRect` (which restore faithfully
+  rebuilt as an offscreen sliver).
+
+**Known limitation (filed as T109):** the ring is a concatenation of
+segments drawn at DIFFERENT geometries (every attach resize appends a new
+conhost fresh-paint at the new size). Single-geometry replay cannot be
+faithful for a mixed ring — the fix anchors to the agent's last-drawn
+geometry (deterministic; right for the stable-geometry real-world case and
+for the last segment), where the old behavior anchored to the client's
+arbitrary transient grid. The principled endgame is WP-D3 persisted
+snapshots on Windows (attach_offset > 0 ⇒ no full-ring replay at all).
+
+**Validation:** ad-hoc repro (`t106-repro.ps1`, scratchpad) baseline-proved
+visible=LOST/minimized=PRESENT pre-fix and visible=PRESENT post-fix with
+grid-transition sidecar dumps; `session-reattach.ps1` F5 cycle flipped to
+VISIBLE (the real-world style — F8 was the RED oracle pre-fix) ALL PASS ×3;
+session-relaunch/session-open/session-close ALL PASS; both app lanes,
+`test-agent` ×3, P1–P3 green.
 
 ## T107 — focus-defer.ps1 tail asserts red on the box
 
@@ -4919,3 +4956,30 @@ app was mid-upgrade lineage; the capture debounce timer starved while the GUI
 thread was consumed by the ping-pong (plausible — WM_TIMER is low priority
 vs the posted-message storm). Post-T105 verification steps are in the state
 table row. Prune: `+sessions` → close leaked ids.
+
+## T109 — mixed-geometry ring replay / WP-D3 persisted snapshots on Windows
+
+Filed from T106 (2026-07-20). The agent's per-session ring is a
+concatenation of segments drawn at DIFFERENT geometries: every ATTACH
+applies the client's seed size to the ConPTY, and conhost appends a fresh
+`ESC[H ESC[2J` + viewport repaint at each new size. A full-ring replay
+parsed at any single geometry is faithful only for the segments drawn at
+that geometry — content from other-geometry segments can fail to reach
+scrollback before a later in-ring ED2 erases it. T106 anchors the replay to
+the agent's LAST-drawn geometry (`Attached.replay_rows/cols`) — right for
+the stable-geometry common case and proven by the visible-relaunch oracle —
+but a ring spanning geometry changes (e.g. repeated relaunches at different
+window sizes) remains lossy for its older segments (demonstrated by the
+T106 repro's phase-B chain: visible-capture → minimized relaunch lost a
+marker recorded two geometries earlier).
+
+The principled fix is the Mac WP-D3 design on Windows: the app persists a
+structured screen+scrollback snapshot per pane (debounced, alongside the
+T89f manifest) and re-attaches at `attach_offset = snapshot offset`, so the
+agent gap-fills only the small `(offset, S]` tail and no full-ring raw
+replay happens at all. The client-side machinery (restore_snapshot paint,
+`applied_bytes` tracking, discard watermark) already exists in
+`Remote.zig`/`connection.zig` — the Windows work is capturing/persisting
+the snapshot + threading it through the restore Overrides. Also folds in
+T106's completion-lag caveat (evicted ring head ⇒ late reflow-to-live).
+Priority: after publish readiness — T106 covers the user-visible loss.

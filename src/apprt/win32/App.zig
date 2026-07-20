@@ -901,15 +901,18 @@ const FrameCapture = struct {
     maximized: bool = false,
 };
 
-/// Read a window's outer rect + maximized flag (T89f). For a maximized window
-/// this is the RESTORED rect (`rcNormalPosition`) so restore comes back to a
-/// sane size before re-maximizing — the same split `persistPlacement` (T85)
-/// uses. Null frame ⇒ the query failed / no hwnd; restore falls back to config.
+/// Read a window's outer rect + maximized flag (T89f). For a maximized OR
+/// minimized window this is the RESTORED rect (`rcNormalPosition`) so restore
+/// comes back to a sane size — the same split `persistPlacement` (T85) uses.
+/// `GetWindowRect` on an iconic window returns the −32000,−32000 caption-stub
+/// rect, which a later restore would faithfully rebuild as an offscreen sliver
+/// (T106). Null frame ⇒ the query failed / no hwnd; restore falls back to
+/// config.
 fn captureFrame(hwnd_opt: ?w32.HWND) FrameCapture {
     const hwnd = hwnd_opt orelse return .{};
     const maximized = w32.IsZoomed(hwnd) != 0;
     var r: w32.RECT = undefined;
-    if (maximized) {
+    if (maximized or w32.IsIconic(hwnd) != 0) {
         var wp: w32.WINDOWPLACEMENT = undefined;
         wp.length = @sizeOf(w32.WINDOWPLACEMENT);
         if (w32.GetWindowPlacement(hwnd, &wp) == 0) return .{ .maximized = maximized };

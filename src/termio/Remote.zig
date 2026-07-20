@@ -435,6 +435,14 @@ pub fn threadEnter(
     // don't smear (§5.4). Only meaningful with `relaunch_replayed`.
     var replay_cols: u16 = 0;
     var replay_rows: u16 = 0;
+    // Set on a live ATTACH from the agent-reported pre-attach geometry + ring
+    // head (T106): the raw ring replay is geometry-bound VT, so we replay at
+    // the geometry it was drawn at and reflow to the live grid once the drain
+    // has applied everything up to `attach_snapshot_at`. 0 = unknown/older
+    // agent → keep today's live-width replay.
+    var attach_replay_rows: u16 = 0;
+    var attach_replay_cols: u16 = 0;
+    var attach_snapshot_at: u64 = 0;
 
     // Open a new session or attach to an existing one to obtain our pane.
     const pane: *connection.Pane = if (self.session_id) |sid| pane: {
@@ -470,7 +478,12 @@ pub fn threadEnter(
             outcome = try self.conn.attachChannelCancellable(sid, rows, cols, self.attach_offset, true, &self.canceller);
         }
         defer outcome.deinit();
-        if (outcome.pane) |p| break :pane p;
+        if (outcome.pane) |p| {
+            attach_replay_rows = outcome.replay_rows;
+            attach_replay_cols = outcome.replay_cols;
+            attach_snapshot_at = outcome.snapshot_at_offset;
+            break :pane p;
+        }
 
         // No live pane. A DEAD-but-relaunchable tombstone means the AGENT itself
         // restarted (a reboot or an agent upgrade) and materialized this session
@@ -660,6 +673,28 @@ pub fn threadEnter(
     const live_rows: u16 = @intCast(@min(self.grid_size.rows, std.math.maxInt(u16)));
     const reflow_replay = relaunch_replayed and replay_cols != 0 and replay_cols != live_cols;
     if (reflow_replay) io.reflowLocalGrid(replay_cols, live_rows);
+
+    // T106: geometry-faithful ATTACH replay. On a full-ring re-attach
+    // (`attach_offset == 0` — the win32 restore path, no persisted snapshot)
+    // the agent's raw ring bytes are geometry-bound VT: conhost paints with
+    // `ESC[H` re-homes and bottom-row line feeds whose scroll (and thus
+    // scrollback) semantics only hold at the geometry they were emitted at.
+    // Parsed into a grid with MORE rows, the recorded scrolls never trigger, the
+    // replayed content stays on the visible screen, and conhost's post-attach
+    // fresh-paint (`ESC[H ESC[2J` + viewport redraw) erases all of it — total
+    // scrollback loss (the visible-relaunch bug). So: reflow the local grid to
+    // the agent-reported capture geometry first, and have the drain reflow back
+    // to the live grid exactly when the replay is fully applied (`applied_bytes`
+    // reaches the ring head S carried by ATTACHED). An older agent omits the
+    // capture geometry (0) → keep today's live-width replay.
+    if (!did_relaunch and !self.awaiting_relaunch and
+        self.attach_offset == 0 and attach_snapshot_at > 0 and
+        attach_replay_cols != 0 and attach_replay_rows != 0 and
+        (attach_replay_cols != live_cols or attach_replay_rows != live_rows))
+    {
+        io.reflowLocalGrid(attach_replay_cols, attach_replay_rows);
+        rd.attach_reflow_target = attach_snapshot_at;
+    }
 
     // WP-D3: paint the persisted structured snapshot for an instant, correctly
     // sized frame BEFORE the agent's delta replay lands on top. Applied only on
@@ -958,6 +993,20 @@ fn wakeFromDemux(ctx: *anyopaque) void {
         log.warn("error notifying ring async err={}", .{err});
 }
 
+/// T106: the attach replay is fully applied — reflow the local grid from the
+/// capture geometry back to the CURRENT live grid (read fresh from the backend,
+/// so a user resize that raced the replay wins) and disarm. The authoritative
+/// post-attach RESIZE already re-asserted the pty geometry in `threadEnter`, so
+/// conhost's repaint of the final viewport follows in the stream and now parses
+/// at the matching grid.
+fn finishAttachReflow(rd: *ThreadData) void {
+    rd.attach_reflow_target = 0;
+    const remote = &rd.io.backend.remote;
+    const cols: u16 = @intCast(@min(remote.grid_size.columns, std.math.maxInt(u16)));
+    const rows: u16 = @intCast(@min(remote.grid_size.rows, std.math.maxInt(u16)));
+    rd.io.reflowLocalGrid(cols, rows);
+}
+
 /// xev callback: the demux thread woke us because bytes landed in the ring. Drain
 /// the whole ring and feed `processOutput` on this thread (the same call Exec's
 /// `ReadThread` makes, self-locking the renderer mutex). Re-arm to keep waiting.
@@ -1009,8 +1058,28 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
         // a consistent (grid, offset) pair. This counts every byte fed to the
         // terminal (the agent's `(attach_offset, S]` gap-fill and then live DATA),
         // so `appliedOffset()` tracks the true absolute stream position.
-        @call(.always_inline, termio.Termio.processOutputTracked, .{
-            rd.io, buf[0..res.read], &rd.io.backend.remote.applied_bytes,
+        //
+        // T106: while an attach-replay reflow is pending, everything at/below
+        // `attach_reflow_target` must parse at the capture geometry and
+        // everything above it (conhost's post-attach repaint + live output) at
+        // the live grid — so a chunk that straddles the boundary is split and
+        // the reflow-back runs exactly at the boundary.
+        var chunk: []const u8 = buf[0..res.read];
+        if (rd.attach_reflow_target > 0) {
+            const applied = rd.io.backend.remote.applied_bytes.load(.monotonic);
+            if (applied >= rd.attach_reflow_target) {
+                finishAttachReflow(rd);
+            } else if (applied + chunk.len > rd.attach_reflow_target) {
+                const head: usize = @intCast(rd.attach_reflow_target - applied);
+                @call(.always_inline, termio.Termio.processOutputTracked, .{
+                    rd.io, chunk[0..head], &rd.io.backend.remote.applied_bytes,
+                });
+                finishAttachReflow(rd);
+                chunk = chunk[head..];
+            }
+        }
+        if (chunk.len > 0) @call(.always_inline, termio.Termio.processOutputTracked, .{
+            rd.io, chunk, &rd.io.backend.remote.applied_bytes,
         });
 
         if (res.send_resume) rd.conn.sendFlowResume(ch.id) catch |err|
@@ -1088,6 +1157,15 @@ pub const ThreadData = struct {
 
     /// Set true once the agent reports the session exited (stops further input).
     exited: bool = false,
+
+    /// T106 geometry-faithful attach replay: nonzero while the local grid is
+    /// reflowed to the agent-reported capture geometry so the raw ring replay
+    /// lands correctly. Holds the absolute stream offset of the replay's end
+    /// (ATTACHED's `snapshot_at_offset`); once `applied_bytes` reaches it the
+    /// drain reflows back to the live grid and clears this. Only ever set on
+    /// the full-ring attach path (`attach_offset == 0`), so `applied_bytes`
+    /// IS the absolute stream offset. Touched only on the pane's IO thread.
+    attach_reflow_target: u64 = 0,
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         _ = alloc;
