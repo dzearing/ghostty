@@ -432,6 +432,10 @@ extension AppDelegate {
             // Seed the last-synced pane title; live OSC titles (if the
             // session emits them) take over after re-attach.
             if let title = leaf.title, !title.isEmpty { view.setTitle(title) }
+            // Re-apply the persisted sticky banner: app-side overlay state,
+            // not part of the agent's PTY replay, so this is its only way
+            // back after a relaunch.
+            if let banner = leaf.banner, !banner.isEmpty { view.paneBanner = banner }
             return PaneView(surface: view)
         }
     }

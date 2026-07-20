@@ -1867,7 +1867,8 @@ class IPCServer {
                 tty: view.surfaceModel?.ttyName ?? "",
                 name: paneName,
                 focused: view === focusedSurface,
-                exit_code: view.exitCode.map { Int($0) }
+                exit_code: view.exitCode.map { Int($0) },
+                banner: view.paneBanner
             ))
         case .split(let split):
             let direction: String = switch split.direction {
