@@ -252,7 +252,23 @@ Work these first, in order, before falling back to first-todo-in-table:
     build a native `TrackPopupMenu` (T79 dark-mode) wired to the palette
     actions. NOTE: banner heading SIZE was a NON-bug (the user's title lacked
     `#`; sizing already matches Mac — pane-banner.ps1's heading-taller assert
-    passes).
+    passes). (a) DONE 2026-07-20 in the ACTIVE PLUGIN CACHE
+    (`~/.claude/plugins/cache/dzearing-claude-marketplace/ghoztty/0.4.0/skills/
+    ghoztty/SKILL.md`: headings documented + examples use `# Title\n…`);
+    durability follow-up: mirror the edit into the source repo
+    `github.com/dzearing/ghoztty-claude-plugin` (not cloned on this box —
+    clone it, apply, commit/push, bump plugin version).
+20. **PUBLISH-READINESS QUEUE (user directive 2026-07-20, standing): work
+    fully autonomously — no questions — until the Windows version is READY
+    to publish.** Order after item 19's (b)/(c): **T100** (agent exe via
+    gnu target or wWinMain shim — unblocks T89h) → **T89h** (autostart +
+    upgrade guard + agent in release zip/MSI + delivery to all 3 install
+    locations + docs un-gate) → **T89i** (session-persistence E2E hardening
+    + soak) → **T38** (Windows build in the release process; version+arch
+    in installer/zip filenames) → **T39** (website: Windows installer
+    download link, same filename format) → the skill source-repo mirror
+    from item 19(a). T90b–T90h (viewer panes) follow after publish
+    readiness unless the user says otherwise.
 
 Done recently: T40 (lost renderer wakeups) fixed and DELIVERED to all
 install locations 2026-07-15; T49 hero-mode report root-caused to a stale
@@ -306,8 +322,8 @@ One line per row. Full spec + validation + evidence per task:
 | T35 | Sticky pane banner on win32 — done 2026-07-19: `+set-banner` verb + OSC 7778 + layered-popup strip (markdown subset via pure banner_markdown.zig, clickable links, per-pane) + ctrl+shift+b editor dialog + palette entry + `+list` additive `banner`; `pane-banner.ps1` ALL PASS (30) ×3 | I | — | done | (this commit) |
 | T36 | Release install refresh flow | H | — | in-progress | ae71b19b4.. |
 | T37 | CLAUDE.md symmetry mandate + dual-arch instructions | — | — | todo | — |
-| T38 | Windows build in the release process | H | T23,T24 | todo | — |
-| T39 | Website: Windows installer download link | H | T38 | todo | — |
+| T38 | Windows build in the release process — fold `publish-windows-release.ps1` (gnu-target ReleaseFast, per T100) into the standard release flow so every release produces the Windows zip + MSI alongside the Mac artifacts; installer/zip filenames MUST carry version + arch (e.g. `Ghoztty-<version>-x64.msi` / `Ghoztty-portable-<version>-x64.zip` — match the existing win-vX.Y.Z release asset convention from T24); agent exe included (T89h) | H | T23,T24 | todo | — |
+| T39 | Website: Windows installer download link — add the Windows download to the site next to the Mac one, pointing at the latest win-vX.Y.Z GitHub release asset; SAME filename format as published (version/arch in the installer name) so the link/copy stays consistent across releases; include portable-zip alternative + minimum-OS note | H | T38 | todo | — |
 | T40 | FIX PERF: lost renderer wakeups (slow scrolling) | I | — | done | see details |
 | T41 | Skip close-confirm when shell is idle | I | — | todo | — |
 | T42 | Remote sessions: user env/PATH missing | G | — | todo | — |
