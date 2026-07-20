@@ -47,10 +47,13 @@ extension Ghostty {
         // Maintain whether our window has focus (is key) or not
         @State private var windowFocus: Bool = true
 
-        // Measured height of the sticky pane banner, used to inset the
-        // terminal surface so content isn't covered by the overlay. Banner
-        // height changes are unanimated (collapse/expand is an instant
-        // toggle), so this moves in a single step per state change.
+        // Target height of the sticky pane banner (the height its card
+        // settles at after any collapse/expand animation), used to inset the
+        // terminal surface so content isn't covered by the overlay. Published
+        // by a hidden animation-free copy of the banner content, so it moves
+        // in a single instant step per state change while the visible card
+        // animates — the scroll area never chases animated intermediate
+        // frames.
         @State private var bannerHeight: CGFloat = 0
 
         #if canImport(AppKit)
@@ -197,16 +200,18 @@ extension Ghostty {
                                 text: banner,
                                 background: paneBackgroundColor,
                                 paneWidth: geo.size.width)
-                                .onGeometryChange(for: CGFloat.self) { proxy in
-                                    proxy.size.height
-                                } action: { height in
-                                    // Never let an ambient animation interpolate
-                                    // this — an animated inset drags the terminal
-                                    // surface through per-frame resizes.
+                                .onPreferenceChange(BannerTargetHeightKey.self) { target in
+                                    // The target comes from a hidden
+                                    // animation-free copy of the banner, so it
+                                    // jumps straight to the settled height while
+                                    // the visible card animates. Never let an
+                                    // ambient animation interpolate this — an
+                                    // animated inset drags the terminal surface
+                                    // through per-frame resizes.
                                     var tx = Transaction()
                                     tx.disablesAnimations = true
                                     withTransaction(tx) {
-                                        bannerHeight = height
+                                        bannerHeight = target
                                     }
                                 }
                             Spacer(minLength: 0)
