@@ -234,6 +234,140 @@ function Count-Leaf-Nodes($node) {
     return 0
 }
 
+# ---- T105 focus-stability interop (section F10/F11) ------------------------
+# Pre-fix, a 2-window restore live-locked: each restored window queued a
+# WM_APP_SETFOCUS assert whose execution stole activation from the other
+# window; every steal re-fired the loser's WM_SETFOCUS forwarding, queueing
+# the next assert — a perpetual activation ping-pong that made the app
+# uncontrollable. The oracle samples the GUI thread's focus window (wedge-
+# immune: needs no foreground) and the global foreground window, counting
+# transitions between the two restored top-levels.
+Add-Type @'
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+public class T105Drv {
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUITHREADINFO {
+        public uint cbSize; public uint flags;
+        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+        public RECT rcCaret;
+    }
+    [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+
+    // All visible GhozttyWindow top-levels of a process.
+    public static IntPtr[] TopWindows(uint pid) {
+        var wins = new List<IntPtr>();
+        EnumWindows((h, l) => {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if (p == pid && IsWindowVisible(h)) {
+                var sb = new StringBuilder(64);
+                GetClassNameW(h, sb, 64);
+                if (sb.ToString() == "GhozttyWindow") wins.Add(h);
+            }
+            return true;
+        }, IntPtr.Zero);
+        return wins.ToArray();
+    }
+
+    static void Key(ushort vk, bool up) {
+        var i = new INPUT[1];
+        i[0].type = 1;
+        i[0].ki.wVk = vk;
+        i[0].ki.dwFlags = up ? 2u : 0u;
+        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    // T86-hardened foreground grab (best-effort; the wedge may swallow it).
+    public static bool GrabForeground(IntPtr top) {
+        uint cur = GetCurrentThreadId();
+        bool fg = (GetForegroundWindow() == top);
+        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
+            IntPtr curFg = GetForegroundWindow();
+            uint fgTid = 0;
+            if (curFg != IntPtr.Zero && curFg != top) {
+                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
+                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
+            }
+            Key(0x12, false); Key(0x12, true); // Alt tap
+            SetForegroundWindow(top);
+            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
+            Thread.Sleep(150 + attempt * 200);
+            fg = (GetForegroundWindow() == top);
+        }
+        return fg;
+    }
+
+    // First GhozttyTerminal child of a top-level (a pane surface HWND).
+    public static IntPtr FirstTerminal(IntPtr top) {
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(top, (h, l) => {
+            var sb = new StringBuilder(64);
+            GetClassNameW(h, sb, 64);
+            if (sb.ToString() == "GhozttyTerminal") { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // Which of the app top-levels does hwnd belong to (itself or via root)?
+    static IntPtr Belongs(IntPtr[] wins, IntPtr h) {
+        if (h == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr root = GetAncestor(h, 2); // GA_ROOT
+        foreach (var w in wins) if (w == h || w == root) return w;
+        return IntPtr.Zero;
+    }
+
+    // Sample for totalMs at stepMs; count transitions of (a) the global
+    // foreground window and (b) the GUI thread's focus window between
+    // DIFFERENT app top-levels. Returns { fgFlips, focusFlips }.
+    public static int[] SampleFlips(IntPtr[] wins, int totalMs, int stepMs) {
+        uint pid; uint tid = GetWindowThreadProcessId(wins[0], out pid);
+        int fgFlips = 0, focFlips = 0;
+        IntPtr lastFg = IntPtr.Zero, lastFoc = IntPtr.Zero;
+        for (int t = 0; t < totalMs; t += stepMs) {
+            IntPtr fgApp = Belongs(wins, GetForegroundWindow());
+            if (fgApp != IntPtr.Zero) {
+                if (lastFg != IntPtr.Zero && fgApp != lastFg) fgFlips++;
+                lastFg = fgApp;
+            }
+            var gi = new GUITHREADINFO();
+            gi.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (GetGUIThreadInfo(tid, ref gi)) {
+                IntPtr focApp = Belongs(wins, gi.hwndFocus);
+                if (focApp != IntPtr.Zero) {
+                    if (lastFoc != IntPtr.Zero && focApp != lastFoc) focFlips++;
+                    lastFoc = focApp;
+                }
+            }
+            Thread.Sleep(stepMs);
+        }
+        return new int[] { fgFlips, focFlips };
+    }
+}
+'@
+
 # One hermetic GUI launch (fresh LOCALAPPDATA + agent-bin override).
 function Start-Backed($label, $title) {
     $tmp = Join-Path $root $label
@@ -381,7 +515,7 @@ Assert "F4 the agent kept all 3 sessions alive after the app died" (
 # startup window and rebuild both windows by re-ATTACHing.
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-Start-Process -FilePath $Exe -WindowStyle Minimized | Out-Null
+$relaunched = Start-Process -FilePath $Exe -WindowStyle Minimized -PassThru
 
 $winCount = Wait-Windows $tmp 'f-post' 2 30
 Assert "F5 relaunch restored exactly two windows (no extra blank)" ($winCount -eq 2)
@@ -400,7 +534,9 @@ Assert "F7 the same 3 sessions are alive after relaunch (ATTACH, not re-OPEN)" (
 $postOk = $false
 $deadline = (Get-Date).AddSeconds(25)
 while ((Get-Date) -lt $deadline) {
-    $code = Run-Cli '+read --name=f89sib --lines=200' "$tmp\read-post.txt" 10
+    # 2000 lines (was 200): headroom against reflow/repaint after re-attach
+    # pushing the narrow-wrapped replayed marker deeper into the tail.
+    $code = Run-Cli '+read --name=f89sib --lines=2000' "$tmp\read-post.txt" 10
     if ($code -eq 0 -and (Read-HasMarker "$tmp\read-post.txt")) { $postOk = $true; break }
     Start-Sleep -Milliseconds 700
 }
@@ -423,6 +559,69 @@ while ((Get-Date) -lt $deadline) {
 Assert "F9 the restored window's title pin came back" $f9
 
 # ============================================================================
+"== F10: restore-time focus stability across a VISIBLE relaunch (T105)"
+# The pre-fix live-lock needs the app to be foreground while restore builds
+# both windows back-to-back (baseline-proven: fgFlips=38/focusFlips=36 in 3s
+# pre-fix, 0/0 post-fix). Do a SECOND app-only kill + relaunch, this time
+# visible, grabbing foreground onto the first restored window the moment it
+# exists, and sample before any Run-Cli cmd.exe perturbs activation. The
+# scrollback asserts stay in the minimized F5-F9 cycle above: a visible
+# relaunch currently loses the replayed scrollback (pre-existing, tracked as
+# T106) — THIS cycle asserts focus stability only.
+Stop-AppOnly
+$env:LOCALAPPDATA = $tmp
+$env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+$relaunch2 = Start-Process -FilePath $Exe -PassThru
+$wins = @()
+$grabbedEarly = $false
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline) {
+    $wins = @([T105Drv]::TopWindows([uint32]$relaunch2.Id))
+    if (-not $grabbedEarly -and $wins.Count -ge 1) {
+        $grabbedEarly = [T105Drv]::GrabForeground($wins[0])
+    }
+    if ($wins.Count -ge 2) { break }
+    Start-Sleep -Milliseconds 100
+}
+Assert "F10a both restored top-level windows enumerated (visible relaunch)" ($wins.Count -eq 2)
+if ($wins.Count -eq 2) {
+    $storm = [T105Drv]::SampleFlips($wins, 3000, 40)
+    "  (restore-time fgFlips=$($storm[0]) focusFlips=$($storm[1]) grabbedEarly=$grabbedEarly)"
+    Assert "F10 no restore-time focus storm between the two windows" ($storm[1] -le 2)
+}
+
+# F11 (T105 floor): seed one pending WM_APP_SETFOCUS (0x8005 = WM_APP+5)
+# assert per window, queued back-to-back with no drain gap, then require
+# focus/foreground to settle. This is an invariant floor, not the
+# discriminating oracle (F10 is: the perpetual storm needs the app to be
+# foreground DURING restore — baseline-proven). Post-fix the guard drops any
+# assert whose window is not foreground, so the pair must always settle.
+# PostMessage needs no foreground rights: wedge-immune.
+"== F11: seeded co-pending focus asserts must settle, not ping-pong (T105)"
+if ($wins.Count -eq 2) {
+    $grabbed = [T105Drv]::GrabForeground($wins[0])  # realism, best-effort
+    $surf0 = [T105Drv]::FirstTerminal($wins[0])
+    $surf1 = [T105Drv]::FirstTerminal($wins[1])
+    Assert "F11a a terminal surface found in each restored window" (
+        $surf0 -ne [IntPtr]::Zero -and $surf1 -ne [IntPtr]::Zero)
+    if ($surf0 -ne [IntPtr]::Zero -and $surf1 -ne [IntPtr]::Zero) {
+        [T105Drv]::PostMessageW($surf0, 0x8005, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        [T105Drv]::PostMessageW($surf1, 0x8005, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $flips = [T105Drv]::SampleFlips($wins, 3000, 40)
+        "  (post-seed fgFlips=$($flips[0]) focusFlips=$($flips[1]) grabbed=$grabbed)"
+        Assert "F11 GUI-thread focus settles after seeded asserts" ($flips[1] -le 2)
+        if ($grabbed) {
+            Assert "F11b foreground stays parked after seeded asserts" ($flips[0] -le 2)
+        } else {
+            "  SKIP F11b (foreground grab failed - box wedge); focus oracle still ran"
+        }
+    }
+} else {
+    "  SKIP F11 (restored windows not enumerated)"
+}
+
+# ============================================================================
 if ($script:failures -gt 0) {
     "== DIAG: final manifest =="
     $dp = Manifest-Path $tmp
@@ -436,7 +635,8 @@ Stop-TestProcs
 $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
-Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+if ($script:failures -eq 0) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+else { "artifacts preserved at $root" }
 
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

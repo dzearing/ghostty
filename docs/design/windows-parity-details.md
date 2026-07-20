@@ -4818,3 +4818,104 @@ Notes: the "worked on Jul 19" staging build was NOT reproduced/root-caused
 (likely stale zig-cache state); with the explicit entry the outcome no
 longer depends on it. T89h can now build/package the agent for native-msvc
 or gnu interchangeably.
+
+## T105 — FIX: restore focus ping-pong live-lock
+
+**Symptom (user-hit, 2026-07-20, on the T89h-delivered release):** relaunch
+with a 2-window session layout → the two restored windows flip
+activation/foreground endlessly; the app is uncontrollable. Mitigation at
+the time was sidelining `session-layout.json`.
+
+**Mechanism:** every restored window queues a deferred focus assert
+(`WM_APP_SETFOCUS`, T48) for its surface during the restore walk — two
+windows created back-to-back leave two asserts co-pending. Executing assert
+A `SetFocus`es window A's surface, which *activates* A; the activation path
+(DefWindowProc → top-level `WM_SETFOCUS` → forwarding at Window.zig
+`WM_SETFOCUS`) queues a fresh assert while B's is still pending. The pair
+alternates forever. Foreground is the required ingredient: the storm
+engages when the app is foreground during restore (the real post-upgrade
+relaunch), which is why the previously-minimized harness never saw it.
+
+**Fix:** `App.performDeferredFocus(hwnd)` — a queued assert executes only
+while `GetAncestor(hwnd, GA_ROOT) == GetForegroundWindow()`. A deferred
+assert is a *forward* of focus the window already received, never a grab;
+a stale assert is dropped (the surface gets focus on the window's next
+genuine activation). Both drain sites route through it: the `App.run` loop
+and the `ConfirmDialog.runModal` loop. `win32.zig` gains
+`GetAncestor`/`GA_ROOT`.
+
+**Validation (on-box):**
+- `session-reattach.ps1` grew a second restore cycle + interop
+  (`T105Drv`): after F9, kill the app again and relaunch VISIBLE, grab
+  foreground onto the first restored window the moment it exists, and
+  sample foreground + GUI-thread focus (GetGUIThreadInfo) for 3s at 40ms —
+  **F10** asserts ≤2 transitions between the two windows. **F11** then
+  seeds the exact hazard (PostMessage one `0x8005` per window,
+  back-to-back → co-pending asserts) and asserts the pair settles.
+- **Baseline-proven oracle:** pre-fix binary (fix stashed, same script)
+  F10 = 33–38 flips/3s, F11 = 38–44 flips → RED; post-fix ALL PASS ×3
+  with 0 flips (grabs succeeded; wedge inactive).
+- `focus-defer.ps1` (T48 regression): click→deferred-focus asserts still
+  pass on the fix binary; its 2 tail asserts are red on BOTH binaries
+  (pre-existing → T107).
+- Both app lanes green (one silent win32-lane exit=-1 flake, green on
+  rerun — the known T89h-logged pattern), `test-agent` green ×3 (after 3
+  transient silent -1s, same known flake, watch in T89i), P1–P3 ALL PASS.
+- F8's `+read` widened 200→2000 lines (reflow headroom); failure
+  artifacts now preserved under `%TEMP%\ghoztty-session-reattach-<pid>`.
+
+**Found during validation:** T106 (visible relaunch loses replayed
+scrollback), T107 (focus-defer tail reds).
+
+## T106 — FIX: visible relaunch loses re-attached scrollback
+
+Found by T105 validation, 2026-07-20; PRE-EXISTING (identical on pre/post
+T105 binaries, with and without any foreground grab). With the exact same
+manifest and agent state: minimized relaunch → F8 finds the pre-quit marker
+in the re-attached split pane (ring replay lands); visible relaunch → the
+pane's terminal is EMPTY (`+read --lines=2000` returns just a prompt;
+7 bytes) even though F7 proves the same sessions ATTACHed (no re-OPEN) and
+`+sessions` shows them attached. Users always relaunch visible → real
+scrollback loss the minimized harness cycle can't see.
+
+Suspects (unverified): the visible restore path resizes/repaints the pane
+after (or racing) the ring replay — ConPTY repaint emitting erase
+sequences that wipe the just-replayed core scrollback, a transient
+default-size → manifest-frame double resize, or replay ordered before the
+surface reaches its final geometry. Note the manifest frame itself was
+captured from a minimized window (x/y −32000, 199×104 observed) — the
+capture-normal-rect question is part of this task.
+
+Repro: flip `session-reattach.ps1`'s F5 relaunch from `-WindowStyle
+Minimized` to visible and watch F8 fail. Fix should make F8 pass in BOTH
+styles — then make the visible style the default cycle.
+
+## T107 — focus-defer.ps1 tail asserts red on the box
+
+2026-07-20, found while regression-running T105. PRE-EXISTING: identical
+2 failures ×3 on both pre- and post-T105 binaries: after the FD-LOAD
+flood (150k echo lines) + 1500-click storm, `+list` (Start-Job, 8s) times
+out and `focus still moves after storm` fails — while `Responsive`
+(SMTO WM_NULL) still passes. The script's own teardown comment already
+concedes the flood keeps the GUI-thread IPC listener busy. Separately the
+3-pane setup intermittently finds only 1 surface (the `+split`s race a
+fresh agent spawn after `Stop-DebugGhoztty` killed the previous debug
+agent lineage — sleeps are fixed at 1–3s).
+
+Decide: harness fix (wait-for-idle before the IPC assert, retry-based
+setup) vs product issue (IPC listener starvation under sustained PTY
+output — if real, it affects agents driving busy panes). The T53 soak saw
+no IPC starvation, so harness-first is the working theory.
+
+## T108 — release-box restore anomalies (session_id-less leaves, stale capture)
+
+Observed 2026-07-20 on the user's release install during the T105 live-lock
+episode (recorded by the session that authored the fix): (a) manifest leaves
+without `session_id` made restore OPEN fresh pinned cmd sessions instead of
+ATTACHing — 7 leaked pinned sessions accumulated on the local agent; (b)
+`session-layout.json` stopped being rewritten (stale from 12:02). Neither
+reproduces in the hermetic harness. Candidate explanations: the 12:25-delivered
+app was mid-upgrade lineage; the capture debounce timer starved while the GUI
+thread was consumed by the ping-pong (plausible — WM_TIMER is low priority
+vs the posted-message storm). Post-T105 verification steps are in the state
+table row. Prune: `+sessions` → close leaked ids.

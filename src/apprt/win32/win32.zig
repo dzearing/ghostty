@@ -1431,6 +1431,13 @@ pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
 
 pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 
+pub const GA_ROOT: u32 = 2;
+
+pub extern "user32" fn GetAncestor(
+    hwnd: HWND,
+    gaFlags: u32,
+) callconv(.winapi) ?HWND;
+
 pub extern "user32" fn GetWindowThreadProcessId(
     hWnd: HWND,
     lpdwProcessId: ?*u32,

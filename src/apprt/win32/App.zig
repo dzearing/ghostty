@@ -419,6 +419,21 @@ pub fn deferSetFocus(hwnd: w32.HWND) void {
     _ = w32.PostMessageW(hwnd, WM_APP_SETFOCUS, 0, 0);
 }
 
+/// Perform a queued WM_APP_SETFOCUS: SetFocus the target surface, but only
+/// while its top-level window still holds foreground. A deferred assert is a
+/// *forward* of focus the window already received — never a grab. Without this
+/// guard, two windows created back-to-back (session restore, T89f2) each queue
+/// an assert whose execution steals activation from the other window; every
+/// steal re-fires the loser's top-level WM_SETFOCUS forwarding, queueing the
+/// next assert — a perpetual foreground ping-pong that makes the app
+/// uncontrollable. Stale asserts are dropped; the surface gets focus on the
+/// next genuine activation of its window.
+pub fn performDeferredFocus(hwnd: w32.HWND) void {
+    const root = w32.GetAncestor(hwnd, w32.GA_ROOT) orelse return;
+    if (w32.GetForegroundWindow() != root) return;
+    _ = w32.SetFocus(hwnd);
+}
+
 /// Re-run the split layout of the window owning the given terminal-surface
 /// HWND — used when a pane's banner strip height changed (T101 collapse/
 /// expand) so the terminal band under the strip grows/shrinks to match.
@@ -570,7 +585,7 @@ pub fn run(self: *App) !void {
         // this message; the target is the posted window (msg.hwnd), whose
         // queued messages the OS drops if it was destroyed meanwhile.
         if (msg.message == WM_APP_SETFOCUS) {
-            if (msg.hwnd) |h| _ = w32.SetFocus(h);
+            if (msg.hwnd) |h| performDeferredFocus(h);
             continue;
         }
 

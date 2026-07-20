@@ -418,7 +418,7 @@ fn runModal(self: *ConfirmDialog) void {
             return;
         }
         if (msg.message == App.WM_APP_SETFOCUS) {
-            if (msg.hwnd) |h| _ = w32.SetFocus(h);
+            if (msg.hwnd) |h| App.performDeferredFocus(h);
             continue;
         }
         if (msg.message == w32.WM_KEYDOWN and msg.hwnd != null and self.ownsHwnd(msg.hwnd.?)) {

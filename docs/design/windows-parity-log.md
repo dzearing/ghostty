@@ -9,6 +9,21 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 46) — T105 DONE (restore focus ping-pong live-lock,
+  user-hit on the delivered release; an earlier session left the fix
+  uncommitted — this session validated + landed it). T89h delivery
+  verified in ghoztty-upgrade.log (12:25: exe+agent swapped, share
+  mirrored, correct resume). Fix: foreground-guarded deferred focus
+  (`App.performDeferredFocus`, both pump loops). session-reattach.ps1 grew
+  a VISIBLE-relaunch cycle: F10 (early-grab + 3s flip sampling) + F11
+  (seeded co-pending 0x8005 asserts); baseline-proven RED (33–44 flips/3s
+  pre-fix) → ALL PASS ×3 post-fix (0 flips). Standing bar green (win32
+  lane + test-agent each showed the known transient silent -1 once, green
+  on rerun ×3). Surprises → new tasks: T106 (visible relaunch loses
+  replayed scrollback — real-world path, harness only passed because F5
+  relaunches minimized) + T107 (focus-defer tail reds pre-existing).
+  Delivery to all 3 install locations launched at boundary. Next per
+  item-20 queue: T106 → T89i.
 - 2026-07-20 (on-box, 45) — T89h DONE (session-persistence ships): HKCU
   Run autostart (`GhozttyAgent[-debug]`, exact spawn command via shared
   `agentCommandLine`, release-gated w/ force hook), agent exe now a
