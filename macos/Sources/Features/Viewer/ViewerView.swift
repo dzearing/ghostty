@@ -17,8 +17,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
         subsystem: Bundle.main.bundleIdentifier ?? "com.dzearing.ghoztty",
         category: "Viewer")
 
-    /// The viewed location: an absolute file path or an http(s) URL.
-    let location: String
+    /// The location this viewer was FIRST opened with. Fixed for the pane's
+    /// life — it is what the chrome bar's home button returns to.
+    let homeLocation: String
+
+    /// The location currently on display: an absolute file path or an
+    /// http(s) URL. Follows the user as they navigate (address bar, links,
+    /// back/forward), so `+list` and the session manifest report — and
+    /// restore — what the pane is actually showing, not where it started.
+    private(set) var location: String
 
     /// Display title: the file's name, or the page title once known (web).
     @Published private(set) var title: String
@@ -32,7 +39,22 @@ final class ViewerView: NSView, Codable, ObservableObject {
         case web(URL)
     }
 
-    let mode: Mode
+    /// The mode of the page currently committed in the web view. Not fixed at
+    /// init: typing a URL into a file viewer's address bar switches it to
+    /// `.web`, and navigating Back over that boundary switches it home again
+    /// (see `syncMode(toCommitted:)`).
+    private(set) var mode: Mode
+
+    /// The file the template page is showing, if any. Kept separately from
+    /// `mode` because the web view's URL while a file is displayed is the
+    /// template's `ghoztty-viewer://` address, not the file's — this is what
+    /// lets Back cross from a website into the file view and land correctly.
+    private var fileLocation: URL?
+
+    /// A blank start page. The browser palette command opens here so the user
+    /// can just type an address (the field shows its placeholder, not
+    /// "about:blank").
+    static let blankPage = "about:blank"
 
     private(set) var webView: WKWebView!
     private var schemeHandler: ViewerSchemeHandler?
@@ -47,12 +69,14 @@ final class ViewerView: NSView, Codable, ObservableObject {
     // very top of the pane and auto-hides after inactivity. While visible
     // it RESERVES its space: the web view's top is inset below the bar, so
     // the top of the page is never covered and stays clickable. It shows an
-    // editable URL + nav controls for web, and a read-only file:// address
-    // for markdown/code files.
+    // editable address field + nav controls in every mode.
     @Published private(set) var chromeVisible = false
     @Published private(set) var currentURL: String = ""
     @Published private(set) var canGoBack = false
     @Published private(set) var canGoForward = false
+    /// Bumped to ask the chrome bar to focus its address field; the bar
+    /// watches this rather than exposing its @FocusState upward.
+    @Published private(set) var addressFocusRequest = 0
     private var urlObservation: NSKeyValueObservation?
     private var backObservation: NSKeyValueObservation?
     private var forwardObservation: NSKeyValueObservation?
@@ -67,7 +91,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// edge (clipped away); 0 is fully slid in. Animated for the slide.
     private var chromeTopConstraint: NSLayoutConstraint?
 
-    /// True when location is a web URL (network allowed) rather than a file.
+    /// True when the displayed page is a website (network allowed) rather
+    /// than a rendered local file.
     var isWebURL: Bool {
         if case .web = mode { return true }
         return false
@@ -81,9 +106,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
-    init(location: String) {
+    convenience init(location: String) {
+        self.init(location: location, homeLocation: location)
+    }
+
+    /// `homeLocation` differs from `location` only when a viewer is restored
+    /// from a session manifest after the user navigated away from where the
+    /// pane was originally opened — home still points at the original.
+    init(location: String, homeLocation: String) {
         self.location = location
+        self.homeLocation = homeLocation
         self.mode = Self.mode(for: location)
+        self.fileLocation = Self.mode(for: location).fileURL
         self.title = Self.initialTitle(for: location)
         super.init(frame: .zero)
         // The chrome bar parks above the top edge between reveals; without
@@ -128,12 +162,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
-    private static func mode(for location: String) -> Mode {
-        if location.hasPrefix("http://") || location.hasPrefix("https://"),
+    /// Classify a location as a website or a file to render. `about:` pages
+    /// (the blank start page) count as web — they are navigable, not files.
+    static func mode(for location: String) -> Mode {
+        if location.hasPrefix("http://") || location.hasPrefix("https://")
+            || location.hasPrefix("about:"),
            let url = URL(string: location) {
             return .web(url)
         }
-        let url = URL(fileURLWithPath: location)
+        let url = URL(fileURLWithPath: Self.expandFilePath(location))
         switch url.pathExtension.lowercased() {
         case "md", "markdown", "mdown", "mkd", "mdwn":
             return .markdown(url)
@@ -142,11 +179,21 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
-    private static func initialTitle(for location: String) -> String {
-        if location.hasPrefix("http://") || location.hasPrefix("https://") {
-            return URL(string: location)?.host ?? location
+    /// Strip a `file://` prefix and expand a leading `~` so paths typed into
+    /// the address bar behave like paths typed into a shell.
+    private static func expandFilePath(_ location: String) -> String {
+        var path = location
+        if path.hasPrefix("file://") {
+            path = URL(string: path)?.path ?? String(path.dropFirst("file://".count))
         }
-        return (location as NSString).lastPathComponent
+        return (path as NSString).expandingTildeInPath
+    }
+
+    private static func initialTitle(for location: String) -> String {
+        switch mode(for: location) {
+        case .web(let url): return url.host ?? location
+        case .markdown(let url), .code(let url): return url.lastPathComponent
+        }
     }
 
     // MARK: - Web view setup
@@ -154,21 +201,22 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private func setupWebView() {
         let config = WKWebViewConfiguration()
 
-        switch mode {
-        case .markdown(let url), .code(let url):
-            // Offline page: bundled assets + the file's own directory are
-            // served via the custom scheme; nothing persists to disk.
-            config.websiteDataStore = .nonPersistent()
-            let handler = ViewerSchemeHandler(
-                baseDirectory: url.deletingLastPathComponent())
-            config.setURLSchemeHandler(handler, forURLScheme: ViewerSchemeHandler.scheme)
-            self.schemeHandler = handler
-            // Surface the file:// URL in the address bar (read-only — a file
-            // viewer never navigates, so this is set once and never changes).
-            self.currentURL = url.absoluteString
-        case .web:
-            break
-        }
+        // The scheme handler is registered for EVERY viewer, not just the
+        // file-backed ones: a configuration is copied into the web view at
+        // init and can never gain a handler afterwards, so a web viewer that
+        // is later pointed at a local file (address bar, home button) would
+        // otherwise have no way to serve the render template.
+        //
+        // Every viewer also shares the default (persistent) website data
+        // store. File viewers used to get a `.nonPersistent()` one, but now
+        // that any pane can browse, one store keeps sessions/logins
+        // consistent no matter which kind of viewer the browsing started in.
+        let handler = ViewerSchemeHandler(
+            baseDirectory: fileLocation?.deletingLastPathComponent()
+                ?? FileManager.default.homeDirectoryForCurrentUser)
+        config.setURLSchemeHandler(handler, forURLScheme: ViewerSchemeHandler.scheme)
+        self.schemeHandler = handler
+        self.currentURL = addressText(for: fileLocation ?? URL(string: location))
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.translatesAutoresizingMaskIntoConstraints = false
@@ -188,24 +236,29 @@ final class ViewerView: NSView, Codable, ObservableObject {
         self.webViewTopConstraint = topConstraint
         self.webView = webView
 
-        if case .web = mode {
-            titleObservation = webView.observe(\.title, options: [.new]) { [weak self] webView, _ in
-                guard let self, let pageTitle = webView.title, !pageTitle.isEmpty else { return }
-                DispatchQueue.main.async { self.title = pageTitle }
+        // Observed for EVERY viewer, not just web ones: a file viewer becomes
+        // navigable the moment the user types an address, and an observation
+        // installed only for the starting mode would be dead by then.
+        titleObservation = webView.observe(\.title, options: [.new]) { [weak self] webView, _ in
+            guard let self, let pageTitle = webView.title, !pageTitle.isEmpty else { return }
+            DispatchQueue.main.async {
+                // A file's name is its title; only the web supplies its own.
+                guard self.isWebURL else { return }
+                self.title = pageTitle
             }
-            currentURL = location
-            urlObservation = webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
-                guard let self, let url = webView.url else { return }
-                DispatchQueue.main.async { self.currentURL = url.absoluteString }
-            }
-            backObservation = webView.observe(\.canGoBack, options: [.new]) { [weak self] webView, _ in
-                let value = webView.canGoBack
-                DispatchQueue.main.async { self?.canGoBack = value }
-            }
-            forwardObservation = webView.observe(\.canGoForward, options: [.new]) { [weak self] webView, _ in
-                let value = webView.canGoForward
-                DispatchQueue.main.async { self?.canGoForward = value }
-            }
+        }
+        urlObservation = webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
+            guard let self else { return }
+            let url = webView.url
+            DispatchQueue.main.async { self.currentURL = self.addressText(for: url) }
+        }
+        backObservation = webView.observe(\.canGoBack, options: [.new]) { [weak self] webView, _ in
+            let value = webView.canGoBack
+            DispatchQueue.main.async { self?.canGoBack = value }
+        }
+        forwardObservation = webView.observe(\.canGoForward, options: [.new]) { [weak self] webView, _ in
+            let value = webView.canGoForward
+            DispatchQueue.main.async { self?.canGoForward = value }
         }
 
         installEventMonitor()
@@ -246,13 +299,93 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
-    /// Navigate from the chrome URL field, completing bare input like a
-    /// browser omnibox (see completeAddress).
+    /// Navigate from the chrome URL field. Accepts anything a viewer can
+    /// show — a website, or a local file path, which switches the pane back
+    /// to rendering a file. Bare input is completed like a browser omnibox
+    /// (see completeAddress).
     func navigate(to input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let url = URL(string: Self.completeAddress(trimmed)) else { return }
-        webView.load(URLRequest(url: url))
+        openLocation(Self.isFilePath(trimmed) ? trimmed : Self.completeAddress(trimmed))
+    }
+
+    /// Return to the location this pane was opened with (the home button).
+    func goHome() {
+        openLocation(homeLocation)
+    }
+
+    /// A typed address that names a local file rather than a website: an
+    /// explicit `file://`, or a path starting at root or at the home dir.
+    /// (A bare word like "docs" is treated as a hostname, as in a browser.)
+    static func isFilePath(_ input: String) -> Bool {
+        input.hasPrefix("file://") || input.hasPrefix("/") || input.hasPrefix("~/")
+    }
+
+    /// Point this pane at a new location, switching between web and
+    /// file-rendering mode as needed. The web view keeps its history, so
+    /// Back still works across the switch.
+    private func openLocation(_ newLocation: String) {
+        let newMode = Self.mode(for: newLocation)
+        switch newMode {
+        case .web(let url):
+            mode = newMode
+            location = url.absoluteString
+            currentURL = addressText(for: url)
+            webView.allowsBackForwardNavigationGestures = true
+            webView.load(URLRequest(url: url))
+        case .markdown(let url), .code(let url):
+            mode = newMode
+            fileLocation = url
+            location = url.path
+            title = url.lastPathComponent
+            currentURL = addressText(for: url)
+            // Relative images in the new file resolve against ITS directory.
+            schemeHandler?.baseDirectory = url.deletingLastPathComponent()
+            webView.allowsBackForwardNavigationGestures = false
+            pageLoaded = false
+            startWatchingFile()
+            load()
+        }
+    }
+
+    /// What the address field should show for a committed web-view URL. The
+    /// template page's `ghoztty-viewer://` address is an implementation
+    /// detail — a file viewer shows the file's own `file://` URL — and the
+    /// blank start page shows nothing at all, leaving the field's
+    /// "Enter URL" placeholder visible to type into.
+    private func addressText(for url: URL?) -> String {
+        guard let url else { return "" }
+        if url.scheme == ViewerSchemeHandler.scheme {
+            return fileLocation?.absoluteString ?? ""
+        }
+        if url.absoluteString == Self.blankPage { return "" }
+        return url.absoluteString
+    }
+
+    /// Reveal the chrome bar and put the caret in the address field. Used by
+    /// the "Open Browser Pane" command, which opens a blank pane whose whole
+    /// point is that the user types an address into it.
+    func focusAddressBar() {
+        holdChrome(true)
+        addressFocusRequest += 1
+        // Belt and braces: SwiftUI's @FocusState does not propagate reliably
+        // inside an NSHostingView (the same reason chromeKeyboardFocused is
+        // checked at the AppKit level), so claim the field directly once the
+        // bar has mounted its content.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let chromeHost = self.chromeHost,
+                  let field = Self.firstTextField(in: chromeHost) else { return }
+            self.window?.makeFirstResponder(field)
+        }
+    }
+
+    /// The address field inside the mounted chrome bar, if it has rendered.
+    static func firstTextField(in view: NSView) -> NSTextField? {
+        if let field = view as? NSTextField, field.isEditable { return field }
+        for subview in view.subviews {
+            if let found = firstTextField(in: subview) { return found }
+        }
+        return nil
     }
 
     /// Complete a typed address the way a browser omnibox would:
@@ -283,6 +416,47 @@ final class ViewerView: NSView, Codable, ObservableObject {
             authority += ".com"
         }
         return (isLocal ? "http://" : "https://") + authority + port + rest
+    }
+
+    /// The address field gained or lost keyboard focus.
+    ///
+    /// Browser convention is that clicking into the address bar selects the
+    /// whole address, ready to be replaced. Selecting it the moment focus
+    /// arrives does NOT survive: focus is granted on mouse-DOWN, and AppKit's
+    /// field-editor click tracking then runs on to mouse-up, where it places
+    /// a plain caret at the click point and wipes the selection out again.
+    /// So the selection is applied once the click is FINISHED.
+    func addressFieldFocusChanged(_ focused: Bool) {
+        holdChrome(focused)
+        guard focused else { return }
+        selectAddressWhenClickCompletes()
+    }
+
+    /// Wait for the mouse button to come back up, then select the address.
+    /// Polling the button state rather than watching for a mouse-up EVENT is
+    /// deliberate: the field editor's drag-tracking loop consumes that event
+    /// itself, so an event monitor may never see it.
+    private func selectAddressWhenClickCompletes(attempt: Int = 0) {
+        // Keyboard focus (the palette's blank browser pane) has no click in
+        // flight and satisfies this on the first pass. The attempt cap stops
+        // a held button from polling forever.
+        guard NSEvent.pressedMouseButtons != 0, attempt < 100 else {
+            selectEntireAddress()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            self?.selectAddressWhenClickCompletes(attempt: attempt + 1)
+        }
+    }
+
+    /// Select the whole address, unless the user dragged out a range of their
+    /// own during the click — that selection was deliberate, so it stands.
+    private func selectEntireAddress() {
+        guard let chromeHost, let field = Self.firstTextField(in: chromeHost),
+              let editor = field.currentEditor() ?? window?.firstResponder as? NSText
+        else { return }
+        guard editor.selectedRange.length == 0 else { return }
+        editor.selectAll(nil)
     }
 
     /// The chrome bar calls this while hovered or while the URL field is
@@ -325,8 +499,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// responder on the last terminal even after a click lands in web
     /// content. One app-local event monitor solves both: clicks inside the
     /// pane claim keyboard focus for the web view, and mouse movement near
-    /// the pane top reveals the chrome bar (all viewer modes — the bar shows
-    /// an editable URL for web and a read-only file:// address for files).
+    /// the pane top reveals the chrome bar (all viewer modes).
     private func installEventMonitor() {
         guard chromeMonitor == nil else { return }
         chromeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] event in
@@ -586,22 +759,64 @@ final class ViewerView: NSView, Codable, ObservableObject {
 
     private enum CodingKeys: String, CodingKey {
         case location
+        case homeLocation
     }
 
     convenience init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(location: try container.decode(String.self, forKey: .location))
+        let location = try container.decode(String.self, forKey: .location)
+        // Absent in state written before the home button existed: such a
+        // viewer had never navigated, so where it is IS its home.
+        let home = try container.decodeIfPresent(String.self, forKey: .homeLocation)
+        self.init(location: location, homeLocation: home ?? location)
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(location, forKey: .location)
+        try container.encode(homeLocation, forKey: .homeLocation)
+    }
+}
+
+extension ViewerView.Mode {
+    /// The file this mode renders, nil for a website.
+    var fileURL: URL? {
+        switch self {
+        case .markdown(let url), .code(let url): return url
+        case .web: return nil
+        }
     }
 }
 
 // MARK: - WKNavigationDelegate
 
 extension ViewerView: WKNavigationDelegate {
+    /// Reconcile the pane's mode with whatever the web view actually
+    /// committed. This is what makes Back/Forward work across a mode switch:
+    /// a user who types a URL into a file viewer and then presses Back lands
+    /// on the template page again, and the pane must go back to rendering
+    /// the file rather than sitting in web mode over a blank template.
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        syncMode(toCommitted: webView.url)
+    }
+
+    private func syncMode(toCommitted url: URL?) {
+        guard let url else { return }
+        if url.scheme == ViewerSchemeHandler.scheme {
+            guard let fileLocation else { return }
+            mode = Self.mode(for: fileLocation.path)
+            location = fileLocation.path
+            title = fileLocation.lastPathComponent
+            webView.allowsBackForwardNavigationGestures = false
+            pageLoaded = false
+        } else if url.scheme == "http" || url.scheme == "https" || url.scheme == "about" {
+            mode = .web(url)
+            location = url.absoluteString
+            webView.allowsBackForwardNavigationGestures = true
+        }
+        currentURL = addressText(for: url)
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if case .web = mode { return }
         pageLoaded = true
@@ -688,7 +903,7 @@ final class ViewerSchemeHandler: NSObject, WKURLSchemeHandler {
 
     /// The viewed file's directory; relative resources (e.g. images referenced
     /// by the markdown) resolve against this.
-    private let baseDirectory: URL
+    var baseDirectory: URL
 
     /// The bundled template/assets directory in app Resources.
     private static var resourcesDirectory: URL? {

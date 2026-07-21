@@ -310,13 +310,15 @@ fn runArgs(
 /// `--working-directory=` when present (else the caller's cwd; note this
 /// command always inserts the caller's cwd as `--working-directory` when
 /// none was given, so the base is always present here). URLs (containing
-/// "://") and absolute paths pass through untouched.
+/// "://"), `about:` pages such as the blank browser start page, and absolute
+/// paths pass through untouched.
 fn resolveViewArgument(alloc: Allocator, arguments: [][:0]const u8) !void {
     for (arguments, 0..) |arg, i| {
         const rest = lib.cutPrefix(u8, arg, "--view=") orelse continue;
         if (rest.len == 0) return;
         if (rest[0] == '/') return;
         if (std.mem.indexOf(u8, rest, "://") != null) return;
+        if (std.mem.startsWith(u8, rest, "about:")) return;
 
         var base: ?[]const u8 = null;
         for (arguments) |a| {

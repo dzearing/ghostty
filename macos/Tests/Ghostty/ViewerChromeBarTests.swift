@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import Testing
 @testable import Ghostty
 
@@ -127,5 +128,90 @@ struct ViewerChromeBarTests {
         viewer.setDetached(true)
         viewer.layoutSubtreeIfNeeded()
         #expect(viewer.webView.frame == viewer.bounds)
+    }
+}
+
+/// Every viewer mode — including markdown/code files — gets the full
+/// navigation chrome: back, forward, reload, home, and an EDITABLE address
+/// field. File viewers used to render a static, read-only label here, which
+/// made a file pane a dead end you could not navigate out of.
+@MainActor
+struct ViewerChromeControlsTests {
+    private func mountBar(location: String) async -> (ViewerView, NSHostingView<WebChromeBar>) {
+        let viewer = ViewerView(location: location)
+        let host = NSHostingView(rootView: WebChromeBar(viewerView: viewer))
+        host.frame = NSRect(x: 0, y: 0, width: 700, height: 44)
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        host.layoutSubtreeIfNeeded()
+        return (viewer, host)
+    }
+
+    private func editableFields(in view: NSView) -> [NSTextField] {
+        var found: [NSTextField] = []
+        if let field = view as? NSTextField, field.isEditable { found.append(field) }
+        view.subviews.forEach { found.append(contentsOf: editableFields(in: $0)) }
+        return found
+    }
+
+    private func buttonCount(in view: NSView) -> Int {
+        var count = String(describing: type(of: view)).contains("Button") ? 1 : 0
+        view.subviews.forEach { count += buttonCount(in: $0) }
+        return count
+    }
+
+    private func makeMarkdownFile() throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("viewer-chrome-controls-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("a.md")
+        try "# hi\n".write(to: file, atomically: true, encoding: .utf8)
+        return file.path
+    }
+
+    @Test func fileViewerBarHasEditableAddressAndFourNavButtons() async throws {
+        let (_, host) = await mountBar(location: try makeMarkdownFile())
+        #expect(editableFields(in: host).count == 1)
+        // back, forward, reload, home
+        #expect(buttonCount(in: host) == 4)
+    }
+
+    @Test func webViewerBarHasTheSameControls() async throws {
+        let (_, host) = await mountBar(location: "https://example.invalid/page")
+        #expect(editableFields(in: host).count == 1)
+        #expect(buttonCount(in: host) == 4)
+    }
+
+    /// "Open Browser Pane" opens blank and asks for the caret; the address
+    /// field must actually take keyboard focus, or the user is left typing
+    /// into nothing.
+    @Test func focusAddressBarPutsCaretInTheField() async throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: true)
+        let viewer = ViewerView(location: ViewerView.blankPage)
+        viewer.frame = window.contentView!.bounds
+        window.contentView!.addSubview(viewer)
+        viewer.layoutSubtreeIfNeeded()
+        defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
+
+        viewer.focusAddressBar()
+        for _ in 0..<40 {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        #expect(viewer.chromeVisible)
+        let field = try #require(ViewerView.firstTextField(in: viewer))
+        // Focus lands on the field itself, or on the window's field editor
+        // acting for it — but NOT on the web view, which is what the pane
+        // focuses by default.
+        let responder = window.firstResponder
+        let isField = (responder as? NSView) === field
+        let isFieldEditor = (responder as? NSText)?.delegate === field
+        #expect(isField || isFieldEditor)
     }
 }

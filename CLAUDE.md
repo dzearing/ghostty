@@ -277,6 +277,23 @@ ghoztty +close --target=doc
   default app.
 - **Live reload**: file viewers watch the file (including atomic saves) and
   re-render preserving scroll position.
+- **Navigation chrome**: hovering the thin strip at a pane's top slides in a
+  bar with back / forward / reload / **home** and an **editable address
+  field** — in every mode, files included. Typing an `http(s)` address (or a
+  bare `example.com`, completed omnibox-style) navigates the pane to the web;
+  typing an absolute or `~` path points it back at a file. Back and forward
+  reflect real history (disabled when there is none) and work across the
+  file↔web boundary — going Back from a website re-renders the file. **Home**
+  returns to the location the pane was originally opened with, which is
+  remembered separately from where the user has navigated to (and both
+  survive a session restore). Clicking into the address field selects the
+  whole address; clicking again inside it just moves the caret.
+- `--view=about:blank` opens a **blank browser pane**. The command palette's
+  "Viewer: Open Browser Pane" does the same interactively and puts the caret
+  straight in the address field — the equivalent of `+split --view=<url>` for
+  when the URL is not known up front.
+- Because any viewer can browse, `+list --json`'s `"url"` (and the session
+  manifest) report where a pane currently IS, not where it was opened.
 - Relative `--view` paths resolve against `--working-directory` if given,
   else the caller's cwd.
 - `+list` marks viewer panes with a `view:` prefix (JSON: `"type": "viewer"`

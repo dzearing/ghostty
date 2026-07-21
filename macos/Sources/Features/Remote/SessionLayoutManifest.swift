@@ -66,6 +66,12 @@ final class SessionLayoutManifest {
         /// this location — viewers have no process, so they are always
         /// restorable and never counted toward the all-dead drop policy.
         var viewerLocation: String?
+        /// The location the viewer was ORIGINALLY opened with (viewer leaves
+        /// only) — the home button's target, which survives the user
+        /// navigating the pane elsewhere. Optional/additive: manifests written
+        /// before the home button decode with nil, and restore then treats the
+        /// restored location as home (that viewer had never navigated).
+        var viewerHomeLocation: String?
         /// The pane's STABLE surface UUID (wp3 pane identity): restore
         /// recreates the SurfaceView with this exact uuid so the `+list`
         /// leaf `id` — and the GHOZTTY_PANE_ID env baked into the still-
@@ -556,6 +562,7 @@ final class SessionLayoutManifest {
                         ipcName: ipc?.registeredPaneName(forViewerPane: pane),
                         kind: "viewer",
                         viewerLocation: viewer.location,
+                        viewerHomeLocation: viewer.homeLocation,
                         surfaceID: nil)
                 }
                 let view = pane.surfaceView
