@@ -30,7 +30,7 @@
     // Clamp happens naturally; restore after layout.
     requestAnimationFrame(function () {
       window.scrollTo(0, y);
-      updateActiveEntry();
+      reportActiveHeading();
     });
   }
 
@@ -47,7 +47,7 @@
     // Heading ids are assigned AFTER sanitization, on the live nodes, so the
     // TOC's anchors can never be stripped by DOMPurify (and a file that ships
     // its own heading ids keeps them).
-    buildTableOfContents();
+    indexHeadings();
     restoreScroll(y);
   }
 
@@ -69,8 +69,8 @@
     }
     pre.appendChild(code);
     content.replaceChildren(pre);
-    // Text/code files have no heading structure: no TOC chrome at all.
-    clearTableOfContents();
+    // Text/code files have no heading structure: no TOC at all.
+    clearHeadingIndex();
     restoreScroll(y);
   }
 
@@ -86,30 +86,45 @@
     card.appendChild(h);
     card.appendChild(p);
     content.appendChild(card);
-    clearTableOfContents();
+    clearHeadingIndex();
   }
 
   /* ---------------------------------------------------------------------
-   * Table of contents
+   * Table of contents bridge
    *
-   * Built in-page from the rendered markdown: the gutter layout reflows the
-   * markdown column with plain CSS, and scroll-spy / anchor jumps stay a
-   * couple of DOM reads. Gutter-vs-panel is decided by media queries on the
-   * pane width (see viewer.css), so a split-divider drag reflows it live
-   * with no resize plumbing here.
+   * The TOC itself is drawn NATIVELY (ViewerTOCPanel, on the Swift side) so
+   * it is pixel-identical to the pane banner overlay rather than a CSS
+   * approximation of it. This page is only the data source: it assigns
+   * anchor ids, hands over the heading list after every render, reports
+   * which section is at the top of the pane as the user scrolls, and
+   * performs the scroll when the native list is clicked.
+   *
+   * Everything here degrades to a no-op when the message handler is absent
+   * (the browser harness, or a WebKit build without the bridge installed),
+   * so the page still renders standalone.
    * ------------------------------------------------------------------- */
 
-  const toc = document.getElementById("toc");
-  const tocList = document.getElementById("toc-list");
-  const tocToggle = document.getElementById("toc-toggle");
-  /* Headings in document order and their matching TOC links (same indexes). */
+  /* Headings in document order, and the id last reported as active. */
   let tocHeadings = [];
-  let tocLinks = [];
-  let activeLink = null;
+  let reportedActiveID = null;
 
   /* Distance below the top of the pane at which a heading counts as "the
    * section you are reading" for scroll-spy. */
   const SPY_MARKER = 88;
+
+  function bridge() {
+    return window.webkit
+      && window.webkit.messageHandlers
+      && window.webkit.messageHandlers.viewerTOC;
+  }
+
+  function post(message) {
+    const handler = bridge();
+    if (!handler) return;
+    try {
+      handler.postMessage(message);
+    } catch (e) { /* handler torn down mid-flight */ }
+  }
 
   /* GitHub-style anchor slug, deduplicated within the document. */
   function slugify(text, used) {
@@ -129,38 +144,32 @@
     return slug;
   }
 
-  function clearTableOfContents() {
-    tocList.replaceChildren();
+  function clearHeadingIndex() {
     tocHeadings = [];
-    tocLinks = [];
-    activeLink = null;
-    document.body.classList.remove("viewer-has-toc", "viewer-toc-open");
-    setTogglePressed(false);
+    reportedActiveID = null;
+    post({ type: "headings", items: [] });
   }
 
-  function buildTableOfContents() {
-    const wasOpen = document.body.classList.contains("viewer-toc-open");
-    tocList.replaceChildren();
+  /* Assign anchor ids to the rendered headings and hand the list to the
+   * native side. Ids are assigned AFTER sanitization, on the live nodes, so
+   * they can never be stripped by DOMPurify (and a file that ships its own
+   * heading ids keeps them). */
+  function indexHeadings() {
     tocHeadings = [];
-    tocLinks = [];
-    activeLink = null;
+    reportedActiveID = null;
 
     const headings = Array.prototype.filter.call(
       content.querySelectorAll("h1, h2, h3, h4, h5, h6"),
       function (h) { return h.textContent.trim() !== ""; });
 
-    // One heading is a title, not a table of contents: show no chrome.
+    // One heading is a title, not a table of contents.
     if (headings.length < 2) {
-      clearTableOfContents();
+      clearHeadingIndex();
       return;
     }
 
     const used = new Set();
-    let topLevel = 6;
-    for (const h of headings) {
-      topLevel = Math.min(topLevel, Number(h.tagName.slice(1)));
-    }
-
+    const items = [];
     for (const heading of headings) {
       const text = heading.textContent.trim();
       if (heading.id) {
@@ -168,55 +177,20 @@
       } else {
         heading.id = slugify(text, used);
       }
-
-      // Depth is relative to the document's own top level (a file whose
-      // headings start at h2 shouldn't be indented a step) and capped so a
-      // deeply nested section still fits the card.
-      const depth = Math.min(3, Number(heading.tagName.slice(1)) - topLevel);
-
-      const item = document.createElement("li");
-      const link = document.createElement("a");
-      link.href = "#" + heading.id;
-      link.title = text;
-      link.style.setProperty("--depth", String(depth));
-      const label = document.createElement("span");
-      label.className = "viewer-toc-label";
-      label.textContent = text;
-      link.appendChild(label);
-      link.addEventListener("click", function (event) {
-        // Never let this become a real navigation: in a file viewer the
-        // native side treats link activations as "open that location", and a
-        // fragment on the template page's URL is not a location.
-        event.preventDefault();
-        scrollToHeading(heading);
-        closePanel();
+      items.push({
+        id: heading.id,
+        text: text,
+        level: Number(heading.tagName.slice(1)),
       });
-      item.appendChild(link);
-      tocList.appendChild(item);
       tocHeadings.push(heading);
-      tocLinks.push(link);
     }
 
-    document.body.classList.add("viewer-has-toc");
-    // A live reload keeps the panel as the user left it.
-    if (wasOpen) {
-      document.body.classList.add("viewer-toc-open");
-      setTogglePressed(true);
-    }
-    updateActiveEntry();
+    post({ type: "headings", items: items });
+    reportActiveHeading();
   }
 
-  function scrollToHeading(heading) {
-    const top = heading.getBoundingClientRect().top + window.scrollY - 12;
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    window.scrollTo({
-      top: Math.max(0, top),
-      behavior: reduceMotion ? "auto" : "smooth",
-    });
-  }
-
-  /* Highlight the entry for the section currently at the top of the pane. */
-  function updateActiveEntry() {
+  /* Report the section currently at the top of the pane, when it changes. */
+  function reportActiveHeading() {
     if (!tocHeadings.length) return;
 
     let index = 0;
@@ -233,25 +207,10 @@
       window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
     if (documentEnd) index = tocHeadings.length - 1;
 
-    const link = tocLinks[index];
-    if (link === activeLink) return;
-    if (activeLink) activeLink.classList.remove("is-active");
-    activeLink = link;
-    link.classList.add("is-active");
-    revealInList(link);
-  }
-
-  /* Keep the active entry inside a long, independently scrolled TOC.
-   * Scrolling the list directly (rather than scrollIntoView) so the page
-   * itself is never scrolled as a side effect. */
-  function revealInList(link) {
-    const listBox = tocList.getBoundingClientRect();
-    const linkBox = link.getBoundingClientRect();
-    if (linkBox.top < listBox.top) {
-      tocList.scrollTop -= listBox.top - linkBox.top + 8;
-    } else if (linkBox.bottom > listBox.bottom) {
-      tocList.scrollTop += linkBox.bottom - listBox.bottom + 8;
-    }
+    const id = tocHeadings[index].id;
+    if (id === reportedActiveID) return;
+    reportedActiveID = id;
+    post({ type: "active", id: id });
   }
 
   let spyQueued = false;
@@ -260,50 +219,44 @@
     spyQueued = true;
     requestAnimationFrame(function () {
       spyQueued = false;
-      updateActiveEntry();
+      reportActiveHeading();
     });
   }
 
   window.addEventListener("scroll", requestSpyUpdate, { passive: true });
   window.addEventListener("resize", requestSpyUpdate);
 
-  function setTogglePressed(open) {
-    tocToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  function scrollToHeading(heading) {
+    const top = heading.getBoundingClientRect().top + window.scrollY - 12;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({
+      top: Math.max(0, top),
+      behavior: reduceMotion ? "auto" : "smooth",
+    });
   }
 
-  function closePanel() {
-    document.body.classList.remove("viewer-toc-open");
-    setTogglePressed(false);
-  }
-
-  tocToggle.addEventListener("click", function (event) {
-    event.stopPropagation();
-    const open = document.body.classList.toggle("viewer-toc-open");
-    setTogglePressed(open);
-  });
-
-  // Clicking the content (or pressing Escape) dismisses the slide-over panel.
-  document.addEventListener("click", function (event) {
-    if (!document.body.classList.contains("viewer-toc-open")) return;
-    if (toc.contains(event.target) || tocToggle.contains(event.target)) return;
-    closePanel();
-  });
-
-  document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") closePanel();
-  });
-
-  // The panel is only a narrow-pane affordance; widening the pane into gutter
-  // layout leaves no stale open state behind for the next time it narrows.
-  const gutterQuery = window.matchMedia("(min-width: 720px)");
-  gutterQuery.addEventListener("change", function (event) {
-    if (event.matches) closePanel();
+  /* Reserve space on the left for the native TOC card.
+   *
+   * The gutter is padding on the PAGE rather than an inset on the web view:
+   * the card floats over the document, so the strip behind it has to be the
+   * document's own background. Insetting the web view natively instead left
+   * a visible seam — that strip painted the window background, not the
+   * markdown page's. */
+  function setGutter(width) {
+    document.body.style.paddingLeft = width > 0 ? width + "px" : "";
     requestSpyUpdate();
-  });
+  }
 
-  // In-document links written by the author ("[jump](#section)") now have
-  // real targets, and need the same treatment as TOC links: scroll in page
-  // instead of escaping to the native link router.
+  /* Called by the native TOC when a row is clicked. */
+  function scrollToAnchor(id) {
+    const target = document.getElementById(id);
+    if (!target) return;
+    scrollToHeading(target);
+  }
+
+  // In-document links written by the author ("[jump](#section)") have real
+  // targets now that headings carry ids, and need the same treatment: scroll
+  // in page instead of escaping to the native link router.
   content.addEventListener("click", function (event) {
     const link = event.target.closest ? event.target.closest("a") : null;
     if (!link || !content.contains(link)) return;
@@ -324,5 +277,8 @@
     setMarkdown: setMarkdown,
     setCode: setCode,
     setError: setError,
+    // Called from the native TOC panel.
+    scrollToAnchor: scrollToAnchor,
+    setGutter: setGutter,
   };
 })();

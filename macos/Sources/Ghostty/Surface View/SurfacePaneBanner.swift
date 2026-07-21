@@ -42,12 +42,12 @@ extension Ghostty {
         static let maxCellWrapLines = 3
 
         /// Corner radius of the floating banner card.
-        private static let cornerRadius: CGFloat = 14
+        private static let cornerRadius = GlassCard.cornerRadius
 
         /// Uniform inner padding of the card. Equal on all sides so the
         /// collapsed card — which shows only the title row — is vertically
         /// centered around a title that hasn't moved from its expanded spot.
-        private static let innerPadding: CGFloat = 12
+        private static let innerPadding = GlassCard.innerPadding
 
         /// Margin between the card and the pane edges (the card floats,
         /// Liquid Glass style, instead of running edge to edge). Sized so the
@@ -55,7 +55,7 @@ extension Ghostty {
         /// the pane edge. The bottom margin is part of the banner's measured
         /// height, so the terminal content below always starts a breath under
         /// the card — content is never hidden behind it.
-        private static let outerMargin: CGFloat = 14
+        private static let outerMargin = GlassCard.outerMargin
 
         /// Fallback per-column cap used ONLY before the pane's real width is
         /// known (`paneWidth == 0`, e.g. the harness/preview case). Once the
@@ -228,115 +228,13 @@ extension Ghostty {
         /// Falls back to the translucent material when the background isn't
         /// known.
         private var cardFill: AnyShapeStyle {
-            guard let background else { return AnyShapeStyle(.ultraThinMaterial) }
-            return OSColor(background).isLightColor
-                ? AnyShapeStyle(Color.black.opacity(0.04))
-                : AnyShapeStyle(Color.white.opacity(0.06))
+            guard let background else { return GlassCard.materialFill }
+            return GlassCard.fill(isLightBackground: OSColor(background).isLightColor)
         }
 
-        /// The floating card's glass look, drawn by hand: a translucent
-        /// wash fill, an elliptical specular sheen, a hairline rim, and a
-        /// soft elevation shadow. Deliberately NOT the system `glassEffect` —
-        /// its material re-renders when the window's key state changes
-        /// (the backdrop flips `windowServerAware` and its vibrancy layer
-        /// turns off on resign), so the card visibly shifted color on every
-        /// window switch, and its frost washed the pane hue toward grey.
-        /// Hand-drawn overlays are deterministic: the card stays the pane's
-        /// own color no matter which window is focused.
-        private struct GlassCardBackground: ViewModifier {
-            let fill: AnyShapeStyle
-
-            private var shape: RoundedRectangle {
-                RoundedRectangle(
-                    cornerRadius: SurfacePaneBanner.cornerRadius,
-                    style: .continuous
-                )
-            }
-
-            /// Specular sheen: not a straight linear band but an ellipse of
-            /// light centered above the card, so the highlight bulges down
-            /// into the top in a curve and falls away toward the corners —
-            /// plus a faint darkening along the bottom edge to ground the
-            /// card. Attached as a background of the content so it renders
-            /// above the material but below the text (an overlay would wash
-            /// the glyphs too).
-            private var sheen: some View {
-                ZStack {
-                    shape.fill(
-                        EllipticalGradient(
-                            stops: [
-                                .init(color: .white.opacity(0.10), location: 0),
-                                .init(color: .white.opacity(0.03), location: 0.6),
-                                .init(color: .clear, location: 1),
-                            ],
-                            center: UnitPoint(x: 0.5, y: -0.5),
-                            startRadiusFraction: 0,
-                            endRadiusFraction: 1.15
-                        )
-                    )
-                    shape.fill(
-                        LinearGradient(
-                            stops: [
-                                .init(color: .clear, location: 0.75),
-                                .init(color: .black.opacity(0.05), location: 1),
-                            ],
-                            startPoint: .top, endPoint: .bottom
-                        )
-                    )
-                }
-                .allowsHitTesting(false)
-            }
-
-            /// Specular rim: a hairline border lit by the same overhead
-            /// ellipse — brightest at the top-center, softening around the
-            /// upper corners, nearly gone along the bottom.
-            private var rim: some View {
-                shape.strokeBorder(
-                    EllipticalGradient(
-                        stops: [
-                            .init(color: .white.opacity(0.28), location: 0),
-                            .init(color: .white.opacity(0.10), location: 0.7),
-                            .init(color: .white.opacity(0.04), location: 1),
-                        ],
-                        center: UnitPoint(x: 0.5, y: -0.5),
-                        startRadiusFraction: 0,
-                        endRadiusFraction: 1.3
-                    ),
-                    lineWidth: 1
-                )
-                .allowsHitTesting(false)
-            }
-
-            /// Elevation shadow as its own element. The card's fill is a
-            /// near-transparent wash, so a `.shadow` on it would be scaled
-            /// down by the fill's alpha to nothing — instead blur a dark
-            /// copy of the shape, and mask the card's own interior out of it
-            /// so the wash isn't darkened from behind.
-            private var dropShadow: some View {
-                shape
-                    .fill(Color.black.opacity(0.3))
-                    .blur(radius: 8)
-                    .offset(y: 4)
-                    .mask {
-                        ZStack {
-                            Rectangle().fill(.white).padding(-24)
-                            shape.fill(.black).blendMode(.destinationOut)
-                        }
-                        .compositingGroup()
-                    }
-                    .allowsHitTesting(false)
-            }
-
-            func body(content: Content) -> some View {
-                // Backgrounds stack front-to-back: sheen over the wash fill
-                // over the drop shadow.
-                content
-                    .background(sheen)
-                    .background(shape.fill(fill))
-                    .background(dropShadow)
-                    .overlay(rim)
-            }
-        }
+        // The card surface itself (fill wash, sheen, rim, elevation shadow) lives in
+        // GlassCardBackground so the viewer pane's table of contents renders the exact
+        // same card — see Helpers/GlassCard.swift.
 
         /// Render one block. `natural` carries the cached natural column
         /// widths when the block is a table (nil otherwise).

@@ -211,6 +211,67 @@ with screenshots captured during T02–T12:
 - **File → Open**: `open -a Ghoztty-Debug x.md` opens a viewer window;
   scripts/dirs keep terminal behavior.
 
+## 8. Table of contents + native typography (2026-07-21)
+
+Markdown viewers gained a heading navigator, and the document type moved onto
+the system font stack.
+
+**Split of responsibility — page is the data source, native draws the card.**
+The first implementation was entirely in-page (HTML/CSS/JS). It worked, but
+placed beside a real pane banner the two cards were visibly different, and CSS
+cannot close the gap: `border-radius` is a circular-arc rect where SwiftUI
+uses a `.continuous` squircle, and WebKit rasterizes SF differently from
+AppKit. So the chrome is native and the page feeds it:
+
+- `viewer.js` assigns heading anchor ids (AFTER DOMPurify, on the live nodes,
+  so sanitization can never strip them), posts `{type:"headings", items}` on
+  every render and `{type:"active", id}` on scroll-spy changes over the
+  `viewerTOC` script-message bridge, and exposes `scrollToAnchor(id)` /
+  `setGutter(px)`. It degrades to a no-op when the bridge is absent, so the
+  page still renders standalone in a browser.
+- The message-handler proxy holds the viewer **weakly**: the content
+  controller retains its handlers and the web view retains the controller, so
+  registering `ViewerView` directly would leak the whole pane.
+- `ViewerTOCPanel` (SwiftUI) draws the card via the shared
+  `GlassCardBackground`, extracted from `SurfacePaneBanner` into
+  `Helpers/GlassCard.swift`. The banner uses the same type — the two surfaces
+  are identical by construction, not by matched constants.
+
+**The gutter is page padding, not a web-view inset.** Insetting the web view
+natively is the obvious approach and is wrong: the reserved strip then paints
+`ViewerView`'s background while the document beside it paints the markdown
+page's, leaving a visible seam in both themes. Instead the web view always
+spans the pane, the card floats over it, and the page reserves
+`body { padding-left }`. Re-pushed on `didFinish` — a reload resets the
+document and takes the padding with it.
+
+**Compact layout.** Below 720pt the chrome bar pins open (single choke point
+in `setChromeVisible`, so hover-out, the hide timer, and field blur all
+respect it) and carries the contents toggle as its first button. The card is
+an overlay, opaque over the document.
+
+**The slide is a Core Animation transform**, on a layer-backed container
+wrapping the hosting view. The first attempt animated the panel's leading
+*constraint*, which re-runs Auto Layout every frame and re-lays-out the
+SwiftUI list inside it — CPU work per frame, and visibly chunky. A layer
+transform + opacity costs no layout at all. Consequences: the panel is parked
+off-edge rather than unmounted (a destroyed view cannot animate), and it must
+be `isHidden` while parked because AppKit hit-tests by frame, not by layer
+transform.
+
+**Typography.** `viewer.css` redefines the vendored stylesheet's own
+`--fontStack-sansSerif` / `--fontStack-monospace` custom properties rather
+than editing `vendor/github-markdown.css`, plus retuned size/leading/heading
+tracking — SF has a larger x-height and looser tracking, so GitHub's 16px/1.5
+metrics read oversized dropped straight in.
+
+Tests: `macos/Tests/Ghostty/ViewerTOCTests.swift` drives a real WKWebView end
+to end (headings over the bridge, gutter value *and* the page's computed
+padding, narrow collapse + re-widen, single-heading/code cases, detach).
+
+Known gaps (accepted): the TOC is markdown-only (a code viewer has no heading
+structure); panel open state is deliberately ephemeral across restore.
+
 Known v1 gaps (accepted): goto_split keybinds don't originate FROM a
 focused viewer pane (nav INTO viewers works); hero mode skips viewers;
 activity state/banners unsupported on viewers (clean error); web page

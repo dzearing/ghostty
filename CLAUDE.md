@@ -269,7 +269,22 @@ ghoztty +close --target=doc
   rendering via bundled markdown-it + highlight.js (offline, zero network) —
   headings, GFM tables, nested/task lists, fenced code with syntax
   highlighting, blockquotes, images (relative paths resolve against the
-  file's directory), links. Light/dark follows the window appearance.
+  file's directory), links. Light/dark follows the window appearance. Body
+  text is set in the **system font** (SF Pro via `-apple-system`) and code in
+  SF Mono, so a viewer reads as macOS content rather than a web page.
+- **Table of contents** (markdown only, and only with two or more headings):
+  a native card listing the document's headings, nested by level, with the
+  section you are reading highlighted as you scroll. Clicking a row scrolls
+  to it; the list scrolls independently when it is long. In a **wide pane**
+  the card sits in a left gutter and the document column reflows beside it.
+  In a **narrow pane** (< 720pt) the gutter would crowd the text, so the card
+  becomes an overlay: the navigation bar stays pinned open and gains a
+  contents button as its first item, which slides the card in and out. The
+  switch follows the *pane* width live, so dragging a split divider reflows
+  it. The card is the same glass card as the pane banner overlay (shared
+  `GlassCardBackground`), opaque so document text never shows through it.
+  Panel open/closed state is ephemeral — it does not survive a session
+  restore, since restoring an overlay would hide the content it covers.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Links** in file viewers: http(s) opens the default browser; a relative
