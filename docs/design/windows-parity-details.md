@@ -4117,7 +4117,13 @@ as tombstones per config; MSI install/uninstall E2E still green.
   pass the current one on future runs). session-open + session-reattach +
   P1–P3 + both lanes green; test-agent green ×5 after three transient
   exit=-1 runs (no failure text captured; did not reproduce across 5
-  logged runs — watch under T89i's soak).
+  logged runs — watch under T89i's soak). **RESOLVED by T89i
+  (2026-07-21): not a flake at all.** Piping a build into `Select-Object
+  -First N` stops the pipeline as soon as N items arrive, tearing down
+  the still-running `zig build` → exit -1 with no failure text. Both
+  lanes and `test-agent` exit 0 when the same command is redirected to a
+  file and the FILE is filtered. That is exactly the "no failure text
+  captured" signature. Guidance added to `go.md`.
 - **Delivery**: ReleaseFast(gnu, -Dstrip=false) staged to zig-out-release
   (now incl. the agent) and the upgrade script launched at the task
   boundary — installed release + Desktop portable + share copy all gain
@@ -4137,6 +4143,122 @@ starvation); flood-during-reattach gap-fill correctness.
 
 *Validation:* `session-persistence.ps1` ALL PASS ×3; soak clean;
 P1–P3 + both lanes + test-agent green at HEAD.
+
+*Evidence (done 2026-07-21):* new `test/win32/session-persistence.ps1`
+(hermetic: per-run `%LOCALAPPDATA%` + `GHOSTTY_LOCAL_AGENT_BIN`; only ever
+kills zig-out-lineage processes). Five sections, one agent lineage:
+
+- **A — scenario**: the py `headlineAcceptance` shape rebuilt through the
+  win32 CLI — 2 windows / 5 agent-backed panes, `winA = P0 | (spA / spB)`
+  and `winB = P3 | spC`, with DISTINCT ratios applied via `+rearrange`
+  (0.30 / 0.70 / 0.40). Asserts all five panes are agent-backed.
+- **B — crash-kill re-attach ×3** (py main loop, `--quit=kill`):
+  `taskkill /f` the GUI each cycle; the detached agent keeps every ConPTY;
+  relaunch must rebuild 2 windows / 5 panes, re-ATTACH the SAME 5 session
+  ids (no re-OPEN, no leak), restore the ratios EXACTLY, replay this
+  cycle's marker AND every earlier cycle's, and accept input again.
+  Measured recovery (relaunch → fully restored): **1.1–1.2s**.
+- **C — winsize/ConPTY geometry** (py `--winsize` analog; the pane's own
+  `mode con` Columns is the oracle, read through `+send-keys`/`+read`, so
+  it needs no tty): a live programmatic resize must reach the ConPTY, the
+  manifest must capture the new frames, and after a crash-kill relaunch
+  the restored frames AND the re-attached ConPTY width must match exactly
+  (the "big window, small content" guard), with live resizes still
+  tracking afterwards.
+- **D — flood-during-reattach gap-fill**: a paced ~1 Hz sequence printer
+  spans pre-kill output, output while the app is DEAD (agent-only), and
+  output during the ATTACH replay. Asserts order preserved through the
+  replay/live interleave and no runaway duplication, and splits the
+  loss contract BY REGION: `D5b` requires that **nothing** produced while
+  the app was dead or after re-attach is ever lost (that is what gap-fill
+  exists to deliver), while `D5` bounds the replayed pre-kill block at a
+  single clobbered row. Measured across runs: seq 6 lost in one, seq 2 in
+  another, none in a third — always inside the replayed pre-kill block,
+  never in the dead-gap. That row is one the user had already seen; it
+  dies at the junction where the replayed block starts overwriting the
+  restored pane's existing screen content (the T109 mixed-geometry
+  remainder — the same junction that truncates the replayed cmd banner
+  mid-line). A first pass anchored this bound to the SIGKILL instant and
+  was wrong: the loss tracks the replay junction, not the kill.
+- **E — bounded persistence-on soak**: a byte-heavy `type`-loop storm AND
+  a tiny-write echo storm, both agent-backed (7 live sessions). `+list`
+  answered **40/40** under the double storm; echo-storm `+read` **144ms**
+  (T62 bound 2s); a crash-kill relaunch MID-STORM re-ATTACHed all 7
+  sessions (recovery 12.1s); `+close` of each storm pane returned in
+  **7.9s / 6.4s** (T63 bound 10s). E10 asserts IPC RECOVERS to sub-2s
+  within a settle window rather than bounding the single worst instant
+  (4.2s measured immediately post-restore while two panes replay
+  multi-MB rings — legitimately slow, and not the user-facing contract).
+
+Two harness traps worth remembering (both cost a full run): PS 5.1
+**double array protection** — a unary comma on return PLUS `@()` at the
+call site NESTS the array (`@()` does not flatten), so `.Count` reads 1
+and every count/membership assert silently misreads; and the repo's
+standing ASCII-only rule for these scripts (an em-dash in a comment made
+the whole file fail to parse).
+
+Bonus finding, and the reason the standing bar looked red at first: the
+`| Select-Object -First N` trick for trimming build output **kills the
+build**. `-First` stops the pipeline once N items arrive, tearing down the
+running `zig build`, which then reports exit -1 with no failure text —
+precisely the "transient exit=-1" T89h logged and asked to watch here.
+Both lanes and `test-agent` exit 0 when the command is redirected to a file
+and the FILE is filtered. `go.md` now carries the rule.
+
+Two harness-citizenship rules this task learned the hard way, both after a
+run wedged and left storm panes spamming a live desktop: **every** CLI call
+in a flood section goes through the timeout-guarded `Run-Cli` (an unguarded
+`& $Exe +list` hung a whole run instead of recording a failed probe), and
+the storms are **bounded** (~3 min of output, not endless) and run in
+**minimized** windows — section E asserts nothing about geometry, so it has
+no business painting a flood on screen where an abandoned run keeps
+spamming.
+
+*Status:* sections A–D green and stable; the harness is delivered and
+already earned its keep. Left `blocked(T111)` rather than `done` because
+its own bar (ALL PASS ×3) cannot be met while section E reproduces a real
+product failure: `+list` answers **1/40** under the double agent-backed
+storm, with the CLI reporting `No running Ghoztty instance found.` — the
+GUI-thread pipe listener stops ACCEPTING. Those asserts are precedented
+(`ipc-under-load.ps1` holds the same 40/40 under the same storm on the
+Exec path), so they stay red as a signal instead of being relaxed to fit
+the current behavior. Flip to done when T111 lands.
+
+Validation surfaced **T110** (split ratios never persisted — fixed here)
+and **T111** (agent-path IPC starvation — filed as the next task; a
+publish blocker, since persistence is default-on and every local pane now
+rides that path).
+
+## T110 — FIX: split-ratio changes never armed the layout capture
+
+Found by T89i (2026-07-21). `session-persistence.ps1` B*.6 caught it:
+baseline ratios 0.30 / 0.70 / 0.40 came back as **0.5 / 0.5 / 0.5** after
+every crash-kill restore — deterministic across all 3 cycles.
+
+*Root cause:* the T89f1 debounced capture is armed by `markLayoutDirty`,
+which was called from every topology/title/color/frame mutation but from
+**no ratio mutation**. So the manifest kept whatever ratios existed at the
+last unrelated write: a `+rearrange` (or an interactive divider drag) that
+was the final change before a quit was never persisted, and restore
+rebuilt the splits at their creation-time default. The restore side was
+already correct — `restoreBuildSubtree` passes the recorded ratio to
+`newSplitAt`, which forwards it to `SplitTree.split`; there was simply
+nothing but 0.5 in the manifest to pass.
+
+*Fix:* arm the capture at every ratio mutation —
+`Window.endDividerDrag` (at drag END, so a drag is one debounced write,
+mirroring how `persistPlacement` coalesces window frames at
+WM_EXITSIZEMOVE), `Window.equalizeSplits`, the divider double-click reset
+in the WM_LBUTTONDBLCLK path, and `IpcHandlers.handleRearrange` (which
+swaps the whole tree).
+
+*Why the existing tests missed it:* `session-reattach.ps1` B5 asserts the
+captured ratio is merely *in range* (`0 < r < 1`) — 0.5 passes. Only a
+test that sets a DISTINCT ratio and compares it after restore can catch
+this, which is what T89i's B*.6 does.
+
+*Validation:* `session-persistence.ps1` B1.6/B2.6/B3.6 ALL PASS (were
+deterministically RED pre-fix on the same binary/scenario).
 
 ## T90a — Viewer panes on Windows: design (Phase K)
 

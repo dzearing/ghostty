@@ -1956,6 +1956,10 @@ fn endDividerDrag(self: *Window) void {
     if (!self.dragging_split) return;
     self.dragging_split = false;
     _ = w32.ReleaseCapture();
+    // T110: persist the dragged split ratio. Armed at drag END (not on every
+    // motion tick) so a drag is one debounced write, the same coalescing
+    // `persistPlacement` does for window frames at WM_EXITSIZEMOVE.
+    self.app.markLayoutDirty();
 }
 
 /// Create a new split in the active tab.
@@ -2203,6 +2207,7 @@ pub fn equalizeSplits(self: *Window) void {
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
     self.layoutSplits();
+    self.app.markLayoutDirty(); // T110: equalized ratios must survive restore
 }
 
 /// Toggle zoom on the active split surface.
@@ -3900,6 +3905,7 @@ pub fn windowWndProc(
             if (window.hitTestDivider(x, y)) |hit| {
                 window.tab_trees[window.active_tab].resizeInPlace(hit.handle, @as(f16, 0.5));
                 window.layoutSplits();
+                window.app.markLayoutDirty(); // T110: double-click reset ratio
                 return 0;
             }
             return 0;

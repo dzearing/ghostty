@@ -41,6 +41,17 @@ over dumping full build logs; prefer `| Select-Object -Last 1` on acceptance
 scripts (they print a single ALL PASS / N FAILURE(S) line by design). Read
 only the parts of files you need.
 
+**NEVER pipe a build into `Select-Object -First N`.** `-First` STOPS the
+pipeline once it has N items, which tears down the still-running native
+command: `zig build` dies mid-run and reports **exit -1 with no failure
+text**. This is a FALSE failure and it has already been mis-filed twice as a
+"transient exit=-1" flake (T89h, then T89i). `-Last N` is safe (it must drain
+the whole stream). When you want the first few matches, redirect first and
+filter the file: `zig build test -Dapp-runtime=win32 *> $log; "exit:
+$LASTEXITCODE"; Select-String -Path $log -Pattern 'error:' | Select-Object
+-First 10`. Rule of thumb: a lane that "fails" with warnings but no `error:`
+line did not fail — re-run it unfiltered before believing it.
+
 ## What to do
 
 1. Read `docs/design/windows-parity-tasks.md`. It is the canonical

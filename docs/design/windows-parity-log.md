@@ -9,6 +9,41 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-21 (on-box, 49) — T89i DELIVERED, left blocked(T111):
+  new `test/win32/session-persistence.ps1` ports the py harness (scenario +
+  crash-kill re-attach ×3 + winsize) and adds flood-during-reattach gap-fill
+  and a bounded persistence-on soak. It immediately earned its keep: found
+  **T110** — split ratios were NEVER persisted (`markLayoutDirty` fired on
+  every topology/title/color/frame change but on NO ratio change), so every
+  restore came back 50/50; fixed at all four ratio-mutation sites.
+  `session-reattach.ps1` B5 had missed it for two tasks because it only
+  asserts the ratio is *in range* — 0.5 passes. Also found **T111**, which
+  is why this task is `blocked` and not `done`: the GUI went Windows-"Not
+  Responding" under the double agent-backed storm with an unanswered
+  `+list` (the user saw it live and interrupted). It looked intermittent —
+  the same section was 40/40 the run before — but once E2 was
+  timeout-guarded it reproduced hard: **`+list` 1/40**, and the CLI's own
+  error is `No running Ghoztty instance found.`, i.e. the GUI-thread pipe
+  listener stops ACCEPTING, not merely answering slowly. Section E's bar is
+  precedented (`ipc-under-load.ps1` holds the same 40/40 under the same
+  storm on the Exec path), so those asserts stay red as a real signal
+  rather than being relaxed to make the task look finished. T111 is the
+  next task and is a publish blocker: persistence is default-on, so every
+  local pane rides the starved path. Two self-inflicted lessons, both after
+  that wedge left storm panes spamming the user's live desktop: guard EVERY
+  CLI call in a flood section with the timeout-guarded `Run-Cli` (an
+  unguarded one hangs the whole run instead of recording a failed probe),
+  and make storms bounded + minimized. Third lesson, cheaper: a PS 5.1
+  unary comma on return PLUS `@()` at the call site NESTS the array, so
+  `.Count` reads 1 — that alone faked 28 failures on the first run. Fourth,
+  and it closes an open question T89h left for this task: the "transient
+  exit=-1" on the test lanes is NOT a flake — piping a build into
+  `Select-Object -First N` stops the pipeline and tears down the running
+  `zig build`, so it exits -1 with no failure text. Redirect to a file and
+  filter the FILE; both lanes + test-agent are green that way. `go.md` now
+  says so. Next:
+  **T111** (ahead of T38 — a GUI freeze on the default path outranks
+  release packaging).
 - 2026-07-20 (on-box, 48) — loop repair after the T106 delivery: the 16:10
   upgrade's resume never produced a live claude (loop stalled; user
   noticed) and its agent swap failed on a .bak that is the RUNNING

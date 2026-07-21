@@ -852,6 +852,9 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     window.layoutSplits();
     if (focus.hwnd) |h| App.deferSetFocus(h); // T48
     window.updateWindowTitle();
+    // T110: the whole tree (topology AND every split ratio) just changed —
+    // re-persist, else a restore rebuilds the PRE-rearrange shape.
+    app.markLayoutDirty();
 
     return response;
 }
