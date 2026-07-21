@@ -4260,6 +4260,134 @@ this, which is what T89i's B*.6 does.
 *Validation:* `session-persistence.ps1` B1.6/B2.6/B3.6 ALL PASS (were
 deterministically RED pre-fix on the same binary/scenario).
 
+## T111a — FIX: bound per-lock parse work on the agent drain
+
+Found by T89i section E (2026-07-21). Split out of T111 when the task proved
+too big for one context; T111b carries the remainder.
+
+*How the root cause was found (the method matters — the filed prime suspect
+was wrong):* instrumentation at each component boundary, not inspection.
+
+1. `IpcServer.serveOne` already measures the GUI round trip. Splitting it into
+   **queue latency** (post → GUI thread picks up WM_APP_IPC) and **handler
+   time** gave `queue 0ms + handler 1400–5500ms`. So the message loop is NOT
+   starved and this is not the T53a posted-message flood — the `list` handler
+   itself blocks.
+2. Timing each leaf inside `buildNode` isolated it further: `pwd 3257ms /
+   title 0ms / pid 0ms`. Only `core_surface.pwd()` takes a lock
+   (`Surface.zig` → `renderer_state.mutex`).
+3. Drain-side telemetry then answered *who holds it*: `in_process=99%,
+   **lockwait=0%**`. The pane's IO thread never waits for the mutex — it
+   HOLDS it, in 3 chunks/sec of 16 KiB, i.e. **~330 ms of held-lock parsing
+   per `processOutputTracked` call**.
+4. The same telemetry on Exec (`--session-persistence=false`, identical
+   storm) showed `avg_batch=4131b`, ~24 cycles/sec — ~40 ms holds.
+
+*Root cause:* work per mutex acquisition is unbounded on the agent path.
+Exec's reader parses whatever ONE ConPTY `ReadFile` returned, which the OS
+hands out in ~4 KiB pieces, so its holds are naturally short. The agent path
+interposes a 256 KiB inbound ring that COALESCES the stream, so `drainRing`
+popped a full 16 KiB buffer and handed all of it to the parser in one hold —
+4x Exec's granularity. Since the GUI thread takes that same per-pane mutex
+for ordinary interactive work, the hold time IS the GUI's worst-case stall.
+
+*Why the filed prime suspect was wrong, and why that matters:* T111 guessed
+"renderer-mutex starvation — the drain calls `processOutputTracked` per chunk
+(up to 32 per wake), one lock cycle each, where T62 fixed exactly this for
+Exec by batching to ONE lock cycle per batch." The measurement inverts it: the
+drain does **fewer, coarser** lock cycles than Exec, not more. Batching — the
+literal T62 fix — would have made this strictly worse. Two mechanisms that
+sound identical ("too much time in `processOutput` under a flood") needed
+opposite fixes, and only instrumentation could tell them apart.
+
+*Fix:* `feedSliced` caps one `processOutputTracked` call at
+`max_parse_slice` = 4 KiB, with the boundary arithmetic split into a pure
+`SliceIter` so it is unit testable. Same total parse work, same byte order;
+`applied_bytes` advances per slice under the same lock, so WP-D3's
+(grid, offset) pair stays consistent — it just advances in finer steps. The
+T106 attach-reflow split still lands exactly on `attach_reflow_target`
+(slicing happens strictly inside the head). Note this converges on T62's "one
+lock cycle per ~4 KiB" from the OPPOSITE direction: T62 batched Exec's tiny
+writes UP to that size, T111a slices the ring's coalesced chunks DOWN to it.
+
+*Validation (2026-07-21):* same storm, A/B on one box —
+
+| | `+list` worst | `pwd()` worst |
+|---|---|---|
+| agent path, before | 5504 ms | 3257 ms |
+| agent path, after | 767 ms | 534 ms |
+| Exec baseline (`--session-persistence=false`) | 709 ms | 569 ms |
+
+so the agent data path is no longer strictly worse than the path it replaced
+— the specific charge T111 was filed on. On `session-persistence.ps1`:
+**E2 1/40 → 15/40**, **E10 4.2 s → 630 ms**, E11/E12 `+close` 3.5 s / 1.5 s,
+and A–D + E1 + E6–E12 all PASS. Four `SliceIter` unit tests (coverage/order,
+short + empty input, exact multiple, bound ≤ the 16 KiB drain buffer);
+`test -Dapp-runtime=none`, `test -Dapp-runtime=win32`, `test-agent` and the
+win32 build all exit 0.
+
+*Test-honesty note:* the new tests were canary-verified — one assert was
+deliberately flipped and the none lane went red (`3049/3118 passed, 1
+failed`) before being restored. A unit test in a file with no prior tests is
+worth nothing until you have seen it fail.
+
+*Not fixed here:* section E's E2/E3/E4/E5 remain red — see T111b.
+
+## T111b — REMAINING agent-path IPC starvation (open)
+
+What T111a did not reach. `session-persistence.ps1` section E, post-fix:
+
+| assert | result |
+|---|---|
+| E2 `+list` under double storm | **15/40** (2 wedged) |
+| E3/E4 `+read` of echo-storm pane | **9202 ms** (T62 bound 2000 ms) |
+| E5 quiet-pane round-trip | **FAIL** |
+| E1, E6–E12 and sections A–D | PASS |
+
+*Two hypotheses, BOTH UNPROVEN. Instrument before fixing* — T111a's filed
+prime suspect was refuted by measurement, and the same trap is set here.
+
+1. **Mutex barging.** T111a bounded each hold to ~80 ms in the debug build
+   the harness runs, so a 9.2 s `+read` wait is roughly **100 consecutive
+   lost races**, not one long hold. The drain unlocks and re-locks with
+   essentially no gap (a slice-pointer bump), while Exec has
+   `PeekNamedPipe`/`ReadFile` syscalls between its unlock and next lock,
+   which is the window a parked waiter needs. Zig's `Thread.Mutex` is a
+   futex and makes no fairness promise. Candidate fix: `std.Thread.yield()`
+   (SwitchToThread) between slices in `feedSliced` — free when uncontended.
+   Verify by measuring the wait distribution, not just the mean.
+2. **Something GLOBAL, not per-pane.** E5 round-trips the QUIET pane `spC`,
+   whose mutex nothing is holding, so a pure per-pane-mutex theory does not
+   explain its failure. Suspects: (a) the agent-connection WRITE path —
+   `+send-keys` to an agent-backed pane writes into the single duplex pipe
+   the storm is saturating inbound; (b) plain serialization — the win32 IPC
+   server is a SINGLE pipe instance (`nMaxInstances = 1`) served strictly
+   serially with no timeout on the GUI marshal, so one 9 s handler parks the
+   next client at `PIPE_BUSY`, and `connectPath` gives up after 10 ×
+   `WaitNamedPipeW(1000)` and reports `No running Ghoztty instance found.`
+   — which is exactly the string T111 was filed on.
+
+*Free win, worth taking regardless of the above:* core already emits a `.pwd`
+apprt action on every `pwd_change` (`Surface.zig` `.pwd_change` →
+`performAction(.pwd)`), and win32 currently ACKs and DROPS it (`App.zig`,
+"acknowledge actions that don't need Win32-specific handling"). Caching the
+value there lets `buildNode` read a cached string, so `+list` — the liveness
+probe the whole bar is written against — would take no terminal lock at all.
+That removes `+list` from the contended path entirely instead of making it
+merely faster.
+
+*Harness note:* `scratchpad/t111-repro.ps1` gives a ~3 min A/B loop (launch
+with stderr redirected, 2 storm panes, hammer `+list`, stop the storm, re-probe
+to separate starvation from listener death) and was how T111a was measured.
+It is NOT sensitive enough for T111b — it tops out at 767 ms and never
+reproduced E3/E4/E5. Extend it to section E's shape first (5 idle + 2 storm
+agent-backed panes, plus `+read` and quiet-pane round-trip probes) so the
+loop stays fast, then confirm on the real harness.
+
+*Validation:* `session-persistence.ps1` ALL PASS ×3 (which also flips T89i to
+`done`), plus `ipc-under-load.ps1` for the Exec path, P1–P3, both lanes and
+`test-agent`.
+
 ## T90a — Viewer panes on Windows: design (Phase K)
 
 Port viewer panes (CLAUDE.md "Viewer Panes") to win32. Mac uses

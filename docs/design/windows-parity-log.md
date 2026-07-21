@@ -1432,3 +1432,33 @@ workaround. Desktop portable + share copy refreshed via the established
 installed release swapped via the detached upgrade script (kill/swap/
 resume, default -ResumeCommand). Next task: T100 (agent exe), then T89h
 per the item-20 publish queue.
+
+## 2026-07-21 — T111 split: T111a (drain hold-time bound) landed, T111b open
+
+Measured the agent-path IPC starvation instead of trusting the filed prime
+suspect — and the suspect was wrong. Boundary instrumentation showed the
+`+list` stall is `queue 0ms + handler 1.4-5.5s`, inside the handler it is
+`pwd()` (title/pid 0ms) on the pane's renderer mutex, and drain telemetry
+read `lockwait=0%` with 16 KiB chunks: the drain HOLDS the mutex ~330ms per
+call, it never waits for it. The 256 KiB inbound ring coalesces the stream to
+4x what a ConPTY read ever returns, so the fix is to slice DOWN to ~4 KiB —
+the opposite of T62's batching, which the T111 row had proposed and which
+would have made it strictly worse.
+
+T111a: `feedSliced` + pure `SliceIter` (4 unit tests, canary-verified to
+actually run). Same storm A/B: `+list` worst 5504ms -> 767ms vs an Exec
+baseline of 709ms, so the agent path is no longer worse than the path it
+replaced. Harness: E2 1/40 -> 15/40, E10 4.2s -> 630ms; A-D + E1 + E6-E12
+PASS. Both lanes + test-agent + build green.
+
+T111b (next, publish blocker): E2/E3/E4/E5 still red. `+read` at 9.2s with
+~80ms holds means ~100 consecutive lost races (barging), and E5 fails on a
+QUIET pane whose mutex is free — so something global is also in play (agent
+write path, or serialization behind the single-instance IPC pipe). Both
+hypotheses are UNPROVEN and written down as such; instrument first. A ready
+win is cached pwd via the `.pwd` apprt action win32 currently drops, which
+takes `+list` off the contended path entirely.
+
+Split per go.md's sizing rule: one context could not carry both mechanisms.
+Not delivered to install locations — T110 and T111a both ride with the T111b
+fix so the release does not ship a half-fixed freeze on the default path.

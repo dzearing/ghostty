@@ -1007,6 +1007,55 @@ fn finishAttachReflow(rd: *ThreadData) void {
     rd.io.reflowLocalGrid(cols, rows);
 }
 
+/// The most bytes handed to the parser in ONE `processOutputTracked` call, and
+/// therefore the most work done in one hold of the pane's renderer mutex (T111).
+///
+/// The GUI thread takes that same mutex for ordinary interactive work — reading
+/// a pane's pwd/title for `+list`, input, focus, resize — so the mutex hold time
+/// here IS the GUI's worst-case stall. Local Exec never had to think about this:
+/// its reader parses whatever one ConPTY `ReadFile` returned, which the OS hands
+/// out in ~4 KiB pieces, so its holds are naturally short. The agent path
+/// interposes a 256 KiB inbound ring that COALESCES the stream, so an unsliced
+/// drain fed the parser 16 KiB at a time — 4x Exec's granularity, measured at
+/// ~330 ms of held-lock parsing per chunk under a storm, which stalled `+list`
+/// for 0.3–3.3 s (vs 0.1–0.6 s on Exec under the identical storm).
+///
+/// Slicing at Exec's natural granularity restores parity: same total parse work,
+/// same byte order, just released and re-taken often enough that a GUI waiter
+/// gets in. Note this is the OPPOSITE of T62, which BATCHED Exec's tiny writes
+/// up to this size — both fixes converge on "one lock cycle per ~4 KiB", from
+/// opposite directions.
+const max_parse_slice = 4 * 1024;
+
+/// Feed `bytes` to the terminal in `max_parse_slice` pieces, so no single
+/// renderer-mutex hold covers more than that. The parser is a streaming state
+/// machine and `applied_bytes` advances per slice under the same lock, so the
+/// split is invisible to both the terminal and any snapshot reader (WP-D3):
+/// slicing only makes the (grid, offset) pair advance in finer steps.
+fn feedSliced(rd: *ThreadData, bytes: []const u8) void {
+    var it: SliceIter = .{ .rest = bytes };
+    while (it.next()) |slice| {
+        @call(.always_inline, termio.Termio.processOutputTracked, .{
+            rd.io, slice, &rd.io.backend.remote.applied_bytes,
+        });
+    }
+}
+
+/// The pure half of `feedSliced`: hands out the input in `max_parse_slice`
+/// pieces, in order, covering every byte exactly once. Split out so the
+/// boundary arithmetic — which must not drop, duplicate, or reorder a byte of
+/// terminal output — is unit tested without a live pane.
+const SliceIter = struct {
+    rest: []const u8,
+
+    fn next(self: *SliceIter) ?[]const u8 {
+        if (self.rest.len == 0) return null;
+        const n = @min(self.rest.len, max_parse_slice);
+        defer self.rest = self.rest[n..];
+        return self.rest[0..n];
+    }
+};
+
 /// xev callback: the demux thread woke us because bytes landed in the ring. Drain
 /// the whole ring and feed `processOutput` on this thread (the same call Exec's
 /// `ReadThread` makes, self-locking the renderer mutex). Re-arm to keep waiting.
@@ -1071,16 +1120,12 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
                 finishAttachReflow(rd);
             } else if (applied + chunk.len > rd.attach_reflow_target) {
                 const head: usize = @intCast(rd.attach_reflow_target - applied);
-                @call(.always_inline, termio.Termio.processOutputTracked, .{
-                    rd.io, chunk[0..head], &rd.io.backend.remote.applied_bytes,
-                });
+                feedSliced(rd, chunk[0..head]);
                 finishAttachReflow(rd);
                 chunk = chunk[head..];
             }
         }
-        if (chunk.len > 0) @call(.always_inline, termio.Termio.processOutputTracked, .{
-            rd.io, chunk, &rd.io.backend.remote.applied_bytes,
-        });
+        if (chunk.len > 0) feedSliced(rd, chunk);
 
         if (res.send_resume) rd.conn.sendFlowResume(ch.id) catch |err|
             log.warn("error sending FLOW resume err={}", .{err});
@@ -1176,3 +1221,62 @@ pub const ThreadData = struct {
     }
 };
 
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "T111 slice iter: covers the input exactly, in order, bounded pieces" {
+    const testing = std.testing;
+
+    // Deliberately not a multiple of the slice size: the tail piece is the
+    // easiest one to get wrong.
+    var buf: [max_parse_slice * 2 + 7]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @truncate(i);
+
+    var it: SliceIter = .{ .rest = &buf };
+    var seen: usize = 0;
+    var pieces: usize = 0;
+    while (it.next()) |slice| {
+        try testing.expect(slice.len > 0);
+        try testing.expect(slice.len <= max_parse_slice);
+        // Same bytes, same order, at the expected offset.
+        try testing.expectEqualSlices(u8, buf[seen..][0..slice.len], slice);
+        seen += slice.len;
+        pieces += 1;
+    }
+    try testing.expectEqual(buf.len, seen);
+    try testing.expectEqual(@as(usize, 3), pieces);
+}
+
+test "T111 slice iter: sub-slice input is one piece, empty input is none" {
+    const testing = std.testing;
+
+    var one: SliceIter = .{ .rest = "hello" };
+    try testing.expectEqualStrings("hello", one.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), one.next());
+
+    var none: SliceIter = .{ .rest = "" };
+    try testing.expectEqual(@as(?[]const u8, null), none.next());
+}
+
+test "T111 slice iter: exact multiple yields no empty trailing piece" {
+    const testing = std.testing;
+
+    var buf: [max_parse_slice * 2]u8 = undefined;
+    @memset(&buf, 'z');
+    var it: SliceIter = .{ .rest = &buf };
+    var pieces: usize = 0;
+    while (it.next()) |slice| {
+        try testing.expectEqual(max_parse_slice, slice.len);
+        pieces += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), pieces);
+}
+
+test "T111 slice bound stays at or under the drain buffer it slices" {
+    // drainRing pops into a 16 KiB buffer; a slice larger than that would be
+    // dead code and would silently re-widen the mutex hold this bounds.
+    try std.testing.expect(max_parse_slice <= 16 * 1024);
+    try std.testing.expect(max_parse_slice > 0);
+}
