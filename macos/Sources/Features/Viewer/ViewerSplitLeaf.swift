@@ -5,8 +5,8 @@ import SwiftUI
 /// peeks in (animated) on mouse-over of the thin strip at the pane top and
 /// auto-hides after inactivity. While visible the bar reserves its space
 /// (the web view is inset below it), so top-of-page content is never
-/// covered. Web panes show back/forward/reload + an editable URL field;
-/// file panes (markdown/code) show a read-only, selectable file:// address.
+/// covered. Every pane — website or rendered file — gets the same
+/// back/forward/reload/home controls and an editable address field.
 struct ViewerSplitLeaf: View {
     @ObservedObject var viewerView: ViewerView
 
@@ -33,9 +33,9 @@ private struct ViewerRepresentable: NSViewRepresentable {
 /// so it feels native. Hosted by ViewerView in an NSHostingView; revealed on
 /// mouse-over at the pane top, auto-hidden after inactivity. The web view
 /// is inset below the bar while it shows, so the bar never covers content.
-/// Web panes get an interactive toolbar (back/forward/reload + an editable
-/// URL field); file panes (markdown/code) get a read-only, selectable
-/// file:// address so the pane reads like any other page — just not navigable.
+/// Every viewer mode gets the same interactive toolbar (back/forward/reload/
+/// home + an editable address field): a markdown pane is a page you can
+/// navigate away from and come home to, not a dead end.
 struct WebChromeBar: View {
     @ObservedObject var viewerView: ViewerView
 
@@ -43,23 +43,20 @@ struct WebChromeBar: View {
     @FocusState private var urlFocused: Bool
 
     var body: some View {
-        Group {
-            if viewerView.isWebURL {
-                webChrome
-            } else {
-                fileChrome
-            }
-        }
-        .buttonStyle(.borderless)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity)
-        .modifier(ChromeBarBackground())
-        .onHover { viewerView.holdChrome($0) }
+        chrome
+            .buttonStyle(.borderless)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity)
+            .modifier(ChromeBarBackground())
+            .onHover { viewerView.holdChrome($0) }
     }
 
-    /// Web: back/forward/reload + an editable, submittable URL field.
-    private var webChrome: some View {
+    /// One bar for every viewer mode: back/forward/reload/home + an
+    /// editable, submittable address field. A file viewer is not a dead end —
+    /// typing a URL into it navigates the pane to the web, and Home brings it
+    /// back to the file it was opened with.
+    private var chrome: some View {
         HStack(spacing: 4) {
             Button(action: { viewerView.goBack() }) {
                 Image(systemName: "chevron.left")
@@ -84,6 +81,13 @@ struct WebChromeBar: View {
             }
             .help("Reload")
 
+            Button(action: { viewerView.goHome() }) {
+                Image(systemName: "house")
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .help("Home — back to \(viewerView.homeLocation)")
+
             TextField("Enter URL", text: $urlText)
                 .textFieldStyle(.plain)
                 .font(.callout)
@@ -98,45 +102,24 @@ struct WebChromeBar: View {
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
                 .padding(.leading, 4)
         }
-        .onAppear { urlText = viewerView.currentURL }
+        .onAppear {
+            urlText = viewerView.currentURL
+            // A pane opened blank by "Open Browser Pane" asks for the caret
+            // before this bar exists, so the request is also honored here.
+            if viewerView.addressFocusRequest > 0 { urlFocused = true }
+        }
         .onChange(of: viewerView.currentURL) { newValue in
+            // Never overwrite an address the user is part-way through typing.
             if !urlFocused { urlText = newValue }
         }
+        .onChange(of: viewerView.addressFocusRequest) { _ in urlFocused = true }
         .onChange(of: urlFocused) { focused in
-            viewerView.holdChrome(focused)
-            // Browser convention: clicking into the address bar selects the
-            // whole URL. Deferred so it runs after the click's own caret
-            // placement; the first responder is the field's editor by then.
-            if focused {
-                DispatchQueue.main.async {
-                    (viewerView.window?.firstResponder as? NSTextView)?.selectAll(nil)
-                }
-            }
+            // Select-all-on-focus is handled AppKit-side, where the click
+            // that granted focus can be followed to its mouse-up.
+            viewerView.addressFieldFocusChanged(focused)
         }
     }
 
-    /// File (markdown/code): a read-only, selectable file:// address with a
-    /// leading document glyph — no navigation controls (a file viewer never
-    /// browses). Long paths truncate in the middle so the filename stays legible.
-    private var fileChrome: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "doc.text")
-                .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
-
-            Text(viewerView.currentURL)
-                .font(.callout)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
-                .padding(.leading, 4)
-                .help(viewerView.currentURL)
-        }
-    }
 }
 
 /// Liquid Glass on macOS 26+, translucent material bar otherwise, with a

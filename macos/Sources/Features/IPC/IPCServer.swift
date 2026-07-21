@@ -790,21 +790,36 @@ class IPCServer {
                 return
             }
 
-            guard let surfaceView = controller.focusedSurface else {
-                Self.logger.warning("IPC: no focused surface for split")
+            // The window's focused pane may be a VIEWER, which has no
+            // SurfaceView at all. Anchor on the PANE so `--target=<window>`
+            // splits whatever kind of pane happens to be focused — requiring
+            // a focused *surface* here made the whole command a silent no-op
+            // for a window whose viewer pane had focus.
+            //
+            // The last fallback matters for the common agent pattern of
+            // splitting into a NAMED BACKGROUND window: `focusedSurface` is a
+            // stored property that survives losing key, but focusedViewerPane
+            // is resolved from the live first responder and goes nil the
+            // moment another window takes over. Anchoring at the tree's first
+            // pane keeps `--target` deterministic instead of dependent on
+            // which window the user happens to be looking at.
+            let focusedSurfaceView = controller.focusedSurface
+            let anchorPane = focusedSurfaceView.flatMap { controller.surfaceTree.pane(for: $0) }
+                ?? controller.focusedViewerPane
+                ?? controller.surfaceTree.first(where: { _ in true })
+            guard let anchorPane else {
+                Self.logger.warning("IPC: no pane to anchor split in target window")
                 return
             }
 
             if let viewLocation = parsed.view {
-                if let anchorPane = controller.surfaceTree.pane(for: surfaceView) {
-                    self?.createViewerSplit(
-                        controller: controller,
-                        atPane: anchorPane,
-                        direction: direction,
-                        ratio: ratio,
-                        location: viewLocation,
-                        name: parsed.name)
-                }
+                self?.createViewerSplit(
+                    controller: controller,
+                    atPane: anchorPane,
+                    direction: direction,
+                    ratio: ratio,
+                    location: viewLocation,
+                    name: parsed.name)
                 return
             }
 
@@ -830,6 +845,26 @@ class IPCServer {
             }
             if let name = parsed.name {
                 splitConfig.environmentVariables["GHOZTTY_PANE_NAME"] = name
+            }
+
+            // Terminal split anchored at a viewer pane: there is no surface
+            // to inherit cwd/command from, so build a plain local one.
+            guard let surfaceView = focusedSurfaceView else {
+                if let newView = controller.newTerminalSplit(
+                    atPane: anchorPane,
+                    direction: direction,
+                    baseConfig: splitConfig,
+                    ratio: ratio
+                ) {
+                    Self.applyColorScheme(for: tintColor, to: newView)
+                    if let name = parsed.name {
+                        self?.targetRegistry[name] = .pane(
+                            controller: WeakRef(controller),
+                            surface: WeakRef(newView))
+                        Self.logger.info("IPC: registered pane target '\(name)'")
+                    }
+                }
+                return
             }
 
             // Registration happens in `onCreate` (not on the return value)

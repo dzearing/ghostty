@@ -20,6 +20,21 @@ enum ViewerCommands {
         }
     }
 
+    /// Open a browser pane with nothing loaded and the caret already in the
+    /// address bar, so the user just types where they want to go. This is the
+    /// interactive counterpart to `+split --view=<url>` for the common case
+    /// where the URL is not known up front — no modal to fill in first.
+    @MainActor
+    static func openBrowserFromPalette(surfaceView: Ghostty.SurfaceView) {
+        guard let window = surfaceView.window,
+              let controller = window.windowController as? BaseTerminalController else { return }
+
+        let viewer = ViewerView(location: ViewerView.blankPage)
+        controller.newViewerSplit(at: surfaceView, direction: .right, viewer: viewer)
+        // After the split lands and the bar's hosting view is mounted.
+        DispatchQueue.main.async { viewer.focusAddressBar() }
+    }
+
     @MainActor
     static func openURLFromPalette(surfaceView: Ghostty.SurfaceView) {
         guard let window = surfaceView.window,

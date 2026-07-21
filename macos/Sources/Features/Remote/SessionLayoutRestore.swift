@@ -404,7 +404,10 @@ extension AppDelegate {
             // viewed file/URL. Missing files render an in-page error rather
             // than failing the tree.
             if leaf.isViewer {
-                return PaneView(viewer: ViewerView(location: leaf.viewerLocation ?? ""))
+                let location = leaf.viewerLocation ?? ""
+                return PaneView(viewer: ViewerView(
+                    location: location,
+                    homeLocation: leaf.viewerHomeLocation ?? location))
             }
 
             var cfg = Ghostty.SurfaceConfiguration()

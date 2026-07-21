@@ -208,6 +208,13 @@ struct TerminalCommandPaletteView: View {
             ) {
                 ViewerCommands.openURLFromPalette(surfaceView: surfaceView)
             },
+            CommandOption(
+                title: "Viewer: Open Browser Pane",
+                description: "Open a blank browser beside this pane and type an address",
+                leadingIcon: "safari"
+            ) {
+                ViewerCommands.openBrowserFromPalette(surfaceView: surfaceView)
+            },
         ]
     }
 
