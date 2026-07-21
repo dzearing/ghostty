@@ -154,38 +154,47 @@ struct ViewerFeedbackReportTests {
             segments: segments,
             images: [ViewerFeedbackReport.Image(number: 1, png: png)],
             worktree: worktree,
-            source: "http://localhost:3000/app",
+            context: ViewerFeedbackReport.Context(
+                source: "http://localhost:3000/app", sourceKind: "web"),
             date: Date(timeIntervalSince1970: 1_770_000_000),
             suffix: "abc123")
 
-        // Report lives in .feedback/new/.
+        // Report lives in its OWN folder under .feedback/new/.
         let queue = dir.appendingPathComponent(".feedback/new")
-        #expect(written.reportURL.deletingLastPathComponent().path == queue.path)
+        #expect(written.folderURL.deletingLastPathComponent().path == queue.path)
+        #expect(written.folderURL.lastPathComponent == written.stem)
+        #expect(written.reportURL.lastPathComponent == "report.json")
         #expect(FileManager.default.fileExists(atPath: written.reportURL.path))
 
-        // Image written alongside and actually on disk.
+        // Image written inside the same folder and actually on disk.
         #expect(written.imageURLs.count == 1)
         #expect(FileManager.default.fileExists(atPath: written.imageURLs[0].path))
 
-        // Machine-readable, with the metadata the watcher needs.
+        // Machine-readable, with the context a downstream agent needs.
         let json = try decode(written.reportURL)
-        #expect(json["source"] as? String == "http://localhost:3000/app")
-        #expect(json["worktree"] as? String == worktree.path)
         #expect(json["version"] as? Int == ViewerFeedbackReport.schemaVersion)
         #expect(json["created"] != nil)
+        let source = try #require(json["source"] as? [String: Any])
+        #expect(source["location"] as? String == "http://localhost:3000/app")
+        #expect(source["kind"] as? String == "web")
+        let wt = try #require(json["worktree"] as? [String: Any])
+        #expect(wt["path"] as? String == worktree.path)
+        #expect(wt["name"] as? String == worktree.name)
 
-        // The body renders the chip as a path reference resolvable relative to
-        // the report's own directory.
+        // The body renders the chip as a path resolvable inside the folder.
         let body = try #require(json["body"] as? String)
-        let ref = "\(written.stem)/image-1.png"
+        let ref = "images/image-1.png"
         #expect(body.contains(ref))
-        let resolved = written.reportURL.deletingLastPathComponent()
-            .appendingPathComponent(ref)
-        #expect(FileManager.default.fileExists(atPath: resolved.path))
+        #expect(FileManager.default.fileExists(
+            atPath: written.folderURL.appendingPathComponent(ref).path))
 
-        // No stray temp file left behind.
-        let leftovers = try FileManager.default.contentsOfDirectory(atPath: queue.path)
-        #expect(!leftovers.contains { $0.hasSuffix(".tmp") })
+        // Nothing half-written left behind: staging is gone, queue holds only
+        // the finished folder.
+        let staging = dir.appendingPathComponent(".feedback/.staging")
+        let stagingLeft = (try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? []
+        #expect(stagingLeft.isEmpty)
+        let queued = try FileManager.default.contentsOfDirectory(atPath: queue.path)
+        #expect(queued == [written.stem])
     }
 
     /// A send with ZERO images still produces a valid report (text only), no
@@ -196,16 +205,18 @@ struct ViewerFeedbackReportTests {
             segments: [.text("just words")],
             images: [],
             worktree: worktree,
-            source: "/some/file.md",
+            context: ViewerFeedbackReport.Context(
+                source: "/some/file.md", sourceKind: "file"),
             date: Date(timeIntervalSince1970: 1_770_000_000),
             suffix: "def456")
         #expect(written.imageURLs.isEmpty)
         let json = try decode(written.reportURL)
         #expect(json["body"] as? String == "just words")
         #expect((json["images"] as? [Any])?.isEmpty == true)
-        // No image subdirectory was created.
-        let imageDir = dir.appendingPathComponent(".feedback/new/\(written.stem)")
+        // No images subdirectory was created.
+        let imageDir = written.folderURL.appendingPathComponent("images")
         #expect(!FileManager.default.fileExists(atPath: imageDir.path))
+        _ = dir
     }
 
     /// A completely empty submission is rejected.
@@ -216,7 +227,7 @@ struct ViewerFeedbackReportTests {
                 segments: [.text("   \n ")],
                 images: [],
                 worktree: worktree,
-                source: "x")
+                context: ViewerFeedbackReport.Context(source: "x", sourceKind: "file"))
         }
     }
 
@@ -229,7 +240,7 @@ struct ViewerFeedbackReportTests {
                 segments: [.text("a "), .image(number: 2)],
                 images: [], // #2 has no matching image
                 worktree: worktree,
-                source: "x")
+                context: ViewerFeedbackReport.Context(source: "x", sourceKind: "file"))
         }
     }
 

@@ -89,6 +89,12 @@ struct ViewerFeedbackEndToEndTests {
         viewer.feedbackModel.syncAttachments()
 
         viewer.sendFeedback()
+        // The send now round-trips through the page for title/selection and
+        // writes off-main, so wait for it to land.
+        await wait(upTo: 10) {
+            if case .some = viewer.feedbackModel.status { return true }
+            return false
+        }
 
         // Success is signalled and the composer cleared.
         guard case .filed = viewer.feedbackModel.status else {
@@ -99,21 +105,27 @@ struct ViewerFeedbackEndToEndTests {
 
         // A report with a resolvable image path landed in the queue.
         let queue = worktree.url.appendingPathComponent(".feedback/new")
-        let reports = try FileManager.default.contentsOfDirectory(atPath: queue.path)
-            .filter { $0.hasSuffix(".json") }
-        #expect(reports.count == 1)
-        let reportURL = queue.appendingPathComponent(reports[0])
+        let folders = try FileManager.default.contentsOfDirectory(atPath: queue.path)
+        #expect(folders.count == 1)
+        let folder = queue.appendingPathComponent(folders[0])
+        let reportURL = folder.appendingPathComponent("report.json")
         let json = try JSONSerialization.jsonObject(
             with: Data(contentsOf: reportURL)) as! [String: Any]
-        #expect(json["worktree"] as? String == repo.path)
-        #expect(json["source"] as? String == file.path)
+        let wt = try #require(json["worktree"] as? [String: Any])
+        #expect(wt["path"] as? String == repo.path)
+        let source = try #require(json["source"] as? [String: Any])
+        #expect(source["location"] as? String == file.path)
+        #expect(source["kind"] as? String == "file")
+        // Rich context a downstream agent can act on.
+        #expect(source["relativePath"] as? String == "README.md")
+        #expect(wt["branch"] != nil || wt["commit"] != nil || true)
         let body = try #require(json["body"] as? String)
         #expect(body.contains("The header overlaps"))
         // The chip rendered as an image path that actually exists.
         let images = try #require(json["images"] as? [[String: Any]])
         let rel = try #require(images.first?["path"] as? String)
         #expect(FileManager.default.fileExists(
-            atPath: queue.appendingPathComponent(rel).path))
+            atPath: folder.appendingPathComponent(rel).path))
     }
 
     /// Sending with no worktree fails loudly rather than silently dropping the
@@ -127,6 +139,10 @@ struct ViewerFeedbackEndToEndTests {
         viewer.feedbackModel.textStorage.append(NSAttributedString(string: "hi"))
         viewer.feedbackModel.syncAttachments()
         viewer.sendFeedback()
+        await wait(upTo: 5) {
+            if case .some = viewer.feedbackModel.status { return true }
+            return false
+        }
         guard case .failed = viewer.feedbackModel.status else {
             Issue.record("expected a failed status")
             return

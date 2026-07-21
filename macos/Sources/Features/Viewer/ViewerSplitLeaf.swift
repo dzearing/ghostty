@@ -120,21 +120,18 @@ struct WebChromeBar: View {
 
             // Feedback, trailing. Present only when the pane's content
             // resolves to a git worktree — with nowhere to file a report, the
-            // button would be a lie. Its label is the worktree's own name (full
-            // path on hover) because feedback landing silently in the WRONG
-            // repo is the failure this whole affordance has to prevent.
+            // button would be a lie.
+            //
+            // Icon only, in the same 24pt square as every other control in
+            // this bar: a text label here read as a heading rather than a
+            // button and broke the row's rhythm. The destination is not lost —
+            // it is on the tooltip, and spelled out in the composer's footer
+            // once the toolbar is open, which is when it actually matters.
             if let worktree = viewerView.worktree {
                 Button(action: { viewerView.toggleFeedback() }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.bubble")
-                        Text(worktree.name)
-                            .font(.caption)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .frame(maxWidth: 110)
-                    }
-                    .frame(height: 24)
-                    .contentShape(Rectangle())
+                    Image(systemName: "exclamationmark.bubble")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
                 }
                 .foregroundStyle(
                     viewerView.feedbackOpen ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))

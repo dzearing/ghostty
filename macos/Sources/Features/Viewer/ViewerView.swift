@@ -900,11 +900,28 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return nil
     }
 
+    /// Take an interactive screen snapshot into the composer (the `+` button).
+    func captureFeedbackScreenshot() {
+        guard let feedbackHost,
+              let textView = Self.firstTextView(in: feedbackHost) else { return }
+        // The capture UI takes over the screen; the bar must not auto-hide
+        // out from under the user while they are dragging out a region.
+        holdChrome(true)
+        textView.captureScreenshot { [weak self] in
+            self?.holdChrome(false)
+        }
+    }
+
     /// File the composed report into the detected worktree's queue.
     ///
-    /// On success the composer is cleared and a confirmation replaces the
-    /// destination line, then the toolbar closes on its own — the user is
-    /// never left unsure whether the report was filed.
+    /// Gathers the page's own context first — what the user had SELECTED, the
+    /// page title — because a report that quotes what someone was pointing at
+    /// is actionable where "this is broken" is not. That read is asynchronous
+    /// (it crosses into the web view), so the write happens in its completion.
+    ///
+    /// On success the composer clears, a confirmation replaces the destination
+    /// line, and the toolbar closes itself — the user is never left unsure
+    /// whether the report was filed.
     func sendFeedback() {
         guard let worktree else {
             feedbackModel.status = .failed("No worktree — nowhere to file this")
@@ -912,28 +929,131 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
         guard !feedbackModel.isEmpty else { return }
 
-        do {
-            let written = try ViewerFeedbackReport.write(
-                segments: feedbackModel.segments(),
-                images: feedbackModel.imagePayloads(),
-                worktree: worktree,
-                source: location)
-            feedbackModel.reset()
-            feedbackModel.status = .filed(written.reportURL.lastPathComponent)
-            Self.logger.info(
-                "filed feedback report \(written.reportURL.path, privacy: .public)")
-            // Long enough to read the confirmation, short enough that the
-            // pane gives its space back without being asked.
-            feedbackCloseTimer?.invalidate()
-            feedbackCloseTimer = Timer.scheduledTimer(
-                withTimeInterval: 1.8, repeats: false
-            ) { [weak self] _ in
-                self?.setFeedbackOpen(false)
+        // Snapshot the composer NOW: the JS round-trip below is async, and the
+        // user can keep typing during it.
+        let segments = feedbackModel.segments()
+        let images = feedbackModel.imagePayloads()
+
+        readPageContext { [weak self] pageTitle, selection in
+            guard let self else { return }
+            var context = ViewerFeedbackReport.Context(
+                source: self.location,
+                sourceKind: self.isWebURL ? "web" : "file")
+            context.filePath = self.fileURL?.path
+            context.relativePath = self.fileURL.flatMap {
+                Self.relativePath(of: $0.path, under: worktree.path)
             }
-        } catch {
-            feedbackModel.status = .failed(Self.feedbackErrorText(error))
-            Self.logger.warning("failed to file feedback report: \(error)")
+            context.pageTitle = pageTitle ?? self.title
+            context.selection = selection
+            context.paneID = self.paneID
+            context.viewport = "\(Int(self.bounds.width))x\(Int(self.bounds.height))"
+            context.appVersion = Bundle.main
+                .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            self.writeFeedback(
+                segments: segments, images: images,
+                worktree: worktree, context: context)
         }
+    }
+
+    /// Ask the page for its title and the user's current selection.
+    ///
+    /// Best-effort by design: a website that blocks script evaluation, or a
+    /// pane whose page never loaded, must still be able to file feedback — it
+    /// just files it without a quote.
+    private func readPageContext(
+        completion: @escaping (String?, String?) -> Void
+    ) {
+        let js = """
+        (function () {
+          var s = "";
+          try { s = String(window.getSelection()); } catch (e) {}
+          return JSON.stringify({ title: document.title || "", selection: s });
+        })()
+        """
+        var finished = false
+        let finish = { (title: String?, selection: String?) in
+            guard !finished else { return }
+            finished = true
+            completion(title, selection)
+        }
+        // A wedged or hostile page must not strand the send.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { finish(nil, nil) }
+
+        webView.evaluateJavaScript(js) { result, _ in
+            guard let raw = result as? String,
+                  let data = raw.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                finish(nil, nil)
+                return
+            }
+            let title = (parsed["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let selection = (parsed["selection"] as? String)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .flatMap { $0.isEmpty ? nil : $0 }
+            finish(title, selection)
+        }
+    }
+
+    /// Resolve git revision off the main thread, then write. Both are blocking
+    /// work (a subprocess and file I/O) that has no business on the main queue.
+    private func writeFeedback(
+        segments: [ViewerFeedbackReport.Segment],
+        images: [ViewerFeedbackReport.Image],
+        worktree: ViewerWorktree,
+        context: ViewerFeedbackReport.Context
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var context = context
+            let revision = ViewerWorktreeResolver.revision(at: worktree.path)
+            context.branch = revision.branch
+            context.commit = revision.commit
+
+            let result = Result {
+                try ViewerFeedbackReport.write(
+                    segments: segments, images: images,
+                    worktree: worktree, context: context)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let written):
+                    self.feedbackModel.reset()
+                    self.feedbackModel.status = .filed(written.stem)
+                    Self.logger.info(
+                        "filed feedback report \(written.folderURL.path, privacy: .public)")
+                    // Long enough to read the confirmation, short enough that
+                    // the pane gives its space back without being asked.
+                    self.feedbackCloseTimer?.invalidate()
+                    self.feedbackCloseTimer = Timer.scheduledTimer(
+                        withTimeInterval: 1.8, repeats: false
+                    ) { [weak self] _ in
+                        self?.setFeedbackOpen(false)
+                    }
+                case .failure(let error):
+                    self.feedbackModel.status = .failed(Self.feedbackErrorText(error))
+                    Self.logger.warning("failed to file feedback report: \(error)")
+                }
+            }
+        }
+    }
+
+    /// This pane's stable ghoztty id — the same value `+list --json` reports
+    /// and `--target` accepts, so a report names a pane the reader can address.
+    /// Owned by the enclosing `PaneView`, so it is resolved through the tree.
+    var paneID: String? {
+        guard let controller = window?.windowController as? BaseTerminalController,
+              let pane = controller.surfaceTree.first(where: { $0.viewerView === self })
+        else { return nil }
+        return pane.id.uuidString
+    }
+
+    /// A path expressed relative to a containing directory, or nil when it is
+    /// not inside it. The repo-relative form is what a coding agent can act on.
+    static func relativePath(of path: String, under root: String) -> String? {
+        let root = root.hasSuffix("/") ? root : root + "/"
+        guard path.hasPrefix(root) else { return nil }
+        return String(path.dropFirst(root.count))
     }
 
     static func feedbackErrorText(_ error: Error) -> String {

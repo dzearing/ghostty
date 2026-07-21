@@ -16,22 +16,27 @@ import Foundation
 /// a watcher that prints `report["body"]` gets a readable document with
 /// working image links.
 ///
-/// ## Layout on disk
+/// ## Layout on disk — one self-contained folder per report
 ///
 /// ```
-/// <worktree>/.feedback/new/20260721T214512Z-a3f9c2.json
-/// <worktree>/.feedback/new/20260721T214512Z-a3f9c2/image-1.png
+/// <worktree>/.feedback/new/20260721T214512Z-a3f9c2/
+///     report.json
+///     images/image-1.png
 /// ```
 ///
-/// Image paths inside the report are relative to the report file's own
-/// directory, so the queue can be moved or archived wholesale.
+/// Everything for a submission lives together, so a report can be moved,
+/// archived, or handed to an agent as one unit. Image paths inside the report
+/// are relative to the report folder.
 enum ViewerFeedbackReport {
-    /// Schema version of the emitted JSON. Bump on any incompatible change so
-    /// a watcher can refuse what it doesn't understand.
-    static let schemaVersion = 1
+    /// Schema version of the emitted JSON. Bumped to 2 when reports moved
+    /// into per-report folders and gained the full source/worktree context.
+    static let schemaVersion = 2
 
     static let queueDirectoryName = ".feedback"
     static let newDirectoryName = "new"
+    static let stagingDirectoryName = ".staging"
+    static let reportFileName = "report.json"
+    static let imagesDirectoryName = "images"
 
     /// One piece of the composed message, in document order.
     enum Segment: Equatable {
@@ -44,15 +49,55 @@ enum ViewerFeedbackReport {
     struct Image: Equatable {
         let number: Int
         let png: Data
+        var pixelWidth: Int = 0
+        var pixelHeight: Int = 0
+    }
+
+    /// Everything known about WHAT the feedback is about. The point of a
+    /// feedback report is that a downstream agent can act on it without asking
+    /// follow-up questions, so this is deliberately generous: where the user
+    /// was, what they had selected, and which revision they were looking at.
+    struct Context {
+        /// The location as displayed (URL or absolute file path).
+        var source: String
+        /// `"file"` or `"web"` — lets a reader branch without parsing `source`.
+        var sourceKind: String
+        /// Absolute path of the viewed file, when file-backed.
+        var filePath: String?
+        /// `filePath` relative to the worktree root — the form a coding agent
+        /// actually wants ("macos/Sources/…", not "/Users/me/git/…").
+        var relativePath: String?
+        /// The page's own title (web) or the file name.
+        var pageTitle: String?
+        /// Text the user had SELECTED in the page when they hit send — the
+        /// quote of what they were pointing at.
+        var selection: String?
+        /// The viewer pane's stable ghoztty id.
+        var paneID: String?
+        /// Pane size in points, e.g. "820x540" — tells a reader whether a
+        /// layout complaint was at a narrow width.
+        var viewport: String?
+        /// Branch and commit of the worktree, so a report can be replayed
+        /// against the exact revision the user saw.
+        var branch: String?
+        var commit: String?
+        var appVersion: String?
+
+        init(source: String, sourceKind: String) {
+            self.source = source
+            self.sourceKind = sourceKind
+        }
     }
 
     /// What landed on disk.
     struct Written: Equatable {
-        /// The report JSON.
+        /// The report folder.
+        let folderURL: URL
+        /// The report JSON inside it.
         let reportURL: URL
         /// The images, in the order they were written.
         let imageURLs: [URL]
-        /// The sortable stem shared by the report and its image directory.
+        /// The sortable folder name.
         let stem: String
     }
 
@@ -85,6 +130,11 @@ enum ViewerFeedbackReport {
 
     static func imageFileName(number: Int) -> String { "image-\(number).png" }
 
+    /// An image's path relative to the report folder.
+    static func imageRelativePath(number: Int) -> String {
+        "\(imagesDirectoryName)/\(imageFileName(number: number))"
+    }
+
     // MARK: - Body rendering
 
     /// Render the composed segments as markdown, with each chip replaced by a
@@ -93,15 +143,15 @@ enum ViewerFeedbackReport {
     /// The reference is a markdown image link whose alt text is the chip's own
     /// label, so a downstream reader gets a resolvable path without having to
     /// parse chip metadata — the whole point of rendering rather than
-    /// serializing the attachment.
-    static func renderBody(segments: [Segment], stem: String) -> String {
+    /// serializing the attachment. Paths are relative to the report folder, so
+    /// the body renders correctly in a markdown viewer opened in place.
+    static func renderBody(segments: [Segment]) -> String {
         segments.map { segment in
             switch segment {
             case .text(let text):
                 return text
             case .image(let number):
-                let path = "\(stem)/\(imageFileName(number: number))"
-                return "![Image #\(number)](\(path))"
+                return "![Image #\(number)](\(imageRelativePath(number: number)))"
             }
         }.joined()
     }
@@ -117,28 +167,28 @@ enum ViewerFeedbackReport {
 
     // MARK: - Writing
 
-    /// Write a report (and its images) into `worktree/.feedback/new/`.
+    /// Write a report folder into `worktree/.feedback/new/`.
     ///
-    /// Ordering is what makes this safe for a watcher: images land first —
-    /// unobservable, because nothing references them yet — and the report is
-    /// then written to a dot-prefixed temp file in the SAME directory and
-    /// `rename`d onto its final name. `rename(2)` guarantees the destination
-    /// appears whole or not at all, so a watcher globbing `*.json` can never
-    /// read a half-written report, nor a report whose images are still being
-    /// written.
+    /// The whole folder is built in a sibling staging directory and then moved
+    /// into place with a single `rename`, which is atomic — a watcher scanning
+    /// `.feedback/new/` sees either nothing or a complete report folder with
+    /// every image already present. Staging under `.feedback/` (not `/tmp`)
+    /// keeps it on the same filesystem, since a cross-device rename fails with
+    /// EXDEV and would silently degrade to a non-atomic copy.
     ///
     /// `date` and `suffix` are injectable purely so tests can assert exact
-    /// file names.
+    /// names.
     @discardableResult
     static func write(
         segments: [Segment],
         images: [Image],
         worktree: ViewerWorktree,
-        source: String,
+        context: Context,
         date: Date = Date(),
         suffix: String = randomSuffix()
     ) throws -> Written {
-        let text = plainText(segments: segments).trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = plainText(segments: segments)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !images.isEmpty else { throw WriteError.empty }
 
         // A chip whose image is gone would serialize a path to a file that
@@ -153,60 +203,85 @@ enum ViewerFeedbackReport {
         }
 
         let stem = makeStem(date: date, suffix: suffix)
-        let queueDir = worktree.url
-            .appendingPathComponent(queueDirectoryName)
-            .appendingPathComponent(newDirectoryName)
-        try FileManager.default.createDirectory(
-            at: queueDir, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        let feedbackDir = worktree.url.appendingPathComponent(queueDirectoryName)
+        let queueDir = feedbackDir.appendingPathComponent(newDirectoryName)
+        let stagingDir = feedbackDir
+            .appendingPathComponent(stagingDirectoryName)
+            .appendingPathComponent(stem)
+        try fm.createDirectory(at: queueDir, withIntermediateDirectories: true)
+        // A leftover staging dir from a crashed write would fail the move.
+        if fm.fileExists(atPath: stagingDir.path) {
+            try fm.removeItem(at: stagingDir)
+        }
+        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
-        // 1. Images. Nothing points at them yet, so a watcher that wakes up
-        // mid-write sees only an inert directory.
-        var imageURLs: [URL] = []
-        if !images.isEmpty {
-            let imageDir = queueDir.appendingPathComponent(stem)
-            try FileManager.default.createDirectory(
-                at: imageDir, withIntermediateDirectories: true)
-            for image in images.sorted(by: { $0.number < $1.number }) {
-                let url = imageDir.appendingPathComponent(
-                    imageFileName(number: image.number))
-                try image.png.write(to: url, options: .atomic)
-                imageURLs.append(url)
+        let sorted = images.sorted { $0.number < $1.number }
+        var stagedImageNames: [String] = []
+        if !sorted.isEmpty {
+            let imagesDir = stagingDir.appendingPathComponent(imagesDirectoryName)
+            try fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+            for image in sorted {
+                let name = imageFileName(number: image.number)
+                try image.png.write(to: imagesDir.appendingPathComponent(name))
+                stagedImageNames.append(name)
             }
         }
 
-        // 2. The report, temp-then-rename inside the queue directory (same
-        // directory ⇒ same filesystem ⇒ the rename is atomic; a cross-device
-        // rename would fail with EXDEV and silently degrade to a copy).
         let payload = Payload(
             version: schemaVersion,
             id: stem,
             created: ISO8601DateFormatter.feedbackFormatter.string(from: date),
-            source: source,
-            worktree: worktree.path,
-            body: renderBody(segments: segments, stem: stem),
-            images: images
-                .sorted(by: { $0.number < $1.number })
-                .map { PayloadImage(number: $0.number, path: "\(stem)/\(imageFileName(number: $0.number))") })
+            body: renderBody(segments: segments),
+            source: PayloadSource(
+                location: context.source,
+                kind: context.sourceKind,
+                filePath: context.filePath,
+                relativePath: context.relativePath,
+                pageTitle: context.pageTitle,
+                selection: context.selection,
+                paneID: context.paneID,
+                viewport: context.viewport),
+            worktree: PayloadWorktree(
+                path: worktree.path,
+                name: worktree.name,
+                branch: context.branch,
+                commit: context.commit),
+            app: PayloadApp(name: "Ghoztty", version: context.appVersion),
+            images: sorted.map {
+                PayloadImage(
+                    number: $0.number,
+                    path: imageRelativePath(number: $0.number),
+                    pixelWidth: $0.pixelWidth > 0 ? $0.pixelWidth : nil,
+                    pixelHeight: $0.pixelHeight > 0 ? $0.pixelHeight : nil,
+                    bytes: $0.png.count)
+            })
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(payload)
+        try encoder.encode(payload)
+            .write(to: stagingDir.appendingPathComponent(reportFileName))
 
-        let reportURL = queueDir.appendingPathComponent("\(stem).json")
-        // Dot-prefixed AND .tmp-suffixed: invisible to a `*.json` glob and to
-        // a plain directory listing, so neither kind of watcher trips on it.
-        let tempURL = queueDir.appendingPathComponent(".\(stem).json.tmp")
-        try data.write(to: tempURL, options: .atomic)
+        // One atomic move publishes the whole folder.
+        let finalDir = queueDir.appendingPathComponent(stem)
         guard rename(
-            (tempURL as NSURL).fileSystemRepresentation,
-            (reportURL as NSURL).fileSystemRepresentation) == 0
+            (stagingDir as NSURL).fileSystemRepresentation,
+            (finalDir as NSURL).fileSystemRepresentation) == 0
         else {
             let code = errno
-            try? FileManager.default.removeItem(at: tempURL)
+            try? fm.removeItem(at: stagingDir)
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
         }
 
-        return Written(reportURL: reportURL, imageURLs: imageURLs, stem: stem)
+        return Written(
+            folderURL: finalDir,
+            reportURL: finalDir.appendingPathComponent(reportFileName),
+            imageURLs: stagedImageNames.map {
+                finalDir
+                    .appendingPathComponent(imagesDirectoryName)
+                    .appendingPathComponent($0)
+            },
+            stem: stem)
     }
 
     // MARK: - Payload
@@ -214,15 +289,42 @@ enum ViewerFeedbackReport {
     private struct PayloadImage: Codable {
         let number: Int
         let path: String
+        let pixelWidth: Int?
+        let pixelHeight: Int?
+        let bytes: Int
+    }
+
+    private struct PayloadSource: Codable {
+        let location: String
+        let kind: String
+        let filePath: String?
+        let relativePath: String?
+        let pageTitle: String?
+        let selection: String?
+        let paneID: String?
+        let viewport: String?
+    }
+
+    private struct PayloadWorktree: Codable {
+        let path: String
+        let name: String
+        let branch: String?
+        let commit: String?
+    }
+
+    private struct PayloadApp: Codable {
+        let name: String
+        let version: String?
     }
 
     private struct Payload: Codable {
         let version: Int
         let id: String
         let created: String
-        let source: String
-        let worktree: String
         let body: String
+        let source: PayloadSource
+        let worktree: PayloadWorktree
+        let app: PayloadApp
         let images: [PayloadImage]
     }
 }

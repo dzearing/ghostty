@@ -276,7 +276,14 @@ final class ViewerFeedbackModel: ObservableObject {
 
     /// The images still referenced by a chip, ready for the report writer.
     func imagePayloads() -> [ViewerFeedbackReport.Image] {
-        attachments.map { ViewerFeedbackReport.Image(number: $0.number, png: $0.png) }
+        attachments.map { attachment in
+            let rep = NSBitmapImageRep(data: attachment.png)
+            return ViewerFeedbackReport.Image(
+                number: attachment.number,
+                png: attachment.png,
+                pixelWidth: rep?.pixelsWide ?? 0,
+                pixelHeight: rep?.pixelsHigh ?? 0)
+        }
     }
 
     /// Empty the composer after a successful send. The number counter is NOT
@@ -342,6 +349,41 @@ final class ViewerFeedbackTextView: NSTextView {
     override func paste(_ sender: Any?) {
         if pasteImagesFromPasteboard() { return }
         pasteAsPlainText(sender)
+    }
+
+    /// Image types must appear here or Cmd-V is DEAD for a screenshot.
+    ///
+    /// AppKit validates the Edit▸Paste menu item against this list, so when it
+    /// omits image types an image-only clipboard leaves the item DISABLED —
+    /// the keystroke never dispatches and `paste(_:)` above never runs. That
+    /// was the original "can't paste images" bug. Declaring the types
+    /// explicitly (rather than trusting `importsGraphics`, which does not put
+    /// them here) is what actually enables the command.
+    override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        var types = super.readablePasteboardTypes
+        for type in [NSPasteboard.PasteboardType.png, .tiff, .fileURL]
+        where !types.contains(type) {
+            types.append(type)
+        }
+        return types
+    }
+
+    /// Belt and braces for the same failure: some menu paths validate through
+    /// here instead. An image on the pasteboard always enables Paste.
+    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(NSText.paste(_:)),
+           NSPasteboard.general.canReadObject(forClasses: [NSImage.self], options: nil) {
+            return true
+        }
+        return super.validateMenuItem(menuItem)
+    }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(NSText.paste(_:)),
+           NSPasteboard.general.canReadObject(forClasses: [NSImage.self], options: nil) {
+            return true
+        }
+        return super.validateUserInterfaceItem(item)
     }
 
     /// Screenshots arrive as image data; a file dragged from Finder arrives as
@@ -422,6 +464,46 @@ final class ViewerFeedbackTextView: NSTextView {
     override func mouseDown(with event: NSEvent) {
         if let id = chipID(at: event) { onChipClick?(id) }
         super.mouseDown(with: event)
+    }
+
+    /// Take an interactive screen snapshot and insert it as a chip.
+    ///
+    /// Captures to a temp FILE rather than `screencapture -c` (clipboard) on
+    /// purpose: the user's clipboard is theirs, and silently overwriting it to
+    /// implement our own button would destroy whatever they had copied.
+    /// `-i` is interactive region select, `-o` drops the window shadow.
+    /// Escaping the capture writes no file and inserts nothing.
+    func captureScreenshot(completion: (() -> Void)? = nil) {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ghoztty-feedback-\(UUID().uuidString).png")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            process.arguments = ["-i", "-o", url.path]
+            do {
+                try process.run()
+            } catch {
+                DispatchQueue.main.async { completion?() }
+                return
+            }
+            process.waitUntilExit()
+
+            let data = try? Data(contentsOf: url)
+            try? FileManager.default.removeItem(at: url)
+            DispatchQueue.main.async {
+                defer { completion?() }
+                // Cancelled selection ⇒ no file ⇒ nothing to insert.
+                guard let self, let data, !data.isEmpty,
+                      let image = NSImage(data: data) else { return }
+                guard let model = self.model else { return }
+                let range = self.selectedRange()
+                let inserted = model.insertImage(image, png: data, at: range)
+                self.setSelectedRange(
+                    NSRange(location: inserted.location + inserted.length, length: 0))
+                self.didChangeText()
+                self.window?.makeFirstResponder(self)
+            }
+        }
     }
 
     /// The chip under a mouse event, if any.

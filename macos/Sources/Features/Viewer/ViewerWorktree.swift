@@ -172,6 +172,24 @@ enum ViewerWorktreeResolver {
         return root
     }
 
+    /// The branch and commit a worktree is currently on, so a report can be
+    /// replayed against the exact revision the user was looking at. Blocking;
+    /// call off the main thread. Either half is nil when git can't answer
+    /// (a detached HEAD has no branch name; a repo with no commits has no HEAD).
+    static func revision(at root: String) -> (branch: String?, commit: String?) {
+        let branch = run(
+            tool: gitPaths,
+            arguments: ["-C", root, "rev-parse", "--abbrev-ref", "HEAD"]
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let commit = run(
+            tool: gitPaths,
+            arguments: ["-C", root, "rev-parse", "HEAD"]
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (
+            branch.flatMap { $0.isEmpty || $0 == "HEAD" ? nil : $0 },
+            commit.flatMap { $0.isEmpty ? nil : $0 })
+    }
+
     // MARK: - Process plumbing
 
     private static let gitPaths = [

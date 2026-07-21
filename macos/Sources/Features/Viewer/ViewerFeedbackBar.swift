@@ -2,41 +2,37 @@ import AppKit
 import SwiftUI
 
 /// The feedback composer toolbar: slides in below the viewer's navigation bar
-/// and above the content. A multi-line rich input on the left, a send button
-/// on the right, a thumbnail carousel beneath, and a footer naming the
-/// worktree the report will land in.
+/// and above the content.
+///
+/// The input is a **pill** that grows with its content, with the snapshot and
+/// send controls as circular buttons sitting INSIDE it on the trailing edge —
+/// a chat composer, not a form. A thumbnail carousel and a destination footer
+/// sit beneath.
 struct ViewerFeedbackBar: View {
     @ObservedObject var viewerView: ViewerView
     @ObservedObject var model: ViewerFeedbackModel
 
-    /// Height of the text input. Roughly five lines — enough to write a real
-    /// report in without the toolbar eating the pane it is describing.
-    private static let inputHeight: CGFloat = 92
-    private static let thumbnailHeight: CGFloat = 56
+    /// Live content height of the text view, so the pill grows as the report
+    /// is written instead of committing a tall box up front.
+    @State private var contentHeight: CGFloat = ViewerFeedbackBar.minInputHeight
+
+    /// One line of text plus the pill's own padding. At this height the shape
+    /// is a true capsule — the composer starts as a single-line pill.
+    static let minInputHeight: CGFloat = 22
+    /// Roughly six lines; past this the text view scrolls rather than eating
+    /// the pane the feedback is about.
+    static let maxInputHeight: CGFloat = 116
+    private static let thumbnailHeight: CGFloat = 52
+    /// Diameter of the in-pill circular buttons.
+    static let actionButtonSize: CGFloat = 24
+
+    private var inputHeight: CGFloat {
+        min(max(contentHeight, Self.minInputHeight), Self.maxInputHeight)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .bottom, spacing: 8) {
-                ViewerFeedbackTextEditor(
-                    model: model,
-                    onSend: { viewerView.sendFeedback() },
-                    onEscape: { viewerView.setFeedbackOpen(false) })
-                    .frame(height: Self.inputHeight)
-                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
-                    .accessibilityLabel("Feedback message")
-
-                Button(action: { viewerView.sendFeedback() }) {
-                    Label("Send", systemImage: "paperplane.fill")
-                        .labelStyle(.titleAndIcon)
-                        .font(.callout)
-                        .padding(.horizontal, 10)
-                        .frame(height: 26)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.isEmpty)
-                .help("Send feedback (⌘↩)")
-            }
+        VStack(alignment: .leading, spacing: 7) {
+            composerPill
 
             if !model.attachments.isEmpty {
                 carousel
@@ -49,6 +45,61 @@ struct ViewerFeedbackBar: View {
         .frame(maxWidth: .infinity)
         .modifier(ChromeBarBackground())
         .onHover { viewerView.holdChrome($0) }
+    }
+
+    /// The pill: text on the left, circular actions pinned bottom-right inside
+    /// it. Bottom-aligned so the buttons stay put as the pill grows upward.
+    private var composerPill: some View {
+        HStack(alignment: .bottom, spacing: 6) {
+            ViewerFeedbackTextEditor(
+                model: model,
+                onSend: { viewerView.sendFeedback() },
+                onEscape: { viewerView.setFeedbackOpen(false) },
+                onHeightChange: { contentHeight = $0 })
+                .frame(height: inputHeight)
+                .accessibilityLabel("Feedback message")
+
+            snapshotButton
+            sendButton
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 5)
+        .padding(.vertical, 5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(.quaternary.opacity(0.5))
+                .overlay(Capsule(style: .continuous).strokeBorder(.quaternary, lineWidth: 1)))
+    }
+
+    /// Grab a region of the screen without leaving the composer — the whole
+    /// point of feedback about a UI is pointing at the UI.
+    private var snapshotButton: some View {
+        Button(action: { viewerView.captureFeedbackScreenshot() }) {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: Self.actionButtonSize, height: Self.actionButtonSize)
+                .background(Circle().fill(.quaternary))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Add a screenshot of the screen")
+        .accessibilityLabel("Add screenshot")
+    }
+
+    private var sendButton: some View {
+        Button(action: { viewerView.sendFeedback() }) {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 12, weight: .bold))
+                .frame(width: Self.actionButtonSize, height: Self.actionButtonSize)
+                .background(Circle().fill(model.isEmpty ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.tint)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(model.isEmpty ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.white))
+        .disabled(model.isEmpty)
+        .help("Send feedback (⌘↩)")
+        .accessibilityLabel("Send feedback")
     }
 
     /// One thumbnail per pasted image, labeled with the same stable number as
@@ -150,8 +201,12 @@ struct ViewerFeedbackTextEditor: NSViewRepresentable {
     @ObservedObject var model: ViewerFeedbackModel
     let onSend: () -> Void
     let onEscape: () -> Void
+    /// Reports the laid-out text height so the pill can grow with content.
+    var onHeightChange: ((CGFloat) -> Void)?
 
-    func makeCoordinator() -> Coordinator { Coordinator(model: model) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(model: model, onHeightChange: onHeightChange)
+    }
 
     func makeNSView(context: Context) -> NSScrollView {
         // The model's storage is reused across mounts, so any layout manager
@@ -190,7 +245,8 @@ struct ViewerFeedbackTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.allowsUndo = true
         textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 6, height: 6)
+        // The pill supplies the padding; insetting again would double it.
+        textView.textContainerInset = NSSize(width: 0, height: 1)
         textView.typingAttributes = ViewerFeedbackModel.typingAttributes
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
@@ -207,6 +263,7 @@ struct ViewerFeedbackTextEditor: NSViewRepresentable {
         scrollView.borderType = .noBorder
         scrollView.documentView = textView
         context.coordinator.textView = textView
+        DispatchQueue.main.async { context.coordinator.reportHeight() }
         return scrollView
     }
 
@@ -237,11 +294,14 @@ struct ViewerFeedbackTextEditor: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         let model: ViewerFeedbackModel
+        let onHeightChange: ((CGFloat) -> Void)?
         weak var textView: ViewerFeedbackTextView?
         var lastRevealToken = 0
+        private var lastReportedHeight: CGFloat = -1
 
-        init(model: ViewerFeedbackModel) {
+        init(model: ViewerFeedbackModel, onHeightChange: ((CGFloat) -> Void)?) {
             self.model = model
+            self.onHeightChange = onHeightChange
         }
 
         /// Every edit re-derives the carousel from the text. A chip deleted
@@ -252,6 +312,22 @@ struct ViewerFeedbackTextEditor: NSViewRepresentable {
             // The user is composing again — clear a stale "filed" banner so
             // it can never be mistaken for confirmation of the NEW report.
             if model.status != nil { model.status = nil }
+            reportHeight()
+        }
+
+        /// Push the laid-out text height up so the pill can size to content.
+        /// Only on change: this runs from layout, and feeding SwiftUI an
+        /// identical value every pass re-enters layout forever.
+        func reportHeight() {
+            guard let textView, let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer
+            else { return }
+            layoutManager.ensureLayout(for: container)
+            let used = layoutManager.usedRect(for: container).height
+            let height = ceil(used + textView.textContainerInset.height * 2)
+            guard abs(height - lastReportedHeight) > 0.5 else { return }
+            lastReportedHeight = height
+            onHeightChange?(height)
         }
     }
 }

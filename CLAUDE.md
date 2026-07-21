@@ -372,8 +372,13 @@ the queue; consuming it is separate and not built here).
   or the main checkout). No repo ⇒ no feedback button. Resolutions are cached
   per (location, origin) for 15s so navigation never stutters and a dev server
   started later still makes the button appear.
-- **Composer.** A multi-line rich-text input (AppKit `NSTextView`): `Enter`
-  inserts a newline, `Cmd-Enter` (or the send button) sends, `Escape` closes.
+  The button is **icon-only**, in the same 24pt square as the other chrome
+  controls; the destination is on its tooltip and in the composer footer.
+- **Composer.** A **pill** that grows with its content (one line up to ~6),
+  with two **circular buttons inside its trailing edge**: `+` takes an
+  interactive screen snapshot (`screencapture -i -o` to a temp file — never
+  `-c`, which would clobber the user's clipboard), and `↑` sends. `Enter`
+  inserts a newline, `Cmd-Enter` sends, `Escape` closes.
   Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
   `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
   deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
@@ -383,18 +388,35 @@ the queue; consuming it is separate and not built here).
   number always points at the same image. Composer contents survive
   toggling the toolbar closed/open and a detach/undo (they live on the pane,
   not the toolbar).
-- **Report output.** Per submission, into `<worktree>/.feedback/new/`:
-  `<timestamp>-<suffix>.json` (sortable, collision-free) plus a sibling
-  `<stem>/image-N.png` per image. Written **images first, then the report via
-  temp-file + `rename`** (same directory, so atomic) — a watcher globbing
-  `*.json` never sees a half-written report or a report whose images are
-  missing. **Format is JSON** (not markdown-frontmatter: a multi-line prose
-  body with a `---` or `key:` line breaks naive frontmatter splitting; JSON has
-  one parse path). Fields: `version`, `id`, `created`, `source` (the URL/path
-  the feedback was written against), `worktree`, `body` (the composed text with
-  each chip rendered as a `![Image #N](<stem>/image-N.png)` path reference),
-  and `images`. On success the composer clears and the toolbar shows a "Filed …"
-  confirmation before closing.
+
+  The text view **must** override `readablePasteboardTypes` to include image
+  types. AppKit validates the Edit▸Paste menu item against that list, so
+  without it Cmd-V is *disabled* for an image-only clipboard and the paste
+  override never runs — a silent no-op. `importsGraphics = true` does **not**
+  add those types; only the override does.
+- **Report output.** One **self-contained folder per submission**, so a report
+  can be moved or handed to an agent as a unit:
+
+  ```
+  <worktree>/.feedback/new/<timestamp>-<suffix>/
+      report.json
+      images/image-1.png
+  ```
+
+  The whole folder is built under `.feedback/.staging/` and moved into place
+  with a single **atomic `rename`** (same filesystem), so a watcher sees either
+  nothing or a complete report with every image already present.
+  **Format is JSON** (not markdown-frontmatter: a multi-line prose body with a
+  `---` or `key:` line breaks naive frontmatter splitting; JSON has one parse
+  path). `body` is markdown with each chip rendered as a
+  `![Image #N](images/image-N.png)` reference relative to the folder.
+  Alongside it, deliberately generous context so a downstream agent needn't ask
+  follow-ups: `source` (`location`, `kind`, `filePath`, **`relativePath`** —
+  repo-relative, `pageTitle`, **`selection`** — the text the user had selected,
+  i.e. what they were pointing at, `paneID`, `viewport`), `worktree` (`path`,
+  `name`, **`branch`**, **`commit`** — the exact revision they saw), `app`, and
+  `images` (with pixel dimensions and byte size). On success the composer
+  clears and the toolbar shows a "Filed …" confirmation before closing.
 
 ## Session Persistence
 
