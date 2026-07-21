@@ -42,11 +42,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private var reloadDebounce: DispatchWorkItem?
     private var reloadNeedsRearm = false
 
-    // Browser chrome state. The chrome bar is a SwiftUI overlay
-    // (WebChromeBar) that appears when the mouse moves near the top of the
-    // pane and auto-hides after inactivity so content keeps the space. It
-    // shows an editable URL + nav controls for web, and a read-only file://
-    // address for markdown/code files.
+    // Browser chrome state. The chrome bar (WebChromeBar, hosted in an
+    // NSHostingView) peeks in when the mouse hovers the thin strip at the
+    // very top of the pane and auto-hides after inactivity. While visible
+    // it RESERVES its space: the web view's top is inset below the bar, so
+    // the top of the page is never covered and stays clickable. It shows an
+    // editable URL + nav controls for web, and a read-only file:// address
+    // for markdown/code files.
     @Published private(set) var chromeVisible = false
     @Published private(set) var currentURL: String = ""
     @Published private(set) var canGoBack = false
@@ -58,6 +60,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private var chromeHeld = false
     private var chromeMonitor: Any?
     private var chromeHost: NSHostingView<WebChromeBar>?
+    /// Top inset of the web view: 0 with the bar hidden, the bar's height
+    /// while it is visible (content starts below the bar, never under it).
+    private var webViewTopConstraint: NSLayoutConstraint?
+    /// The bar's top offset: -barHeight parks it just above the pane's top
+    /// edge (clipped away); 0 is fully slid in. Animated for the slide.
+    private var chromeTopConstraint: NSLayoutConstraint?
 
     /// True when location is a web URL (network allowed) rather than a file.
     var isWebURL: Bool {
@@ -78,6 +86,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
         self.mode = Self.mode(for: location)
         self.title = Self.initialTitle(for: location)
         super.init(frame: .zero)
+        // The chrome bar parks above the top edge between reveals; without
+        // clipping it would paint over whatever sits above this pane.
+        clipsToBounds = true
         setupWebView()
         load()
         startWatchingFile()
@@ -106,7 +117,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
             chromeHideTimer?.invalidate()
             chromeHost?.removeFromSuperview()
             chromeHost = nil
+            chromeTopConstraint = nil
             chromeVisible = false
+            webViewTopConstraint?.constant = 0
             if isWebURL {
                 webView.pauseAllMediaPlayback()
             }
@@ -165,12 +178,14 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // prefers-color-scheme inside the page, switching live).
         webView.underPageBackgroundColor = .windowBackgroundColor
         addSubview(webView)
+        let topConstraint = webView.topAnchor.constraint(equalTo: topAnchor)
         NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: topAnchor),
+            topConstraint,
             webView.bottomAnchor.constraint(equalTo: bottomAnchor),
             webView.leadingAnchor.constraint(equalTo: leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
+        self.webViewTopConstraint = topConstraint
         self.webView = webView
 
         if case .web = mode {
@@ -199,7 +214,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
     // MARK: - Browser chrome (web mode)
 
     /// The pane-top strip (in points) that reveals the chrome bar on hover.
-    private static let chromeRevealHeight: CGFloat = 80
+    /// Deliberately thin so ordinary interaction with the page never
+    /// triggers the bar — only an intentional move to the very top edge.
+    private static let chromeRevealHeight: CGFloat = 20
 
     func goBack() { webView.goBack() }
     func goForward() { webView.goForward() }
@@ -229,13 +246,43 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
-    /// Navigate from the chrome URL field. A bare host gets https://.
+    /// Navigate from the chrome URL field, completing bare input like a
+    /// browser omnibox (see completeAddress).
     func navigate(to input: String) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let candidate = trimmed.contains("://") ? trimmed : "https://" + trimmed
-        guard let url = URL(string: candidate) else { return }
+        guard let url = URL(string: Self.completeAddress(trimmed)) else { return }
         webView.load(URLRequest(url: url))
+    }
+
+    /// Complete a typed address the way a browser omnibox would:
+    /// - an explicit scheme passes through untouched ("http://cnn")
+    /// - a scheme-less address gets https:// ("example.org" → https://example.org)
+    /// - a single dotless word also gets .com ("cnn" → https://cnn.com,
+    ///   "cnn:8080/x" → https://cnn.com:8080/x — port and path survive)
+    /// - localhost and 127.0.0.1 get http:// and never .com (dev servers
+    ///   are plain HTTP; https://localhost would just fail)
+    static func completeAddress(_ input: String) -> String {
+        guard !input.contains("://") else { return input }
+
+        // Split into authority (host[:port]) and the trailing path/query.
+        let slash = input.firstIndex(of: "/")
+        var authority = slash.map { String(input[..<$0]) } ?? input
+        let rest = slash.map { String(input[$0...]) } ?? ""
+
+        var port = ""
+        if let colon = authority.firstIndex(of: ":") {
+            port = String(authority[colon...])
+            authority = String(authority[..<colon])
+        }
+
+        let isLocal = authority.caseInsensitiveCompare("localhost") == .orderedSame
+            || authority == "127.0.0.1"
+        if !isLocal, !authority.isEmpty, !authority.contains("."),
+           authority.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) {
+            authority += ".com"
+        }
+        return (isLocal ? "http://" : "https://") + authority + port + rest
     }
 
     /// The chrome bar calls this while hovered or while the URL field is
@@ -328,7 +375,17 @@ final class ViewerView: NSView, Codable, ObservableObject {
     }
 
     /// Mount/animate the chrome bar hosting view. AppKit-level (not a SwiftUI
-    /// overlay) so it reliably layers above the WKWebView subview.
+    /// overlay) so it reliably sits above the WKWebView subview. The bar
+    /// reserves its space rather than floating over the page: while visible,
+    /// the web view's top is inset by the bar height, so top-of-page content
+    /// is never covered and stays clickable.
+    ///
+    /// Reveal/hide is a SLIDE: the bar starts parked just above the pane's
+    /// top edge (clipped away) and its top constraint animates to 0 while
+    /// the web view's top inset animates to the bar height in the same
+    /// group, so the bar visibly pushes the content down and retracts back
+    /// up. Constraint animators re-run layout every frame — implicit
+    /// animation does not animate constraint-driven layout reliably.
     private func setChromeVisible(_ visible: Bool) {
         chromeVisible = visible
 
@@ -336,24 +393,46 @@ final class ViewerView: NSView, Codable, ObservableObject {
             let host = NSHostingView(rootView: WebChromeBar(viewerView: self))
             host.translatesAutoresizingMaskIntoConstraints = false
             addSubview(host, positioned: .above, relativeTo: webView)
+            let top = host.topAnchor.constraint(
+                equalTo: topAnchor, constant: -host.fittingSize.height)
             NSLayoutConstraint.activate([
-                host.topAnchor.constraint(equalTo: topAnchor),
+                top,
                 host.leadingAnchor.constraint(equalTo: leadingAnchor),
                 host.trailingAnchor.constraint(equalTo: trailingAnchor),
             ])
+            chromeTopConstraint = top
             chromeHost = host
+            // Realize the parked-above position now so the first slide
+            // animates from offscreen instead of from a zero frame.
+            layoutSubtreeIfNeeded()
         }
 
         guard let chromeHost else { return }
+        if visible { chromeHost.isHidden = false }
+        let barHeight = chromeHost.fittingSize.height
+        let barTop: CGFloat = visible ? 0 : -barHeight
+        let contentInset: CGFloat = visible ? barHeight : 0
+
+        // Constraint animation only progresses while the window is actually
+        // displayed; snap directly otherwise (hidden panes, tests).
+        guard window?.isVisible == true else {
+            chromeTopConstraint?.constant = barTop
+            webViewTopConstraint?.constant = contentInset
+            layoutSubtreeIfNeeded()
+            if !visible { chromeHost.isHidden = true }
+            return
+        }
+
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            chromeHost.animator().alphaValue = visible ? 1 : 0
+            ctx.duration = 0.25
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            chromeTopConstraint?.animator().constant = barTop
+            webViewTopConstraint?.animator().constant = contentInset
         } completionHandler: { [weak self] in
             if !visible, self?.chromeVisible == false {
                 self?.chromeHost?.isHidden = true
             }
         }
-        if visible { chromeHost.isHidden = false }
     }
 
     // MARK: - Loading

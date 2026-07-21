@@ -1,11 +1,12 @@
 import SwiftUI
 
 /// SwiftUI leaf for a viewer pane inside the split tree. Every viewer pane
-/// gets a floating chrome bar mounted by ViewerView itself as an NSHostingView
-/// above the web view — it reveals on mouse-over near the top of the pane and
-/// auto-hides after inactivity so the content keeps the space. Web panes show
-/// back/forward/reload + an editable URL field; file panes (markdown/code) show
-/// a read-only, selectable file:// address.
+/// gets a chrome bar mounted by ViewerView itself as an NSHostingView — it
+/// peeks in (animated) on mouse-over of the thin strip at the pane top and
+/// auto-hides after inactivity. While visible the bar reserves its space
+/// (the web view is inset below it), so top-of-page content is never
+/// covered. Web panes show back/forward/reload + an editable URL field;
+/// file panes (markdown/code) show a read-only, selectable file:// address.
 struct ViewerSplitLeaf: View {
     @ObservedObject var viewerView: ViewerView
 
@@ -29,10 +30,11 @@ private struct ViewerRepresentable: NSViewRepresentable {
 
 /// Chrome bar for viewer panes: anchored flush to the pane top, stretched
 /// full width. Uses Liquid Glass on macOS 26+ (translucent material fallback)
-/// so it feels native. Hosted by ViewerView in an NSHostingView layered above
-/// the WKWebView; revealed on mouse-over near the pane top, auto-hidden after
-/// inactivity. Web panes get an interactive toolbar (back/forward/reload + an
-/// editable URL field); file panes (markdown/code) get a read-only, selectable
+/// so it feels native. Hosted by ViewerView in an NSHostingView; revealed on
+/// mouse-over at the pane top, auto-hidden after inactivity. The web view
+/// is inset below the bar while it shows, so the bar never covers content.
+/// Web panes get an interactive toolbar (back/forward/reload + an editable
+/// URL field); file panes (markdown/code) get a read-only, selectable
 /// file:// address so the pane reads like any other page — just not navigable.
 struct WebChromeBar: View {
     @ObservedObject var viewerView: ViewerView
@@ -100,7 +102,17 @@ struct WebChromeBar: View {
         .onChange(of: viewerView.currentURL) { newValue in
             if !urlFocused { urlText = newValue }
         }
-        .onChange(of: urlFocused) { viewerView.holdChrome($0) }
+        .onChange(of: urlFocused) { focused in
+            viewerView.holdChrome(focused)
+            // Browser convention: clicking into the address bar selects the
+            // whole URL. Deferred so it runs after the click's own caret
+            // placement; the first responder is the field's editor by then.
+            if focused {
+                DispatchQueue.main.async {
+                    (viewerView.window?.firstResponder as? NSTextView)?.selectAll(nil)
+                }
+            }
+        }
     }
 
     /// File (markdown/code): a read-only, selectable file:// address with a
