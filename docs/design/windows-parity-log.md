@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-21 (on-box, 51) — T112 DONE (jumped the queue ahead of T111b:
+  it is the loop's own continuation mechanism, and it is an out-of-repo
+  skill edit, so it was cheap). Root cause confirmed, not assumed —
+  `+list --json` reports `"pid":0` for every leaf, so the `--pid` ancestry
+  walk answers "IPC request failed". The prescribed fix did not survive
+  contact: **`$GHOZTTY_PANE_ID` does not exist on win32** (Swift-side
+  concept; the core only exports `GHOSTTY_SURFACE_ID` +
+  `GHOZTTY_WINDOW_NAME`/`GHOZTTY_PANE_NAME`, and in this pane PANE_NAME held
+  the *window* name — the exact trap the skill's old note warned about).
+  Shipped a 3-step chain instead: pane id → `GHOSTTY_SURFACE_ID` as unsigned
+  decimal (== the registered leaf name; the `0x` hex form is rejected) → the
+  legacy `--pid`/`--tty` walk, each candidate probed with a cheap `+read` so
+  a wrong value falls through rather than clearing someone else's pane.
+  Correction to the row's premise: the marketplace source repo **is** on this
+  box (`D:\git\dzearing-claude-marketplace`, a `directory` marketplace) — it
+  was 11 commits behind, so fast-forwarded first, then edited; pushed b9a1082,
+  plugin 0.10.1→0.10.2, cache byte-identical. Filed **T113** (win32 should
+  export `GHOZTTY_PANE_ID` per CLAUDE.md's documented contract, which would
+  demote T112's fallback from load-bearing to belt-and-braces). No product
+  code touched, so no build/lane runs; the reset at this boundary is the
+  end-to-end validation. Next: **T111b** (unchanged, publish blocker).
+
 - 2026-07-21 (on-box, 49) — T89i DELIVERED, left blocked(T111):
   new `test/win32/session-persistence.ps1` ports the py harness (scenario +
   crash-kill re-attach ×3 + winsize) and adds flood-during-reattach gap-fill

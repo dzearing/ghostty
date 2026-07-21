@@ -5268,3 +5268,96 @@ repo `github.com/dzearing/ghoztty-claude-plugin`.
 Fixing T98's pid capture would also revive the old path, but is neither
 necessary (pane id already works) nor sufficient (remote panes have no
 meaningful local pid). Do T112 regardless of T98's fate.
+
+### Outcome — DONE 2026-07-21
+
+Root cause **confirmed on-box**, not assumed. `ghoztty +list --json` at the
+installed release (`1.4.0-…-+f9be1f35d`) reports `"pid":0` for *every* leaf,
+so the ancestry walk has nothing to match:
+
+```
+$ ghoztty +list --pid=$(cat /proc/$$/winpid)     # winpid=50248, alive
+IPC request failed
+```
+
+**The prescribed fix did not survive contact.** `$GHOZTTY_PANE_ID` is *not
+exported on win32* — it is a Swift/macOS-side concept. Grep of `src/` finds
+no `env.put("GHOZTTY_PANE_ID", …)`; the core sets only `GHOSTTY_SURFACE_ID`,
+`GHOZTTY_WINDOW_NAME`, `GHOZTTY_PANE_NAME` (`src/Surface.zig:896-900`), and
+IPC overwrites the latter two with the *window*/pane target name. Confirmed
+live in this pane's env: `GHOZTTY_PANE_ID` unset, `GHOZTTY_PANE_NAME=goloop`
+(the **window** name — exactly the trap the skill's old note warned about).
+Filed as **T113**.
+
+What does work on win32: `+list --json`'s leaf `id`/`name` is the surface id
+in **unsigned decimal**, and `GHOSTTY_SURFACE_ID` is the same value in hex.
+
+```
+GHOSTTY_SURFACE_ID = 0x646d7ed7af3b77fb
+        -> decimal = 7236579641077233659 = leaf id/name of this pane
+$ ghoztty +read --name=7236579641077233659 --lines=2   # -> this session's own footer
+$ ghoztty +read --name=0x646d7ed7af3b77fb --lines=1    # -> not found in registry (hex rejected)
+```
+
+**Shipped fix** — a 3-step chain in the skill's Step 1, each candidate probed
+with a cheap `+read` before use so a stale/wrong value falls through instead
+of typing `/clear` into someone else's pane:
+
+1. `$GHOZTTY_PANE_ID` (Mac today, win32 once T113 lands).
+2. `$GHOSTTY_SURFACE_ID` → `printf '%u' $((16#…))` (handles ids above 2^63,
+   where plain `$(())` would print negative). A leading `ghoztty +list` is
+   load-bearing: it auto-registers panes so the decimal name resolves.
+3. The legacy `--pid` / `--tty` walk, unchanged, for old builds.
+
+Validated on-box before editing anything: the chain returns
+`PANE=[7236579641077233659]` (this pane) while the legacy probe alone returns
+`IPC request failed`. The `/reset-context` at this task's boundary is the
+end-to-end validation — if the fix were wrong, this session would not clear.
+
+**Two-location edit, both done** (and byte-identical, BOM-free, mojibake-free):
+the active plugin cache
+(`~/.claude/plugins/cache/dzearing-claude-marketplace/dzearing-skills/0.10.1/
+skills/reset-context/SKILL.md`) and the source repo. Correction to the row's
+premise and to item 19(a)'s note: the marketplace source **is** cloned on this
+box at `D:\git\dzearing-claude-marketplace` (registered as a `directory`
+marketplace in `known_marketplaces.json`) — it was 11 commits behind, so it was
+fast-forwarded first and the edit re-applied on top. Committed + pushed as
+`b9a1082`, plugin version 0.10.1 → 0.10.2. (The still-open item-19(a) mirror is
+a *different* repo, `ghoztty-claude-plugin`, which is NOT on this box.)
+
+## T113 — win32 never exports `$GHOZTTY_PANE_ID`
+
+Filed 2026-07-21 by T112, which needed the pane id and found it absent.
+
+CLAUDE.md's "Pane identity" section states every pane has a stable
+ghoztty-owned UUID that is exported as `$GHOZTTY_PANE_ID`, shown as the leaf
+`id` in `+list --json`, accepted directly by every `--target`/`--name`, and
+should be **preferred over pid/tty** for self-identification. On Windows none
+of that is true:
+
+- No `GHOZTTY_PANE_ID` is ever put into a pane's env. `src/Surface.zig:896-900`
+  sets `GHOSTTY_SURFACE_ID` / `GHOZTTY_WINDOW_NAME` / `GHOZTTY_PANE_NAME` only;
+  the remaining `GHOZTTY_PANE_ID` hits in `src/` are all *forwarding* code
+  (`remote/protocol.zig`, `remote/agent/*`, `termio/Remote.zig`) that relays
+  whatever the apprt set — i.e. the Swift apprt.
+- `+list --json`'s leaf `id` is the decimal surface id, not a UUID.
+- The hex spelling that *is* in the env (`0x…`) is rejected by the registry.
+
+Impact: any tool that follows the documented contract to identify its own pane
+silently fails on Windows and must special-case it (T112's fallback exists
+purely for this). It also blocks the contract's real payoff — remote panes,
+where pid/tty are meaningless by construction.
+
+**Fix:** export `GHOZTTY_PANE_ID` from the win32 path. Deriving it from the
+surface id is fine — that value is already stable for the pane's life and is
+persisted in the T89f session-layout manifest and re-applied on relaunch, which
+is exactly the durability CLAUDE.md promises. Accept the `0x…` hex spelling as
+a target alias too, so `--target=$GHOSTTY_SURFACE_ID` works unconverted. Then
+T112's step 2 becomes dead weight rather than the load-bearing path (leave it
+in — old installed builds still need it).
+
+**Validation:** from inside a pane, `--target=$GHOZTTY_PANE_ID` must resolve to
+that exact pane for `+read`/`+set-banner`/`+send-keys`, including in a
+multi-pane window (where the window-name trap would pick the wrong pane), after
+an app-quit re-attach, and after an agent-relaunch respawn. Re-check `+list
+--json` leaf shape against the Mac golden shape while there.
