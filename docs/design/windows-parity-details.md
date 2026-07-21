@@ -5105,3 +5105,38 @@ replay happens at all. The client-side machinery (restore_snapshot paint,
 the snapshot + threading it through the restore Overrides. Also folds in
 T106's completion-lag caveat (evicted ring head ⇒ late reflow-to-live).
 Priority: after publish readiness — T106 covers the user-visible loss.
+
+## T112 — /reset-context broken for agent-backed panes (loop-critical)
+
+Found 2026-07-21 by the supervisor session, watching the loop worker fail to
+self-reset after finishing T89i.
+
+**Chain:** the `dzearing-skills:reset-context` skill identifies its own pane by
+reading `/proc/self/winpid` and asking `ghoztty +list --pid=<winpid>`. That
+walks process ancestry against the pid the app knows for each pane. For an
+agent-backed pane the recorded pid is the ConPTY-reparented bogus one (T98 —
+"Secure System" pid 428 observed), so no pane matches and the probe returns
+empty. The skill then falls back to "ask the user to run /clear" and the
+autonomous loop stops until a human intervenes.
+
+**Why it is worse than T98 looked:** T98 was filed as a `+list --pid`
+self-ID/tooling nuisance. Since T89d made session-persistence default-on,
+EVERY local pane is agent-backed — so the nuisance became "the loop cannot
+reset its own context," which is step 3 of the go.md protocol and the thing
+that keeps hours-long autonomous runs going. Observed cost this session: the
+worker sat idle ~12 min after a clean, committed handoff; the supervisor's
+watchdog caught it and typed `/clear` manually.
+
+**Fix:** probe `$GHOZTTY_PANE_ID` first (exported into every pane at spawn,
+persisted in the session-layout manifest, re-applied to the respawned shell on
+agent relaunch, and accepted directly by every `--target`/`--name`), keeping
+the `--pid` walk as a fallback for old builds. CLAUDE.md already prescribes
+exactly this — "Prefer the pane id over pid/tty matching for self-
+identification" — the skill predates it. Two-location edit like item 19(a):
+the active plugin cache
+(`~/.claude/plugins/cache/dzearing-claude-marketplace/...`) AND the source
+repo `github.com/dzearing/ghoztty-claude-plugin`.
+
+Fixing T98's pid capture would also revive the old path, but is neither
+necessary (pane id already works) nor sufficient (remote panes have no
+meaningful local pid). Do T112 regardless of T98's fate.
