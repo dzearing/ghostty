@@ -44,7 +44,14 @@ next, any surprises>`.
   says so. Delivery to the 3 install locations is deliberately HELD: T110
   is user-visible and should ship, but not in a release that still carries
   T111's freeze on the same subsystem — deliver both together when T111
-  lands. Next:
+  lands. The boundary reset itself then FAILED and became **T112**:
+  `+list --pid` returns "IPC request failed" from inside a pane because
+  persistence is default-on, so every pane's shell is a child of the
+  agent, not the GUI, and the ancestry walk can't match (panes list as
+  `pid:0`); `$GHOZTTY_PANE_ID` is unset too. `/reset-context` resolves its
+  own pane exactly that way, so the loop can no longer clear its own
+  context — the very failure mode go.md was written to prevent. Cleared by
+  hand this time. Next:
   **T111** (ahead of T38 — a GUI freeze on the default path outranks
   release packaging).
 - 2026-07-20 (on-box, 48) — loop repair after the T106 delivery: the 16:10
