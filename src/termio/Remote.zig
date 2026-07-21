@@ -1038,20 +1038,25 @@ fn feedSliced(rd: *ThreadData, bytes: []const u8) void {
         @call(.always_inline, termio.Termio.processOutputTracked, .{
             rd.io, slice, &rd.io.backend.remote.applied_bytes,
         });
-        // T111b: bounding the HOLD (above) is not enough on its own, because
-        // nothing bounds how often we re-take it. `processOutputTracked`
+        // T111b/T114/T115: bounding the HOLD (above) is not enough on its own,
+        // because nothing bounds how often we re-take it. `processOutputTracked`
         // self-locks and unlocks, and the next iteration re-locks after
         // nothing but a slice-pointer bump — so a GUI thread parked on this
         // same mutex loses race after race rather than one long race. Zig's
         // Mutex is a futex and promises no fairness; Exec never hit this
         // because it has PeekNamedPipe/ReadFile syscalls between its unlock
-        // and next lock, which IS the window a parked waiter needs. Measured
-        // here: a `+read` of a flooded pane waited 15514 ms while doing 47 ms
-        // of work — roughly 190 consecutive lost races, not one long hold.
-        // Yield only when more slices follow: free when uncontended
-        // (SwitchToThread returns immediately with no ready peer), and never
-        // paid at all on the common single-slice chunk.
-        if (it.rest.len > 0) std.Thread.yield() catch {};
+        // and next lock, which IS the window a parked waiter needs.
+        //
+        // T111b tried a bare `std.Thread.yield()` here and it was not enough:
+        // `SwitchToThread` only yields to a thread already runnable on the
+        // SAME processor, so it is a hint, not a handoff — a `+read` still
+        // spiked to ~11.9 s and the RENDERER thread (which takes this same
+        // mutex once per frame, and is where it notices a stop request) was
+        // measured waiting 65392 ms, blocking `+close` for 33 s in its join.
+        // So the waiter now announces itself (`lockPriority`) and we keep the
+        // mutex UNLOCKED until it is in — a real handoff, bounded so a stream
+        // of waiters cannot starve the drain in turn.
+        if (it.rest.len > 0) rd.io.renderer_state.yieldToPriorityWaiters();
     }
 }
 
@@ -1113,6 +1118,16 @@ fn drainRing(td: *termio.Termio.ThreadData) void {
     var chunks: usize = 0;
     const max_chunks_per_wake = 32;
     while (chunks < max_chunks_per_wake) : (chunks += 1) {
+        // T115: the surface is being torn down and the GUI thread is already
+        // blocked in `io_thr.join()` waiting for us to return to the loop and
+        // see the stop. Parsing the rest of a flooded ring into a terminal
+        // that is about to be freed buys the user nothing and costs them a
+        // frozen window: a full wake is up to 32 x 16 KiB of held-lock parse
+        // (~7.7 s in the debug build), which is most of T63's 10 s close
+        // bound. Bail immediately instead — same precedent as the EXIT
+        // notification below, which is likewise dropped once `closing` is set.
+        if (rd.io.closing.load(.acquire)) return;
+
         const res = ch.pop(&buf);
         if (res.read == 0) break;
 

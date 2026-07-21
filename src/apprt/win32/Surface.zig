@@ -3360,8 +3360,10 @@ fn positionImeWindow(self: *Surface) void {
 /// via \x1b[?9001h and causes key events to be sent as
 /// \x1b[Vk;Sc;Uc;Kd;Cs;Rc_ sequences.
 pub fn isWin32InputMode(self: *Surface) bool {
-    self.core_surface.renderer_state.mutex.lock();
-    defer self.core_surface.renderer_state.mutex.unlock();
+    // PRIORITY (T114): every keystroke asks this on the GUI thread, so a lost
+    // race here is felt directly as unresponsive typing into a busy pane.
+    self.core_surface.renderer_state.lockPriority();
+    defer self.core_surface.renderer_state.unlockPriority();
     return self.core_surface.io.terminal.modes.get(.win32_input);
 }
 

@@ -4442,7 +4442,141 @@ fully measured mechanism — see **T114** and **T115**.
 probe) green; `ipc-under-load.ps1` including its new occupancy guard; P1–P3;
 `test -Dapp-runtime=none`, `test -Dapp-runtime=win32`, `test-agent`.
 
-## T114 — `+read` of a flooded pane loses long lock races (open)
+## T114/T115 — renderer-mutex fairness: `+read` and `+close` under a flood
+
+**Both fixed together (2026-07-21) by one change, because they were one
+defect.** The two rows below are the evidence as FILED; this section records
+what measurement actually found and what shipped.
+
+### The filed theory, and how it was wrong
+
+T115 was filed as "the Remote-backend analog of T63" — a teardown that hangs
+in the IO reader, the way a missed `CancelIoEx` once hung `+close` for 9+
+minutes on Exec. That was a reasonable read of `handler=64883ms`, and it was
+wrong. Splitting `Surface.deinit` into its three serial phases (new
+`GHOZTTY_PERF` `closeperf` line — backend shutdown / renderer-thread join / IO
+-thread join) named the phase on the first run:
+
+    closeperf shutdown=0ms renderer_join=33257ms io_join=4049ms total=37307ms
+
+The IO join — the phase the T63 analogy pointed at — was 11% of it. The GUI
+was blocked in `renderer_thr.join()`, and the renderer thread's own telemetry
+(already present since T40/T48) said why:
+
+    warning(generic_renderer): perf slow state mutex acquire ms=65392
+
+The renderer thread takes the pane's `renderer_state.mutex` once per frame in
+`updateFrame`, and that is also where it returns to its loop to notice a stop
+request. Starved there, it cannot exit, so the GUI thread's join waits exactly
+as long as the starvation lasts. Same run, same mutex, same storm:
+
+    ipcperf read pane=echoP lockwait=23628ms dump=45ms
+
+So T114 (`+read` waits 23 s to do 45 ms of work) and T115 (`+close` freezes
+the GUI for a minute) were never two bugs. They were two victims of one
+producer: the agent-path drain re-taking that mutex in a tight loop.
+
+### Why the T111b yield was not enough
+
+T111a bounded each HOLD to 4 KiB; T111b added `std.Thread.yield()` between
+slices to bound how often the drain RE-TAKES it. That helped and did not fix
+it, because `SwitchToThread` only yields to a thread already runnable on the
+same core — a hint, not a handoff. Worse, it has no duration: 512 of them
+elapse in microseconds, so any spin-count-based window can expire before a
+waiter on another core is scheduled at all. (The unit test below caught
+exactly that and is why the shipped bound is a duration, not a spin count.)
+
+### The fix: a fairness ticket on `renderer.State`
+
+`renderer.State` gained `priority_waiters` plus `lockPriority` /
+`unlockPriority` / `yieldToPriorityWaiters` (`src/renderer/State.zig`):
+
+- A latency-sensitive waiter announces itself, blocks on the mutex, and
+  clears its ticket **on acquisition** (not on release).
+- The bulk producer calls `yieldToPriorityWaiters` between lock cycles — it
+  holds nothing and simply keeps the mutex FREE until the ticket count drains,
+  i.e. until the waiter is actually inside. That is a real handoff.
+- Bounded at 2 ms, so a stream of waiters cannot invert the problem and starve
+  the drain. The bound is a duration for the reason above.
+
+Priority waiters (all latency-sensitive, all previously starvable):
+`generic.zig` `updateFrame` (the renderer frame — and therefore the close
+join), `IpcHandlers.handleRead` (`+read` runs on the GUI thread), and
+`Surface.isWin32InputMode` (asked on every keystroke).
+
+Producer: `termio/Remote.zig` `feedSliced`, replacing the bare yield.
+
+Second, smaller fix in the same teardown path: `drainRing` now returns
+immediately when `io.closing` is set. Once `Surface.deinit` has called
+`io.shutdown()`, the GUI thread is already blocked in the IO join, and
+finishing a full wake (up to 32 × 16 KiB of held-lock parse — ~7.7 s in the
+debug build) parses output into a terminal that is about to be freed. Same
+precedent as the EXIT notification a few lines below it, which is likewise
+dropped once `closing` is set.
+
+### Shared-code note (Mac)
+
+`renderer/State.zig`, `renderer/generic.zig` and `termio/Remote.zig` are
+shared. The producer-side handoff runs ONLY in the Remote drain, so Mac local
+(Exec) panes are untouched; Mac remote panes get the same improvement. For
+every other apprt the change is one uncontended atomic load per frame.
+
+### Measured, same box, same storm (debug build)
+
+| probe | before | after |
+|---|---|---|
+| `+read` worst (E3/E4, bound 2000 ms) | 30259 ms | 206 ms |
+| `+read` lockwait | 23628 ms | 10–27 ms |
+| renderer frame acquire, worst | 65392 ms | 164 ms |
+| `closeperf renderer_join` | 33257 ms | 61–72 ms |
+| `closeperf io_join` | 4049 ms | 0–38 ms |
+| `+close` storm pane (E11, bound 10 s) | 37452 ms | 252 ms |
+| `+close` echo pane (E12, bound 10 s) | 2027 ms | 174 ms |
+
+Note the renderer number is the user-visible one: a pane that could not paint
+a frame for 65 s is the "Not Responding" freeze T111 was originally reported
+as, and it now repaints within one lock cycle.
+
+*Unit tests* (`src/renderer/State.zig`, both lanes): the ticket returns to
+zero after a lock/unlock (a leaked ticket would make the producer step aside
+forever); the handoff keeps stepping aside until the waiter is in; and the
+handoff is bounded when no waiter ever arrives (otherwise the fix would just
+move the starvation onto the drain). The second test failed on the first
+spin-count implementation — that is the canary proving these run.
+
+*Validation (2026-07-21):* **`session-persistence.ps1` ALL PASS x3 — the
+first fully green run of that script.** E4 223/175/207 ms (bound 2000),
+E11 154/172/199 ms and E12 139/248/140 ms (bound 10 000), E2 40/40 all three
+runs, and sections A–D (re-attach x3, winsize, gap-fill) unaffected.
+`ipc-under-load.ps1` ALL PASS (10) for the Exec path; `ipc-p1/p2/p3` ALL PASS;
+`test -Dapp-runtime=none`, `test -Dapp-runtime=win32`, `test-agent` all green.
+The none lane failed once on `remote.agent.server.test.client DATA reaches the
+child` ("[tripwire] untripped point=read") and passed on re-run and in
+isolation — recorded as a flake, not swept under the rug.
+
+*Harness trap found while validating (worth more than it cost):*
+`ipc-under-load.ps1` reported 2 FAILURES on T111b's accept-pool guard —
+deterministically, with the exact pre-fix signature (9159/9188/9179 ms then
+"No running Ghoztty instance found."). It was not a regression and not a
+product bug: the script's default `-ExePath` was `zig-out-release\bin`, a
+staging dir last built the previous day, i.e. it was grading a binary that
+predated the accept pool. A direct probe confirmed the pool is healthy on the
+build under test (4 instances; 3 simultaneous hogs fine, exhausted only at 4,
+no listener leak after a 40-request hammer), and the script passes ALL PASS
+(10) against `zig-out\bin`. The default now points at the debug build like
+every other script here, plus a loud warning when a newer `zig-out*` binary
+exists. This is the T49 stale-binary lesson recurring in a place nobody was
+looking — a standing "must stay ALL PASS" script that silently graded the
+wrong binary.
+
+*Repro harness:* section E of `session-persistence.ps1` is the contract, but
+iterating on it means paying for sections A–D. A focused scratch script
+(2 storm panes + `+list`/`+read`/soak/`+close`, hermetic, app stderr captured
+for `ipcperf`/`closeperf`) reproduces both failures in ~2 minutes; the storms
+must run ~40 s before the close probe or the backlog is too shallow to show
+it (a 3-second setup measured close at 2.2 s and hid the bug entirely).
+
+## T114 — `+read` of a flooded pane loses long lock races (FIXED — see above)
 
 Section E's E4, and all that survives of it now that T111b removed the connect
 failure that used to mask it (E4's old 9202 ms never reached the handler at
@@ -4473,7 +4607,7 @@ home that leaves the other apprts unchanged.
 *Validation:* section E's E3/E4 inside the T62 2000 ms bound across 3 runs,
 `ipc-under-load.ps1` for the Exec path, both lanes.
 
-## T115 — `+close` of a flooded pane blocks the GUI thread ~65 s (open)
+## T115 — `+close` of a flooded pane blocks the GUI thread ~65 s (FIXED — see T114/T115 above)
 
 Section E's E11/E12 (T63's 10 s bound). Measured ON the GUI thread, so it is
 neither a connect nor a queue effect:

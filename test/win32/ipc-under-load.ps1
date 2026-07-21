@@ -8,13 +8,28 @@
 #
 # Fully IPC-driven (no keyboard injection). Isolated pipe suffix, only
 # touches ghoztty processes from this repo's zig-out*.
+# Default target is the DEBUG build under test, like every other script in
+# this directory. It used to default to zig-out-release, and that silently
+# graded a stale binary: on 2026-07-21 this script reported 2 FAILURES on the
+# T111b accept-pool guard while the actual build under test passed it — the
+# release staging dir was a day old and predated the pool (the T49
+# stale-binary lesson, re-learned). Pass -ExePath to grade a release build.
 param(
-    [string]$ExePath = 'D:\git\ghoztty\zig-out-release\bin\ghoztty.exe'
+    [string]$ExePath = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe'
 )
 $ErrorActionPreference = 'Stop'
 $repo = 'D:\git\ghoztty'
 $exe = $ExePath
 if (-not (Test-Path $exe)) { Write-Host "SETUP FAIL: exe not found: $exe"; exit 1 }
+# Loud staleness check: grading a binary older than the newest build in the
+# repo is almost always an accident, and it reads as a product failure.
+$newest = Get-ChildItem 'D:\git\ghoztty\zig-out*\bin\ghoztty.exe' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($newest -and $newest.FullName -ne (Resolve-Path $exe).Path -and
+    $newest.LastWriteTime -gt (Get-Item $exe).LastWriteTime) {
+    Write-Host ("WARNING: grading $exe ($((Get-Item $exe).LastWriteTime)) but " +
+        "$($newest.FullName) is NEWER ($($newest.LastWriteTime)) -- stale target?") -ForegroundColor Yellow
+}
 $env:GHOZTTY_PIPE_SUFFIX = '-ipcload'
 
 $script:pass = 0

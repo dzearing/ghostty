@@ -699,9 +699,12 @@ fn handleRead(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         if (perf) (std.time.Instant.now() catch null) else null;
     var t_locked: ?std.time.Instant = null;
     const dump: ?[]const u8 = dump: {
-        core.renderer_state.mutex.lock();
+        // PRIORITY (T114): this runs ON the GUI thread, so losing races here
+        // freezes the window. Measured at 23628 ms of lock wait for 45 ms of
+        // work before the fairness ticket existed.
+        core.renderer_state.lockPriority();
         if (perf) t_locked = std.time.Instant.now() catch null;
-        defer core.renderer_state.mutex.unlock();
+        defer core.renderer_state.unlockPriority();
         const pages = &core.io.terminal.screens.active.pages;
         const tl = pages.getTopLeft(.screen);
         const br = pages.getBottomRight(.screen) orelse break :dump null;

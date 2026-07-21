@@ -1217,6 +1217,18 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
+    // GHOZTTY_PERF (T115): close teardown runs ON the UI thread, so every
+    // millisecond here is a frozen window. It has three serial phases with
+    // three different causes (backend abort, renderer join, IO join), and a
+    // single "close was slow" number cannot tell them apart — T115 was filed
+    // from a 64883ms close with no idea which phase owned it. Env-gated so
+    // the timing costs nothing when nobody is looking.
+    const perf = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+    const t_start: ?std.time.Instant =
+        if (perf) (std.time.Instant.now() catch null) else null;
+    var t_shutdown: ?std.time.Instant = null;
+    var t_renderer: ?std.time.Instant = null;
+
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
@@ -1228,6 +1240,7 @@ pub fn deinit(self: *Surface) void {
     // a wedged join here beachballs the entire app permanently (observed:
     // post-wake remote reconnect swaps freezing the GUI).
     self.io.shutdown();
+    if (perf) t_shutdown = std.time.Instant.now() catch null;
 
     // Stop rendering thread
     {
@@ -1246,12 +1259,29 @@ pub fn deinit(self: *Surface) void {
         // below.
         self.renderer_thread.mailbox.close();
     }
+    if (perf) t_renderer = std.time.Instant.now() catch null;
 
     // Stop our IO thread
     {
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();
+    }
+
+    if (perf) perf: {
+        const now = std.time.Instant.now() catch break :perf;
+        const t0 = t_start orelse break :perf;
+        const t1 = t_shutdown orelse break :perf;
+        const t2 = t_renderer orelse break :perf;
+        const ms = struct {
+            fn f(a: std.time.Instant, b: std.time.Instant) u64 {
+                return a.since(b) / std.time.ns_per_ms;
+            }
+        }.f;
+        log.info(
+            "closeperf shutdown={d}ms renderer_join={d}ms io_join={d}ms total={d}ms",
+            .{ ms(t1, t0), ms(t2, t1), ms(now, t2), ms(now, t0) },
+        );
     }
 
     // We need to deinit AFTER everything is stopped, since there are

@@ -1195,8 +1195,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 else
                     null;
 
-                state.mutex.lock();
-                defer state.mutex.unlock();
+                // PRIORITY (T115): a frame update is latency-sensitive and,
+                // worse, it is where the renderer thread notices its stop
+                // request — so starving here does not merely drop frames, it
+                // blocks the GUI thread's join in `Surface.deinit` for as long
+                // as it lasts (measured: a 65 s acquire => a 33 s `+close`).
+                state.lockPriority();
+                defer state.unlockPriority();
 
                 if (lock_start) |start| {
                     if (std.time.Instant.now() catch null) |end| {

@@ -9,6 +9,52 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-21 (on-box, 53) - T115 + T114 DONE, one fix. Picked T115; its own
+  row and details said "do T114 first and re-measure", and measurement said
+  they were the same defect, so both closed together.
+
+  The filed T115 theory (Remote-side analog of T63: a hung IO reader) was
+  REFUTED by the first measurement. New `closeperf` telemetry splits
+  `Surface.deinit` into backend-shutdown / renderer-join / io-join:
+  `renderer_join=33257ms io_join=4049ms`. The IO teardown the row blamed was
+  11%. The renderer thread takes the pane's renderer mutex once per frame in
+  `updateFrame` and that is where it notices its stop, so starving it blocks
+  the GUI's join for exactly as long -- its own long-standing telemetry read
+  `slow state mutex acquire ms=65392`. `+read` was starving on the same mutex
+  (lockwait 23628ms for 45ms of work). One producer, two victims.
+
+  Fix: fairness ticket on `renderer.State` (`priority_waiters` +
+  `lockPriority`/`yieldToPriorityWaiters`). Waiters announce themselves and
+  clear the ticket ON ACQUISITION; the Remote drain keeps the mutex FREE
+  between slices until the waiter is in. T111b's bare `std.Thread.yield()` was
+  not enough because SwitchToThread only yields to a same-core runnable thread
+  -- a hint, not a handoff. Priority waiters: renderer `updateFrame`,
+  `+read`, `isWin32InputMode`. Plus `drainRing` bails once `io.closing` is
+  set (finishing a wake parses up to 32x16 KiB into a terminal about to be
+  freed: io_join 4049ms -> 38ms).
+
+  A unit test earned its keep: the first implementation bounded the handoff by
+  SPIN COUNT, and 512 SwitchToThread calls elapse in microseconds -- the test
+  failed, and the shipped bound is a duration (2ms). Only the box would have
+  found that otherwise, and only sometimes.
+
+  Validation: `session-persistence.ps1` ALL PASS x3, the first fully green run
+  of that script (E4 223/175/207ms, E11 154/172/199ms, E12 139/248/140ms, E2
+  40/40 x3). Both lanes + test-agent + P1-P3 green; the none lane flaked once
+  on an agent PTY round-trip test and passed on re-run (recorded as a flake).
+
+  Surprise worth more than it cost: `ipc-under-load.ps1` failed its T111b
+  accept-pool guard deterministically with the exact pre-fix signature. Not a
+  regression -- the script's default -ExePath was `zig-out-release`, a day-old
+  staging build that predated the pool. A direct probe proved the pool healthy
+  on the build under test (3 hogs fine, exhausted at 4, no leak after 40
+  requests). Default repointed at `zig-out\bin` + a staleness warning. The T49
+  stale-binary lesson, recurring inside a standing "must stay ALL PASS"
+  script.
+
+  Next: the held delivery (T110 + T111a/b + T114/T115) to all 3 install
+  locations, then T113.
+
 - 2026-07-21 (on-box, 52) — T111b DONE. Both of the row's filed hypotheses
   were WRONG, and the instrumentation added this session is the only reason
   that is known: splitting the IPC round trip into accept/read/queue/handler

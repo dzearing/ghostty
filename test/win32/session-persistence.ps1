@@ -29,20 +29,16 @@
 #      a crash-kill relaunch MID-STORM restores everything, and +close of
 #      each storm pane returns within the T63 bound.
 #
-# KNOWN RED (2026-07-21, narrowed): section E's E4 (+read latency) and
-# E11/E12 (+close latency) FAIL. E2 (+list 40/40) and E3/E5 went green with
-# T111b, which fixed the two mechanisms behind them: the server had ONE pipe
-# instance and so stopped ACCEPTING whenever a handler was slow (clients then
-# printed "No running Ghoztty instance found." about a running app), and
-# `+list` took every pane's renderer mutex to read its pwd.
-# What is left is a DIFFERENT mechanism on the same panes, and both remaining
-# asserts now measure real work rather than a failed connect:
-#   T114 -- `+read` of a flooded agent-backed pane loses long races on that
-#           pane's renderer mutex (measured lockwait 15514ms / dump 47ms).
-#   T115 -- `+close` of a flooded agent-backed pane blocks the GUI thread in
-#           its teardown (measured handler=64883ms).
-# These asserts are deliberately left strict so the regressions stay visible;
-# expect ALL PASS here only once T114 and T115 land.
+# FULLY GREEN since 2026-07-21 (T114/T115). The last two reds were E4 (+read
+# latency) and E11/E12 (+close latency), and they turned out to be ONE defect
+# with two victims: the agent-path drain re-took each pane's renderer mutex in
+# a tight loop, so every latency-sensitive waiter on that mutex lost race after
+# race -- `+read` (23628ms of lock wait for 45ms of work) and, less obviously,
+# the RENDERER thread (65392ms for one frame), which is where it notices its
+# stop request, so `+close` sat in `renderer_thr.join()` for 33s. Fixed by a
+# fairness ticket on `renderer.State` plus an early `drainRing` bail once
+# `io.closing` is set. Section E is the contract for both: keep these bounds
+# strict, and treat any E4/E11/E12 red as that starvation returning.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Fully hermetic:
 # per-run $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN; only ever kills
