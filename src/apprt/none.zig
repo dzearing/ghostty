@@ -47,20 +47,14 @@ pub const App = struct {
         var stderr_writer = std.fs.File.stderr().writerStreaming(&buf);
         const stderr = &stderr_writer.interface;
 
-        const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-        const uid = std.c.getuid();
-        const build_config = @import("../build_config.zig");
-        const suffix = if (build_config.is_debug) "-debug" else "";
-        const sock_path = std.fmt.allocPrintSentinel(alloc, "{s}ghostty{s}-{d}.sock", .{
-            tmpdir, suffix, uid,
-        }, 0) catch |err| {
+        const sock_path = apprt.ipc.socketPath(alloc) catch |err| {
             stderr.print("Failed to build socket path: {}\n", .{err}) catch {};
             stderr.flush() catch {};
             return error.IPCFailed;
         };
         defer alloc.free(sock_path);
 
-        const fd = connectUnixSocket(sock_path) catch blk: {
+        const fd = apprt.ipc.connect(sock_path) catch blk: {
             // Connection failed. Drop a sentinel file to signal the main
             // process to rebind its socket, then retry with backoff.
             const sentinel_path = std.fmt.allocPrintSentinel(alloc, "{s}.reset", .{sock_path}, 0) catch {
@@ -78,7 +72,7 @@ pub const App = struct {
             var attempt: usize = 0;
             while (attempt < max_retries) : (attempt += 1) {
                 std.Thread.sleep(300 * std.time.ns_per_ms);
-                if (connectUnixSocket(sock_path)) |connected_fd| {
+                if (apprt.ipc.connect(sock_path)) |connected_fd| {
                     std.fs.cwd().deleteFile(sentinel_path) catch {};
                     break :blk connected_fd;
                 } else |_| {}
@@ -177,23 +171,6 @@ pub const App = struct {
         }
 
         return true;
-    }
-
-    fn connectUnixSocket(path: [:0]const u8) !std.posix.fd_t {
-        const fd = try std.posix.socket(
-            std.posix.AF.UNIX,
-            std.posix.SOCK.STREAM,
-            0,
-        );
-        errdefer std.posix.close(fd);
-
-        var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
-        if (path.len >= addr.path.len) return error.NameTooLong;
-        @memcpy(addr.path[0..path.len], path);
-        addr.path[path.len] = 0;
-
-        try std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-        return fd;
     }
 
     fn readFull(fd: std.posix.fd_t, buffer: []u8) !void {

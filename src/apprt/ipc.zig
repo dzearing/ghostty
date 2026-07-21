@@ -4,6 +4,102 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const lib = @import("../lib/main.zig");
+const build_config = @import("../build_config.zig");
+const internal_os = @import("../os/main.zig");
+
+/// Environment variable naming the IPC socket of the app instance that owns
+/// the calling process's pane. Every pane's environment is baked with this by
+/// the app that created it (see `IPCSocket.path` on the macOS side), so a CLI
+/// run from inside a pane talks to THAT app — not to whichever build the
+/// `ghoztty` binary on `$PATH` happens to be.
+///
+/// This matters because the socket name is per-BUILD (`-debug` suffix), not
+/// per-binary: `ghoztty` on `$PATH` is normally the release app's binary, so
+/// without this it would compile-time-derive the release socket even when run
+/// from a debug-app pane and silently drive the wrong instance.
+///
+/// It holds a full absolute path rather than a build-flavor hint so it keeps
+/// working if the socket name ever gains an instance discriminator.
+///
+/// Absent (a plain non-Ghoztty shell, or a pane baked by an app/agent that
+/// predates this var) means "derive it" — see `socketPath`.
+pub const socket_env = "GHOZTTY_IPC_SOCKET";
+
+/// Resolve the IPC socket to dial: `$GHOZTTY_IPC_SOCKET` when the caller runs
+/// inside a pane, else this build's own `<tmp>/ghostty[-debug]-<uid>.sock`
+/// (which is what the app's IPC server binds — keep the two in sync).
+///
+/// This is the ONE place the socket address is resolved; every CLI command and
+/// apprt IPC client goes through it so the derivation can't drift.
+///
+/// Caller owns the returned path.
+pub fn socketPath(alloc: Allocator) Allocator.Error![:0]u8 {
+    return socketPathFrom(alloc, std.posix.getenv(socket_env));
+}
+
+/// `socketPath` with the baked value injected, so the resolution rule is
+/// testable without mutating the process environment.
+fn socketPathFrom(alloc: Allocator, baked: ?[]const u8) Allocator.Error![:0]u8 {
+    if (baked) |path| {
+        if (path.len > 0) return alloc.dupeZ(u8, path);
+    }
+
+    const tmpdir = try internal_os.allocTmpDir(alloc);
+    defer internal_os.freeTmpDir(alloc, tmpdir);
+    const uid = std.c.getuid();
+    const suffix = if (build_config.is_debug) "-debug" else "";
+    return std.fmt.allocPrintSentinel(alloc, "{s}/ghostty{s}-{d}.sock", .{
+        tmpdir, suffix, uid,
+    }, 0);
+}
+
+test "socketPath: prefers the pane's baked socket over the compile-time guess" {
+    const testing = std.testing;
+    const baked = "/tmp/gz-test/ghostty-debug-501.sock";
+    const path = try socketPathFrom(testing.allocator, baked);
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings(baked, path);
+}
+
+test "socketPath: falls back to this build's own socket when unset or empty" {
+    const testing = std.testing;
+
+    // An empty value means the same thing as absent: derive it. (A pane baked
+    // by an app or agent that predates the var leaves it absent entirely.)
+    const unset = try socketPathFrom(testing.allocator, null);
+    defer testing.allocator.free(unset);
+    const empty = try socketPathFrom(testing.allocator, "");
+    defer testing.allocator.free(empty);
+    try testing.expectEqualStrings(unset, empty);
+
+    // Exactly one separator between the tmp dir and the socket name, whether or
+    // not $TMPDIR carries a trailing slash.
+    try testing.expect(std.mem.endsWith(u8, unset, ".sock"));
+    try testing.expect(std.mem.indexOf(u8, unset, "//") == null);
+    try testing.expect(std.mem.startsWith(
+        u8,
+        std.fs.path.basename(unset),
+        if (build_config.is_debug) "ghostty-debug-" else "ghostty-",
+    ));
+}
+
+/// Connect to an IPC socket by path. Caller owns the returned fd.
+pub fn connect(path: [:0]const u8) !std.posix.fd_t {
+    const fd = try std.posix.socket(
+        std.posix.AF.UNIX,
+        std.posix.SOCK.STREAM,
+        0,
+    );
+    errdefer std.posix.close(fd);
+
+    var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
+    if (path.len >= addr.path.len) return error.NameTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    addr.path[path.len] = 0;
+
+    try std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+    return fd;
+}
 
 pub const Errors = error{
     /// The IPC failed. If a function returns this error, it's expected that

@@ -4,6 +4,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
+const ipc = @import("../apprt/ipc.zig");
 
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
@@ -121,16 +122,10 @@ fn sendListQuery(
     alloc: Allocator,
     stderr: *std.Io.Writer,
 ) ![]const u8 {
-    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-    const uid = std.c.getuid();
-    const build_config = @import("../build_config.zig");
-    const suffix = if (build_config.is_debug) "-debug" else "";
-    const sock_path = try std.fmt.allocPrintSentinel(alloc, "{s}ghostty{s}-{d}.sock", .{
-        tmpdir, suffix, uid,
-    }, 0);
+    const sock_path = try ipc.socketPath(alloc);
     defer alloc.free(sock_path);
 
-    const fd = connectUnixSocket(sock_path) catch {
+    const fd = ipc.connect(sock_path) catch {
         return error.NoRunningInstance;
     };
     defer std.posix.close(fd);
@@ -397,23 +392,6 @@ fn jsonInt(val: ?std.json.Value) i64 {
         .integer => |i| i,
         else => 0,
     };
-}
-
-fn connectUnixSocket(path: [:0]const u8) !std.posix.fd_t {
-    const fd = try std.posix.socket(
-        std.posix.AF.UNIX,
-        std.posix.SOCK.STREAM,
-        0,
-    );
-    errdefer std.posix.close(fd);
-
-    var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
-    if (path.len >= addr.path.len) return error.NameTooLong;
-    @memcpy(addr.path[0..path.len], path);
-    addr.path[path.len] = 0;
-
-    try std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-    return fd;
 }
 
 fn readFull(fd: std.posix.fd_t, buffer: []u8) !void {

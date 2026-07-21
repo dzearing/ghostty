@@ -237,6 +237,26 @@ Prefer the pane id over pid/tty matching for self-identification: pids and ttys
 belong to the machine the process runs on and are meaningless for remote panes.
 (`+list --tty=<tty>` still works for local panes as a fallback.)
 
+### Instance addressability
+
+An IPC command run inside a pane targets **the app instance that owns that
+pane**, not whichever build the `ghoztty` binary on `$PATH` happens to be. Every
+pane's env is baked with `$GHOZTTY_IPC_SOCKET` — the absolute path of its own
+app's IPC socket — and the CLI prefers it over the compile-time
+`ghostty[-debug]-<uid>.sock` derivation. So `ghoztty +split` run from a
+debug-build pane splits the **debug** window even though `ghoztty` on `$PATH` is
+the release binary (before this, it silently drove the release app).
+
+- Baked on every pane path: plain local spawn, session-persistence agent panes
+  (the agent replays the pane env on RELAUNCH), and remote panes — a remote
+  pane's IPC still belongs to the *local* app.
+- Absent or empty ⇒ today's derivation, so a CLI run from a plain non-Ghoztty
+  shell is unchanged, as is a pane baked by an older app or agent.
+- Override it (`GHOZTTY_IPC_SOCKET=<path> ghoztty +list`) to aim a single
+  command at a specific instance.
+- One resolution site each side: `apprt.ipc.socketPath()` (`src/apprt/ipc.zig`)
+  for the CLI, `IPCSocket.path` (Swift) for the server.
+
 ### Example: three-pane layout
 
 ```bash
@@ -432,4 +452,4 @@ zig build -Doptimize=Debug
 - **Zig core** (`src/`): terminal emulation, input handling, CLI commands, IPC client
 - **Swift macOS app** (`macos/`): SwiftUI frontend, IPC server, split tree layout
 - Split panes use a binary tree (`SplitTree`) with a ratio (0.0–1.0) per split node
-- IPC uses JSON messages over a Unix domain socket at `$TMPDIR/ghostty[-debug]-<uid>.sock`
+- IPC uses JSON messages over a Unix domain socket at `$TMPDIR/ghostty[-debug]-<uid>.sock`, overridden per pane by `$GHOZTTY_IPC_SOCKET` (see Instance addressability)

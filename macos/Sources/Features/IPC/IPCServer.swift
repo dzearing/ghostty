@@ -64,12 +64,10 @@ class IPCServer {
 
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
-        let uid = getuid()
-        let suffix = Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG
-            || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE
-            ? "-debug" : ""
-        self.socketPath = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ghostty\(suffix)-\(uid).sock").path
+        // Single source of truth for this build's socket address — the same
+        // value every pane's env advertises as GHOZTTY_IPC_SOCKET, so a CLI
+        // run inside a pane dials the app that owns it.
+        self.socketPath = IPCSocket.path
     }
 
     private var sentinelPath: String {
