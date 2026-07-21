@@ -172,13 +172,18 @@ final class LocalAgentManager {
     /// relaunch. Removed/rebound whenever `sharedOwner` changes. Main only.
     private var sharedLinkObserver: NSObjectProtocol?
 
-    /// Called (main thread) the first time the shared connection's transport
-    /// drops to a non-self-healing state (`reconnecting`/`reattaching`/`dead`).
-    /// The local UDS transport never re-dials itself (the Zig FSM only computes
-    /// the backoff — see connection.zig), so a drop is permanent until we act:
-    /// `AppDelegate` wires this to `recoverSessionLayoutInPlace()`. Set once at
-    /// launch; fired at most once per shared connection (the recovery re-dials
-    /// and installs a fresh `sharedOwner` with a fresh observer). Main only.
+    /// Called (main thread) once the shared connection's transport has been
+    /// CONFIRMED down — down at the edge and still down `sharedLinkDropSettle`
+    /// later (see `evaluateSharedLinkDrop`). `AppDelegate` wires this to
+    /// `recoverSessionLayoutInPlace()`. Set once at launch; fired at most once
+    /// per shared connection (the recovery re-dials and installs a fresh
+    /// `sharedOwner` with a fresh observer). Main only.
+    ///
+    /// A down EDGE on its own is not enough: the Zig link FSM enters
+    /// `reconnecting` after three missed heartbeats and returns to `connected`
+    /// on the next authentic packet, so a stalled heartbeat is indistinguishable
+    /// from a dead agent for a few hundred milliseconds — and rebuilding on that
+    /// blip is pure damage.
     var onSharedConnectionDrop: (@MainActor () -> Void)?
 
     /// The Machine value describing the local agent endpoint. A loopback
@@ -451,14 +456,15 @@ final class LocalAgentManager {
         return owner
     }
 
-    /// (Re)bind the link-state observer to `owner` so a transport drop on the
-    /// shared connection triggers in-place recovery (T12e). The prior
+    /// (Re)bind the link-state observer to `owner` so a CONFIRMED transport drop
+    /// on the shared connection triggers in-place recovery (T12e). The prior
     /// observer, if any, is removed first. Main-thread only.
     private func bindSharedLinkObserver(_ owner: RemoteConnection) {
         if let existing = sharedLinkObserver {
             NotificationCenter.default.removeObserver(existing)
             sharedLinkObserver = nil
         }
+        sharedLinkDropWatchOwner = nil
         sharedLinkObserver = NotificationCenter.default.addObserver(
             forName: .ghosttyRemoteConnectionLinkDidChange,
             object: owner,
@@ -466,26 +472,153 @@ final class LocalAgentManager {
         ) { [weak self] note in
             guard let self,
                   let conn = note.object as? RemoteConnection,
-                  conn === self.sharedOwner else { return }
-            switch conn.linkState {
-            case .reconnecting, .reattaching, .dead:
-                // The local UDS link does not self-heal (the Zig side computes
-                // backoff but never re-dials), so this is terminal for THIS
-                // connection: hand off to recovery ONCE. We stop observing this
-                // owner now — recovery re-dials and installs a fresh owner with
-                // its own observer — so a follow-up reconnecting→dead edge can't
-                // re-fire the same handoff.
-                if let observer = self.sharedLinkObserver {
-                    NotificationCenter.default.removeObserver(observer)
-                    self.sharedLinkObserver = nil
-                }
-                Self.logger.warning(
-                    "shared local-agent link dropped (\(String(describing: conn.linkState))); triggering in-place recovery")
-                self.onSharedConnectionDrop?()
-            case .connected, .degraded:
-                break
+                  conn === self.sharedOwner,
+                  conn.linkState.isDown else { return }
+            // A down edge is NOT proof the agent died — see `LinkState.isDown`.
+            // Recovery replaces every local window's surface tree, so it must
+            // never run on a blip: watch the link for `sharedLinkDropSettle`
+            // and only hand off if it never comes back. The observer stays
+            // bound throughout, so a link that heals and drops again later is
+            // still caught.
+            self.beginSharedLinkDropWatch(conn)
+        }
+    }
+
+    // MARK: - Confirming a shared-link drop
+
+    /// How long the shared link must stay down before a drop counts as real.
+    /// The Zig FSM's heartbeat path recovers on the very next authentic packet
+    /// (the 2026-07-21 incident healed in 27ms); a genuinely dead agent never
+    /// does. Sized past one full `heartbeat_interval_ms` (3s in
+    /// `src/remote/connection.zig`) so a link that only heals on its next
+    /// heartbeat round-trip still gets to, plus margin. Recovery rebuilds every
+    /// local window, and a truly dead agent leaves those panes frozen either
+    /// way — so waiting to be sure costs nothing that was not already lost.
+    static let sharedLinkDropSettle: TimeInterval = 5.0
+
+    /// How often the settle window is re-checked. Short enough that a real drop
+    /// is confirmed promptly once the window elapses.
+    static let sharedLinkDropPollInterval: TimeInterval = 0.25
+
+    /// What a down shared link means once re-checked. Pure, so the policy is
+    /// unit-testable without a live agent.
+    enum SharedLinkDropVerdict: Equatable {
+        /// The link came back on its own. Do nothing at all.
+        case linkRecovered
+
+        /// A different shared connection has been installed meanwhile (a racing
+        /// re-dial), so this owner is nobody's transport now. Do nothing.
+        case ownerReplaced
+
+        /// Still down, but the settle window has not elapsed. Keep watching.
+        case keepWatching
+
+        /// Still down after the settle window, and the agent we were talking to
+        /// is no longer the agent on disk (it restarted, or it is gone).
+        /// `currentPid` is nil when no live agent could be found at all.
+        case agentRestarted(previousPid: pid_t, currentPid: pid_t?)
+
+        /// Still down after the settle window, but the SAME agent process is
+        /// alive: the transport failed, not the agent. Rebuilding is still the
+        /// cure (re-dial + re-ATTACH), but nothing here restarted — saying so
+        /// in the log is what made the 2026-07-21 incident hard to diagnose.
+        case transportDown(pid: pid_t)
+
+        /// Whether this verdict means "rebuild the local windows in place".
+        var triggersRecovery: Bool {
+            switch self {
+            case .agentRestarted, .transportDown: return true
+            case .linkRecovered, .ownerReplaced, .keepWatching: return false
             }
         }
+    }
+
+    /// Decide what a down shared link means. `settleRemaining` is the settle
+    /// time left AFTER this check; `liveAgentPid` is the pid recorded in the
+    /// agent's info file (nil when no live agent is there) and is only consulted
+    /// once the window has elapsed.
+    static func evaluateSharedLinkDrop(
+        linkState: RemoteConnection.LinkState,
+        ownerIsCurrentShared: Bool,
+        settleRemaining: TimeInterval,
+        previousAgentPid: pid_t,
+        liveAgentPid: pid_t?
+    ) -> SharedLinkDropVerdict {
+        guard ownerIsCurrentShared else { return .ownerReplaced }
+        guard linkState.isDown else { return .linkRecovered }
+        guard settleRemaining <= 0 else { return .keepWatching }
+        if let liveAgentPid, previousAgentPid > 0, liveAgentPid == previousAgentPid {
+            return .transportDown(pid: liveAgentPid)
+        }
+        return .agentRestarted(previousPid: previousAgentPid, currentPid: liveAgentPid)
+    }
+
+    /// The connection whose down link we are currently watching, so overlapping
+    /// down edges (`reconnecting → dead`) share ONE settle window. Main only.
+    private var sharedLinkDropWatchOwner: RemoteConnection?
+
+    /// Start (or keep) the settle window for `owner`'s down link.
+    private func beginSharedLinkDropWatch(_ owner: RemoteConnection) {
+        guard sharedLinkDropWatchOwner !== owner else { return }
+        sharedLinkDropWatchOwner = owner
+        Self.logger.warning(
+            "shared local-agent link went down (\(String(describing: owner.linkState), privacy: .public)); watching \(Self.sharedLinkDropSettle, privacy: .public)s before deciding on in-place recovery")
+        pollSharedLinkDrop(owner, remaining: Self.sharedLinkDropSettle)
+    }
+
+    /// One tick of the settle window. Re-arms itself until the link recovers,
+    /// the owner is replaced, or the window elapses with the link still down.
+    private func pollSharedLinkDrop(_ owner: RemoteConnection, remaining: TimeInterval) {
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.sharedLinkDropPollInterval
+        ) { [weak self] in
+            guard let self, self.sharedLinkDropWatchOwner === owner else { return }
+            let left = remaining - Self.sharedLinkDropPollInterval
+            let isShared = self.sharedOwner === owner
+            // Only touch the filesystem on the deciding tick.
+            let livePid: pid_t? = (isShared && owner.linkState.isDown && left <= 0)
+                ? Self.liveAgentPid(paths: .current) : nil
+            let verdict = Self.evaluateSharedLinkDrop(
+                linkState: owner.linkState,
+                ownerIsCurrentShared: isShared,
+                settleRemaining: left,
+                previousAgentPid: self.sharedAgentPid,
+                liveAgentPid: livePid)
+
+            switch verdict {
+            case .keepWatching:
+                self.pollSharedLinkDrop(owner, remaining: left)
+            case .linkRecovered:
+                self.sharedLinkDropWatchOwner = nil
+                Self.logger.warning(
+                    "shared local-agent link recovered on its own (\(String(describing: owner.linkState), privacy: .public)); no in-place recovery needed")
+            case .ownerReplaced:
+                self.sharedLinkDropWatchOwner = nil
+                Self.logger.info(
+                    "shared local-agent link dropped but a new shared connection is already in place; nothing to recover")
+            case .transportDown(let pid):
+                self.sharedLinkDropWatchOwner = nil
+                self.detachSharedLinkObserver()
+                Self.logger.warning(
+                    "shared local-agent link stayed down for \(Self.sharedLinkDropSettle, privacy: .public)s while agent pid \(pid, privacy: .public) is still running: the transport failed, not the agent; re-dialing to rebuild local windows in place")
+                self.onSharedConnectionDrop?()
+            case .agentRestarted(let previous, let current):
+                self.sharedLinkDropWatchOwner = nil
+                self.detachSharedLinkObserver()
+                Self.logger.warning(
+                    "shared local-agent link stayed down for \(Self.sharedLinkDropSettle, privacy: .public)s and agent pid \(previous, privacy: .public) is gone (info file now reports \(current.map(String.init) ?? "no live agent", privacy: .public)); re-dialing the restarted agent to rebuild local windows in place")
+                self.onSharedConnectionDrop?()
+            }
+        }
+    }
+
+    /// Stop observing the current shared owner's link. Recovery re-dials and
+    /// installs a fresh owner with its own observer, so a follow-up
+    /// `reconnecting → dead` edge can't re-fire the same handoff.
+    private func detachSharedLinkObserver() {
+        guard let observer = sharedLinkObserver else { return }
+        NotificationCenter.default.removeObserver(observer)
+        sharedLinkObserver = nil
     }
 
     /// Drop the cached shared connection and its observer so the NEXT resolve
@@ -495,10 +628,8 @@ final class LocalAgentManager {
     /// Main-thread only.
     func invalidateShared() {
         dispatchPrecondition(condition: .onQueue(.main))
-        if let existing = sharedLinkObserver {
-            NotificationCenter.default.removeObserver(existing)
-            sharedLinkObserver = nil
-        }
+        detachSharedLinkObserver()
+        sharedLinkDropWatchOwner = nil
         sharedOwner = nil
         sharedAgentPid = 0
     }
@@ -741,10 +872,21 @@ final class LocalAgentManager {
     /// unresponsive agent (slow HELLO, socket backlog) must count as alive here so
     /// we never restart it out from under its sessions.
     private static func agentProcessAlive(paths: Paths) -> Bool {
+        liveAgentPid(paths: paths) != nil
+    }
+
+    /// The pid of the agent recorded in the info file, or nil when the file is
+    /// missing/garbage or that process is gone. Same liveness probe as
+    /// `dialExisting` (signal 0; EPERM still means "exists") and, like
+    /// `agentProcessAlive`, deliberately does NOT dial: this answers "is the
+    /// agent I was talking to still the agent that is there?", which a slow
+    /// HELLO must not turn into a false "it restarted".
+    static func liveAgentPid(paths: Paths) -> pid_t? {
         guard let data = try? Data(contentsOf: paths.portFile),
-              let record = parsePortFile(data)
-        else { return false }
-        return kill(record.pid, 0) == 0 || errno == EPERM
+              let record = parsePortFile(data),
+              kill(record.pid, 0) == 0 || errno == EPERM
+        else { return nil }
+        return record.pid
     }
 
     // MARK: - Spawn

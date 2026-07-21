@@ -102,3 +102,104 @@ struct LocalAgentManagerPortFileTests {
         #expect(parsed == LocalAgentManager.PortFile(port: 5, pid: 9, socket: "/tmp/x.sock"))
     }
 }
+
+/// The gate in front of in-place session recovery. Recovery replaces every
+/// local window's surface tree, so it must only run on a link that is REALLY
+/// down — not on the self-healing heartbeat blip that triggered the 2026-07-21
+/// incident (`degraded → reconnecting → connected` in 27ms, agent never
+/// restarted, five windows rebuilt for nothing).
+struct SharedLinkDropVerdictTests {
+    private let agentPid: pid_t = 77545
+
+    private func evaluate(
+        state: RemoteConnection.LinkState,
+        shared: Bool = true,
+        remaining: TimeInterval = 0,
+        previous: pid_t? = nil,
+        live: pid_t?
+    ) -> LocalAgentManager.SharedLinkDropVerdict {
+        LocalAgentManager.evaluateSharedLinkDrop(
+            linkState: state,
+            ownerIsCurrentShared: shared,
+            settleRemaining: remaining,
+            previousAgentPid: previous ?? agentPid,
+            liveAgentPid: live)
+    }
+
+    // MARK: Link-state classification
+
+    @Test func onlyNonCarryingStatesCountAsDown() {
+        #expect(RemoteConnection.LinkState.connected.isDown == false)
+        #expect(RemoteConnection.LinkState.degraded.isDown == false)
+        #expect(RemoteConnection.LinkState.reconnecting.isDown == true)
+        #expect(RemoteConnection.LinkState.reattaching.isDown == true)
+        #expect(RemoteConnection.LinkState.dead.isDown == true)
+    }
+
+    // MARK: The regression — a transient edge must not trigger recovery
+
+    @Test func aLinkThatHealsWithinTheWindowNeverTriggersRecovery() {
+        // The incident, replayed: the edge fired, and by the time the settle
+        // window is re-checked the FSM is back to connected.
+        let verdict = evaluate(state: .connected, remaining: 1.75, live: agentPid)
+        #expect(verdict == .linkRecovered)
+        #expect(verdict.triggersRecovery == false)
+    }
+
+    @Test func healingIsHonoredEvenAfterTheWindowElapses() {
+        let verdict = evaluate(state: .connected, remaining: -0.25, live: agentPid)
+        #expect(verdict == .linkRecovered)
+    }
+
+    @Test func degradedIsNotADrop() {
+        // Two missed heartbeats: the link is slow, not gone.
+        #expect(evaluate(state: .degraded, remaining: -1, live: agentPid) == .linkRecovered)
+    }
+
+    @Test func stillDownInsideTheWindowKeepsWatching() {
+        let verdict = evaluate(state: .reconnecting, remaining: 1.5, live: nil)
+        #expect(verdict == .keepWatching)
+        #expect(verdict.triggersRecovery == false)
+    }
+
+    @Test func aReplacedOwnerIsNeverRecovered() {
+        // A racing new window already dialed a fresh shared connection: this
+        // owner is nobody's transport, so rebuilding on it is meaningless.
+        let verdict = evaluate(state: .dead, shared: false, remaining: -1, live: nil)
+        #expect(verdict == .ownerReplaced)
+        #expect(verdict.triggersRecovery == false)
+    }
+
+    @Test func aReplacedOwnerWinsOverEveryOtherSignal() {
+        #expect(evaluate(
+            state: .connected, shared: false, remaining: 1, live: agentPid) == .ownerReplaced)
+    }
+
+    // MARK: A confirmed drop still recovers — with an honest reason
+
+    @Test func aRestartedAgentIsReportedAsARestart() {
+        let verdict = evaluate(state: .dead, remaining: 0, live: 90210)
+        #expect(verdict == .agentRestarted(previousPid: agentPid, currentPid: 90210))
+        #expect(verdict.triggersRecovery)
+    }
+
+    @Test func aMissingAgentIsReportedAsARestartWithNoPid() {
+        let verdict = evaluate(state: .reconnecting, remaining: 0, live: nil)
+        #expect(verdict == .agentRestarted(previousPid: agentPid, currentPid: nil))
+        #expect(verdict.triggersRecovery)
+    }
+
+    @Test func aLiveSameAgentIsReportedAsATransportFailureNotARestart() {
+        // The log line that made the incident hard to diagnose asserted a
+        // restart that never happened. Same pid ⇒ never claim one.
+        let verdict = evaluate(state: .dead, remaining: 0, live: agentPid)
+        #expect(verdict == .transportDown(pid: agentPid))
+        #expect(verdict.triggersRecovery)
+    }
+
+    @Test func anUnknownPreviousPidCannotMasqueradeAsTheSameAgent() {
+        // sharedAgentPid is 0 before any dial; pid 0 must never match.
+        let verdict = evaluate(state: .dead, remaining: 0, previous: 0, live: 0)
+        #expect(verdict == .agentRestarted(previousPid: 0, currentPid: 0))
+    }
+}

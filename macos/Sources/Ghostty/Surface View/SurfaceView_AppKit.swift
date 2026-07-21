@@ -159,6 +159,30 @@ extension Ghostty {
             ghostty_surface_set_session_close_intent(surface, closeOnFree)
         }
 
+        /// The LIVE agent session id, published by the termio thread once
+        /// OPEN/ATTACH completes. Nil for a local exec surface, and nil for a
+        /// remote surface whose bring-up is still in flight.
+        var liveRemoteSessionID: String? {
+            guard let surface = self.surface else { return nil }
+            let s = Ghostty.AllocatedString(
+                ghostty_surface_remote_session_id(surface)).string
+            return s.isEmpty ? nil : s
+        }
+
+        /// The agent session this surface is BOUND to: the live id once it is
+        /// published, else the id the surface was created to attach. Nil only
+        /// for a local exec surface (or a remote OPEN-new whose session id has
+        /// not landed yet — it has no prior session to name).
+        ///
+        /// The fallback matters at exactly the moments the live id is missing
+        /// but the binding is already decided: a surface built to re-ATTACH a
+        /// recorded session names that session from birth, before its termio
+        /// thread has connected. Both the session-layout sync and the
+        /// close-intent policy need that early answer.
+        var boundRemoteSessionID: String? {
+            liveRemoteSessionID ?? expectedRemoteSessionID
+        }
+
         // Returns the inspector instance for this surface, or nil if the
         // surface has been closed or no inspector is active.
         var inspector: Ghostty.Inspector? {

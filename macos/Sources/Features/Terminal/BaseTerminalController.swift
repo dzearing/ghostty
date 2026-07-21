@@ -899,14 +899,18 @@ class BaseTerminalController: NSWindowController,
         // PRESENT in the tree is alive — clear any pending intent, which is
         // what un-marks a view brought back by undo (the undo restore assigns
         // the old tree directly, landing here).
-        let toLeaves = to.root?.leaves() ?? []
-        for view in toLeaves { view.setSessionCloseIntent(false) }
-        if let fromLeaves = from.root?.leaves(), !fromLeaves.isEmpty {
-            let toSet = Set(toLeaves.map { ObjectIdentifier($0) })
-            for view in fromLeaves where !toSet.contains(ObjectIdentifier(view)) {
-                view.setSessionCloseIntent(true)
-            }
-        }
+        //
+        // The exception is a tree SWAP (in-place session recovery): a departing
+        // leaf whose session the NEW tree re-attached is not a close at all, and
+        // marking it would kill a session a live pane is using. See
+        // `SessionCloseIntentPolicy`.
+        let plan = SessionCloseIntentPolicy.plan(
+            from: from.root?.leaves() ?? [],
+            to: to.root?.leaves() ?? [],
+            sessionID: { $0.surfaceView?.boundRemoteSessionID })
+        for view in plan.keepAlive { view.setSessionCloseIntent(false) }
+        for view in plan.spared { view.setSessionCloseIntent(false) }
+        for view in plan.close { view.setSessionCloseIntent(true) }
 
         // Session persistence (T05): the split topology is the heart of the
         // layout manifest — re-sync on every tree change (new split, close,

@@ -1035,7 +1035,25 @@ pub const Server = struct {
         // avoid the deadlock: UNLINK under the lock, then terminate+free OUTSIDE it
         // (terminate joins the pty reader, whose sink takes this very lock).
         self.store.mutex.lock();
-        const s = self.store.table.getByChannel(channel);
+        const s = blk: {
+            const sess = self.store.table.getByChannel(channel) orelse break :blk null;
+            // OWNERSHIP GUARD (same rule as handleDetach/handleFlow, and the one
+            // that matters most: this branch KILLS the child). During a
+            // reconnect/rebuild swap the NEW connection ATTACHes — rebinding the
+            // bridge to itself — and only then does the old surface's teardown
+            // arrive over the still-open OLD connection. Unguarded, that stale
+            // CLOSE terminated the session the new owner had just re-attached,
+            // leaving a live-looking pane with a dead session behind it.
+            //
+            // The test is "bridged to SOMEONE ELSE", not handleDetach's stricter
+            // "bridged to me": an UNBOUND session (bridge_ctx null — orphaned by
+            // a DETACH or a dropped connection) has no owner to protect, and
+            // refusing to close it would only leak it until the idle TTL.
+            if (sess.bridge_ctx) |ctx| {
+                if (ctx != @as(*anyopaque, self)) break :blk null;
+            }
+            break :blk sess;
+        };
         const unlinked = if (s) |sess| self.store.table.unlink(sess.id) else null;
         self.store.mutex.unlock();
         if (unlinked) |u| {
@@ -3653,6 +3671,122 @@ test "WP-D1: stale DETACH from a superseded connection must not silence the new 
     const dp = try protocol.DataPayload.decode(d.?.payload);
     try testing.expectEqual(@as(u64, 5), dp.byte_offset);
     try testing.expectEqualSlices(u8, "+live", dp.bytes);
+}
+
+test "stale CLOSE from a superseded connection must not kill the new owner's session" {
+    // The 2026-07-21 session-kill incident, at the agent: conn 1 owns a session;
+    // conn 2 ATTACHes (the agent rebinds the bridge — the in-place rebuild swap);
+    // THEN conn 1's orphaned surface finally deallocates and sends CLOSE for the
+    // same channel. Pre-fix that stale CLOSE unlinked the session and terminated
+    // the child conn 2 was using, leaving a live-looking pane with nothing behind
+    // it. It must be a no-op.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 1000 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(29);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    var id_buf: [32]u8 = o.id;
+    h.server.onChildOutput(o.channel, "hello"); // offsets [0,5)
+    _ = try h.client.nextData();
+
+    // Conn 2 over the SAME store: ATTACH rebinds the bridge (conn 1 still open).
+    var rc = try ReConn.init(&h, .raw);
+    defer rc.deinit();
+    try rc.server.start();
+    try rc.client.handshake();
+    _ = try rc.server.waitHandshake();
+    try rc.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 24,
+        .cols = 80,
+        .last_byte_offset = 5,
+    });
+    const af = try rc.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    try testing.expectEqual(protocol.Attached.AttachStatus.alive, ap.value.status);
+
+    // Conn 1: the STALE CLOSE. Sync with a PING/PONG on the same control lane so
+    // we know it was processed before we assert.
+    try h.client.sendControlRaw(.close, o.channel, "");
+    try h.client.sendControlRaw(.ping, protocol.control_channel, "stale-close-sync");
+    _ = try h.client.waitControl(.pong);
+
+    // The session must still exist, still be bound + streaming, and the child
+    // must NOT have been terminated.
+    h.store.mutex.lock();
+    const s = h.store.table.getByChannel(o.channel);
+    try testing.expect(s != null);
+    try testing.expect(s.?.alive and s.?.bound and s.?.streaming);
+    h.store.mutex.unlock();
+    try testing.expect(!fc.terminated);
+
+    // ...and live output must still reach conn 2.
+    h.server.onChildOutput(o.channel, "+live");
+    const d = try rc.client.nextData();
+    const dp = try protocol.DataPayload.decode(d.?.payload);
+    try testing.expectEqual(@as(u64, 5), dp.byte_offset);
+    try testing.expectEqualSlices(u8, "+live", dp.bytes);
+}
+
+test "CLOSE from the bridge owner still frees the session (guard is not a blanket refusal)" {
+    // The guard's counterpart: a normal user close over the OWNING connection
+    // must keep working, and so must a close of an UNBOUND (detached, orphaned)
+    // session — nobody owns it, so there is nothing to protect and refusing
+    // would only leak it until the idle TTL.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 1000 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var fc2: FakeChild = .{ .alloc = alloc };
+    defer fc2.deinit();
+    var kids = [_]*FakeChild{ &fc, &fc2 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(31);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // 1) Owner closes its own session.
+    const owned = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    try h.client.sendControlRaw(.close, owned.channel, "");
+
+    // 2) DETACH first (bridge_ctx → null), THEN close the orphan.
+    const orphan = try doOpen(&h, .{ .rows = 24, .cols = 80 });
+    try h.client.sendControlRaw(.detach, orphan.channel, "");
+    try h.client.sendControlRaw(.close, orphan.channel, "");
+
+    try h.client.sendControlRaw(.ping, protocol.control_channel, "close-sync");
+    _ = try h.client.waitControl(.pong);
+
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        h.store.mutex.lock();
+        const gone = h.store.table.getByChannel(owned.channel) == null and
+            h.store.table.getByChannel(orphan.channel) == null;
+        h.store.mutex.unlock();
+        if (gone) break;
+        std.Thread.yield() catch {};
+    }
+    h.store.mutex.lock();
+    try testing.expect(h.store.table.getByChannel(owned.channel) == null);
+    try testing.expect(h.store.table.getByChannel(orphan.channel) == null);
+    h.store.mutex.unlock();
+    try testing.expect(fc.terminated);
+    try testing.expect(fc2.terminated);
 }
 
 test "P1: idle-TTL reaper evicts an orphaned session once past the TTL" {
