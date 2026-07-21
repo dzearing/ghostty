@@ -147,9 +147,30 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// the gutter would squeeze the document column too far to read.
     private static let tocGutterMinWidth: CGFloat = 720
 
-    /// Card width in the gutter layout, and its cap in the compact one.
-    private static let tocCardWidth: CGFloat = 216
-    private static let tocCompactCardWidth: CGFloat = 276
+    /// Card width, and the range the user may drag it to. One width serves
+    /// both layouts (the compact overlay just clamps it to the pane), so
+    /// there is a single number to reason about and to persist.
+    private static let tocCardDefaultWidth: CGFloat = 240
+    private static let tocCardMinWidth: CGFloat = 170
+    private static let tocCardMaxWidth: CGFloat = 460
+
+    /// The user's chosen card width. A chrome preference rather than a
+    /// property of any one document, so it lives in defaults and applies to
+    /// every viewer pane — the same way a sidebar width behaves in a document
+    /// app, and unlike a split ratio, which is per-window by nature.
+    private static let tocCardWidthDefaultsKey = "ViewerTOCCardWidth"
+
+    private(set) var tocCardWidth: CGFloat = {
+        let stored = UserDefaults.standard.double(forKey: tocCardWidthDefaultsKey)
+        guard stored > 0 else { return tocCardDefaultWidth }
+        return min(tocCardMaxWidth, max(tocCardMinWidth, CGFloat(stored)))
+    }()
+
+    /// Thin drag target straddling the card's right edge, mounted only in the
+    /// gutter layout (the compact card floats over the document like a menu —
+    /// there is no gutter for a resize to redistribute).
+    private var tocResizeHandle: TOCResizeHandle?
+    private var tocResizeHandleCenterX: NSLayoutConstraint?
 
     /// True when the displayed page is a website (network allowed) rather
     /// than a rendered local file.
@@ -884,8 +905,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let available = webView.frame.height > 0 ? webView.frame.height : bounds.height
         let maxCardHeight = max(80, available - GlassCard.outerMargin * 2)
         let cardWidth = layout == .gutter
-            ? Self.tocCardWidth
-            : min(Self.tocCompactCardWidth,
+            ? tocCardWidth
+            : min(tocCardWidth,
                   max(120, bounds.width - GlassCard.outerMargin * 2))
 
         // Mounted in both layouts. A closed compact panel is PARKED off the
@@ -923,15 +944,96 @@ final class ViewerView: NSView, Codable, ObservableObject {
             tocPanelSignature = nil
         }
 
+        updateTOCResizeHandle(layout: layout, cardWidth: cardWidth)
+
         // Only the gutter reserves space; the compact panel floats over the
         // document the way a menu does.
+        //
+        // The gutter covers the card's LEFT margin plus the card — not a
+        // margin on each side. The space between the card's right edge and
+        // the text is the document's own left padding (see viewer.css, which
+        // uses the same 12px on all four sides), so that gap is one number in
+        // one place instead of a card margin and a page padding that have to
+        // be added up to reason about.
         let gutter = layout == .gutter
-            ? Self.tocCardWidth + GlassCard.outerMargin * 2
+            ? GlassCard.outerMargin + cardWidth
             : 0
         if gutter != tocGutterWidth {
             tocGutterWidth = gutter
             pushTOCGutter()
         }
+    }
+
+    /// Mount, move, or tear down the card's resize handle.
+    ///
+    /// The handle straddles the card's right edge rather than sitting inside
+    /// it: a card edge is a 1pt rim, and a target you have to hit exactly is
+    /// a target you miss. It is a sibling of the panel (not a subview of the
+    /// SwiftUI hosting view) for the same reason the split divider is an
+    /// AppKit view — the hosting view and the web view both out-hit-test a
+    /// SwiftUI gesture area.
+    private func updateTOCResizeHandle(layout: TOCLayout, cardWidth: CGFloat) {
+        guard layout == .gutter, let container = tocPanelContainer else {
+            tocResizeHandle?.removeFromSuperview()
+            tocResizeHandle = nil
+            tocResizeHandleCenterX = nil
+            return
+        }
+
+        let handle: TOCResizeHandle
+        if let existing = tocResizeHandle {
+            handle = existing
+        } else {
+            handle = TOCResizeHandle()
+            handle.translatesAutoresizingMaskIntoConstraints = false
+            handle.onDrag = { [weak self] delta, startWidth in
+                self?.setTOCCardWidth(startWidth + delta)
+            }
+            handle.widthAtDragStart = { [weak self] in
+                self?.tocCardWidth ?? Self.tocCardDefaultWidth
+            }
+            handle.onDragEnded = { [weak self] in
+                guard let self else { return }
+                UserDefaults.standard.set(
+                    Double(self.tocCardWidth), forKey: Self.tocCardWidthDefaultsKey)
+            }
+            addSubview(handle, positioned: .above, relativeTo: container)
+            let centerX = handle.centerXAnchor.constraint(
+                equalTo: container.leadingAnchor, constant: 0)
+            NSLayoutConstraint.activate([
+                centerX,
+                handle.widthAnchor.constraint(equalToConstant: TOCResizeHandle.grabWidth),
+                handle.topAnchor.constraint(
+                    equalTo: container.topAnchor, constant: GlassCard.outerMargin),
+                handle.bottomAnchor.constraint(
+                    equalTo: container.bottomAnchor, constant: -GlassCard.outerMargin),
+            ])
+            tocResizeHandle = handle
+            tocResizeHandleCenterX = centerX
+        }
+
+        let edge = GlassCard.outerMargin + cardWidth
+        if tocResizeHandleCenterX?.constant != edge {
+            tocResizeHandleCenterX?.constant = edge
+        }
+    }
+
+    /// Apply a dragged card width, clamped to the allowed range and to what
+    /// the pane can actually give the document beside it.
+    func setTOCCardWidth(_ proposed: CGFloat) {
+        // Never let the card starve the document: cap it so the text column
+        // keeps at least the width the gutter layout is predicated on.
+        let paneCap = max(
+            Self.tocCardMinWidth,
+            bounds.width - Self.tocGutterMinWidth / 2)
+        let clamped = min(
+            min(Self.tocCardMaxWidth, paneCap),
+            max(Self.tocCardMinWidth, proposed))
+        guard clamped != tocCardWidth else { return }
+        tocCardWidth = clamped
+        // The card, the handle, and the page's gutter all derive from this —
+        // one layout pass moves all three together.
+        updateTOCLayout()
     }
 
     /// Hand the gutter width to the page, which reserves it as padding on

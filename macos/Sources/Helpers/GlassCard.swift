@@ -1,4 +1,72 @@
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+
+/// An `NSVisualEffectView` as a SwiftUI background.
+///
+/// SwiftUI's own `Material` styles pick both the blur radius and the vibrancy
+/// for you, and for a small overlay their choice is too heavy: content passing
+/// behind an `.ultraThinMaterial` header dissolves into a colored wash instead
+/// of staying legible the way it does under a real sidebar header. Naming the
+/// AppKit material directly (e.g. `.headerView`, which is the one a sidebar
+/// header actually uses) is the only way to get the platform's own recipe.
+struct VisualEffectBackground: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    var isEmphasized: Bool = false
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.autoresizingMask = [.width, .height]
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+        nsView.isEmphasized = isEmphasized
+    }
+}
+// NOTE: a CoreImage `backgroundFilters` blur (which would let a caller pick
+// its own radius) does NOT work inside an `NSHostingView`: the content behind
+// the representable's layer is not composited where the filter can reach it,
+// so the layer renders completely unblurred. There is no adjustable blur
+// radius available here — pick a backdrop, don't try to tune one.
+
+extension View {
+    /// The platform's Liquid Glass behind this view, falling back to the
+    /// closest pre-Tahoe material.
+    ///
+    /// Reach for this on a small overlay that content scrolls *under* — a
+    /// pinned list header, say. Liquid Glass is the only backdrop macOS
+    /// offers whose blur is scaled for something card-sized: an
+    /// `NSVisualEffectView` (and every SwiftUI `Material`) blurs at one fixed,
+    /// window-sized radius, which dissolves a passing row into a flat band.
+    ///
+    /// NOT for the glass CARD itself — see `GlassCardBackground`, which is
+    /// hand-drawn precisely because a system material re-renders when the
+    /// window's key state changes and visibly shifts the card's color.
+    /// `tint` darkens (or colors) the glass. Pass the surface's own base color
+    /// at partial opacity to keep the glass reading as part of that surface —
+    /// untinted glass takes on whatever is passing behind it, which on a
+    /// selected row means the header briefly turns accent-colored.
+    @ViewBuilder
+    func glassBackdrop(tint: Color? = nil) -> some View {
+        if #available(macOS 26.0, *) {
+            self.glassEffect(.regular.tint(tint), in: .rect)
+        } else {
+            self.background {
+                ZStack {
+                    VisualEffectBackground(
+                        material: .headerView,
+                        blendingMode: .withinWindow)
+                    if let tint { tint }
+                }
+            }
+        }
+    }
+}
+#endif
 
 /// The floating translucent card shared by every "glass" overlay in a pane —
 /// the sticky pane banner (`Ghostty.SurfacePaneBanner`) and the viewer pane's
@@ -19,7 +87,13 @@ enum GlassCard {
     /// Margin between the card and the pane edges (the card floats rather
     /// than running edge to edge). Sized so the elevation shadow has room to
     /// render instead of being cut off at the pane edge.
-    static let outerMargin: CGFloat = 14
+    ///
+    /// UNIFORM, and the single source of truth: every glass card leaves this
+    /// same gap on all four sides. A per-side fudge (the banner used to shave
+    /// its top to `outerMargin * 0.8`) is exactly what makes a banner in one
+    /// pane and a TOC card in the next fail to line up at their corners — the
+    /// two surfaces sit inches apart and any drift reads as a bug.
+    static let outerMargin: CGFloat = 12
 
     /// The card's fill: a translucent wash over whatever sits behind it —
     /// white on a dark background, black on a light one. Compositing white at

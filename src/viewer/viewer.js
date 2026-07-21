@@ -147,6 +147,9 @@
   function clearHeadingIndex() {
     tocHeadings = [];
     reportedActiveID = null;
+    // A pin belongs to the document that was on screen; a new one (or a live
+    // reload) must not inherit a frozen spy.
+    pinnedHeadingID = null;
     post({ type: "headings", items: [] });
   }
 
@@ -157,6 +160,7 @@
   function indexHeadings() {
     tocHeadings = [];
     reportedActiveID = null;
+    pinnedHeadingID = null;
 
     const headings = Array.prototype.filter.call(
       content.querySelectorAll("h1, h2, h3, h4, h5, h6"),
@@ -189,9 +193,54 @@
     reportActiveHeading();
   }
 
+  /* The heading the user just clicked in the TOC (or an in-page link).
+   *
+   * A click starts a SMOOTH scroll, which fires a scroll event on every frame
+   * of the way there — and the spy below would happily report each section the
+   * page flies past, so clicking a distant heading selected it and then walked
+   * the selection off somewhere else before the scroll even finished. While a
+   * heading is pinned the spy stays quiet: the user said where they are going,
+   * and the animation getting there is not new information.
+   *
+   * The pin is released by the user's own next scroll gesture (see below), not
+   * by the scroll settling: a heading near the end of the document can never
+   * reach the spy marker, so "release when the scroll stops" would hand the
+   * selection straight back to whichever section could. */
+  var pinnedHeadingID = null;
+
+  function pinActiveHeading(id) {
+    pinnedHeadingID = id;
+    if (reportedActiveID === id) return;
+    reportedActiveID = id;
+    post({ type: "active", id: id });
+  }
+
+  function releasePinnedHeading() {
+    if (pinnedHeadingID === null) return;
+    pinnedHeadingID = null;
+    // Resync NOW rather than through requestAnimationFrame: the pin has been
+    // suppressing reports, so the native side is showing a row the reader may
+    // have already scrolled away from, and rAF is throttled (or suspended
+    // outright) whenever the pane is not visibly on screen.
+    reportActiveHeading();
+  }
+
+  /* Any scroll the USER starts hands the spy back. Listening for the input
+   * events rather than for `scroll` is the whole point — a programmatic
+   * smooth scroll is indistinguishable from a user one by the time it reaches
+   * the scroll event. Capture phase so a handler that stops propagation
+   * can't leave the selection frozen. */
+  ["wheel", "touchmove", "keydown", "mousedown"].forEach(function (type) {
+    window.addEventListener(type, releasePinnedHeading, {
+      passive: true,
+      capture: true,
+    });
+  });
+
   /* Report the section currently at the top of the pane, when it changes. */
   function reportActiveHeading() {
     if (!tocHeadings.length) return;
+    if (pinnedHeadingID !== null) return;
 
     let index = 0;
     for (let i = 0; i < tocHeadings.length; i++) {
@@ -244,6 +293,10 @@
    * markdown page's. */
   function setGutter(width) {
     document.body.style.paddingLeft = width > 0 ? width + "px" : "";
+    // The gutter covers the card's left margin and the card itself; the gap
+    // between the card and the text is the document's own left padding. The
+    // class stops the column from centering, which would widen that gap.
+    document.body.classList.toggle("viewer-has-gutter", width > 0);
     requestSpyUpdate();
   }
 
@@ -251,6 +304,7 @@
   function scrollToAnchor(id) {
     const target = document.getElementById(id);
     if (!target) return;
+    pinActiveHeading(id);
     scrollToHeading(target);
   }
 
@@ -270,6 +324,12 @@
     }
     if (!target) return;
     event.preventDefault();
+    // Same deal as a TOC row: the click, not the flight, says where the
+    // reader is. Only headings the TOC actually lists can be pinned — an
+    // anchor to some other element has no row to hold, and pinning it would
+    // freeze the spy on a selection nothing shows. (The mousedown that
+    // preceded this click already released any earlier pin.)
+    if (tocHeadings.indexOf(target) !== -1) pinActiveHeading(target.id);
     scrollToHeading(target);
   });
 

@@ -20,18 +20,27 @@ body {
   }
 }
 
+/* Page margins are measured against the pane's glass cards, not against a
+ * web page's habits: the SAME 12px the TOC card and the pane banner leave
+ * around themselves (`GlassCard.outerMargin`), on all four sides. So the
+ * first line of text starts on the card's top edge, and the gap between the
+ * card's right edge and the text is the same 12px the card leaves on its
+ * left. One number, everywhere. */
 .markdown-body {
   box-sizing: border-box;
   min-width: 200px;
   max-width: 880px;
   margin: 0 auto;
-  padding: 32px 40px 64px;
+  padding: 12px;
 }
 
-@media (max-width: 767px) {
-  .markdown-body {
-    padding: 16px;
-  }
+/* With a TOC gutter the document is the right-hand column of a two-column
+ * layout, so it left-aligns against the card rather than centering in what
+ * is left of the pane — `margin: auto` would turn the fixed 24px gap beside
+ * the card into "however much slack this pane happens to have". */
+body.viewer-has-gutter .markdown-body {
+  margin-left: 0;
+  margin-right: auto;
 }
 
 /* Keep images inside the column. */
