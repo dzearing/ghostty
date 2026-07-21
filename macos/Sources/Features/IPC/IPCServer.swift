@@ -1996,8 +1996,13 @@ class IPCServer {
 
     private static func randomDarkColor() -> NSColor {
         let hue = CGFloat.random(in: 0...1)
-        let saturation = CGFloat.random(in: 0.2...0.3)
-        let brightness = CGFloat.random(in: 0.1...0.15)
+        // Floors raised from 0.2...0.3 / 0.1...0.15: the old ranges landed every
+        // window on the same near-black (brightest channel ~26-38/255, hue
+        // imperceptible), so `--color=random` tints were indistinguishable.
+        // These keep windows comfortably dark but lift them off pure black and
+        // let the hue read.
+        let saturation = CGFloat.random(in: 0.33...0.46)
+        let brightness = CGFloat.random(in: 0.13...0.18)
         return NSColor(hue: hue, saturation: saturation, brightness: brightness, alpha: 1)
     }
 
