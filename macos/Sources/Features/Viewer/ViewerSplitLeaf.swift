@@ -117,6 +117,31 @@ struct WebChromeBar: View {
                 .frame(maxWidth: .infinity)
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
                 .padding(.leading, 4)
+
+            // Feedback, trailing. Present only when the pane's content
+            // resolves to a git worktree — with nowhere to file a report, the
+            // button would be a lie. Its label is the worktree's own name (full
+            // path on hover) because feedback landing silently in the WRONG
+            // repo is the failure this whole affordance has to prevent.
+            if let worktree = viewerView.worktree {
+                Button(action: { viewerView.toggleFeedback() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.bubble")
+                        Text(worktree.name)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 110)
+                    }
+                    .frame(height: 24)
+                    .contentShape(Rectangle())
+                }
+                .foregroundStyle(
+                    viewerView.feedbackOpen ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .help("Send feedback to \(worktree.path)")
+                .accessibilityLabel("Send feedback to \(worktree.name)")
+                .padding(.leading, 4)
+            }
         }
         .onAppear {
             urlText = viewerView.currentURL
@@ -139,8 +164,9 @@ struct WebChromeBar: View {
 }
 
 /// Liquid Glass on macOS 26+, translucent material bar otherwise, with a
-/// hairline bottom edge in both cases.
-private struct ChromeBarBackground: ViewModifier {
+/// hairline bottom edge in both cases. Shared by the nav bar and the feedback
+/// composer that slides in beneath it, so the two read as one stack of chrome.
+struct ChromeBarBackground: ViewModifier {
     func body(content: Content) -> some View {
         Group {
             if #available(macOS 26.0, *) {

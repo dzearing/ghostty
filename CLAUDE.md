@@ -342,6 +342,60 @@ ghoztty +close --target=doc
 - File → Open (or dragging onto the dock icon, or `open -a Ghoztty file.md`)
   opens `.md`-family files as a viewer window.
 
+### Worktree feedback capture
+
+When a viewer pane's content can be attributed to a **git worktree**, its
+navigation bar gains a **feedback button** (labeled with the worktree's
+basename, full path on hover) that opens a composer toolbar below the nav bar.
+On send it writes a report — plus any pasted screenshots — into
+`<worktree>/.feedback/new/` for an external watcher to drain (Ghoztty produces
+the queue; consuming it is separate and not built here).
+
+- **Provenance (strategy D — port lookup first, pane-origin fallback).** The
+  worktree is derived live from the pane's *current* location, re-resolved on
+  every navigation (a pane can move between a file, `localhost:3000`, and a
+  remote site, each a different worktree or none):
+  1. **File viewers** → the viewed file's own directory.
+  2. **`http://localhost:PORT` / `127.0.0.1` / `0.0.0.0` viewers** → the port's
+     listening pid's cwd, via `lsof` (`-iTCP:<port> -sTCP:LISTEN -t`, then
+     `-p <pid> -d cwd -Fn`) run off the main thread. lsof, not
+     `proc_pidinfo`, because there is no port→pid syscall.
+  3. **Fallback** (remote site, blank pane, or a port with no listener) → the
+     pane's **origin directory**: `--working-directory` at `+split --view=` /
+     `+new-window --view=` time, else the caller's cwd. `+split` now seeds the
+     caller's cwd as `--working-directory` for `--view=` splits (terminal
+     splits are unchanged so cwd inheritance still works). The origin is
+     persisted in the session manifest (`viewerOriginDirectory`).
+
+  Whatever directory results is resolved to a repo root via `git -C <dir>
+  rev-parse --show-toplevel` (**any** working tree counts — a linked worktree
+  or the main checkout). No repo ⇒ no feedback button. Resolutions are cached
+  per (location, origin) for 15s so navigation never stutters and a dev server
+  started later still makes the button appear.
+- **Composer.** A multi-line rich-text input (AppKit `NSTextView`): `Enter`
+  inserts a newline, `Cmd-Enter` (or the send button) sends, `Escape` closes.
+  Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
+  `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
+  deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
+  mirrors the chips; clicking a chip scrolls to its thumbnail and vice versa.
+  **Chip numbers are stable, not positional** — deleting `[Image #2]` leaves
+  the sequence 1, 3 in both the text and the carousel (never renumbered), so a
+  number always points at the same image. Composer contents survive
+  toggling the toolbar closed/open and a detach/undo (they live on the pane,
+  not the toolbar).
+- **Report output.** Per submission, into `<worktree>/.feedback/new/`:
+  `<timestamp>-<suffix>.json` (sortable, collision-free) plus a sibling
+  `<stem>/image-N.png` per image. Written **images first, then the report via
+  temp-file + `rename`** (same directory, so atomic) — a watcher globbing
+  `*.json` never sees a half-written report or a report whose images are
+  missing. **Format is JSON** (not markdown-frontmatter: a multi-line prose
+  body with a `---` or `key:` line breaks naive frontmatter splitting; JSON has
+  one parse path). Fields: `version`, `id`, `created`, `source` (the URL/path
+  the feedback was written against), `worktree`, `body` (the composed text with
+  each chip rendered as a `![Image #N](<stem>/image-N.png)` path reference),
+  and `images`. On success the composer clears and the toolbar shows a "Filed …"
+  confirmation before closing.
+
 ## Session Persistence
 
 Terminal processes can be made independent of the GUI app so they survive app

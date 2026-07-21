@@ -407,7 +407,8 @@ extension AppDelegate {
                 let location = leaf.viewerLocation ?? ""
                 return PaneView(viewer: ViewerView(
                     location: location,
-                    homeLocation: leaf.viewerHomeLocation ?? location))
+                    homeLocation: leaf.viewerHomeLocation ?? location,
+                    originDirectory: leaf.viewerOriginDirectory))
             }
 
             var cfg = Ghostty.SurfaceConfiguration()

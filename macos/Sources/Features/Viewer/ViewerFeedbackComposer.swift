@@ -1,0 +1,444 @@
+import AppKit
+import Combine
+import SwiftUI
+import UniformTypeIdentifiers
+
+// MARK: - Chip attachment
+
+/// A pasted image, rendered inline in the composer as an `[Image #N]` chip.
+///
+/// The chip is ONE `NSTextAttachment`, which occupies exactly one character
+/// (`NSAttachmentCharacter`, U+FFFC) in the backing store. That is what makes
+/// it genuinely atomic: selection, copy, caret traversal, and a single
+/// Backspace all treat it as one unit because the storage layer has nothing
+/// finer to address. No custom key handling is needed to achieve that — only
+/// to react to it.
+final class ViewerFeedbackChipAttachment: NSTextAttachment {
+    let chipID: UUID
+    /// The chip's display number. Assigned once at paste time and never
+    /// reused or renumbered (see `ViewerFeedbackModel.nextNumber`).
+    let number: Int
+
+    init(chipID: UUID, number: Int) {
+        self.chipID = chipID
+        self.number = number
+        super.init(data: nil, ofType: nil)
+        attachmentCell = ViewerFeedbackChipCell(number: number)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+}
+
+/// Draws the `[Image #N]` chip.
+///
+/// A cell rather than a pre-rendered `NSImage` so the chip repaints in the
+/// view's CURRENT appearance — a composer left open while the system flips to
+/// dark mode would otherwise keep light-mode chips baked into its images.
+final class ViewerFeedbackChipCell: NSTextAttachmentCell {
+    private static let horizontalPadding: CGFloat = 7
+    private static let verticalPadding: CGFloat = 2
+    private static let cornerRadius: CGFloat = 4
+
+    let number: Int
+
+    init(number: Int) {
+        self.number = number
+        super.init()
+    }
+
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    private var label: String { "[Image #\(number)]" }
+
+    private var labelAttributes: [NSAttributedString.Key: Any] {
+        [.font: NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)]
+    }
+
+    override func cellSize() -> NSSize {
+        let size = (label as NSString).size(withAttributes: labelAttributes)
+        return NSSize(
+            width: ceil(size.width) + Self.horizontalPadding * 2,
+            height: ceil(size.height) + Self.verticalPadding * 2)
+    }
+
+    /// Sit the chip on the text baseline rather than hanging below it, so a
+    /// line mixing prose and chips reads as one line of text.
+    override func cellBaselineOffset() -> NSPoint {
+        let font = labelAttributes[.font] as? NSFont
+        return NSPoint(x: 0, y: (font?.descender ?? -3) - Self.verticalPadding)
+    }
+
+    override func draw(withFrame cellFrame: NSRect, in controlView: NSView?) {
+        drawChip(in: cellFrame, controlView: controlView)
+    }
+
+    override func draw(
+        withFrame cellFrame: NSRect,
+        in controlView: NSView?,
+        characterIndex: Int,
+        layoutManager: NSLayoutManager
+    ) {
+        drawChip(in: cellFrame, controlView: controlView)
+    }
+
+    private func drawChip(in frame: NSRect, controlView: NSView?) {
+        let render = {
+            let path = NSBezierPath(
+                roundedRect: frame.insetBy(dx: 0.5, dy: 0.5),
+                xRadius: Self.cornerRadius,
+                yRadius: Self.cornerRadius)
+            NSColor.controlAccentColor.withAlphaComponent(0.16).setFill()
+            path.fill()
+            NSColor.controlAccentColor.withAlphaComponent(0.45).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+
+            var attributes = self.labelAttributes
+            attributes[.foregroundColor] = NSColor.controlAccentColor
+            let text = self.label as NSString
+            let size = text.size(withAttributes: attributes)
+            text.draw(
+                at: NSPoint(
+                    x: frame.minX + (frame.width - size.width) / 2,
+                    y: frame.minY + (frame.height - size.height) / 2),
+                withAttributes: attributes)
+        }
+
+        if let appearance = controlView?.effectiveAppearance {
+            appearance.performAsCurrentDrawingAppearance(render)
+        } else {
+            render()
+        }
+    }
+}
+
+// MARK: - Model
+
+/// The composer's contents for one viewer pane.
+///
+/// Owned by the `ViewerView`, NOT by the SwiftUI bar, so a half-written report
+/// survives the toolbar being toggled closed and reopened (and survives the
+/// pane being detached and re-attached by close/undo). The `NSTextStorage` is
+/// the single source of truth for both the prose and which chips still exist —
+/// the carousel is derived from it, never maintained in parallel.
+@MainActor
+final class ViewerFeedbackModel: ObservableObject {
+    /// A pasted image that still has a chip in the text.
+    struct Attachment: Identifiable, Equatable {
+        let id: UUID
+        let number: Int
+        let image: NSImage
+        let png: Data
+
+        static func == (lhs: Attachment, rhs: Attachment) -> Bool { lhs.id == rhs.id }
+    }
+
+    enum Status: Equatable {
+        case filed(String)
+        case failed(String)
+    }
+
+    let textStorage = NSTextStorage()
+
+    /// Chips currently present in the text, in document order. Recomputed from
+    /// the storage after every edit, so deleting a chip removes its thumbnail
+    /// without any separate bookkeeping.
+    @Published private(set) var attachments: [Attachment] = []
+
+    /// The chip the user last clicked or selected in the carousel.
+    @Published var selectedChipID: UUID?
+
+    /// Bumped to ask the carousel to scroll `selectedChipID` into view.
+    @Published private(set) var scrollCarouselToken = 0
+    /// Bumped to ask the text view to select and scroll to `selectedChipID`.
+    @Published private(set) var revealChipToken = 0
+
+    @Published var status: Status?
+
+    /// Every image ever pasted, keyed by chip id. Kept across deletions so an
+    /// undo (Cmd-Z) that restores a chip still has its image.
+    private var pool: [UUID: Attachment] = [:]
+
+    /// Next chip number. Monotonic and never reset within a pane session:
+    /// numbers are STABLE, not positional. Deleting `[Image #2]` leaves the
+    /// sequence 1, 3 in both the text and the carousel — the two views agree
+    /// because both read the same numbers off the same attachments. The
+    /// alternative (renumber on delete) would mean rewriting every chip's
+    /// rendered label after each edit, and any missed rewrite would leave
+    /// `[Image #2]` pointing at the third thumbnail.
+    private var nextNumber = 1
+
+    var isEmpty: Bool {
+        attachments.isEmpty
+            && textStorage.string
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "\u{FFFC}", with: "")
+                .isEmpty
+    }
+
+    /// The attributes new typing and pasted plain text take on.
+    static var typingAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+            .foregroundColor: NSColor.labelColor,
+        ]
+    }
+
+    /// Insert a chip for `image` at `range`, returning the inserted range.
+    @discardableResult
+    func insertImage(_ image: NSImage, png: Data, at range: NSRange) -> NSRange {
+        let id = UUID()
+        let number = nextNumber
+        nextNumber += 1
+        pool[id] = Attachment(id: id, number: number, image: image, png: png)
+
+        let attachment = ViewerFeedbackChipAttachment(chipID: id, number: number)
+        let chip = NSMutableAttributedString(attachment: attachment)
+        chip.addAttributes(Self.typingAttributes, range: NSRange(location: 0, length: chip.length))
+
+        textStorage.beginEditing()
+        textStorage.replaceCharacters(in: range, with: chip)
+        textStorage.endEditing()
+        syncAttachments()
+        return NSRange(location: range.location, length: chip.length)
+    }
+
+    /// Recompute `attachments` from what is actually in the text storage.
+    /// Call after every edit — this is what keeps the carousel honest.
+    func syncAttachments() {
+        var found: [Attachment] = []
+        var seen = Set<UUID>()
+        let full = NSRange(location: 0, length: textStorage.length)
+        textStorage.enumerateAttribute(.attachment, in: full) { value, _, _ in
+            guard let chip = value as? ViewerFeedbackChipAttachment,
+                  let entry = pool[chip.chipID],
+                  !seen.contains(chip.chipID)
+            else { return }
+            seen.insert(chip.chipID)
+            found.append(entry)
+        }
+        guard found != attachments || found.count != attachments.count else { return }
+        attachments = found
+        if let selected = selectedChipID, !seen.contains(selected) {
+            selectedChipID = nil
+        }
+    }
+
+    /// The character range of a chip in the text, or nil if it is gone.
+    func range(ofChip id: UUID) -> NSRange? {
+        var result: NSRange?
+        let full = NSRange(location: 0, length: textStorage.length)
+        textStorage.enumerateAttribute(.attachment, in: full) { value, range, stop in
+            if let chip = value as? ViewerFeedbackChipAttachment, chip.chipID == id {
+                result = range
+                stop.pointee = true
+            }
+        }
+        return result
+    }
+
+    /// A chip was clicked in the text: select it and scroll the carousel to it.
+    func chipClicked(_ id: UUID) {
+        selectedChipID = id
+        scrollCarouselToken += 1
+    }
+
+    /// A thumbnail was clicked: select it and reveal its chip in the text.
+    func thumbnailClicked(_ id: UUID) {
+        selectedChipID = id
+        revealChipToken += 1
+    }
+
+    /// The composed message as ordered segments, ready for the report writer.
+    func segments() -> [ViewerFeedbackReport.Segment] {
+        var segments: [ViewerFeedbackReport.Segment] = []
+        var pending = ""
+        let full = NSRange(location: 0, length: textStorage.length)
+        textStorage.enumerateAttribute(.attachment, in: full) { value, range, _ in
+            let piece = textStorage.attributedSubstring(from: range).string
+            if let chip = value as? ViewerFeedbackChipAttachment {
+                if !pending.isEmpty {
+                    segments.append(.text(pending))
+                    pending = ""
+                }
+                segments.append(.image(number: chip.number))
+            } else {
+                pending += piece
+            }
+        }
+        if !pending.isEmpty { segments.append(.text(pending)) }
+        return segments
+    }
+
+    /// The images still referenced by a chip, ready for the report writer.
+    func imagePayloads() -> [ViewerFeedbackReport.Image] {
+        attachments.map { ViewerFeedbackReport.Image(number: $0.number, png: $0.png) }
+    }
+
+    /// Empty the composer after a successful send. The number counter is NOT
+    /// reset — a fresh report starts at #1 only because its chips are gone,
+    /// and reusing numbers across reports in one session would make the
+    /// pane's own history ambiguous if the user scrolls back through undo.
+    func reset() {
+        textStorage.beginEditing()
+        textStorage.setAttributedString(NSAttributedString(string: ""))
+        textStorage.endEditing()
+        pool.removeAll()
+        nextNumber = 1
+        selectedChipID = nil
+        syncAttachments()
+    }
+}
+
+// MARK: - Text view
+
+/// The composer's text view.
+///
+/// `Enter` inserts a newline (NSTextView's default when it is not a field
+/// editor); `Cmd-Enter` sends; `Escape` closes. Pasting an image inserts a
+/// chip at the caret instead of an editable image.
+final class ViewerFeedbackTextView: NSTextView {
+    var onSend: (() -> Void)?
+    var onEscape: (() -> Void)?
+    var onChipClick: ((UUID) -> Void)?
+    weak var model: ViewerFeedbackModel?
+
+    /// Cmd-Return reaches a view through `performKeyEquivalent` before
+    /// `keyDown`, because AppKit routes command-modified keys as key
+    /// equivalents first. Handling it here is what makes it fire at all.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if Self.isSendShortcut(event) {
+            onSend?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if Self.isSendShortcut(event) {
+            onSend?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    static func isSendShortcut(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.command) else { return false }
+        // Return (36) and the numeric keypad's Enter (76).
+        return event.keyCode == 36 || event.keyCode == 76
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        onEscape?()
+    }
+
+    /// Paste an image from the clipboard as a chip; paste anything else as
+    /// plain text (the composer's content model is prose plus chips — styled
+    /// runs pasted from a browser would serialize to nothing meaningful).
+    override func paste(_ sender: Any?) {
+        if pasteImagesFromPasteboard() { return }
+        pasteAsPlainText(sender)
+    }
+
+    /// Screenshots arrive as image data; a file dragged from Finder arrives as
+    /// a file URL. Both are handled — a URL that is not an image falls
+    /// through to a plain-text paste of the path.
+    @discardableResult
+    func pasteImagesFromPasteboard(_ pasteboard: NSPasteboard = .general) -> Bool {
+        guard let model else { return false }
+        let images = Self.images(from: pasteboard)
+        guard !images.isEmpty else { return false }
+
+        var range = selectedRange()
+        for (image, png) in images {
+            let inserted = model.insertImage(image, png: png, at: range)
+            range = NSRange(location: inserted.location + inserted.length, length: 0)
+        }
+        setSelectedRange(range)
+        didChangeText()
+        return true
+    }
+
+    /// Image + PNG encoding for every image on the pasteboard.
+    ///
+    /// The PNG is produced up front rather than at send time so the report
+    /// writer never has to re-encode, and so a paste that cannot be encoded
+    /// is rejected while the user is still looking at the composer.
+    static func images(from pasteboard: NSPasteboard) -> [(NSImage, Data)] {
+        let objects = pasteboard.readObjects(
+            forClasses: [NSImage.self],
+            options: [.urlReadingContentsConformToTypes: [UTType.image.identifier]])
+        guard let images = objects as? [NSImage], !images.isEmpty else { return [] }
+        return images.compactMap { image in
+            guard let png = pngData(from: image) else { return nil }
+            return (image, png)
+        }
+    }
+
+    /// Re-encode any image representation as PNG.
+    ///
+    /// Going through a fresh `NSBitmapImageRep` sized in PIXELS (not points)
+    /// is deliberate: `NSImage.tiffRepresentation` on a Retina screenshot
+    /// yields a point-sized bitmap, which silently halves the resolution of
+    /// every screenshot pasted on this machine.
+    static func pngData(from image: NSImage) -> Data? {
+        let pixelWidth = image.representations.map(\.pixelsWide).max() ?? 0
+        let pixelHeight = image.representations.map(\.pixelsHigh).max() ?? 0
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0)
+        else { return nil }
+        rep.size = NSSize(width: pixelWidth, height: pixelHeight)
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.current = context
+        image.draw(
+            in: NSRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight),
+            from: .zero,
+            operation: .copy,
+            fraction: 1.0)
+        context.flushGraphics()
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    /// A click on a chip selects it and reveals its thumbnail. The click is
+    /// still forwarded so the caret lands where AppKit would put it.
+    override func mouseDown(with event: NSEvent) {
+        if let id = chipID(at: event) { onChipClick?(id) }
+        super.mouseDown(with: event)
+    }
+
+    /// The chip under a mouse event, if any.
+    func chipID(at event: NSEvent) -> UUID? {
+        guard let layoutManager, let textContainer, let storage = textStorage,
+              storage.length > 0
+        else { return nil }
+        let point = convert(event.locationInWindow, from: nil)
+        let origin = textContainerOrigin
+        let inContainer = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+        var fraction: CGFloat = 0
+        let glyph = layoutManager.glyphIndex(
+            for: inContainer, in: textContainer,
+            fractionOfDistanceThroughGlyph: &fraction)
+        let index = layoutManager.characterIndexForGlyph(at: glyph)
+        guard index < storage.length else { return nil }
+        let chip = storage.attribute(.attachment, at: index, effectiveRange: nil)
+        return (chip as? ViewerFeedbackChipAttachment)?.chipID
+    }
+}

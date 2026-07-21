@@ -641,7 +641,12 @@ class AppDelegate: NSObject,
         if !isDirectory.boolValue,
            ["md", "markdown", "mdown", "mkd", "mdwn"]
                .contains((filename as NSString).pathExtension.lowercased()) {
-            let pane = PaneView(viewer: ViewerView(location: filename))
+            // The file's own directory is also its origin: if the user later
+            // navigates this pane to a dev-server URL, feedback still has a
+            // directory to fall back to.
+            let pane = PaneView(viewer: ViewerView(
+                location: filename,
+                originDirectory: (filename as NSString).deletingLastPathComponent))
             let controller = TerminalController.newWindow(
                 ghostty,
                 tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
