@@ -81,6 +81,62 @@ struct ViewerTOCTests {
     Body.
     """
 
+    /// A document tall enough that jumping to its last heading is a long,
+    /// animated scroll past many others.
+    private static var longDocument: String {
+        (1...30).map { "## Section \($0)\n\n" + String(repeating: "Filler line.\n", count: 12) }
+            .joined(separator: "\n")
+    }
+
+    /// Clicking a TOC row selects THAT row and keeps it selected.
+    ///
+    /// The click starts a smooth scroll, and the scroll spy sees every section
+    /// the page flies past on the way — so without a pin the selection lands
+    /// on the clicked heading and then walks off it mid-animation, which is
+    /// exactly what the reader did not ask for.
+    @Test func clickingARowKeepsItSelectedThroughTheScroll() async throws {
+        let path = try makeFile(named: "long.md", contents: Self.longDocument)
+        let (window, viewer) = makeViewer(location: path, width: 900)
+        defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
+
+        #expect(await wait { viewer.tocItems.count >= 30 })
+
+        // Jump from the top of the document to a heading far down it.
+        let target = viewer.tocItems[25].id
+        viewer.scrollToHeading(id: target)
+
+        // Now stand in for the animation: scroll the page somewhere else and
+        // let the resulting scroll event reach the spy. No user input was
+        // involved, so the click still owns the selection. (Driving it this
+        // way rather than waiting out a real smooth scroll keeps the test
+        // deterministic — an offscreen web view may not animate at all.)
+        _ = await evaluate("(window.scrollTo(0, 0), 'ok')", in: viewer)
+        _ = await wait(upTo: 1.5) { false }
+        #expect(
+            viewer.activeHeadingID == target,
+            "selection drifted to \(viewer.activeHeadingID ?? "nil") during the scroll")
+
+        // ...and the spy is not wedged: a scroll the USER starts hands it back
+        // immediately, from wherever the page actually is.
+        let diag = await evaluate(
+            """
+            (function () {
+              window.dispatchEvent(new WheelEvent('wheel', {deltaY: 10}));
+              return 'scrollY=' + window.scrollY
+                + ' h1top=' + Math.round(
+                    document.querySelectorAll('h2')[0].getBoundingClientRect().top);
+            })()
+            """,
+            in: viewer)
+        let settled = await wait(upTo: 8) {
+            viewer.activeHeadingID == viewer.tocItems.first?.id
+        }
+        let message =
+            "spy stayed pinned after the user scrolled: "
+            + "\(viewer.activeHeadingID ?? "nil") [\(diag ?? "no diag")]"
+        #expect(settled, "\(message)")
+    }
+
     /// Headings reach the native side with anchors, and nesting is relative
     /// to the document's own top level.
     @Test func headingsArriveFromThePage() async throws {
@@ -113,15 +169,25 @@ struct ViewerTOCTests {
         #expect(await wait { !viewer.tocItems.isEmpty })
         #expect(await wait { viewer.tocGutterWidth > 0 }, "gutter never reserved")
 
-        // Card width + a margin on each side.
-        #expect(viewer.tocGutterWidth == CGFloat(216 + 14 * 2))
+        // Pin the width: it is a user preference read from defaults, so
+        // whatever this machine happens to have dragged it to must not decide
+        // whether the test passes.
+        viewer.setTOCCardWidth(240)
+
+        // The card's left margin + the card. The gap on the card's RIGHT is
+        // the document's own padding, not part of the gutter.
+        let expected = GlassCard.outerMargin + 240
+        #expect(viewer.tocGutterWidth == expected)
         // The web view still spans the pane; only the page is padded.
         #expect(viewer.webView.frame.minX == 0)
         #expect(viewer.webView.frame.width == 900)
         // And the page actually applied it.
+        _ = await wait(upTo: 1) { false }
         let padding = await evaluate(
-            "getComputedStyle(document.body).paddingLeft", in: viewer)
-        #expect(padding == "244px", "body padding was \(padding ?? "nil")")
+            "String(parseFloat(getComputedStyle(document.body).paddingLeft))", in: viewer)
+        #expect(
+            padding.flatMap(Double.init) == Double(expected),
+            "body padding was \(padding ?? "nil")")
         // A hosting view for the card is mounted above the web view.
         let overlays = viewer.subviews.filter { $0 !== viewer.webView }
         #expect(!overlays.isEmpty)
@@ -150,7 +216,83 @@ struct ViewerTOCTests {
         // And widening restores it.
         viewer.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
         viewer.layoutSubtreeIfNeeded()
-        #expect(viewer.tocGutterWidth == CGFloat(216 + 14 * 2))
+        #expect(viewer.tocGutterWidth == GlassCard.outerMargin + viewer.tocCardWidth)
+    }
+
+    /// Dragging the card's right edge moves the card AND the document's
+    /// gutter together — the gutter is derived from the card width, so a
+    /// resize that updated only one of them would leave a dead strip or an
+    /// overlap. The width is clamped so a drag can neither collapse the card
+    /// nor squeeze the document column out of the pane.
+    @Test func resizingTheCardMovesTheGutterWithIt() async throws {
+        let path = try makeFile(named: "doc.md", contents: Self.document)
+        let (window, viewer) = makeViewer(location: path, width: 900)
+        defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
+
+        #expect(await wait { viewer.tocGutterWidth > 0 })
+
+        viewer.setTOCCardWidth(320)
+        #expect(viewer.tocCardWidth == 320)
+        #expect(viewer.tocGutterWidth == GlassCard.outerMargin + 320)
+        _ = await wait(upTo: 1) { false }
+        let padding = await evaluate(
+            "String(parseFloat(getComputedStyle(document.body).paddingLeft))", in: viewer)
+        #expect(
+            padding.flatMap(Double.init) == Double(GlassCard.outerMargin + 320),
+            "body padding was \(padding ?? "nil")")
+
+        // Absurd drags clamp instead of doing damage.
+        viewer.setTOCCardWidth(10)
+        let narrow = viewer.tocCardWidth
+        #expect(narrow > 100, "card collapsed to \(narrow)")
+        viewer.setTOCCardWidth(5_000)
+        #expect(
+            viewer.tocCardWidth < viewer.bounds.width - 300,
+            "card ate the document column: \(viewer.tocCardWidth)")
+    }
+
+    /// The measurement that makes a TOC card and a pane banner look like one
+    /// design: the card floats `GlassCard.outerMargin` from the pane's edges,
+    /// and the document leaves that same margin on every side of itself — so
+    /// the first line of text starts one margin right of the card's right
+    /// edge, on the same line as the card's top edge.
+    @Test func documentAlignsToTheCard() async throws {
+        let path = try makeFile(named: "doc.md", contents: Self.document)
+        let (window, viewer) = makeViewer(location: path, width: 900)
+        defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
+
+        #expect(await wait { viewer.tocGutterWidth > 0 })
+        // Let the gutter round-trip into the page.
+        _ = await wait(upTo: 2) { false }
+
+        let margin = GlassCard.outerMargin
+        // The gutter IS the card's right edge: outerMargin + card width.
+        let cardRight = viewer.tocGutterWidth
+
+        // Text left edge = body padding (the gutter) + the column's own
+        // padding, with no `margin: auto` slack in between.
+        let textLeft = await evaluate(
+            """
+            (function () {
+              var b = document.querySelector('.markdown-body');
+              var r = b.getBoundingClientRect();
+              var p = parseFloat(getComputedStyle(b).paddingLeft);
+              return String(Math.round(r.left + p));
+            })()
+            """, in: viewer)
+        #expect(
+            textLeft == String(Int(cardRight + margin)),
+            "text left was \(textLeft ?? "nil")")
+
+        // ...and the first line of text starts on the card's top edge.
+        let textTop = await evaluate(
+            """
+            (function () {
+              var h = document.querySelector('.markdown-body').firstElementChild;
+              return String(Math.round(h.getBoundingClientRect().top));
+            })()
+            """, in: viewer)
+        #expect(textTop == String(Int(margin)), "text top was \(textTop ?? "nil")")
     }
 
     /// One heading is a title, not a table of contents.

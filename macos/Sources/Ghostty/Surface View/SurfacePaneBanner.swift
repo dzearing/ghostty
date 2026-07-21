@@ -123,9 +123,7 @@ extension Ghostty {
                 guard collapsible else { return }
                 toggleCollapsed()
             }
-            .padding(.horizontal, Self.outerMargin)
-            .padding(.top, Self.outerMargin * 0.8)
-            .padding(.bottom, Self.outerMargin)
+            .padding(Self.outerMargin)
             // A hidden, animation-free copy of the same content measures the
             // height the banner is headed for and publishes it as the banner's
             // target height. The host insets the terminal from this — one
@@ -157,7 +155,7 @@ extension Ghostty {
         /// the card's outer margins. Added to the measured content height to
         /// produce the banner's total (target) height.
         private static var chromeHeight: CGFloat {
-            innerPadding * 2 + outerMargin * 0.8 + outerMargin
+            innerPadding * 2 + outerMargin * 2
         }
 
         /// The card's inner content: the title row (first block + collapse

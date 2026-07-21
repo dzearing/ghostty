@@ -294,9 +294,21 @@ ghoztty +close --target=doc
   SF Mono, so a viewer reads as macOS content rather than a web page.
 - **Table of contents** (markdown only, and only with two or more headings):
   a native card listing the document's headings, nested by level, with the
-  section you are reading highlighted as you scroll. Clicking a row scrolls
-  to it; the list scrolls independently when it is long. In a **wide pane**
-  the card sits in a left gutter and the document column reflows beside it.
+  section you are reading highlighted as you scroll. The card reads as a
+  macOS sidebar: the selected row is a rounded pill in the system's own
+  selection colors — accent-filled with white text while the window is key,
+  the neutral unemphasized gray otherwise — and hover is a separate faint
+  wash. **Clicking a row pins the selection to it**: the smooth scroll on the
+  way there fires a scroll event per frame, and the highlight must not walk
+  off the row you asked for. Your next scroll gesture hands the selection
+  back to the scroll spy. A pinned "CONTENTS" header sits on Liquid Glass
+  (`glassBackdrop()`, macOS 26; an `NSVisualEffectView` before that) with the
+  rows scrolling *under* it, and the scroller's track stops below it —
+  both from one `safeAreaInset`, not a ZStack.
+  In a **wide pane** the card sits in a left gutter and the document column
+  reflows beside it; **drag the card's right edge** to resize it (the gutter
+  and the document's text column follow in the same layout pass). The width
+  is a preference in defaults, shared by every viewer pane.
   In a **narrow pane** (< 720pt) the gutter would crowd the text, so the card
   becomes an overlay: the navigation bar stays pinned open and gains a
   contents button as its first item, which slides the card in and out. The
@@ -305,6 +317,12 @@ ghoztty +close --target=doc
   `GlassCardBackground`), opaque so document text never shows through it.
   Panel open/closed state is ephemeral — it does not survive a session
   restore, since restoring an overlay would hide the content it covers.
+- **Margins are one number.** `GlassCard.outerMargin` (12pt) is the gap every
+  glass card leaves around itself, on all four sides, and the document leaves
+  the same 12px on all four of its own — so a TOC card and a banner in the
+  pane next door line up at their corners, and the text starts exactly one
+  margin right of the card. Per-component fudges are what break that; there
+  are none. Enforced by `documentAlignsToTheCard` in `ViewerTOCTests`.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Links** in file viewers: http(s) opens the default browser; a relative
