@@ -58,6 +58,22 @@ struct WebChromeBar: View {
     /// back to the file it was opened with.
     private var chrome: some View {
         HStack(spacing: 4) {
+            // Contents toggle, leading. Only in the compact TOC layout: a
+            // wide pane shows the card in its gutter permanently, so there
+            // is nothing to toggle. While this is present the bar stops
+            // auto-hiding (see ViewerView.chromeAlwaysVisible) — it would be
+            // useless otherwise.
+            if viewerView.tocLayout == .compact {
+                Button(action: { viewerView.toggleTOCPanel() }) {
+                    Image(systemName: "list.bullet")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .foregroundStyle(viewerView.tocPanelOpen ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .help(viewerView.tocPanelOpen ? "Hide contents" : "Show contents")
+                .accessibilityLabel("Table of contents")
+            }
+
             Button(action: { viewerView.goBack() }) {
                 Image(systemName: "chevron.left")
                     .frame(width: 24, height: 24)

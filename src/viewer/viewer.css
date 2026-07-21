@@ -1,5 +1,9 @@
 /* Page chrome around the GitHub-styled markdown body. The colors follow
- * github-markdown.css's own light/dark variables so the gutter matches. */
+ * github-markdown.css's own light/dark variables so the gutter matches.
+ *
+ * Everything here layers ON TOP of vendor/github-markdown.css — that file is
+ * vendored third-party CSS and is never edited; this stylesheet is linked
+ * after it, so plain (non-!important) rules win. */
 
 html, body {
   margin: 0;
@@ -42,6 +46,93 @@ body {
   border-radius: 6px;
 }
 
+/* ---------------------------------------------------------------------------
+ * Native typography
+ *
+ * The vendored stylesheet ships GitHub's web font stack (Segoe UI / Noto Sans
+ * ahead of Helvetica) and its metrics. A viewer pane is macOS content, not a
+ * web page, so the body renders in the system font — SF Pro via -apple-system —
+ * and code in SF Mono via ui-monospace.
+ *
+ * The font stacks are swapped by redefining the vendor's own custom
+ * properties, which every one of its font-family rules reads. The size and
+ * spacing tuning below is NOT cosmetic drift: SF Text has a larger x-height
+ * and looser default tracking than GitHub's stack, so dropping it into
+ * GitHub's 16px/1.5 metrics reads oversized and airy, and SF at heading sizes
+ * needs negative tracking to look set rather than spaced out.
+ * ------------------------------------------------------------------------ */
+
+.markdown-body {
+  --fontStack-sansSerif: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Helvetica Neue", Helvetica, Arial, sans-serif, "Apple Color Emoji";
+  --fontStack-monospace: ui-monospace, "SF Mono", SFMono-Regular, Menlo,
+    Monaco, "Liberation Mono", monospace;
+
+  font-size: 15px;
+  line-height: 1.62;
+  /* Grayscale AA is what AppKit draws; WebKit's default subpixel smoothing
+   * makes the same string look heavier than the surrounding native chrome. */
+  -webkit-font-smoothing: antialiased;
+  font-synthesis: none;
+}
+
+/* The vendored file hardcodes `font-family: monospace` in a few normalization
+ * rules that predate its custom properties; point those at SF Mono too. */
+.markdown-body code,
+.markdown-body kbd,
+.markdown-body pre,
+.markdown-body samp,
+.markdown-body tt,
+.markdown-body .footnotes .data-footnote-backref g-emoji {
+  font-family: var(--fontStack-monospace);
+}
+
+/* SF Mono runs small next to SF Text at the same nominal size; GitHub's 85%
+ * leaves code blocks looking undersized, and 1.45 is tight for the wider
+ * glyphs. */
+.markdown-body code,
+.markdown-body tt,
+.markdown-body samp,
+.markdown-body .highlight pre,
+.markdown-body pre {
+  font-size: 88%;
+}
+
+.markdown-body .highlight pre,
+.markdown-body pre {
+  line-height: 1.5;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  line-height: 1.28;
+  letter-spacing: -0.01em;
+}
+
+.markdown-body h1 {
+  font-size: 1.8em;
+  font-weight: 700;
+  letter-spacing: -0.021em;
+}
+
+.markdown-body h2 {
+  font-size: 1.4em;
+  letter-spacing: -0.016em;
+}
+
+.markdown-body h3 {
+  font-size: 1.16em;
+}
+
+.markdown-body h4 {
+  font-size: 1.02em;
+  letter-spacing: -0.005em;
+}
+
 /* Error card shown when a file is missing/unreadable. */
 .viewer-error {
   margin: 48px auto;
@@ -49,7 +140,8 @@ body {
   padding: 24px 28px;
   border: 1px solid #d1d9e0;
   border-radius: 8px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 .viewer-error h1 {

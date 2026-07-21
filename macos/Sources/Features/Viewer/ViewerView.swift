@@ -87,9 +87,69 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// Top inset of the web view: 0 with the bar hidden, the bar's height
     /// while it is visible (content starts below the bar, never under it).
     private var webViewTopConstraint: NSLayoutConstraint?
+
     /// The bar's top offset: -barHeight parks it just above the pane's top
     /// edge (clipped away); 0 is fully slid in. Animated for the slide.
     private var chromeTopConstraint: NSLayoutConstraint?
+
+    // Table of contents. The page (viewer.js) extracts headings from the
+    // rendered markdown and reports them — plus the section currently at the
+    // top of the pane — over the `viewerTOC` script-message bridge; the card
+    // itself is drawn natively (ViewerTOCPanel) so it is the same glass card
+    // as the pane banner rather than a CSS lookalike.
+    @Published private(set) var tocItems: [ViewerTOCItem] = []
+    @Published private(set) var activeHeadingID: String?
+    /// Narrow-layout panel state. Deliberately ephemeral: it is an overlay
+    /// covering the document, so restoring a session with it open would hide
+    /// the content the user actually asked to see.
+    @Published private(set) var tocPanelOpen = false
+    private var tocPanelHost: NSHostingView<ViewerTOCPanel>?
+    private var tocPanelConstraints: [NSLayoutConstraint] = []
+    /// Layer-backed wrapper around the panel's hosting view. The slide is a
+    /// Core Animation transform on THIS layer: animating the panel's leading
+    /// constraint instead re-runs Auto Layout every frame, and every one of
+    /// those frames re-lays-out the SwiftUI list inside — which is CPU work
+    /// per frame rather than compositing, and visibly stutters.
+    private var tocPanelContainer: NSView?
+    /// Set for the duration of a user-driven toggle so the slide animates —
+    /// `layout()` reaches the same code every frame of a divider drag and
+    /// must never start an animation.
+    private var animatingTOCPanel = false
+    /// Left gutter the page reserves for the TOC card, in CSS px. 0 unless
+    /// the card is in gutter layout. Pushed to the page (not applied as a
+    /// native inset) so the strip behind the card is the document's own
+    /// background — see `pushTOCGutter()`.
+    private(set) var tocGutterWidth: CGFloat = 0
+    @Published private(set) var tocLayout: TOCLayout = .hidden
+    private var tocPanelSignature: TOCPanelSignature?
+
+    /// The size-dependent inputs of the mounted panel, so `layout()` can skip
+    /// re-pushing an identical root view.
+    private struct TOCPanelSignature: Equatable {
+        let width: CGFloat
+        let maxHeight: CGFloat
+    }
+
+    /// How the table of contents is presented, decided by pane width.
+    enum TOCLayout {
+        /// No TOC: not a markdown document, or fewer than two headings.
+        case hidden
+        /// Wide pane: a card in a left gutter, content inset beside it.
+        case gutter
+        /// Narrow pane: the card is an overlay, opened from the chrome bar.
+        case compact
+    }
+
+    /// Script-message channel name for the TOC bridge.
+    fileprivate static let tocMessageName = "viewerTOC"
+
+    /// Pane width at or above which the TOC gets its own gutter. Below it
+    /// the gutter would squeeze the document column too far to read.
+    private static let tocGutterMinWidth: CGFloat = 720
+
+    /// Card width in the gutter layout, and its cap in the compact one.
+    private static let tocCardWidth: CGFloat = 216
+    private static let tocCompactCardWidth: CGFloat = 276
 
     /// True when the displayed page is a website (network allowed) rather
     /// than a rendered local file.
@@ -154,6 +214,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
             chromeTopConstraint = nil
             chromeVisible = false
             webViewTopConstraint?.constant = 0
+            // Same reasoning as the chrome bar: these hosting views' root
+            // views strongly reference us, so a detached pane sitting in the
+            // undo stack would never let go of its web view.
+            tocPanelContainer?.removeFromSuperview()
+            tocPanelContainer = nil
+            tocPanelHost = nil
+            tocPanelConstraints = []
+            tocPanelSignature = nil
+            tocLayout = .hidden
+            tocGutterWidth = 0
             if isWebURL {
                 webView.pauseAllMediaPlayback()
             }
@@ -216,6 +286,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 ?? FileManager.default.homeDirectoryForCurrentUser)
         config.setURLSchemeHandler(handler, forURLScheme: ViewerSchemeHandler.scheme)
         self.schemeHandler = handler
+
+        // TOC bridge. The proxy holds the viewer WEAKLY on purpose: the
+        // content controller retains its handlers and the web view retains
+        // the controller, so registering `self` directly would be a cycle
+        // that keeps the whole pane (and its web view) alive forever.
+        config.userContentController.add(
+            ViewerTOCMessageProxy(viewer: self), name: Self.tocMessageName)
         self.currentURL = addressText(for: fileLocation ?? URL(string: location))
 
         let webView = WKWebView(frame: .zero, configuration: config)
@@ -459,6 +536,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
         editor.selectAll(nil)
     }
 
+    /// True while the chrome bar must stay on screen regardless of hover:
+    /// the compact TOC layout hosts the contents toggle there, and a control
+    /// that slides away before you can reach it is not a control.
+    private var chromeAlwaysVisible: Bool { tocLayout == .compact }
+
+    /// Toggle the contents panel (the chrome bar's leading button).
+    func toggleTOCPanel() {
+        setTOCPanelOpen(!tocPanelOpen)
+    }
+
     /// The chrome bar calls this while hovered or while the URL field is
     /// focused so auto-hide pauses.
     func holdChrome(_ hold: Bool) {
@@ -559,7 +646,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// group, so the bar visibly pushes the content down and retracts back
     /// up. Constraint animators re-run layout every frame — implicit
     /// animation does not animate constraint-driven layout reliably.
-    private func setChromeVisible(_ visible: Bool) {
+    private func setChromeVisible(_ requested: Bool) {
+        // Single choke point for the pin: in the compact TOC layout the bar
+        // carries the contents toggle, so nothing may hide it.
+        let visible = requested || chromeAlwaysVisible
         chromeVisible = visible
 
         if visible, chromeHost == nil {
@@ -606,6 +696,261 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 self?.chromeHost?.isHidden = true
             }
         }
+    }
+
+    // MARK: - Table of contents
+
+    /// A heading list (or the section now at the top of the pane) arrived
+    /// from the page.
+    fileprivate func handleTOCMessage(_ body: Any) {
+        guard let payload = body as? [String: Any],
+              let type = payload["type"] as? String
+        else { return }
+
+        switch type {
+        case "headings":
+            let raw = (payload["items"] as? [[String: Any]] ?? [])
+                .compactMap { item -> (id: String, text: String, level: Int)? in
+                    guard let id = item["id"] as? String,
+                          let text = item["text"] as? String,
+                          let level = item["level"] as? Int
+                    else { return nil }
+                    return (id: id, text: text, level: level)
+                }
+            setTOCItems(ViewerTOCItem.list(from: raw))
+        case "active":
+            activeHeadingID = payload["id"] as? String
+        default:
+            break
+        }
+    }
+
+    private func setTOCItems(_ items: [ViewerTOCItem]) {
+        guard items != tocItems else { return }
+        tocItems = items
+        if items.isEmpty {
+            activeHeadingID = nil
+            tocPanelOpen = false
+        }
+        updateTOCLayout()
+    }
+
+    /// Scroll the page to a heading (a TOC row was clicked). The panel is an
+    /// overlay in the narrow layout, so using it dismisses it.
+    func scrollToHeading(id: String) {
+        webView.evaluateJavaScript("window.__viewer.scrollToAnchor(\(Self.js(id)))")
+        activeHeadingID = id
+        if tocLayout == .compact { setTOCPanelOpen(false) }
+    }
+
+    func setTOCPanelOpen(_ open: Bool) {
+        guard tocPanelOpen != open else { return }
+        tocPanelOpen = open
+        // Only a deliberate toggle animates. Layout passes reach the same
+        // code and must stay silent.
+        animatingTOCPanel = true
+        updateTOCLayout()
+        animatingTOCPanel = false
+    }
+
+    /// Mount the panel inside a layer-backed container, so the slide can be
+    /// a transform on one layer rather than a relayout of the whole card.
+    private func mountTOCPanel(_ panel: ViewerTOCPanel, parked: Bool, cardWidth: CGFloat) {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+
+        let host = NSHostingView(rootView: panel)
+        host.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(host)
+        NSLayoutConstraint.activate([
+            host.topAnchor.constraint(equalTo: container.topAnchor),
+            host.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            host.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+
+        addSubview(container, positioned: .above, relativeTo: webView)
+        tocPanelConstraints = [
+            container.topAnchor.constraint(equalTo: webView.topAnchor),
+            container.leadingAnchor.constraint(equalTo: leadingAnchor),
+        ]
+        NSLayoutConstraint.activate(tocPanelConstraints)
+        tocPanelContainer = container
+        tocPanelHost = host
+
+        if parked {
+            // Realize the parked position before the first slide, so opening
+            // animates in from off-edge instead of from nowhere.
+            applyTOCPanelState(parked: true, cardWidth: cardWidth, animated: false)
+        }
+    }
+
+    /// Slide + fade the compact panel in or out.
+    ///
+    /// Runs entirely on the compositor: the layer's contents are already
+    /// rendered, so translating and fading it costs no layout and no SwiftUI
+    /// work per frame. The panel's constraints never move.
+    private func applyTOCPanelState(parked: Bool, cardWidth: CGFloat, animated: Bool) {
+        guard let container = tocPanelContainer, let layer = container.layer else { return }
+
+        let offset = parked ? -(cardWidth + GlassCard.outerMargin * 2) : 0
+        let targetTransform = CATransform3DMakeTranslation(offset, 0, 0)
+        let targetOpacity: Float = parked ? 0 : 1
+
+        guard animated else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = targetTransform
+            layer.opacity = targetOpacity
+            CATransaction.commit()
+            // A layer transform does not move the VIEW, and AppKit hit-tests
+            // views by frame — a parked panel left visible would keep
+            // swallowing clicks over the document it slid away from.
+            container.isHidden = parked
+            return
+        }
+
+        // Sliding in: unhide before animating, or there is nothing to see.
+        container.isHidden = false
+
+        // Start from what is on screen right now, so a toggle that interrupts
+        // the opposite animation continues from there instead of jumping.
+        let fromTransform = layer.presentation()?.transform ?? layer.transform
+        let fromOpacity = layer.presentation()?.opacity ?? layer.opacity
+
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self, weak container] in
+            guard let self, let container else { return }
+            // Re-read the state: a fast double-toggle can land here after the
+            // opposite animation has already started.
+            container.isHidden = self.tocLayout == .compact && !self.tocPanelOpen
+        }
+
+        let move = CABasicAnimation(keyPath: "transform")
+        move.fromValue = fromTransform
+        move.toValue = targetTransform
+        move.duration = 0.26
+        move.timingFunction = CAMediaTimingFunction(controlPoints: 0.32, 0.72, 0, 1)
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = fromOpacity
+        fade.toValue = targetOpacity
+        fade.duration = parked ? 0.16 : 0.22
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+
+        layer.transform = targetTransform
+        layer.opacity = targetOpacity
+        layer.add(move, forKey: "toc-slide")
+        layer.add(fade, forKey: "toc-fade")
+        CATransaction.commit()
+    }
+
+    /// Which TOC presentation the pane's current width calls for.
+    private var desiredTOCLayout: TOCLayout {
+        guard !tocItems.isEmpty else { return .hidden }
+        return bounds.width >= Self.tocGutterMinWidth ? .gutter : .compact
+    }
+
+    override func layout() {
+        super.layout()
+        // Panes are resized constantly by split-tree drags, so the gutter ⇄
+        // compact switch has to ride layout rather than any one-shot setup.
+        updateTOCLayout()
+    }
+
+    /// Mount, size, or tear down the TOC views for the current pane width,
+    /// and tell the page how much gutter to reserve.
+    private func updateTOCLayout() {
+        // layout() can run before setupWebView has assigned the web view.
+        guard webView != nil else { return }
+
+        let layout = desiredTOCLayout
+        if tocLayout != layout {
+            tocLayout = layout
+            // The compact layout puts the only control that opens the
+            // contents panel in the chrome bar, so the bar has to stop
+            // auto-hiding. Leaving compact hands it back to hover.
+            if layout == .compact {
+                setChromeVisible(true)
+            } else {
+                scheduleChromeHide()
+            }
+        }
+
+        // The card hangs off the WEB VIEW's top, not the pane's: when the
+        // chrome bar slides in it insets the web view, and the TOC has to
+        // move down with the content instead of sliding under the bar.
+        let available = webView.frame.height > 0 ? webView.frame.height : bounds.height
+        let maxCardHeight = max(80, available - GlassCard.outerMargin * 2)
+        let cardWidth = layout == .gutter
+            ? Self.tocCardWidth
+            : min(Self.tocCompactCardWidth,
+                  max(120, bounds.width - GlassCard.outerMargin * 2))
+
+        // Mounted in both layouts. A closed compact panel is PARKED off the
+        // left edge rather than unmounted: a view that is destroyed on close
+        // has nothing to animate, so it could only ever pop.
+        let showsPanel = layout != .hidden
+        let parked = layout == .compact && !tocPanelOpen
+
+        if showsPanel {
+            let panel = ViewerTOCPanel(
+                viewerView: self, width: cardWidth, maxHeight: maxCardHeight)
+            let signature = TOCPanelSignature(width: cardWidth, maxHeight: maxCardHeight)
+            if let host = tocPanelHost {
+                // Only push a new root view when its inputs actually moved.
+                // This runs from layout(), and re-assigning rootView marks
+                // the hosting view dirty — doing that unconditionally would
+                // re-enter layout every frame of a divider drag.
+                if signature != tocPanelSignature {
+                    tocPanelSignature = signature
+                    host.rootView = panel
+                }
+            } else {
+                tocPanelSignature = signature
+                mountTOCPanel(panel, parked: parked, cardWidth: cardWidth)
+            }
+            applyTOCPanelState(
+                parked: parked,
+                cardWidth: cardWidth,
+                animated: animatingTOCPanel && window?.isVisible == true)
+        } else {
+            tocPanelContainer?.removeFromSuperview()
+            tocPanelContainer = nil
+            tocPanelHost = nil
+            tocPanelConstraints = []
+            tocPanelSignature = nil
+        }
+
+        // Only the gutter reserves space; the compact panel floats over the
+        // document the way a menu does.
+        let gutter = layout == .gutter
+            ? Self.tocCardWidth + GlassCard.outerMargin * 2
+            : 0
+        if gutter != tocGutterWidth {
+            tocGutterWidth = gutter
+            pushTOCGutter()
+        }
+    }
+
+    /// Hand the gutter width to the page, which reserves it as padding on
+    /// the document body.
+    ///
+    /// The card floats OVER the web view rather than beside it, and the page
+    /// makes room for it. Insetting the web view natively looked equivalent
+    /// but was not: the reserved strip then painted this view's background
+    /// instead of the markdown page's, leaving a visible seam down the edge
+    /// of the gutter in both light and dark.
+    private func pushTOCGutter() {
+        guard pageLoaded else { return }
+        webView.evaluateJavaScript("window.__viewer.setGutter(\(tocGutterWidth))")
+    }
+
+    /// Drop the TOC entirely (leaving a file view, or tearing the pane down).
+    private func clearTOC() {
+        setTOCItems([])
+        updateTOCLayout()
     }
 
     // MARK: - Loading
@@ -813,6 +1158,10 @@ extension ViewerView: WKNavigationDelegate {
             mode = .web(url)
             location = url.absoluteString
             webView.allowsBackForwardNavigationGestures = true
+            // A website is not a rendered document: whatever headings the
+            // template page last reported are gone with it. (Nothing will
+            // arrive to clear them — the bridge only exists in our template.)
+            clearTOC()
         }
         currentURL = addressText(for: url)
     }
@@ -821,6 +1170,9 @@ extension ViewerView: WKNavigationDelegate {
         if case .web = mode { return }
         pageLoaded = true
         renderFileContent()
+        // A reload/renavigation resets the document, taking the body padding
+        // the TOC gutter relies on with it.
+        pushTOCGutter()
     }
 
     func webView(
@@ -890,6 +1242,29 @@ extension ViewerView: WKNavigationDelegate {
             atPane: myPane,
             direction: .right,
             viewer: ViewerView(location: location))
+    }
+}
+
+// MARK: - TOC script bridge
+
+/// Receives `viewerTOC` messages from the page and forwards them to the
+/// viewer.
+///
+/// A separate object purely to break a retain cycle: `WKUserContentController`
+/// retains its message handlers and the web view retains the controller, so a
+/// `ViewerView` registered as its own handler could never be deallocated.
+private final class ViewerTOCMessageProxy: NSObject, WKScriptMessageHandler {
+    private weak var viewer: ViewerView?
+
+    init(viewer: ViewerView) {
+        self.viewer = viewer
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        viewer?.handleTOCMessage(message.body)
     }
 }
 
