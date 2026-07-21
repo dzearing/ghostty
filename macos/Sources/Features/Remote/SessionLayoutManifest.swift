@@ -571,12 +571,13 @@ final class SessionLayoutManifest {
                 // the gap. Nil for a fresh/exec pane → full-ring replay.
                 let snap = view.flatMap { Self.liveScreenSnapshot(of: $0) }
                 return Leaf(
-                    // Fall back to the id the surface was CREATED to attach
-                    // when the live id is unavailable — surface creation can
-                    // fail entirely (dark-wake OutOfMemory, T06b) and a sync
-                    // in that state must not wipe the recorded session id
-                    // (next launch would then drop the whole entry).
-                    sessionID: view.flatMap { Self.liveSessionID(of: $0) ?? $0.expectedRemoteSessionID },
+                    // `boundRemoteSessionID` falls back to the id the surface
+                    // was CREATED to attach when the live id is unavailable —
+                    // surface creation can fail entirely (dark-wake
+                    // OutOfMemory, T06b) and a sync in that state must not
+                    // wipe the recorded session id (next launch would then
+                    // drop the whole entry).
+                    sessionID: view?.boundRemoteSessionID,
                     title: pane.title,
                     ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) },
                     surfaceID: view?.id.uuidString,
@@ -617,16 +618,6 @@ final class SessionLayoutManifest {
             tabGroupID: tabGroupID,
             tabIndex: tabIndex,
             tree: tree)
-    }
-
-    /// The surface's live agent session UUID, nil until OPEN has completed
-    /// (the id is published asynchronously by the termio thread).
-    @MainActor
-    static func liveSessionID(of view: Ghostty.SurfaceView) -> String? {
-        guard let surface = view.surface else { return nil }
-        let s = Ghostty.AllocatedString(
-            ghostty_surface_remote_session_id(surface)).string
-        return s.isEmpty ? nil : s
     }
 
     /// WP-D3: capture the surface's structured VT screen snapshot (base64) and

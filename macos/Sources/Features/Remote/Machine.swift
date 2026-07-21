@@ -674,6 +674,21 @@ final class RemoteConnection {
         case reconnecting = 2
         case reattaching = 3
         case dead = 4
+
+        /// True while the transport is not carrying traffic. NOT a statement
+        /// that the peer died: the Zig FSM enters `reconnecting` after
+        /// `reconnect_misses` missed heartbeats and snaps back to `connected`
+        /// on the very next authentic packet (`LinkState.onHeartbeatAck` in
+        /// `src/remote/connection.zig`), so a momentary stall — a machine
+        /// wake, a starved scheduler — produces a down state that self-heals
+        /// in milliseconds. Callers that act destructively on a down state
+        /// must confirm it PERSISTS first.
+        var isDown: Bool {
+            switch self {
+            case .connected, .degraded: return false
+            case .reconnecting, .reattaching, .dead: return true
+            }
+        }
     }
 
     /// The last observed transport link state. Main-thread only (updated by the
