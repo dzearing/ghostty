@@ -4333,60 +4333,173 @@ worth nothing until you have seen it fail.
 
 *Not fixed here:* section E's E2/E3/E4/E5 remain red — see T111b.
 
-## T111b — REMAINING agent-path IPC starvation (open)
+## T111b — FIX: keep ACCEPTING under load; take `+list` off the terminal lock
 
-What T111a did not reach. `session-persistence.ps1` section E, post-fix:
+What T111a did not reach: `session-persistence.ps1` section E's E2 (`+list`
+15/40), E3/E4 (`+read` 9202 ms) and E5. **Both filed hypotheses were wrong**,
+and for the second task running the measurement is what said so.
 
-| assert | result |
-|---|---|
-| E2 `+list` under double storm | **15/40** (2 wedged) |
-| E3/E4 `+read` of echo-storm pane | **9202 ms** (T62 bound 2000 ms) |
-| E5 quiet-pane round-trip | **FAIL** |
-| E1, E6–E12 and sections A–D | PASS |
+### What the instrumentation showed
 
-*Two hypotheses, BOTH UNPROVEN. Instrument before fixing* — T111a's filed
-prime suspect was refuted by measurement, and the same trap is set here.
+Added `GHOZTTY_PERF` timing at the IPC boundary (`IpcServer`: accept / read /
+queue / handler; `handleRead`: lock wait vs work under the lock; `buildNode`:
+a named, timed line on every pwd cache MISS).
 
-1. **Mutex barging.** T111a bounded each hold to ~80 ms in the debug build
-   the harness runs, so a 9.2 s `+read` wait is roughly **100 consecutive
-   lost races**, not one long hold. The drain unlocks and re-locks with
-   essentially no gap (a slice-pointer bump), while Exec has
-   `PeekNamedPipe`/`ReadFile` syscalls between its unlock and next lock,
-   which is the window a parked waiter needs. Zig's `Thread.Mutex` is a
-   futex and makes no fairness promise. Candidate fix: `std.Thread.yield()`
-   (SwitchToThread) between slices in `feedSliced` — free when uncontended.
-   Verify by measuring the wait distribution, not just the mean.
-2. **Something GLOBAL, not per-pane.** E5 round-trips the QUIET pane `spC`,
-   whose mutex nothing is holding, so a pure per-pane-mutex theory does not
-   explain its failure. Suspects: (a) the agent-connection WRITE path —
-   `+send-keys` to an agent-backed pane writes into the single duplex pipe
-   the storm is saturating inbound; (b) plain serialization — the win32 IPC
-   server is a SINGLE pipe instance (`nMaxInstances = 1`) served strictly
-   serially with no timeout on the GUI marshal, so one 9 s handler parks the
-   next client at `PIPE_BUSY`, and `connectPath` gives up after 10 ×
-   `WaitNamedPipeW(1000)` and reports `No running Ghoztty instance found.`
-   — which is exactly the string T111 was filed on.
+1. In the failing run the 8th `+list` under the double storm logged
+   `accept=298ms read=0ms queue=0ms handler=29347ms`. **queue 0 ms** — the
+   message loop was not starved (so not the T53a posted-message flood); one
+   handler ran **29.3 s**.
+2. `+read` of the echo-storm pane logged **no handler line at all** — grep for
+   `ipcperf read pane=echoP` in the app log finds nothing. E4's 9202 ms was
+   therefore never a read latency. **The request never reached the app**,
+   which refutes hypothesis 1 (mutex barging) as its cause outright.
+3. Isolation experiment, no storm, idle app (`t111b-busy.ps1`): a raw pipe
+   client connects and never sends a request. Every subsequent
+   `ghoztty +list` then failed after **9190 ms** with `No running Ghoztty
+   instance found.` — 10 × `WaitNamedPipeW(1000)` in `connectPath`. That is
+   the exact string and the exact latency T111 was filed on, produced on an
+   app doing nothing at all. Hypothesis 2(b) confirmed.
+4. After the pool fix, `+list` handlers were STILL 12.9 s and 68.3 s, and a
+   `+read` logged `queue=56111ms` — the GUI thread stuck inside `list`. The
+   pwd-miss line named the culprit: `pwd-miss name=stormP ms=584 got=no`,
+   repeating on every call.
 
-*Free win, worth taking regardless of the above:* core already emits a `.pwd`
-apprt action on every `pwd_change` (`Surface.zig` `.pwd_change` →
-`performAction(.pwd)`), and win32 currently ACKs and DROPS it (`App.zig`,
-"acknowledge actions that don't need Win32-specific handling"). Caching the
-value there lets `buildNode` read a cached string, so `+list` — the liveness
-probe the whole bar is written against — would take no terminal lock at all.
-That removes `+list` from the contended path entirely instead of making it
-merely faster.
+### Root cause (two layers, both needed)
 
-*Harness note:* `scratchpad/t111-repro.ps1` gives a ~3 min A/B loop (launch
-with stderr redirected, 2 storm panes, hammer `+list`, stop the storm, re-probe
-to separate starvation from listener death) and was how T111a was measured.
-It is NOT sensitive enough for T111b — it tops out at 767 ms and never
-reproduced E3/E4/E5. Extend it to section E's shape first (5 idle + 2 storm
-agent-backed panes, plus `+read` and quiet-pane round-trip probes) so the
-loop stays fast, then confirm on the real harness.
+- **Amplifier — the server stopped ACCEPTING.** The win32 IPC server had ONE
+  pipe instance served strictly serially, so it could only accept while no
+  request was outstanding. Any slow handler stopped accepting, the client's
+  PIPE_BUSY retry budget expired, and a running app reported itself absent.
+  This, not lock contention, is all of E3/E4 and most of E2. A failed
+  `ConnectNamedPipe` also `return`ed from the listener, retiring the
+  instance for the life of the process.
+- **Trigger — `+list` sat on every pane's renderer mutex.** `buildNode`
+  called `core_surface.pwd()` per leaf. T111a bounded the drain's hold to
+  ~4 KiB, but the drain re-locks with no gap, so the GUI thread loses race
+  after race; 7 leaves is how 4 KiB holds become a 29 s handler.
+  Caching alone was not enough: panes launched without a working directory
+  (every `+split` that doesn't pass one) have **no** terminal pwd, so a
+  cache that only stored non-empty values missed forever and kept `+list`
+  on the mutex — the 68 s handler above.
 
-*Validation:* `session-persistence.ps1` ALL PASS ×3 (which also flips T89i to
-`done`), plus `ipc-under-load.ps1` for the Exec path, P1–P3, both lanes and
-`test-agent`.
+### Fix
+
+- `IpcServer` accepts on a pool of `instance_count` (4) pipe instances, one
+  listener thread each. Handlers still execute one at a time on the GUI
+  thread, so verb semantics are unchanged — the pool only buys the ability
+  to accept a client while another request is in flight. Instance 0 keeps
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it is still the single-instance lock;
+  extra instances that fail to create cost concurrency, never startup. A
+  failed accept now resets the instance and keeps accepting, retiring only
+  after 8 consecutive failures. `deinit` issues dummy connects in a loop
+  (one connect wakes exactly one instance) while draining WM_APP_IPC.
+- `+list` reads a per-pane **cached pwd** (`Surface.pwd`), fed by the core
+  `.pwd` action win32 previously ACKed and dropped — the same use GTK makes
+  of that action. Every mutation of the terminal pwd emits it (including the
+  OSC 7 empty-URL reset), so the only value the cache can miss is the
+  initial cwd, which `Termio.init` → `backend.initTerminal` sets
+  **synchronously** before `core_surface_ready`. "No pwd" is therefore a
+  permanent answer, not a not-yet, and is cached as such: measured at
+  **exactly one miss per pane, ever**.
+
+### Evidence
+
+Fast repro (`scratchpad/t111b-repro.ps1`, section-E shape: 5 idle + 2 storm
+agent-backed panes, ~3 min), same box, same storm:
+
+| | `+list` p50 | `+list` max | `+read` echoP |
+|---|---|---|---|
+| before | 828 ms | 2311 ms | 227–768 ms |
+| after | 113 ms | 426 ms | 376–905 ms |
+
+Isolation experiment, one pipe instance held hostage on an idle app:
+**9190 ms + "No running Ghoztty instance found."** → **114 ms + exit 0**.
+
+### Harness defect found and fixed (it fabricated 24 failures)
+
+`session-persistence.ps1`'s `Run-Cli` killed only `cmd.exe` on timeout, so the
+`ghoztty` CLI child survived and kept the redirect target open. Every later
+probe writing that same file then died at ~35 ms with exit 1 and NO output —
+because cmd could not open the file, not because the server failed. In the
+run above that turned **2 real timeouts into 26 recorded failures**, and the
+stale file content made the failures look like successful lists. Now killed
+with `taskkill /F /T`. Any T111-class evidence gathered before this fix should
+be read as "2 wedges", not "26 failures".
+
+*Tests:* `ipc-under-load.ps1` gained a T111b guard — a raw pipe client
+occupies an instance and `+list` must still answer, exit 0, under 5 s (pre-fix
+9190 ms then the not-found error). `ipc-p1.ps1` asserts the `+list --json`
+leaf `working_directory` FIELD, which nothing did before (its older text
+assert also matches the cmd.exe title, so it passed on an empty value) — that
+is the field the pwd cache serves.
+
+### What T111b did NOT fix (split out)
+
+Section E's E4 and E11/E12 are still red, but they are now a different and
+fully measured mechanism — see **T114** and **T115**.
+
+*Validation (T111b):* section E's E2 **40/40**, E3, E5, E9, E10 (117 ms first
+probe) green; `ipc-under-load.ps1` including its new occupancy guard; P1–P3;
+`test -Dapp-runtime=none`, `test -Dapp-runtime=win32`, `test-agent`.
+
+## T114 — `+read` of a flooded pane loses long lock races (open)
+
+Section E's E4, and all that survives of it now that T111b removed the connect
+failure that used to mask it (E4's old 9202 ms never reached the handler at
+all). With the request arriving, the handler splits cleanly:
+
+    ipcperf read pane=echoP lockwait=15514ms dump=47ms
+
+47 ms of work behind a 15.5 s wait. T111a already bounded each drain hold to
+4 KiB (~80 ms in the debug build the harness runs), so this is roughly **190
+consecutive lost races**, not one long hold — the drain unlocks and re-locks
+after nothing but a slice-pointer bump, and Zig's `Thread.Mutex` is a futex
+with no fairness promise. Exec never hit this: it has `PeekNamedPipe`/
+`ReadFile` syscalls between its unlock and next lock, which is exactly the
+window a parked waiter needs.
+
+T111b added `std.Thread.yield()` between slices in `feedSliced`. Same
+experiment, same box: worst lockwait **15514 ms → 1439 ms**. That proves the
+mechanism but does not hold E4's 2000 ms bound — a later run still spiked to
+~11.9 s — because `SwitchToThread` only yields to a thread ready on the SAME
+processor, so it is a hint, not a handoff.
+
+*Candidate:* a real fairness ticket — an atomic "a GUI-side waiter wants this
+pane's mutex" that the drain reads between slices and honors with a bounded
+sleep, so a waiter cannot be starved indefinitely. Note `termio/Remote.zig` is
+SHARED core code (Mac remote panes use the same drain), so the flag needs a
+home that leaves the other apprts unchanged.
+
+*Validation:* section E's E3/E4 inside the T62 2000 ms bound across 3 runs,
+`ipc-under-load.ps1` for the Exec path, both lanes.
+
+## T115 — `+close` of a flooded pane blocks the GUI thread ~65 s (open)
+
+Section E's E11/E12 (T63's 10 s bound). Measured ON the GUI thread, so it is
+neither a connect nor a queue effect:
+
+    ipcperf action=close accept=477ms read=0ms queue=0ms handler=64883ms
+
+and the next verb behind it logged `queue=24864ms` — one close freezes every
+other IPC verb for as long as it runs. This is the Remote-backend analog of
+T63, which fixed exactly this shape for Exec (a missed one-shot `CancelIoEx`
+left the reader blocked and `+close` hung 9+ minutes).
+
+*Regression honesty:* E11/E12 PASSED before T111b — 7192 ms / 3129 ms on this
+box the same day — and fail after it. Not because close became slower: T111b
+stopped the GUI thread from hogging the renderer mutex, and that hogging had
+been throttling the drain and pacing the storm. The teardown cost was always
+there; T111b removed what was hiding it. The numbers track that reading
+exactly (E11 across successive fixes: 7.2 s → 9.7 s → 30.2 s as IPC got
+faster).
+
+*Likely shared with T114:* both scale with drain aggressiveness, and the
+T111b yield moved close 33 s → 18 s in the same run that moved `+read`
+15.5 s → 1.4 s. Do T114 first and re-measure before designing a separate
+fix. Fold in **T96** (pre-existing ConPTY close-teardown hang, reproduced
+over TCP too).
+
+*Validation:* E11/E12 inside the T63 10 s bound across 3 runs.
 
 ## T90a — Viewer panes on Windows: design (Phase K)
 

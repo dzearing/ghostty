@@ -81,6 +81,13 @@ $p1ide = $json.data.windows | Where-Object { $_.target -eq 'p1ide' }
 Assert "split node shape" ($p1ide.tabs[0].splits.type -eq 'split' -and
     $p1ide.tabs[0].splits.left.type -eq 'leaf' -and
     $null -ne $p1ide.tabs[0].splits.ratio)
+# working_directory is served from the pane's CACHED pwd (T111b) so that
+# +list never takes a terminal lock. Assert the FIELD, not just that the path
+# appears somewhere in the human tree -- the older text assert above also
+# matches the cmd.exe title, so it would pass on an empty working_directory.
+$p1leaf = $p1ide.tabs[0].splits.left.terminal
+Assert "leaf reports working_directory" (
+    $null -ne $p1leaf -and $p1leaf.working_directory -match 'Windows')
 
 "== 6: +close named pane"
 & $Exe +close --target=p1term 2>&1 | Out-Null

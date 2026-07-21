@@ -9,6 +9,38 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-21 (on-box, 52) — T111b DONE. Both of the row's filed hypotheses
+  were WRONG, and the instrumentation added this session is the only reason
+  that is known: splitting the IPC round trip into accept/read/queue/handler
+  showed a `+list` handler at 29347ms with queue 0ms, and — the decisive
+  one — E4's `+read` produced NO handler log line at all, so its 9202ms was
+  never a read latency; the request never reached the app. An isolation
+  experiment then reproduced T111's exact string and latency on a
+  completely IDLE app: hold the server's single pipe instance with a raw
+  client and every `ghoztty +list` fails after 9190ms with "No running
+  Ghoztty instance found." Two layers, both fixed: a 4-instance accept pool
+  (a slow handler can no longer make a running app look absent) and a
+  per-pane pwd cache fed by the `.pwd` action win32 had been ACKing and
+  dropping. Two things the cache got wrong before it was right, both caught
+  by measurement, not review: seeding lazily charged the lock to whichever
+  `+list` saw a pane first (19155ms handler), and skipping the seed when a
+  pane has no pwd at all — which is every `+split` without a working
+  directory — meant the miss repeated forever (68312ms handler). Seeding
+  eagerly at surface creation, negatives included, took `+list` worst from
+  29347ms to 141ms with handler=0ms. E2 7/40 → 40/40; E3/E5/E10 green.
+  ALSO: the harness had been fabricating evidence — `Run-Cli` killed only
+  cmd.exe on timeout, the orphaned CLI child kept the redirect file open,
+  and every later probe died at ~35ms with exit 1 and no output, so 2 real
+  timeouts were recorded as 26 failures with a stale successful list left
+  in the artifact file. Fixed with `taskkill /F /T`; earlier T111 evidence
+  should be re-read with that in mind. Section E is still red on E4 and
+  E11/E12, now split out as T114 (`+read` loses ~190 consecutive lock races;
+  the yield added here moved it 15514ms → 1439ms, enough to prove the
+  mechanism, not enough to hold the 2s bound) and T115 (`+close` handler
+  64883ms on the GUI thread — a cost that ALWAYS existed and that T111b
+  unmasked by removing the accidental throttle; E11 was 7.2s before and is
+  30.2s now, and saying so is the point). Next on-box: T115, then T114.
+
 - 2026-07-21 (on-box, 51) — T112 DONE (jumped the queue ahead of T111b:
   it is the loop's own continuation mechanism, and it is an out-of-repo
   skill edit, so it was cheap). Root cause confirmed, not assumed —

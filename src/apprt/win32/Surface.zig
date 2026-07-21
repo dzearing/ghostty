@@ -130,6 +130,27 @@ current_cursor: ?w32.HCURSOR = null,
 /// `+list` tree can report a per-pane title. Null until the first set.
 title: ?[:0]u8 = null,
 
+/// The pane's working directory (owned copy), cached off the GUI thread's
+/// hot path exactly like `title` — GTK caches the same action the same way
+/// (`apprt/gtk/class/surface.zig` setPwd).
+///
+/// T111b: `+list` used to read this with `core_surface.pwd()`, which takes
+/// that pane's `renderer_state.mutex`. Under a flood the IO thread holds
+/// that mutex nearly continuously, so the liveness probe every automation
+/// bar in this tracker is written against (`+list` answers) was the one
+/// call that queued behind the flood. Core already pushes every change here
+/// as a `.pwd` action, so the cache is not merely faster — it removes
+/// `+list` from the contended path entirely.
+///
+/// Null until the first `.pwd` action or the first `+list` seeds it from
+/// the terminal (the initial cwd is set by termio at startup and reported
+/// through no action, so `+list` seeds it once and every later read is
+/// lock-free). An EMPTY string is a real cached value — "this pane has no
+/// working directory" — not an absent one; panes launched without a
+/// working directory never get a terminal pwd, and treating that as
+/// "not cached yet" put `+list` back on the pane's mutex on every call.
+pwd: ?[:0]u8 = null,
+
 /// Non-null while the user has manually set this pane's title ("Change
 /// Pane Title…" prompt, T92). Holds the last terminal-reported title so
 /// clearing the manual title restores it; while set, setTitle updates
@@ -537,6 +558,21 @@ pub fn init(
     self.core_surface_ready = true;
     self.core_surface_initialized = true;
 
+    // Seed the cached pwd HERE, not on the first `+list` (T111b). The value
+    // is already final: `Termio.init` → `backend.initTerminal` sets the
+    // initial pwd synchronously before this point, and every later change
+    // arrives as a `.pwd` action. Seeding now costs one uncontended lock on
+    // a pane that has not produced a byte yet; seeding lazily charged that
+    // same lock to whichever `+list` happened to see the pane first, which
+    // under a flood is not cheap at all — measured at a 19.2 s `+list`
+    // handler when the first sighting landed on a storm pane.
+    if (self.core_surface.pwd(self.app.core_app.alloc)) |maybe| {
+        if (maybe) |p| {
+            defer self.app.core_app.alloc.free(p);
+            self.setPwd(p);
+        } else self.setPwd("");
+    } else |_| {}
+
     // Report the OS color scheme so OSC 10/11 queries and `light:`/`dark:`
     // conditional config start out correct (T26). WM_SETTINGCHANGE keeps
     // it current afterwards.
@@ -560,6 +596,11 @@ pub fn deinit(self: *Surface) void {
     if (self.title_from_terminal) |t| {
         self.app.core_app.alloc.free(t);
         self.title_from_terminal = null;
+    }
+
+    if (self.pwd) |p| {
+        self.app.core_app.alloc.free(p);
+        self.pwd = null;
     }
 
     if (self.core_surface_initialized) {
@@ -1276,6 +1317,15 @@ pub fn setTitle(self: *Surface, title: [:0]const u8) void {
     if (self.title) |old| alloc.free(old);
     self.title = copy;
     self.parent_window.onTabTitleChanged(self, title);
+}
+
+/// Cache the pane's working directory (core `.pwd` action, or the one-time
+/// seed from the terminal on the first `+list`). GUI thread only.
+pub fn setPwd(self: *Surface, pwd_str: []const u8) void {
+    const alloc = self.app.core_app.alloc;
+    const copy = alloc.dupeZ(u8, pwd_str) catch return;
+    if (self.pwd) |old| alloc.free(old);
+    self.pwd = copy;
 }
 
 /// Set (or clear, with null) the user's manual pane title ("Change Pane

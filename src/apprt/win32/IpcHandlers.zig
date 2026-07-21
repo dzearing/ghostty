@@ -691,8 +691,16 @@ fn handleRead(ctx: Context, request: Request) Allocator.Error!?[]u8 {
     // Dump the whole screen (scrollback + active) as plain text, matching
     // the Mac's full-SCREEN ghostty_surface_read_text selection.
     const core = &surface.core_surface;
+    // GHOZTTY_PERF (T111b): split the handler into LOCK WAIT vs work under the
+    // lock. `+read` of a flooded pane is the sharpest probe of contention on
+    // that pane's renderer mutex, and the two halves have opposite fixes.
+    const perf = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+    const t_enter: ?std.time.Instant =
+        if (perf) (std.time.Instant.now() catch null) else null;
+    var t_locked: ?std.time.Instant = null;
     const dump: ?[]const u8 = dump: {
         core.renderer_state.mutex.lock();
+        if (perf) t_locked = std.time.Instant.now() catch null;
         defer core.renderer_state.mutex.unlock();
         const pages = &core.io.terminal.screens.active.pages;
         const tl = pages.getTopLeft(.screen);
@@ -701,6 +709,17 @@ fn handleRead(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         const text = core.dumpTextLocked(arena, sel) catch break :dump null;
         break :dump text.text;
     };
+    if (perf) perf: {
+        const now = std.time.Instant.now() catch break :perf;
+        const enter = t_enter orelse break :perf;
+        const locked = t_locked orelse break :perf;
+        log.info("ipcperf read pane={s} lockwait={d}ms dump={d}ms", .{
+            name,
+            locked.since(enter) / std.time.ns_per_ms,
+            now.since(locked) / std.time.ns_per_ms,
+        });
+    }
+
     var full = dump orelse
         return try errorResponse(ctx.alloc, "failed to read terminal content from '{s}'", .{name});
 
@@ -1280,9 +1299,47 @@ fn buildNode(
                 ctx.app.ipcRegister(id, .{ .pane = surface }) catch {};
                 break :name id;
             };
+            // T111b: read the pane's CACHED working directory. This used to
+            // call `core_surface.pwd()`, which takes that pane's renderer
+            // mutex — under a flood the IO thread holds it nearly
+            // continuously, so `+list`, the liveness probe every automation
+            // bar here is written against, was the one call that queued
+            // behind the flood (one handler measured at 29.3 s). Core pushes
+            // every change to the cache as a `.pwd` action, so the only
+            // value the cache can miss is the initial cwd termio sets at
+            // startup with no action: the first `+list` to see a pane seeds
+            // that, and no `+list` after it takes a terminal lock at all.
             const pwd: []const u8 = pwd: {
-                const copy = surface.core_surface.pwd(arena) catch break :pwd "";
-                break :pwd copy orelse "";
+                if (surface.pwd) |cached| break :pwd cached;
+                // Cache miss: this is the ONLY path in `+list` that can touch
+                // a terminal lock, so GHOZTTY_PERF names the leaf and times
+                // it — a miss that repeats every call is the whole bug back.
+                const perf = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+                const t0: ?std.time.Instant =
+                    if (perf) (std.time.Instant.now() catch null) else null;
+                const copy = surface.core_surface.pwd(arena) catch null;
+                if (perf) perf: {
+                    const now = std.time.Instant.now() catch break :perf;
+                    const start = t0 orelse break :perf;
+                    log.info("ipcperf list pwd-miss name={s} ms={d} got={s}", .{
+                        name,
+                        now.since(start) / std.time.ns_per_ms,
+                        if (copy != null) "yes" else "no",
+                    });
+                }
+                // Seed even when the terminal has NO pwd, or the miss repeats
+                // forever: a pane launched without a working directory (every
+                // `+split` that doesn't pass one) never gets a terminal pwd,
+                // and re-asking put `+list` right back on that pane's mutex —
+                // measured at 183/298/535/584 ms per call on a flooded pane
+                // and, under the section-E double storm, a 68 s handler.
+                // "No pwd" is a permanent answer, not a not-yet: the initial
+                // pwd is set synchronously by `Termio.init` →
+                // `backend.initTerminal`, so it is already there (or already
+                // absent) before `core_surface_ready`, and every later change
+                // arrives as a `.pwd` action.
+                surface.setPwd(copy orelse "");
+                break :pwd surface.pwd orelse "";
             };
             node.* = .{
                 .leaf = .{

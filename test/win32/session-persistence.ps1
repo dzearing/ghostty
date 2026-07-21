@@ -29,13 +29,20 @@
 #      a crash-kill relaunch MID-STORM restores everything, and +close of
 #      each storm pane returns within the T63 bound.
 #
-# KNOWN RED (2026-07-21): section E's storm asserts (E2-E5) currently FAIL --
-# `+list` answers ~1/40 under the double agent-backed storm and the CLI reports
-# "No running Ghoztty instance found.", i.e. the GUI-thread pipe listener stops
-# accepting. That is tracker T111, a real product bug, NOT a harness defect:
-# `ipc-under-load.ps1` holds the identical 40/40 bar under the identical storm
-# on the Exec path. These asserts are deliberately left strict so the
-# regression stays visible; expect ALL PASS here only once T111 lands.
+# KNOWN RED (2026-07-21, narrowed): section E's E4 (+read latency) and
+# E11/E12 (+close latency) FAIL. E2 (+list 40/40) and E3/E5 went green with
+# T111b, which fixed the two mechanisms behind them: the server had ONE pipe
+# instance and so stopped ACCEPTING whenever a handler was slow (clients then
+# printed "No running Ghoztty instance found." about a running app), and
+# `+list` took every pane's renderer mutex to read its pwd.
+# What is left is a DIFFERENT mechanism on the same panes, and both remaining
+# asserts now measure real work rather than a failed connect:
+#   T114 -- `+read` of a flooded agent-backed pane loses long races on that
+#           pane's renderer mutex (measured lockwait 15514ms / dump 47ms).
+#   T115 -- `+close` of a flooded agent-backed pane blocks the GUI thread in
+#           its teardown (measured handler=64883ms).
+# These asserts are deliberately left strict so the regressions stay visible;
+# expect ALL PASS here only once T114 and T115 land.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Fully hermetic:
 # per-run $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN; only ever kills
@@ -132,7 +139,14 @@ function Run-Cli($argsLine, $out, $timeoutSec = 15) {
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
         -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
     if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        # Kill the TREE, not just cmd.exe. Stop-Process leaves the ghoztty CLI
+        # child alive, and that orphan keeps the redirect target ($out) open --
+        # so EVERY later probe writing the same file dies at ~35ms with exit 1
+        # and no output, because cmd cannot open the file, not because the
+        # server failed. That artifact turned 2 real timeouts into 26 fake
+        # failures in a T111b run and is exactly the kind of harness defect
+        # that gets mis-filed as a product bug.
+        & taskkill /F /T /PID $p.Id 2>&1 | Out-Null
         return $null
     }
     return $p.ExitCode

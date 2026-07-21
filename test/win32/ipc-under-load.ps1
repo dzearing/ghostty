@@ -112,6 +112,32 @@ $sw.Stop()
 Assert ($echoTail -match 'tiny-write-storm') "echo-storm pane +read returns content (len $($echoTail.Length))"
 Assert ($sw.ElapsedMilliseconds -lt 2000) "echo-storm +read latency $($sw.ElapsedMilliseconds)ms < 2000ms (T62)"
 
+# T111b: the server must keep ACCEPTING while a request is outstanding.
+# With a single pipe instance it could not: one client holding the instance
+# (or one slow handler) made every other client exhaust its PIPE_BUSY retries
+# and print "No running Ghoztty instance found." — a running app reported as
+# absent. Measured before the instance pool: 9190ms then that error, on an
+# app that was otherwise completely idle. Simulated here by a raw pipe client
+# that connects and never sends a request, which parks a listener in its
+# request read exactly like a slow handler parks one on the GUI thread.
+$pipeName = "ghoztty$($env:GHOZTTY_PIPE_SUFFIX)-$env:USERNAME"
+$hog = New-Object System.IO.Pipes.NamedPipeClientStream(
+    '.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
+$hogOk = $true
+try { $hog.Connect(5000) } catch { $hogOk = $false }
+Assert $hogOk "raw client can occupy one pipe instance (name: $pipeName)"
+if ($hogOk) {
+    $swHog = [System.Diagnostics.Stopwatch]::StartNew()
+    & $exe +list | Out-Null
+    $hogCode = $LASTEXITCODE
+    $swHog.Stop()
+    $hog.Dispose()
+    Assert ($hogCode -eq 0) "+list still answers while a client occupies an instance (exit $hogCode)"
+    Assert ($swHog.ElapsedMilliseconds -lt 5000) (
+        "+list latency with an instance occupied $($swHog.ElapsedMilliseconds)ms < 5000ms " +
+        "(pre-fix: ~9190ms then 'No running Ghoztty instance found.')")
+}
+
 # Teardown — asserted, not just performed: closing a window with noisy
 # panes used to hang the GUI thread forever in Exec.threadExit's
 # read_thread.join() when the one-shot CancelIoEx missed (the reader was

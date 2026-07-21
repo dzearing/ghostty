@@ -2196,11 +2196,25 @@ pub fn performAction(
             return true;
         },
 
+        // The pane's working directory changed (OSC 7 / shell integration).
+        // Cache it on the rt surface so `+list` never has to take that
+        // pane's renderer mutex to report it (T111b) — the same thing GTK
+        // does with this action.
+        .pwd => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    const surface = core_surface.rt_surface;
+                    if (surface.core_surface_ready) surface.setPwd(value.pwd);
+                },
+            }
+            return true;
+        },
+
         // Acknowledge actions that don't need Win32-specific handling.
         // The core handles the logic; we just confirm receipt.
         .key_sequence,
         .key_table,
-        .pwd,
         .cell_size,
         .readonly,
         // Platform-specific actions that don't apply on Windows:

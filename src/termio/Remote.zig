@@ -1038,6 +1038,20 @@ fn feedSliced(rd: *ThreadData, bytes: []const u8) void {
         @call(.always_inline, termio.Termio.processOutputTracked, .{
             rd.io, slice, &rd.io.backend.remote.applied_bytes,
         });
+        // T111b: bounding the HOLD (above) is not enough on its own, because
+        // nothing bounds how often we re-take it. `processOutputTracked`
+        // self-locks and unlocks, and the next iteration re-locks after
+        // nothing but a slice-pointer bump — so a GUI thread parked on this
+        // same mutex loses race after race rather than one long race. Zig's
+        // Mutex is a futex and promises no fairness; Exec never hit this
+        // because it has PeekNamedPipe/ReadFile syscalls between its unlock
+        // and next lock, which IS the window a parked waiter needs. Measured
+        // here: a `+read` of a flooded pane waited 15514 ms while doing 47 ms
+        // of work — roughly 190 consecutive lost races, not one long hold.
+        // Yield only when more slices follow: free when uncontended
+        // (SwitchToThread returns immediately with no ready peer), and never
+        // paid at all on the common single-slice chunk.
+        if (it.rest.len > 0) std.Thread.yield() catch {};
     }
 }
 
