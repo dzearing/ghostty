@@ -9,6 +9,15 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-20 (on-box, 48) — loop repair after the T106 delivery: the 16:10
+  upgrade's resume never produced a live claude (loop stalled; user
+  noticed) and its agent swap failed on a .bak that is the RUNNING
+  agent's mapped image (undeletable, renameable). Fixed the script
+  (delete-else-dated-rename fallback), manually installed the staging
+  agent (4:06 PM build) alongside the already-swapped app exe, relaunched
+  the loop in the installed Ghoztty with a fresh session. T105+T106 are
+  both live in all install locations; running agent stays on its old
+  binary until next cold start (lazy upgrade, by design).
 - 2026-07-20 (on-box, 47) — T106 DONE (visible relaunch lost re-attached
   scrollback). Root cause was NOT the suspected repaint race: byte dumps
   proved visible/minimized relaunches feed IDENTICAL streams; the loss was

@@ -123,7 +123,17 @@ $oldAgent = Join-Path $InstallDir 'ghoztty-agent.exe'
 if (Test-Path $newAgent) {
     try {
         if (Test-Path $oldAgent) {
-            Remove-Item "$oldAgent.bak" -Force -ErrorAction SilentlyContinue
+            if (Test-Path "$oldAgent.bak") {
+                # The .bak may be the mapped image of the still-running
+                # previous agent: undeletable, but renameable. Try delete,
+                # fall back to shoving it to a dated name (observed
+                # 2026-07-20 16:10: Remove-Item failed silently, Move-Item
+                # hit 'already exists', and the agent swap was skipped).
+                try { Remove-Item "$oldAgent.bak" -Force -ErrorAction Stop }
+                catch {
+                    Move-Item "$oldAgent.bak" ("$oldAgent.bak-" + (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force -ErrorAction Stop
+                }
+            }
             Move-Item $oldAgent "$oldAgent.bak" -Force -ErrorAction Stop
         }
         Copy-Item $newAgent $oldAgent -Force -ErrorAction Stop
