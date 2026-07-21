@@ -380,6 +380,18 @@ extension Ghostty {
             // reconnect swap), so the baked value never goes stale: the same
             // id fronts the pane for its whole life, across app relaunches.
             surface_cfg.environmentVariables["GHOZTTY_PANE_ID"] = self.id.uuidString
+            // Instance addressability: the IPC socket name is per-BUILD, but
+            // the `ghoztty` on $PATH derives it from its OWN compile-time build
+            // mode — so a CLI run inside a debug-app pane would otherwise dial
+            // the RELEASE socket and drive the wrong instance. Bake THIS app's
+            // socket path in so every IPC command run inside this pane reaches
+            // the app that owns the pane. This is the one env-building funnel
+            // for every pane kind: a plain local spawn reads it via
+            // `config.env` (exec's env_override), a session-persistence pane
+            // forwards it to the local agent via OPEN.env (which the agent also
+            // replays on a RELAUNCH), and a remote pane carries it too — a
+            // remote pane's IPC still belongs to this local app.
+            surface_cfg.environmentVariables[IPCSocket.envKey] = IPCSocket.path
             self.expectedRemoteSessionID = surface_cfg.remoteSessionId
             self.backgroundTint = surface_cfg.backgroundTint
             self.backgroundTintNSColor = surface_cfg.backgroundTintNSColor

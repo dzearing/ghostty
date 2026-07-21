@@ -39,6 +39,28 @@ Unix sockets are the simplest cross-language transport (Zig ↔ Swift) that avoi
 - ReleaseFast/ReleaseSmall builds use `ghostty-$UID.sock`
 - This prevents debug builds from conflicting with a running release instance
 
+**Instance addressability (`$GHOZTTY_IPC_SOCKET`):** because the name above is
+per-BUILD while the CLI derives it from its OWN compile-time build mode — and
+the `ghoztty` on `$PATH` is normally the release app's binary — a CLI run
+inside a debug-app pane would dial the *release* socket and drive the wrong
+instance. So every pane's environment is baked with the absolute socket path of
+the app that owns it (`GHOZTTY_IPC_SOCKET`), and the CLI prefers it:
+
+- Server: `IPCSocket.path` (`macos/Sources/Features/IPC/IPCSocket.swift`) is
+  the single source of truth — `IPCServer` binds it, and `SurfaceView.init`
+  bakes it into `surface_cfg.environmentVariables` for every pane (the one
+  funnel covering local exec panes, session-persistence agent panes — the agent
+  replays it on RELAUNCH — and remote panes, whose IPC still belongs to the
+  local app).
+- Client: `apprt.ipc.socketPath()` (`src/apprt/ipc.zig`) is the single
+  resolution site for every CLI command and apprt IPC client. Absent or empty
+  ⇒ derive `<tmp>/ghostty[-debug]-<uid>.sock` as before, so a CLI invoked from
+  a plain non-Ghoztty shell is unchanged, as is a pane baked by an app or agent
+  that predates the variable.
+
+A full path (not a build-flavor hint) is baked so this keeps working if the
+socket name ever gains an instance discriminator.
+
 **Socket security:**
 - Mode `0600` (owner read/write only)
 - `FD_CLOEXEC` set to prevent leaking into child processes
