@@ -4569,6 +4569,25 @@ exists. This is the T49 stale-binary lesson recurring in a place nobody was
 looking — a standing "must stay ALL PASS" script that silently graded the
 wrong binary.
 
+*Incident while validating — the harness is not safe against a release exe
+(now T116):* wanting to grade the actual delivery artifact, I ran
+`session-persistence.ps1 -Exe zig-out-release\bin\ghoztty.exe`. It is hermetic
+in `LOCALAPPDATA` only; its ENDPOINTS come from the build. A Debug exe speaks
+`ghoztty-debug-<user>` and spawns `ghoztty-agent-debug-<user>` — that, not the
+temp dir, is what has always kept it clear of the installed release. A release
+exe collides on both, so the app it launched lost the single-instance race and
+every CLI call in the script drove the USER'S RUNNING TERMINAL: sections A–D
+"failed" against someone else's windows while its `+close` calls closed them,
+and the user's GUI ended up gone. (Session persistence did its job — every
+shell, including the Claude session driving this work, survived under the
+agent and came back on relaunch. That is the feature working exactly as
+designed, not a mitigation I planned.) `GHOZTTY_PIPE_SUFFIX` does NOT fix it:
+`LocalAgent.pipeName` derives the agent name from the build mode alone, so no
+env makes a release run safe. Guard added instead — if anything already
+answers on the endpoint the target exe would use, the script aborts with exit
+2 before touching a window. Mechanism-free, and it would have caught this
+before the first `+close`.
+
 *Repro harness:* section E of `session-persistence.ps1` is the contract, but
 iterating on it means paying for sections A–D. A focused scratch script
 (2 storm panes + `+list`/`+read`/soak/`+close`, hermetic, app stderr captured

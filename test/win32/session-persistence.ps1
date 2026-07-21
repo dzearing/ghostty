@@ -342,6 +342,33 @@ $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 
+# ---------------------------------------------------------------------------
+# ISOLATION GUARD (2026-07-21 incident). This harness is hermetic in
+# LOCALAPPDATA only. Its ENDPOINTS come from the build: a Debug exe speaks
+# `ghoztty-debug-<user>` and spawns `ghoztty-agent-debug-<user>`, which is what
+# keeps it clear of the user's installed release. Point it at a RELEASE exe
+# (e.g. -Exe zig-out-release\bin\ghoztty.exe, to grade a delivery artifact) and
+# both names collide with the live instance: the launched app loses the
+# single-instance race and every CLI call in this script -- including
+# `+close` -- is then aimed at the USER'S RUNNING TERMINAL. That is exactly
+# what happened: sections A-D "failed" against someone else's windows while
+# quietly closing them, and the user's GUI ended up dead. The agent pipe name
+# is build-mode-derived and NOT overridable by GHOZTTY_PIPE_SUFFIX, so there is
+# no env that makes a release run safe -- refuse instead of maiming.
+#
+# The check is mechanism-free: if anything already answers on the endpoint this
+# exe will use, we are not hermetic, full stop.
+& $Exe +list 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host ""
+    Write-Host "ABORT: a Ghoztty instance is ALREADY answering on the endpoint '$Exe' uses." -ForegroundColor Red
+    Write-Host "  This harness would drive that instance instead of its own (and its +close" -ForegroundColor Red
+    Write-Host "  calls would close ITS panes). Use the Debug build (zig-out\bin\ghoztty.exe)," -ForegroundColor Red
+    Write-Host "  which speaks the -debug pipe; a release exe cannot be isolated here." -ForegroundColor Red
+    $env:LOCALAPPDATA = $savedLocalAppData
+    exit 2
+}
+
 # Hermetic state root for the whole run (one agent lineage across sections).
 $script:tmp = Join-Path $root 'state'
 New-Item -ItemType Directory -Force (Join-Path $script:tmp 'ghoztty\local-agent-debug') | Out-Null
