@@ -41,7 +41,10 @@ next, any surprises>`.
   `Select-Object -First N` stops the pipeline and tears down the running
   `zig build`, so it exits -1 with no failure text. Redirect to a file and
   filter the FILE; both lanes + test-agent are green that way. `go.md` now
-  says so. Next:
+  says so. Delivery to the 3 install locations is deliberately HELD: T110
+  is user-visible and should ship, but not in a release that still carries
+  T111's freeze on the same subsystem — deliver both together when T111
+  lands. Next:
   **T111** (ahead of T38 — a GUI freeze on the default path outranks
   release packaging).
 - 2026-07-20 (on-box, 48) — loop repair after the T106 delivery: the 16:10
