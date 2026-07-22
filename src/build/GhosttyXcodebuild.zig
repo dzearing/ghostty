@@ -245,12 +245,19 @@ pub fn init(
             b.allocator,
             "GHOSTTY_CODESIGN_IDENTITY",
         ) catch identity: {
+            // No `-v`: a local self-signed identity is untrusted by the system
+            // PKI, so it never appears under "valid identities only" — but
+            // codesign signs with it fine, and that is all a stable local
+            // designated requirement needs. Create one once with:
+            //   Keychain Access ▸ Certificate Assistant ▸ Create a Certificate
+            //   (name "Ghoztty Debug Signing", type Code Signing), or import a
+            //   self-signed code-signing cert named the same.
             const probe = std.process.Child.run(.{
                 .allocator = b.allocator,
-                .argv = &.{ "security", "find-identity", "-v", "-p", "codesigning" },
+                .argv = &.{ "security", "find-identity", "-p", "codesigning" },
             }) catch break :identity b.dupe("-");
-            if (std.mem.indexOf(u8, probe.stdout, "Ztabby Debug Signing") != null)
-                break :identity b.dupe("Ztabby Debug Signing");
+            if (std.mem.indexOf(u8, probe.stdout, "Ghoztty Debug Signing") != null)
+                break :identity b.dupe("Ghoztty Debug Signing");
             break :identity b.dupe("-");
         };
         const step = RunStep.create(b, "codesign app bundle");
