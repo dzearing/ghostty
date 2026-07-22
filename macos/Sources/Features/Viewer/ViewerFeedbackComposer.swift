@@ -118,6 +118,41 @@ final class ViewerFeedbackChipCell: NSTextAttachmentCell {
 
 // MARK: - Model
 
+/// A passage the user quoted out of the viewed page, with enough referential
+/// context that a downstream agent can find what was being discussed.
+///
+/// Text alone is ambiguous — the same sentence can appear twice in a document
+/// — so a quote carries its section, its containing block's full text, and its
+/// offsets within both. `sourceLine` is filled in natively at send time for
+/// file-backed viewers by locating the passage in the file on disk.
+struct ViewerFeedbackQuote: Identifiable, Equatable {
+    let id: UUID
+    /// Display number, stable for the composer session (same rule as chips).
+    let number: Int
+    let text: String
+    var headingID: String?
+    var headingText: String?
+    var blockSelector: String?
+    var blockText: String?
+    var offsetInBlock: Int?
+    var documentOffset: Int?
+    /// 1-based line in the source file, resolved at send time when the passage
+    /// can be located there. Nil for web pages and unlocatable passages.
+    var sourceLine: Int?
+
+    init(number: Int, text: String) {
+        self.id = UUID()
+        self.number = number
+        self.text = text
+    }
+}
+
+/// Attribute marking a run of text as a quote block, valued with the quote's
+/// id so the run can be mapped back to its reference metadata.
+extension NSAttributedString.Key {
+    static let feedbackQuoteID = NSAttributedString.Key("ghozttyFeedbackQuoteID")
+}
+
 /// The composer's contents for one viewer pane.
 ///
 /// Owned by the `ViewerView`, NOT by the SwiftUI bar, so a half-written report
@@ -162,6 +197,62 @@ final class ViewerFeedbackModel: ObservableObject {
     /// Every image ever pasted, keyed by chip id. Kept across deletions so an
     /// undo (Cmd-Z) that restores a chip still has its image.
     private var pool: [UUID: Attachment] = [:]
+
+    /// Every quote ever inserted, keyed by id. Like `pool`, retained across
+    /// deletion so an undo that restores the run still has its references.
+    private var quotePool: [UUID: ViewerFeedbackQuote] = [:]
+    private var nextQuoteNumber = 1
+
+    /// Quotes still present in the text, in document order.
+    @Published private(set) var quotes: [ViewerFeedbackQuote] = []
+
+    /// Paragraph style for a quote block: indented past the accent bar the
+    /// text view draws, with air above and below so it reads as its own block.
+    static var quoteParagraphStyle: NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.firstLineHeadIndent = 14
+        style.headIndent = 14
+        style.tailIndent = -6
+        style.paragraphSpacingBefore = 6
+        style.paragraphSpacing = 6
+        return style
+    }
+
+    /// Insert a quote as its own block at `range`, returning the inserted range.
+    ///
+    /// Surrounded by newlines so it can never merge into the user's prose: a
+    /// quote is a block, and half a line of it glued to a sentence would be
+    /// neither quotable nor readable.
+    @discardableResult
+    func insertQuote(_ quote: ViewerFeedbackQuote, at range: NSRange) -> NSRange {
+        quotePool[quote.id] = quote
+
+        let existing = textStorage.string as NSString
+        let needsLeadingNewline = range.location > 0
+            && existing.substring(
+                with: NSRange(location: range.location - 1, length: 1)) != "\n"
+
+        var attributes = Self.typingAttributes
+        attributes[.paragraphStyle] = Self.quoteParagraphStyle
+        attributes[.feedbackQuoteID] = quote.id.uuidString
+        attributes[.foregroundColor] = NSColor.secondaryLabelColor
+
+        let block = NSMutableAttributedString()
+        if needsLeadingNewline {
+            block.append(NSAttributedString(
+                string: "\n", attributes: Self.typingAttributes))
+        }
+        block.append(NSAttributedString(string: quote.text, attributes: attributes))
+        // Trailing newline is PLAIN, so what the user types next is not
+        // swallowed into the quote's styling.
+        block.append(NSAttributedString(string: "\n", attributes: Self.typingAttributes))
+
+        textStorage.beginEditing()
+        textStorage.replaceCharacters(in: range, with: block)
+        textStorage.endEditing()
+        syncAttachments()
+        return NSRange(location: range.location, length: block.length)
+    }
 
     /// Next chip number. Monotonic and never reset within a pane session:
     /// numbers are STABLE, not positional. Deleting `[Image #2]` leaves the
@@ -221,10 +312,45 @@ final class ViewerFeedbackModel: ObservableObject {
             seen.insert(chip.chipID)
             found.append(entry)
         }
-        guard found != attachments || found.count != attachments.count else { return }
-        attachments = found
-        if let selected = selectedChipID, !seen.contains(selected) {
-            selectedChipID = nil
+        if found != attachments || found.count != attachments.count {
+            attachments = found
+            if let selected = selectedChipID, !seen.contains(selected) {
+                selectedChipID = nil
+            }
+        }
+        syncQuotes()
+    }
+
+    /// Recompute `quotes` from the runs still carrying a quote attribute, so
+    /// deleting a quote block drops its references from the report too.
+    private func syncQuotes() {
+        var found: [ViewerFeedbackQuote] = []
+        var seen = Set<UUID>()
+        let full = NSRange(location: 0, length: textStorage.length)
+        textStorage.enumerateAttribute(.feedbackQuoteID, in: full) { value, _, _ in
+            guard let raw = value as? String, let id = UUID(uuidString: raw),
+                  let quote = quotePool[id], !seen.contains(id)
+            else { return }
+            seen.insert(id)
+            found.append(quote)
+        }
+        guard found != quotes else { return }
+        quotes = found
+    }
+
+    /// Next quote number (monotonic, never reused — same rule as chips).
+    func takeQuoteNumber() -> Int {
+        defer { nextQuoteNumber += 1 }
+        return nextQuoteNumber
+    }
+
+    /// Update a quote's resolved references (the source line found at send
+    /// time). Returns the updated list.
+    func quotesWithSourceLines(_ lines: [UUID: Int]) -> [ViewerFeedbackQuote] {
+        quotes.map { quote in
+            var copy = quote
+            copy.sourceLine = lines[quote.id]
+            return copy
         }
     }
 
@@ -254,23 +380,35 @@ final class ViewerFeedbackModel: ObservableObject {
     }
 
     /// The composed message as ordered segments, ready for the report writer.
+    ///
+    /// Walks the storage once, splitting at every chip AND every quote run, so
+    /// the body preserves the order the user actually wrote things in.
     func segments() -> [ViewerFeedbackReport.Segment] {
         var segments: [ViewerFeedbackReport.Segment] = []
         var pending = ""
-        let full = NSRange(location: 0, length: textStorage.length)
-        textStorage.enumerateAttribute(.attachment, in: full) { value, range, _ in
-            let piece = textStorage.attributedSubstring(from: range).string
-            if let chip = value as? ViewerFeedbackChipAttachment {
-                if !pending.isEmpty {
-                    segments.append(.text(pending))
-                    pending = ""
-                }
-                segments.append(.image(number: chip.number))
-            } else {
-                pending += piece
-            }
+        func flush() {
+            guard !pending.isEmpty else { return }
+            segments.append(.text(pending))
+            pending = ""
         }
-        if !pending.isEmpty { segments.append(.text(pending)) }
+
+        let full = NSRange(location: 0, length: textStorage.length)
+        textStorage.enumerateAttributes(in: full) { attributes, range, _ in
+            let piece = textStorage.attributedSubstring(from: range).string
+            if let chip = attributes[.attachment] as? ViewerFeedbackChipAttachment {
+                flush()
+                segments.append(.image(number: chip.number))
+                return
+            }
+            if let raw = attributes[.feedbackQuoteID] as? String,
+               let id = UUID(uuidString: raw), let quote = quotePool[id] {
+                flush()
+                segments.append(.quote(number: quote.number, text: piece))
+                return
+            }
+            pending += piece
+        }
+        flush()
         return segments
     }
 
@@ -322,12 +460,55 @@ final class ViewerFeedbackTextView: NSTextView {
             onSend?()
             return true
         }
+        if Self.isSnapshotShortcut(event) {
+            captureScreenshot()
+            return true
+        }
         return super.performKeyEquivalent(with: event)
+    }
+
+    /// Paint quote blocks: a soft background panel with an accent bar down the
+    /// left edge, so a quoted passage reads as quoted rather than as more
+    /// prose. Drawn here (behind the glyphs) rather than as a background-color
+    /// attribute, which paints only tight line boxes with no bar and no
+    /// rounding.
+    override func drawBackground(in rect: NSRect) {
+        super.drawBackground(in: rect)
+        guard let layoutManager, let container = textContainer,
+              let storage = textStorage, storage.length > 0
+        else { return }
+
+        let origin = textContainerOrigin
+        let full = NSRange(location: 0, length: storage.length)
+        storage.enumerateAttribute(.feedbackQuoteID, in: full) { value, range, _ in
+            guard value != nil else { return }
+            let glyphs = layoutManager.glyphRange(
+                forCharacterRange: range, actualCharacterRange: nil)
+            var box = layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
+            box.origin.x += origin.x
+            box.origin.y += origin.y
+            // Full-width panel: a quote is a block, so the backdrop should not
+            // stop at the ragged right edge of its last line.
+            box.origin.x = origin.x
+            box.size.width = container.size.width - origin.x
+            box = box.insetBy(dx: 0, dy: -2)
+
+            NSColor.controlAccentColor.withAlphaComponent(0.07).setFill()
+            NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill()
+
+            let bar = NSRect(x: box.minX + 1, y: box.minY, width: 3, height: box.height)
+            NSColor.controlAccentColor.withAlphaComponent(0.55).setFill()
+            NSBezierPath(roundedRect: bar, xRadius: 1.5, yRadius: 1.5).fill()
+        }
     }
 
     override func keyDown(with event: NSEvent) {
         if Self.isSendShortcut(event) {
             onSend?()
+            return
+        }
+        if Self.isSnapshotShortcut(event) {
+            captureScreenshot()
             return
         }
         super.keyDown(with: event)
@@ -337,6 +518,20 @@ final class ViewerFeedbackTextView: NSTextView {
         guard event.modifierFlags.contains(.command) else { return false }
         // Return (36) and the numeric keypad's Enter (76).
         return event.keyCode == 36 || event.keyCode == 76
+    }
+
+    /// ⇧⌘S — add a screenshot without leaving the keyboard.
+    ///
+    /// Chosen because it collides with nothing: the app's shift+cmd letters are
+    /// t/z/w/d/f/g/v/n/r/[/], macOS's own capture shortcuts are ⇧⌘3/4/5, and
+    /// this is only handled while the composer has focus, so it cannot shadow
+    /// anything elsewhere in the app.
+    static func isSnapshotShortcut(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command), flags.contains(.shift),
+              !flags.contains(.option), !flags.contains(.control)
+        else { return false }
+        return event.charactersIgnoringModifiers?.lowercased() == "s"
     }
 
     override func cancelOperation(_ sender: Any?) {

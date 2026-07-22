@@ -933,6 +933,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // user can keep typing during it.
         let segments = feedbackModel.segments()
         let images = feedbackModel.imagePayloads()
+        let quotes = feedbackModel.quotes
 
         readPageContext { [weak self] pageTitle, selection in
             guard let self else { return }
@@ -950,7 +951,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             context.appVersion = Bundle.main
                 .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             self.writeFeedback(
-                segments: segments, images: images,
+                segments: segments, images: images, quotes: quotes,
                 worktree: worktree, context: context)
         }
     }
@@ -1000,18 +1001,40 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private func writeFeedback(
         segments: [ViewerFeedbackReport.Segment],
         images: [ViewerFeedbackReport.Image],
+        quotes: [ViewerFeedbackQuote],
         worktree: ViewerWorktree,
         context: ViewerFeedbackReport.Context
     ) {
+        let filePath = fileURL?.path
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var context = context
             let revision = ViewerWorktreeResolver.revision(at: worktree.path)
             context.branch = revision.branch
             context.commit = revision.commit
 
+            // Locate each quote in the SOURCE file. Mapping rendered DOM back
+            // to markdown source is unreliable; searching the file for the
+            // passage is not, and a line number is what a reader actually
+            // wants. Web pages have no source file, so they get nil.
+            let sourceText = filePath.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+            let payloadQuotes = quotes.map { quote in
+                ViewerFeedbackReport.Quote(
+                    number: quote.number,
+                    text: quote.text,
+                    headingID: quote.headingID,
+                    headingText: quote.headingText,
+                    blockSelector: quote.blockSelector,
+                    blockText: quote.blockText,
+                    offsetInBlock: quote.offsetInBlock,
+                    documentOffset: quote.documentOffset,
+                    sourceLine: sourceText.flatMap {
+                        Self.lineNumber(of: quote.text, in: $0)
+                    })
+            }
+
             let result = Result {
                 try ViewerFeedbackReport.write(
-                    segments: segments, images: images,
+                    segments: segments, images: images, quotes: payloadQuotes,
                     worktree: worktree, context: context)
             }
             DispatchQueue.main.async {
@@ -1046,6 +1069,40 @@ final class ViewerView: NSView, Codable, ObservableObject {
               let pane = controller.surfaceTree.first(where: { $0.viewerView === self })
         else { return nil }
         return pane.id.uuidString
+    }
+
+    /// The 1-based line in `source` where a quoted passage appears, or nil.
+    ///
+    /// The quote comes from RENDERED text, so it rarely matches the source
+    /// byte-for-byte (markdown syntax, wrapped lines, collapsed whitespace).
+    /// So: try the whole passage first, then its first line, then a
+    /// whitespace-normalized comparison — and give up honestly rather than
+    /// report a line that might be wrong.
+    static func lineNumber(of quote: String, in source: String) -> Int? {
+        let lines = source.components(separatedBy: .newlines)
+        func normalize(_ text: String) -> String {
+            text.components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+                .lowercased()
+        }
+
+        let needle = quote.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return nil }
+        // Wrapped rendering means only the first line is likely contiguous.
+        let firstLine = needle
+            .components(separatedBy: .newlines)
+            .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? needle
+
+        for (index, line) in lines.enumerated() where line.contains(firstLine) {
+            return index + 1
+        }
+        let target = normalize(firstLine)
+        guard !target.isEmpty else { return nil }
+        for (index, line) in lines.enumerated() where normalize(line).contains(target) {
+            return index + 1
+        }
+        return nil
     }
 
     /// A path expressed relative to a containing directory, or nil when it is
@@ -1089,8 +1146,45 @@ final class ViewerView: NSView, Codable, ObservableObject {
             setTOCItems(ViewerTOCItem.list(from: raw))
         case "active":
             activeHeadingID = payload["id"] as? String
+        case "quote":
+            handleQuoteMessage(payload)
         default:
             break
+        }
+    }
+
+    /// The page's selection toolbar sent a passage to quote. Opens the
+    /// composer if it is closed — quoting is a request to write feedback — and
+    /// inserts the passage as its own block at the caret.
+    private func handleQuoteMessage(_ payload: [String: Any]) {
+        guard worktree != nil else { return }
+        let text = (payload["text"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { return }
+
+        var quote = ViewerFeedbackQuote(
+            number: feedbackModel.takeQuoteNumber(), text: text)
+        quote.headingID = (payload["headingId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.headingText = (payload["headingText"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.blockSelector = (payload["blockSelector"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.blockText = (payload["blockText"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.offsetInBlock = (payload["offsetInBlock"] as? Int).flatMap { $0 < 0 ? nil : $0 }
+        quote.documentOffset = (payload["documentOffset"] as? Int).flatMap { $0 < 0 ? nil : $0 }
+
+        setFeedbackOpen(true)
+        // Mount/focus first, then insert at wherever the caret ended up, so
+        // the quote lands in the flow the user is writing rather than always
+        // at the top.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let feedbackHost = self.feedbackHost,
+                  let textView = Self.firstTextView(in: feedbackHost) else { return }
+            let caret = textView.selectedRange()
+            let inserted = self.feedbackModel.insertQuote(quote, at: caret)
+            textView.setSelectedRange(
+                NSRange(location: inserted.location + inserted.length, length: 0))
+            textView.didChangeText()
+            textView.scrollRangeToVisible(textView.selectedRange())
+            self.window?.makeFirstResponder(textView)
         }
     }
 

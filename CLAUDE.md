@@ -389,11 +389,33 @@ the queue; consuming it is separate and not built here).
   toggling the toolbar closed/open and a detach/undo (they live on the pane,
   not the toolbar).
 
+  **⇧⌘S** adds a screenshot from the keyboard while the composer has focus
+  (free: the app's shift+cmd letters are t/z/w/d/f/g/v/n/r/[/], and macOS's own
+  capture shortcuts are ⇧⌘3/4/5).
+
   The text view **must** override `readablePasteboardTypes` to include image
   types. AppKit validates the Edit▸Paste menu item against that list, so
   without it Cmd-V is *disabled* for an image-only clipboard and the paste
   override never runs — a silent no-op. `importsGraphics = true` does **not**
   add those types; only the override does.
+- **Quoting.** Selecting text in a viewer pops a small **Quote / Copy**
+  toolbar above the selection. *Copy* puts it on the clipboard; *Quote* opens
+  the composer (if closed) and inserts the passage at the caret as its own
+  block — indented, with a tinted panel and an accent bar down the left, drawn
+  in `drawBackground(in:)` (a background-color attribute paints only tight line
+  boxes, with no bar and no rounding). The run carries a `feedbackQuoteID`
+  attribute, so deleting it drops its metadata from the report — the same
+  derive-from-storage rule the image carousel uses. The body renders it as a
+  real markdown blockquote.
+
+  Each quote carries **referential context** so an agent can find what was
+  being discussed (text alone is ambiguous — the same sentence can appear
+  twice): the containing section's `headingId`/`headingText`, the containing
+  block's `blockSelector` and full `blockText`, `offsetInBlock`,
+  `documentOffset`, and — for file viewers — a 1-based **`sourceLine`**,
+  resolved natively at send time by searching the file for the passage
+  (mapping rendered DOM back to markdown source is unreliable; searching is
+  not). It reports nil rather than a confidently wrong line.
 - **Report output.** One **self-contained folder per submission**, so a report
   can be moved or handed to an agent as a unit:
 
@@ -414,8 +436,8 @@ the queue; consuming it is separate and not built here).
   follow-ups: `source` (`location`, `kind`, `filePath`, **`relativePath`** —
   repo-relative, `pageTitle`, **`selection`** — the text the user had selected,
   i.e. what they were pointing at, `paneID`, `viewport`), `worktree` (`path`,
-  `name`, **`branch`**, **`commit`** — the exact revision they saw), `app`, and
-  `images` (with pixel dimensions and byte size). On success the composer
+  `name`, **`branch`**, **`commit`** — the exact revision they saw), `app`,
+  `quotes` (see above), and `images` (with pixel dimensions and byte size). On success the composer
   clears and the toolbar shows a "Filed …" confirmation before closing.
 
 ## Session Persistence

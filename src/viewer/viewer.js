@@ -273,6 +273,218 @@
     scrollToHeading(target);
   });
 
+  /* ---------------------------------------------------------------------
+   * Selection toolbar
+   *
+   * Selecting text pops a small toolbar with Quote and Copy. Quote hands the
+   * selection to the native feedback composer along with enough REFERENTIAL
+   * context that an agent reading the report can find what was being
+   * discussed: the section it sits under, the containing block's full text,
+   * and the offsets of the quote inside that block and inside the document.
+   * Text alone is ambiguous — the same sentence can appear twice.
+   * ------------------------------------------------------------------- */
+
+  let selectionBar = null;
+
+  function buildSelectionBar() {
+    const bar = document.createElement("div");
+    bar.className = "viewer-selbar";
+    bar.setAttribute("role", "toolbar");
+    // The toolbar must never become part of what the user is quoting.
+    bar.setAttribute("data-viewer-ui", "true");
+
+    const quote = document.createElement("button");
+    quote.type = "button";
+    quote.className = "viewer-selbar-btn";
+    quote.textContent = "Quote";
+    quote.addEventListener("mousedown", function (event) {
+      // mousedown, not click: a click would first collapse the selection.
+      event.preventDefault();
+      event.stopPropagation();
+      sendQuote();
+    });
+
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "viewer-selbar-btn";
+    copy.textContent = "Copy";
+    copy.addEventListener("mousedown", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      copySelection(copy);
+    });
+
+    bar.appendChild(quote);
+    bar.appendChild(copy);
+    document.body.appendChild(bar);
+    return bar;
+  }
+
+  function selectionBarElement() {
+    if (!selectionBar || !document.body.contains(selectionBar)) {
+      selectionBar = buildSelectionBar();
+    }
+    return selectionBar;
+  }
+
+  function hideSelectionBar() {
+    if (selectionBar) selectionBar.classList.remove("is-visible");
+  }
+
+  /* The live selection, but only when it is a real, non-collapsed range
+   * inside the rendered content (never inside our own toolbar). */
+  function contentSelection() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+    const text = String(selection).trim();
+    if (!text) return null;
+    const range = selection.getRangeAt(0);
+    let node = range.commonAncestorContainer;
+    if (node.nodeType === 3) node = node.parentNode;
+    if (!node || !content.contains(node)) return null;
+    if (node.closest && node.closest("[data-viewer-ui]")) return null;
+    return { selection: selection, range: range, text: text };
+  }
+
+  function showSelectionBarForRange(range) {
+    const rect = range.getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) return;
+    const bar = selectionBarElement();
+    bar.classList.add("is-visible");
+    // Measure after making it visible, then clamp inside the viewport.
+    const barRect = bar.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - barRect.width / 2;
+    left = Math.max(6, Math.min(left, window.innerWidth - barRect.width - 6));
+    let top = rect.top - barRect.height - 8;
+    // No room above the selection: sit below it instead.
+    if (top < 4) top = rect.bottom + 8;
+    bar.style.left = left + window.scrollX + "px";
+    bar.style.top = top + window.scrollY + "px";
+  }
+
+  function updateSelectionBar() {
+    const found = contentSelection();
+    if (!found) {
+      hideSelectionBar();
+      return;
+    }
+    showSelectionBarForRange(found.range);
+  }
+
+  /* A CSS path for a node, stable enough to re-find the block later. */
+  function selectorFor(node) {
+    if (!node || node === content) return "";
+    const parts = [];
+    let current = node;
+    while (current && current !== content && current.nodeType === 1 && parts.length < 8) {
+      if (current.id) {
+        parts.unshift("#" + current.id);
+        break;
+      }
+      const parent = current.parentNode;
+      let index = 1;
+      if (parent) {
+        for (const sibling of parent.children) {
+          if (sibling === current) break;
+          if (sibling.tagName === current.tagName) index += 1;
+        }
+      }
+      parts.unshift(current.tagName.toLowerCase() + ":nth-of-type(" + index + ")");
+      current = parent;
+    }
+    return parts.join(" > ");
+  }
+
+  /* The block-level element a node sits in — the unit worth quoting around. */
+  function blockFor(node) {
+    let current = node.nodeType === 3 ? node.parentNode : node;
+    const blocks = "P,LI,BLOCKQUOTE,PRE,TD,TH,H1,H2,H3,H4,H5,H6,DD,DT,FIGCAPTION";
+    while (current && current !== content) {
+      if (current.matches && current.matches(blocks)) return current;
+      current = current.parentNode;
+    }
+    return content;
+  }
+
+  /* The heading whose section contains a node. */
+  function headingFor(node) {
+    let element = node.nodeType === 3 ? node.parentNode : node;
+    const all = Array.prototype.slice.call(
+      content.querySelectorAll("h1, h2, h3, h4, h5, h6"));
+    if (!all.length) return null;
+    let best = null;
+    for (const heading of all) {
+      const position = heading.compareDocumentPosition(element);
+      // Node comes after this heading in document order.
+      if (position & Node.DOCUMENT_POSITION_FOLLOWING) best = heading;
+    }
+    return best;
+  }
+
+  /* Character offset of a range's start within an ancestor's text. */
+  function offsetWithin(ancestor, range) {
+    try {
+      const probe = document.createRange();
+      probe.selectNodeContents(ancestor);
+      probe.setEnd(range.startContainer, range.startOffset);
+      return probe.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  function sendQuote() {
+    const found = contentSelection();
+    if (!found) return;
+    const range = found.range;
+    const block = blockFor(range.startContainer);
+    const heading = headingFor(range.startContainer);
+    post({
+      type: "quote",
+      text: found.text,
+      headingId: heading ? heading.id : "",
+      headingText: heading ? heading.textContent.trim() : "",
+      blockSelector: selectorFor(block),
+      blockText: block ? block.textContent.trim() : "",
+      offsetInBlock: block ? offsetWithin(block, range) : -1,
+      documentOffset: offsetWithin(content, range),
+    });
+    hideSelectionBar();
+    window.getSelection().removeAllRanges();
+  }
+
+  function copySelection(button) {
+    const found = contentSelection();
+    if (!found) return;
+    const restore = function () { button.textContent = "Copy"; };
+    const done = function () {
+      button.textContent = "Copied";
+      setTimeout(restore, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(found.text).then(done, done);
+    } else {
+      try {
+        document.execCommand("copy");
+      } catch (e) { /* nothing else to try */ }
+      done();
+    }
+  }
+
+  document.addEventListener("mouseup", function () {
+    // After the mouseup that finished the drag, so the range is final.
+    setTimeout(updateSelectionBar, 0);
+  });
+  document.addEventListener("keyup", function (event) {
+    if (event.shiftKey || event.key === "Escape") setTimeout(updateSelectionBar, 0);
+  });
+  document.addEventListener("mousedown", function (event) {
+    if (event.target.closest && event.target.closest("[data-viewer-ui]")) return;
+    hideSelectionBar();
+  });
+  window.addEventListener("scroll", hideSelectionBar, { passive: true });
+  window.addEventListener("resize", hideSelectionBar);
+
   window.__viewer = {
     setMarkdown: setMarkdown,
     setCode: setCode,

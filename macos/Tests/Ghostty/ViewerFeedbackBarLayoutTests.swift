@@ -102,6 +102,24 @@ struct ViewerFeedbackBarLayoutTests {
                 "input \(inputFrame.width) is crowded by controls \(actionsWidth)")
     }
 
+    /// The corner radius is exactly what a one-line pill needs, and does NOT
+    /// track height beyond that.
+    ///
+    /// A `Capsule` recomputes radius as height/2 at every height, so a grown
+    /// composer stops being a pill and becomes an oval. Pinning the radius to
+    /// half the COLLAPSED height is what keeps the corners fixed while the
+    /// straight sides lengthen.
+    @Test func pillCornerRadiusIsFixedAtTheOneLineValue() {
+        // At one line the shape is a true capsule: radius == half the height.
+        #expect(ViewerFeedbackBar.pillCornerRadius * 2
+                == ViewerFeedbackBar.collapsedPillHeight)
+        // Grown, the radius is strictly less than half the height — i.e. the
+        // corners stayed put instead of rounding into an oval.
+        let grownHeight = ViewerFeedbackBar.maxInputHeight
+            + ViewerFeedbackBar.pillVerticalPadding * 2
+        #expect(ViewerFeedbackBar.pillCornerRadius < grownHeight / 2)
+    }
+
     /// The pill starts at one line and grows as the report is written, rather
     /// than committing a tall box up front — and is capped so it can never
     /// swallow the pane it is describing.

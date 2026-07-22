@@ -25,6 +25,23 @@ struct ViewerFeedbackBar: View {
     private static let thumbnailHeight: CGFloat = 52
     /// Diameter of the in-pill circular buttons.
     static let actionButtonSize: CGFloat = 24
+    static let pillVerticalPadding: CGFloat = 5
+
+    /// The pill's height with the input collapsed to a single line. The
+    /// circular actions are the taller element at that point, so they set it.
+    static var collapsedPillHeight: CGFloat {
+        max(minInputHeight, actionButtonSize) + pillVerticalPadding * 2
+    }
+
+    /// Corner radius, FIXED at half the collapsed height.
+    ///
+    /// Deliberately not a `Capsule`: a capsule recomputes its radius as
+    /// height/2 at every height, so a pill that grows to six lines stops being
+    /// a pill and becomes an oval. Pinning the radius to the one-line value
+    /// keeps the corners exactly as round as they start and lets the straight
+    /// sides lengthen instead — a true capsule at one line, the same corner
+    /// roundness beyond it.
+    static var pillCornerRadius: CGFloat { collapsedPillHeight / 2 }
 
     private var inputHeight: CGFloat {
         min(max(contentHeight, Self.minInputHeight), Self.maxInputHeight)
@@ -63,12 +80,14 @@ struct ViewerFeedbackBar: View {
             sendButton
         }
         .padding(.leading, 12)
-        .padding(.trailing, 5)
-        .padding(.vertical, 5)
-        .background(
-            Capsule(style: .continuous)
-                .fill(.quaternary.opacity(0.5))
-                .overlay(Capsule(style: .continuous).strokeBorder(.quaternary, lineWidth: 1)))
+        .padding(.trailing, Self.pillVerticalPadding)
+        .padding(.vertical, Self.pillVerticalPadding)
+        .background(pillShape.fill(.quaternary.opacity(0.5)))
+        .overlay(pillShape.strokeBorder(.quaternary, lineWidth: 1))
+    }
+
+    private var pillShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: Self.pillCornerRadius, style: .continuous)
     }
 
     /// Grab a region of the screen without leaving the composer — the whole
@@ -83,7 +102,7 @@ struct ViewerFeedbackBar: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
-        .help("Add a screenshot of the screen")
+        .help("Add a screenshot of the screen (⇧⌘S)")
         .accessibilityLabel("Add screenshot")
     }
 
@@ -182,7 +201,7 @@ struct ViewerFeedbackBar: View {
                 }
             }
             Spacer()
-            Text("⌘↩ send · ⎋ close")
+            Text("⌘↩ send · ⇧⌘S shot · ⎋ close")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }

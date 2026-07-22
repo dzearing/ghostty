@@ -43,6 +43,21 @@ enum ViewerFeedbackReport {
         case text(String)
         /// A pasted-image chip, identified by its stable display number.
         case image(number: Int)
+        /// A passage quoted out of the page, rendered as a markdown blockquote.
+        case quote(number: Int, text: String)
+    }
+
+    /// A quoted passage plus the references that let a reader locate it.
+    struct Quote: Equatable {
+        let number: Int
+        let text: String
+        var headingID: String?
+        var headingText: String?
+        var blockSelector: String?
+        var blockText: String?
+        var offsetInBlock: Int?
+        var documentOffset: Int?
+        var sourceLine: Int?
     }
 
     /// A pasted image, already encoded.
@@ -152,6 +167,16 @@ enum ViewerFeedbackReport {
                 return text
             case .image(let number):
                 return "![Image #\(number)](\(imageRelativePath(number: number)))"
+            case .quote(_, let text):
+                // A real markdown blockquote, so the body reads correctly in
+                // any viewer. The structured references for each quote live in
+                // the report's `quotes` array, matched by identical text.
+                let quoted = text
+                    .trimmingCharacters(in: .newlines)
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { "> " + $0 }
+                    .joined(separator: "\n")
+                return "\n" + quoted + "\n"
             }
         }.joined()
     }
@@ -160,8 +185,13 @@ enum ViewerFeedbackReport {
     /// whether a submission is empty.
     static func plainText(segments: [Segment]) -> String {
         segments.map { segment -> String in
-            if case .text(let text) = segment { return text }
-            return ""
+            switch segment {
+            case .text(let text): return text
+            // A quote counts as content: quoting a passage and hitting send
+            // with no prose is a legitimate report ("this bit is wrong").
+            case .quote(_, let text): return text
+            case .image: return ""
+            }
         }.joined()
     }
 
@@ -182,6 +212,7 @@ enum ViewerFeedbackReport {
     static func write(
         segments: [Segment],
         images: [Image],
+        quotes: [Quote] = [],
         worktree: ViewerWorktree,
         context: Context,
         date: Date = Date(),
@@ -248,6 +279,15 @@ enum ViewerFeedbackReport {
                 branch: context.branch,
                 commit: context.commit),
             app: PayloadApp(name: "Ghoztty", version: context.appVersion),
+            quotes: quotes.map {
+                PayloadQuote(
+                    number: $0.number, text: $0.text,
+                    headingId: $0.headingID, headingText: $0.headingText,
+                    blockSelector: $0.blockSelector, blockText: $0.blockText,
+                    offsetInBlock: $0.offsetInBlock,
+                    documentOffset: $0.documentOffset,
+                    sourceLine: $0.sourceLine)
+            },
             images: sorted.map {
                 PayloadImage(
                     number: $0.number,
@@ -312,6 +352,18 @@ enum ViewerFeedbackReport {
         let commit: String?
     }
 
+    private struct PayloadQuote: Codable {
+        let number: Int
+        let text: String
+        let headingId: String?
+        let headingText: String?
+        let blockSelector: String?
+        let blockText: String?
+        let offsetInBlock: Int?
+        let documentOffset: Int?
+        let sourceLine: Int?
+    }
+
     private struct PayloadApp: Codable {
         let name: String
         let version: String?
@@ -325,6 +377,7 @@ enum ViewerFeedbackReport {
         let source: PayloadSource
         let worktree: PayloadWorktree
         let app: PayloadApp
+        let quotes: [PayloadQuote]
         let images: [PayloadImage]
     }
 }
