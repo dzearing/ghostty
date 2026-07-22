@@ -433,7 +433,9 @@ final class ViewerFeedbackModel: ObservableObject {
         textStorage.setAttributedString(NSAttributedString(string: ""))
         textStorage.endEditing()
         pool.removeAll()
+        quotePool.removeAll()
         nextNumber = 1
+        nextQuoteNumber = 1
         selectedChipID = nil
         syncAttachments()
     }
@@ -536,6 +538,20 @@ final class ViewerFeedbackTextView: NSTextView {
 
     override func cancelOperation(_ sender: Any?) {
         onEscape?()
+    }
+
+    /// Typing must never inherit a quote's styling.
+    ///
+    /// AppKit carries `typingAttributes` over from the text around the caret —
+    /// including from text that has just been DELETED. So selecting all,
+    /// deleting, and typing left the caret holding the quote's paragraph
+    /// style, color, AND its `feedbackQuoteID`: everything newly typed became
+    /// part of a quote, with no way out (and `syncQuotes` would resurrect the
+    /// deleted quote's metadata from it). A quote is inserted as a whole
+    /// block; nothing typed afterwards belongs to it.
+    func sanitizeTypingAttributes() {
+        guard typingAttributes[.feedbackQuoteID] != nil else { return }
+        typingAttributes = ViewerFeedbackModel.typingAttributes
     }
 
     /// Paste an image from the clipboard as a chip; paste anything else as

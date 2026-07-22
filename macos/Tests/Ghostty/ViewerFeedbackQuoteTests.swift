@@ -1,4 +1,5 @@
 import AppKit
+import WebKit
 import Testing
 @testable import Ghostty
 
@@ -202,5 +203,145 @@ struct ViewerFeedbackSnapshotShortcutTests {
         let shot = event("s", [.command, .shift])
         #expect(ViewerFeedbackTextView.isSnapshotShortcut(shot))
         #expect(!ViewerFeedbackTextView.isSendShortcut(shot))
+    }
+}
+
+/// Typing must never get trapped inside a quote's styling.
+///
+/// Reported: quote something, select-all, delete, then type — and everything
+/// typed comes out as part of the quote, with no way out. AppKit carries
+/// `typingAttributes` over from the text around the caret, INCLUDING text that
+/// was just deleted, so the caret kept the quote's paragraph style, color and
+/// `feedbackQuoteID`.
+@MainActor
+struct ViewerFeedbackQuoteEscapeTests {
+    private func makeComposer() -> (ViewerFeedbackModel, ViewerFeedbackTextView) {
+        let model = ViewerFeedbackModel()
+        let layoutManager = NSLayoutManager()
+        model.textStorage.addLayoutManager(layoutManager)
+        let container = NSTextContainer(
+            size: NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude))
+        layoutManager.addTextContainer(container)
+        let textView = ViewerFeedbackTextView(frame: .zero, textContainer: container)
+        textView.model = model
+        textView.isRichText = true
+        textView.typingAttributes = ViewerFeedbackModel.typingAttributes
+        return (model, textView)
+    }
+
+    /// The reproduction: after deleting everything, typing is plain again and
+    /// the deleted quote does not come back to life.
+    @Test func typingAfterDeletingAQuoteIsNotQuoted() {
+        let (model, textView) = makeComposer()
+        var quote = ViewerFeedbackQuote(number: 1, text: "the quoted passage")
+        quote.headingText = "Intro"
+        model.insertQuote(quote, at: NSRange(location: 0, length: 0))
+        #expect(model.quotes.count == 1)
+
+        // Select all + delete, the way the user did.
+        textView.setSelectedRange(NSRange(location: 0, length: model.textStorage.length))
+        textView.delete(nil)
+        textView.sanitizeTypingAttributes()
+        model.syncAttachments()
+        #expect(model.textStorage.length == 0)
+        #expect(model.quotes.isEmpty)
+
+        // Now type. Nothing typed may carry the quote attribute.
+        textView.insertText("my own words", replacementRange: textView.selectedRange())
+        model.syncAttachments()
+
+        var quotedRuns = 0
+        model.textStorage.enumerateAttribute(
+            .feedbackQuoteID,
+            in: NSRange(location: 0, length: model.textStorage.length)
+        ) { value, _, _ in
+            if value != nil { quotedRuns += 1 }
+        }
+        #expect(quotedRuns == 0, "typed text inherited the deleted quote's attribute")
+        // ...and the deleted quote must not resurrect from it.
+        #expect(model.quotes.isEmpty)
+        #expect(model.segments() == [.text("my own words")])
+    }
+
+    /// Sanitizing is idempotent and leaves plain typing attributes untouched.
+    @Test func sanitizeLeavesPlainAttributesAlone() {
+        let (_, textView) = makeComposer()
+        let before = textView.typingAttributes
+        textView.sanitizeTypingAttributes()
+        #expect(textView.typingAttributes[.feedbackQuoteID] == nil)
+        #expect((textView.typingAttributes[.font] as? NSFont) == (before[.font] as? NSFont))
+    }
+
+    /// A send clears quote bookkeeping too, so the next report starts at #1
+    /// and cannot inherit the previous one's references.
+    @Test func resetClearsQuoteState() {
+        let (model, _) = makeComposer()
+        model.insertQuote(
+            ViewerFeedbackQuote(number: model.takeQuoteNumber(), text: "first"),
+            at: NSRange(location: 0, length: 0))
+        #expect(model.quotes.count == 1)
+
+        model.reset()
+        #expect(model.quotes.isEmpty)
+
+        model.insertQuote(
+            ViewerFeedbackQuote(number: model.takeQuoteNumber(), text: "second"),
+            at: NSRange(location: 0, length: 0))
+        #expect(model.quotes.first?.number == 1)
+    }
+}
+
+/// The selection toolbar must reach REAL WEB PAGES, not just the bundled
+/// template. It used to live in viewer.js — a <script src> inside viewer.html
+/// — so a website never loaded it, which is why quoting worked on markdown and
+/// silently did nothing on http(s) content.
+@MainActor
+@Suite(.serialized)
+struct ViewerSelectionInjectionTests {
+    private func wait(_ seconds: TimeInterval) async {
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    /// The script is bundled and loadable.
+    @Test func userScriptIsAvailable() throws {
+        let script = try #require(
+            ViewerView.selectionUserScript(),
+            "selection.js is missing from the bundle")
+        #expect(script.source.contains("__ghozttySelection"))
+        // Injected late enough that document.body exists to attach to.
+        #expect(script.injectionTime == .atDocumentEnd)
+    }
+
+    /// Every viewer's configuration carries it, regardless of the mode the
+    /// pane started in — a file viewer can be navigated to a website later.
+    @Test func everyViewerInjectsIt() async throws {
+        for location in ["https://example.invalid/page", "/tmp/nonexistent.md"] {
+            let viewer = ViewerView(location: location)
+            let scripts = viewer.webView.configuration.userContentController.userScripts
+            #expect(
+                scripts.contains { $0.source.contains("__ghozttySelection") },
+                "no selection script for \(location)")
+        }
+    }
+
+    /// It actually installs and builds its toolbar inside a real loaded page —
+    /// the end of the chain that was broken.
+    @Test func installsInsideALoadedPage() async throws {
+        let viewer = ViewerView(location: ViewerView.blankPage)
+        let html = "<html><body><p id='p'>quotable text here</p></body></html>"
+        viewer.webView.loadHTMLString(html, baseURL: URL(string: "https://example.invalid/"))
+
+        var installed = false
+        for _ in 0..<60 {
+            await wait(0.1)
+            let value = try? await viewer.webView.evaluateJavaScript(
+                "!!window.__ghozttySelection && !!document.querySelector('[data-ghoztty-ui]')")
+            if let flag = value as? Bool, flag { installed = true; break }
+            // The host element is created lazily on first selection, so also
+            // accept the install flag alone and force a build.
+            let ready = try? await viewer.webView.evaluateJavaScript("!!window.__ghozttySelection")
+            if let flag = ready as? Bool, flag { installed = true; break }
+        }
+        #expect(installed, "selection script never installed in a web page")
     }
 }

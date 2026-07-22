@@ -270,6 +270,27 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
+    /// The bundled selection-toolbar user script, or nil if the resource is
+    /// missing (a broken bundle degrades to "no quoting", never a crash).
+    ///
+    /// Main frame only: the toolbar positions itself in viewport coordinates,
+    /// which a subframe's own coordinate space would not match.
+    static func selectionUserScript() -> WKUserScript? {
+        guard let url = Bundle.main.url(
+            forResource: "selection",
+            withExtension: "js",
+            subdirectory: "ghostty/viewer"),
+            let source = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            logger.warning("selection.js missing from bundle; quoting disabled")
+            return nil
+        }
+        return WKUserScript(
+            source: source,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true)
+    }
+
     /// Classify a location as a website or a file to render. `about:` pages
     /// (the blank start page) count as web — they are navigable, not files.
     static func mode(for location: String) -> Mode {
@@ -331,6 +352,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // that keeps the whole pane (and its web view) alive forever.
         config.userContentController.add(
             ViewerTOCMessageProxy(viewer: self), name: Self.tocMessageName)
+
+        // Selection toolbar (Quote / Copy), injected into EVERY page.
+        //
+        // It cannot ship inside viewer.js: that is a <script src> in
+        // viewer.html, so it only ever runs on the bundled template page —
+        // which is why quoting used to work on markdown and code but never on
+        // an actual website. As a user script it runs in the template AND in
+        // arbitrary web content, which is where quoting a dev server's UI
+        // matters most.
+        if let script = Self.selectionUserScript() {
+            config.userContentController.addUserScript(script)
+        }
         self.currentURL = addressText(for: fileLocation ?? URL(string: location))
 
         let webView = WKWebView(frame: .zero, configuration: config)

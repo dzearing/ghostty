@@ -399,14 +399,24 @@ the queue; consuming it is separate and not built here).
   override never runs — a silent no-op. `importsGraphics = true` does **not**
   add those types; only the override does.
 - **Quoting.** Selecting text in a viewer pops a small **Quote / Copy**
-  toolbar above the selection. *Copy* puts it on the clipboard; *Quote* opens
+  toolbar (standard `format_quote` / `content_copy` glyphs) above the
+  selection. It lives in `src/viewer/selection.js` and is injected as a
+  **`WKUserScript` into every page** — it cannot ship inside `viewer.js`,
+  which is a `<script src>` in `viewer.html` and therefore only ever runs on
+  the bundled template, which is why quoting used to work on markdown and do
+  nothing on a website. Because it runs inside pages we do not control, its UI
+  lives in a **shadow root** so page CSS cannot restyle or hide it. *Copy* puts it on the clipboard; *Quote* opens
   the composer (if closed) and inserts the passage at the caret as its own
   block — indented, with a tinted panel and an accent bar down the left, drawn
   in `drawBackground(in:)` (a background-color attribute paints only tight line
   boxes, with no bar and no rounding). The run carries a `feedbackQuoteID`
   attribute, so deleting it drops its metadata from the report — the same
   derive-from-storage rule the image carousel uses. The body renders it as a
-  real markdown blockquote.
+  real markdown blockquote. Typing never inherits quote styling: AppKit
+  carries `typingAttributes` over from text around the caret *including text
+  just deleted*, so select-all + delete + type used to leave the user trapped
+  writing inside the quote (and resurrected its metadata). The delegate
+  refuses quote attributes at the source.
 
   Each quote carries **referential context** so an agent can find what was
   being discussed (text alone is ambiguous — the same sentence can appear

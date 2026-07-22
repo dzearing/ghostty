@@ -290,6 +290,10 @@ struct ViewerFeedbackTextEditor: NSViewRepresentable {
         guard let textView = context.coordinator.textView else { return }
         textView.onSend = onSend
         textView.onEscape = onEscape
+        // A programmatic clear (send, reset) does not post a text-change
+        // notification, so the caret can be left holding a cleared quote's
+        // attributes here too.
+        textView.sanitizeTypingAttributes()
 
         // A thumbnail was clicked: select its chip and scroll it into view.
         if context.coordinator.lastRevealToken != model.revealChipToken {
@@ -331,7 +335,28 @@ struct ViewerFeedbackTextEditor: NSViewRepresentable {
             // The user is composing again — clear a stale "filed" banner so
             // it can never be mistaken for confirmation of the NEW report.
             if model.status != nil { model.status = nil }
+            textView?.sanitizeTypingAttributes()
             reportHeight()
+        }
+
+        /// The designed hook for this: AppKit asks before adopting new typing
+        /// attributes, so a quote's attributes can be refused at the source
+        /// rather than cleaned up after the fact.
+        func textView(
+            _ textView: NSTextView,
+            shouldChangeTypingAttributes oldTypingAttributes: [String: Any],
+            toAttributes newTypingAttributes: [NSAttributedString.Key: Any]
+        ) -> [NSAttributedString.Key: Any] {
+            guard newTypingAttributes[.feedbackQuoteID] != nil else {
+                return newTypingAttributes
+            }
+            return ViewerFeedbackModel.typingAttributes
+        }
+
+        /// Moving the caret out of (or past the end of) a quote must also drop
+        /// its styling — selection changes recompute typing attributes too.
+        func textViewDidChangeSelection(_ notification: Notification) {
+            textView?.sanitizeTypingAttributes()
         }
 
         /// Push the laid-out text height up so the pill can size to content.
