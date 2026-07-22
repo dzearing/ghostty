@@ -449,7 +449,9 @@ class IPCServer {
         // Viewer window: a one-pane tree whose leaf renders the file/URL.
         if let viewLocation = parsed.view {
             DispatchQueue.main.async { [ghostty = self.ghostty, weak self] in
-                let pane = PaneView(viewer: ViewerView(location: viewLocation))
+                let pane = PaneView(viewer: ViewerView(
+                    location: viewLocation,
+                    originDirectory: parsed.config.workingDirectory))
                 let controller = TerminalController.newWindow(
                     ghostty,
                     tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
@@ -682,6 +684,7 @@ class IPCServer {
                         direction: direction,
                         ratio: ratio,
                         location: viewLocation,
+                        originDirectory: parsed.config.workingDirectory,
                         name: parsed.name)
                     return
                 }
@@ -817,6 +820,7 @@ class IPCServer {
                     direction: direction,
                     ratio: ratio,
                     location: viewLocation,
+                    originDirectory: parsed.config.workingDirectory,
                     name: parsed.name)
                 return
             }
@@ -896,9 +900,10 @@ class IPCServer {
         direction: SplitTree<PaneView>.NewDirection,
         ratio: Double,
         location: String,
+        originDirectory: String?,
         name: String?
     ) {
-        let viewer = ViewerView(location: location)
+        let viewer = ViewerView(location: location, originDirectory: originDirectory)
         guard let pane = controller.newViewerSplit(
             atPane: anchorPane,
             direction: direction,

@@ -29,7 +29,12 @@ enum ViewerCommands {
         guard let window = surfaceView.window,
               let controller = window.windowController as? BaseTerminalController else { return }
 
-        let viewer = ViewerView(location: ViewerView.blankPage)
+        // A blank pane has no content to derive provenance from, so the
+        // terminal it was opened beside supplies the origin directory — the
+        // same relationship `+split --view=` gets from `--working-directory`.
+        let viewer = ViewerView(
+            location: ViewerView.blankPage,
+            originDirectory: surfaceView.pwd)
         controller.newViewerSplit(at: surfaceView, direction: .right, viewer: viewer)
         // After the split lands and the bar's hosting view is mounted.
         DispatchQueue.main.async { viewer.focusAddressBar() }
@@ -67,6 +72,6 @@ enum ViewerCommands {
         controller.newViewerSplit(
             at: anchor,
             direction: .right,
-            viewer: ViewerView(location: location))
+            viewer: ViewerView(location: location, originDirectory: anchor.pwd))
     }
 }

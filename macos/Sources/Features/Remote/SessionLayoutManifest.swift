@@ -72,6 +72,13 @@ final class SessionLayoutManifest {
         /// before the home button decode with nil, and restore then treats the
         /// restored location as home (that viewer had never navigated).
         var viewerHomeLocation: String?
+        /// The directory the viewer pane was OPENED from (viewer leaves
+        /// only) — the fallback leg of worktree provenance for a pane showing
+        /// a remote site or a blank page, which has no directory of its own to
+        /// derive one from. Optional/additive: manifests written before
+        /// feedback capture decode with nil, and such a pane simply has no
+        /// fallback until it is reopened.
+        var viewerOriginDirectory: String?
         /// The pane's STABLE surface UUID (wp3 pane identity): restore
         /// recreates the SurfaceView with this exact uuid so the `+list`
         /// leaf `id` — and the GHOZTTY_PANE_ID env baked into the still-
@@ -563,6 +570,7 @@ final class SessionLayoutManifest {
                         kind: "viewer",
                         viewerLocation: viewer.location,
                         viewerHomeLocation: viewer.homeLocation,
+                        viewerOriginDirectory: viewer.originDirectory,
                         surfaceID: nil)
                 }
                 let view = pane.surfaceView

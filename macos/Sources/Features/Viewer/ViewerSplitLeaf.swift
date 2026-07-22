@@ -117,6 +117,28 @@ struct WebChromeBar: View {
                 .frame(maxWidth: .infinity)
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7))
                 .padding(.leading, 4)
+
+            // Feedback, trailing. Present only when the pane's content
+            // resolves to a git worktree — with nowhere to file a report, the
+            // button would be a lie.
+            //
+            // Icon only, in the same 24pt square as every other control in
+            // this bar: a text label here read as a heading rather than a
+            // button and broke the row's rhythm. The destination is not lost —
+            // it is on the tooltip, and spelled out in the composer's footer
+            // once the toolbar is open, which is when it actually matters.
+            if let worktree = viewerView.worktree {
+                Button(action: { viewerView.toggleFeedback() }) {
+                    Image(systemName: "exclamationmark.bubble")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .foregroundStyle(
+                    viewerView.feedbackOpen ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .help("Send feedback to \(worktree.path)")
+                .accessibilityLabel("Send feedback to \(worktree.name)")
+                .padding(.leading, 4)
+            }
         }
         .onAppear {
             urlText = viewerView.currentURL
@@ -139,8 +161,9 @@ struct WebChromeBar: View {
 }
 
 /// Liquid Glass on macOS 26+, translucent material bar otherwise, with a
-/// hairline bottom edge in both cases.
-private struct ChromeBarBackground: ViewModifier {
+/// hairline bottom edge in both cases. Shared by the nav bar and the feedback
+/// composer that slides in beneath it, so the two read as one stack of chrome.
+struct ChromeBarBackground: ViewModifier {
     func body(content: Content) -> some View {
         Group {
             if #available(macOS 26.0, *) {

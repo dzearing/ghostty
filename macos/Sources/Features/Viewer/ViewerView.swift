@@ -25,7 +25,31 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// http(s) URL. Follows the user as they navigate (address bar, links,
     /// back/forward), so `+list` and the session manifest report — and
     /// restore — what the pane is actually showing, not where it started.
-    private(set) var location: String
+    private(set) var location: String {
+        didSet {
+            guard location != oldValue else { return }
+            refreshWorktree()
+        }
+    }
+
+    /// The directory this pane was OPENED from: `--working-directory` at
+    /// `+split --view=` / `+new-window --view=` time, else the caller's cwd.
+    /// Fixed for the pane's life and persisted in the session manifest.
+    ///
+    /// This is the fallback leg of worktree provenance: a pane showing a
+    /// REMOTE site, a blank page, or a loopback port with nothing listening
+    /// has no content-derived directory of its own, and without this the
+    /// feedback affordance would simply vanish for those panes.
+    let originDirectory: String?
+
+    /// The git worktree the displayed content belongs to, or nil if it
+    /// belongs to none (in which case no feedback affordance appears).
+    /// Re-resolved off the main thread on every navigation.
+    @Published private(set) var worktree: ViewerWorktree?
+
+    /// Guards against a slow resolution for a location the pane has since
+    /// navigated away from overwriting the current answer.
+    private var worktreeGeneration = 0
 
     /// Display title: the file's name, or the page title once known (web).
     @Published private(set) var title: String
@@ -187,16 +211,20 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
-    convenience init(location: String) {
-        self.init(location: location, homeLocation: location)
+    convenience init(location: String, originDirectory: String? = nil) {
+        self.init(
+            location: location,
+            homeLocation: location,
+            originDirectory: originDirectory)
     }
 
     /// `homeLocation` differs from `location` only when a viewer is restored
     /// from a session manifest after the user navigated away from where the
     /// pane was originally opened — home still points at the original.
-    init(location: String, homeLocation: String) {
+    init(location: String, homeLocation: String, originDirectory: String? = nil) {
         self.location = location
         self.homeLocation = homeLocation
+        self.originDirectory = originDirectory
         self.mode = Self.mode(for: location)
         self.fileLocation = Self.mode(for: location).fileURL
         self.title = Self.initialTitle(for: location)
@@ -207,6 +235,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         setupWebView()
         load()
         startWatchingFile()
+        refreshWorktree()
     }
 
     required init?(coder: NSCoder) {
@@ -234,6 +263,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
             chromeHost = nil
             chromeTopConstraint = nil
             chromeVisible = false
+            // Same retain-cycle reasoning as the chrome bar. The composer's
+            // CONTENT is safe: it lives in `feedbackModel`, which this view
+            // owns, so an undo that re-attaches the pane brings the
+            // half-written report back with it.
+            feedbackCloseTimer?.invalidate()
+            feedbackHost?.removeFromSuperview()
+            feedbackHost = nil
+            feedbackTopConstraint = nil
+            feedbackOpen = false
             webViewTopConstraint?.constant = 0
             // Same reasoning as the chrome bar: these hosting views' root
             // views strongly reference us, so a detached pane sitting in the
@@ -251,6 +289,27 @@ final class ViewerView: NSView, Codable, ObservableObject {
         } else {
             installEventMonitor()
         }
+    }
+
+    /// The bundled selection-toolbar user script, or nil if the resource is
+    /// missing (a broken bundle degrades to "no quoting", never a crash).
+    ///
+    /// Main frame only: the toolbar positions itself in viewport coordinates,
+    /// which a subframe's own coordinate space would not match.
+    static func selectionUserScript() -> WKUserScript? {
+        guard let url = Bundle.main.url(
+            forResource: "selection",
+            withExtension: "js",
+            subdirectory: "ghostty/viewer"),
+            let source = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            logger.warning("selection.js missing from bundle; quoting disabled")
+            return nil
+        }
+        return WKUserScript(
+            source: source,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true)
     }
 
     /// Classify a location as a website or a file to render. `about:` pages
@@ -314,6 +373,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // that keeps the whole pane (and its web view) alive forever.
         config.userContentController.add(
             ViewerTOCMessageProxy(viewer: self), name: Self.tocMessageName)
+
+        // Selection toolbar (Quote / Copy), injected into EVERY page.
+        //
+        // It cannot ship inside viewer.js: that is a <script src> in
+        // viewer.html, so it only ever runs on the bundled template page —
+        // which is why quoting used to work on markdown and code but never on
+        // an actual website. As a user script it runs in the template AND in
+        // arbitrary web content, which is where quoting a dev server's UI
+        // matters most.
+        if let script = Self.selectionUserScript() {
+            config.userContentController.addUserScript(script)
+        }
         self.currentURL = addressText(for: fileLocation ?? URL(string: location))
 
         let webView = WKWebView(frame: .zero, configuration: config)
@@ -559,8 +630,11 @@ final class ViewerView: NSView, Codable, ObservableObject {
 
     /// True while the chrome bar must stay on screen regardless of hover:
     /// the compact TOC layout hosts the contents toggle there, and a control
-    /// that slides away before you can reach it is not a control.
-    private var chromeAlwaysVisible: Bool { tocLayout == .compact }
+    /// that slides away before you can reach it is not a control. The open
+    /// feedback composer pins it for the same reason — and because the
+    /// composer hangs off the bar's bottom edge, so retracting the bar would
+    /// drag the toolbar the user is typing into off screen with it.
+    private var chromeAlwaysVisible: Bool { tocLayout == .compact || feedbackOpen }
 
     /// Toggle the contents panel (the chrome bar's leading button).
     func toggleTOCPanel() {
@@ -676,7 +750,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
         if visible, chromeHost == nil {
             let host = NSHostingView(rootView: WebChromeBar(viewerView: self))
             host.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(host, positioned: .above, relativeTo: webView)
+            // Above the composer too: the composer parks behind the bar and
+            // slides out from under it.
+            addSubview(host, positioned: .above, relativeTo: feedbackHost ?? webView)
             let top = host.topAnchor.constraint(
                 equalTo: topAnchor, constant: -host.fittingSize.height)
             NSLayoutConstraint.activate([
@@ -691,31 +767,414 @@ final class ViewerView: NSView, Codable, ObservableObject {
             layoutSubtreeIfNeeded()
         }
 
-        guard let chromeHost else { return }
-        if visible { chromeHost.isHidden = false }
-        let barHeight = chromeHost.fittingSize.height
-        let barTop: CGFloat = visible ? 0 : -barHeight
-        let contentInset: CGFloat = visible ? barHeight : 0
+        guard chromeHost != nil else { return }
+        if visible { chromeHost?.isHidden = false }
+        applyTopChromeGeometry(animated: window?.isVisible == true)
+    }
+
+    /// Where the nav bar, the composer, and the content top edge belong for
+    /// the CURRENT `chromeVisible`/`feedbackOpen` state.
+    ///
+    /// One function for both, because the two are not independent: the
+    /// composer hangs off the bar's bottom edge and both reserve content
+    /// space. Computing them in separate places is how they drift into
+    /// disagreeing about where "parked" is.
+    private struct TopChromeGeometry {
+        let barTop: CGFloat
+        let composerTop: CGFloat
+        let contentInset: CGFloat
+    }
+
+    private var topChromeGeometry: TopChromeGeometry {
+        let barHeight = chromeHost?.fittingSize.height ?? 0
+        let composerHeight = feedbackHost?.fittingSize.height ?? 0
+        let barTop: CGFloat = chromeVisible ? 0 : -barHeight
+        return TopChromeGeometry(
+            barTop: barTop,
+            // Open: flush under the bar. Parked: pushed up far enough that
+            // its bottom edge meets the bar's, i.e. fully behind it.
+            composerTop: feedbackOpen
+                ? barTop + barHeight
+                : barTop + barHeight - composerHeight,
+            contentInset: chromeVisible
+                ? barHeight + (feedbackOpen ? composerHeight : 0)
+                : 0)
+    }
+
+    private func applyTopChromeGeometry(animated: Bool) {
+        let geometry = topChromeGeometry
 
         // Constraint animation only progresses while the window is actually
         // displayed; snap directly otherwise (hidden panes, tests).
-        guard window?.isVisible == true else {
-            chromeTopConstraint?.constant = barTop
-            webViewTopConstraint?.constant = contentInset
+        guard animated else {
+            chromeTopConstraint?.constant = geometry.barTop
+            feedbackTopConstraint?.constant = geometry.composerTop
+            webViewTopConstraint?.constant = geometry.contentInset
             layoutSubtreeIfNeeded()
-            if !visible { chromeHost.isHidden = true }
+            if !chromeVisible { chromeHost?.isHidden = true }
+            if !feedbackOpen { feedbackHost?.isHidden = true }
             return
         }
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.25
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            chromeTopConstraint?.animator().constant = barTop
-            webViewTopConstraint?.animator().constant = contentInset
+            chromeTopConstraint?.animator().constant = geometry.barTop
+            feedbackTopConstraint?.animator().constant = geometry.composerTop
+            webViewTopConstraint?.animator().constant = geometry.contentInset
         } completionHandler: { [weak self] in
-            if !visible, self?.chromeVisible == false {
-                self?.chromeHost?.isHidden = true
+            guard let self else { return }
+            if !self.chromeVisible { self.chromeHost?.isHidden = true }
+            if !self.feedbackOpen { self.feedbackHost?.isHidden = true }
+        }
+    }
+
+    // MARK: - Worktree provenance
+
+    /// Re-resolve which worktree the pane's content belongs to.
+    ///
+    /// Live, not one-shot: the address field lets one pane move between a
+    /// file, `localhost:3000`, and a remote site, and each of those resolves
+    /// to a different worktree or to none — so the affordance has to appear
+    /// and disappear with the content. Resolution itself is subprocess work
+    /// and runs off the main thread; a cached answer comes back
+    /// synchronously, so stepping Back and Forward never flickers the button.
+    private func refreshWorktree() {
+        worktreeGeneration += 1
+        let generation = worktreeGeneration
+        let location = self.location
+        ViewerWorktreeCache.shared.resolve(
+            location: location,
+            originDirectory: originDirectory
+        ) { [weak self] resolved in
+            guard let self, self.worktreeGeneration == generation else { return }
+            guard self.worktree != resolved else { return }
+            self.worktree = resolved
+            // The destination just changed under a composer that is already
+            // open. Closing it silently would be worse than useless — the
+            // half-written report would look filed — so keep the text and
+            // only drop the toolbar when there is nowhere left to file to.
+            if resolved == nil, self.feedbackOpen {
+                self.setFeedbackOpen(false)
             }
+        }
+    }
+
+    // MARK: - Feedback composer
+
+    /// The composer's contents. Owned here rather than by the toolbar so a
+    /// half-written report survives the toolbar being toggled closed and
+    /// reopened, and survives a detach/re-attach (close then undo).
+    let feedbackModel = ViewerFeedbackModel()
+
+    @Published private(set) var feedbackOpen = false
+    private var feedbackHost: NSHostingView<ViewerFeedbackBar>?
+    /// The bar's top offset. Parked it sits fully behind the chrome bar
+    /// (clipped by it); open it sits flush beneath it.
+    private var feedbackTopConstraint: NSLayoutConstraint?
+    private var feedbackCloseTimer: Timer?
+
+    func toggleFeedback() {
+        setFeedbackOpen(!feedbackOpen)
+    }
+
+    /// Show or hide the composer. Opening with no worktree is a no-op — there
+    /// would be nowhere to file the report.
+    func setFeedbackOpen(_ open: Bool) {
+        guard feedbackOpen != open else { return }
+        if open, worktree == nil { return }
+        feedbackCloseTimer?.invalidate()
+        feedbackOpen = open
+
+        if open {
+            mountFeedbackHost()
+            // The composer's only close affordance lives in the chrome bar,
+            // so the bar must stop auto-hiding while it is open (same reason
+            // the compact TOC layout pins it).
+            setChromeVisible(true)
+            applyFeedbackState(animated: window?.isVisible == true)
+            focusFeedbackInput()
+        } else {
+            applyFeedbackState(animated: window?.isVisible == true)
+            // Hand focus back to the content so the pane is usable again.
+            if let responder = window?.firstResponder as? NSView,
+               let feedbackHost, responder.isDescendant(of: feedbackHost) {
+                window?.makeFirstResponder(webView)
+            }
+            scheduleChromeHide()
+        }
+    }
+
+    private func mountFeedbackHost() {
+        guard feedbackHost == nil else { return }
+        let host = NSHostingView(
+            rootView: ViewerFeedbackBar(viewerView: self, model: feedbackModel))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(host, positioned: .above, relativeTo: webView)
+        // The chrome bar has to stay on top: the composer parks BEHIND it and
+        // slides out from under it.
+        if let chromeHost {
+            addSubview(chromeHost, positioned: .above, relativeTo: host)
+        }
+        let top = host.topAnchor.constraint(equalTo: topAnchor)
+        NSLayoutConstraint.activate([
+            top,
+            host.leadingAnchor.constraint(equalTo: leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+        feedbackTopConstraint = top
+        feedbackHost = host
+        // Realize the parked position before the first slide, so it animates
+        // in from behind the bar instead of from a zero frame.
+        applyFeedbackState(animated: false)
+    }
+
+    /// Slide the composer out from behind the nav bar (or back under it) and
+    /// move the content down to make room in the same animation group.
+    private func applyFeedbackState(animated: Bool) {
+        if feedbackOpen { feedbackHost?.isHidden = false }
+        applyTopChromeGeometry(animated: animated)
+    }
+
+    /// Put the caret in the composer's text view once SwiftUI has mounted it.
+    private func focusFeedbackInput() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let feedbackHost,
+                  let textView = Self.firstTextView(in: feedbackHost) else { return }
+            self.window?.makeFirstResponder(textView)
+        }
+    }
+
+    /// The composer's text view inside the mounted bar, if it has rendered.
+    static func firstTextView(in view: NSView) -> ViewerFeedbackTextView? {
+        if let textView = view as? ViewerFeedbackTextView { return textView }
+        for subview in view.subviews {
+            if let found = firstTextView(in: subview) { return found }
+        }
+        return nil
+    }
+
+    /// Take an interactive screen snapshot into the composer (the `+` button).
+    func captureFeedbackScreenshot() {
+        guard let feedbackHost,
+              let textView = Self.firstTextView(in: feedbackHost) else { return }
+        // The capture UI takes over the screen; the bar must not auto-hide
+        // out from under the user while they are dragging out a region.
+        holdChrome(true)
+        textView.captureScreenshot { [weak self] in
+            self?.holdChrome(false)
+        }
+    }
+
+    /// File the composed report into the detected worktree's queue.
+    ///
+    /// Gathers the page's own context first — what the user had SELECTED, the
+    /// page title — because a report that quotes what someone was pointing at
+    /// is actionable where "this is broken" is not. That read is asynchronous
+    /// (it crosses into the web view), so the write happens in its completion.
+    ///
+    /// On success the composer clears, a confirmation replaces the destination
+    /// line, and the toolbar closes itself — the user is never left unsure
+    /// whether the report was filed.
+    func sendFeedback() {
+        guard let worktree else {
+            feedbackModel.status = .failed("No worktree — nowhere to file this")
+            return
+        }
+        guard !feedbackModel.isEmpty else { return }
+
+        // Snapshot the composer NOW: the JS round-trip below is async, and the
+        // user can keep typing during it.
+        let segments = feedbackModel.segments()
+        let images = feedbackModel.imagePayloads()
+        let quotes = feedbackModel.quotes
+
+        readPageContext { [weak self] pageTitle, selection in
+            guard let self else { return }
+            var context = ViewerFeedbackReport.Context(
+                source: self.location,
+                sourceKind: self.isWebURL ? "web" : "file")
+            context.filePath = self.fileURL?.path
+            context.relativePath = self.fileURL.flatMap {
+                Self.relativePath(of: $0.path, under: worktree.path)
+            }
+            context.pageTitle = pageTitle ?? self.title
+            context.selection = selection
+            context.paneID = self.paneID
+            context.viewport = "\(Int(self.bounds.width))x\(Int(self.bounds.height))"
+            context.appVersion = Bundle.main
+                .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            self.writeFeedback(
+                segments: segments, images: images, quotes: quotes,
+                worktree: worktree, context: context)
+        }
+    }
+
+    /// Ask the page for its title and the user's current selection.
+    ///
+    /// Best-effort by design: a website that blocks script evaluation, or a
+    /// pane whose page never loaded, must still be able to file feedback — it
+    /// just files it without a quote.
+    private func readPageContext(
+        completion: @escaping (String?, String?) -> Void
+    ) {
+        let js = """
+        (function () {
+          var s = "";
+          try { s = String(window.getSelection()); } catch (e) {}
+          return JSON.stringify({ title: document.title || "", selection: s });
+        })()
+        """
+        var finished = false
+        let finish = { (title: String?, selection: String?) in
+            guard !finished else { return }
+            finished = true
+            completion(title, selection)
+        }
+        // A wedged or hostile page must not strand the send.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { finish(nil, nil) }
+
+        webView.evaluateJavaScript(js) { result, _ in
+            guard let raw = result as? String,
+                  let data = raw.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                finish(nil, nil)
+                return
+            }
+            let title = (parsed["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let selection = (parsed["selection"] as? String)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .flatMap { $0.isEmpty ? nil : $0 }
+            finish(title, selection)
+        }
+    }
+
+    /// Resolve git revision off the main thread, then write. Both are blocking
+    /// work (a subprocess and file I/O) that has no business on the main queue.
+    private func writeFeedback(
+        segments: [ViewerFeedbackReport.Segment],
+        images: [ViewerFeedbackReport.Image],
+        quotes: [ViewerFeedbackQuote],
+        worktree: ViewerWorktree,
+        context: ViewerFeedbackReport.Context
+    ) {
+        let filePath = fileURL?.path
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var context = context
+            let revision = ViewerWorktreeResolver.revision(at: worktree.path)
+            context.branch = revision.branch
+            context.commit = revision.commit
+
+            // Locate each quote in the SOURCE file. Mapping rendered DOM back
+            // to markdown source is unreliable; searching the file for the
+            // passage is not, and a line number is what a reader actually
+            // wants. Web pages have no source file, so they get nil.
+            let sourceText = filePath.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+            let payloadQuotes = quotes.map { quote in
+                ViewerFeedbackReport.Quote(
+                    number: quote.number,
+                    text: quote.text,
+                    headingID: quote.headingID,
+                    headingText: quote.headingText,
+                    blockSelector: quote.blockSelector,
+                    blockText: quote.blockText,
+                    offsetInBlock: quote.offsetInBlock,
+                    documentOffset: quote.documentOffset,
+                    sourceLine: sourceText.flatMap {
+                        Self.lineNumber(of: quote.text, in: $0)
+                    })
+            }
+
+            let result = Result {
+                try ViewerFeedbackReport.write(
+                    segments: segments, images: images, quotes: payloadQuotes,
+                    worktree: worktree, context: context)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let written):
+                    self.feedbackModel.reset()
+                    self.feedbackModel.status = .filed(written.stem)
+                    Self.logger.info(
+                        "filed feedback report \(written.folderURL.path, privacy: .public)")
+                    // Long enough to read the confirmation, short enough that
+                    // the pane gives its space back without being asked.
+                    self.feedbackCloseTimer?.invalidate()
+                    self.feedbackCloseTimer = Timer.scheduledTimer(
+                        withTimeInterval: 1.8, repeats: false
+                    ) { [weak self] _ in
+                        self?.setFeedbackOpen(false)
+                    }
+                case .failure(let error):
+                    self.feedbackModel.status = .failed(Self.feedbackErrorText(error))
+                    Self.logger.warning("failed to file feedback report: \(error)")
+                }
+            }
+        }
+    }
+
+    /// This pane's stable ghoztty id — the same value `+list --json` reports
+    /// and `--target` accepts, so a report names a pane the reader can address.
+    /// Owned by the enclosing `PaneView`, so it is resolved through the tree.
+    var paneID: String? {
+        guard let controller = window?.windowController as? BaseTerminalController,
+              let pane = controller.surfaceTree.first(where: { $0.viewerView === self })
+        else { return nil }
+        return pane.id.uuidString
+    }
+
+    /// The 1-based line in `source` where a quoted passage appears, or nil.
+    ///
+    /// The quote comes from RENDERED text, so it rarely matches the source
+    /// byte-for-byte (markdown syntax, wrapped lines, collapsed whitespace).
+    /// So: try the whole passage first, then its first line, then a
+    /// whitespace-normalized comparison — and give up honestly rather than
+    /// report a line that might be wrong.
+    static func lineNumber(of quote: String, in source: String) -> Int? {
+        let lines = source.components(separatedBy: .newlines)
+        func normalize(_ text: String) -> String {
+            text.components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+                .lowercased()
+        }
+
+        let needle = quote.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return nil }
+        // Wrapped rendering means only the first line is likely contiguous.
+        let firstLine = needle
+            .components(separatedBy: .newlines)
+            .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? needle
+
+        for (index, line) in lines.enumerated() where line.contains(firstLine) {
+            return index + 1
+        }
+        let target = normalize(firstLine)
+        guard !target.isEmpty else { return nil }
+        for (index, line) in lines.enumerated() where normalize(line).contains(target) {
+            return index + 1
+        }
+        return nil
+    }
+
+    /// A path expressed relative to a containing directory, or nil when it is
+    /// not inside it. The repo-relative form is what a coding agent can act on.
+    static func relativePath(of path: String, under root: String) -> String? {
+        let root = root.hasSuffix("/") ? root : root + "/"
+        guard path.hasPrefix(root) else { return nil }
+        return String(path.dropFirst(root.count))
+    }
+
+    static func feedbackErrorText(_ error: Error) -> String {
+        switch error {
+        case ViewerFeedbackReport.WriteError.empty:
+            return "Nothing to send"
+        case ViewerFeedbackReport.WriteError.danglingImageReference(let number):
+            return "Image #\(number) is missing"
+        default:
+            return "Could not write report: \(error.localizedDescription)"
         }
     }
 
@@ -741,8 +1200,45 @@ final class ViewerView: NSView, Codable, ObservableObject {
             setTOCItems(ViewerTOCItem.list(from: raw))
         case "active":
             activeHeadingID = payload["id"] as? String
+        case "quote":
+            handleQuoteMessage(payload)
         default:
             break
+        }
+    }
+
+    /// The page's selection toolbar sent a passage to quote. Opens the
+    /// composer if it is closed — quoting is a request to write feedback — and
+    /// inserts the passage as its own block at the caret.
+    private func handleQuoteMessage(_ payload: [String: Any]) {
+        guard worktree != nil else { return }
+        let text = (payload["text"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { return }
+
+        var quote = ViewerFeedbackQuote(
+            number: feedbackModel.takeQuoteNumber(), text: text)
+        quote.headingID = (payload["headingId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.headingText = (payload["headingText"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.blockSelector = (payload["blockSelector"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.blockText = (payload["blockText"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        quote.offsetInBlock = (payload["offsetInBlock"] as? Int).flatMap { $0 < 0 ? nil : $0 }
+        quote.documentOffset = (payload["documentOffset"] as? Int).flatMap { $0 < 0 ? nil : $0 }
+
+        setFeedbackOpen(true)
+        // Mount/focus first, then insert at wherever the caret ended up, so
+        // the quote lands in the flow the user is writing rather than always
+        // at the top.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let feedbackHost = self.feedbackHost,
+                  let textView = Self.firstTextView(in: feedbackHost) else { return }
+            let caret = textView.selectedRange()
+            let inserted = self.feedbackModel.insertQuote(quote, at: caret)
+            textView.setSelectedRange(
+                NSRange(location: inserted.location + inserted.length, length: 0))
+            textView.didChangeText()
+            textView.scrollRangeToVisible(textView.selectedRange())
+            self.window?.makeFirstResponder(textView)
         }
     }
 
@@ -1207,6 +1703,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private enum CodingKeys: String, CodingKey {
         case location
         case homeLocation
+        case originDirectory
     }
 
     convenience init(from decoder: Decoder) throws {
@@ -1215,13 +1712,21 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // Absent in state written before the home button existed: such a
         // viewer had never navigated, so where it is IS its home.
         let home = try container.decodeIfPresent(String.self, forKey: .homeLocation)
-        self.init(location: location, homeLocation: home ?? location)
+        // Absent in state written before feedback capture existed: such a
+        // pane simply has no fallback leg, so a remote/blank location
+        // resolves to no worktree until it is reopened.
+        let origin = try container.decodeIfPresent(String.self, forKey: .originDirectory)
+        self.init(
+            location: location,
+            homeLocation: home ?? location,
+            originDirectory: origin)
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(location, forKey: .location)
         try container.encode(homeLocation, forKey: .homeLocation)
+        try container.encodeIfPresent(originDirectory, forKey: .originDirectory)
     }
 }
 
@@ -1343,7 +1848,10 @@ extension ViewerView: WKNavigationDelegate {
         controller.newViewerSplit(
             atPane: myPane,
             direction: .right,
-            viewer: ViewerView(location: location))
+            // A pane opened from a link in this one inherits this one's
+            // origin, so a chain of doc links keeps filing feedback to the
+            // same repo.
+            viewer: ViewerView(location: location, originDirectory: originDirectory))
     }
 }
 

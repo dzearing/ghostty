@@ -174,6 +174,7 @@ fn runArgs(
     const alloc = arena.allocator();
 
     try resolveViewArgument(alloc, opts._arguments.items);
+    try seedViewWorkingDirectory(alloc, &opts._arguments);
 
     if (apprt.App.performIpc(
         alloc,
@@ -222,4 +223,34 @@ fn resolveViewArgument(alloc: Allocator, arguments: [][:0]const u8) !void {
         arguments[i] = try std.fmt.allocPrintSentinel(alloc, "--view={s}", .{resolved}, 0);
         return;
     }
+}
+
+/// For a `--view=` split with no explicit `--working-directory=`, insert the
+/// caller's cwd as one.
+///
+/// A viewer pane records this as its ORIGIN DIRECTORY, which is the fallback
+/// leg of worktree provenance: a pane showing a remote site or a blank page
+/// has no directory of its own, so without this the feedback affordance could
+/// never appear for it. `+new-window` already inserts the cwd unconditionally;
+/// `+split` does not, because a terminal split inherits cwd from its parent
+/// surface and an injected `--working-directory` would override that
+/// inheritance. Restricting the insert to `--view=` splits keeps terminal
+/// behavior exactly as it was.
+fn seedViewWorkingDirectory(
+    alloc: Allocator,
+    arguments: *std.ArrayList([:0]const u8),
+) !void {
+    var has_view = false;
+    for (arguments.items) |a| {
+        if (std.mem.startsWith(u8, a, "--view=")) has_view = true;
+        if (std.mem.startsWith(u8, a, "--working-directory=")) return;
+    }
+    if (!has_view) return;
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.fs.cwd().realpath(".", &buf) catch return;
+    try arguments.append(
+        alloc,
+        try std.fmt.allocPrintSentinel(alloc, "--working-directory={s}", .{cwd}, 0),
+    );
 }
