@@ -221,7 +221,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// `homeLocation` differs from `location` only when a viewer is restored
     /// from a session manifest after the user navigated away from where the
     /// pane was originally opened — home still points at the original.
-    init(location: String, homeLocation: String, originDirectory: String? = nil) {
+    ///
+    /// `adoptedWebView` is set only for a popup (see `init(adopting:…)`): the
+    /// viewer wraps a web view WebKit already built instead of creating its
+    /// own, and must not load anything itself.
+    init(
+        location: String,
+        homeLocation: String,
+        originDirectory: String? = nil,
+        adoptedWebView: WKWebView? = nil
+    ) {
         self.location = location
         self.homeLocation = homeLocation
         self.originDirectory = originDirectory
@@ -232,10 +241,32 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // The chrome bar parks above the top edge between reveals; without
         // clipping it would paint over whatever sits above this pane.
         clipsToBounds = true
-        setupWebView()
-        load()
-        startWatchingFile()
+        setupWebView(adopting: adoptedWebView)
+        // A popup adopts a web view WebKit is already driving (see
+        // `createWebViewWith`): loading our own request would fight that
+        // navigation and break the opener↔popup link, and there is no file to
+        // watch. Everything else — chrome, observations, worktree — is shared.
+        if adoptedWebView == nil {
+            load()
+            startWatchingFile()
+        }
         refreshWorktree()
+    }
+
+    /// Wrap a web view WebKit created for a popup (`window.open()` /
+    /// `target="_blank"`) so it becomes its own viewer. WebKit itself drives
+    /// the navigation on that web view, so this viewer must never load
+    /// anything — reusing WebKit's own instance is what keeps the
+    /// opener↔popup relationship intact so `window.close()` works.
+    convenience init(adopting webView: WKWebView, url: URL?, originDirectory: String?) {
+        // Popups are always web content; a missing URL (a bare `window.open()`)
+        // is the blank page the script goes on to write into.
+        let location = url?.absoluteString ?? Self.blankPage
+        self.init(
+            location: location,
+            homeLocation: location,
+            originDirectory: originDirectory,
+            adoptedWebView: webView)
     }
 
     required init?(coder: NSCoder) {
@@ -348,48 +379,67 @@ final class ViewerView: NSView, Codable, ObservableObject {
 
     // MARK: - Web view setup
 
-    private func setupWebView() {
-        let config = WKWebViewConfiguration()
-
-        // The scheme handler is registered for EVERY viewer, not just the
-        // file-backed ones: a configuration is copied into the web view at
-        // init and can never gain a handler afterwards, so a web viewer that
-        // is later pointed at a local file (address bar, home button) would
-        // otherwise have no way to serve the render template.
-        //
-        // Every viewer also shares the default (persistent) website data
-        // store. File viewers used to get a `.nonPersistent()` one, but now
-        // that any pane can browse, one store keeps sessions/logins
-        // consistent no matter which kind of viewer the browsing started in.
-        let handler = ViewerSchemeHandler(
-            baseDirectory: fileLocation?.deletingLastPathComponent()
-                ?? FileManager.default.homeDirectoryForCurrentUser)
-        config.setURLSchemeHandler(handler, forURLScheme: ViewerSchemeHandler.scheme)
-        self.schemeHandler = handler
-
-        // TOC bridge. The proxy holds the viewer WEAKLY on purpose: the
-        // content controller retains its handlers and the web view retains
-        // the controller, so registering `self` directly would be a cycle
-        // that keeps the whole pane (and its web view) alive forever.
-        config.userContentController.add(
-            ViewerTOCMessageProxy(viewer: self), name: Self.tocMessageName)
-
-        // Selection toolbar (Quote / Copy), injected into EVERY page.
-        //
-        // It cannot ship inside viewer.js: that is a <script src> in
-        // viewer.html, so it only ever runs on the bundled template page —
-        // which is why quoting used to work on markdown and code but never on
-        // an actual website. As a user script it runs in the template AND in
-        // arbitrary web content, which is where quoting a dev server's UI
-        // matters most.
-        if let script = Self.selectionUserScript() {
-            config.userContentController.addUserScript(script)
-        }
+    private func setupWebView(adopting adopted: WKWebView? = nil) {
         self.currentURL = addressText(for: fileLocation ?? URL(string: location))
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView: WKWebView
+        if let adopted {
+            // Popup path: WebKit already built this web view from the
+            // configuration it handed us in `createWebViewWith`. We reuse that
+            // exact instance and never rebuild its configuration — that is what
+            // preserves the opener↔popup relationship (and thus
+            // `window.close()`). A popup is web content, so it needs no file
+            // scheme handler of its own; re-registering one on the inherited
+            // configuration would in fact throw.
+            webView = adopted
+        } else {
+            let config = WKWebViewConfiguration()
+
+            // The scheme handler is registered for EVERY viewer, not just the
+            // file-backed ones: a configuration is copied into the web view at
+            // init and can never gain a handler afterwards, so a web viewer that
+            // is later pointed at a local file (address bar, home button) would
+            // otherwise have no way to serve the render template.
+            //
+            // Every viewer also shares the default (persistent) website data
+            // store. File viewers used to get a `.nonPersistent()` one, but now
+            // that any pane can browse, one store keeps sessions/logins
+            // consistent no matter which kind of viewer the browsing started in.
+            let handler = ViewerSchemeHandler(
+                baseDirectory: fileLocation?.deletingLastPathComponent()
+                    ?? FileManager.default.homeDirectoryForCurrentUser)
+            config.setURLSchemeHandler(handler, forURLScheme: ViewerSchemeHandler.scheme)
+            self.schemeHandler = handler
+
+            // TOC bridge. The proxy holds the viewer WEAKLY on purpose: the
+            // content controller retains its handlers and the web view retains
+            // the controller, so registering `self` directly would be a cycle
+            // that keeps the whole pane (and its web view) alive forever.
+            config.userContentController.add(
+                ViewerTOCMessageProxy(viewer: self), name: Self.tocMessageName)
+
+            // Selection toolbar (Quote / Copy), injected into EVERY page.
+            //
+            // It cannot ship inside viewer.js: that is a <script src> in
+            // viewer.html, so it only ever runs on the bundled template page —
+            // which is why quoting used to work on markdown and code but never on
+            // an actual website. As a user script it runs in the template AND in
+            // arbitrary web content, which is where quoting a dev server's UI
+            // matters most.
+            if let script = Self.selectionUserScript() {
+                config.userContentController.addUserScript(script)
+            }
+
+            webView = WKWebView(frame: .zero, configuration: config)
+        }
+
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = self
+        // A UI delegate on EVERY viewer is what makes `window.open()` /
+        // `target="_blank"` do anything at all (without one WebKit silently
+        // drops them), and it lets a popup itself spawn further popups. Weak,
+        // like `navigationDelegate`, so assigning `self` is not a retain cycle.
+        webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = isWebURL
         // Render with the host window's appearance (drives
         // prefers-color-scheme inside the page, switching live).
@@ -598,6 +648,17 @@ final class ViewerView: NSView, Codable, ObservableObject {
     func addressFieldFocusChanged(_ focused: Bool) {
         holdChrome(focused)
         guard focused else { return }
+        // Cmd-C / Cmd-V are Ghoztty keybindings (copy_to_clipboard /
+        // paste_from_clipboard). A terminal surface sharing this window keeps
+        // its `focused` flag set even while the address field has keyboard
+        // focus, so its `performKeyEquivalent` consumes those keys before the
+        // menu can route copy:/paste: to the field editor — the address bar
+        // then can't copy or paste. Make the surface yield its focus state (the
+        // same fix the command palette uses on open) so clipboard actions reach
+        // the field.
+        if let controller = window?.windowController as? BaseTerminalController {
+            _ = controller.focusedSurface?.resignFirstResponder()
+        }
         selectAddressWhenClickCompletes()
     }
 
@@ -1852,6 +1913,79 @@ extension ViewerView: WKNavigationDelegate {
             // origin, so a chain of doc links keeps filing feedback to the
             // same repo.
             viewer: ViewerView(location: location, originDirectory: originDirectory))
+    }
+}
+
+// MARK: - WKUIDelegate
+
+extension ViewerView: WKUIDelegate {
+    /// A page called `window.open()` or activated a `target="_blank"` link.
+    /// The decision (see the task brief) is that a popup opens as its own new
+    /// Ghoztty viewer window — so it can be focused, persisted, and, crucially,
+    /// self-close via `window.close()` the way an OAuth sign-in popup expects.
+    ///
+    /// The returned web view MUST be one built from `configuration` (WebKit's
+    /// own object): WebKit drives the navigation on it and keeps the
+    /// opener↔popup relationship. Building our own web view and loading the
+    /// request ourselves would break `window.close()`. Returning nil cancels
+    /// the popup.
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        // Without a host controller there is nowhere to put a window; drop the
+        // popup rather than leak an unparented web view.
+        guard let controller = window?.windowController as? BaseTerminalController
+        else { return nil }
+
+        // Build the popup's web view from WebKit's configuration and hand it to
+        // a new viewer that adopts (never reloads) it.
+        let popupWebView = WKWebView(frame: .zero, configuration: configuration)
+        let popup = ViewerView(
+            adopting: popupWebView,
+            url: navigationAction.request.url,
+            // A popup inherits its opener's origin, so feedback filed from it
+            // still lands in the same repo when the destination can't be
+            // derived from the popup's own (often remote) location.
+            originDirectory: originDirectory)
+
+        // Honor the size the opener asked for. Sign-in / OAuth popups open at a
+        // deliberate small size via `window.open(url, name, "width=…,height=…")`
+        // and look broken at a full terminal-window size. `newWindow(tree:)`
+        // sizes the window's content to the tree leaf's view bounds, so stamp
+        // the requested size onto the popup view before wrapping it; a page that
+        // requests no size just cascades at the default like any new window.
+        if let width = windowFeatures.width?.doubleValue,
+           let height = windowFeatures.height?.doubleValue,
+           width > 0, height > 0 {
+            popup.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        }
+
+        let pane = PaneView(viewer: popup)
+        let newController = TerminalController.newWindow(
+            controller.ghostty,
+            tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
+        // A viewer-only window has no focused surface to title it, so pin the
+        // popup's title the same way the `+new-window --view` path does.
+        newController.titleOverride = pane.title
+
+        // WebKit navigates the returned web view itself — do not load it here.
+        return popupWebView
+    }
+
+    /// The popup page called `window.close()` (e.g. an OAuth flow finishing).
+    /// Close this viewer's own pane: for the single-pane popup window that is
+    /// the whole window, matching browser semantics; if the user has since
+    /// split it, only the popup pane goes. Viewers own no process, so there is
+    /// nothing to confirm.
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let controller = window?.windowController as? BaseTerminalController,
+              let pane = controller.surfaceTree.first(where: { $0.viewerView === self }),
+              let node = controller.surfaceTree.root?.node(view: pane)
+        else { return }
+        controller.closeSurface(node, withConfirmation: false)
     }
 }
 
