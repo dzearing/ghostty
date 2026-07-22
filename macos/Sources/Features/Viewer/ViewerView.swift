@@ -445,6 +445,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // like `navigationDelegate`, so assigning `self` is not a retain cycle.
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = isWebURL
+        // Trackpad pinch magnifies the pane (native pixel zoom, like Safari's
+        // two-finger pinch), for every viewer kind — web, markdown, and code all
+        // render in this one web view. This is independent of keyboard page zoom
+        // (Cmd+/−/0, see performKeyEquivalent) and is ephemeral: WebKit tracks
+        // the magnification itself and we do not persist it, matching Safari.
+        webView.allowsMagnification = true
         // Render with the host window's appearance (drives
         // prefers-color-scheme inside the page, switching live).
         webView.underPageBackgroundColor = .windowBackgroundColor
@@ -1916,6 +1922,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// still performs the actual navigation.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if Self.isHeroNavChord(event) { return true }
+        // Cmd+/−/0 zoom the viewer instead of the terminal font size — but only
+        // when this viewer's own content is focused, so a focused terminal in
+        // the same window keeps its font-size behavior and an unfocused viewer
+        // split stays put. Returning true stops the event before the menu's
+        // font-size key equivalent (which runs AFTER the view hierarchy's
+        // performKeyEquivalent walk) can route it to the terminal.
+        if isViewerContentFocused, let action = Self.zoomAction(for: event) {
+            handleZoom(action)
+            return true
+        }
         return super.performKeyEquivalent(with: event)
     }
 
@@ -1923,6 +1939,77 @@ final class ViewerView: NSView, Codable, ObservableObject {
     static func isHeroNavChord(_ event: NSEvent) -> Bool {
         guard event.modifierFlags.contains([.shift, .command]) else { return false }
         return event.specialKey == .upArrow || event.specialKey == .downArrow
+    }
+
+    // MARK: - Zoom (keyboard page zoom)
+
+    /// A Cmd+/−/0 keyboard-zoom request. Trackpad pinch is handled entirely by
+    /// WebKit (`allowsMagnification`) and is independent of this.
+    enum ZoomAction { case zoomIn, zoomOut, reset }
+
+    /// Keyboard page-zoom bounds and per-press step. 1.0 is 100%.
+    static let minZoom: CGFloat = 0.5
+    static let maxZoom: CGFloat = 3.0
+    static let zoomStep: CGFloat = 1.1
+
+    /// Classify a key event as a viewer zoom chord, or nil if it is not one.
+    ///
+    /// Matches the DEFAULT font-size chords (Cmd + `=`/`+`/`-`/`0`) — the same
+    /// keys `Config.zig` binds to increase/decrease/reset_font_size. Deliberately
+    /// does NOT consult user-remapped bindings (first-cut simplification).
+    /// Requires Command and rejects Control/Option so it never collides with
+    /// other chords. `charactersIgnoringModifiers` keeps Shift, so Shift+= ("+")
+    /// still reads as zoom-in.
+    static func zoomAction(for event: NSEvent) -> ZoomAction? {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard mods.contains(.command),
+              !mods.contains(.control),
+              !mods.contains(.option),
+              let chars = event.charactersIgnoringModifiers
+        else { return nil }
+        switch chars {
+        case "=", "+": return .zoomIn
+        case "-": return .zoomOut
+        case "0": return .reset
+        default: return nil
+        }
+    }
+
+    /// The next page-zoom factor for an action, clamped to [minZoom, maxZoom].
+    static func steppedZoom(from current: CGFloat, action: ZoomAction) -> CGFloat {
+        switch action {
+        case .zoomIn: return min(maxZoom, current * zoomStep)
+        case .zoomOut: return max(minZoom, current / zoomStep)
+        case .reset: return 1.0
+        }
+    }
+
+    /// The keyboard (Cmd+/−/0) page-zoom factor for this pane. 1.0 is 100%.
+    /// In-session only — deliberately NOT persisted, so a restored pane comes
+    /// back at 100%. Independent of trackpad pinch magnification, which WebKit
+    /// tracks itself.
+    private var zoomFactor: CGFloat = 1.0
+
+    /// Push the current `zoomFactor` to the web view.
+    private func pushZoomToWebView() {
+        webView.pageZoom = zoomFactor
+    }
+
+    /// Apply a Cmd+/−/0 zoom chord: step the factor and push it to the page.
+    private func handleZoom(_ action: ZoomAction) {
+        zoomFactor = Self.steppedZoom(from: zoomFactor, action: action)
+        pushZoomToWebView()
+    }
+
+    /// True when THIS viewer's own web content holds keyboard focus. The guard
+    /// that keeps zoom chords from stealing Cmd+/−/0 from a focused terminal in
+    /// the same window (performKeyEquivalent is offered to every view, not just
+    /// the focused one) and from firing in an unfocused viewer split. The chrome
+    /// bar's address field is a descendant of the pane but NOT of the web view,
+    /// so it is excluded too.
+    private var isViewerContentFocused: Bool {
+        guard let responder = window?.firstResponder as? NSView else { return false }
+        return responder === webView || responder.isDescendant(of: webView)
     }
 
     // MARK: - Codable
@@ -2001,6 +2088,10 @@ extension ViewerView: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        // A fresh navigation can drop pageZoom; reapply so keyboard zoom sticks
+        // as the user follows links / types addresses within the pane (all
+        // modes). Cheap no-op at 100%.
+        if zoomFactor != 1.0 { pushZoomToWebView() }
         if case .web = mode { return }
         pageLoaded = true
         renderFileContent()
