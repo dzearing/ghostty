@@ -1698,6 +1698,32 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return true
     }
 
+    /// Swallow the hero-navigation chords (Cmd+Shift+Up/Down) before they reach
+    /// the inner WKWebView.
+    ///
+    /// Hero mode navigates panes with an app-wide local key monitor
+    /// (`HeroKeyNavigator`) that consumes Cmd+Shift+Up/Down. That works for a
+    /// focused terminal, but a focused viewer's first responder is the WKWebView
+    /// (see `becomeFirstResponder`), which does NOT honor the monitor's consume:
+    /// the same physical keystroke is still delivered to WebKit, which
+    /// (1) interprets it as a text-selection command and emits an NSBeep for the
+    /// unhandled key, and (2) re-injects it, so the monitor fires a SECOND time
+    /// and the hero selection double-steps (skips a pane). Because this view is
+    /// an ancestor of the web view, our `performKeyEquivalent` runs first in the
+    /// hierarchy's key-equivalent walk; returning `true` here marks the chord
+    /// handled so WebKit never sees it — no beep, no re-injection. The monitor
+    /// still performs the actual navigation.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if Self.isHeroNavChord(event) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// Cmd+Shift+Up/Down — the exact chord `HeroKeyNavigator` navigates with.
+    static func isHeroNavChord(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains([.shift, .command]) else { return false }
+        return event.specialKey == .upArrow || event.specialKey == .downArrow
+    }
+
     // MARK: - Codable
 
     private enum CodingKeys: String, CodingKey {

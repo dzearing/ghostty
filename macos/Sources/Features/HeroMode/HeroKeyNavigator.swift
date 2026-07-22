@@ -55,6 +55,13 @@ final class HeroKeyNavigator {
     /// is what keeps this and the libghostty `goto_split` path (which also
     /// moves the hero selection, see `BaseTerminalController`) from both
     /// firing for one keystroke.
+    ///
+    /// A focused *viewer* pane can't rely on this swallow alone: its first
+    /// responder is a WKWebView that receives the keystroke even after we
+    /// return nil, which both beeped and re-injected the event (double-stepping
+    /// the selection). `ViewerView.performKeyEquivalent` swallows the same
+    /// chord before WebKit sees it; the two guards together keep one press to
+    /// one step with no beep.
     func handle(_ event: NSEvent) -> NSEvent? {
         guard let state, state.isActive else { return event }
         guard leaves.count > 1 else { return event }
