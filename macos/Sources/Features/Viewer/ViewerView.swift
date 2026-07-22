@@ -303,6 +303,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
             feedbackHost = nil
             feedbackTopConstraint = nil
             feedbackOpen = false
+            // The bar is gone; a re-attach re-mounts and re-measures it. Keep
+            // `feedbackDraftStem` so an undo restores the same draft folder.
+            feedbackBarHeight = 0
+            chromeAnimating = false
             webViewTopConstraint?.constant = 0
             // Same reasoning as the chrome bar: these hosting views' root
             // views strongly reference us, so a detached pane sitting in the
@@ -848,7 +852,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
 
     private var topChromeGeometry: TopChromeGeometry {
         let barHeight = chromeHost?.fittingSize.height ?? 0
-        let composerHeight = feedbackHost?.fittingSize.height ?? 0
+        let composerHeight = feedbackComposerHeight
         let barTop: CGFloat = chromeVisible ? 0 : -barHeight
         return TopChromeGeometry(
             barTop: barTop,
@@ -860,6 +864,30 @@ final class ViewerView: NSView, Codable, ObservableObject {
             contentInset: chromeVisible
                 ? barHeight + (feedbackOpen ? composerHeight : 0)
                 : 0)
+    }
+
+    /// The composer bar's current height. Prefer the height the bar most
+    /// recently MEASURED for itself (reported live as the pill grows and
+    /// shrinks) over the hosting view's fitting size, which lags a content edit
+    /// by a layout pass — that lag is what left deleted lines' space unreclaimed.
+    private var feedbackComposerHeight: CGFloat {
+        guard feedbackHost != nil else { return 0 }
+        if feedbackBarHeight > 0 { return feedbackBarHeight }
+        return feedbackHost?.fittingSize.height ?? 0
+    }
+
+    /// The composer reported a new measured height (its content grew or shrank).
+    /// Re-reserve exactly that much space so the page reflows DOWN when lines
+    /// are added and back UP when they are deleted — the up-reflow is the one
+    /// that used to leak, because nothing recomputed the inset on a plain edit.
+    func feedbackBarDidChangeHeight(_ height: CGFloat) {
+        guard height > 0, abs(height - feedbackBarHeight) > 0.5 else { return }
+        feedbackBarHeight = height
+        // Steady-state edits reflow immediately; during the open/close slide
+        // the inset is already being animated toward this height and settles to
+        // it on completion, so don't fight the animation here.
+        guard feedbackOpen, !chromeAnimating else { return }
+        applyTopChromeGeometry(animated: false)
     }
 
     private func applyTopChromeGeometry(animated: Bool) {
@@ -877,6 +905,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             return
         }
 
+        chromeAnimating = true
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.25
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -885,8 +914,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
             webViewTopConstraint?.animator().constant = geometry.contentInset
         } completionHandler: { [weak self] in
             guard let self else { return }
+            self.chromeAnimating = false
             if !self.chromeVisible { self.chromeHost?.isHidden = true }
             if !self.feedbackOpen { self.feedbackHost?.isHidden = true }
+            // The composer may have grown/shrunk mid-slide; settle the reserved
+            // space to the height it actually ended at now the slide is done.
+            if self.feedbackOpen { self.applyTopChromeGeometry(animated: false) }
         }
     }
 
@@ -935,6 +968,25 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private var feedbackTopConstraint: NSLayoutConstraint?
     private var feedbackCloseTimer: Timer?
 
+    /// The composer's most recently MEASURED height, reported by the bar as its
+    /// pill grows and shrinks (see `feedbackBarDidChangeHeight`). The content
+    /// inset tracks this so the page reflows in BOTH directions — the un-reclaimed
+    /// space after deleting lines used to leak because nothing recomputed the
+    /// inset on a plain edit.
+    private var feedbackBarHeight: CGFloat = 0
+
+    /// True while the nav-bar / composer slide is animating. Live height
+    /// updates defer to it (the slide animates the inset itself and settles to
+    /// the measured height on completion) rather than snapping it mid-slide.
+    private var chromeAnimating = false
+
+    /// Stable folder name for the report currently being composed, minted when
+    /// the composer opens and cleared on send. The footer link, the files the
+    /// user drops into the folder, and the eventual atomic publish all refer to
+    /// one `temp/feedback/.staging/<stem>` folder for the draft's whole life.
+    /// Nil when no draft is in progress.
+    private(set) var feedbackDraftStem: String?
+
     func toggleFeedback() {
         setFeedbackOpen(!feedbackOpen)
     }
@@ -948,6 +1000,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
         feedbackOpen = open
 
         if open {
+            // Mint the draft's stable staging-folder name so the footer link
+            // has a concrete folder to name and reveal from the moment the
+            // composer appears (the folder itself is created lazily — on reveal
+            // or on send — so a composer opened and closed without a word
+            // leaves nothing behind).
+            if feedbackDraftStem == nil {
+                feedbackDraftStem = ViewerFeedbackReport.makeStem(
+                    date: Date(), suffix: ViewerFeedbackReport.randomSuffix())
+            }
             mountFeedbackHost()
             // The composer's only close affordance lives in the chrome bar,
             // so the bar must stop auto-hiding while it is open (same reason
@@ -971,7 +1032,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let host = NSHostingView(
             rootView: ViewerFeedbackBar(viewerView: self, model: feedbackModel))
         host.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(host, positioned: .above, relativeTo: webView)
+        // Above the TOC card as well as the web view: the composer spans the
+        // full pane width just under the nav bar and must never draw BEHIND the
+        // table-of-contents card in the gutter. The TOC layers are mounted
+        // `.above webView` too, so anchoring to the topmost of them (rather than
+        // to `webView`) is what keeps the composer in front regardless of which
+        // was created first. (The chrome bar is lifted back on top just below.)
+        addSubview(
+            host, positioned: .above,
+            relativeTo: tocResizeHandle ?? tocPanelContainer ?? webView)
         // The chrome bar has to stay on top: the composer parks BEHIND it and
         // slides out from under it.
         if let chromeHost {
@@ -1027,6 +1096,70 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
     }
 
+    /// The draft's staging folder, or nil when there is no draft in progress
+    /// or no worktree to file to. This is what the footer link reveals and
+    /// where the user can drop extra files before sending.
+    var feedbackStagingURL: URL? {
+        guard let worktree, let stem = feedbackDraftStem else { return nil }
+        return ViewerFeedbackReport.stagingDirectory(in: worktree, stem: stem)
+    }
+
+    /// Worktree-relative path of the draft's staging folder, for the composer
+    /// footer (e.g. `temp/feedback/.staging/<stem>`).
+    var feedbackStagingRelativePath: String? {
+        guard let stem = feedbackDraftStem, worktree != nil else { return nil }
+        return "\(ViewerFeedbackReport.stagingRelativePath)/\(stem)"
+    }
+
+    /// Reveal the draft's staging folder in Finder, materializing it — the
+    /// draft's images plus a work-in-progress `report.json` — if it doesn't
+    /// exist yet, so opening it never shows a stale or empty draft. The user
+    /// can drop additional files into the folder before sending; the send path
+    /// publishes the whole folder, so those files become part of the report.
+    func revealFeedbackStagingFolder() {
+        guard let worktree, let stem = feedbackDraftStem else { return }
+        let target = ViewerFeedbackReport.stagingDirectory(in: worktree, stem: stem)
+
+        let segments = feedbackModel.segments()
+        let images = feedbackModel.imagePayloads()
+        let quotes = feedbackModel.quotes.map { quote in
+            ViewerFeedbackReport.Quote(
+                number: quote.number, text: quote.text,
+                headingID: quote.headingID, headingText: quote.headingText,
+                blockSelector: quote.blockSelector, blockText: quote.blockText,
+                offsetInBlock: quote.offsetInBlock,
+                documentOffset: quote.documentOffset,
+                // Resolved against the source file at send time, not here.
+                sourceLine: nil)
+        }
+        var context = ViewerFeedbackReport.Context(
+            source: location, sourceKind: isWebURL ? "web" : "file")
+        context.filePath = fileURL?.path
+        context.relativePath = fileURL.flatMap {
+            Self.relativePath(of: $0.path, under: worktree.path)
+        }
+        context.pageTitle = title
+        context.paneID = paneID
+        context.viewport = "\(Int(bounds.width))x\(Int(bounds.height))"
+        context.appVersion = Bundle.main
+            .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+
+        do {
+            try ViewerFeedbackReport.stage(
+                segments: segments, images: images, quotes: quotes,
+                worktree: worktree, context: context, stem: stem)
+        } catch {
+            // Still give the reveal something to select so the user can drop
+            // files in — a create-then-open fallback, never a silent no-op.
+            try? FileManager.default.createDirectory(
+                at: target, withIntermediateDirectories: true)
+            Self.logger.warning(
+                "failed to materialize feedback staging folder: \(error)")
+        }
+
+        NSWorkspace.shared.activateFileViewerSelecting([target])
+    }
+
     /// File the composed report into the detected worktree's queue.
     ///
     /// Gathers the page's own context first — what the user had SELECTED, the
@@ -1049,6 +1182,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let segments = feedbackModel.segments()
         let images = feedbackModel.imagePayloads()
         let quotes = feedbackModel.quotes
+        // Publish THIS draft's staging folder (with any files the user dragged
+        // into it), not a fresh one. Nil when the send skipped the composer.
+        let stem = feedbackDraftStem
 
         readPageContext { [weak self] pageTitle, selection in
             guard let self else { return }
@@ -1067,7 +1203,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             self.writeFeedback(
                 segments: segments, images: images, quotes: quotes,
-                worktree: worktree, context: context)
+                worktree: worktree, context: context, stem: stem)
         }
     }
 
@@ -1118,7 +1254,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
         images: [ViewerFeedbackReport.Image],
         quotes: [ViewerFeedbackQuote],
         worktree: ViewerWorktree,
-        context: ViewerFeedbackReport.Context
+        context: ViewerFeedbackReport.Context,
+        stem: String?
     ) {
         let filePath = fileURL?.path
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1150,13 +1287,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
             let result = Result {
                 try ViewerFeedbackReport.write(
                     segments: segments, images: images, quotes: payloadQuotes,
-                    worktree: worktree, context: context)
+                    worktree: worktree, context: context, stem: stem)
             }
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
                 case .success(let written):
                     self.feedbackModel.reset()
+                    // The draft's folder was just published; the next draft
+                    // mints its own stem when the composer next opens.
+                    self.feedbackDraftStem = nil
                     self.feedbackModel.status = .filed(written.stem)
                     Self.logger.info(
                         "filed feedback report \(written.folderURL.path, privacy: .public)")

@@ -156,3 +156,47 @@ struct ViewerFeedbackPasteValidationTests {
         }
     }
 }
+
+/// Cmd-C/V/X/A (and undo/redo) must be recognized so the composer can service
+/// them itself — the app's Edit menu ships those items WITHOUT key equivalents
+/// (Cmd-C/V are terminal copy/paste on the surface), so an unclaimed shortcut
+/// in a focused composer just beeps. This tests the pure key-mapping; the
+/// routing (only while first responder) is exercised by the composer live.
+@MainActor
+struct ViewerFeedbackEditingShortcutTests {
+    private func keyEvent(
+        _ chars: String, _ flags: NSEvent.ModifierFlags
+    ) -> NSEvent {
+        NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: flags,
+            timestamp: 0, windowNumber: 0, context: nil,
+            characters: chars, charactersIgnoringModifiers: chars,
+            isARepeat: false, keyCode: 0)!
+    }
+
+    @Test func recognizesStandardEditingShortcuts() {
+        let cmd: NSEvent.ModifierFlags = [.command]
+        #expect(ViewerFeedbackTextView.editingCommand(for: keyEvent("c", cmd)) == .copy)
+        #expect(ViewerFeedbackTextView.editingCommand(for: keyEvent("v", cmd)) == .paste)
+        #expect(ViewerFeedbackTextView.editingCommand(for: keyEvent("x", cmd)) == .cut)
+        #expect(ViewerFeedbackTextView.editingCommand(for: keyEvent("a", cmd)) == .selectAll)
+        #expect(ViewerFeedbackTextView.editingCommand(for: keyEvent("z", cmd)) == .undo)
+        #expect(ViewerFeedbackTextView.editingCommand(
+            for: keyEvent("z", [.command, .shift])) == .redo)
+    }
+
+    @Test func ignoresNonEditingAndModifierMismatches() {
+        // No command modifier: plain typing must never be swallowed.
+        #expect(ViewerFeedbackTextView.editingCommand(for: keyEvent("c", [])) == nil)
+        // The app's own composer shortcuts stay out of this path.
+        #expect(ViewerFeedbackTextView.editingCommand(
+            for: keyEvent("s", [.command, .shift])) == nil) // ⇧⌘S snapshot
+        #expect(ViewerFeedbackTextView.editingCommand(
+            for: keyEvent("\r", [.command])) == nil)        // ⌘↩ send
+        // Control/option-carrying combos are not our editing shortcuts.
+        #expect(ViewerFeedbackTextView.editingCommand(
+            for: keyEvent("c", [.command, .control])) == nil)
+        #expect(ViewerFeedbackTextView.editingCommand(
+            for: keyEvent("v", [.command, .option])) == nil)
+    }
+}

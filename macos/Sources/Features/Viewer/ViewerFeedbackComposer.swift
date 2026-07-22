@@ -466,7 +466,48 @@ final class ViewerFeedbackTextView: NSTextView {
             captureScreenshot()
             return true
         }
+        // Standard editing shortcuts (Cmd-C/V/X/A, Cmd-Z/⇧Z). Ghoztty's main
+        // menu ships the Edit ▸ Copy/Paste/… items WITHOUT key equivalents —
+        // Cmd-C/Cmd-V are bound to TERMINAL copy/paste on the surface instead —
+        // so when this text view is focused they reach no handler and just
+        // beep. Claim them here, but only while WE hold first responder, so a
+        // Cmd-C aimed at a focused terminal pane in the same window still
+        // copies the terminal (performKeyEquivalent is offered to every view,
+        // not just the focused one).
+        if window?.firstResponder === self, let command = Self.editingCommand(for: event) {
+            switch command {
+            case .copy: copy(nil)
+            case .paste: paste(nil)
+            case .cut: cut(nil)
+            case .selectAll: selectAll(nil)
+            case .undo: undoManager?.undo()
+            case .redo: undoManager?.redo()
+            }
+            return true
+        }
         return super.performKeyEquivalent(with: event)
+    }
+
+    /// A standard editing command the composer must service itself (see
+    /// `performKeyEquivalent`). Pure classification, no side effects, so the
+    /// key mapping is unit-testable without touching the system pasteboard.
+    enum EditingCommand { case copy, paste, cut, selectAll, undo, redo }
+
+    static func editingCommand(for event: NSEvent) -> EditingCommand? {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command),
+              !flags.contains(.control), !flags.contains(.option)
+        else { return nil }
+        let shift = flags.contains(.shift)
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "c" where !shift: return .copy
+        case "v" where !shift: return .paste
+        case "x" where !shift: return .cut
+        case "a" where !shift: return .selectAll
+        case "z" where !shift: return .undo
+        case "z" where shift: return .redo
+        default: return nil
+        }
     }
 
     /// Paint quote blocks: a soft background panel with an accent bar down the

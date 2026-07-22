@@ -253,4 +253,158 @@ struct ViewerFeedbackReportTests {
             date: Date(timeIntervalSince1970: 2_000), suffix: "000000")
         #expect(early < late)
     }
+
+    // MARK: - Draft staging lifecycle
+
+    /// The staging paths are worktree-relative and stable, so the composer can
+    /// display and reveal them.
+    @Test func stagingPathsAreWorktreeRelative() throws {
+        let (worktree, _) = try makeWorktree()
+        #expect(ViewerFeedbackReport.stagingRelativePath == "temp/feedback/.staging")
+        let stem = "20260721T000000Z-abc123"
+        let url = ViewerFeedbackReport.stagingDirectory(in: worktree, stem: stem)
+        #expect(url.path == worktree.url
+            .appendingPathComponent("temp/feedback/.staging/\(stem)").path)
+    }
+
+    /// `stage` materializes the draft folder in place — a `report.json` plus
+    /// the draft's images — WITHOUT publishing it into `new/` yet. This is what
+    /// makes the folder openable while the user is still composing.
+    @Test func stageMaterializesDraftFolderWithoutPublishing() throws {
+        let (worktree, dir) = try makeWorktree()
+        let png = pngFixture()
+        let stem = "20260721T000000Z-draft1"
+        let staging = try ViewerFeedbackReport.stage(
+            segments: [.text("wip "), .image(number: 1)],
+            images: [ViewerFeedbackReport.Image(number: 1, png: png)],
+            worktree: worktree,
+            context: ViewerFeedbackReport.Context(source: "/f.md", sourceKind: "file"),
+            stem: stem)
+
+        // Compare paths, not URLs: `appendingPathComponent` adds a trailing
+        // slash once the directory exists, so the two URLs differ cosmetically.
+        #expect(staging.path
+            == ViewerFeedbackReport.stagingDirectory(in: worktree, stem: stem).path)
+        #expect(FileManager.default.fileExists(
+            atPath: staging.appendingPathComponent("report.json").path))
+        #expect(FileManager.default.fileExists(
+            atPath: staging.appendingPathComponent("images/image-1.png").path))
+
+        // Nothing published yet: the queue is empty (or absent).
+        let queue = dir.appendingPathComponent("temp/feedback/new")
+        let queued = (try? FileManager.default.contentsOfDirectory(atPath: queue.path)) ?? []
+        #expect(queued.isEmpty)
+    }
+
+    /// A work-in-progress folder legitimately has nothing typed in it yet, so
+    /// `stage` tolerates an empty draft (unlike `write`, which rejects it).
+    @Test func stageToleratesEmptyDraft() throws {
+        let (worktree, _) = try makeWorktree()
+        let stem = "20260721T000000Z-empty1"
+        let staging = try ViewerFeedbackReport.stage(
+            segments: [], images: [],
+            worktree: worktree,
+            context: ViewerFeedbackReport.Context(source: "x", sourceKind: "file"),
+            stem: stem)
+        #expect(FileManager.default.fileExists(
+            atPath: staging.appendingPathComponent("report.json").path))
+        // No images subdirectory for an image-less draft.
+        #expect(!FileManager.default.fileExists(
+            atPath: staging.appendingPathComponent("images").path))
+    }
+
+    /// The heart of the feature: a file the user dropped into the draft's
+    /// staging folder while composing rides along into the published report
+    /// (the send reuses the draft's stem instead of minting a fresh folder).
+    @Test func sendPublishesFilesDroppedIntoStaging() throws {
+        let (worktree, dir) = try makeWorktree()
+        let stem = "20260721T120000Z-draft2"
+
+        // Compose: the composer materializes the draft's staging folder.
+        try ViewerFeedbackReport.stage(
+            segments: [.text("look at this")], images: [],
+            worktree: worktree,
+            context: ViewerFeedbackReport.Context(source: "/f.md", sourceKind: "file"),
+            stem: stem)
+
+        // The user opens the folder and drops an extra file into it.
+        let staging = ViewerFeedbackReport.stagingDirectory(in: worktree, stem: stem)
+        let dropped = staging.appendingPathComponent("extra-notes.txt")
+        try "hand-added".write(to: dropped, atomically: true, encoding: .utf8)
+
+        // Send reuses THIS draft's stem.
+        let written = try ViewerFeedbackReport.write(
+            segments: [.text("look at this")], images: [],
+            worktree: worktree,
+            context: ViewerFeedbackReport.Context(source: "/f.md", sourceKind: "file"),
+            stem: stem)
+
+        #expect(written.stem == stem)
+        // The dropped file was consumed into the published folder, intact.
+        let publishedExtra = written.folderURL.appendingPathComponent("extra-notes.txt")
+        #expect(FileManager.default.fileExists(atPath: publishedExtra.path))
+        #expect(try String(contentsOf: publishedExtra, encoding: .utf8) == "hand-added")
+        #expect(FileManager.default.fileExists(atPath: written.reportURL.path))
+
+        // Staging is empty afterward (the whole draft folder moved atomically).
+        let stagingRoot = dir.appendingPathComponent("temp/feedback/.staging")
+        let left = (try? FileManager.default.contentsOfDirectory(atPath: stagingRoot.path)) ?? []
+        #expect(left.isEmpty)
+    }
+
+    /// Re-staging a draft (as happens each time the folder is revealed or on
+    /// send) refreshes report.json + images but never wipes a dropped file.
+    @Test func restagePreservesDroppedFiles() throws {
+        let (worktree, _) = try makeWorktree()
+        let stem = "20260721T130000Z-draft3"
+        try ViewerFeedbackReport.stage(
+            segments: [.text("first")], images: [], worktree: worktree,
+            context: ViewerFeedbackReport.Context(source: "x", sourceKind: "file"),
+            stem: stem)
+        let staging = ViewerFeedbackReport.stagingDirectory(in: worktree, stem: stem)
+        try "keep me".write(
+            to: staging.appendingPathComponent("dropped.bin"),
+            atomically: true, encoding: .utf8)
+
+        // Refresh with new content.
+        try ViewerFeedbackReport.stage(
+            segments: [.text("second, edited")], images: [], worktree: worktree,
+            context: ViewerFeedbackReport.Context(source: "x", sourceKind: "file"),
+            stem: stem)
+
+        #expect(FileManager.default.fileExists(
+            atPath: staging.appendingPathComponent("dropped.bin").path))
+        let body = try #require(
+            (try decode(staging.appendingPathComponent("report.json")))["body"] as? String)
+        #expect(body == "second, edited")
+    }
+
+    /// Abandoned drafts are pruned by age, but a draft being composed now — the
+    /// `keeping` stem — and recent ones (another pane's live draft) are left be.
+    @Test func pruneRemovesStaleButKeepsCurrentAndRecent() throws {
+        let (worktree, _) = try makeWorktree()
+        let now = Date(timeIntervalSince1970: 2_000_000)
+
+        func makeStaging(_ stem: String, ageSeconds: TimeInterval) throws {
+            let url = ViewerFeedbackReport.stagingDirectory(in: worktree, stem: stem)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes(
+                [.modificationDate: now.addingTimeInterval(-ageSeconds)],
+                ofItemAtPath: url.path)
+        }
+
+        // "current" is old but protected by `keeping`; "recent" is protected by
+        // age; "stale" is neither.
+        try makeStaging("current", ageSeconds: 48 * 60 * 60)
+        try makeStaging("recent", ageSeconds: 60)
+        try makeStaging("stale", ageSeconds: 48 * 60 * 60)
+
+        let removed = ViewerFeedbackReport.pruneStaleStaging(
+            in: worktree, keeping: "current", olderThan: 24 * 60 * 60, now: now)
+
+        #expect(removed == ["stale"])
+        let root = worktree.url.appendingPathComponent("temp/feedback/.staging")
+        let left = Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [])
+        #expect(left == ["current", "recent"])
+    }
 }

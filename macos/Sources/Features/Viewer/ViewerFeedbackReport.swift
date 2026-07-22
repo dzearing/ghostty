@@ -214,6 +214,105 @@ enum ViewerFeedbackReport {
         }.joined()
     }
 
+    // MARK: - Staging (while a draft is being composed)
+
+    /// Worktree-relative path of the staging area, shown in the composer so the
+    /// user can see — and open — exactly where the draft they are writing lives.
+    static let stagingRelativePath =
+        "\(tempDirectoryName)/\(queueDirectoryName)/\(stagingDirectoryName)"
+
+    /// The `.staging/<stem>` folder a single draft is assembled in before it is
+    /// published into `new/`. The stem is stable for the draft's whole life, so
+    /// the footer link, the files the user drops into the folder, and the
+    /// eventual atomic publish all refer to one folder.
+    static func stagingDirectory(in worktree: ViewerWorktree, stem: String) -> URL {
+        feedbackDirectory(in: worktree.url)
+            .appendingPathComponent(stagingDirectoryName)
+            .appendingPathComponent(stem)
+    }
+
+    /// Create or refresh a draft's staging folder *in place*: (over)write
+    /// `report.json` and the draft's own `images/`, while leaving every other
+    /// file untouched — in particular the ones the user dragged into the folder
+    /// through the footer link, which must ride along into the published report.
+    ///
+    /// Unlike `write`, this tolerates an empty draft: a work-in-progress folder
+    /// legitimately has nothing typed in it yet. Returns the staging directory.
+    @discardableResult
+    static func stage(
+        segments: [Segment],
+        images: [Image],
+        quotes: [Quote] = [],
+        worktree: ViewerWorktree,
+        context: Context,
+        stem: String,
+        date: Date = Date()
+    ) throws -> URL {
+        let fm = FileManager.default
+        let stagingDir = stagingDirectory(in: worktree, stem: stem)
+        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+
+        // Drafts that get composed but never sent would otherwise leave their
+        // folders here forever; sweep the stale ones whenever a draft touches
+        // disk — never this draft's folder, nor a recent one another pane may
+        // still be composing into.
+        pruneStaleStaging(in: worktree, keeping: stem, now: date)
+
+        let sorted = images.sorted { $0.number < $1.number }
+        if !sorted.isEmpty {
+            let imagesDir = stagingDir.appendingPathComponent(imagesDirectoryName)
+            try fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+            for image in sorted {
+                try image.png.write(
+                    to: imagesDir.appendingPathComponent(imageFileName(number: image.number)))
+            }
+        }
+
+        let payload = makePayload(
+            segments: segments, images: sorted, quotes: quotes,
+            context: context, worktree: worktree, stem: stem, date: date)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try encoder.encode(payload)
+            .write(to: stagingDir.appendingPathComponent(reportFileName))
+
+        return stagingDir
+    }
+
+    /// Remove staging folders left by drafts that were never sent, so the
+    /// staging area doesn't accumulate abandoned work. Only folders whose last
+    /// modification is older than `olderThan` are removed, and never `keeping`,
+    /// so a draft being composed right now — in this pane or another — is safe.
+    /// Returns the names removed. `olderThan`/`now` are injectable for testing.
+    @discardableResult
+    static func pruneStaleStaging(
+        in worktree: ViewerWorktree,
+        keeping stem: String,
+        olderThan: TimeInterval = 24 * 60 * 60,
+        now: Date = Date()
+    ) -> [String] {
+        let fm = FileManager.default
+        let root = feedbackDirectory(in: worktree.url)
+            .appendingPathComponent(stagingDirectoryName)
+        guard let entries = try? fm.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles])
+        else { return [] }
+
+        var removed: [String] = []
+        for entry in entries where entry.lastPathComponent != stem {
+            let modified = (try? entry.resourceValues(
+                forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                ?? .distantFuture
+            guard now.timeIntervalSince(modified) > olderThan else { continue }
+            if (try? fm.removeItem(at: entry)) != nil {
+                removed.append(entry.lastPathComponent)
+            }
+        }
+        return removed
+    }
+
     // MARK: - Writing
 
     /// Write a report folder into `worktree/temp/feedback/new/`.
@@ -225,7 +324,10 @@ enum ViewerFeedbackReport {
     /// the same filesystem, since a cross-device rename fails with EXDEV and
     /// would silently degrade to a non-atomic copy.
     ///
-    /// `date` and `suffix` are injectable purely so tests can assert exact
+    /// When `stem` is supplied the draft's own staging folder is reused and
+    /// published as-is, so any files the user dropped into it while composing
+    /// (see `stage`) are carried along. When it is nil a fresh one is minted
+    /// from `date`/`suffix` — both injectable purely so tests can assert exact
     /// names.
     @discardableResult
     static func write(
@@ -235,7 +337,8 @@ enum ViewerFeedbackReport {
         worktree: ViewerWorktree,
         context: Context,
         date: Date = Date(),
-        suffix: String = randomSuffix()
+        suffix: String = randomSuffix(),
+        stem explicitStem: String? = nil
     ) throws -> Written {
         let text = plainText(segments: segments)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -252,33 +355,53 @@ enum ViewerFeedbackReport {
             }
         }
 
-        let stem = makeStem(date: date, suffix: suffix)
+        let stem = explicitStem ?? makeStem(date: date, suffix: suffix)
         let fm = FileManager.default
-        let feedbackDir = feedbackDirectory(in: worktree.url)
-        let queueDir = feedbackDir.appendingPathComponent(newDirectoryName)
-        let stagingDir = feedbackDir
-            .appendingPathComponent(stagingDirectoryName)
-            .appendingPathComponent(stem)
+        let queueDir = feedbackDirectory(in: worktree.url)
+            .appendingPathComponent(newDirectoryName)
         try fm.createDirectory(at: queueDir, withIntermediateDirectories: true)
-        // A leftover staging dir from a crashed write would fail the move.
-        if fm.fileExists(atPath: stagingDir.path) {
-            try fm.removeItem(at: stagingDir)
+
+        // Build/refresh the draft folder (preserving any dragged-in files),
+        // then publish it with a single atomic move.
+        let stagingDir = try stage(
+            segments: segments, images: images, quotes: quotes,
+            worktree: worktree, context: context, stem: stem, date: date)
+
+        let finalDir = queueDir.appendingPathComponent(stem)
+        guard rename(
+            (stagingDir as NSURL).fileSystemRepresentation,
+            (finalDir as NSURL).fileSystemRepresentation) == 0
+        else {
+            let code = errno
+            try? fm.removeItem(at: stagingDir)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
         }
-        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
         let sorted = images.sorted { $0.number < $1.number }
-        var stagedImageNames: [String] = []
-        if !sorted.isEmpty {
-            let imagesDir = stagingDir.appendingPathComponent(imagesDirectoryName)
-            try fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
-            for image in sorted {
-                let name = imageFileName(number: image.number)
-                try image.png.write(to: imagesDir.appendingPathComponent(name))
-                stagedImageNames.append(name)
-            }
-        }
+        return Written(
+            folderURL: finalDir,
+            reportURL: finalDir.appendingPathComponent(reportFileName),
+            imageURLs: sorted.map {
+                finalDir
+                    .appendingPathComponent(imagesDirectoryName)
+                    .appendingPathComponent(imageFileName(number: $0.number))
+            },
+            stem: stem)
+    }
 
-        let payload = Payload(
+    /// Assemble the JSON payload for a report. Shared by `stage` (the
+    /// work-in-progress folder) and the final publish so the two never drift.
+    /// `images` is expected already sorted by number.
+    private static func makePayload(
+        segments: [Segment],
+        images: [Image],
+        quotes: [Quote],
+        context: Context,
+        worktree: ViewerWorktree,
+        stem: String,
+        date: Date
+    ) -> Payload {
+        Payload(
             version: schemaVersion,
             id: stem,
             created: ISO8601DateFormatter.feedbackFormatter.string(from: date),
@@ -307,7 +430,7 @@ enum ViewerFeedbackReport {
                     documentOffset: $0.documentOffset,
                     sourceLine: $0.sourceLine)
             },
-            images: sorted.map {
+            images: images.map {
                 PayloadImage(
                     number: $0.number,
                     path: imageRelativePath(number: $0.number),
@@ -315,32 +438,6 @@ enum ViewerFeedbackReport {
                     pixelHeight: $0.pixelHeight > 0 ? $0.pixelHeight : nil,
                     bytes: $0.png.count)
             })
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        try encoder.encode(payload)
-            .write(to: stagingDir.appendingPathComponent(reportFileName))
-
-        // One atomic move publishes the whole folder.
-        let finalDir = queueDir.appendingPathComponent(stem)
-        guard rename(
-            (stagingDir as NSURL).fileSystemRepresentation,
-            (finalDir as NSURL).fileSystemRepresentation) == 0
-        else {
-            let code = errno
-            try? fm.removeItem(at: stagingDir)
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
-        }
-
-        return Written(
-            folderURL: finalDir,
-            reportURL: finalDir.appendingPathComponent(reportFileName),
-            imageURLs: stagedImageNames.map {
-                finalDir
-                    .appendingPathComponent(imagesDirectoryName)
-                    .appendingPathComponent($0)
-            },
-            stem: stem)
     }
 
     // MARK: - Payload

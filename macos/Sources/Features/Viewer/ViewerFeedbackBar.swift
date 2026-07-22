@@ -61,7 +61,28 @@ struct ViewerFeedbackBar: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
         .modifier(ChromeBarBackground())
+        .background(heightReporter)
         .onHover { viewerView.holdChrome($0) }
+    }
+
+    /// Reports the bar's laid-out height to the viewer so it reserves exactly
+    /// that much space above the page — and, crucially, gives it back when the
+    /// pill shrinks. Measuring the WHOLE bar (not just the text editor) makes
+    /// the page reflow track the carousel and footer too. The report is
+    /// deferred a tick so it never mutates AppKit layout from inside the very
+    /// layout pass that produced the measurement.
+    private var heightReporter: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .onAppear { reportBarHeight(proxy.size.height) }
+                .onChange(of: proxy.size.height) { newHeight in
+                    reportBarHeight(newHeight)
+                }
+        }
+    }
+
+    private func reportBarHeight(_ height: CGFloat) {
+        DispatchQueue.main.async { viewerView.feedbackBarDidChangeHeight(height) }
     }
 
     /// The pill: text on the left, circular actions pinned bottom-right inside
@@ -188,17 +209,9 @@ struct ViewerFeedbackBar: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             case nil:
-                Image(systemName: "folder")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if let worktree = viewerView.worktree {
-                    Text(verbatim:
-                        "\(worktree.name)/\(ViewerFeedbackReport.queueRelativePath)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                        .help(worktree.path)
+                if let worktree = viewerView.worktree,
+                   let stagingPath = viewerView.feedbackStagingRelativePath {
+                    stagingLink(worktree: worktree, path: stagingPath)
                 }
             }
             Spacer()
@@ -206,6 +219,30 @@ struct ViewerFeedbackBar: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
+    }
+
+    /// The destination shown as a clickable link that reveals THIS draft's
+    /// staging folder in Finder. The point isn't just to see where the report
+    /// lands: the user can open the folder and drop extra files into it before
+    /// sending, and those files are published with the report.
+    private func stagingLink(worktree: ViewerWorktree, path: String) -> some View {
+        Button(action: { viewerView.revealFeedbackStagingFolder() }) {
+            HStack(spacing: 4) {
+                Image(systemName: "folder")
+                Text(verbatim: "\(worktree.name)/\(path)")
+                    .underline()
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(
+            "Reveal this draft's folder in Finder — drop files here to include "
+                + "them in the report"
+                + (viewerView.feedbackStagingURL.map { "\n\($0.path)" } ?? ""))
     }
 }
 
