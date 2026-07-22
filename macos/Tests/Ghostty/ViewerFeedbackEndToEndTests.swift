@@ -67,7 +67,7 @@ struct ViewerFeedbackEndToEndTests {
 
     /// The full send path: resolve the worktree, compose text plus an image,
     /// call `sendFeedback`, and confirm a machine-readable report with its
-    /// image lands in the repo's `.feedback/new/` — and the composer clears.
+    /// image lands in the repo's `temp/feedback/new/` — and the composer clears.
     @Test func sendFeedbackWritesReportIntoRepo() async throws {
         let (repo, file) = try makeRepo()
         ViewerWorktreeCache.shared.invalidateAll()
@@ -104,7 +104,7 @@ struct ViewerFeedbackEndToEndTests {
         #expect(viewer.feedbackModel.isEmpty)
 
         // A report with a resolvable image path landed in the queue.
-        let queue = worktree.url.appendingPathComponent(".feedback/new")
+        let queue = worktree.url.appendingPathComponent("temp/feedback/new")
         let folders = try FileManager.default.contentsOfDirectory(atPath: queue.path)
         #expect(folders.count == 1)
         let folder = queue.appendingPathComponent(folders[0])

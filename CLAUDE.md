@@ -366,7 +366,7 @@ When a viewer pane's content can be attributed to a **git worktree**, its
 navigation bar gains a **feedback button** (labeled with the worktree's
 basename, full path on hover) that opens a composer toolbar below the nav bar.
 On send it writes a report — plus any pasted screenshots — into
-`<worktree>/.feedback/new/` for an external watcher to drain (Ghoztty produces
+`<worktree>/temp/feedback/new/` for an external watcher to drain (Ghoztty produces
 the queue; consuming it is separate and not built here).
 
 - **Provenance (strategy D — port lookup first, pane-origin fallback).** The
@@ -448,14 +448,19 @@ the queue; consuming it is separate and not built here).
   can be moved or handed to an agent as a unit:
 
   ```
-  <worktree>/.feedback/new/<timestamp>-<suffix>/
+  <worktree>/temp/feedback/new/<timestamp>-<suffix>/
       report.json
       images/image-1.png
   ```
 
-  The whole folder is built under `.feedback/.staging/` and moved into place
+  The whole folder is built under `temp/feedback/.staging/` and moved into place
   with a single **atomic `rename`** (same filesystem), so a watcher sees either
-  nothing or a complete report with every image already present.
+  nothing or a complete report with every image already present. Promoting one
+  to an `in-progress/` queue is likewise a single `mv` — image paths in the
+  report are folder-relative, so they survive the move.
+  The queue lives under **`temp/`** because that name is already gitignored
+  here (`.gitignore`) and conventionally elsewhere; a top-level `.feedback/`
+  was not, so every filed report showed up as untracked in `git status`.
   **Format is JSON** (not markdown-frontmatter: a multi-line prose body with a
   `---` or `key:` line breaks naive frontmatter splitting; JSON has one parse
   path). `body` is markdown with each chip rendered as a

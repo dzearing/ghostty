@@ -140,7 +140,7 @@ struct ViewerFeedbackReportTests {
         return try JSONSerialization.jsonObject(with: data) as! [String: Any]
     }
 
-    /// A text-plus-image report lands in `.feedback/new/`, atomically, with
+    /// A text-plus-image report lands in `temp/feedback/new/`, atomically, with
     /// the image written alongside and referenced by a resolvable path.
     @Test func writesReportWithImage() throws {
         let (worktree, dir) = try makeWorktree()
@@ -159,8 +159,8 @@ struct ViewerFeedbackReportTests {
             date: Date(timeIntervalSince1970: 1_770_000_000),
             suffix: "abc123")
 
-        // Report lives in its OWN folder under .feedback/new/.
-        let queue = dir.appendingPathComponent(".feedback/new")
+        // Report lives in its OWN folder under temp/feedback/new/.
+        let queue = dir.appendingPathComponent("temp/feedback/new")
         #expect(written.folderURL.deletingLastPathComponent().path == queue.path)
         #expect(written.folderURL.lastPathComponent == written.stem)
         #expect(written.reportURL.lastPathComponent == "report.json")
@@ -190,7 +190,7 @@ struct ViewerFeedbackReportTests {
 
         // Nothing half-written left behind: staging is gone, queue holds only
         // the finished folder.
-        let staging = dir.appendingPathComponent(".feedback/.staging")
+        let staging = dir.appendingPathComponent("temp/feedback/.staging")
         let stagingLeft = (try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? []
         #expect(stagingLeft.isEmpty)
         let queued = try FileManager.default.contentsOfDirectory(atPath: queue.path)

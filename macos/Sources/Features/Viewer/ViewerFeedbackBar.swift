@@ -192,7 +192,8 @@ struct ViewerFeedbackBar: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let worktree = viewerView.worktree {
-                    Text(verbatim: "\(worktree.name)/.feedback/new")
+                    Text(verbatim:
+                        "\(worktree.name)/\(ViewerFeedbackReport.queueRelativePath)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)

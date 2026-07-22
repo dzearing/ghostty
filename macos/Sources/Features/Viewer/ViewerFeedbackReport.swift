@@ -1,6 +1,6 @@
 import Foundation
 
-/// Writes one feedback report into a worktree's `.feedback/new/` queue.
+/// Writes one feedback report into a worktree's `temp/feedback/new/` queue.
 ///
 /// The queue is drained by an external watcher, one report at a time — this
 /// side only produces. Pure logic (no AppKit, no UI state) so the whole
@@ -19,24 +19,43 @@ import Foundation
 /// ## Layout on disk — one self-contained folder per report
 ///
 /// ```
-/// <worktree>/.feedback/new/20260721T214512Z-a3f9c2/
+/// <worktree>/temp/feedback/new/20260721T214512Z-a3f9c2/
 ///     report.json
 ///     images/image-1.png
 /// ```
 ///
 /// Everything for a submission lives together, so a report can be moved,
-/// archived, or handed to an agent as one unit. Image paths inside the report
-/// are relative to the report folder.
+/// archived, or handed to an agent as one unit (`mv new/<stem> in-progress/`
+/// is a single rename, and the report's image paths are folder-relative so
+/// they survive it).
+///
+/// The queue lives under `temp/` because that name is already gitignored in
+/// this repo and conventionally in others; a top-level `.feedback/` was not,
+/// so every filed report showed up as untracked in `git status`.
 enum ViewerFeedbackReport {
     /// Schema version of the emitted JSON. Bumped to 2 when reports moved
     /// into per-report folders and gained the full source/worktree context.
     static let schemaVersion = 2
 
-    static let queueDirectoryName = ".feedback"
+    /// `temp/` is gitignored here and in most repos; a bare `.feedback/` was
+    /// not, so filed reports dirtied `git status`.
+    static let tempDirectoryName = "temp"
+    static let queueDirectoryName = "feedback"
     static let newDirectoryName = "new"
     static let stagingDirectoryName = ".staging"
     static let reportFileName = "report.json"
     static let imagesDirectoryName = "images"
+
+    /// Worktree-relative path of the queue reports land in, for display.
+    static let queueRelativePath =
+        "\(tempDirectoryName)/\(queueDirectoryName)/\(newDirectoryName)"
+
+    /// The `temp/feedback` directory inside a worktree.
+    static func feedbackDirectory(in worktree: URL) -> URL {
+        worktree
+            .appendingPathComponent(tempDirectoryName)
+            .appendingPathComponent(queueDirectoryName)
+    }
 
     /// One piece of the composed message, in document order.
     enum Segment: Equatable {
@@ -197,14 +216,14 @@ enum ViewerFeedbackReport {
 
     // MARK: - Writing
 
-    /// Write a report folder into `worktree/.feedback/new/`.
+    /// Write a report folder into `worktree/temp/feedback/new/`.
     ///
     /// The whole folder is built in a sibling staging directory and then moved
     /// into place with a single `rename`, which is atomic — a watcher scanning
-    /// `.feedback/new/` sees either nothing or a complete report folder with
-    /// every image already present. Staging under `.feedback/` (not `/tmp`)
-    /// keeps it on the same filesystem, since a cross-device rename fails with
-    /// EXDEV and would silently degrade to a non-atomic copy.
+    /// `new/` sees either nothing or a complete report folder with every image
+    /// already present. Staging under `temp/feedback/` (not `/tmp`) keeps it on
+    /// the same filesystem, since a cross-device rename fails with EXDEV and
+    /// would silently degrade to a non-atomic copy.
     ///
     /// `date` and `suffix` are injectable purely so tests can assert exact
     /// names.
@@ -235,7 +254,7 @@ enum ViewerFeedbackReport {
 
         let stem = makeStem(date: date, suffix: suffix)
         let fm = FileManager.default
-        let feedbackDir = worktree.url.appendingPathComponent(queueDirectoryName)
+        let feedbackDir = feedbackDirectory(in: worktree.url)
         let queueDir = feedbackDir.appendingPathComponent(newDirectoryName)
         let stagingDir = feedbackDir
             .appendingPathComponent(stagingDirectoryName)
