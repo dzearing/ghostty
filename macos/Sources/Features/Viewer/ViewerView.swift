@@ -536,6 +536,15 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         openLocation(Self.isFilePath(trimmed) ? trimmed : Self.completeAddress(trimmed))
+        // Submitting an address hands keyboard focus to the page body, the way a
+        // browser omnibox does: you can immediately scroll/interact, and — just
+        // as important — the address field genuinely resigns first responder, so
+        // a later click back into it registers as a real focus change and
+        // re-selects the address. SwiftUI's `@FocusState = false` does not
+        // reliably move the AppKit first responder off the field editor here (a
+        // recurring NSHostingView limitation elsewhere in this file), so move it
+        // explicitly.
+        window?.makeFirstResponder(webView)
     }
 
     /// Return to the location this pane was opened with (the home button).
@@ -733,6 +742,23 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return responder === chromeHost || responder.isDescendant(of: chromeHost)
     }
 
+    /// True when the chrome bar's address field (its field editor) holds
+    /// keyboard focus — narrower than `chromeKeyboardFocused`, which also covers
+    /// the bar's buttons. Only a focused text editor should capture the standard
+    /// editing chords (see `performKeyEquivalent`).
+    private var chromeTextFieldFocused: Bool {
+        window?.firstResponder is NSText && chromeKeyboardFocused
+    }
+
+    /// True when keyboard focus is on an element inside THIS viewer pane that
+    /// should receive the standard editing chords: the address field's editor or
+    /// the web content. Deliberately excludes the bar's buttons and the feedback
+    /// composer (which handles the chords itself). Gates the editing routing in
+    /// `performKeyEquivalent`.
+    private var paneHoldsEditingFocus: Bool {
+        chromeTextFieldFocused || isViewerContentFocused
+    }
+
     private func scheduleChromeHide(after delay: TimeInterval = 2.0) {
         chromeHideTimer?.invalidate()
         chromeHideTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
@@ -777,11 +803,35 @@ final class ViewerView: NSView, Codable, ObservableObject {
         guard let window, event.window === window else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard bounds.contains(point) else { return }
+
+        // A focus-GAINING click into the address field selects the whole
+        // address (browser omnibox). Detected here at the AppKit level, not from
+        // SwiftUI's @FocusState: when the user clicks the web content the
+        // WKWebView takes first responder itself, and that focus loss is not
+        // observed by @FocusState — so a later click back into the field is not
+        // seen as a focus change and would never re-select. Let the click go on
+        // to focus the field normally; we only add the selection.
+        if addressClickSelectsAll(at: point) {
+            selectAddressWhenClickCompletes()
+            return
+        }
+
         if let responder = window.firstResponder as? NSView,
            responder === webView || responder.isDescendant(of: self) {
             return // already ours
         }
         window.makeFirstResponder(webView)
+    }
+
+    /// Whether a left-click at `point` (in this view's coordinates) should
+    /// select the whole address: it lands on the address field, and the field
+    /// does NOT already hold keyboard focus. A click into an already-focused
+    /// field returns false so it just places the caret (browser omnibox rule).
+    func addressClickSelectsAll(at point: NSPoint) -> Bool {
+        guard !chromeTextFieldFocused, chromeVisible,
+              let chromeHost, let field = Self.firstTextField(in: chromeHost)
+        else { return false }
+        return field.convert(field.bounds, to: self).contains(point)
     }
 
     private func handleChromeMouseMoved(_ event: NSEvent) {
@@ -1922,6 +1972,23 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// still performs the actual navigation.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if Self.isHeroNavChord(event) { return true }
+        // Whatever is focused INSIDE this viewer pane — the address field or the
+        // web page itself — must get the standard editing chords (Cmd-C/V/X/A)
+        // so the pane behaves like a browser. They otherwise don't: Ghoztty
+        // binds Cmd-C/V to TERMINAL copy/paste on the surface, so the Edit menu
+        // carries no plain Cmd-C/V equivalent that routes copy:/paste:/… to an
+        // ordinary AppKit responder — a focused web page or address field is
+        // left with no handler and the chord just no-ops. Dispatch them down the
+        // focused element's own responder chain here (so it reaches the field
+        // editor, or the WKWebView behind its content view), ahead of super's
+        // descent, and only while THIS pane holds the focus so a Cmd-C aimed at
+        // a terminal split is untouched. The feedback composer is excluded: it
+        // services these chords in its own performKeyEquivalent.
+        if paneHoldsEditingFocus,
+           let selector = Self.editingSelector(for: event),
+           window?.firstResponder?.tryToPerform(selector, with: nil) == true {
+            return true
+        }
         // Cmd+/−/0 zoom the viewer instead of the terminal font size — but only
         // when this viewer's own content is focused, so a focused terminal in
         // the same window keeps its font-size behavior and an unfocused viewer
@@ -1939,6 +2006,27 @@ final class ViewerView: NSView, Codable, ObservableObject {
     static func isHeroNavChord(_ event: NSEvent) -> Bool {
         guard event.modifierFlags.contains([.shift, .command]) else { return false }
         return event.specialKey == .upArrow || event.specialKey == .downArrow
+    }
+
+    /// The standard editing action a Cmd-key chord maps to, or nil if the event
+    /// is not one. Pure classification (no side effects) so the mapping is
+    /// unit-testable without a pasteboard or a live responder. Requires exactly
+    /// Command (no Control/Option/Shift) so it never collides with the viewer's
+    /// other chords or the app's Cmd-Shift bindings.
+    static func editingSelector(for event: NSEvent) -> Selector? {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard mods.contains(.command),
+              !mods.contains(.control),
+              !mods.contains(.option),
+              !mods.contains(.shift)
+        else { return nil }
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "c": return #selector(NSText.copy(_:))
+        case "v": return #selector(NSText.paste(_:))
+        case "x": return #selector(NSText.cut(_:))
+        case "a": return #selector(NSText.selectAll(_:))
+        default: return nil
+        }
     }
 
     // MARK: - Zoom (keyboard page zoom)
