@@ -276,6 +276,18 @@ enum UpdateState: Equatable {
         let appcastItem: SUAppcastItem
         let reply: @Sendable (SPUUserUpdateChoice) -> Void
 
+        /// Client-scoped notes for the OFFERED version, parsed from the appcast
+        /// item's embedded `<description>`. nil when the appcast carries none.
+        let clientNotes: VersionNotes?
+
+        init(appcastItem: SUAppcastItem,
+             reply: @escaping @Sendable (SPUUserUpdateChoice) -> Void,
+             clientNotes: VersionNotes? = nil) {
+            self.appcastItem = appcastItem
+            self.reply = reply
+            self.clientNotes = clientNotes
+        }
+
         var releaseNotes: ReleaseNotes? {
             let currentCommit = Bundle.main.infoDictionary?["GhosttyCommit"] as? String
             return ReleaseNotes(displayVersionString: appcastItem.displayVersionString, currentCommit: currentCommit)
