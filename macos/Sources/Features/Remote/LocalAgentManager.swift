@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import GhosttyKit
 import os
+import SwiftUI
 
 /// Finds or spawns the local `ghoztty-agent` and hands back dialed connection
 /// handles to it — the local end of session persistence: panes backed by this
@@ -777,18 +778,44 @@ final class LocalAgentManager {
         }
     }
 
+    /// Build the mandatory agent-restart confirmation, including the offline
+    /// "What's new" accessory when bundled notes are available. Free of side
+    /// effects (no runModal) so it is unit-testable.
+    @MainActor
+    static func makeUpgradeAlert(
+        liveSessionCount n: Int,
+        previousSeen: String?,
+        current: String,
+        store: ReleaseNotesStore
+    ) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "Restart to finish updating Ghoztty?"
+        let sessions = "\(n) open terminal session\(n == 1 ? "" : "s")"
+        alert.informativeText = "Ghoztty keeps your terminal sessions running in the background. Finishing this update restarts that background process, which will close your \(sessions) — they can’t be carried across the update. You can keep working instead: Ghoztty updates automatically the next time no sessions are open."
+        alert.addButton(withTitle: "Update Now")
+        alert.addButton(withTitle: "Later")
+        alert.alertStyle = .warning
+
+        let split = store.partitioned(previousSeen: previousSeen, current: current)
+        if !split.new.isEmpty || !split.installed.isEmpty {
+            let host = NSHostingView(
+                rootView: WhatsNewNotesView(newNotes: split.new, installedNotes: split.installed))
+            host.frame = NSRect(origin: .zero, size: WhatsNewNotesView.preferredSize)
+            alert.accessoryView = host
+        }
+        return alert
+    }
+
     /// The mandatory confirmation before a destructive agent restart while
     /// sessions are live. On confirm → refresh (live windows recover/relaunch);
     /// on defer → nothing (the agent refreshes automatically once idle).
     @MainActor
     private func promptAndRefreshLocalAgent(liveSessionCount n: Int, running: String?, bundled: String) {
-        let alert = NSAlert()
-        alert.messageText = "Update the background terminal agent?"
-        let sessions = "\(n) live terminal session\(n == 1 ? "" : "s")"
-        alert.informativeText = "A newer terminal agent is ready. Applying it now will close your \(sessions) — they can’t be carried across this update. You can also keep working: it will update automatically the next time no sessions are open."
-        alert.addButton(withTitle: "Update Now")
-        alert.addButton(withTitle: "Later")
-        alert.alertStyle = .warning
+        let alert = Self.makeUpgradeAlert(
+            liveSessionCount: n,
+            previousSeen: WhatsNewTracking.previousSeenVersion,
+            current: WhatsNewTracking.currentAppVersion,
+            store: ReleaseNotesStore(directory: ReleaseNotesStore.bundledDirectory))
         guard alert.runModal() == .alertFirstButtonReturn else {
             Self.logger.info("user deferred destructive agent refresh (\(n) live session(s))")
             return
