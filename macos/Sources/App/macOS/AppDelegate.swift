@@ -251,6 +251,11 @@ class AppDelegate: NSObject,
         // Store our start time
         applicationLaunchTime = ProcessInfo.processInfo.systemUptime
 
+        // Record the app version the user last ran, before session restore can
+        // surface the agent-update dialog, so "What's new" shows only the notes
+        // accrued since then.
+        WhatsNewTracking.snapshotAndAdvance(current: WhatsNewTracking.currentAppVersion)
+
         // Check if secure input was enabled when we last quit.
         if UserDefaults.ghostty.bool(forKey: "SecureInput") != SecureInput.shared.enabled {
             toggleSecureInput(self)

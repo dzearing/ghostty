@@ -1,0 +1,14 @@
+{
+  "version": "1.13.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Your terminals survive Ghoztty itself",
+          "text": "App updates, crashes, and force-quits no longer kill what's running. Processes live in the background agent, and windows re-attach on relaunch with their layout, tabs, titles, and scrollback intact. After a reboot, sessions come back with scrollback restored."
+        }
+      ]
+    }
+  ]
+}

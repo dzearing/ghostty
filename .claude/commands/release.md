@@ -55,6 +55,26 @@ From the categorized commits, write user-facing release notes. Rules:
 
 Present the notes and ask the user to approve or edit. Do NOT proceed until approved.
 
+**If the agent changed, author the bundled agent notes.** When this release
+changes the background agent (session persistence, re-attach, agent lifecycle,
+remote/relay — i.e. the `AGENT: changed` case from Step 1), write
+`release-notes/agent/<version>.json` containing **only** the agent/session
+changes — the reasons a user would restart the agent and reset live sessions.
+This is the offline "What's new" shown in the agent-restart dialog (schema in
+`release-notes/README.md`). Do NOT include viewer/banner/UI features here.
+Commit it with the release commit **before** tagging (Step 3) so it ships in the
+app bundle. Skip this when the agent didn't change. Example:
+
+```json
+{
+  "version": "1.4.1",
+  "sections": [
+    { "title": "Session persistence",
+      "items": [ { "title": "Seamless agent upgrades", "text": "What the user gains." } ] }
+  ]
+}
+```
+
 ### Step 3: Tag and Push
 
 ```bash
@@ -121,6 +141,10 @@ Installs alongside official Ghostty — separate app with its own bundle ID.
 NOTES
 )"
 ```
+
+If the agent changed, the bundled `release-notes/agent/<version>.json` (authored
+in Step 2) carries the agent-scoped subset for the in-app agent-restart dialog;
+this GitHub body is the full, general release notes.
 
 ### Step 7: Update Website
 

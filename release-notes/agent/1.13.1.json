@@ -1,0 +1,14 @@
+{
+  "version": "1.13.1",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "The background agent now ships",
+          "text": "1.13.0 shipped without the agent that powers session persistence, so it silently did nothing. It's included now, and the release pipeline refuses to build without it — so app restarts and future updates re-attach your terminals with the same running processes."
+        }
+      ]
+    }
+  ]
+}
