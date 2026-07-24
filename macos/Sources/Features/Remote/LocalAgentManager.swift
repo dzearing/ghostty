@@ -789,7 +789,7 @@ final class LocalAgentManager {
         store: ReleaseNotesStore
     ) -> NSAlert {
         let alert = NSAlert()
-        alert.messageText = "Restart to finish updating Ghoztty?"
+        alert.messageText = "Restart the Ghoztty background terminal process?"
         let sessions = "\(n) open terminal session\(n == 1 ? "" : "s")"
         alert.informativeText = "Ghoztty keeps your terminal sessions running in the background. Finishing this update restarts that background process, which will close your \(sessions) — they can’t be carried across the update. You can keep working instead: Ghoztty updates automatically the next time no sessions are open."
         alert.addButton(withTitle: "Update Now")

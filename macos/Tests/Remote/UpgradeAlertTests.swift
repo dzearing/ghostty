@@ -17,7 +17,7 @@ struct UpgradeAlertTests {
     @Test func copyIsPluralAndBrandedGhoztty() {
         let alert = LocalAgentManager.makeUpgradeAlert(
             liveSessionCount: 3, previousSeen: "1.4.0", current: "1.5.0", store: sampleStore())
-        #expect(alert.messageText == "Restart to finish updating Ghoztty?")
+        #expect(alert.messageText == "Restart the Ghoztty background terminal process?")
         #expect(alert.informativeText.contains("3 open terminal sessions"))
         #expect(!alert.informativeText.lowercased().contains("ghostty ")) // no Z-less leak
         #expect(alert.buttons.map(\.title) == ["Update Now", "Later"])
