@@ -55,6 +55,23 @@ From the categorized commits, write user-facing release notes. Rules:
 
 Present the notes and ask the user to approve or edit. Do NOT proceed until approved.
 
+**Also author the bundled notes.** From the same approved notes, write
+`release-notes/<version>.json` (the offline "What's new" for the agent-update
+dialog — schema in `release-notes/README.md`). Commit it with the release commit
+**before** tagging (Step 3) so it ships in the app bundle. The JSON and the
+GitHub release body (Step 6) are the same content in two shapes — keep them in
+sync. Example:
+
+```json
+{
+  "version": "1.4.1",
+  "sections": [
+    { "title": "Fork Changes",
+      "items": [ { "title": "Feature", "text": "What the user can now do." } ] }
+  ]
+}
+```
+
 ### Step 3: Tag and Push
 
 ```bash
@@ -121,6 +138,10 @@ Installs alongside official Ghostty — separate app with its own bundle ID.
 NOTES
 )"
 ```
+
+The bundled `release-notes/<version>.json` (authored in Step 2) already carries
+these notes for the in-app agent-update dialog; this GitHub body is the same
+content as markdown.
 
 ### Step 7: Update Website
 
