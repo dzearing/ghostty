@@ -1,0 +1,38 @@
+{
+  "version": "1.25.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Send feedback straight from a viewer pane",
+          "text": "Any viewer pane whose content belongs to a git worktree now has a feedback button in its nav bar. Write a note, hit send, and it's filed into that worktree as a self-contained report folder for an agent or watcher to pick up. Ghoztty figures out which worktree you mean from what the pane is actually showing — a file's own directory, or for a `localhost:PORT` page, the directory of whatever process is serving it — and re-checks on every navigation, so a pane that moves between a doc, a dev server, and a website always files to the right repo (and shows no button when there isn't one)."
+        },
+        {
+          "title": "Quote what you're pointing at",
+          "text": "Select any text in a viewer, on a rendered markdown file or a live web page alike, and a small Quote / Copy toolbar appears. Quote drops the passage into the composer as a proper blockquote and carries along where it came from — the section heading, the surrounding block, and for files the exact source line — so whoever reads the report can find the spot without guessing."
+        },
+        {
+          "title": "A composer that behaves like a chat box",
+          "text": "A pill that grows as you type, with a `+` for grabbing an interactive screenshot and a send button inside its trailing edge. Pasted screenshots become tidy `[Image #N]` chips that select, copy, and delete as one piece, mirrored in a thumbnail strip below. Enter is a newline, Cmd-Enter sends, Escape closes, and ⇧⌘S grabs a screenshot from the keyboard. Your draft survives closing and reopening the toolbar."
+        },
+        {
+          "title": "Reports carry real context",
+          "text": "Each submission is one folder holding the report and its images, published atomically so nothing is ever read half-written. It records the page, the file's repo-relative path, what you had selected, the worktree's branch and exact commit, and each image's size — so the person or agent reading it doesn't have to come back with questions."
+        },
+        {
+          "title": "Feedback no longer clutters `git status`",
+          "text": "Reports are filed under the already-ignored `temp/feedback/` instead of a top-level `.feedback/`, so filing one doesn't leave untracked files in the worktree you're reviewing."
+        },
+        {
+          "title": "Pasting a screenshot actually works",
+          "text": "Cmd-V was silently disabled for an image-only clipboard; it now pastes as expected."
+        },
+        {
+          "title": "Fixed getting stuck inside a quote",
+          "text": "Quoting, selecting all, deleting, and typing used to leave everything you wrote trapped in the quote's styling with no way out."
+        }
+      ]
+    }
+  ]
+}

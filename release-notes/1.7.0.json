@@ -1,0 +1,22 @@
+{
+  "version": "1.7.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Hero mode",
+          "text": "Press a keybinding to zoom into a full-screen carousel view of all your terminal panes. Navigate between them with keyboard arrows, scroll, or click, then drop back into the selected pane. Built with pure Core Animation for smooth, GPU-accelerated transitions."
+        },
+        {
+          "title": "Smarter ANSI colors",
+          "text": "When `--color` is active, palette colors are automatically recomputed for better contrast against the tinted background."
+        },
+        {
+          "title": "Performance & stability fixes",
+          "text": "Resolved stale closures, a timer leak, and dead code. Carousel only renders visible and adjacent surfaces, and tile sizing is deferred until layout bounds are valid."
+        }
+      ]
+    }
+  ]
+}

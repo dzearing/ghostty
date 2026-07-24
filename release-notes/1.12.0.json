@@ -1,0 +1,26 @@
+{
+  "version": "1.12.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Remote sessions survive sleep",
+          "text": "Closing your laptop no longer kills remote shells: sessions now live for 24 hours instead of 5 minutes, and Ghoztty reconnects the moment your network comes back, with a Connecting indicator and a Reconnect button on the machine pill."
+        },
+        {
+          "title": "Windows agent installer, fixed and polished",
+          "text": "The installer is now versioned like the app (`Ghoztty-Agent-1.12.0-x64.msi`), shows its version in Apps & Features and in the file's properties, starts the agent immediately after install (and at every logon), and cleanly retires older installs — including the pre-MSI setup that could silently keep an outdated agent running."
+        },
+        {
+          "title": "Rename windows with ⌘⇧R",
+          "text": "Window rename now has a default keyboard shortcut."
+        },
+        {
+          "title": "No more freeze when closing terminals",
+          "text": "Closing a window or pane whose process was slow to exit could beachball the whole app; it can't anymore."
+        }
+      ]
+    }
+  ]
+}

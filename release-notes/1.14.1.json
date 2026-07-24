@@ -1,0 +1,26 @@
+{
+  "version": "1.14.1",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Richer banners",
+          "text": "Banner text now supports headings and headerless tables in its markdown subset, so status overlays can be laid out with more structure."
+        },
+        {
+          "title": "Banner colors that fit in",
+          "text": "The banner background now shares the hue of its pane's tint, so it blends with the pane instead of standing out as a mismatched block."
+        },
+        {
+          "title": "No more white-flash panes",
+          "text": "Opening the background-color picker no longer flips panes to white while you adjust it."
+        },
+        {
+          "title": "Cleaner session re-attach",
+          "text": "When you relaunch and re-attach persistent sessions, panes now repaint correctly (proper SIGWINCH-driven redraw) and scrollback replays with the right width, so re-attached terminals come back looking right instead of smeared."
+        }
+      ]
+    }
+  ]
+}

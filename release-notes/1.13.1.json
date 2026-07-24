@@ -1,0 +1,18 @@
+{
+  "version": "1.13.1",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Session persistence now actually ships",
+          "text": "v1.13.0 introduced session persistence (windows survive app quits, crashes, and updates) but the release packaging left out the background agent that powers it, so it silently did nothing. v1.13.1 includes the agent, and the release pipeline now refuses to build a release without it. After installing this update, your windows will reset one last time — from then on, app restarts and future updates re-attach your terminals with the same running processes."
+        },
+        {
+          "title": "Windows agent update",
+          "text": "the remote agent for Windows was rebuilt with a build fix and published to the relay; installed agents pick it up automatically on their next idle self-update check."
+        }
+      ]
+    }
+  ]
+}

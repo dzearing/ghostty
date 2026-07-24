@@ -1,0 +1,38 @@
+{
+  "version": "1.8.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Remote machines",
+          "text": "Open a terminal on another machine with **Cmd-Shift-N**. Pick a machine from the chooser and get a real remote shell in a Ghoztty window, complete with a hostname pill so you always know where you're typing. Remote windows even restore after you relaunch Ghoztty."
+        },
+        {
+          "title": "Sign in with Google",
+          "text": "Enroll your machines to your account with a simple browser sign-in (device-code fallback for headless boxes). Your machines follow your account: signing out closes your remote windows and blocks new connections, signing back in restores them. Rename or remove machines right from the chooser."
+        },
+        {
+          "title": "Connect from anywhere",
+          "text": "Remote sessions run over a secure SSH-over-WebSocket relay, so you can reach your machines from anywhere with no VPN or network setup. Sessions survive laptop sleep and brief network drops, and automatically reconnect."
+        },
+        {
+          "title": "Windows agent",
+          "text": "A single-binary `ghoztty-agent` brings your Windows machines online with a native system-tray control (connect/disconnect, live status). Install it with a standard per-user MSI that shows up in Apps & Features, and it keeps itself up to date automatically — seamless, sha-verified updates that only swap in when the machine is idle. First launch walks you through enrollment."
+        },
+        {
+          "title": "Activity Monitor",
+          "text": "A built-in, cross-machine process monitor with live CPU and memory sparklines, a machine-switcher carousel, full command paths, and the ability to kill or spawn processes on any connected machine."
+        },
+        {
+          "title": "First-launch setup",
+          "text": "Ghoztty now sets up its CLI and Claude Code integration automatically the first time you launch it."
+        },
+        {
+          "title": "Stability",
+          "text": "Many fixes across the remote stack: crash-safe window restore, no orphaned shells when a session ends, reliable reconnect after long outages, single-instance enforcement, and machine renames that propagate to every open window."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "version": "1.14.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Viewer panes",
+          "text": "Panes (or whole windows) can now render content instead of a terminal: markdown files with GitHub-style rendering (fully offline — tables, task lists, syntax-highlighted code, images), plain text/code files with syntax highlighting, and websites. Open them with `--view` on `+new-window` or `+split`, from the command palette, or via File → Open / dragging a `.md` file onto the dock. Viewers live in the normal split tree — they resize, focus, zoom, split, and close like any pane, follow light/dark appearance, and restore with session persistence. File viewers live-reload on save (preserving scroll position), and relative markdown links open in a new viewer split."
+        },
+        {
+          "title": "Window titles",
+          "text": "Press Cmd+Shift+R to set a window-level title that pins the titlebar until cleared, winning over tab and pane titles and surviving shell title updates. Also scriptable via `ghoztty +rename --title` (empty title clears the pin), with separate Change Tab Title and Change Pane Title commands in the menu and palette."
+        },
+        {
+          "title": "Banner tables & polish",
+          "text": "Pane banners now render markdown pipe tables as aligned grids with bold headers, plus alignment markers. Banners got symmetric padding, a shaded background, and a collapse toggle."
+        },
+        {
+          "title": "Sign-in without secrets",
+          "text": "Google sign-in now uses relay-brokered OAuth: the app holds only a short-lived session token and no client secret ships in the binary. Sign-in, renewal, and sign-out all flow through the relay."
+        },
+        {
+          "title": "Easier split dragging",
+          "text": "Split dividers now have a real ~9pt grab target, so resizing panes no longer requires pixel-perfect aim. Web viewer panes get an auto-hiding browser chrome that stays out of the way."
+        },
+        {
+          "title": "Session persistence fixes",
+          "text": "Closing a pane now reliably ends its persistent session (no orphaned processes), re-attached terminals keep correct PTY geometry, and quitting the app no longer warns about terminating sessions that actually survive the quit. Every pane also gets a stable id (`$GHOZTTY_PANE_ID`) that survives restarts, restores, and reconnects — the reliable way for scripts to target their own pane."
+        }
+      ]
+    },
+    {
+      "title": "Windows Agent",
+      "items": [
+        {
+          "text": "Protocol and connection-handling improvements to the remote agent; a new agent build ships alongside this release and installed agents pick it up automatically on their next idle self-update check."
+        }
+      ]
+    }
+  ]
+}

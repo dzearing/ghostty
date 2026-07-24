@@ -1,0 +1,18 @@
+{
+  "version": "1.11.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Find your own pane",
+          "text": "`ghoztty +list --tty=<tty>` returns the pane name for a given terminal device, so scripts and agents running inside a pane can identify themselves in a single command."
+        },
+        {
+          "title": "Polite input injection",
+          "text": "`ghoztty +send-keys --when-idle` waits for the target pane to go idle (e.g. for Claude Code to finish generating) before typing, with a configurable `--idle-timeout`. No more keystrokes landing mid-output."
+        }
+      ]
+    }
+  ]
+}

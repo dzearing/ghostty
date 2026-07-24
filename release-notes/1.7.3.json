@@ -1,0 +1,18 @@
+{
+  "version": "1.7.3",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Ghoztty logs now show up under the right subsystem",
+          "text": "Internal Zig errors (like \"failed to initialize surface\") were being logged under `com.mitchellh.ghostty`, so `log show --predicate 'subsystem == \"com.dzearing.ghoztty\"'` came up empty. They now land under the correct subsystem and are actually discoverable."
+        },
+        {
+          "title": "No more collisions with an installed upstream Ghostty",
+          "text": "Dock tile preferences, pasteboard selection, exported file types, Quick Terminal window, Shortcuts permissions, and the fullscreen helper all used `com.mitchellh.*` identifiers and could conflict with a side-by-side Ghostty install. All renamed to `com.dzearing.*`."
+        }
+      ]
+    }
+  ]
+}

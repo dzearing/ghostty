@@ -1,0 +1,18 @@
+{
+  "version": "1.7.1",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Background window creation",
+          "text": "`+new-window` now supports `--no-activate`, letting you spawn windows without stealing focus from your current workspace. Useful for automation and agent-driven layouts."
+        },
+        {
+          "title": "Sparkle update check fix",
+          "text": "`CFBundleVersion` now matches the release version, preventing Sparkle from incorrectly prompting for updates."
+        }
+      ]
+    }
+  ]
+}

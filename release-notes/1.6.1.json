@@ -1,0 +1,22 @@
+{
+  "version": "1.6.1",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Shell fallback after command exits",
+          "text": "When a `--command` finishes, Ghoztty now drops you into an interactive shell instead of closing the pane. This makes it much easier to inspect output or continue working after a one-shot command completes."
+        },
+        {
+          "title": "Process exit diagnostics",
+          "text": "When a process dies unexpectedly, Ghoztty now logs detailed exit information (exit code, signal, timing) both to the terminal and to a diagnostics file, making it easier to debug what went wrong."
+        },
+        {
+          "title": "Debug build naming fix",
+          "text": "The debug build is now `Ghoztty-Debug.app`, preventing conflicts with the installed release app."
+        }
+      ]
+    }
+  ]
+}

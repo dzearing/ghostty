@@ -1,0 +1,14 @@
+{
+  "version": "1.4.1",
+  "sections": [
+    {
+      "title": "Fix",
+      "items": [
+        {
+          "title": "Split pane sizing now works as expected",
+          "text": "`--split-percent` now describes the size of the new pane, not the existing one. `ghoztty +split --split-percent=30` now gives the new pane 30% of the space (previously it gave 30% to the existing pane)."
+        }
+      ]
+    }
+  ]
+}

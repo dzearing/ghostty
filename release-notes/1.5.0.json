@@ -1,0 +1,18 @@
+{
+  "version": "1.5.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Rename windows and panes",
+          "text": "New `+rename` command lets you set a display title on any named window or pane, making it easy to keep track of your layout."
+        },
+        {
+          "title": "Automatic update checks",
+          "text": "Ghoztty now checks for updates automatically via Sparkle, so you'll know when a new version is available without checking GitHub."
+        }
+      ]
+    }
+  ]
+}

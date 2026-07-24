@@ -1,0 +1,42 @@
+{
+  "version": "1.23.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Table of contents for markdown panes",
+          "text": "Markdown viewers with two or more headings now get a native contents card that tracks the section you're reading and jumps you to any heading. Wide panes get it in a left gutter with the document reflowing beside it; narrow panes get a slide-in overlay from the navigation bar. It's the same glass card as the pane banner, so it looks like part of the app rather than part of the page."
+        },
+        {
+          "title": "Markdown reads like macOS content",
+          "text": "Body text is now set in the system font (SF Pro) and code in SF Mono, with sizing and leading retuned to match, instead of GitHub's web font stack."
+        },
+        {
+          "title": "Viewer panes browse like a browser",
+          "text": "Every viewer, files included, now has an editable address bar plus back / forward / reload / home. Type a URL (or just `example.com`) to go to the web, or type a path to point the pane back at a file — and Back crosses that boundary correctly. Home returns to wherever the pane was originally opened, tracked separately from where you've navigated since, and both survive a session restore. `--view=about:blank` (or \"Viewer: Open Browser Pane\" in the command palette) opens a blank pane with the caret already in the address field."
+        },
+        {
+          "title": "IPC commands hit the right app",
+          "text": "Each pane now knows the socket of the app instance that owns it, so `ghoztty +split` run inside a debug-build pane splits the debug window instead of silently driving the release app. Works on every pane kind — plain, session-persistence, and remote — and falls back to the old behavior outside Ghoztty."
+        },
+        {
+          "title": "Recovery no longer kills the sessions it recovers",
+          "text": "A brief hiccup on the local agent link could rebuild your windows and then terminate the very sessions it had just re-attached. Recovery now waits to confirm the agent is actually gone before acting, a pane that gets swapped out is no longer mistaken for one you closed, and the agent refuses a shutdown request from a superseded connection."
+        },
+        {
+          "title": "Hero mode follows the live layout",
+          "text": "Splits created or closed after entering hero mode are now reachable, and with two windows in hero mode a single keystroke moves only the window you're aiming at instead of stepping both."
+        },
+        {
+          "title": "`+split --target=<window>` works with a viewer focused",
+          "text": "It used to exit 0 and do nothing."
+        },
+        {
+          "title": "Random window tints are actually distinguishable",
+          "text": "`--color=random` windows stay dark but now lift off pure black, so the hue reads."
+        }
+      ]
+    }
+  ]
+}

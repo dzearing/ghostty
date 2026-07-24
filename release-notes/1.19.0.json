@@ -1,0 +1,22 @@
+{
+  "version": "1.19.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Address bar for file viewers",
+          "text": "Open a markdown or code file in a viewer pane and move the mouse to the top: a chrome bar now slides down showing the file's `file://` location — read-only and selectable, so you can see and copy exactly where the content lives. Matches how website viewer panes already work; websites keep their full back/forward/reload toolbar."
+        }
+      ]
+    },
+    {
+      "title": "Upstream Sync",
+      "items": [
+        {
+          "text": "None this release."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "version": "1.15.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Redesigned session chooser",
+          "text": "The Cmd-Shift-N chooser is now a master–detail layout showing your live sessions with richer labels, plus a Kill action to end a session directly from the list."
+        },
+        {
+          "title": "Native banner checkboxes & aligned lists",
+          "text": "Task-list checkboxes (`[x]`/`[ ]`) now render as real native boxes, and bullet, numbered, and checkbox items in a banner all line up on a shared gutter."
+        },
+        {
+          "title": "More resilient session persistence",
+          "text": "After a crash, windows orphaned from their sessions are now recovered from the agent's authoritative layout, so your panes come back correctly."
+        },
+        {
+          "title": "Crash fix",
+          "text": "Fixed a use-after-free during surface teardown that could crash the app when closing panes or windows."
+        }
+      ]
+    }
+  ]
+}

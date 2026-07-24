@@ -1,0 +1,18 @@
+{
+  "version": "1.16.2",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Upgrades no longer tombstone your sessions",
+          "text": "Updating the app used to sometimes bring every window back \"exited\"/tombstoned. The updater now leaves your running agent (and all its live processes) untouched during an upgrade instead of tearing it down, so your windows re-attach to the same still-running processes. Verified across real binary-swap upgrade cycles."
+        },
+        {
+          "title": "Re-attached panes repaint exactly — no more blank/smeared screens",
+          "text": "Reconnecting to a full-screen app (editors, `top`, anything using the alternate screen) could leave the pane blank or smeared if its output had scrolled out of the replay buffer. Panes now restore their exact visible screen on re-attach, with genuinely-evicted scrollback still honestly marked."
+        }
+      ]
+    }
+  ]
+}

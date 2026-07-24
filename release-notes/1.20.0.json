@@ -1,0 +1,22 @@
+{
+  "version": "1.20.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        {
+          "title": "Liquid Glass pane banners",
+          "text": "Sticky pane banners now render as a floating Liquid Glass card that tints to match the pane background, with a soft elliptical sheen and a cleaner shade. Collapse/expand is instant and geometry stays stable, so the terminal content below shifts once instead of jittering."
+        },
+        {
+          "title": "`ghoztty +reload`",
+          "text": "Refresh a viewer pane in place without closing and reopening it. Website viewers re-fetch from origin (bypassing caches); file viewers re-render while preserving scroll position."
+        },
+        {
+          "title": "No more duplicate window names",
+          "text": "Auto-generated `window-N` target names are never minted twice, so scripted windows stay uniquely addressable."
+        }
+      ]
+    }
+  ]
+}
