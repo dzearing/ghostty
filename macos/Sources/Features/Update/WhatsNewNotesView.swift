@@ -1,50 +1,61 @@
 import SwiftUI
 
 /// The "What's new" area shown as the agent-update dialog's accessory view.
-/// Notes newer than the user's last version are always visible; older
-/// ("already installed") notes hide behind a collapsed disclosure. The fixed
-/// frame + internal ScrollView means expanding the disclosure never resizes
-/// the host NSAlert. Fully offline — rendered from bundled JSON.
+/// A fixed frame + internal ScrollView means expanding the disclosure never
+/// resizes the host NSAlert. The scrollable content lives in
+/// `WhatsNewNotesContent` so it can be laid out (and rendered) independently.
 struct WhatsNewNotesView: View {
     let newNotes: [VersionNotes]
     let installedNotes: [VersionNotes]
-
-    @State private var showInstalled = false
 
     /// The size the host NSHostingView is pinned to.
     static let preferredSize = NSSize(width: 420, height: 240)
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("What’s new")
-                    .font(.headline)
-
-                if newNotes.isEmpty {
-                    Text("No new release notes since your last update.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(newNotes, id: \.version) { versionBlock($0) }
-                }
-
-                if !installedNotes.isEmpty {
-                    Divider()
-                    DisclosureGroup(isExpanded: $showInstalled) {
-                        VStack(alignment: .leading, spacing: 14) {
-                            ForEach(installedNotes, id: \.version) { versionBlock($0) }
-                        }
-                        .padding(.top, 6)
-                    } label: {
-                        Text("Show changes already installed")
-                            .font(.callout)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(14)
+            WhatsNewNotesContent(newNotes: newNotes, installedNotes: installedNotes)
+                .padding(14)
         }
         .frame(width: Self.preferredSize.width, height: Self.preferredSize.height)
+    }
+}
+
+/// The notes body: new-since-last-version notes always visible, older
+/// ("already installed") notes behind a collapsed disclosure. Fully offline —
+/// rendered from bundled JSON.
+struct WhatsNewNotesContent: View {
+    let newNotes: [VersionNotes]
+    let installedNotes: [VersionNotes]
+
+    @State private var showInstalled = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("What’s new")
+                .font(.headline)
+
+            if newNotes.isEmpty {
+                Text("No new release notes since your last update.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(newNotes, id: \.version) { versionBlock($0) }
+            }
+
+            if !installedNotes.isEmpty {
+                Divider()
+                DisclosureGroup(isExpanded: $showInstalled) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(installedNotes, id: \.version) { versionBlock($0) }
+                    }
+                    .padding(.top, 6)
+                } label: {
+                    Text("Show changes already installed")
+                        .font(.callout)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
