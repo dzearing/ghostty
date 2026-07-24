@@ -55,6 +55,22 @@ struct ReleaseNotesStorePartitionTests {
     }
 }
 
+struct ReleaseNotesStoreAppcastDescriptionTests {
+    @Test func decodesValidJSON() {
+        let json = #"{"version":"1.24.0","sections":[{"title":"Fork Changes","items":[{"title":"Viewer","text":"open a website in a side pane"}]}]}"#
+        let notes = ReleaseNotesStore.versionNotes(fromAppcastDescription: json)
+        #expect(notes?.version == "1.24.0")
+        #expect(notes?.sections.first?.items.first?.title == "Viewer")
+    }
+
+    @Test func nilForNilEmptyOrNonJSON() {
+        #expect(ReleaseNotesStore.versionNotes(fromAppcastDescription: nil) == nil)
+        #expect(ReleaseNotesStore.versionNotes(fromAppcastDescription: "") == nil)
+        #expect(ReleaseNotesStore.versionNotes(fromAppcastDescription: "not json") == nil)
+        #expect(ReleaseNotesStore.versionNotes(fromAppcastDescription: "<h1>HTML release notes</h1>") == nil)
+    }
+}
+
 struct ReleaseNotesStoreLoadTests {
     @Test func nilDirectoryLoadsNothing() {
         #expect(ReleaseNotesStore(directory: nil).all.isEmpty)
