@@ -75,6 +75,16 @@ app bundle. Skip this when the agent didn't change. Example:
 }
 ```
 
+**Author the bundled client notes.** For every release that changes the app/UI
+(viewer, banners, terminal UI, menus — anything a user sees that is NOT
+session-persistence/agent), write `release-notes/client/<version>.json` with
+**only** the client-scoped items (schema in `release-notes/README.md`; same
+shape as the agent notes). Commit it with the release commit **before** tagging
+(Step 3) so it both ships in the app bundle (the "What's New in Ghoztty…" menu
+window) and is embedded into the Sparkle appcast `<description>` by `release.yml`
+(the pre-update dialog on the update chip reads it from the appcast). Exclude the
+agent/session items already captured under `release-notes/agent/`.
+
 ### Step 3: Tag and Push
 
 ```bash

@@ -37,10 +37,24 @@ Shape:
   (see `.claude/commands/release.md`, Step 2), **before** tagging, so it ships in
   the build.
 
-## `client/` — reserved for the app "What's new"
+## `client/` — the app "What's new"
 
-A future "Update Ghoztty" popover may show client/app-scoped notes from a
-sibling `client/<version>.json` set (viewer, banners, UI, etc.). Not built yet.
+`client/<version>.json` is the client/app-scoped "What's new" (app, UI, viewer,
+banner changes — everything a user sees that is NOT session-persistence/agent).
+Same JSON shape as `agent/`. It ships **two ways**:
+
+1. **Bundled offline** into the app (`src/build/GhosttyResources.zig` →
+   `Contents/Resources/ghostty/release-notes/client/`) and shown in the
+   **"What's New in Ghoztty…"** menu window (Client tab).
+2. **Embedded in the Sparkle appcast** `<description>` by
+   `.github/workflows/release.yml` at release time, so the **pre-update dialog**
+   on the update chip can render the OFFERED version's notes before the user
+   updates (the running old app can't have the new version's notes bundled —
+   they travel over the network).
+
+Author `client/<version>.json` before tagging a release (see
+`.claude/commands/release.md`, Step 2). Exclude agent/session items — those live
+under `agent/`.
 
 ## `scripts/backfill-release-notes.py`
 
