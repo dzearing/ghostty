@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Backfill bundled release-notes JSON from GitHub Releases.
+"""Generate GENERAL release-notes JSON drafts from GitHub Releases.
 
-One-time / occasionally-run helper. Fetches each GitHub release body for the
-Ghoztty macOS app, strips the install boilerplate, parses `### Section` +
-`- **Title** — text` bullets, and writes release-notes/<semver>.json keyed by
-the app's CFBundleShortVersionString (bare semver, no leading 'v').
+Reference/curation helper. Fetches each GitHub release body for the Ghoztty
+macOS app, strips the install boilerplate, parses `### Section` +
+`- **Title** — text` bullets, and writes <out>/<semver>.json keyed by the app's
+CFBundleShortVersionString (bare semver, no leading 'v').
 
-Usage: python3 scripts/backfill-release-notes.py   (run from repo root)
-Requires: authenticated `gh`.
+The output is a GENERAL draft — it does not know the agent-vs-client split. The
+bundled agent notes (`release-notes/agent/*.json`) are curated by hand from
+these drafts down to session-persistence / background-agent changes only (the
+reasons to restart the agent). See release-notes/README.md.
+
+Usage: python3 scripts/backfill-release-notes.py [out_dir]   (run from repo root;
+       default out_dir is release-notes/.drafts). Requires authenticated `gh`.
 """
 import json
 import re
@@ -16,7 +21,7 @@ import sys
 from pathlib import Path
 
 REPO = "dzearing/ghoztty"
-OUT = Path("release-notes")
+OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("release-notes/.drafts")
 MIN = (1, 4, 0)  # skip pre-1.4 -dz dev tags (predate session persistence)
 
 BULLET = re.compile(r"^\s*[-*]\s+(.*)$")
@@ -74,7 +79,7 @@ def parse_body(body):
 
 
 def main():
-    OUT.mkdir(exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
     for v in list_versions():
         body = sh("gh", "release", "view", f"v{v}", "--repo", REPO,
                   "--json", "body", "-q", ".body")

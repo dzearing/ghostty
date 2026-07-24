@@ -815,7 +815,7 @@ final class LocalAgentManager {
             liveSessionCount: n,
             previousSeen: WhatsNewTracking.previousSeenVersion,
             current: WhatsNewTracking.currentAppVersion,
-            store: ReleaseNotesStore(directory: ReleaseNotesStore.bundledDirectory))
+            store: ReleaseNotesStore(directory: ReleaseNotesStore.agentNotesDirectory))
         guard alert.runModal() == .alertFirstButtonReturn else {
             Self.logger.info("user deferred destructive agent refresh (\(n) live session(s))")
             return

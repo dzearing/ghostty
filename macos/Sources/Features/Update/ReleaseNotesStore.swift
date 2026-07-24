@@ -44,11 +44,16 @@ struct ReleaseNotesStore {
             }
     }
 
-    /// The bundled notes directory inside the app Resources, or nil if absent.
-    static var bundledDirectory: URL? {
+    /// The bundled AGENT release-notes directory inside the app Resources, or
+    /// nil if absent. These are scoped to session-persistence / background-agent
+    /// changes — the reasons a user would restart the agent (and reset live
+    /// sessions). Client/app-wide notes, if ever surfaced, live in a sibling
+    /// `release-notes/client` directory.
+    static var agentNotesDirectory: URL? {
         Bundle.main.resourceURL?
             .appendingPathComponent("ghostty", isDirectory: true)
             .appendingPathComponent("release-notes", isDirectory: true)
+            .appendingPathComponent("agent", isDirectory: true)
     }
 
     /// True iff dotted-numeric version `a` is strictly newer than `b`

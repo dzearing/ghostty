@@ -1,0 +1,14 @@
+{
+  "version": "1.23.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Recovery no longer kills the sessions it recovers",
+          "text": "A brief hiccup on the agent link could rebuild your windows and then terminate the sessions it had just re-attached. Recovery now confirms the agent is actually gone before acting, a swapped-out pane is no longer mistaken for a closed one, and the agent refuses a shutdown request from a superseded connection."
+        }
+      ]
+    }
+  ]
+}

@@ -55,19 +55,22 @@ From the categorized commits, write user-facing release notes. Rules:
 
 Present the notes and ask the user to approve or edit. Do NOT proceed until approved.
 
-**Also author the bundled notes.** From the same approved notes, write
-`release-notes/<version>.json` (the offline "What's new" for the agent-update
-dialog — schema in `release-notes/README.md`). Commit it with the release commit
-**before** tagging (Step 3) so it ships in the app bundle. The JSON and the
-GitHub release body (Step 6) are the same content in two shapes — keep them in
-sync. Example:
+**If the agent changed, author the bundled agent notes.** When this release
+changes the background agent (session persistence, re-attach, agent lifecycle,
+remote/relay — i.e. the `AGENT: changed` case from Step 1), write
+`release-notes/agent/<version>.json` containing **only** the agent/session
+changes — the reasons a user would restart the agent and reset live sessions.
+This is the offline "What's new" shown in the agent-restart dialog (schema in
+`release-notes/README.md`). Do NOT include viewer/banner/UI features here.
+Commit it with the release commit **before** tagging (Step 3) so it ships in the
+app bundle. Skip this when the agent didn't change. Example:
 
 ```json
 {
   "version": "1.4.1",
   "sections": [
-    { "title": "Fork Changes",
-      "items": [ { "title": "Feature", "text": "What the user can now do." } ] }
+    { "title": "Session persistence",
+      "items": [ { "title": "Seamless agent upgrades", "text": "What the user gains." } ] }
   ]
 }
 ```
@@ -139,9 +142,9 @@ NOTES
 )"
 ```
 
-The bundled `release-notes/<version>.json` (authored in Step 2) already carries
-these notes for the in-app agent-update dialog; this GitHub body is the same
-content as markdown.
+If the agent changed, the bundled `release-notes/agent/<version>.json` (authored
+in Step 2) carries the agent-scoped subset for the in-app agent-restart dialog;
+this GitHub body is the full, general release notes.
 
 ### Step 7: Update Website
 

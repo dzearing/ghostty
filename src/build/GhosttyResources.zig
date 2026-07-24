@@ -141,13 +141,14 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     }
 
     // Release notes: bundled per-version "What's new" JSON, keyed by app
-    // version, rendered offline in the agent-update dialog. Rides the
+    // version, rendered offline in the agent-update dialog. Scoped to the
+    // agent/session-persistence changes that justify a restart. Rides the
     // `share/ghostty` folder reference into the macOS bundle Resources.
     {
         const install_step = b.addInstallDirectory(.{
-            .source_dir = b.path("release-notes"),
+            .source_dir = b.path("release-notes/agent"),
             .install_dir = .{ .custom = "share" },
-            .install_subdir = b.pathJoin(&.{ "ghostty", "release-notes" }),
+            .install_subdir = b.pathJoin(&.{ "ghostty", "release-notes", "agent" }),
         });
         try steps.append(b.allocator, &install_step.step);
     }
