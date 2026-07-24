@@ -165,10 +165,11 @@ jobs:
           git clone --branch gh-pages --single-branch "$REPO_URL" /tmp/gh-pages
           cd /tmp/gh-pages
 
-          python3 - "$VERSION" "$DOWNLOAD_URL" "$ED_SIGNATURE" "$DMG_LENGTH" "$PUB_DATE" <<'PYEOF'
-          import sys, xml.etree.ElementTree as ET
+          CLIENT_NOTES="$GITHUB_WORKSPACE/release-notes/client/${VERSION}.json"
+          python3 - "$VERSION" "$DOWNLOAD_URL" "$ED_SIGNATURE" "$DMG_LENGTH" "$PUB_DATE" "$CLIENT_NOTES" <<'PYEOF'
+          import sys, os, xml.etree.ElementTree as ET
 
-          version, url, sig, length, pub_date = sys.argv[1:6]
+          version, url, sig, length, pub_date, client_notes_path = sys.argv[1:7]
 
           ns = {"sparkle": "http://www.andymatuschak.net/xml-namespaces/sparkle"}
           ET.register_namespace("sparkle", ns["sparkle"])
@@ -182,6 +183,10 @@ jobs:
           ET.SubElement(item, "{%s}version" % ns["sparkle"]).text = version
           ET.SubElement(item, "{%s}shortVersionString" % ns["sparkle"]).text = version
           ET.SubElement(item, "pubDate").text = pub_date
+
+          if client_notes_path and os.path.isfile(client_notes_path):
+              with open(client_notes_path, "r", encoding="utf-8") as f:
+                  ET.SubElement(item, "description").text = f.read()
 
           enclosure = ET.SubElement(item, "enclosure")
           enclosure.set("url", url)
