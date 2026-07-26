@@ -151,7 +151,7 @@ ghoztty +set-banner --target=dev "**PR #123** — _3 files_, +120/−45 — [vie
 ghoztty +set-banner --target=dev --clear
 ```
 
-Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels).
+Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels). Cmd+R only reaches this while a **terminal** pane is focused — a focused viewer pane takes Cmd+R for reload (see Viewer Panes).
 
 Banners are persisted per pane in the session-layout manifest (keyed to the stable pane id), so a session-persistence restore brings them back with their text intact — across app quit/relaunch/upgrade re-attach and across an agent-restart relaunch alike. `+list --json` reports each terminal pane's current banner in a `banner` field (absent when no banner is set), which is also the CLI way to read a banner back.
 
@@ -170,6 +170,8 @@ ghoztty +reload --target=<name>
   target the reload applies to its focused pane.
 - Targeting a terminal pane fails with `... is a terminal pane, nothing to
   reload` (exit 1), mirroring how terminal-only commands reject viewer panes.
+- Interactive equivalent: **Cmd+R** while a viewer pane is focused (see
+  Viewer Panes → Keyboard).
 
 ```bash
 ghoztty +split --target=dev --name=preview --view=http://localhost:3000
@@ -341,6 +343,18 @@ ghoztty +close --target=doc
   remembered separately from where the user has navigated to (and both
   survive a session restore). Clicking into the address field selects the
   whole address; clicking again inside it just moves the caret.
+- **Keyboard** (pane-scoped: live only while keyboard focus is inside a
+  viewer pane — its page, its nav bar, or its feedback composer — in any
+  viewer mode):
+  - **Cmd+R** reloads the pane in place, exactly like `+reload` (web
+    re-fetches from origin, files re-render with scroll preserved).
+  - **Cmd+D** slides the nav bar in if hidden and puts the caret in the
+    address field with the whole address selected — the keyboard version of
+    clicking into it.
+  - Both **override their global binding only while the viewer holds focus**
+    (Cmd+R = "Set Pane Banner…", Cmd+D = split right). Focus a terminal pane
+    and they do their global thing again; Cmd+Shift+R ("Change Window Title")
+    and Cmd+Shift+D (split down) are never affected.
 - `--view=about:blank` opens a **blank browser pane**. The command palette's
   "Viewer: Open Browser Pane" does the same interactively and puts the caret
   straight in the address field — the equivalent of `+split --view=<url>` for

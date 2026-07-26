@@ -151,6 +151,13 @@ struct WebChromeBar: View {
             if !urlFocused { urlText = newValue }
         }
         .onChange(of: viewerView.addressFocusRequest) { _ in urlFocused = true }
+        .onChange(of: viewerView.addressRevertRequest) { _ in
+            // Escape: the abandoned edit goes away and the field shows where
+            // the pane actually is again (ViewerView.cancelAddressEditing has
+            // already moved focus to the page).
+            urlFocused = false
+            urlText = viewerView.currentURL
+        }
         .onChange(of: urlFocused) { focused in
             // Select-all-on-focus is handled AppKit-side, where the click
             // that granted focus can be followed to its mouse-up.
