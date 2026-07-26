@@ -101,6 +101,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// Bumped to ask the chrome bar to focus its address field; the bar
     /// watches this rather than exposing its @FocusState upward.
     @Published private(set) var addressFocusRequest = 0
+    /// Bumped to ask the chrome bar to throw away a half-typed address and
+    /// show `currentURL` again (Escape). Same one-way channel as
+    /// `addressFocusRequest`.
+    @Published private(set) var addressRevertRequest = 0
     private var urlObservation: NSKeyValueObservation?
     private var backObservation: NSKeyValueObservation?
     private var forwardObservation: NSKeyValueObservation?
@@ -600,21 +604,108 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return url.absoluteString
     }
 
-    /// Reveal the chrome bar and put the caret in the address field. Used by
-    /// the "Open Browser Pane" command, which opens a blank pane whose whole
-    /// point is that the user types an address into it.
-    func focusAddressBar() {
+    /// Reveal the chrome bar and put the caret in the address field with the
+    /// whole address selected — the keyboard equivalent of clicking into it.
+    /// Used by the "Open Browser Pane" command, which opens a blank pane whose
+    /// whole point is that the user types an address into it, and by the
+    /// pane-scoped Cmd-D chord (see `paneChord`).
+    ///
+    /// Returns false when this pane has no address field to focus — it is not
+    /// in a window, so no chrome bar can ever mount — so a keybinding can fall
+    /// through to its global action instead of swallowing the key.
+    @discardableResult
+    func focusAddressBar() -> Bool {
+        guard window != nil else { return false }
         holdChrome(true)
         addressFocusRequest += 1
         // Belt and braces: SwiftUI's @FocusState does not propagate reliably
         // inside an NSHostingView (the same reason chromeKeyboardFocused is
         // checked at the AppKit level), so claim the field directly once the
         // bar has mounted its content.
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let chromeHost = self.chromeHost,
-                  let field = Self.firstTextField(in: chromeHost) else { return }
-            self.window?.makeFirstResponder(field)
+        claimAddressField()
+        return true
+    }
+
+    /// Make the address field first responder and select its whole contents.
+    ///
+    /// The bar's SwiftUI content is not built in the same run-loop turn the bar
+    /// is mounted, so the field usually does not exist yet on the first pass —
+    /// this retries until it does rather than firing once and silently missing
+    /// (which is what a plain `DispatchQueue.main.async` did when the bar was
+    /// mounted by this very call).
+    private func claimAddressField(attempt: Int = 0) {
+        guard let window, let chromeHost,
+              let field = Self.firstTextField(in: chromeHost)
+        else {
+            // ~1s of retries: long enough for the hosting view to build its
+            // content, bounded so a pane that never mounts one stops polling.
+            guard attempt < 50 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                self?.claimAddressField(attempt: attempt + 1)
+            }
+            return
         }
+        // A terminal surface sharing this window keeps its `focused` flag set
+        // even while the field holds keyboard focus, so its
+        // performKeyEquivalent would consume Cmd-C/V before they reach the
+        // field editor. Same yield the click path does (addressFieldFocusChanged).
+        if let controller = window.windowController as? BaseTerminalController {
+            _ = controller.focusedSurface?.resignFirstResponder()
+        }
+        window.makeFirstResponder(field)
+        // Browser convention: the address arrives selected, ready to replace.
+        field.currentEditor()?.selectAll(nil)
+    }
+
+    /// Escape while editing the address: throw the edit away, put the pane's
+    /// real location back in the field, and hand focus to the page — what a
+    /// browser omnibox does. Submitting (Return) is the only way an edit takes
+    /// effect, so an abandoned edit must never be left sitting in the field
+    /// looking like where the pane is.
+    func cancelAddressEditing() {
+        // Focus first: resigning the field editor commits whatever was typed
+        // into the bar's text binding, so the revert has to land after it.
+        window?.makeFirstResponder(webView)
+        addressRevertRequest += 1
+        reclaimPageFocus()
+    }
+
+    /// Put keyboard focus back on the page after the address field lets go.
+    ///
+    /// Needed because dropping the field's SwiftUI `@FocusState` (which the
+    /// revert does) parks first responder on the WINDOW a turn later, undoing
+    /// the `makeFirstResponder` above — Escape would leave the pane with no
+    /// focused content. Only the window-is-first-responder state is corrected,
+    /// so a click that lands elsewhere in the meantime keeps its focus.
+    private func reclaimPageFocus(attempt: Int = 0) {
+        guard attempt < 3 else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window else { return }
+            if window.firstResponder === window {
+                window.makeFirstResponder(self.webView)
+            }
+            self.reclaimPageFocus(attempt: attempt + 1)
+        }
+    }
+
+    /// A key event this pane wants before the focused element sees it (from the
+    /// pane's local event monitor). Today: Escape while the address field is
+    /// being edited. Returns true when the event was consumed.
+    ///
+    /// AppKit-level rather than a SwiftUI `.onExitCommand` for the same reason
+    /// the rest of the chrome's focus handling is: @FocusState does not
+    /// propagate reliably inside an NSHostingView, and the field editor — not
+    /// the SwiftUI view — is what actually holds the keystroke.
+    func handleChromeKeyDown(_ event: NSEvent) -> Bool {
+        guard event.window === window, chromeTextFieldFocused else { return false }
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard event.keyCode == 53,  // Escape
+              !mods.contains(.command),
+              !mods.contains(.control),
+              !mods.contains(.option)
+        else { return false }
+        cancelAddressEditing()
+        return true
     }
 
     /// The address field inside the mounted chrome bar, if it has rendered.
@@ -781,11 +872,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// the pane top reveals the chrome bar (all viewer modes).
     private func installEventMonitor() {
         guard chromeMonitor == nil else { return }
-        chromeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] event in
+        chromeMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDown, .keyDown]
+        ) { [weak self] event in
             guard let self else { return event }
             switch event.type {
             case .leftMouseDown: self.handleMouseDown(event)
             case .mouseMoved: self.handleChromeMouseMoved(event)
+            // Escape in the address field: consumed here (return nil) so the
+            // field editor never sees it.
+            case .keyDown: if self.handleChromeKeyDown(event) { return nil }
             default: break
             }
             return event
@@ -1999,7 +2095,65 @@ final class ViewerView: NSView, Codable, ObservableObject {
             handleZoom(action)
             return true
         }
+        // Pane-scoped chords (Cmd-R reload, Cmd-D address field). These override
+        // their global Ghoztty bindings (prompt_surface_banner / new_split) only
+        // while THIS pane holds keyboard focus; every other pane, and every
+        // terminal, still gets the global behavior because we fall through to
+        // super, whose walk ends at the menu's key equivalent.
+        if paneHoldsFocus, let chord = Self.paneChord(for: event), handle(chord) {
+            return true
+        }
         return super.performKeyEquivalent(with: event)
+    }
+
+    /// A chord that belongs to a focused viewer pane rather than to the app.
+    enum PaneChord {
+        /// Cmd-R — reload in place, the interactive `+reload`.
+        case reload
+        /// Cmd-D — focus and select the address field.
+        case focusAddress
+    }
+
+    /// Classify a key event as one of the viewer's pane-scoped chords, or nil
+    /// if it is not one. Pure classification (no side effects) so the mapping is
+    /// unit-testable without a live pane. Requires exactly Command (no
+    /// Control/Option/Shift) so Cmd+Shift+R ("Change Window Title") and the
+    /// other Cmd+Shift bindings are untouched.
+    static func paneChord(for event: NSEvent) -> PaneChord? {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard mods.contains(.command),
+              !mods.contains(.control),
+              !mods.contains(.option),
+              !mods.contains(.shift)
+        else { return nil }
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "r": return .reload
+        case "d": return .focusAddress
+        default: return nil
+        }
+    }
+
+    /// Perform a pane-scoped chord. Returns false when the pane could not
+    /// service it, so the caller passes the key on to its global binding rather
+    /// than swallowing it.
+    private func handle(_ chord: PaneChord) -> Bool {
+        switch chord {
+        case .reload:
+            reloadContent()
+            return true
+        case .focusAddress:
+            return focusAddressBar()
+        }
+    }
+
+    /// True while keyboard focus is anywhere inside THIS viewer pane — its web
+    /// content, its chrome bar's field or buttons, or its feedback composer.
+    /// The guard that keeps the pane-scoped chords from firing for a focused
+    /// terminal (or another viewer split) in the same window:
+    /// `performKeyEquivalent` is offered to every view, not just the focused one.
+    private var paneHoldsFocus: Bool {
+        guard let responder = window?.firstResponder as? NSView else { return false }
+        return responder === self || responder.isDescendant(of: self)
     }
 
     /// Cmd+Shift+Up/Down — the exact chord `HeroKeyNavigator` navigates with.
