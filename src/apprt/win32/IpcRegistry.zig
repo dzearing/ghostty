@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
+const pane_id_mod = @import("pane_id.zig");
 
 targets: std.StringHashMapUnmanaged(Target) = .empty,
 
@@ -55,6 +56,13 @@ pub fn register(
 }
 
 /// Look up a live target by name (stale entries are pruned first).
+///
+/// Explicitly registered names win. On a miss we fall back to the pane's OWN
+/// identity (T113), which CLAUDE.md promises is "accepted directly by every
+/// `--target`/`--name` (case-insensitive), with no prior registration or
+/// `+list` needed" — the pane id itself, plus the two legacy surface-id
+/// spellings a pane's processes may be holding instead (see
+/// `pane_id.parseSurfaceIdAlias`).
 pub fn lookup(
     self: *IpcRegistry,
     alloc: Allocator,
@@ -62,7 +70,35 @@ pub fn lookup(
     name: []const u8,
 ) ?Target {
     self.prune(alloc, live_windows);
-    return self.targets.get(name);
+    if (self.targets.get(name)) |t| return t;
+    return findPaneByIdentity(live_windows, name);
+}
+
+/// Resolve a pane by its own identity rather than a registered name. Returns
+/// null when `name` is not an identity spelling, or names no live pane.
+fn findPaneByIdentity(live_windows: []const *Window, name: []const u8) ?Target {
+    const surface_id: ?u64 = if (pane_id_mod.isValid(name))
+        null
+    else
+        pane_id_mod.parseSurfaceIdAlias(name) orelse return null;
+
+    for (live_windows) |win| {
+        for (0..win.tab_count) |i| {
+            var surfaces = win.tab_trees[i].iterator();
+            while (surfaces.next()) |v| {
+                const s = v.view;
+                if (surface_id) |sid| {
+                    // A legacy spelling names a surface only once its core
+                    // surface is up (`core_surface.id` is set by init).
+                    if (!s.core_surface_ready) continue;
+                    if (s.core_surface.id == sid) return .{ .pane = s };
+                } else if (pane_id_mod.eql(s.paneId(), name)) {
+                    return .{ .pane = s };
+                }
+            }
+        }
+    }
+    return null;
 }
 
 /// Reverse lookup: the registered name of a target, if any.

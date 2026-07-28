@@ -25,6 +25,7 @@ const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
+const pane_id_mod = @import("pane_id.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
 
@@ -52,6 +53,15 @@ app: *App,
 
 /// The parent Window that contains this Surface as a tab.
 parent_window: *Window = undefined,
+
+/// This pane's stable, ghoztty-owned identity (T113): the CLAUDE.md "Pane
+/// identity" UUID, exported to the pane's processes as `$GHOZTTY_PANE_ID`,
+/// reported as the `+list --json` leaf `id`, and accepted directly by every
+/// `--target`/`--name`. Filled by `init` — either generated fresh or taken
+/// from the session-layout manifest on restore, so the value the shell was
+/// baked with keeps addressing the same pane across app relaunch, re-attach,
+/// and agent RELAUNCH. Never null after `init`; read it via `paneId()`.
+pane_id: pane_id_mod.Buf = undefined,
 
 /// The core terminal surface. Initialized by init() after creating
 /// the window and WGL context. Manages fonts, renderer, PTY, and IO.
@@ -300,6 +310,11 @@ pub fn eql(self: *const Surface, other: *const Surface) bool {
     return self == other;
 }
 
+/// This pane's stable id (T113). Valid from the top of `init` onward.
+pub fn paneId(self: *const Surface) []const u8 {
+    return &self.pane_id;
+}
+
 /// Per-surface config overrides for IPC-driven creation (`+new-window
 /// --command/--working-directory/--env`, `+split ...`). Consumed by the
 /// next Surface.init through the parent Window's pending_surface_overrides
@@ -311,6 +326,15 @@ pub const Overrides = struct {
     command_argv: ?[]const [:0]const u8 = null,
     working_directory: ?[]const u8 = null,
     env: []const EnvVar = &.{},
+
+    /// The pane id to ADOPT instead of generating a fresh one (T113): the
+    /// session-layout manifest's recorded id for the leaf this surface is
+    /// restoring. The re-attached (or agent-RELAUNCHed) shell keeps the
+    /// `$GHOZTTY_PANE_ID` it was baked with, so restore MUST hand the same
+    /// value back or the pane stops answering to its own documented id.
+    /// Borrowed for the consuming `Surface.init` only (copied into the
+    /// surface's own buffer); ignored when malformed. Null ⇒ generate.
+    pane_id: ?[]const u8 = null,
 
     /// Remote-machine session (`+new-remote-window`): the surface is built
     /// with the `.remote` termio backend riding on this connection instead
@@ -362,6 +386,12 @@ pub fn init(
         .app = app,
         .parent_window = parent,
     };
+
+    // T113: this pane's identity exists before anything else can ask for it
+    // (the IPC registry resolves it, the manifest records it, and the env bake
+    // below hands it to the shell). A restore override replaces it further
+    // down, before the bake.
+    _ = pane_id_mod.generate(&self.pane_id);
 
     // Create a manual-reset event for synchronizing resize with the
     // renderer thread. Manual-reset so we control exactly when it's reset.
@@ -482,6 +512,17 @@ pub fn init(
     if (parent.pending_surface_overrides) |ov| {
         parent.pending_surface_overrides = null;
         const carena = config._arena.?.allocator();
+        // T113: adopt the restored identity BEFORE the env bake below, so the
+        // re-attached shell's baked `$GHOZTTY_PANE_ID` still names this pane.
+        // A malformed value is dropped (the generated one stands) rather than
+        // producing a pane that answers to garbage.
+        if (ov.pane_id) |pid| {
+            if (pane_id_mod.isValid(pid)) {
+                @memcpy(&self.pane_id, pid);
+            } else {
+                log.warn("session-restore: ignoring malformed pane id '{s}'", .{pid});
+            }
+        }
         if (ov.command_argv) |argv| {
             const copy = try carena.alloc([:0]const u8, argv.len);
             for (argv, 0..) |arg, i| copy[i] = try carena.dupeZ(u8, arg);
@@ -521,6 +562,26 @@ pub fn init(
                 config.@"wait-after-command" = true;
             }
         }
+    }
+
+    // T113: bake `$GHOZTTY_PANE_ID` into the pane's environment, the way the
+    // Mac apprt does via `surface_cfg.environmentVariables`. This rides the
+    // surface config's `env` overrides on purpose: that is the ONE seam both
+    // backends read — an exec pane applies it last as `env_override`, and an
+    // agent-backed pane (session-persistence is on by default, so that is
+    // every local pane) has it forwarded verbatim in the OPEN's env, which the
+    // agent also replays when it RELAUNCHes a tombstone. Applied AFTER the IPC
+    // overrides so the ghoztty-owned id always wins over a stray `--env`.
+    {
+        const carena = config._arena.?.allocator();
+        const kv = try std.fmt.allocPrint(
+            carena,
+            "GHOZTTY_PANE_ID={s}",
+            .{self.paneId()},
+        );
+        config.env.parseCLI(carena, kv) catch |err| {
+            log.warn("pane id env bake failed err={}", .{err});
+        };
     }
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,

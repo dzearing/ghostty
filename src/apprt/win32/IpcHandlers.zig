@@ -1187,7 +1187,7 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                     const name = app.ipcNameOf(.{ .pane = entry.view }) orelse name: {
                         // Register the fallback name so the returned value is
                         // immediately usable as a target, matching buildNode.
-                        const id = try std.fmt.allocPrint(arena, "{d}", .{entry.view.core_surface.id});
+                        const id = try arena.dupe(u8, entry.view.paneId());
                         app.ipcRegister(id, .{ .pane = entry.view }) catch {};
                         break :name id;
                     };
@@ -1297,7 +1297,12 @@ fn buildNode(
 
     switch (tree.nodes[handle.idx()]) {
         .leaf => |surface| {
-            const id = try std.fmt.allocPrint(arena, "{d}", .{surface.core_surface.id});
+            // T113: the leaf `id` is the pane's stable ghoztty-owned id, the
+            // same value its processes see as `$GHOZTTY_PANE_ID` and the same
+            // shape the Mac reports (`pane.id.uuidString`). It used to be the
+            // decimal `core_surface.id`, which changed on every re-attach and
+            // matched nothing in the pane's environment.
+            const id = try arena.dupe(u8, surface.paneId());
             const name = ctx.app.ipcNameOf(.{ .pane = surface }) orelse name: {
                 ctx.app.ipcRegister(id, .{ .pane = surface }) catch {};
                 break :name id;

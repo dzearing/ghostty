@@ -928,8 +928,9 @@ fn captureFrame(hwnd_opt: ?w32.HWND) FrameCapture {
 
 /// Capture one leaf's restore metadata: the agent session id to re-ATTACH to
 /// (null when the pane is not agent-backed — it restores as an exited pane),
-/// the current title, and any registered IPC name. `kind`/`viewer_location`
-/// stay null (reserved for viewer panes, T90h). Strings dupe into `arena`.
+/// the pane's stable id (T113), the current title, and any registered IPC
+/// name. `kind`/`viewer_location` stay null (reserved for viewer panes, T90h).
+/// Strings dupe into `arena`.
 fn captureLeaf(self: *App, arena: Allocator, surface: *Surface) !session_layout.Leaf {
     const sid: ?[]const u8 = if (surface.core_surface_ready)
         surface.core_surface.remoteSessionId()
@@ -940,6 +941,9 @@ fn captureLeaf(self: *App, arena: Allocator, surface: *Surface) !session_layout.
         .session_id = if (sid) |s| try arena.dupe(u8, s) else null,
         .title = if (surface.getTitle()) |t| try arena.dupe(u8, t) else null,
         .ipc_name = if (ipc_name) |n| try arena.dupe(u8, n) else null,
+        // Recorded unconditionally: it must survive even for a leaf with no
+        // session (a fresh OPEN still keeps the id its shell was baked with).
+        .pane_id = try arena.dupe(u8, surface.paneId()),
     };
 }
 
@@ -1157,11 +1161,18 @@ fn restoreAttachOverride(
         const ok = if (attach) |a| a.contains(s) else true; // null set ⇒ unknown ⇒ attempt
         break :blk if (ok) s else null;
     } else null;
-    return .{ .remote = .{
-        .connection = conn,
-        .local_agent = true,
-        .session_id = sid,
-    } };
+    return .{
+        // T113: hand back the RECORDED pane id. The process we are re-attaching
+        // to still holds it in `$GHOZTTY_PANE_ID`; generating a fresh one here
+        // would silently break every pane's ability to name itself across an
+        // app restart — the exact class of breakage T112 hit with pids.
+        .pane_id = leaf.pane_id,
+        .remote = .{
+            .connection = conn,
+            .local_agent = true,
+            .session_id = sid,
+        },
+    };
 }
 
 /// The first (leftmost-deepest) leaf reachable from `idx` in a flat manifest

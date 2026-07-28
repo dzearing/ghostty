@@ -21,7 +21,8 @@
 //!      "title_override":..?,"ipc_name":..?,"active_tab":0,
 //!      "tabs":[{"nodes":[{"split":{"layout":"horizontal","ratio":0.5,
 //!                                  "left":1,"right":2}},
-//!                        {"leaf":{"session_id":"<32hex>","title":..?}},
+//!                        {"leaf":{"session_id":"<32hex>","pane_id":"<uuid>",
+//!                                 "title":..?}},
 //!                        {"leaf":{"session_id":"<32hex>"}}],
 //!               "color":"blue"?,"hero_ratio":..?,"title":..?,"active":true}]}]}
 //!
@@ -75,10 +76,18 @@ pub const Frame = struct {
 /// preserved, matching the Mac null-sessionID behavior). `kind`/`viewer_location`
 /// are RESERVED for viewer panes (T90a pinned this reservation); terminal
 /// leaves leave them null.
+///
+/// `pane_id` is the pane's stable ghoztty-owned identity (T113) — the value
+/// baked into its shell as `$GHOZTTY_PANE_ID`. It MUST round-trip: the
+/// re-attached (or agent-RELAUNCHed) process keeps the env it was spawned
+/// with, so a restore that generated a fresh id would leave the pane unable to
+/// address itself. Additive and optional — a manifest written by a pre-T113
+/// build simply has none and its restored panes get fresh ids.
 pub const Leaf = struct {
     session_id: ?[]const u8 = null,
     title: ?[]const u8 = null,
     ipc_name: ?[]const u8 = null,
+    pane_id: ?[]const u8 = null,
     kind: ?[]const u8 = null,
     viewer_location: ?[]const u8 = null,
 };
