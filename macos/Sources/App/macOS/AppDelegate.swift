@@ -172,6 +172,9 @@ class AppDelegate: NSObject,
         updateController.viewModel
     }
 
+    /// The reusable "What's New" window (created lazily, kept for reuse).
+    private var whatsNewWindow: NSWindow?
+
     /// The elapsed time since the process was started
     var timeSinceLaunch: TimeInterval {
         return ProcessInfo.processInfo.systemUptime - applicationLaunchTime
@@ -1166,6 +1169,34 @@ class AppDelegate: NSObject,
     @IBAction func checkForUpdates(_ sender: Any?) {
         updateController.checkForUpdates()
         // UpdateSimulator.happyPath.simulate(with: updateViewModel)
+    }
+
+    @IBAction func showWhatsNew(_ sender: Any?) {
+        if let win = whatsNewWindow {
+            win.makeKeyAndOrderFront(sender)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let previousSeen = WhatsNewTracking.previousSeenVersion
+        let current = WhatsNewTracking.currentAppVersion
+        let client = ReleaseNotesStore(directory: ReleaseNotesStore.clientNotesDirectory)
+            .partitioned(previousSeen: previousSeen, current: current)
+        let agent = ReleaseNotesStore(directory: ReleaseNotesStore.agentNotesDirectory)
+            .partitioned(previousSeen: previousSeen, current: current)
+
+        let view = WhatsNewWindowView(
+            clientNew: client.new, clientInstalled: client.installed,
+            agentNew: agent.new, agentInstalled: agent.installed)
+
+        let window = NSWindow(contentViewController: NSHostingController(rootView: view))
+        window.title = "What’s New in Ghoztty"
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.isReleasedWhenClosed = false
+        window.center()
+        whatsNewWindow = window
+        window.makeKeyAndOrderFront(sender)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @IBAction func newWindow(_ sender: Any?) {

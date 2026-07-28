@@ -1,0 +1,15 @@
+{
+  "version": "1.24.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "The viewer's table of contents is a real macOS sidebar", "text": "The selected heading uses the system's own selection colors — an accent-filled pill while the window is focused, neutral gray when it isn't — and rows no longer shift as you scroll." },
+        { "title": "Resize the contents card", "text": "Drag its right edge and the card, the gutter, and the document's text column all move together. Your width is remembered across panes and sessions." },
+        { "title": "Clicking a heading takes you there and stays there", "text": "Your click pins the selection until your next scroll gesture, instead of the highlight walking off as the page smooth-scrolls." },
+        { "title": "A pinned \"CONTENTS\" header on Liquid Glass", "text": "Headings scroll underneath it, and long tables of contents now show a scroll indicator." },
+        { "title": "Glass cards line up", "text": "Every glass card leaves the same 12pt margin on all four sides, so their corners align and document text starts exactly one margin from the card." }
+      ]
+    }
+  ]
+}

@@ -59,7 +59,11 @@ class UpdateDriver: NSObject, SPUUserDriver {
     func showUpdateFound(with appcastItem: SUAppcastItem,
                          state: SPUUserUpdateState,
                          reply: @escaping @Sendable (SPUUserUpdateChoice) -> Void) {
-        viewModel.state = .updateAvailable(.init(appcastItem: appcastItem, reply: reply))
+        viewModel.state = .updateAvailable(.init(
+            appcastItem: appcastItem,
+            reply: reply,
+            clientNotes: ReleaseNotesStore.versionNotes(
+                fromAppcastDescription: appcastItem.itemDescription)))
         if !hasUnobtrusiveTarget {
             standard.showUpdateFound(with: appcastItem, state: state, reply: reply)
         }

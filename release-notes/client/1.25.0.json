@@ -1,0 +1,17 @@
+{
+  "version": "1.25.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "Send feedback straight from a viewer pane", "text": "Any viewer pane whose content belongs to a git worktree gets a feedback button; write a note, hit send, and it's filed into that worktree as a self-contained report. Ghoztty figures out which worktree from what the pane is actually showing and re-checks on every navigation." },
+        { "title": "Quote what you're pointing at", "text": "Select text in a viewer — rendered markdown or a live web page — and a Quote / Copy toolbar appears. Quote drops the passage into the composer as a blockquote and carries where it came from: the heading, the block, and for files the exact source line." },
+        { "title": "A composer that behaves like a chat box", "text": "A pill that grows as you type, with a `+` for an interactive screenshot and a send button inside its trailing edge. Pasted screenshots become `[Image #N]` chips; Enter is a newline, Cmd-Enter sends, Escape closes, ⇧⌘S grabs a shot. Your draft survives closing the toolbar." },
+        { "title": "Reports carry real context", "text": "Each submission is one folder holding the report and its images, published atomically. It records the page, the file's repo-relative path, your selection, and the worktree's branch and exact commit." },
+        { "text": "Feedback is filed under the already-ignored `temp/feedback/`, so filing a report no longer clutters `git status`." },
+        { "text": "Pasting a screenshot now works — Cmd-V was silently disabled for an image-only clipboard." },
+        { "text": "Fixed getting stuck inside a quote when you selected all, deleted, and typed." }
+      ]
+    }
+  ]
+}

@@ -48,7 +48,16 @@ struct UpdatePopoverView: View {
                 UpdateErrorView(error: error, dismiss: dismiss)
             }
         }
-        .frame(width: 300)
+        .frame(width: popoverWidth)
+    }
+
+    /// The update-available dialog is wider to fit inline release notes; other
+    /// states keep the compact width. When no notes are present it stays compact.
+    private var popoverWidth: CGFloat {
+        if case .updateAvailable(let update) = model.state, update.clientNotes != nil {
+            return 420
+        }
+        return 300
     }
 }
 
@@ -166,13 +175,7 @@ private struct UpdateAvailableView: View {
                 }
 
                 HStack(spacing: 8) {
-                    Button("Skip") {
-                        update.reply(.skip)
-                        dismiss()
-                    }
-                    .controlSize(.small)
-
-                    Button("Later") {
+                    Button("Cancel") {
                         update.reply(.dismiss)
                         dismiss()
                     }
@@ -181,7 +184,7 @@ private struct UpdateAvailableView: View {
 
                     Spacer()
 
-                    Button("Install and Relaunch") {
+                    Button("Update") {
                         update.reply(.install)
                         dismiss()
                     }
@@ -192,26 +195,15 @@ private struct UpdateAvailableView: View {
             }
             .padding(16)
 
-            if let notes = update.releaseNotes {
+            if let notes = update.clientNotes {
                 Divider()
 
-                Link(destination: notes.url) {
-                    HStack {
-                        Image(systemName: "doc.text")
-                            .font(.system(size: 11))
-                        Text(notes.label)
-                            .font(.system(size: 11, weight: .medium))
-                        Spacer()
-                        Image(systemName: "arrow.up.right")
-                            .font(.system(size: 10))
-                    }
-                    .foregroundColor(.primary)
-                    .padding(12)
-                    .frame(maxWidth: .infinity)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .contentShape(Rectangle())
+                ScrollView {
+                    WhatsNewNotesContent(newNotes: [notes], installedNotes: [])
+                        .padding(14)
                 }
-                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
+                .frame(maxHeight: 260)
             }
         }
     }
