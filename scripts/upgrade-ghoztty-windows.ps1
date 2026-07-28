@@ -193,7 +193,38 @@ foreach ($v in $scrub) { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
 Log "relaunch env scrubbed: $($scrub -join ', ')"
 
 # Auto-launches the freshly installed exe (the pipe owner died with the kill).
+#
+# Set this PROCESS's cwd to the repo first. `--working-directory` alone is not
+# enough on the auto-launch path: 2026-07-27 23:36 the relaunched pane came up
+# in C:\Windows\System32 (this script's own cwd when Start-Process'd), so
+# `claude --continue` found no session there and stopped dead on Claude Code's
+# "Is this a project you trust?" prompt. Nothing was waiting to answer it, and
+# the loop stayed dead for 7h20m until a human noticed. The dropped flag is a
+# product bug in its own right (filed as T132); this is the belt to its braces.
+try { Set-Location -LiteralPath $WorkingDirectory -ErrorAction Stop } catch {
+    Log "WARNING: could not cd to $WorkingDirectory ($($_.Exception.Message)); relaunch may land in the wrong cwd"
+}
 & $oldExe +new-window --target=main "--working-directory=$WorkingDirectory" "--command=$ResumeCommand" 2>&1 |
     ForEach-Object { Log "relaunch: $_" }
+
+# VERIFY the relaunch instead of assuming it. A pane in the wrong directory
+# looks identical to a healthy one from here, and that invisibility is what
+# made the stall above cost hours rather than seconds.
+$landed = $null
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Milliseconds 750
+    try {
+        $raw = & $oldExe +list --json 2>$null | Out-String
+        if ($raw -match '"working_directory"\s*:\s*"([^"]+)"') { $landed = $Matches[1] -replace '\\\\', '\' }
+    } catch {}
+    if ($landed) { break }
+}
+if (-not $landed) {
+    Log 'RELAUNCH-CWD UNKNOWN: no pane working_directory reported; check the new window by hand'
+} elseif ($landed.TrimEnd('\') -ieq $WorkingDirectory.TrimEnd('\')) {
+    Log "RELAUNCH-CWD OK: $landed"
+} else {
+    Log "RELAUNCH-CWD FAIL: pane landed in '$landed', expected '$WorkingDirectory' -- the resumed session will not find its conversation and the loop is STALLED (see T132)"
+}
 Log "UPGRADE OK (relaunched, resume: $ResumeCommand)"
 exit 0

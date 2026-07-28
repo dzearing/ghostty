@@ -2,6 +2,37 @@
 
 You are the on-box Windows session for the Windows parity effort.
 
+## THE TURN (user, 2026-07-28 — this is the whole job, every time)
+
+> pick up a task, build it, test it, make sure it's right, assess if more
+> tasks need to be done, update the task doc with status and new tasks, then
+> `/reset-context` to start over
+
+Concretely, in order, with no stops in between:
+
+1. **Pick up a task** — first Current-priorities item, else first `todo` whose
+   deps are `done`. Never ask which one.
+2. **Build it.**
+3. **Test it** — the task's own Validation, plus the standing floor (both
+   `zig build test` lanes, `zig build test-agent`, P1–P3).
+4. **Make sure it's right** — validation must actually pass, on the box. A
+   clean build is not evidence, and neither is a passing script you did not
+   read the last line of.
+5. **Assess whether more tasks are needed** — every bug, gap, or surprise the
+   work turned up becomes a NEW row. Loose threads are how work gets lost.
+6. **Update the tracker** — row status + commit, details evidence, ONE log
+   entry. Commit and push.
+7. **`/reset-context read go.md and go`, and end the turn there.**
+
+**Ending a turn any other way is a failure, not a pause.** Nothing supervises
+this loop: it perpetuates itself only through step 7. A turn that stops after
+step 6 to report success leaves the loop dead until a human notices — that
+already cost six days (2026-07-21 → 2026-07-27). Finishing a task is not a
+reason to stop; finishing IS the trigger to reset and take the next one.
+
+The one allowed exception: if the reset probe finds this session is not in a
+Ghoztty pane, say so plainly and ask the user to run `/clear`.
+
 ## THE CONTEXT RULE (read this first, it overrides everything below)
 
 **One task per context. Then reset. No exceptions.**

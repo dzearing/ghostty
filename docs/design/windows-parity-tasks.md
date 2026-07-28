@@ -41,6 +41,26 @@ New tasks: add a table row + a details section (bugs found during
 validation become tasks, not loose threads). Never delete a task — mark
 `skipped(<reason>)` so decisions stay visible.
 
+**THE BAR (user, 2026-07-28, verbatim):** *"we are not done until we have
+achieved our overall goals with a 99.9% well validated confidence level that
+we have parity in all the places we can with the mac version of ghoztty. that
+means current state!"*
+
+Three things follow, and they are not negotiable:
+
+- **Current state, not the state we forked from.** Parity is measured against
+  Mac Ghoztty *as it is today*, so upstream merges (T88, T117) are part of the
+  job, not a distraction from it — and every merge must be followed by a gap
+  audit that files rows (that is what produced T89a–T94 and T118–T128).
+- **99.9% confidence means validated, not believed.** A row goes `done` only
+  with evidence that was actually run on the box. "It compiles", "it looks
+  right", and "the code is obviously correct" are not evidence. When a harness
+  and the product disagree, prove which one is lying (T113's four failures were
+  the harness; T111b's two prime suspects were both refuted by instrumentation).
+- **"In all the places we can"** — where a Mac concept has no Windows analog,
+  build the native equivalent and record the divergence in the row, so the gap
+  is a decision on the record rather than an omission.
+
 **THE GOAL (user, 2026-07-15, verbatim intent):** Windows Ghoztty at full
 parity with Mac Ghoztty, *very reliable and usable for long contexts*.
 Thoroughly test it, optimize, fine-tune, make the Windows things look
@@ -366,9 +386,14 @@ Work these first, in order, before falling back to first-todo-in-table:
    Pane Banner..." row, and every bound row is now labeled `Title\tChord` from
    the LIVE keybind set, so a rebind relabels the menu and unbound rows stay
    bare. `context-menu.ps1` ALL PASS (31) ×3 (incl. choosing the row opens the
-   editor, and a rebind run). DELIVERED to all 3 install locations. Next:
-   **T130** (make the plugin-side banner-hook fixes durable), then T38/T39 per
-   item 20.
+   editor, and a rebind run). DELIVERED to all 3 install locations.
+
+3d. **NEXT, in this order** (user-reported live 2026-07-28, ahead of the item-20
+   publish queue): **T132** (the loop-killer: `--working-directory` dropped on
+   the auto-launch path — fix this first, everything else depends on the loop
+   surviving its own deliveries) → **T131** (banner overlay: content scrolls
+   behind it, and Mac has since moved to a rounded/shadowed card) → **T130**
+   (make the plugin-side banner-hook fixes durable) → T38/T39 per item 20.
 
 4. **Post-merge parity band (T118–T128), filed 2026-07-27 by ~~T117~~** (merge
    of origin/main `1e1cdbbd2`, 70 commits). These do NOT displace T113/T38/T39
@@ -565,6 +590,8 @@ One line per row. Full spec + validation + evidence per task:
 | T127 | T90b–T90h viewer scope has GROWN — the T90a design (2026-07-19) predates 16 main viewer commits that added capabilities its task split never accounted for: navigable address bar + sliding/omnibox completion + `file://` display (`13b950e77`, `6af1fc12a`, `25c454b24`), native + in-page markdown TOC (`2137da95a`, `3691cc4e8`, `2af9a6e95`), browser-style zoom (`dc5daa4c5`), popups-as-windows (`0b8335d7c`), quote-from-page toolbar + screenshot key (`1cf83764b`, `2f0b286ba`), worktree-aware feedback capture (`4cf88905d`, `1edce34c7`, `efe1e1d17`, `bd5667887`), copy/paste + browser-like focus (`a7fc890a9`), Cmd-R/Cmd-D pane-scoped keys (`14d22875a`), and `+reload` (T119). Do NOT silently widen T90b–T90h: re-scope them against the current Mac viewer FIRST (a T90a refresh), decide explicitly what Windows v1 ships vs defers, and record the deferrals as rows so they stay visible. Much of the JS (`src/viewer/*.js`, incl. the new `selection.js`) is shared and came in free with T117 — it is the WebView2 host side that has to catch up | K | T117,T90a | todo | — |
 | T128 | INVESTIGATE: does `+rearrange` dropping a pane LEAK its agent session? — main's `e65cfa4d5` fixed the mirror-image bug on Mac (a tree SWAP marked every departed leaf CLOSE-on-free, so in-place recovery killed the very sessions it recovered) and hardened it into an invariant: a session still referenced by the new tree is never marked CLOSE-on-free. win32 does NOT infer intent from tree departure — `setSessionCloseIntent(true)` is called only at explicit user-close sites (`Window.zig:979/1083/3515`) — so win32 is structurally immune to main's bug. But the `+rearrange` handler swaps trees and destroys panes absent from the new layout via refcount, with no close-intent set, which suggests the OPPOSITE defect: a dropped pane DETACHes and its agent session lingers forever instead of ending. Unverified — confirm with `+sessions` before/after a `+rearrange` that drops a pane; if it leaks, set the intent on exactly the dropped leaves (and only those, so recovery-style swaps stay safe) | K | T117 | todo | — |
 | T129 | Banner editor is UNDISCOVERABLE on Windows — reported by the user 2026-07-27 as "ctrl-r doesn't rename them". Working as designed: `Config.zig:7005` deliberately binds the editor to **ctrl+shift+b** on Windows because plain ctrl+r is the shell's reverse-history-search and ctrl+shift+r is the cross-platform rename. The defect is that nothing in the app SAYS so. The win32 context menu (`context_menu.zig`) offers "Change Tab Title..." and "Change Pane Title..." but has no "Set Pane Banner..." entry, where Mac exposes it in both the menu and the command palette — so a user who knows the Mac chord has no in-app path to the Windows one and concludes the feature is broken. Fix: add "Set Pane Banner..." to the win32 context menu (and the command palette if it has an entry list), with the ctrl+shift+b accelerator shown in the item text so the chord is self-teaching. Cheap, and it converts a "feature is broken" report into a discovered feature | K | T117 | done | eb3c3044f — row added + EVERY bound row now labeled "Title\tChord" from the live keybind set (palette already had the entry + a hint); `context-menu.ps1` ALL PASS (31) ×3 |
+| T131 | **Banner overlay: terminal content scrolls BEHIND it, and the overlay is a flat band where Mac now draws a rounded, shadowed card.** User-reported live 2026-07-28 on the delivered `+eb3c3044f` build: "i see the text scrolling behind the banner. in the mac version we have changed this to not scroll behind, and for the banner to have more of a rounded overlay with shadow appearance." T101 reserved a strip band above the terminal drawable, so either that reservation is not holding in the current build (regressed by a later layout path, or the band is computed from a stale/short height when the banner wraps or grows) or it never covered the scroll path — **measure before fixing**; the failing case is scrolling content, not a static frame. Then port the Mac's *current* banner appearance: rounded corners + drop shadow (the `GlassCardBackground` card look), not the flat full-width strip win32 draws now. Both halves are user-visible parity against Mac's current state | K | T101 | todo | — |
+| T132 | **`+new-window --working-directory` is dropped on the Windows auto-launch path — and it killed the loop.** Proven 2026-07-28: `upgrade-ghoztty-windows.ps1` relaunched with `--target=main --working-directory=D:\git\ghoztty --command="claude … --continue …"` after killing the app; the pane came up in `C:\Windows\System32` (the launcher process's cwd), so `--continue` had no session to resume and Claude Code stopped on its "Is this a project you trust?" prompt with nobody to answer. The loop was dead 7h20m (23:36 → 06:56) until the user noticed — same silent-stall class as the 6-day gap. When `+new-window` finds no running instance it auto-launches the exe and the startup window is built from the app's own startup path; the queued IPC request's `--working-directory` is not applied to it. Fix so the flag survives the auto-launch (and so any pane created that way honors it); the script now sets its own cwd + verifies where the pane landed, but that is a workaround, not the fix. Validation: with no instance running, `+new-window --working-directory=<dir>` must produce a pane whose `+list --json` `working_directory` is `<dir>` | K | — | todo | — |
 | T130 | Ghoztty Claude-Code plugin: make the Windows banner-hook fixes DURABLE (they currently live only in this box's active plugin cache, `~/.claude/plugins/cache/dzearing-claude-marketplace/ghoztty/0.7.0/hooks/ghoztty-banner.sh`, and a plugin update would silently revert them and re-break the user's banners). Two edits to mirror into the source repo `github.com/dzearing/ghoztty-claude-plugin` (not cloned on this box) + a version bump: (a) the tty gate — `TTY_NAME=$(find_tty) || exit 0` bailed BEFORE `$GHOZTTY_PANE_ID` was ever read, which is fatal on Windows where no pane has a tty, now `|| TTY_NAME=""` with a both-routes-gone bail, a pane-id-keyed state file, and an OSC fallback that no-ops without a tty; (b) `jq` is a hard dependency (`command -v jq || exit 0`) and was ABSENT on this box until this task installed it (winget `jqlang.jq`, user scope) — a Windows user without jq gets the same silent no-op, so either vendor/relax the dependency or make the plugin say why it is inert. Also carries the item-19(a) `# ` banner-title mirror | K | T113 | todo | — |
 
 Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /

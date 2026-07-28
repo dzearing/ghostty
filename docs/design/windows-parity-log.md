@@ -9,6 +9,28 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-28 - LOOP POST-MORTEM (the loop stalled 7h20m; root cause found) +
+  new rows T131/T132 + the 99.9%-parity bar recorded. The turn ended at
+  06:36:05Z with a summary and NO /reset-context, on the assumption that the
+  upgrade script's relaunch would carry the loop. It did not, and the transcript
+  proves it: no prompt reached any session in this project between 06:36:05Z and
+  the user's 13:56Z message. Read the relaunched pane to find out why instead of
+  theorizing -- it is sitting at Claude Code's "Is this a project you trust?"
+  prompt with `Accessing workspace: C:\Windows\System32`. So `+new-window
+  --target=main --working-directory=D:\git\ghoztty --command="claude … --continue"`
+  auto-launched the app (the pipe owner died with the kill) and the pane landed
+  in the LAUNCHER's cwd, not the requested one; `--continue` then had no session
+  to resume and Claude blocked on a prompt nobody was there to answer. Filed as
+  **T132** (product bug), and the script now (a) sets its own cwd and (b) VERIFIES
+  the landed `working_directory`, logging RELAUNCH-CWD OK/FAIL -- a wrong-cwd
+  relaunch was indistinguishable from a healthy one from the log, which is why it
+  cost hours instead of seconds. go.md gained a "THE TURN" section (the user's
+  own words for the loop) stating that ending a turn without the reset is a
+  failure, not a pause. Also filed **T131** from a live user report: terminal
+  content scrolls BEHIND the banner overlay, and Mac has since moved the banner
+  to a rounded, shadowed card. Recorded the standing bar: parity is measured
+  against Mac's CURRENT state, at a 99.9% validated confidence level.
+
 - 2026-07-27 (latest) - T113 delivery VERIFIED + T129 DONE. Verified the T113
   delivery from this session's own pane, which is the real-world test the row
   asked for: upgrade log shows the exe + agent swap and the correct resume
