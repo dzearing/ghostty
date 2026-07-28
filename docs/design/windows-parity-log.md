@@ -1678,5 +1678,21 @@ Windows pane has a tty), and `jq` — a hard dependency — was not installed on
 this box. Both fixed on the box; durability filed as T130 since they live only
 in the plugin cache.
 
-pane-id.ps1 ALL PASS (45) ×3; both lanes + test-agent + P1–P3 green. Next: T129
-(banner editor discoverability), then T130, then T38/T39.
+pane-id.ps1 ALL PASS (45) ×3; both lanes + test-agent + P1–P3 green.
+
+DELIVERED to all 3 install locations (this one is user-facing — the installed
+release was still the 2026-07-21 build, so the user's panes had no
+`$GHOZTTY_PANE_ID` at all and their banners could not work no matter what the
+plugin did): ReleaseFast gnu `-Dstrip=false` staged to `zig-out-release`
+(`+version` = `+43aa8b972`); Desktop portable + `\\homeassistant\share` swapped
+with `.bak-20260727-t113`; installed release via the detached upgrade script at
+the task boundary (default `-ResumeCommand`, so its relaunch is also this
+task's context reset). Note this delivery also ships the whole T117 merge of
+origin/main to the user's build for the first time.
+
+**Resumed session: verify the delivery, in this order** — (1) `%TEMP%\ghoztty-
+upgrade.log` for the exe + agent swap lines; (2) `$GHOZTTY_PANE_ID` is set in
+your own pane (it is a NEW pane of the NEW build, so it must be); (3) the
+banner hooks actually fire now — that is the user's original report, and the
+resumed session is the real-world test of it. Next: T129 (banner editor
+discoverability), then T130 (make the plugin fixes durable), then T38/T39.

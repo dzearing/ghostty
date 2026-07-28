@@ -334,8 +334,8 @@ Work these first, in order, before falling back to first-todo-in-table:
     warning (the T49 lesson, recurring unnoticed in a standing script). **JUMPED AHEAD OF T111b, 2026-07-21: ~~T112~~ DONE** — the
     `/reset-context` breakage is the loop's own continuation mechanism, so it
     was fixed first (cheap, out-of-repo skill edit; the reset at that task's
-    boundary was itself the end-to-end validation). Gap it surfaced: **T113** (win32 never exports
-    `$GHOZTTY_PANE_ID` despite CLAUDE.md documenting it) → **T38** (Windows build in the release process; version+arch
+    boundary was itself the end-to-end validation). Gap it surfaced: ~~T113~~ (win32 never exported
+    `$GHOZTTY_PANE_ID` despite CLAUDE.md documenting it; DONE 2026-07-27, see 3b) → **T38** (Windows build in the release process; version+arch
     in installer/zip filenames) → **T39** (website: Windows installer
     download link, same filename format) → the skill source-repo mirror
     from item 19(a). T90b–T90h (viewer panes) follow after publish
@@ -352,7 +352,12 @@ Work these first, in order, before falling back to first-todo-in-table:
    section G that runs the real hook end-to-end. Plugin-fix durability (mirror
    to the source repo, jq dependency) filed as **T130**. Next: **T129** (banner
    editor undiscoverable — same user report, same subsystem, cheap), then T130,
-   then T38/T39 per item 20.
+   then T38/T39 per item 20. **DELIVERED to all 3 install locations** (the
+   installed release was still 2026-07-21, i.e. the user's panes had no pane id
+   at all): staging `+43aa8b972`, portable + share swapped, installed release
+   via the detached upgrade script at the boundary — the resumed session
+   verifies `%TEMP%\ghoztty-upgrade.log`, then that its OWN pane has
+   `$GHOZTTY_PANE_ID`, then that the banner hooks fire.
 
 4. **Post-merge parity band (T118–T128), filed 2026-07-27 by ~~T117~~** (merge
    of origin/main `1e1cdbbd2`, 70 commits). These do NOT displace T113/T38/T39
