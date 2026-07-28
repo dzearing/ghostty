@@ -1659,3 +1659,24 @@ takes `+list` off the contended path entirely.
 Split per go.md's sizing rule: one context could not carry both mechanisms.
 Not delivered to install locations — T110 and T111a both ride with the T111b
 fix so the release does not ship a half-fixed freeze on the default path.
+
+## 2026-07-27 — T113 done: the product was right, the harness was lying
+
+The 4 failures the previous session left (C2/C3, F4/F5) were all one harness
+bug: `Run-Cli` goes through `cmd /c`, so `%VAR%` in a probe was expanded against
+the HARNESS's own env before ghoztty saw it. F4/F5 read back the poison the test
+itself had planted; C2/C3 targeted the harness's own surface id. Instrumenting
+every hop (bake → config.env → OPEN.env → the agent's child_env) showed the id
+correct throughout, and `GHOSTTY_BIN_DIR` coming back as the INSTALLED path —
+a value neither side could produce — pinned it on the probe text. Probe now
+clears the var for the send.
+
+New section G runs the REAL plugin hook inside a pane, and it earned its keep
+immediately: the app fix alone would NOT have restored the user's banners. The
+hook `exit 0`s on a missing tty before it ever reads `$GHOZTTY_PANE_ID` (no
+Windows pane has a tty), and `jq` — a hard dependency — was not installed on
+this box. Both fixed on the box; durability filed as T130 since they live only
+in the plugin cache.
+
+pane-id.ps1 ALL PASS (45) ×3; both lanes + test-agent + P1–P3 green. Next: T129
+(banner editor discoverability), then T130, then T38/T39.

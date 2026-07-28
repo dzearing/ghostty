@@ -5673,6 +5673,92 @@ the pane banner on their own — that exercises the whole documented contract
 (baked at spawn, readable from a hook shell, accepted by `--target`) through the
 exact path the user cares about.
 
+### 2026-07-27 — DONE: the 4 remaining failures were the harness lying
+
+The first validation run reported 4 failures (C2, C3, F4, F5) and the row filed
+F4/F5 as "a REAL product bug": a launcher that already has `GHOZTTY_PANE_ID` in
+its env appearing to poison the panes it opens. **It was not a product bug. The
+product was correct at every hop, and the harness was substituting the values it
+claimed to be measuring.**
+
+**How it was proven** (measured, not reasoned — the row's prime suspect was
+wrong, again):
+
+1. Instrumented the whole chain and read the logs: the win32 bake (`config.env`
+   count 1, the pane's own UUID), core's forwarded `remote_env` (11 pairs,
+   including `GHOZTTY_PANE_ID=<this pane's uuid>`), the `OPEN` actually sent,
+   and — with the agent pre-started under captured stderr, since the GUI spawns
+   it with no inherited handles — the agent's own `child_env` right before
+   `cmd.start()`. Every hop carried the correct id.
+2. Probed an OS-level discriminator instead of the disputed variable:
+   `GHOSTTY_BIN_DIR` came back as `C:\…\Programs\Ghoztty` (the INSTALLED build)
+   where the agent's `child_env` said `D:\git\ghoztty\zig-out\bin`. A value that
+   is in neither the app's env-building code nor the agent's map can only have
+   come from the harness's own environment.
+3. Reproduced the substitution in isolation: the same argument string sent
+   through `cmd /c` arrives as `echo probe=POISONVALUE`, and sent shell-free
+   arrives as `echo probe=%T113X%`.
+
+**Root cause.** `Run-Cli` invokes ghoztty through `cmd.exe /c "… > file 2>&1"`,
+and cmd expands `%VAR%` **against the harness's own environment** while parsing
+that command line. `Probe-PaneEnv` deliberately sends both the `%VAR%` (cmd) and
+`$env:VAR` (PowerShell) spellings so it works whatever shell the pane runs — so
+the cmd spelling was pre-substituted before ghoztty was invoked, and the pane
+faithfully echoed a foreign value:
+
+- **F4/F5:** section F *deliberately* puts the poison in the harness env (the
+  GUI must inherit it), so `%GHOZTTY_PANE_ID%` became the poison in the probe
+  text itself. The assert then read the poison back and called it inheritance.
+- **C2/C3:** `%GHOSTTY_SURFACE_ID%` became the *harness's* surface id (the pane
+  the session ran in). C1 "passed" on it — a false pass, since it only checks
+  the shape — and C2/C3 then targeted a pane that does not exist in the test
+  app. The minimized-window wrap theory in the row was a red herring.
+
+Note the asymmetry that made this look like a product defect: a var that is
+**undefined** in the harness passes through cmd untouched, so every probe for a
+var the harness lacked (section A's `GHOZTTY_PANE_ID`, section B's) worked
+perfectly — the failures appeared only, and exactly, where the harness itself
+had the variable set.
+
+**Harness fix.** `Probe-PaneEnv` saves and clears the variable from its own
+environment for the duration of the two sends, then restores it (section F still
+needs the poison in the env at LAUNCH time, which is untouched). The comment
+above the function records the trap so the next person does not re-file it as a
+product bug.
+
+**Section G — the end-to-end this row demanded.** It runs the REAL plugin hook
+(`ghoztty-banner.sh set --title … --goal …`) via `bash` inside a real pane, with
+PATH pointed at the build under test (otherwise `ghoztty` resolves to the
+installed release and the banner lands in one of the user's own windows — the
+T116 trap), and asserts the marker comes back in that pane's `+list --json`
+`banner` field, in the multi-line `## heading` + table form that only the CLI
+path can produce (the OSC fallback is single-line, so the shape proves the pane
+was resolved via `$GHOZTTY_PANE_ID`).
+
+**It found the outage's second cause, outside this repo.** Fixing the app alone
+would NOT have brought the user's banners back:
+
+- `ghoztty-banner.sh` line 68 was `TTY_NAME=$(find_tty) || exit 0` — it bailed
+  on a missing tty *before* `$GHOZTTY_PANE_ID` was ever read. On Windows no pane
+  has a tty (`ps -o tty=` is empty for the hook shell and every ancestor), so
+  every hook no-opped no matter what the app exported. Fixed in the active
+  plugin cache (0.7.0): the tty is now optional, the state file falls back to a
+  pane-id key, the OSC fallback no-ops without a tty, and the script bails only
+  when BOTH routes are gone.
+- `jq` is a hard dependency (`command -v jq >/dev/null || exit 0`) and was not
+  installed on this box at all. Installed via winget (`jqlang.jq`, user scope).
+
+Both plugin-side fixes live only in this box's plugin cache today, so a plugin
+update would silently revert them — filed as **T130** (mirror to the source repo
++ decide what to do about the jq dependency).
+
+**Validation:** `test/win32/pane-id.ps1` **ALL PASS (45) ×3** (sections A–G),
+both test lanes (`-Dapp-runtime=none`, `-Dapp-runtime=win32`), `zig build
+test-agent`, and P1–P3 acceptance all green at HEAD. (The `none` lane failed
+once with `compile exe helpgen … error code 5` and no error text — a transient
+file-lock/AV exit, green on an immediate re-run; noting it because go.md's rule
+is that a lane failing with no `error:` line did not really fail.)
+
 ## T117 — Merge origin/main `1e1cdbbd2` (2026-07-27)
 
 70 commits since the T88 merge base (`8bb5d9845`). Merged, NOT rebased: the
@@ -5980,3 +6066,52 @@ agent session alive and unreferenced forever rather than ending.
 set the intent on exactly the dropped leaves and only those, so that any
 future tree-replacing path (recovery-style swaps) stays safe — i.e. adopt main's
 invariant in the win32 shape rather than copying its mechanism.
+
+## T130 — Make the plugin's Windows banner-hook fixes durable
+
+Filed 2026-07-27 by T113, whose end-to-end section G proved that the app-side
+`$GHOZTTY_PANE_ID` contract is only *half* of why the user's banners were dead.
+The other half is in the Claude Code plugin, and the fixes for it currently live
+**only in this box's active plugin cache** —
+`~/.claude/plugins/cache/dzearing-claude-marketplace/ghoztty/0.7.0/hooks/ghoztty-banner.sh`
+— so the next plugin update silently reverts them and the user's banners break
+again with no new symptom to go on.
+
+**(a) The tty gate (fixed here, must be mirrored).** The script opened with
+
+    TTY_NAME=$(find_tty) || exit 0
+
+which exits *before* `$GHOZTTY_PANE_ID` is read. On Windows that is fatal and
+unconditional: an agent-backed pane has no tty, and MSYS `ps -o tty=` reports
+none for the hook shell or any ancestor, so `find_tty` always fails. Every
+SessionStart / UserPromptSubmit / Stop hook no-opped — invisibly, because each
+hook call is `>/dev/null 2>&1`. The fix makes the tty one of two routes rather
+than a precondition: `|| TTY_NAME=""`, bail only when the tty AND the pane id
+are both empty, key the state file by `pane-$PANE_ID` when there is no tty, and
+make `send_osc` (which writes to `/dev/$TTY_NAME`) a no-op without one.
+`resolve_pane` is unchanged — its two fallbacks legitimately need a tty, and
+they are only reached when the pane id is absent, which now implies one exists.
+
+**(b) The `jq` dependency (worked around here, needs a decision).** The script
+starts with `command -v jq >/dev/null 2>&1 || exit 0`, and jq was **not
+installed on this box at all** — no PATH entry, none of the usual winget/scoop/
+choco/git-bin locations. Installed via `winget install --id jqlang.jq --scope
+user` so the end-to-end could run, which means the user's banners now depend on
+a package this task happened to install. Any other Windows user gets the same
+silent no-op. Decide one of: vendor a minimal JSON read/merge in the script
+(the state file is a flat string map), or keep the dependency but make the
+plugin *say* it is inert (a one-time visible message) instead of exiting 0.
+
+**(c) Carries item 19(a).** The same mirror pass should bring over the banner
+title fix already applied to the cached SKILL.md (title lines need a leading
+`# ` or they render body-size).
+
+**Work:** clone `github.com/dzearing/ghoztty-claude-plugin` (not on this box),
+apply (a) + (c), decide and apply (b), bump the plugin version, push. **Note the
+version trap:** in-process hooks keep running the OLD cached script until the
+session restarts, so a mirrored fix is not live for existing sessions.
+
+**Validation:** `test/win32/pane-id.ps1` section G already covers the behavior —
+it runs the highest-versioned cached `ghoztty-banner.sh` end-to-end, so a
+mirrored-and-reinstalled plugin is re-validated by re-running that script
+(it SKIPs, loudly, if the hook or jq is missing rather than fabricating a pass).

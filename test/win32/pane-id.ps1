@@ -135,11 +135,27 @@ function Wait-Leaves($tmp, $tag, $count, $timeoutSec = 25) {
 # window has a near-zero client rect and wraps ONE GLYPH PER LINE, so a ~40
 # character probe costs ~40 scrollback lines. Reading only the default tail
 # silently loses the answer (this cost the first run of this script).
+#
+# THE TRAP THIS FUNCTION EXISTS TO AVOID (cost the first validation run 4 of its
+# ~35 asserts, all of them FABRICATED): `Run-Cli` reaches ghoztty through
+# `cmd.exe /c`, and cmd expands `%VAR%` against the HARNESS's OWN environment
+# before ghoztty ever sees the text. So `echo $mark=%GHOZTTY_PANE_ID%` arrives
+# at the pane already substituted with whatever the harness inherited from the
+# Ghoztty pane it was started in - the pane then faithfully echoes a foreign
+# value and the assert reads it as the pane's own. That is precisely how section
+# F's poison (which is deliberately IN the harness env) came back as "the
+# inherited id won", and how section C read the harness's $GHOSTTY_SURFACE_ID
+# instead of the pane's. An UNDEFINED var passes through cmd untouched, so we
+# clear the var from OUR env for the duration of the two sends and restore it
+# after (section F needs the poison in the env at LAUNCH time, not here).
 function Probe-PaneEnv($tmp, $target, $var, $valueRe, $tag, $timeoutSec = 25) {
     $mark = "PP$tag"
+    $savedVar = [Environment]::GetEnvironmentVariable($var)
+    if ($null -ne $savedVar) { Remove-Item "env:$var" -ErrorAction SilentlyContinue }
     Run-Cli "+send-keys --target=$target `"echo $mark=%$var%`" Enter" "$tmp\p1-$tag.txt" 12 | Out-Null
     Start-Sleep -Milliseconds 400
     Run-Cli "+send-keys --target=$target `"echo $mark=`$env:$var`" Enter" "$tmp\p2-$tag.txt" 12 | Out-Null
+    if ($null -ne $savedVar) { Set-Item "env:$var" $savedVar }
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 600
@@ -439,6 +455,77 @@ Assert "F4 the pane's OWN id won over the inherited one" (
 Assert "F5 the id the shell sees is the one +list reports" (
     $idF -ne '' -and @($leavesF | Where-Object { [string]$_.id.ToLower() -eq $idF.ToLower() }).Count -eq 1)
 Remove-Item env:GHOZTTY_PANE_ID -ErrorAction SilentlyContinue
+Stop-TestProcs
+
+# ============================================================================
+"== G: the ghoztty plugin's banner hook paints THIS pane's banner (end-to-end)"
+# ============================================================================
+# The reason this task was raised from a contract nicety to a user-facing
+# outage: the ghoztty Claude Code plugin resolves its own pane in
+# `resolve_pane()` and, on Windows, had NO way to do it - $GHOZTTY_PANE_ID was
+# never baked (this task) and both fallbacks need a tty, which an agent-backed
+# pane does not have. The hooks then no-op silently (every call is
+# `>/dev/null 2>&1`), so the only honest proof is to run the REAL hook script
+# inside a real pane and look at the banner that comes back.
+#
+# The hook is driven exactly as Claude Code drives it - `bash <hook> set ...`
+# with the pane's own environment - except that PATH is pointed at the build
+# under test (otherwise `ghoztty` resolves to the installed release and the
+# banner would land in one of the USER's windows, the T116 trap).
+$hookDir = Join-Path $env:USERPROFILE '.claude\plugins\cache\dzearing-claude-marketplace\ghoztty'
+$hook = @(Get-ChildItem -Path $hookDir -Filter 'ghoztty-banner.sh' -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending)[0]
+$bash = 'C:\Program Files\Git\bin\bash.exe'
+$jq = @(Get-Command jq -ErrorAction SilentlyContinue)[0]
+$jqDir = if ($null -ne $jq) { Split-Path $jq.Source } else { "$env:LOCALAPPDATA\Microsoft\WinGet\Links" }
+$missing = @()
+if ($null -eq $hook) { $missing += 'plugin hook script' }
+if (-not (Test-Path $bash)) { $missing += 'git bash' }
+if (-not (Test-Path (Join-Path $jqDir 'jq.exe'))) { $missing += 'jq' }
+
+if ($missing.Count -gt 0) {
+    "  SKIP G (end-to-end hook check needs: $($missing -join ', '))"
+} else {
+    $tmpG = Join-Path $root 'g'
+    New-Item -ItemType Directory -Force (Join-Path $tmpG 'home') | Out-Null
+    Launch $tmpG 't113-g' $false
+    $leavesG = @(Wait-Leaves $tmpG 'g0' 1 30)
+    Assert "G1 GUI opened a pane" ($leavesG.Count -ge 1)
+    $paneG = if ($leavesG.Count -ge 1) { [string]$leavesG[0].name } else { '' }
+
+    # The driver runs INSIDE the pane, so $GHOZTTY_PANE_ID is the pane's own
+    # (never the harness's - the whole point). HOME is hermetic and written
+    # with forward slashes so MSYS bash can mkdir under it.
+    $marker = 'T113HOOKGOAL'
+    $homeFwd = ((Join-Path $tmpG 'home') -replace '\\', '/')
+    $hookFwd = ($hook.FullName -replace '\\', '/')
+    $binDir = Split-Path $Exe
+    $driver = Join-Path $tmpG 'hook.ps1'
+    Set-Content -Path $driver -Encoding ascii -Value @(
+        "`$env:PATH = '$binDir;$jqDir;' + `$env:PATH"
+        "`$env:HOME = '$homeFwd'"
+        "`$env:TERM_PROGRAM = 'ghostty'"
+        "& '$bash' '$hookFwd' set --title 'T113 hook' --goal '$marker'"
+    )
+    Run-Cli "+send-keys --target=$paneG `"powershell -NoProfile -File $driver`" Enter" `
+        "$tmpG\send.txt" 15 | Out-Null
+
+    # Poll the banner back through +list --json (the CLI way to read a banner).
+    $bannerG = ''
+    $deadlineG = (Get-Date).AddSeconds(40)
+    while ((Get-Date) -lt $deadlineG) {
+        Start-Sleep -Milliseconds 1000
+        $leafG = Leaf-ByName (Get-List $tmpG 'g1') $paneG
+        if ($null -ne $leafG -and [string]$leafG.banner -ne '') { $bannerG = [string]$leafG.banner; break }
+    }
+    Assert "G2 the hook painted a banner on its OWN pane with no plugin edit" (
+        $bannerG -match $marker)
+    # A banner carrying the `## ` heading + table proves the CLI path (pane
+    # resolved via $GHOZTTY_PANE_ID); the OSC fallback can only emit one line.
+    Assert "G3 it used the pane-id CLI path, not the single-line OSC fallback" (
+        $bannerG -match '## T113 hook' -and $bannerG -match '\|')
+    Stop-TestProcs
+}
 
 # ============================================================================
 "== cleanup"
