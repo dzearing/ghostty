@@ -45,34 +45,9 @@ struct AboutView: View {
 
     private var copyright: String? { Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String }
 
-    #if os(macOS)
-    // This creates a background style similar to the Apple "About My Mac" Window
-    private struct VisualEffectBackground: NSViewRepresentable {
-        let material: NSVisualEffectView.Material
-        let blendingMode: NSVisualEffectView.BlendingMode
-        let isEmphasized: Bool
-
-        init(material: NSVisualEffectView.Material,
-             blendingMode: NSVisualEffectView.BlendingMode = .behindWindow,
-             isEmphasized: Bool = false) {
-            self.material = material
-            self.blendingMode = blendingMode
-            self.isEmphasized = isEmphasized
-        }
-
-        func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-            nsView.material = material
-            nsView.blendingMode = blendingMode
-            nsView.isEmphasized = isEmphasized
-        }
-
-        func makeNSView(context: Context) -> NSVisualEffectView {
-            let visualEffect = NSVisualEffectView()
-            visualEffect.autoresizingMask = [.width, .height]
-            return visualEffect
-        }
-    }
-    #endif
+    // The "About My Mac"-style backdrop comes from the shared
+    // `VisualEffectBackground` in Helpers/GlassCard.swift — this view used to
+    // carry its own private copy of the same NSViewRepresentable.
 
     var body: some View {
         VStack(alignment: .center) {

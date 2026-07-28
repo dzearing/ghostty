@@ -1,0 +1,18 @@
+{
+  "version": "1.18.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Faster, cleaner re-attach",
+          "text": "Reopening Ghoztty brings persistent sessions back quicker and renders them correctly right away, via a structured snapshot + delta replay instead of raw scrollback dumps — no smeared or mis-sized panes, and a resize can no longer be dropped mid-re-attach."
+        },
+        {
+          "title": "No more spurious agent-update prompts",
+          "text": "Upgrading the app no longer asks you to reset sessions for an agent that didn't actually change. The agent is flagged \"new\" only when its own code really changed."
+        }
+      ]
+    }
+  ]
+}

@@ -1906,6 +1906,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        /// Set the minimum contrast ratio enforced at render time,
+        /// clamped so it never drops below the configured
+        /// `minimum-contrast` (a runtime request can only strengthen the
+        /// user's floor). Uniforms sync to the GPU every frame, so this
+        /// takes effect on the next draw.
+        pub fn setMinContrast(self: *Self, ratio: f32) void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+            self.uniforms.min_contrast = @max(ratio, self.config.min_contrast);
+        }
+
         /// Update the configuration.
         pub fn changeConfig(self: *Self, config: *DerivedConfig) !void {
             self.draw_mutex.lock();

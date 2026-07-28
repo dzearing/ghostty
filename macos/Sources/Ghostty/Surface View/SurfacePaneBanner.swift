@@ -20,101 +20,228 @@ extension Ghostty {
         /// darker on light — so it reads as a distinct sticky region.
         var background: Color?
 
+        /// The hosting pane's current width, passed top-down (from a
+        /// `GeometryReader` at the overlay level). Table column sizing derives
+        /// from this so the banner always reflows to the pane and can never
+        /// establish its own minimum width: measuring the banner's *content*
+        /// width instead (as a preference fed back into state) deadlocks the
+        /// moment the content overflows — the content is as wide as the
+        /// columns, the columns are as wide as the measurement, and the pane
+        /// can no longer shrink past it. 0 means "not yet known".
+        var paneWidth: CGFloat = 0
+
         /// Total display cap in lines. Table rows (including the header)
         /// each count as one line; the separator row never renders.
         static let maxDisplayLines = 10
 
-        /// Content height when collapsed: the first line fully visible
-        /// plus a sliver of the next, which the fade mask dissolves to
-        /// hint that there's more to view.
-        private static let collapsedContentHeight: CGFloat = 24
+        /// Maximum wrapped display lines for a single table cell. A cell that
+        /// would wrap past this (e.g. a long unbroken token in a very narrow
+        /// pane) is tail-truncated with an ellipsis instead of growing the row
+        /// unbounded. Counts *within* one table row — the row still counts
+        /// once toward `maxDisplayLines`.
+        static let maxCellWrapLines = 3
 
-        /// The width a single table cell grows to before its content wraps
-        /// to the next line. Long cell text word-wraps within this bound and
-        /// the row height expands to fit, rather than being clipped to one
-        /// line — while a very long cell stops widening the table absurdly,
-        /// matching how a normal markdown renderer lays out table cells.
+        /// Corner radius of the floating banner card.
+        private static let cornerRadius = GlassCard.cornerRadius
+
+        /// Uniform inner padding of the card. Equal on all sides so the
+        /// collapsed card — which shows only the title row — is vertically
+        /// centered around a title that hasn't moved from its expanded spot.
+        private static let innerPadding = GlassCard.innerPadding
+
+        /// Margin between the card and the pane edges (the card floats,
+        /// Liquid Glass style, instead of running edge to edge). Sized so the
+        /// card's elevation shadow has room to render instead of being cut at
+        /// the pane edge. The bottom margin is part of the banner's measured
+        /// height, so the terminal content below always starts a breath under
+        /// the card — content is never hidden behind it.
+        private static let outerMargin = GlassCard.outerMargin
+
+        /// Fallback per-column cap used ONLY before the pane's real width is
+        /// known (`paneWidth == 0`, e.g. the harness/preview case). Once the
+        /// width is known, columns size to the available space instead (see
+        /// `columnWidths(natural:available:)`), so a row uses the full pane
+        /// width before wrapping rather than wrapping at this fixed bound
+        /// with the pane half-empty.
         private static let maxCellWidth: CGFloat = 360
 
         /// Collapsed state is per-pane and ephemeral; it resets when the
         /// banner is cleared and set again.
-        @State private var collapsed = false
+        @State private var collapsed: Bool
+
+        init(
+            text: String,
+            background: Color? = nil,
+            paneWidth: CGFloat = 0,
+            initiallyCollapsed: Bool = false
+        ) {
+            self.text = text
+            self.background = background
+            self.paneWidth = paneWidth
+            self._collapsed = State(initialValue: initiallyCollapsed)
+        }
 
         var body: some View {
-            let blocks = BannerMarkdown.parseBlocks(text, maxLines: Self.maxDisplayLines)
-            // Single-line banners have nothing to collapse; hide the
-            // chevron and ignore background clicks.
-            let collapsible = text.contains("\n")
+            // Parsed blocks and measured natural column widths come from a
+            // text-keyed cache: during a live divider drag this body runs
+            // every frame, and neither parsing nor text measurement belongs
+            // on that path — only the O(columns) fair-share division below
+            // depends on the width.
+            let layout = BannerLayout.shared.layout(for: text)
+            let blocks = layout.blocks
 
-            HStack(alignment: .top, spacing: 8) {
-                // Paragraph-style gap between blocks (text runs, tables);
-                // lines within a text run stay tight since a run is a
-                // single Text.
-                let content = VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                        blockView(block)
-                    }
-                }
-                if collapsed {
-                    content
-                        .frame(height: Self.collapsedContentHeight, alignment: .topLeading)
-                        .clipped()
-                        .mask {
-                            LinearGradient(
-                                stops: [
-                                    .init(color: .black, location: 0),
-                                    .init(color: .black, location: 0.55),
-                                    .init(color: .clear, location: 1),
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        }
-                } else {
-                    content
-                }
-                Spacer(minLength: 0)
-                if collapsible {
-                    Button(action: toggleCollapsed) {
-                        Image(systemName: collapsed ? "chevron.down" : "chevron.up")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(collapsed ? "Expand banner" : "Collapse banner")
-                }
-            }
+            // The pane width drives all wrapping. Subtract the card's outer
+            // margins and inner padding to get the content's usable width.
+            // Floor a known-but-tiny width at 1 (not 0) so downstream sizing
+            // can tell "pane is absurdly narrow" (stay bounded) apart from
+            // "width not known yet" (fall back to the fixed cap).
+            let availableWidth = paneWidth > 0
+                ? max(1, paneWidth - 2 * (Self.outerMargin + Self.innerPadding))
+                : 0
+            // The first block is the title row; everything after it is the
+            // collapsible body. A banner with nothing after the title has
+            // nothing to collapse: hide the chevron, ignore background clicks.
+            let collapsible = blocks.count > 1
+
+            // Width budget for table layout. The title row shares its line
+            // with the chevron column; body blocks get the full width.
+            let titleBudget = availableWidth > 0
+                ? max(1, availableWidth - 8 - (collapsible ? 26 : 0))
+                : 0
+            let bodyBudget = availableWidth
+
+            cardContent(
+                layout: layout, collapsible: collapsible,
+                titleBudget: titleBudget, bodyBudget: bodyBudget
+            )
             .font(.system(size: 12))
-            .padding(12)
-            .background(backgroundStyle)
-            .contentShape(Rectangle())
+            .padding(Self.innerPadding)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .modifier(GlassCardBackground(fill: cardFill))
+            .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
             .onTapGesture {
                 guard collapsible else { return }
                 toggleCollapsed()
             }
-            .overlay(alignment: .bottom) {
-                Divider()
+            .padding(Self.outerMargin)
+            // A hidden, animation-free copy of the same content measures the
+            // height the banner is headed for and publishes it as the banner's
+            // target height. The host insets the terminal from this — one
+            // exact step per toggle — while the visible card above animates
+            // its resize, so the terminal never chases intermediate frames.
+            .background(alignment: .top) {
+                cardContent(
+                    layout: layout, collapsible: collapsible,
+                    titleBudget: titleBudget, bodyBudget: bodyBudget
+                )
+                .font(.system(size: 12))
+                .frame(width: availableWidth > 0 ? availableWidth : nil, alignment: .topLeading)
+                .fixedSize(horizontal: false, vertical: true)
+                .transaction { $0.animation = nil }
+                .hidden()
+                .allowsHitTesting(false)
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: BannerTargetHeightKey.self,
+                            value: proxy.size.height + Self.chromeHeight
+                        )
+                    }
+                )
             }
         }
 
+        /// Vertical chrome around the banner content: inner card padding plus
+        /// the card's outer margins. Added to the measured content height to
+        /// produce the banner's total (target) height.
+        private static var chromeHeight: CGFloat {
+            innerPadding * 2 + outerMargin * 2
+        }
+
+        /// The card's inner content: the title row (first block + collapse
+        /// chevron) with the body blocks below it.
+        @ViewBuilder
+        private func cardContent(
+            layout: BannerLayout.Entry,
+            collapsible: Bool,
+            titleBudget: CGFloat,
+            bodyBudget: CGFloat
+        ) -> some View {
+            VStack(alignment: .leading, spacing: 8) {
+                // Title row. The chevron is center-aligned against the title
+                // in both states — collapsing removes the body below this row
+                // and nothing in the row itself moves.
+                HStack(alignment: .center, spacing: 8) {
+                    if let title = layout.blocks.first {
+                        blockView(title, natural: layout.naturalWidths[0], budget: titleBudget)
+                    }
+                    Spacer(minLength: 0)
+                    if collapsible {
+                        Button(action: toggleCollapsed) {
+                            Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(collapsed ? "Expand banner" : "Collapse banner")
+                    }
+                }
+                // Body blocks, with a paragraph-style gap between them (lines
+                // within a text run stay tight since a run is a single Text).
+                if !(collapsed && collapsible) {
+                    ForEach(
+                        Array(layout.blocks.dropFirst().enumerated()),
+                        id: \.offset
+                    ) { offset, block in
+                        blockView(
+                            block,
+                            natural: layout.naturalWidths[offset + 1],
+                            budget: bodyBudget)
+                    }
+                }
+            }
+        }
+
+        /// Animate the card only: the resize interpolates and the body
+        /// content cross-fades (the default insertion/removal transition) in
+        /// parallel. The terminal inset below is deliberately NOT driven by
+        /// the visible card's animated frame — it reads the hidden
+        /// measurement copy's target height (see `body`), which ignores this
+        /// animation, so the terminal reflows in one instant step instead of
+        /// dragging the Metal surface through per-frame resizes.
         private func toggleCollapsed() {
             withAnimation(.easeInOut(duration: 0.18)) {
                 collapsed.toggle()
             }
         }
 
-        /// A shade deviated from the pane background (lighter when dark,
-        /// darker when light); falls back to the translucent material
-        /// when the background isn't known.
-        private var backgroundStyle: AnyShapeStyle {
-            guard let background else { return AnyShapeStyle(.ultraThinMaterial) }
-            let os = OSColor(background)
-            let shaded = os.isLightColor ? os.darken(by: 0.06) : os.lighten(by: 0.1)
-            return AnyShapeStyle(Color(shaded))
+        /// The card's fill: a translucent wash over whatever sits behind the
+        /// card — white on a dark pane, black on a light one. Compositing
+        /// white at 6% is exactly `lighten(by: 0.06)` of the color behind
+        /// (black at 4% is `darken(by: 0.04)`), so the card reads as a shade
+        /// off the pane background without ever holding a color of its own:
+        /// when the pane color changes, only the single element behind the
+        /// banner repaints and the card follows in the same paint pass. The
+        /// known `background` is consulted only for the light/dark direction.
+        /// Falls back to the translucent material when the background isn't
+        /// known.
+        private var cardFill: AnyShapeStyle {
+            guard let background else { return GlassCard.materialFill }
+            return GlassCard.fill(isLightBackground: OSColor(background).isLightColor)
         }
 
+        // The card surface itself (fill wash, sheen, rim, elevation shadow) lives in
+        // GlassCardBackground so the viewer pane's table of contents renders the exact
+        // same card — see Helpers/GlassCard.swift.
+
+        /// Render one block. `natural` carries the cached natural column
+        /// widths when the block is a table (nil otherwise).
         @ViewBuilder
-        private func blockView(_ block: BannerMarkdown.Block) -> some View {
+        private func blockView(
+            _ block: BannerMarkdown.Block,
+            natural: [CGFloat]?,
+            budget: CGFloat
+        ) -> some View {
             switch block {
             case .text(let str, let lineLimit):
                 Text(str)
@@ -157,13 +284,14 @@ extension Ghostty {
                 Divider()
             case .table(let table):
                 let showHeader = table.hasVisibleHeader
-                // Fixed per-column widths (content width, capped at
-                // `maxCellWidth`) let a long cell wrap at a known width while
-                // the Grid grows each row to its wrapped height — a greedy
-                // `frame(maxWidth:)` would instead fill the banner width, and
-                // a rigid `fixedSize` cell overflows its row instead of
-                // growing it.
-                let widths = columnWidths(for: table)
+                // Fixed per-column widths (sized to the available banner width)
+                // let a long cell wrap at a known width while the Grid grows
+                // each row to its wrapped height — a greedy `frame(maxWidth:)`
+                // would collapse layout, and a rigid `fixedSize` cell overflows
+                // its row instead of growing it.
+                let widths = columnWidths(
+                    natural: natural ?? BannerLayout.naturalColumnWidths(for: table),
+                    available: budget)
                 Grid(alignment: .topLeading, horizontalSpacing: 18, verticalSpacing: 4) {
                     if showHeader {
                         GridRow(alignment: .top) {
@@ -215,6 +343,11 @@ extension Ghostty {
             if let width, !hasCheckbox {
                 Text(BannerMarkdown.attributed(segments))
                     .multilineTextAlignment(textAlignment(alignment))
+                    // A nasty cell (long unbroken token in a skinny pane)
+                    // can't grow the row unbounded: cap the wrap and
+                    // ellipsize the last visible line.
+                    .lineLimit(Self.maxCellWrapLines)
+                    .truncationMode(.tail)
                     // Vertical-only fixed size: wrap at the fixed column width,
                     // take whatever height the wrapped text needs.
                     .fixedSize(horizontal: false, vertical: true)
@@ -280,78 +413,65 @@ extension Ghostty {
             }
         }
 
-        /// The fixed width of each table column: the widest cell's natural
-        /// (single-line) content width, capped at `maxCellWidth` so a very long
-        /// cell wraps rather than stretching the table. Widths are exact (not a
-        /// flexible max) so the Grid stays as wide as its content and grows each
-        /// row to the height its cells wrap to.
+        /// The fixed width of each table column, divided from the cached
+        /// natural widths and the current width budget. Pure arithmetic —
+        /// this runs every frame during a divider drag, so no parsing or
+        /// text measurement happens here (see `BannerLayout`). Widths are
+        /// exact (not a flexible max) so the Grid stays as wide as its
+        /// content and grows each row to the height its cells wrap to.
         ///
-        /// Each run is measured at the weight/face it actually renders (bold
-        /// runs at bold, code runs monospaced); measuring bold body text as
-        /// regular under-sized the column and force-wrapped bold labels like
-        /// `**Prompt**` mid-word. Header cells render bold, so they force bold.
-        /// A cell whose content fits under the cap gets its exact width and so
-        /// never wraps at all; only content past the cap wraps, at word
-        /// boundaries (a lone word longer than the whole cap is the sole case
-        /// that can still break mid-character).
-        private func columnWidths(for table: BannerMarkdown.Table) -> [CGFloat] {
-            let columns = table.header.count
+        /// Sizing policy, given the banner's `available` inner width:
+        /// - If every column's natural (single-line) width fits within
+        ///   `available`, each column gets its exact natural width and nothing
+        ///   wraps — so a row uses the full pane width it needs, no more.
+        /// - If the natural widths together exceed `available`, columns share
+        ///   the space max-min fair: narrow columns (e.g. the `**Goal**` label)
+        ///   keep their natural width, and wide columns split the remainder, so
+        ///   each column wraps only at the width the pane can actually give it —
+        ///   never at a fixed cap that leaves the pane half-empty.
+        /// - Before the pane width is known (`available <= 0`), fall back to
+        ///   the fixed `maxCellWidth` cap so the initial render is never
+        ///   absurdly wide.
+        private func columnWidths(natural: [CGFloat], available: CGFloat) -> [CGFloat] {
+            let columns = natural.count
             guard columns > 0 else { return [] }
-            var widths = [CGFloat](repeating: 0, count: columns)
-            if table.hasVisibleHeader {
-                for (col, cell) in table.header.enumerated() where col < columns {
-                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: true))
-                }
-            }
-            for row in table.rows {
-                for (col, cell) in row.enumerated() where col < columns {
-                    widths[col] = max(widths[col], Self.cellNaturalWidth(cell, forceBold: false))
-                }
-            }
-            // A hair of slack absorbs sub-pixel measurement differences so a
-            // cell that fits on one line isn't wrapped by rounding.
-            return widths.map { min($0 + 2, Self.maxCellWidth) }
-        }
 
-        /// The unwrapped width a cell's inline content occupies: the measured
-        /// width of its text runs plus a fixed box per checkbox.
-        private static func cellNaturalWidth(
-            _ segments: [BannerMarkdown.Inline], forceBold: Bool
-        ) -> CGFloat {
-            segments.reduce(0) { acc, seg in
-                switch seg {
-                case .text(let a):
-                    return acc + attrWidth(a, forceBold: forceBold)
-                case .checkbox:
-                    return acc + CheckboxMark.side
+            // Budget for cell content = available width minus the inter-column
+            // spacing the Grid inserts (18pt between adjacent columns).
+            let budget = available - 18 * CGFloat(max(0, columns - 1))
+
+            // No room once inter-column spacing is paid: with a KNOWN pane
+            // width, stay bounded (tiny equal shares — the pane is being
+            // squeezed to nothing and must never be blocked from shrinking);
+            // with an UNKNOWN width, fall back to the fixed cap.
+            guard budget > 0 else {
+                if available > 0 {
+                    return [CGFloat](
+                        repeating: max(1, available / CGFloat(columns)),
+                        count: columns)
                 }
+                return natural.map { min($0, Self.maxCellWidth) }
             }
-        }
 
-        /// Width of an attributed run sequence in the 12pt banner font, each run
-        /// measured at the weight/face it renders. Matches SwiftUI's
-        /// `.system(size: 12)`. `forceBold` measures every run bold (header row).
-        private static func attrWidth(_ a: AttributedString, forceBold: Bool) -> CGFloat {
-            var total: CGFloat = 0
-            for run in a.runs {
-                let s = String(a[run.range].characters)
-                if s.isEmpty { continue }
-                total += ceil((s as NSString).size(withAttributes: [.font: runFont(run, forceBold: forceBold)]).width)
+            // Everything fits on one line: exact natural widths, no wrapping.
+            if natural.reduce(0, +) <= budget { return natural }
+
+            // Overflow: max-min fair share. Process columns narrowest-first —
+            // a column that fits its equal share of the remaining budget takes
+            // its natural width and hands the slack to the wider columns still
+            // to be sized; a column that doesn't fit takes its fair share and
+            // wraps there.
+            var result = [CGFloat](repeating: 0, count: columns)
+            var remaining = budget
+            var left = columns
+            for col in (0..<columns).sorted(by: { natural[$0] < natural[$1] }) {
+                let share = remaining / CGFloat(left)
+                let w = min(natural[col], share)
+                result[col] = w
+                remaining -= w
+                left -= 1
             }
-            return total
-        }
-
-        /// The font a run renders in: bold for a strongly-emphasized run (or a
-        /// force-bold header), monospaced for a code run. SwiftUI draws the bold
-        /// presentation intent at full bold weight, so measure it there.
-        private static func runFont(
-            _ run: AttributedString.Runs.Run, forceBold: Bool
-        ) -> OSFont {
-            let intent = run.inlinePresentationIntent ?? []
-            let bold = forceBold || intent.contains(.stronglyEmphasized)
-            return intent.contains(.code)
-                ? OSFont.monospacedSystemFont(ofSize: 12, weight: bold ? .bold : .regular)
-                : OSFont.systemFont(ofSize: 12, weight: bold ? .bold : .regular)
+            return result
         }
 
         /// How the wrapped lines of a table cell align to each other.
@@ -376,6 +496,122 @@ extension Ghostty {
             }
         }
 
+        /// Text-keyed cache of everything about a banner that does NOT depend
+        /// on the pane width: the parsed blocks and each table's natural
+        /// (unwrapped, measured) column widths. The view's body re-runs every
+        /// frame while a split divider drags the pane width around; with this
+        /// cache that hot path does zero parsing and zero text measurement —
+        /// only the cheap fair-share division in `columnWidths(natural:available:)`
+        /// and SwiftUI's own native text layout depend on the width.
+        final class BannerLayout {
+            static let shared = BannerLayout()
+
+            final class Entry {
+                let blocks: [BannerMarkdown.Block]
+                /// Natural column widths for each `.table` block, keyed by the
+                /// block's index in `blocks` (slack included).
+                let naturalWidths: [Int: [CGFloat]]
+
+                init(blocks: [BannerMarkdown.Block], naturalWidths: [Int: [CGFloat]]) {
+                    self.blocks = blocks
+                    self.naturalWidths = naturalWidths
+                }
+            }
+
+            private let cache = NSCache<NSString, Entry>()
+
+            private init() {
+                // Banners are one-per-pane and small; a handful of entries
+                // covers every live pane plus a little churn.
+                cache.countLimit = 64
+            }
+
+            func layout(for text: String) -> Entry {
+                let key = text as NSString
+                if let entry = cache.object(forKey: key) { return entry }
+                let blocks = BannerMarkdown.parseBlocks(
+                    text, maxLines: SurfacePaneBanner.maxDisplayLines)
+                var naturals: [Int: [CGFloat]] = [:]
+                for (i, block) in blocks.enumerated() {
+                    if case .table(let table) = block {
+                        naturals[i] = Self.naturalColumnWidths(for: table)
+                    }
+                }
+                let entry = Entry(blocks: blocks, naturalWidths: naturals)
+                cache.setObject(entry, forKey: key)
+                return entry
+            }
+
+            /// Measure a table's natural (single-line) column widths.
+            ///
+            /// Each run is measured at the weight/face it actually renders
+            /// (bold runs at bold, code runs monospaced); measuring bold body
+            /// text as regular under-sized the column and force-wrapped bold
+            /// labels like `**Prompt**` mid-word. Header cells render bold, so
+            /// they force bold.
+            static func naturalColumnWidths(for table: BannerMarkdown.Table) -> [CGFloat] {
+                let columns = table.header.count
+                guard columns > 0 else { return [] }
+                var natural = [CGFloat](repeating: 0, count: columns)
+                if table.hasVisibleHeader {
+                    for (col, cell) in table.header.enumerated() where col < columns {
+                        natural[col] = max(natural[col], cellNaturalWidth(cell, forceBold: true))
+                    }
+                }
+                for row in table.rows {
+                    for (col, cell) in row.enumerated() where col < columns {
+                        natural[col] = max(natural[col], cellNaturalWidth(cell, forceBold: false))
+                    }
+                }
+                // A hair of slack absorbs sub-pixel measurement differences so
+                // a cell that fits on one line isn't wrapped by rounding.
+                return natural.map { $0 + 2 }
+            }
+
+            /// The unwrapped width a cell's inline content occupies: the
+            /// measured width of its text runs plus a fixed box per checkbox.
+            private static func cellNaturalWidth(
+                _ segments: [BannerMarkdown.Inline], forceBold: Bool
+            ) -> CGFloat {
+                segments.reduce(0) { acc, seg in
+                    switch seg {
+                    case .text(let a):
+                        return acc + attrWidth(a, forceBold: forceBold)
+                    case .checkbox:
+                        return acc + CheckboxMark.side
+                    }
+                }
+            }
+
+            /// Width of an attributed run sequence in the 12pt banner font,
+            /// each run measured at the weight/face it renders. Matches
+            /// SwiftUI's `.system(size: 12)`. `forceBold` measures every run
+            /// bold (header row).
+            private static func attrWidth(_ a: AttributedString, forceBold: Bool) -> CGFloat {
+                var total: CGFloat = 0
+                for run in a.runs {
+                    let s = String(a[run.range].characters)
+                    if s.isEmpty { continue }
+                    total += ceil((s as NSString).size(withAttributes: [.font: runFont(run, forceBold: forceBold)]).width)
+                }
+                return total
+            }
+
+            /// The font a run renders in: bold for a strongly-emphasized run
+            /// (or a force-bold header), monospaced for a code run. SwiftUI
+            /// draws the bold presentation intent at full bold weight, so
+            /// measure it there.
+            private static func runFont(
+                _ run: AttributedString.Runs.Run, forceBold: Bool
+            ) -> OSFont {
+                let intent = run.inlinePresentationIntent ?? []
+                let bold = forceBold || intent.contains(.stronglyEmphasized)
+                return intent.contains(.code)
+                    ? OSFont.monospacedSystemFont(ofSize: 12, weight: bold ? .bold : .regular)
+                    : OSFont.systemFont(ofSize: 12, weight: bold ? .bold : .regular)
+            }
+        }
+
         /// A task-list checkbox drawn as a small native control rather than a
         /// glyph: a rounded (2pt-radius) box with a thin border, filled with a
         /// tinted wash and a colored check when checked. Sized to sit inline
@@ -383,17 +619,29 @@ extension Ghostty {
         private struct CheckboxMark: View {
             let checked: Bool
 
+            /// The banner renders inside a window whose appearance follows
+            /// the pane background, so the environment scheme tracks pane
+            /// lightness. System green reads well on dark washes but sits
+            /// too close to a light one — use a deeper green there.
+            @Environment(\.colorScheme) private var colorScheme
+
             // `side` is read by the table column-width measurement.
             static let side: CGFloat = 12
             private static let radius: CGFloat = 2
 
+            private var green: Color {
+                colorScheme == .light
+                    ? Color(red: 0.11, green: 0.44, blue: 0.16)
+                    : Color.green
+            }
+
             var body: some View {
                 RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
-                    .fill(checked ? Color.green.opacity(0.16) : Color.clear)
+                    .fill(checked ? green.opacity(0.16) : Color.clear)
                     .overlay(
                         RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
                             .strokeBorder(
-                                checked ? Color.green.opacity(0.55)
+                                checked ? green.opacity(colorScheme == .light ? 0.7 : 0.55)
                                         : Color.secondary.opacity(0.55),
                                 lineWidth: 1
                             )
@@ -402,7 +650,7 @@ extension Ghostty {
                         if checked {
                             Image(systemName: "checkmark")
                                 .font(.system(size: 8, weight: .bold))
-                                .foregroundStyle(Color.green)
+                                .foregroundStyle(green)
                         }
                     }
                     .frame(width: Self.side, height: Self.side)
@@ -953,5 +1201,17 @@ extension Ghostty {
                 str[run.range].inlinePresentationIntent = combined
             }
         }
+    }
+}
+
+/// The banner's total target height — the height the card will occupy once
+/// any collapse/expand animation settles, measured off a hidden animation-free
+/// copy of the content. The host insets the terminal below the banner from
+/// this value so the scroll area moves in one exact step per state change
+/// instead of tracking the animated frame.
+struct BannerTargetHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

@@ -47,8 +47,13 @@ extension Ghostty {
         // Maintain whether our window has focus (is key) or not
         @State private var windowFocus: Bool = true
 
-        // Measured height of the sticky pane banner, used to inset the
-        // terminal surface so content isn't covered by the overlay.
+        // Target height of the sticky pane banner (the height its card
+        // settles at after any collapse/expand animation), used to inset the
+        // terminal surface so content isn't covered by the overlay. Published
+        // by a hidden animation-free copy of the banner content, so it moves
+        // in a single instant step per state change while the visible card
+        // animates — the scroll area never chases animated intermediate
+        // frames.
         @State private var bannerHeight: CGFloat = 0
 
         #if canImport(AppKit)
@@ -83,6 +88,18 @@ extension Ghostty {
             #endif
         }
 
+        /// The pane's base background color (no tint compositing): what the
+        /// terminal surface itself clears to. The banner strip is painted
+        /// with this so it matches the surface exactly — the translucent
+        /// tint overlay then draws over both alike.
+        private var basePaneBackgroundColor: Color {
+            #if canImport(AppKit)
+            surfaceView.backgroundColor ?? ghostty.config.backgroundColor
+            #else
+            ghostty.config.backgroundColor
+            #endif
+        }
+
         private var isFocusedSurface: Bool {
             surfaceFocus || lastFocusedSurface?.value === surfaceView
         }
@@ -91,6 +108,27 @@ extension Ghostty {
             let center = NotificationCenter.default
 
             ZStack {
+                // The terminal surface is inset below the sticky banner, so
+                // the strip the banner card floats over would otherwise show
+                // the window background (a grey that also changes with window
+                // focus). This rect — the pane's base background at the
+                // surface's opacity — is the single color-carrying element
+                // behind that strip: the tint overlay draws over it exactly
+                // as it does over the terminal, and the banner card itself is
+                // a translucent wash, so a background color change repaints
+                // one element per region in one pass instead of several
+                // elements on their own schedules.
+                if surfaceView.paneBanner != nil {
+                    VStack(spacing: 0) {
+                        Rectangle()
+                            .fill(basePaneBackgroundColor)
+                            .opacity(ghostty.config.backgroundOpacity)
+                            .frame(height: bannerHeight)
+                        Spacer(minLength: 0)
+                    }
+                    .allowsHitTesting(false)
+                }
+
                 // We use a GeometryReader to get the frame bounds so that our metal surface
                 // is up to date. See TerminalSurfaceView for why we don't use the NSView
                 // resize callback.
@@ -149,16 +187,36 @@ extension Ghostty {
                 // scrolling and screen clears. Hit-testable so links are
                 // clickable.
                 if let banner = surfaceView.paneBanner {
-                    VStack(spacing: 0) {
-                        SurfacePaneBanner(text: banner, background: paneBackgroundColor)
-                            .onGeometryChange(for: CGFloat.self) { proxy in
-                                proxy.size.height
-                            } action: { height in
-                                bannerHeight = height
-                            }
-                        Spacer()
+                    // The GeometryReader hands the banner the pane's current
+                    // width top-down, so its table columns size to the pane in
+                    // the same layout pass. The banner must never learn its
+                    // width by measuring its own content — that feedback loop
+                    // let an overflowing banner pin the pane's minimum width
+                    // (the pane couldn't be dragged narrower than a long
+                    // unwrappable table cell).
+                    GeometryReader { geo in
+                        VStack(spacing: 0) {
+                            SurfacePaneBanner(
+                                text: banner,
+                                background: paneBackgroundColor,
+                                paneWidth: geo.size.width)
+                                .onPreferenceChange(BannerTargetHeightKey.self) { target in
+                                    // The target comes from a hidden
+                                    // animation-free copy of the banner, so it
+                                    // jumps straight to the settled height while
+                                    // the visible card animates. Never let an
+                                    // ambient animation interpolate this — an
+                                    // animated inset drags the terminal surface
+                                    // through per-frame resizes.
+                                    var tx = Transaction()
+                                    tx.disablesAnimations = true
+                                    withTransaction(tx) {
+                                        bannerHeight = target
+                                    }
+                                }
+                            Spacer(minLength: 0)
+                        }
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .zIndex(1)
                 }
 

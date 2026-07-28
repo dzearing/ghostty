@@ -1,9 +1,131 @@
 //! Inter-process Communication to a running Ghostty instance from a separate
 //! process.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const lib = @import("../lib/main.zig");
+const build_config = @import("../build_config.zig");
+const internal_os = @import("../os/main.zig");
+
+/// Environment variable naming the IPC socket of the app instance that owns
+/// the calling process's pane. Every pane's environment is baked with this by
+/// the app that created it (see `IPCSocket.path` on the macOS side), so a CLI
+/// run from inside a pane talks to THAT app — not to whichever build the
+/// `ghoztty` binary on `$PATH` happens to be.
+///
+/// This matters because the socket name is per-BUILD (`-debug` suffix), not
+/// per-binary: `ghoztty` on `$PATH` is normally the release app's binary, so
+/// without this it would compile-time-derive the release socket even when run
+/// from a debug-app pane and silently drive the wrong instance.
+///
+/// It holds a full absolute path rather than a build-flavor hint so it keeps
+/// working if the socket name ever gains an instance discriminator.
+///
+/// Absent (a plain non-Ghoztty shell, or a pane baked by an app/agent that
+/// predates this var) means "derive it" — see `socketPath`.
+pub const socket_env = "GHOZTTY_IPC_SOCKET";
+
+/// Resolve the IPC socket to dial: `$GHOZTTY_IPC_SOCKET` when the caller runs
+/// inside a pane, else this build's own `<tmp>/ghostty[-debug]-<uid>.sock`
+/// (which is what the app's IPC server binds — keep the two in sync).
+///
+/// This is the ONE place the socket address is resolved; every CLI command and
+/// apprt IPC client goes through it so the derivation can't drift.
+///
+/// Caller owns the returned path.
+pub fn socketPath(alloc: Allocator) Allocator.Error![:0]u8 {
+    // `std.posix.getenv` is not available on Windows; read the value owned
+    // there and hand the same slice to the shared resolution rule.
+    if (comptime builtin.os.tag == .windows) {
+        const baked: ?[]u8 = std.process.getEnvVarOwned(alloc, socket_env) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        defer if (baked) |b| alloc.free(b);
+        return socketPathFrom(alloc, baked);
+    }
+
+    return socketPathFrom(alloc, std.posix.getenv(socket_env));
+}
+
+/// `socketPath` with the baked value injected, so the resolution rule is
+/// testable without mutating the process environment.
+fn socketPathFrom(alloc: Allocator, baked: ?[]const u8) Allocator.Error![:0]u8 {
+    if (baked) |path| {
+        if (path.len > 0) return alloc.dupeZ(u8, path);
+    }
+
+    // Windows has no uid and no unix-socket path: the IPC endpoint is a named
+    // pipe. Defer to the helper the win32 CLI actually dials so the two can't
+    // drift, rather than deriving a POSIX path that would never connect.
+    // (`std.c.getuid` does not even link on this target.)
+    if (comptime builtin.os.tag == .windows) {
+        return internal_os.ipc_client.endpointPath(alloc);
+    }
+
+    const tmpdir = try internal_os.allocTmpDir(alloc);
+    defer internal_os.freeTmpDir(alloc, tmpdir);
+    const uid = std.c.getuid();
+    const suffix = if (build_config.is_debug) "-debug" else "";
+    return std.fmt.allocPrintSentinel(alloc, "{s}/ghostty{s}-{d}.sock", .{
+        tmpdir, suffix, uid,
+    }, 0);
+}
+
+test "socketPath: prefers the pane's baked socket over the compile-time guess" {
+    const testing = std.testing;
+    const baked = "/tmp/gz-test/ghostty-debug-501.sock";
+    const path = try socketPathFrom(testing.allocator, baked);
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings(baked, path);
+}
+
+test "socketPath: falls back to this build's own socket when unset or empty" {
+    const testing = std.testing;
+
+    // An empty value means the same thing as absent: derive it. (A pane baked
+    // by an app or agent that predates the var leaves it absent entirely.)
+    const unset = try socketPathFrom(testing.allocator, null);
+    defer testing.allocator.free(unset);
+    const empty = try socketPathFrom(testing.allocator, "");
+    defer testing.allocator.free(empty);
+    try testing.expectEqualStrings(unset, empty);
+
+    // The remaining asserts describe the POSIX unix-socket shape. On Windows
+    // the fallback is a named pipe (`\\.\pipe\ghoztty[-debug]-<user>`), which
+    // `os/ipc_client.zig` owns and tests; the agreement checked above (absent
+    // == empty) is what this test asserts on both.
+    if (comptime builtin.os.tag == .windows) return;
+
+    // Exactly one separator between the tmp dir and the socket name, whether or
+    // not $TMPDIR carries a trailing slash.
+    try testing.expect(std.mem.endsWith(u8, unset, ".sock"));
+    try testing.expect(std.mem.indexOf(u8, unset, "//") == null);
+    try testing.expect(std.mem.startsWith(
+        u8,
+        std.fs.path.basename(unset),
+        if (build_config.is_debug) "ghostty-debug-" else "ghostty-",
+    ));
+}
+
+/// Connect to an IPC socket by path. Caller owns the returned fd.
+pub fn connect(path: [:0]const u8) !std.posix.fd_t {
+    const fd = try std.posix.socket(
+        std.posix.AF.UNIX,
+        std.posix.SOCK.STREAM,
+        0,
+    );
+    errdefer std.posix.close(fd);
+
+    var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
+    if (path.len >= addr.path.len) return error.NameTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    addr.path[path.len] = 0;
+
+    try std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+    return fd;
+}
 
 /// Pure verb-argument logic (flag parsing, shell wrap table, ConPTY input
 /// normalization, layout validation) shared by IPC servers.
@@ -175,6 +297,9 @@ pub const Action = union(enum) {
 
     /// Set or clear the sticky banner of a named pane or window.
     set_banner: SetBanner,
+
+    /// Reload a named viewer pane's content in place.
+    reload: Reload,
 
     pub const NewWindow = struct {
         /// A list of command arguments to launch in the new window. If this is
@@ -431,6 +556,35 @@ pub const Action = union(enum) {
         }
     };
 
+    pub const Reload = struct {
+        arguments: ?[][:0]const u8,
+
+        pub const C = extern struct {
+            arguments: ?[*]?[*:0]const u8,
+
+            pub fn deinit(self: *Reload.C, alloc: Allocator) void {
+                if (self.arguments) |arguments| alloc.free(arguments);
+            }
+        };
+
+        pub fn cval(self: *Reload, alloc: Allocator) Allocator.Error!Reload.C {
+            var result: Reload.C = undefined;
+
+            if (self.arguments) |arguments| {
+                result.arguments = try alloc.alloc([*:0]const u8, arguments.len + 1);
+
+                for (arguments, 0..) |argument, i|
+                    result.arguments[i] = argument.ptr;
+
+                result.arguments[arguments.len] = null;
+            } else {
+                result.arguments = null;
+            }
+
+            return result;
+        }
+    };
+
     /// Sync with: ghostty_ipc_action_tag_e
     pub const Key = enum(c_int) {
         new_window,
@@ -441,6 +595,7 @@ pub const Action = union(enum) {
         send_keys,
         set_state,
         set_banner,
+        reload,
 
         /// The wire name of this action: the `action` field of the IPC JSON
         /// request (and the CLI `+<verb>` spelling).
@@ -454,6 +609,7 @@ pub const Action = union(enum) {
                 .send_keys => "send-keys",
                 .set_state => "set-state",
                 .set_banner => "set-banner",
+                .reload => "reload",
             };
         }
 

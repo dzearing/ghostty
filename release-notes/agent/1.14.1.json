@@ -1,0 +1,14 @@
+{
+  "version": "1.14.1",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Cleaner session re-attach",
+          "text": "Re-attached panes repaint correctly (proper SIGWINCH-driven redraw) and scrollback replays at the right width, so restored terminals come back looking right instead of smeared."
+        }
+      ]
+    }
+  ]
+}

@@ -64,12 +64,10 @@ class IPCServer {
 
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
-        let uid = getuid()
-        let suffix = Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG
-            || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE
-            ? "-debug" : ""
-        self.socketPath = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ghostty\(suffix)-\(uid).sock").path
+        // Single source of truth for this build's socket address — the same
+        // value every pane's env advertises as GHOZTTY_IPC_SOCKET, so a CLI
+        // run inside a pane dials the app that owns it.
+        self.socketPath = IPCSocket.path
     }
 
     private var sentinelPath: String {
@@ -333,6 +331,8 @@ class IPCServer {
             return handleSetState(request)
         case "set-banner":
             return handleSetBanner(request)
+        case "reload":
+            return handleReload(request)
         case "new-remote-window":
             return handleNewRemoteWindow(request)
         default:
@@ -449,7 +449,9 @@ class IPCServer {
         // Viewer window: a one-pane tree whose leaf renders the file/URL.
         if let viewLocation = parsed.view {
             DispatchQueue.main.async { [ghostty = self.ghostty, weak self] in
-                let pane = PaneView(viewer: ViewerView(location: viewLocation))
+                let pane = PaneView(viewer: ViewerView(
+                    location: viewLocation,
+                    originDirectory: parsed.config.workingDirectory))
                 let controller = TerminalController.newWindow(
                     ghostty,
                     tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
@@ -682,6 +684,7 @@ class IPCServer {
                         direction: direction,
                         ratio: ratio,
                         location: viewLocation,
+                        originDirectory: parsed.config.workingDirectory,
                         name: parsed.name)
                     return
                 }
@@ -788,21 +791,37 @@ class IPCServer {
                 return
             }
 
-            guard let surfaceView = controller.focusedSurface else {
-                Self.logger.warning("IPC: no focused surface for split")
+            // The window's focused pane may be a VIEWER, which has no
+            // SurfaceView at all. Anchor on the PANE so `--target=<window>`
+            // splits whatever kind of pane happens to be focused — requiring
+            // a focused *surface* here made the whole command a silent no-op
+            // for a window whose viewer pane had focus.
+            //
+            // The last fallback matters for the common agent pattern of
+            // splitting into a NAMED BACKGROUND window: `focusedSurface` is a
+            // stored property that survives losing key, but focusedViewerPane
+            // is resolved from the live first responder and goes nil the
+            // moment another window takes over. Anchoring at the tree's first
+            // pane keeps `--target` deterministic instead of dependent on
+            // which window the user happens to be looking at.
+            let focusedSurfaceView = controller.focusedSurface
+            let anchorPane = focusedSurfaceView.flatMap { controller.surfaceTree.pane(for: $0) }
+                ?? controller.focusedViewerPane
+                ?? controller.surfaceTree.first(where: { _ in true })
+            guard let anchorPane else {
+                Self.logger.warning("IPC: no pane to anchor split in target window")
                 return
             }
 
             if let viewLocation = parsed.view {
-                if let anchorPane = controller.surfaceTree.pane(for: surfaceView) {
-                    self?.createViewerSplit(
-                        controller: controller,
-                        atPane: anchorPane,
-                        direction: direction,
-                        ratio: ratio,
-                        location: viewLocation,
-                        name: parsed.name)
-                }
+                self?.createViewerSplit(
+                    controller: controller,
+                    atPane: anchorPane,
+                    direction: direction,
+                    ratio: ratio,
+                    location: viewLocation,
+                    originDirectory: parsed.config.workingDirectory,
+                    name: parsed.name)
                 return
             }
 
@@ -828,6 +847,26 @@ class IPCServer {
             }
             if let name = parsed.name {
                 splitConfig.environmentVariables["GHOZTTY_PANE_NAME"] = name
+            }
+
+            // Terminal split anchored at a viewer pane: there is no surface
+            // to inherit cwd/command from, so build a plain local one.
+            guard let surfaceView = focusedSurfaceView else {
+                if let newView = controller.newTerminalSplit(
+                    atPane: anchorPane,
+                    direction: direction,
+                    baseConfig: splitConfig,
+                    ratio: ratio
+                ) {
+                    Self.applyColorScheme(for: tintColor, to: newView)
+                    if let name = parsed.name {
+                        self?.targetRegistry[name] = .pane(
+                            controller: WeakRef(controller),
+                            surface: WeakRef(newView))
+                        Self.logger.info("IPC: registered pane target '\(name)'")
+                    }
+                }
+                return
             }
 
             // Registration happens in `onCreate` (not on the return value)
@@ -861,9 +900,10 @@ class IPCServer {
         direction: SplitTree<PaneView>.NewDirection,
         ratio: Double,
         location: String,
+        originDirectory: String?,
         name: String?
     ) {
-        let viewer = ViewerView(location: location)
+        let viewer = ViewerView(location: location, originDirectory: originDirectory)
         guard let pane = controller.newViewerSplit(
             atPane: anchorPane,
             direction: direction,
@@ -1081,6 +1121,77 @@ class IPCServer {
         }
 
         Self.logger.info("IPC: \(clear ? "cleared" : "set") banner for '\(target)'")
+
+        return .ok
+    }
+
+    /// Reload a named viewer pane's content in place (`+reload`). Website
+    /// viewers re-fetch from origin (bypassing caches); file viewers
+    /// re-render the file preserving scroll. For a window target the reload
+    /// applies to its focused pane. A terminal target is an error — there
+    /// is nothing to reload.
+    private func handleReload(_ request: IPCRequest) -> IPCResponse {
+        var target: String?
+        for arg in request.arguments ?? [] {
+            if let value = arg.dropPrefix("--target=") {
+                target = String(value)
+            }
+        }
+
+        guard let target else {
+            return IPCResponse(success: false, error: "--target is required for +reload")
+        }
+
+        pruneStaleTargets()
+
+        guard let entry = resolveTarget(target) else {
+            return IPCResponse(success: false, error: "target '\(target)' not found in registry")
+        }
+
+        var reloadError: String?
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            defer { semaphore.signal() }
+
+            let viewer: ViewerView?
+            switch entry {
+            case .viewerPane(_, let paneRef):
+                viewer = paneRef.value?.viewerView
+            case .pane:
+                reloadError = "target '\(target)' is a terminal pane, nothing to reload"
+                return
+            case .window(let ref):
+                guard let controller = ref.value else {
+                    reloadError = "target '\(target)' is no longer alive"
+                    return
+                }
+                let panes = Array(controller.surfaceTree)
+                if let pane = controller.focusedViewerPane {
+                    viewer = pane.viewerView
+                } else if controller.focusedSurface == nil,
+                          panes.count == 1, panes.first?.viewerView != nil {
+                    // A never-focused window (e.g. opened --no-activate) has
+                    // no first responder; a lone viewer pane is unambiguous.
+                    viewer = panes.first?.viewerView
+                } else {
+                    reloadError = "focused pane of '\(target)' is a terminal pane, nothing to reload"
+                    return
+                }
+            }
+
+            guard let viewer else {
+                reloadError = "target '\(target)' is no longer alive"
+                return
+            }
+            viewer.reloadContent()
+        }
+        semaphore.wait()
+
+        if let reloadError {
+            return IPCResponse(success: false, error: reloadError)
+        }
+
+        Self.logger.info("IPC: reloaded viewer '\(target)'")
 
         return .ok
     }
@@ -1659,7 +1770,14 @@ class IPCServer {
     @MainActor
     func registerRestoredRemoteWindow(name: String, controller: TerminalController) {
         pruneStaleTargets()
-        guard targetRegistry[name] == nil else {
+        // A live window can hold the name without being in the registry yet
+        // (fresh windows are only lazily registered on +list / first
+        // targeting) — check both, or the restored window would become a
+        // second holder of the same target name.
+        let heldByLiveWindow = TerminalController.all.contains {
+            $0 !== controller && $0.windowName == name
+        }
+        guard targetRegistry[name] == nil, !heldByLiveWindow else {
             Self.logger.info("IPC: restored remote window not re-registered — target '\(name)' already in use")
             return
         }
@@ -1787,7 +1905,8 @@ class IPCServer {
                 tty: view.surfaceModel?.ttyName ?? "",
                 name: paneName,
                 focused: view === focusedSurface,
-                exit_code: view.exitCode.map { Int($0) }
+                exit_code: view.exitCode.map { Int($0) },
+                banner: view.paneBanner
             ))
         case .split(let split):
             let direction: String = switch split.direction {
@@ -1915,8 +2034,13 @@ class IPCServer {
 
     private static func randomDarkColor() -> NSColor {
         let hue = CGFloat.random(in: 0...1)
-        let saturation = CGFloat.random(in: 0.2...0.3)
-        let brightness = CGFloat.random(in: 0.1...0.15)
+        // Floors raised from 0.2...0.3 / 0.1...0.15: the old ranges landed every
+        // window on the same near-black (brightest channel ~26-38/255, hue
+        // imperceptible), so `--color=random` tints were indistinguishable.
+        // These keep windows comfortably dark but lift them off pure black and
+        // let the hue read.
+        let saturation = CGFloat.random(in: 0.33...0.46)
+        let brightness = CGFloat.random(in: 0.13...0.18)
         return NSColor(hue: hue, saturation: saturation, brightness: brightness, alpha: 1)
     }
 

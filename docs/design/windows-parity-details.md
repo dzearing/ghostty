@@ -5627,3 +5627,311 @@ that exact pane for `+read`/`+set-banner`/`+send-keys`, including in a
 multi-pane window (where the window-name trap would pick the wrong pane), after
 an app-quit re-attach, and after an agent-relaunch respawn. Re-check `+list
 --json` leaf shape against the Mac golden shape while there.
+
+## T117 — Merge origin/main `1e1cdbbd2` (2026-07-27)
+
+70 commits since the T88 merge base (`8bb5d9845`). Merged, NOT rebased: the
+branch was 203 commits ahead, has synced by merge every previous time, and the
+task table in this doc set cites commit hashes that a rebase would invalidate
+wholesale. The user picked merge after being shown both options.
+
+**Why the conflicts were all one thing.** Six files conflicted and five of them
+were the same story: main landed `ab3c1e25d`, which centralized CLI socket
+resolution into `apprt/ipc.zig::socketPath` and deleted the copy-pasted
+`connectUnixSocket` from each CLI command. This branch had *already* centralized
+the same thing — into `src/os/ipc_client.zig`, because Windows needs named
+pipes, not `AF_UNIX`. Two independent solutions to one problem. Verified before
+resolving that main's edit to `read/list/rearrange/new_remote_window.zig` was
+ONLY that refactor (`git diff <base> origin/main -- <file>` on each), so keeping
+ours drops no behavior — it drops a *duplicate* of behavior we already have,
+except for the one genuinely new capability, which is filed as **T118**.
+
+`CLAUDE.md` was hand-merged: took main's side wholesale (it adds the `+reload`
+section and the banner-persistence paragraph) and re-inserted this branch's
+Windows-specific sentence about the Ctrl+Shift+B banner-editor chord.
+
+**Two real post-merge build breaks**, both caused by the merge rather than
+present on either side alone:
+
+1. `Action.Key.wireName` (in `apprt/ipc.zig`) is a switch this branch owns; main
+   added a `.reload` member to the enum it switches over. Zig switches are
+   exhaustive, so the combination does not compile even though neither side was
+   broken. Added `.reload => "reload"`.
+2. `helpgen.zig::genActions` blew the default 1000-branch comptime budget once
+   the action list grew — its `inline for` resolves each action's source file at
+   comptime. Raised with `@setEvalBranchQuota(10_000)`, the fix the compiler
+   itself names.
+
+**And one Windows-only break that main could not have seen:** main's new
+`socketPathFrom` fallback calls `std.c.getuid()` and `std.posix.getenv`, neither
+of which exists on Windows — the `none` test lane failed to LINK
+(`undefined symbol: getuid`) because main's new unit test references the
+function. Rather than `#ifdef`-ing the symbol away, made the resolver actually
+correct on Windows: the baked-value rule (the part worth having) is shared, and
+the derive-a-default branch delegates to `internal_os.ipc_client.endpointPath`,
+which is the pipe name the win32 CLI really dials. The POSIX-shape asserts in
+main's second test now return early on Windows, where `os/ipc_client.zig` owns
+and tests the pipe-name shape instead. Note this makes `apprt.ipc.socketPath`
+*compile and answer sensibly* on Windows; it does NOT by itself deliver
+instance addressability, which still needs the env bake — that is T118.
+
+**Validation run:** `zig build -Dapp-runtime=win32 -Doptimize=Debug` (the full
+GUI link, per the standing rule that the test lanes alone miss GUI-only
+compile errors) plus `zig build test` in both the `none` and `win32` lanes.
+
+**Gap triage.** Classified all 70 commits by whether they touch `src/` (shared,
+arrives free) or only `macos/` (needs a Windows answer). Roughly 60% are
+macOS-only. The shared half — `src/viewer/*.js` including the new
+`selection.js`, the `+reload` CLI plumbing, the agent-stamp fix, the agent
+server change from `e65cfa4d5` — came in with the merge and needs no port. The
+macOS-only half became **T118–T128**, filed below. Deliberately did NOT widen
+the existing T90b–T90h viewer rows to absorb 16 new viewer commits; that
+re-scoping is its own task (T127) so the growth stays visible.
+
+## T118 — Instance addressability on Windows
+
+Main's `ab3c1e25d` makes an IPC command run inside a pane target **the app
+instance that owns that pane**: every pane's env is baked with
+`$GHOZTTY_IPC_SOCKET` (the absolute path of its own app's IPC socket) and the
+CLI prefers it over the compile-time derivation. CLAUDE.md now documents this
+under "Instance addressability".
+
+On Windows **neither half exists.** Grep for `GHOZTTY_IPC_SOCKET` across
+`src/apprt/win32/` and `src/os/ipc_client.zig`: zero hits. `endpointPath`
+derives the pipe name from build mode + `USERNAME` alone, so a `+split` run
+from inside a **Debug** pane silently drives the installed **release** app. That
+is the same class of confusion that produced T116 (a harness aimed at a release
+endpoint closed the user's real windows), and unlike Mac there is currently no
+per-pane escape hatch — only the global `GHOZTTY_PIPE_SUFFIX` test hook.
+
+**Fix:** bake the resolved endpoint into the pane env on all three win32 spawn
+paths — plain exec, agent-backed OPEN (and the agent's RELAUNCH replay, which
+must carry it like it carries the rest of the pane env), and remote panes (whose
+IPC still belongs to the *local* app). Then have `endpointPath` prefer the baked
+value, keeping `GHOZTTY_PIPE_SUFFIX` working for the harnesses.
+
+**Decision to make and write down:** the Windows endpoint is a PIPE NAME, not a
+socket path. Either reuse the documented `GHOZTTY_IPC_SOCKET` name (simplest;
+CLAUDE.md's wording says "socket", so the doc needs a Windows clause) or add a
+sibling var. Pick one explicitly — a silent divergence here is exactly what
+CLAUDE.md's agent-contract section warns about, and the var is baked into
+long-lived panes that outlive the app.
+
+**Validation:** from a Debug-build pane with a release app also running,
+`ghoztty +list` and `ghoztty +split` must hit the DEBUG instance; overriding the
+var for one command must aim it elsewhere; a pane baked by an older
+app/agent (no var) must still work via today's derivation.
+
+## T119 — `+reload` verb unhandled on win32
+
+Main's `2daaa98c9` added `ghoztty +reload` to refresh a viewer pane in place.
+The CLI + `apprt.ipc` plumbing arrived with T117 (and `wireName` now maps it),
+but `IpcHandlers.dispatch` has no `"reload"` branch, so the verb falls through
+to the generic unknown-action error.
+
+Real reload behavior cannot exist before viewer panes do (T90b–T90h), so the
+near-term deliverable is the **parity error string**: targeting a terminal pane
+must fail with `... is a terminal pane, nothing to reload` (exit 1), mirroring
+how the terminal-only verbs reject viewer panes. Wire the actual reload as part
+of T90e/T90f.
+
+## T120 — `--color=random` tints are indistinguishable on Windows
+
+`color_math.randomDark` generates HSB with saturation `0.2–0.3` and brightness
+`0.1–0.15`. Those are precisely the ranges main replaced in `45f4f2250`, whose
+message records why: every window landed on the same near-black (brightest
+channel ~26–38/255) and the hue was imperceptible, so `--color=random` produced
+windows you could not tell apart.
+
+Main's replacement is saturation `0.33–0.46`, brightness `0.13–0.18` — still
+comfortably dark, but lifted off pure black so the hue reads. Port the same
+numbers. The function's own doc comment claims "IPCServer.randomDarkColor
+parity", which is currently false; fixing the code makes it true again.
+
+Smallest task in this band: one pure function that already has a unit-test
+harness in every app-runtime lane.
+
+## T121 — auto `window-N` names can duplicate after a session restore
+
+`IpcRegistry.nextWindowName` is a bare counter:
+
+    self.window_counter += 1;
+    return std.fmt.allocPrint(alloc, "window-{d}", .{self.window_counter});
+
+The counter restarts at zero every app launch, while T89f session restore
+re-adopts window names minted by a PREVIOUS run. Restore a window named
+`window-3`, open three fresh windows, and the third mints `window-3` again:
+two live windows holding one target name, with `+close`/`+split`/`+rename`
+routed to whichever registered first.
+
+Main hit exactly this and fixed it in `565b77a58` with two independent halves,
+both of which apply here:
+
+1. **Reserve adopted names.** Any name a window ADOPTS rather than mints —
+   a restored name, a `GHOZTTY_WINDOW_NAME` inherited at spawn, or an explicit
+   `+new-window --target=` — advances the allocator past it if it matches the
+   `window-N` pattern, so a later mint can never repeat it.
+2. **Check live windows, not just the registry.** A live window can hold a name
+   without being registered yet (registration is lazy — first `+list` or first
+   targeting), so the registry alone is not authoritative.
+
+**Validation:** restore a session whose windows are named `window-1..3`, then
+open fresh windows past that count and assert `+list` shows no duplicate name
+and that `+close --target=window-3` closes the one you meant.
+
+## T122 — pane banners don't survive relaunch/re-attach on Windows
+
+Main's `5d5897936` added a `banner` field to the session-layout manifest so a
+restore brings banner text back — across app quit/relaunch, upgrade re-attach,
+and agent RELAUNCH alike. CLAUDE.md (merged in T117) now documents this as the
+behavior.
+
+win32's `session_layout.zig` has no banner field at all (zero `banner` hits).
+The READ side is already at parity — `IpcHandlers.zig:1368` emits `banner` in
+`+list --json` — so this is purely: write the banner into the manifest leaf, and
+re-apply it on restore.
+
+**Compatibility:** this is an additive manifest field and the manifest crosses
+app/agent version skew, so it must degrade both directions per CLAUDE.md's
+agent-contract rules — an older app reading a newer manifest ignores it; a newer
+app reading an older manifest restores no banner rather than failing.
+
+**Validation:** set a banner, quit, relaunch, assert the banner text is back and
+that `+list --json` reports it; repeat across an agent restart (RELAUNCH path).
+
+## T123 — banner table columns use a fixed 360pt cap
+
+`BannerOverlay.MAX_CELL_W = 360.0` is the exact constant main replaced across
+`1d56c6948` and `c94a8158a`. The merged CLAUDE.md now documents the post-fix
+contract:
+
+- Column widths derive from the pane's **current** width, so the banner reflows
+  live as the pane resizes and can never block the pane from shrinking — even a
+  long unbroken token breaks mid-string.
+- A cell is capped at **3 wrapped lines**; beyond that it tail-truncates with an
+  ellipsis, so one nasty cell cannot blow up the banner height.
+
+Windows satisfies none of this today, which means the merge left CLAUDE.md
+**over-promising for win32**. Fix the code rather than weakening the doc — the
+resize-blocking half is a real usability bug (a banner can currently pin a
+minimum pane width), not a cosmetic one.
+
+**Validation:** a banner with a wide table must let the pane shrink to its
+normal minimum; a cell with a long unbroken string must break rather than
+overflow; a very long cell must stop at 3 lines with an ellipsis.
+
+## T124 — banner visual refresh parity (cosmetic, lowest priority)
+
+Six macOS-only commits restyled the banner: `6778d22a0` (Liquid Glass floating
+card + stable collapse geometry), `286078a2f` + `755af5c97` (glass tinted off
+the pane background, elliptical sheen), `53e763c28` (stable pane-hued card,
+dropping the focus-reactive `glassEffect`), `088c44201` (composite off a single
+pane-colored element), and `ec0c62671` + `89465f320` (collapse/expand timing so
+the terminal inset moves exactly once).
+
+win32's `BannerOverlay.zig` is a hand-painted GDI strip, so this is a
+**reinterpretation, not a port** — and THE GOAL says Windows should look
+Windows-native. Triage per item rather than wholesale:
+
+- The **collapse/inset timing** fixes are behavioral (the terminal grid moving
+  twice on a toggle is a visible glitch on any platform) — worth taking.
+- **Liquid Glass** is a macOS material with no native Windows analog; the right
+  Windows answer is probably Mica/Acrylic or simply the current solid pane-hued
+  strip. Decide and record, don't emulate.
+
+Lowest priority of the T118–T128 band.
+
+## T125 — no agent-update dialog and no "What's new" on Windows
+
+Main built a whole feature that is entirely macOS Swift: `981d18e29`
+(ReleaseNotesStore), `1d7f809b3` (WhatsNewTracking — snapshot last-seen version
+at launch), `d28adcec1` (WhatsNewNotesView), `65d345cd5` (split
+WhatsNewNotesContent), `f5c75454f` + `1f8f7c302` (reframed agent-restart dialog
+copy + What's-new accessory), `1a236ecf7` (scope the notes to agent-process
+changes), `047a80c47` (bundle the notes JSON into the app Resources).
+
+On Windows, `update_check.zig` covers only the **app**-version check (T24,
+`win-v*` tags), and `LocalAgent.zig:264` states outright that "the listen-pipe
+agent never self-updates".
+
+**Split this by risk, because the two halves are not equally important.**
+
+- **The notes UI is nice-to-have.** `release-notes/*.json` is repo-shared, so
+  only presentation + last-seen tracking need porting.
+- **The agent-upgrade confirmation is a correctness requirement.** CLAUDE.md's
+  agent-contract section mandates that when a protocol skew means live sessions
+  cannot be carried across, the app shows an explicit *"Upgrading will reset all
+  windows. Continue?"* before resetting — and prefers a lazy, non-destructive
+  upgrade when sessions CAN be carried. Windows has no implementation of either
+  path. Since the win32 agent already outlives the app (HKCU Run entry, survives
+  app upgrade), the skew this protects against is reachable on Windows today.
+
+Treat the second bullet as the real T125 and the notes viewer as a follow-on.
+
+## T126 — hero-mode key navigation audit vs main's `HeroKeyNavigator`
+
+Main's `280f2449e` extracted hero navigation into a dedicated `HeroKeyNavigator`
+because the Mac was navigating a **stale snapshot** of the split tree and could
+act on a window other than the aimed-at one; `4eb13a651` then fixed an arrow-nav
+beep and a skipped pane.
+
+win32 has its own hero implementation (`HeroCarousel.zig` + `hero_math.zig`), so
+this is an **audit, not a port**. Confirm on the box that win32 navigates the
+LIVE tree — it does call `heroOnTreeChanged` on rearrange, which is a good sign
+but not proof that key navigation reads current state — and that arrow
+navigation skips no pane and never beeps.
+
+The viewer half of `1e0cf5484` / `4eb13a651` (viewer panes participating in hero
+mode, viewer-pane beep) is moot until T90 lands viewer panes.
+
+## T127 — T90b–T90h viewer scope has grown
+
+The T90a design is dated 2026-07-19 and predates **16** main viewer commits.
+The task split it produced (T90b–T90h) therefore does not account for:
+
+- navigable address bar, sliding/omnibox completion, `file://` display —
+  `13b950e77`, `6af1fc12a`, `25c454b24`
+- native + in-page markdown TOC, Apple system typography, sidebar styling —
+  `2137da95a`, `3691cc4e8`, `2af9a6e95`
+- browser-style zoom (pinch + Cmd +/−/0) — `dc5daa4c5`
+- popups opening as new windows — `0b8335d7c`
+- quote-from-page toolbar + screenshot keystroke — `1cf83764b`, `2f0b286ba`
+- worktree-aware feedback capture and its UI rework — `4cf88905d`, `1edce34c7`,
+  `efe1e1d17`, `bd5667887`
+- copy/paste + browser-like focus — `a7fc890a9`
+- pane-scoped Cmd-R / Cmd-D — `14d22875a`
+- `+reload` — T119
+
+**Do not silently widen T90b–T90h to absorb this.** Refresh T90a against the
+current Mac viewer first, decide explicitly what Windows v1 ships versus defers,
+and file the deferrals as their own rows so the cuts stay visible instead of
+becoming invisible scope inside existing tasks.
+
+Note the JS side (`src/viewer/*.js`, including the new `selection.js`) is shared
+and arrived free with T117 — it is the **WebView2 host** side that has to catch
+up, which is where the T90a design work already points.
+
+## T128 — INVESTIGATE: does `+rearrange` leak the dropped pane's session?
+
+Main's `e65cfa4d5` fixed a serious Mac bug and hardened it into an invariant
+worth restating here: *a session still referenced by the new tree is never
+marked CLOSE-on-free.* The Mac inferred "user closed this pane" from "this leaf
+left the tree", which is wrong for a tree SWAP — in-place session recovery
+replaces a controller's whole tree with fresh surfaces re-attaching the SAME
+sessions, so every old leaf "left", and marking them CLOSE-on-free meant
+recovery terminated the very sessions it had just recovered.
+
+**win32 is structurally immune to that particular bug**, because it does not
+infer intent from tree departure at all: `setSessionCloseIntent(true)` is called
+only at explicit user-close sites (`Window.zig:979`, `:1083`, `:3515`).
+
+But that asymmetry suggests the **opposite** defect. The `+rearrange` handler
+swaps trees and destroys panes absent from the new layout by refcount, with no
+close intent set anywhere — which would make a dropped pane DETACH, leaving its
+agent session alive and unreferenced forever rather than ending.
+
+**Unverified — this is an investigation, not a filed bug.** Confirm with
+`+sessions` before and after a `+rearrange` that drops a pane. If it does leak,
+set the intent on exactly the dropped leaves and only those, so that any
+future tree-replacing path (recovery-style swaps) stays safe — i.e. adopt main's
+invariant in the win32 shape rather than copying its mechanism.

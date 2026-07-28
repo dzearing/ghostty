@@ -1,0 +1,14 @@
+{
+  "version": "1.17.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Seamless agent upgrades",
+          "text": "When the background agent needs to update, it now refreshes lazily and non-destructively — on idle, or as sessions naturally close — carrying your live sessions across instead of resetting them. If a session genuinely can't be carried over, you get an explicit confirmation first, never a silent reset."
+        }
+      ]
+    }
+  ]
+}

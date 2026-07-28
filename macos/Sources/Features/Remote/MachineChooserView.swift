@@ -791,7 +791,7 @@ struct MachineChooserView: View {
         for controller in TerminalController.all {
             for pane in controller.surfaceTree {
                 guard let view = pane.surfaceView,
-                      let sid = SessionLayoutManifest.liveSessionID(of: view)
+                      let sid = view.liveRemoteSessionID
                 else { continue }
                 info.openIDs.insert(sid)
                 if !pane.title.isEmpty { info.titles[sid] = pane.title }
@@ -881,7 +881,7 @@ struct MachineChooserView: View {
         for controller in TerminalController.all {
             for pane in controller.surfaceTree {
                 if let view = pane.surfaceView,
-                   SessionLayoutManifest.liveSessionID(of: view) == sessionID {
+                   view.liveRemoteSessionID == sessionID {
                     return (controller, view)
                 }
             }

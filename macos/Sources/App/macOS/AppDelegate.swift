@@ -55,6 +55,7 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuToggleFullScreen: NSMenuItem?
     @IBOutlet private var menuBringAllToFront: NSMenuItem?
     @IBOutlet private var menuZoomSplit: NSMenuItem?
+    @IBOutlet private var menuHeroMode: NSMenuItem?
     @IBOutlet private var menuPreviousSplit: NSMenuItem?
     @IBOutlet private var menuNextSplit: NSMenuItem?
     @IBOutlet private var menuSelectSplitAbove: NSMenuItem?
@@ -249,6 +250,11 @@ class AppDelegate: NSObject,
 
         // Store our start time
         applicationLaunchTime = ProcessInfo.processInfo.systemUptime
+
+        // Record the app version the user last ran, before session restore can
+        // surface the agent-update dialog, so "What's new" shows only the notes
+        // accrued since then.
+        WhatsNewTracking.snapshotAndAdvance(current: WhatsNewTracking.currentAppVersion)
 
         // Check if secure input was enabled when we last quit.
         if UserDefaults.ghostty.bool(forKey: "SecureInput") != SecureInput.shared.enabled {
@@ -640,7 +646,12 @@ class AppDelegate: NSObject,
         if !isDirectory.boolValue,
            ["md", "markdown", "mdown", "mkd", "mdwn"]
                .contains((filename as NSString).pathExtension.lowercased()) {
-            let pane = PaneView(viewer: ViewerView(location: filename))
+            // The file's own directory is also its origin: if the user later
+            // navigates this pane to a dev-server URL, feedback still has a
+            // directory to fall back to.
+            let pane = PaneView(viewer: ViewerView(
+                location: filename,
+                originDirectory: (filename as NSString).deletingLastPathComponent))
             let controller = TerminalController.newWindow(
                 ghostty,
                 tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
@@ -2095,6 +2106,7 @@ extension AppDelegate {
         syncMenuShortcut(config, action: "navigate_search:previous", menuItem: self.menuFindPrevious)
 
         syncMenuShortcut(config, action: "toggle_split_zoom", menuItem: self.menuZoomSplit)
+        syncMenuShortcut(config, action: "toggle_hero_mode", menuItem: self.menuHeroMode)
         syncMenuShortcut(config, action: "goto_split:previous", menuItem: self.menuPreviousSplit)
         syncMenuShortcut(config, action: "goto_split:next", menuItem: self.menuNextSplit)
         syncMenuShortcut(config, action: "goto_split:up", menuItem: self.menuSelectSplitAbove)

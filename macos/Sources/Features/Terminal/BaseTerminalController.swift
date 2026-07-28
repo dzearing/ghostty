@@ -95,6 +95,9 @@ class BaseTerminalController: NSWindowController,
     /// Cancellable for aggregating activity state across all surfaces in this controller.
     private var activityStateCancellable: AnyCancellable?
 
+    /// Cancellable for the pane-banner manifest sync (session persistence).
+    private var paneBannerCancellable: AnyCancellable?
+
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
     var titleOverride: String? {
@@ -180,7 +183,9 @@ class BaseTerminalController: NSWindowController,
         windowTitleOverride = newTitle
     }
 
-    var windowName: String = "window-\(BaseTerminalController.nextWindowId())"
+    var windowName: String = BaseTerminalController.mintWindowName() {
+        didSet { Self.reserveWindowName(windowName) }
+    }
 
     /// The remote machine this window's terminals run on, if any. When set, the
     /// window title is suffixed with the machine name and new splits/tabs inherit
@@ -281,9 +286,28 @@ class BaseTerminalController: NSWindowController,
     var sessionLayoutEntryID: UUID?
 
     private static var _nextWindowId: Int = 0
-    private static func nextWindowId() -> Int {
+
+    /// Mint the next auto window name ("window-1", "window-2", …).
+    static func mintWindowName() -> String {
         _nextWindowId += 1
-        return _nextWindowId
+        return "window-\(_nextWindowId)"
+    }
+
+    /// Reserve a window name a controller ADOPTED rather than minted — a
+    /// persisted session-restore name, a `GHOZTTY_WINDOW_NAME` inherited at
+    /// spawn, or an explicit `+new-window --target=`. If it matches the auto
+    /// pattern "window-N", advance the allocator past N so a later mint can
+    /// never repeat it: the allocator restarts at zero every app launch while
+    /// session restore re-adopts names minted by a PREVIOUS run (e.g.
+    /// "window-3"), and without the reservation the third fresh window of the
+    /// new run would mint "window-3" again — two windows holding one target
+    /// name, with +close/+split/+rename routed to whichever registered first.
+    static func reserveWindowName(_ name: String) {
+        guard name.hasPrefix("window-"),
+              let n = Int(name.dropFirst("window-".count)),
+              n > 0
+        else { return }
+        _nextWindowId = max(_nextWindowId, n)
     }
 
     /// The last computed title from the focused surface (without the override).
@@ -333,6 +357,9 @@ class BaseTerminalController: NSWindowController,
         var initialConfig = base ?? Ghostty.SurfaceConfiguration()
         if let existingName = initialConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] {
             self.windowName = existingName
+            // didSet does not fire during init — reserve explicitly so the
+            // allocator can never re-mint this adopted name.
+            Self.reserveWindowName(existingName)
         } else {
             initialConfig.environmentVariables["GHOZTTY_WINDOW_NAME"] = windowName
         }
@@ -351,6 +378,9 @@ class BaseTerminalController: NSWindowController,
 
         // Setup activity state aggregation for the window
         setupActivityStatePublisher()
+
+        // Keep the session-layout manifest current with pane banner changes
+        setupPaneBannerSyncPublisher()
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default
@@ -869,14 +899,18 @@ class BaseTerminalController: NSWindowController,
         // PRESENT in the tree is alive — clear any pending intent, which is
         // what un-marks a view brought back by undo (the undo restore assigns
         // the old tree directly, landing here).
-        let toLeaves = to.root?.leaves() ?? []
-        for view in toLeaves { view.setSessionCloseIntent(false) }
-        if let fromLeaves = from.root?.leaves(), !fromLeaves.isEmpty {
-            let toSet = Set(toLeaves.map { ObjectIdentifier($0) })
-            for view in fromLeaves where !toSet.contains(ObjectIdentifier(view)) {
-                view.setSessionCloseIntent(true)
-            }
-        }
+        //
+        // The exception is a tree SWAP (in-place session recovery): a departing
+        // leaf whose session the NEW tree re-attached is not a close at all, and
+        // marking it would kill a session a live pane is using. See
+        // `SessionCloseIntentPolicy`.
+        let plan = SessionCloseIntentPolicy.plan(
+            from: from.root?.leaves() ?? [],
+            to: to.root?.leaves() ?? [],
+            sessionID: { $0.surfaceView?.boundRemoteSessionID })
+        for view in plan.keepAlive { view.setSessionCloseIntent(false) }
+        for view in plan.spared { view.setSessionCloseIntent(false) }
+        for view in plan.close { view.setSessionCloseIntent(true) }
 
         // Session persistence (T05): the split topology is the heart of the
         // layout manifest — re-sync on every tree change (new split, close,
@@ -1423,14 +1457,21 @@ class BaseTerminalController: NSWindowController,
 
     @objc private func ghosttyDidToggleHeroMode(_ notification: Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard surfaceTree.root?.node(view: target) != nil else { return }
+        guard let pane = surfaceTree.first(where: { $0.surfaceView === target }) else { return }
+        toggleHeroMode(target: pane)
+    }
 
+    /// Toggle hero mode with `pane` becoming the hero on activation. Reached
+    /// two ways: the core keybind action for terminal panes (notification
+    /// above), and the menu accelerator (`toggleHeroMode(_:)` IBAction) when
+    /// a viewer pane has focus.
+    private func toggleHeroMode(target pane: PaneView) {
         if heroModeState.isActive {
-            let previousSurface = heroSurfaceForCurrentSelection()
+            let previousPane = heroPaneForCurrentSelection()
             heroModeState.deactivate()
-            if let surface = previousSurface {
+            if let previousPane {
                 DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: surface)
+                    Ghostty.moveFocus(to: previousPane)
                 }
             }
         } else {
@@ -1442,23 +1483,23 @@ class BaseTerminalController: NSWindowController,
             let leaves = surfaceTree.root?.leaves() ?? []
             guard leaves.count > 1 else { return }
 
-            let focusedIndex = leaves.firstIndex(where: { $0.surfaceView === target }) ?? 0
+            let focusedIndex = leaves.firstIndex(of: pane) ?? 0
             heroModeState.activate(focusedIndex: focusedIndex, leafCount: leaves.count)
         }
 
         window?.makeKeyAndOrderFront(nil)
     }
 
-    private func heroSurfaceForCurrentSelection() -> Ghostty.SurfaceView? {
+    private func heroPaneForCurrentSelection() -> PaneView? {
         let leaves = surfaceTree.root?.leaves() ?? []
         guard heroModeState.selectedIndex < leaves.count else { return nil }
-        return leaves[heroModeState.selectedIndex].surfaceView
+        return leaves[heroModeState.selectedIndex]
     }
 
     private func heroSelectionDidChange(to index: Int) {
         guard heroModeState.isActive else { return }
-        if let surface = heroSurfaceForCurrentSelection() {
-            Ghostty.moveFocus(to: surface)
+        if let pane = heroPaneForCurrentSelection() {
+            Ghostty.moveFocus(to: pane)
         }
     }
 
@@ -3105,6 +3146,19 @@ class BaseTerminalController: NSWindowController,
         ghostty.splitToggleZoom(surface: surface)
     }
 
+    @IBAction func toggleHeroMode(_ sender: Any) {
+        // Menu path. The core keybind needs a focused terminal surface, so a
+        // window whose focused pane is a viewer only reaches the toggle here,
+        // via the menu accelerator (synced from the same keybind). Terminal
+        // panes consume the key equivalent before the menu sees it, so this
+        // and the notification path never double-fire.
+        let pane = focusedViewerPane
+            ?? surfaceTree.first(where: { $0.surfaceView === focusedSurface })
+            ?? surfaceTree.root?.leaves().first
+        guard let pane else { return }
+        toggleHeroMode(target: pane)
+    }
+
     @IBAction func splitMoveFocusPrevious(_ sender: Any) {
         splitMoveFocus(direction: .previous)
     }
@@ -3366,6 +3420,24 @@ extension BaseTerminalController {
                     NSApp.requestUserAttention(.informationalRequest)
                 }
             }
+        }
+    }
+
+    /// Session persistence: a pane's sticky banner is part of the layout
+    /// manifest (it is app-side overlay state the agent's PTY replay cannot
+    /// bring back), so re-sync the manifest whenever any pane's banner
+    /// changes — a crash after +set-banner must not lose the banner to the
+    /// quit-time-only sync.
+    private func setupPaneBannerSyncPublisher() {
+        paneBannerCancellable = surfaceValuesPublisher(
+            valueKeyPath: \.paneBanner,
+            publisherKeyPath: \.$paneBanner
+        )
+        .removeDuplicates()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            guard let self, self.sessionLayoutEntryID != nil else { return }
+            SessionLayoutManifest.shared.scheduleSync(self)
         }
     }
 

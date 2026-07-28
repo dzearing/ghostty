@@ -1,0 +1,18 @@
+{
+  "version": "1.16.2",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Upgrades no longer tombstone your sessions",
+          "text": "App updates used to sometimes bring every window back \"exited\". The updater now leaves your running agent and its live processes untouched during an upgrade, so your windows re-attach to the same running processes."
+        },
+        {
+          "title": "Exact repaint on re-attach",
+          "text": "Reconnecting to a full-screen app (editors, `top`, anything using the alternate screen) no longer leaves the pane blank or smeared; panes restore their exact visible screen, with genuinely-evicted scrollback honestly marked."
+        }
+      ]
+    }
+  ]
+}

@@ -5,11 +5,19 @@ struct HeroModeView: View {
     let tree: SplitTree<PaneView>
     @ObservedObject var state: HeroModeState
 
-    @State private var keyMonitor: Any? = nil
+    @State private var navigator = HeroKeyNavigator()
 
     var body: some View {
-        // Hero mode presents terminal surfaces only; viewer panes are skipped.
-        let leaves = (tree.root?.leaves() ?? []).compactMap(\.surfaceView)
+        // Every pane participates: terminals and viewers alike. This must stay
+        // the full leaf list — the controller's selection/count logic
+        // (BaseTerminalController) indexes the same list.
+        let leaves = tree.root?.leaves() ?? []
+
+        // Republish the live pane list to the key monitor. The monitor is
+        // installed once (onAppear) while SwiftUI hands this struct a new
+        // `tree` on every split change, so it must never navigate a captured
+        // one — body is the one place guaranteed to run with the current tree.
+        let _ = navigator.update(state: state, leaves: leaves)
 
         GeometryReader { geo in
             let carouselWidth = geo.size.width * state.carouselRatio
@@ -43,37 +51,11 @@ struct HeroModeView: View {
                 .frame(width: carouselWidth, height: geo.size.height)
             }
         }
-        .onAppear { installKeyMonitor() }
-        .onDisappear { removeKeyMonitor() }
+        .onAppear { navigator.install() }
+        .onDisappear { navigator.remove() }
     }
 
     private let dividerWidth: CGFloat = 6
-
-    private func installKeyMonitor() {
-        guard keyMonitor == nil else { return }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard state.isActive else { return event }
-            let leaves = (tree.root?.leaves() ?? []).compactMap(\.surfaceView)
-            guard leaves.count > 1 else { return event }
-
-            let hasShiftCmd = event.modifierFlags.contains([.shift, .command])
-            if hasShiftCmd && event.specialKey == .upArrow {
-                state.selectPrevious(leafCount: leaves.count)
-                return nil
-            } else if hasShiftCmd && event.specialKey == .downArrow {
-                state.selectNext(leafCount: leaves.count)
-                return nil
-            }
-            return event
-        }
-    }
-
-    private func removeKeyMonitor() {
-        if let monitor = keyMonitor {
-            NSEvent.removeMonitor(monitor)
-            keyMonitor = nil
-        }
-    }
 }
 
 struct HeroDivider: View {

@@ -404,7 +404,11 @@ extension AppDelegate {
             // viewed file/URL. Missing files render an in-page error rather
             // than failing the tree.
             if leaf.isViewer {
-                return PaneView(viewer: ViewerView(location: leaf.viewerLocation ?? ""))
+                let location = leaf.viewerLocation ?? ""
+                return PaneView(viewer: ViewerView(
+                    location: location,
+                    homeLocation: leaf.viewerHomeLocation ?? location,
+                    originDirectory: leaf.viewerOriginDirectory))
             }
 
             var cfg = Ghostty.SurfaceConfiguration()
@@ -432,20 +436,27 @@ extension AppDelegate {
             // Seed the last-synced pane title; live OSC titles (if the
             // session emits them) take over after re-attach.
             if let title = leaf.title, !title.isEmpty { view.setTitle(title) }
+            // Re-apply the persisted sticky banner: app-side overlay state,
+            // not part of the agent's PTY replay, so this is its only way
+            // back after a relaunch.
+            if let banner = leaf.banner, !banner.isEmpty { view.paneBanner = banner }
             return PaneView(surface: view)
         }
     }
 
     // MARK: In-place recovery (T12e)
 
-    /// The shared local-agent connection's transport dropped while the app
-    /// stayed up — the agent crashed and launchd (KeepAlive, T12d) is bringing
-    /// a NEW one back. Re-dial the restarted agent ONCE and rebuild every open
-    /// local-agent window in place: each leaf re-`ATTACH`es its recorded
-    /// session, finds a relaunchable tombstone (the restarted agent
-    /// materialized it from disk metadata, T12b), and auto-RELAUNCHes with the
-    /// "--- session restarted ---" banner (T12c). No app relaunch; the local
-    /// machine pill is never shown (isLocalMachine). Wired to
+    /// The shared local-agent connection's transport is CONFIRMED down while
+    /// the app stayed up (`LocalAgentManager` has already ruled out a
+    /// self-healing heartbeat blip — see `evaluateSharedLinkDrop`). Re-dial the
+    /// agent ONCE and rebuild every open local-agent window in place: each leaf
+    /// re-`ATTACH`es its recorded session. If the agent itself restarted
+    /// (a crash + launchd KeepAlive respawn, T12d) the attach finds a
+    /// relaunchable tombstone that the new agent materialized from disk
+    /// metadata (T12b) and auto-RELAUNCHes with the "--- session restarted ---"
+    /// banner (T12c); if only the transport failed, the same sessions are still
+    /// live and simply re-attach. No app relaunch; the local machine pill is
+    /// never shown (isLocalMachine). Wired to
     /// `LocalAgentManager.onSharedConnectionDrop`. Main-thread only.
     @MainActor
     func recoverSessionLayoutInPlace() {
@@ -469,7 +480,7 @@ extension AppDelegate {
 
         isRecoveringSessionLayout = true
         Self.logger.warning(
-            "session recovery: shared local-agent link dropped; re-dialing the restarted agent to rebuild local windows in place")
+            "session recovery: shared local-agent link confirmed down; re-dialing the agent to rebuild local windows in place")
 
         LocalAgentManager.shared.reconnectSharedForRecovery { [weak self] connection in
             guard let self else { return }
@@ -514,6 +525,13 @@ extension AppDelegate {
     /// pane). The window/frame/title stay; the old dead-transport surfaces are
     /// released with the old tree, and the old shared connection frees once its
     /// last surface deallocates. Main-thread only.
+    ///
+    /// The replacement leaves re-ATTACH the SAME agent sessions the old leaves
+    /// were on, so the old leaves leaving the tree must NOT be read as "the user
+    /// closed these panes" — `SessionCloseIntentPolicy` spares any departing
+    /// leaf whose session the new tree still references, which is what keeps a
+    /// rebuild from CLOSEing the sessions it just recovered when those orphaned
+    /// surfaces eventually deallocate.
     @MainActor
     private func rebuildSessionLayoutController(
         _ controller: TerminalController,

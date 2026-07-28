@@ -73,6 +73,11 @@ fn genConfigField(
 }
 
 fn genActions(alloc: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    // The `inline for` below unrolls once per CLI action, and each iteration
+    // resolves the action's source file at comptime. The action list has grown
+    // past what the default 1000-branch budget covers, so raise it.
+    @setEvalBranchQuota(10_000);
+
     try writer.writeAll(
         \\
         \\/// Actions help

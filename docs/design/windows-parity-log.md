@@ -9,6 +9,51 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-27 - T117 DONE (merge origin/main 1e1cdbbd2, 70 commits), T118-T128
+  filed. Merged rather than rebased: the branch was 203 ahead / 70 behind, has
+  synced by merge every previous time, and the task table cites commit hashes a
+  rebase would invalidate. User chose merge after seeing both options.
+
+  Five of the six conflicts were one story: main centralized CLI socket
+  resolution into `apprt/ipc.zig` while this branch had already centralized the
+  same thing into the cross-platform `os/ipc_client.zig` (Windows needs named
+  pipes). Verified main's edit to each CLI file was ONLY that refactor before
+  keeping ours, so nothing was dropped except a duplicate — the one genuinely
+  new capability in main's version is instance addressability, filed as T118
+  instead of being silently lost. CLAUDE.md hand-merged.
+
+  Three build breaks, none of which existed on either side alone. (1)
+  `Action.Key.wireName` is a switch this branch owns and main added a `.reload`
+  member to the enum it switches over — exhaustive-switch failure from the
+  combination. (2) `helpgen.zig` blew the 1000-branch comptime quota once the
+  action list grew. (3) The one worth remembering: main's new `socketPathFrom`
+  calls `std.c.getuid()`, so the `none` lane failed to LINK on Windows
+  (`undefined symbol: getuid`) — main cannot see this, and it will keep
+  happening every time main adds POSIX-shaped code to a shared file. Fixed by
+  making the resolver actually correct on Windows (derive branch delegates to
+  `ipc_client.endpointPath`, the pipe name the win32 CLI really dials) rather
+  than ifdef-ing the symbol away.
+
+  Gap triage: classified all 70 commits by `src/` (shared, arrives free) vs
+  `macos/`-only (needs a Windows answer). ~60% are macOS-only. Highest-value
+  finds are NOT the big visible features: T118 (a CLI run inside a Debug pane
+  silently drives the installed RELEASE app — the T116 confusion class, with no
+  per-pane escape hatch on Windows) and T125's second half (CLAUDE.md mandates
+  an explicit "upgrading will reset all windows" confirmation on an
+  incompatible agent skew; Windows implements neither that nor the lazy
+  non-destructive upgrade, and the win32 agent already outlives the app, so the
+  skew is reachable today). T120/T121/T123 are cheap ports of fixes main just
+  made to code Windows still carries in its pre-fix form. T128 is an
+  investigation, not a bug: win32 is structurally immune to the Mac's
+  recovery-kills-sessions bug, which suggests it may have the mirror defect
+  (`+rearrange` dropping a pane may leak its session) — unverified, needs
+  `+sessions` before/after on the box.
+
+  Deliberately did NOT widen T90b-T90h to absorb 16 new viewer commits; that
+  re-scoping is T127 so the growth stays visible. Validation: win32 Debug GUI
+  build + both test lanes. Next: T113 is still `todo` with WIP committed
+  (b86dce1d0) and unvalidated.
+
 - 2026-07-21 (on-box, 53) - T115 + T114 DONE, one fix. Picked T115; its own
   row and details said "do T114 first and re-measure", and measurement said
   they were the same defect, so both closed together.

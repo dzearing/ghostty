@@ -1,0 +1,14 @@
+{
+  "version": "1.14.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Reliable cleanup and stable pane ids",
+          "text": "Closing a pane reliably ends its persistent session (no orphaned processes), re-attached terminals keep correct PTY geometry, and quitting no longer warns about sessions that actually survive. Every pane also gets a stable `$GHOZTTY_PANE_ID` that survives restarts, restores, and reconnects."
+        }
+      ]
+    }
+  ]
+}

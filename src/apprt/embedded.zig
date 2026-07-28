@@ -353,6 +353,7 @@ pub const App = struct {
             .send_keys => "send-keys",
             .set_state => "set-state",
             .set_banner => "set-banner",
+            .reload => "reload",
         };
 
         return sendIpc(alloc, action_name, value.arguments);
@@ -370,20 +371,14 @@ pub const App = struct {
         var stderr_writer = std.fs.File.stderr().writerStreaming(&buf);
         const stderr = &stderr_writer.interface;
 
-        const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-        const uid = std.c.getuid();
-        const build_config = @import("../build_config.zig");
-        const suffix = if (build_config.is_debug) "-debug" else "";
-        const sock_path = std.fmt.allocPrintSentinel(alloc, "{s}ghostty{s}-{d}.sock", .{
-            tmpdir, suffix, uid,
-        }, 0) catch |err| {
+        const sock_path = apprt.ipc.socketPath(alloc) catch |err| {
             stderr.print("Failed to build socket path: {}\n", .{err}) catch {};
             stderr.flush() catch {};
             return error.IPCFailed;
         };
         defer alloc.free(sock_path);
 
-        const fd = connectUnixSocket(sock_path) catch blk: {
+        const fd = apprt.ipc.connect(sock_path) catch blk: {
             // Connection failed. Drop a sentinel file to signal the main
             // process to rebind its socket, then retry with backoff.
             const sentinel_path = std.fmt.allocPrintSentinel(alloc, "{s}.reset", .{sock_path}, 0) catch {
@@ -401,7 +396,7 @@ pub const App = struct {
             var attempt: usize = 0;
             while (attempt < max_retries) : (attempt += 1) {
                 std.Thread.sleep(300 * std.time.ns_per_ms);
-                if (connectUnixSocket(sock_path)) |connected_fd| {
+                if (apprt.ipc.connect(sock_path)) |connected_fd| {
                     std.fs.cwd().deleteFile(sentinel_path) catch {};
                     break :blk connected_fd;
                 } else |_| {}
@@ -500,23 +495,6 @@ pub const App = struct {
         }
 
         return true;
-    }
-
-    fn connectUnixSocket(path: [:0]const u8) !std.posix.fd_t {
-        const fd = try std.posix.socket(
-            std.posix.AF.UNIX,
-            std.posix.SOCK.STREAM,
-            0,
-        );
-        errdefer std.posix.close(fd);
-
-        var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
-        if (path.len >= addr.path.len) return error.NameTooLong;
-        @memcpy(addr.path[0..path.len], path);
-        addr.path[path.len] = 0;
-
-        try std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-        return fd;
     }
 
     fn readFull(fd: std.posix.fd_t, buffer: []u8) !void {
@@ -3465,25 +3443,107 @@ pub const CAPI = struct {
         b: u8,
     ) void {
         const color: terminal.color.RGB = .{ .r = r, .g = g, .b = b };
-        var t = &surface.core_surface.io.terminal;
-        switch (kind) {
-            0 => {
-                t.colors.palette.set(index, color);
-                t.flags.dirty.palette = true;
-            },
-            1 => t.colors.foreground.set(color),
-            2 => t.colors.background.set(color),
-            else => return,
+        const core = &surface.core_surface;
+        {
+            core.renderer_state.mutex.lock();
+            defer core.renderer_state.mutex.unlock();
+            var t = &core.io.terminal;
+            switch (kind) {
+                0 => {
+                    t.colors.palette.set(index, color);
+                    t.flags.dirty.palette = true;
+                },
+                1 => t.colors.foreground.set(color),
+                2 => t.colors.background.set(color),
+                else => return,
+            }
         }
+
+        // Wake the renderer so the new color paints now. Without this the
+        // change sits until the next natural frame (new output, cursor
+        // blink), which reads as the terminal background lagging visibly
+        // behind the rest of the pane during a color pick.
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of color change err={}", .{err});
+        };
     }
 
     /// Reset all dynamic colors on the surface back to their defaults.
     export fn ghostty_surface_reset_colors(surface: *Surface) void {
-        var t = &surface.core_surface.io.terminal;
-        t.colors.palette.resetAll();
-        t.colors.foreground.reset();
-        t.colors.background.reset();
-        t.flags.dirty.palette = true;
+        const core = &surface.core_surface;
+        {
+            core.renderer_state.mutex.lock();
+            defer core.renderer_state.mutex.unlock();
+            var t = &core.io.terminal;
+            t.colors.palette.resetAll();
+            t.colors.foreground.reset();
+            t.colors.background.reset();
+            t.flags.dirty.palette = true;
+        }
+
+        // Wake the renderer so the reset paints now (see set_color above).
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of color reset err={}", .{err});
+        };
+    }
+
+    /// Regenerate palette indices 16–255 (the 6×6×6 color cube and the
+    /// grayscale ramp) from the terminal's current base-16 palette and its
+    /// current default background/foreground, using the same CIELAB
+    /// interpolation as the `palette-generate` config option. `harmonious`
+    /// mirrors `palette-harmonious`: when true the generated colors keep
+    /// their contrast relative to the background (readable on light and
+    /// dark backgrounds alike) instead of their absolute dark-to-light
+    /// ordering.
+    ///
+    /// Called after a runtime background change so 256-color content
+    /// (prompt greys, cube colors) stays legible on the new background.
+    export fn ghostty_surface_regenerate_palette(
+        surface: *Surface,
+        harmonious: bool,
+    ) void {
+        const core = &surface.core_surface;
+        {
+            core.renderer_state.mutex.lock();
+            defer core.renderer_state.mutex.unlock();
+            var t = &core.io.terminal;
+            const bg = t.colors.background.get() orelse t.colors.palette.current[0];
+            const fg = t.colors.foreground.get() orelse t.colors.palette.current[15];
+            const generated = terminal.color.generate256Color(
+                t.colors.palette.current,
+                .initEmpty(),
+                bg,
+                fg,
+                harmonious,
+            );
+            // Adopt only the cube/ramp; the base 16 stay as-is.
+            @memcpy(t.colors.palette.current[16..], generated[16..]);
+            t.flags.dirty.palette = true;
+        }
+
+        // Wake the renderer so the new palette paints now (see set_color).
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of palette regen err={}", .{err});
+        };
+    }
+
+    /// Set the minimum WCAG contrast ratio (1–21) the renderer enforces
+    /// between every cell's foreground and background. Unlike the palette
+    /// APIs this reaches truecolor content too: the shader adjusts any
+    /// under-contrast foreground at draw time. The renderer clamps the
+    /// value so it never weakens the configured `minimum-contrast`.
+    ///
+    /// Called after a runtime background change so foregrounds chosen by
+    /// programs for the old background (e.g. a dark-theme TUI's light
+    /// greys once the background goes light) remain readable.
+    export fn ghostty_surface_set_min_contrast(surface: *Surface, ratio: f64) void {
+        const core = &surface.core_surface;
+        _ = core.renderer_thread.mailbox.push(.{
+            .min_contrast = @floatCast(@min(21.0, @max(1.0, ratio))),
+        }, .{ .forever = {} });
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer of min contrast err={}", .{err});
+        };
     }
 
     /// Update the content scale of the surface.

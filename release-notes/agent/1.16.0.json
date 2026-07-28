@@ -1,0 +1,14 @@
+{
+  "version": "1.16.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "Accurate session lifecycle",
+          "text": "Sessions disappear the moment nothing is attached to them (a killed pane, a shell exiting) instead of piling up as dead \"exited\" rows that survive restarts. Sessions whose process is gone only because the agent restarted still show as resumable."
+        }
+      ]
+    }
+  ]
+}

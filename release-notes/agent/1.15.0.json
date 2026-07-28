@@ -1,0 +1,14 @@
+{
+  "version": "1.15.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        {
+          "title": "More resilient recovery",
+          "text": "After a crash, windows orphaned from their sessions are rebuilt from the agent's authoritative layout, so your panes come back correctly."
+        }
+      ]
+    }
+  ]
+}

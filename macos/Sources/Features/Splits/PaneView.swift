@@ -29,6 +29,7 @@ final class PaneView: NSView, Codable, Identifiable, ObservableObject {
     @Published private(set) var title: String = ""
     @Published private(set) var bell: Bool = false
     @Published private(set) var activityState: Ghostty.ActivityState = .idle
+    @Published private(set) var paneBanner: String?
 
     var surfaceView: Ghostty.SurfaceView? {
         if case .terminal(let view) = content { return view }
@@ -82,6 +83,7 @@ final class PaneView: NSView, Codable, Identifiable, ObservableObject {
             view.$title.assign(to: &$title)
             view.$bell.assign(to: &$bell)
             view.$activityState.assign(to: &$activityState)
+            view.$paneBanner.assign(to: &$paneBanner)
         case .viewer(let view):
             view.$title.assign(to: &$title)
         }

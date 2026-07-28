@@ -66,6 +66,19 @@ final class SessionLayoutManifest {
         /// this location — viewers have no process, so they are always
         /// restorable and never counted toward the all-dead drop policy.
         var viewerLocation: String?
+        /// The location the viewer was ORIGINALLY opened with (viewer leaves
+        /// only) — the home button's target, which survives the user
+        /// navigating the pane elsewhere. Optional/additive: manifests written
+        /// before the home button decode with nil, and restore then treats the
+        /// restored location as home (that viewer had never navigated).
+        var viewerHomeLocation: String?
+        /// The directory the viewer pane was OPENED from (viewer leaves
+        /// only) — the fallback leg of worktree provenance for a pane showing
+        /// a remote site or a blank page, which has no directory of its own to
+        /// derive one from. Optional/additive: manifests written before
+        /// feedback capture decode with nil, and such a pane simply has no
+        /// fallback until it is reopened.
+        var viewerOriginDirectory: String?
         /// The pane's STABLE surface UUID (wp3 pane identity): restore
         /// recreates the SurfaceView with this exact uuid so the `+list`
         /// leaf `id` — and the GHOZTTY_PANE_ID env baked into the still-
@@ -83,6 +96,13 @@ final class SessionLayoutManifest {
         /// (the pre-WP-D3 behavior). Always nil for viewer leaves.
         var screenSnapshot: String?
         var screenSnapshotOffset: UInt64?
+        /// The pane's sticky banner (raw markdown-subset source text, set via
+        /// +set-banner / OSC 7778 / Cmd+R). App-side overlay state — not part
+        /// of the PTY output the agent replays — so it must ride the layout
+        /// manifest to survive a relaunch. Optional/additive: older manifests
+        /// decode with nil. Always nil for viewer leaves (banners are
+        /// terminal-only).
+        var banner: String?
 
         var isViewer: Bool { kind == "viewer" }
     }
@@ -549,6 +569,8 @@ final class SessionLayoutManifest {
                         ipcName: ipc?.registeredPaneName(forViewerPane: pane),
                         kind: "viewer",
                         viewerLocation: viewer.location,
+                        viewerHomeLocation: viewer.homeLocation,
+                        viewerOriginDirectory: viewer.originDirectory,
                         surfaceID: nil)
                 }
                 let view = pane.surfaceView
@@ -557,17 +579,19 @@ final class SessionLayoutManifest {
                 // the gap. Nil for a fresh/exec pane → full-ring replay.
                 let snap = view.flatMap { Self.liveScreenSnapshot(of: $0) }
                 return Leaf(
-                    // Fall back to the id the surface was CREATED to attach
-                    // when the live id is unavailable — surface creation can
-                    // fail entirely (dark-wake OutOfMemory, T06b) and a sync
-                    // in that state must not wipe the recorded session id
-                    // (next launch would then drop the whole entry).
-                    sessionID: view.flatMap { Self.liveSessionID(of: $0) ?? $0.expectedRemoteSessionID },
+                    // `boundRemoteSessionID` falls back to the id the surface
+                    // was CREATED to attach when the live id is unavailable —
+                    // surface creation can fail entirely (dark-wake
+                    // OutOfMemory, T06b) and a sync in that state must not
+                    // wipe the recorded session id (next launch would then
+                    // drop the whole entry).
+                    sessionID: view?.boundRemoteSessionID,
                     title: pane.title,
                     ipcName: view.flatMap { ipc?.registeredPaneName(forSurface: $0) },
                     surfaceID: view?.id.uuidString,
                     screenSnapshot: snap?.snapshot,
-                    screenSnapshotOffset: snap?.offset)
+                    screenSnapshotOffset: snap?.offset,
+                    banner: view?.paneBanner)
             }
         }
 
@@ -602,16 +626,6 @@ final class SessionLayoutManifest {
             tabGroupID: tabGroupID,
             tabIndex: tabIndex,
             tree: tree)
-    }
-
-    /// The surface's live agent session UUID, nil until OPEN has completed
-    /// (the id is published asynchronously by the termio thread).
-    @MainActor
-    static func liveSessionID(of view: Ghostty.SurfaceView) -> String? {
-        guard let surface = view.surface else { return nil }
-        let s = Ghostty.AllocatedString(
-            ghostty_surface_remote_session_id(surface)).string
-        return s.isEmpty ? nil : s
     }
 
     /// WP-D3: capture the surface's structured VT screen snapshot (base64) and

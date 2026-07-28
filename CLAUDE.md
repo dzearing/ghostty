@@ -148,7 +148,7 @@ Banner text supports a small markdown subset: `**bold**`, `*italic*` or `_italic
 
 **Separators.** A line of 3+ of the same `-`, `*`, or `_` (spaces allowed — `---`, `***`, `___`, `- - -`) is a **thematic break**, rendered as a full-width horizontal divider between the blocks above and below it (e.g. to separate a title, a table, and a trailing note). A `- `/`* ` bullet or `**bold**` on its own line is unaffected (they carry non-marker content or mixed characters). Each rule counts as one line toward the 10-line display cap.
 
-Banners also support standard markdown pipe tables, rendered as an aligned grid with a bold header row: a `| a | b |` header line immediately followed by a `|---|---|` separator with the same column count, then `| 1 | 2 |` body rows. Separator cells may carry `:` alignment markers (`:---` left, `:---:` center, `---:` right). Cells support the full inline subset; `\|` puts a literal pipe inside a cell. Ragged body rows are padded/truncated to the header width. The separator row doesn't render; every other table row counts toward the 10-line display cap (a row still counts once no matter how many lines its cells wrap to). **Long cell text word-wraps** onto multiple lines (up to a sensible max column width) and the row grows to fit, rather than truncating to one line — matching a normal markdown renderer. A cell that contains a task-list checkbox stays a single line (its native box can't reflow around wrapping text), like list checkbox rows.
+Banners also support standard markdown pipe tables, rendered as an aligned grid with a bold header row: a `| a | b |` header line immediately followed by a `|---|---|` separator with the same column count, then `| 1 | 2 |` body rows. Separator cells may carry `:` alignment markers (`:---` left, `:---:` center, `---:` right). Cells support the full inline subset; `\|` puts a literal pipe inside a cell. Ragged body rows are padded/truncated to the header width. The separator row doesn't render; every other table row counts toward the 10-line display cap (a row still counts once no matter how many lines its cells wrap to). **Long cell text word-wraps** onto multiple lines and the row grows to fit, rather than truncating to one line — matching a normal markdown renderer. Column widths derive from the pane's current width, so the banner reflows live as the pane is resized and never blocks the pane from shrinking (even a long unbroken token breaks mid-string). A cell is capped at **3 wrapped lines** — a cell that would wrap further (e.g. a long unbroken string in a very narrow pane) is tail-truncated with an ellipsis on its last visible line, so one nasty cell can't blow up the banner height. A cell that contains a task-list checkbox stays a single line (its native box can't reflow around wrapping text), like list checkbox rows.
 
 ```bash
 ghoztty +set-banner --target=dev "**Build status**\n| Job | State |\n|---|---:|\n| lint | ok |\n| tests | **3 failed** |"
@@ -159,7 +159,32 @@ ghoztty +set-banner --target=dev "**PR #123** — _3 files_, +120/−45 — [vie
 ghoztty +set-banner --target=dev --clear
 ```
 
-Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels). On Windows the editor chord is Ctrl+Shift+B and Ctrl+Enter saves (plain Ctrl+R belongs to the shell); `+list --json` panes additionally carry the banner source as an additive `banner` field.
+Processes can also set the banner from inside the pane via OSC escape sequence: `\033]7778;<text>\007` (empty text clears). The interactive equivalent is Cmd+R ("Set Pane Banner…", also in the command palette), which opens a multi-line editor for the focused pane's banner (Return inserts a newline, Cmd+Return saves, Escape cancels). Cmd+R only reaches this while a **terminal** pane is focused — a focused viewer pane takes Cmd+R for reload (see Viewer Panes). On Windows the editor chord is Ctrl+Shift+B and Ctrl+Enter saves (plain Ctrl+R belongs to the shell).
+
+Banners are persisted per pane in the session-layout manifest (keyed to the stable pane id), so a session-persistence restore brings them back with their text intact — across app quit/relaunch/upgrade re-attach and across an agent-restart relaunch alike. `+list --json` reports each terminal pane's current banner in a `banner` field (absent when no banner is set), which is also the CLI way to read a banner back.
+
+### `ghoztty +reload`
+
+Reload a named **viewer pane** (see Viewer Panes below) in place — no
+close/reopen. Website viewers re-fetch the page from origin (bypassing
+caches); file viewers re-render the file preserving scroll position (they
+already live-reload on their own, so this mainly matters for URL viewers).
+
+```
+ghoztty +reload --target=<name>
+```
+
+- `--target`: Named window or pane (or a pane id). Required. For a window
+  target the reload applies to its focused pane.
+- Targeting a terminal pane fails with `... is a terminal pane, nothing to
+  reload` (exit 1), mirroring how terminal-only commands reject viewer panes.
+- Interactive equivalent: **Cmd+R** while a viewer pane is focused (see
+  Viewer Panes → Keyboard).
+
+```bash
+ghoztty +split --target=dev --name=preview --view=http://localhost:3000
+ghoztty +reload --target=preview
+```
 
 ### `ghoztty +new-remote-window`
 
@@ -265,6 +290,26 @@ Prefer the pane id over pid/tty matching for self-identification: pids and ttys
 belong to the machine the process runs on and are meaningless for remote panes.
 (`+list --tty=<tty>` still works for local panes as a fallback.)
 
+### Instance addressability
+
+An IPC command run inside a pane targets **the app instance that owns that
+pane**, not whichever build the `ghoztty` binary on `$PATH` happens to be. Every
+pane's env is baked with `$GHOZTTY_IPC_SOCKET` — the absolute path of its own
+app's IPC socket — and the CLI prefers it over the compile-time
+`ghostty[-debug]-<uid>.sock` derivation. So `ghoztty +split` run from a
+debug-build pane splits the **debug** window even though `ghoztty` on `$PATH` is
+the release binary (before this, it silently drove the release app).
+
+- Baked on every pane path: plain local spawn, session-persistence agent panes
+  (the agent replays the pane env on RELAUNCH), and remote panes — a remote
+  pane's IPC still belongs to the *local* app.
+- Absent or empty ⇒ today's derivation, so a CLI run from a plain non-Ghoztty
+  shell is unchanged, as is a pane baked by an older app or agent.
+- Override it (`GHOZTTY_IPC_SOCKET=<path> ghoztty +list`) to aim a single
+  command at a specific instance.
+- One resolution site each side: `apprt.ipc.socketPath()` (`src/apprt/ipc.zig`)
+  for the CLI, `IPCSocket.path` (Swift) for the server.
+
 ### Example: three-pane layout
 
 ```bash
@@ -297,7 +342,40 @@ ghoztty +close --target=doc
   rendering via bundled markdown-it + highlight.js (offline, zero network) —
   headings, GFM tables, nested/task lists, fenced code with syntax
   highlighting, blockquotes, images (relative paths resolve against the
-  file's directory), links. Light/dark follows the window appearance.
+  file's directory), links. Light/dark follows the window appearance. Body
+  text is set in the **system font** (SF Pro via `-apple-system`) and code in
+  SF Mono, so a viewer reads as macOS content rather than a web page.
+- **Table of contents** (markdown only, and only with two or more headings):
+  a native card listing the document's headings, nested by level, with the
+  section you are reading highlighted as you scroll. The card reads as a
+  macOS sidebar: the selected row is a rounded pill in the system's own
+  selection colors — accent-filled with white text while the window is key,
+  the neutral unemphasized gray otherwise — and hover is a separate faint
+  wash. **Clicking a row pins the selection to it**: the smooth scroll on the
+  way there fires a scroll event per frame, and the highlight must not walk
+  off the row you asked for. Your next scroll gesture hands the selection
+  back to the scroll spy. A pinned "CONTENTS" header sits on Liquid Glass
+  (`glassBackdrop()`, macOS 26; an `NSVisualEffectView` before that) with the
+  rows scrolling *under* it, and the scroller's track stops below it —
+  both from one `safeAreaInset`, not a ZStack.
+  In a **wide pane** the card sits in a left gutter and the document column
+  reflows beside it; **drag the card's right edge** to resize it (the gutter
+  and the document's text column follow in the same layout pass). The width
+  is a preference in defaults, shared by every viewer pane.
+  In a **narrow pane** (< 720pt) the gutter would crowd the text, so the card
+  becomes an overlay: the navigation bar stays pinned open and gains a
+  contents button as its first item, which slides the card in and out. The
+  switch follows the *pane* width live, so dragging a split divider reflows
+  it. The card is the same glass card as the pane banner overlay (shared
+  `GlassCardBackground`), opaque so document text never shows through it.
+  Panel open/closed state is ephemeral — it does not survive a session
+  restore, since restoring an overlay would hide the content it covers.
+- **Margins are one number.** `GlassCard.outerMargin` (12pt) is the gap every
+  glass card leaves around itself, on all four sides, and the document leaves
+  the same 12px on all four of its own — so a TOC card and a banner in the
+  pane next door line up at their corners, and the text starts exactly one
+  margin right of the card. Per-component fudges are what break that; there
+  are none. Enforced by `documentAlignsToTheCard` in `ViewerTOCTests`.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Links** in file viewers: http(s) opens the default browser; a relative
@@ -305,6 +383,35 @@ ghoztty +close --target=doc
   default app.
 - **Live reload**: file viewers watch the file (including atomic saves) and
   re-render preserving scroll position.
+- **Navigation chrome**: hovering the thin strip at a pane's top slides in a
+  bar with back / forward / reload / **home** and an **editable address
+  field** — in every mode, files included. Typing an `http(s)` address (or a
+  bare `example.com`, completed omnibox-style) navigates the pane to the web;
+  typing an absolute or `~` path points it back at a file. Back and forward
+  reflect real history (disabled when there is none) and work across the
+  file↔web boundary — going Back from a website re-renders the file. **Home**
+  returns to the location the pane was originally opened with, which is
+  remembered separately from where the user has navigated to (and both
+  survive a session restore). Clicking into the address field selects the
+  whole address; clicking again inside it just moves the caret.
+- **Keyboard** (pane-scoped: live only while keyboard focus is inside a
+  viewer pane — its page, its nav bar, or its feedback composer — in any
+  viewer mode):
+  - **Cmd+R** reloads the pane in place, exactly like `+reload` (web
+    re-fetches from origin, files re-render with scroll preserved).
+  - **Cmd+D** slides the nav bar in if hidden and puts the caret in the
+    address field with the whole address selected — the keyboard version of
+    clicking into it.
+  - Both **override their global binding only while the viewer holds focus**
+    (Cmd+R = "Set Pane Banner…", Cmd+D = split right). Focus a terminal pane
+    and they do their global thing again; Cmd+Shift+R ("Change Window Title")
+    and Cmd+Shift+D (split down) are never affected.
+- `--view=about:blank` opens a **blank browser pane**. The command palette's
+  "Viewer: Open Browser Pane" does the same interactively and puts the caret
+  straight in the address field — the equivalent of `+split --view=<url>` for
+  when the URL is not known up front.
+- Because any viewer can browse, `+list --json`'s `"url"` (and the session
+  manifest) report where a pane currently IS, not where it was opened.
 - Relative `--view` paths resolve against `--working-directory` if given,
   else the caller's cwd.
 - `+list` marks viewer panes with a `view:` prefix (JSON: `"type": "viewer"`
@@ -317,6 +424,119 @@ ghoztty +close --target=doc
   as an in-page error card.
 - File → Open (or dragging onto the dock icon, or `open -a Ghoztty file.md`)
   opens `.md`-family files as a viewer window.
+
+### Worktree feedback capture
+
+When a viewer pane's content can be attributed to a **git worktree**, its
+navigation bar gains a **feedback button** (labeled with the worktree's
+basename, full path on hover) that opens a composer toolbar below the nav bar.
+On send it writes a report — plus any pasted screenshots — into
+`<worktree>/temp/feedback/new/` for an external watcher to drain (Ghoztty produces
+the queue; consuming it is separate and not built here).
+
+- **Provenance (strategy D — port lookup first, pane-origin fallback).** The
+  worktree is derived live from the pane's *current* location, re-resolved on
+  every navigation (a pane can move between a file, `localhost:3000`, and a
+  remote site, each a different worktree or none):
+  1. **File viewers** → the viewed file's own directory.
+  2. **`http://localhost:PORT` / `127.0.0.1` / `0.0.0.0` viewers** → the port's
+     listening pid's cwd, via `lsof` (`-iTCP:<port> -sTCP:LISTEN -t`, then
+     `-p <pid> -d cwd -Fn`) run off the main thread. lsof, not
+     `proc_pidinfo`, because there is no port→pid syscall.
+  3. **Fallback** (remote site, blank pane, or a port with no listener) → the
+     pane's **origin directory**: `--working-directory` at `+split --view=` /
+     `+new-window --view=` time, else the caller's cwd. `+split` now seeds the
+     caller's cwd as `--working-directory` for `--view=` splits (terminal
+     splits are unchanged so cwd inheritance still works). The origin is
+     persisted in the session manifest (`viewerOriginDirectory`).
+
+  Whatever directory results is resolved to a repo root via `git -C <dir>
+  rev-parse --show-toplevel` (**any** working tree counts — a linked worktree
+  or the main checkout). No repo ⇒ no feedback button. Resolutions are cached
+  per (location, origin) for 15s so navigation never stutters and a dev server
+  started later still makes the button appear.
+  The button is **icon-only**, in the same 24pt square as the other chrome
+  controls; the destination is on its tooltip and in the composer footer.
+- **Composer.** A **pill** that grows with its content (one line up to ~6),
+  with two **circular buttons inside its trailing edge**: `+` takes an
+  interactive screen snapshot (`screencapture -i -o` to a temp file — never
+  `-c`, which would clobber the user's clipboard), and `↑` sends. `Enter`
+  inserts a newline, `Cmd-Enter` sends, `Escape` closes.
+  Pasting a screenshot inserts an **`[Image #N]` chip** — one atomic
+  `NSTextAttachment` (a single `U+FFFC` character), so it selects, copies, and
+  deletes (one Backspace) as a unit. A **thumbnail carousel** below the input
+  mirrors the chips; clicking a chip scrolls to its thumbnail and vice versa.
+  **Chip numbers are stable, not positional** — deleting `[Image #2]` leaves
+  the sequence 1, 3 in both the text and the carousel (never renumbered), so a
+  number always points at the same image. Composer contents survive
+  toggling the toolbar closed/open and a detach/undo (they live on the pane,
+  not the toolbar).
+
+  **⇧⌘S** adds a screenshot from the keyboard while the composer has focus
+  (free: the app's shift+cmd letters are t/z/w/d/f/g/v/n/r/[/], and macOS's own
+  capture shortcuts are ⇧⌘3/4/5).
+
+  The text view **must** override `readablePasteboardTypes` to include image
+  types. AppKit validates the Edit▸Paste menu item against that list, so
+  without it Cmd-V is *disabled* for an image-only clipboard and the paste
+  override never runs — a silent no-op. `importsGraphics = true` does **not**
+  add those types; only the override does.
+- **Quoting.** Selecting text in a viewer pops a small **Quote / Copy**
+  toolbar (standard `format_quote` / `content_copy` glyphs) above the
+  selection. It lives in `src/viewer/selection.js` and is injected as a
+  **`WKUserScript` into every page** — it cannot ship inside `viewer.js`,
+  which is a `<script src>` in `viewer.html` and therefore only ever runs on
+  the bundled template, which is why quoting used to work on markdown and do
+  nothing on a website. Because it runs inside pages we do not control, its UI
+  lives in a **shadow root** so page CSS cannot restyle or hide it. *Copy* puts it on the clipboard; *Quote* opens
+  the composer (if closed) and inserts the passage at the caret as its own
+  block — indented, with a tinted panel and an accent bar down the left, drawn
+  in `drawBackground(in:)` (a background-color attribute paints only tight line
+  boxes, with no bar and no rounding). The run carries a `feedbackQuoteID`
+  attribute, so deleting it drops its metadata from the report — the same
+  derive-from-storage rule the image carousel uses. The body renders it as a
+  real markdown blockquote. Typing never inherits quote styling: AppKit
+  carries `typingAttributes` over from text around the caret *including text
+  just deleted*, so select-all + delete + type used to leave the user trapped
+  writing inside the quote (and resurrected its metadata). The delegate
+  refuses quote attributes at the source.
+
+  Each quote carries **referential context** so an agent can find what was
+  being discussed (text alone is ambiguous — the same sentence can appear
+  twice): the containing section's `headingId`/`headingText`, the containing
+  block's `blockSelector` and full `blockText`, `offsetInBlock`,
+  `documentOffset`, and — for file viewers — a 1-based **`sourceLine`**,
+  resolved natively at send time by searching the file for the passage
+  (mapping rendered DOM back to markdown source is unreliable; searching is
+  not). It reports nil rather than a confidently wrong line.
+- **Report output.** One **self-contained folder per submission**, so a report
+  can be moved or handed to an agent as a unit:
+
+  ```
+  <worktree>/temp/feedback/new/<timestamp>-<suffix>/
+      report.json
+      images/image-1.png
+  ```
+
+  The whole folder is built under `temp/feedback/.staging/` and moved into place
+  with a single **atomic `rename`** (same filesystem), so a watcher sees either
+  nothing or a complete report with every image already present. Promoting one
+  to an `in-progress/` queue is likewise a single `mv` — image paths in the
+  report are folder-relative, so they survive the move.
+  The queue lives under **`temp/`** because that name is already gitignored
+  here (`.gitignore`) and conventionally elsewhere; a top-level `.feedback/`
+  was not, so every filed report showed up as untracked in `git status`.
+  **Format is JSON** (not markdown-frontmatter: a multi-line prose body with a
+  `---` or `key:` line breaks naive frontmatter splitting; JSON has one parse
+  path). `body` is markdown with each chip rendered as a
+  `![Image #N](images/image-N.png)` reference relative to the folder.
+  Alongside it, deliberately generous context so a downstream agent needn't ask
+  follow-ups: `source` (`location`, `kind`, `filePath`, **`relativePath`** —
+  repo-relative, `pageTitle`, **`selection`** — the text the user had selected,
+  i.e. what they were pointing at, `paneID`, `viewport`), `worktree` (`path`,
+  `name`, **`branch`**, **`commit`** — the exact revision they saw), `app`,
+  `quotes` (see above), and `images` (with pixel dimensions and byte size). On success the composer
+  clears and the toolbar shows a "Filed …" confirmation before closing.
 
 ## Session Persistence
 
@@ -434,4 +654,4 @@ zig build -Doptimize=Debug
 - **Zig core** (`src/`): terminal emulation, input handling, CLI commands, IPC client
 - **Swift macOS app** (`macos/`): SwiftUI frontend, IPC server, split tree layout
 - Split panes use a binary tree (`SplitTree`) with a ratio (0.0–1.0) per split node
-- IPC uses JSON messages over a Unix domain socket at `$TMPDIR/ghostty[-debug]-<uid>.sock`
+- IPC uses JSON messages over a Unix domain socket at `$TMPDIR/ghostty[-debug]-<uid>.sock`, overridden per pane by `$GHOZTTY_IPC_SOCKET` (see Instance addressability)

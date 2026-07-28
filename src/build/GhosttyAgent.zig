@@ -12,7 +12,6 @@ const Agent = @This();
 
 const std = @import("std");
 const Config = @import("Config.zig");
-const GitVersion = @import("GitVersion.zig");
 const SharedDeps = @import("SharedDeps.zig");
 const setMsvcGuiEntry = @import("win32_entry.zig").setMsvcGuiEntry;
 
@@ -141,32 +140,65 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
 }
 
 /// The agent's build-time version string, in the FIXED format the relay's
-/// `/dl/version.json` manifest publisher stamps: `YYYYMMDD-<git short hash>`
-/// (commit date, so rebuilds of the same commit agree). Precedence:
+/// `/dl/version.json` manifest publisher stamps: `YYYYMMDD-<git short hash>`.
+/// It is the agent binary's SELF-UPDATE IDENTITY, so it must change if and only
+/// if the agent binary actually changes. Precedence:
 ///   1. `-Dagent-version=<str>` (explicit override — deterministic publisher
 ///      builds and tests),
-///   2. git detection (commit date + short hash),
+///   2. the commit date + short hash of the LAST COMMIT that touched the agent's
+///      compiled sources (NOT HEAD — see below),
 ///   3. `"dev"` (git unavailable / not a repo). Dev builds never self-update.
+///
+/// Why the last agent-relevant commit and not HEAD: keying on HEAD re-stamped
+/// the agent on every app release (each release is a new HEAD ⇒ a new short
+/// hash) even when the agent was byte-for-byte identical. The macOS host judges
+/// the running agent stale by comparing its stamp to the bundled one
+/// (`LocalAgentManager.agentIsStale`), so a HEAD-derived stamp made every app
+/// upgrade wrongly report a "newer" agent — spuriously prompting the user to
+/// reset live terminal sessions to adopt an identical binary. Stamping from the
+/// last commit that modified the agent's compiled inputs keeps the stamp stable
+/// across releases that don't touch the agent, so `running == bundled` and no
+/// prompt fires. (This mirrors the Windows publisher's `--if-changed` gate,
+/// which only re-publishes `version.json` when the agent's inputs changed.)
+///
+/// The path set is the agent's compiled inputs: `src/agent_main.zig` (its root),
+/// `src/remote` (the bulk — transport, protocol, agent), the two shared leaves
+/// it pulls in (`src/pty.zig`, `src/CommandCore.zig`), and this build recipe. It
+/// deliberately excludes `build.zig` (broad app-wide churn) and `relay/deploy`
+/// (packaging/installer/site — not compiled into the binary); either would
+/// reintroduce the spurious-stale churn without changing the agent's bytes.
 fn versionString(b: *std.Build) ![]const u8 {
     if (b.option(
         []const u8,
         "agent-version",
         "Version string baked into ghoztty-agent (self-update identity). " ++
-            "Defaults to YYYYMMDD-<git short hash>, or \"dev\" without git.",
+            "Defaults to YYYYMMDD-<short hash of the last agent-source commit>, " ++
+            "or \"dev\" without git.",
     )) |v| return v;
 
-    const git = GitVersion.detect(b) catch return "dev";
-
-    // Commit date as YYYY-MM-DD (`%cs`), compacted to YYYYMMDD.
+    // One git call yields the last agent-source commit's date + short hash as
+    // "YYYY-MM-DD-<hash>" (`%cs` is always 10 chars; `%h` matches GitVersion's
+    // abbreviation so stamps stay format-consistent with older builds).
     var code: u8 = 0;
-    const date_raw = b.runAllowFail(
-        &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "log", "-1", "--pretty=format:%cs" },
+    const raw = b.runAllowFail(
+        &[_][]const u8{
+            "git",                        "-C",
+            b.build_root.path orelse ".", "-c",
+            "log.showSignature=false",    "log",
+            "-1",                         "--pretty=format:%cs-%h",
+            "--",                         "src/agent_main.zig",
+            "src/remote",                 "src/pty.zig",
+            "src/CommandCore.zig",        "src/build/GhosttyAgent.zig",
+        },
         &code,
         .Ignore,
     ) catch return "dev";
-    const date = std.mem.trim(u8, date_raw, "\r\n ");
-    if (date.len < 10) return "dev";
-    return b.fmt("{s}{s}{s}-{s}", .{ date[0..4], date[5..7], date[8..10], git.short_hash });
+    const out = std.mem.trim(u8, raw, "\r\n ");
+    // Expect "YYYY-MM-DD-<shorthash>"; anything else ⇒ treat as no-git ("dev").
+    if (out.len < 12 or out[4] != '-' or out[7] != '-' or out[10] != '-') return "dev";
+    const short = out[11..];
+    if (short.len == 0) return "dev";
+    return b.fmt("{s}{s}{s}-{s}", .{ out[0..4], out[5..7], out[8..10], short });
 }
 
 /// The release semver the agent ships under — the app's git tag, so the

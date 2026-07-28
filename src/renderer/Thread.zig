@@ -475,6 +475,8 @@ fn drainMailbox(self: *Thread) !void {
                 self.renderer.search_matches_dirty = true;
             },
 
+            .min_contrast => |v| self.renderer.setMinContrast(v),
+
             .inspector => |v| {
                 self.flags.has_inspector = v;
             },

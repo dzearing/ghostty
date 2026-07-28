@@ -2,7 +2,7 @@ import SwiftUI
 import GhosttyKit
 
 struct HeroPaneView: View {
-    let leaves: [Ghostty.SurfaceView]
+    let leaves: [PaneView]
     @ObservedObject var state: HeroModeState
 
     var body: some View {
@@ -14,7 +14,7 @@ struct HeroPaneView: View {
 }
 
 struct HeroPaneRepresentable: NSViewRepresentable {
-    let leaves: [Ghostty.SurfaceView]
+    let leaves: [PaneView]
     let selectedIndex: Int
 
     func makeNSView(context: Context) -> HeroPaneContainer {
@@ -54,7 +54,7 @@ class HeroPaneContainer: NSView {
         relayout()
     }
 
-    func update(leaves: [Ghostty.SurfaceView], selectedIndex: Int) {
+    func update(leaves: [PaneView], selectedIndex: Int) {
         let changed = rebuildIfNeeded(leaves: leaves)
         if changed { relayout() }
         updateBackgroundColor()
@@ -77,28 +77,28 @@ class HeroPaneContainer: NSView {
         }
     }
 
-    private func rebuildIfNeeded(leaves: [Ghostty.SurfaceView]) -> Bool {
-        let currentSurfaces = slots.map(\.surfaceView)
-        guard currentSurfaces != leaves else { return false }
+    private func rebuildIfNeeded(leaves: [PaneView]) -> Bool {
+        let currentPanes = slots.map(\.pane)
+        guard currentPanes != leaves else { return false }
 
-        var slotsBySurface: [ObjectIdentifier: HeroPaneSlot] = [:]
+        var slotsByPane: [ObjectIdentifier: HeroPaneSlot] = [:]
         for slot in slots {
-            slotsBySurface[ObjectIdentifier(slot.surfaceView)] = slot
+            slotsByPane[ObjectIdentifier(slot.pane)] = slot
         }
 
         var newSlots: [HeroPaneSlot] = []
-        for surface in leaves {
-            let id = ObjectIdentifier(surface)
-            if let existing = slotsBySurface.removeValue(forKey: id) {
+        for pane in leaves {
+            let id = ObjectIdentifier(pane)
+            if let existing = slotsByPane.removeValue(forKey: id) {
                 newSlots.append(existing)
             } else {
-                let slot = HeroPaneSlot(surfaceView: surface)
+                let slot = HeroPaneSlot(pane: pane)
                 strip.addSubview(slot)
                 newSlots.append(slot)
             }
         }
 
-        for (_, slot) in slotsBySurface {
+        for (_, slot) in slotsByPane {
             slot.removeFromSuperview()
         }
 
@@ -107,8 +107,14 @@ class HeroPaneContainer: NSView {
     }
 
     private func updateBackgroundColor() {
-        guard let surface = slots.first?.surfaceView else { return }
-        let bgColor = NSColor(surface.derivedConfig.backgroundColor).cgColor
+        // Viewers have no terminal config; tint off the first terminal pane,
+        // falling back to the window background when the tree is all viewers.
+        let bgColor: CGColor
+        if let surface = slots.compactMap({ $0.pane.surfaceView }).first {
+            bgColor = NSColor(surface.derivedConfig.backgroundColor).cgColor
+        } else {
+            bgColor = NSColor.windowBackgroundColor.cgColor
+        }
         layer?.backgroundColor = bgColor
         strip.layer?.backgroundColor = bgColor
     }
@@ -122,7 +128,7 @@ class HeroPaneContainer: NSView {
 
         for (i, slot) in slots.enumerated() {
             slot.frame = NSRect(x: 0, y: CGFloat(i) * stride, width: w, height: h)
-            slot.surfaceView.frame = slot.bounds
+            slot.contentView.frame = slot.bounds
         }
 
         let totalHeight = CGFloat(slots.count) * stride
@@ -213,18 +219,31 @@ private class HeroPaneStrip: NSView {
 }
 
 private class HeroPaneSlot: NSView {
-    let surfaceView: Ghostty.SurfaceView
+    let pane: PaneView
+
+    /// The NSView actually mounted in this slot (the surface for terminals,
+    /// the ViewerView for viewers). PaneView itself is never in the hierarchy.
+    var contentView: NSView { pane.contentView }
 
     /// The last size we notified the terminal core about. Used to skip
     /// redundant (expensive) reflows when the size hasn't actually changed.
     private var lastNotifiedSize: CGSize = .zero
 
-    init(surfaceView: Ghostty.SurfaceView) {
-        self.surfaceView = surfaceView
+    init(pane: PaneView) {
+        self.pane = pane
         super.init(frame: .zero)
         wantsLayer = true
-        surfaceView.removeFromSuperview()
-        addSubview(surfaceView)
+        let content = pane.contentView
+        content.removeFromSuperview()
+        // SwiftUI mounts pane content with translatesAutoresizingMaskIntoConstraints
+        // off and positions it via its own constraints. Hero mode lays out by
+        // assigning frames, so re-enable the autoresizing translation to make
+        // the assigned frame authoritative in the constraint engine. Without
+        // this a viewer's WKWebView — edge-pinned to the ViewerView with Auto
+        // Layout — solves against an ambiguous 0×0 parent and renders nothing.
+        // (SwiftUI switches it back off when it re-adopts the view on exit.)
+        content.translatesAutoresizingMaskIntoConstraints = true
+        addSubview(content)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -233,7 +252,7 @@ private class HeroPaneSlot: NSView {
 
     override func layout() {
         super.layout()
-        surfaceView.frame = bounds
+        contentView.frame = bounds
     }
 
     /// Notify the terminal core that this slot's surface has resized so its
@@ -241,6 +260,10 @@ private class HeroPaneSlot: NSView {
     /// normal split-resize chain uses (SurfaceScrollView -> sizeDidChange ->
     /// ghostty_surface_set_size). Hero mode bypasses that chain by assigning
     /// frames directly, so the visible slot must call it explicitly.
+    ///
+    /// Viewer panes have no terminal grid — their WKWebView is pinned to the
+    /// ViewerView's edges with constraints, so the frame assignment alone is
+    /// a complete resize and the grid notification is skipped.
     ///
     /// No-ops if the size is zero or unchanged since the last notification,
     /// which lets the container call this freely on every layout pass.
@@ -253,8 +276,8 @@ private class HeroPaneSlot: NSView {
         // the new size instead of interpolating its bounds.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        surfaceView.frame = bounds
-        surfaceView.sizeDidChange(size)
+        contentView.frame = bounds
+        pane.surfaceView?.sizeDidChange(size)
         CATransaction.commit()
     }
 }
