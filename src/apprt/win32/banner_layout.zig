@@ -17,6 +17,30 @@ pub fn clampInset(strip_h: i32, slot_h: i32) i32 {
     return @min(strip_h, @divTrunc(slot_h * 3, 4));
 }
 
+/// Total height of the banner BAND for a card `card_h` px tall that floats
+/// `margin` px inside it (T131). The margin counts on the top AND the
+/// bottom, so the terminal content below the band always starts a breath
+/// under the card instead of hard against it — Mac parity, where the card's
+/// bottom margin is part of the measured banner height that pads the
+/// terminal down.
+pub fn bandHeight(card_h: i32, margin: i32) i32 {
+    if (card_h <= 0) return 0;
+    return card_h + @max(margin, 0) * 2;
+}
+
+test "bandHeight: a margin on both sides of the card" {
+    try std.testing.expectEqual(@as(i32, 79), bandHeight(55, 12));
+    // 2x DPI: the margin scales with the card.
+    try std.testing.expectEqual(@as(i32, 158), bandHeight(110, 24));
+}
+
+test "bandHeight: degenerate inputs" {
+    try std.testing.expectEqual(@as(i32, 0), bandHeight(0, 12));
+    try std.testing.expectEqual(@as(i32, 0), bandHeight(-4, 12));
+    try std.testing.expectEqual(@as(i32, 30), bandHeight(30, 0));
+    try std.testing.expectEqual(@as(i32, 30), bandHeight(30, -5));
+}
+
 test "clampInset: strip fits — full reservation" {
     try std.testing.expectEqual(@as(i32, 31), clampInset(31, 400));
     try std.testing.expectEqual(@as(i32, 251), clampInset(251, 1000));

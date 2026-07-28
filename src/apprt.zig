@@ -95,6 +95,10 @@ test {
     // Pure win32 banner strip-inset clamp (T101), same no-OS-imports deal.
     _ = @import("apprt/win32/banner_layout.zig");
 
+    // Pure win32 banner glass-card pixel math (T131), same no-OS-imports
+    // deal.
+    _ = @import("apprt/win32/banner_card.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 

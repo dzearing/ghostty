@@ -1,14 +1,21 @@
 //! Sticky pane-banner overlay (T35/T91). Windows analog of the Mac
-//! `SurfacePaneBanner`: a strip rendered above the terminal content of a
+//! `SurfacePaneBanner`: a card rendered above the terminal content of a
 //! pane that persists (survives scrolling, screen clears, content updates)
 //! until changed or cleared.
 //!
-//! Like DimOverlay/Scrollbar, the strip is a WS_EX_LAYERED popup owned by
+//! Like DimOverlay/Scrollbar, the banner is a WS_EX_LAYERED popup owned by
 //! its surface HWND — DWM composites it above the surface's OpenGL
 //! content, which a plain child window cannot reliably do. Unlike the dim
 //! overlay it is NOT click-through: `[text](url)` links are clickable
 //! (hand cursor + ShellExecuteW), a multi-line banner collapses/expands on
 //! click, and a click on a single-line banner focuses the pane underneath.
+//!
+//! The window covers the band the layout reserves above the terminal
+//! (T101) and is fully OPAQUE (T131): it paints the pane background, then
+//! the floating glass card inside it (`banner_card.zig`, the port of Mac's
+//! `GlassCardBackground`). It used to be a translucent full-width strip,
+//! which let the stale terminal pixels behind the band show through — that
+//! see-through is what read as "text scrolling behind the banner".
 //!
 //! Content comes from the pure banner_markdown block parser (unit tested
 //! in every lane): text lines, headings, thematic-break rules, lists with
@@ -21,20 +28,30 @@ const std = @import("std");
 const w32 = @import("win32.zig");
 const App = @import("App.zig");
 const markdown = @import("banner_markdown.zig");
+const card = @import("banner_card.zig");
+const banner_layout = @import("banner_layout.zig");
 const color_math = @import("color_math.zig");
 
 const log = std.log.scoped(.win32_banner);
 
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyBannerOverlay");
 
-/// Strip translucency (LWA_ALPHA): mostly opaque so text stays crisp, a
-/// hint of the terminal beneath (Mac uses a shaded solid over the pane).
-const STRIP_ALPHA: u8 = 242;
+/// Window opacity (LWA_ALPHA). FULLY opaque (T131): the card's own
+/// translucency is composited against the pane background in
+/// `banner_card.render`, so nothing behind the window can bleed through.
+/// A window-wide alpha let stale terminal pixels in the reserved band show
+/// through the banner — the user-visible "text scrolling behind" bug. The
+/// window stays WS_EX_LAYERED because that is what puts it above the
+/// surface's OpenGL content.
+const STRIP_ALPHA: u8 = 255;
+
+/// Margin between the card and the band edges (Mac `GlassCard.outerMargin`).
+const MARGIN: f32 = card.MARGIN;
 
 /// Unscaled layout metrics. The Mac banner is a 12pt system font with
 /// 12pt padding; our base font is 15px (T35), so px metrics scale by
 /// 15/12 where they mirror a Mac point value.
-const PAD: f32 = 12.0;
+const PAD: f32 = card.PADDING;
 const FONT_H: f32 = 15.0;
 const LINE_H: f32 = 20.0;
 /// Vertical gap between blocks (Mac: VStack spacing 8).
@@ -91,14 +108,30 @@ pub const BannerOverlay = struct {
     inset: i32 = 0,
 
     scale: f32 = 1.0,
-    bg: u32 = 0, // COLORREF strip fill
+    bg: u32 = 0, // COLORREF card fill
     bg_rgb: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 },
+    /// The pane's own background — what the band around the card shows,
+    /// and the backdrop the card's wash is composited over (T131).
+    pane_bg_rgb: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 },
     fg: u32 = 0xFFFFFF,
     fg_rgb: color_math.Rgb = .{ .r = 255, .g = 255, .b = 255 },
     link_fg: u32 = 0xFF9C4F, // COLORREF is 0x00BBGGRR
     divider: u32 = 0,
     bg_brush: ?w32.HBRUSH = null,
     alpha_set: bool = false,
+
+    /// Cached card backdrop (T131): the band background + elevation shadow
+    /// + card fill/sheen/rim, rendered by `banner_card` into a DIB section
+    /// and blitted under the text. Regenerated only when the band size, the
+    /// pane background, or the DPI scale changes — a banner repaint (hover,
+    /// collapse, content update) reuses it.
+    card_dc: ?w32.HDC = null,
+    card_bmp: ?*anyopaque = null,
+    card_bits: ?[*]u32 = null,
+    card_w: i32 = 0,
+    card_h: i32 = 0,
+    card_bg: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 },
+    card_scale: f32 = 0,
 
     /// Lazy font cache: size class (0 base, 1–6 headings) × style bits
     /// (bold | italic<<1 | ul<<2 | code<<3).
@@ -161,6 +194,7 @@ pub const BannerOverlay = struct {
         _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
         _ = w32.DestroyWindow(self.hwnd);
         self.clearFonts();
+        self.releaseCardSurface();
         if (self.bg_brush) |b| _ = w32.DeleteObject(@ptrCast(b));
         self.links.deinit(self.alloc);
         self.arena.deinit();
@@ -180,14 +214,18 @@ pub const BannerOverlay = struct {
         _ = w32.InvalidateRect(self.hwnd, null, 1);
     }
 
-    /// Refresh strip colors from the pane's effective background (per-pane
-    /// tint or config background) and the config foreground.
+    /// Refresh card colors from the pane's effective background (per-pane
+    /// tint or config background) and the config foreground. The fill is
+    /// Mac's glass wash — `lighten(0.06)` on a dark pane, `darken(0.04)` on
+    /// a light one (T131) — composited, not translucent.
     pub fn setColors(self: *BannerOverlay, pane_bg: color_math.Rgb, fg: color_math.Rgb) void {
         const light = color_math.isLight(pane_bg);
-        const strip = if (light)
-            color_math.darken(pane_bg, 0.07)
-        else
-            color_math.lighten(pane_bg, 0.09);
+        const strip = card.fillColor(pane_bg);
+        // The band around the card is the pane's own background, so a pane
+        // background change repaints even when the card fill rounds to the
+        // same value.
+        const bg_changed = !std.meta.eql(self.pane_bg_rgb, pane_bg);
+        self.pane_bg_rgb = pane_bg;
         const div = if (light)
             color_math.darken(pane_bg, 0.25)
         else
@@ -196,7 +234,7 @@ pub const BannerOverlay = struct {
         const fg_ref = w32.RGB(fg.r, fg.g, fg.b);
         const link_ref: u32 = if (light) w32.RGB(0, 102, 204) else w32.RGB(90, 160, 255);
         const div_ref = w32.RGB(div.r, div.g, div.b);
-        if (bg_ref == self.bg and fg_ref == self.fg and
+        if (!bg_changed and bg_ref == self.bg and fg_ref == self.fg and
             link_ref == self.link_fg and div_ref == self.divider and
             self.bg_brush != null) return;
         self.bg = bg_ref;
@@ -261,12 +299,24 @@ pub const BannerOverlay = struct {
         _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
     }
 
+    /// Total band height: the floating card (padding + content) plus the
+    /// margin it leaves on the top AND bottom, so the terminal content
+    /// below always starts a breath under the card (Mac parity — its
+    /// bottom margin is part of the measured banner height too).
     fn stripHeight(self: *BannerOverlay) i32 {
+        return banner_layout.bandHeight(
+            self.cardHeight(),
+            self.px(MARGIN),
+        );
+    }
+
+    /// Height of the card itself: uniform inner padding around the content.
+    fn cardHeight(self: *BannerOverlay) i32 {
         const content = if (self.collapsed)
             self.px(COLLAPSED_H)
         else
             self.ensureContentHeight();
-        return self.px(PAD) * 2 + content + 1; // +1 divider
+        return self.px(PAD) * 2 + content;
     }
 
     /// Expanded content height, measured via a window DC when stale.
@@ -276,7 +326,7 @@ pub const BannerOverlay = struct {
             return self.px(LINE_H); // degrade: one-line strip
         };
         defer _ = w32.ReleaseDC(self.hwnd, hdc);
-        self.content_h = self.renderContent(hdc, 1 << 20, false);
+        self.content_h = self.renderContent(hdc, 0, 0, 1 << 20, false);
         return self.content_h;
     }
 
@@ -757,83 +807,194 @@ pub const BannerOverlay = struct {
     }
 
     /// Walk all blocks: measure (draw=false) or paint (draw=true).
-    /// Returns total content height. `client_w` bounds the rule width.
-    fn renderContent(self: *BannerOverlay, hdc: w32.HDC, client_w: i32, draw: bool) i32 {
-        const pad = self.px(PAD);
+    /// Returns total content height. (`x0`, `y0`) is the content origin in
+    /// client coords (the card's inner top-left) and `content_w` is the
+    /// width available to it (bounds the rule width).
+    fn renderContent(
+        self: *BannerOverlay,
+        hdc: w32.HDC,
+        x0: i32,
+        y0: i32,
+        content_w: i32,
+        draw: bool,
+    ) i32 {
         const line_h = self.px(LINE_H);
         const block_gap = self.px(BLOCK_GAP);
         _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
 
-        var y: i32 = pad;
+        var y: i32 = y0;
         for (self.blocks, 0..) |block, bi| {
             if (bi > 0) y += block_gap;
             const h: i32 = switch (block) {
                 .text => |segs| blk: {
-                    _ = self.drawInlineLine(hdc, pad, y, line_h, segs, 0, false, draw);
+                    _ = self.drawInlineLine(hdc, x0, y, line_h, segs, 0, false, draw);
                     break :blk line_h;
                 },
                 .heading => |h| blk: {
                     const hpx = heading_px[@min(h.level - 1, 5)];
                     const hl = self.px(hpx * 4.0 / 3.0);
-                    _ = self.drawInlineLine(hdc, pad, y, hl, h.content, @min(h.level, 6), false, draw);
+                    _ = self.drawInlineLine(hdc, x0, y, hl, h.content, @min(h.level, 6), false, draw);
                     break :blk hl;
                 },
                 .rule => blk: {
-                    if (draw) self.drawHLine(hdc, pad, client_w - pad, y);
+                    if (draw) self.drawHLine(hdc, x0, x0 + content_w, y);
                     break :blk 1;
                 },
-                .list => |items| self.renderList(hdc, items, pad, y, draw),
-                .table => |t| self.renderTable(hdc, t, pad, y, draw),
+                .list => |items| self.renderList(hdc, items, x0, y, draw),
+                .table => |t| self.renderTable(hdc, t, x0, y, draw),
             };
             y += h;
         }
-        return y - pad;
+        return y - y0;
     }
 
-    /// Chevron toggle hit rect (top-right corner), in client coords.
+    /// Chevron toggle hit rect (the card's top-right corner), in client
+    /// coords — inside the card, not the band (T131).
     fn chevronRect(self: *BannerOverlay, client_w: i32) w32.RECT {
         const side = self.px(24.0);
+        const margin = self.px(MARGIN);
         return .{
-            .left = client_w - side,
-            .top = 0,
-            .right = client_w,
-            .bottom = side,
+            .left = client_w - margin - side,
+            .top = margin,
+            .right = client_w - margin,
+            .bottom = margin + side,
         };
     }
 
-    /// Paint the strip: background, blocks, collapse fade + chevron,
-    /// bottom divider. Rebuilds the link hit rects as a side effect.
+    /// Paint the band: the glass card backdrop (pane background + shadow +
+    /// card), then the blocks inside the card, then collapse fade +
+    /// chevron. Rebuilds the link hit rects as a side effect.
     fn paint(self: *BannerOverlay, hdc: w32.HDC) void {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(self.hwnd, &client) == 0) return;
 
-        if (self.bg_brush) |brush| _ = w32.FillRect(hdc, &client, brush);
+        self.paintCardBackdrop(hdc, client);
 
         self.links.clearRetainingCapacity();
 
+        // Content lives inside the card: one margin, then one padding.
+        const inner = self.px(MARGIN) + self.px(PAD);
+        const content_w = @max(client.right - inner * 2, 1);
+
+        // Clip everything the content walker draws to the card's own
+        // rounded shape, so a collapsed banner's overflow (and any block
+        // wider than the card) stops at the card edge instead of spilling
+        // across the margin the terminal sees.
+        const clip = self.cardClipRegion(client);
+        defer if (clip) |rgn| {
+            _ = w32.SelectClipRgn(hdc, null);
+            _ = w32.DeleteObject(rgn);
+        };
+        if (clip) |rgn| _ = w32.SelectClipRgn(hdc, rgn);
+
         if (self.collapsed) {
-            // Clip content to the collapsed window: the strip window is
-            // already collapsed-height, so painting just overflows past
-            // the bottom; the fade below dissolves it (Mac mask parity).
-            _ = self.renderContent(hdc, client.right, true);
+            // Clip content to the collapsed card: the band is already
+            // collapsed-height, so painting just overflows past the
+            // bottom; the fade below dissolves it (Mac mask parity).
+            _ = self.renderContent(hdc, inner, inner, content_w, true);
             self.paintCollapseFade(hdc, client);
         } else {
-            _ = self.renderContent(hdc, client.right, true);
+            _ = self.renderContent(hdc, inner, inner, content_w, true);
         }
 
         if (self.collapsible) self.paintChevron(hdc, client);
-
-        // Bottom divider (Mac: Divider under the strip).
-        self.drawHLine(hdc, client.left, client.right, client.bottom - 1);
     }
 
-    /// Fade the tail of collapsed content into the strip background: an
-    /// alpha-ramp DIB of the bg color blended over the lower portion
-    /// (Mac: linear mask opaque→clear from 55% to 100%).
+    /// The card's rounded shape as a GDI region (client coords), for
+    /// clipping content to it. Null when the region cannot be created —
+    /// callers then draw unclipped rather than not at all.
+    fn cardClipRegion(self: *BannerOverlay, client: w32.RECT) ?*anyopaque {
+        const margin = self.px(MARGIN);
+        const r = self.px(card.RADIUS);
+        const left = client.left + margin;
+        const top = client.top + margin;
+        const right = client.right - margin;
+        const bottom = client.bottom - margin;
+        if (right <= left or bottom <= top) return null;
+        return w32.CreateRoundRectRgn(left, top, right + 1, bottom + 1, r * 2, r * 2);
+    }
+
+    /// Blit the cached glass-card backdrop, regenerating it when the band
+    /// size, the pane background, or the DPI scale changed (T131). Falls
+    /// back to a flat card-fill rect if the DIB cannot be created.
+    fn paintCardBackdrop(self: *BannerOverlay, hdc: w32.HDC, client: w32.RECT) void {
+        const w = @max(client.right - client.left, 1);
+        const h = @max(client.bottom - client.top, 1);
+
+        const stale = self.card_dc == null or self.card_w != w or self.card_h != h or
+            !std.meta.eql(self.card_bg, self.pane_bg_rgb) or self.card_scale != self.scale;
+        if (stale) self.buildCardSurface(hdc, w, h);
+
+        if (self.card_dc) |mem| {
+            _ = w32.BitBlt(hdc, 0, 0, w, h, mem, 0, 0, w32.SRCCOPY);
+            return;
+        }
+        if (self.bg_brush) |brush| _ = w32.FillRect(hdc, &client, brush);
+    }
+
+    fn buildCardSurface(self: *BannerOverlay, hdc: w32.HDC, w: i32, h: i32) void {
+        self.releaseCardSurface();
+
+        var bmi = std.mem.zeroes(w32.BITMAPINFO);
+        bmi.bmiHeader.biSize = @sizeOf(w32.BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+
+        const mem_dc = w32.CreateCompatibleDC(hdc) orelse return;
+        var bits: ?*anyopaque = null;
+        const bmp = w32.CreateDIBSection(mem_dc, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse {
+            _ = w32.DeleteDC(mem_dc);
+            return;
+        };
+        const raw = bits orelse {
+            _ = w32.DeleteObject(bmp);
+            _ = w32.DeleteDC(mem_dc);
+            return;
+        };
+        _ = w32.SelectObject(mem_dc, bmp);
+
+        const pixels = @as([*]u32, @ptrCast(@alignCast(raw)));
+        const count: usize = @intCast(w * h);
+        card.render(
+            pixels[0..count],
+            card.Metrics.init(w, h, self.scale),
+            self.pane_bg_rgb,
+        );
+
+        self.card_dc = mem_dc;
+        self.card_bmp = bmp;
+        self.card_bits = pixels;
+        self.card_w = w;
+        self.card_h = h;
+        self.card_bg = self.pane_bg_rgb;
+        self.card_scale = self.scale;
+    }
+
+    fn releaseCardSurface(self: *BannerOverlay) void {
+        if (self.card_dc) |dc| _ = w32.DeleteDC(dc);
+        if (self.card_bmp) |b| _ = w32.DeleteObject(b);
+        self.card_dc = null;
+        self.card_bmp = null;
+        self.card_bits = null;
+        self.card_w = 0;
+        self.card_h = 0;
+        self.card_scale = 0;
+    }
+
+    /// Fade the tail of collapsed content into the card fill: an
+    /// alpha-ramp DIB of the fill color blended over the lower portion of
+    /// the CARD (Mac: linear mask opaque→clear from 55% to 100%). Spans the
+    /// card, not the band — the margins around it are pane background.
     fn paintCollapseFade(self: *BannerOverlay, hdc: w32.HDC, client: w32.RECT) void {
-        const total = client.bottom - 1; // above the divider
-        const fade_top = @divTrunc(total * 45, 100);
-        const fade_h = total - fade_top;
+        const margin = self.px(MARGIN);
+        const card_top = client.top + margin;
+        const card_bottom = client.bottom - margin;
+        const card_h = card_bottom - card_top;
+        if (card_h <= 0) return;
+        const fade_top = card_top + @divTrunc(card_h * 45, 100);
+        const fade_h = card_bottom - fade_top;
         if (fade_h <= 0) return;
 
         var bmi = std.mem.zeroes(w32.BITMAPINFO);
@@ -881,7 +1042,9 @@ pub const BannerOverlay = struct {
     fn paintChevron(self: *BannerOverlay, hdc: w32.HDC, client: w32.RECT) void {
         const rect = self.chevronRect(client.right);
         const cx = @divTrunc(rect.left + rect.right, 2);
-        const cy = self.px(PAD) + @divTrunc(self.px(LINE_H), 2);
+        // Vertically centered on the card's first content line (the card
+        // starts one margin down from the band top, T131).
+        const cy = self.px(MARGIN) + self.px(PAD) + @divTrunc(self.px(LINE_H), 2);
         const half = self.px(CHEV_W);
         const rise = self.px(CHEV_H);
         const pen = w32.CreatePen(0, @max(1, self.px(1.6)), self.secondary());

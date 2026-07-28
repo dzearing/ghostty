@@ -15,6 +15,14 @@
 #   - A screen-pixel probe inside the strip is BRIGHTER than the dark pane
 #     background while the banner is up and reverts after --clear (proves
 #     the strip reaches the glass, not just the data model).
+#   - T131 (glass card): the banner is a FLOATING CARD, not a full-width
+#     strip. The band's own corners read the pane background EXACTLY (the
+#     card is inset by a uniform margin and the window is opaque, so
+#     nothing behind the band can bleed through — that see-through was the
+#     "text scrolls behind the banner" report), the card interior is the
+#     Mac wash `white @ 6%` over the pane background, an elevation shadow
+#     darkens the band just under the card, and the composited screen
+#     pixel EQUALS the own-DC pixel (proof the window is fully opaque).
 #   - A heading is taller than a plain line; an `---` rule line is thinner
 #     than a text line; a pipe table renders 3 display rows from 4 source
 #     lines (the separator row never renders).
@@ -311,8 +319,16 @@ function Get-Overlay([uint32]$procId, [IntPtr]$top, [int]$i = 0) {
 
 Kill-RepoInstances
 
-# Pinned dark background so the strip-brightness pixel oracle is stable.
-$proc = Start-Process $exe -ArgumentList '--background=#101014' -PassThru
+# Pinned dark background so the card pixel oracles are stable, and session
+# persistence OFF so the run starts from a BLANK layout. Without that, the
+# previous run's layout restores — including its own `bw` window with the
+# `bp1` split still in it — and `+new-window --target=bw` idempotently
+# focuses that stale window instead of making a fresh one, so every banner
+# lands on the restored split's focused pane and pane 0 reads empty. That
+# made run 1 pass and runs 2..N fail identically (T131).
+# (`=false`, not `=off`: the CLI bool parser takes true/false only — `off`
+# is silently rejected and the default `true` stays in force.)
+$proc = Start-Process $exe -ArgumentList '--background=#101014', '--session-persistence=false' -PassThru
 Start-Sleep -Seconds 3
 if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
 $pid32 = [uint32]$proc.Id
@@ -350,7 +366,9 @@ if ($ov) {
     $r = $ov -split ','; $c = $paneRect -split ','
     $oneLineH = [int]$r[3] - [int]$r[1]
     Assert (([int]$r[2] - [int]$r[0]) -eq ([int]$c[2] - [int]$c[0])) 'overlay spans the pane width'
-    Assert ($oneLineH -gt 0 -and $oneLineH -lt 80) "one-line strip height sane ($oneLineH px)"
+    # Band = card (2x padding + one line) + 2x the card's outer margin
+    # (T131), so the sane bound is looser than the pre-card strip's.
+    Assert ($oneLineH -gt 0 -and $oneLineH -lt 120) "one-line band height sane ($oneLineH px)"
 }
 
 # --- 2b. T101: the strip band is RESERVED — grid starts below the banner ---
@@ -363,9 +381,10 @@ if ($ov) {
     Assert (([int]$c[3]) -eq ([int]$pre[3])) 'pane bottom unchanged (terminal shrank, not shifted)'
 } else { $script:fail += 2 }
 
-# --- 3. strip paints the exact lightened color; composites to the glass ---
-# Own-DC read is deterministic (z-order/overlap immune): the strip fill is
-# pinned to color_math.lighten(#101014, 0.09) = rgb(33,33,41).
+# --- 3. T131 glass card: floating, opaque, exact wash fill ---------------
+# The band is the pane background with a rounded card floating a uniform
+# margin inside it. Oracles are pinned to #101014: the card fill is Mac's
+# `white @ 6%` composite = rgb(30,30,34), the band is rgb(16,16,20).
 if ($ov) {
     # Composited check: park the whole window in the topmost band at a
     # fixed spot so no unrelated desktop window (browser, console) can
@@ -378,28 +397,52 @@ if ($ov) {
     Assert ($null -ne $ov) 'overlay re-glued above the pane after a window move'
     if ($ov) {
         $r = $ov -split ','
-        $sx = [int]$r[0] + [int](([int]$r[2] - [int]$r[0]) * 0.9)
-        $sy = [int]$r[1] + [int]($oneLineH / 2)
-        $stripPx = Get-ScreenPx $sx $sy
-        $sp = $stripPx -split ','
-        # 94.9% strip (33,33,41) over 5.1% pane bg (16,16,20) = ~(32,32,40).
-        $okBand = ([math]::Abs([int]$sp[0] - 32) -le 6) -and
-            ([math]::Abs([int]$sp[1] - 32) -le 6) -and
-            ([math]::Abs([int]$sp[2] - 40) -le 6)
-        Assert $okBand "composited strip is the alpha-blended fill (got $stripPx, want ~32,32,40)"
-
-        # Own-DC read pins the exact painted fill. NOTE: must run AFTER the
-        # composited sample — GetDC on an SLWA layered window knocks its
-        # surface out of the DWM composite until the next repaint.
         $ovH = [IntPtr]([int64]$r[4])
         $ow = [int]$r[2] - [int]$r[0]
-        $own = [BannerDrv]::OwnPixel($ovH, [int]($ow * 0.9), [int]($oneLineH / 2))
-        Assert ($own -eq '33,33,41') "strip surface is lighten(bg, 0.09) exactly (got $own)"
+        # Sample low in the card, where neither specular ramp is in play
+        # (the sheen has faded, the bottom darkening starts at 75%).
+        $cardY = [int]($oneLineH * 0.72)
+        $sx = [int]$r[0] + [int]($ow * 0.9)
+        $sy = [int]$r[1] + $cardY
+        $stripPx = Get-ScreenPx $sx $sy
+        $sp = $stripPx -split ','
+        $okBand = ([math]::Abs([int]$sp[0] - 30) -le 3) -and
+            ([math]::Abs([int]$sp[1] - 30) -le 3) -and
+            ([math]::Abs([int]$sp[2] - 34) -le 3)
+        Assert $okBand "composited card is the white@6% wash (got $stripPx, want ~30,30,34)"
+
+        # The band's own top-left corner is OUTSIDE the card: it must read
+        # the pane background EXACTLY. A translucent overlay (the pre-T131
+        # strip) leaks whatever is behind the band through here — that is
+        # the "text scrolls behind the banner" bug, and it fails this.
+        $cornerPx = Get-ScreenPx ([int]$r[0] + 2) ([int]$r[1] + 2)
+        Assert ($cornerPx -eq '16,16,20') "band corner is the pane background, opaque (got $cornerPx)"
+
+        # Own-DC reads pin the exact painted pixels. NOTE: must run AFTER
+        # the composited samples — GetDC on a layered window can knock its
+        # surface out of the DWM composite until the next repaint.
+        $own = [BannerDrv]::OwnPixel($ovH, [int]($ow * 0.9), $cardY)
+        Assert ($own -eq $stripPx) "card is fully opaque: composited pixel == own-DC pixel ($stripPx vs $own)"
+        $ownCorner = [BannerDrv]::OwnPixel($ovH, 2, 2)
+        Assert ($ownCorner -eq '16,16,20') "card is inset by a margin on every side (corner $ownCorner)"
+
+        # Elevation shadow: somewhere in the bottom margin the band is
+        # DARKER than the bare pane background (the margin is DPI-scaled,
+        # so scan it rather than pinning one row).
+        $darkest = 999
+        $shadowPx = ''
+        for ($dy = 2; $dy -le 14; $dy++) {
+            $s = [BannerDrv]::OwnPixel($ovH, [int]($ow / 2), $oneLineH - $dy)
+            $parts = $s -split ','
+            $sum = [int]$parts[0] + [int]$parts[1] + [int]$parts[2]
+            if ($sum -lt $darkest) { $darkest = $sum; $shadowPx = $s }
+        }
+        Assert ($darkest -lt 52) "elevation shadow darkens the band under the card (darkest $shadowPx vs bg 16,16,20)"
     } else {
-        $script:fail += 2
+        $script:fail += 5
     }
 } else {
-    $script:fail += 3
+    $script:fail += 6
 }
 
 # --- 4. multi-line: \n grows the strip; 10-line display cap ---------------
@@ -480,8 +523,10 @@ $ovC = Get-Overlay $pid32 $top
 if ($ovC) {
     $r = $ovC -split ','
     $ovhH = [IntPtr]([int64]$r[4])
-    # First list row's marker gutter sits just inside the 12dip padding.
-    $green = [BannerDrv]::ScanGreen($ovhH, 5, 5, 45, 45)
+    # First list row's marker gutter sits just inside the card's 12dip
+    # padding, which is itself one 12dip card margin in from the band edge
+    # (T131) — so scan from the band origin out past both.
+    $green = [BannerDrv]::ScanGreen($ovhH, 5, 5, 80, 80)
     Assert ($green -ge 3) "checked box paints green check pixels ($green found)"
     # Force a repaint so the own-DC read doesn't leave a stale composite.
     & $exe +set-banner --target=bw "[x] done\n[ ] todo" | Out-Null
