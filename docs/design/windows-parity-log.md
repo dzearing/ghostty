@@ -9,6 +9,34 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-27 (later still) - T113 IN-PROGRESS, first validation run: 4 failures
+  of ~35, and the core is green. A/B/D/E all pass, which is the hard half --
+  ids are real UUIDs, distinct per pane, resolve with no prior registration,
+  and survive BOTH an app-quit re-attach and an agent-restart RELAUNCH with
+  the respawned shell baked with the same id.
+
+  C2/C3 (legacy 0x/decimal surface-id aliases) are probably a HARNESS defect,
+  not a product one. Hand-verified on a hermetic exec instance that both
+  spellings resolve and land a banner (exit 0, banner readable back). The
+  harness asserts them through Marker-LandsIn, which echoes into a SPLIT pane
+  and reads it back -- and a split inside the harness's -WindowStyle Minimized
+  window can be about ONE COLUMN wide. My own repro hit exactly that: +read
+  returned the prompt one character per line. That would shred the marker.
+  Do not "fix" the product for C2/C3 before re-running with a real window.
+
+  F4/F5 is the real remaining work: a launcher that already carries
+  GHOZTTY_PANE_ID poisons the panes it opens -- the inherited value wins over
+  the pane's own. The bake itself is fine (unconditional, applied after the
+  IPC overrides), so the fault is downstream in how config.env reaches the
+  child: exec env_override ordering, or the agent OPEN env. Note the harness
+  comment at section C already flags a sibling of this for GHOSTTY_SURFACE_ID
+  on agent panes and blames T117 -- worth checking whether that is the same
+  defect wearing two hats.
+
+  Stopped here deliberately per the go.md context rule rather than pushing on:
+  this context had already absorbed a 70-commit merge, a full parity audit,
+  and a user-reported outage diagnosis.
+
 - 2026-07-27 (later) - T129 filed, T113 priority raised, loop found DEAD. The
   user surfaced two banner complaints and both were worth having.
 
