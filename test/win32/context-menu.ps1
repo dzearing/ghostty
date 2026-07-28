@@ -16,6 +16,10 @@
 #      the message wparam).
 #   E: `right-click-action = paste` opt-out — right-click pastes, no menu
 #      (the Windows-Terminal-style behavior, as a config choice).
+#   G: T129 discoverability — the menu carries "Set Pane Banner..." labeled
+#      with its accelerator (Ctrl+Shift+B, NOT the Mac cmd+r), the label
+#      tracks the live keybind set (a rebind relabels it), and choosing the
+#      row opens the banner editor.
 #
 # All input is PostMessage-driven (client-coordinate mouse messages with
 # crafted MK_* wparam bits), so the script needs neither foreground nor
@@ -120,6 +124,35 @@ public class CtxMenuDrv {
             return true;
         }, IntPtr.Zero);
         return found;
+    }
+
+    // Visible top-level window of a class owned by pid (T129 uses it to see
+    // the banner editor the menu row opens), or zero.
+    public static IntPtr WindowOfClass(uint pid, string cls) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            var sb = new StringBuilder(64);
+            GetClassNameW(h, sb, 64);
+            if (sb.ToString() == cls && IsWindowVisible(h)) {
+                uint p; GetWindowThreadProcessId(h, out p);
+                if (p == pid) { found = h; return false; }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    public static IntPtr WaitClass(uint pid, string cls, int ms) {
+        for (int t = 0; t < ms; t += 50) {
+            IntPtr h = WindowOfClass(pid, cls);
+            if (h != IntPtr.Zero) return h;
+            Thread.Sleep(50);
+        }
+        return IntPtr.Zero;
+    }
+
+    public static void CloseWindow(IntPtr h) {
+        PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero); // WM_CLOSE
     }
 
     public static IntPtr WaitMenu(uint pid, int ms) {
@@ -236,14 +269,44 @@ function Dump-Items([string[]]$items, [string]$label) {
     Write-Host "      $label items: $($items -join ' | ')"
 }
 
+# MenuItems returns "Base[<tab>Accel][:grayed][:checked]" (T129 added the
+# accelerator half). Split it back apart so the item-list compare stays about
+# labels/flags and the accelerator gets its own assertions.
+function Split-Item([string]$s) {
+    $flags = ''
+    $more = $true
+    while ($more) {
+        $more = $false
+        foreach ($f in @(':grayed', ':checked')) {
+            if ($s.EndsWith($f)) { $flags = $f + $flags; $s = $s.Substring(0, $s.Length - $f.Length); $more = $true }
+        }
+    }
+    $accel = ''
+    $tab = $s.IndexOf("`t")
+    if ($tab -ge 0) { $accel = $s.Substring($tab + 1); $s = $s.Substring(0, $tab) }
+    [pscustomobject]@{ Base = $s; Accel = $accel; Flags = $flags; Label = ($s + $flags) }
+}
+
+function Split-Items([string[]]$items) { $items | ForEach-Object { Split-Item $_ } }
+
+# Accelerator for a base label, or '' when the row has none / is missing.
+function Accel-For($parsed, [string]$base) {
+    $row = @($parsed | Where-Object { $_.Base -eq $base })
+    if ($row.Count -eq 0) { return $null }
+    $row[0].Accel
+}
+
 # The Mac surface menu (menu(for:)) + win32's Select All; the exact rows the
 # pure context_menu.zig model must produce on a pane with no selection.
+#
+# Accelerator suffixes are stripped before the compare (see Split-Item);
+# section G asserts those separately.
 $expected = @(
     'Copy:grayed', 'Paste', 'Select All', '---',
     'Split Right', 'Split Left', 'Split Down', 'Split Up', '---',
     'Reset Terminal', 'Terminal Read-only', '---',
     'Background Color...', '---',
-    'Change Tab Title...', 'Change Pane Title...'
+    'Change Tab Title...', 'Change Pane Title...', 'Set Pane Banner...'
 )
 
 # ---------------------------------------------------------------------------
@@ -260,13 +323,28 @@ $menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
 Assert ($menuWnd -ne [IntPtr]::Zero) 'F: WM_CONTEXTMENU (VK_APPS path) opens the menu'
 if ($menuWnd -ne [IntPtr]::Zero) {
     $items = [CtxMenuDrv]::MenuItems($menuWnd)
+    $parsed = @(Split-Items $items)
     Assert ($items.Count -eq $expected.Count) "F: menu has $($expected.Count) rows (got $($items.Count))"
     $mismatch = @()
-    for ($i = 0; $i -lt [Math]::Min($items.Count, $expected.Count); $i++) {
-        if ($items[$i] -ne $expected[$i]) { $mismatch += "row $i got '$($items[$i])' want '$($expected[$i])'" }
+    for ($i = 0; $i -lt [Math]::Min($parsed.Count, $expected.Count); $i++) {
+        if ($parsed[$i].Label -ne $expected[$i]) { $mismatch += "row $i got '$($parsed[$i].Label)' want '$($expected[$i])'" }
     }
     Assert ($mismatch.Count -eq 0) 'F: item order/labels/flags match the Mac surface menu'
     if ($mismatch.Count) { $mismatch | ForEach-Object { Write-Host "      $_" }; Dump-Items $items 'F' }
+
+    # G: the banner row and its self-teaching accelerator (T129).
+    $bannerAccel = Accel-For $parsed 'Set Pane Banner...'
+    Assert ($null -ne $bannerAccel) 'G: menu carries a "Set Pane Banner..." row'
+    Assert ($bannerAccel -eq 'Ctrl+Shift+B') "G: banner row is labeled Ctrl+Shift+B (got '$bannerAccel')"
+    # The whole point of the row: the Windows chord is NOT the Mac one.
+    Assert ($bannerAccel -notmatch 'Win\+R|Ctrl\+R$') 'G: banner accelerator is not the Mac cmd+r chord'
+    # Accelerators are a menu-wide affordance, not a one-off for the banner.
+    $withAccel = @($parsed | Where-Object { $_.Accel -ne '' })
+    Assert ($withAccel.Count -ge 3) "G: bound items show their chords (got $($withAccel.Count) labeled rows)"
+    Write-Host "      G accels: $(($withAccel | ForEach-Object { "$($_.Base)=$($_.Accel)" }) -join ' | ')"
+    # An action with no default bind must show a bare label, not an empty tab.
+    $unbound = @($parsed | Where-Object { $_.Base -eq 'Background Color...' })
+    Assert ($unbound.Count -eq 1 -and $unbound[0].Accel -eq '') 'G: apprt-local row (Background Color...) shows no chord'
 }
 [CtxMenuDrv]::CancelMenu($pane)
 Assert ([CtxMenuDrv]::WaitMenuGone($gpid, 2000)) 'F: WM_CANCELMODE dismisses the menu'
@@ -285,8 +363,10 @@ $menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
 Assert ($menuWnd -ne [IntPtr]::Zero) 'A: right-click opens the context menu'
 if ($menuWnd -ne [IntPtr]::Zero) {
     $items = [CtxMenuDrv]::MenuItems($menuWnd)
-    Assert ($items.Count -gt 0 -and $items[0] -eq 'Copy') 'A: right-click on text selects the word (Copy enabled)'
-    if ($items.Count -gt 0 -and $items[0] -ne 'Copy') { Dump-Items $items 'A' }
+    $parsed = @(Split-Items $items)
+    $copyOk = ($parsed.Count -gt 0 -and $parsed[0].Label -eq 'Copy')
+    Assert $copyOk 'A: right-click on text selects the word (Copy enabled)'
+    if (-not $copyOk) { Dump-Items $items 'A' }
 }
 [CtxMenuDrv]::CancelMenu($pane)
 [CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
@@ -336,6 +416,27 @@ if ($menuWnd -ne [IntPtr]::Zero) {
 Assert $unchecked 'C: Terminal Read-only unchecked after second toggle'
 [CtxMenuDrv]::CancelMenu($pane)
 [CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+
+# G: choosing the banner row opens the editor. The row is last, so Up from a
+# fresh menu lands on it (no letter key: Select All / the four Splits / Set
+# Pane Banner all start with S).
+[CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
+$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Assert ($menuWnd -ne [IntPtr]::Zero) 'G: menu reopens for the banner-row test'
+[CtxMenuDrv]::PostKey($pane, 0x26) # VK_UP -> last item
+[CtxMenuDrv]::PostKey($pane, 0x0D) # VK_RETURN -> execute
+Assert ([CtxMenuDrv]::WaitMenuGone($gpid, 2000)) 'G: choosing the banner row closes the menu'
+$dlg = [CtxMenuDrv]::WaitClass($gpid, 'GhozttyBannerDialog', 3000)
+Assert ($dlg -ne [IntPtr]::Zero) 'G: banner row opens the banner editor (GhozttyBannerDialog)'
+if ($dlg -ne [IntPtr]::Zero) {
+    [CtxMenuDrv]::CloseWindow($dlg)
+    $gone = $false
+    for ($t = 0; $t -lt 40; $t++) {
+        Start-Sleep -Milliseconds 50
+        if ([CtxMenuDrv]::WindowOfClass($gpid, 'GhozttyBannerDialog') -eq [IntPtr]::Zero) { $gone = $true; break }
+    }
+    Assert $gone 'G: banner editor closes again'
+}
 
 Assert (-not $proc.HasExited) 'run 1: no crash'
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
@@ -419,6 +520,29 @@ for ($try = 0; $try -lt 3 -and -not $pasted2; $try++) {
 Assert $pasted2 'E: right-click-action=paste pastes the clipboard'
 
 Assert (-not $proc.HasExited) 'run 3: no crash'
+Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+# Run 4: section G — the accelerator label is read from the live keybind set,
+# not hardcoded. A user bind added after the defaults wins the reverse map, so
+# the row must relabel itself (and the banner must still be reachable).
+# ---------------------------------------------------------------------------
+$g = Start-Gui 'rebind' @('--keybind=ctrl+alt+k=prompt_surface_banner')
+$proc = $g.Proc; $pane = $g.Pane
+$gpid = [uint32]$proc.Id
+
+[CtxMenuDrv]::PostKeyboardMenu($pane)
+$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Assert ($menuWnd -ne [IntPtr]::Zero) 'G: menu opens under the rebind config'
+if ($menuWnd -ne [IntPtr]::Zero) {
+    $parsed = @(Split-Items ([CtxMenuDrv]::MenuItems($menuWnd)))
+    $accel = Accel-For $parsed 'Set Pane Banner...'
+    Assert ($accel -eq 'Ctrl+Alt+K') "G: rebinding relabels the row (got '$accel')"
+}
+[CtxMenuDrv]::CancelMenu($pane)
+[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+
+Assert (-not $proc.HasExited) 'run 4: no crash'
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 Kill-RepoInstances
 

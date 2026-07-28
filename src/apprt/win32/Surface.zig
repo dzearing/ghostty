@@ -2971,7 +2971,15 @@ fn openContextMenu(self: *Surface, client_x: i32, client_y: i32) void {
             var flags: u32 = w32.MF_STRING;
             if (!c.enabled) flags |= w32.MF_GRAYED;
             if (c.checked) flags |= w32.MF_CHECKED;
-            _ = w32.AppendMenuW(menu, flags, @intFromEnum(c.id), c.title.ptr);
+            // AppendMenuW copies the string, so a per-item stack buffer is
+            // enough to carry the accelerator label.
+            var label: [96]u16 = undefined;
+            _ = w32.AppendMenuW(
+                menu,
+                flags,
+                @intFromEnum(c.id),
+                self.menuLabel(c.id, c.title, &label),
+            );
         },
     };
 
@@ -2991,26 +2999,51 @@ fn openContextMenu(self: *Surface, client_x: i32, client_y: i32) void {
         context_menu.Id,
         @as(usize, @intCast(cmd)),
     ) catch return; // 0 = dismissed without choosing
-    const binding: input.Binding.Action = switch (id) {
-        .copy => .{ .copy_to_clipboard = .mixed },
-        .paste => .paste_from_clipboard,
-        .select_all => .select_all,
-        .split_right => .{ .new_split = .right },
-        .split_left => .{ .new_split = .left },
-        .split_down => .{ .new_split = .down },
-        .split_up => .{ .new_split = .up },
-        .reset => .reset,
-        .readonly => .toggle_readonly,
-        .tab_title => .prompt_tab_title,
-        .pane_title => .prompt_surface_title,
-        .bg_color => {
-            self.pickBackgroundColor();
-            return;
-        },
-    };
+    if (id == .bg_color) {
+        self.pickBackgroundColor();
+        return;
+    }
+    // Everything else is a binding action, and it is the SAME action the
+    // item's accelerator hint was formatted from (context_menu.action).
+    const binding = context_menu.action(id) orelse return;
     _ = self.core_surface.performBindingAction(binding) catch |err| {
         log.err("context menu action failed err={}", .{err});
     };
+}
+
+/// Menu item text for `id`: the base title, plus a tab and the accelerator
+/// when the live keybind set has a trigger for the item's action — the
+/// Windows convention, and the app's only self-teaching surface for chords
+/// (T129: the pane banner's ctrl+shift+b differs from the Mac cmd+r and was
+/// named nowhere, so users concluded the feature was broken). Reading the
+/// trigger from config means a rebind relabels the menu, and an unbound
+/// action simply shows no hint.
+///
+/// Returns a pointer into `buf`, or `title` itself when there is no chord.
+fn menuLabel(
+    self: *const Surface,
+    id: context_menu.Id,
+    title: [:0]const u16,
+    buf: *[96]u16,
+) [*:0]const u16 {
+    const act = context_menu.action(id) orelse return title.ptr;
+    const trigger = self.app.config.keybind.set.getTrigger(act) orelse return title.ptr;
+
+    var accel: [64]u8 = undefined;
+    const accel_len = formatTrigger(trigger, &accel);
+    if (accel_len == 0) return title.ptr;
+
+    // title + '\t' + accel + NUL; fall back to the bare title if it can't fit
+    // (accel is ASCII, so one u16 per byte).
+    if (title.len + 1 + accel_len + 1 > buf.len) return title.ptr;
+    @memcpy(buf[0..title.len], title[0..title.len]);
+    var pos = title.len;
+    buf[pos] = '\t';
+    pos += 1;
+    pos += std.unicode.utf8ToUtf16Le(buf[pos..], accel[0..accel_len]) catch
+        return title.ptr;
+    buf[pos] = 0;
+    return @ptrCast(buf);
 }
 
 /// The pane's effective background: the explicit/inherited tint when set,
