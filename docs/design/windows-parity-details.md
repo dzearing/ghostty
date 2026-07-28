@@ -5759,6 +5759,57 @@ once with `compile exe helpgen … error code 5` and no error text — a transie
 file-lock/AV exit, green on an immediate re-run; noting it because go.md's rule
 is that a lane failing with no `error:` line did not really fail.)
 
+## T129 — banner editor undiscoverable on win32
+
+Filed 2026-07-27 by T113, from the same user report. "ctrl-r doesn't rename
+them" was not a broken feature: Windows binds the banner editor to
+**ctrl+shift+b** on purpose (`Config.zig:7005` — plain ctrl+r is the shell's
+reverse history search and ctrl+shift+r is the cross-platform rename). The
+defect was that nothing in the app ever named the chord, so a user who knew the
+Mac one (cmd+r) had no way to find the Windows one and concluded the feature
+was gone.
+
+**Where the gap actually was.** The command palette was already fine: it has a
+"Set Pane Banner…" entry (`Surface.zig` `palette_entries`) *and* draws a keybind
+hint next to every entry from `keybind.set.getTrigger`. The context menu was
+not: it is the only menu surface Windows has (no menu bar), Mac reaches the
+banner editor from its menu bar, and `context_menu.zig` had no banner row — and
+no accelerators on any row, so even the rows it had taught nothing.
+
+**Fix (two parts, both in the pure model + its win32 renderer):**
+
+- A `banner` id and a "Set Pane Banner..." row closing the labeling group after
+  Change Tab/Pane Title. This is a deliberate *divergence* from
+  `menu(for:)` — Mac's surface menu has no banner row either, because Mac does
+  not need one.
+- `context_menu.action(id)` — the id→binding-action map, moved out of
+  `Surface.zig`'s dispatch switch into the model. That is what keeps the label
+  honest: `Surface.menuLabel` formats the accelerator from the trigger the live
+  keybind set has for *that* action, and dispatch performs the *same* action, so
+  the two cannot drift. Items are appended as `Title\tChord` (the Windows
+  convention); an action with no bound trigger, and the apprt-local Background
+  Color… row (`action` returns null), render bare. A user rebind wins the
+  reverse map, so the menu relabels itself.
+
+`AppendMenuW` copies its string, so a per-item stack buffer is enough; a label
+that would not fit falls back to the bare title.
+
+**Validation:** `test/win32/context-menu.ps1` **ALL PASS (31) ×3**. Section G
+asserts the row exists, is labeled `Ctrl+Shift+B`, is *not* the Mac chord, that
+other bound rows are labeled too (6 of them on default config: Copy=Ctrl+Insert,
+Paste=Ctrl+V, Select All=Ctrl+Shift+A, Split Right=Ctrl+D, Split
+Down=Ctrl+Shift+D, Set Pane Banner=Ctrl+Shift+B), that the apprt-local row shows
+no chord, and — the behavioral half — that choosing the row (Up, Enter: the row
+is last, and six items start with "S") opens `GhozttyBannerDialog`. Run 4
+launches with `--keybind=ctrl+alt+k=prompt_surface_banner` and asserts the label
+follows to `Ctrl+Alt+K`, which is what proves the hint is read from config
+rather than hardcoded. Harness note: `MenuItems` now returns
+`Base<tab>Accel[:flags]`, so the item-list compare splits the accelerator off
+first (`Split-Item`) — sections A and F were updated with it.
+
+Both test lanes, `zig build test-agent`, P1–P3 and `pane-banner.ps1` (42) green
+at HEAD.
+
 ## T117 — Merge origin/main `1e1cdbbd2` (2026-07-27)
 
 70 commits since the T88 merge base (`8bb5d9845`). Merged, NOT rebased: the

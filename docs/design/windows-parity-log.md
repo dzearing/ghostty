@@ -9,6 +9,26 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-27 (latest) - T113 delivery VERIFIED + T129 DONE. Verified the T113
+  delivery from this session's own pane, which is the real-world test the row
+  asked for: upgrade log shows the exe + agent swap and the correct resume
+  command, `+list --json` reports the running build as `+43aa8b972`, the pane
+  exports `$GHOZTTY_PANE_ID`, and the plugin banner hook set this pane's banner
+  (read back out of the `banner` field). T129 then closed the other half of the
+  user's report: the ctrl+shift+b chord was correct but unnamed, so the win32
+  context menu (Windows' only menu surface) gained a "Set Pane Banner..." row,
+  and every bound row is now labeled `Title\tChord` from the LIVE keybind set --
+  `context_menu.action(id)` moved the id->action map into the pure model so the
+  label and the dispatch read the same source. Run 4 of the script rebinds the
+  action and asserts the label follows, which is what proves it isn't
+  hardcoded. `context-menu.ps1` ALL PASS (31) x3; both lanes + test-agent +
+  P1-P3 + pane-banner (42) green. DELIVERED to all 3 install locations
+  (user-facing discoverability fix): ReleaseFast gnu `-Dstrip=false` staged to
+  `zig-out-release`, portable + share swapped, installed release via the
+  detached upgrade script at the boundary. Next: T130 (make the plugin-side
+  banner-hook fixes durable -- they live only in this box's plugin cache), then
+  T38/T39.
+
 - 2026-07-27 (later still) - T113 IN-PROGRESS, first validation run: 4 failures
   of ~35, and the core is green. A/B/D/E all pass, which is the hard half --
   ids are real UUIDs, distinct per pane, resolve with no prior registration,
