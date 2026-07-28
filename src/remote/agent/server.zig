@@ -752,6 +752,14 @@ pub const Server = struct {
         } else if (open.shell) |sh| {
             s.setArgv(sh);
         }
+        // Record the working directory the child was spawned in (T132). Without
+        // this the field stayed null for every session ever opened, so it was
+        // never written to `sessions.json` and `handleRelaunch` passed a null cwd
+        // — a session that outlived the agent (reboot, agent upgrade) respawned in
+        // the AGENT's own inherited cwd. On the win32 auto-launch path that is the
+        // launching process's cwd (`C:\Windows\System32` for a detached script),
+        // which is how a relaunched pane came back in the wrong directory.
+        if (open.cwd) |c| s.setCwd(c);
         // Pin persistent local sessions so the idle-TTL reaper never evicts them
         // while orphaned (§7.1, T11). Set by the local-agent client for panes the
         // viewer's session-layout manifest references; false for cross-machine.
@@ -1944,6 +1952,16 @@ const FakeSpawner = struct {
     last_env_val_len: usize = 0,
     last_term_buf: [32]u8 = undefined,
     last_term_len: usize = 0,
+    /// The LAST spawn's `OPEN.cwd` (T132): null when the OPEN carried none, so a
+    /// test can tell "spawned in the recorded directory" from "spawned wherever
+    /// the agent happened to be".
+    last_cwd_buf: [128]u8 = undefined,
+    last_cwd_len: ?usize = null,
+
+    fn lastCwd(self: *const FakeSpawner) ?[]const u8 {
+        const len = self.last_cwd_len orelse return null;
+        return self.last_cwd_buf[0..len];
+    }
 
     fn lastEnvKey(self: *const FakeSpawner) []const u8 {
         return self.last_env_key_buf[0..self.last_env_key_len];
@@ -1970,6 +1988,11 @@ const FakeSpawner = struct {
         }
         self.last_term_len = @min(open.term.len, self.last_term_buf.len);
         @memcpy(self.last_term_buf[0..self.last_term_len], open.term[0..self.last_term_len]);
+        if (open.cwd) |c| {
+            const n = @min(c.len, self.last_cwd_buf.len);
+            @memcpy(self.last_cwd_buf[0..n], c[0..n]);
+            self.last_cwd_len = n;
+        } else self.last_cwd_len = null;
         const fc = self.children[self.next];
         self.next += 1;
         return .{ .child = fc.child(), .pid = self.pid_base + @as(i64, @intCast(self.next)), .tty = self.tty };
@@ -3296,6 +3319,114 @@ test "RELAUNCH: reboot ring snapshot is replayed (scrollback + divider) before l
     const dp1 = try protocol.DataPayload.decode(d1.payload);
     try testing.expectEqual(@as(u64, want.len), dp1.byte_offset);
     try testing.expectEqualSlices(u8, "fresh-prompt$ ", dp1.bytes);
+}
+
+test "OPEN records cwd → sessions.json carries it (T132 reboot floor)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0x132);
+
+    // The store only BORROWS `meta_path`, and the server's threads can write
+    // through it until `h.deinit()` joins them — so the temp dir and the path
+    // must be declared BEFORE the harness, making their (LIFO) cleanup run
+    // AFTER it. The reverse order is a use-after-free, not a test-only nit.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const meta_path = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(meta_path);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    h.store.meta_path = meta_path;
+
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // The exact shape the loop's relaunch script sends: run a command, in a
+    // named directory, pinned (a persistent local pane).
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{
+        .command = "claude --continue",
+        .cwd = "/work/ghoztty",
+        .rows = 24,
+        .cols = 80,
+        .pinned = true,
+    });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+
+    // The spawn itself got the directory (it always did) ...
+    try testing.expectEqualStrings("/work/ghoztty", sp.lastCwd().?);
+
+    // ... and so does the session, so the reboot floor on disk can relaunch
+    // there. Before T132 `cwd` was dropped here and the record had none.
+    h.store.mutex.lock();
+    const s = h.store.table.getByIdStr(op.value.session_id).?;
+    try testing.expectEqualStrings("/work/ghoztty", s.cwd.?);
+    h.store.mutex.unlock();
+
+    // `handleOpen` persists on its own thread right after OPENED; persist here
+    // so the read below is ordered rather than racing that write.
+    h.store.persistMeta();
+
+    const session_meta = @import("session_meta.zig");
+    var parsed = (try session_meta.load(alloc, meta_path)).?;
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.sessions.len);
+    try testing.expectEqualStrings("/work/ghoztty", parsed.value.sessions[0].cwd.?);
+    try testing.expectEqualStrings("claude --continue", parsed.value.sessions[0].argv.?);
+}
+
+test "RELAUNCH respawns in the RECORDED cwd, not the agent's (T132)" {
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0x133);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // A tombstone materialized from sessions.json after an agent restart —
+    // the state the loop's panes were in when the upgrade script replaced the
+    // agent binary.
+    const rec_id = "dededededededededededededededede";
+    h.server.store.mutex.lock();
+    _ = (h.server.store.table.materialize(.{
+        .id = rec_id,
+        .argv = "claude --continue",
+        .cwd = "/work/ghoztty",
+        .pinned = true,
+        .created_ms = 50,
+    }, 4096, h.clock.ms) catch unreachable).?;
+    h.server.store.mutex.unlock();
+
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 24,
+        .cols = 80,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+
+    // The respawn ran in the recorded directory. With no recorded cwd this is
+    // null and the child inherits the AGENT's cwd — on the win32 auto-launch
+    // path, the launching script's (`C:\Windows\System32`).
+    try testing.expectEqualStrings("/work/ghoztty", sp.lastCwd().?);
 }
 
 test "RELAUNCH: unknown session id → not found (client falls back to OPEN)" {

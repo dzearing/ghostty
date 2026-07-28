@@ -1592,7 +1592,18 @@ pub fn performIpc(
     ) catch |err| switch (err) {
         error.NoRunningInstance => switch (comptime action) {
             .new_window => {
-                try autoLaunchInstance(alloc);
+                // T132: launch the GUI IN the requested directory. The app the
+                // request wakes up inherits the CLI's cwd, and everything it
+                // starts inherits it in turn — the startup window, any
+                // `working-directory = inherit` pane, and (crucially) the
+                // session-persistence agent it spawns, whose cwd is where a
+                // later RELAUNCH lands a session that recorded none. A detached
+                // launcher script sits in `C:\Windows\System32`, so without this
+                // the auto-launched instance and its agent do too.
+                try autoLaunchInstance(
+                    alloc,
+                    apprt.ipc.args.autoLaunchDirectory(value.arguments),
+                );
                 // The new instance needs to create its window and bind the
                 // pipe; a cold debug start on a busy box can take a while.
                 var attempt: usize = 0;
@@ -1622,8 +1633,12 @@ pub fn performIpc(
 /// GUI that inherits the CLI's redirected stdout/stderr keeps the caller's
 /// pipes open — any script capturing `ghoztty +new-window` output would
 /// block until the GUI exits.
-fn autoLaunchInstance(alloc: Allocator) apprt.ipc.Errors!void {
-    _ = alloc;
+///
+/// `cwd` (T132) is the directory to start the instance in — the request's
+/// `--working-directory` when it named a real path. Null, or a path we cannot
+/// encode, falls back to inheriting our own cwd (the pre-T132 behavior); the
+/// re-sent IPC request still carries the flag, so the worst case is the old one.
+fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!void {
     const windows = std.os.windows;
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1639,6 +1654,15 @@ fn autoLaunchInstance(alloc: Allocator) apprt.ipc.Errors!void {
         return error.IPCFailed;
     cmd_w[cmd_len] = 0;
 
+    // Working directory for the new instance, NUL-terminated wide. Best-effort:
+    // an unencodable path just leaves it null (inherit ours) rather than
+    // failing the launch.
+    const cwd_w: ?[:0]const u16 = if (cwd) |c|
+        (std.unicode.utf8ToUtf16LeAllocZ(alloc, c) catch null)
+    else
+        null;
+    defer if (cwd_w) |w| alloc.free(w);
+
     var si: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
     si.cb = @sizeOf(windows.STARTUPINFOW);
     var pi: windows.PROCESS_INFORMATION = undefined;
@@ -1650,7 +1674,7 @@ fn autoLaunchInstance(alloc: Allocator) apprt.ipc.Errors!void {
         windows.FALSE, // no handle inheritance (see above)
         .{ .detached_process = true, .create_new_process_group = true },
         null,
-        null,
+        if (cwd_w) |w| w.ptr else null,
         &si,
         &pi,
     ) == 0) return error.IPCFailed;

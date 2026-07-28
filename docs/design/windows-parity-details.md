@@ -6118,6 +6118,74 @@ set the intent on exactly the dropped leaves and only those, so that any
 future tree-replacing path (recovery-style swaps) stays safe — i.e. adopt main's
 invariant in the win32 shape rather than copying its mechanism.
 
+## T132 — `--working-directory` lost on the auto-launch path (the loop-killer)
+
+**Done 2026-07-28.** The row's own repro was NOT the defect, and finding that out
+first is what made the fix correct. Filed symptom: the upgrade script relaunched
+with `+new-window --target=main --working-directory=D:\git\ghoztty
+--command="claude … --continue"` and the pane came up in `C:\Windows\System32`
+(the detached launcher's cwd), so `--continue` had no session to resume and
+Claude Code stopped on its trust prompt with nobody to answer — the loop was dead
+7h20m.
+
+**Measured first.** With no instance running, `+new-window
+--working-directory=<dir>` was run from `C:\Windows\System32` on the pre-fix
+build. The requested pane came up **correctly** in `<dir>` (`+list --json`
+*and* the shell's own `cd`), so the stated validation already passed. What was
+in `C:\Windows\System32` were the *other* panes on screen — the ones session
+restore had brought back. That reframed the whole task: the flag was not being
+dropped by the request path, it was never being **remembered** by the session.
+
+**Two real defects, both proven:**
+
+1. **The agent never recorded `OPEN.cwd`.** `session_meta.Record` has had a `cwd`
+   field all along, and `handleRelaunch` reads `s.cwd` to synthesize the respawn
+   — but `handleOpen` only ever set `argv`, so `s.cwd` was null for **every
+   session ever opened**. Ground truth on the box: all 37 sessions in the debug
+   agent's `sessions.json` had no `cwd` key at all. A session that outlived its
+   agent (reboot, or an agent upgrade — exactly what the upgrade script does when
+   it swaps `ghoztty-agent.exe`) therefore RELAUNCHed with a null cwd and
+   inherited **the agent's** cwd. This is shared code, so Mac had it too.
+2. **The auto-launch spawned the GUI with no working directory.**
+   `autoLaunchInstance` passed `lpCurrentDirectory = null` to `CreateProcessW`,
+   so the new instance inherited the CLI's cwd — and so did everything it
+   started: the startup window, every `working-directory = inherit` pane, and the
+   session-persistence agent it spawns. A detached launcher script sits in
+   `C:\Windows\System32`, which is precisely where defect 1 then dumped the
+   relaunched panes.
+
+**Fix.** (1) `Session.setCwd` (best-effort, mirrors `setArgv`, ignores empty
+strings) + `handleOpen` records `open.cwd`; it then flows to `sessions.json` via
+the existing `dupMetaRecord` path and back out through `materialize` →
+`handleRelaunch`. (2) A pure `apprt.ipc.args.autoLaunchDirectory` picks the
+request's `--working-directory` (last one wins; the `inherit`/`home` sentinels
+and empty values return null since they resolve elsewhere), and
+`autoLaunchInstance` passes it as `lpCurrentDirectory`. Unencodable paths fall
+back to today's inherit, so the worst case is the old behavior.
+
+**Validation:** new `test/win32/auto-launch-cwd.ps1`, ALL PASS (21) ×3, hermetic
+(per-run `LOCALAPPDATA` + `GHOSTTY_LOCAL_AGENT_BIN`; only ever kills `zig-out`
+processes). A = the request's pane is in `<dir>`, reported *and* asked of the
+shell; B = the auto-launched instance's **startup window** — which nobody passed
+a directory to — is there too; C = kill app AND agent, relaunch the app from
+`C:\Windows\System32`, and the auto-RELAUNCHed pane comes back in the recorded
+directory, with `sessions.json` proving the reboot floor carried it.
+
+**The script was proved to fail before it was believed.** Both fixes were
+temporarily neutralized in place and the binary rebuilt: B3/B4 and C4/C5/C6
+failed, every one of them reporting `c:\windows\system32` — the user's symptom,
+verbatim. A passed in both builds, which is the documented evidence that the
+row's stated repro never touched the defect. Unit tests: `autoLaunchDirectory`
+(sentinels, empty, prefix-lookalike, last-wins) in the none lane;
+`OPEN records cwd → sessions.json carries it` and `RELAUNCH respawns in the
+RECORDED cwd` in `test-agent`, the latter asserting through a new
+`FakeSpawner.lastCwd` so "spawned in the recorded directory" is distinguishable
+from "spawned wherever the agent happened to be".
+
+**Note for the Mac seat:** defect 1 is in `src/remote/agent/server.zig`, which is
+shared. Mac's LaunchAgent has a stable cwd so the symptom is milder there, but a
+relaunched session still ignores the directory it was opened in.
+
 ## T130 — Make the plugin's Windows banner-hook fixes durable
 
 Filed 2026-07-27 by T113, whose end-to-end section G proved that the app-side

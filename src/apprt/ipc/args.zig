@@ -141,6 +141,35 @@ pub fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The directory a `+new-window` auto-launch should start the GUI in (T132),
+/// or null to inherit the CLI's own cwd (today's behavior).
+///
+/// When `+new-window` finds no running instance it spawns one and re-sends the
+/// request. Everything that instance starts inherits ITS cwd: the startup
+/// window, any `working-directory = inherit` pane, and the session-persistence
+/// agent — whose cwd is where a RELAUNCH lands a session that recorded none. A
+/// detached launcher (a script, a scheduled task) sits in `C:\Windows\System32`,
+/// so inheriting blindly puts the whole instance there even though the caller
+/// said exactly where it wanted to be.
+///
+/// Only a real path is returned. `--working-directory=inherit` means "the
+/// caller's cwd", which is what inheriting already does, and `home` is resolved
+/// app-side against the user's profile — both leave the spawn unchanged. The
+/// LAST occurrence wins, matching the request parser's last-flag-wins rule.
+pub fn autoLaunchDirectory(arguments: ?[]const []const u8) ?[]const u8 {
+    const args = arguments orelse return null;
+    var found: ?[]const u8 = null;
+    for (args) |arg| {
+        const raw = dropPrefix(arg, "--working-directory=") orelse continue;
+        const dir = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        if (dir.len == 0) continue;
+        if (std.mem.eql(u8, dir, "inherit")) continue;
+        if (std.mem.eql(u8, dir, "home")) continue;
+        found = dir;
+    }
+    return found;
+}
+
 /// `+set-banner` arguments (T35), Mac handleSetBanner parity: `--target=`
 /// and `--clear` are flags; every other argument is banner text, joined
 /// with spaces. A literal `\n` becomes a line break so multi-line banners
@@ -320,6 +349,33 @@ const testing = std.testing;
 
 fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(testing.allocator);
+}
+
+test "autoLaunchDirectory: returns a real path, ignores inherit/home/empty" {
+    // A real path is what the auto-launched instance should start in.
+    try testing.expectEqualStrings("D:\\git\\ghoztty", autoLaunchDirectory(&[_][]const u8{
+        "--target=main", "--working-directory=D:\\git\\ghoztty", "--command=claude",
+    }).?);
+
+    // The sentinels resolve elsewhere: `inherit` IS the fallback behavior and
+    // `home` is expanded app-side, so neither changes the spawn.
+    try testing.expect(autoLaunchDirectory(&[_][]const u8{"--working-directory=inherit"}) == null);
+    try testing.expect(autoLaunchDirectory(&[_][]const u8{"--working-directory=home"}) == null);
+
+    // Nothing to go on ⇒ inherit (null), never an empty string CreateProcessW
+    // would reject.
+    try testing.expect(autoLaunchDirectory(&[_][]const u8{"--working-directory="}) == null);
+    try testing.expect(autoLaunchDirectory(&[_][]const u8{"--working-directory=   "}) == null);
+    try testing.expect(autoLaunchDirectory(&[_][]const u8{"--target=main"}) == null);
+    try testing.expect(autoLaunchDirectory(null) == null);
+
+    // A flag that merely starts the same way is not a match.
+    try testing.expect(autoLaunchDirectory(&[_][]const u8{"--working-directory-ish=/tmp"}) == null);
+
+    // Last occurrence wins (the request parser's rule).
+    try testing.expectEqualStrings("/second", autoLaunchDirectory(&[_][]const u8{
+        "--working-directory=/first", "--working-directory=/second",
+    }).?);
 }
 
 test "parseSetBannerArgs: text joined, \\n unescaped, trimmed" {

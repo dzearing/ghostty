@@ -1738,3 +1738,42 @@ your own pane (it is a NEW pane of the NEW build, so it must be); (3) the
 banner hooks actually fire now — that is the user's original report, and the
 resumed session is the real-world test of it. Next: T129 (banner editor
 discoverability), then T130 (make the plugin fixes durable), then T38/T39.
+
+## 2026-07-28 — T132 done: the filed repro was not the defect
+
+Took T132 (the loop-killer). Measured before fixing, and the row's own
+validation passed on the PRE-fix build: with no instance running,
+`+new-window --working-directory=<dir>` from `C:\Windows\System32` produced a
+pane correctly in `<dir>` (reported *and* asked of the shell). The panes sitting
+in System32 were the ones session RESTORE had brought back — a different
+mechanism entirely.
+
+Two real defects, both proven on the box:
+
+1. `handleOpen` never recorded `OPEN.cwd`. `session_meta.Record` has always had
+   the field and `handleRelaunch` has always read it, but nothing ever set it —
+   all 37 sessions in the debug agent's `sessions.json` had no `cwd` key. Any
+   session outliving its agent (reboot, or the upgrade script swapping
+   `ghoztty-agent.exe`) relaunched with a null cwd and inherited the AGENT's.
+   Shared code: Mac has this too, just with a milder symptom.
+2. `autoLaunchInstance` spawned the GUI with `lpCurrentDirectory = null`, so the
+   new instance — and its startup window, its `inherit` panes, and the agent it
+   spawns — inherited the CLI's cwd. A detached launcher sits in System32, which
+   is exactly where defect 1 then dumped the relaunched panes.
+
+Fix: `Session.setCwd` + record at OPEN; pure `args.autoLaunchDirectory`
+(last-wins, `inherit`/`home`/empty → null) passed as the spawn's working
+directory.
+
+New `test/win32/auto-launch-cwd.ps1` ALL PASS (21) ×3. **Negative control run
+before believing it:** both fixes neutralized in place and the binary rebuilt →
+B3/B4/C4/C5/C6 fail, every one reporting `c:\windows\system32`, the user's
+symptom verbatim; section A passes in BOTH builds, which is the evidence that
+the row's stated repro never touched the defect. Unit tests in the none lane
+(`autoLaunchDirectory` sentinels/empty/prefix-lookalike/last-wins) and in
+test-agent (OPEN records cwd → sessions.json; RELAUNCH respawns in the recorded
+cwd, via a new `FakeSpawner.lastCwd`).
+
+Mid-task the box rebooted unexpectedly and corrupted the repo-local
+`.zig-cache` (build-runner panic, not a code error); cleared it and rebuilt
+cold. Filed **T134** for the Mac seat to carry defect 1 across.

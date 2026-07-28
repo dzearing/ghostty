@@ -648,6 +648,23 @@ pub const Session = struct {
         self.argv = copy;
     }
 
+    /// Record the session's working directory — the cwd the child was spawned in
+    /// (`OPEN.cwd`). Owns a copy; replaces any prior value. Best-effort like
+    /// `setArgv`: an allocation failure leaves `cwd` null rather than propagating.
+    ///
+    /// This is the RELAUNCH input (T132): `handleRelaunch` respawns the recorded
+    /// command in the recorded cwd, and `persistMeta` writes it to `sessions.json`,
+    /// so a session that outlives the agent comes back where it was opened rather
+    /// than in whatever directory the agent process happens to be sitting in.
+    /// Empty strings are ignored so a stray `--working-directory=` never records a
+    /// cwd that would later be spawned as `""`.
+    pub fn setCwd(self: *Session, path: []const u8) void {
+        if (path.len == 0) return;
+        const copy = self.alloc.dupe(u8, path) catch return;
+        if (self.cwd) |c| self.alloc.free(c);
+        self.cwd = copy;
+    }
+
     /// Record (or clear, with null) the child's PTY slave path. Owns a copy;
     /// replaces any prior value. Best-effort like `setArgv` — an allocation
     /// failure leaves the field unchanged rather than propagating.
