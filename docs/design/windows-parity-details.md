@@ -5176,6 +5176,75 @@ PASS. The runs' only failures are the four PRE-EXISTING box/oracle
 issues proven at the pre-T101 baseline via git-stash (identical
 failures there, 28 passed) — filed as T103.
 
+## T131 — Banner: the floating glass card, and an opaque overlay (Phase K)
+
+User live review 2026-07-28 on the delivered `+eb3c3044f` build: *"i see
+the text scrolling behind the banner. in the mac version we have changed
+this to not scroll behind, and for the banner to have more of a rounded
+overlay with shadow appearance."*
+
+**Measured before fixing** (the row said to). On the user's own running
+pane: banner overlay `667,175 2021x167`, terminal HWND `667,342
+2021x1238` — the terminal starts exactly at the banner's bottom edge, so
+T101's reservation is intact and no glyph is ever laid out under the
+banner. A screen capture of that same pane shows the answer: the string
+`v2.1.220` is faintly legible THROUGH the strip. The overlay was
+`WS_EX_LAYERED` with `SetLayeredWindowAttributes(..., 242, LWA_ALPHA)`, so
+6% of whatever sits behind the band composites into it — and what sits
+behind the band is the terminal's own stale pixels, left there when the
+layout moved the surface HWND down. Every time the band is re-vacated
+(banner set, grown, collapsed) a fresh set of those pixels appears. That
+is the "scrolling behind".
+
+So both halves of the report have ONE fix: draw the Mac card, composited
+against the pane background, in an opaque window.
+
+- New pure `banner_card.zig` — the port of `macos/Sources/Helpers/
+  GlassCard.swift` (`GlassCard` + `GlassCardBackground`). GDI has neither
+  an antialiased rounded rectangle nor a soft shadow, so both are computed
+  per pixel: an analytic rounded-rect SDF gives corner coverage, and a
+  `smoothstep` of the same SDF (offset down) gives the elevation shadow
+  without a blur pass. Mac's numbers throughout: `MARGIN` 12 (uniform, all
+  four sides), `RADIUS` 14, `PADDING` 12, shadow black@30% blur 8 offset 4
+  with the card's interior masked out of it, specular sheen (white@10%
+  falling off from the top + a faint bottom darkening) and a hairline rim
+  (white 0.28 → 0.04, top to bottom).
+- `fillColor` is an ALPHA COMPOSITE of white@6% (black@4% on a light pane),
+  not `color_math.lighten` — that one is an HSB-brightness lift, which
+  keeps saturation and lands on a different color than Mac's. On `#101014`:
+  `(30,30,34)` composited vs `(27,27,34)` HSB.
+- `BannerOverlay` renders that into a cached DIB section (regenerated only
+  when the band size, the pane background, or the DPI scale changes) and
+  blits it under the text; content is clipped to the card's rounded region
+  (`CreateRoundRectRgn`) so a collapsed banner's overflow stops at the card
+  edge instead of spilling into the margin; the collapse fade dissolves into
+  the card rather than the band; the chevron moved inside the card; the
+  bottom divider is gone (the rim replaces it). `STRIP_ALPHA` is now **255**.
+- `banner_layout.bandHeight(card_h, margin)`: the band is the card plus its
+  margin on BOTH sides, so the terminal below always starts a breath under
+  the card (Mac's bottom margin is part of its measured banner height too).
+
+*Validation:* `pane-banner.ps1` **ALL PASS (45) ×3** (was 34), with new
+card oracles: the band's corner reads the pane background EXACTLY (`16,16,20`
+— a translucent overlay leaks the band's backdrop here, which is the bug),
+the composited screen pixel EQUALS the own-DC pixel (`30,30,34` vs
+`30,30,34` — the direct proof the window is opaque), the interior is the
+white@6% wash, and a scan of the bottom margin finds the shadow (`12,12,15`
+against a `16,16,20` background). Both test lanes + `test-agent` + P1–P3
+green. Visually confirmed on the box against a dark pane and a light one
+(`--background=#fafaf8`), live, mid-scroll.
+
+**A harness bug this turned up** (worth more than the assert count): the
+script had only ever passed on its FIRST run after a fresh build. Session
+restore brought back the previous run's own `bw` window — with the `bp1`
+split still in it — and `+new-window --target=bw` idempotently *focuses* an
+existing target instead of recreating it, so every subsequent run set its
+banners on the restored split's focused pane while `Wait-Banner 'bw' 0`
+read pane 0 and found nothing: 19 identical failures, deterministic, and
+nothing to do with the product. It now launches with
+`--session-persistence=false` (`=false`, not the documented `=off` — see
+T137).
+
 ## T103 — pane-banner.ps1 pixel oracles + editor chord red on the box (pre-existing)
 
 Found during T101 validation (2026-07-20), PROVEN pre-existing at the

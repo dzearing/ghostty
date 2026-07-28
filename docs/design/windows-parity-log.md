@@ -1777,3 +1777,40 @@ cwd, via a new `FakeSpawner.lastCwd`).
 Mid-task the box rebooted unexpectedly and corrupted the repo-local
 `.zig-cache` (build-runner panic, not a code error); cleared it and rebuilt
 cold. Filed **T134** for the Mac seat to carry defect 1 across.
+
+## 2026-07-28 — T131: the banner is a floating glass card, and it is opaque
+
+The user's two complaints ("text scrolling behind the banner", "Mac has moved
+to a rounded overlay with a shadow") were one defect. Measured first, on the
+user's own live pane: T101's band reservation is intact — the terminal HWND
+starts exactly at the banner's bottom edge — so nothing is ever laid out under
+the banner. What leaked was the overlay's WINDOW alpha (`WS_EX_LAYERED`, SLWA
+242): the terminal's stale pixels, still sitting in the band the layout
+vacated, composited through the strip. A capture of the user's pane shows
+`v2.1.220` legible through it.
+
+Fix: new pure `banner_card.zig`, the port of Mac's `GlassCard` /
+`GlassCardBackground`. A rounded-rect SDF gives antialiased corners and a
+smoothstep of the same SDF gives the elevation shadow (GDI has neither), and
+the whole card is composited against the pane background there — so the window
+is now fully opaque and the see-through is structurally impossible. Mac's
+numbers: 12px uniform margin, 14px radius, white@6% wash (black@4% on light,
+as an alpha composite, not `color_math`'s HSB lift), sheen + hairline rim,
+black@30% blur 8 offset 4.
+
+`pane-banner.ps1` ALL PASS (45) ×3, up from 34. It also closed **T103**: those
+four "box state" failures since 2026-07-20 were the layered alpha itself — the
+composited pixel now equals the own-DC pixel, and the ctrl+shift+b chord passes
+with no wedge.
+
+The harness had a bug worth more than the assert count: it only ever passed on
+its FIRST run. Session restore handed it back its own previous `bw` window,
+split and all, and `+new-window --target=bw` idempotently focuses an existing
+target — so every later run banner'd the restored split's focused pane and read
+pane 0 empty (19 identical failures, deterministic). Now launched with
+`--session-persistence=false`.
+
+Filed **T136** (a `test-agent` panic-flake in `RESIZE and SIGNAL are recorded
+on the child`, green on re-run — a standing gate should not flake) and **T137**
+(`--session-persistence=off` is silently rejected on the CLI although the docs
+spell it that way; only `=false` parses).
