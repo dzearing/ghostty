@@ -5628,6 +5628,51 @@ multi-pane window (where the window-name trap would pick the wrong pane), after
 an app-quit re-attach, and after an agent-relaunch respawn. Re-check `+list
 --json` leaf shape against the Mac golden shape while there.
 
+### 2026-07-27 — priority raised: this is why the banner hooks are dead
+
+The user reported two banner problems. One was a non-bug; the other is this
+task, and it turns this row from a contract nicety into a live user-facing
+outage.
+
+**Non-bug:** "ctrl-r doesn't rename them". Windows deliberately binds the banner
+editor to **ctrl+shift+b** (`Config.zig:7005` — plain ctrl+r is the shell's
+reverse-history search, ctrl+shift+r is the cross-platform rename). Working as
+designed, but undiscoverable, because the win32 context menu has no "Set Pane
+Banner..." entry where Mac has one — filed separately as **T129**.
+
+**This task:** "the ghoztty plugin is supposed to have hooks to update the
+banner which isn't working". The plugin (0.7.0,
+`hooks/ghoztty-banner.sh:133 resolve_pane`) resolves its own pane in three
+steps, and on Windows every one fails:
+
+1. `$GHOZTTY_PANE_ID` — unset. This task.
+2. A cached pane name, validated against `/dev/$TTY_NAME`.
+3. `ghoztty +list --tty="$TTY_NAME"`.
+
+Steps 2 and 3 both hinge on a tty, and an agent-backed pane has none. Measured
+in a live pane on the delivered build:
+
+    GHOZTTY_PANE_ID    = <unset>
+    GHOSTTY_SURFACE_ID = 0x95584e6058ee31b6
+    tty                = not a tty
+
+So `resolve_pane` returns empty and the SessionStart / UserPromptSubmit / Stop
+hooks all silently no-op — the failure is invisible because the hook swallows it
+(`>/dev/null 2>&1`). Note `0x95584e6058ee31b6` as unsigned decimal is
+`10761437485317632438`, which IS the pane's registered name in `+list` — the
+reason T112's fallback chain works at all, and why it is currently load-bearing
+rather than the dead weight this task was supposed to make it.
+
+**Status:** the implementation is already written and committed as WIP
+`b86dce1d0` (during the T117 merge, explicitly marked unvalidated). What remains
+is validation, not implementation.
+
+**Added end-to-end validation** (this row previously had none that a user would
+feel): with no edit to the plugin, a fresh session's banner hooks must update
+the pane banner on their own — that exercises the whole documented contract
+(baked at spawn, readable from a hook shell, accepted by `--target`) through the
+exact path the user cares about.
+
 ## T117 — Merge origin/main `1e1cdbbd2` (2026-07-27)
 
 70 commits since the T88 merge base (`8bb5d9845`). Merged, NOT rebased: the

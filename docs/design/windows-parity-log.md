@@ -9,6 +9,30 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-27 (later) - T129 filed, T113 priority raised, loop found DEAD. The
+  user surfaced two banner complaints and both were worth having.
+
+  "ctrl-r doesn't rename them" is a NON-BUG: Windows deliberately binds the
+  banner editor to ctrl+shift+b (Config.zig:7005 - plain ctrl+r is the shell's
+  reverse-history search). But the win32 context menu has no "Set Pane
+  Banner..." entry where Mac does, so there is no in-app way to learn the
+  chord and the feature reads as broken. Filed as T129.
+
+  "the plugin hooks that update the banner aren't working" root-caused to
+  T113, on the box. The plugin's resolve_pane tries $GHOZTTY_PANE_ID, then a
+  cached name validated against /dev/$TTY_NAME, then +list --tty. All three
+  fail on Windows: the var is unset, and an agent-backed pane reports "not a
+  tty" so both fallbacks get an empty tty. The hook swallows its own errors,
+  so it fails invisibly. This reframes T113 from a contract nicety to a live
+  outage and finally gives it an end-to-end validation a user would feel.
+
+  Also found: the loop has NO supervisor. No scheduled task, and the only
+  HKCU Run entry is GhozttyAgent. It self-perpetuates only via /reset-context
+  per task, so any turn that ends without a reset kills it silently. It died
+  after 2026-07-21 14:33 (upgrade log resume arg intact, so not the known
+  resume-arg-drop failure) and sat cold 6 days until the user noticed. A
+  watchdog does not exist and probably should.
+
 - 2026-07-27 - T117 DONE (merge origin/main 1e1cdbbd2, 70 commits), T118-T128
   filed. Merged rather than rebased: the branch was 203 ahead / 70 behind, has
   synced by merge every previous time, and the task table cites commit hashes a
