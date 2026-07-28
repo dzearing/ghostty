@@ -1814,3 +1814,11 @@ Filed **T136** (a `test-agent` panic-flake in `RESIZE and SIGNAL are recorded
 on the child`, green on re-run — a standing gate should not flake) and **T137**
 (`--session-persistence=off` is silently rejected on the CLI although the docs
 spell it that way; only `=false` parses).
+
+Delivery verified by the resumed session: upgrade log clean, running instance
+at `commit: 179804307`, and this session's own pane renders the card. One trap
+for the next pixel probe — `PrintWindow` on the banner overlay right after a
+relaunch came back as a card with NO content, which looked exactly like a
+regression; it is a WM_PRINT/DWM-surface artifact on a layered window (we
+handle WM_PAINT, not WM_PRINTCLIENT). Raise the window and `CopyFromScreen`
+instead: every row is there.
