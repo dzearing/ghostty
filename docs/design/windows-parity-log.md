@@ -1822,3 +1822,35 @@ relaunch came back as a card with NO content, which looked exactly like a
 regression; it is a WM_PRINT/DWM-surface artifact on a layered window (we
 handle WM_PAINT, not WM_PRINTCLIENT). Raise the window and `CopyFromScreen`
 instead: every row is there.
+
+## 2026-07-29 — the loop had forked, and then stopped
+
+The user came back to two windows both running `go.md`, both stopped. State,
+measured rather than assumed:
+
+- **Two sessions.** `claude` pid 16076 (08:01) and pid 644 (09:46:40). The
+  09:46 one is the upgrade script's relaunch; the 08:01 one is the session the
+  upgrade was supposed to have killed. It survived because the agent owns its
+  PTY and the script deliberately never kills the agent — so the relaunched app
+  re-attached it while the script also started a fresh `--continue` session.
+  Both then resumed the same transcript and worked T131. Filed **T138**.
+- **No repo damage:** tree clean, in sync with origin, and the duplicate never
+  committed — the three T131 commits are all from this session.
+- **Why it stopped:** both sessions ended their turn with a written report
+  instead of `/reset-context`. That is the documented loop-killer (go.md step
+  7) and it is now the second and third time it has happened. Filed **T139**
+  for the single-instance guard the user asked for plus the watchdog `go.md`
+  admits does not exist.
+- **Banner overlap was mine, not the product's.** T131's `raiseshot.ps1` probe
+  set `HWND_TOPMOST` on both banner overlays to beat occlusion and never
+  restored it, so background windows' banners floated over foreground windows
+  for the rest of the day. Clearing the bit fixed it. The product still cannot
+  self-heal from it (`updatePosition` uses `SWP_NOZORDER`) — filed **T142**.
+
+Two parity gaps the user surfaced by hand, both ahead of the old queue:
+**T141** (`+relay-login`/`+relay-logout` exist only on Windows — the Mac client
+never had them, and the chooser advertises one; delete and audit the CLI for
+other one-platform verbs) and **T140** (the Ctrl+Shift+N chooser is a bare
+Win32 dialog with a clipped footer, nowhere near Mac's).
+
+45 rows remain open. Nothing about this effort is finished.
