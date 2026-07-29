@@ -6925,16 +6925,24 @@ pub const Keybinds = struct {
             // Clipboard, Windows Terminal-style: ctrl+c copies ONLY when a
             // selection exists (performable), otherwise falls through to the
             // shell as SIGINT. ctrl+v pastes (quoted-insert is rare enough).
+            //
+            // ctrl+v is performable for the same reason: with no text on the
+            // clipboard the paste cannot be performed (the apprt reports
+            // false when CF_UNICODETEXT is absent), and the chord must reach
+            // the pane as a raw ^V so a TUI can handle it itself — that is
+            // how Claude Code reads a screenshot off the clipboard. Without
+            // the flag ghoztty swallowed the key and pasted nothing.
             try self.set.putFlags(
                 alloc,
                 .{ .key = .{ .unicode = 'c' }, .mods = .{ .ctrl = true } },
                 .{ .copy_to_clipboard = .mixed },
                 .{ .performable = true },
             );
-            try self.set.put(
+            try self.set.putFlags(
                 alloc,
                 .{ .key = .{ .unicode = 'v' }, .mods = .{ .ctrl = true } },
                 .paste_from_clipboard,
+                .{ .performable = true },
             );
 
             // Clear screen + scrollback (mac: cmd+k). Performable: on the
@@ -10696,6 +10704,35 @@ test "parse e: command and args" {
     try testing.expectEqualStrings(cmd.direct[0], "echo");
     try testing.expectEqualStrings(cmd.direct[1], "foo");
     try testing.expectEqualStrings(cmd.direct[2], "bar baz");
+}
+
+// T154: on Windows the plain-ctrl clipboard mirrors MUST be performable.
+// A non-performable binding is swallowed even when the action reports that
+// it did nothing, so ctrl+v with an image-only clipboard pasted nothing AND
+// never reached the TUI that wanted to read the image itself.
+test "default keybinds: windows ctrl clipboard mirrors are performable" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    const cases = .{
+        .{ 'v', inputpkg.Binding.Action.paste_from_clipboard },
+        .{ 'c', inputpkg.Binding.Action{ .copy_to_clipboard = .mixed } },
+    };
+    inline for (cases) |case| {
+        const entry = cfg.keybind.set.get(.{
+            .key = .{ .unicode = case[0] },
+            .mods = .{ .ctrl = true },
+        }) orelse return error.TestExpectedBinding;
+
+        const leaf = entry.value_ptr.leaf;
+        try testing.expectEqual(case[1], leaf.action);
+        try testing.expect(leaf.flags.performable);
+    }
 }
 
 test "clone default" {

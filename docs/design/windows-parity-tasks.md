@@ -499,6 +499,27 @@ July-5 exe (no code regression; pixel-verified on HEAD).
 
 ## State table
 
+> **FROZEN 2026-07-29 — this table is a historical snapshot, not ground truth.**
+> Tasks now live one-per-file in `windows-parity-tasks/` (`T<id>.md`), so two
+> agents can file and edit tasks without writing to the same file. That change
+> was made because this table had already produced a duplicate `T112` (one bug
+> filed twice) and a duplicate `T153` (two sessions minting the same id on the
+> same day).
+>
+> **Do not add or edit rows here.** Use the script:
+>
+> ```
+> powershell -NoProfile -File scripts\parity-tasks.ps1 next
+> powershell -NoProfile -File scripts\parity-tasks.ps1 show T144
+> powershell -NoProfile -File scripts\parity-tasks.ps1 new -Title "..." -Phase K
+> powershell -NoProfile -File scripts\parity-tasks.ps1 set-status T144 -Status done -Commit <sha>
+> ```
+>
+> Format and full command set: `windows-parity-tasks/README.md`. Everything in
+> this table was migrated (185 files, `validate` passes). The rest of THIS file
+> — the resume protocol above and **Current priorities**, which still outranks
+> `next` — remains live and correct.
+
 One line per row. Full spec + validation + evidence per task:
 `windows-parity-details.md` (`## T<id>` sections).
 

@@ -1905,3 +1905,42 @@ did not.
 
 Floor for this turn: both test lanes exit 0, `test-agent` exit 0, P1/P2/P3 ALL
 PASS, `go-loop-guard.ps1` ALL PASS (78) x3.
+
+## 2026-07-29 - T154 done: the flag was missing, and the probe proved it
+
+ctrl+v could not paste a screenshot into Claude Code. The row had already
+root-caused it by inspection - the win32 ctrl-mirror binds ctrl+v with a bare
+`put()` while ctrl+c and ctrl+k beside it use `putFlags(.performable)` - and
+the whole turn was really about not taking that on faith. One line changed in
+`Config.zig`.
+
+What made it verifiable was the oracle: a PowerShell probe running INSIDE the
+pane, blocked on `[Console]::ReadKey($true)`, printing the raw character code
+it receives. Reading the pane's rendered text cannot tell "pasted nothing"
+from "swallowed the key"; a character code can. Text clipboard should yield
+90 (`Z`, the token's first char), an image-only clipboard should yield 22
+(`^V`), and a swallowed chord shows up as the probe never printing at all.
+
+Pre-fix, on the box: `1 FAILED / 11 passed` - section B at `probe char=-1`
+while section C (ctrl+shift+v, which has always carried the flag) returned
+22. That asymmetry is the diagnosis, measured rather than argued: same chord
+target, same clipboard, different flag, different outcome. Post-fix ALL PASS
+(12) x3.
+
+The turn's real cost was the harness, not the fix. The first draft of
+`clipboard-paste.ps1` failed its own positive control - typed keys never
+reached the shell despite `SendInput` reporting every event delivered and
+`GetForegroundWindow() == top`. The terminal surface is a `GhozttyTerminal`
+CHILD of the `GhozttyWindow` top-level, and a window raised programmatically
+is foreground with focus still on the FRAME. One `SetFocus(paneChild)` fixed
+it. Then running `keybinds-t01.ps1` as a regression showed it failing its own
+positive control the same way, 14 of 21 red - the standing keybind coverage
+has been reporting harness artifacts, filed as T157. A script whose positive
+control fails is not evidence about the product in either direction.
+
+Also filed T156: shift+insert -> `paste_from_selection` is the same defect one
+block over, and worse - win32 has no selection clipboard, so it can never
+perform AND is swallowed, i.e. the chord does nothing at all today.
+
+Floor for this turn: both test lanes exit 0, `test-agent` exit 0, P1/P2/P3
+ALL PASS, `clipboard-paste.ps1` ALL PASS (12) x3.
