@@ -44,6 +44,7 @@ $emptyTracker = Join-Path $root 'tracker-empty.md'
 $log = Join-Path $root 'watchdog.log'
 $lockScript = Join-Path $Repo 'scripts\go-loop-lock.ps1'
 $dogScript = Join-Path $Repo 'scripts\go-loop-watchdog.ps1'
+$execScript = Join-Path $Repo 'scripts\go-loop-exec.ps1'
 
 New-Item -ItemType Directory -Force $root | Out-Null
 
@@ -64,6 +65,13 @@ function Dog-Run([string[]]$extra, [string]$trackerPath) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
         '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $state,
         '-Tracker', $trackerPath, '-LogPath', $log, '-Once') + $extra
+    $out = & powershell @argList 2>&1 | Out-String
+    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+}
+
+function Exec-Run([string[]]$extra) {
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $execScript,
+        '-Repo', $Repo, '-LockPath', $lock, '-GhozttyExe', $Exe) + $extra
     $out = & powershell @argList 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
@@ -110,6 +118,22 @@ function Get-WindowPane($target) {
             Find-Leaves $t.splits $acc
             if ($acc.Count -gt 0) { return $acc[0] }
         }
+    }
+    return $null
+}
+function Get-WindowTitle($target) {
+    $r = Ghoz @('+list', '--json')
+    if ($r.Code -ne 0) { return $null }
+    try { $j = $r.Out | ConvertFrom-Json } catch { return $null }
+    foreach ($w in $j.data.windows) { if ($w.target -eq $target) { return $w.title } }
+    return $null
+}
+function New-TestWindow($target) {
+    Ghoz @('+new-window', "--target=$target", "--working-directory=$Repo") | Out-Null
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 500
+        $p = Get-WindowPane $target
+        if ($p) { return $p }
     }
     return $null
 }
@@ -344,6 +368,83 @@ if ($ready) {
         Assert 'J5 and the watchdog says why' ($r.Out -match 'still producing output')
         Ghoz @('+send-keys', "--target=$($pane.id)", 'C-c') | Out-Null
         Ghoz @('+close', '--target=go-loop-live') | Out-Null
+    }
+
+    ""
+    "K. execution-window marking"
+    $paneA = New-TestWindow 'exec-a'
+    $paneC = New-TestWindow 'plain-c'
+    Assert 'K0 two stand-in windows are open' ($null -ne $paneA -and $null -ne $paneC)
+    if ($paneA -and $paneC) {
+        $r = Exec-Run @('mark', '-PaneId', $paneA.id)
+        Assert 'K1 mark succeeds' ($r.Code -eq 0 -and $r.Out -match '^MARKED')
+        Assert 'K2 the window title carries the marker' ((Get-WindowTitle 'exec-a') -like '`[go-loop`]*')
+        Assert 'K3 an unmarked window keeps its own title' ((Get-WindowTitle 'plain-c') -notlike '`[go-loop`]*')
+        $r = Exec-Run @('list', '-PaneId', $paneA.id)
+        Assert 'K4 list flags only the marked window' `
+            (([regex]::Matches($r.Out, '(?m)^EXEC ')).Count -eq 1 -and $r.Out -match 'EXEC exec-a')
+        $r = Exec-Run @('unmark', '-PaneId', $paneA.id)
+        Assert 'K5 unmark succeeds' ($r.Code -eq 0 -and $r.Out -match '^UNMARKED')
+        Assert 'K6 the marker is gone from the title' ((Get-WindowTitle 'exec-a') -notlike '`[go-loop`]*')
+    }
+
+    ""
+    "L. duplicate execution windows resolve themselves"
+    $paneB = New-TestWindow 'exec-b'
+    Assert 'L0 a second execution window is open' ($null -ne $paneB)
+    if ($paneA -and $paneB -and $paneC) {
+        # A holds the lock (a live owner); B is a marked duplicate; C is the
+        # user's task-filing window - unmarked, and must be left strictly alone.
+        $primary = Start-Sleeper; $sleepers += $primary
+        Remove-Item $lock -Force -ErrorAction SilentlyContinue
+        Lock-Run @('acquire', '-PaneId', $paneA.id, '-ClaudePid', $primary.Id) | Out-Null
+        Exec-Run @('mark', '-PaneId', $paneB.id) | Out-Null
+        $titleC = Get-WindowTitle 'plain-c'
+
+        $r = Exec-Run @('claim', '-PaneId', $paneA.id, '-GraceSeconds', 1)
+        Assert 'L1 the lock holder claims primary' ($r.Code -eq 0 -and $r.Out -match '^PRIMARY')
+        Assert 'L2 it marks its own window' ((Get-WindowTitle 'exec-a') -like '`[go-loop`]*')
+        Assert 'L3 it names the duplicate' ($r.Out -match 'DUPLICATE execution window target=exec-b')
+        Assert 'L4 it reports resolving exactly one' ($r.Out -match 'resolved 1 duplicate')
+        $gone = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (-not (Get-WindowPane 'exec-b')) { $gone = $true; break }
+        }
+        Assert 'L5 the duplicate window is closed' $gone
+        Assert 'L6 the UNMARKED window is untouched' `
+            (($null -ne (Get-WindowPane 'plain-c')) -and ((Get-WindowTitle 'plain-c') -eq $titleC))
+
+        # The loser's side of the same protocol: a marked window that does not
+        # hold the lock stands down, tells the primary, and unmarks itself.
+        $paneD = New-TestWindow 'exec-d'
+        Assert 'L7 a would-be duplicate is open' ($null -ne $paneD)
+        if ($paneD) {
+            Exec-Run @('mark', '-PaneId', $paneD.id) | Out-Null
+            $r = Exec-Run @('claim', '-PaneId', $paneD.id, '-NoSelfClose')
+            Assert 'L8 it stands down with exit 3' ($r.Code -eq 3 -and $r.Out -match '^STAND-DOWN')
+            Assert 'L9 it names the primary it deferred to' ($r.Out -match "notified primary in pane $($paneA.id)")
+            Assert 'L10 it unmarks itself' ((Get-WindowTitle 'exec-d') -notlike '`[go-loop`]*')
+            $seen = ''
+            for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Milliseconds 500
+                $seen = (Ghoz @('+read', "--name=$($paneA.id)", '--lines=20')).Out
+                if ($seen -match 'stood down') { break }
+            }
+            Assert 'L11 the primary was really told, in its own pane' ($seen -match 'duplicate execution window .* stood down')
+
+            # ...and with self-close on (the default), the duplicate goes away.
+            Exec-Run @('mark', '-PaneId', $paneD.id) | Out-Null
+            Exec-Run @('claim', '-PaneId', $paneD.id) | Out-Null
+            $gone = $false
+            for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Milliseconds 500
+                if (-not (Get-WindowPane 'exec-d')) { $gone = $true; break }
+            }
+            Assert 'L12 a stood-down duplicate closes itself' $gone
+        }
+        Ghoz @('+close', '--target=exec-a') | Out-Null
+        Ghoz @('+close', '--target=plain-c') | Out-Null
     }
 }
 

@@ -6303,3 +6303,192 @@ session restarts, so a mirrored fix is not live for existing sessions.
 it runs the highest-versioned cached `ghoztty-banner.sh` end-to-end, so a
 mirrored-and-reinstalled plugin is re-validated by re-running that script
 (it SKIPs, loudly, if the hook or jq is missing rather than fabricating a pass).
+
+## T152 — parity sweep evidence (2026-07-29)
+
+Filed with T145–T151. This is the raw enumeration the row refers to, kept so
+the next sweep can diff against it rather than re-derive it.
+
+**Method.** `git log --since=2026-07-08 --no-merges -- macos/ src/viewer/`
+(107 commits), then each short hash grepped against every
+`docs/design/windows-parity-*.md`. Zero hits = no Windows work item.
+
+**Commits with ZERO references (the finding):**
+
+| Commit | Subject | Filed as |
+|---|---|---|
+| `03f0f1f30` | in-place agent-crash recovery — rebuild local windows without an app relaunch | T145 |
+| `20e505aaf` | recover crash-orphaned windows from the agent's authoritative layout | T145 |
+| `040c6a959` | session-chooser master–detail redesign (live sessions, Kill, richer labels) | T146 |
+| `c066f8681` | cross-machine session browse in the Cmd-Shift-N chooser | T146 |
+| `236a217ca` | resume a single browsed session on the local machine | T146 |
+| `43bfb8e4a` | agent-owned layout blobs + cross-machine "Resume all" | T146 |
+| `e5da5d02b` | reap dead tombstones so the chooser only lists connectable sessions | T146 |
+| `c6ad0fc07` | non-destructive agent upgrade delivery | T147 |
+| `ae2be57cb` | eliminate tombstone reload + blank re-attach on upgrade | T147 |
+| `cdb689025` | don't re-run parent command on local splits/tabs/windows | T148 |
+| `a5adff229` | banner symmetric padding, content inset, shaded bg, collapse toggle | T149 |
+| `c3e9999e7` | single-pass, accessible runtime background changes | T150 |
+| `752f3178a` | stop background-color picker from flipping panes to white | T150 |
+| `173320776` | inject shell integration for local-agent panes | T151 |
+| `89d9de2af` | render raw HTML in markdown via DOMPurify-sanitized output | T127 (added) |
+| `538f4fd64` | live foreground pid + stable ghoztty-owned pane id | T98/T113 (behavior covered, commit was uncited) |
+
+**Already covered (spot-checked, no action):** the viewer band (`13b950e77`,
+`6af1fc12a`, `25c454b24`, `2137da95a`, `3691cc4e8`, `2af9a6e95`, `dc5daa4c5`,
+`0b8335d7c`, `1cf83764b`, `2f0b286ba`, `4cf88905d`, `1edce34c7`, `efe1e1d17`,
+`bd5667887`, `a7fc890a9`, `14d22875a`) → T127; `ab3c1e25d` → T118;
+`2daaa98c9` → T119; `45f4f2250` → T120; `565b77a58` → T121; `5d5897936` → T122;
+`1d56c6948`/`c94a8158a` → T123; the banner visual band → T124; the What's New
+band (`981d18e29`, `1d7f809b3`, `d28adcec1`, `f5c75454f`, `65d345cd5`,
+`1f8f7c302`, `1a236ecf7`) → T125; `280f2449e` → T126; `e65cfa4d5` → T128;
+`a1d2aa721` → T109; `001834466` → T94; `9a95213b4`/`9c7665354` → T92;
+`106dcdc9c` → T89e; `853ec3168` → T89e; `4a605cc6b` → T56; `a3f5e2e11` → T35.
+
+**Mac-only, no parity owed:** `a0c4d1976` (nil `bundleIdentifier` CLI crash),
+`40a2dbb1e` (AppKit surface userdata use-after-free), `a9f0122af` (doc scrub),
+`646651574` (`/bin/zsh` login-shell resolution — win32 has its own resolver,
+T34), `6647865b9`/`caa49f690` (Mac build/dev-token plumbing).
+
+**Why the earlier sweeps leaked.** T88 (154 commits) and T117 (70 commits) both
+recorded a *narrative* summary of what the merge contained. A summary cannot be
+checked for completeness; an enumeration can. T152's script makes the
+enumeration the gate.
+
+## T139 - loop single-instance guard + watchdog
+
+**Why.** `go.md` had two unguarded failure modes at opposite ends. Nothing
+stopped two sessions from running the loop at once (T138's upgrade script
+produced exactly that on 2026-07-28 - two claude processes resuming the same
+transcript, both picking T131), and nothing restarted the loop when it stopped
+(a turn that ends with a summary instead of `/reset-context` kills it silently;
+that cost six days 2026-07-21 to 07-27, and stopped it again 2026-07-28). The
+user's ask, verbatim: *"if you detect multiple processes trying to work on 'go'
+process, we need to find a way to stop that as they would clash."*
+
+**(a) The lock - `scripts/go-loop-lock.ps1`.** A JSON file (default
+`<repo>\temp\go-loop.lock.json`; `temp/` is gitignored) recording the owner's
+Ghoztty pane id, its claude pid, the pid's **process name and start time**, and
+a heartbeat. Actions `acquire | heartbeat | release | status`; exit codes
+`0` ok, `3` BUSY, `4` not owner. `go.md` step 0 runs `acquire` and a session
+that gets exit 3 stops without picking a task.
+
+Three design calls, each forced by a real failure mode:
+
+- **Ownership is keyed on the PANE, not the pid.** `/reset-context` keeps both,
+  but `upgrade-ghoztty-windows.ps1` kills claude and relaunches it in the same
+  pane - that relaunched session is the same loop slot, not a rival. Keying on
+  pid would have made every upgrade look like a fork; keying on the pane makes
+  T138's *extra* window look like one, which is exactly right.
+- **Pid liveness is not enough.** Pids are recycled, so the lock records the
+  owner's process name + start time and `Test-OwnerAlive` requires all three to
+  match. Without it, a lock could be held indefinitely by an unrelated process
+  that inherited the number.
+- **Every stale state is recoverable.** A dead owner (`reason=dead-owner`) or a
+  heartbeat older than `-StaleMinutes` (30, `reason=stale-heartbeat`) is taken
+  over automatically, so a crashed session never wedges the loop permanently -
+  the failure mode a naive lock would introduce.
+
+**(b) The watchdog - `scripts/go-loop-watchdog.ps1`.** The supervisor `go.md`
+said did not exist. Each tick (default 300s): if no tracker rows remain the
+loop is *finished*, not stuck, so do nothing; if the lock is healthy, do
+nothing; otherwise re-enter with the cheapest action that fits -
+
+| Situation | Action |
+|---|---|
+| owner alive, pane alive, pane quiet | `+send-keys` the resume prompt (the turn ended with a summary) |
+| owner alive, pane still emitting output | nothing - it is mid-task |
+| owner dead, pane alive | `+send-keys` the resume shim (restart claude in place) |
+| no lock, or the pane is gone | `+new-window` running the resume shim |
+
+then hold off for `-RearmMinutes` (20) so a wedged box is nudged, not spammed.
+"Still producing output" is measured, not assumed: two `+read` samples of the
+pane tail `-ProbeGapSeconds` apart.
+
+The resume command is written to a generated `.cmd` shim rather than passed
+through `--command`/`+send-keys` quoting. That is not fastidiousness - it is
+the exact layer T138's upgrade script got wrong: its log shows the prompt
+arriving as `--continue read`, truncated at the first space.
+
+Autostart is an **HKCU `Run` entry** (`GhozttyGoLoopWatchdog`), the same
+mechanism T89h gave the agent. A scheduled task was the first choice and was
+abandoned on the box: `schtasks /Create /SC ONLOGON` returns *Access is denied*
+without elevation, and this must be installable from an ordinary session.
+`-Install` also starts the watchdog immediately; single-instance is enforced by
+the `Global\GhozttyGoLoopWatchdog` mutex - and the *first* `-Install` reported
+"already running" because a command-line match on the script name also matches
+the shell running `-Install` itself, which is why the check asks the mutex now.
+
+**Validation.** `test/win32/go-loop-guard.ps1` - **ALL PASS (58) x3**.
+Sections A-G cover the lock (lifecycle; a second pane refused with exit 3 while
+the lock keeps naming the first owner; same-pane re-acquire including a
+relaunched pid; dead-owner takeover; stale-heartbeat takeover and the
+`-StaleMinutes` boundary in both directions; a recycled pid rejected via the
+start-time stamp; non-owner heartbeat/release rejected with the lock intact).
+H covers the watchdog's decisions in dry run. **I and J are real end-to-end
+against a live debug GUI**: I asserts the watchdog opened a window and the pane
+*really ran* the shim (marker read back with `+read`); J asserts a live-but-
+stalled session is nudged in place - the prompt appears in the pane, no second
+window is opened - and that a pane still emitting output is left alone.
+Hermetic: per-run temp lock/state/tracker, the repo's own lock untouched, only
+zig-out ghoztty processes killed.
+
+On-box install verified: the Run value is present and the watchdog process is
+running, with `%TEMP%\ghoztty-go-loop-watchdog.log` showing it reading this
+session's own lock as `healthy: pane=5E3D7D38-... pid=644`.
+
+**Follow-up filed:** T153 (`+list --pid=` is broken for session-persistence
+panes - every agent-backed pane reports `pid:0`, so the documented tty-less
+self-identification route fails).
+
+**(c) Execution-window marking + automatic duplicate resolution
+(`scripts/go-loop-exec.ps1`).** Added the same day on the user's correction:
+the lock answers *"is another session working the loop?"* but not *"which
+windows are even trying to?"*, and on this box the normal state is a SECOND
+Claude window that only files tasks and must never be treated as a rival or
+closed. The user's direction, verbatim: *"if there is something you can do in
+the go.md so that you can distinguish execution windows (e.g. rename the window
+or something) that could help refine the rule a bit. Also when this condition
+happens, I want you to communicate with the other window to establish which
+window is the primary execution window (if both are execution marked) and close
+the dupe and CONTINUE. don't ask me to resolve."*
+
+So an execution window says so out loud: `+rename` pins its window title to
+`[go-loop] ...`, which `+list --json` reports back. **Marked = executing;
+unmarked = never touched, ever.** That single rule is what makes the user's
+task-filing window safe, and it is asserted directly (L6: the unmarked window
+survives a resolution with its title unchanged).
+
+`claim` is now the one command `go.md` step 0 runs, and it never asks anyone:
+
+- **Primary** (lock acquired): mark this window, then for every OTHER marked
+  window - `+send-keys` a message into that window's session telling it it is a
+  duplicate and who holds the lock, wait `-GraceSeconds`, `+close` it, and
+  CONTINUE.
+- **Duplicate** (lock BUSY): message the primary that it is standing down,
+  unmark itself, and close itself.
+
+The arbiter is the **lock**, not a negotiation - whoever holds it is primary.
+That is symmetric (both sides compute the same answer from the same file) and
+cannot deadlock or ping-pong, which a "who has been running longer?" exchange
+between two live sessions could.
+
+One bug worth recording: `claim` first delegated to the lock script without
+forwarding `-PaneId`, so the lock re-derived identity from the CALLING shell's
+`$env:GHOZTTY_PANE_ID` - the harness's pane, not the pane being claimed. The
+primary therefore diagnosed *itself* as a duplicate and closed its own window.
+Section L caught it on the first run (5 reds), which is the argument for
+asserting on real windows rather than on the script's own log lines.
+
+**Validation (superseding the count above).** `test/win32/go-loop-guard.ps1` -
+**ALL PASS (78) x3**, sections A-J as described plus **K** (marking: the title
+carries the marker, an unmarked window keeps its own, `list` flags exactly one)
+and **L**, which is end-to-end against a live debug GUI with three real
+windows: the lock holder claims primary, names the duplicate, and the duplicate
+window is really gone from `+list` afterwards while the unmarked window is
+untouched; then the loser's half - a marked window that does not hold the lock
+stands down with exit 3, the message really lands in the primary's pane (read
+back with `+read`), it unmarks itself, and with self-close on it closes itself.
+
+This session's own window is marked on the box (`[go-loop] ghoztty parity`),
+and `go-loop-exec.ps1 list` shows the user's other two windows unmarked.

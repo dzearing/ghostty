@@ -1854,3 +1854,54 @@ other one-platform verbs) and **T140** (the Ctrl+Shift+N chooser is a bare
 Win32 dialog with a clipped footer, nowhere near Mac's).
 
 45 rows remain open. Nothing about this effort is finished.
+
+## 2026-07-29 - T139 done: the loop now has a lock and a supervisor
+
+Both halves of the user's ask landed. `go.md` gained a **step 0** that takes a
+lock (`scripts/go-loop-lock.ps1`) before a task is even picked: a session in a
+different pane gets exit 3, names the owner, and stops. Ownership is keyed on
+the PANE rather than the pid on purpose - `/reset-context` keeps both, but the
+upgrade script kills claude and relaunches it in the same pane, and that is the
+same loop slot, not a rival. A dead owner or a heartbeat older than 30 min is
+taken over, so the lock cannot introduce the failure it is preventing.
+
+The second half is `scripts/go-loop-watchdog.ps1` - the supervisor `go.md`
+flatly said did not exist. It watches the heartbeat and, only while tracker
+rows remain, re-enters with the cheapest fitting action: nudge a live-but-
+stalled session, restart claude in a surviving pane, or open a window. A pane
+still emitting output is mid-task and is left alone (measured with two `+read`
+samples, not assumed). It is installed and running on the box via an HKCU Run
+entry - the scheduled task was the first choice and `schtasks /SC ONLOGON`
+returned *Access is denied* without elevation.
+
+`go-loop-guard.ps1` ALL PASS (58) x3. Sections I and J are real end-to-end
+against a live debug GUI, not simulations: the watchdog's window really runs
+the resume shim (marker read back out of the pane), and the nudge really lands
+as typed text in a stalled pane with no second window opened.
+
+Two things this turn surfaced. `+list --pid=` fails on every pane on this box -
+agent-backed panes report `pid:0`, so CLAUDE.md's documented tty-less
+self-identification route is dead wherever session persistence is on (which is
+the default). Filed **T153**. And the fork this task exists to prevent was
+visible while working it: a second, user-directed Claude session was editing
+this same working tree throughout, which is why this turn's commits name their
+paths explicitly.
+
+**Same-day correction from the user, folded into T139.** The second window is
+*only filing tasks*, and treating it as a rival would have been the wrong rule.
+So execution windows now say so out loud: `scripts/go-loop-exec.ps1` pins the
+window title to `[go-loop] ...` and **only marked windows are ever touched** -
+the task-filing window is unmarked, so it can never be closed or contended
+with. When two windows ARE both marked, the sessions settle it themselves: the
+lock holder messages the duplicate and closes it; the duplicate messages the
+primary, unmarks, and closes itself. No question reaches the user.
+
+The bug that section L caught on its first run is the one worth remembering:
+`claim` delegated to the lock without forwarding `-PaneId`, so the lock
+re-derived identity from the calling shell's `$env:GHOZTTY_PANE_ID` and the
+primary diagnosed *itself* as the duplicate - and closed its own window. Log
+lines would have looked plausible; asserting against real windows in `+list`
+did not.
+
+Floor for this turn: both test lanes exit 0, `test-agent` exit 0, P1/P2/P3 ALL
+PASS, `go-loop-guard.ps1` ALL PASS (78) x3.

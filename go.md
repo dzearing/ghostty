@@ -10,24 +10,34 @@ You are the on-box Windows session for the Windows parity effort.
 
 Concretely, in order, with no stops in between:
 
-0. **Take the loop lock** (T139) — one command, before anything else:
+0. **Claim the loop** (T139) — one command, before anything else:
 
    ```
-   powershell -NoProfile -File scripts\go-loop-lock.ps1 acquire
+   powershell -NoProfile -File scripts\go-loop-exec.ps1 claim
    ```
 
-   - Exit **0** (`ACQUIRED …`): you own the loop. Carry on.
-   - Exit **3** (`BUSY owner_pane=… age=…m`): **another session is already
-     running this loop.** Say so, name the owner, and STOP — do not pick a
-     task. Two loops on one tracker clash (that is exactly what T138's
-     upgrade-script fork did on 2026-07-28: both sessions built T131).
-   - The same command each turn refreshes the heartbeat, and a lock whose
-     owner died — or whose heartbeat is older than 30 min — is taken over
-     automatically, so a crash never wedges the loop. Ownership is keyed on
-     the **pane**, so a relaunched claude in the same pane is the same slot.
+   - Exit **0** (`PRIMARY …`): you are the execution window. Carry on.
+   - Exit **3** (`STAND-DOWN …`): another session already holds the loop.
+     This window has been unmarked and closed; **stop, do not pick a task.**
+   - What it does: takes the lock (`scripts\go-loop-lock.ps1`), pins this
+     window's title to `[go-loop] …` so the execution window is identifiable
+     on sight and in `+list --json`, then resolves duplicates **without
+     asking anyone** — it messages the other window's session to say it is a
+     duplicate, closes it, and continues.
+   - **Only `[go-loop]`-marked windows are ever touched.** A second Claude
+     window that is filing tasks, auditing, or reviewing is unmarked, so it is
+     never a rival and never gets closed. That is the normal case on this box.
+   - The arbiter is the lock, not a negotiation: whoever holds it is primary,
+     which is symmetric and cannot deadlock. Ownership is keyed on the
+     **pane**, so a relaunched claude in the same pane is the same slot (the
+     upgrade script does exactly that). A lock whose owner died — or whose
+     heartbeat is older than 30 min — is taken over automatically, so a crash
+     never wedges the loop.
+   - `scripts\go-loop-exec.ps1 list` shows every window and which are marked.
 
-1. **Pick up a task** — first Current-priorities item, else first `todo` whose
-   deps are `done`. Never ask which one.
+1. **Pick up a task** — first Current-priorities item, else
+   `powershell -NoProfile -File scripts\parity-tasks.ps1 next`. Never ask
+   which one.
 2. **Build it.**
 3. **Test it** — the task's own Validation, plus the standing floor (both
    `zig build test` lanes, `zig build test-agent`, P1–P3).
@@ -35,9 +45,16 @@ Concretely, in order, with no stops in between:
    clean build is not evidence, and neither is a passing script you did not
    read the last line of.
 5. **Assess whether more tasks are needed** — every bug, gap, or surprise the
-   work turned up becomes a NEW row. Loose threads are how work gets lost.
-6. **Update the tracker** — row status + commit, details evidence, ONE log
-   entry. Commit and push.
+   work turned up becomes a NEW task file, minted with
+   `scripts\parity-tasks.ps1 new -Title "…"`. Loose threads are how work gets
+   lost. Never hand-pick an id; `new` allocates atomically so a second agent
+   filing at the same moment cannot collide with you.
+6. **Update the tracker** — `scripts\parity-tasks.ps1 set-status <id> -Status
+   done -Commit <sha>`, evidence into that task's own file, ONE log entry in
+   `docs/design/windows-parity-log.md`. Run `scripts\parity-tasks.ps1
+   validate` before committing. Commit and push. Refresh the lock while you are here
+   (`scripts\go-loop-lock.ps1 heartbeat`) — a long task is the one case where
+   a turn can outlive the watchdog's staleness window.
 7. **`/reset-context read go.md and go`, and end the turn there.**
 
 **Ending a turn any other way is a failure, not a pause.** The loop
@@ -65,8 +82,8 @@ work is *already* durable in git + the tracker doc, so there is nothing to
 
 Concretely:
 
-1. Pick exactly **one** task (the first `todo` whose deps are `done`).
-2. Do it: implement → validate on the box → update the tracker row + session
+1. Pick exactly **one** task (`scripts\parity-tasks.ps1 next`).
+2. Do it: implement → validate on the box → update the task file + session
    log → commit → push.
 3. **STOP and reset context.** Do NOT keep working after invoking a reset —
    the clear only fires when your turn ends, so continuing silently cancels
@@ -85,8 +102,9 @@ Concretely:
 
 **Check your context usage at every task boundary.** If you are above ~150k,
 reset even if you feel mid-flow. If a single task pushes you past ~250k, the
-task is too big: split it into sub-tasks in the tracker (e.g. "T19a design"
-+ "T19 implement"), commit the split, and reset.
+task is too big: split it into sub-tasks (e.g. "T19a design" + "T19
+implement" — `parity-tasks.ps1 new`, then set the parent to
+`skipped(split → …)`), commit the split, and reset.
 
 **Keep tool output small.** Prefer `zig build ... 2>&1 | Select-String error`
 over dumping full build logs; prefer `| Select-Object -Last 1` on acceptance
@@ -106,17 +124,34 @@ line did not fail — re-run it unfiltered before believing it.
 
 ## What to do
 
-1. Read `docs/design/windows-parity-tasks.md`. It is the canonical
-   state/task doc; the state table is ground truth. **Read only that file.**
-   The per-task details (`windows-parity-details.md`), the session log
-   (`windows-parity-log.md`), the audit appendix
+1. **Tasks live one-per-file** in `docs/design/windows-parity-tasks/`
+   (`T<id>.md`, YAML frontmatter + Summary + Details). This replaced the
+   single state table on 2026-07-29 so two agents can file and edit tasks
+   without writing to the same file — see that directory's `README.md` for
+   the format and the full command set.
+
+   **Do not read the directory wholesale.** Use the script, then read only
+   the one task file you are working:
+
+   ```
+   powershell -NoProfile -File scripts\parity-tasks.ps1 next
+   powershell -NoProfile -File scripts\parity-tasks.ps1 show T144
+   ```
+
+   `docs/design/windows-parity-tasks.md` is still worth reading for its
+   narrative sections — the resume protocol, **Current priorities** (which
+   still outranks `next`), and the key code landmarks — but its **state
+   table is frozen**: a historical snapshot, no longer ground truth. Never
+   add a row to it. Likewise `windows-parity-details.md` is frozen; its
+   per-task sections were copied into the task files, and the task file
+   wins. The session log (`windows-parity-log.md`), the audit appendix
    (`windows-parity-audit.md`), and the spec (`windows-parity-spec.md`) are
-   split out on purpose — open at most the one section you actually need for
-   your task (for details, Grep `^## T<id> ` and Read that slice), never
-   all of them "for background".
-2. Follow its resume protocol for **one** task, per the context rule above.
-   At the boundary, append ONE short entry to `windows-parity-log.md` (no
-   build output, no diffs).
+   unchanged — open at most the one section you actually need, never all of
+   them "for background".
+2. Work **one** task, per the context rule above. At the boundary, record
+   status and evidence in the task's own file, and append ONE short entry to
+   `windows-parity-log.md` (no build output, no diffs). Run
+   `scripts\parity-tasks.ps1 validate` before you commit.
 3. The repo CLAUDE.md is written from the Mac seat (app bundles, unix
    sockets, /Applications paths). Where it conflicts with the tracker doc,
    the tracker doc wins on Windows. The "never touch /Applications/
