@@ -10,6 +10,22 @@ You are the on-box Windows session for the Windows parity effort.
 
 Concretely, in order, with no stops in between:
 
+0. **Take the loop lock** (T139) — one command, before anything else:
+
+   ```
+   powershell -NoProfile -File scripts\go-loop-lock.ps1 acquire
+   ```
+
+   - Exit **0** (`ACQUIRED …`): you own the loop. Carry on.
+   - Exit **3** (`BUSY owner_pane=… age=…m`): **another session is already
+     running this loop.** Say so, name the owner, and STOP — do not pick a
+     task. Two loops on one tracker clash (that is exactly what T138's
+     upgrade-script fork did on 2026-07-28: both sessions built T131).
+   - The same command each turn refreshes the heartbeat, and a lock whose
+     owner died — or whose heartbeat is older than 30 min — is taken over
+     automatically, so a crash never wedges the loop. Ownership is keyed on
+     the **pane**, so a relaunched claude in the same pane is the same slot.
+
 1. **Pick up a task** — first Current-priorities item, else first `todo` whose
    deps are `done`. Never ask which one.
 2. **Build it.**
@@ -24,11 +40,16 @@ Concretely, in order, with no stops in between:
    entry. Commit and push.
 7. **`/reset-context read go.md and go`, and end the turn there.**
 
-**Ending a turn any other way is a failure, not a pause.** Nothing supervises
-this loop: it perpetuates itself only through step 7. A turn that stops after
-step 6 to report success leaves the loop dead until a human notices — that
-already cost six days (2026-07-21 → 2026-07-27). Finishing a task is not a
+**Ending a turn any other way is a failure, not a pause.** The loop
+perpetuates itself through step 7. A turn that stops after step 6 to report
+success leaves the loop dead — that already cost six days (2026-07-21 →
+2026-07-27) and killed it again on 2026-07-28. Finishing a task is not a
 reason to stop; finishing IS the trigger to reset and take the next one.
+
+Since T139 there IS a supervisor, but do not lean on it: the watchdog
+(`scripts\go-loop-watchdog.ps1`, a per-user scheduled task) only notices the
+step-0 heartbeat going stale, and only re-enters after up to ~45 min of dead
+time. It is the safety net for a crash, not a substitute for step 7.
 
 The one allowed exception: if the reset probe finds this session is not in a
 Ghoztty pane, say so plainly and ask the user to run `/clear`.
