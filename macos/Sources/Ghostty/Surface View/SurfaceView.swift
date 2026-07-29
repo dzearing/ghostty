@@ -199,7 +199,8 @@ extension Ghostty {
                             SurfacePaneBanner(
                                 text: banner,
                                 background: paneBackgroundColor,
-                                paneWidth: geo.size.width)
+                                paneWidth: geo.size.width,
+                                linkSurface: surfaceView)
                                 .onPreferenceChange(BannerTargetHeightKey.self) { target in
                                     // The target comes from a hidden
                                     // animation-free copy of the banner, so it

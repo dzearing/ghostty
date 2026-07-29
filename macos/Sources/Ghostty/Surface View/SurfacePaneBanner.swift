@@ -69,16 +69,23 @@ extension Ghostty {
         /// banner is cleared and set again.
         @State private var collapsed: Bool
 
+        /// The pane the banner belongs to. Passed to link runs so a clicked
+        /// link opens relative to this pane (new window / side pane). nil in
+        /// previews/tests, where links fall back to the system browser.
+        var linkSurface: Ghostty.SurfaceView? = nil
+
         init(
             text: String,
             background: Color? = nil,
             paneWidth: CGFloat = 0,
-            initiallyCollapsed: Bool = false
+            initiallyCollapsed: Bool = false,
+            linkSurface: Ghostty.SurfaceView? = nil
         ) {
             self.text = text
             self.background = background
             self.paneWidth = paneWidth
             self._collapsed = State(initialValue: initiallyCollapsed)
+            self.linkSurface = linkSurface
         }
 
         var body: some View {
@@ -244,10 +251,22 @@ extension Ghostty {
         ) -> some View {
             switch block {
             case .text(let str, let lineLimit):
-                Text(str)
+                let plain = Text(str)
                     .lineLimit(lineLimit)
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
+                #if canImport(AppKit)
+                // A link-bearing line renders through BannerText so its links
+                // get the dotted-at-rest / solid-on-hover affordance; link-free
+                // text stays plain SwiftUI Text.
+                if str.hasBannerLink {
+                    BannerText(attributed: str, lineLimit: lineLimit, surface: linkSurface)
+                } else {
+                    plain
+                }
+                #else
+                plain
+                #endif
             case .list(let items):
                 // A two-column grid: markers share the first (auto-sized)
                 // column so every item's content left-aligns in the second,
@@ -273,11 +292,24 @@ extension Ghostty {
                 // the checkbox case needs it; text-led lists already have parity.
                 .padding(.top, leadsWithCheckbox(items) ? 2 : 0)
             case .heading(let str, let level):
-                Text(str)
+                let plain = Text(str)
                     .font(.system(size: headingFontSize(level), weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
+                #if canImport(AppKit)
+                if str.hasBannerLink {
+                    BannerText(
+                        attributed: str,
+                        baseFont: .systemFont(ofSize: headingFontSize(level), weight: .semibold),
+                        singleLine: true,
+                        surface: linkSurface)
+                } else {
+                    plain
+                }
+                #else
+                plain
+                #endif
             case .rule:
                 // A full-width separator between blocks. The 8pt block gap
                 // above and below gives it breathing room without extra padding.
@@ -341,7 +373,8 @@ extension Ghostty {
                 return false
             }
             if let width, !hasCheckbox {
-                Text(BannerMarkdown.attributed(segments))
+                let attributed = BannerMarkdown.attributed(segments)
+                let plain = Text(attributed)
                     .multilineTextAlignment(textAlignment(alignment))
                     // A nasty cell (long unbroken token in a skinny pane)
                     // can't grow the row unbounded: cap the wrap and
@@ -352,12 +385,34 @@ extension Ghostty {
                     // take whatever height the wrapped text needs.
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(width: width, alignment: frameAlignment(alignment))
+                #if canImport(AppKit)
+                if attributed.hasBannerLink {
+                    BannerText(
+                        attributed: attributed,
+                        width: width,
+                        lineLimit: Self.maxCellWrapLines,
+                        alignment: nsTextAlignment(alignment),
+                        surface: linkSurface)
+                } else {
+                    plain
+                }
+                #else
+                plain
+                #endif
             } else {
                 let row = HStack(alignment: .center, spacing: 0) {
                     ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                         switch seg {
                         case .text(let str):
+                            #if canImport(AppKit)
+                            if str.hasBannerLink {
+                                BannerText(attributed: str, singleLine: true, surface: linkSurface)
+                            } else {
+                                Text(str).lineLimit(1)
+                            }
+                            #else
                             Text(str).lineLimit(1)
+                            #endif
                         case .checkbox(let checked):
                             CheckboxMark(checked: checked)
                         }
@@ -495,6 +550,20 @@ extension Ghostty {
             case .leading, nil: return .leading
             }
         }
+
+        #if canImport(AppKit)
+        /// Column alignment as an AppKit `NSTextAlignment`, for a link-bearing
+        /// cell rendered through `BannerText`.
+        private func nsTextAlignment(
+            _ alignment: BannerMarkdown.ColumnAlignment?
+        ) -> NSTextAlignment {
+            switch alignment {
+            case .center: return .center
+            case .trailing: return .right
+            case .leading, nil: return .left
+            }
+        }
+        #endif
 
         /// Text-keyed cache of everything about a banner that does NOT depend
         /// on the pane width: the parsed blocks and each table's natural
