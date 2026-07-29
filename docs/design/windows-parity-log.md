@@ -1944,3 +1944,12 @@ perform AND is swallowed, i.e. the chord does nothing at all today.
 
 Floor for this turn: both test lanes exit 0, `test-agent` exit 0, P1/P2/P3
 ALL PASS, `clipboard-paste.ps1` ALL PASS (12) x3.
+
+DELIVERED to all 3 install locations (the user reported this one and it blocks
+their daily workflow): ReleaseFast gnu `-Dstrip=false` staged to
+`zig-out-release` (`+version` = `+650ea4da9`); Desktop portable +
+`\homeassistant\share` swapped with `.bak-20260729-t154`; installed release
+via the detached upgrade script at the task boundary (default
+`-ResumeCommand`, so its relaunch is also this turn's context reset). The
+resumed session verifies `%TEMP%\ghoztty-upgrade.log`, then `+version`, then
+the fix itself by pasting a screenshot into a Claude Code pane. Next: T155.
