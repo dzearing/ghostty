@@ -461,9 +461,17 @@ Work these first, in order, before falling back to first-todo-in-table:
 
 3g. **USER LIVE-REVIEW #3, 2026-07-29 (same day, later still).** Two more,
    both root-caused by inspection before filing — neither needs a build to
-   diagnose, and both are small: **T154** (ctrl+v swallowed, so screenshots
-   can't be pasted into Claude Code — a single missing `performable` flag
-   that the binding's own neighbors already set) → **T155** (split dividers
+   diagnose, and both are small: ~~**T154**~~ (**DONE 2026-07-29**, 61e4e847c —
+   the filed one-flag diagnosis was right and the row's own testable
+   prediction held: pre-fix, an image-only clipboard + ctrl+v delivered NO
+   character to the pane while ctrl+shift+v delivered 22, so the defect was
+   the `performable` flag and not the chord. New `clipboard-paste.ps1` proves
+   it with an in-pane `[Console]::ReadKey` probe — reading rendered text
+   cannot tell "pasted nothing" from "swallowed the key", a character code
+   can. ALL PASS (12) ×3. Audit of the rest of the block found one real gap
+   (**T156**, shift+insert); building the harness exposed **T157**, the
+   standing `keybinds-t01.ps1` failing its own positive control) → **T155**
+   (split dividers
    accumulate stale lines because the parent's `WM_ERASEBKGND` paints
    nothing and the divider is stroked outside the paint cycle). T154 is the
    cheapest fix on the whole board and unblocks the user's daily workflow;
