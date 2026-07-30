@@ -1,0 +1,450 @@
+# The upgrade must not FORK the loop (tracker T138).
+#
+# `upgrade-ghoztty-windows.ps1` was written when killing ghoztty.exe killed the
+# Claude session inside it, so it always relaunched `claude --continue` after
+# the swap. Session persistence (T89) ended that: the agent owns the PTY, the
+# script deliberately never kills it, and the relaunched app RE-ATTACHES the
+# pane - so the old session is still there and the relaunch adds a SECOND one
+# on the same transcript. Both then pick the same task (user-hit 2026-07-28:
+# claude pid 16076 from 08:01 was still alive next to pid 644 started 09:46 by
+# the script, and both started building T131).
+#
+# Sections:
+#   A  pure: the resume decision, the prompt derivation, the process-identity
+#      guard, and the `+sessions --json` parser. A's parser cases carry the
+#      pre-fix oracle: the old line-by-line reader finds 0 sessions in the
+#      output the command actually prints, which is why SESSIONS-SURVIVE had
+#      been silently skipping since T89h.
+#   B  E2E reuse: a live pane plus a live "loop process" -> the script swaps
+#      the binaries, brings the app back, types the prompt into the EXISTING
+#      pane, and starts nothing new. The headline assert is the fork one:
+#      afterwards there is exactly one loop process and no new window.
+#   C  E2E relaunch: the loop process is dead -> the old behavior is intact,
+#      a window opens running the resume command.
+#
+# Hermetic: a sandbox install dir + staging dir + LOCALAPPDATA + TEMP under
+# %TEMP%\ghoztty-upgrade-nofork-<pid>, so it never touches the user's
+# installed release, the real upgrade log, or the real agent. It only ever
+# kills processes running out of that sandbox.
+#
+# The isolation needs one more knob than the other suites: the local agent's
+# pipe is `\\.\pipe\ghoztty-agent[-debug]-<USERNAME>`, which is NOT covered by
+# a private LOCALAPPDATA. Left alone, this sandbox's app binds (or finds) the
+# box's REAL debug agent while reading port.json/sessions.json out of the
+# sandbox - a half-isolated state where sessions look dead to `+sessions` and
+# restore, and the reuse path can never pass. Overriding $env:USERNAME gives
+# the sandbox its own pipe lineage, so no other agent on the box is disturbed
+# (the other suites get there by killing every zig-out agent first).
+#
+#   powershell -NoProfile -File test\win32\upgrade-no-fork.ps1
+param(
+    [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
+    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    [string]$Repo = 'D:\git\ghoztty',
+    [switch]$PureOnly,
+    # Leave the sandbox (and its copy of the upgrade log) on disk for
+    # post-mortem instead of deleting it.
+    [switch]$Keep
+)
+
+$ErrorActionPreference = 'Continue'
+$script:failures = 0
+$root = Join-Path $env:TEMP "ghoztty-upgrade-nofork-$PID"
+
+function Assert($name, $cond) {
+    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+}
+function AssertEq($name, $expected, $actual) {
+    if ($expected -eq $actual) { "  PASS $name" }
+    else { "  FAIL $name (expected '$expected', got '$actual')"; $script:failures++ }
+}
+
+. (Join-Path $Repo 'scripts\loop-session.ps1')
+
+# ============================================================================
+"== A: the resume decision, in isolation"
+# ============================================================================
+
+# --- A1 the `+sessions --json` parser --------------------------------------
+# Verbatim shape of what `ghoztty +sessions --json` prints (captured on the box
+# 2026-07-29): a pretty-printed ARRAY, not one object per line.
+$prettyArray = @'
+[
+  {
+    "id": "59777171fd211b995a94f16163ad83e0",
+    "alive": true,
+    "attached": true,
+    "pid": 732,
+    "cwd": null,
+    "created_at": 1785370903862
+  },
+  {
+    "id": "95718f1322beebf3f3b45bde63b06ae8",
+    "alive": true,
+    "attached": true,
+    "pid": 792,
+    "cwd": "D:\\git\\ghoztty",
+    "created_at": 1785372075719
+  }
+]
+'@
+$ndjson = '{"id":"aaa","alive":true}' + "`r`n" + '{"id":"bbb","alive":true}'
+
+AssertEq "A1 pretty array yields both session ids" 2 (Get-GhozttySessionIds $prettyArray).Count
+AssertEq "A2 pretty array yields the right first id" '59777171fd211b995a94f16163ad83e0' `
+    (Get-GhozttySessionIds $prettyArray)[0]
+AssertEq "A3 NDJSON still parses (the shape CLAUDE.md documents)" 2 (Get-GhozttySessionIds $ndjson).Count
+AssertEq "A4 a leading warning line does not defeat the parse" 2 `
+    (Get-GhozttySessionIds ("warning: something`r`n" + $prettyArray)).Count
+AssertEq "A5 empty output yields no sessions" 0 (Get-GhozttySessionIds '').Count
+AssertEq "A6 garbage yields no sessions instead of throwing" 0 (Get-GhozttySessionIds 'not json at all').Count
+AssertEq "A7 a single object parses" 1 (Get-GhozttySessionIds '{"id":"solo"}').Count
+
+# The pre-fix oracle: the reader the upgrade script used to have, run over the
+# output the command actually prints. It finds nothing - which is exactly what
+# "pre-kill agent sessions: 0" meant in the 2026-07-28 log.
+$oldParserCount = 0
+try {
+    $oldParserCount = @($prettyArray -split "`r?`n" | Where-Object { $_ -match '^\s*\{' } |
+        ForEach-Object { ($_ | ConvertFrom-Json).id }).Count
+} catch { $oldParserCount = 0 }
+AssertEq "A8 PRE-FIX ORACLE: the old line-by-line reader found 0 in this output" 0 $oldParserCount
+
+# --- A9 the decision table --------------------------------------------------
+AssertEq "A9 -NoResume wins over everything" 'none' `
+    (Resolve-LoopResumeAction -NoResume $true -ClaudeAlive $true)
+AssertEq "A10 a surviving session is REUSED, not duplicated" 'reuse' `
+    (Resolve-LoopResumeAction -ClaudeAlive $true)
+AssertEq "A11 a dead session is relaunched (the pre-T138 behavior)" 'relaunch' `
+    (Resolve-LoopResumeAction -ClaudeAlive $false)
+AssertEq "A12 -ForceRelaunch overrides a surviving session" 'relaunch' `
+    (Resolve-LoopResumeAction -ClaudeAlive $true -ForceRelaunch $true)
+
+# --- A13 the prompt derivation ---------------------------------------------
+AssertEq "A13 the prompt comes from the resume command's trailing quotes" 'read go.md and go' `
+    (Resolve-LoopResumePrompt -ResumeCommand 'claude --dangerously-skip-permissions --continue "read go.md and go"')
+AssertEq "A14 an explicit prompt wins" 'do the thing' `
+    (Resolve-LoopResumePrompt -ResumeCommand 'claude --continue "read go.md and go"' -Explicit 'do the thing')
+AssertEq "A15 an unquoted resume command falls back to the loop prompt" 'read go.md and go' `
+    (Resolve-LoopResumePrompt -ResumeCommand 'claude --continue')
+
+# --- A16 process identity ---------------------------------------------------
+$sleeper = Start-Process powershell -PassThru -WindowStyle Hidden `
+    -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 120'
+Start-Sleep -Milliseconds 400
+$stamp = Get-LoopProcStamp $sleeper.Id
+Assert "A16 a live process stamps with a name and start time" ($stamp -and $stamp.Name -and $stamp.Start)
+Assert "A17 the stamped process reads back as alive" (Test-LoopProcAlive $stamp)
+AssertEq "A18 an explicit loop pid is taken as-is" $sleeper.Id (Resolve-LoopClaudePid -Explicit $sleeper.Id)
+
+# The pid-reuse guard: same live pid, different start time -> not our process.
+$imposter = [pscustomobject]@{ Pid = $stamp.Pid; Name = $stamp.Name; Start = $stamp.Start.AddMinutes(-10) }
+Assert "A19 a recycled pid does NOT read as the process we stamped" (-not (Test-LoopProcAlive $imposter))
+
+Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 600
+Assert "A20 a dead process reads as dead" (-not (Test-LoopProcAlive $stamp))
+AssertEq "A21 a dead loop process decides RELAUNCH" 'relaunch' `
+    (Resolve-LoopResumeAction -ClaudeAlive (Test-LoopProcAlive $stamp))
+
+if ($PureOnly) {
+    ""
+    if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }
+}
+
+# ============================================================================
+# E2E scaffolding: a complete sandbox install the script can upgrade.
+# ============================================================================
+$installDir = Join-Path $root 'install'
+$stagingDir = Join-Path $root 'staging'
+$workDir = Join-Path $root 'work'
+$stateDir = Join-Path $root 'state'
+$tempDir = Join-Path $root 'temp'
+$sandboxExe = Join-Path $installDir 'ghoztty.exe'
+$upgrade = Join-Path $Repo 'scripts\upgrade-ghoztty-windows.ps1'
+$upgradeLog = Join-Path $tempDir 'ghoztty-upgrade.log'
+
+# The agent takes a per-user, per-lineage single-instance guard (a named
+# mutex), so a debug agent already running on the box makes the sandbox's own
+# agent exit 183 - "another instance is already running" - and the sandbox
+# silently runs WITHOUT session persistence, which no amount of private state
+# can fix. Clear the debug lineage first, exactly as the other suites do.
+# Matched on `local-agent-debug` in the command line, so the user's RELEASE
+# agent (`local-agent`, holding their real panes) is never a candidate.
+function Stop-DebugLineage {
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and (
+                $_.ExecutablePath -like '*zig-out*' -or
+                $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase))
+        } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like '*local-agent-debug*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 900
+}
+
+# Only ever touch processes running out of the sandbox.
+function Stop-SandboxProcs {
+    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
+        Get-CimInstance Win32_Process -Filter "Name='$n'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    Start-Sleep -Milliseconds 900
+}
+# The resume command writes a file. A file is a durable oracle - a process
+# check can miss a command that already exited, and "did the relaunch run?" has
+# to be answerable minutes later.
+function New-ResumeCommand($markerFile) { return "cmd /c echo started > $markerFile" }
+function Run-Sandbox($argsLine, $out, $timeoutSec = 30) {
+    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru -WorkingDirectory $workDir `
+        -ArgumentList "/c `"`"$sandboxExe`" $argsLine > `"$out`" 2>&1`""
+    if (-not $p.WaitForExit($timeoutSec * 1000)) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    return $p.ExitCode
+}
+function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
+function Find-Leaf($node) {
+    if ($null -eq $node) { return $null }
+    if ($node.type -eq 'leaf') { return $node.terminal }
+    if ($node.type -eq 'split') {
+        $l = Find-Leaf $node.left
+        if ($null -ne $l) { return $l }
+        return (Find-Leaf $node.right)
+    }
+    return $null
+}
+function Get-Tree($tag) {
+    $f = Join-Path $root "list-$tag.json"
+    if ((Run-Sandbox '+list --json' $f 25) -ne 0) { return $null }
+    try { return (Out-Text $f | ConvertFrom-Json) } catch { return $null }
+}
+function Windows-Of($tree) {
+    if ($null -eq $tree) { return @() }
+    if ($null -ne $tree.data) { return @($tree.data.windows) }
+    return @($tree.windows)
+}
+function Pane-In($tree, $target) {
+    foreach ($w in (Windows-Of $tree)) {
+        if ($w.target -ne $target) { continue }
+        foreach ($t in @($w.tabs)) {
+            $leaf = Find-Leaf $t.splits
+            if ($null -ne $leaf) { return $leaf }
+        }
+    }
+    return $null
+}
+function Wait-Windows($tag, $count, $timeoutSec = 60) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $tree = $null
+    while ((Get-Date) -lt $deadline) {
+        $tree = Get-Tree $tag
+        if ((Windows-Of $tree).Count -ge $count) { return $tree }
+        Start-Sleep -Milliseconds 800
+    }
+    return $tree
+}
+# Run the upgrade script synchronously against the sandbox, from a launcher
+# directory it must not leak (the T132 trap), and keep its log per section.
+# Every argument with whitespace is quoted: -ArgumentList joins the array with
+# spaces, so an unquoted 'cmd /c echo ...' silently becomes four arguments and
+# -ResumeCommand ends up as 'cmd'.
+function Invoke-Upgrade($tag, $extraArgs, $timeoutSec = 300) {
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgrade,
+        '-Staging', $stagingDir, '-InstallDir', $installDir,
+        '-WorkingDirectory', $workDir, '-DelaySeconds', '1') + $extraArgs
+    $quoted = $a | ForEach-Object {
+        $s = [string]$_
+        if ($s -match '[\s&<>|]') { '"' + $s + '"' } else { $s }
+    }
+    Remove-Item $upgradeLog -Force -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru `
+        -WorkingDirectory 'C:\Windows\System32' -ArgumentList $quoted
+    $code = $null
+    if ($p.WaitForExit($timeoutSec * 1000)) { $code = $p.ExitCode }
+    else { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $upgradeLog) { Copy-Item $upgradeLog (Join-Path $root "upgrade-$tag.log") -Force }
+    return $code
+}
+
+Stop-DebugLineage
+Stop-SandboxProcs
+foreach ($d in @($installDir, (Join-Path $stagingDir 'bin'), $workDir, $tempDir,
+                 (Join-Path $stateDir 'ghoztty\local-agent-debug'))) {
+    New-Item -ItemType Directory -Force $d | Out-Null
+}
+Assert "B0a the built exe exists" (Test-Path $Exe)
+Assert "B0b the built agent exists" (Test-Path $AgentExe)
+Copy-Item $Exe $installDir -Force
+Copy-Item $AgentExe $installDir -Force
+Copy-Item $Exe (Join-Path $stagingDir 'bin') -Force
+Copy-Item $AgentExe (Join-Path $stagingDir 'bin') -Force
+
+$savedLocalAppData = $env:LOCALAPPDATA
+$savedTemp = $env:TEMP
+$savedTmp = $env:TMP
+$savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
+$savedUser = $env:USERNAME
+$env:LOCALAPPDATA = $stateDir
+$env:TEMP = $tempDir
+$env:TMP = $tempDir
+$env:GHOSTTY_LOCAL_AGENT_BIN = (Join-Path $installDir 'ghoztty-agent.exe')
+$env:USERNAME = "nofork$PID"   # own agent pipe lineage; see the header
+
+try {
+    # ========================================================================
+    "== B: a surviving session is REUSED, not forked"
+    # ========================================================================
+    $codeB = Run-Sandbox "+new-window --target=main --working-directory=$workDir" `
+        (Join-Path $root 'new-window.txt') 60
+    Assert "B1 the sandbox instance launched and took a window" ($codeB -eq 0)
+    $treeB = Wait-Windows 'b0' 1 60
+    $paneB = Pane-In $treeB 'main'
+    Assert "B2 the loop's pane exists and is addressable" ($null -ne $paneB -and $paneB.id)
+    $paneId = if ($paneB) { [string]$paneB.id } else { '' }
+    $windowsBefore = (Windows-Of $treeB).Count
+
+    # Guard against a silently non-persistent sandbox: without an agent the
+    # pane dies with the app, "no fork" would pass for the wrong reason, and
+    # this whole section would be theatre.
+    $portFile = Join-Path $stateDir 'ghoztty\local-agent-debug\port.json'
+    $agentUp = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        if (Test-Path $portFile) { $agentUp = $true; break }
+        Start-Sleep -Milliseconds 800
+    }
+    Assert "B2b the sandbox pane really is agent-backed (port.json written)" $agentUp
+
+    # The stand-in for the loop's claude: a live process the script is told to
+    # treat as the launching session. Using a stand-in (rather than a real
+    # `claude`) is what makes the decision testable - the script's own
+    # -LoopClaudePid parameter exists for exactly this.
+    $loop = Start-Process powershell -PassThru -WindowStyle Hidden `
+        -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 600'
+    Start-Sleep -Milliseconds 400
+    Assert "B3 the stand-in loop process is running" ($null -ne (Get-Process -Id $loop.Id -ErrorAction SilentlyContinue))
+
+    # If the script relaunches, THIS is what it would run. Nothing in the reuse
+    # path may run it - the marker file must never appear.
+    $markerB = Join-Path $root 'relaunched-b.marker'
+    $promptB = 'T138-REUSE-PROMPT'
+    $codeU = Invoke-Upgrade 'b' @('-LoopClaudePid', $loop.Id, '-LoopPaneId', $paneId,
+        '-ResumePrompt', $promptB, '-AllowPlainResume',
+        '-ResumeCommand', (New-ResumeCommand $markerB))
+    AssertEq "B4 the upgrade script exited 0" 0 $codeU
+
+    $logB = Out-Text (Join-Path $root 'upgrade-b.log')
+    Assert "B5 the script decided to REUSE the surviving session" ($logB -match 'resume decision: reuse')
+    Assert "B6 the surviving session was recorded before the kill" ($logB -match 'loop session: claude pid=')
+    Assert "B7 it never ran the relaunch command" (-not ($logB -match 'relaunch:'))
+    Assert "B8 THE FORK ASSERT: nothing new was started for the resume" (-not (Test-Path $markerB))
+    Assert "B9 the loop process is still the same one, still alive" `
+        ($null -ne (Get-Process -Id $loop.Id -ErrorAction SilentlyContinue))
+
+    # The `+sessions --json` probe: pre-fix this logged 0 sessions and the
+    # assert skipped, on a box that had live ones.
+    Assert "B10 the pre-kill session probe SAW the agent's sessions" `
+        ($logB -match 'pre-kill agent sessions: [1-9]')
+    Assert "B11 the sessions-survive assert ran and passed" ($logB -match 'SESSIONS-SURVIVE OK')
+
+    $treeB2 = Wait-Windows 'b1' 1 90
+    $paneB2 = Pane-In $treeB2 'main'
+    Assert "B12 the app came back with the loop's window re-attached" ($null -ne $paneB2)
+    AssertEq "B13 it is the SAME pane (re-attached, not recreated)" $paneId ([string]$paneB2.id)
+    AssertEq "B14 no extra window was opened" $windowsBefore (Windows-Of $treeB2).Count
+
+    # The prompt must actually reach the pane. The pane runs cmd.exe, so an
+    # unknown command echoes back - proof of delivery, not of intent.
+    $tail = ''
+    for ($i = 0; $i -lt 12; $i++) {
+        Run-Sandbox "+read --name=$paneId --lines=60" (Join-Path $root 'read-b.txt') 25 | Out-Null
+        $tail = Out-Text (Join-Path $root 'read-b.txt')
+        if ($tail -match $promptB) { break }
+        Start-Sleep -Milliseconds 900
+    }
+    Assert "B15 the resume prompt was typed into the SURVIVING pane" ($tail -match $promptB)
+    Assert "B16 the script logged the delivery" ($logB -match 'RESUME-REUSE (OK|SENT)')
+
+    # ========================================================================
+    "== C: with nothing left alive, the relaunch behavior is intact"
+    # ========================================================================
+    Stop-Process -Id $loop.Id -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 700
+    Assert "C1 the loop process is gone" ($null -eq (Get-Process -Id $loop.Id -ErrorAction SilentlyContinue))
+
+    # `+new-window --target=main` focuses an existing 'main' instead of
+    # creating one, so clear it: the relaunch case is "nothing survived".
+    Run-Sandbox '+close --target=main' (Join-Path $root 'close-main.txt') 30 | Out-Null
+    Start-Sleep -Seconds 2
+
+    $markerC = Join-Path $root 'relaunched-c.marker'
+    $codeC = Invoke-Upgrade 'c' @('-LoopClaudePid', $loop.Id, '-LoopPaneId', $paneId,
+        '-AllowPlainResume', '-ResumeCommand', (New-ResumeCommand $markerC))
+    AssertEq "C2 the upgrade script exited 0" 0 $codeC
+
+    $logC = Out-Text (Join-Path $root 'upgrade-c.log')
+    Assert "C3 the script decided to RELAUNCH" ($logC -match 'resume decision: relaunch')
+    Assert "C4 it reported the dead loop process as the reason" ($logC -match 'alive=False')
+    Assert "C5 it ran the relaunch" ($logC -match 'UPGRADE OK \(relaunched')
+
+    $started = $false
+    for ($i = 0; $i -lt 25; $i++) {
+        if (Test-Path $markerC) { $started = $true; break }
+        Start-Sleep -Milliseconds 900
+    }
+    Assert "C6 the resume command actually ran in the new window" $started
+
+    # ========================================================================
+    "== D: a relaunch onto a RESTORED window still resumes"
+    # ========================================================================
+    # C left a window registered as 'main' and the loop process is still dead -
+    # the state a persistence box is always in after a restore, since restore
+    # brings the IPC names back with it. `+new-window --target=main` FOCUSES an
+    # existing target and never runs its --command, so the pre-T138 script
+    # logged a successful relaunch while starting nothing at all (measured
+    # 2026-07-29: exit 0, "UPGRADE OK (relaunched...)", resume command never
+    # ran). A silent stall is the same class of failure as a fork.
+    $treeD = Wait-Windows 'd0' 1 60
+    Assert "D1 a window is still registered as 'main' (the restored-name case)" `
+        ($null -ne (Pane-In $treeD 'main'))
+
+    $markerD = Join-Path $root 'relaunched-d.marker'
+    $codeD = Invoke-Upgrade 'd' @('-LoopClaudePid', $loop.Id, '-LoopPaneId', $paneId,
+        '-AllowPlainResume', '-ResumeCommand', (New-ResumeCommand $markerD))
+    AssertEq "D2 the upgrade script exited 0" 0 $codeD
+    $logD = Out-Text (Join-Path $root 'upgrade-d.log')
+    # It must VERIFY that a window is running the resume command rather than
+    # assume the request took effect - whether the restored app has already
+    # re-registered 'main' when the request lands is a race, so the outcome
+    # check is the only honest one.
+    Assert "D3 it verified that a window is running the resume command" `
+        ($logD -match 'RELAUNCH-WINDOW OK')
+
+    $ranD = $false
+    for ($i = 0; $i -lt 25; $i++) {
+        if (Test-Path $markerD) { $ranD = $true; break }
+        Start-Sleep -Milliseconds 900
+    }
+    Assert "D4 the resume command ran anyway (no silent stall)" $ranD
+    Assert "D5 the script did not claim success without running it" `
+        (-not ($logD -match 'RELAUNCH FAIL'))
+} finally {
+    # ---- teardown ----------------------------------------------------------
+    Stop-SandboxProcs
+    if ($loop) { Stop-Process -Id $loop.Id -Force -ErrorAction SilentlyContinue }
+    $env:USERNAME = $savedUser
+    $env:LOCALAPPDATA = $savedLocalAppData
+    $env:TEMP = $savedTemp
+    $env:TMP = $savedTmp
+    if ($null -eq $savedAgentBin) { Remove-Item Env:\GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
+    else { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
+    if ($Keep) { "  (sandbox kept: $root)" }
+    else { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+}
+
+""
+if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }

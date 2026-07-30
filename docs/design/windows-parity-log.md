@@ -2093,3 +2093,47 @@ Validation: docs only, no source touched. `parity-tasks.ps1 validate` ALL PASS
 (195 tasks), both test lanes and `zig build test-agent` exit 0, P1/P2/P3
 ACCEPTANCE ALL PASS. Next: T123 per priority 3f (the banner table's 360pt cap),
 with T159-T162 sequenced behind T90b-T90e.
+
+## 2026-07-29 - T138 done: the resume is a decision now, and two blind diagnostics could not say so
+
+The upgrade script assumed its own kill ended the loop's Claude session. That
+stopped being true at T89 - the agent owns the PTY and is never killed - so the
+script's unconditional `claude --continue` relaunch landed on top of a session
+that was still alive, and the user got two windows building T131 (2026-07-28).
+
+The fix is a decision made from one knowable fact: is the Claude that launched
+this script still alive after the swap? `scripts/loop-session.ps1` (new)
+resolves it (`-LoopClaudePid` -> `$env:CLAUDE_PID` -> ancestry walk) and stamps
+its start time so a recycled pid cannot impersonate it. Alive => bring the app
+back with a plain `Start-Process`, wait for restore to re-attach the pane, and
+`+send-keys --when-idle` the prompt into it. Dead => relaunch, as before. The
+pane comes from the inherited `$env:GHOZTTY_PANE_ID`; pane trees were unusable
+because `+list --json` reports pid 0 and an empty working_directory for
+agent-backed panes, which is the row's original plan refuted and now **T166**.
+
+Two diagnostics turned out to have been lying the whole time, and both were
+found by building the test rather than by reading the code. The `+sessions`
+probe parsed line-by-line while the command prints a pretty-printed array, so
+`SESSIONS-SURVIVE` had been SKIPPING since T89h - on a box with four live
+sessions it logged 0. And `+new-window --target=main` is idempotent: with the
+IPC names restored, the relaunch FOCUSES the existing window and never runs its
+command. The pre-fix script does that in the negative control - `UPGRADE OK
+(relaunched...)` with the resume command never started - so the same defect
+forks in the field and stalls silently in the sandbox depending on which side
+of the restore race the request lands. The relaunch now verifies a window
+actually appeared and retries under a unique target if not.
+
+`test/win32/upgrade-no-fork.ps1` ALL PASS x3 (48 assertions): A pure (incl. the
+pre-fix parser oracle), B reuse (no fork, same pane re-attached, prompt
+delivered, `pre-kill agent sessions: 2` + SESSIONS-SURVIVE OK), C relaunch
+intact, D relaunch onto a restored window still resumes. Building it cost three
+runs to a silent trap worth its own row: a debug agent already on the box takes
+a per-user single-instance mutex, so a sandbox agent exits 183 and the app
+quietly falls back to non-persistent panes - **T167**, with a
+"the pane really is agent-backed" assert added here so it can never pass for
+the wrong reason again. **T168** tracks converging the duplicated identity
+helpers in `go-loop-lock.ps1`.
+
+Both test lanes and `zig build test-agent` exit 0; P1/P2/P3 ACCEPTANCE ALL
+PASS. Next: T141 per priority 3e (delete the Windows-only relay-login verbs),
+then T140, T142.

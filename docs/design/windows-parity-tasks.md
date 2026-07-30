@@ -430,7 +430,17 @@ Work these first, in order, before falling back to first-todo-in-table:
    only marked windows are ever touched — and a duplicate is resolved with no
    human in the loop (the two sessions message each other; the loser closes).
    `go-loop-guard.ps1` ALL PASS (78) ×3, sections I–L real end-to-end against a
-   live GUI. Filed T153) → **T138** (the upgrade script is what forked it) → **T141** (delete the Windows-only `+relay-login`/
+   live GUI. Filed T153) → ~~**T138**~~ (**DONE 2026-07-29** — the resume is a
+   DECISION now: the script stamps the launching claude before the kill and,
+   if it outlived the swap (which it always does since T89 — the agent owns
+   the PTY), types the prompt into its re-attached pane instead of starting a
+   second `claude --continue`. Two diagnostics were found lying while building
+   the test: the `+sessions` probe parsed line-by-line against a
+   pretty-printed array, so SESSIONS-SURVIVE had been SKIPPING since T89h; and
+   `+new-window --target=main` is idempotent, so with the IPC names restored
+   the relaunch FOCUSED the old window and ran nothing — the pre-fix negative
+   control logged `UPGRADE OK (relaunched...)` with the command never started.
+   `upgrade-no-fork.ps1` ALL PASS (48) ×3. Filed T166–T168) → **T141** (delete the Windows-only `+relay-login`/
    `+relay-logout`; audit the CLI for every other one-platform verb) → **T140**
    (rebuild the Ctrl+Shift+N chooser to Mac parity) → **T142** (banner overlay
    z-order self-healing). Then 3d.

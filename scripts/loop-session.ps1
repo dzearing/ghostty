@@ -1,0 +1,156 @@
+# Shared helpers for identifying the go.md loop's Claude session and deciding
+# how to resume it (tracker T138).
+#
+# Dot-source it:
+#   . (Join-Path $PSScriptRoot 'loop-session.ps1')
+#
+# Why this exists: `upgrade-ghoztty-windows.ps1` used to assume that killing
+# ghoztty.exe kills the Claude session running inside it. Session persistence
+# (T89) ended that - the agent owns the PTY and is deliberately never killed,
+# so the session SURVIVES the upgrade and the relaunched app re-attaches it.
+# Relaunching `claude --continue` on top of that produces a SECOND session on
+# the same transcript, and both pick the same task (user-hit 2026-07-28).
+#
+# So the resume decision needs one fact: is the Claude that launched the
+# upgrade still alive afterwards? These helpers answer that without guessing
+# from pane trees (a local-agent pane reports pid 0 / empty working_directory
+# in `+list --json`, see T98) and without confusing the loop's session with any
+# OTHER Claude the user has open.
+#
+# NOTE: `go-loop-lock.ps1` carries its own copy of the pid/stamp resolution it
+# needs for the lock file. Converging the two is filed as its own task rather
+# than folded in here, so this change cannot destabilize the loop lock.
+
+# --- process identity -------------------------------------------------------
+
+# Name + start time of a pid, or $null if it is gone. The start time is what
+# makes a later liveness check honest: pids are recycled, so "pid 1234 exists"
+# is not "the process I recorded is still running".
+function Get-LoopProcStamp {
+    param([int]$ProcId)
+    if ($ProcId -le 0) { return $null }
+    $p = Get-Process -Id $ProcId -ErrorAction SilentlyContinue
+    if (-not $p) { return $null }
+    $start = $null
+    try { $start = $p.StartTime } catch { $start = $null }
+    return [pscustomobject]@{ Pid = $ProcId; Name = $p.ProcessName; Start = $start }
+}
+
+# The claude process that owns the calling session:
+#   1. an explicit pid (tests, and callers that already know it)
+#   2. $env:CLAUDE_PID - set by Claude Code in every tool shell, and inherited
+#      by a Start-Process'd detached script, which is exactly our case
+#   3. our own ancestry - the fallback for a shell that lost the env var
+# Returns 0 when there is no Claude above us (a hand-run upgrade), which is a
+# real answer: nothing survived the kill, so relaunching is correct.
+function Resolve-LoopClaudePid {
+    param([int]$Explicit = 0)
+    if ($Explicit -gt 0) { return $Explicit }
+    if ($env:CLAUDE_PID) {
+        $envPid = 0
+        [void][int]::TryParse($env:CLAUDE_PID, [ref]$envPid)
+        $stamp = Get-LoopProcStamp $envPid
+        if ($stamp -and $stamp.Name -like 'claude*') { return $envPid }
+    }
+    $walk = $PID
+    for ($i = 0; $i -lt 8 -and $walk -gt 0; $i++) {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$walk" -ErrorAction SilentlyContinue
+        if (-not $proc) { break }
+        if ($proc.Name -like 'claude*') { return [int]$proc.ProcessId }
+        $walk = [int]$proc.ParentProcessId
+    }
+    return 0
+}
+
+# Is the process we stamped earlier still the same live process?
+function Test-LoopProcAlive {
+    param($Stamp)
+    if (-not $Stamp) { return $false }
+    $now = Get-LoopProcStamp ([int]$Stamp.Pid)
+    if (-not $now) { return $false }
+    if ($Stamp.Name -and $now.Name -ne $Stamp.Name) { return $false }
+    if ($Stamp.Start -and $now.Start) {
+        if ([math]::Abs(($now.Start - $Stamp.Start).TotalSeconds) -gt 2) { return $false }
+    }
+    return $true
+}
+
+# --- `+sessions --json` -----------------------------------------------------
+
+# Parse whatever `ghoztty +sessions --json` printed into session objects.
+#
+# The upgrade script used to read this line-by-line, expecting one JSON object
+# per line (which is what CLAUDE.md describes). The command actually prints a
+# pretty-printed ARRAY, so every line failed to parse and the pre-kill probe
+# reported "0 sessions" on a box with four live ones - which is why the
+# sessions-survive assert had been silently skipping since T89h.
+#
+# Accepts: pretty array, single object, NDJSON, empty, and leading non-JSON
+# noise (a warning line ahead of the payload). Returns @() on anything else
+# rather than throwing - this is a diagnostic probe, not a gate.
+function ConvertFrom-GhozttySessionsJson {
+    param([string]$Text)
+    if (-not $Text) { return @() }
+    $trimmed = $Text.Trim()
+    if (-not $trimmed) { return @() }
+
+    # Whole-payload parse first: handles the real (array) shape and a single
+    # object. Skip any leading noise before the first '[' or '{'.
+    $start = ($trimmed.IndexOfAny([char[]]@('[', '{')))
+    if ($start -ge 0) {
+        try {
+            $parsed = $trimmed.Substring($start) | ConvertFrom-Json
+            if ($null -ne $parsed) { return @($parsed) }
+        } catch {}
+    }
+
+    # NDJSON fallback: one complete object per line.
+    $out = @()
+    foreach ($line in ($trimmed -split "`r?`n")) {
+        $l = $line.Trim()
+        if (-not $l.StartsWith('{')) { continue }
+        try { $out += ($l | ConvertFrom-Json) } catch {}
+    }
+    return @($out)
+}
+
+function Get-GhozttySessionIds {
+    param([string]$Text)
+    return @(ConvertFrom-GhozttySessionsJson $Text |
+        Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'id' -and $_.id } |
+        ForEach-Object { [string]$_.id })
+}
+
+# --- the resume decision ----------------------------------------------------
+
+# Pure: given what we know after the swap, how should the loop be resumed?
+#
+#   'none'     -> caller asked for no resume
+#   'reuse'    -> the launching Claude outlived the kill; type the prompt into
+#                 its pane instead of starting a second one
+#   'relaunch' -> nothing survived (or the caller forced it); open a window
+#                 running the resume command, the pre-T138 behavior
+function Resolve-LoopResumeAction {
+    param(
+        [bool]$NoResume = $false,
+        [bool]$ClaudeAlive = $false,
+        [bool]$ForceRelaunch = $false
+    )
+    if ($NoResume) { return 'none' }
+    if ($ForceRelaunch) { return 'relaunch' }
+    if ($ClaudeAlive) { return 'reuse' }
+    return 'relaunch'
+}
+
+# The prompt to type into a surviving session, derived from the resume command
+# so the two can never disagree: `claude ... --continue "read go.md and go"`
+# resumes with exactly the text a reused session is sent.
+function Resolve-LoopResumePrompt {
+    param([string]$ResumeCommand, [string]$Explicit = '')
+    if ($Explicit) { return $Explicit }
+    if ($ResumeCommand) {
+        $m = [regex]::Match($ResumeCommand, '"([^"]+)"\s*$')
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+    return 'read go.md and go'
+}
