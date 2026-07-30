@@ -259,15 +259,16 @@ test {
     _ = @import("extra/vim.zig");
     _ = @import("extra/zsh.zig");
 
-    // Relay client account (T21a/T93): pure OAuth/PKCE logic, the brokered
-    // session-client parse layer, and the DPAPI account-store round-trip.
-    // Reached only through the win32 apprt and the CLI verbs otherwise, so
-    // pull them in explicitly to run their unit tests in BOTH the `none` and
-    // `win32` lanes.
+    // Relay client account (T21a/T93/T141): pure OAuth/PKCE logic, the brokered
+    // session-client parse layer, the DPAPI account-store round-trip, and the
+    // sign-in/sign-out flow the win32 chooser drives. Reached only through the
+    // win32 apprt otherwise, so pull them in explicitly to run their unit tests
+    // in BOTH the `none` and `win32` lanes.
     _ = @import("remote/google_oauth.zig");
     _ = @import("remote/relay_account.zig");
     _ = @import("remote/relay_directory.zig");
     _ = @import("remote/relay_session.zig");
+    _ = @import("remote/relay_signin.zig");
 
     // Socket Reader/Writer with panic-free close-race error mappings (T81):
     // the ws transport teardown depends on these staying error-returning.

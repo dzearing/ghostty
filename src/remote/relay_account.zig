@@ -33,7 +33,8 @@
 //! email}` (the direct-Google flow). The brokered relay no longer accepts raw
 //! Google ID tokens as client bearers, so a legacy credential cannot mint
 //! anything useful — `load` surfaces it as `Error.Legacy` and the user signs
-//! in once more (`+relay-login`), which overwrites the store in the new shape.
+//! in once more (from the machine chooser's account row — T141 deleted the
+//! `+relay-login` CLI verb), which overwrites the store in the new shape.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -82,7 +83,7 @@ pub const Error = error{
     /// The file exists but couldn't be decrypted or parsed.
     Corrupt,
     /// A pre-T93 direct-Google store (refresh token, no session token). The
-    /// only remedy is one fresh `+relay-login` (see the file header).
+    /// only remedy is one fresh sign-in (see the file header).
     Legacy,
 };
 

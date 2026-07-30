@@ -2,7 +2,9 @@
 //! flow (T21a origin; slimmed by T93 — the Zig analog of
 //! `macos/Sources/Features/Remote/GoogleOAuth.swift`).
 //!
-//! This is the headlessly-testable machinery a `+relay-login` CLI drives:
+//! This is the headlessly-testable machinery `relay_signin.zig` drives (from
+//! the win32 machine chooser's account row; T141 removed the CLI verb that
+//! used to drive it):
 //!
 //! - PKCE verifier/challenge generation (RFC 7636, S256)
 //! - the authorization URL builder (the browser still goes to Google)

@@ -203,8 +203,9 @@ ghoztty +new-remote-window --host=<host> --port=<port> --relay=<base> --device=<
   rendezvous relay at `--relay=<https-base>` instead of direct TCP (takes
   precedence over `--host`/`--port` when both are given). Auth bearer:
   explicit `--token=`, else the signed-in account (macOS Keychain; on Windows
-  the `+relay-login` account store, see below), else the `GHOSTTY_RELAY_TOKEN`
-  env var — with no source the command fails with "not signed in".
+  the DPAPI account store, see Relay account sign-in below), else the
+  `GHOSTTY_RELAY_TOKEN` env var — with no source the command fails with "not
+  signed in".
 - `--working-directory`: Working directory ON THE REMOTE MACHINE for the new
   session. Overrides the machine's per-host default.
 - `--shell`: Shell ON THE REMOTE MACHINE to run (e.g. `wsl.exe`,
@@ -228,42 +229,41 @@ device id or `host:port`; explicit `--working-directory`/`--shell` flags
 override them per window. New tabs/splits on a remote window use the per-host
 default shell too (their cwd inherits from the parent pane).
 
-### `ghoztty +relay-login` / `ghoztty +relay-logout` (Windows)
+### Relay account sign-in (GUI only — there is no CLI verb)
 
-Sign in to (or out of) a Google account used to authenticate relay
-connections, the Windows analog of the macOS Keychain-backed `RelayAccount`,
-using the same **relay-brokered (BFF) OAuth** as the Mac: the CLI runs PKCE +
-a loopback redirect to obtain the authorization code locally, hands it to the
-relay's `/oauth/exchange` (the relay holds the client secret and talks to
-Google server-side), and stores the returned opaque **relay session token** +
-expiry + email + relay base **DPAPI-encrypted** at
+Signing in to the Google account that authenticates relay connections is a
+**GUI affordance on every platform**: the machine chooser's account row
+(Cmd-Shift-N on macOS, Ctrl+Shift+N on Windows) shows the signed-in email with
+a **Sign Out** button, or a **Sign in with Google…** button when signed out.
+There is deliberately **no `+relay-login` / `+relay-logout` CLI command** —
+Windows briefly had that pair and it was removed (T141), because a verb that
+exists on one platform's CLI and not the other's is exactly the divergence this
+project does not ship. If you are looking for a CLI way to sign in, there isn't
+one by design; open the chooser.
+
+Both platforms use the same **relay-brokered (BFF) OAuth**: PKCE + a loopback
+redirect obtain the authorization code locally, the code goes to the relay's
+`/oauth/exchange` (the relay holds the client secret and talks to Google
+server-side), and the returned opaque **relay session token** + expiry + email
++ relay base are stored — macOS in the Keychain, Windows **DPAPI-encrypted** at
 `%LOCALAPPDATA%\ghoztty\account.dat` (owner-only DACL). No Google token or
-client secret ever touches the machine. Both run entirely in the CLI process
-(no IPC — the GUI only *reads* the stored credential, renewing the session at
-the stored relay via `/oauth/renew` as it nears expiry; renewal rotates the
-token and the rotation is persisted).
+client secret ever touches the machine. The flow runs on a background thread so
+the window never blocks while the browser is open; the app renews the session
+at the stored relay via `/oauth/renew` as it nears expiry (renewal rotates the
+token and the rotation is persisted). Sign-out best-effort revokes at the relay
+(`/oauth/signout`, which also destroys the relay-held Google refresh token)
+before deleting the local store.
 
-```
-ghoztty +relay-login [--client-id=<id>] [--relay=<base>] [--no-browser]
-ghoztty +relay-logout
-```
-
-- `--client-id`: the Google OAuth client id (public — it appears in the
-  browser URL). Falls back to `GHOSTTY_GOOGLE_CLIENT_ID`, then the id baked
-  into the build via `-Dgoogle-client-id` (so a release build needs no flag).
-- `--relay`: the relay to sign in to. Falls back to `GHOSTTY_RELAY_BASE`,
-  then the built-in default relay.
-- `--no-browser`: print the sign-in URL and wait for the loopback redirect
-  instead of opening a browser (headless/automation).
+The Google OAuth client id is baked into the build via `-Dgoogle-client-id`
+(public — it appears in the browser URL), overridable with
+`GHOSTTY_GOOGLE_CLIENT_ID`; the relay comes from `GHOSTTY_RELAY_BASE`, else the
+built-in default. Shared implementation: `src/remote/relay_signin.zig`; win32
+UI in `src/apprt/win32/RelayAccountRow.zig`.
 
 Once signed in, `+new-remote-window --relay/--device` with **no** `--token`
 uses the account's session token (token-resolution order: explicit `--token`
-→ signed-in account → `GHOSTTY_RELAY_TOKEN`). `+relay-logout` best-effort
-revokes the session at the relay (`/oauth/signout`, which also destroys the
-relay-held Google refresh token) and deletes the store (falling back to the
-env token); signing out when already signed out succeeds silently. A pre-
-brokered store (refresh-token shape) is treated as signed out — sign in once
-more to migrate.
+→ signed-in account → `GHOSTTY_RELAY_TOKEN`). A pre-brokered store
+(refresh-token shape) is treated as signed out — sign in once more to migrate.
 
 ### Naming
 

@@ -2137,3 +2137,50 @@ helpers in `go-loop-lock.ps1`.
 Both test lanes and `zig build test-agent` exit 0; P1/P2/P3 ACCEPTANCE ALL
 PASS. Next: T141 per priority 3e (delete the Windows-only relay-login verbs),
 then T140, T142.
+
+## 2026-07-29 - T141 done: the verbs are gone, and disabling a button made the dialog deaf
+
+`+relay-login` / `+relay-logout` are deleted. They were T21a's Windows analog of
+the Mac's Keychain `RelayAccount`, and the Mac needed no CLI verb because it
+signs in from the machine chooser - so the fix was not to rename them but to
+put sign-in where the Mac already has it. `MachineChooser` gained an account row
+(email + Sign Out, or "Sign in with Google..." when signed out) above the
+filter; the flow itself moved to a new shared `src/remote/relay_signin.zig`, and
+its async half to `src/apprt/win32/RelayAccountRow.zig`.
+
+It has to be async: `signIn` blocks for as long as a consent screen takes, so
+inline it would freeze every window. A detached thread posts WM_APP+9 to
+`App.msg_hwnd` (ClaudeIntegration's pattern) and the GUI-thread landing routes
+the outcome to whichever chooser is open - or to nobody, because the store is
+the state and not the dialog. On success the row relabels AND re-fetches the
+device list in place.
+
+**The one defect the validation caught was measured, not argued.** `Escape
+closed the chooser` failed on the first full run, and the obvious reading -
+"Escape is mis-routed" - was wrong. Disabling the focused button makes Windows
+drop the thread's keyboard focus entirely, and with no focus window WM_KEYDOWN
+arrives with `msg.hwnd == null`, which `App.run`'s dialog-key routing cannot
+attribute to the chooser: Enter, Escape and Tab all went dead for the duration
+of the sign-in. Proven with a cross-process `GetGUIThreadInfo` oracle (GetFocus
+is per-thread-queue, so a harness in another process cannot use it) that FAILED
+pre-fix beside the Escape assertion and passes after `refreshAccountRow` hands
+focus to the filter before disabling the button. Deleting the CLI files also
+almost deleted test coverage: they were what pulled `relay_account` into the
+`none` lane, so `relay_signin` is registered in `main_ghostty.zig`.
+
+The audit's useful answer is structural: the `Action` enum is one shared source
+with no `builtin.os.tag` branch, so a one-platform verb cannot exist there
+without someone adding one. What does still exist is the same divergence one
+level down - verbs both seats accept and only one can answer: `+version`'s
+Running Instance section (Mac `IPCServer.swift` has no `case "version"`,
+**T169**) and `+list --pid` (parses everywhere, resolved server-side, no `"pid"`
+anywhere in the Mac server, **T170**). `+reload`'s Windows absence is viewer
+panes, already T127's.
+
+`ipc-relay-login.ps1` -> `relay-account.ps1` (the old name advertised a verb
+that no longer exists), reworked to drive the GUI: chord -> chooser -> BM_CLICK
+the account button -> harness plays the browser off the URL the app logs. ALL
+PASS (53) x3 plus two earlier back-to-back runs. Both lanes + `test-agent` exit
+0; P1-P3 and `ipc-machine-chooser.ps1` ALL PASS. **T171** records the one
+unreproduced flake (30 pass / 1 fail) whose text the summarising loop threw
+away - filed rather than shrugged off. Next: T140, then T142.

@@ -20,6 +20,13 @@
 //! thread, bounded like the dial). No credential, or a fetch error, degrades
 //! to a "Local"-only list plus a footer hint — never a crash (T22a decision 1).
 //! Live re-poll while open is a deliberate non-goal for this first cut.
+//!
+//! Account (T141): the dialog's top row is the signed-in Google account —
+//! email plus a Sign In / Sign Out button — mirroring the Mac chooser's
+//! `accountRow`. This is the ONLY place a relay sign-in is initiated; the
+//! `+relay-login` / `+relay-logout` CLI verbs that used to do it were deleted
+//! because the Mac client never had them. The async half lives in
+//! `RelayAccountRow.zig`; signing in re-fetches the device list in place.
 
 const MachineChooser = @This();
 
@@ -28,7 +35,9 @@ const Allocator = std.mem.Allocator;
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
+const RelayAccountRow = @import("RelayAccountRow.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
+const relay_signin = @import("../../remote/relay_signin.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -36,6 +45,7 @@ const log = std.log.scoped(.win32);
 const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyMachineChooser");
 const FILTER_ID: u16 = 100;
 const LIST_ID: u16 = 101;
+const ACCOUNT_ID: u16 = 102;
 
 /// Cap on rendered device rows (bounds the fixed-size `rows` array). The
 /// account device list is tiny in practice; extra devices are dropped from
@@ -67,13 +77,19 @@ list: w32.HWND,
 hint: w32.HWND,
 open_btn: w32.HWND,
 cancel_btn: w32.HWND,
+account_status: w32.HWND,
+account_btn: w32.HWND,
 font: ?*anyopaque = null,
 
-/// Backs `relay_base` and `token` for the dialog's lifetime (used by the dial
-/// on selection). Freed in `close`.
+/// Backs `relay_base`, `token` and `email` for the dialog's lifetime (used by
+/// the dial on selection). Freed in `close`.
 arena: std.heap.ArenaAllocator,
 relay_base: []const u8 = "",
 token: ?[]const u8 = null,
+
+/// The signed-in account's email, or null when signed out. Read from the
+/// account store on open and after every sign-in/sign-out (T141).
+email: ?[]const u8 = null,
 
 /// The fetched device list. Owned by `parsed` (its own JSON arena); empty when
 /// there is no credential or the fetch failed. Freed in `close`.
@@ -88,6 +104,8 @@ row_count: usize = 0,
 pub const Layout = struct {
     client_w: i32,
     client_h: i32,
+    account_status: w32.RECT,
+    account_btn: w32.RECT,
     filter: w32.RECT,
     list: w32.RECT,
     hint: w32.RECT,
@@ -106,10 +124,15 @@ pub fn layout(scale: f32) Layout {
     const btn_w = px(96, scale);
     const btn_h = px(28, scale);
     const btn_gap_h = px(8, scale);
+    // The account row (T141): status text on the left, the Sign In / Sign Out
+    // button right-aligned. Wide enough for "Sign in with Google…".
+    const account_h = px(26, scale);
+    const account_btn_w = px(150, scale);
 
     const client_w = px(420, scale);
 
-    const filter_top = margin;
+    const account_top = margin;
+    const filter_top = account_top + account_h + gap;
     const list_top = filter_top + filter_h + gap;
     const hint_top = list_top + list_h + gap;
     const btn_top = hint_top + hint_h + btn_gap_v;
@@ -117,10 +140,20 @@ pub fn layout(scale: f32) Layout {
 
     const cancel_left = client_w - margin - btn_w;
     const open_left = cancel_left - btn_gap_h - btn_w;
+    const account_btn_left = client_w - margin - account_btn_w;
 
     return .{
         .client_w = client_w,
         .client_h = client_h,
+        // The status STATIC is vertically centered against the taller button so
+        // its single line of text sits on the button's baseline band.
+        .account_status = .{
+            .left = margin,
+            .top = account_top + @divTrunc(account_h - hint_h, 2),
+            .right = account_btn_left - btn_gap_h,
+            .bottom = account_top + @divTrunc(account_h - hint_h, 2) + hint_h,
+        },
+        .account_btn = .{ .left = account_btn_left, .top = account_top, .right = account_btn_left + account_btn_w, .bottom = account_top + account_h },
         .filter = .{ .left = margin, .top = filter_top, .right = client_w - margin, .bottom = filter_top + filter_h },
         .list = .{ .left = margin, .top = list_top, .right = client_w - margin, .bottom = list_top + list_h },
         .hint = .{ .left = margin, .top = hint_top, .right = client_w - margin, .bottom = hint_top + hint_h },
@@ -205,6 +238,8 @@ pub fn open(window: *Window) void {
         .hint = undefined,
         .open_btn = undefined,
         .cancel_btn = undefined,
+        .account_status = undefined,
+        .account_btn = undefined,
         .arena = std.heap.ArenaAllocator.init(alloc),
     };
 
@@ -213,6 +248,7 @@ pub fn open(window: *Window) void {
     const arena = self.arena.allocator();
     self.relay_base = relay_directory.resolveBase(arena) catch relay_directory.default_base;
     self.token = IpcHandlers.resolveToken(arena);
+    self.email = relay_signin.signedInEmail(arena);
     const hint_text = self.fetchDevices(alloc);
 
     const style: u32 = w32.WS_POPUP | w32.WS_CAPTION | w32.WS_SYSMENU;
@@ -257,6 +293,45 @@ pub fn open(window: *Window) void {
         @ptrCast(&dark_mode),
         @sizeOf(u32),
     );
+
+    // Account row (T141): status text + the Sign In / Sign Out button.
+    self.account_status = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
+        l.account_status.left,
+        l.account_status.top,
+        l.account_status.right - l.account_status.left,
+        l.account_status.bottom - l.account_status.top,
+        hwnd,
+        null,
+        window.app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        self.destroyState();
+        return;
+    };
+    self.account_btn = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
+        l.account_btn.left,
+        l.account_btn.top,
+        l.account_btn.right - l.account_btn.left,
+        l.account_btn.bottom - l.account_btn.top,
+        hwnd,
+        @ptrFromInt(@as(usize, ACCOUNT_ID)),
+        window.app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        self.destroyState();
+        return;
+    };
+    _ = w32.SetWindowTheme(self.account_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
 
     self.filter = w32.CreateWindowExW(
         0,
@@ -375,12 +450,17 @@ pub fn open(window: *Window) void {
         std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
     );
     if (self.font) |f| {
-        for ([_]w32.HWND{ self.filter, self.list, self.hint, self.open_btn, self.cancel_btn }) |c| {
+        for ([_]w32.HWND{
+            self.filter,         self.list,       self.hint,
+            self.account_status, self.account_btn, self.open_btn,
+            self.cancel_btn,
+        }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
     }
 
     self.setHint(hint_text);
+    self.refreshAccountRow();
     self.refilter("");
 
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -397,12 +477,12 @@ pub fn open(window: *Window) void {
 /// `list_alloc` backs the returned `Parsed` (freed in `close`).
 fn fetchDevices(self: *MachineChooser, list_alloc: Allocator) []const u8 {
     const tok = self.token orelse
-        return "Not signed in — run  ghoztty +relay-login  to list your machines.";
+        return "Not signed in — use Sign in with Google above to list your machines.";
 
     const parsed = relay_directory.listDevices(list_alloc, self.relay_base, tok) catch |err| {
         log.warn("machine chooser: device list failed err={}", .{err});
         return switch (err) {
-            error.Unauthorized => "Session expired — sign in again with  ghoztty +relay-login.",
+            error.Unauthorized => "Session expired — sign in again above.",
             error.NotFound => "No device directory on this relay.",
             else => "Couldn't reach the relay — showing this machine only.",
         };
@@ -450,12 +530,81 @@ fn rowLabel(self: *const MachineChooser, row: Row, buf: []u8) []const u8 {
     };
 }
 
-/// Set the footer hint text (empty hides it visually).
-fn setHint(self: *MachineChooser, text: []const u8) void {
+/// Relabel the account row from the current state: the email (or "Not signed
+/// in") on the left, "Sign Out" / "Sign in with Google…" on the button, and the
+/// button disabled while an operation is in flight (T141).
+fn refreshAccountRow(self: *MachineChooser) void {
+    const busy = RelayAccountRow.isRunning();
+    setText(self.account_status, RelayAccountRow.statusText(self.email, busy));
+    setText(self.account_btn, RelayAccountRow.buttonLabel(self.email != null, busy));
+
+    // Hand focus off BEFORE disabling the button. Disabling the focused control
+    // makes Windows drop the thread's keyboard focus entirely, and with no
+    // focus window WM_KEYDOWN arrives with `msg.hwnd == null` — which the app's
+    // message loop cannot attribute to this dialog, so Enter/Escape/Tab go
+    // dead for as long as the sign-in runs (measured, not theorized:
+    // `relay-account.ps1` asserts focus stays inside the chooser while busy,
+    // and it failed before this line existed).
+    if (busy and w32.GetFocus() == @as(?w32.HWND, self.account_btn)) {
+        _ = w32.SetFocus(self.filter);
+    }
+    _ = w32.EnableWindow(self.account_btn, if (busy) 0 else 1);
+}
+
+/// The account button was clicked: sign out when signed in, else sign in. Both
+/// run off-thread (`RelayAccountRow`); the row goes to its pending state
+/// immediately so the click is visibly acknowledged.
+fn onAccountClicked(self: *MachineChooser) void {
+    const started = if (self.email != null)
+        RelayAccountRow.signOutAsync(self.window.app)
+    else
+        RelayAccountRow.signInAsync(self.window.app);
+    if (!started) return;
+    self.refreshAccountRow();
+    if (self.email == null) self.setHint("Complete the sign-in in your browser…");
+}
+
+/// GUI thread: a sign-in/sign-out finished. Re-read the account, relabel the
+/// row, and (on a successful sign-in) re-fetch the device list in place so the
+/// user's machines appear without reopening the chooser.
+pub fn onAccountResult(self: *MachineChooser, res: *const RelayAccountRow.Result) void {
+    const arena = self.arena.allocator();
+    self.email = relay_signin.signedInEmail(arena);
+
+    if (res.ok) {
+        self.token = IpcHandlers.resolveToken(arena);
+        self.reloadDevices();
+    }
+    self.refreshAccountRow();
+    if (res.message.len > 0) self.setHint(res.message);
+}
+
+/// Drop the current device list and fetch it again with the current token.
+fn reloadDevices(self: *MachineChooser) void {
+    const alloc = self.window.app.core_app.alloc;
+    if (self.parsed) |*p| {
+        p.deinit();
+        self.parsed = null;
+    }
+    self.devices = &.{};
+    const hint_text = self.fetchDevices(alloc);
+    self.setHint(hint_text);
+
+    var buf: [256]u8 = undefined;
+    self.refilter(self.filterText(&buf));
+}
+
+/// Set a control's text from UTF-8 (truncated to fit).
+fn setText(hwnd: w32.HWND, text: []const u8) void {
     var wbuf: [512]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch 0;
     wbuf[@min(wlen, wbuf.len - 1)] = 0;
-    _ = w32.SetWindowTextW(self.hint, @ptrCast(&wbuf));
+    _ = w32.SetWindowTextW(hwnd, @ptrCast(&wbuf));
+}
+
+/// Set the footer hint text (empty hides it visually).
+fn setHint(self: *MachineChooser, text: []const u8) void {
+    setText(self.hint, text);
 }
 
 fn registerClass(app: *App) ?void {
@@ -500,6 +649,10 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
                     },
                     w32.IDCANCEL => {
                         self.cancel();
+                        return 0;
+                    },
+                    ACCOUNT_ID => {
+                        self.onAccountClicked();
                         return 0;
                     },
                     else => {},
@@ -558,24 +711,29 @@ fn filterText(self: *const MachineChooser, buf: []u8) []const u8 {
 /// away from the Surface-cast popup-edit intercepts).
 pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
     return hwnd == self.hwnd or hwnd == self.filter or hwnd == self.list or
-        hwnd == self.hint or hwnd == self.open_btn or hwnd == self.cancel_btn;
+        hwnd == self.hint or hwnd == self.open_btn or hwnd == self.cancel_btn or
+        hwnd == self.account_status or hwnd == self.account_btn;
 }
 
-/// Keyboard focus targets, in Tab order.
-pub const Focusable = enum { filter, list, open, cancel };
+/// Keyboard focus targets, in Tab order. `account` is the sign-in/out button
+/// (T141) — last in the cycle so Tab from the filter still reaches the list
+/// first, the common path.
+pub const Focusable = enum { filter, list, open, cancel, account };
 
 /// Pure Tab-order cycle. Unit-tested.
 pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
     return if (backwards) switch (cur) {
-        .filter => .cancel,
+        .filter => .account,
         .list => .filter,
         .open => .list,
         .cancel => .open,
+        .account => .cancel,
     } else switch (cur) {
         .filter => .list,
         .list => .open,
         .open => .cancel,
-        .cancel => .filter,
+        .cancel => .account,
+        .account => .filter,
     };
 }
 
@@ -600,7 +758,13 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
             return true;
         },
         w32.VK_RETURN => {
-            self.openSelection();
+            // Enter on the account button presses IT, not the default Open
+            // button — this loop intercepts Enter before the control sees it.
+            if (w32.GetFocus() == @as(?w32.HWND, self.account_btn)) {
+                self.onAccountClicked();
+            } else {
+                self.openSelection();
+            }
             return true;
         },
         w32.VK_UP, w32.VK_DOWN => {
@@ -619,6 +783,8 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 .open
             else if (focus == @as(?w32.HWND, self.cancel_btn))
                 .cancel
+            else if (focus == @as(?w32.HWND, self.account_btn))
+                .account
             else
                 .filter;
             const next_hwnd = switch (nextFocus(cur, backwards)) {
@@ -626,6 +792,7 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 .list => self.list,
                 .open => self.open_btn,
                 .cancel => self.cancel_btn,
+                .account => self.account_btn,
             };
             _ = w32.SetFocus(next_hwnd);
             return true;
@@ -655,7 +822,7 @@ fn openSelection(self: *MachineChooser) void {
         .device => |i| {
             const dev = self.devices[i];
             const tok = self.token orelse {
-                self.setHint("Not signed in — run  ghoztty +relay-login.");
+                self.setHint("Not signed in — use Sign in with Google above.");
                 return;
             };
             // Dial synchronously while the chooser is still alive (relay_base,
@@ -793,18 +960,33 @@ test "clampSelection: clamps within bounds and handles empty" {
     try testing.expectEqual(@as(i32, 0), clampSelection(-1, 1, 3)); // from no-selection
 }
 
-test "nextFocus: forward cycle filter -> list -> open -> cancel -> filter" {
+test "nextFocus: forward cycle filter -> list -> open -> cancel -> account -> filter" {
     try testing.expectEqual(Focusable.list, nextFocus(.filter, false));
     try testing.expectEqual(Focusable.open, nextFocus(.list, false));
     try testing.expectEqual(Focusable.cancel, nextFocus(.open, false));
-    try testing.expectEqual(Focusable.filter, nextFocus(.cancel, false));
+    try testing.expectEqual(Focusable.account, nextFocus(.cancel, false));
+    try testing.expectEqual(Focusable.filter, nextFocus(.account, false));
 }
 
 test "nextFocus: backward cycle reverses" {
-    try testing.expectEqual(Focusable.cancel, nextFocus(.filter, true));
+    try testing.expectEqual(Focusable.account, nextFocus(.filter, true));
+    try testing.expectEqual(Focusable.cancel, nextFocus(.account, true));
     try testing.expectEqual(Focusable.open, nextFocus(.cancel, true));
     try testing.expectEqual(Focusable.list, nextFocus(.open, true));
     try testing.expectEqual(Focusable.filter, nextFocus(.list, true));
+}
+
+test "nextFocus: every target is reachable both ways (no orphan in the cycle)" {
+    inline for (.{ false, true }) |backwards| {
+        var seen = [_]bool{false} ** @typeInfo(Focusable).@"enum".fields.len;
+        var cur: Focusable = .filter;
+        for (0..seen.len) |_| {
+            seen[@intFromEnum(cur)] = true;
+            cur = nextFocus(cur, backwards);
+        }
+        try testing.expectEqual(Focusable.filter, cur); // closed cycle
+        for (seen) |s| try testing.expect(s);
+    }
 }
 
 test "containsIgnoreCase: basic matches" {
@@ -817,7 +999,7 @@ test "containsIgnoreCase: basic matches" {
 test "layout: controls nest inside the client area, buttons right-aligned" {
     const l = layout(1.0);
     try testing.expect(l.client_w > 0 and l.client_h > 0);
-    for ([_]w32.RECT{ l.filter, l.list, l.hint, l.open, l.cancel }) |r| {
+    for ([_]w32.RECT{ l.account_status, l.account_btn, l.filter, l.list, l.hint, l.open, l.cancel }) |r| {
         try testing.expect(r.left >= 0 and r.top >= 0);
         try testing.expect(r.right <= l.client_w and r.bottom <= l.client_h);
         try testing.expect(r.right > r.left and r.bottom > r.top);
@@ -826,10 +1008,28 @@ test "layout: controls nest inside the client area, buttons right-aligned" {
     try testing.expect(l.list.bottom < l.hint.top);
 }
 
+test "layout: the account row sits above the filter and never overlaps it" {
+    const l = layout(1.0);
+    // Status text left of the button, with a gap; both above the filter.
+    try testing.expect(l.account_status.right <= l.account_btn.left);
+    try testing.expect(l.account_status.right < l.account_btn.left);
+    try testing.expect(l.account_btn.bottom <= l.filter.top);
+    try testing.expect(l.account_status.bottom <= l.filter.top);
+    // Right-aligned with the same margin as the dialog's other right edges.
+    try testing.expectEqual(l.filter.right, l.account_btn.right);
+    // Wide enough for "Sign in with Google…" at 1.0 scale.
+    try testing.expect(l.account_btn.right - l.account_btn.left >= 140);
+}
+
 test "layout: scales with DPI" {
     const l1 = layout(1.0);
     const l2 = layout(2.0);
     try testing.expectEqual(l1.client_w * 2, l2.client_w);
     try testing.expectEqual(l1.list.top * 2, l2.list.top);
     try testing.expectEqual(l1.font_h * 2, l2.font_h);
+    try testing.expectEqual(l1.account_btn.top * 2, l2.account_btn.top);
+    try testing.expectEqual(
+        (l1.account_btn.right - l1.account_btn.left) * 2,
+        l2.account_btn.right - l2.account_btn.left,
+    );
 }

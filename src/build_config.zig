@@ -46,8 +46,8 @@ pub const windows_update_check: bool = options.windows_update_check;
 
 /// The Google OAuth client id baked via `-Dgoogle-client-id` (public — it
 /// appears in the browser authorize URL; the confidential client secret lives
-/// only on the relay). Empty when the build carries none: `+relay-login` then
-/// needs `--client-id=` or `GHOSTTY_GOOGLE_CLIENT_ID`.
+/// only on the relay). Empty when the build carries none, in which case
+/// sign-in needs `GHOSTTY_GOOGLE_CLIENT_ID` in the app's environment.
 pub const google_client_id: []const u8 = options.google_client_id;
 
 /// The bundle ID for the app. This is used in many places and is currently

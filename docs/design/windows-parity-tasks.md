@@ -440,8 +440,22 @@ Work these first, in order, before falling back to first-todo-in-table:
    `+new-window --target=main` is idempotent, so with the IPC names restored
    the relaunch FOCUSED the old window and ran nothing — the pre-fix negative
    control logged `UPGRADE OK (relaunched...)` with the command never started.
-   `upgrade-no-fork.ps1` ALL PASS (48) ×3. Filed T166–T168) → **T141** (delete the Windows-only `+relay-login`/
-   `+relay-logout`; audit the CLI for every other one-platform verb) → **T140**
+   `upgrade-no-fork.ps1` ALL PASS (48) ×3. Filed T166–T168) → ~~**T141**~~
+   (**DONE 2026-07-29** — both verbs deleted; sign-in is now the chooser's own
+   account row, Mac-shaped, run on a detached thread that posts back to the
+   message loop so the window never freezes while the browser is open. The
+   validation caught a real defect and MEASURED it instead of arguing it:
+   `Escape` stopped working because disabling the focused button drops the
+   thread's keyboard focus, and with no focus window `WM_KEYDOWN` arrives with
+   `msg.hwnd == null`, which the dialog-key routing cannot attribute — so the
+   whole dialog went deaf. A new cross-process `GetGUIThreadInfo` oracle failed
+   pre-fix and passes post-fix. The audit's structural finding: the `Action`
+   enum has no `builtin.os.tag` branch, so a one-platform verb cannot exist
+   there any more — but the same divergence one level down does, and both cases
+   are filed (**T169** `+version`'s Running Instance section, **T170** `+list
+   --pid`, both Mac-seat; `+reload`'s Windows absence stays with T127).
+   `ipc-relay-login.ps1` → `relay-account.ps1`, ALL PASS (53) ×3. Also filed
+   **T171** for one unreproduced harness flake) → **T140**
    (rebuild the Ctrl+Shift+N chooser to Mac parity) → **T142** (banner overlay
    z-order self-healing). Then 3d.
 

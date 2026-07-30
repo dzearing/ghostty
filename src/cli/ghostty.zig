@@ -32,8 +32,6 @@ const set_state = @import("set_state.zig");
 const set_banner = @import("set_banner.zig");
 const reload = @import("reload.zig");
 const new_remote_window = @import("new_remote_window.zig");
-const relay_login = @import("relay_login.zig");
-const relay_logout = @import("relay_logout.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -124,10 +122,12 @@ pub const Action = enum {
     // over TCP). Drives the same flow as the Cmd-Shift-N menu action.
     @"new-remote-window",
 
-    // Sign in / out of the relay Google account (no IPC — runs in the CLI
-    // process; the GUI reads the stored credential).
-    @"relay-login",
-    @"relay-logout",
+    // NOTE (T141): there is deliberately NO `+relay-login` / `+relay-logout`
+    // here. Relay account sign-in is a GUI affordance (the machine chooser's
+    // account row, mirroring the Mac chooser) — this enum is shared by every
+    // apprt, so a verb added for one platform's convenience becomes a
+    // cross-platform CLI divergence. The flow itself lives in
+    // `src/remote/relay_signin.zig`.
 
     pub fn description(comptime self: Action) []const u8 {
         return switch (self) {
@@ -159,8 +159,6 @@ pub const Action = enum {
             .@"set-banner" => "Set or clear the sticky banner of a pane or window via IPC",
             .reload => "Reload a viewer pane's content in place via IPC",
             .@"new-remote-window" => "Open a remote-machine terminal window via IPC",
-            .@"relay-login" => "Sign in to a Google account for relay authentication",
-            .@"relay-logout" => "Sign out of the relay Google account",
         };
     }
 
@@ -255,8 +253,6 @@ pub const Action = enum {
             .@"set-banner" => try set_banner.run(alloc),
             .reload => try reload.run(alloc),
             .@"new-remote-window" => try new_remote_window.run(alloc),
-            .@"relay-login" => try relay_login.run(alloc),
-            .@"relay-logout" => try relay_logout.run(alloc),
         };
     }
 
@@ -309,8 +305,6 @@ pub const Action = enum {
                 .@"set-banner" => set_banner.Options,
                 .reload => reload.Options,
                 .@"new-remote-window" => new_remote_window.Options,
-                .@"relay-login" => relay_login.Options,
-                .@"relay-logout" => relay_logout.Options,
             };
         }
     }

@@ -20,6 +20,7 @@ const PathInstaller = @import("PathInstaller.zig");
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
+const RelayAccountRow = @import("RelayAccountRow.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
@@ -3832,6 +3833,16 @@ fn msgWndProc(
         if (wparam != 0) {
             const done: *ClaudeIntegration.Done = @ptrFromInt(wparam);
             ClaudeIntegration.onDone(app, done);
+        }
+        return 0;
+    }
+
+    if (msg == RelayAccountRow.WM_APP_RELAY_ACCOUNT) {
+        // wparam = heap *Result owned by the handler (T141 relay sign-in/out
+        // ran on a detached thread; this is the GUI-thread landing).
+        if (wparam != 0) {
+            const res: *RelayAccountRow.Result = @ptrFromInt(wparam);
+            RelayAccountRow.onResult(app, res);
         }
         return 0;
     }

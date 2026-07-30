@@ -388,7 +388,7 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         const token = nonEmpty(args.token) orelse resolveAccountToken(arena) orelse resolveEnvToken(arena) orelse {
             return try errorResponse(
                 ctx.alloc,
-                "not signed in: sign in with +relay-login, pass --token=, or set GHOSTTY_RELAY_TOKEN to open relay windows",
+                "not signed in: sign in from the machine chooser (ctrl+shift+n), pass --token=, or set GHOSTTY_RELAY_TOKEN to open relay windows",
                 .{},
             );
         };
@@ -461,7 +461,7 @@ pub fn resolveAccountToken(arena: Allocator) ?[]const u8 {
     return relay_account.resolveSessionToken(arena, path) catch |err| {
         switch (err) {
             error.Legacy => log.warn(
-                "account store predates the brokered sign-in — run `ghoztty +relay-login` once to migrate",
+                "account store predates the brokered sign-in — sign in once from the machine chooser (ctrl+shift+n) to migrate",
                 .{},
             ),
             else => log.warn("IPC new-remote-window: account session renew failed err={}", .{err}),

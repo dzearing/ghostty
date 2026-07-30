@@ -42,7 +42,7 @@ lib_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 
 /// The Google OAuth client id baked into the app — macOS via Info.plist
 /// `GhosttyGoogleClientID`, Windows via the `build_config.google_client_id`
-/// build option (`+relay-login`, T93) — used to build the browser authorize
+/// build option (T93) — used to build the browser authorize
 /// URL for the relay-brokered sign-in. Public (it appears in the browser
 /// URL); the confidential client secret lives only on the relay. Sourced from
 /// `-Dgoogle-client-id` (CI secret for releases) or, when unset, a git-ignored
