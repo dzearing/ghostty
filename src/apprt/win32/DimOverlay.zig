@@ -112,6 +112,9 @@ pub const DimOverlay = struct {
             @max(rect.bottom - rect.top, 1),
             w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
         );
+        // Every reposition re-checks the z-order instead of leaving it to
+        // whatever last touched it (T142).
+        w32.healOverlayZOrder(self.hwnd, self.owner);
     }
 
     pub fn hide(self: *DimOverlay) void {

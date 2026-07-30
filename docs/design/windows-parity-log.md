@@ -2355,3 +2355,51 @@ T146). Next: **T174**, then T142.
   `remote-inherit.ps1` is red on 4 assertions (the remote-native `--command`
   split's marker never appears) — PROVEN pre-existing by building a worktree at
   HEAD `f1f973b88` and reproducing the identical four. Next: **T142**.
+
+## 2026-07-30 - T142 done: the overlays defend their z-order, and the baseline assertion found the real bug
+
+- **T142 done.** The filed cause (a T131 probe left `HWND_TOPMOST` on two
+  overlays and `SWP_NOZORDER` meant nothing ever cleared it) was real and is
+  fixed — but the *healthy baseline* assertion of the new harness failed before
+  any injection, and that is where the user's actual report lived: with window B
+  in the foreground directly over window A, A's banner overlay indexed **above
+  B**, and the `Between(overlay, A)` probe named the sandwiched windows
+  (`GhozttyScrollbar, GhozttyWindow`). Mechanism: `SWP_SHOWWINDOW` lifts a popup
+  to the top of the non-topmost band, and ownership only pins a popup above its
+  OWN owner — nothing keeps it below unrelated windows. So any banner set while
+  its window was not in front floated over other apps indefinitely, no stray
+  probe required.
+
+  One helper fixes both: `win32.healOverlayZOrder(hwnd, owner)` clears a stray
+  topmost bit AND re-seats the popup directly above its owner when a foreign
+  VISIBLE window has got between them. Called after every reposition
+  (`BannerOverlay.updatePosition`, `DimOverlay.show`,
+  `Scrollbar.repositionAndResize`, `Window.showResizeOverlay`) and — the part
+  that matters for a window nobody resizes — from **`WM_ACTIVATE`** via
+  `Window.healOverlayZOrders` / `Surface.healOverlayZOrders`, because switching
+  windows is exactly when the defect becomes visible. Policy is a pure
+  `overlay_zorder.zig` (`isStray`, `walkStep`) unit-tested in the none lane.
+
+  Three drafts were wrong and the harness said so each time, not an argument:
+  the check must be **owner-relative** (`toggle_window_float_on_top` and the
+  quick terminal make a window topmost and Windows propagates the bit to owned
+  popups — clearing it would hide the banner behind its own floating window;
+  section E asserts the propagated bit SURVIVES); `SetWindowPos(overlay, owner)`
+  puts the overlay **behind** its owner (measured `ov=6, A=5` — an owned window
+  cannot be sunk by the SYSTEM's ordering, but an explicit call is honored as
+  given), so the seat is `GetWindow(root, GW_HWNDPREV)`; and re-placing
+  unconditionally churns sibling overlays against each other every layout pass,
+  so the walk short-circuits when already seated.
+
+  New `test/win32/overlay-zorder.ps1` ALL PASS (24) ×3, with a **negative
+  control** (fix neutered by an early `return`, same binary otherwise) at **9
+  FAILED / 13 passed** — baseline trio, reposition-heal, activation-heal and
+  both dim/scrollbar cases all fail pre-fix. Both lanes + `test-agent` + P1–P3
+  green; `pane-banner.ps1` and `split-dim.ps1` re-run green. Harness trap worth
+  remembering: **PowerShell variables are case-insensitive**, so `$OV = Hwnd-Of
+  $ov` destroyed the rect row it came from and every geometry probe then sampled
+  `(6685007, …)`, which reads exactly like a product verdict. Filed **T179**
+  (probes must restore `HWND_NOTOPMOST` — the class of harness bug that
+  manufactured this task's phantom) and **T180** (the transient drag-preview
+  popup and the quick terminal were left out of the heal on purpose; verify
+  rather than assume). Next: **T133** per 3d.

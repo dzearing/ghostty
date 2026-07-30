@@ -919,6 +919,19 @@ pub fn hideDimOverlay(self: *Surface) void {
     if (self.dim_overlay) |d| d.hide();
 }
 
+/// Re-check the z-order of every layered popup this pane owns and heal any
+/// stray `WS_EX_TOPMOST` another process left behind (T142). A no-op in the
+/// normal case; see `overlay_zorder.zig`. Rides window activation as well as
+/// the layout path, because the moment the defect is VISIBLE — a background
+/// window's banner over the foreground — is an activation change, and a
+/// window nobody resizes would otherwise stay broken.
+pub fn healOverlayZOrders(self: *Surface) void {
+    const owner = self.hwnd orelse return;
+    if (self.banner_overlay) |b| w32.healOverlayZOrder(b.hwnd, owner);
+    if (self.dim_overlay) |d| w32.healOverlayZOrder(d.hwnd, owner);
+    if (self.scrollbar) |s| w32.healOverlayZOrder(s.hwnd, owner);
+}
+
 /// Set (or clear, with null/empty text) this pane's sticky banner (T35).
 /// Reached from the `.pane_banner` apprt action (OSC 7778 / core routing)
 /// and the `+set-banner` IPC verb. Stores the raw markdown source so the

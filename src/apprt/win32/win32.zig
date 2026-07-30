@@ -1544,6 +1544,88 @@ pub const SWP_SHOWWINDOW: u32 = 0x0040;
 pub const WS_EX_TOPMOST: u32 = 0x00000008;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
 
+// GetWindow relationships (z-order and ownership walks).
+pub const GW_HWNDPREV: u32 = 3;
+pub const GW_OWNER: u32 = 4;
+
+pub extern "user32" fn GetWindow(
+    hWnd: HWND,
+    uCmd: u32,
+) callconv(.winapi) ?HWND;
+
+const overlay_zorder = @import("overlay_zorder.zig");
+
+comptime {
+    // The policy module duplicates this bit so it can be pure.
+    std.debug.assert(WS_EX_TOPMOST == overlay_zorder.ex_topmost);
+}
+
+/// Walk down from `root` through the windows directly above it, and report
+/// whether `hwnd` is in that run — i.e. whether any VISIBLE window that is
+/// not one of `root`'s own overlays sits between the two.
+///
+/// Hidden windows are part of the z-order but cannot occlude anything, so
+/// they are skipped; other popups owned by `root` (a sibling overlay of
+/// another pane) are fine to have between us and the owner.
+fn seatedAboveOwner(hwnd: HWND, root: HWND) bool {
+    var next: ?HWND = GetWindow(root, GW_HWNDPREV);
+    // Bounded: a pathological chain must fall through to a reseat, not spin.
+    for (0..64) |_| {
+        const cur = next orelse return false;
+        switch (overlay_zorder.walkStep(.{
+            .is_self = cur == hwnd,
+            .is_visible = IsWindowVisible_(cur) != 0,
+            .is_sibling = GetWindow(cur, GW_OWNER) == root,
+        })) {
+            .seated => return true,
+            .reseat => return false,
+            .keep_walking => next = GetWindow(cur, GW_HWNDPREV),
+        }
+    }
+    return false;
+}
+
+/// Re-assert the z-order of an owned overlay popup — the banner strip, dim
+/// overlay, themed scrollbar and resize overlay — so that it sits directly
+/// above the window it decorates and nowhere else (T142). Call after every
+/// reposition; both failure modes are permanent until something does.
+///
+///   1. A stray `WS_EX_TOPMOST` another process left on the popup. We never
+///      set it, and nothing else was clearing it.
+///   2. A popup that was shown while its owner was NOT in front. Showing a
+///      popup lifts it to the top of the non-topmost band, and ownership
+///      only guarantees it stays above its OWNER — not below unrelated
+///      windows. That is the "banner of a background window floats over the
+///      foreground app" report, with no stray bit involved at all.
+///
+/// A no-op once the popup is seated, so the common path is a short z-order
+/// walk and two `GetWindowLongW` reads. A window whose owner is legitimately
+/// topmost (`toggle_window_float_on_top`, the quick terminal) is left
+/// entirely alone: Windows keeps owned popups in the topmost band with their
+/// owner, and both "corrections" below would drop the overlay out of it and
+/// hide the banner behind its own window.
+///
+/// `owner` may be a child window (the pane overlays are owned by the surface
+/// HWND); the z-order — and the topmost bit — live on its top-level ancestor.
+pub fn healOverlayZOrder(hwnd: HWND, owner: HWND) void {
+    const root = GetAncestor(owner, GA_ROOT) orelse owner;
+    const root_ex = GetWindowLongW(root, GWL_EXSTYLE);
+    if (overlay_zorder.isTopmost(root_ex)) return;
+
+    const flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
+    if (overlay_zorder.isStray(GetWindowLongW(hwnd, GWL_EXSTYLE), root_ex)) {
+        _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    }
+    if (seatedAboveOwner(hwnd, root)) return;
+
+    // Insert AFTER whatever is directly above the owner (null = top of the
+    // band, when the owner is already at the top). Inserting after the OWNER
+    // itself would put the overlay behind it — an owned window is kept above
+    // its owner when the SYSTEM orders them, but an explicit SetWindowPos is
+    // honored as given, and the banner would vanish behind the terminal.
+    _ = SetWindowPos(hwnd, GetWindow(root, GW_HWNDPREV), 0, 0, 0, 0, flags);
+}
+
 // -----------------------------------------------------------------------
 // WinINet — HTTP client for update checks
 // -----------------------------------------------------------------------

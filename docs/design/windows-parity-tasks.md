@@ -493,7 +493,18 @@ Work these first, in order, before falling back to first-todo-in-table:
    apply rules — including a measured before/after shell flip, so it proves the
    store changed the shell instead of matching the box default. Filed **T178**
    (`remote-inherit.ps1` red on 4 assertions, PROVEN pre-existing against a
-   HEAD worktree). **Next: T142** (banner overlay z-order self-healing). Then 3d.
+   HEAD worktree). ~~**T142**~~ **DONE 2026-07-30** (overlay z-order
+   self-healing): the filed stray-`HWND_TOPMOST` cause was real, but the new
+   harness's HEALTHY-baseline assertion failed before any injection and that is
+   where the user's report actually lived — `SWP_SHOWWINDOW` lifts a popup to the
+   top of the non-topmost band and ownership only pins it above its OWN window,
+   so a background window's banner floated over the foreground app with no probe
+   involved. One helper (`win32.healOverlayZOrder`) clears the stray bit AND
+   re-seats the popup above its owner, called on every reposition and on
+   `WM_ACTIVATE` (the moment the defect is seen). Owner-RELATIVE, because
+   `toggle_window_float_on_top` / the quick terminal legitimately propagate the
+   bit to owned popups. `overlay-zorder.ps1` ALL PASS (24) ×3; negative control
+   9 FAILED / 13 passed. Filed T179 + T180. **Next: T133** per 3d.
 
 3f. **USER LIVE-REVIEW #2, 2026-07-29 (same day, later) — "The goal is
    complete parity with the macOS client."** The user named three gaps by

@@ -1790,6 +1790,22 @@ pub fn updateDimOverlays(self: *Window) void {
     self.updatePaneBanners();
 }
 
+/// Re-check the z-order of every layered popup this window owns — each
+/// pane's banner/dim/scrollbar plus the window's own resize overlay — and
+/// heal a stray `WS_EX_TOPMOST` (T142). Cheap and idempotent: a window with
+/// nothing wrong pays two `GetWindowLongW` reads per popup.
+pub fn healOverlayZOrders(self: *Window) void {
+    // A window on its way out has no z-order worth defending, and its panes
+    // are being torn down under us.
+    if (self.closing) return;
+    const hwnd = self.hwnd orelse return;
+    for (0..self.tab_count) |tab| {
+        var it = self.tab_trees[tab].iterator();
+        while (it.next()) |entry| entry.view.healOverlayZOrders();
+    }
+    if (self.resize_overlay_hwnd) |h| w32.healOverlayZOrder(h, hwnd);
+}
+
 /// Reposition/show/hide every pane's sticky banner strip (T35). Rides the
 /// dim-overlay triggers (layoutSplits, focus changes, WM_MOVE, tab switch,
 /// config reload) via updateDimOverlays. Idempotent and cheap — panes
@@ -2942,6 +2958,9 @@ fn showResizeOverlay(self: *Window) void {
     };
     _ = w32.ClientToScreen(hwnd, &pt);
     _ = w32.SetWindowPos(overlay, null, pt.x, pt.y, ow, oh, w32.SWP_NOACTIVATE | w32.SWP_NOZORDER);
+    // Every reposition re-checks the z-order instead of leaving it to
+    // whatever last touched it (T142).
+    w32.healOverlayZOrder(overlay, hwnd);
     _ = w32.ShowWindow(overlay, w32.SW_SHOWNOACTIVATE);
 
     // (Re-)arm the auto-hide timer. asMilliseconds saturates, so huge
@@ -4044,6 +4063,11 @@ pub fn windowWndProc(
         },
         w32.WM_ACTIVATE => {
             const activated = @as(u16, @truncate(wparam & 0xFFFF));
+            // Either direction: this is the event at which a stray topmost
+            // overlay becomes visible as "the background window's banner is
+            // over the foreground", so it is the event that must heal it
+            // (T142). Idempotent and cheap when nothing is wrong.
+            window.healOverlayZOrders();
             if (activated == w32.WA_INACTIVE and window.is_quick_terminal) {
                 if (window.app.quick_terminal) |qt| {
                     qt.onFocusLost();

@@ -280,6 +280,9 @@ pub const BannerOverlay = struct {
             @max(height, 1),
             w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
         );
+        // Every reposition re-checks the z-order instead of leaving it to
+        // whatever last touched it (T142).
+        w32.healOverlayZOrder(self.hwnd, self.owner);
     }
 
     /// The strip's natural height at `scale`, for the window layout to
