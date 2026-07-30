@@ -496,6 +496,18 @@ pub extern "user32" fn GetClassLongW(
 
 pub const GCW_ATOM: i32 = -32;
 
+/// Window-proc slot, for subclassing a system control (T172: the chooser's
+/// LISTBOX, to get hover feedback the parent never sees).
+pub const GWLP_WNDPROC: i32 = -4;
+
+pub extern "user32" fn CallWindowProcW(
+    lpPrevWndFunc: *const anyopaque,
+    hWnd: HWND,
+    Msg: u32,
+    wParam: usize,
+    lParam: isize,
+) callconv(.winapi) isize;
+
 pub const GetCursorPos_ = struct {
     extern "user32" fn GetCursorPos(
         lpPoint: *POINT,
@@ -879,6 +891,44 @@ pub const LB_GETCOUNT: u32 = 0x018B;
 pub const LBN_SELCHANGE: u16 = 1;
 pub const LBN_DBLCLK: u16 = 2;
 
+// Owner-drawn LISTBOX rows (T172 machine chooser). The listbox reports item
+// geometry to its parent (WM_MEASUREITEM) and asks it to paint each row
+// (WM_DRAWITEM) instead of rendering a system-blue string bar.
+pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
+pub const LB_GETITEMRECT: u32 = 0x0198;
+pub const LB_GETITEMHEIGHT: u32 = 0x01A1;
+pub const LB_ITEMFROMPOINT: u32 = 0x01A9;
+pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
+pub const WM_MEASUREITEM: u32 = 0x002C;
+pub const WM_DRAWITEM: u32 = 0x002B;
+pub const ODT_LISTBOX: u32 = 2;
+pub const ODA_DRAWENTIRE: u32 = 0x0001;
+pub const ODS_SELECTED: u32 = 0x0001;
+
+pub const MEASUREITEMSTRUCT = extern struct {
+    CtlType: u32,
+    CtlID: u32,
+    itemID: u32,
+    itemWidth: u32,
+    itemHeight: u32,
+    itemData: usize,
+};
+
+pub const DRAWITEMSTRUCT = extern struct {
+    CtlType: u32,
+    CtlID: u32,
+    itemID: u32,
+    itemAction: u32,
+    itemState: u32,
+    hwndItem: ?HWND,
+    hDC: HDC,
+    rcItem: RECT,
+    itemData: usize,
+};
+
+// EDIT cue banner ("placeholder" text shown while empty and unfocused).
+pub const EM_SETCUEBANNER: u32 = 0x1501;
+
 // Button control styles / notifications
 pub const BS_DEFPUSHBUTTON: u32 = 0x00000001;
 pub const BN_CLICKED: u16 = 0;
@@ -1202,6 +1252,7 @@ pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn TextOutW(hdc: HDC, x: i32, y: i32, lpString: [*]const u16, c: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn GetTextExtentPoint32W(hdc: HDC, lpString: [*]const u16, c: i32, psizl: *SIZE) callconv(.winapi) i32;
 pub extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(.winapi) ?*anyopaque;
+pub const PS_SOLID: i32 = 0;
 pub extern "gdi32" fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: ?*anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn LineTo(hdc: HDC, x: i32, y: i32) callconv(.winapi) i32;
 
@@ -1217,6 +1268,10 @@ pub extern "gdi32" fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: 
 pub extern "gdi32" fn SelectClipRgn(hdc: HDC, hrgn: ?*anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) i32;
 pub const NULL_BRUSH: i32 = 5;
+
+// Machine-chooser owner-drawn rows (T172): status dot + machine glyph.
+pub extern "gdi32" fn Ellipse(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) i32;
+pub extern "gdi32" fn Rectangle(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) i32;
 
 // Hero-mode animations (T59b): honor the OS "animate controls and elements
 // inside windows" accessibility setting.

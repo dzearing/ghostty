@@ -2184,3 +2184,51 @@ PASS (53) x3 plus two earlier back-to-back runs. Both lanes + `test-agent` exit
 0; P1-P3 and `ipc-machine-chooser.ps1` ALL PASS. **T171** records the one
 unreproduced flake (30 pass / 1 fail) whose text the summarising loop threw
 away - filed rather than shrugged off. Next: T140, then T142.
+
+## 2026-07-30 - T172 done (T140 split 1/3): the chooser rows, and two probes that lied before the code did
+
+T140 was too big for one context - Mac's chooser is a 840x540 master-detail
+view over session browse, metrics and account management - so it was split:
+**T172** (this: rows, filter, footer), **T173** (master-detail structure + the
+per-row `...` menu), **T174** (per-host defaults store + Host Settings dialog,
+which Windows has never had at all: `Window.zig` says so in a comment).
+
+This is the half the user screenshotted. The list is owner-drawn now
+(`LBS_OWNERDRAWFIXED`, no `LBS_HASSTRINGS` - the lParam is the row index):
+each row is a status shape, a GDI-drawn machine glyph, the name, and a dimmed
+subline, with the selection an inset rounded accent pill instead of a
+full-width system-blue bar. The row model is pure and ported straight from
+Mac, `hostnameSubtext` rule included (`MaximusHome` over `(maximushome)` is
+noise, so that row says "Relay device"). The glyphs are DRAWN, not an icon
+font - a missing symbol font can render as tofu, and geometry can be
+unit-tested. The empty filter got its cue banner. And the footer wraps: the
+hint is measured with `DT_CALCRECT | DT_WORDBREAK` and the dialog grows by
+exactly the extra lines, capped at four, so the clipped "...to list your"
+sentence cannot come back.
+
+One ordering trap: `WM_MEASUREITEM` arrives DURING `CreateWindowExW`, before
+the dialog's userdata points at `self`, so row height is set explicitly with
+`LB_SETITEMHEIGHT`. Hover needed the listbox subclassed - the parent never
+sees a control's own mouse messages.
+
+The evidence is what took the time. Both new on-box probes passed vacuously
+at first and had to be made honest:
+
+- Every pixel assertion agreed on one wrong value. Cause: an unaware process
+  gets DPI-VIRTUALIZED `GetWindowRect` while `Graphics.CopyFromScreen` is
+  physical - the capture was 189px off at 125%. `SetProcessDPIAware()` first,
+  and the DPI scale is now derived from the chooser's own client width
+  (`px(440, scale)` by construction) rather than hardcoded.
+- Per-pixel `GetPixel` on the desktop DC under DWM is ~1000x slower than a
+  blit; it turned a seconds-long script into a minutes-long one. One
+  `CopyFromScreen` per probe set, then managed reads.
+
+With that fixed the pill reads b-r = 47 - exactly the computed
+`blend(30,30,30, 3D8EF8, 0.25)` - while the gutter beside it and an
+unselected row read 0. **Negative control on the claim that matters**: paint
+the fill edge-to-edge and `selection is inset, not full-width` FAILS at b-r =
+47 in the gutter. Reverted and re-passed. A second, signed-out launch proves
+the footer independently: 3 hint lines to the signed-in run's 1, the window
+taller by exactly that, and the wrapped tail actually painted inside the
+control. `ipc-machine-chooser.ps1` ALL PASS (23) x3; both lanes +
+`test-agent` exit 0; P1-P3 ALL PASS. Next: T173, then T174, then T142.

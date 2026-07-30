@@ -102,6 +102,10 @@ test {
     // Pure win32 split-divider geometry (T155), same no-OS-imports deal.
     _ = @import("apprt/win32/split_geometry.zig");
 
+    // Pure win32 machine-chooser row model + geometry (T172), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/chooser_rows.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 
