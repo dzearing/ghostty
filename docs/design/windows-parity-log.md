@@ -2469,3 +2469,54 @@ T146). Next: **T174**, then T142.
   that fully worked, because T133's new check looks for the continuation text
   echoed in the pane and *accepting* the prompt is what erases it. Both lanes,
   `test-agent` and P1–P3 green. Next: **T144** per 3f.
+
+## 2026-07-30 - T144 done: new panes stop landing in System32, and the config that would have let you say otherwise was never written
+
+- The user's report ("it keeps defaulting to windows system32 folder
+  (HORRIBLE!)") had a filed primary hypothesis, and it held - but only after it
+  was **measured**. There is no API for "another process's cwd", so the agent's
+  `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory` was read out of its PEB while
+  the user's real build ran: the installed agent, started by the T89h HKCU `Run`
+  entry, sits in `C:\WINDOWS\system32`. The repo-launched debug agent sits in
+  `D:\git\ghoztty` - which is exactly why months of on-box testing never saw
+  this.
+- The defect: `Surface.zig` refused to forward the resolved
+  `working-directory` to *any* remote agent. Correct and load-bearing for a
+  CROSS-MACHINE agent (a local path on a different-OS agent is the OPEN-stall
+  wedge); wrong for the LOCAL one, which is this same machine. So the OPEN
+  carried no cwd and the child spawned wherever the agent was sitting. The
+  invariant that closes it: **the same app with the same config must not open in
+  two different directories depending on `session-persistence`**. Mac has
+  forwarded it since the local agent landed (`TerminalController.swift`);
+  Windows never ported that line. The rule now lives in shared core as
+  `termio.Remote.openWorkingDirectory`.
+- **Two premises in the filed row were wrong.** The loader does NOT read
+  `config` - since 1.3.0 the default is `config.ghostty` and the user's file was
+  at the right path, just empty. And "find out what wrote it": Ghoztty did.
+  `writeConfigTemplate` printed a ~2 KiB template into a 4096-byte buffered
+  writer and **never flushed**, so every user with no config got a zero-byte one
+  - and an empty file still counted as "a config exists", so it was never
+  retried. That is why the user had no escape hatch: there was nowhere to
+  discover `working-directory`. Both fixed; an empty config now self-heals, a
+  file that fails to PARSE is still never clobbered.
+- **The CLI cannot reproduce this bug.** `ghoztty +new-window` always inserts
+  `--working-directory=<caller's cwd>` when the flag is absent
+  (`src/cli/new_window.zig:268`) - by design, a CLI-opened window belongs where
+  you typed. A first draft of the harness asserted on `+new-window` and "failed"
+  for that reason. The report is about **ctrl+n**, so section D injects the real
+  chord.
+- `test/win32/new-window-cwd.ps1` ALL PASS (39) x3. Its section A proves the
+  trap is ARMED before asserting it is harmless (the agent's cwd IS the
+  launcher's), so nothing can pass vacuously. **Negative control**
+  (`T144_NEUTERED`): 8 assertions fail and they read as the user's report -
+  every persistence-ON shell in `c:\windows\system32`, persistence-OFF fine.
+  Both lanes, `test-agent` and P1-P3 green.
+- Harness trap worth keeping: **PowerShell unrolls a one-element array on
+  return**, and a lone `PSCustomObject` has no usable `.Count` in PS 5.1, so
+  `(Windows-Of $tree).Count -ge 1` was *always false* for a single-window app -
+  three assertions failing while the ones after them passed. `return ,@(...)`.
+  `auto-launch-cwd.ps1` only escaped it by always waiting for >=2 windows.
+- Filed **T185** (a Windows pane reports its INITIAL cwd forever - cmd/powershell
+  emit no OSC 7, so `+list` and window-inherit are both stale the moment you
+  `cd`) and **T186** (Mac seat: both changes are shared core and unrun there;
+  the template flush is very likely an upstream bug worth reporting).

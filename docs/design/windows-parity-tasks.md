@@ -540,9 +540,29 @@ Work these first, in order, before falling back to first-todo-in-table:
    - **T123** — the banner table's fixed 360pt cap. Re-reported verbatim by
      the user, still `MAX_CELL_W = 360.0` at `BannerOverlay.zig:68`, and the
      Mac fix is a known-good port. Cheapest user-visible win on the list.
-   - **T144** — ctrl+n opens in `C:\Windows\System32`. Root-cause on the box
-     before fixing (primary hypothesis in the row); the user also wants a
-     working `working-directory` default and currently has no loadable config.
+   - ~~**T144**~~ — **DONE 2026-07-30**: ctrl+n opened in `C:\Windows\System32`.
+     The filed primary hypothesis held, but only after it was measured: the
+     installed agent's own cwd (read out of its PEB while the user's build ran)
+     really is System32, because the T89h `Run` entry starts it there — while a
+     repo-launched debug agent sits in the repo, which is why the box never
+     showed this. `Surface.zig` withheld the resolved `working-directory` from
+     *every* remote agent; correct for a cross-machine one (the OPEN-stall
+     wedge), wrong for the LOCAL one, so the OPEN carried no cwd and the child
+     spawned wherever the agent sat. Now shared-core
+     `termio.Remote.openWorkingDirectory`, matching Mac's
+     `TerminalController.swift`. The escape-hatch half had two wrong premises in
+     the row: the loader reads `config.ghostty` (the user's file was at the RIGHT
+     path, just empty), and what wrote it was **Ghoztty** —
+     `writeConfigTemplate` never flushed its 4096-byte buffer, so every user
+     with no config got a zero-byte one, which then counted as "a config exists"
+     and was never retried. Both fixed; empty configs self-heal, parse-failing
+     ones are never clobbered. New `test/win32/new-window-cwd.ps1` ALL PASS (39)
+     ×3 — section A proves the trap is ARMED before asserting it is harmless, and
+     section D presses the REAL ctrl+n because `+new-window` always inserts the
+     caller's cwd and so cannot reproduce the bug. Negative control: 8 failures,
+     all of them the user's report. Filed **T185** (a Windows pane reports its
+     INITIAL cwd forever — no OSC 7 from cmd/powershell) and **T186** (Mac seat:
+     both changes are shared core; the template flush is likely upstream).
    - **T143** — the missing menu bar. Every discoverability complaint
      (T129 included) is a symptom of this.
    - **T145 → T147 → T146 → T151 → T148 → T150 → T149** — the sweep's

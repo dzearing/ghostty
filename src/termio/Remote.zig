@@ -271,6 +271,37 @@ pub const Config = struct {
     restore_offset: u64 = 0,
 };
 
+/// Which working directory an OPEN should carry (T144).
+///
+/// `explicit` is the REMOTE-native cwd the apprt resolved for this surface —
+/// the parent pane's live cwd for a tab/split, or an IPC/menu-supplied path.
+/// It always wins.
+///
+/// `local` is the surface config's already-resolved `working-directory`, i.e.
+/// what the EXEC backend would chdir into: the focused surface's pwd when
+/// `window-inherit-working-directory` applies, else the platform default
+/// (`$HOME` / `%HOMEDRIVE%%HOMEPATH%` for a GUI launch). It is only usable
+/// when the agent runs on THIS machine.
+///
+/// The distinction is the whole point: a CROSS-MACHINE agent may run a
+/// different OS, where a local path does not exist — forwarding one makes the
+/// agent's spawn fail and never reply OPENED (a blank, wedged pane). The LOCAL
+/// session-persistence agent is this same machine, so refusing to forward it
+/// buys nothing and costs everything: the OPEN carries no cwd, the agent
+/// spawns the child in the AGENT's own inherited cwd, and an agent started by
+/// the HKCU `Run` autostart entry inherits `C:\WINDOWS\system32` — measured on
+/// the box, and exactly the user-reported symptom. Mac already forwards it
+/// (`TerminalController.swift`, "the agent runs on THIS machine"); this is the
+/// shared-core home for that rule so both apprts get it.
+pub fn openWorkingDirectory(
+    explicit: ?[]const u8,
+    local: ?[]const u8,
+    is_local_agent: bool,
+) ?[]const u8 {
+    if (explicit) |e| return e;
+    return if (is_local_agent) local else null;
+}
+
 /// What a restored pane does when its ATTACH target comes back as a
 /// dead-but-relaunchable tombstone across an agent restart (§5.4, T12c). Mirrors
 /// `config.SessionRelaunch`; kept local so this backend need not import config.
@@ -1308,4 +1339,49 @@ test "T111 slice bound stays at or under the drain buffer it slices" {
     // dead code and would silently re-widen the mutex hold this bounds.
     try std.testing.expect(max_parse_slice <= 16 * 1024);
     try std.testing.expect(max_parse_slice > 0);
+}
+
+test "T144 openWorkingDirectory: local agent falls back to the local resolved cwd" {
+    const testing = std.testing;
+
+    // A fresh local-agent window: no explicit remote cwd, but the surface
+    // config resolved one (home, or the focused pane's pwd). It must be
+    // forwarded — otherwise the agent spawns the child in its OWN cwd, which
+    // on the win32 autostart path is C:\WINDOWS\system32.
+    try testing.expectEqualStrings(
+        "C:\\Users\\dave",
+        openWorkingDirectory(null, "C:\\Users\\dave", true).?,
+    );
+}
+
+test "T144 openWorkingDirectory: cross-machine never forwards a local path" {
+    const testing = std.testing;
+
+    // The local path may not exist on the remote OS; forwarding it wedges the
+    // OPEN. Null means "the agent picks its own default".
+    try testing.expect(openWorkingDirectory(null, "C:\\Users\\dave", false) == null);
+}
+
+test "T144 openWorkingDirectory: an explicit remote cwd always wins" {
+    const testing = std.testing;
+
+    // Tab/split inheritance (the parent pane's live cwd) and IPC
+    // --working-directory both arrive as `explicit`, on either agent flavor.
+    try testing.expectEqualStrings(
+        "/work/ghoztty",
+        openWorkingDirectory("/work/ghoztty", "C:\\Users\\dave", true).?,
+    );
+    try testing.expectEqualStrings(
+        "/work/ghoztty",
+        openWorkingDirectory("/work/ghoztty", "C:\\Users\\dave", false).?,
+    );
+}
+
+test "T144 openWorkingDirectory: nothing to forward stays null" {
+    const testing = std.testing;
+
+    // `working-directory = inherit` resolves to null; the agent's default is
+    // then the only answer either flavor can give.
+    try testing.expect(openWorkingDirectory(null, null, true) == null);
+    try testing.expect(openWorkingDirectory(null, null, false) == null);
 }

@@ -1019,21 +1019,31 @@ pub fn init(
                     });
                 }
 
-                // Working directory (§WP4): we must NEVER forward the LOCAL
-                // `config.@"working-directory"` — by default Ghostty inherits the
-                // launching surface's pwd (e.g. a macOS path), which does not
-                // exist on a remote machine (e.g. a Windows agent); an OPEN
-                // carrying it makes the agent's chdir/spawn fail and never reply
-                // OPENED (the stall wedge). We ONLY forward an EXPLICIT remote cwd
-                // (`rb.working_directory`), which the split/tab path resolves by
-                // querying the parent remote pane's actual cwd. A fresh remote
-                // window (no parent, no explicit remote cwd) forwards null and the
-                // agent starts the session in its own default cwd.
+                // Working directory (§WP4, T144). A CROSS-MACHINE agent must
+                // NEVER receive the LOCAL `config.@"working-directory"` — by
+                // default Ghostty inherits the launching surface's pwd (e.g. a
+                // macOS path), which does not exist on the remote machine (e.g.
+                // a Windows agent); an OPEN carrying it makes the agent's
+                // chdir/spawn fail and never reply OPENED (the stall wedge). It
+                // gets only an EXPLICIT remote cwd (`rb.working_directory`),
+                // which the split/tab path resolves by querying the parent
+                // remote pane's actual cwd.
+                //
+                // The LOCAL session-persistence agent is THIS machine, so the
+                // resolved local path is valid there and withholding it is what
+                // put new panes in `C:\WINDOWS\system32`: with no cwd the agent
+                // spawns the child in its own inherited cwd, and the autostart
+                // agent inherits the launcher's. See
+                // `termio.Remote.openWorkingDirectory` for the full rule.
                 const io_remote = try termio.Remote.init(alloc, .{
                     .conn = rb.connection,
                     .session_id = rb.session_id,
                     .command = remote_command,
-                    .working_directory = rb.working_directory,
+                    .working_directory = termio.Remote.openWorkingDirectory(
+                        rb.working_directory,
+                        working_directory,
+                        rb.local_shell_integration,
+                    ),
                     .shell = rb.shell,
                     .term = config.term,
                     .env = remote_env.items,

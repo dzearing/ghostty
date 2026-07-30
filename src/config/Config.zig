@@ -4013,7 +4013,28 @@ test "handle bom in config files" {
     }
 }
 
-pub const OptionalFileAction = enum { loaded, not_found, @"error" };
+pub const OptionalFileAction = enum {
+    loaded,
+    not_found,
+    /// The file exists but is zero bytes. Reported separately from `.@"error"`
+    /// so `loadDefaultFiles` can treat it as "the user has no config yet" and
+    /// (re)write the template into it (T144). A truncated-to-empty config is
+    /// otherwise a dead end: it carries no settings AND suppresses the template
+    /// that would tell the user what settings exist.
+    empty,
+    @"error",
+
+    /// Whether this counts as "the user already has a config file here", i.e.
+    /// whether it should suppress writing the template. A file that failed to
+    /// PARSE still counts (it has the user's content in it and must never be
+    /// clobbered); a zero-byte one does not.
+    pub fn present(self: OptionalFileAction) bool {
+        return switch (self) {
+            .loaded, .@"error" => true,
+            .not_found, .empty => false,
+        };
+    }
+};
 
 /// Load optional configuration file from `path`. All errors are ignored.
 ///
@@ -4027,6 +4048,7 @@ pub fn loadOptionalFile(
         return .loaded;
     } else |err| switch (err) {
         error.FileNotFound => return .not_found,
+        error.FileIsEmpty => return .empty,
         else => {
             std.log.warn(
                 "error reading optional config file, not loading err={} path={s}",
@@ -4052,6 +4074,14 @@ fn writeConfigTemplate(path: []const u8) !void {
         @embedFile("./config-template"),
         .{ .path = path },
     );
+    // The template is ~2 KiB, i.e. it fits entirely in `buf` and NOTHING ever
+    // reaches the file without this flush. Every user who has never had a
+    // config was handed a zero-byte one instead of the documented template —
+    // and because an empty file still counts as "a config exists" (see
+    // `loadDefaultFiles`), it was never retried. Found on the box: the user's
+    // `%LOCALAPPDATA%\ghostty\config.ghostty` was 0 bytes, so they had no
+    // discoverable place to set `working-directory` (T144).
+    try writer.flush();
 }
 
 /// Load configurations from the default configuration files. The default
@@ -4071,14 +4101,13 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
     const xdg_loaded: bool = xdg_loaded: {
         const legacy_xdg_action = self.loadOptionalFile(alloc, legacy_xdg_path);
         const xdg_action = self.loadOptionalFile(alloc, xdg_path);
-        if (xdg_action != .not_found and legacy_xdg_action != .not_found) {
+        if (xdg_action.present() and legacy_xdg_action.present()) {
             log.warn("both config files `{s}` and `{s}` exist.", .{ legacy_xdg_path, xdg_path });
             log.warn("loading them both in that order", .{});
             break :xdg_loaded true;
         }
 
-        break :xdg_loaded xdg_action != .not_found or
-            legacy_xdg_action != .not_found;
+        break :xdg_loaded xdg_action.present() or legacy_xdg_action.present();
     };
 
     // On macOS load the app support directory as well
@@ -4105,7 +4134,7 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
                 app_support_path,
             ) else .not_found;
 
-            if (app_support_action != .not_found and legacy_app_support_action != .not_found) {
+            if (app_support_action.present() and legacy_app_support_action.present()) {
                 log.warn(
                     "both config files `{s}` and `{s}` exist.",
                     .{ legacy_app_support_path, app_support_path },
@@ -4114,8 +4143,8 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
                 break :loaded true;
             }
 
-            break :loaded app_support_action != .not_found or
-                legacy_app_support_action != .not_found;
+            break :loaded app_support_action.present() or
+                legacy_app_support_action.present();
         };
 
         // If both files are not found, then we create a template file.
@@ -11285,4 +11314,83 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "T144 writeConfigTemplate actually writes the template" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try td.dir.realpath(".", &dir_buf);
+    const path = try std.fs.path.join(alloc, &.{ dir, "config.ghostty" });
+    defer alloc.free(path);
+
+    try writeConfigTemplate(path);
+
+    // The template is smaller than the writer's buffer, so an unflushed writer
+    // left a ZERO-BYTE file behind — which then read back as "a config exists"
+    // and permanently suppressed the retry. Assert on the bytes, not on the
+    // call succeeding.
+    const stat = try td.dir.statFile("config.ghostty");
+    try testing.expect(stat.size > 0);
+
+    const contents = try td.dir.readFileAlloc(alloc, "config.ghostty", 1024 * 1024);
+    defer alloc.free(contents);
+    try testing.expect(std.mem.indexOf(u8, contents, "configuration file for Ghostty") != null);
+    // The path is interpolated into the template, so it must survive the write.
+    try testing.expect(std.mem.indexOf(u8, contents, path) != null);
+}
+
+test "T144 an empty config file is not 'present' and does not suppress the template" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    (try td.dir.createFile("config.ghostty", .{})).close();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try td.dir.realpath(".", &dir_buf);
+    const path = try std.fs.path.join(alloc, &.{ dir, "config.ghostty" });
+    defer alloc.free(path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // A zero-byte file is neither a loaded config nor a parse error: it is the
+    // state a truncated template write leaves behind, and it must self-heal.
+    const action = cfg.loadOptionalFile(alloc, path);
+    try testing.expectEqual(OptionalFileAction.empty, action);
+    try testing.expect(!action.present());
+}
+
+test "T144 a config file that fails to parse still counts as present" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    {
+        var file = try td.dir.createFile("config.ghostty", .{});
+        defer file.close();
+        var buf: [256]u8 = undefined;
+        var writer = file.writer(&buf);
+        try writer.interface.writeAll("font-size = 13\n");
+        try writer.end();
+    }
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try td.dir.realpath(".", &dir_buf);
+    const path = try std.fs.path.join(alloc, &.{ dir, "config.ghostty" });
+    defer alloc.free(path);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Non-empty user content must never be clobbered by the template.
+    const action = cfg.loadOptionalFile(alloc, path);
+    try testing.expect(action.present());
 }
