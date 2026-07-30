@@ -446,10 +446,19 @@ Work these first, in order, before falling back to first-todo-in-table:
    named were already tracked but not shipped, which is the real lesson:
    *tracked ≠ shipped, and a narrative sweep hides what an enumeration
    catches.* Order:
-   - **T127 first — the viewer panes.** 27 Mac commits, `--view` still answers
-     "viewers are not yet supported on Windows". This is the largest single
-     hole and the user has now named it twice. Re-scope T90b–T90h against the
-     current Mac viewer before writing any more code against the stale split.
+   - ~~**T127**~~ — the viewer panes. **DONE 2026-07-29** (re-scope only, no
+     code): refreshed design in `docs/design/viewer-panes-windows.md`, v1 line
+     decided, T90b–T90h each annotated instead of silently widened, new v1
+     surface filed as T159 (nav chrome + address bar), T160 (markdown TOC),
+     T161 (zoom + pane-scoped chords), T162 (selection-toolbar Copy), and the
+     cuts filed as rows: T163 (popups), T164 (feedback capture, design-first).
+     Two premises in the row were wrong and are corrected there: `--view` does
+     NOT answer "viewers are not yet supported on Windows" (it is silently
+     dropped — `VerbArgs` has no `view` field), and the shared viewer JS is not
+     free (it posts through `window.webkit.messageHandlers`, so WebView2 needs
+     a shim). **The viewer BUILD order is now T90b → T90c → T90d → T90e → T90f
+     → T90g → T90h with T159–T162 sequenced behind their deps**; it is still
+     the largest hole and still ahead of the cosmetics below.
    - **T123** — the banner table's fixed 360pt cap. Re-reported verbatim by
      the user, still `MAX_CELL_W = 360.0` at `BannerOverlay.zig:68`, and the
      Mac fix is a known-good port. Cheapest user-visible win on the list.

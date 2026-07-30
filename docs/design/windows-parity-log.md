@@ -2044,3 +2044,52 @@ guard file. Both lanes + `test-agent` re-run green; no app source changed.
 Also mirrored into the active cache so this box has the fix now. The version
 trap stands: in-process hooks keep running the old script until a session
 restarts.
+
+## 2026-07-29 - T127 done: the viewer scope, re-cut against the code
+
+Refreshed the Windows viewer design against the Mac viewer as it exists today
+(`docs/design/viewer-panes-windows.md`), decided the v1 line, and re-scoped the
+band. T90a was written against 8 commits; there are 27. The rule T127 set for
+itself - do not silently widen T90b-T90h - is what shaped the output: each of
+those seven rows got an explicit "Re-scoped" note, the new v1 surface became its
+own tasks (T159 nav chrome + address bar, T160 markdown TOC, T161 zoom +
+pane-scoped chords, T162 selection-toolbar Copy), the cuts became rows too
+(T163 popups, T164 feedback capture, design-first), and T90g was NARROWED to
+say what it no longer owns.
+
+Reading the code rather than the commit subjects changed the plan four times.
+The shared viewer JS is NOT free the way this task assumed: rendering is, but
+`viewer.js` and `selection.js` both post to native through
+`window.webkit.messageHandlers`, so WebView2 needs a ~6-line shim over
+`chrome.webview` - and forking the JS is rejected, or every future Mac viewer
+commit needs a Windows translation. The TOC, which looked like the expensive
+half of file viewing, is cheap: it is the SAME glass card as the pane banner,
+and T131 already ported that to `banner_card.zig`, which is what moved it into
+v1 next to the address bar the user named. Feedback capture went the other way -
+its three hard parts (lsof port->cwd, `NSTextAttachment` image chips,
+clipboard-safe interactive capture) are all platform-specific, so it is a design
+problem, not a port, and it is deferred with the reasons written down instead of
+being absorbed into a chrome task. And the pane-scoped chords can only have
+their STRUCTURE copied: on Windows ctrl+r is free (a viewer pane has no shell)
+where on Mac it belonged to the banner editor.
+
+Two corrections to the record. T127's own Summary said `--view` returns T90b's
+"viewers are not yet supported on Windows"; it does not - `VerbArgs` has no
+`view` field, so the flag is silently dropped as unknown, which is the worse
+behavior T90a wanted to replace. And `resolveViewArgument`'s POSIX-only
+absolute-path test is still live at `src/cli/split.zig:212` /
+`new_window.zig:319`; the address bar's `isFilePath` will need the identical
+Windows-shaped fix, so both are cited in the rows that own them.
+
+Checked the inventory was actually current before designing against it:
+`git log HEAD..origin/main -- macos/Sources/Features/Viewer src/viewer` is
+empty, so 27 is the whole delta. The 12 unmerged non-viewer commits were not
+free either - `d6f1c1de5` (banner link hover + action menu) had no row anywhere
+and became **T165**, and the client-scoped What's New band belongs to the
+existing T125, noted there. Filing them now instead of at merge time is T152's
+discipline applied early.
+
+Validation: docs only, no source touched. `parity-tasks.ps1 validate` ALL PASS
+(195 tasks), both test lanes and `zig build test-agent` exit 0, P1/P2/P3
+ACCEPTANCE ALL PASS. Next: T123 per priority 3f (the banner table's 360pt cap),
+with T159-T162 sequenced behind T90b-T90e.
