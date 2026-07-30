@@ -250,5 +250,28 @@
             <pubDate>Sat, 25 Jul 2026 15:40:14 +0000</pubDate>
             <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.27.0/Ghoztty-1.27.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="cNQGSgk+23FXojFOe2nHi+5HL7L5azJEDHK0Txs3kJbpD/dOtHsObtagbjY8u+gsYqvLh6t+jZz3aPfrdInWAA==" length="25358733" />
         </item>
+        <item>
+            <title>Version 1.28.0</title>
+            <sparkle:version>1.28.0</sparkle:version>
+            <sparkle:shortVersionString>1.28.0</sparkle:shortVersionString>
+            <pubDate>Thu, 30 Jul 2026 23:34:44 +0000</pubDate>
+            <description>{
+  "version": "1.28.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "Banners autolink URLs and file paths", "text": "A bare `https://` URL or a `/`, `~/`, `./`, or `../` path in a pane banner is now clickable on its own — no `[text](url)` needed. Clicking a file link reveals it in Finder; Cmd-click opens it in a viewer, and the right-click menu adds Open in Side Pane and Copy Path. Dot-relative paths resolve against the pane's working directory." },
+        { "title": "Banner links look and behave like links", "text": "Links show a dotted underline at rest that goes solid on hover, and a right-click menu offers Side Pane / New Window / Default Browser / Copy Link. Clicking a link no longer collapses the banner out from under you." },
+        { "title": "Viewer panes get their own keyboard shortcuts", "text": "Cmd-R reloads the focused viewer in place and Cmd-D drops the caret into its address field with the address selected. Both apply only while a viewer holds focus, so they keep doing their usual thing in a terminal pane. Escape now cancels an address edit and hands focus back to the page." },
+        { "title": "`+send-keys` actually submits", "text": "`ghoztty +send-keys --target=pane \"some message\" Enter` now sends the message instead of leaving it parked unsent in the composer. Text is framed as a bracketed paste so the trailing Enter reads as a keypress rather than a newline inside pasted text." },
+        { "title": "What's New in Ghoztty…", "text": "A new menu window with Client and Agent tabs shows what changed in each, and the update chip's pre-update dialog now previews the incoming version's notes before you commit." }
+      ]
+    }
+  ]
+}
+</description>
+            <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.28.0/Ghoztty-1.28.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="/EIP4CnbdaKcqf4sCdpAW+FouHWRI5rll5CnXpiQQ+x99eoGx1QGh7udrB74cnnKr0Xmk89pOnxLNmi67hgQAA==" length="25406252" />
+        </item>
     </channel>
 </rss>
