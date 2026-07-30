@@ -44,22 +44,37 @@ pub const Options = struct {
     /// fit the longer caption.
     ok_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("OK"),
     cancel_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Cancel"),
+    /// When non-null the dialog carries a single-line text field seeded with
+    /// this text, below the message — Mac's NSAlert `accessoryView` prompts
+    /// (rename a relay device, T176) are the same alert with a field bolted
+    /// on, so this is the same dialog rather than a second class.
+    ///
+    /// Only `prompt` reads the field back; `show` ignores it. A field takes
+    /// initial focus (with its text selected) and makes OK the Enter default,
+    /// because a prompt's Enter must commit what was typed.
+    input: ?[:0]const u16 = null,
 };
 
 /// Dialog colors — the RenameDialog dark palette (matches the command
 /// palette and the tab bar's dark styling).
 const COLOR_BG = w32.RGB(32, 32, 32);
 const COLOR_TEXT = w32.RGB(230, 230, 230);
+/// The prompt field's fill — the same field color the chooser and the rename
+/// dialog use, one notch darker than the dialog surface.
+const COLOR_FIELD_BG = w32.RGB(30, 30, 30);
 
-/// Class-lifetime brush, created at class registration and never freed
-/// (lives for the process, like the other dialog classes).
+/// Class-lifetime brushes, created at class registration and never freed
+/// (they live for the process, like the other dialog classes).
 var class_registered: bool = false;
 var bg_brush: ?w32.HBRUSH = null;
+var field_brush: ?w32.HBRUSH = null;
 
 hwnd: w32.HWND,
 static: ?w32.HWND,
 ok_btn: w32.HWND,
 cancel_btn: ?w32.HWND,
+/// The optional text field (`Options.input`), read back by `prompt`.
+edit: ?w32.HWND = null,
 icon_handle: ?w32.HICON,
 icon_rect: w32.RECT,
 default_cancel: bool,
@@ -73,6 +88,9 @@ pub const Layout = struct {
     client_h: i32,
     icon: w32.RECT,
     text: w32.RECT,
+    /// The optional text field, spanning the text column (empty rect when the
+    /// dialog has no input).
+    input: w32.RECT,
     ok: w32.RECT,
     cancel: w32.RECT,
     font_h: i32,
@@ -80,31 +98,45 @@ pub const Layout = struct {
 
 /// `btn_w` is the physical-pixel button width — at least the standard
 /// 88 DIP, wider when a caption needs the room (see buttonWidth).
-pub fn layoutFor(scale: f32, text_w: i32, text_h: i32, has_icon: bool, has_cancel: bool, btn_w: i32) Layout {
+/// `has_input` adds a single-line field row under the message (T176).
+pub fn layoutFor(
+    scale: f32,
+    text_w: i32,
+    text_h: i32,
+    has_icon: bool,
+    has_input: bool,
+    has_cancel: bool,
+    btn_w: i32,
+) Layout {
     const margin = px(16, scale);
     const icon_px = px(32, scale);
     const icon_gap = px(12, scale);
     const btn_h = px(28, scale);
     const btn_gap_h = px(8, scale);
     const btn_gap_v = px(18, scale);
+    const input_h = px(26, scale);
+    const input_gap = px(12, scale);
 
     const icon_span: i32 = if (has_icon) icon_px + icon_gap else 0;
     const n_btns: i32 = if (has_cancel) 2 else 1;
     const btns_w = n_btns * btn_w + (n_btns - 1) * btn_gap_h;
 
     var client_w = margin + icon_span + text_w + margin;
-    // Never narrower than the button row (or a sane floor).
+    // Never narrower than the button row (or a sane floor). A prompt gets a
+    // wider floor: a field the width of a two-word message is unusable.
     client_w = @max(client_w, margin + btns_w + margin);
-    client_w = @max(client_w, px(280, scale));
+    client_w = @max(client_w, px(if (has_input) 380 else 280, scale));
 
     const content_h = @max(text_h, if (has_icon) icon_px else 0);
-    const client_h = margin + content_h + btn_gap_v + btn_h + margin;
+    const input_span: i32 = if (has_input) input_gap + input_h else 0;
+    const client_h = margin + content_h + input_span + btn_gap_v + btn_h + margin;
 
     // Vertically center the shorter of icon/text within the content band.
     const icon_top = margin + @divTrunc(content_h - icon_px, 2);
     const text_top = margin + @divTrunc(content_h - text_h, 2);
 
-    const btn_top = margin + content_h + btn_gap_v;
+    const input_top = margin + content_h + input_gap;
+    const btn_top = margin + content_h + input_span + btn_gap_v;
     const right_left = client_w - margin - btn_w;
     const left_left = right_left - btn_gap_h - btn_w;
     // With two buttons OK sits left of Cancel; alone, OK takes the right slot.
@@ -125,6 +157,14 @@ pub fn layoutFor(scale: f32, text_w: i32, text_h: i32, has_icon: bool, has_cance
             .right = margin + icon_span + text_w,
             .bottom = text_top + text_h,
         },
+        .input = if (has_input) .{
+            .left = margin + icon_span,
+            .top = input_top,
+            // The field spans to the trailing margin, not to the message's
+            // measured width — it is an entry box, not a caption.
+            .right = client_w - margin,
+            .bottom = input_top + input_h,
+        } else .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
         .ok = .{ .left = ok_left, .top = btn_top, .right = ok_left + btn_w, .bottom = btn_top + btn_h },
         .cancel = if (has_cancel) .{
             .left = right_left,
@@ -160,12 +200,51 @@ pub fn show(
     refocus: ?w32.HWND,
     opts: Options,
 ) Result {
+    return run(app, owner, scale, refocus, opts, null);
+}
+
+/// Show a dialog carrying a text field (`opts.input` MUST be set) and return
+/// what the user left in it, UTF-8 in `buf`, or null when they cancelled —
+/// the win32 counterpart to Mac's NSAlert-with-accessoryView prompts.
+///
+/// Whitespace and no-op handling belong to the caller (see
+/// `chooser_menu.newName`): this returns the field verbatim.
+pub fn prompt(
+    app: *App,
+    owner: ?w32.HWND,
+    scale: f32,
+    refocus: ?w32.HWND,
+    opts: Options,
+    buf: []u8,
+) ?[]const u8 {
+    std.debug.assert(opts.input != null);
+    var out: Output = .{ .buf = buf };
+    if (run(app, owner, scale, refocus, opts, &out) != .ok) return null;
+    return buf[0..out.len];
+}
+
+/// Where `prompt` collects the field's text. Separate from `Result` so `show`
+/// can pass null and stay allocation-free.
+const Output = struct {
+    buf: []u8,
+    len: usize = 0,
+};
+
+fn run(
+    app: *App,
+    owner: ?w32.HWND,
+    scale: f32,
+    refocus: ?w32.HWND,
+    opts: Options,
+    out: ?*Output,
+) Result {
     registerClass(app) orelse return fallback(owner, opts);
 
     const style: u32 = w32.WS_POPUP | w32.WS_CAPTION | w32.WS_SYSMENU;
     const ex_style: u32 = w32.WS_EX_DLGMODALFRAME;
     const has_icon = opts.icon != .none;
     const has_cancel = opts.style == .ok_cancel;
+    const has_input = opts.input != null;
 
     // DPI-scaled dialog font, needed up front to measure the text.
     const font = w32.CreateFontW(
@@ -233,6 +312,7 @@ pub fn show(
         text_rect.right - text_rect.left,
         text_rect.bottom - text_rect.top,
         has_icon,
+        has_input,
         has_cancel,
         buttonWidth(scale, label_w),
     );
@@ -266,7 +346,10 @@ pub fn show(
             .info => w32.LoadIconW(null, w32.IDI_INFORMATION),
         },
         .icon_rect = l.icon,
-        .default_cancel = has_cancel and opts.default_cancel,
+        // A prompt's Enter must commit what was typed, so a field forces the
+        // Enter default onto OK regardless of the caller's MB_DEFBUTTON2
+        // preference (which exists to protect destructive confirmations).
+        .default_cancel = has_cancel and opts.default_cancel and !has_input,
     };
 
     const hwnd = w32.CreateWindowExW(
@@ -309,6 +392,27 @@ pub fn show(
         app.hinstance,
         null,
     );
+
+    // Optional text field (Mac's accessoryView).
+    if (opts.input) |initial| {
+        self.edit = w32.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("EDIT"),
+            initial.ptr,
+            w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.ES_AUTOHSCROLL | w32.WS_BORDER,
+            l.input.left,
+            l.input.top,
+            l.input.right - l.input.left,
+            l.input.bottom - l.input.top,
+            hwnd,
+            null,
+            app.hinstance,
+            null,
+        );
+        if (self.edit) |e| {
+            _ = w32.SetWindowTheme(e, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
+        }
+    }
 
     self.ok_btn = w32.CreateWindowExW(
         0,
@@ -355,6 +459,7 @@ pub fn show(
 
     if (font) |f| {
         if (self.static) |s| _ = w32.SendMessageW(s, w32.WM_SETFONT, @intFromPtr(f), 1);
+        if (self.edit) |e| _ = w32.SendMessageW(e, w32.WM_SETFONT, @intFromPtr(f), 1);
         _ = w32.SendMessageW(self.ok_btn, w32.WM_SETFONT, @intFromPtr(f), 1);
         if (self.cancel_btn) |c| _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
     }
@@ -365,9 +470,21 @@ pub fn show(
     if (owner) |o| _ = w32.EnableWindow(o, 0);
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.SetForegroundWindow(hwnd);
-    _ = w32.SetFocus(self.defaultButton());
+    if (self.edit) |e| {
+        // The field takes focus with its seed text selected, so typing
+        // replaces the old name (RenameDialog's behavior).
+        _ = w32.SetFocus(e);
+        _ = w32.SendMessageW(e, 0x00B1, 0, -1); // EM_SETSEL(0, -1)
+    } else {
+        _ = w32.SetFocus(self.defaultButton());
+    }
 
     self.runModal();
+
+    // Read the field BEFORE the window is destroyed.
+    if (out) |o| if (self.edit) |e| {
+        if (self.result == .ok) o.len = readEdit(e, o.buf);
+    };
 
     // Teardown. The owner MUST be re-enabled before the dialog is
     // destroyed, otherwise Windows may activate another app's window.
@@ -378,6 +495,14 @@ pub fn show(
     if (refocus) |h| App.deferSetFocus(h); // T48
 
     return self.result;
+}
+
+/// Copy the edit control's text into `buf` as UTF-8, returning its length
+/// (0 when it does not fit — a truncated device name is worse than none).
+fn readEdit(edit: w32.HWND, buf: []u8) usize {
+    var wbuf: [512]u16 = undefined;
+    const wlen: usize = @intCast(w32.GetWindowTextW(edit, &wbuf, wbuf.len));
+    return std.unicode.utf16LeToUtf8(buf, wbuf[0..wlen]) catch 0;
 }
 
 /// Last-resort fallback when dialog construction fails: the old (light)
@@ -441,7 +566,16 @@ fn ownsHwnd(self: *const ConfirmDialog, hwnd: w32.HWND) bool {
     if (hwnd == self.hwnd or hwnd == self.ok_btn) return true;
     if (self.static) |s| if (hwnd == s) return true;
     if (self.cancel_btn) |c| if (hwnd == c) return true;
+    if (self.edit) |e| if (hwnd == e) return true;
     return false;
+}
+
+/// Tab order: field (when present) → OK → Cancel → wrap. Pure — unit-tested
+/// through `nextFocusIndex`, which is the same cycle over stop indices.
+pub fn nextFocusIndex(cur: usize, stops: usize, backwards: bool) usize {
+    if (stops == 0) return 0;
+    if (backwards) return (cur + stops - 1) % stops;
+    return (cur + 1) % stops;
 }
 
 fn finish(self: *ConfirmDialog, result: Result) void {
@@ -459,7 +593,8 @@ fn handleKey(self: *ConfirmDialog, vk: u16) bool {
         },
         w32.VK_RETURN => {
             // Enter activates the focused button, else the default —
-            // standard dialog convention (MB_DEFBUTTON2 preserved).
+            // standard dialog convention (MB_DEFBUTTON2 preserved). Enter in
+            // the text field commits, like any prompt.
             const focus = w32.GetFocus();
             if (self.cancel_btn != null and focus == self.cancel_btn) {
                 self.finish(.cancel);
@@ -471,13 +606,28 @@ fn handleKey(self: *ConfirmDialog, vk: u16) bool {
             return true;
         },
         w32.VK_TAB => {
-            // Two focus stops at most: OK <-> Cancel.
-            const cancel_btn = self.cancel_btn orelse return true;
-            const next = if (w32.GetFocus() == @as(?w32.HWND, self.ok_btn))
-                cancel_btn
-            else
-                self.ok_btn;
-            _ = w32.SetFocus(next);
+            // Focus stops in order: field (when present), OK, Cancel.
+            var stops: [3]w32.HWND = undefined;
+            var n: usize = 0;
+            if (self.edit) |e| {
+                stops[n] = e;
+                n += 1;
+            }
+            stops[n] = self.ok_btn;
+            n += 1;
+            if (self.cancel_btn) |c| {
+                stops[n] = c;
+                n += 1;
+            }
+            if (n < 2) return true;
+
+            const focus = w32.GetFocus();
+            var cur: usize = 0;
+            for (stops[0..n], 0..) |h, i| {
+                if (focus == @as(?w32.HWND, h)) cur = i;
+            }
+            const backwards = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+            _ = w32.SetFocus(stops[nextFocusIndex(cur, n, backwards)]);
             return true;
         },
         else => return false,
@@ -487,6 +637,7 @@ fn handleKey(self: *ConfirmDialog, vk: u16) bool {
 fn registerClass(app: *App) ?void {
     if (class_registered) return;
     bg_brush = w32.CreateSolidBrush(COLOR_BG);
+    field_brush = w32.CreateSolidBrush(COLOR_FIELD_BG);
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         .style = 0,
@@ -563,9 +714,18 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             if (state != w32.WA_INACTIVE) {
                 const focus = w32.GetFocus();
                 const owned = focus != null and self.ownsHwnd(focus.?);
-                if (!owned) _ = w32.SetFocus(self.defaultButton());
+                if (!owned) _ = w32.SetFocus(self.edit orelse self.defaultButton());
             }
             return 0;
+        },
+        // The prompt field is a field, not dialog surface — without this it
+        // renders as a white box in an otherwise dark dialog.
+        w32.WM_CTLCOLOREDIT => {
+            const hdc: w32.HDC = @ptrFromInt(wparam);
+            _ = w32.SetTextColor(hdc, COLOR_TEXT);
+            _ = w32.SetBkColor(hdc, COLOR_FIELD_BG);
+            if (field_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLORSTATIC, w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
@@ -585,7 +745,7 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
 const testing = std.testing;
 
 test "layoutFor: controls nest inside the client area at 1.0 scale" {
-    const l = layoutFor(1.0, 300, 40, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, false, true, 88);
     try testing.expect(l.client_w > 0 and l.client_h > 0);
     for ([_]w32.RECT{ l.icon, l.text, l.ok, l.cancel }) |r| {
         try testing.expect(r.left >= 0 and r.top >= 0);
@@ -594,47 +754,47 @@ test "layoutFor: controls nest inside the client area at 1.0 scale" {
 }
 
 test "layoutFor: buttons right-aligned, OK left of Cancel, no overlap" {
-    const l = layoutFor(1.0, 300, 40, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, false, true, 88);
     try testing.expect(l.ok.right < l.cancel.left);
     try testing.expectEqual(l.ok.top, l.cancel.top);
     try testing.expectEqual(l.cancel.right, l.client_w - 16);
 }
 
 test "layoutFor: ok-only puts OK in the rightmost slot, no cancel rect" {
-    const l = layoutFor(1.0, 300, 40, false, false, 88);
+    const l = layoutFor(1.0, 300, 40, false, false, false, 88);
     try testing.expectEqual(l.ok.right, l.client_w - 16);
     try testing.expectEqual(@as(i32, 0), l.cancel.right - l.cancel.left);
     try testing.expectEqual(@as(i32, 0), l.icon.right - l.icon.left);
 }
 
 test "layoutFor: text starts right of the icon with a gap" {
-    const l = layoutFor(1.0, 300, 40, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, false, true, 88);
     try testing.expect(l.text.left >= l.icon.right + 12);
     // Without an icon the text hugs the margin.
-    const l2 = layoutFor(1.0, 300, 40, false, true, 88);
+    const l2 = layoutFor(1.0, 300, 40, false, false, true, 88);
     try testing.expectEqual(@as(i32, 16), l2.text.left);
 }
 
 test "layoutFor: short text is vertically centered against the icon" {
-    const l = layoutFor(1.0, 300, 16, true, true, 88);
+    const l = layoutFor(1.0, 300, 16, true, false, true, 88);
     // Icon (32px) taller than text (16px): text drops to center.
     try testing.expect(l.text.top > l.icon.top);
     try testing.expectEqual(l.icon.top, 16);
     // Text (60px) taller than icon: icon centers instead.
-    const l2 = layoutFor(1.0, 300, 60, true, true, 88);
+    const l2 = layoutFor(1.0, 300, 60, true, false, true, 88);
     try testing.expect(l2.icon.top > l2.text.top);
 }
 
 test "layoutFor: narrow text still fits the button row" {
-    const l = layoutFor(1.0, 40, 20, false, true, 88);
+    const l = layoutFor(1.0, 40, 20, false, false, true, 88);
     // Two 88px buttons + 8px gap + 2*16 margins = 216, floored at 280.
     try testing.expect(l.client_w >= 280);
     try testing.expect(l.ok.left >= 16);
 }
 
 test "layoutFor: scales with DPI" {
-    const l1 = layoutFor(1.0, 300, 40, true, true, 88);
-    const l2 = layoutFor(2.0, 600, 80, true, true, 176);
+    const l1 = layoutFor(1.0, 300, 40, true, false, true, 88);
+    const l2 = layoutFor(2.0, 600, 80, true, false, true, 176);
     try testing.expectEqual(l1.client_w * 2, l2.client_w);
     try testing.expectEqual(l1.client_h * 2, l2.client_h);
     try testing.expectEqual(l1.ok.left * 2, l2.ok.left);
@@ -650,11 +810,77 @@ test "buttonWidth: standard until the caption outgrows it, then padded" {
 }
 
 test "layoutFor: wide buttons widen the row and never overlap" {
-    const l = layoutFor(1.0, 40, 20, false, true, 124);
+    const l = layoutFor(1.0, 40, 20, false, false, true, 124);
     try testing.expectEqual(@as(i32, 124), l.ok.right - l.ok.left);
     try testing.expectEqual(@as(i32, 124), l.cancel.right - l.cancel.left);
     try testing.expect(l.ok.right < l.cancel.left);
     try testing.expect(l.ok.left >= 16);
     // Client floor still respected: 2*124 + 8 + 2*16 = 288 > 280.
     try testing.expectEqual(@as(i32, 288), l.client_w);
+}
+
+// --- Prompt field (T176) -----------------------------------------------
+
+test "layoutFor: no input means no input rect and no extra height" {
+    const plain = layoutFor(1.0, 300, 40, true, false, true, 88);
+    try testing.expectEqual(@as(i32, 0), plain.input.right - plain.input.left);
+    try testing.expectEqual(@as(i32, 0), plain.input.bottom - plain.input.top);
+}
+
+test "layoutFor: the field sits between the message and the buttons" {
+    const l = layoutFor(1.0, 300, 40, true, true, true, 88);
+    try testing.expect(l.input.top >= l.text.bottom);
+    try testing.expect(l.input.top >= l.icon.bottom - 1);
+    try testing.expect(l.ok.top >= l.input.bottom);
+    try testing.expect(l.cancel.top >= l.input.bottom);
+    // Aligned with the message column, running to the trailing margin.
+    try testing.expectEqual(l.text.left, l.input.left);
+    try testing.expectEqual(l.client_w - 16, l.input.right);
+    // And it nests, like everything else.
+    for ([_]w32.RECT{ l.icon, l.text, l.input, l.ok, l.cancel }) |r| {
+        try testing.expect(r.left >= 0 and r.top >= 0);
+        try testing.expect(r.right <= l.client_w and r.bottom <= l.client_h);
+    }
+}
+
+test "layoutFor: the field's row is what makes a prompt taller" {
+    const plain = layoutFor(1.0, 300, 40, true, false, true, 88);
+    const with = layoutFor(1.0, 300, 40, true, true, true, 88);
+    // 12 gap + 26 field.
+    try testing.expectEqual(plain.client_h + 38, with.client_h);
+    // The message band above it does not move.
+    try testing.expectEqual(plain.text.top, with.text.top);
+    try testing.expectEqual(plain.icon.top, with.icon.top);
+}
+
+test "layoutFor: a prompt is never too narrow to type in" {
+    // A two-word message would otherwise leave a 280-wide dialog whose field
+    // is barely wider than the button row.
+    const l = layoutFor(1.0, 40, 20, false, true, true, 88);
+    try testing.expect(l.client_w >= 380);
+    try testing.expect(l.input.right - l.input.left >= 340);
+}
+
+test "layoutFor: the field scales with DPI like everything else" {
+    const a = layoutFor(1.0, 300, 40, true, true, true, 88);
+    const b = layoutFor(2.0, 600, 80, true, true, true, 176);
+    try testing.expectEqual(a.client_h * 2, b.client_h);
+    try testing.expectEqual(a.input.top * 2, b.input.top);
+    try testing.expectEqual((a.input.bottom - a.input.top) * 2, b.input.bottom - b.input.top);
+}
+
+test "nextFocusIndex: cycles both ways and wraps" {
+    // field -> OK -> Cancel -> field
+    try testing.expectEqual(@as(usize, 1), nextFocusIndex(0, 3, false));
+    try testing.expectEqual(@as(usize, 2), nextFocusIndex(1, 3, false));
+    try testing.expectEqual(@as(usize, 0), nextFocusIndex(2, 3, false));
+    try testing.expectEqual(@as(usize, 2), nextFocusIndex(0, 3, true));
+    try testing.expectEqual(@as(usize, 0), nextFocusIndex(1, 3, true));
+    // Two stops (no field) is the old OK <-> Cancel toggle.
+    try testing.expectEqual(@as(usize, 1), nextFocusIndex(0, 2, false));
+    try testing.expectEqual(@as(usize, 0), nextFocusIndex(1, 2, false));
+    try testing.expectEqual(@as(usize, 1), nextFocusIndex(0, 2, true));
+    // Degenerate cases never index out of range.
+    try testing.expectEqual(@as(usize, 0), nextFocusIndex(0, 1, false));
+    try testing.expectEqual(@as(usize, 0), nextFocusIndex(0, 0, false));
 }

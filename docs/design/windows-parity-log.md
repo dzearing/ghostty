@@ -2264,3 +2264,52 @@ cannot browse sessions until T146. `ipc-machine-chooser.ps1` 26 -> 34
 assertions, ALL PASS x3; `relay-account.ps1` ALL PASS (its account-button
 finder had to learn the new `New Window` label); both test lanes +
 `test-agent` exit 0; P1-P3 ALL PASS. Next: **T176**, then T174, then T142.
+
+## 2026-07-30 - T176 (chooser row menu + relay Rename/Remove)
+
+The chooser's rows are now manageable. A `...` button beside `New Window` and a
+right-click on a row open the same menu, built by a new pure `chooser_menu.zig`
+from the row kind: `Rename...` | sep | `Remove from Account...`. Behind them,
+`relay_directory` gained `renameDevice` (PATCH) and `deleteDevice` (DELETE)
+over a new method-generic `http_client.requestAuth`, with path segments
+percent-encoded so a hostile device id cannot retarget the request.
+
+Three decisions worth keeping:
+
+- **The row's task file said not to spin a nested message loop; I did anyway.**
+  `ConfirmDialog` (T80) is that dialog minus a text field and already runs one,
+  citing the T48 analysis - which found the deadlock was a NON-PUMPING wait
+  inside a WndProc, not nesting. So `Rename...` is `ConfirmDialog` plus an
+  optional field (`Options.input` + `prompt()`), which is also what Mac does
+  (NSAlert + accessoryView, the same class as the remove confirmation). A field
+  takes focus with its seed selected and forces Enter onto OK; the destructive
+  remove keeps MB_DEFBUTTON2, and the script proves Enter there CANCELS with no
+  DELETE sent.
+- **`Host Settings...` is absent, not greyed** - one bool
+  (`HOST_SETTINGS_AVAILABLE`) that T174 flips. `hasMenu` derives from `build`,
+  so a row whose only item is gated away gets no menu instead of an empty
+  popup, and no menu ever opens with a leading separator.
+- **The test found a real gap by accident.** With the rename finally landing,
+  the whole remove block stopped running - because the re-list selected row 0
+  and hid the `...`. Renaming a machine was throwing the user back to Local.
+  `reloadDevices` now re-anchors by device ID (copied out first - the refetch
+  frees the arena it points into), by ID and not index because a refetch may
+  reorder. Mac calls this `reanchorSelection`.
+
+The harness trap that cost the time: **a cross-process `SetWindowTextW` on an
+EDIT does not type into it.** It updated USER32's cached window text - so the
+script's `GetWindowTextW` read the new name back and the assertion passed -
+while the control's buffer kept the old one, and the app, reading in-process
+via `WM_GETTEXT`, saw the OLD name. The rename became a silent no-op that read
+as a product bug. The script now sends real keystrokes and reads the field with
+`WM_GETTEXT`, which also makes the assertion honest: it proves the seed is
+pre-selected, because typing replaces it.
+
+New `test/win32/chooser-menu.ps1` drives both entry points with real mouse
+clicks against a STATEFUL fake relay (it really renames and deletes, so the
+re-list shows the consequence) and reads the live popup through `MN_GETHMENU` +
+`GetMenuStringW` to assert the exact item list. ALL PASS (33) x3; both test
+lanes + `test-agent` exit 0; P1-P3 ALL PASS; `ipc-machine-chooser.ps1`,
+`relay-account.ps1` and `confirm-dialogs.ps1` re-run green. Filed **T177** (the
+detail action row is short Mac's `Activity`, and `Restore All` which belongs to
+T146). Next: **T174**, then T142.

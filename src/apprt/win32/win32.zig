@@ -411,6 +411,10 @@ pub extern "user32" fn ShowWindow(
     nCmdShow: i32,
 ) callconv(.winapi) i32;
 
+pub extern "user32" fn IsWindowVisible(
+    hWnd: HWND,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn UpdateWindow(
     hWnd: HWND,
 ) callconv(.winapi) i32;

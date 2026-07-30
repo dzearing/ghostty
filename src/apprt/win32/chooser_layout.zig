@@ -62,6 +62,9 @@ pub const Layout = struct {
     detail_title: Rect,
     detail_subtitle: Rect,
     primary_btn: Rect,
+    /// The per-row management menu button (`…`), Mac's `ellipsis.circle` menu
+    /// in the same action row as the primary button (T176).
+    menu_btn: Rect,
 
     /// Footer: a rule, then Cancel alone at the trailing edge.
     footer_divider_y: i32,
@@ -217,6 +220,14 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
             .right = detail.left + margin + primary_w,
             .bottom = primary_top + btn_h,
         },
+        // Square, so it reads as a glyph button rather than a second command
+        // (Mac's borderless ellipsis menu, 456-492).
+        .menu_btn = .{
+            .left = detail.left + margin + primary_w + px(8, scale),
+            .top = primary_top,
+            .right = detail.left + margin + primary_w + px(8, scale) + btn_h,
+            .bottom = primary_top + btn_h,
+        },
         .footer_divider_y = footer_divider_y,
         .cancel = .{
             .left = client_w - margin - btn_w,
@@ -325,6 +336,20 @@ test "layout: the hint line count is clamped like the strip that renders it" {
     try testing.expect(capped.list.height() >= chooser_rows.rowMetrics(1.0).height * 5);
 }
 
+test "layout: the management menu button sits beside the primary action" {
+    const l = layout(1.0, 1);
+    // Same row, to its trailing side, with a gap.
+    try testing.expectEqual(l.primary_btn.top, l.menu_btn.top);
+    try testing.expectEqual(l.primary_btn.bottom, l.menu_btn.bottom);
+    try testing.expect(l.menu_btn.left >= l.primary_btn.right);
+    try testing.expect(l.menu_btn.left - l.primary_btn.right <= 12);
+    // Square, and inside the detail pane.
+    try testing.expectEqual(l.menu_btn.height(), l.menu_btn.width());
+    try testing.expect(l.menu_btn.left > l.master.right);
+    try testing.expect(l.menu_btn.right <= l.detail.right);
+    try testing.expect(l.menu_btn.bottom < l.footer_divider_y);
+}
+
 test "layout: detail header runs glyph -> title -> subtitle -> primary action" {
     const l = layout(1.0, 1);
     try testing.expect(l.detail_glyph.left >= l.detail.left);
@@ -334,7 +359,7 @@ test "layout: detail header runs glyph -> title -> subtitle -> primary action" {
     try testing.expect(l.primary_btn.top >= l.detail_subtitle.bottom);
     try testing.expect(l.primary_btn.top >= l.detail_glyph.bottom);
     // Everything nests inside the pane.
-    for ([_]Rect{ l.detail_glyph, l.detail_title, l.detail_subtitle, l.primary_btn }) |r| {
+    for ([_]Rect{ l.detail_glyph, l.detail_title, l.detail_subtitle, l.primary_btn, l.menu_btn }) |r| {
         try testing.expect(r.left >= l.detail.left);
         try testing.expect(r.right <= l.detail.right);
         try testing.expect(r.bottom <= l.detail.bottom);

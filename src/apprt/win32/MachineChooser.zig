@@ -45,8 +45,10 @@ const App = @import("App.zig");
 const Window = @import("Window.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
+const ConfirmDialog = @import("ConfirmDialog.zig");
 const chooser_rows = @import("chooser_rows.zig");
 const chooser_layout = @import("chooser_layout.zig");
+const chooser_menu = @import("chooser_menu.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
 const relay_signin = @import("../../remote/relay_signin.zig");
 const w32 = @import("win32.zig");
@@ -57,6 +59,12 @@ const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyMachineChooser
 const FILTER_ID: u16 = 100;
 const LIST_ID: u16 = 101;
 const ACCOUNT_ID: u16 = 102;
+const MENU_ID: u16 = 103;
+
+/// `Host Settings…` needs T174's per-host defaults store, which does not exist
+/// on Windows yet. One bool, at the one place the menu is built — T174 flips it
+/// and adds a handler rather than reshaping the menu (see `chooser_menu`).
+const HOST_SETTINGS_AVAILABLE = false;
 
 /// Cap on rendered device rows (bounds the fixed-size `rows` array). The
 /// account device list is tiny in practice; extra devices are dropped from
@@ -108,6 +116,9 @@ hint: w32.HWND,
 /// The detail pane's primary action ("New Window"), Mac's `.borderedProminent`
 /// button — in the detail header, NOT the footer (which holds Cancel alone).
 primary_btn: w32.HWND,
+/// The `…` management-menu button, beside the primary action (T176). Hidden
+/// for rows that have no management actions (the Local row).
+menu_btn: w32.HWND,
 cancel_btn: w32.HWND,
 account_status: w32.HWND,
 account_btn: w32.HWND,
@@ -228,6 +239,7 @@ pub fn open(window: *Window) void {
         .list = undefined,
         .hint = undefined,
         .primary_btn = undefined,
+        .menu_btn = undefined,
         .cancel_btn = undefined,
         .account_status = undefined,
         .account_btn = undefined,
@@ -442,6 +454,29 @@ pub fn open(window: *Window) void {
         self.destroyState();
         return;
     };
+    // Mac's per-row management menu (`ellipsis.circle`) lives in the same
+    // action row (456-492). Labeled with the ellipsis CHARACTER rather than
+    // three periods so it reads as one glyph at any DPI.
+    self.menu_btn = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        std.unicode.utf8ToUtf16LeStringLiteral("…"),
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
+        l.menu_btn.left,
+        l.menu_btn.top,
+        l.menu_btn.right - l.menu_btn.left,
+        l.menu_btn.bottom - l.menu_btn.top,
+        hwnd,
+        @ptrFromInt(@as(usize, MENU_ID)),
+        window.app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        self.destroyState();
+        return;
+    };
+    _ = w32.SetWindowTheme(self.menu_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
+
     self.cancel_btn = w32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
@@ -484,7 +519,7 @@ pub fn open(window: *Window) void {
         for ([_]w32.HWND{
             self.filter,         self.list,        self.hint,
             self.account_status, self.account_btn, self.primary_btn,
-            self.cancel_btn,
+            self.menu_btn,       self.cancel_btn,
         }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
@@ -645,8 +680,26 @@ pub fn onAccountResult(self: *MachineChooser, res: *const RelayAccountRow.Result
     if (res.message.len > 0) self.setHint(res.message);
 }
 
-/// Drop the current device list and fetch it again with the current token.
+/// Drop the current device list and fetch it again with the current token,
+/// keeping the highlight on the machine that was selected (Mac's
+/// `reanchorSelection`). Without the re-anchor, renaming a machine throws the
+/// user back to the Local row — and with it the detail pane and the management
+/// button that acted on the machine they were working with.
 fn reloadDevices(self: *MachineChooser) void {
+    // The id has to be COPIED: the refetch frees the arena it points into.
+    var anchor_buf: [128]u8 = undefined;
+    const anchor: ?[]const u8 = anchor: {
+        switch (self.selectedRow() orelse break :anchor null) {
+            .local => break :anchor null,
+            .device => |i| {
+                const id = self.devices[i].id;
+                if (id.len > anchor_buf.len) break :anchor null;
+                @memcpy(anchor_buf[0..id.len], id);
+                break :anchor anchor_buf[0..id.len];
+            },
+        }
+    };
+
     const alloc = self.window.app.core_app.alloc;
     if (self.parsed) |*p| {
         p.deinit();
@@ -658,6 +711,31 @@ fn reloadDevices(self: *MachineChooser) void {
 
     var buf: [256]u8 = undefined;
     self.refilter(self.filterText(&buf));
+
+    // A machine that is gone (removed, or filtered out) simply keeps
+    // `refilter`'s first-row selection.
+    if (anchor) |id| {
+        if (rowForDeviceId(self.rows[0..self.row_count], self.devices, id)) |row| {
+            _ = w32.SendMessageW(self.list, w32.LB_SETCURSEL, row, 0);
+            self.refreshDetail();
+        }
+    }
+}
+
+/// The display row showing the device with `id`, or null when it is not in the
+/// current filtered list. Pure — unit-tested.
+pub fn rowForDeviceId(
+    rows: []const Row,
+    devices: []const relay_directory.Device,
+    id: []const u8,
+) ?usize {
+    for (rows, 0..) |row, i| switch (row) {
+        .local => {},
+        .device => |d| {
+            if (d < devices.len and std.mem.eql(u8, devices[d].id, id)) return i;
+        },
+    };
+    return null;
 }
 
 /// Set a control's text from UTF-8 (truncated to fit).
@@ -727,6 +805,7 @@ fn applyLayout(self: *MachineChooser) void {
         .{ .hwnd = self.list, .r = rect(l.list) },
         .{ .hwnd = self.hint, .r = rect(l.hint) },
         .{ .hwnd = self.primary_btn, .r = rect(l.primary_btn) },
+        .{ .hwnd = self.menu_btn, .r = rect(l.menu_btn) },
         .{ .hwnd = self.cancel_btn, .r = rect(l.cancel) },
     };
     for (placements) |p| {
@@ -824,16 +903,237 @@ fn selectedRow(self: *const MachineChooser) ?Row {
 }
 
 /// Repaint the detail pane (the selection moved, or the list was refiltered)
-/// and show or hide the primary action with it — there is nothing to open when
-/// no row is selected.
+/// and show or hide the detail actions with it — there is nothing to open when
+/// no row is selected, and the Local row has no management actions at all.
 fn refreshDetail(self: *MachineChooser) void {
     const l = layout(self.window.scale, self.hint_lines);
     var r = rect(l.detail);
     _ = w32.InvalidateRect(self.hwnd, &r, 1);
+    const row = self.selectedRow();
     _ = w32.ShowWindow(
         self.primary_btn,
-        if (self.selectedRow() == null) w32.SW_HIDE else w32.SW_SHOW,
+        if (row == null) w32.SW_HIDE else w32.SW_SHOW,
     );
+    // Hidden rather than greyed: Mac omits the menu on rows that have none,
+    // and a `…` that opens nothing is worse than no `…` at all.
+    const menu_visible = row != null and chooser_menu.hasMenu(menuState(row.?));
+    _ = w32.ShowWindow(self.menu_btn, if (menu_visible) w32.SW_SHOW else w32.SW_HIDE);
+    // Focus must not be left on a control the user can no longer see.
+    if (!menu_visible and w32.GetFocus() == @as(?w32.HWND, self.menu_btn)) {
+        _ = w32.SetFocus(self.list);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Per-row management menu (T176)
+// ---------------------------------------------------------------------
+
+/// What menu `row` gets. Every non-local row in the Windows chooser comes from
+/// the relay device directory today (there is no direct-TCP machine list yet),
+/// so a device row is a relay row.
+fn menuState(row: Row) chooser_menu.State {
+    return .{
+        .kind = switch (row) {
+            .local => .local,
+            .device => .relay,
+        },
+        .host_settings = HOST_SETTINGS_AVAILABLE,
+    };
+}
+
+/// Build and track the management menu for the selected row at a SCREEN point,
+/// then run the chosen action. Both entry points (the `…` button and a
+/// right-click on a row) land here, so the two can never drift.
+fn openRowMenu(self: *MachineChooser, screen_x: i32, screen_y: i32) void {
+    const row = self.selectedRow() orelse return;
+    const device_index = switch (row) {
+        .local => return, // no management actions
+        .device => |i| i,
+    };
+
+    var buf: [chooser_menu.max_items]chooser_menu.Item = undefined;
+    const items = chooser_menu.build(menuState(row), &buf);
+    if (items.len == 0) return;
+
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+    for (items) |item| switch (item) {
+        .separator => _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null),
+        .cmd => |c| _ = w32.AppendMenuW(menu, w32.MF_STRING, @intFromEnum(c.id), c.title.ptr),
+    };
+
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        screen_x,
+        screen_y,
+        self.hwnd,
+        null,
+    );
+    // 0 = dismissed without choosing.
+    const id = std.meta.intToEnum(chooser_menu.Id, @as(usize, @intCast(cmd))) catch return;
+    switch (id) {
+        .rename => self.promptRename(device_index),
+        .remove => self.confirmRemove(device_index),
+        // Gated off until T174 lands the per-host defaults store, so the item
+        // is never built — but if it ever is, say so instead of doing nothing.
+        .host_settings => self.setHint("Host settings aren't available on Windows yet."),
+    }
+}
+
+/// Open the management menu from the `…` button: aligned under its leading
+/// edge, the way a menu button's popup should hang.
+fn openRowMenuFromButton(self: *MachineChooser) void {
+    var r: w32.RECT = undefined;
+    if (w32.GetWindowRect(self.menu_btn, &r) == 0) return;
+    self.openRowMenu(r.left, r.bottom);
+}
+
+/// Prompt for a new name and PATCH it onto the relay account. Errors land in
+/// the status strip, never silently.
+fn promptRename(self: *MachineChooser, device_index: usize) void {
+    const dev = self.devices[device_index];
+    if (self.token == null) {
+        self.setHint("Not signed in — use Sign in with Google above.");
+        return;
+    }
+
+    // `dev` borrows the device list's JSON arena, and the modal below pumps
+    // messages — a sign-in completing under it re-lists and frees that arena.
+    // Everything needed afterwards is copied out first.
+    var id_buf: [128]u8 = undefined;
+    var old_buf: [128]u8 = undefined;
+    if (dev.id.len > id_buf.len or dev.name.len > old_buf.len) {
+        // Never a silent no-op: the user pressed a menu item and is owed an
+        // answer even in the case we cannot serve.
+        self.setHint("That machine's name or id is too long to edit here.");
+        return;
+    }
+    const id = id_buf[0..dev.id.len];
+    const old_name = old_buf[0..dev.name.len];
+    @memcpy(id, dev.id);
+    @memcpy(old_name, dev.name);
+
+    var title_buf: [160]u16 = undefined;
+    var seed_buf: [160]u16 = undefined;
+    const title = utf16z(&title_buf, "Rename this machine") orelse return;
+    const seed = utf16z(&seed_buf, old_name) orelse return;
+
+    // The chooser must survive the nested modal pump; `window` is the handle
+    // back to it afterwards.
+    const window = self.window;
+    var typed_buf: [256]u8 = undefined;
+    const typed = ConfirmDialog.prompt(window.app, self.hwnd, window.scale, null, .{
+        .title = title.ptr,
+        .text = std.unicode.utf8ToUtf16LeStringLiteral("Enter a new name for this device."),
+        .icon = .none,
+        .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Rename"),
+        .input = seed,
+    }, &typed_buf) orelse return;
+    // The prompt ran its own message loop; the chooser may not have survived it.
+    if (window.machine_chooser != self) return;
+
+    const name = chooser_menu.newName(typed, old_name) orelse return;
+    const tok = self.token orelse return;
+    var parsed = relay_directory.renameDevice(
+        self.window.app.core_app.alloc,
+        self.relay_base,
+        tok,
+        id,
+        name,
+    ) catch |err| {
+        log.warn("machine chooser: rename failed device={s} err={}", .{ id, err });
+        self.setHint(renameError(err));
+        return;
+    };
+    parsed.deinit();
+
+    // Re-list rather than patching the row in place: the device list is owned
+    // by a JSON arena of const strings, and a refetch is also what proves the
+    // relay accepted the change.
+    self.reloadDevices();
+}
+
+/// Confirm, then DELETE the device from the relay account and drop its row.
+fn confirmRemove(self: *MachineChooser, device_index: usize) void {
+    const dev = self.devices[device_index];
+    if (self.token == null) {
+        self.setHint("Not signed in — use Sign in with Google above.");
+        return;
+    }
+    // `dev` borrows the device list's JSON arena, which the confirmation's
+    // nested pump can free out from under us (a sign-in landing under it
+    // re-lists) — copy the id out first.
+    var id_buf: [128]u8 = undefined;
+    if (dev.id.len > id_buf.len) {
+        self.setHint("That machine's id is too long to act on here.");
+        return;
+    }
+    const id = id_buf[0..dev.id.len];
+    @memcpy(id, dev.id);
+
+    var title_buf: [256]u16 = undefined;
+    const title = utf16z(&title_buf, "Remove this machine from your account?") orelse return;
+
+    const window = self.window;
+    const answer = ConfirmDialog.show(window.app, self.hwnd, window.scale, null, .{
+        .title = title.ptr,
+        .text = std.unicode.utf8ToUtf16LeStringLiteral(
+            "This deletes the device from the relay and revokes its credential. " ++
+                "The agent on that machine will no longer be able to connect.",
+        ),
+        .icon = .warning,
+        .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Remove"),
+        // Destructive: Enter must not approve it (MB_DEFBUTTON2 parity).
+        .default_cancel = true,
+    });
+    if (window.machine_chooser != self) return;
+    if (answer != .ok) return;
+
+    const tok = self.token orelse return;
+    relay_directory.deleteDevice(
+        self.window.app.core_app.alloc,
+        self.relay_base,
+        tok,
+        id,
+    ) catch |err| switch (err) {
+        // Already gone on the relay: the user's intent is satisfied, so drop
+        // the row rather than reporting a failure they cannot act on.
+        error.NotFound => {},
+        else => {
+            log.warn("machine chooser: remove failed device={s} err={}", .{ id, err });
+            self.setHint(removeError(err));
+            return;
+        },
+    };
+
+    self.reloadDevices();
+}
+
+/// Status-strip text for a failed rename.
+fn renameError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Unauthorized => "Session expired — sign in again above.",
+        error.NotFound => "That machine is no longer on this account.",
+        error.BadResponse => "The relay's reply to the rename made no sense.",
+        else => "Couldn't rename that machine — is the relay reachable?",
+    };
+}
+
+/// Status-strip text for a failed removal.
+fn removeError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Unauthorized => "Session expired — sign in again above.",
+        else => "Couldn't remove that machine — is the relay reachable?",
+    };
+}
+
+/// UTF-8 into a NUL-terminated UTF-16 buffer, or null when it does not fit.
+/// Dialog captions are built at runtime, so they cannot be string literals.
+fn utf16z(buf: []u16, text: []const u8) ?[:0]const u16 {
+    const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], text) catch return null;
+    buf[n] = 0;
+    return buf[0..n :0];
 }
 
 // ---------------------------------------------------------------------
@@ -1035,9 +1335,66 @@ fn listWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(
             self.tracking_leave = false;
             self.setHover(-1);
         },
+        // Right-click is the second way into the management menu (Mac's
+        // `.contextMenu` on the row). Select the row under the cursor first —
+        // a menu that acts on a different row than the one you clicked is a
+        // bug waiting to happen — then open on the button UP: opening on DOWN
+        // leaves the pending release to dismiss the menu immediately.
+        w32.WM_RBUTTONDOWN => {
+            if (rowAtPoint(hwnd, self, lparam)) |row| {
+                _ = w32.SendMessageW(hwnd, w32.LB_SETCURSEL, @intCast(row), 0);
+                self.refreshDetail();
+            }
+            return 0;
+        },
+        w32.WM_RBUTTONUP => {
+            var pt = w32.POINT{ .x = loWordSigned(lparam), .y = hiWordSigned(lparam) };
+            _ = w32.ClientToScreen(hwnd, &pt);
+            self.openRowMenu(pt.x, pt.y);
+            return 0;
+        },
+        // Keyboard menu key (VK_APPS / shift+F10): lParam is -1 and there is
+        // no click point, so it opens at the selected row.
+        w32.WM_CONTEXTMENU => {
+            if (lparam == -1) {
+                self.openRowMenuAtSelection();
+                return 0;
+            }
+        },
         else => {},
     }
     return w32.CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+}
+
+/// The row index under a listbox client point (`lparam` of a mouse message),
+/// or null when the point is past the last row.
+fn rowAtPoint(list: w32.HWND, self: *const MachineChooser, lparam: isize) ?i32 {
+    const hit = w32.SendMessageW(list, w32.LB_ITEMFROMPOINT, 0, lparam);
+    // High word non-zero ⇒ the point is outside the client area.
+    if ((@as(usize, @bitCast(hit)) >> 16) & 0xFFFF != 0) return null;
+    const row: i32 = @intCast(hit & 0xFFFF);
+    if (row < 0 or @as(usize, @intCast(row)) >= self.row_count) return null;
+    return row;
+}
+
+fn loWordSigned(lparam: isize) i32 {
+    return @intCast(@as(i16, @truncate(lparam & 0xFFFF)));
+}
+
+fn hiWordSigned(lparam: isize) i32 {
+    return @intCast(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
+}
+
+/// Open the management menu over the selected row (keyboard path — there is no
+/// pointer to anchor it to).
+fn openRowMenuAtSelection(self: *MachineChooser) void {
+    const sel: i32 = @intCast(w32.SendMessageW(self.list, w32.LB_GETCURSEL, 0, 0));
+    if (sel < 0) return;
+    var r: w32.RECT = undefined;
+    if (w32.SendMessageW(self.list, w32.LB_GETITEMRECT, @intCast(sel), @bitCast(@intFromPtr(&r))) < 0) return;
+    var pt = w32.POINT{ .x = r.left, .y = r.bottom };
+    _ = w32.ClientToScreen(self.list, &pt);
+    self.openRowMenu(pt.x, pt.y);
 }
 
 /// Move the hover highlight, repainting only when it actually changed.
@@ -1095,6 +1452,10 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
                     },
                     ACCOUNT_ID => {
                         self.onAccountClicked();
+                        return 0;
+                    },
+                    MENU_ID => {
+                        self.openRowMenuFromButton();
                         return 0;
                     },
                     else => {},
@@ -1195,13 +1556,15 @@ fn filterText(self: *const MachineChooser, buf: []u8) []const u8 {
 pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
     return hwnd == self.hwnd or hwnd == self.filter or hwnd == self.list or
         hwnd == self.hint or hwnd == self.primary_btn or hwnd == self.cancel_btn or
-        hwnd == self.account_status or hwnd == self.account_btn;
+        hwnd == self.account_status or hwnd == self.account_btn or
+        hwnd == self.menu_btn;
 }
 
-/// Keyboard focus targets, in Tab order. `account` is the sign-in/out button
-/// (T141) — last in the cycle so Tab from the filter still reaches the list
-/// first, the common path.
-pub const Focusable = enum { filter, list, primary, cancel, account };
+/// Keyboard focus targets, in Tab order. `menu` is the `…` management button
+/// (T176), immediately after the primary action it sits beside. `account` is
+/// the sign-in/out button (T141) — last in the cycle so Tab from the filter
+/// still reaches the list first, the common path.
+pub const Focusable = enum { filter, list, primary, menu, cancel, account };
 
 /// Pure Tab-order cycle. Unit-tested.
 pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
@@ -1209,14 +1572,28 @@ pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
         .filter => .account,
         .list => .filter,
         .primary => .list,
-        .cancel => .primary,
+        .menu => .primary,
+        .cancel => .menu,
         .account => .cancel,
     } else switch (cur) {
         .filter => .list,
         .list => .primary,
-        .primary => .cancel,
+        .primary => .menu,
+        .menu => .cancel,
         .cancel => .account,
         .account => .filter,
+    };
+}
+
+/// The control behind a focus stop.
+fn hwndFor(self: *const MachineChooser, f: Focusable) w32.HWND {
+    return switch (f) {
+        .filter => self.filter,
+        .list => self.list,
+        .primary => self.primary_btn,
+        .menu => self.menu_btn,
+        .cancel => self.cancel_btn,
+        .account => self.account_btn,
     };
 }
 
@@ -1241,10 +1618,13 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
             return true;
         },
         w32.VK_RETURN => {
-            // Enter on the account button presses IT, not the default Open
+            // Enter on a non-default button presses IT, not the default Open
             // button — this loop intercepts Enter before the control sees it.
-            if (w32.GetFocus() == @as(?w32.HWND, self.account_btn)) {
+            const focus = w32.GetFocus();
+            if (focus == @as(?w32.HWND, self.account_btn)) {
                 self.onAccountClicked();
+            } else if (focus == @as(?w32.HWND, self.menu_btn)) {
+                self.openRowMenuFromButton();
             } else {
                 self.openSelection();
             }
@@ -1266,24 +1646,29 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
         w32.VK_TAB => {
             const backwards = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
             const focus = w32.GetFocus();
-            const cur: Focusable = if (focus == @as(?w32.HWND, self.list))
+            var cur: Focusable = if (focus == @as(?w32.HWND, self.list))
                 .list
             else if (focus == @as(?w32.HWND, self.primary_btn))
                 .primary
+            else if (focus == @as(?w32.HWND, self.menu_btn))
+                .menu
             else if (focus == @as(?w32.HWND, self.cancel_btn))
                 .cancel
             else if (focus == @as(?w32.HWND, self.account_btn))
                 .account
             else
                 .filter;
-            const next_hwnd = switch (nextFocus(cur, backwards)) {
-                .filter => self.filter,
-                .list => self.list,
-                .primary => self.primary_btn,
-                .cancel => self.cancel_btn,
-                .account => self.account_btn,
-            };
-            _ = w32.SetFocus(next_hwnd);
+
+            // The detail actions come and go with the selection, so Tab has to
+            // step OVER a hidden one instead of parking focus on an invisible
+            // control. Bounded by the cycle length; something is always shown.
+            var next = nextFocus(cur, backwards);
+            for (0..@typeInfo(Focusable).@"enum".fields.len) |_| {
+                if (w32.IsWindowVisible(self.hwndFor(next)) != 0) break;
+                cur = next;
+                next = nextFocus(cur, backwards);
+            }
+            _ = w32.SetFocus(self.hwndFor(next));
             return true;
         },
         else => return false,
@@ -1458,10 +1843,11 @@ test "clampSelection: clamps within bounds and handles empty" {
     try testing.expectEqual(@as(i32, 0), clampSelection(-1, 1, 3)); // from no-selection
 }
 
-test "nextFocus: forward cycle filter -> list -> primary -> cancel -> account -> filter" {
+test "nextFocus: forward cycle filter -> list -> primary -> menu -> cancel -> account -> filter" {
     try testing.expectEqual(Focusable.list, nextFocus(.filter, false));
     try testing.expectEqual(Focusable.primary, nextFocus(.list, false));
-    try testing.expectEqual(Focusable.cancel, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.menu, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.cancel, nextFocus(.menu, false));
     try testing.expectEqual(Focusable.account, nextFocus(.cancel, false));
     try testing.expectEqual(Focusable.filter, nextFocus(.account, false));
 }
@@ -1469,9 +1855,39 @@ test "nextFocus: forward cycle filter -> list -> primary -> cancel -> account ->
 test "nextFocus: backward cycle reverses" {
     try testing.expectEqual(Focusable.account, nextFocus(.filter, true));
     try testing.expectEqual(Focusable.cancel, nextFocus(.account, true));
-    try testing.expectEqual(Focusable.primary, nextFocus(.cancel, true));
+    try testing.expectEqual(Focusable.menu, nextFocus(.cancel, true));
+    try testing.expectEqual(Focusable.primary, nextFocus(.menu, true));
     try testing.expectEqual(Focusable.list, nextFocus(.primary, true));
     try testing.expectEqual(Focusable.filter, nextFocus(.list, true));
+}
+
+test "the management button sits with the primary action in the Tab order" {
+    // The `…` acts on the machine the primary button opens, so it must follow
+    // it directly rather than turning up after Cancel.
+    try testing.expectEqual(Focusable.menu, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.primary, nextFocus(.menu, true));
+}
+
+test "menuState: the Local row has no menu, a device row gets the relay menu" {
+    try testing.expectEqual(chooser_menu.Kind.local, menuState(.local).kind);
+    try testing.expectEqual(chooser_menu.Kind.relay, menuState(.{ .device = 3 }).kind);
+    try testing.expect(!chooser_menu.hasMenu(menuState(.local)));
+    // Every non-local row in the Windows chooser comes from the relay
+    // directory, so a device row must be manageable.
+    try testing.expect(chooser_menu.hasMenu(menuState(.{ .device = 0 })));
+}
+
+test "T176 ships with Host Settings gated off (T174 owns it)" {
+    try testing.expect(!HOST_SETTINGS_AVAILABLE);
+    var buf: [chooser_menu.max_items]chooser_menu.Item = undefined;
+    const items = chooser_menu.build(
+        .{ .kind = .relay, .host_settings = HOST_SETTINGS_AVAILABLE },
+        &buf,
+    );
+    for (items) |item| switch (item) {
+        .separator => {},
+        .cmd => |c| try testing.expect(c.id != .host_settings),
+    };
 }
 
 test "nextFocus: every target is reachable both ways (no orphan in the cycle)" {
@@ -1485,6 +1901,49 @@ test "nextFocus: every target is reachable both ways (no orphan in the cycle)" {
         try testing.expectEqual(Focusable.filter, cur); // closed cycle
         for (seen) |s| try testing.expect(s);
     }
+}
+
+test "rowForDeviceId: finds a device's display row past the Local row" {
+    const devs = [_]relay_directory.Device{
+        testDevice("Winbox", null, true),
+        testDevice("Laptop", null, false),
+    };
+    const rows = [_]Row{ .local, .{ .device = 0 }, .{ .device = 1 } };
+    try testing.expectEqual(@as(?usize, 1), rowForDeviceId(&rows, &devs, "Winbox"));
+    try testing.expectEqual(@as(?usize, 2), rowForDeviceId(&rows, &devs, "Laptop"));
+}
+
+test "rowForDeviceId: a filtered-out or removed device has no row" {
+    const devs = [_]relay_directory.Device{testDevice("Winbox", null, true)};
+    // Only the Local row survived the filter.
+    const only_local = [_]Row{.local};
+    try testing.expect(rowForDeviceId(&only_local, &devs, "Winbox") == null);
+    // And an id that is not on the account at all.
+    const rows = [_]Row{ .local, .{ .device = 0 } };
+    try testing.expect(rowForDeviceId(&rows, &devs, "gone") == null);
+    try testing.expect(rowForDeviceId(&rows, &devs, "") == null);
+}
+
+test "rowForDeviceId: indices are re-resolved, not assumed stable" {
+    // A refetch can reorder the list; the anchor must follow the ID, not the
+    // old position (this is the whole point of re-anchoring by id).
+    const before = [_]relay_directory.Device{
+        testDevice("A", null, true),
+        testDevice("B", null, true),
+    };
+    const after = [_]relay_directory.Device{
+        testDevice("B", null, true),
+        testDevice("A", null, true),
+    };
+    const rows = [_]Row{ .local, .{ .device = 0 }, .{ .device = 1 } };
+    try testing.expectEqual(@as(?usize, 1), rowForDeviceId(&rows, &before, "A"));
+    try testing.expectEqual(@as(?usize, 2), rowForDeviceId(&rows, &after, "A"));
+}
+
+test "rowForDeviceId: a stale row index never reads past the device list" {
+    const devs = [_]relay_directory.Device{testDevice("A", null, true)};
+    const rows = [_]Row{ .local, .{ .device = 7 } };
+    try testing.expect(rowForDeviceId(&rows, &devs, "A") == null);
 }
 
 test "containsIgnoreCase: basic matches" {

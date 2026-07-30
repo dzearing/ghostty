@@ -119,16 +119,123 @@ pub fn listDevices(alloc: Allocator, base: []const u8, token: []const u8) !Parse
     var resp = try http_client.getAuth(alloc, url, token, max_body_len);
     defer resp.deinit(alloc);
 
-    if (classifyStatus(resp.status)) |derr| return switch (derr) {
+    if (statusError(resp.status, "list")) |err| return err;
+
+    return parseDevices(alloc, resp.body);
+}
+
+// =============================================================================
+// Device management: rename + remove (T176)
+// =============================================================================
+
+/// An owned, parsed single device — what a rename returns. Same arena rules as
+/// `Parsed`.
+pub const ParsedDevice = std.json.Parsed(Device);
+
+/// Percent-encode one URL path segment: everything outside RFC 3986's
+/// unreserved set is escaped. Device ids are relay-generated and so far always
+/// unreserved, but a raw `/` or `?` in one would silently retarget the request
+/// at a different endpoint — `appendingPathComponent` (which Mac uses) escapes,
+/// so this does too. Pure; caller frees.
+pub fn escapePathSegment(alloc: Allocator, seg: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (seg) |c| {
+        const unreserved = switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
+            else => false,
+        };
+        if (unreserved) {
+            try out.append(alloc, c);
+        } else {
+            try out.appendSlice(alloc, &.{ '%', std.fmt.digitToChar(c >> 4, .upper), std.fmt.digitToChar(c & 0xF, .upper) });
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// `v1/client/devices/<escaped id>` — the per-device resource path both
+/// management verbs address. Pure; caller frees.
+pub fn devicePath(alloc: Allocator, device_id: []const u8) Allocator.Error![]u8 {
+    const esc = try escapePathSegment(alloc, device_id);
+    defer alloc.free(esc);
+    return std.fmt.allocPrint(alloc, "v1/client/devices/{s}", .{esc});
+}
+
+/// The rename request body, `{"name":"…"}` with JSON escaping. Pure; caller
+/// frees. Mirrors Mac's `JSONEncoder().encode(["name": name])`.
+pub fn renameBody(alloc: Allocator, name: []const u8) Allocator.Error![]u8 {
+    return std.json.Stringify.valueAlloc(alloc, .{ .name = name }, .{});
+}
+
+/// Parse the single-device body a rename returns. Same `.alloc_always` copy
+/// rule as `parseDevices`, so the caller may free the source body. Pure.
+pub fn parseDevice(alloc: Allocator, body: []const u8) error{ BadResponse, OutOfMemory }!ParsedDevice {
+    return std.json.parseFromSlice(Device, alloc, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadResponse,
+    };
+}
+
+/// `PATCH {base}/v1/client/devices/{id}` with `{"name": …}` — rename an owned
+/// device, returning the relay's updated view of it (caller `.deinit()`s).
+/// Mirrors `RelayDirectoryClient.rename`.
+pub fn renameDevice(
+    alloc: Allocator,
+    base: []const u8,
+    token: []const u8,
+    device_id: []const u8,
+    name: []const u8,
+) !ParsedDevice {
+    const path = try devicePath(alloc, device_id);
+    defer alloc.free(path);
+    const url = try joinUrl(alloc, base, path);
+    defer alloc.free(url);
+    const body = try renameBody(alloc, name);
+    defer alloc.free(body);
+
+    var resp = try http_client.requestAuth(alloc, url, "PATCH", token, body, max_body_len);
+    defer resp.deinit(alloc);
+
+    if (statusError(resp.status, "rename")) |err| return err;
+    return parseDevice(alloc, resp.body);
+}
+
+/// `DELETE {base}/v1/client/devices/{id}` — remove an owned device and revoke
+/// its credential (the relay answers 204). Mirrors
+/// `RelayDirectoryClient.delete`; the body, if any, is ignored.
+pub fn deleteDevice(
+    alloc: Allocator,
+    base: []const u8,
+    token: []const u8,
+    device_id: []const u8,
+) !void {
+    const path = try devicePath(alloc, device_id);
+    defer alloc.free(path);
+    const url = try joinUrl(alloc, base, path);
+    defer alloc.free(url);
+
+    var resp = try http_client.requestAuth(alloc, url, "DELETE", token, null, max_body_len);
+    defer resp.deinit(alloc);
+
+    if (statusError(resp.status, "delete")) |err| return err;
+}
+
+/// `classifyStatus` mapped onto the `FetchError` a caller sees, or null for
+/// success. Shared by every verb so one status means one error everywhere.
+fn statusError(status: u16, what: []const u8) ?FetchError {
+    const derr = classifyStatus(status) orelse return null;
+    return switch (derr) {
         .unauthorized => error.Unauthorized,
         .not_found => error.NotFound,
         .http => |code| blk: {
-            log.warn("device list: relay returned HTTP {d}", .{code});
+            log.warn("device {s}: relay returned HTTP {d}", .{ what, code });
             break :blk error.UnexpectedStatus;
         },
     };
-
-    return parseDevices(alloc, resp.body);
 }
 
 /// The relay base to use: `GHOSTTY_RELAY_BASE` if set and non-empty, else
@@ -232,6 +339,87 @@ test "parseDevices: empty list" {
 test "parseDevices: garbage body → BadResponse" {
     try testing.expectError(error.BadResponse, parseDevices(testing.allocator, "not json at all"));
     try testing.expectError(error.BadResponse, parseDevices(testing.allocator, "{\"devices\":"));
+}
+
+// --- Device management (T176) ------------------------------------------------
+
+test "devicePath: the per-device resource under the list endpoint" {
+    const p = try devicePath(testing.allocator, "dev-e2e");
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("v1/client/devices/dev-e2e", p);
+}
+
+test "devicePath composed with joinUrl is the full mac URL" {
+    const p = try devicePath(testing.allocator, "abc123");
+    defer testing.allocator.free(p);
+    const u = try joinUrl(testing.allocator, "https://relay.example.com/", p);
+    defer testing.allocator.free(u);
+    try testing.expectEqualStrings("https://relay.example.com/v1/client/devices/abc123", u);
+}
+
+test "escapePathSegment: unreserved survives, everything else is percent-encoded" {
+    const plain = try escapePathSegment(testing.allocator, "aZ0-._~");
+    defer testing.allocator.free(plain);
+    try testing.expectEqualStrings("aZ0-._~", plain);
+
+    // A raw '/' would retarget the request at a different endpoint entirely;
+    // '?' would turn the rest into a query string.
+    const nasty = try escapePathSegment(testing.allocator, "a/b?c d#e");
+    defer testing.allocator.free(nasty);
+    try testing.expectEqualStrings("a%2Fb%3Fc%20d%23e", nasty);
+}
+
+test "devicePath escapes a hostile device id" {
+    const p = try devicePath(testing.allocator, "../devices");
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("v1/client/devices/..%2Fdevices", p);
+}
+
+test "renameBody: mac's {\"name\": …}, JSON-escaped" {
+    const b = try renameBody(testing.allocator, "Winbox");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("{\"name\":\"Winbox\"}", b);
+
+    const q = try renameBody(testing.allocator, "He said \"hi\"\\");
+    defer testing.allocator.free(q);
+    try testing.expectEqualStrings("{\"name\":\"He said \\\"hi\\\"\\\\\"}", q);
+}
+
+test "renameBody round-trips through the device parser's escaping rules" {
+    const b = try renameBody(testing.allocator, "a\"b");
+    defer testing.allocator.free(b);
+    const Named = struct { name: []const u8 };
+    var p = try std.json.parseFromSlice(Named, testing.allocator, b, .{});
+    defer p.deinit();
+    try testing.expectEqualStrings("a\"b", p.value.name);
+}
+
+test "parseDevice: the single-device body a rename returns" {
+    const body =
+        \\{"id":"d1","name":"Renamed","hostname":"winbox.local","online":true,"created_at":"x"}
+    ;
+    var p = try parseDevice(testing.allocator, body);
+    defer p.deinit();
+    try testing.expectEqualStrings("d1", p.value.id);
+    try testing.expectEqualStrings("Renamed", p.value.name);
+    try testing.expectEqualStrings("winbox.local", p.value.hostname.?);
+    try testing.expect(p.value.online);
+}
+
+test "parseDevice: a list body is NOT a device" {
+    try testing.expectError(
+        error.BadResponse,
+        parseDevice(testing.allocator, "{\"devices\":[]}"),
+    );
+    try testing.expectError(error.BadResponse, parseDevice(testing.allocator, "nope"));
+}
+
+test "statusError: one status means one error for every verb" {
+    try testing.expect(statusError(200, "list") == null);
+    try testing.expect(statusError(204, "delete") == null); // the relay's delete success
+    try testing.expectEqual(@as(?FetchError, error.Unauthorized), statusError(401, "rename"));
+    try testing.expectEqual(@as(?FetchError, error.NotFound), statusError(404, "delete"));
+    try testing.expectEqual(@as(?FetchError, error.UnexpectedStatus), statusError(500, "rename"));
 }
 
 test {

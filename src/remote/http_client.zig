@@ -103,7 +103,32 @@ pub fn getAuth(alloc: Allocator, url: []const u8, bearer: []const u8, max_len: u
 /// Bearer-authenticated POST with an OPTIONAL body. Used by the agent's self
 /// de-enroll (`/v1/agent/deenroll`, no body). Pass `null` for a body-less POST.
 pub fn postAuth(alloc: Allocator, url: []const u8, bearer: []const u8, json_body: ?[]const u8) !Response {
-    return request(alloc, url, "POST", if (json_body) |b| .{ .json = b } else .none, bearer, max_body_len);
+    return requestAuth(alloc, url, "POST", bearer, json_body, max_body_len);
+}
+
+/// Bearer-authenticated request with an ARBITRARY method and an optional JSON
+/// body — the general form `getAuth`/`postAuth` are the two shorthands for.
+///
+/// It exists because the relay's account directory needs verbs beyond GET/POST
+/// (`PATCH` to rename a device, `DELETE` to remove one, T176), and a helper
+/// per verb would multiply with every endpoint. The method is written into the
+/// request line verbatim, so callers pass an uppercase HTTP token.
+pub fn requestAuth(
+    alloc: Allocator,
+    url: []const u8,
+    method: []const u8,
+    bearer: []const u8,
+    json_body: ?[]const u8,
+    max_len: usize,
+) !Response {
+    return request(
+        alloc,
+        url,
+        method,
+        if (json_body) |b| .{ .json = b } else .none,
+        bearer,
+        max_len,
+    );
 }
 
 /// GET the absolute `url` into memory, returning the status + owned body
@@ -390,6 +415,49 @@ test "readResponse: truncated content-length body errors" {
     const raw = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
     var r: std.Io.Reader = .fixed(raw);
     try testing.expectError(error.EndOfStream, readResponse(testing.allocator, &r, max_body_len));
+}
+
+/// Render a request into a buffer the way `request` would, so the wire form of
+/// the method/auth/body headers can be asserted without a socket.
+fn renderRequest(buf: []u8, url: []const u8, method: []const u8, body: Body, bearer: ?[]const u8) ![]const u8 {
+    const u = try parseUrl(url);
+    var w: std.Io.Writer = .fixed(buf);
+    try writeRequest(&w, method, u, body, bearer);
+    return w.buffered();
+}
+
+test "writeRequest: arbitrary method + bearer (PATCH rename)" {
+    // T176: the relay's device rename is `PATCH /v1/client/devices/<id>` with
+    // a JSON body — the shape `requestAuth` exists to make expressible.
+    var buf: [512]u8 = undefined;
+    const out = try renderRequest(
+        &buf,
+        "https://relay.example.com/v1/client/devices/dev-1",
+        "PATCH",
+        .{ .json = "{\"name\":\"Winbox\"}" },
+        "tok-abc",
+    );
+    try testing.expect(std.mem.startsWith(u8, out, "PATCH /v1/client/devices/dev-1 HTTP/1.1\r\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "Host: relay.example.com\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Authorization: Bearer tok-abc\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Type: application/json\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 17\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n{\"name\":\"Winbox\"}"));
+}
+
+test "writeRequest: body-less method still carries auth and no framing headers" {
+    var buf: [512]u8 = undefined;
+    const out = try renderRequest(
+        &buf,
+        "http://127.0.0.1:8080/v1/client/devices/dev-1",
+        "DELETE",
+        .none,
+        "tok-abc",
+    );
+    try testing.expect(std.mem.startsWith(u8, out, "DELETE /v1/client/devices/dev-1 HTTP/1.1\r\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "Authorization: Bearer tok-abc\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+    try testing.expect(std.mem.endsWith(u8, out, "Connection: close\r\n\r\n"));
 }
 
 test {
