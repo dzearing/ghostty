@@ -3630,6 +3630,20 @@ pub const CAPI = struct {
         };
     }
 
+    /// Write bytes to the pty as pasted content: framed in bracketed-paste
+    /// fenceposts if the running program has enabled them, verbatim if not.
+    /// Unlike `ghostty_surface_text` this does no control character
+    /// stripping, so escape sequences pass through intact.
+    export fn ghostty_surface_write_pty_bracketed(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.core_surface.writePtyBracketed(ptr[0..len]) catch |err| {
+            log.warn("failed to write to pty: {}", .{err});
+        };
+    }
+
     export fn ghostty_surface_text(
         surface: *Surface,
         ptr: [*]const u8,

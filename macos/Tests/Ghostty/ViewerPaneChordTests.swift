@@ -51,10 +51,6 @@ struct ViewerPaneChordClassificationTests {
 @MainActor
 @Suite(.serialized)
 struct ViewerPaneChordRoutingTests {
-    private func wait(_ seconds: TimeInterval) async {
-        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-    }
-
     private func keyEvent(
         _ chars: String, _ flags: NSEvent.ModifierFlags
     ) -> NSEvent {
@@ -102,7 +98,7 @@ struct ViewerPaneChordRoutingTests {
 
         // The address the bar will show is only known once the file has
         // loaded; pressing Cmd-D before that would focus an empty field.
-        for _ in 0..<150 where viewer.currentURL.isEmpty { await wait(0.02) }
+        await poll { !viewer.currentURL.isEmpty }
         #expect(!viewer.currentURL.isEmpty, "file viewer never resolved an address")
 
         // Focus starts on the page, as it does after clicking into the pane.
@@ -111,16 +107,23 @@ struct ViewerPaneChordRoutingTests {
         #expect(window.performKeyEquivalent(with: keyEvent("d", [.command])),
                 "Cmd-D was not handled by the focused viewer pane")
 
+        // Poll for the caret, and capture the editor the moment it appears —
+        // an offscreen window is never key, so the field holds focus only
+        // briefly before the bar's 2s auto-hide reclaims it. Reading the state
+        // after a fixed wait loses that window on a loaded machine.
         var editor: NSText?
-        for _ in 0..<150 {
-            await wait(0.02)
+        await poll {
             viewer.layoutSubtreeIfNeeded()
-            if let text = window.firstResponder as? NSText, !text.string.isEmpty {
-                editor = text
-                break
-            }
+            guard let text = window.firstResponder as? NSText, !text.string.isEmpty
+            else { return false }
+            editor = text
+            return true
         }
-        let editorText = try #require(editor, "address field never took focus")
+        let editorText = try #require(editor, """
+            address field never took focus: chromeVisible=\(viewer.chromeVisible) \
+            field=\(String(describing: ViewerView.firstTextField(in: viewer))) \
+            responder=\(String(describing: window.firstResponder))
+            """)
         #expect(editorText.string == viewer.currentURL,
                 "address field did not show the pane's location")
         #expect(editorText.selectedRange.length == (editorText.string as NSString).length,
@@ -160,7 +163,7 @@ struct ViewerPaneChordRoutingTests {
             window.orderOut(nil)
         }
 
-        for _ in 0..<150 where viewer.currentURL.isEmpty { await wait(0.02) }
+        await poll { !viewer.currentURL.isEmpty }
         let original = viewer.currentURL
         #expect(!original.isEmpty, "file viewer never resolved an address")
 
@@ -168,13 +171,12 @@ struct ViewerPaneChordRoutingTests {
         #expect(window.performKeyEquivalent(with: keyEvent("d", [.command])))
 
         var editor: NSText?
-        for _ in 0..<150 {
-            await wait(0.02)
+        await poll {
             viewer.layoutSubtreeIfNeeded()
-            if let text = window.firstResponder as? NSText, !text.string.isEmpty {
-                editor = text
-                break
-            }
+            guard let text = window.firstResponder as? NSText, !text.string.isEmpty
+            else { return false }
+            editor = text
+            return true
         }
         let editorText = try #require(editor, "address field never took focus")
 
@@ -183,9 +185,7 @@ struct ViewerPaneChordRoutingTests {
         // text field — that is what a real keystroke does, and what carries
         // the edit into the bar's SwiftUI binding.
         editorText.insertText("example.com/typed")
-        for _ in 0..<50 where ViewerView.firstTextField(in: viewer)?.stringValue != "example.com/typed" {
-            await wait(0.02)
-        }
+        await poll { ViewerView.firstTextField(in: viewer)?.stringValue == "example.com/typed" }
         #expect(ViewerView.firstTextField(in: viewer)?.stringValue == "example.com/typed",
                 "precondition: the typed edit never reached the field")
 
@@ -197,10 +197,14 @@ struct ViewerPaneChordRoutingTests {
         #expect(viewer.handleChromeKeyDown(escape),
                 "Escape was not consumed while the address field was being edited")
 
-        for _ in 0..<150 {
-            await wait(0.02)
+        // Poll for BOTH halves of what Escape promises. Waiting only for the
+        // reverted text can return while focus is still in flight — and it is
+        // the focus hand-back that the assertion below would then read too
+        // early.
+        await poll {
             viewer.layoutSubtreeIfNeeded()
-            if ViewerView.firstTextField(in: viewer)?.stringValue == original { break }
+            return ViewerView.firstTextField(in: viewer)?.stringValue == original
+                && window.firstResponder === viewer.webView
         }
         #expect(ViewerView.firstTextField(in: viewer)?.stringValue == original,
                 "Escape left the abandoned edit in the address field")
