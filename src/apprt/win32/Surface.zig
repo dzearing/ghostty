@@ -25,6 +25,7 @@ const DimOverlay = @import("DimOverlay.zig").DimOverlay;
 const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
+const commands = @import("commands.zig");
 const pane_id_mod = @import("pane_id.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
@@ -1816,23 +1817,13 @@ pub fn handleSearchKey(self: *Surface, vk: u16) bool {
 // Command Palette
 // -----------------------------------------------------------------------
 
-/// A command palette entry: display name + the binding action to execute.
-/// `remote` entries have no binding action (there is none for "new remote
-/// window"); they are special-cased in `executePaletteSelection` to open the
-/// machine chooser locally, and `action` is an unused placeholder. `about`
-/// entries are likewise local-only (T52): they show the About box.
-const PaletteEntry = struct {
-    name: []const u8,
-    action: input.Binding.Action,
-    remote: bool = false,
-    about: bool = false,
-    /// Local-only like `about` (T71): runs the Claude Code plugin install.
-    claude: bool = false,
-    /// The Quit entry (T89e): its display name becomes "Quit Ghoztty (keep
-    /// sessions)" when session-persistence is on, to signal that quitting
-    /// detaches persistent sessions for re-attach rather than ending them.
-    quit_keep: bool = false,
-};
+/// The palette's static entries ARE the shared command registry (T189), in
+/// registry order: `commands.zig` owns every command's name and what it
+/// performs, and the menu system (T143) renders that same list in a
+/// different shape. Neither surface can therefore offer a command the other
+/// has never heard of — the drift that left hero mode out of the palette in
+/// T57 while its keybind worked.
+const palette_entries = commands.registry;
 
 /// Cap on user-configured command-palette-entry commands shown in the
 /// palette (bounds the fixed-size palette_filtered index array).
@@ -1856,10 +1847,10 @@ fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
 
 fn paletteEntryAction(self: *const Surface, idx: u16) ?input.Binding.Action {
     if (idx < palette_entries.len) {
-        // Remote/about/claude entries have no binding action (handled
-        // locally); returning null suppresses a misleading keybind hint.
+        // Locally handled kinds have no binding action; returning null
+        // suppresses a misleading keybind hint.
         const entry = palette_entries[idx];
-        return if (entry.remote or entry.about or entry.claude) null else entry.action;
+        return if (entry.kind == .binding) entry.action else null;
     }
     const user = self.app.config.@"command-palette-entry".value.items;
     const uidx = idx - palette_entries.len;
@@ -1874,68 +1865,6 @@ pub const PALETTE_EDIT_ID: u16 = 200;
 pub const PALETTE_LIST_TOP: f32 = 40.0;
 pub const PALETTE_ITEM_HEIGHT: f32 = 28.0;
 
-/// Static list of commands shown in the palette.
-const palette_entries = [_]PaletteEntry{
-    .{ .name = "New Window", .action = .new_window },
-    .{ .name = "New Remote Window", .action = .new_window, .remote = true },
-    .{ .name = "New Tab", .action = .new_tab },
-    .{ .name = "Close Surface", .action = .close_surface },
-    .{ .name = "Close Tab", .action = .{ .close_tab = .this } },
-    .{ .name = "Close Window", .action = .close_window },
-    .{ .name = "Previous Tab", .action = .previous_tab },
-    .{ .name = "Next Tab", .action = .next_tab },
-    .{ .name = "Last Tab", .action = .last_tab },
-    .{ .name = "Split Right", .action = .{ .new_split = .right } },
-    .{ .name = "Split Down", .action = .{ .new_split = .down } },
-    .{ .name = "Split Left", .action = .{ .new_split = .left } },
-    .{ .name = "Split Up", .action = .{ .new_split = .up } },
-    .{ .name = "Focus Split Right", .action = .{ .goto_split = .right } },
-    .{ .name = "Focus Split Down", .action = .{ .goto_split = .down } },
-    .{ .name = "Focus Split Left", .action = .{ .goto_split = .left } },
-    .{ .name = "Focus Split Up", .action = .{ .goto_split = .up } },
-    .{ .name = "Focus Previous Split", .action = .{ .goto_split = .previous } },
-    .{ .name = "Focus Next Split", .action = .{ .goto_split = .next } },
-    .{ .name = "Swap Split Right", .action = .{ .swap_split = .right } },
-    .{ .name = "Swap Split Down", .action = .{ .swap_split = .down } },
-    .{ .name = "Swap Split Left", .action = .{ .swap_split = .left } },
-    .{ .name = "Swap Split Up", .action = .{ .swap_split = .up } },
-    .{ .name = "Toggle Split Zoom", .action = .toggle_split_zoom },
-    .{ .name = "Toggle Hero Mode", .action = .toggle_hero_mode },
-    .{ .name = "Equalize Splits", .action = .equalize_splits },
-    .{ .name = "Toggle Fullscreen", .action = .toggle_fullscreen },
-    .{ .name = "Toggle Maximize", .action = .toggle_maximize },
-    .{ .name = "Reset Window Size", .action = .reset_window_size },
-    .{ .name = "Toggle Window Decorations", .action = .toggle_window_decorations },
-    .{ .name = "Toggle Background Opacity", .action = .toggle_background_opacity },
-    .{ .name = "Toggle Quick Terminal", .action = .toggle_quick_terminal },
-    .{ .name = "Toggle Read-Only", .action = .toggle_readonly },
-    .{ .name = "Toggle Mouse Reporting", .action = .toggle_mouse_reporting },
-    .{ .name = "Copy to Clipboard", .action = .{ .copy_to_clipboard = .mixed } },
-    .{ .name = "Paste from Clipboard", .action = .paste_from_clipboard },
-    .{ .name = "Copy URL to Clipboard", .action = .copy_url_to_clipboard },
-    .{ .name = "Copy Title to Clipboard", .action = .copy_title_to_clipboard },
-    .{ .name = "Change Window Title…", .action = .prompt_window_title },
-    .{ .name = "Change Tab Title…", .action = .prompt_tab_title },
-    .{ .name = "Change Pane Title…", .action = .prompt_surface_title },
-    .{ .name = "Set Pane Banner…", .action = .prompt_surface_banner },
-    .{ .name = "Select All", .action = .select_all },
-    .{ .name = "Find", .action = .start_search },
-    .{ .name = "Search Selection", .action = .search_selection },
-    .{ .name = "Increase Font Size", .action = .{ .increase_font_size = 1 } },
-    .{ .name = "Decrease Font Size", .action = .{ .decrease_font_size = 1 } },
-    .{ .name = "Reset Font Size", .action = .reset_font_size },
-    .{ .name = "Scroll Page Up", .action = .scroll_page_up },
-    .{ .name = "Scroll Page Down", .action = .scroll_page_down },
-    .{ .name = "Scroll to Top", .action = .scroll_to_top },
-    .{ .name = "Scroll to Bottom", .action = .scroll_to_bottom },
-    .{ .name = "Clear Screen", .action = .clear_screen },
-    .{ .name = "Reset Terminal", .action = .reset },
-    .{ .name = "Open Config", .action = .open_config },
-    .{ .name = "Reload Config", .action = .reload_config },
-    .{ .name = "About Ghoztty", .action = .new_window, .about = true },
-    .{ .name = "Install Claude Code Integration", .action = .new_window, .claude = true },
-    .{ .name = "Quit", .action = .quit, .quit_keep = true },
-};
 
 /// Toggle the command palette visibility.
 pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
@@ -2149,6 +2078,41 @@ pub fn handlePaletteKey(self: *Surface, vk: u16) bool {
     }
 }
 
+/// Perform a registry command (T189). THE dispatch path for every command
+/// surface — the palette today, the menu system tomorrow (T143/T190) — so a
+/// command cannot behave one way when picked from a menu and another way
+/// when picked from the palette.
+///
+/// Binding commands go through `performBindingAction`, exactly as their
+/// keybind would. The rest are apprt-local because there is no binding to
+/// perform.
+pub fn performCommand(self: *Surface, id: commands.Id) void {
+    if (!self.core_surface_ready) return;
+    const cmd = commands.get(id);
+    switch (cmd.kind) {
+        // Opened locally via the machine chooser, not through a binding
+        // action (there is none) — the T22c decision-4 path.
+        .remote => {
+            log.info("machine chooser: opening via command surface", .{});
+            self.parent_window.openMachineChooser();
+        },
+
+        // Build provenance of this running instance (T52).
+        .about => self.showAboutDialog(),
+
+        // Runs the plugin install on a background thread; the outcome
+        // dialog arrives via WM_APP (T71).
+        .claude => ClaudeIntegration.installAsync(self.app, .palette),
+
+        // The docs, in the default browser (macOS "Ghoztty Help").
+        .help => self.app.openUrl(commands.help_url),
+
+        .binding => _ = self.core_surface.performBindingAction(cmd.action) catch |err| {
+            log.err("command action error id={s} err={}", .{ @tagName(id), err });
+        },
+    }
+}
+
 /// Execute the currently selected palette entry.
 pub fn executePaletteSelection(self: *Surface) void {
     if (!self.core_surface_ready) return;
@@ -2159,28 +2123,15 @@ pub fn executePaletteSelection(self: *Surface) void {
     // Close the palette first.
     self.setCommandPaletteActive(false);
 
-    // Remote entry (e.g. "New Remote Window") — opened locally via the machine
-    // chooser, not through a binding action (there is none). Special-cased here
-    // (T22c decision 4), the palette counterpart to the ctrl+shift+n intercept.
-    if (entry_idx < palette_entries.len and palette_entries[entry_idx].remote) {
-        log.info("machine chooser: opening via command palette", .{});
-        self.parent_window.openMachineChooser();
+    // A registry entry runs through the shared command dispatch (T189), so
+    // the palette and the menu perform it identically.
+    if (entry_idx < palette_entries.len) {
+        self.performCommand(palette_entries[entry_idx].id);
         return;
     }
 
-    // About entry (T52) — local-only, like remote: show build provenance.
-    if (entry_idx < palette_entries.len and palette_entries[entry_idx].about) {
-        self.showAboutDialog();
-        return;
-    }
-
-    // Claude Code integration (T71) — local-only: run the plugin install
-    // on a background thread; the outcome dialog arrives via WM_APP.
-    if (entry_idx < palette_entries.len and palette_entries[entry_idx].claude) {
-        ClaudeIntegration.installAsync(self.app, .palette);
-        return;
-    }
-
+    // Below the registry are the user's own `command-palette-entry`
+    // commands, which are always binding actions.
     const action = self.paletteEntryAction(entry_idx) orelse return;
 
     // Execute the action

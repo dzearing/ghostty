@@ -1697,6 +1697,28 @@ fn autoLaunchInstance(alloc: Allocator, cwd: ?[]const u8) apprt.ipc.Errors!void 
     windows.CloseHandle(pi.hThread);
 }
 
+/// Open a URL in the user's default browser — the native Windows way.
+/// `internal_os.open()` uses `std.process.Child`, which can hit unreachable
+/// on Windows, so this goes straight to `ShellExecuteW`.
+///
+/// Shared by the core's `open_url` action and the Help command (T189), which
+/// has no binding to route through.
+pub fn openUrl(self: *App, url: []const u8) void {
+    _ = self;
+    var wbuf: [2048]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, url) catch return;
+    if (wlen >= wbuf.len) return;
+    wbuf[wlen] = 0;
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        @ptrCast(&wbuf),
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+}
+
 pub fn performAction(
     self: *App,
     target: apprt.Target,
@@ -1900,22 +1922,7 @@ pub fn performAction(
         },
 
         .open_url => {
-            // Open a URL using ShellExecuteW — the native Windows way.
-            // internal_os.open() uses std.process.Child which can hit
-            // unreachable on Windows, so we use ShellExecuteW directly.
-            var wbuf: [2048]u16 = undefined;
-            const wlen = std.unicode.utf8ToUtf16Le(&wbuf, value.url) catch return true;
-            if (wlen < wbuf.len) {
-                wbuf[wlen] = 0;
-                _ = w32.ShellExecuteW(
-                    null,
-                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                    @ptrCast(&wbuf),
-                    null,
-                    null,
-                    w32.SW_SHOW,
-                );
-            }
+            self.openUrl(value.url);
             return true;
         },
 

@@ -2571,3 +2571,52 @@ T146). Next: **T174**, then T142.
   (numbers above), but the bound is a timeout rather than a design.
 - `upgrade-no-fork.ps1` ALL PASS (60) x3 and `go-loop-guard.ps1` ALL PASS
   (`loop-session.ps1` is shared by both).
+
+## 2026-07-30 - T189 done: one command list, so a second command surface cannot drift from the first
+
+- T143 (*"on the mac version, there is a way to access the menu bar. On
+  windows, there's none."*) does not fit one context - host design, a ~60-item
+  tree, an HMENU host, and a script that walks every item. Split into **T189**
+  (design + pure model) and **T190** (the GUI host). This is T189.
+- **The host decision, with reasons rather than taste**: a `≡` button at the
+  end of the tab strip opening a nested popup, NOT `SetMenu`. The classic menu
+  BAR is drawn by the system frame and ignores the uxtheme dark-mode ordinals
+  (only popups honor them - the whole T79 mechanism), so it would be a light
+  strip pinned over a dark terminal; it also lives outside the client area,
+  and every layout path in `Window.zig` is written against "client top == tab
+  strip". Windows Terminal, VS Code and Edge all use a button.
+- **The refactor is the point of this half.** The palette owned a private
+  `palette_entries` array in `Surface.zig`. A menu is a second surface over
+  the same commands, and two hand-maintained lists drift - that is exactly
+  T57, where fork actions had keybinds but never reached the palette's
+  parallel list, so hero mode was undiscoverable while working. New pure
+  `commands.zig` is the ONE registry both surfaces read; new `menu_bar.zig`
+  holds the tree, mnemonics and per-item state and references commands by id.
+  `Surface.performCommand` is the single dispatch path.
+- Anti-drift is a TEST, not a habit: `everyCommandIsPlacedOrOmitted` fails the
+  build unless every registry command is in the menu tree or in
+  `menu_bar.omitted` with a written reason. Adding a command now forces a
+  decision instead of quietly landing in one surface.
+- Free side effect: because the palette renders the registry, ten commands
+  that had a keybind and no palette row now have one (Close All Windows,
+  Show/Hide All Terminals, Command Palette, Find Next/Previous, Hide Find Bar,
+  Jump to Selection, the four Move Divider rows, Check for Updates, Help).
+- Rows deliberately NOT in the tree, each because the command does nothing on
+  Windows rather than because of taste: Undo/Redo, Services/Hide Others/Show
+  All/Bring All to Front, Secure Keyboard Entry, Terminal Inspector, **Paste
+  Selection** (`supportsClipboard` returns false for `.selection` - see T156)
+  and **Float on Top** (no win32 handler at all - filed as **T191**).
+- New `test/win32/command-registry.ps1` **ALL PASS (19) x3**, asserting by
+  outcome: a pre-existing command still dispatches after the refactor, a
+  filter matching nothing dispatches nothing (and - verified in
+  `handlePaletteKey`, not assumed - leaves the palette OPEN), and a command
+  that reached the palette only via the registry dispatches.
+- **Negative control run for real**: renaming that one registry row and
+  rebuilding failed **exactly one assertion and nothing else** (18/1), then
+  restoring it returned 19/19.
+- That control also caught **T192**: `zig build` exits 1 on `AccessDenied`
+  installing `ghoztty-agent.exe` while a repo-lineage agent is running - after
+  it has already installed a new `ghoztty.exe`. A false "it didn't build" over
+  a binary that did change, which is the T49 lesson with the sign flipped.
+- Floor: both lanes + `test-agent` + P1-P3 green; `hero-mode.ps1` ALL PASS (60)
+  as the palette-dispatch regression check.

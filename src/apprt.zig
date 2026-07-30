@@ -117,6 +117,14 @@ test {
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 
+    // Pure win32 command registry — the one list the palette and the menu
+    // system both render (T189), same no-OS-imports deal.
+    _ = @import("apprt/win32/commands.zig");
+
+    // Pure win32 menu-system tree, mnemonics and per-item state (T143/T189),
+    // same no-OS-imports deal.
+    _ = @import("apprt/win32/menu_bar.zig");
+
     // Pure win32 pane-identity (UUID generation + legacy surface-id target
     // aliases, T113), same no-OS-imports deal.
     _ = @import("apprt/win32/pane_id.zig");
