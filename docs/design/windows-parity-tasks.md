@@ -411,8 +411,15 @@ Work these first, in order, before falling back to first-todo-in-table:
    jq stays a dependency — vendoring a JSON writer for markdown-bearing values
    would corrupt banners rather than fail — but a missing jq now announces
    itself in a one-time per-pane banner instead of `exit 0`. `pane-id.ps1` ALL
-   PASS (45)) → **T133** (same, for the
-   `/reset-context` composer wipe) → T38/T39 per item 20.
+   PASS (45)) → ~~**T133**~~ (**DONE 2026-07-30** — same, for the
+   `/reset-context` composer wipe: mirrored to
+   `dzearing/dzearing-claude-marketplace` `2ef7766`, 0.10.2 → 0.11.0, and it
+   was the plugin's ONLY drift. The helper now verifies both the clear and the
+   continuation by reading the pane back, shouting into its log and onto a pane
+   banner when either fails, while always sending the continuation — liveness
+   beats cleanliness. New `reset-context.ps1` ALL PASS (24) ×3 with a negative
+   control that reproduces the filed `nn/clear`; filed T181) →
+   **T38/T39 per item 20**.
 
 3e. **USER LIVE-REVIEW, 2026-07-29 — do these FIRST, ahead of 3d.** The user
    came back to a stopped, forked loop and a chooser that is visibly not

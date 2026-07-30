@@ -2403,3 +2403,21 @@ T146). Next: **T174**, then T142.
   manufactured this task's phantom) and **T180** (the transient drag-preview
   popup and the quick terminal were left out of the heal on purpose; verify
   rather than assume). Next: **T133** per 3d.
+
+## 2026-07-30 - T133 done: the reset helper wipes the composer, and now proves the reset landed
+
+- **T133 done.** The cache-only `C-u` composer wipe is mirrored into the
+  `dzearing-claude-marketplace` source repo (`2ef7766`, dzearing-skills
+  0.10.2 → 0.11.0) — it was the only drift in the whole plugin, and it was the
+  line that keeps the loop alive. Added the "while there" half: the helper now
+  reads the pane back to verify both the `/clear` and the continuation, and on
+  failure writes a `!!! RESET-CONTEXT FAILED` block with the pane tail into its
+  log *and* sets a pane banner. The continuation is sent either way — an
+  uncleared context merely gets big, a missing one stops the loop. New
+  `test/win32/reset-context.ps1` ALL PASS (24) ×3 against a readline-based
+  composer model, with a negative control (the `C-u` line deleted, nothing
+  else) reproducing the filed `nn/clear` symptom and tripping the loud path.
+  Filed **T181** (`+read` transiently fails on a pane `+list` already reports —
+  an empty tail reads exactly like a product verdict). Both lanes, `test-agent`
+  and P1–P3 green. Next: **T38/T39 per item 20** — that closes the 3d chain
+  (T132 → T131 → T130 → T133); check for 3e–3g leftovers first, they outrank it.
