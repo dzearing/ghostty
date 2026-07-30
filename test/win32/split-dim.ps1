@@ -251,7 +251,12 @@ function Start-Gui([string]$label, [string[]]$extraArgs, [bool]$control) {
     Kill-RepoInstances
     if ($control) { Remove-Item $errlog -ErrorAction SilentlyContinue }
     $sp = @{ FilePath = $exe; PassThru = $true }
-    if ($extraArgs.Count) { $sp.ArgumentList = $extraArgs }
+    # --session-persistence=false is mandatory, not optional: this script
+    # launches a GUI per section, and each launch WRITES a session-layout
+    # manifest that the NEXT launch would restore — so section 2 came up with
+    # section 1's panes and "2 visible panes" failed. Same trap T131 fixed for
+    # pane-banner.ps1's bw window (found again here 2026-07-29 during T155).
+    $sp.ArgumentList = @('--session-persistence=false') + $extraArgs
     if (-not $ExePath -and $control) { $sp.RedirectStandardError = $errlog }
     $proc = Start-Process @sp
     Start-Sleep -Seconds 3

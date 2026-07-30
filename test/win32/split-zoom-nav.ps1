@@ -190,7 +190,10 @@ function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectZoomFollows
     if ($control) { Remove-Item $errlog -ErrorAction SilentlyContinue }
 
     $sp = @{ FilePath = $exe; PassThru = $true }
-    if ($extraArgs.Count) { $sp.ArgumentList = $extraArgs }
+    # Mandatory: each section's launch writes a session-layout manifest the
+    # next one would restore, so a later section came up with an earlier
+    # section's panes (T131's trap, found again 2026-07-29 during T155).
+    $sp.ArgumentList = @('--session-persistence=false') + $extraArgs
     if (-not $ExePath -and $control) { $sp.RedirectStandardError = $errlog }
     $proc = Start-Process @sp
     Start-Sleep -Seconds 3

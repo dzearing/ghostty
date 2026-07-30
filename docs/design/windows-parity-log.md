@@ -1953,3 +1953,49 @@ via the detached upgrade script at the task boundary (default
 `-ResumeCommand`, so its relaunch is also this turn's context reset). The
 resumed session verifies `%TEMP%\ghoztty-upgrade.log`, then `+version`, then
 the fix itself by pasting a screenshot into a Claude Code pane. Next: T155.
+
+## 2026-07-29 - T155 done: the filed mechanism was wrong, and the first test passed on the broken build
+
+Split dividers rendered as double and triple lines. The row had root-caused it
+by inspection: a 5 DIP gap with a 1px hairline stroked down the middle, a
+parent that erases nothing, and therefore "every ratio change strokes a NEW
+line and leaves the OLD one on screen". Two of its three defects were exactly
+right. The third - the mechanism that actually made the user see doubles - was
+wrong, and the way that surfaced is the whole lesson of this turn.
+
+The first oracle dragged a divider three times and counted contiguous runs of
+divider-colored pixels on a scanline. It reported `exactly ONE divider band
+after 3 drags (got 1)` **on the pre-fix build**. A test that passes on the
+broken build is worth nothing, so the mechanism had to be measured instead of
+argued: dragging moves the line clear of the old gap, and the growing pane's
+child window covers the stale pixels. Sweeping window-resize steps against the
+pre-fix build found the real trigger - 3x 4px shrink gave TWO runs at offsets
+973,975, while 6/8/10/14px steps gave one, because a bigger drift pushes the
+old line out of the gap where a child covers it. Repeated SMALL resizes, each
+drifting the split by less than the gap was wide. That is why the user saw it
+resizing a window and nobody saw it dragging dividers.
+
+The fix is one pure module (`split_geometry.zig`) replacing arithmetic that
+was triplicated across layout, paint, and hit-test: gap == band == 1 DIP (Mac's
+`splitterVisibleSize`), so panes and divider TILE the rect and no parent-owned
+pixel is left to hold a stale line; and the band is FillRect'd rather than
+stroked, which also kills the 3-edge look.
+
+`WM_ERASEBKGND` is the other half worth recording. The row asked for a real
+erase handler; adding one regressed `pane-banner.ps1`. That was settled by
+comparison rather than by reasoning about layered windows: pane-banner gave ALL
+PASS (45) on the pre-fix build, failed on the build with the hook, and passed
+again with the hook removed. It is unnecessary once the tiling holds, so the
+handler still returns 1 - now with a comment saying why, so the next person
+does not re-add it.
+
+Two more traps, both harness: the pixel oracle needs a screen-pixel control
+(an occluded window reads as "0 divider pixels" and looks exactly like a
+product failure - it did, twice, before the control went in), and
+`split-dim.ps1` + `split-zoom-nav.ps1` launch a GUI per section without
+`--session-persistence=false`, so each section restored the previous
+section's panes. Both fixed; the sweep of the other ~28 scripts is T158.
+
+Floor for this turn: both test lanes exit 0, `test-agent` exit 0, P1/P2/P3 ALL
+PASS, `split-divider.ps1` ALL PASS (25) x3, and `split-dim` (23),
+`split-zoom-nav` (16), `pane-banner` (45) ALL PASS.

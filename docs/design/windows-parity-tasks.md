@@ -476,6 +476,20 @@ Work these first, in order, before falling back to first-todo-in-table:
    nothing and the divider is stroked outside the paint cycle). T154 is the
    cheapest fix on the whole board and unblocks the user's daily workflow;
    do it first. Slot both ahead of the 3f cosmetics (T149/T150).
+   ~~**T155**~~ — **DONE 2026-07-29**: defects (b) 3-edge render and (c)
+   inconsistent width were as filed, but **(a)'s mechanism was filed wrong and
+   the first oracle passed on the broken build** — dragging a divider does NOT
+   leave the old line behind (the growing pane covers it); repeated SMALL
+   window resizes do, each drifting the split by less than the gap was wide.
+   Measured, not argued: 3× 4px shrink gave TWO bands pre-fix, 6/8/10/14px gave
+   one. Fixed with a new pure `split_geometry.zig` (gap == band == 1 DIP, Mac's
+   `splitterVisibleSize`, so panes and divider TILE and no parent-owned pixel
+   can hold a stale line) + FillRect instead of a stroke. A `WM_ERASEBKGND`
+   handler was tried and REVERTED — it regressed `pane-banner.ps1` and the
+   tiling makes it unnecessary. `split-divider.ps1` 15 → 25 assertions, ALL
+   PASS ×3 (pre-fix: 2 FAILED, both on the resize case, both axes). Filed
+   **T158** (the ~28 other scripts that launch without
+   `--session-persistence=false`). Next: **T130** per 3d.
 
 4. **Post-merge parity band (T118–T128), filed 2026-07-27 by ~~T117~~** (merge
    of origin/main `1e1cdbbd2`, 70 commits). These do NOT displace T113/T38/T39

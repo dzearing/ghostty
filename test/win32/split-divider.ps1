@@ -107,6 +107,18 @@ public class DivDrv {
         return lines.ToArray();
     }
 
+    // Composited screen pixels in a horizontal strip: "r,g,b" per x (T155).
+    public static string[] StripH(int y, int x0, int x1) {
+        var lines = new List<string>();
+        IntPtr dc = GetDC(IntPtr.Zero);
+        for (int x = x0; x <= x1; x++) {
+            uint c = GetPixel(dc, x, y);
+            lines.Add((c & 0xFF) + "," + ((c >> 8) & 0xFF) + "," + ((c >> 16) & 0xFF));
+        }
+        ReleaseDC(IntPtr.Zero, dc);
+        return lines.ToArray();
+    }
+
     // Composited screen pixels in a vertical strip: "r,g,b" per y.
     public static string[] Strip(int x, int y0, int y1) {
         var lines = new List<string>();
@@ -185,6 +197,36 @@ public class DivDrv {
         Thread.Sleep(100);
         for (int i = 1; i <= 8; i++) {
             SetCursorPos(x, y0 + (y1 - y0) * i / 8);
+            Thread.Sleep(40);
+        }
+        Thread.Sleep(100);
+        MouseBtn(true);
+        Thread.Sleep(250);
+        return "SENT";
+    }
+
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    // Shrink the window by (dw, dh) physical px, keeping its origin (T155).
+    // Small repeated resizes are what actually accumulated stale divider
+    // lines: each one drifts the split position by less than the old gap
+    // was wide, so the previous line stayed inside the never-erased gap.
+    public static void Shrink(IntPtr h, int dw, int dh) {
+        RECT r; GetWindowRect(h, out r);
+        SetWindowPos(h, IntPtr.Zero, r.left, r.top,
+            (r.right - r.left) - dw, (r.bottom - r.top) - dh,
+            0x0004 | 0x0010); // SWP_NOZORDER | SWP_NOACTIVATE
+    }
+
+    // Real-input horizontal divider drag (T155), mirror of DragV.
+    public static string DragH(IntPtr top, int y, int x0, int x1) {
+        if (!ForceForeground(top)) return "ABORT: foreground owned by another window";
+        SetCursorPos(x0, y);
+        Thread.Sleep(150);
+        MouseBtn(false);
+        Thread.Sleep(100);
+        for (int i = 1; i <= 8; i++) {
+            SetCursorPos(x0 + (x1 - x0) * i / 8, y);
             Thread.Sleep(40);
         }
         Thread.Sleep(100);
@@ -296,7 +338,7 @@ function Start-Gui([string]$label, [string[]]$extraArgs, [bool]$control) {
 
 # Common args: hermetic config, no dim overlays near the gap, black terminal
 # so gray/red/blue divider pixels cannot be produced by terminal content.
-$common = @('--config-default-files=false', '--background=#000000', '--unfocused-split-opacity=1')
+$common = @('--config-default-files=false', '--background=#000000', '--unfocused-split-opacity=1', '--session-persistence=false')
 
 # ---------------------------------------------------------------------------
 # Run 1: config file sets red; live reload re-colors to blue.
@@ -403,6 +445,177 @@ Assert ($d.Y -lt $before - 40) "T94: drag from -4 DIP resized (line $before -> $
 
 Assert (-not $proc.HasExited) 'default: no crash'
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+# T155: exactly ONE divider band, and it is a solid fill.
+#
+# The old code left a ~5 DIP gap between the panes and stroked a hairline
+# down the middle of it, while the parent's WM_ERASEBKGND painted nothing —
+# so every ratio change stroked a NEW line and left the OLD one on screen.
+# The user's screenshot showed two parallel verticals and a 3-line stack.
+#
+# Oracle: scan a full scanline ACROSS both panes and count contiguous runs
+# of divider-colored pixels. Stale lines show up as extra runs; the 3-edge
+# render (pane | parent bg | line | parent bg | pane) shows up as a run
+# narrower than the gap it sits in. Both are counted here, after THREE
+# drags — one drag is not enough, the reported bug accumulates.
+#
+# Green is used so no earlier run's red/blue can be mistaken for a band,
+# and the terminal background is black so white-on-black text (which can
+# antialias to mid-gray) cannot match either.
+# ---------------------------------------------------------------------------
+function Count-ColorRuns([string[]]$strip, [int]$tr, [int]$tg, [int]$tb) {
+    $runs = 0; $inRun = $false
+    foreach ($px in $strip) {
+        if (Pixel-Matches $px $tr $tg $tb) {
+            if (-not $inRun) { $runs++; $inRun = $true }
+        } else { $inRun = $false }
+    }
+    return $runs
+}
+# Screen-pixel control (learned the hard way, 2026-07-29): every count in
+# this section comes from GetPixel on the COMPOSITED SCREEN, so an occluded
+# or non-foreground window reads as "0 divider pixels" — indistinguishable
+# from a product failure unless something proves the window is on screen
+# first. The panes are launched with --background=#000000, so a pixel deep
+# inside a pane must read near-black. If it does not, the probe is looking at
+# some other window and the axis is SKIPPED rather than failed.
+function Pane-IsOnScreen($pane) {
+    $x = [int]($pane.Left + ($pane.Right - $pane.Left) * 0.5)
+    $y = [int]($pane.Top + ($pane.Bottom - $pane.Top) * 0.75)
+    $px = ([DivDrv]::Strip($x, $y, $y))[0]
+    $c = $px -split ','
+    return (([int]$c[0] -le 40) -and ([int]$c[1] -le 40) -and ([int]$c[2] -le 40))
+}
+
+function Dump-Green([string[]]$strip, [string]$label) {
+    $hits = @()
+    for ($i = 0; $i -lt $strip.Count; $i++) { if (Pixel-Matches $strip[$i] 0 255 0) { $hits += $i } }
+    Write-Host "  DEBUG ($label) divider-colored offsets: $($hits -join ',')"
+}
+function Max-RunLength([string[]]$strip, [int]$tr, [int]$tg, [int]$tb) {
+    $best = 0; $cur = 0
+    foreach ($px in $strip) {
+        if (Pixel-Matches $px $tr $tg $tb) { $cur++; if ($cur -gt $best) { $best = $cur } }
+        else { $cur = 0 }
+    }
+    return $best
+}
+
+# One GUI per axis: a single split each, so a run count of 1 is unambiguous.
+function Start-T155Gui([string]$direction) {
+    Kill-RepoInstances
+    $args155 = $common + @('--split-divider-color=00ff00')
+    $p = Start-Process -FilePath $exe -ArgumentList $args155 -PassThru
+    Start-Sleep -Seconds 3
+    if ($p.HasExited) { return $null }
+    $t = [DivDrv]::FindTop([uint32]$p.Id)
+    if ($t -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; return $null }
+    & $exe +split --direction=$direction | Out-Null
+    Start-Sleep -Milliseconds 900
+    [DivDrv]::ForceForeground($t) | Out-Null
+    Start-Sleep -Milliseconds 300
+    [pscustomobject]@{ Proc = $p; Top = $t }
+}
+
+foreach ($axis in @('down', 'right')) {
+    $g = Start-T155Gui $axis
+    if ($null -eq $g) { Write-Host "SKIP T155/$axis : GUI did not come up"; continue }
+    $bandPx = [math]::Max([int][math]::Round([DivDrv]::GetDpiForWindow($g.Top) / 96.0), 1)
+    $panes = @(Parse-Panes ([DivDrv]::Panes($g.Top)) | Where-Object Visible)
+    if ($panes.Count -ne 2) {
+        Assert $false "T155/$axis setup: 2 visible panes (got $($panes.Count))"
+        Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue
+        continue
+    }
+
+    # Three drags, each landing somewhere new. Every one of them used to
+    # leave its old line behind.
+    $aborted = $false
+    foreach ($delta in 60, -40, 70) {
+        $panes = @(Parse-Panes ([DivDrv]::Panes($g.Top)) | Where-Object Visible)
+        if ($axis -eq 'down') {
+            $pa = $panes | Sort-Object Top | Select-Object -First 1
+            $pb = $panes | Sort-Object Top | Select-Object -Last 1
+            $lineY = [int](($pa.Bottom + $pb.Top) / 2)
+            $x = [int](($pa.Left + $pa.Right) / 2)
+            $r = [DivDrv]::DragV($g.Top, $x, $lineY, $lineY + $delta)
+        } else {
+            $pa = $panes | Sort-Object Left | Select-Object -First 1
+            $pb = $panes | Sort-Object Left | Select-Object -Last 1
+            $lineX = [int](($pa.Right + $pb.Left) / 2)
+            $y = [int](($pa.Top + $pa.Bottom) / 2)
+            $r = [DivDrv]::DragH($g.Top, $y, $lineX, $lineX + $delta)
+        }
+        if ($r -ne 'SENT') { Write-Host "SKIP T155/$axis : drag not sent ($r)"; $aborted = $true; break }
+        Start-Sleep -Milliseconds 300
+    }
+    if ($aborted) { Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue; continue }
+
+    [DivDrv]::ForceForeground($g.Top) | Out-Null
+    Start-Sleep -Milliseconds 600
+    $panes = @(Parse-Panes ([DivDrv]::Panes($g.Top)) | Where-Object Visible)
+    if ($axis -eq 'down') {
+        $pa = $panes | Sort-Object Top | Select-Object -First 1
+        $pb = $panes | Sort-Object Top | Select-Object -Last 1
+        $x = [int](($pa.Left + $pa.Right) / 2)
+        $strip = [DivDrv]::Strip($x, ($pa.Top + 4), ($pb.Bottom - 4))
+    } else {
+        $pa = $panes | Sort-Object Left | Select-Object -First 1
+        $pb = $panes | Sort-Object Left | Select-Object -Last 1
+        $y = [int](($pa.Top + $pa.Bottom) / 2)
+        $strip = [DivDrv]::StripH($y, ($pa.Left + 4), ($pb.Right - 4))
+    }
+    if (-not (Pane-IsOnScreen $pa)) {
+        Write-Host "SKIP T155/$axis (after drags): pane is not on screen - pixel probe would be meaningless"
+        Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue
+        continue
+    }
+    $runs = Count-ColorRuns $strip 0 255 0
+    $width = Max-RunLength $strip 0 255 0
+    Assert ($runs -eq 1) "T155/$axis : exactly ONE divider band after 3 drags (got $runs)"
+    Assert ($width -eq $bandPx) "T155/$axis : band is a solid ${bandPx}px fill (got ${width}px)"
+    if ($runs -ne 1 -or $width -ne $bandPx) { Dump-Green $strip 'drags' }
+
+    # THE case that actually reproduces the user's report. Drags alone do
+    # NOT: a big ratio change moves the line clear of the old gap, so the
+    # growing pane covers the stale pixels and the count stays at 1 even on
+    # a broken build (measured 2026-07-29 — the first version of this
+    # oracle passed pre-fix, which is why this sub-case exists). Repeated
+    # SMALL window resizes are the trigger: each drifts the split position
+    # by ~2px, less than the old 5 DIP gap, so the previous line survived
+    # inside it. Pre-fix this reports 2 runs; post-fix, 1.
+    foreach ($i in 1..3) {
+        if ($axis -eq 'down') { [DivDrv]::Shrink($g.Top, 0, 4) } else { [DivDrv]::Shrink($g.Top, 4, 0) }
+        Start-Sleep -Milliseconds 300
+    }
+    [DivDrv]::ForceForeground($g.Top) | Out-Null
+    Start-Sleep -Milliseconds 600
+    $panes = @(Parse-Panes ([DivDrv]::Panes($g.Top)) | Where-Object Visible)
+    if ($axis -eq 'down') {
+        $pa = $panes | Sort-Object Top | Select-Object -First 1
+        $pb = $panes | Sort-Object Top | Select-Object -Last 1
+        $strip = [DivDrv]::Strip([int](($pa.Left + $pa.Right) / 2), ($pa.Top + 4), ($pb.Bottom - 4))
+    } else {
+        $pa = $panes | Sort-Object Left | Select-Object -First 1
+        $pb = $panes | Sort-Object Left | Select-Object -Last 1
+        $strip = [DivDrv]::StripH([int](($pa.Top + $pa.Bottom) / 2), ($pa.Left + 4), ($pb.Right - 4))
+    }
+    if (-not (Pane-IsOnScreen $pa)) {
+        Write-Host "SKIP T155/$axis (after resizes): pane is not on screen"
+        Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue
+        continue
+    }
+    $runs2 = Count-ColorRuns $strip 0 255 0
+    $width2 = Max-RunLength $strip 0 255 0
+    Assert ($runs2 -eq 1) "T155/$axis : still ONE band after 3 small window resizes (got $runs2)"
+    Assert ($width2 -eq $bandPx) "T155/$axis : band still a solid ${bandPx}px fill after resizes (got ${width2}px)"
+    if ($runs2 -ne 1 -or $width2 -ne $bandPx) { Dump-Green $strip 'resizes' }
+
+    Assert (-not $g.Proc.HasExited) "T155/$axis : no crash"
+    Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue
+}
+
 Remove-Item $conf -ErrorAction SilentlyContinue
 
 Write-Host ''

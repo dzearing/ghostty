@@ -72,6 +72,7 @@ const DarkMode = @import("DarkMode.zig");
 const HeroCarousel = @import("HeroCarousel.zig");
 const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
+const split_geometry = @import("split_geometry.zig");
 const color_math = @import("color_math.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
@@ -1787,19 +1788,19 @@ fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface
             }
         },
         .split => |s| {
-            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
+            // Panes and the divider band TILE the rect (T155): the child
+            // rects end/start exactly at the band, so no parent-owned pixel
+            // is left between them to hold a stale line.
             if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
+                const a = split_geometry.axis(rect.left, rect.right, s.ratio, self.scale);
+                const left_rect = w32.RECT{ .left = a.lo_start, .top = rect.top, .right = a.band_lo, .bottom = rect.bottom };
+                const right_rect = w32.RECT{ .left = a.band_hi, .top = rect.top, .right = a.hi_end, .bottom = rect.bottom };
                 self.layoutNode(tree, s.left, left_rect);
                 self.layoutNode(tree, s.right, right_rect);
             } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
+                const a = split_geometry.axis(rect.top, rect.bottom, s.ratio, self.scale);
+                const top_rect = w32.RECT{ .left = rect.left, .top = a.lo_start, .right = rect.right, .bottom = a.band_lo };
+                const bottom_rect = w32.RECT{ .left = rect.left, .top = a.band_hi, .right = rect.right, .bottom = a.hi_end };
                 self.layoutNode(tree, s.left, top_rect);
                 self.layoutNode(tree, s.right, bottom_rect);
             }
@@ -1819,40 +1820,35 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
         w32.RGB(c.r, c.g, c.b)
     else
         0x00808080;
-    self.paintDividerNode(hdc, tree, .root, rect, color);
+    const brush = w32.CreateSolidBrush(color) orelse return;
+    defer _ = w32.DeleteObject(brush);
+    self.paintDividerNode(hdc, tree, .root, rect, brush);
 }
 
-fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT, color: u32) void {
+fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT, brush: w32.HBRUSH) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
         .leaf => {},
         .split => |s| {
-            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
-            const line_w: i32 = @max(@as(i32, @intFromFloat(@round(1.0 * self.scale))), 1);
-
-            const pen = w32.CreatePen(0, line_w, color) orelse return;
-            defer _ = w32.DeleteObject(pen);
-            const old_pen = w32.SelectObject(hdc, pen);
-            defer _ = w32.SelectObject(hdc, old_pen);
-
+            // FILL the whole band (Mac draws a filled Rectangle, not a
+            // stroke). A hairline down the middle of a wider gap reads as
+            // three edges once the panes carry their own background tint.
             if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                _ = w32.MoveToEx(hdc, split_x, rect.top, null);
-                _ = w32.LineTo(hdc, split_x, rect.bottom);
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, left_rect, color);
-                self.paintDividerNode(hdc, tree, s.right, right_rect, color);
+                const a = split_geometry.axis(rect.left, rect.right, s.ratio, self.scale);
+                var band = w32.RECT{ .left = a.band_lo, .top = rect.top, .right = a.band_hi, .bottom = rect.bottom };
+                _ = w32.FillRect(hdc, &band, brush);
+                const left_rect = w32.RECT{ .left = a.lo_start, .top = rect.top, .right = a.band_lo, .bottom = rect.bottom };
+                const right_rect = w32.RECT{ .left = a.band_hi, .top = rect.top, .right = a.hi_end, .bottom = rect.bottom };
+                self.paintDividerNode(hdc, tree, s.left, left_rect, brush);
+                self.paintDividerNode(hdc, tree, s.right, right_rect, brush);
             } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                _ = w32.MoveToEx(hdc, rect.left, split_y, null);
-                _ = w32.LineTo(hdc, rect.right, split_y);
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, top_rect, color);
-                self.paintDividerNode(hdc, tree, s.right, bottom_rect, color);
+                const a = split_geometry.axis(rect.top, rect.bottom, s.ratio, self.scale);
+                var band = w32.RECT{ .left = rect.left, .top = a.band_lo, .right = rect.right, .bottom = a.band_hi };
+                _ = w32.FillRect(hdc, &band, brush);
+                const top_rect = w32.RECT{ .left = rect.left, .top = a.lo_start, .right = rect.right, .bottom = a.band_lo };
+                const bottom_rect = w32.RECT{ .left = rect.left, .top = a.band_hi, .right = rect.right, .bottom = a.hi_end };
+                self.paintDividerNode(hdc, tree, s.left, top_rect, brush);
+                self.paintDividerNode(hdc, tree, s.right, bottom_rect, brush);
             }
         },
     }
@@ -1892,29 +1888,22 @@ fn hitTestDividerNode(
     switch (tree.nodes[handle.idx()]) {
         .leaf => return null,
         .split => |s| {
-            const gap: i32 = @as(i32, @intFromFloat(@round(5.0 * self.scale)));
-            // Half-width of the grab band: 4.5 DIP each side ≈ 9 DIP
-            // total, matching the Mac ~9pt grab handle (T94).
-            const hit_area: i32 = @max(@as(i32, @intFromFloat(@round(4.5 * self.scale))), 4);
-
             if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                if (x >= split_x - hit_area and x <= split_x + hit_area and y >= rect.top and y <= rect.bottom) {
+                const a = split_geometry.axis(rect.left, rect.right, s.ratio, self.scale);
+                if (split_geometry.inGrabBand(a, x, self.scale) and y >= rect.top and y <= rect.bottom) {
                     return .{ .handle = handle, .layout = .horizontal };
                 }
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
+                const left_rect = w32.RECT{ .left = a.lo_start, .top = rect.top, .right = a.band_lo, .bottom = rect.bottom };
+                const right_rect = w32.RECT{ .left = a.band_hi, .top = rect.top, .right = a.hi_end, .bottom = rect.bottom };
                 return self.hitTestDividerNode(tree, s.left, left_rect, x, y) orelse
                     self.hitTestDividerNode(tree, s.right, right_rect, x, y);
             } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                if (y >= split_y - hit_area and y <= split_y + hit_area and x >= rect.left and x <= rect.right) {
+                const a = split_geometry.axis(rect.top, rect.bottom, s.ratio, self.scale);
+                if (split_geometry.inGrabBand(a, y, self.scale) and x >= rect.left and x <= rect.right) {
                     return .{ .handle = handle, .layout = .vertical };
                 }
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
+                const top_rect = w32.RECT{ .left = rect.left, .top = a.lo_start, .right = rect.right, .bottom = a.band_lo };
+                const bottom_rect = w32.RECT{ .left = rect.left, .top = a.band_hi, .right = rect.right, .bottom = a.hi_end };
                 return self.hitTestDividerNode(tree, s.left, top_rect, x, y) orelse
                     self.hitTestDividerNode(tree, s.right, bottom_rect, x, y);
             }
@@ -2475,6 +2464,11 @@ fn paintWindow(self: *Window) void {
     defer _ = w32.EndPaint(hwnd, &ps);
 
     self.paintTabBar(hdc_screen);
+    // Dividers are part of the paint cycle (T155). BeginPaint clips to the
+    // invalid region, so this covers an exposed band; the post-layout
+    // GetDC pass in layoutSplits is what updates a band that MOVED without
+    // anything invalidating the old spot.
+    self.paintDividers(hdc_screen);
     if (self.tab_count > 0 and self.tab_hero_active[self.active_tab]) {
         HeroCarousel.paint(self, hdc_screen);
         // While a selection slide runs every hero HWND is hidden and the
@@ -3836,6 +3830,14 @@ pub fn windowWndProc(
             }
             return 0;
         },
+        // Deliberately still "erased nothing" (T155). Painting the divider
+        // bands from here was tried and REVERTED: it regressed
+        // pane-banner.ps1 (the banner overlay is a layered window above this
+        // area, and erase-time painting into the parent DC disturbs its
+        // composite). It is also unnecessary — the panes and the band now
+        // TILE the content area, so a moved band's old pixels are covered by
+        // a child window and there is no parent-owned region left to hold a
+        // stale line. The band itself is painted in WM_PAINT and after layout.
         w32.WM_ERASEBKGND => return 1,
         w32.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
