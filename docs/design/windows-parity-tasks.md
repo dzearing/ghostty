@@ -464,10 +464,24 @@ Work these first, in order, before falling back to first-todo-in-table:
    by exactly its extra lines. `ipc-machine-chooser.ps1` ALL PASS (23) ×3 with
    a pixel oracle proven by a negative control — and two probes that lied
    first: DPI-virtualized `GetWindowRect` vs physical `CopyFromScreen`, and
-   desktop-DC `GetPixel` being ~1000x slower than a blit). **Next: T173**
-   (master-detail structure + the per-row `⋯` menu), then **T174** (per-host
-   defaults store + Host Settings dialog — Windows has never had one)) →
-   **T142** (banner overlay z-order self-healing). Then 3d.
+   desktop-DC `GetPixel` being ~1000x slower than a blit). ~~T173~~ **split
+   2026-07-30** — a layout port and a network-backed menu with its own modal
+   prompt were two tasks in one id: **T175** (shell) → **T176** (menu). ~~T175~~
+   DONE 2026-07-30: the chooser is Mac's 840x540 master-detail — account row +
+   rule, a fixed 260-wide machine column on a wash, a vertical rule, a detail
+   pane naming the selected machine with `New Window` beside it, and Cancel
+   ALONE in the footer. Geometry moved to a pure `chooser_layout.zig`; the wash,
+   rules and detail header are painted in `WM_PAINT`. Two defects the new
+   assertions caught: a listbox snaps its height to whole items **at creation
+   using the default item height** (so the column silently stopped flexing when
+   the strip wrapped — fixed with `LBS_NOINTEGRALHEIGHT` plus our own whole-row
+   snap), and `LB_SETCURSEL` does not notify (so arrow keys left the detail pane
+   describing the machine you left). The detail pane below the header is
+   deliberately EMPTY until T146 brings session browsing.
+   `ipc-machine-chooser.ps1` 26 → 34 assertions, ALL PASS ×3.
+   **Next: T176** (the per-row `⋯` menu + relay Rename…/Remove from Account…),
+   then **T174** (per-host defaults store + Host Settings dialog — Windows has
+   never had one)) → **T142** (banner overlay z-order self-healing). Then 3d.
 
 3f. **USER LIVE-REVIEW #2, 2026-07-29 (same day, later) — "The goal is
    complete parity with the macOS client."** The user named three gaps by

@@ -2232,3 +2232,35 @@ the footer independently: 3 hint lines to the signed-in run's 1, the window
 taller by exactly that, and the wrapped tail actually painted inside the
 control. `ipc-machine-chooser.ps1` ALL PASS (23) x3; both lanes +
 `test-agent` exit 0; P1-P3 ALL PASS. Next: T173, then T174, then T142.
+
+## 2026-07-30 - T173 split; T175 (chooser master-detail shell)
+
+T173 ("master-detail layout + per-row `...` menu") was two tasks wearing one
+id: a layout port and a network-backed menu with its own modal prompt. Split
+into **T175** (shell) and **T176** (menu + relay Rename/Remove), and did T175.
+
+The chooser is now Mac's 840x540 master-detail: account row and rule, a fixed
+260-wide machine column on a faint wash, a vertical rule, a detail pane naming
+the selected machine with `New Window` beside it, a rule, and **Cancel alone**
+in the footer. Geometry moved out to a new pure `chooser_layout.zig` (the old
+`MachineChooser.Layout` and its tests went with it); the wash, the rules and
+the detail header are painted in `WM_PAINT`, so the detail glyph is the same
+GDI silhouette the rows draw, one size up.
+
+Two defects the new assertions caught, neither guessable from the code:
+
+- A listbox snaps its height to whole items **at creation, using the default
+  item height** - our `LB_SETITEMHEIGHT` lands afterwards. It shaved a row off
+  and pinned the height there, so when the status strip wrapped the column
+  silently stopped flexing (measured: list -0 for strip +60). `chooser_layout`
+  snaps to whole rows itself, so `LBS_NOINTEGRALHEIGHT` is now correct and the
+  accounting is exact (-56 for +60, whole rows, list ends above the strip).
+- `LB_SETCURSEL` does not send `LBN_SELCHANGE`, so arrowing moved the highlight
+  and left the detail pane describing the machine you had left.
+
+Also recorded as deliberate, not oversight: the detail pane below the header is
+**empty**, because what fills it on Mac is the browsed session list and Windows
+cannot browse sessions until T146. `ipc-machine-chooser.ps1` 26 -> 34
+assertions, ALL PASS x3; `relay-account.ps1` ALL PASS (its account-button
+finder had to learn the new `New Window` label); both test lanes +
+`test-agent` exit 0; P1-P3 ALL PASS. Next: **T176**, then T174, then T142.
