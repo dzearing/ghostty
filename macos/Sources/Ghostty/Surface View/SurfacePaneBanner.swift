@@ -94,7 +94,7 @@ extension Ghostty {
             // every frame, and neither parsing nor text measurement belongs
             // on that path — only the O(columns) fair-share division below
             // depends on the width.
-            let layout = BannerLayout.shared.layout(for: text)
+            let layout = BannerLayout.shared.layout(for: text, cwd: linkSurface?.pwd)
             let blocks = layout.blocks
 
             // The pane width drives all wrapping. Subtract the card's outer
@@ -595,11 +595,15 @@ extension Ghostty {
                 cache.countLimit = 64
             }
 
-            func layout(for text: String) -> Entry {
-                let key = text as NSString
+            /// `cwd` (the pane's working directory) is part of the key, not
+            /// just an argument: it changes where a bare `./foo` points, so two
+            /// panes showing the same banner text from different directories
+            /// must not share an entry.
+            func layout(for text: String, cwd: String?) -> Entry {
+                let key = "\(cwd ?? "")\u{0}\(text)" as NSString
                 if let entry = cache.object(forKey: key) { return entry }
                 let blocks = BannerMarkdown.parseBlocks(
-                    text, maxLines: SurfacePaneBanner.maxDisplayLines)
+                    text, maxLines: SurfacePaneBanner.maxDisplayLines, cwd: cwd)
                 var naturals: [Int: [CGFloat]] = [:]
                 for (i, block) in blocks.enumerated() {
                     if case .table(let table) = block {
@@ -736,6 +740,8 @@ extension Ghostty {
     ///   - `__underline__` (differs from CommonMark, which treats `__` as bold)
     ///   - `` `code` `` (monospaced, contents not further parsed)
     ///   - `[text](url)` clickable links; the label may contain other styles
+    ///   - bare `http(s)://…` URLs and bare `/…`, `~/…`, `./…`, `../…` file
+    ///     paths, linkified with no markdown syntax (see `autolink`)
     ///   - `\` escapes the next character (e.g. `\*`, `\[`, `\\`, `\|`)
     ///
     /// Block syntax: ATX headings and standard markdown pipe tables. A
@@ -829,8 +835,11 @@ extension Ghostty {
             case rule
         }
 
-        static func parse(_ source: String) -> AttributedString {
-            parseInline(Substring(source))
+        /// `cwd` is the pane's working directory, used to resolve bare
+        /// `./`/`../` file paths (see `autolink`). nil where there's no pane
+        /// (previews, tests): those paths then stay plain text.
+        static func parse(_ source: String, cwd: String? = nil) -> AttributedString {
+            parseInline(Substring(source), cwd: cwd)
         }
 
         /// Flatten inline segments to a single `AttributedString`, rendering a
@@ -850,7 +859,9 @@ extension Ghostty {
 
         /// Parse banner source into displayable blocks, truncated to at most
         /// `maxLines` display lines (table rows count as one line each).
-        static func parseBlocks(_ source: String, maxLines: Int = Int.max) -> [Block] {
+        static func parseBlocks(
+            _ source: String, maxLines: Int = Int.max, cwd: String? = nil
+        ) -> [Block] {
             let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
             var blocks: [Block] = []
             var textLines: [Substring] = []
@@ -870,7 +881,7 @@ extension Ghostty {
                     if line.allSatisfy(\.isWhitespace) { continue }
                     let limit = remaining
                     remaining -= 1
-                    blocks.append(.text(parseInline(line), lineLimit: limit))
+                    blocks.append(.text(parseInline(line, cwd: cwd), lineLimit: limit))
                 }
             }
 
@@ -880,7 +891,7 @@ extension Ghostty {
                     flushText()
                     if remaining > 0 {
                         remaining -= 1
-                        blocks.append(.heading(parseInline(text), level: level))
+                        blocks.append(.heading(parseInline(text, cwd: cwd), level: level))
                     }
                     i += 1
                     continue
@@ -914,12 +925,12 @@ extension Ghostty {
                             remaining -= 1 + keptRows.count
                             let columns = headerCells.count
                             blocks.append(.table(Table(
-                                header: headerCells.map { segments(Substring($0)) },
+                                header: headerCells.map { segments(Substring($0), cwd: cwd) },
                                 alignments: sepCells.map(columnAlignment),
                                 rows: keptRows.map { row in
                                     (0..<columns).map { col in
                                         col < row.count
-                                            ? segments(Substring(row[col]))
+                                            ? segments(Substring(row[col]), cwd: cwd)
                                             : []
                                     }
                                 }
@@ -942,7 +953,7 @@ extension Ghostty {
                         if remaining > 0 {
                             items.append(ListItem(
                                 marker: item.marker,
-                                content: segments(item.content)
+                                content: segments(item.content, cwd: cwd)
                             ))
                             remaining -= 1
                         }
@@ -1060,8 +1071,8 @@ extension Ghostty {
         /// Parse inline markdown into a flat `AttributedString`, rendering any
         /// checkbox as its box glyph. Used for nested contexts (link labels,
         /// styled spans), heading text, and the wrapping-text fallback.
-        private static func parseInline(_ s: Substring) -> AttributedString {
-            attributed(segments(s))
+        private static func parseInline(_ s: Substring, cwd: String? = nil) -> AttributedString {
+            attributed(segments(s, cwd: cwd))
         }
 
         /// Parse inline markdown into ordered segments, emitting a native
@@ -1069,7 +1080,7 @@ extension Ghostty {
         /// after a leading `- `/`* ` marker) and `.text` for everything else.
         /// A checkbox nested inside a link/bold/italic span stays a glyph (via
         /// the `parseInline` recursion) — native boxes are a top-level affair.
-        static func segments(_ s: Substring) -> [Inline] {
+        static func segments(_ s: Substring, cwd: String? = nil) -> [Inline] {
             var out: [Inline] = []
             var run = AttributedString()
             var literal = ""
@@ -1132,11 +1143,30 @@ extension Ghostty {
                    let url = URL(string: String(s[s.index(closeBracket, offsetBy: 2)..<closeParen])),
                    url.scheme != nil {
                     flushLiteral()
-                    var linked = parseInline(s[s.index(after: i)..<closeBracket])
+                    // The label's own autolinks can't survive: `linked.link`
+                    // below applies to every run, so an explicit link always
+                    // owns its whole label and links never nest.
+                    var linked = parseInline(s[s.index(after: i)..<closeBracket], cwd: cwd)
                     linked.link = url
                     linked.underlineStyle = Text.LineStyle.single
                     run.append(linked)
                     i = s.index(after: closeParen)
+                    continue
+                }
+
+                // Bare URLs and file paths, linkified without markdown syntax.
+                // Runs after the explicit-link branch (which consumes its own
+                // URL first) and never sees the inside of a code span, which
+                // the delimiter branch below takes literally. The character
+                // test is a cheap gate — only these can start a bare link.
+                if c == "h" || c == "/" || c == "~" || c == ".",
+                   let (url, end) = autolink(in: s, at: i, cwd: cwd) {
+                    flushLiteral()
+                    var linked = AttributedString(String(s[i..<end]))
+                    linked.link = url
+                    linked.underlineStyle = Text.LineStyle.single
+                    run.append(linked)
+                    i = end
                     continue
                 }
 
@@ -1234,6 +1264,119 @@ extension Ghostty {
             // A trailing "(" means this is link text, e.g. [x](https://…).
             if after < s.endIndex, s[after] == "(" { return nil }
             return (checked, after)
+        }
+
+        // MARK: Autolinking
+
+        /// URL schemes that linkify on their own. Scheme-only by design: a
+        /// bare `www.example.com`, `config.io`, or `see foo.md` in prose must
+        /// stay text, so there is no bare-domain or TLD matching here.
+        private static let autolinkSchemes = ["https://", "http://"]
+
+        /// The prefixes that mark a bare file path. The sigil IS the signal —
+        /// it's what lets a path linkify with no filesystem check and no TLD
+        /// guessing, and why a bare `macos/Sources/Foo.swift` stays text.
+        private static let autolinkSigils = ["/", "~/", "./", "../"]
+
+        /// Characters a bare link may start immediately after (besides
+        /// whitespace and the start of the run), so `(https://x.com)` links
+        /// while `and/or` and `xhttps://x.com` don't.
+        private static let autolinkOpeners: Set<Character> = ["(", "[", "{", "<", "\"", "'"]
+
+        /// Trailing characters that read as the surrounding sentence's rather
+        /// than the link's. Closing brackets are handled separately — balanced
+        /// pairs inside a path are common (`…/Foo_(bar)`).
+        private static let autolinkTrailing: Set<Character> = [
+            ".", ",", ";", ":", "!", "?", "\"", "'", ">",
+        ]
+
+        /// Closing brackets and their openers, for the balance test above.
+        private static let autolinkClosers: [Character: Character] = [")": "(", "]": "["]
+
+        /// If a bare URL or file path begins at `index`, return where it points
+        /// and the index just past the linked text.
+        ///
+        /// `cwd` is the pane's working directory, which `./`/`../` resolve
+        /// against; with none, those stay plain text rather than resolving
+        /// against a guess. The pane's cwd moves as the user `cd`s, so the same
+        /// banner text can resolve differently over its life — the banner
+        /// re-parses against the current cwd, which is what `./foo` means.
+        private static func autolink(
+            in s: Substring,
+            at index: Substring.Index,
+            cwd: String?
+        ) -> (url: URL, end: Substring.Index)? {
+            // Only at a word boundary, so a link is a whole token.
+            if index > s.startIndex {
+                let prev = s[s.index(before: index)]
+                guard prev.isWhitespace || autolinkOpeners.contains(prev) else { return nil }
+            }
+
+            let rest = s[index...]
+            let scheme = autolinkSchemes.first { rest.hasPrefix($0) }
+            // Exactly one sigil can match: `./`, `../`, and `~/` all fail the
+            // `/` test, and `../` fails the `./` one.
+            let sigil = scheme == nil ? autolinkSigils.first { rest.hasPrefix($0) } : nil
+            guard let prefix = scheme ?? sigil else { return nil }
+
+            let end = autolinkEnd(in: s, from: index)
+            let text = s[index..<end]
+            // A bare scheme or sigil with no body after it isn't a link.
+            guard text.count > prefix.count else { return nil }
+
+            if scheme != nil { return URL(string: String(text)).map { ($0, end) } }
+            return fileURL(String(text), cwd: cwd).map { ($0, end) }
+        }
+
+        /// Where the bare link starting at `from` ends: up to whitespace (or a
+        /// backtick or pipe, neither of which can sit inside banner link text),
+        /// minus any trailing sentence punctuation.
+        private static func autolinkEnd(
+            in s: Substring, from: Substring.Index
+        ) -> Substring.Index {
+            var end = from
+            while end < s.endIndex, !s[end].isWhitespace, s[end] != "`", s[end] != "|" {
+                end = s.index(after: end)
+            }
+            while end > from {
+                let last = s[s.index(before: end)]
+                if autolinkTrailing.contains(last) {
+                    end = s.index(before: end)
+                    continue
+                }
+                // A closing bracket is the sentence's only when the link has no
+                // matching opener: `(see https://x.com)` sheds it, a wiki-style
+                // `…/Foo_(bar)` keeps it.
+                if let opener = autolinkClosers[last] {
+                    let body = s[from..<end]
+                    let closes = body.reduce(0) { $1 == last ? $0 + 1 : $0 }
+                    let opens = body.reduce(0) { $1 == opener ? $0 + 1 : $0 }
+                    if closes > opens {
+                        end = s.index(before: end)
+                        continue
+                    }
+                }
+                break
+            }
+            return end
+        }
+
+        /// Resolve a bare file path to an absolute `file:` URL: `/…` as-is,
+        /// `~/…` tilde-expanded, `./…` and `../…` against `cwd`. Returns nil
+        /// for a dot-relative path with no cwd to resolve against.
+        private static func fileURL(_ path: String, cwd: String?) -> URL? {
+            let absolute: String
+            if path.hasPrefix("/") {
+                absolute = path
+            } else if path.hasPrefix("~/") {
+                absolute = (path as NSString).expandingTildeInPath
+            } else {
+                guard let cwd, !cwd.isEmpty else { return nil }
+                absolute = cwd.hasSuffix("/") ? cwd + path : cwd + "/" + path
+            }
+            // `isDirectory` is stated so the initializer doesn't stat the
+            // filesystem — parsing runs on the view's render path.
+            return URL(fileURLWithPath: absolute, isDirectory: false).standardized
         }
 
         /// Find the next unescaped occurrence of `needle` at or after `from`.

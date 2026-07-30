@@ -271,7 +271,7 @@ final class BannerTextView: NSView {
         // `hitTest` only routes clicks here when they land on a link, but
         // re-check so a non-link click falls through to the SwiftUI card
         // (whose tap collapses the banner).
-        guard linkRange(at: convert(event.locationInWindow, from: nil)) != nil else {
+        guard linkURL(at: convert(event.locationInWindow, from: nil)) != nil else {
             super.mouseDown(with: event)
             return
         }
@@ -285,15 +285,20 @@ final class BannerTextView: NSView {
             inMode: .eventTracking,
             dequeue: true) {
             guard next.type == .leftMouseUp else { continue }
-            if let range = linkRange(at: convert(next.locationInWindow, from: nil)),
-               let url = links.first(where: { $0.range == range })?.url {
-                // Modifier-click routing: plain → side pane, Cmd → new window,
-                // Cmd-Shift → system browser.
+            if let url = linkURL(at: convert(next.locationInWindow, from: nil)) {
+                // Modifier-click routing: Cmd → new Ghoztty window, Cmd-Shift →
+                // hand it to the system. A plain click opens a web URL in a
+                // side pane, but only *reveals* a file path — clicking a path
+                // shouldn't launch whatever app claims that extension. Keep
+                // this in step with `BannerLinkOpener.menu(for:)`, whose first
+                // item is by contract the left-click default.
                 let mods = next.modifierFlags
                 if mods.contains(.command) && mods.contains(.shift) {
-                    linkOpener.openInDefaultBrowser(url)
+                    linkOpener.openWithSystem(url)
                 } else if mods.contains(.command) {
                     linkOpener.openInNewWindow(url)
+                } else if url.isFileURL {
+                    linkOpener.revealInFinder(url)
                 } else {
                     linkOpener.openInSidePane(url)
                 }
@@ -305,9 +310,16 @@ final class BannerTextView: NSView {
     /// Right-click on a link shows the standard link menu; elsewhere returns nil
     /// so the event falls through (points off links don't hit-test to us anyway).
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard let range = linkRange(at: convert(event.locationInWindow, from: nil)),
-              let url = links.first(where: { $0.range == range })?.url else { return nil }
+        guard let url = linkURL(at: convert(event.locationInWindow, from: nil)) else { return nil }
         return linkOpener.menu(for: url)
+    }
+
+    /// Where the link under `point` (view coordinates) goes, or nil if the
+    /// point isn't on one. The single lookup behind hit-testing, click, and
+    /// the right-click menu.
+    func linkURL(at point: CGPoint) -> URL? {
+        guard let range = linkRange(at: point) else { return nil }
+        return links.first { $0.range == range }?.url
     }
 
     /// The link range under `point` (view coordinates), or nil if the point is
