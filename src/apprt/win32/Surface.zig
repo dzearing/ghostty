@@ -26,6 +26,7 @@ const BannerOverlay = @import("BannerOverlay.zig").BannerOverlay;
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
 const commands = @import("commands.zig");
+const menu_label = @import("menu_label.zig");
 const pane_id_mod = @import("pane_id.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
@@ -187,6 +188,12 @@ search_edit: ?w32.HWND = null,
 
 /// Whether the search bar is currently visible.
 search_active: bool = false,
+
+/// A lone Alt press is pending: Alt went down with nothing else held, and
+/// nothing has happened since. Releasing it opens the menu (T190) — the
+/// classic Windows menu-bar activation. Any other key, or losing focus
+/// (alt+tab), disarms it, so alt-as-a-modifier is untouched.
+alt_menu_armed: bool = false,
 
 /// Font handle for the search edit (must be deleted on cleanup).
 search_font: ?*anyopaque = null,
@@ -2299,135 +2306,10 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
     }
 }
 
-/// Format a keybinding trigger as a human-readable string (e.g. "Ctrl+Shift+T").
-fn formatTrigger(trigger: input.Binding.Trigger, buf: []u8) usize {
-    var pos: usize = 0;
-
-    if (trigger.mods.super) {
-        const s = "Win+";
-        @memcpy(buf[pos..][0..s.len], s);
-        pos += s.len;
-    }
-    if (trigger.mods.ctrl) {
-        const s = "Ctrl+";
-        @memcpy(buf[pos..][0..s.len], s);
-        pos += s.len;
-    }
-    if (trigger.mods.alt) {
-        const s = "Alt+";
-        @memcpy(buf[pos..][0..s.len], s);
-        pos += s.len;
-    }
-    if (trigger.mods.shift) {
-        const s = "Shift+";
-        @memcpy(buf[pos..][0..s.len], s);
-        pos += s.len;
-    }
-
-    switch (trigger.key) {
-        .unicode => |cp| {
-            // Convert to upper-case letter for display
-            if (cp >= 'a' and cp <= 'z') {
-                buf[pos] = @intCast(cp - 32);
-                pos += 1;
-            } else if (cp >= ' ' and cp <= '~') {
-                buf[pos] = @intCast(cp);
-                pos += 1;
-            }
-        },
-        .physical => |k| {
-            const name = keyName(k);
-            if (name.len > 0 and pos + name.len <= buf.len) {
-                @memcpy(buf[pos..][0..name.len], name);
-                pos += name.len;
-            }
-        },
-        .catch_all => {},
-    }
-
-    return pos;
-}
-
-/// Map physical key enum to display name.
-fn keyName(k: input.Key) []const u8 {
-    return switch (k) {
-        .key_a => "A",
-        .key_b => "B",
-        .key_c => "C",
-        .key_d => "D",
-        .key_e => "E",
-        .key_f => "F",
-        .key_g => "G",
-        .key_h => "H",
-        .key_i => "I",
-        .key_j => "J",
-        .key_k => "K",
-        .key_l => "L",
-        .key_m => "M",
-        .key_n => "N",
-        .key_o => "O",
-        .key_p => "P",
-        .key_q => "Q",
-        .key_r => "R",
-        .key_s => "S",
-        .key_t => "T",
-        .key_u => "U",
-        .key_v => "V",
-        .key_w => "W",
-        .key_x => "X",
-        .key_y => "Y",
-        .key_z => "Z",
-        .digit_0 => "0",
-        .digit_1 => "1",
-        .digit_2 => "2",
-        .digit_3 => "3",
-        .digit_4 => "4",
-        .digit_5 => "5",
-        .digit_6 => "6",
-        .digit_7 => "7",
-        .digit_8 => "8",
-        .digit_9 => "9",
-        .f1 => "F1",
-        .f2 => "F2",
-        .f3 => "F3",
-        .f4 => "F4",
-        .f5 => "F5",
-        .f6 => "F6",
-        .f7 => "F7",
-        .f8 => "F8",
-        .f9 => "F9",
-        .f10 => "F10",
-        .f11 => "F11",
-        .f12 => "F12",
-        .space => "Space",
-        .enter => "Enter",
-        .tab => "Tab",
-        .backspace => "Backspace",
-        .escape => "Escape",
-        .arrow_left => "Left",
-        .arrow_right => "Right",
-        .arrow_up => "Up",
-        .arrow_down => "Down",
-        .page_up => "PgUp",
-        .page_down => "PgDn",
-        .home => "Home",
-        .end => "End",
-        .insert => "Insert",
-        .delete => "Delete",
-        .comma => ",",
-        .period => ".",
-        .slash => "/",
-        .semicolon => ";",
-        .quote => "'",
-        .bracket_left => "[",
-        .bracket_right => "]",
-        .backslash => "\\",
-        .minus => "-",
-        .equal => "=",
-        .backquote => "`",
-        else => "",
-    };
-}
+/// Format a keybinding trigger for display (e.g. "Ctrl+Shift+T"). The
+/// formatter is shared with the menu system (T190) so a chord reads the same
+/// in the palette, the context menu, and the menu.
+const formatTrigger = menu_label.formatTrigger;
 
 /// Toggle window decorations (title bar + borders) on/off.
 /// Delegates to the parent Window.
@@ -2604,6 +2486,10 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
         self.key_event_produced_text = false;
         return;
     }
+
+    // F10 / a lone Alt press open the menu system (T190). Runs before the
+    // key reaches the terminal so the disarm bookkeeping sees every key.
+    if (self.trackMenuActivation(vk, lparam, action)) return;
 
     // ctrl+shift+n → "New Remote Window" (the machine chooser). Handled
     // locally (T22c decision 3): there is no core binding action for "new
@@ -2905,6 +2791,97 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     );
 }
 
+/// Classic Windows menu activation for the menu system (T190): **F10** and
+/// a **lone Alt press** open the menu at the tab strip's ≡ button. Windows
+/// users still reach for both, and neither had any meaning here before.
+///
+/// Returns true when the key was consumed (F10 only).
+///
+/// Two deliberate narrowings, because this is a terminal and the child owns
+/// the keyboard:
+///
+///   - **Alt only counts when it is alone.** It arms on a first press with
+///     no other modifier held and disarms on any other key, on autorepeat,
+///     and on focus loss (alt+tab) — so alt-as-a-modifier, alt+key escape
+///     sequences and alt+tab are all untouched. The release is never
+///     consumed, so a client reading key releases still sees it.
+///   - **F10 yields to full-screen TUIs.** `htop`, `mc` and friends bind F10
+///     and they all run on the ALTERNATE screen; a shell prompt does not.
+///     So F10 opens the menu on the primary screen only, and is passed
+///     through untouched on the alternate one. That is a measurable
+///     discriminator rather than a guess about what the child wants.
+///
+/// The menu itself is opened by POSTING to the window (WM_APP_OPEN_MENU),
+/// never by tracking a modal popup nested inside this key WndProc.
+fn trackMenuActivation(
+    self: *Surface,
+    vk: u16,
+    lparam: isize,
+    action: input.Action,
+) bool {
+    const repeat = (lparam & (1 << 30)) != 0;
+
+    if (vk == w32.VK_MENU) {
+        if (action == .press) {
+            // Autorepeat means the key is being HELD as a modifier.
+            if (repeat) {
+                self.alt_menu_armed = false;
+                return false;
+            }
+            const ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
+            const shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+            const winkey = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+                w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0;
+            self.alt_menu_armed = !ctrl and !shift and !winkey;
+            return false;
+        }
+
+        // Release: open the menu if nothing intervened, and still deliver
+        // the release to the terminal.
+        if (self.alt_menu_armed) {
+            self.alt_menu_armed = false;
+            self.postOpenMenu();
+        }
+        return false;
+    }
+
+    // Any other key ends the "lone" part of a lone Alt.
+    self.alt_menu_armed = false;
+
+    if (action != .press or repeat or vk != w32.VK_F10) return false;
+    const ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
+    const shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+    const alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0;
+    const winkey = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+        w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0;
+    if (ctrl or shift or alt or winkey) return false;
+    if (self.onAlternateScreen()) return false;
+
+    self.postOpenMenu();
+    return true;
+}
+
+/// Is the terminal showing the alternate screen (i.e. a full-screen TUI is
+/// running)?
+///
+/// PRIORITY (T114), for the same reason `isWin32InputMode` is: this runs on
+/// the GUI thread on an F10 keystroke, and the plain mutex can be held by a
+/// busy pane's IO/renderer for seconds. Measured with the plain lock: F10
+/// right after a zoom, or while a child was flooding output, produced NO
+/// menu within 3s and then opened one several seconds later, out of band.
+fn onAlternateScreen(self: *Surface) bool {
+    if (!self.core_surface_ready) return false;
+    self.core_surface.renderer_state.lockPriority();
+    defer self.core_surface.renderer_state.unlockPriority();
+    return self.core_surface.io.terminal.screens.active_key == .alternate;
+}
+
+/// Ask the parent window to open the menu system from its message loop.
+fn postOpenMenu(self: *Surface) void {
+    const hwnd = self.parent_window.hwnd orelse return;
+    _ = w32.PostMessageW(hwnd, Window.WM_APP_OPEN_MENU, 0, 0);
+}
+
 /// Keyboard-invoked context menu (WM_CONTEXTMENU: VK_APPS / Shift+F10
 /// falling through to DefWindowProc, or automation). Opens at the pane
 /// center — there is no click point.
@@ -2940,7 +2917,7 @@ fn openContextMenu(self: *Surface, client_x: i32, client_y: i32) void {
             if (c.checked) flags |= w32.MF_CHECKED;
             // AppendMenuW copies the string, so a per-item stack buffer is
             // enough to carry the accelerator label.
-            var label: [96]u16 = undefined;
+            var label: menu_label.Buf = undefined;
             _ = w32.AppendMenuW(
                 menu,
                 flags,
@@ -2987,30 +2964,21 @@ fn openContextMenu(self: *Surface, client_x: i32, client_y: i32) void {
 /// action simply shows no hint.
 ///
 /// Returns a pointer into `buf`, or `title` itself when there is no chord.
+/// The formatting itself is `menu_label.withAccel`, shared with the menu
+/// system (T190) so the two menu surfaces cannot label the same chord
+/// differently.
 fn menuLabel(
     self: *const Surface,
     id: context_menu.Id,
     title: [:0]const u16,
-    buf: *[96]u16,
+    buf: *menu_label.Buf,
 ) [*:0]const u16 {
     const act = context_menu.action(id) orelse return title.ptr;
-    const trigger = self.app.config.keybind.set.getTrigger(act) orelse return title.ptr;
-
-    var accel: [64]u8 = undefined;
-    const accel_len = formatTrigger(trigger, &accel);
-    if (accel_len == 0) return title.ptr;
-
-    // title + '\t' + accel + NUL; fall back to the bare title if it can't fit
-    // (accel is ASCII, so one u16 per byte).
-    if (title.len + 1 + accel_len + 1 > buf.len) return title.ptr;
-    @memcpy(buf[0..title.len], title[0..title.len]);
-    var pos = title.len;
-    buf[pos] = '\t';
-    pos += 1;
-    pos += std.unicode.utf8ToUtf16Le(buf[pos..], accel[0..accel_len]) catch
-        return title.ptr;
-    buf[pos] = 0;
-    return @ptrCast(buf);
+    return menu_label.withAccel(
+        title,
+        self.app.config.keybind.set.getTrigger(act),
+        buf,
+    );
 }
 
 /// The pane's effective background: the explicit/inherited tint when set,
@@ -3546,6 +3514,12 @@ pub fn signalFrameDrawn(self: *Surface) void {
 
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.
 pub fn handleFocus(self: *Surface, focused: bool) void {
+    // Focus changes are the other end of a lone Alt: alt+tab takes the alt
+    // DOWN here and delivers its UP somewhere else, and the menu must not
+    // open when focus comes back (T190). Cleared on both edges, and before
+    // the readiness guard so it can never get stuck armed.
+    self.alt_menu_armed = false;
+
     if (!self.core_surface_ready) return;
     // Drop any buffered high surrogate and pending dead key on focus loss —
     // otherwise they would combine with the next character when focus returns.

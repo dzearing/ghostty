@@ -88,6 +88,9 @@ const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
 const window_memory = @import("window_memory.zig");
 const host_defaults = @import("host_defaults.zig");
+const commands = @import("commands.zig");
+const menu_bar = @import("menu_bar.zig");
+const menu_label = @import("menu_label.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -96,6 +99,14 @@ const log = std.log.scoped(.win32);
 /// active tab's tree before any pointer is touched). WM_APP+1..+5 are
 /// defined in App.zig.
 pub const WM_APP_HERO_SNAP: u32 = w32.WM_APP + 6;
+
+/// Posted by a surface to open the menu system (T190) from the message loop
+/// rather than from inside the key WndProc. Two reasons: the key event
+/// finishes being delivered to the terminal first (so alt keeps behaving as
+/// a modifier for anything reading key releases), and the modal
+/// TrackPopupMenuEx loop never runs nested inside a keyboard WndProc — the
+/// re-entrancy class T48 was.
+pub const WM_APP_OPEN_MENU: u32 = w32.WM_APP + 10;
 
 /// Hero-mode carousel thumbnail refresh period (Mac parity: 0.15s).
 const HERO_SNAP_INTERVAL_MS: u32 = 150;
@@ -156,6 +167,20 @@ hover_close: bool = false,
 
 /// Whether the "+" (new tab) button is being hovered.
 hover_new_tab: bool = false,
+
+/// Hit-test rectangle for the "≡" (menu) button at the right end of the tab
+/// strip — the host for the menu system (T190). Zero until the first paint,
+/// which reads as "no match" for the input handlers.
+menu_btn_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+
+/// Whether the "≡" (menu) button is being hovered.
+hover_menu_btn: bool = false,
+
+/// The menu is currently tracking (`TrackPopupMenuEx` is on the stack).
+/// Guards against re-entering the modal loop from a second click/key while
+/// it is up — the second `TrackPopupMenuEx` would nest and the first would
+/// return a stale result.
+menu_open: bool = false,
 
 /// Tab drag state: which tab is being dragged (-1 = none).
 drag_tab: isize = -1,
@@ -738,6 +763,13 @@ pub fn deinit(self: *Window) void {
 pub fn tabBarHeight(self: *const Window) i32 {
     if (!self.tab_bar_visible) return 0;
     return @intFromFloat(@round(32.0 * self.scale));
+}
+
+/// Width of the tab strip's "≡" menu button at a given DPI scale (T190).
+/// Same 36pt square as the "+" beside it, so the two controls read as a
+/// group and the strip's arithmetic stays one expression.
+pub fn menuButtonWidth(scale: f32) i32 {
+    return @intFromFloat(@round(36.0 * scale));
 }
 
 /// Returns the client rect available for the active surface, which is
@@ -2483,7 +2515,16 @@ fn updateTabBarVisibility(self: *Window) void {
     const show_config = self.app.config.@"window-show-tab-bar";
     const should_show = switch (show_config) {
         .always => true,
-        .auto => self.tab_count > 1,
+        // `auto` means "show the strip when it has something to show". On
+        // macOS that is tabs alone, because the app menu lives in the system
+        // menu bar, which is always there. Windows has no such bar, so since
+        // T190 the strip is ALSO the app's menu host (the ≡ button) — and a
+        // menu you can only see once you happen to open a second tab is the
+        // same "there's no way to get to the menu" the user reported in the
+        // first place. So on Windows the strip has something to show from the
+        // first window, and `never` remains the opt-out (F10 / a lone Alt /
+        // the command palette still reach the menu there).
+        .auto => true,
         .never => false,
     };
     if (should_show != self.tab_bar_visible) {
@@ -2606,7 +2647,12 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     const accent_h: i32 = @intFromFloat(@round(2.0 * self.scale));
 
     const tab_count_i32: i32 = @intCast(self.tab_count);
-    const available_w = client_w - new_tab_btn_w;
+    // The menu button (T190) sits at the far right, past the "+" — Windows
+    // Terminal / VS Code / Edge all put this control there. Its width comes
+    // out of the tab area exactly like the "+"'s, so the strip reflows
+    // around it at any tab count and any DPI.
+    const menu_btn_w: i32 = menuButtonWidth(self.scale);
+    const available_w = client_w - new_tab_btn_w - menu_btn_w;
 
     // Calculate each tab's width: proportional, min 60px.
     const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
@@ -2734,6 +2780,25 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         x += this_tab_w;
     }
 
+    // --- Draw the strip's buttons ---
+    //
+    // Pinned to the right EDGE, not to wherever the last tab ended. Tabs stop
+    // shrinking at `min_tab_w`, so past ~20 tabs they overrun `available_w`
+    // and anything drawn after them lands off-screen — which used to cost only
+    // the "+" and would now cost the app's whole menu. Repaint the band first
+    // so an overrunning tab does not show through it.
+    {
+        const btns_left = client_w - new_tab_btn_w - menu_btn_w;
+        if (x > btns_left) {
+            var band = w32.RECT{ .left = btns_left, .top = 0, .right = client_w, .bottom = bar_h };
+            if (w32.CreateSolidBrush(bar_color)) |brush| {
+                _ = w32.FillRect(mem_dc, &band, brush);
+                _ = w32.DeleteObject(@ptrCast(brush));
+            }
+        }
+        x = btns_left;
+    }
+
     // --- Draw new-tab (+) button ---
     {
         const btn_left = x;
@@ -2769,6 +2834,46 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
             1,
             &plus_rect,
             w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+        );
+    }
+
+    // --- Draw menu (≡) button (T190) ---
+    {
+        const btn_left = x + new_tab_btn_w;
+        const btn_right = btn_left + menu_btn_w;
+        self.menu_btn_rect = w32.RECT{
+            .left = btn_left,
+            .top = 0,
+            .right = btn_right,
+            .bottom = bar_h,
+        };
+
+        // Same hover treatment as the "+" so the two read as one control
+        // group. The menu being OPEN keeps it lit, which is how every
+        // Windows menu button signals its popup belongs to it.
+        if (self.hover_menu_btn or self.menu_open) {
+            var btn_rect = w32.RECT{ .left = btn_left, .top = 0, .right = btn_right, .bottom = bar_h };
+            if (w32.CreateSolidBrush(hover_color)) |brush| {
+                _ = w32.FillRect(mem_dc, &btn_rect, brush);
+                _ = w32.DeleteObject(@ptrCast(brush));
+            }
+        }
+
+        _ = w32.SetTextColor(mem_dc, inactive_text_color);
+        // U+2261 IDENTICAL TO — the hamburger glyph, present in Segoe UI.
+        const menu_char = std.unicode.utf8ToUtf16LeStringLiteral("≡");
+        var menu_rect = w32.RECT{
+            .left = btn_left,
+            .top = 0,
+            .right = btn_right,
+            .bottom = bar_h,
+        };
+        _ = w32.DrawTextW(
+            mem_dc,
+            menu_char,
+            1,
+            &menu_rect,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
         );
     }
 
@@ -2975,6 +3080,14 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
     if (!self.tab_bar_visible) return;
     if (y >= self.tabBarHeight()) return;
 
+    // Check the menu (≡) button first — it sits past the "+" at the far
+    // right, so the two rects never overlap, but ordering the more specific
+    // one first keeps a future layout change from silently swallowing it.
+    if (x >= self.menu_btn_rect.left and x < self.menu_btn_rect.right) {
+        self.openMenuBar();
+        return;
+    }
+
     // Check new-tab button.
     if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
         _ = self.addTab() catch |err| {
@@ -3098,10 +3211,14 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
     var new_hover: isize = -1;
     var new_close = false;
     var new_new_tab = false;
+    var new_menu_btn = false;
 
     if (y < self.tabBarHeight()) {
-        // Check new-tab button.
-        if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
+        // Check the menu (≡) button.
+        if (x >= self.menu_btn_rect.left and x < self.menu_btn_rect.right) {
+            new_menu_btn = true;
+        } else if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
+            // Check new-tab button.
             new_new_tab = true;
         } else {
             // Check tabs.
@@ -3119,10 +3236,15 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
         }
     }
 
-    if (new_hover != self.hover_tab or new_close != self.hover_close or new_new_tab != self.hover_new_tab) {
+    if (new_hover != self.hover_tab or
+        new_close != self.hover_close or
+        new_new_tab != self.hover_new_tab or
+        new_menu_btn != self.hover_menu_btn)
+    {
         self.hover_tab = new_hover;
         self.hover_close = new_close;
         self.hover_new_tab = new_new_tab;
+        self.hover_menu_btn = new_menu_btn;
         self.invalidateTabBar();
     }
 }
@@ -3134,6 +3256,151 @@ const TAB_CTX_CLOSE_RIGHT: usize = 9003;
 const TAB_CTX_NEW_TAB: usize = 9004;
 // Tab-color submenu (T72): one id per TabColor, in enum order.
 const TAB_CTX_COLOR_BASE: usize = 9100;
+
+// --- The menu system (T143/T190) ------------------------------------------
+//
+// The tree, its titles/mnemonics and the per-item state live in the pure
+// `menu_bar.zig`; every row names a `commands.Id` and dispatches through
+// `Surface.performCommand`, the same entry point the command palette uses
+// (T189). Nothing below decides what a command DOES — it only builds the
+// HMENU, tracks it, and hands the result back to that one dispatcher.
+
+/// Open the menu system at the tab strip's "≡" button.
+///
+/// Also the target of F10 and a lone Alt press (Surface.handleKeyEvent), so
+/// the classic Windows menu-bar activation lands on the same popup as the
+/// click — the button is where the user is told to look.
+pub fn openMenuBar(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.menu_open) return;
+
+    // Bottom-left of the button, so the popup hangs off it the way a menu
+    // bar's does. Before the first paint the rect is zeroed; the top-left of
+    // the client area is the sane fallback and still lands under the strip.
+    var pt = w32.POINT{
+        .x = self.menu_btn_rect.left,
+        .y = if (self.menu_btn_rect.bottom > 0) self.menu_btn_rect.bottom else self.tabBarHeight(),
+    };
+    _ = w32.ClientToScreen(hwnd, &pt);
+
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu); // recursively frees the submenus too
+
+    const state = self.menuBarState();
+    self.buildMenuNodes(menu, &menu_bar.root, state);
+
+    // Keep the button lit for the life of the popup (Windows menu-button
+    // idiom) and repaint immediately — TrackPopupMenuEx blocks below.
+    self.menu_open = true;
+    self.invalidateTabBar();
+    _ = w32.UpdateWindow(hwnd);
+
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        hwnd,
+        null,
+    );
+
+    // Drop the lit state HERE, not in a defer. Close Window / Close All
+    // Windows / Exit run `Window.close()` inside the dispatch below, which
+    // calls `DestroyWindow` synchronously — `onDestroy` then frees this very
+    // allocation. Anything touching `self` after `performCommand` is a
+    // use-after-free, so nothing does.
+    self.menu_open = false;
+    self.invalidateTabBar();
+
+    if (cmd <= 0) return; // 0 = dismissed without choosing
+    const id = menu_bar.fromMenuCommandId(@intCast(cmd)) orelse {
+        log.warn("menu returned an unknown command id={}", .{cmd});
+        return;
+    };
+    const surface = self.getActiveSurface() orelse return;
+    log.debug("menu command id={s}", .{@tagName(id)});
+    surface.performCommand(id);
+}
+
+/// Fill `menu_bar.State` from the focused surface and this window. Read at
+/// open time only — the menu is built fresh per open, so there is no stale
+/// state to invalidate.
+fn menuBarState(self: *Window) menu_bar.State {
+    var state: menu_bar.State = .{
+        .tab_count = self.tab_count,
+        .pane_count = if (self.tab_count > 0) self.leafCount(self.active_tab) else 1,
+        .session_persistence = self.app.config.@"session-persistence",
+    };
+    if (self.getActiveSurface()) |surface| {
+        state.search_active = surface.search_active;
+        if (surface.core_surface_ready) {
+            state.has_selection = surface.core_surface.hasSelection();
+            state.readonly = surface.core_surface.readonly;
+        }
+    }
+    return state;
+}
+
+/// Append `nodes` to `menu`, recursing into submenus. Item ids come from
+/// `menu_bar.menuCommandId`, so a TPM_RETURNCMD result maps straight back
+/// with `fromMenuCommandId`.
+fn buildMenuNodes(
+    self: *Window,
+    menu: w32.HMENU,
+    nodes: []const menu_bar.Node,
+    state: menu_bar.State,
+) void {
+    for (nodes) |node| switch (node) {
+        .separator => _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null),
+
+        .item => |item| {
+            const f = menu_bar.flags(item.cmd, state);
+            var mf: u32 = w32.MF_STRING;
+            if (!f.enabled) mf |= w32.MF_GRAYED;
+            if (f.checked) mf |= w32.MF_CHECKED;
+            // AppendMenuW copies the string, so a per-item stack buffer is
+            // enough to carry the accelerator label.
+            var label: menu_label.Buf = undefined;
+            _ = w32.AppendMenuW(
+                menu,
+                mf,
+                menu_bar.menuCommandId(item.cmd),
+                self.menuItemLabel(item.cmd, menu_bar.title(item, state), &label),
+            );
+        },
+
+        .submenu => |sub| {
+            const child = w32.CreatePopupMenu() orelse {
+                log.warn("submenu creation failed", .{});
+                continue;
+            };
+            self.buildMenuNodes(child, sub.items, state);
+            // Ownership passes to `menu`: DestroyMenu on the parent frees
+            // every popup attached with MF_POPUP.
+            _ = w32.AppendMenuW(menu, w32.MF_POPUP, @intFromPtr(child), sub.title);
+        },
+    };
+}
+
+/// `title`, plus a tab and the accelerator when the LIVE keybind set has a
+/// trigger for this command's action (T129) — so a rebind relabels the menu
+/// and an unbound command shows no hint. Commands with no binding behind
+/// them (the machine chooser, About, the plugin install, Help) carry a
+/// placeholder action in the registry and must never be labeled from it.
+fn menuItemLabel(
+    self: *const Window,
+    id: commands.Id,
+    title: [:0]const u16,
+    buf: *menu_label.Buf,
+) [*:0]const u16 {
+    const cmd = commands.get(id);
+    if (cmd.kind != .binding) return title.ptr;
+    return menu_label.withAccel(
+        title,
+        self.app.config.keybind.set.getTrigger(cmd.action),
+        buf,
+    );
+}
 
 /// Handle a right-button click in the tab bar region.
 /// Shows a context menu for the clicked tab.
@@ -3289,10 +3556,11 @@ fn makeSwatchBitmap(self: *Window, c: tab_color.TabColor) ?w32.HANDLE {
 /// Handle WM_MOUSELEAVE: reset all hover state and repaint.
 fn handleTabBarMouseLeave(self: *Window) void {
     self.tracking_mouse = false;
-    if (self.hover_tab != -1 or self.hover_new_tab) {
+    if (self.hover_tab != -1 or self.hover_new_tab or self.hover_menu_btn) {
         self.hover_tab = -1;
         self.hover_close = false;
         self.hover_new_tab = false;
+        self.hover_menu_btn = false;
         self.invalidateTabBar();
     }
 }
@@ -3731,6 +3999,10 @@ pub fn windowWndProc(
         },
         WM_APP_HERO_SNAP => {
             window.heroOnSnapReady(wparam);
+            return 0;
+        },
+        WM_APP_OPEN_MENU => {
+            window.openMenuBar();
             return 0;
         },
 

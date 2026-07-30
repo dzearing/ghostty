@@ -576,8 +576,17 @@ Work these first, in order, before falling back to first-todo-in-table:
      a wait that watches the started PROCESS and logs every failure, and a
      180s deadline. `upgrade-no-fork.ps1` A22–A30 ALL PASS. Filed **T188** for
      the pre-loop restore latency on its own merits.
-   - **T143** — the missing menu bar. Every discoverability complaint
-     (T129 included) is a symptom of this.
+   - ~~**T143**~~ — the missing menu bar. Every discoverability complaint
+     (T129 included) was a symptom of this. **DONE 2026-07-30** via its two
+     halves: ~~T189~~ (the host decision + `commands.zig`/`menu_bar.zig`, the
+     ONE list the palette and the menu both render) → ~~T190~~ (the `≡`
+     tab-strip button, the recursive HMENU, dispatch through the single
+     `Surface.performCommand`, accelerator labels from the live keybind set,
+     and F10 / lone-Alt activation; `menu-bar.ps1` ALL PASS (49) ×3 with two
+     real negative controls). T190 also had to make the tab strip show in a
+     single-tab window — on Windows the strip IS the menu host, so `auto`
+     hiding it left the menu invisible in exactly the default window the
+     user's report was about. Filed T191/T192/T193 along the way.
    - **T145 → T147 → T146 → T151 → T148 → T150 → T149** — the sweep's
      findings, session-persistence correctness first (crash recovery, then
      non-destructive upgrade delivery — both are CLAUDE.md contract gaps, not

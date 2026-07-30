@@ -2620,3 +2620,72 @@ T146). Next: **T174**, then T142.
   a binary that did change, which is the T49 lesson with the sign flipped.
 - Floor: both lanes + `test-agent` + P1-P3 green; `hero-mode.ps1` ALL PASS (60)
   as the palette-dispatch regression check.
+
+## 2026-07-30 - T190 done: the menu exists now, and the strip it lives in had to start existing too
+
+- **T143 is closed by this half.** T189 landed the model and the one dispatch
+  path; nothing was reachable. Now: a `≡` button at the right end of the tab
+  strip, a recursively built `HMENU` (85 rows across five submenus plus the
+  Settings pair), `TPM_RETURNCMD` → `menu_bar.fromMenuCommandId` →
+  `Surface.performCommand`. No second dispatch path — that was the T189
+  contract and it holds.
+- **The task's premise was wrong in one place, and it mattered.** T190 assumed
+  the tab strip is there. `window-show-tab-bar = auto` hid it until a second
+  tab existed, so the menu button was invisible in exactly the default
+  single-tab window whose missing menu the user reported. On win32 `auto` now
+  shows the strip from the first window: macOS can afford "tabs only" because
+  its app menu lives in the system menu bar, Windows has no such bar, and since
+  this task the strip IS the menu host. Windows Terminal, VS Code and Edge all
+  show a strip with one tab, so it is also the native shape. `never` stays the
+  opt-out (F10 / lone Alt / the palette still reach the menu there).
+- **Accelerator labels are a MOVE, not a copy.** `formatTrigger`/`keyName` came
+  out of `Surface.zig` into a new pure `menu_label.zig` with `withAccel` and
+  its own tests, so the context menu (T129) and the menu format a chord through
+  one code path. `menuItemLabel` refuses to label a non-`binding` command, so
+  New Remote Window / About / Help / the plugin install never advertise the
+  placeholder action's chord.
+- **F10 and a lone Alt open it**, posted (WM_APP+10) rather than tracked inside
+  the key WndProc — the key finishes being delivered and the modal loop never
+  nests inside a keyboard message (the T48 class). Two deliberate narrowings:
+  Alt only counts when nothing else happens between its down and up (so
+  alt+key, alt-as-modifier and alt+tab are untouched, and the release is never
+  consumed), and **F10 yields on the ALTERNATE screen**, because every TUI that
+  binds F10 runs there and a shell prompt does not.
+- **Measured, not argued (1).** That alternate-screen read is on the key path,
+  so the plain `renderer_state.mutex` was the wrong lock: F10 right after a
+  zoom produced NO menu within 3s and then opened one seconds later, out of
+  band. `lockPriority`/`unlockPriority` (T114), exactly like `isWin32InputMode`
+  next to it.
+- **Measured, not argued (2).** The harness scored the product wrong for three
+  runs. Its "back on the primary screen" oracle was "`+read` works again" — but
+  `+read` failing means *nothing to read*, not *alternate screen*, and a
+  ^C-killed child never emits `?1049l`, so the terminal was still on the
+  alternate screen and F10 was correctly passing through. The child now
+  switches back itself and prints a marker; seeing the marker is positive
+  proof. Filed **T193** for `+read`'s unhelpful answer on the alternate screen.
+- Harness note worth carrying: `GetMenuState(MF_BYPOSITION)` returns a
+  submenu's ITEM COUNT in the high byte, so any submenu with 8–15 items sets
+  0x800 and reads as MF_SEPARATOR. Check `GetSubMenu` first. (`context-menu.ps1`
+  carries the same latent bug; its menu has no submenus, so it never fires.)
+- New `test/win32/menu-bar.ps1` **ALL PASS (47) ×3** — button (incl. a pixel
+  check for the painted glyph with a blank-strip control, and proof the `+`
+  beside it still works), the full recursive tree, four dispatches asserted by
+  outcome, state gating both ways, the T89e Exit label under both settings, a
+  rebind relabel, and the keyboard section.
+- **Two negative controls, both run for real.** Retitling ONE row failed
+  **exactly the two predicted assertions** (the tree compare and the Ctrl+T
+  label lookup) and nothing else — 45/2 — then 47/47 on restore. And disabling
+  the new right-edge button pin failed exactly the reflow section, in the way
+  the mechanism predicts: only 24 of the 26 requested tabs could be opened,
+  because the `+` the script was clicking had itself scrolled off the edge.
+- That reflow section exists because the strip's buttons were drawn AFTER the
+  last tab, and tabs stop shrinking at a minimum width — so past ~26 tabs on
+  this box both buttons left the screen. A pre-existing `+` bug nobody had hit,
+  which would now take the whole menu with it. Both are pinned to the right
+  edge now, and the tab count in the test is COMPUTED from the window's width
+  and DPI: the first version hardcoded 18, which still fit here and proved
+  nothing.
+- Floor: both lanes + `test-agent` + P1–P3 green; regression `context-menu.ps1`
+  ALL PASS (31) — the accelerator formatter was MOVED, so that is the assertion
+  that the older menu still labels its chords — and `command-registry.ps1` ALL
+  PASS (19).

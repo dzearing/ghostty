@@ -125,6 +125,10 @@ test {
     // same no-OS-imports deal.
     _ = @import("apprt/win32/menu_bar.zig");
 
+    // Pure win32 menu accelerator labeling — shared by the context menu and
+    // the menu system (T190), same no-OS-imports deal.
+    _ = @import("apprt/win32/menu_label.zig");
+
     // Pure win32 pane-identity (UUID generation + legacy surface-id target
     // aliases, T113), same no-OS-imports deal.
     _ = @import("apprt/win32/pane_id.zig");
