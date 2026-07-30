@@ -2685,7 +2685,22 @@ T146). Next: **T174**, then T142.
   edge now, and the tab count in the test is COMPUTED from the window's width
   and DPI: the first version hardcoded 18, which still fit here and proved
   nothing.
-- Floor: both lanes + `test-agent` + P1–P3 green; regression `context-menu.ps1`
+- **A crash caught by review, not by luck.** `Window.close()` calls
+  `DestroyWindow` synchronously and `onDestroy` frees the `Window` allocation,
+  so File → Close Window / Exit free the very window whose menu host is on the
+  stack. The first version cleared the button's lit state in a `defer`, i.e.
+  after the dispatch — a use-after-free on the row every Windows user reaches
+  for. The script now chooses Close Window, accepts the confirmation, and
+  asserts the app is still healthy afterwards; with the `defer` put back that
+  run leaves `+list` failing with "Failed to read IPC response length".
+- Floor: both lanes + `test-agent` + P1–P3 green; regressions `context-menu.ps1`
   ALL PASS (31) — the accelerator formatter was MOVED, so that is the assertion
-  that the older menu still labels its chords — and `command-registry.ps1` ALL
-  PASS (19).
+  that the older menu still labels its chords — `command-registry.ps1` (19),
+  and, because the strip now shows in a single-tab window, `split-divider.ps1`
+  (25), `pane-banner.ps1` (54) and `hero-mode.ps1` (60).
+- DELIVERED to all 3 install locations (ReleaseFast gnu `-Dstrip=false`,
+  `+version` = `+5d07c3835`): Desktop portable + the `\homeassistant\share`
+  copy swapped, installed release via the detached upgrade script at the
+  boundary — with `-ResumePrompt` set to this turn's `/reset-context`, so the
+  reset lands after the swap and the fresh session verifies the upgrade log
+  and `+version` first.
