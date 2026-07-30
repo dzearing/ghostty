@@ -64,8 +64,14 @@ const GUTTER_GAP: f32 = 6.0;
 const COL_GAP: f32 = 18.0;
 /// Native checkbox side (Mac: 12 at 12pt → 15 at our 15px base).
 const CHECK_SIDE: f32 = 15.0;
-/// A table cell's max width before its content word-wraps (Mac: 360).
-const MAX_CELL_W: f32 = 360.0;
+/// Tail-truncation glyph for a cell that runs past `MAX_CELL_LINES`.
+const ELLIPSIS = "…";
+/// Negative-control switch (kept, deliberately): true restores the
+/// pre-T123 table sizing — the fixed 360pt cap, no mid-string break, no
+/// 3-line cell cap. Flipping it and re-running `pane-banner.ps1` must fail
+/// exactly the 6 section-6g assertions and nothing else; that is how those
+/// assertions were shown to test the fix rather than the harness.
+const T123_NEUTERED = false;
 /// Collapsed content height: first line fully visible plus a sliver that
 /// fades out (Mac: 24 at 12pt → 30 at 15px).
 const COLLAPSED_H: f32 = 30.0;
@@ -106,6 +112,13 @@ pub const BannerOverlay = struct {
     /// a layout pass ran (then the strip falls back to overlapping the
     /// owner top so it is never lost).
     inset: i32 = 0,
+
+    /// Width of the pane slot the banner spans, fed TOP-DOWN by the window
+    /// layout (T123). Table columns are sized from it, so the banner
+    /// reflows live with the pane and can never act as a minimum pane
+    /// width. 0 until a layout pass ran — then column sizing falls back to
+    /// the old fixed cap so the first paint is never absurdly wide.
+    pane_w: i32 = 0,
 
     scale: f32 = 1.0,
     bg: u32 = 0, // COLORREF card fill
@@ -257,13 +270,16 @@ pub const BannerOverlay = struct {
             self.hide();
             return;
         }
-        const strip = self.insetHeight(scale);
         if (!self.alpha_set) {
             _ = w32.SetLayeredWindowAttributes(self.hwnd, 0, STRIP_ALPHA, w32.LWA_ALPHA);
             self.alpha_set = true;
         }
         var rect: w32.RECT = undefined;
         if (w32.GetWindowRect(self.owner, &rect) == 0) return;
+        // The owner spans the pane slot's full width (the layout only ever
+        // offsets its TOP by the band), so its rect is the pane width the
+        // banner content must size itself to (T123).
+        const strip = self.insetHeight(scale, rect.right - rect.left);
         // `inset` > 0: the layout moved the owner down by that much; the
         // strip fills the vacated band exactly (bottom-clipped when the
         // clamp engaged in a degenerate short pane). `inset` == 0: no
@@ -285,13 +301,23 @@ pub const BannerOverlay = struct {
         w32.healOverlayZOrder(self.hwnd, self.owner);
     }
 
-    /// The strip's natural height at `scale`, for the window layout to
-    /// reserve above the owner pane (T101). Syncs the overlay's scale
-    /// first so a DPI change measures with the right fonts.
-    pub fn insetHeight(self: *BannerOverlay, scale: f32) i32 {
+    /// The strip's natural height at `scale` in a `pane_w`-wide pane slot,
+    /// for the window layout to reserve above the owner pane (T101). Syncs
+    /// the overlay's scale and pane width first, so a DPI change measures
+    /// with the right fonts and a resize re-measures at the width the
+    /// content will actually be painted into (T123 — a table that rewraps
+    /// narrower gets a taller band, and one that unwraps gets a shorter
+    /// one, instead of the band and the paint disagreeing).
+    pub fn insetHeight(self: *BannerOverlay, scale: f32, pane_w: i32) i32 {
         if (scale != self.scale) {
             self.scale = scale;
             self.clearFonts();
+            self.content_h = -1;
+            _ = w32.InvalidateRect(self.hwnd, null, 1);
+        }
+        const w = @max(pane_w, 0);
+        if (w != self.pane_w) {
+            self.pane_w = w;
             self.content_h = -1;
             _ = w32.InvalidateRect(self.hwnd, null, 1);
         }
@@ -322,14 +348,25 @@ pub const BannerOverlay = struct {
         return self.px(PAD) * 2 + content;
     }
 
-    /// Expanded content height, measured via a window DC when stale.
+    /// Width available to the content INSIDE the card: the pane slot less
+    /// the card's margin and padding on both sides. 0 while the pane width
+    /// is still unknown, which is the signal for the fixed-cap fallback.
+    fn contentWidth(self: *const BannerOverlay) i32 {
+        if (self.pane_w <= 0) return 0;
+        const inner = self.px(MARGIN) + self.px(PAD);
+        return @max(self.pane_w - inner * 2, 1);
+    }
+
+    /// Expanded content height, measured via a window DC when stale. The
+    /// measure runs at the SAME content width the paint will use, so the
+    /// reserved band always matches what gets drawn into it (T123).
     fn ensureContentHeight(self: *BannerOverlay) i32 {
         if (self.content_h >= 0) return self.content_h;
         const hdc = w32.GetDC(self.hwnd) orelse {
             return self.px(LINE_H); // degrade: one-line strip
         };
         defer _ = w32.ReleaseDC(self.hwnd, hdc);
-        self.content_h = self.renderContent(hdc, 0, 0, 1 << 20, false);
+        self.content_h = self.renderContent(hdc, 0, 0, self.contentWidth(), false);
         return self.content_h;
     }
 
@@ -584,17 +621,105 @@ pub const BannerOverlay = struct {
         return total;
     }
 
+    /// Replace every non-space token wider than `max_w` with a run of
+    /// sub-tokens that each fit, so a long unbroken string breaks
+    /// mid-string instead of overflowing its column (T123 / CLAUDE.md:
+    /// "even a long unbroken token breaks mid-string"). Returns `tokens`
+    /// untouched — no allocation — when nothing is too wide, which is the
+    /// overwhelmingly common case.
+    fn breakWideTokens(
+        self: *BannerOverlay,
+        arena: std.mem.Allocator,
+        hdc: w32.HDC,
+        tokens: []const Token,
+        max_w: i32,
+    ) std.mem.Allocator.Error![]const Token {
+        if (max_w <= 0) return tokens;
+        const limit: f32 = @floatFromInt(max_w);
+        const too_wide = struct {
+            fn f(t: Token, lim: f32) bool {
+                return t.checkbox == null and !t.is_space and t.width > lim;
+            }
+        }.f;
+        var any = false;
+        for (tokens) |t| {
+            if (too_wide(t, limit)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return tokens;
+
+        var out: std.ArrayList(Token) = .empty;
+        for (tokens) |t| {
+            if (!too_wide(t, limit)) {
+                try out.append(arena, t);
+                continue;
+            }
+            var rest = t.text;
+            while (rest.len > 0) {
+                const fit = self.prefixFitting(hdc, rest, t.style, max_w);
+                // Always consume at least one codepoint: a column too
+                // narrow for even a single glyph must still terminate.
+                const take = if (fit > 0)
+                    fit
+                else
+                    (std.unicode.utf8ByteSequenceLength(rest[0]) catch 1);
+                const chunk = rest[0..@min(take, rest.len)];
+                try out.append(arena, .{
+                    .text = chunk,
+                    .style = t.style,
+                    .link = t.link,
+                    .width = @floatFromInt(self.measureSeg(hdc, chunk, t.style, 0, false).cx),
+                });
+                rest = rest[chunk.len..];
+            }
+        }
+        return out.items;
+    }
+
+    /// Byte length of the longest prefix of `text` that renders within
+    /// `max_w` px in `style`. 0 when nothing fits (or on failure).
+    fn prefixFitting(
+        self: *BannerOverlay,
+        hdc: w32.HDC,
+        text: []const u8,
+        style: markdown.Style,
+        max_w: i32,
+    ) usize {
+        var wbuf: [1024]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return 0;
+        if (wlen == 0) return 0;
+        const font = self.fontFor(style, 0);
+        const prev = w32.SelectObject(hdc, font);
+        defer _ = w32.SelectObject(hdc, prev);
+        var fit: i32 = 0;
+        var size: w32.SIZE = .{ .cx = 0, .cy = 0 };
+        if (w32.GetTextExtentExPointW(hdc, &wbuf, @intCast(wlen), max_w, &fit, null, &size) == 0) return 0;
+        if (fit <= 0) return 0;
+        var units: usize = @min(@as(usize, @intCast(fit)), wlen);
+        // Never break inside a surrogate pair.
+        if (units > 0 and units < wlen and wbuf[units - 1] >= 0xD800 and wbuf[units - 1] <= 0xDBFF) units -= 1;
+        return banner_layout.utf16PrefixBytes(text, units);
+    }
+
     const CellLayout = struct {
-        tokens: []Token = &.{},
+        tokens: []const Token = &.{},
         lines: []markdown.WrapLine = &.{},
         /// Single-line fast path when the cell fits (or holds a checkbox).
         single: bool = true,
+        /// The cell ran past MAX_CELL_LINES and its last visible line
+        /// tail-truncates with an ellipsis.
+        truncated: bool = false,
     };
 
-    /// Height + draw of one table block. Column widths are the widest
-    /// cell's natural width (+slack, capped) with header cells measured
-    /// bold — the Mac's exact scheme, so bold labels never force-wrap.
-    fn renderTable(self: *BannerOverlay, hdc: w32.HDC, table: markdown.Table, x0: i32, y0: i32, draw: bool) i32 {
+    /// Height + draw of one table block in `avail_w` px of content width.
+    /// Column widths come from the widest cell's natural width (+slack)
+    /// with header cells measured bold — the Mac's exact scheme, so bold
+    /// labels never force-wrap — divided against the PANE's width rather
+    /// than a fixed cap (T123), so a wide pane is used and a narrow one
+    /// rewraps instead of being blocked from shrinking.
+    fn renderTable(self: *BannerOverlay, hdc: w32.HDC, table: markdown.Table, x0: i32, y0: i32, avail_w: i32, draw: bool) i32 {
         const columns = table.header.len;
         if (columns == 0) return 0;
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -605,23 +730,32 @@ pub const BannerOverlay = struct {
         const row_gap = self.px(ROW_GAP);
         const col_gap = self.px(COL_GAP);
         const slack = self.px(2.0);
-        const cap = self.px(MAX_CELL_W);
         const show_header = table.hasVisibleHeader();
 
-        const widths = arena.alloc(i32, columns) catch return 0;
-        @memset(widths, 0);
+        const natural = arena.alloc(f32, columns) catch return 0;
+        @memset(natural, 0);
         if (show_header) {
             for (table.header, 0..) |cell, col| {
-                widths[col] = @max(widths[col], self.cellNaturalWidth(hdc, cell, true));
+                natural[col] = @max(natural[col], @as(f32, @floatFromInt(self.cellNaturalWidth(hdc, cell, true))));
             }
         }
         for (table.rows) |row| {
             for (row, 0..) |cell, col| {
                 if (col >= columns) break;
-                widths[col] = @max(widths[col], self.cellNaturalWidth(hdc, cell, false));
+                natural[col] = @max(natural[col], @as(f32, @floatFromInt(self.cellNaturalWidth(hdc, cell, false))));
             }
         }
-        for (widths) |*wd| wd.* = @min(wd.* + slack, cap);
+        for (natural) |*n| n.* += @floatFromInt(slack);
+
+        const shares = arena.alloc(f32, columns) catch return 0;
+        banner_layout.columnWidths(
+            natural,
+            shares,
+            if (T123_NEUTERED) 0 else @floatFromInt(@max(avail_w, 0)),
+            @floatFromInt(col_gap),
+        );
+        const widths = arena.alloc(i32, columns) catch return 0;
+        for (shares, 0..) |s, col| widths[col] = @max(1, @as(i32, @intFromFloat(@floor(s))));
 
         // Wrap layout per body cell (checkbox cells stay single-line).
         const layouts = arena.alloc(CellLayout, table.rows.len * columns) catch return 0;
@@ -632,17 +766,25 @@ pub const BannerOverlay = struct {
                 const lay = &layouts[r * columns + col];
                 if (hasCheckbox(cell)) continue;
                 if (self.cellNaturalWidth(hdc, cell, false) <= widths[col]) continue;
-                const tokens = self.tokenizeCell(arena, hdc, cell, false) catch continue;
+                const raw = self.tokenizeCell(arena, hdc, cell, false) catch continue;
+                const tokens = if (T123_NEUTERED) raw else self.breakWideTokens(arena, hdc, raw, widths[col]) catch continue;
                 const tw = arena.alloc(f32, tokens.len) catch continue;
                 const ts = arena.alloc(bool, tokens.len) catch continue;
                 for (tokens, 0..) |t, ti| {
                     tw[ti] = t.width;
                     ts[ti] = t.is_space;
                 }
+                var lines = markdown.wrapTokens(arena, tw, ts, @floatFromInt(widths[col])) catch continue;
+                // A cell is capped at MAX_CELL_LINES display lines; past
+                // that the last visible line tail-truncates, so one nasty
+                // cell can't blow up the banner height (Mac parity).
+                const truncated = !T123_NEUTERED and lines.len > banner_layout.MAX_CELL_LINES;
+                if (truncated) lines = lines[0..banner_layout.MAX_CELL_LINES];
                 lay.* = .{
                     .tokens = tokens,
-                    .lines = markdown.wrapTokens(arena, tw, ts, @floatFromInt(widths[col])) catch continue,
+                    .lines = lines,
                     .single = false,
+                    .truncated = truncated,
                 };
             }
         }
@@ -687,16 +829,42 @@ pub const BannerOverlay = struct {
                     _ = self.drawInlineLine(hdc, alignedX(cx, widths[col], cw, table.alignments[col]), y, line_h, cell, 0, false, draw);
                 } else {
                     for (lay.lines, 0..) |wl, li| {
-                        var lw: f32 = 0;
-                        for (lay.tokens[wl.start..wl.end]) |t| lw += t.width;
+                        var run = lay.tokens[wl.start..wl.end];
+                        // Tail-truncate the last visible line of a capped
+                        // cell: drop whatever no longer fits beside the
+                        // ellipsis, then draw the ellipsis itself.
+                        const ellipsis = lay.truncated and li + 1 == lay.lines.len;
+                        var ell_w: i32 = 0;
+                        if (ellipsis) {
+                            ell_w = self.measureSeg(hdc, ELLIPSIS, .{}, 0, false).cx;
+                            var tw2: []f32 = &.{};
+                            if (arena.alloc(f32, run.len)) |buf| {
+                                tw2 = buf;
+                            } else |_| {}
+                            if (tw2.len == run.len) {
+                                for (run, 0..) |t, ti| tw2[ti] = t.width;
+                                const keep = banner_layout.fitWithEllipsis(
+                                    tw2,
+                                    @floatFromInt(ell_w),
+                                    @floatFromInt(widths[col]),
+                                );
+                                run = run[0..keep];
+                                while (run.len > 0 and run[run.len - 1].is_space) run = run[0 .. run.len - 1];
+                            }
+                        }
+                        var lw: f32 = @floatFromInt(ell_w);
+                        for (run) |t| lw += t.width;
                         var tx = alignedX(cx, widths[col], @intFromFloat(@round(lw)), table.alignments[col]);
                         const ly = y + @as(i32, @intCast(li)) * line_h;
-                        for (lay.tokens[wl.start..wl.end]) |t| {
+                        for (run) |t| {
                             if (t.checkbox) |checked| {
                                 tx += self.drawCheckbox(hdc, tx, ly, line_h, checked, draw);
                             } else {
                                 tx += self.drawSegText(hdc, tx, ly, line_h, t.text, t.style, t.link, 0, false, draw);
                             }
+                        }
+                        if (ellipsis) {
+                            _ = self.drawSegText(hdc, tx, ly, line_h, ELLIPSIS, .{}, null, 0, false, draw);
                         }
                     }
                 }
@@ -844,7 +1012,7 @@ pub const BannerOverlay = struct {
                     break :blk 1;
                 },
                 .list => |items| self.renderList(hdc, items, x0, y, draw),
-                .table => |t| self.renderTable(hdc, t, x0, y, draw),
+                .table => |t| self.renderTable(hdc, t, x0, y, content_w, draw),
             };
             y += h;
         }

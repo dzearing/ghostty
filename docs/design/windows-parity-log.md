@@ -2421,3 +2421,51 @@ T146). Next: **T174**, then T142.
   an empty tail reads exactly like a product verdict). Both lanes, `test-agent`
   and P1–P3 green. Next: **T38/T39 per item 20** — that closes the 3d chain
   (T132 → T131 → T130 → T133); check for 3e–3g leftovers first, they outrank it.
+
+## 2026-07-30 - T123 done: banner tables size to the pane, not a fixed 360pt cap
+
+- **T123 done** (3e/3g were already clear, so this is 3f's first open item —
+  the user's *"the text in the table has fixed width and doesn't use available
+  space"*). Mac's `columnWidths(natural:available:)` ported line for line; what
+  did NOT port is how the width arrives. Mac reads it with a SwiftUI
+  `GeometryReader`, win32 has none, so it goes **top-down through the layout
+  call that already runs on every resize** — `layoutNode` →
+  `bannerLayoutInset(slot_w, slot_h)` → `insetHeight(scale, pane_w)`. One-way,
+  so the measurement↔column feedback loop `c94a8158a` had to break on the Mac
+  cannot form here.
+- Beyond the port: `ensureContentHeight` had been measuring the band at
+  `1 << 20` px — infinity — so the reserved band came from a layout that could
+  never be the one painted. Measure and paint now share one width, which is
+  what lets the band track a rewrap. Long unbroken tokens break mid-string
+  (`breakWideTokens` + one `GetTextExtentExPointW` per chunk, with
+  `utf16PrefixBytes` keeping the split off codepoint and surrogate-pair
+  boundaries), and cells cap at 3 lines with a tail ellipsis.
+- **The band height IS the oracle** — `pane-banner.ps1` section 6g counts
+  display rows from the overlay rect, so every assertion is self-relative and
+  needs no pixel constants at any DPI. ALL PASS (54) ×3. The **negative
+  control** (`T123_NEUTERED`, left in the source) fails **exactly those 6 and
+  nothing else**, and its numbers are the user's report measured: a >360px
+  value wrapped at 146px on a 1400px pane while the short one sat at 121px;
+  narrowing 1400 → 520 moved the band 146 → 146, i.e. not at all; a 90-char
+  token took one clipped line; one nasty cell blew the band to 446px. The pane
+  measured 1382 → 502 px across that resize, so "a banner can pin a minimum
+  pane width" is closed by measurement.
+- Two harness traps worth remembering. **Non-ASCII inside a PowerShell string
+  literal** in a BOM-less UTF-8 `.ps1`: PS 5.1 decodes it as cp1252 and an em
+  dash becomes `â€"` — that `"` is a smart quote PS treats as a **string
+  delimiter**, so the parse blows up lines later. Every em dash already in
+  these scripts sits in a COMMENT, which is why it had never bitten. And the
+  file-rewrite half of the same trap bit me directly: `(Get-Content -Raw) |
+  Set-Content -Encoding utf8` mojibaked `BannerOverlay.zig` in one shot
+  (recovered by re-encoding the UTF-8 read back through cp1252 — the round trip
+  is exactly reversible). Use the Edit tool on repo text; never a PowerShell
+  whole-file rewrite.
+- Filed **T184** (text/heading/list blocks still clip instead of wrapping — the
+  same complaint one block type over, and the T123 machinery is what fixes it),
+  **T183** (an agent-server test that panics on a null when its temp dir
+  vanishes; it took the none lane red once while P1–P3 ran concurrently and
+  passed solo — a floor lane that lies is expensive), and **T182** from a live
+  user question: `/reset-context` shouted `RESET-CONTEXT FAILED` on a reset
+  that fully worked, because T133's new check looks for the continuation text
+  echoed in the pane and *accepting* the prompt is what erases it. Both lanes,
+  `test-agent` and P1–P3 green. Next: **T144** per 3f.

@@ -981,9 +981,12 @@ pub fn setPaneBanner(self: *Surface, text: ?[]const u8) void {
 /// the sticky banner strip (T101), clamped to the pane slot. Records the
 /// reservation on the overlay so updatePosition glues the strip into the
 /// reserved band. 0 when no banner is set.
-pub fn bannerLayoutInset(self: *Surface, slot_h: i32) i32 {
+///
+/// `slot_w` is the pane slot's width, fed down so the banner's tables size
+/// their columns to the pane and re-measure on every resize (T123).
+pub fn bannerLayoutInset(self: *Surface, slot_w: i32, slot_h: i32) i32 {
     const overlay = self.banner_overlay orelse return 0;
-    const inset = banner_layout.clampInset(overlay.insetHeight(self.scale), slot_h);
+    const inset = banner_layout.clampInset(overlay.insetHeight(self.scale, slot_w), slot_h);
     overlay.inset = inset;
     return inset;
 }

@@ -576,6 +576,75 @@ if ($ovE) {
 & $exe +set-banner --target=bw --clear | Out-Null
 $null = Wait-Banner 'bw' 0 'NONE'
 
+# --- 6g. T123: table columns size to the PANE, not a fixed 360pt cap -------
+# The banner used to size every table column at min(natural, 360px), so a
+# value wider than 360 wrapped on a pane with hundreds of px to spare, and
+# narrowing the pane never rewrapped it. Every oracle here is the BAND
+# HEIGHT, which is the number of display rows the table produced — a
+# self-relative measure that needs no pixel constants.
+$oneRow = [int]($twoLines / 2)   # one text row incl. its row gap
+# Wide value: naturally ~2x the old 360px cap, but comfortably inside a
+# 1400px pane. Short value: the same table with a one-word value.
+$longVal = 'ready to merge after the final review pass lands on main'
+$tblLong = "| Goal | Value |\n|---|---|\n| ship | $longVal |"
+$tblShort = "| Goal | Value |\n|---|---|\n| ship | ok |"
+function Get-BandH([string]$text) {
+    & $exe +set-banner --target=bw $text | Out-Null
+    $null = Wait-Banner 'bw' 0 ($text -replace '\\n', "`n")
+    Start-Sleep -Milliseconds 700
+    $o = Get-Overlay $pid32 $top
+    if (-not $o) { return 0 }
+    $r = $o -split ','
+    return [int]$r[3] - [int]$r[1]
+}
+
+# Wide pane: the long value must NOT wrap - it fits, so it gets its natural
+# width and the table is the same height as the short-value one.
+[BannerDrv]::SetWindowPos($top, [IntPtr](-1), 100, 100, 1400, 700, 0x0040) | Out-Null
+Start-Sleep -Milliseconds 900
+$wideShortH = Get-BandH $tblShort
+$wideLongH = Get-BandH $tblLong
+$paneWide = (Get-Pane $top 0) -split ','
+$wideW = [int]$paneWide[2] - [int]$paneWide[0]
+Assert ($wideShortH -gt 0 -and $wideLongH -gt 0) "wide pane: banner measured ($wideShortH / $wideLongH px)"
+Assert ($wideLongH -eq $wideShortH) "wide pane: a >360px value does not wrap (short $wideShortH == long $wideLongH px)"
+
+# Narrow pane: the SAME banner must reflow - more rows, taller band. Before
+# the fix the columns were pinned at 360px and this height never moved.
+[BannerDrv]::SetWindowPos($top, [IntPtr](-1), 100, 100, 520, 700, 0x0040) | Out-Null
+Start-Sleep -Milliseconds 900
+$narrowLongH = Get-BandH $tblLong
+$paneNarrow = (Get-Pane $top 0) -split ','
+$narrowW = [int]$paneNarrow[2] - [int]$paneNarrow[0]
+Assert ($narrowW -lt $wideW - 500) "the pane really shrank ($wideW -> $narrowW px): the banner is no minimum width"
+Assert ($narrowLongH -gt $wideLongH) "narrow pane: the table reflowed taller ($wideLongH -> $narrowLongH px)"
+# A wrapped line INSIDE a cell adds the bare line height, while $oneRow is
+# a line height plus the 8/20 inter-block gap - so a real extra display
+# line is always more than 60% of $oneRow, at any DPI. That separates a
+# genuine rewrap from a rounding wobble without hard-coding pixels.
+Assert (($narrowLongH - $wideLongH) -ge [int]($oneRow * 0.6)) "narrow pane: reflow added a whole display line (+$($narrowLongH - $wideLongH) px, row ~$oneRow px)"
+
+# A long UNBROKEN token has no space to wrap at, so it must break
+# mid-string; before the fix it took one over-wide line and clipped.
+$blob = 'A' * 90
+$narrowBlobH = Get-BandH "| K | V |\n|---|---|\n| x | $blob |"
+Assert ($narrowBlobH -gt ($wideShortH + $oneRow - 4)) "narrow pane: a 90-char unbroken token breaks mid-string ($narrowBlobH px vs 1-row $wideShortH px)"
+
+# A cell is capped at 3 display lines: 4x the text must not make the band
+# any taller than 2x did.
+$sentence = 'the quick brown fox jumps over the lazy dog and keeps on running '
+$cap2 = Get-BandH ("| K | V |\n|---|---|\n| x | " + ($sentence * 2).Trim() + " |")
+$cap8 = Get-BandH ("| K | V |\n|---|---|\n| x | " + ($sentence * 8).Trim() + " |")
+Assert ($cap8 -eq $cap2) "cell capped at 3 wrapped lines: 4x the text is the same height ($cap2 vs $cap8 px)"
+# 3 lines instead of 1 is +2 display lines, each smaller than $oneRow.
+Assert ($cap8 -le ($wideShortH + 2 * $oneRow)) "capped cell stays within header + 3 lines ($cap8 px, 1-row $wideShortH px, row ~$oneRow px)"
+Assert (-not $proc.HasExited) 'reflow section: GUI alive'
+
+& $exe +set-banner --target=bw --clear | Out-Null
+$null = Wait-Banner 'bw' 0 'NONE'
+[BannerDrv]::SetWindowPos($top, [IntPtr](-1), 100, 100, 1100, 700, 0x0040) | Out-Null
+Start-Sleep -Milliseconds 900
+
 # --- 7. per-pane: named split pane gets its own banner ---------------------
 & $exe +split --target=bw --name=bp1 --direction=down | Out-Null
 Start-Sleep -Seconds 1

@@ -254,8 +254,10 @@ pub const WrapLine = struct { start: usize, end: usize };
 /// measured width; `is_space[i]` marks whitespace tokens. A break happens
 /// before a non-space token that would exceed `max_w`; space tokens at a
 /// line start are dropped. A lone token wider than `max_w` gets its own
-/// line (it clips rather than breaking mid-token — the sole divergence
-/// from the Mac, which can break a super-long word mid-character).
+/// line — breaking it mid-string is the CALLER's job, done by measuring
+/// sub-token chunks before wrapping (`BannerOverlay.breakWideTokens`,
+/// T123), because only the caller owns the device context the split has
+/// to be measured against.
 pub fn wrapTokens(
     arena: Allocator,
     widths: []const f32,

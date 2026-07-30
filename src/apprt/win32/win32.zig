@@ -1275,6 +1275,19 @@ pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
 // Pane-banner run painting (T35): sequential styled text segments.
 pub extern "gdi32" fn TextOutW(hdc: HDC, x: i32, y: i32, lpString: [*]const u16, c: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn GetTextExtentPoint32W(hdc: HDC, lpString: [*]const u16, c: i32, psizl: *SIZE) callconv(.winapi) i32;
+/// Longest prefix that fits a pixel budget: `lpnFit` receives the number of
+/// UTF-16 units of `lpszString` that fit within `nMaxExtent`. One call
+/// instead of a measure-per-prefix loop when breaking a long unbroken token
+/// mid-string in a banner table cell (T123).
+pub extern "gdi32" fn GetTextExtentExPointW(
+    hdc: HDC,
+    lpszString: [*]const u16,
+    cchString: i32,
+    nMaxExtent: i32,
+    lpnFit: ?*i32,
+    lpnDx: ?[*]i32,
+    lpSize: *SIZE,
+) callconv(.winapi) i32;
 pub extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(.winapi) ?*anyopaque;
 pub const PS_SOLID: i32 = 0;
 pub extern "gdi32" fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: ?*anyopaque) callconv(.winapi) i32;
