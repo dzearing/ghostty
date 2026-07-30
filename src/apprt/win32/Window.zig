@@ -1024,6 +1024,72 @@ pub fn addTab(self: *Window) !*Surface {
     return surface;
 }
 
+/// Replace a tab's ENTIRE split tree with a single fresh surface built from
+/// `overrides`, and return it (T145, in-place local-agent crash recovery).
+///
+/// This is a SWAP, not a close. The departing surfaces are released by the old
+/// tree's `deinit` with their default teardown intent — DETACH, keep-alive —
+/// and this function deliberately never calls `setSessionCloseIntent`: the
+/// caller's whole purpose is to re-ATTACH those same agent sessions, so ending
+/// them here would terminate the children of the panes it is recovering (the
+/// Mac `e65cfa4d5` incident, stated as an invariant in
+/// `agent_recovery.sessionSpared`).
+///
+/// The tab's presentation state (title, pin, color, hero) is untouched — it
+/// lives on the window and was never lost. On failure the old tree is left
+/// exactly as it was.
+pub fn replaceTabRootSurface(
+    self: *Window,
+    tab_index: usize,
+    overrides: *Surface.Overrides,
+) !*Surface {
+    if (self.closing) return error.WindowClosing;
+    if (tab_index >= self.tab_count) return error.InvalidTabIndex;
+    const alloc = self.app.core_app.alloc;
+
+    // Build the replacement FIRST: if it fails, the tab keeps the surfaces it
+    // has (frozen, but present) rather than being emptied.
+    self.pending_surface_overrides = overrides;
+    defer self.pending_surface_overrides = null;
+
+    const surface = try alloc.create(Surface);
+    surface.init(self.app, self, .tab) catch |err| {
+        alloc.destroy(surface);
+        return err;
+    };
+    var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
+        surface.deinit();
+        alloc.destroy(surface);
+        return err;
+    };
+    errdefer tree.deinit();
+
+    // Swap, then release the old tree. Order matters: the window must never be
+    // observable holding a freed tree, and unref'ing the old surfaces runs
+    // their teardown (which posts messages).
+    var old_tree = self.tab_trees[tab_index];
+    self.tab_trees[tab_index] = tree;
+    self.tab_active_surface[tab_index] = surface;
+    self.tab_hero_active[tab_index] = false;
+    self.tab_hero_index[tab_index] = 0;
+    old_tree.deinit();
+
+    return surface;
+}
+
+/// Show or hide every surface in one tab. Fresh surfaces start visible, so a
+/// caller that rebuilds a BACKGROUND tab (T145 in-place recovery) must hide its
+/// panes or they paint over the active tab.
+pub fn setTabSurfacesVisible(self: *Window, tab: usize, visible: bool) void {
+    if (tab >= self.tab_count) return;
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        entry.view.setVisible(visible);
+        if (entry.view.hwnd) |h|
+            _ = w32.ShowWindow(h, if (visible) w32.SW_SHOW else w32.SW_HIDE);
+    }
+}
+
 /// Close a tab by surface pointer. Removes from the tab list,
 /// deinits the tree, and adjusts the active tab index.
 pub fn closeTab(self: *Window, surface: *Surface) void {

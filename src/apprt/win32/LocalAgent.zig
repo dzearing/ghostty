@@ -74,6 +74,31 @@ alloc: Allocator,
 /// until the first successful resolve (or after the agent is found dead).
 shared: ?tcp_dial.Dialed = null,
 
+/// The pid of the agent process `shared` is talking to, as recorded in its info
+/// file at dial time. 0 when unknown. Read by the crash-recovery policy (T145)
+/// to tell "the agent restarted" from "the transport failed while the SAME
+/// agent kept running" — a distinction that only shows up in the log, but its
+/// absence is what made the Mac's 2026-07-21 incident hard to diagnose.
+shared_pid: i64 = 0,
+
+/// Connections that have been REPLACED but not freed. See `retire`: surfaces
+/// borrow `*Connection` and nothing refcounts it, so a connection may only be
+/// destroyed once every surface that could still touch it is gone — which is
+/// app teardown. Bounded in practice by the number of agent crashes in one app
+/// run.
+retired: std.ArrayList(tcp_dial.Dialed) = .empty,
+
+/// The link-state observer applied to EVERY connection this manager installs as
+/// shared (T145). Stored rather than set once, because recovery replaces the
+/// connection and the replacement needs watching just as much as the original —
+/// a second agent crash must be caught too.
+///
+/// NOTE for whoever writes the handler: it fires on the connection's reader
+/// thread, under `state_mutex`. It must not re-enter `Connection`, and it must
+/// not touch GUI state — post a message and return.
+state_ctx: ?*anyopaque = null,
+state_handler: ?connection.StateHandler = null,
+
 /// Timestamp (ms) of the last find-or-spawn failure, or null. Guards the
 /// cooldown so a broken agent falls back to exec immediately.
 last_failure_ms: ?i64 = null,
@@ -89,6 +114,148 @@ pub fn init(alloc: Allocator) LocalAgent {
 pub fn deinit(self: *LocalAgent) void {
     if (self.shared) |*d| d.deinit();
     self.shared = null;
+    // Safe here and ONLY here: `App.terminate` deinits every window (and thus
+    // every surface that borrowed one of these) before calling us.
+    for (self.retired.items) |*d| d.deinit();
+    self.retired.deinit(self.alloc);
+    self.retired = .empty;
+}
+
+/// Stop using `dialed` as the shared connection without FREEING it (T145).
+///
+/// `tcp_dial.Dialed.deinit` calls `conn.destroy(alloc)`, but that pointer is
+/// borrowed all over: `Surface.remote_conn`, `Window.local_agent_conn`, and the
+/// shared `termio.Remote` backend all hold it, and nothing refcounts it. So
+/// destroying a replaced connection while any surface still exists is a
+/// use-after-free — which is exactly what the pre-T145 dead-connection drop in
+/// `sharedConnection` did. Instead we `shutdown` (idempotent; unblocks anyone
+/// waiting on it and makes every later send fail cleanly) and keep the
+/// allocation alive until app teardown. One live-forever connection per agent
+/// crash is a trade we take: liveness beats cleanliness when the alternative is
+/// a dangling pointer in the user's terminal.
+fn retire(self: *LocalAgent, dialed: tcp_dial.Dialed) void {
+    var d = dialed;
+    // Stop it observing first: a retired connection's dying transitions are
+    // noise, and the watcher would otherwise re-open a settle window on a link
+    // nobody is using. `clearStateHandler` returns only once any in-flight
+    // handler has finished, so this is also the teardown-safe ordering.
+    d.conn.clearStateHandler();
+    d.conn.shutdown();
+    self.retired.append(self.alloc, d) catch {
+        // Out of memory while retiring: dropping the struct leaks it outright,
+        // which is still strictly safer than destroying a borrowed connection.
+        log.warn("retired local-agent connection could not be tracked; leaking it", .{});
+    };
+}
+
+/// Register the link-state observer for the shared connection, now and for
+/// every connection that replaces it. Applied immediately when one is already
+/// dialed.
+pub fn setStateObserver(
+    self: *LocalAgent,
+    ctx: *anyopaque,
+    handler: connection.StateHandler,
+) void {
+    self.state_ctx = ctx;
+    self.state_handler = handler;
+    self.applyStateObserver();
+}
+
+fn applyStateObserver(self: *LocalAgent) void {
+    const ctx = self.state_ctx orelse return;
+    const handler = self.state_handler orelse return;
+    if (self.shared) |*d| d.conn.setStateHandler(ctx, handler);
+}
+
+/// The shared connection's transport link state, or null when there is no
+/// shared connection at all. The crash-recovery watcher (T145) samples this;
+/// see `agent_recovery.zig` for what a down link is allowed to mean.
+pub fn linkState(self: *LocalAgent) ?connection.LinkState.State {
+    if (self.shared) |*d| return d.conn.state();
+    return null;
+}
+
+/// The pid of the agent process the shared connection was dialed against, or 0
+/// when unknown / not connected.
+pub fn sharedPid(self: *const LocalAgent) i64 {
+    return if (self.shared == null) 0 else self.shared_pid;
+}
+
+/// The pid of a LIVE agent process as recorded in the info file, or null when
+/// there is no info file, no pid, or that pid is not a running process.
+///
+/// The liveness check is the whole point (Mac gates the same read on
+/// `kill(pid, 0)`): a crashed agent leaves its `port.json` behind, so a
+/// file-only read would report the dead agent's pid, match it against the pid
+/// we had, and conclude "same agent, transport failed" about a process that no
+/// longer exists. Deliberately does not dial or spawn — this answers "did the
+/// agent restart?" on the deciding tick of a settle window, not "is it well?".
+pub fn liveAgentPid(self: *LocalAgent) ?i64 {
+    const info = self.readInfoFile() orelse return null;
+    if (info.pid <= 0) return null;
+    if (!processAlive(info.pid)) return null;
+    return info.pid;
+}
+
+/// Whether `pid` names a currently-running process. Access-denied counts as
+/// ALIVE (the Mac's `errno == EPERM` arm): a process we cannot open is still a
+/// process, and reporting it dead would invent an agent restart.
+fn processAlive(pid: i64) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (pid <= 0 or pid > std.math.maxInt(u32)) return false;
+    const windows = std.os.windows;
+    const h = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        windows.FALSE,
+        @intCast(pid),
+    ) orelse {
+        return windows.kernel32.GetLastError() == .ACCESS_DENIED;
+    };
+    defer windows.CloseHandle(h);
+    // An exited process keeps a queryable handle until the last one closes, so
+    // existence is not liveness — the exit code is.
+    var code: windows.DWORD = 0;
+    if (windows.kernel32.GetExitCodeProcess(h, &code) == 0) return true;
+    return code == STILL_ACTIVE;
+}
+
+/// Declared here rather than taken from `std.os.windows.kernel32`, which does
+/// not export it (`src/remote/agent/proc.zig` does the same).
+extern "kernel32" fn OpenProcess(
+    dwDesiredAccess: std.os.windows.DWORD,
+    bInheritHandle: std.os.windows.BOOL,
+    dwProcessId: std.os.windows.DWORD,
+) callconv(.winapi) ?std.os.windows.HANDLE;
+
+const PROCESS_QUERY_LIMITED_INFORMATION: std.os.windows.DWORD = 0x1000;
+const STILL_ACTIVE: std.os.windows.DWORD = 259;
+
+/// Re-dial the local agent for in-place crash recovery (T145) and install the
+/// result as the new shared connection, retiring (never freeing) the old one.
+/// Returns the fresh connection, or null when no agent could be reached within
+/// the normal find-or-spawn budget — in which case the OLD connection is left
+/// in place, because handing the caller nothing to re-ATTACH to is worse than
+/// leaving frozen panes pointing at a dead link they can retry later.
+///
+/// Ignores the failure cooldown: a confirmed drop already waited out the settle
+/// window, and recovery is a deliberate user-visible act, not a per-surface
+/// fallback.
+pub fn reconnectForRecovery(self: *LocalAgent) ?*connection.Connection {
+    if (comptime builtin.os.tag != .windows) return null;
+
+    const dialed = self.findOrSpawn() orelse {
+        self.last_failure_ms = std.time.milliTimestamp();
+        log.warn("in-place recovery: no local agent could be reached", .{});
+        return null;
+    };
+
+    if (self.shared) |old| self.retire(old);
+    self.shared = dialed;
+    self.shared_pid = if (self.readInfoFile()) |i| i.pid else 0;
+    self.last_failure_ms = null;
+    self.applyStateObserver();
+    log.info("in-place recovery: re-dialed the local agent (pid {d})", .{self.shared_pid});
+    return self.shared.?.conn;
 }
 
 /// Resolve the shared local-agent connection for a NEW persistent surface,
@@ -105,13 +272,15 @@ pub fn sharedConnection(self: *LocalAgent) ?*connection.Connection {
     if (comptime builtin.os.tag != .windows) return null;
 
     // Fast path: a warm, healthy cached connection — no dial, no wait.
-    if (self.shared) |*d| {
+    if (self.shared) |d| {
         if (d.conn.state() != .dead) return d.conn;
-        // The cached connection went dead (agent crashed): drop it. Surfaces
-        // still riding it keep their own reference alive via the core; a fresh
-        // resolve re-dials the (respawned) agent.
-        d.deinit();
+        // The cached connection went dead (agent crashed): stop handing it to
+        // new surfaces and RETIRE it. It must not be freed here — the surfaces
+        // already riding it hold the raw pointer and nothing refcounts it
+        // (T145). A fresh resolve below re-dials the respawned agent.
+        self.retire(d);
         self.shared = null;
+        self.shared_pid = 0;
     }
 
     // Known-broken recently: fall back to exec now, no probe.
@@ -124,8 +293,10 @@ pub fn sharedConnection(self: *LocalAgent) ?*connection.Connection {
         return null;
     };
     self.shared = dialed;
+    self.shared_pid = if (self.readInfoFile()) |i| i.pid else 0;
     self.last_failure_ms = null;
-    log.info("shared local-agent connection ready", .{});
+    self.applyStateObserver();
+    log.info("shared local-agent connection ready (agent pid {d})", .{self.shared_pid});
 
     // Persistence just engaged: make sure the agent also comes back after a
     // reboot, so sessions rematerialize as relaunchable tombstones (T89h).
@@ -229,6 +400,29 @@ fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
 /// (dead agent) fails the dial fast — the pipe name vanishes with the agent's
 /// last handle (T89c) — so a failed dial reliably means "no healthy agent".
 fn dialExisting(self: *LocalAgent) ?tcp_dial.Dialed {
+    const info = self.readInfoFile() orelse return null;
+    if (info.pipe_len == 0) return null;
+    const pipe = info.pipe_buf[0..info.pipe_len];
+
+    return tcp_dial.dialPipeTimeout(self.alloc, pipe, .raw, probe_handshake_ns) catch |err| {
+        log.debug("dial existing agent failed err={}", .{err});
+        return null;
+    };
+}
+
+/// The agent's info file as OWNED, allocation-free data. The pipe name is
+/// copied into a fixed buffer rather than handed back as a borrowed slice: the
+/// JSON arena has to die with this call, and every caller either dials the pipe
+/// immediately or only wants the pid.
+const Info = struct {
+    pid: i64 = 0,
+    pipe_buf: [256]u8 = undefined,
+    pipe_len: usize = 0,
+};
+
+/// Read + parse `port.json`. Null when absent, unreadable, or not JSON — all of
+/// which mean "no agent we can name", never an error worth surfacing.
+fn readInfoFile(self: *LocalAgent) ?Info {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const info_path = self.infoFilePath(&buf) catch return null;
 
@@ -239,13 +433,14 @@ fn dialExisting(self: *LocalAgent) ?tcp_dial.Dialed {
     }) catch return null;
     defer parsed.deinit();
 
-    const pipe = parsed.value.pipe orelse return null;
-    if (pipe.len == 0) return null;
-
-    return tcp_dial.dialPipeTimeout(self.alloc, pipe, .raw, probe_handshake_ns) catch |err| {
-        log.debug("dial existing agent failed err={}", .{err});
-        return null;
-    };
+    var out: Info = .{ .pid = parsed.value.pid };
+    if (parsed.value.pipe) |p| {
+        if (p.len > 0 and p.len <= out.pipe_buf.len) {
+            @memcpy(out.pipe_buf[0..p.len], p);
+            out.pipe_len = p.len;
+        }
+    }
+    return out;
 }
 
 /// The agent's `--port-file` body (T89c). A Windows named-pipe agent writes

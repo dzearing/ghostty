@@ -137,4 +137,10 @@ test {
     // no-OS-imports deal (LOCALAPPDATA path resolution degrades cleanly off
     // Windows / in the none lane).
     _ = @import("apprt/win32/session_layout.zig");
+
+    // Pure win32 local-agent crash-recovery policy: when a dropped shared link
+    // is a real drop, and whose session a tree swap may never end (T145). Its
+    // only non-std import is the shared-core `remote/connection.zig` link-state
+    // enum, which builds in every lane.
+    _ = @import("apprt/win32/agent_recovery.zig");
 }

@@ -2704,3 +2704,68 @@ T146). Next: **T174**, then T142.
   boundary — with `-ResumePrompt` set to this turn's `/reset-context`, so the
   reset lands after the swap and the fresh session verifies the upgrade log
   and `+version` first.
+
+## 2026-07-30 - T145 done: a dead agent no longer means dead panes until you relaunch
+
+Kill the local `ghoztty-agent` while the GUI is up and, before this, every
+persistent pane was frozen until the user quit and relaunched — the exact
+failure session persistence exists to prevent. Windows had only launch-time
+restore (T89f2); the Mac's in-place recovery (`03f0f1f30`, hardened by
+`e65cfa4d5`) had no equivalent here.
+
+- **Split first.** The row named two Mac commits that are two mechanisms, and
+  the second (`20e505aaf`, reconcile launch restore against the agent's
+  authoritative layouts) turns out to need machinery win32 does not have:
+  **win32 never calls `SET_LAYOUT` at all**, so a straight port would union
+  against an always-empty roster and change nothing. That half is now **T194**.
+- **The decisions are pure** (`agent_recovery.zig`): the settle-window verdict
+  and the "whose session may a tree swap end?" invariant, unit-tested in both
+  lanes. Detection is EVENT-DRIVEN — the connection FSM's state handler fires on
+  the reader thread under `state_mutex`, so it posts `WM_APP_AGENT_LINK_DOWN`
+  and returns (the T190 post-don't-track-inline pattern); the settle timer is
+  armed only while a down link is being judged, so an idle app does no polling.
+- **The rebuild reuses the restore walker.** `recoverLocalAgentInPlace` captures
+  the live topology into the same `session_layout` structs the manifest uses and
+  replays each tab through `restoreFirstLeaf`/`restoreAttachOverride`/
+  `restoreBuildSubtree`, so ratios, tab colors, hero ratios, pinned titles, IPC
+  names and pane ids all come back through code every restore test covers. One
+  new primitive: `Window.replaceTabRootSurface`, which swaps a tab's whole tree
+  and deliberately never marks close intent — the departing leaves left because
+  we replaced them, and their sessions are the ones the new leaves just
+  re-ATTACHed (`e65cfa4d5`).
+- **A live use-after-free was fixed on the way in.** `sharedConnection` freed a
+  dead cached connection (`Dialed.deinit` → `conn.destroy`) while
+  `Surface.remote_conn` and `Window.local_agent_conn` still held that raw
+  pointer; the comment claiming the core kept it alive was simply wrong, nothing
+  refcounts it. Replaced connections are now RETIRED — shut down, kept
+  allocated — and freed only in `LocalAgent.deinit`, which `App.terminate`
+  already runs after every window is gone.
+- **Measured, not argued.** A file-only pid read would have misdiagnosed every
+  crash: a dead agent leaves `port.json` behind, so the recorded pid would have
+  MATCHED and the app would have logged "same agent, transport failed" about a
+  process that no longer exists. `liveAgentPid` gates on the pid being a running
+  process (Mac gates the same read on `kill(pid, 0)`), with access-denied
+  counting as alive.
+- New `test/win32/agent-recovery.ps1` **ALL PASS (25) ×3** — and the assertion
+  that carries the task is C6, a marker round-tripping through the rebuilt pane.
+  Section B proves the trap is ARMED (the panes are genuinely broken before
+  recovery is asserted) and C4 pins the defining invariant that the APP pid
+  never changed.
+- **Negative control, run for real.** With the watch disabled the script failed
+  **exactly** the six recovery assertions (C1/C2/C5/C6/D1/D2) and nothing else.
+  That sections A, B and E still passed is the point: the topology survives a
+  dead agent, so only RESPONSIVENESS separates recovered from frozen — a
+  topology-only test would have passed the broken build.
+- **The harness lied three times before it measured anything.** Timed
+  `WaitForExit(ms)` leaves `ExitCode` unreadable unless you touch `$p.Handle`
+  first; a quoted argument through `cmd /c` reaches cmd WITH its quotes
+  (`'"echo MARK"' is not recognized`); and the minimized test window makes a
+  split pane a couple of columns wide, so the marker WRAPS one character per row
+  and fell off the top of a 25-line read. All three scored a working pane as
+  broken.
+- Floor: both lanes + `test-agent` + P1–P3 green; regressions `session-reattach`,
+  `session-open`, `session-close`, `session-relaunch` ALL PASS, plus
+  `split-divider` (25) and `pane-banner` (54) because the swap touches tab
+  visibility and surface lifetime.
+- Filed **T194** (the split-out launch-restore half) and **T195** (the settle
+  window is unit-tested but has no on-box blip test).

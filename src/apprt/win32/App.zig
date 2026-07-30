@@ -35,6 +35,7 @@ const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
 const session_layout = @import("session_layout.zig");
+const agent_recovery = @import("agent_recovery.zig");
 const host_defaults = @import("host_defaults.zig");
 const w32 = @import("win32.zig");
 
@@ -68,6 +69,13 @@ pub const WM_APP_IPC: u32 = w32.WM_APP + 4;
 /// WndProc. See `deferSetFocus` for why (T48 deadlock).
 pub const WM_APP_SETFOCUS: u32 = w32.WM_APP + 5;
 
+/// Posted to `msg_hwnd` when the shared local-agent connection's transport link
+/// goes DOWN (T145). The observer that posts this runs on the connection's
+/// reader thread under its `state_mutex`, so it may not touch GUI state or
+/// re-enter `Connection` — it posts and returns, and the settle watch below
+/// runs on the GUI thread. (WM_APP+9/+10 are RelayAccountRow / Window's open-menu.)
+const WM_APP_AGENT_LINK_DOWN: u32 = w32.WM_APP + 11;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
@@ -91,6 +99,11 @@ const LAYOUT_SYNC_DEBOUNCE_MS: u32 = 250;
 /// re-arm forever (~40 × 400ms ≈ 16s ceiling).
 const LAYOUT_SYNC_RETRY_MS: u32 = 400;
 const LAYOUT_SYNC_MAX_RETRIES: u16 = 40;
+
+/// Timer ID (on `msg_hwnd`) for the local-agent link settle watch (T145). Armed
+/// only while a down link is being judged — there is no idle polling; the down
+/// EDGE arrives as `WM_APP_AGENT_LINK_DOWN`.
+const AGENT_WATCH_TIMER_ID: usize = 5;
 
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWindow");
@@ -200,6 +213,18 @@ ipc_registry: IpcRegistry = .{},
 /// (mirrors the Mac `LocalAgentManager.sharedOwner`). Bounded + non-fatal:
 /// see `LocalAgent.sharedConnection`.
 local_agent: LocalAgent = undefined,
+
+/// Deadline (ms, `milliTimestamp` scale) by which the shared local-agent link
+/// must come back before its drop counts as real (T145). Non-null ⇒ a settle
+/// watch is running and `AGENT_WATCH_TIMER_ID` is armed. Overlapping down edges
+/// (`reconnecting → dead`) share ONE window: the first one arms it and the rest
+/// are ignored, matching the Mac's single `sharedLinkDropWatchOwner`.
+agent_settle_deadline_ms: ?i64 = null,
+
+/// True while `recoverLocalAgentInPlace` is running. Recovery closes and builds
+/// surfaces, which re-enters the layout-sync and IPC paths; a link transition
+/// arriving mid-rebuild must not start a second recovery on top of the first.
+agent_recovering: bool = false,
 
 pub const IpcTarget = IpcRegistry.Target;
 
@@ -561,6 +586,12 @@ pub fn run(self: *App) !void {
         (if (self.windows.items.len > 0) self.windows.items[0] else null);
     if (diag_owner) |w| self.showConfigErrorsIfAny(&self.config, w);
 
+    // T145: start watching the shared local-agent link, now that the startup
+    // windows (restored or blank) have resolved a connection. From here a dead
+    // agent is NOTICED and the local windows rebuild in place, instead of the
+    // panes sitting frozen until the user quits and relaunches.
+    self.installLocalAgentWatch();
+
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
     loop: while (true) {
@@ -741,6 +772,8 @@ pub fn terminate(self: *App) void {
     // the topology we capture here is exactly what the next launch re-attaches.
     // Kill any pending debounce timer first so it can't fire mid-teardown.
     if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
+    // T145: no in-place recovery during teardown — the windows are about to go.
+    self.endAgentSettleWatch();
     self.syncSessionLayout();
 
     if (self.update_latest_ver) |v| {
@@ -1304,6 +1337,284 @@ fn restoreBuildSubtree(
 
     try self.restoreBuildSubtree(window, nodes, sp.left, anchor, conn, attach, depth + 1);
     try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, conn, attach, depth + 1);
+}
+
+// =============================================================================
+// In-place local-agent crash recovery (T145)
+// =============================================================================
+
+/// Install the shared-connection link observer so a dropped local-agent link is
+/// NOTICED (T145). Idempotent and cheap; `LocalAgent` re-applies it to every
+/// connection it installs as shared, including the one recovery dials, so a
+/// second agent crash is caught the same way as the first.
+///
+/// Without this the app only discovers a dead agent lazily, when the next
+/// surface asks for a connection — i.e. the user's existing panes stay frozen
+/// until they happen to open a new window, which is the whole defect.
+pub fn installLocalAgentWatch(self: *App) void {
+    if (!self.config.@"session-persistence") return;
+    self.local_agent.setStateObserver(self, onLocalAgentLinkChange);
+}
+
+/// Link-state observer. Runs on the CONNECTION'S READER THREAD, under its
+/// `state_mutex`: it may not touch GUI state, allocate into app structures, or
+/// re-enter `Connection`. It posts and returns; every decision happens on the
+/// GUI thread in `beginAgentSettleWatch`.
+fn onLocalAgentLinkChange(
+    ctx: *anyopaque,
+    conn: *remote_connection.Connection,
+    old: remote_connection.LinkState.State,
+    new: remote_connection.LinkState.State,
+) void {
+    _ = conn;
+    // Only DOWN edges are interesting. A link that is already down and moves
+    // between down states (`reconnecting → dead`) posts again, which is
+    // harmless: the watch is single-shot per settle window.
+    if (!agent_recovery.isDown(new)) return;
+    if (agent_recovery.isDown(old) and old == new) return;
+
+    const self: *App = @ptrCast(@alignCast(ctx));
+    // `msg_hwnd` is created in `init` and cleared in `terminate`, both on the
+    // GUI thread. A racing teardown at worst drops this post, and a teardown is
+    // exactly when recovery is pointless anyway.
+    const hwnd = self.msg_hwnd orelse return;
+    _ = w32.PostMessageW(hwnd, WM_APP_AGENT_LINK_DOWN, 0, 0);
+}
+
+/// Start the settle window for a down shared link, or do nothing if one is
+/// already running (overlapping down edges share ONE window). GUI thread.
+fn beginAgentSettleWatch(self: *App) void {
+    if (self.agent_settle_deadline_ms != null) return;
+    if (self.agent_recovering) return;
+    const hwnd = self.msg_hwnd orelse return;
+    const state = self.local_agent.linkState() orelse return;
+    if (!agent_recovery.isDown(state)) return;
+
+    self.agent_settle_deadline_ms = std.time.milliTimestamp() + agent_recovery.settle_ms;
+    _ = w32.SetTimer(hwnd, AGENT_WATCH_TIMER_ID, agent_recovery.poll_ms, null);
+    log.warn(
+        "shared local-agent link went down (state={s}); watching {d}ms before deciding on in-place recovery",
+        .{ @tagName(state), agent_recovery.settle_ms },
+    );
+}
+
+/// End the settle watch and disarm its timer. GUI thread.
+fn endAgentSettleWatch(self: *App) void {
+    self.agent_settle_deadline_ms = null;
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, AGENT_WATCH_TIMER_ID);
+}
+
+/// One tick of the settle window: sample the link, ask the pure policy what it
+/// means, and act. GUI thread.
+fn tickAgentSettleWatch(self: *App) void {
+    const deadline = self.agent_settle_deadline_ms orelse return;
+    const remaining = deadline - std.time.milliTimestamp();
+
+    // No shared connection at all ⇒ a racing re-dial (or teardown) already
+    // replaced what we were watching.
+    const state = self.local_agent.linkState() orelse {
+        self.endAgentSettleWatch();
+        log.info("local-agent link watch ended: no shared connection to judge", .{});
+        return;
+    };
+
+    // Only touch the filesystem on the deciding tick — the pid read is the one
+    // expensive part of the policy's inputs.
+    const live_pid: ?i64 = if (agent_recovery.isDown(state) and remaining <= 0)
+        self.local_agent.liveAgentPid()
+    else
+        null;
+
+    const verdict = agent_recovery.evaluate(
+        state,
+        true, // linkState() is by definition the CURRENT shared connection
+        remaining,
+        self.local_agent.sharedPid(),
+        live_pid,
+    );
+
+    switch (verdict) {
+        .keep_watching => return,
+        .link_recovered => {
+            self.endAgentSettleWatch();
+            log.warn(
+                "shared local-agent link recovered on its own (state={s}); no in-place recovery needed",
+                .{@tagName(state)},
+            );
+        },
+        .owner_replaced => {
+            self.endAgentSettleWatch();
+            log.info("shared local-agent link dropped but a new connection is already in place", .{});
+        },
+        .agent_restarted => |d| {
+            self.endAgentSettleWatch();
+            log.warn(
+                "local agent is gone (was pid {d}, now {?d}); recovering local windows in place",
+                .{ d.previous_pid, d.current_pid },
+            );
+            self.recoverLocalAgentInPlace();
+        },
+        .transport_down => |d| {
+            self.endAgentSettleWatch();
+            log.warn(
+                "local-agent transport failed but agent pid {d} is still alive; recovering local windows in place",
+                .{d.pid},
+            );
+            self.recoverLocalAgentInPlace();
+        },
+    }
+}
+
+/// Rebuild every local-agent-backed window's split topology onto a FRESH
+/// connection, without relaunching the app (T145, Mac `03f0f1f30`).
+///
+/// The shape is deliberately the launch-restore path, not a parallel one: we
+/// capture the live topology into the same manifest structs `syncSessionLayout`
+/// writes, re-dial, and then replay each window's tabs through `restoreTab` —
+/// so split ratios, tab colors, hero ratios, pinned titles, IPC pane names and
+/// pane ids all come back through code that is already exercised by every
+/// restore test, and a bug fixed in one place is fixed in both.
+///
+/// What it does NOT do is close anything. The departing surfaces are released
+/// by `SplitTree.deinit`, which tears them down with their DEFAULT intent —
+/// DETACH, keep-alive — because nothing on this path calls
+/// `setSessionCloseIntent(true)`. That is the invariant `agent_recovery
+/// .sessionSpared` states and the whole lesson of Mac `e65cfa4d5`: the leaves
+/// leave because we replaced the tree, and their sessions are the very ones the
+/// new leaves just re-ATTACHed.
+fn recoverLocalAgentInPlace(self: *App) void {
+    if (self.agent_recovering) return;
+    self.agent_recovering = true;
+    defer self.agent_recovering = false;
+
+    const gpa = self.core_app.alloc;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Capture BEFORE re-dialing: the live tree is the source of truth, and the
+    // debounced manifest on disk may be up to a full debounce stale.
+    var pending = false;
+    const captured = self.captureSessionLayout(arena, &pending) catch |err| {
+        log.warn("in-place recovery: layout capture failed err={}", .{err});
+        return;
+    };
+
+    // Re-dial BEFORE rebuilding, and note the ordering is load-bearing:
+    // retiring the old connection shuts it down, so when the departing surfaces
+    // are freed below their DETACH teardown fails fast instead of blocking the
+    // GUI thread on a pipe nobody is reading.
+    const conn = self.local_agent.reconnectForRecovery() orelse return;
+
+    // A respawned agent materializes its recorded sessions from disk as
+    // relaunchable tombstones, so ATTACH is still the right verb — the shared
+    // termio path turns a tombstone into a RELAUNCH with the
+    // `--- session restarted ---` divider (T89g). Probing which ids it knows
+    // keeps a session it has genuinely lost from blocking the rebuild: that
+    // leaf re-opens fresh instead.
+    var roster: ?remote_connection.OwnedSessions = conn.requestSessions(
+        restore_probe_timeout_ns,
+    ) catch |err| blk: {
+        log.warn("in-place recovery: liveness probe failed err={} (treating as unknown)", .{err});
+        break :blk null;
+    };
+    defer if (roster) |*s| s.deinit();
+
+    var attach_set: ?std.StringHashMap(void) = if (roster) |*s| set: {
+        var m = std.StringHashMap(void).init(gpa);
+        for (s.sessions) |sess| {
+            if (sess.alive or sess.relaunchable) m.put(sess.id, {}) catch {};
+        }
+        break :set m;
+    } else null;
+    defer if (attach_set) |*m| m.deinit();
+    const attach_ptr: ?*const std.StringHashMap(void) = if (attach_set) |*m| m else null;
+
+    // Match captured windows to live ones by POSITION in `self.windows`:
+    // `captureSessionLayout` walks that same list in order, skipping quick
+    // terminals and cross-machine remote windows, so we replay the skip rule
+    // here rather than trying to key on a synthesized `win-N` id.
+    var ci: usize = 0;
+    var rebuilt: usize = 0;
+    for (self.windows.items) |win| {
+        if (win.is_quick_terminal) continue;
+        if (win.remote_dialed != null) continue;
+        if (win.tab_count == 0) continue;
+        defer ci += 1;
+        if (ci >= captured.windows.len) break;
+        // A window that was never agent-backed (persistence unresolved at its
+        // creation, so its panes are plain exec children) has nothing to
+        // re-attach and must not have its shells replaced.
+        if (win.local_agent_conn == null) continue;
+
+        self.rebuildWindowInPlace(win, captured.windows[ci], conn, attach_ptr) catch |err| {
+            log.warn("in-place recovery: window '{s}' failed err={}", .{ captured.windows[ci].id, err });
+            continue;
+        };
+        rebuilt += 1;
+    }
+
+    log.info("in-place recovery: rebuilt {d} window(s) on the new agent connection", .{rebuilt});
+    if (rebuilt > 0) self.markLayoutDirty();
+}
+
+/// Replace one live window's tab trees with fresh surfaces ATTACHed on `conn`.
+/// The window itself — its HWND, position, tab count and selection — is kept;
+/// only the surfaces inside it are rebuilt, which is what makes this "in place".
+fn rebuildWindowInPlace(
+    self: *App,
+    window: *Window,
+    captured: session_layout.Window,
+    conn: *remote_connection.Connection,
+    attach: ?*const std.StringHashMap(void),
+) !void {
+    if (captured.tabs.len == 0) return error.CorruptLayout;
+    const active_tab = window.active_tab;
+
+    // The window's own connection pointer must move to the new connection
+    // BEFORE any surface is built: later tabs/splits read it, and leaving it on
+    // the retired connection would quietly make every future pane in this
+    // window unrecoverable.
+    window.local_agent_conn = conn;
+
+    const tab_count = @min(window.tab_count, captured.tabs.len);
+    for (0..tab_count) |ti| {
+        self.rebuildTabInPlace(window, ti, captured.tabs[ti], conn, attach) catch |err| {
+            log.warn("in-place recovery: tab {d} failed err={}", .{ ti, err });
+            continue;
+        };
+    }
+
+    // Fresh surfaces start visible, so every rebuilt BACKGROUND tab would paint
+    // over the active one. Hide them before re-selecting the tab that was
+    // frontmost, which shows its own panes and lays them out.
+    for (0..window.tab_count) |ti| {
+        if (ti != active_tab) window.setTabSurfacesVisible(ti, false);
+    }
+    if (active_tab < window.tab_count) window.selectTabIndex(active_tab);
+    window.layoutSplits();
+}
+
+/// Rebuild ONE tab in place: build a fresh root surface for it, swap the tree,
+/// then replay the recorded splits onto it via the shared restore walker.
+fn rebuildTabInPlace(
+    self: *App,
+    window: *Window,
+    tab_index: usize,
+    tab: session_layout.Tab,
+    conn: *remote_connection.Connection,
+    attach: ?*const std.StringHashMap(void),
+) !void {
+    if (tab.nodes.len == 0) return error.CorruptLayout;
+    const first_leaf = restoreFirstLeaf(tab.nodes, 0) orelse return error.CorruptLayout;
+
+    var ov = restoreAttachOverride(first_leaf, conn, attach);
+    const root = try window.replaceTabRootSurface(tab_index, &ov);
+
+    // Everything below the root is the ordinary restore walk. `restoreTab`
+    // would re-apply color/hero/title too, but those live on the WINDOW and
+    // were never lost — only the surfaces were — so we replay just the splits.
+    try self.restoreBuildSubtree(window, tab.nodes, 0, root, conn, attach, 0);
 }
 
 /// Apply the restored outer placement. Non-maximized: SetWindowPos to the exact
@@ -3868,6 +4179,14 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == WM_APP_AGENT_LINK_DOWN) {
+        // T145: the shared local-agent link dropped. Posted from the
+        // connection's reader thread; every decision happens here, on the GUI
+        // thread, after a settle window (a down edge is not proof of death).
+        app.beginAgentSettleWatch();
+        return 0;
+    }
+
     if (msg == WM_APP_UPDATE_AVAILABLE) {
         // wparam = heap pointer to the version string, lparam = length.
         // We own the buffer and must free it after use. wparam == 0 is
@@ -3942,6 +4261,13 @@ fn msgWndProc(
     if (msg == w32.WM_TIMER and wparam == LAYOUT_SYNC_TIMER_ID) {
         _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
         app.syncSessionLayout();
+        return 0;
+    }
+
+    // Timer ID 5: local-agent link settle watch (T145). Self-re-arming (a
+    // periodic SetTimer), killed by `endAgentSettleWatch` once a verdict lands.
+    if (msg == w32.WM_TIMER and wparam == AGENT_WATCH_TIMER_ID) {
+        app.tickAgentSettleWatch();
         return 0;
     }
 
