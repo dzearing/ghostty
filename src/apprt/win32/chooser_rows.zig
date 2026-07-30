@@ -71,6 +71,46 @@ pub fn hostnameSubtext(name: []const u8, hostname: ?[]const u8) ?[]const u8 {
 }
 
 // ---------------------------------------------------------------------
+// Detail pane (T175)
+// ---------------------------------------------------------------------
+
+/// What the detail pane's header says about the selected row. `subtitle` may
+/// borrow the caller's scratch buffer (see `deviceDetail`).
+pub const DetailText = struct {
+    title: []const u8,
+    subtitle: []const u8,
+    glyph: Glyph,
+};
+
+/// The local machine's detail header. Mac reads "This Mac" (`detailTitle`,
+/// MachineChooserView.swift:511); the Windows-native name for the same thing is
+/// what the shell calls it.
+pub fn localDetail() DetailText {
+    return .{
+        .title = "This PC",
+        .subtitle = "This machine",
+        .glyph = .local,
+    };
+}
+
+/// A relay device's detail header. Mac's subtitle is "N sessions · hostname";
+/// Windows cannot browse a machine's sessions yet (T146), so the leading
+/// element is the reachability the directory actually reported, and the
+/// hostname follows when it says something the name does not.
+///
+/// `buf` backs the joined subtitle; the returned slice borrows it (and `name`
+/// and `hostname` borrow the caller's device list, as everywhere else here).
+pub fn deviceDetail(buf: []u8, name: []const u8, hostname: ?[]const u8, online: bool) DetailText {
+    const state: []const u8 = if (online) "Online" else "Offline";
+    const host = hostnameSubtext(name, hostname);
+    const subtitle: []const u8 = if (host) |h|
+        std.fmt.bufPrint(buf, "{s} · {s}", .{ state, h }) catch state
+    else
+        state;
+    return .{ .title = name, .subtitle = subtitle, .glyph = .server };
+}
+
+// ---------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------
 
@@ -212,6 +252,19 @@ pub fn hoverFill(bg: Rgb) Rgb {
     return blend(bg, .{ .r = 255, .g = 255, .b = 255 }, 0.06);
 }
 
+/// The master column's backing wash — Mac's `Color.primary.opacity(0.035)`
+/// behind the machine list (MachineChooserView.swift:260). Faint on purpose:
+/// it separates the column from the detail pane without becoming a panel.
+pub fn columnWash(bg: Rgb) Rgb {
+    return blend(bg, .{ .r = 255, .g = 255, .b = 255 }, 0.035);
+}
+
+/// The hairline rules between the account row, the two columns and the footer
+/// (Mac's `Divider()`).
+pub fn dividerColor(bg: Rgb) Rgb {
+    return blend(bg, .{ .r = 255, .g = 255, .b = 255 }, 0.14);
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -248,6 +301,35 @@ test "hostnameSubtext: keeps a genuinely different hostname" {
     try testing.expectEqualStrings("prod-1.internal", hostnameSubtext("Alpha", "prod-1.internal").?);
     try testing.expect(hostnameSubtext("Alpha", "ALPHA") == null);
     try testing.expect(hostnameSubtext("Alpha", null) == null);
+}
+
+test "localDetail: the detail header names the machine, not the row" {
+    const d = localDetail();
+    try testing.expectEqualStrings("This PC", d.title);
+    try testing.expectEqualStrings("This machine", d.subtitle);
+    try testing.expectEqual(Glyph.local, d.glyph);
+}
+
+test "deviceDetail: reachability leads, a useful hostname follows" {
+    var buf: [128]u8 = undefined;
+    const on = deviceDetail(&buf, "Winbox", "winbox.local", true);
+    try testing.expectEqualStrings("Winbox", on.title);
+    try testing.expectEqualStrings("Online · winbox.local", on.subtitle);
+    try testing.expectEqual(Glyph.server, on.glyph);
+
+    const off = deviceDetail(&buf, "Winbox", "winbox.local", false);
+    try testing.expectEqualStrings("Offline · winbox.local", off.subtitle);
+}
+
+test "deviceDetail: a redundant hostname leaves the state standing alone" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("Online", deviceDetail(&buf, "Maximus", "maximus", true).subtitle);
+    try testing.expectEqualStrings("Offline", deviceDetail(&buf, "Maximus", null, false).subtitle);
+}
+
+test "deviceDetail: a buffer too small for the join degrades to the state" {
+    var tiny: [3]u8 = undefined;
+    try testing.expectEqualStrings("Online", deviceDetail(&tiny, "Alpha", "prod-1.internal", true).subtitle);
 }
 
 test "rowMetrics: every piece nests inside the row height" {
@@ -303,6 +385,21 @@ test "blend: endpoints and midpoint" {
     // Out-of-range alphas clamp instead of wrapping.
     try testing.expect(blend(bg, fg, -1.0).eql(bg));
     try testing.expect(blend(bg, fg, 2.0).eql(fg));
+}
+
+test "columnWash is a lift off the background, dimmer than hover" {
+    const bg: Rgb = .{ .r = 32, .g = 32, .b = 32 };
+    const wash = columnWash(bg);
+    try testing.expect(wash.r > bg.r);
+    try testing.expect(wash.r < hoverFill(bg).r);
+    // Neutral: a wash, not a tint.
+    try testing.expectEqual(wash.r, wash.b);
+}
+
+test "dividerColor reads above the wash it separates" {
+    const bg: Rgb = .{ .r = 32, .g = 32, .b = 32 };
+    try testing.expect(dividerColor(bg).r > columnWash(bg).r);
+    try testing.expect(dividerColor(bg).r < 255);
 }
 
 test "selection and hover sit between the background and their source color" {

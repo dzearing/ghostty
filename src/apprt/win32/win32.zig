@@ -895,6 +895,7 @@ pub const LBN_DBLCLK: u16 = 2;
 // geometry to its parent (WM_MEASUREITEM) and asks it to paint each row
 // (WM_DRAWITEM) instead of rendering a system-blue string bar.
 pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
+pub const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
 pub const LB_GETITEMRECT: u32 = 0x0198;
 pub const LB_GETITEMHEIGHT: u32 = 0x01A1;
 pub const LB_ITEMFROMPOINT: u32 = 0x01A9;
@@ -1311,6 +1312,7 @@ pub const PAINTSTRUCT = extern struct {
 pub const SRCCOPY: u32 = 0x00CC0020;
 pub const TRANSPARENT: i32 = 1;
 pub const DT_LEFT: u32 = 0;
+pub const DT_CENTER: u32 = 1;
 pub const DT_VCENTER: u32 = 4;
 pub const DT_WORDBREAK: u32 = 0x10;
 pub const DT_SINGLELINE: u32 = 32;

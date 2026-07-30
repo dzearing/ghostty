@@ -106,6 +106,10 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_rows.zig");
 
+    // Pure win32 machine-chooser master-detail layout (T175), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/chooser_layout.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 

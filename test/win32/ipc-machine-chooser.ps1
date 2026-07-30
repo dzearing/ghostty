@@ -15,8 +15,14 @@
 # with two-line machine rows, the selection is an INSET rounded accent pill
 # rather than a full-width system-blue bar (pixel-probed, with an unselected
 # row as the negative control), the filter shows a cue banner while empty, and
-# the footer hint WRAPS - a second, signed-out run proves the dialog grows by
-# exactly the extra hint height instead of clipping the sentence.
+# the status strip WRAPS - a second, signed-out run proves it never clips.
+#
+# T175 adds the SHAPE (Mac's master-detail chooser): a fixed 840x540 dialog, a
+# washed machine column at the left separated by a hairline rule, a detail pane
+# at the right that names the selected machine and carries the "New Window"
+# primary action, and Cancel alone in the footer. The detail pane is asserted to
+# FOLLOW the selection (arrow down must repaint it), and - since the window no
+# longer grows - the wrapping strip now takes its extra lines out of the LIST.
 #
 #   powershell -NoProfile -File test\win32\ipc-machine-chooser.ps1
 #
@@ -39,6 +45,8 @@ $script:skip = 0
 $script:chooserH1 = 0
 $script:hintH1 = 0
 $script:hintLineH = 0
+$script:listH1 = 0
+$script:rowH1 = 0
 function Assert($cond, $name) {
     if ($cond) { "  PASS $name"; $script:pass++ } else { "  FAIL $name"; $script:fail++ }
 }
@@ -75,8 +83,38 @@ public class McDrv {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int x, y; }
+
+    // Screen coordinates of a window's client origin, so client-space layout
+    // numbers (which is what MachineChooser.layout produces) can be probed on
+    // the captured screenshot without guessing the caption height.
+    public static POINT ClientOrigin(IntPtr h) {
+        POINT p; p.x = 0; p.y = 0;
+        ClientToScreen(h, ref p);
+        return p;
+    }
+
+    // "text|left|top|right|bottom" (screen coords) for every `cls` child, so a
+    // test can find a control by its LABEL instead of by creation order.
+    public static string[] ChildInfo(IntPtr parent, string cls) {
+        var rows = new System.Collections.Generic.List<string>();
+        EnumChildWindows(parent, (h, l) => {
+            var sb = new StringBuilder(64);
+            GetClassNameW(h, sb, 64);
+            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase)) {
+                var t = new StringBuilder(256);
+                GetWindowTextW(h, t, 256);
+                RECT r; GetWindowRect(h, out r);
+                rows.Add(t.ToString() + "|" + r.left + "|" + r.top + "|" + r.right + "|" + r.bottom);
+            }
+            return true;
+        }, IntPtr.Zero);
+        return rows.ToArray();
+    }
 
     // The nth (0-based) direct child of `parent` whose class is `cls`, in
     // z-order. Returns IntPtr.Zero when there is no such child.
@@ -216,16 +254,51 @@ public class McDrv {
 Add-Type -AssemblyName System.Drawing
 [void][McDrv]::SetProcessDPIAware()
 
-# The chooser's client width is `px(440, scale)` by construction (see
-# MachineChooser.layout), so the live DPI scale - and with it the one-line
-# footer height, `px(16, scale)` - is derivable from the window itself instead
-# of hardcoded per box.
+# The chooser's client width is `px(840, scale)` by construction (T175, see
+# chooser_layout.layout), so the live DPI scale - and with it the one-line
+# status-strip height, `px(16, scale)` - is derivable from the window itself
+# instead of hardcoded per box.
 function Get-ChooserScale {
     param([IntPtr]$Hwnd)
     $r = New-Object McDrv+RECT
     if (-not [McDrv]::GetClientRect($Hwnd, [ref]$r)) { return 1.0 }
     if ($r.right -le 0) { return 1.0 }
-    return $r.right / 440.0
+    return $r.right / 840.0
+}
+
+# A DIP measurement in the chooser's physical pixels.
+function Dip($scale, $v) { return [int][Math]::Round($v * $scale) }
+
+# Parse one ChildInfo row into an object with screen-space edges.
+function Get-Controls($chooser, $cls) {
+    foreach ($row in [McDrv]::ChildInfo($chooser, $cls)) {
+        $f = $row -split '\|'
+        [pscustomobject]@{
+            Text   = $f[0]
+            Left   = [int]$f[1]
+            Top    = [int]$f[2]
+            Right  = [int]$f[3]
+            Bottom = [int]$f[4]
+        }
+    }
+}
+
+# A cheap position-weighted checksum of a screen rect: two different strings
+# rendered in the same box give different values, where a bare drawn-pixel
+# COUNT can collide.
+function Get-RegionSignature {
+    param($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1)
+    $sig = 0
+    for ($y = $Y0; $y -lt $Y1; $y++) {
+        for ($x = $X0; $x -lt $X1; $x++) {
+            $lx = $x - $Shot.Left
+            $ly = $y - $Shot.Top
+            if ($lx -lt 0 -or $ly -lt 0 -or $lx -ge $Shot.W -or $ly -ge $Shot.H) { continue }
+            $px = $Shot.Bmp.GetPixel($lx, $ly)
+            $sig = ($sig + ($lx + 1) * [int]$px.R + ($ly + 1) * [int]$px.B) % 2147483647
+        }
+    }
+    return $sig
 }
 
 function Get-WindowShot {
@@ -419,10 +492,77 @@ if ($proc.HasExited) {
                 }
 
                 $script:chooserH1 = [McDrv]::Height($chooser)
-                $script:hintLineH = [int][Math]::Round(16.0 * (Get-ChooserScale -Hwnd $chooser))
+                $scale = Get-ChooserScale -Hwnd $chooser
+                $script:hintLineH = Dip $scale 16
                 $hint1 = [McDrv]::LowestChild($chooser, 'Static')
                 if ($hint1 -ne [IntPtr]::Zero) { $script:hintH1 = [McDrv]::Height($hint1) }
-                Assert ($script:hintH1 -eq $script:hintLineH) "signed-in footer is one line (line=$($script:hintLineH), got $($script:hintH1))"
+                Assert ($script:hintH1 -eq $script:hintLineH) "signed-in status strip is one line (line=$($script:hintLineH), got $($script:hintH1))"
+                if ($list -ne [IntPtr]::Zero) {
+                    $script:listH1 = [McDrv]::Height($list)
+                    $script:rowH1 = $rowH
+                }
+
+                # --- T175: the master-detail shell -----------------------
+                # T140's report was that the dialog "looks nothing like the mac
+                # dialog". Mac's is 840x540 with a washed machine column at the
+                # left, a detail pane at the right carrying the machine's
+                # identity and its primary action, and Cancel alone in the
+                # footer. Each of those is asserted here against the real
+                # window, not against the layout function.
+                $cr = New-Object McDrv+RECT
+                [void][McDrv]::GetClientRect($chooser, [ref]$cr)
+                Assert ([Math]::Abs($cr.bottom - (Dip $scale 540)) -le 2) "chooser client is Mac's 540 tall at this DPI (got $($cr.bottom), want $(Dip $scale 540))"
+
+                $org = [McDrv]::ClientOrigin($chooser)
+                $masterRight = Dip $scale 260
+                $footerY = Dip $scale 480
+                if (-not $shot) { $shot = Get-WindowShot -Hwnd $chooser }
+
+                # The column is a wash: brighter than the dialog surface beside
+                # it, at the same height, below the last row.
+                $yBody = $org.y + (Dip $scale 300)
+                $washPx = Get-ShotPixel $shot ($org.x + (Dip $scale 200)) $yBody
+                $panePx = Get-ShotPixel $shot ($org.x + (Dip $scale 600)) $yBody
+                Assert (($washPx[0] - $panePx[0]) -ge 4) "machine column sits on a wash (col r=$($washPx[0]) vs pane r=$($panePx[0]))"
+
+                # ...and a hairline rule divides them. Sample the 3 candidate
+                # columns so a rounding-off-by-one does not read as absence.
+                $ruleR = 0
+                foreach ($dx in -1, 0, 1) {
+                    $p = Get-ShotPixel $shot ($org.x + $masterRight + $dx) $yBody
+                    if ($p[0] -gt $ruleR) { $ruleR = $p[0] }
+                }
+                Assert (($ruleR - $washPx[0]) -ge 8) "a rule separates the columns (rule r=$ruleR vs wash r=$($washPx[0]))"
+
+                # The primary action is Mac's "New Window", it lives in the
+                # detail pane, and the footer holds Cancel alone.
+                $buttons = @(Get-Controls $chooser 'Button')
+                $primary = $buttons | Where-Object { $_.Text -eq 'New Window' }
+                $cancel = $buttons | Where-Object { $_.Text -eq 'Cancel' }
+                Assert ($null -ne $primary) "the primary action is labeled 'New Window' (saw: $(($buttons | ForEach-Object { $_.Text }) -join ', '))"
+                Assert ($null -ne $cancel) 'the footer has a Cancel button'
+                if ($primary) {
+                    Assert ((($primary.Left - $org.x) -gt $masterRight)) "the primary action is in the detail pane (left=$($primary.Left - $org.x), column ends at $masterRight)"
+                    Assert ((($primary.Bottom - $org.y) -lt $footerY)) 'the primary action is above the footer, not in it'
+                }
+                $inFooter = @($buttons | Where-Object { ($_.Top - $org.y) -ge $footerY })
+                Assert ($inFooter.Count -eq 1 -and $inFooter[0].Text -eq 'Cancel') "Cancel is alone in the footer (found: $(($inFooter | ForEach-Object { $_.Text }) -join ', '))"
+
+                # The detail pane names the selected machine, and it FOLLOWS
+                # the selection: arrowing onto the relay device must repaint it.
+                $dx0 = $org.x + (Dip $scale 300)
+                $dx1 = $org.x + (Dip $scale 620)
+                $dy0 = $org.y + (Dip $scale 60)
+                $dy1 = $org.y + (Dip $scale 110)
+                $headDrawn = Measure-DrawnPixels $shot $dx0 $dy0 $dx1 $dy1 32 32 32 12
+                Assert ($headDrawn -ge 40) "the detail pane renders the machine's identity ($headDrawn drawn pixels)"
+                $sigLocal = Get-RegionSignature $shot $dx0 $dy0 $dx1 $dy1
+
+                [McDrv]::PressForeground($chooser, [uint16]0x28) # VK_DOWN
+                Start-Sleep -Milliseconds 350
+                $shotDown = Get-WindowShot -Hwnd $chooser
+                $sigDevice = Get-RegionSignature $shotDown $dx0 $dy0 $dx1 $dy1
+                Assert ($sigDevice -ne $sigLocal) "the detail pane follows the selection (signature $sigLocal -> $sigDevice)"
             }
 
             # Escape closes the chooser (routed via handleKey), best effort.
@@ -443,7 +583,7 @@ if ($proc.HasExited) {
 # so it must occupy more lines than the signed-in case (whose hint is empty),
 # the dialog must be taller by exactly that much, and the wrapped remainder
 # must actually be painted INSIDE the control.
-if (-not $aborted -and $script:chooserH1 -gt 0 -and $script:hintH1 -gt 0) {
+if (-not $aborted -and $script:chooserH1 -gt 0 -and $script:hintH1 -gt 0 -and $script:listH1 -gt 0) {
     Stop-DebugGhoztty
     $acctDir2 = Join-Path $env:TEMP "ghoztty-mc-acct2-$PID"
     $env:GHOSTTY_ACCOUNT_STORE = (Join-Path $acctDir2 'account.dat')
@@ -475,19 +615,38 @@ if (-not $aborted -and $script:chooserH1 -gt 0 -and $script:hintH1 -gt 0) {
                 $hint2 = [McDrv]::LowestChild($chooser2, 'Static')
                 $hintH2 = [McDrv]::Height($hint2)
                 $chooserH2 = [McDrv]::Height($chooser2)
+                $list2 = [McDrv]::FindChild($chooser2, 'ListBox', 0)
+                $listH2 = if ($list2 -ne [IntPtr]::Zero) { [McDrv]::Height($list2) } else { 0 }
 
-                Assert ($hintH2 -ge 2 * $script:hintLineH) "signed-out hint wraps to 2+ lines (line=$($script:hintLineH), got $hintH2)"
-                Assert (($chooserH2 - $script:chooserH1) -eq ($hintH2 - $script:hintH1)) "dialog grew by exactly the extra hint height (window +$($chooserH2 - $script:chooserH1), hint +$($hintH2 - $script:hintH1))"
+                Assert ($hintH2 -ge 2 * $script:hintLineH) "signed-out status strip wraps to 2+ lines (line=$($script:hintLineH), got $hintH2)"
+                # Since T175 the dialog is Mac's fixed 840x540, so the extra
+                # lines come out of the LIST's height instead of the window's -
+                # same no-clipping invariant, measured on the thing that flexes.
+                Assert ($chooserH2 -eq $script:chooserH1) "dialog stayed a fixed size (was $($script:chooserH1), now $chooserH2)"
+                # The list sheds the room in WHOLE rows (an owner-drawn listbox
+                # must never render a clipped half row), so the accounting is
+                # "the extra strip height, to the nearest row" - and the list
+                # must end above the strip, which is the actual no-overlap
+                # invariant the old grow-the-dialog assertion stood for.
+                $shed = $script:listH1 - $listH2
+                $grew = $hintH2 - $script:hintH1
+                Assert ($shed -ge ($grew - $script:rowH1) -and $shed -le ($grew + $script:rowH1)) "the list gave up the extra strip height, to the nearest row (list -$shed, strip +$grew, row $($script:rowH1))"
+                Assert ($script:rowH1 -gt 0 -and ($listH2 % $script:rowH1) -eq 0) "the list still holds whole rows only ($listH2 / row $($script:rowH1))"
+                $lr2 = New-Object McDrv+RECT
+                [void][McDrv]::GetWindowRect($list2, [ref]$lr2)
+                $hr2 = New-Object McDrv+RECT
+                [void][McDrv]::GetWindowRect($hint2, [ref]$hr2)
+                Assert ($lr2.bottom -le $hr2.top) "the list stops above the wrapped strip (list ends $($lr2.bottom), strip starts $($hr2.top))"
 
                 # The wrapped remainder is painted inside the control, not cut
-                # off: the hint's bottom half has text pixels on the dialog
-                # background.
+                # off: the strip's bottom half has text pixels on the column
+                # wash it sits on.
                 $hr = New-Object McDrv+RECT
                 [void][McDrv]::GetWindowRect($hint2, [ref]$hr)
                 $mid = $hr.top + [int]($hintH2 / 2)
                 $shot2 = Get-WindowShot -Hwnd $chooser2
-                $tail = Measure-DrawnPixels $shot2 $hr.left $mid $hr.right $hr.bottom 32 32 32 12
-                Assert ($tail -ge 20) "the wrapped tail of the hint is rendered ($tail drawn pixels below the first line)"
+                $tail = Measure-DrawnPixels $shot2 $hr.left $mid $hr.right $hr.bottom 40 40 40 12
+                Assert ($tail -ge 20) "the wrapped tail of the strip is rendered ($tail drawn pixels below the first line)"
             }
             Assert (-not $proc2.HasExited) 'app survived the signed-out chooser'
         }

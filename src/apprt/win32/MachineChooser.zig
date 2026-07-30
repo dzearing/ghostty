@@ -15,6 +15,15 @@
 //! them here via `handleKey` (see `App.machineChooserOwning`), exactly like
 //! the rename dialog.
 //!
+//! Shape (T175): a master-detail chooser, ported from Mac's 840x540
+//! `MachineChooserView` — account row across the top, a fixed-width machine
+//! column on a faint wash at the left, a detail pane at the right carrying the
+//! selected machine's identity and its primary action, and a footer holding
+//! Cancel alone. The geometry is pure and lives in `chooser_layout.zig`; the
+//! wash, the rules and the detail header are painted in `WM_PAINT` rather than
+//! built from STATICs, so they can use the same GDI glyph routine the list rows
+//! do.
+//!
 //! Data: the device list is fetched once when the chooser opens, via
 //! `relay_directory.listDevices` (a synchronous authenticated GET on the GUI
 //! thread, bounded like the dial). No credential, or a fetch error, degrades
@@ -37,6 +46,7 @@ const Window = @import("Window.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
 const chooser_rows = @import("chooser_rows.zig");
+const chooser_layout = @import("chooser_layout.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
 const relay_signin = @import("../../remote/relay_signin.zig");
 const w32 = @import("win32.zig");
@@ -67,9 +77,16 @@ const COLOR_FIELD_BG = w32.RGB(30, 30, 30);
 const COLOR_TEXT = w32.RGB(230, 230, 230);
 const COLOR_LABEL = w32.RGB(200, 200, 200);
 
-/// The row background the owner-drawn selection/hover fills composite against
-/// (the list's own field background, not the dialog's).
-const ROW_BG: chooser_rows.Rgb = .{ .r = 30, .g = 30, .b = 30 };
+/// The dialog background as the pure color model sees it, and the master
+/// column's wash derived from it. The listbox is painted with the wash (not the
+/// field color) so the filter, the rows and the status strip read as one
+/// column — the way Mac's `machineListColumn` does.
+const DIALOG_BG: chooser_rows.Rgb = .{ .r = 32, .g = 32, .b = 32 };
+const WASH: chooser_rows.Rgb = chooser_rows.columnWash(DIALOG_BG);
+
+/// The row background the owner-drawn selection/hover fills composite against:
+/// the column wash the rows actually sit on.
+const ROW_BG: chooser_rows.Rgb = WASH;
 
 fn rgb(c: chooser_rows.Rgb) u32 {
     return w32.RGB(c.r, c.g, c.b);
@@ -78,19 +95,27 @@ fn rgb(c: chooser_rows.Rgb) u32 {
 var class_registered: bool = false;
 var bg_brush: ?w32.HBRUSH = null;
 var field_brush: ?w32.HBRUSH = null;
+/// The master column's wash and the hairline rules (T175). Process-lifetime,
+/// like the other two — created once with the window class.
+var wash_brush: ?w32.HBRUSH = null;
+var divider_brush: ?w32.HBRUSH = null;
 
 window: *Window,
 hwnd: w32.HWND,
 filter: w32.HWND,
 list: w32.HWND,
 hint: w32.HWND,
-open_btn: w32.HWND,
+/// The detail pane's primary action ("New Window"), Mac's `.borderedProminent`
+/// button — in the detail header, NOT the footer (which holds Cancel alone).
+primary_btn: w32.HWND,
 cancel_btn: w32.HWND,
 account_status: w32.HWND,
 account_btn: w32.HWND,
 font: ?*anyopaque = null,
 /// Smaller font for the dimmed row subline (Mac's `.caption`).
 subtitle_font: ?*anyopaque = null,
+/// Semibold display font for the detail pane's machine name (Mac's `.title3`).
+title_font: ?*anyopaque = null,
 
 /// The listbox's original window procedure, saved when it is subclassed for
 /// hover tracking. Restored is unnecessary — the control dies with the dialog.
@@ -123,81 +148,14 @@ devices: []const relay_directory.Device = &.{},
 rows: [MAX_DEVICES + 1]Row = undefined,
 row_count: usize = 0,
 
-/// Dialog layout in physical pixels from the owner DPI scale. Pure — tested.
-pub const Layout = struct {
-    client_w: i32,
-    client_h: i32,
-    account_status: w32.RECT,
-    account_btn: w32.RECT,
-    filter: w32.RECT,
-    list: w32.RECT,
-    hint: w32.RECT,
-    open: w32.RECT,
-    cancel: w32.RECT,
-    font_h: i32,
-    /// Height of one wrapped line of footer-hint text. The hint control is
-    /// `hint_lines` of these tall.
-    hint_line_h: i32,
-};
+/// Dialog layout in physical pixels from the owner DPI scale. Pure — the math
+/// and its tests live in `chooser_layout.zig`.
+const Layout = chooser_layout.Layout;
+const layout = chooser_layout.layout;
 
-/// `hint_lines` is how many wrapped lines the footer hint needs (measured at
-/// runtime with `DT_CALCRECT`, clamped by `chooser_rows.clampHintLines`). The
-/// dialog GROWS to fit it — the T140 screenshot showed the hint clipped
-/// mid-sentence because this used to be a fixed one-line slot.
-pub fn layout(scale: f32, hint_lines: i32) Layout {
-    const margin = px(16, scale);
-    const filter_h = px(26, scale);
-    const gap = px(10, scale);
-    // Exactly five owner-drawn rows, so the list never shows a half row.
-    const list_h = chooser_rows.rowMetrics(scale).height * 5 + px(4, scale);
-    const hint_line_h = px(16, scale);
-    const hint_h = hint_line_h * chooser_rows.clampHintLines(hint_lines);
-    const btn_gap_v = px(12, scale);
-    const btn_w = px(96, scale);
-    const btn_h = px(28, scale);
-    const btn_gap_h = px(8, scale);
-    // The account row (T141): status text on the left, the Sign In / Sign Out
-    // button right-aligned. Wide enough for "Sign in with Google…".
-    const account_h = px(26, scale);
-    const account_btn_w = px(150, scale);
-
-    const client_w = px(440, scale);
-
-    const account_top = margin;
-    const filter_top = account_top + account_h + gap;
-    const list_top = filter_top + filter_h + gap;
-    const hint_top = list_top + list_h + gap;
-    const btn_top = hint_top + hint_h + btn_gap_v;
-    const client_h = btn_top + btn_h + margin;
-
-    const cancel_left = client_w - margin - btn_w;
-    const open_left = cancel_left - btn_gap_h - btn_w;
-    const account_btn_left = client_w - margin - account_btn_w;
-
-    return .{
-        .client_w = client_w,
-        .client_h = client_h,
-        // The status STATIC is vertically centered against the taller button so
-        // its single line of text sits on the button's baseline band.
-        .account_status = .{
-            .left = margin,
-            .top = account_top + @divTrunc(account_h - hint_h, 2),
-            .right = account_btn_left - btn_gap_h,
-            .bottom = account_top + @divTrunc(account_h - hint_h, 2) + hint_h,
-        },
-        .account_btn = .{ .left = account_btn_left, .top = account_top, .right = account_btn_left + account_btn_w, .bottom = account_top + account_h },
-        .filter = .{ .left = margin, .top = filter_top, .right = client_w - margin, .bottom = filter_top + filter_h },
-        .list = .{ .left = margin, .top = list_top, .right = client_w - margin, .bottom = list_top + list_h },
-        .hint = .{ .left = margin, .top = hint_top, .right = client_w - margin, .bottom = hint_top + hint_h },
-        .open = .{ .left = open_left, .top = btn_top, .right = open_left + btn_w, .bottom = btn_top + btn_h },
-        .cancel = .{ .left = cancel_left, .top = btn_top, .right = cancel_left + btn_w, .bottom = btn_top + btn_h },
-        .font_h = px(15, scale),
-        .hint_line_h = hint_line_h,
-    };
-}
-
-fn px(v: f32, scale: f32) i32 {
-    return @intFromFloat(@round(v * scale));
+/// `chooser_layout.Rect` as the `RECT` the placement APIs want.
+fn rect(r: chooser_layout.Rect) w32.RECT {
+    return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
 }
 
 /// Case-insensitive ASCII substring test. Pure.
@@ -269,7 +227,7 @@ pub fn open(window: *Window) void {
         .filter = undefined,
         .list = undefined,
         .hint = undefined,
-        .open_btn = undefined,
+        .primary_btn = undefined,
         .cancel_btn = undefined,
         .account_status = undefined,
         .account_btn = undefined,
@@ -286,8 +244,9 @@ pub fn open(window: *Window) void {
 
     const style: u32 = w32.WS_POPUP | w32.WS_CAPTION | w32.WS_SYSMENU;
     const ex_style: u32 = w32.WS_EX_DLGMODALFRAME;
-    // Built at one hint line; `applyLayout` re-sizes once the real hint text
-    // has been measured (see the end of this function).
+    // Built at one status-strip line; `applyLayout` re-places the column once
+    // the real strip text has been measured (see the end of this function).
+    // The dialog itself is a fixed size — only the list flexes.
     const l = layout(window.scale, 1);
 
     var frame: w32.RECT = .{ .left = 0, .top = 0, .right = l.client_w, .bottom = l.client_h };
@@ -401,8 +360,16 @@ pub fn open(window: *Window) void {
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("LISTBOX"),
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.WS_BORDER | w32.WS_VSCROLL |
-            w32.LBS_NOTIFY | w32.LBS_OWNERDRAWFIXED,
+        // No border: the list is not a field sitting on the dialog, it IS the
+        // master column — the wash behind it is the panel (T175).
+        //
+        // LBS_NOINTEGRALHEIGHT because `chooser_layout` already snaps the list
+        // to whole rows. Left to itself the listbox snaps at CREATION using the
+        // default item height (LB_SETITEMHEIGHT lands afterwards), which shaved
+        // a whole row off and then pinned the height there — so the column
+        // stopped flexing when the status strip wrapped.
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.WS_VSCROLL |
+            w32.LBS_NOTIFY | w32.LBS_OWNERDRAWFIXED | w32.LBS_NOINTEGRALHEIGHT,
         l.list.left,
         l.list.top,
         l.list.right - l.list.left,
@@ -454,15 +421,18 @@ pub fn open(window: *Window) void {
         return;
     };
 
-    self.open_btn = w32.CreateWindowExW(
+    // Mac's primary action is labeled for what it does — "New Window" — and it
+    // lives in the detail header beside the machine it acts on, not in the
+    // footer (MachineChooserView.swift:456-466, 1410-1418).
+    self.primary_btn = w32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
-        std.unicode.utf8ToUtf16LeStringLiteral("Open"),
+        std.unicode.utf8ToUtf16LeStringLiteral("New Window"),
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.BS_DEFPUSHBUTTON,
-        l.open.left,
-        l.open.top,
-        l.open.right - l.open.left,
-        l.open.bottom - l.open.top,
+        l.primary_btn.left,
+        l.primary_btn.top,
+        l.primary_btn.right - l.primary_btn.left,
+        l.primary_btn.bottom - l.primary_btn.top,
         hwnd,
         @ptrFromInt(@as(usize, w32.IDOK)),
         window.app.hinstance,
@@ -490,7 +460,7 @@ pub fn open(window: *Window) void {
         self.destroyState();
         return;
     };
-    _ = w32.SetWindowTheme(self.open_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
+    _ = w32.SetWindowTheme(self.primary_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
     _ = w32.SetWindowTheme(self.cancel_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
 
     // DPI-scaled dialog font for all controls.
@@ -512,8 +482,8 @@ pub fn open(window: *Window) void {
     );
     if (self.font) |f| {
         for ([_]w32.HWND{
-            self.filter,         self.list,       self.hint,
-            self.account_status, self.account_btn, self.open_btn,
+            self.filter,         self.list,        self.hint,
+            self.account_status, self.account_btn, self.primary_btn,
             self.cancel_btn,
         }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
@@ -527,6 +497,24 @@ pub fn open(window: *Window) void {
         0,
         0,
         400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+    );
+    // The detail pane's machine name is Mac's `.title3` + `.semibold`: bigger
+    // than the dialog font and heavier, so the pane has an obvious subject.
+    self.title_font = w32.CreateFontW(
+        -l.title_font_h,
+        0,
+        0,
+        0,
+        600,
         0,
         0,
         0,
@@ -592,6 +580,7 @@ fn refilter(self: *MachineChooser, needle: []const u8) void {
         _ = w32.SendMessageW(self.list, w32.LB_ADDSTRING, 0, @intCast(i));
     }
     if (self.row_count > 0) _ = w32.SendMessageW(self.list, w32.LB_SETCURSEL, 0, 0);
+    self.refreshDetail();
 }
 
 /// What a row renders: title, dimmed subline, status shape and glyph. Pure
@@ -679,9 +668,11 @@ fn setText(hwnd: w32.HWND, text: []const u8) void {
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&wbuf));
 }
 
-/// Set the footer hint text (empty hides it visually) and grow or shrink the
-/// dialog so the sentence is never clipped. The T140 screenshot caught the old
-/// fixed one-line slot cutting "…to list your" mid-sentence.
+/// Set the master column's status-strip text (empty hides it visually) and
+/// re-lay-out so the sentence is never clipped. The T140 screenshot caught the
+/// old fixed one-line slot cutting "…to list your" mid-sentence; since T175 the
+/// dialog is a fixed 840x540, so the extra lines come out of the LIST's height
+/// rather than the window's.
 fn setHint(self: *MachineChooser, text: []const u8) void {
     setText(self.hint, text);
 
@@ -723,41 +714,20 @@ fn measureHintLines(self: *const MachineChooser, text: []const u8) i32 {
     return @divTrunc(h + l.hint_line_h - 1, l.hint_line_h);
 }
 
-/// Re-place every control for the current `hint_lines` and resize the dialog
-/// around them, keeping it centered where it already is.
+/// Re-place every control for the current `hint_lines`. The dialog does NOT
+/// resize (it is Mac's fixed 840x540) — only the list gives up the height the
+/// status strip took.
 fn applyLayout(self: *MachineChooser) void {
     const l = layout(self.window.scale, self.hint_lines);
 
-    const style: u32 = w32.WS_POPUP | w32.WS_CAPTION | w32.WS_SYSMENU;
-    const ex_style: u32 = w32.WS_EX_DLGMODALFRAME;
-    var frame: w32.RECT = .{ .left = 0, .top = 0, .right = l.client_w, .bottom = l.client_h };
-    _ = w32.AdjustWindowRectEx(&frame, style, 0, ex_style);
-    const outer_w = frame.right - frame.left;
-    const outer_h = frame.bottom - frame.top;
-
-    var cur: w32.RECT = undefined;
-    if (w32.GetWindowRect(self.hwnd, &cur) != 0) {
-        const cx = cur.left + @divTrunc(cur.right - cur.left, 2);
-        const cy = cur.top + @divTrunc(cur.bottom - cur.top, 2);
-        _ = w32.SetWindowPos(
-            self.hwnd,
-            null,
-            cx - @divTrunc(outer_w, 2),
-            cy - @divTrunc(outer_h, 2),
-            outer_w,
-            outer_h,
-            w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
-        );
-    }
-
     const placements = [_]struct { hwnd: w32.HWND, r: w32.RECT }{
-        .{ .hwnd = self.account_status, .r = l.account_status },
-        .{ .hwnd = self.account_btn, .r = l.account_btn },
-        .{ .hwnd = self.filter, .r = l.filter },
-        .{ .hwnd = self.list, .r = l.list },
-        .{ .hwnd = self.hint, .r = l.hint },
-        .{ .hwnd = self.open_btn, .r = l.open },
-        .{ .hwnd = self.cancel_btn, .r = l.cancel },
+        .{ .hwnd = self.account_status, .r = rect(l.account_status) },
+        .{ .hwnd = self.account_btn, .r = rect(l.account_btn) },
+        .{ .hwnd = self.filter, .r = rect(l.filter) },
+        .{ .hwnd = self.list, .r = rect(l.list) },
+        .{ .hwnd = self.hint, .r = rect(l.hint) },
+        .{ .hwnd = self.primary_btn, .r = rect(l.primary_btn) },
+        .{ .hwnd = self.cancel_btn, .r = rect(l.cancel) },
     };
     for (placements) |p| {
         _ = w32.MoveWindow(
@@ -769,6 +739,101 @@ fn applyLayout(self: *MachineChooser) void {
             1,
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Chrome + detail pane (T175)
+// ---------------------------------------------------------------------
+
+/// Paint the dialog's own surface: the master column's wash, the three rules
+/// that frame it, and the detail pane's header (glyph, machine name, subtitle).
+/// The header is drawn rather than built from STATICs so it can reuse the same
+/// GDI glyph routine the list rows use — one silhouette, two sizes.
+fn paintChrome(self: *MachineChooser, hdc: w32.HDC) void {
+    const l = layout(self.window.scale, self.hint_lines);
+
+    if (wash_brush) |b| {
+        var r = rect(l.master);
+        _ = w32.FillRect(hdc, &r, b);
+    }
+    if (divider_brush) |b| {
+        var rules = [_]w32.RECT{
+            .{ .left = 0, .top = l.header_divider_y, .right = l.client_w, .bottom = l.header_divider_y + 1 },
+            .{ .left = l.master_divider_x, .top = l.master.top, .right = l.master_divider_x + 1, .bottom = l.master.bottom },
+            .{ .left = 0, .top = l.footer_divider_y, .right = l.client_w, .bottom = l.footer_divider_y + 1 },
+        };
+        for (&rules) |*r| _ = w32.FillRect(hdc, r, b);
+    }
+
+    self.paintDetail(hdc, l);
+}
+
+/// The detail pane's header: the selected machine's glyph, name and subtitle —
+/// or Mac's centered "No machines" when the filter matched nothing.
+fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
+    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+
+    const row = self.selectedRow() orelse {
+        _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondary_gray));
+        var r = rect(l.detail);
+        var wbuf: [32]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, "No machines") catch return;
+        _ = w32.DrawTextW(
+            hdc,
+            &wbuf,
+            @intCast(wlen),
+            &r,
+            w32.DT_CENTER | w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_NOPREFIX,
+        );
+        return;
+    };
+
+    var sub_buf: [256]u8 = undefined;
+    const detail = switch (row) {
+        .local => chooser_rows.localDetail(),
+        .device => |i| chooser_rows.deviceDetail(
+            &sub_buf,
+            self.devices[i].name,
+            self.devices[i].hostname,
+            self.devices[i].online,
+        ),
+    };
+
+    // The glyph keeps its 20:16 proportions inside the taller detail box.
+    const box = l.detail_glyph;
+    const gw = box.width();
+    const gh = @divTrunc(gw * 4, 5);
+    drawGlyphBox(hdc, box.left, box.top + @divTrunc(box.height() - gh, 2), gw, gh, detail.glyph);
+
+    var title_rect = rect(l.detail_title);
+    const old_font = if (self.title_font) |f| w32.SelectObject(hdc, f) else null;
+    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    drawTextUtf8(hdc, detail.title, &title_rect);
+    if (old_font) |o| _ = w32.SelectObject(hdc, o);
+
+    var sub_rect = rect(l.detail_subtitle);
+    _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondary_gray));
+    drawTextUtf8(hdc, detail.subtitle, &sub_rect);
+}
+
+/// The highlighted row, or null when the list is empty.
+fn selectedRow(self: *const MachineChooser) ?Row {
+    const sel: i32 = @intCast(w32.SendMessageW(self.list, w32.LB_GETCURSEL, 0, 0));
+    if (sel < 0 or @as(usize, @intCast(sel)) >= self.row_count) return null;
+    return self.rows[@intCast(sel)];
+}
+
+/// Repaint the detail pane (the selection moved, or the list was refiltered)
+/// and show or hide the primary action with it — there is nothing to open when
+/// no row is selected.
+fn refreshDetail(self: *MachineChooser) void {
+    const l = layout(self.window.scale, self.hint_lines);
+    var r = rect(l.detail);
+    _ = w32.InvalidateRect(self.hwnd, &r, 1);
+    _ = w32.ShowWindow(
+        self.primary_btn,
+        if (self.selectedRow() == null) w32.SW_HIDE else w32.SW_SHOW,
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -784,7 +849,7 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
     const idx: i32 = @bitCast(dis.itemID);
     // A listbox with no items still asks for one empty row (itemID == -1).
     if (idx < 0 or @as(usize, @intCast(idx)) >= self.row_count) {
-        if (field_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
+        if (wash_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
         return;
     }
 
@@ -792,9 +857,9 @@ fn drawRow(self: *MachineChooser, dis: *const w32.DRAWITEMSTRUCT) void {
     const selected = (dis.itemState & w32.ODS_SELECTED) != 0;
     const hovered = self.hover_row == idx;
 
-    // Background first: the row's own field color, so the pill composites
-    // against what is actually behind it.
-    if (field_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
+    // Background first: the column wash the row sits on, so the pill
+    // composites against what is actually behind it.
+    if (wash_brush) |b| _ = w32.FillRect(hdc, &dis.rcItem, b);
 
     if (selected or hovered) {
         const fill = if (selected)
@@ -900,12 +965,15 @@ fn drawStatusDot(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, status: 
 /// tofu risk if Segoe's symbol font is missing): a laptop silhouette for the
 /// local machine, a two-unit rack for a relay device.
 fn drawGlyph(hdc: w32.HDC, r: w32.RECT, m: chooser_rows.RowMetrics, glyph: chooser_rows.Glyph) void {
-    const x = r.left + m.glyph_x;
-    const y = r.top + m.glyph_y;
-    const w = m.glyph_w;
-    const h = m.glyph_h;
+    drawGlyphBox(hdc, r.left + m.glyph_x, r.top + m.glyph_y, m.glyph_w, m.glyph_h, glyph);
+}
 
-    const pen = w32.CreatePen(w32.PS_SOLID, 1, rgb(chooser_rows.secondary_gray)) orelse return;
+/// `drawGlyph` at an absolute box, so the detail pane can draw the same
+/// silhouette at its own (larger) size.
+fn drawGlyphBox(hdc: w32.HDC, x: i32, y: i32, w: i32, h: i32, glyph: chooser_rows.Glyph) void {
+    // A bigger glyph needs a heavier stroke or it reads as a wireframe.
+    const pen_w: i32 = if (w >= 24) 2 else 1;
+    const pen = w32.CreatePen(w32.PS_SOLID, pen_w, rgb(chooser_rows.secondary_gray)) orelse return;
     defer _ = w32.DeleteObject(pen);
     const old_pen = w32.SelectObject(hdc, pen);
     const old_brush = w32.SelectObject(hdc, w32.GetStockObject(w32.NULL_BRUSH));
@@ -983,6 +1051,8 @@ fn registerClass(app: *App) ?void {
     if (class_registered) return;
     bg_brush = w32.CreateSolidBrush(COLOR_BG);
     field_brush = w32.CreateSolidBrush(COLOR_FIELD_BG);
+    wash_brush = w32.CreateSolidBrush(rgb(WASH));
+    divider_brush = w32.CreateSolidBrush(rgb(chooser_rows.dividerColor(DIALOG_BG)));
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         .style = 0,
@@ -1036,6 +1106,11 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             } else if (control_id == LIST_ID and notification == w32.LBN_DBLCLK) {
                 self.openSelection();
                 return 0;
+            } else if (control_id == LIST_ID and notification == w32.LBN_SELCHANGE) {
+                // The detail pane is the selection's mirror — it has to follow
+                // a click as well as an arrow key.
+                self.refreshDetail();
+                return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
@@ -1068,18 +1143,38 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             }
             return 0;
         },
-        w32.WM_CTLCOLOREDIT, w32.WM_CTLCOLORLISTBOX => {
+        w32.WM_PAINT => {
+            var ps: w32.PAINTSTRUCT = undefined;
+            const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
+            self.paintChrome(hdc);
+            _ = w32.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        w32.WM_CTLCOLOREDIT => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
             _ = w32.SetTextColor(hdc, COLOR_TEXT);
             _ = w32.SetBkColor(hdc, COLOR_FIELD_BG);
             if (field_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
+        // The list sits ON the column wash, not on a field — its unfilled tail
+        // below the last row has to be the same color as the rows themselves.
+        w32.WM_CTLCOLORLISTBOX => {
+            const hdc: w32.HDC = @ptrFromInt(wparam);
+            _ = w32.SetTextColor(hdc, COLOR_TEXT);
+            _ = w32.SetBkColor(hdc, rgb(WASH));
+            if (wash_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_CTLCOLORSTATIC, w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
             _ = w32.SetTextColor(hdc, COLOR_LABEL);
-            _ = w32.SetBkColor(hdc, COLOR_BG);
-            if (bg_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            // The status strip lives inside the master column, so it takes the
+            // wash; everything else sits on the dialog surface.
+            const on_wash = @as(?w32.HWND, self.hint) == @as(?w32.HWND, @ptrFromInt(@as(usize, @bitCast(lparam))));
+            _ = w32.SetBkColor(hdc, if (on_wash) rgb(WASH) else COLOR_BG);
+            const brush = if (on_wash) wash_brush else bg_brush;
+            if (brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -1099,27 +1194,27 @@ fn filterText(self: *const MachineChooser, buf: []u8) []const u8 {
 /// away from the Surface-cast popup-edit intercepts).
 pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
     return hwnd == self.hwnd or hwnd == self.filter or hwnd == self.list or
-        hwnd == self.hint or hwnd == self.open_btn or hwnd == self.cancel_btn or
+        hwnd == self.hint or hwnd == self.primary_btn or hwnd == self.cancel_btn or
         hwnd == self.account_status or hwnd == self.account_btn;
 }
 
 /// Keyboard focus targets, in Tab order. `account` is the sign-in/out button
 /// (T141) — last in the cycle so Tab from the filter still reaches the list
 /// first, the common path.
-pub const Focusable = enum { filter, list, open, cancel, account };
+pub const Focusable = enum { filter, list, primary, cancel, account };
 
 /// Pure Tab-order cycle. Unit-tested.
 pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
     return if (backwards) switch (cur) {
         .filter => .account,
         .list => .filter,
-        .open => .list,
-        .cancel => .open,
+        .primary => .list,
+        .cancel => .primary,
         .account => .cancel,
     } else switch (cur) {
         .filter => .list,
-        .list => .open,
-        .open => .cancel,
+        .list => .primary,
+        .primary => .cancel,
         .cancel => .account,
         .account => .filter,
     };
@@ -1159,7 +1254,13 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
             const cur: i32 = @intCast(w32.SendMessageW(self.list, w32.LB_GETCURSEL, 0, 0));
             const delta: i32 = if (vk == w32.VK_UP) -1 else 1;
             const next = clampSelection(cur, delta, self.row_count);
-            if (next >= 0) _ = w32.SendMessageW(self.list, w32.LB_SETCURSEL, @intCast(next), 0);
+            if (next >= 0) {
+                _ = w32.SendMessageW(self.list, w32.LB_SETCURSEL, @intCast(next), 0);
+                // LB_SETCURSEL does not notify, so the detail pane has to be
+                // told by hand — otherwise arrowing moves the highlight and
+                // leaves the pane describing the machine you left.
+                self.refreshDetail();
+            }
             return true;
         },
         w32.VK_TAB => {
@@ -1167,8 +1268,8 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
             const focus = w32.GetFocus();
             const cur: Focusable = if (focus == @as(?w32.HWND, self.list))
                 .list
-            else if (focus == @as(?w32.HWND, self.open_btn))
-                .open
+            else if (focus == @as(?w32.HWND, self.primary_btn))
+                .primary
             else if (focus == @as(?w32.HWND, self.cancel_btn))
                 .cancel
             else if (focus == @as(?w32.HWND, self.account_btn))
@@ -1178,7 +1279,7 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
             const next_hwnd = switch (nextFocus(cur, backwards)) {
                 .filter => self.filter,
                 .list => self.list,
-                .open => self.open_btn,
+                .primary => self.primary_btn,
                 .cancel => self.cancel_btn,
                 .account => self.account_btn,
             };
@@ -1264,6 +1365,10 @@ fn close(self: *MachineChooser, refocus_owner: bool) void {
     if (self.subtitle_font) |f| {
         _ = w32.DeleteObject(f);
         self.subtitle_font = null;
+    }
+    if (self.title_font) |f| {
+        _ = w32.DeleteObject(f);
+        self.title_font = null;
     }
 
     if (refocus_owner) {
@@ -1353,10 +1458,10 @@ test "clampSelection: clamps within bounds and handles empty" {
     try testing.expectEqual(@as(i32, 0), clampSelection(-1, 1, 3)); // from no-selection
 }
 
-test "nextFocus: forward cycle filter -> list -> open -> cancel -> account -> filter" {
+test "nextFocus: forward cycle filter -> list -> primary -> cancel -> account -> filter" {
     try testing.expectEqual(Focusable.list, nextFocus(.filter, false));
-    try testing.expectEqual(Focusable.open, nextFocus(.list, false));
-    try testing.expectEqual(Focusable.cancel, nextFocus(.open, false));
+    try testing.expectEqual(Focusable.primary, nextFocus(.list, false));
+    try testing.expectEqual(Focusable.cancel, nextFocus(.primary, false));
     try testing.expectEqual(Focusable.account, nextFocus(.cancel, false));
     try testing.expectEqual(Focusable.filter, nextFocus(.account, false));
 }
@@ -1364,8 +1469,8 @@ test "nextFocus: forward cycle filter -> list -> open -> cancel -> account -> fi
 test "nextFocus: backward cycle reverses" {
     try testing.expectEqual(Focusable.account, nextFocus(.filter, true));
     try testing.expectEqual(Focusable.cancel, nextFocus(.account, true));
-    try testing.expectEqual(Focusable.open, nextFocus(.cancel, true));
-    try testing.expectEqual(Focusable.list, nextFocus(.open, true));
+    try testing.expectEqual(Focusable.primary, nextFocus(.cancel, true));
+    try testing.expectEqual(Focusable.list, nextFocus(.primary, true));
     try testing.expectEqual(Focusable.filter, nextFocus(.list, true));
 }
 
@@ -1389,76 +1494,18 @@ test "containsIgnoreCase: basic matches" {
     try testing.expect(!containsIgnoreCase("ab", "abc")); // needle longer
 }
 
-test "layout: controls nest inside the client area, buttons right-aligned" {
-    const l = layout(1.0, 1);
-    try testing.expect(l.client_w > 0 and l.client_h > 0);
-    for ([_]w32.RECT{ l.account_status, l.account_btn, l.filter, l.list, l.hint, l.open, l.cancel }) |r| {
-        try testing.expect(r.left >= 0 and r.top >= 0);
-        try testing.expect(r.right <= l.client_w and r.bottom <= l.client_h);
-        try testing.expect(r.right > r.left and r.bottom > r.top);
-    }
-    try testing.expect(l.open.right < l.cancel.left);
-    try testing.expect(l.list.bottom < l.hint.top);
-}
-
-test "layout: the account row sits above the filter and never overlaps it" {
-    const l = layout(1.0, 1);
-    // Status text left of the button, with a gap; both above the filter.
-    try testing.expect(l.account_status.right <= l.account_btn.left);
-    try testing.expect(l.account_status.right < l.account_btn.left);
-    try testing.expect(l.account_btn.bottom <= l.filter.top);
-    try testing.expect(l.account_status.bottom <= l.filter.top);
-    // Right-aligned with the same margin as the dialog's other right edges.
-    try testing.expectEqual(l.filter.right, l.account_btn.right);
-    // Wide enough for "Sign in with Google…" at 1.0 scale.
-    try testing.expect(l.account_btn.right - l.account_btn.left >= 140);
-}
-
-test "layout: scales with DPI" {
-    const l1 = layout(1.0, 1);
-    const l2 = layout(2.0, 1);
-    try testing.expectEqual(l1.client_w * 2, l2.client_w);
-    try testing.expectEqual(l1.list.top * 2, l2.list.top);
-    try testing.expectEqual(l1.font_h * 2, l2.font_h);
-    try testing.expectEqual(l1.account_btn.top * 2, l2.account_btn.top);
-    try testing.expectEqual(
-        (l1.account_btn.right - l1.account_btn.left) * 2,
-        l2.account_btn.right - l2.account_btn.left,
-    );
-}
-
-test "layout: a wrapping hint grows the dialog instead of clipping (T140)" {
-    const one = layout(1.0, 1);
-    const three = layout(1.0, 3);
-
-    // The hint control gets exactly its measured lines...
-    try testing.expectEqual(one.hint_line_h, one.hint.bottom - one.hint.top);
-    try testing.expectEqual(one.hint_line_h * 3, three.hint.bottom - three.hint.top);
-    // ...and the dialog is that much taller, so nothing is cut off.
-    try testing.expectEqual(one.client_h + one.hint_line_h * 2, three.client_h);
-    try testing.expectEqual(one.client_w, three.client_w);
-
-    // Everything above the hint is unmoved; the buttons ride down with it.
-    try testing.expectEqual(one.list.bottom, three.list.bottom);
-    try testing.expect(three.open.top > one.open.top);
-    for ([_]w32.RECT{ three.hint, three.open, three.cancel }) |r| {
-        try testing.expect(r.bottom <= three.client_h);
-    }
-}
-
-test "layout: a runaway hint is capped, not unbounded" {
-    const capped = layout(1.0, chooser_rows.max_hint_lines);
-    try testing.expectEqual(capped.client_h, layout(1.0, 99).client_h);
-}
-
-test "layout: the list shows whole rows only" {
+// The layout math itself is tested in `chooser_layout.zig` (it moved there
+// with T175). What stays here is the one thing that couples the two modules:
+// the list column has to hold whole rows of the height the row model asks for.
+test "layout: the machine list holds whole rows at every scale" {
     inline for (.{ @as(f32, 1.0), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
-        const l = layout(scale, 1);
         const row_h = chooser_rows.rowMetrics(scale).height;
-        const list_h = l.list.bottom - l.list.top;
-        // Five full rows fit, and the leftover is less than one more row (so
-        // the list never renders a clipped half row at its foot).
-        try testing.expect(list_h >= row_h * 5);
-        try testing.expect(list_h < row_h * 6);
+        // Even with the status strip at its maximum, the column is deep enough
+        // to be a real list rather than a peephole.
+        const worst = layout(scale, chooser_rows.max_hint_lines);
+        try testing.expect(worst.list.height() >= row_h * 5);
+        // And a one-line strip leaves strictly more room than the worst case.
+        const best = layout(scale, 1);
+        try testing.expect(best.list.height() > worst.list.height());
     }
 }

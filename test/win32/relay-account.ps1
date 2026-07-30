@@ -274,7 +274,9 @@ public class AcctDrv {
 function Get-AccountButton($chooser) {
     foreach ($row in [AcctDrv]::Children($chooser, 'Button')) {
         $f = $row -split '\|'
-        if ($f[1] -ne 'Open' -and $f[1] -ne 'Cancel') {
+        # The chooser's other buttons: the detail pane's primary action (T175
+        # renamed it from "Open" to Mac's "New Window") and the footer's Cancel.
+        if ($f[1] -ne 'New Window' -and $f[1] -ne 'Open' -and $f[1] -ne 'Cancel') {
             return [pscustomobject]@{
                 Hwnd    = [IntPtr][int64]$f[0]
                 Text    = $f[1]
