@@ -42,6 +42,7 @@ const tcp_dial = @import("../../remote/tcp_dial.zig");
 const connection = @import("../../remote/connection.zig");
 const build_config = @import("../../build_config.zig");
 const protocol = @import("../../remote/protocol.zig");
+const agent_upgrade = @import("agent_upgrade.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_local_agent);
@@ -107,6 +108,13 @@ last_failure_ms: ?i64 = null,
 /// (T89h). Once per run: the value only changes when the install moves.
 autostart_done: bool = false,
 
+/// The build stamp of the agent binary THIS app ships beside (T147), learned
+/// once by running `<agent exe> --version`. Null means "not knowable" — no
+/// binary, or the probe failed — which the policy turns into "never judge the
+/// running agent stale". Owned; freed in `deinit`.
+bundled_version: ?[]const u8 = null,
+bundled_version_probed: bool = false,
+
 pub fn init(alloc: Allocator) LocalAgent {
     return .{ .alloc = alloc };
 }
@@ -114,6 +122,8 @@ pub fn init(alloc: Allocator) LocalAgent {
 pub fn deinit(self: *LocalAgent) void {
     if (self.shared) |*d| d.deinit();
     self.shared = null;
+    if (self.bundled_version) |v| self.alloc.free(v);
+    self.bundled_version = null;
     // Safe here and ONLY here: `App.terminate` deinits every window (and thus
     // every surface that borrowed one of these) before calling us.
     for (self.retired.items) |*d| d.deinit();
@@ -304,6 +314,166 @@ pub fn sharedConnection(self: *LocalAgent) ?*connection.Connection {
 
     return self.shared.?.conn;
 }
+
+// =============================================================================
+// Non-destructive agent upgrade (T147)
+// =============================================================================
+
+/// The build stamp of the agent binary this app ships beside, or null when it
+/// cannot be determined (missing binary, `--version` failed or printed
+/// nothing). Probed at most ONCE per app run — the binary can be swapped
+/// underneath us mid-run (that is exactly what the upgrade script does), but
+/// the app that shipped it is this process, so the stamp it should adopt is the
+/// one that was next to it when it started. Cached either way, including the
+/// failure, so a broken probe costs one spawn and never repeats.
+pub fn bundledVersion(self: *LocalAgent) ?[]const u8 {
+    if (comptime builtin.os.tag != .windows) return null;
+    if (self.bundled_version_probed) return self.bundled_version;
+    self.bundled_version_probed = true;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Test hook (DEBUG BUILDS ONLY, like `GHOZTTY_AGENT_AUTOSTART=force`):
+    // pretend we ship a different build than the one on disk. Every stamp in a
+    // real build comes from the same binary the agent runs, so without this the
+    // acceptance harness could only ever exercise the "current" arm — there is
+    // no way to fabricate an old agent from a new tree. Overrides the INPUT
+    // only; the decision and the restart it drives are the shipping ones. Never
+    // honored in a release build: a stray env var must not be able to kill a
+    // user's agent.
+    if (build_config.is_debug) {
+        if (std.process.getEnvVarOwned(self.alloc, "GHOZTTY_AGENT_BUNDLED_VERSION")) |v| {
+            defer self.alloc.free(v);
+            if (v.len > 0) {
+                self.bundled_version = self.alloc.dupe(u8, v) catch return null;
+                log.warn("bundled agent build OVERRIDDEN to {s} (debug test hook)", .{v});
+                return self.bundled_version;
+            }
+        } else |_| {}
+    }
+
+    const exe = self.agentBinary(arena) catch return null;
+    std.fs.cwd().access(exe, .{}) catch {
+        log.warn("bundled agent binary not found at {s}; upgrade check disabled", .{exe});
+        return null;
+    };
+
+    // The agent is a GUI-subsystem exe on Windows (no console pops up for the
+    // tray daemon), but `--version` still writes to whatever stdout handle it
+    // inherits — here, this pipe.
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{ exe, "--version" },
+        .max_output_bytes = 4096,
+    }) catch |err| {
+        log.warn("agent --version probe failed err={}", .{err});
+        return null;
+    };
+
+    const stamp = agent_upgrade.parseVersionOutput(result.stdout) orelse {
+        log.warn("agent --version printed nothing usable; upgrade check disabled", .{});
+        return null;
+    };
+    self.bundled_version = self.alloc.dupe(u8, stamp) catch return null;
+    log.info("bundled agent build is {s}", .{self.bundled_version.?});
+    return self.bundled_version;
+}
+
+/// The build stamp the CONNECTED agent advertised in its HELLO, or null when
+/// there is no shared connection or the agent is too old to advertise one
+/// (which the policy reads as "pre-versioned", i.e. stale).
+pub fn runningVersion(self: *LocalAgent) ?[]const u8 {
+    if (self.shared) |*d| {
+        if (d.conn.peerBuildVersion()) |v| return v;
+    }
+    return null;
+}
+
+/// Whether a shared connection exists right now (i.e. persistence has actually
+/// engaged and there is an agent whose build we can judge).
+pub fn hasSharedConnection(self: *const LocalAgent) bool {
+    return self.shared != null;
+}
+
+/// The cached shared connection if there IS one and it is not dead — never
+/// dialing, never spawning. `sharedConnection` is the resolve-or-fall-back
+/// entry point for new surfaces; this one is for callers that only want to talk
+/// to an agent that already exists (the upgrade check, which must not spawn a
+/// fresh agent just to ask whether the running one is old).
+pub fn sharedConnectionIfWarm(self: *LocalAgent) ?*connection.Connection {
+    if (self.shared) |d| {
+        if (d.conn.state() != .dead) return d.conn;
+    }
+    return null;
+}
+
+/// Terminate the running local agent and drop our connection to it, so the next
+/// resolve spawns the binary now on disk (T147). DESTRUCTIVE: the agent owns
+/// every persistent PTY, so its children die with it — the caller MUST have
+/// established that this is safe (no live sessions) or user-confirmed.
+///
+/// Returns true when an agent was actually terminated. The connection is
+/// RETIRED, never freed, for the same borrowed-pointer reason as everywhere
+/// else in this file.
+pub fn restartForUpgrade(self: *LocalAgent) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+
+    const info = self.readInfoFile();
+    const pid: i64 = if (info) |i| i.pid else 0;
+
+    // Shut our end down BEFORE the kill: a retired connection fails sends fast
+    // instead of blocking the GUI thread on a pipe whose server just died.
+    if (self.shared) |old| self.retire(old);
+    self.shared = null;
+    self.shared_pid = 0;
+    // A deliberate restart is not a failure, and the cooldown must not make the
+    // very next resolve fall back to exec.
+    self.last_failure_ms = null;
+
+    const killed = if (pid > 0) terminateProcess(pid) else false;
+    if (killed) {
+        log.info("terminated local agent pid {d} to adopt the bundled build", .{pid});
+    } else {
+        log.warn("no local agent process to terminate (pid {d}); the next resolve spawns one", .{pid});
+    }
+    return killed;
+}
+
+/// TerminateProcess + a bounded wait for the process to actually go away, so a
+/// respawn can't race the dying agent's still-bound pipe. Best-effort: a
+/// process we cannot open (gone already, or access-denied) reports false and
+/// the caller carries on — the spawn path re-dials before spawning anyway.
+fn terminateProcess(pid: i64) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (pid <= 0 or pid > std.math.maxInt(u32)) return false;
+    const windows = std.os.windows;
+
+    const h = OpenProcess(
+        PROCESS_TERMINATE | SYNCHRONIZE,
+        windows.FALSE,
+        @intCast(pid),
+    ) orelse return false;
+    defer windows.CloseHandle(h);
+
+    if (windows.kernel32.TerminateProcess(h, 0) == 0) {
+        log.warn("TerminateProcess(agent pid {d}) failed err={}", .{ pid, windows.kernel32.GetLastError() });
+        return false;
+    }
+    // The pipe name only frees when the agent's last handle closes; waiting
+    // here is what keeps `findOrSpawn` from dialing the corpse.
+    _ = w32.WaitForSingleObject(h, agent_exit_wait_ms);
+    return true;
+}
+
+/// How long to wait for a terminated agent to actually exit. Generous relative
+/// to the observed teardown (instant on TerminateProcess) and bounded so the
+/// GUI thread can never park here.
+const agent_exit_wait_ms: u32 = 3000;
+
+const PROCESS_TERMINATE: std.os.windows.DWORD = 0x0001;
+const SYNCHRONIZE: std.os.windows.DWORD = 0x00100000;
 
 /// Write/refresh the HKCU Run autostart entry for the local agent (T89h) —
 /// the Windows analog of the Mac's per-user LaunchAgent. At sign-in the agent

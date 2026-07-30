@@ -2769,3 +2769,57 @@ restore (T89f2); the Mac's in-place recovery (`03f0f1f30`, hardened by
   visibility and surface lifetime.
 - Filed **T194** (the split-out launch-restore half) and **T195** (the settle
   window is unit-tested but has no on-box blip test).
+
+## 2026-07-30 - T147 done: the new agent was already on disk; nothing ever picked it up
+
+The row said Windows' agent upgrade was DESTRUCTIVE. It was **inert**, and the
+audit had to come before the code to see that. `ae2be57cb` needs no port at all
+(its FIX 2, the headless emulator + VT repaint on ATTACH, is shared Zig the
+win32 agent has carried since it first built; FIX 1 is launchd), and the
+delivery script already renames the running agent's exe aside instead of killing
+it (T89h). The real gap was the other half of `c6ad0fc07`: **nothing ever
+adopted the new binary.** The running agent keeps every PTY and serves forever,
+so an agent-side fix reached the user only after a reboot — the Mac's 1.15.0
+incident, one platform later.
+
+- The decision is pure and unit-tested (`agent_upgrade.zig`): parse
+  `--version`, order stamps by `YYYYMMDD`, `isStale` (null ⇒ pre-versioned ⇒
+  stale, newer ⇒ never downgrade), `decide → none | refresh_now |
+  confirm_first`. Idle restarts silently; live sessions get the mandatory
+  confirmation CLAUDE.md requires, and a decline defers to the next idle moment
+  instead of nagging.
+- **Liveness is asked of the AGENT, not counted from this app's panes** — the
+  one place a literal port would have been actively dangerous. At app quit every
+  window is destroyed while its sessions stay alive on purpose, so a pane count
+  reads 0 at exactly the moment a restart destroys the most work. Unknown
+  liveness ⇒ do nothing: "we couldn't ask how much this would destroy" is never
+  grounds for destroying it.
+- Two more decisions worth their comments: the idle arm re-dials through
+  `recoverLocalAgentInPlace` (no LIVE sessions still permits windows full of
+  TOMBSTONES, which must be RELAUNCHed onto the new agent, not left on a retired
+  connection), and a 2/run restart cap so a restart that doesn't cure staleness
+  can't kill an innocent agent on every window close.
+- `agent-upgrade.ps1` **ALL PASS (38) ×3**, measured by outcome — agent pids,
+  dialogs on screen, panes that still answer. The contract assert is C5: the
+  agent pid is unchanged *while the dialog is up*, i.e. consent comes before the
+  destruction. D proves the accept path is in place (agent pid changes, app pid
+  does not, pane responsive again); E proves the deferral promise is kept
+  (decline, then the last pane closes ⇒ silent refresh, no second dialog).
+- **Negative control, run for real:** with the check stubbed out the script
+  failed *exactly* the six T147 assertions and nothing else — B and F still
+  passed, so they are controls rather than filler.
+- Staleness is faked with a **debug-only** `GHOZTTY_AGENT_BUNDLED_VERSION`: every
+  stamp in a real build comes from the same binary the agent runs, so there is no
+  way to fabricate an old agent from a new tree. Input only; the decision and the
+  restart are the shipping ones.
+- **The harness lied first, again.** Six assertions failed against a build whose
+  correct `+list --json` output sat complete in the redirect file: a timed
+  `WaitForExit(ms)` leaves `$p.ExitCode` empty unless `.Handle` was cached before
+  the child exited. The durable lesson is the second fix, not the first — gate an
+  oracle on the OUTPUT, never on a shell-plumbing detail. Filed as **T197**.
+- Floor: both lanes + `test-agent` + P1–P3 green; `agent-recovery` (25) and
+  `session-close` ALL PASS as regressions.
+- Filed **T196** (deliver T145 + T147 to all 3 install locations — until then
+  the mechanism that makes future agent fixes reach users exists only in
+  zig-out) and **T197**; annotated **T125**, whose correctness half this closes,
+  leaving the What's-new accessory and protocol-SKEW gating.

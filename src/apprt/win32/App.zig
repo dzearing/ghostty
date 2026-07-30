@@ -36,6 +36,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
 const session_layout = @import("session_layout.zig");
 const agent_recovery = @import("agent_recovery.zig");
+const agent_upgrade = @import("agent_upgrade.zig");
 const host_defaults = @import("host_defaults.zig");
 const w32 = @import("win32.zig");
 
@@ -75,6 +76,20 @@ pub const WM_APP_SETFOCUS: u32 = w32.WM_APP + 5;
 /// re-enter `Connection` — it posts and returns, and the settle watch below
 /// runs on the GUI thread. (WM_APP+9/+10 are RelayAccountRow / Window's open-menu.)
 const WM_APP_AGENT_LINK_DOWN: u32 = w32.WM_APP + 11;
+
+/// Posted to `msg_hwnd` to re-run the non-destructive agent-upgrade check
+/// (T147) at a moment that is safe to be destructive: after the last persistent
+/// window closed. Posted rather than called inline so the close that triggered
+/// it has fully settled (the window is off `self.windows` but its teardown is
+/// still unwinding) before we count what is live — the Mac trigger defers for
+/// exactly the same reason.
+const WM_APP_AGENT_UPGRADE_CHECK: u32 = w32.WM_APP + 12;
+
+/// Ceiling on agent restarts spent chasing the bundled build in one app run
+/// (T147). Two: one for the ordinary "the binary was swapped under us" case,
+/// one spare for a restart that raced something, and no third because a third
+/// means the restart is not the cure.
+const max_agent_upgrade_attempts: u8 = 2;
 
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
@@ -225,6 +240,20 @@ agent_settle_deadline_ms: ?i64 = null,
 /// surfaces, which re-enters the layout-sync and IPC paths; a link transition
 /// arriving mid-rebuild must not start a second recovery on top of the first.
 agent_recovering: bool = false,
+
+/// True once the user has declined a destructive agent refresh in this app run
+/// (T147). It suppresses further PROMPTS only — the silent idle refresh still
+/// happens the next time no sessions are live, which is exactly what the
+/// dialog promises. Per-run by design: the next launch asks again, because by
+/// then the sessions in question are new ones.
+agent_upgrade_declined: bool = false,
+
+/// How many agent restarts this run has already spent trying to adopt the
+/// bundled build (T147). Bounded by `max_agent_upgrade_attempts`: if a restart
+/// does not cure staleness — an agent from another install holding the
+/// single-instance guard, say — retrying on every window close would kill an
+/// innocent agent over and over.
+agent_upgrade_attempts: u8 = 0,
 
 pub const IpcTarget = IpcRegistry.Target;
 
@@ -591,6 +620,13 @@ pub fn run(self: *App) !void {
     // agent is NOTICED and the local windows rebuild in place, instead of the
     // panes sitting frozen until the user quits and relaunches.
     self.installLocalAgentWatch();
+
+    // T147: restore has settled, so this is a safe moment to adopt a newer
+    // bundled agent build. Idle ⇒ silent restart; live sessions ⇒ the mandatory
+    // confirmation. This is what un-sticks an agent that survived several app
+    // upgrades on an old binary (the upgrade script deliberately never kills
+    // it), instead of waiting for a reboot.
+    self.refreshLocalAgentIfStale("launch restore finished");
 
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
@@ -1337,6 +1373,168 @@ fn restoreBuildSubtree(
 
     try self.restoreBuildSubtree(window, nodes, sp.left, anchor, conn, attach, depth + 1);
     try self.restoreBuildSubtree(window, nodes, sp.right, new_surface, conn, attach, depth + 1);
+}
+
+// =============================================================================
+// Non-destructive local-agent upgrade (T147)
+// =============================================================================
+
+/// Post the upgrade re-check to the GUI thread (see
+/// `WM_APP_AGENT_UPGRADE_CHECK`). Called when a persistent window goes away:
+/// the agent may have just become idle, and idle is the one moment a stale
+/// agent can be adopted with nothing to lose.
+pub fn scheduleAgentUpgradeCheck(self: *App) void {
+    if (!self.config.@"session-persistence") return;
+    const hwnd = self.msg_hwnd orelse return;
+    _ = w32.PostMessageW(hwnd, WM_APP_AGENT_UPGRADE_CHECK, 0, 0);
+}
+
+/// How many LIVE sessions the agent itself owns, or null when it could not be
+/// asked — the input the upgrade policy weighs a destructive restart against.
+///
+/// Asked of the AGENT, not counted from this app's panes, and the difference is
+/// load-bearing: at app quit every window is destroyed while its sessions stay
+/// alive on purpose (detach, not close), so a pane count would read 0 at exactly
+/// the moment killing the agent destroys the most work. It also sees sessions
+/// this app never adopted — another instance's, or a previous run's pinned ones
+/// — which a pane walk cannot.
+///
+/// Tombstones (`alive == false`) are NOT counted: their child is already gone
+/// and `sessions.json` brings them back as tombstones after the restart, so a
+/// restart costs them nothing.
+fn liveAgentSessionCount(self: *App) ?usize {
+    const conn = self.local_agent.sharedConnectionIfWarm() orelse return null;
+    var roster = conn.requestSessions(restore_probe_timeout_ns) catch |err| {
+        log.warn("agent upgrade check: session probe failed err={} (treating as unknown)", .{err});
+        return null;
+    };
+    defer roster.deinit();
+
+    var n: usize = 0;
+    for (roster.sessions) |sess| {
+        if (sess.alive) n += 1;
+    }
+    return n;
+}
+
+/// Adopt a newer bundled agent build without waiting for a reboot (T147, Mac
+/// `refreshLocalAgentIfStale`).
+///
+/// The agent deliberately outlives the app — the upgrade script swaps
+/// `ghoztty-agent.exe` on disk and never kills the running one (T89h) — so
+/// without this an agent-side fix reaches the user only when they next reboot.
+/// Called at the two moments where a restart can be safe: launch restore
+/// finished, and the last persistent window closed.
+///
+/// The DECISION is `agent_upgrade.decide` (pure, unit-tested); this function is
+/// only its mechanism. Idle ⇒ restart silently (logged, never invisible). Live
+/// sessions ⇒ the mandatory confirmation CLAUDE.md requires, never a silent
+/// reset; a decline defers to the next idle moment and is not re-asked this run.
+pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
+    if (!self.config.@"session-persistence") return;
+    if (self.agent_recovering) return;
+    // Quitting is never a safe moment: the windows are going away but their
+    // sessions are meant to SURVIVE the app (that is the whole feature), and a
+    // restart here would end them behind the user's back.
+    if (self.quit_requested) return;
+
+    // Nothing dialed ⇒ no agent whose build we can judge. Deliberately does NOT
+    // spawn one: a freshly spawned agent is by definition current, so spawning
+    // to ask would only ever answer "not stale".
+    if (!self.local_agent.hasSharedConnection()) return;
+
+    // A restart that doesn't cure staleness must not retry forever (e.g. an
+    // agent from a different install still holding the single-instance guard).
+    // Bounded, and the ceiling is logged rather than silently absorbed.
+    if (self.agent_upgrade_attempts >= max_agent_upgrade_attempts) return;
+
+    const bundled = self.local_agent.bundledVersion();
+    const running = self.local_agent.runningVersion();
+
+    // Unknown liveness ⇒ do nothing. "We couldn't ask how much this would
+    // destroy" is never grounds for destroying it.
+    const live = self.liveAgentSessionCount() orelse {
+        log.info("agent upgrade check skipped: agent session liveness unknown [{s}]", .{reason});
+        return;
+    };
+
+    switch (agent_upgrade.decide(running, bundled, live)) {
+        .none => return,
+        .refresh_now => {
+            log.info(
+                "local agent stale (running {s} != bundled {s}); idle → refreshing [{s}]",
+                .{ running orelse "<pre-versioned>", bundled orelse "?", reason },
+            );
+            self.agent_upgrade_attempts += 1;
+            _ = self.local_agent.restartForUpgrade();
+            // Re-dial straight away so the fresh agent is warm before the next
+            // window asks — and through the recovery path, not a bare re-dial:
+            // "no LIVE sessions" still allows agent-backed windows full of
+            // TOMBSTONES, and those panes must be re-ATTACHed (RELAUNCHed) onto
+            // the new agent rather than left pointing at a retired connection.
+            // With no windows at all it degrades to exactly a re-dial.
+            self.recoverLocalAgentInPlace();
+            log.info("local agent refreshed to bundled build {s} (idle, no live sessions affected)", .{bundled orelse "?"});
+        },
+        .confirm_first => {
+            if (self.agent_upgrade_declined) {
+                log.info(
+                    "local agent still stale with {d} live session(s), but the user deferred this run [{s}]",
+                    .{ live, reason },
+                );
+                return;
+            }
+            self.promptAndRefreshLocalAgent(live, running, bundled orelse "?");
+        },
+    }
+}
+
+/// The mandatory confirmation before a destructive agent restart while sessions
+/// are live, and the restart itself when the user takes it.
+///
+/// On confirm the local windows are rebuilt in place on the fresh agent: the
+/// terminated agent's children are gone, but its `sessions.json` survives, so
+/// the respawned agent materializes them as relaunchable tombstones and the
+/// re-ATTACH turns each into a RELAUNCH with the `--- session restarted ---`
+/// divider (T89g). That is the honest outcome the dialog promises — the panes
+/// come back, their processes do not.
+fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bundled: []const u8) void {
+    const alloc = self.core_app.alloc;
+
+    var text_buf: [1024]u8 = undefined;
+    const text = agent_upgrade.formatConfirmText(&text_buf, live) catch return;
+    const text_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return;
+    defer alloc.free(text_w);
+    const title_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, agent_upgrade.confirm_title) catch return;
+    defer alloc.free(title_w);
+
+    const owner: ?*Window = if (self.windows.items.len > 0) self.windows.items[0] else null;
+    const result = ConfirmDialog.show(
+        self,
+        if (owner) |win| win.hwnd else null,
+        if (owner) |win| win.scale else 1.0,
+        if (owner) |win| (if (win.getActiveSurface()) |s| s.hwnd else null) else null,
+        .{
+            .title = title_w.ptr,
+            .text = text_w,
+            .icon = .warning,
+            .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Update Now"),
+            .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Later"),
+        },
+    );
+    if (result != .ok) {
+        self.agent_upgrade_declined = true;
+        log.info("user deferred destructive agent refresh ({d} live session(s))", .{live});
+        return;
+    }
+
+    log.warn(
+        "user confirmed destructive agent refresh (running {s} → bundled {s}, {d} live session(s))",
+        .{ running orelse "<pre-versioned>", bundled, live },
+    );
+    self.agent_upgrade_attempts += 1;
+    _ = self.local_agent.restartForUpgrade();
+    self.recoverLocalAgentInPlace();
 }
 
 // =============================================================================
@@ -4176,6 +4374,13 @@ fn msgWndProc(
             const res: *RelayAccountRow.Result = @ptrFromInt(wparam);
             RelayAccountRow.onResult(app, res);
         }
+        return 0;
+    }
+
+    if (msg == WM_APP_AGENT_UPGRADE_CHECK) {
+        // T147: a persistent window closed; the agent may have just gone idle,
+        // which is the safe moment to adopt a newer bundled build.
+        app.refreshLocalAgentIfStale("last persistent window closed");
         return 0;
     }
 

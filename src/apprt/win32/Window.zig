@@ -3930,6 +3930,13 @@ fn onDestroy(self: *Window) void {
     // down and terminate() did the authoritative capture first).
     app.markLayoutDirty();
 
+    // T147 (non-destructive agent upgrade): a persistent window just closed, so
+    // the agent may have gone idle — the one moment a stale agent can be
+    // adopted with nothing to lose. Posted, not called: this window is off the
+    // list but its surfaces are still unwinding below, and the check counts
+    // what is live.
+    if (self.local_agent_conn != null) app.scheduleAgentUpgradeCheck();
+
     // Drop IPC names before the allocation is freed below (deinit() is not
     // called on this path).
     app.ipcForget(.{ .window = self });

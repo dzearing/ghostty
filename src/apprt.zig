@@ -143,4 +143,9 @@ test {
     // only non-std import is the shared-core `remote/connection.zig` link-state
     // enum, which builds in every lane.
     _ = @import("apprt/win32/agent_recovery.zig");
+
+    // Pure win32 non-destructive agent-upgrade policy: is the running agent
+    // older than the one we ship, and may it be restarted now or only after a
+    // confirmation (T147). Pure std, same no-OS-imports deal.
+    _ = @import("apprt/win32/agent_upgrade.zig");
 }
