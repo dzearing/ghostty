@@ -35,6 +35,7 @@ const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
 const session_layout = @import("session_layout.zig");
+const host_defaults = @import("host_defaults.zig");
 const w32 = @import("win32.zig");
 
 const build_config = @import("../../build_config.zig");
@@ -1406,11 +1407,24 @@ pub fn openDialedWindow(
         inline else => |d| d.conn,
     };
 
+    // Per-host defaults (T174): a NEW remote window takes this machine's stored
+    // cwd + shell, and an explicit value from the caller (the chooser, or the
+    // `+new-remote-window` flags, or T68's inheritance) always wins. Mac does
+    // this in `Machine.applyOpenDefaults`; win32 has ONE open tail, so this is
+    // the single seeding site. Only ever an OPEN — an ATTACH's shell/cwd were
+    // fixed when its session was first opened, and no ATTACH comes through here.
+    var defaults: host_defaults.Resolved = .{};
+    if (opts.machine) |machine| host_defaults.lookup(
+        self.core_app.alloc,
+        machine.hostDefaultsKey(),
+        &defaults,
+    );
+
     const overrides: Surface.Overrides = .{
         .remote = .{
             .connection = conn,
-            .working_directory = opts.working_directory,
-            .shell = opts.shell,
+            .working_directory = opts.working_directory orelse defaults.workingDirectory(),
+            .shell = opts.shell orelse defaults.shell(),
             .command = opts.command,
         },
     };

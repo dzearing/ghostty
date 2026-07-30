@@ -46,6 +46,8 @@ const Window = @import("Window.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
+const HostSettingsDialog = @import("HostSettingsDialog.zig");
+const host_defaults = @import("host_defaults.zig");
 const chooser_rows = @import("chooser_rows.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
@@ -61,10 +63,10 @@ const LIST_ID: u16 = 101;
 const ACCOUNT_ID: u16 = 102;
 const MENU_ID: u16 = 103;
 
-/// `Host Settings…` needs T174's per-host defaults store, which does not exist
-/// on Windows yet. One bool, at the one place the menu is built — T174 flips it
-/// and adds a handler rather than reshaping the menu (see `chooser_menu`).
-const HOST_SETTINGS_AVAILABLE = false;
+/// `Host Settings…` needs the per-host defaults store, which T174 built
+/// (`host_defaults.zig` + `HostSettingsDialog.zig`) — one bool, at the one place
+/// the menu is built (see `chooser_menu`).
+const HOST_SETTINGS_AVAILABLE = true;
 
 /// Cap on rendered device rows (bounds the fixed-size `rows` array). The
 /// account device list is tiny in practice; extra devices are dropped from
@@ -975,9 +977,7 @@ fn openRowMenu(self: *MachineChooser, screen_x: i32, screen_y: i32) void {
     switch (id) {
         .rename => self.promptRename(device_index),
         .remove => self.confirmRemove(device_index),
-        // Gated off until T174 lands the per-host defaults store, so the item
-        // is never built — but if it ever is, say so instead of doing nothing.
-        .host_settings => self.setHint("Host settings aren't available on Windows yet."),
+        .host_settings => self.promptHostSettings(device_index),
     }
 }
 
@@ -987,6 +987,63 @@ fn openRowMenuFromButton(self: *MachineChooser) void {
     var r: w32.RECT = undefined;
     if (w32.GetWindowRect(self.menu_btn, &r) == 0) return;
     self.openRowMenu(r.left, r.bottom);
+}
+
+/// Edit this machine's per-host defaults (T174): the working directory and
+/// shell NEW sessions on it start with. Unlike rename/remove this touches
+/// nothing on the relay — the store is local (`host_defaults.zig`), and the
+/// key is the DEVICE ID so a later rename does not orphan the settings.
+///
+/// Available for every remote machine, signed in or not: these are local
+/// preferences, not account resources.
+fn promptHostSettings(self: *MachineChooser, device_index: usize) void {
+    const dev = self.devices[device_index];
+    const alloc = self.window.app.core_app.alloc;
+
+    // `dev` borrows the device list's JSON arena, and the modal below pumps
+    // messages — a sign-in landing under it re-lists and frees that arena.
+    // Copy out everything needed afterwards first (the reloadDevices lesson).
+    var id_buf: [host_defaults.MAX_KEY_LEN]u8 = undefined;
+    var name_buf: [128]u8 = undefined;
+    if (dev.id.len > id_buf.len or dev.name.len > name_buf.len) {
+        // Never a silent no-op: the user picked a menu item.
+        self.setHint("That machine's name or id is too long to edit here.");
+        return;
+    }
+    const id = id_buf[0..dev.id.len];
+    const name = name_buf[0..dev.name.len];
+    @memcpy(id, dev.id);
+    @memcpy(name, dev.name);
+    const key: host_defaults.Key = .{ .relay = id };
+
+    // Seed the fields from the store, then hand it straight back — the dialog
+    // pumps messages, so nothing borrowed from the store may outlive this.
+    var current: host_defaults.Resolved = .{};
+    host_defaults.lookup(alloc, key, &current);
+
+    const window = self.window;
+    var wd_buf: [host_defaults.MAX_VALUE_LEN]u8 = undefined;
+    var shell_buf: [host_defaults.MAX_VALUE_LEN]u8 = undefined;
+    const answer = HostSettingsDialog.prompt(
+        window.app,
+        self.hwnd,
+        window.scale,
+        null,
+        name,
+        .{
+            .working_directory = current.workingDirectory(),
+            .shell = current.shell(),
+        },
+        &wd_buf,
+        &shell_buf,
+    ) orelse return;
+    // The dialog ran its own message loop; the chooser may not have survived.
+    if (window.machine_chooser != self) return;
+
+    host_defaults.update(alloc, key, .{
+        .working_directory = answer.working_directory,
+        .shell = answer.shell,
+    });
 }
 
 /// Prompt for a new name and PATCH it onto the relay account. Errors land in
@@ -1877,17 +1934,33 @@ test "menuState: the Local row has no menu, a device row gets the relay menu" {
     try testing.expect(chooser_menu.hasMenu(menuState(.{ .device = 0 })));
 }
 
-test "T176 ships with Host Settings gated off (T174 owns it)" {
-    try testing.expect(!HOST_SETTINGS_AVAILABLE);
+test "T174 landed the store, so Host Settings is now built into the menu" {
+    try testing.expect(HOST_SETTINGS_AVAILABLE);
     var buf: [chooser_menu.max_items]chooser_menu.Item = undefined;
     const items = chooser_menu.build(
         .{ .kind = .relay, .host_settings = HOST_SETTINGS_AVAILABLE },
         &buf,
     );
+    // Mac's order: Host Settings… leads, the account actions follow.
+    try testing.expectEqual(chooser_menu.Id.host_settings, items[0].cmd.id);
+    var found = false;
     for (items) |item| switch (item) {
         .separator => {},
-        .cmd => |c| try testing.expect(c.id != .host_settings),
+        .cmd => |c| if (c.id == .host_settings) {
+            found = true;
+        },
     };
+    try testing.expect(found);
+}
+
+test "host-settings key is the device id, so a rename cannot orphan it" {
+    // The chooser keys the store on `dev.id`, never on the display name —
+    // renaming a machine must not lose its defaults.
+    var buf: [host_defaults.MAX_KEY_LEN]u8 = undefined;
+    try testing.expectEqualStrings(
+        "dev-abc",
+        host_defaults.formatKey(&buf, .{ .relay = "dev-abc" }).?,
+    );
 }
 
 test "nextFocus: every target is reachable both ways (no orphan in the cycle)" {

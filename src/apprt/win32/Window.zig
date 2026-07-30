@@ -63,6 +63,16 @@ pub const RemoteMachine = union(enum) {
             },
         }
     }
+
+    /// This machine's key in the per-host defaults store (T174): the relay
+    /// DEVICE ID (stable across renames), else `host:port` — Mac's
+    /// `Machine.settingsKey`. Borrows this machine's strings.
+    pub fn hostDefaultsKey(self: RemoteMachine) host_defaults.Key {
+        return switch (self) {
+            .tcp => |t| .{ .tcp = .{ .host = t.host, .port = t.port } },
+            .relay => |r| .{ .relay = r.device },
+        };
+    }
 };
 /// A client-area size in pixels (see `default_client_size`, T66).
 pub const ClientSize = struct { width: u32, height: u32 };
@@ -77,6 +87,7 @@ const color_math = @import("color_math.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
 const window_memory = @import("window_memory.zig");
+const host_defaults = @import("host_defaults.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -801,6 +812,11 @@ pub fn setRemoteMachine(self: *Window, machine: RemoteMachine) Allocator.Error!v
 const RemoteInherit = struct {
     overrides: Surface.Overrides,
     cwd: ?[]u8,
+    /// Backs `overrides.remote.shell` when it came from the per-host defaults
+    /// store (T174). Owned like `cwd` — and heap-owned rather than an inline
+    /// buffer BECAUSE this struct is returned by value: a pointer into its own
+    /// bytes would dangle the moment it was copied out.
+    shell: ?[]u8 = null,
 
     /// Tight bound for the on-demand cwd RPC (Mac remoteCwdQueryTimeoutMs).
     /// A healthy agent replies in single-digit ms; the bound caps how long a
@@ -810,6 +826,7 @@ const RemoteInherit = struct {
 
     fn deinit(self: *RemoteInherit, alloc: Allocator) void {
         if (self.cwd) |c| alloc.free(c);
+        if (self.shell) |s| alloc.free(s);
         self.* = undefined;
     }
 };
@@ -842,16 +859,33 @@ fn buildRemoteInherit(self: *Window, parent: ?*Surface) ?RemoteInherit {
             };
         }
     }
+
+    // T174: a tab/split OPENs a fresh session on the same machine, so the
+    // per-host default SHELL applies — but NOT the default cwd, which would
+    // yank the new pane away from where its parent is (Mac
+    // `BaseTerminalController.newSplit` / `TerminalController`: shell only, the
+    // cwd inherits above). Cross-machine windows only: the local
+    // session-persistence agent is this machine, not a "host" with defaults.
+    var shell: ?[]u8 = null;
+    if (!is_local_agent) {
+        if (self.remote_machine) |machine| {
+            const alloc = self.app.core_app.alloc;
+            var defaults: host_defaults.Resolved = .{};
+            host_defaults.lookup(alloc, machine.hostDefaultsKey(), &defaults);
+            if (defaults.shell()) |s| shell = alloc.dupe(u8, s) catch null;
+        }
+    }
+
     return .{
         .overrides = .{ .remote = .{
             .connection = conn,
             .working_directory = cwd,
-            // No per-host default shell store on win32 (yet): a fresh session
-            // uses the agent's default shell, like the Mac with no override.
+            .shell = shell,
             .command = command,
             .local_agent = is_local_agent,
         } },
         .cwd = cwd,
+        .shell = shell,
     };
 }
 

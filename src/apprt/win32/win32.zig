@@ -933,6 +933,25 @@ pub const DRAWITEMSTRUCT = extern struct {
 
 // EDIT cue banner ("placeholder" text shown while empty and unfocused).
 pub const EM_SETCUEBANNER: u32 = 0x1501;
+/// Select a range of an EDIT's text; `(0, -1)` selects all, so typing replaces
+/// a seeded value.
+pub const EM_SETSEL: u32 = 0x00B1;
+
+// COMBOBOX control styles and messages (T174's Host Settings shell field —
+// Mac's editable NSComboBox with the shell presets).
+/// An editable combo box: a text field plus a drop-down list, so a preset can
+/// be picked OR any other path typed. (`CBS_DROPDOWNLIST` would be read-only.)
+pub const CBS_DROPDOWN: u32 = 0x0002;
+pub const CBS_AUTOHSCROLL: u32 = 0x0040;
+pub const CB_ADDSTRING: u32 = 0x0143;
+pub const CB_SETITEMHEIGHT: u32 = 0x0153;
+pub const CB_GETITEMHEIGHT: u32 = 0x0154;
+/// Whether the drop-down list is currently open. Enter/Escape must close the
+/// LIST when it is, not commit/cancel the dialog behind it.
+pub const CB_GETDROPPEDSTATE: u32 = 0x0157;
+/// The combo's own cue banner ("placeholder"), so the inner EDIT never has to
+/// be found to set one.
+pub const CB_SETCUEBANNER: u32 = 0x1703;
 
 // Button control styles / notifications
 pub const BS_DEFPUSHBUTTON: u32 = 0x00000001;

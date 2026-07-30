@@ -2313,3 +2313,45 @@ lanes + `test-agent` exit 0; P1-P3 ALL PASS; `ipc-machine-chooser.ps1`,
 `relay-account.ps1` and `confirm-dialogs.ps1` re-run green. Filed **T177** (the
 detail action row is short Mac's `Activity`, and `Restore All` which belongs to
 T146). Next: **T174**, then T142.
+
+- 2026-07-30 (on-box) — **T174 DONE**: Windows finally has per-host remote
+  defaults. Three pieces — a `host_defaults.zig` store (JSON under
+  `%LOCALAPPDATA%`, keyed on the relay DEVICE ID else `host:port`, so a rename
+  cannot orphan a machine's settings; corrupt/blank/duplicate rows degrade to
+  empty rather than failing; `GHOSTTY_HOST_DEFAULTS` overrides the path for
+  tests), a `HostSettingsDialog.zig` two-row editor in the ConfirmDialog
+  nested-pump shape (working-directory EDIT + editable shell combo with Mac's
+  exact 6 presets, Save/Cancel), and `HOST_SETTINGS_AVAILABLE` flipped so
+  `Host Settings…` LEADS the chooser's row menu.
+
+  Applied at Mac's two altitudes, deliberately not everywhere: a NEW remote
+  window takes cwd + shell — seeded once in `App.openDialedWindow`, the single
+  remote-open tail, so the chooser, T68's inheriting re-dial and
+  `+new-remote-window` all inherit it from one site (Mac needs two) — while a
+  tab/split takes the SHELL ONLY, because its cwd comes from the parent pane's
+  live GET_CWD and a per-host default must not yank a split away from where its
+  parent is. The local session-persistence agent is excluded: it is this
+  machine, not a host with defaults.
+
+  Two win32 specifics: the combo's OPEN drop-down owns Enter and Escape (without
+  the `CB_GETDROPPEDSTATE` guard, picking a preset by keyboard would also
+  save-and-close the dialog behind the list), and focus inside an editable combo
+  lands on its inner EDIT — so both the nested pump's key routing and the Tab
+  cycle resolve that child back through `GetParent`. One correctness catch during
+  review: `RemoteInherit` is returned BY VALUE, so the inherited shell had to be
+  heap-owned like its `cwd` — an inline buffer would have dangled the moment the
+  struct was copied to the caller.
+
+  The trap that cost the time was in the harness, not the product: **`+send-keys`
+  translates escapes**, so `cd …\t174-elsewhere` arrived with a literal TAB,
+  cmd tab-completed elsewhere, the `cd` never happened, and the split-cwd
+  assertion read as a product bug. Backslashes are doubled now and the script
+  proves the parent moved before asking where its split landed. New
+  `test/win32/host-settings.ps1` ALL PASS (61) ×3 (real GUI for the editor +
+  real loopback agent for the apply rules, with a MEASURED before/after shell
+  flip so it cannot pass by matching the box default); `chooser-menu.ps1` updated
+  for the 3-item menu, ALL PASS (33); ipc-machine-chooser, relay-account,
+  confirm-dialogs green; both lanes + `test-agent` + P1–P3 green. Filed **T178**:
+  `remote-inherit.ps1` is red on 4 assertions (the remote-native `--command`
+  split's marker never appears) — PROVEN pre-existing by building a worktree at
+  HEAD `f1f973b88` and reproducing the identical four. Next: **T142**.

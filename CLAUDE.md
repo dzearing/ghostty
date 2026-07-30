@@ -223,11 +223,17 @@ The remote session uses the remote machine's own default shell and working
 directory (the local shell/pwd are NOT forwarded — they would not exist on a
 different OS such as a Windows ConPTY agent) unless a **per-host default** or
 an explicit flag says otherwise. Per-host defaults (default working directory
-+ default shell per machine) are edited in the machine chooser (Cmd-Shift-N →
-row `⋯` menu → "Host Settings…") and persist in UserDefaults keyed by relay
-device id or `host:port`; explicit `--working-directory`/`--shell` flags
-override them per window. New tabs/splits on a remote window use the per-host
-default shell too (their cwd inherits from the parent pane).
++ default shell per machine) are edited in the machine chooser (Cmd-Shift-N on
+macOS / Ctrl+Shift+N on Windows → row `⋯` menu → "Host Settings…"), keyed by
+relay device id or `host:port` — persisted in UserDefaults on macOS and in
+`%LOCALAPPDATA%\ghoztty\host_defaults.json` on Windows (`-debug` suffixed for
+debug builds; `GHOSTTY_HOST_DEFAULTS` overrides the path outright, which is how
+the acceptance test avoids the real file). Both are LOCAL preferences, never
+account resources: a sign-out or a 401 must not lose a user's shell choice.
+Explicit `--working-directory`/`--shell` flags override them per window. New
+tabs/splits on a remote window use the per-host default shell too — but NOT its
+working directory, since their cwd inherits from the parent pane and a default
+must not yank a split away from where its parent is.
 
 ### Relay account sign-in (GUI only — there is no CLI verb)
 

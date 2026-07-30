@@ -479,9 +479,21 @@ Work these first, in order, before falling back to first-todo-in-table:
    describing the machine you left). The detail pane below the header is
    deliberately EMPTY until T146 brings session browsing.
    `ipc-machine-chooser.ps1` 26 → 34 assertions, ALL PASS ×3.
-   **Next: T176** (the per-row `⋯` menu + relay Rename…/Remove from Account…),
-   then **T174** (per-host defaults store + Host Settings dialog — Windows has
-   never had one)) → **T142** (banner overlay z-order self-healing). Then 3d.
+   ~~T176~~ DONE 2026-07-30 (the per-row `⋯` menu + relay Rename…/Remove from
+   Account…; filed T177). ~~T174~~ **DONE 2026-07-30**: Windows finally has
+   per-host remote defaults — a `host_defaults.zig` store under
+   `%LOCALAPPDATA%` keyed on the relay device id (else `host:port`, Mac's
+   `settingsKey`), a `HostSettingsDialog.zig` two-row editor with Mac's 6 shell
+   presets in an editable combo, and the gate in `chooser_menu` flipped so
+   `Host Settings…` LEADS the row menu. Applied at Mac's exact two altitudes: a
+   new remote window takes cwd + shell (seeded in `openDialedWindow`, the ONE
+   open tail — Mac needs two sites), a tab/split takes the SHELL ONLY because
+   its cwd inherits from the parent pane. New `host-settings.ps1` ALL PASS (61)
+   ×3, driving the real GUI for the editor and a real loopback agent for the
+   apply rules — including a measured before/after shell flip, so it proves the
+   store changed the shell instead of matching the box default. Filed **T178**
+   (`remote-inherit.ps1` red on 4 assertions, PROVEN pre-existing against a
+   HEAD worktree). **Next: T142** (banner overlay z-order self-healing). Then 3d.
 
 3f. **USER LIVE-REVIEW #2, 2026-07-29 (same day, later) — "The goal is
    complete parity with the macOS client."** The user named three gaps by

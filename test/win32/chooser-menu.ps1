@@ -9,9 +9,10 @@
 # fake relay and asserts:
 #
 #   1. the "..." button is hidden on the Local row and shown on a device row;
-#   2. clicking it opens a popup menu whose items are exactly Rename... |
-#      separator | Remove from Account... (no Host Settings... - that is
-#      T174's, and it is gated off);
+#   2. clicking it opens a popup menu whose items are exactly Host Settings...
+#      | separator | Rename... | separator | Remove from Account... (mac's
+#      order; T174 built the store behind the first item, and its behavior is
+#      host-settings.ps1's - this script owns the menu SHAPE);
 #   3. a right-click on a row opens the same menu (and selects that row);
 #   4. Rename... opens a prompt SEEDED with the current name, and committing it
 #      PATCHes /v1/client/devices/<id> with {"name":...} - proven by the relay
@@ -429,12 +430,13 @@ if ($proc.HasExited) {
                     Assert ($popup -ne [IntPtr]::Zero) 'the management button opens a popup menu'
                     if ($popup -ne [IntPtr]::Zero) {
                         $items = @([CmDrv]::MenuItems($popup))
-                        $want = @('Rename...', 'SEP', 'Remove from Account...')
+                        $want = @('Host Settings...', 'SEP', 'Rename...', 'SEP', 'Remove from Account...')
                         Assert (($items -join '|') -eq ($want -join '|')) `
-                            "menu is Rename | sep | Remove from Account (got: $($items -join ' | '))"
-                        # Host Settings... is T174's; gated off, it must be
-                        # ABSENT rather than present-and-dead.
-                        Assert (($items -join '|') -notmatch 'Host Settings') 'Host Settings... is absent while T174 is unbuilt'
+                            "menu is Host Settings | sep | Rename | sep | Remove from Account (got: $($items -join ' | '))"
+                        # Host Settings... leads on mac (managementActions), and
+                        # T174 built the store behind it - what this script owns
+                        # is the SHAPE; host-settings.ps1 owns its behavior.
+                        Assert ($items[0] -eq 'Host Settings...') 'Host Settings... leads the menu (mac order)'
                         [CmDrv]::Press($popup, [uint16]0x1B, $false) # VK_ESCAPE
                         Start-Sleep -Milliseconds 300
                         Assert ([CmDrv]::FindByClass('#32768') -eq [IntPtr]::Zero) 'Escape closed the menu'
@@ -453,10 +455,13 @@ if ($proc.HasExited) {
                 Assert ($popup2 -ne [IntPtr]::Zero) 'right-clicking a row opens the management menu'
                 if ($popup2 -ne [IntPtr]::Zero) {
                     $items2 = @([CmDrv]::MenuItems($popup2))
-                    Assert (($items2 -join '|') -eq 'Rename...|SEP|Remove from Account...') `
+                    Assert (($items2 -join '|') -eq 'Host Settings...|SEP|Rename...|SEP|Remove from Account...') `
                         "right-click menu matches the button's (got: $($items2 -join ' | '))"
 
-                    # --- (4) Rename...: first item, seeded prompt, PATCH
+                    # --- (4) Rename...: seeded prompt, PATCH. Two DOWNs now:
+                    # Host Settings... is the first item (separators are skipped
+                    # by keyboard navigation).
+                    [CmDrv]::Press($popup2, [uint16]0x28, $false) # DOWN -> Host Settings...
                     [CmDrv]::Press($popup2, [uint16]0x28, $false) # DOWN -> Rename...
                     [CmDrv]::Press($popup2, [uint16]0x0D, $false) # ENTER
                     $prompt = Wait-Window 'GhozttyConfirmDialog' 2500
@@ -505,6 +510,7 @@ if ($proc.HasExited) {
                     [CmDrv]::Click($cx, $cy, $false)
                     $popup3 = Wait-Window '#32768' 2000
                     if ($popup3 -ne [IntPtr]::Zero) {
+                        [CmDrv]::Press($popup3, [uint16]0x28, $false) # Host Settings...
                         [CmDrv]::Press($popup3, [uint16]0x28, $false) # Rename...
                         [CmDrv]::Press($popup3, [uint16]0x28, $false) # Remove from Account...
                         [CmDrv]::Press($popup3, [uint16]0x0D, $false)
@@ -534,6 +540,8 @@ if ($proc.HasExited) {
                         [CmDrv]::Click([int](($mb.Left + $mb.Right) / 2), [int](($mb.Top + $mb.Bottom) / 2), $false)
                         $popup4 = Wait-Window '#32768' 2000
                         if ($popup4 -ne [IntPtr]::Zero) {
+                            # Host Settings... -> Rename... -> Remove
+                            [CmDrv]::Press($popup4, [uint16]0x28, $false)
                             [CmDrv]::Press($popup4, [uint16]0x28, $false)
                             [CmDrv]::Press($popup4, [uint16]0x28, $false)
                             [CmDrv]::Press($popup4, [uint16]0x0D, $false)
