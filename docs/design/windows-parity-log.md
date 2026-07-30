@@ -2012,3 +2012,35 @@ window edge a few px. Next: T130.
 Note for whoever runs the next delivery: `scratchpad/deliver.ps1`'s backup tag
 is hardcoded per-task, so it overwrote the previous `.bak-20260729-t154` files.
 The live binaries were never at risk; only one generation of backup was lost.
+
+## 2026-07-29 - T130 done: the durability gap had already swallowed one fix
+
+Mirrored the Windows banner-hook fixes into the plugin source repo
+(`dzearing/ghoztty-claude-plugin` 5a40ac9, 0.7.0 -> 0.8.0). The task existed
+because the fixes lived only in this box's plugin cache, where a plugin update
+would silently revert them - and the first diff showed that had ALREADY
+happened. The cached 0.7.0 hook carried the tty fix and source did not (3 hunks,
+19 lines); worse, the `# ` heading documentation applied to the 0.4.0 cached
+SKILL.md was simply gone from 0.7.0, whose SKILL.md matched source byte-for-byte.
+One of the two fixes was lost by a release before anyone noticed. That is the
+argument for mirroring, made by the artifact rather than by me.
+
+The jq question was the only real decision. Vendoring a JSON read/merge in sh
+was rejected: the state values are banner markdown carrying quotes, pipes,
+backslashes and `\n`, and a hand-rolled writer that gets escaping subtly wrong
+CORRUPTS banners instead of failing - strictly worse than the dependency. The
+trap was never jq, it was `exit 0`. So the hook now announces itself: no jq
+means a one-time per-pane banner saying the banner is inactive and how to fix
+it, which works precisely because `ghoztty +set-banner` needs no jq. Guarded by
+a `nojq-<pane-id>` flag so it fires once, not every prompt.
+
+Validation: `pane-id.ps1` ALL PASS (45) - section G runs the highest-versioned
+cached hook end-to-end and asserts it painted a banner on its own pane via the
+pane-id CLI path, not the OSC fallback. Plus two direct checks of the new code:
+the mirrored script drove this live session's banner (read back out of `+list
+--json`), and with jq removed from PATH the announce path exits 0 and writes its
+guard file. Both lanes + `test-agent` re-run green; no app source changed.
+
+Also mirrored into the active cache so this box has the fix now. The version
+trap stands: in-process hooks keep running the old script until a session
+restarts.

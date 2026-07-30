@@ -404,8 +404,14 @@ Work these first, in order, before falling back to first-todo-in-table:
    ×3 — and that script had only ever passed on its FIRST run, because session
    restore handed it back its own previous `bw` window; it now launches with
    `--session-persistence=false`. Closed T103 (its four "box-state" oracle
-   failures were the layered alpha) and filed T136 + T137) → **T130** (make the
-   plugin-side banner-hook fixes durable) → **T133** (same, for the
+   failures were the layered alpha) and filed T136 + T137) → ~~**T130**~~
+   (**DONE 2026-07-29** — mirrored to `dzearing/ghoztty-claude-plugin`
+   `5a40ac9`, 0.7.0 → 0.8.0. The diff proved the task's own premise: 0.7.0 had
+   ALREADY silently reverted the `# ` heading fix applied to the 0.4.0 cache.
+   jq stays a dependency — vendoring a JSON writer for markdown-bearing values
+   would corrupt banners rather than fail — but a missing jq now announces
+   itself in a one-time per-pane banner instead of `exit 0`. `pane-id.ps1` ALL
+   PASS (45)) → **T133** (same, for the
    `/reset-context` composer wipe) → T38/T39 per item 20.
 
 3e. **USER LIVE-REVIEW, 2026-07-29 — do these FIRST, ahead of 3d.** The user
