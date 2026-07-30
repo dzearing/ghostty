@@ -2520,3 +2520,12 @@ T146). Next: **T174**, then T142.
   emit no OSC 7, so `+list` and window-inherit are both stale the moment you
   `cd`) and **T186** (Mac seat: both changes are shared core and unrun there;
   the template flush is very likely an upstream bug worth reporting).
+- DELIVERED to all 3 install locations (user-facing): ReleaseFast gnu
+  `-Dstrip=false` staged to `zig-out-release` (`+version` = `+43681d1c2`);
+  Desktop portable + `\homeassistant\share` swapped with `.bak-20260730-t144`;
+  installed release via the detached upgrade script at the boundary (default
+  `-ResumeCommand`, so its resume is also this turn's continuation). Resumed
+  session verifies, in order: `%TEMP%\ghoztty-upgrade.log`, then that
+  `%LOCALAPPDATA%\ghostty\config.ghostty` is no longer zero bytes (the user's
+  real profile had exactly that), then that its own pane and a fresh ctrl+n are
+  not in System32. Next: **T143** (the missing menu bar) per 3f.
