@@ -147,6 +147,62 @@ Assert "A20 a dead process reads as dead" (-not (Test-LoopProcAlive $stamp))
 AssertEq "A21 a dead loop process decides RELAUNCH" 'relaunch' `
     (Resolve-LoopResumeAction -ClaudeAlive (Test-LoopProcAlive $stamp))
 
+# --- A22 the readiness probe is BOUNDED (T187) ------------------------------
+# The loop stalled on 2026-07-30 because the readiness probe ran `+list` with no
+# timeout of its own: one blocking call swallowed the whole 60s window without
+# the wait loop ever iterating, and a RUNNING app was reported dead. These drive
+# `Invoke-GhozttyListJson` with stand-in "ghoztty" executables, so the probe's
+# contract is pinned without needing a real app.
+$probeDir = Join-Path $env:TEMP "ghoztty-probe-$PID"
+New-Item -ItemType Directory -Force $probeDir | Out-Null
+
+# A hang: sleeps far longer than the bound. The probe must give up ON TIME and
+# say so - the pre-fix code blocked here indefinitely.
+$hangExe = Join-Path $probeDir 'hang.cmd'
+Set-Content -Path $hangExe -Encoding ascii -Value @(
+    '@echo off',
+    'powershell -NoProfile -Command "Start-Sleep -Seconds 30"'
+)
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$hang = Invoke-GhozttyListJson -Exe $hangExe -WorkingDirectory $probeDir -TimeoutSec 3
+$sw.Stop()
+AssertEq "A22 a hung +list yields no payload" '' $hang.Json
+Assert "A23 it reports the hang instead of a bare failure: $($hang.Why)" ($hang.Why -match 'hung')
+Assert "A24 it returned within its bound, not the callee's ($([int]$sw.Elapsed.TotalSeconds)s)" `
+    ($sw.Elapsed.TotalSeconds -lt 12)
+
+# A refusal: the shape of "no running instance". The reason must carry the exit
+# code AND the first output line, so the log explains itself next time.
+$failExe = Join-Path $probeDir 'fail.cmd'
+Set-Content -Path $failExe -Encoding ascii -Value @(
+    '@echo off',
+    'echo No running Ghoztty instance found.',
+    'exit /b 1'
+)
+$fail = Invoke-GhozttyListJson -Exe $failExe -WorkingDirectory $probeDir -TimeoutSec 5
+AssertEq "A25 a refusing +list yields no payload" '' $fail.Json
+Assert "A26 the reason carries the exit code: $($fail.Why)" ($fail.Why -match 'exit=1')
+Assert "A27 the reason carries what it printed" ($fail.Why -match 'No running Ghoztty instance')
+
+# The success shape: exit 0 AND a payload that actually looks like a window list.
+$okExe = Join-Path $probeDir 'ok.cmd'
+Set-Content -Path $okExe -Encoding ascii -Value @(
+    '@echo off',
+    'echo {"success":true,"data":{"windows":[]}}'
+)
+$ok = Invoke-GhozttyListJson -Exe $okExe -WorkingDirectory $probeDir -TimeoutSec 5
+Assert "A28 a healthy +list returns its payload" ($ok.Json -match '"windows"')
+AssertEq "A29 and reports no reason to keep waiting" '' $ok.Why
+
+# Exit 0 with junk is NOT ready - the old check would also have rejected it, and
+# it must stay rejected or the wait returns garbage to the caller.
+$junkExe = Join-Path $probeDir 'junk.cmd'
+Set-Content -Path $junkExe -Encoding ascii -Value @('@echo off', 'echo hello')
+$junk = Invoke-GhozttyListJson -Exe $junkExe -WorkingDirectory $probeDir -TimeoutSec 5
+AssertEq "A30 exit 0 without a window list is not ready" '' $junk.Json
+
+Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue
+
 if ($PureOnly) {
     ""
     if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }

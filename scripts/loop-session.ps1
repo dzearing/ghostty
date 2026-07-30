@@ -154,3 +154,41 @@ function Resolve-LoopResumePrompt {
     }
     return 'read go.md and go'
 }
+
+# One BOUNDED `ghoztty +list --json` probe (tracker T187).
+#
+# Why this is not just `& $exe +list --json`: that call has no timeout of its
+# own, and a client that connects to a bound-but-not-yet-accepting pipe can
+# block. The upgrade script's readiness loop only checked its deadline BETWEEN
+# calls, so one blocking probe swallowed the whole 60s window without the loop
+# ever iterating - and the app was then reported as dead while it was running
+# fine (2026-07-30: the loop stalled until a human pinged it). Running the CLI
+# as a child with a hard wait is what makes a deadline mean what it says.
+#
+# Returns a hashtable: Json (the payload, or '') and Why (why not, for the log).
+# Never throws.
+function Invoke-GhozttyListJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [string]$WorkingDirectory = $PWD.Path,
+        [int]$TimeoutSec = 10
+    )
+    $out = Join-Path $env:TEMP ("ghoztty-listprobe-{0}-{1}.json" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
+            -WorkingDirectory $WorkingDirectory `
+            -ArgumentList "/c `"`"$Exe`" +list --json > `"$out`" 2>&1`""
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            return @{ Json = ''; Why = "+list hung past ${TimeoutSec}s" }
+        }
+        $t = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
+        if ($p.ExitCode -eq 0 -and $t -match '"windows"') { return @{ Json = $t; Why = '' } }
+        $first = ($t -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        return @{ Json = ''; Why = "exit=$($p.ExitCode) out='$first'" }
+    } catch {
+        return @{ Json = ''; Why = "probe threw: $($_.Exception.Message)" }
+    } finally {
+        Remove-Item $out -Force -ErrorAction SilentlyContinue
+    }
+}

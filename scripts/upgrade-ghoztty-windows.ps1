@@ -250,20 +250,44 @@ try { Set-Location -LiteralPath $WorkingDirectory -ErrorAction Stop } catch {
     Log "WARNING: could not cd to $WorkingDirectory ($($_.Exception.Message)); relaunch may land in the wrong cwd"
 }
 
-function Get-ListJson {
-    try {
-        $t = (& $oldExe +list --json 2>$null) | Out-String
-        if ($LASTEXITCODE -eq 0 -and $t -match '"windows"') { return $t }
-    } catch {}
-    return ''
+# T187 - every probe call is BOUNDED. `& $oldExe +list --json` has no timeout of
+# its own, and a client that connects to a bound-but-not-yet-accepting pipe can
+# block: one such call used to swallow `Wait-Instance`'s whole window without the
+# loop ever iterating, and the deadline then reported the app as DEAD. Running it
+# as a child with a hard wait makes the deadline mean what it says.
+function Get-ListJson([int]$callTimeoutSec = 10) {
+    return (Invoke-GhozttyListJson -Exe $oldExe -WorkingDirectory $WorkingDirectory -TimeoutSec $callTimeoutSec)
 }
-function Wait-Instance([int]$timeoutSec) {
+
+# Wait for the instance to answer IPC. `$appProc` is the process this script
+# started, when it started one: while THAT is alive, "the app did not come back
+# up" is simply false, so a live process buys the longer deadline. Measured
+# worst case for time-to-IPC-ready is ~11s (T187: 451ms with a healthy agent,
+# 10.7s with the agent suspended outright), so these bounds are far above it.
+function Wait-Instance([int]$timeoutSec, $appProc = $null) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $polls = 0
+    $lastWhy = ''
     while ((Get-Date) -lt $deadline) {
-        $t = Get-ListJson
-        if ($t) { return $t }
+        $r = Get-ListJson
+        if ($r.Json) {
+            if ($polls -gt 0) { Log "instance answered +list after $polls failed poll(s) (last: $lastWhy)" }
+            return $r.Json
+        }
+        $polls++
+        # Log the first failure and then every ~15s, so a recurrence explains
+        # itself off the log instead of being re-diagnosed from scratch.
+        if ($r.Why -ne $lastWhy -or ($polls % 20) -eq 0) {
+            Log "instance probe $polls not ready: $($r.Why)"
+            $lastWhy = $r.Why
+        }
+        if ($appProc -and $appProc.HasExited) {
+            Log "instance probe: the process we started (pid=$($appProc.Id)) EXITED with $($appProc.ExitCode)"
+            return ''
+        }
         Start-Sleep -Milliseconds 750
     }
+    Log "instance probe: gave up after ${timeoutSec}s and $polls poll(s); last: $lastWhy"
     return ''
 }
 
@@ -277,14 +301,25 @@ if ($action -eq 'reuse') {
 
     # The GUI died with the kill even though the session did not; bring it back
     # WITHOUT +new-window (which would open a window we do not want).
-    $listJson = Get-ListJson
+    $listJson = (Get-ListJson).Json
     if (-not $listJson) {
         Log 'reuse: no running instance; starting the freshly installed exe'
-        Start-Process -FilePath $oldExe -WorkingDirectory $WorkingDirectory | Out-Null
-        $listJson = Wait-Instance 60
+        $appProc = Start-Process -FilePath $oldExe -WorkingDirectory $WorkingDirectory -PassThru
+        # 180s, not 60s: the deadline exists to catch an app that never starts,
+        # and the cost of calling a LIVE app dead is a stalled loop (2026-07-30).
+        $listJson = Wait-Instance 180 $appProc
     }
     if (-not $listJson) {
-        Log 'RESUME-REUSE FAIL: the app did not come back up; the session is alive but headless. NOT relaunching (that would fork the loop) - the go-loop watchdog covers the stall.'
+        # Say WHICH of the two it is. They need different responses, and the old
+        # message asserted the first while the truth was the second (2026-07-30).
+        $state = if ($appProc -and -not $appProc.HasExited) {
+            "pid=$($appProc.Id) is ALIVE but never answered +list (IPC unreachable, not a dead app)"
+        } elseif ($appProc) {
+            "pid=$($appProc.Id) EXITED with $($appProc.ExitCode)"
+        } else {
+            'no instance and none was started'
+        }
+        Log "RESUME-REUSE FAIL: $state; the session is alive but headless. NOT relaunching (that would fork the loop) - the go-loop watchdog covers the stall."
         exit 1
     }
 
@@ -302,7 +337,7 @@ if ($action -eq 'reuse') {
             $paneBack = $true; break
         }
         Start-Sleep -Milliseconds 750
-        $listJson = Get-ListJson
+        $listJson = (Get-ListJson).Json
     }
     if (-not $paneBack) {
         Log "RESUME-REUSE PARTIAL: pane $LoopPaneId never re-appeared in +list; claude pid=$loopPid is still alive so NOT relaunching (a relaunch here is exactly the T138 fork)."
@@ -353,7 +388,7 @@ if ($action -eq 'reuse') {
 # depends on which side wins, which is exactly the kind of intermittent the
 # 2026-07-28 fork was.
 $relaunched = $false
-$listBefore = Get-ListJson
+$listBefore = (Get-ListJson).Json
 if (-not $listBefore) {
     Log 'relaunch: no running instance; starting the freshly installed exe before resuming'
     Start-Process -FilePath $oldExe -WorkingDirectory $WorkingDirectory | Out-Null
@@ -361,7 +396,7 @@ if (-not $listBefore) {
     # Restore rebuilds windows (and their IPC names) a beat after the pipe
     # comes up; give it that beat before deciding.
     Start-Sleep -Seconds 3
-    $listBefore = Get-ListJson
+    $listBefore = (Get-ListJson).Json
 }
 function Count-Windows($json) {
     if (-not $json) { return 0 }
@@ -380,7 +415,7 @@ if ($listBefore -match '"target"\s*:\s*"main"') {
     ForEach-Object { Log "relaunch: $_" }
 for ($i = 0; $i -lt 14; $i++) {
     Start-Sleep -Milliseconds 750
-    if ((Count-Windows (Get-ListJson)) -gt $before) { $relaunched = $true; break }
+    if ((Count-Windows (Get-ListJson).Json) -gt $before) { $relaunched = $true; break }
 }
 if ($relaunched) {
     Log "RELAUNCH-WINDOW OK: a new window is running the resume command (windows $before -> $($before + 1))"
@@ -391,7 +426,7 @@ if ($relaunched) {
         ForEach-Object { Log "relaunch: $_" }
     for ($i = 0; $i -lt 14; $i++) {
         Start-Sleep -Milliseconds 750
-        if ((Count-Windows (Get-ListJson)) -gt $before) { $relaunched = $true; break }
+        if ((Count-Windows (Get-ListJson).Json) -gt $before) { $relaunched = $true; break }
     }
     if ($relaunched) { Log "RELAUNCH-WINDOW OK: resumed in a new window named $alt" }
 }

@@ -2529,3 +2529,45 @@ T146). Next: **T174**, then T142.
   `%LOCALAPPDATA%\ghostty\config.ghostty` is no longer zero bytes (the user's
   real profile had exactly that), then that its own pane and a fresh ctrl+n are
   not in System32. Next: **T143** (the missing menu bar) per 3f.
+
+## 2026-07-30 - T187 done: the upgrade script called a running app dead, and the loop stalled until a human pinged
+
+- Found by T144's own delivery. `%TEMP%\ghoztty-upgrade.log` said
+  `RESUME-REUSE FAIL: the app did not come back up` at 09:07:00 - while
+  `ghoztty.exe` pid 35456 was up, `StartTime 9:06:00 AM`, and answering `+list`
+  fine afterwards. Because a false "app is dead" is fatal-but-don't-fork, the
+  resume prompt was never typed. This is the failure class T138/T139 exist to
+  prevent, so it jumped the queue (the T112 precedent: the loop's own
+  continuation mechanism gets fixed first).
+- **Both filed mechanisms were REFUTED by measurement**, which is the part worth
+  keeping. Time from `Start-Process` to first successful `+list --json`, debug
+  build, app killed with the agent left alive: cold start **427ms**; restore of
+  a 5-pane manifest **451ms**; restore with the agent **suspended outright**
+  (`NtSuspendProcess`, 40s) **10 755ms**. So the pre-loop
+  `restoreSessionLayout` is neither slow nor unbounded - it gives up and the
+  message loop starts in ~11s. "The app did not come back up" is essentially
+  never true after ~11s, and a 60s IPC blackout is not restore.
+- What the numbers DO indict is the probe. `Get-ListJson` ran `& $oldExe +list
+  --json` with **no timeout**, and `Wait-Instance` only checked its deadline
+  BETWEEN calls - so a single blocking probe (exactly what a client connecting
+  to a bound-but-not-yet-accepting pipe can do) swallows the entire window
+  without the loop iterating, and the deadline then reports death. The verdict
+  was also keyed solely on IPC, never on the far simpler fact that the process
+  the script itself started is alive.
+- Fix: `Invoke-GhozttyListJson` in `loop-session.ps1` - one BOUNDED probe
+  returning `@{Json; Why}` - put in the shared lib precisely so a test can drive
+  it with stand-in executables. `Wait-Instance` now takes the started process,
+  bails when it EXITS, logs the first failure and then every ~15s, and the reuse
+  deadline is 60s -> 180s. The FAIL line says WHICH of "exited" / "alive but IPC
+  unreachable" happened; the old one asserted the first while the truth was the
+  second.
+- `upgrade-no-fork.ps1` A22-A30: a stand-in `.cmd` that sleeps 30s must return
+  within its own 3s bound and say `hung` (pre-fix it blocked for the callee's
+  duration - the whole defect); an exit-1 stand-in must surface `exit=1` AND its
+  first output line so the log explains itself next time.
+- Filed **T188** for the pre-loop restore latency, on its own merits rather than
+  fixed opportunistically: `restoreSessionLayout()` runs before `GetMessageW`,
+  so IPC is bound-but-unserviced for its duration. Small and bounded today
+  (numbers above), but the bound is a timeout rather than a design.
+- `upgrade-no-fork.ps1` ALL PASS (60) x3 and `go-loop-guard.ps1` ALL PASS
+  (`loop-session.ps1` is shared by both).

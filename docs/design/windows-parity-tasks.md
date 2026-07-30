@@ -563,6 +563,19 @@ Work these first, in order, before falling back to first-todo-in-table:
      all of them the user's report. Filed **T185** (a Windows pane reports its
      INITIAL cwd forever — no OSC 7 from cmd/powershell) and **T186** (Mac seat:
      both changes are shared core; the template flush is likely upstream).
+   - ~~**T187**~~ — **DONE 2026-07-30, jumped the queue** (the T112 precedent:
+     the loop's own continuation mechanism gets fixed first). T144's delivery
+     logged `RESUME-REUSE FAIL: the app did not come back up` while the app was
+     up and answering, so the resume prompt was never typed and the loop sat
+     dead until the user pinged. Both filed mechanisms were REFUTED by
+     measurement — restore is 451ms with a healthy agent and 10.7s with the
+     agent suspended outright, so it can never produce a 60s blackout. The
+     defect was the probe: `+list` ran with no timeout and the wait loop only
+     checked its deadline between calls, so one blocking probe swallowed the
+     whole window. Now a bounded `Invoke-GhozttyListJson` in `loop-session.ps1`,
+     a wait that watches the started PROCESS and logs every failure, and a
+     180s deadline. `upgrade-no-fork.ps1` A22–A30 ALL PASS. Filed **T188** for
+     the pre-loop restore latency on its own merits.
    - **T143** — the missing menu bar. Every discoverability complaint
      (T129 included) is a symptom of this.
    - **T145 → T147 → T146 → T151 → T148 → T150 → T149** — the sweep's
