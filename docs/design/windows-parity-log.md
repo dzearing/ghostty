@@ -9,6 +9,31 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-30 (later) - **T196 DONE** (delivery of T145 + T147 to all 3 install
+  locations; no product code changed). Floor re-run at HEAD `9968a62d9`: both
+  lanes + `test-agent` exit 0, P1-P3 ALL PASS. ReleaseFast gnu `-Dstrip=false`
+  staged to `zig-out-release`; Desktop portable and the share's extracted copy
+  swapped (6 binaries + `share\`, previous kept as `.bak-20260730-t196`), the
+  share's loose agent refreshed, the zip rebuilt; the installed release via the
+  detached upgrade script at the boundary.
+  - Both delivered copies were RUN, not just copied - each `+version` reports
+    `+9968a62d9`. Copying is not evidence that the thing you copied works.
+  - The box was already IN the T147 scenario, so this delivery is a field test
+    of it: the installed agent (pid 27568) had been serving since **2026-07-29
+    17:21** across four same-day binary swaps, with **4 live attached sessions**
+    including the loop's own pane. `decide(..., live=4)` therefore owes the
+    mandatory confirmation dialog, not a silent refresh - and `ConfirmDialog`
+    was read first to confirm its modal loop still pumps IPC, so the dialog
+    cannot wedge the resume. The right answer for this box is "Later";
+    confirming would relaunch the pane running the loop.
+  - The hand-built zip exited 0 and was wrong twice (rooted at
+    `Ghoztty-portable-x64\Ghoztty\...` instead of `Ghoztty\...`, and carrying
+    both pdbs - 41.9 MB vs 20.3 MB). Caught only by diffing its entries against
+    the artifact it replaced. Filed **T198** (script + PROVE the delivery, since
+    the copy loop was never the hard part) and **T199** (a harness left a GUI
+    ghoztty running out of `%TEMP%\gh-dbg2\install` for 19 hours).
+  - Next: **T146** per priority 3f (the session chooser; likely needs a split).
+
 - 2026-07-28 - LOOP POST-MORTEM (the loop stalled 7h20m; root cause found) +
   new rows T131/T132 + the 99.9%-parity bar recorded. The turn ended at
   06:36:05Z with a summary and NO /reset-context, on the assumption that the
