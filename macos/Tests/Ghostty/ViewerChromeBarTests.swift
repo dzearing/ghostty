@@ -198,20 +198,30 @@ struct ViewerChromeControlsTests {
         viewer.layoutSubtreeIfNeeded()
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        viewer.focusAddressBar()
-        for _ in 0..<40 {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
+        #expect(viewer.focusAddressBar(), "the pane is in a window, so it must accept the focus request")
 
-        #expect(viewer.chromeVisible)
-        let field = try #require(ViewerView.firstTextField(in: viewer))
         // Focus lands on the field itself, or on the window's field editor
         // acting for it — but NOT on the web view, which is what the pane
         // focuses by default.
-        let responder = window.firstResponder
-        let isField = (responder as? NSView) === field
-        let isFieldEditor = (responder as? NSText)?.delegate === field
-        #expect(isField || isFieldEditor)
+        //
+        // Poll rather than sleep-then-check. The caret arrives within a few
+        // tens of milliseconds, but an offscreen test window is never key, so
+        // the field loses focus again shortly after and the bar's 2s auto-hide
+        // then takes the chrome (and the first responder) with it. A fixed
+        // wait races that teardown; waiting for the condition does not.
+        let caretInField = await poll {
+            guard viewer.chromeVisible,
+                  let field = ViewerView.firstTextField(in: viewer)
+            else { return false }
+            let responder = window.firstResponder
+            return (responder as? NSView) === field
+                || (responder as? NSText)?.delegate === field
+        }
+
+        #expect(caretInField, """
+            caret never reached the address field: chromeVisible=\(viewer.chromeVisible) \
+            field=\(String(describing: ViewerView.firstTextField(in: viewer))) \
+            responder=\(String(describing: window.firstResponder))
+            """)
     }
 }

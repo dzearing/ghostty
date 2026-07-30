@@ -63,17 +63,22 @@ struct ViewerNavigationTests {
         return (window, viewer)
     }
 
-    /// Alternate run-loop spinning with main-actor yielding. BOTH are needed:
-    /// WebKit only makes progress while the run loop turns, and the viewer
-    /// publishes its state via `DispatchQueue.main.async`, which cannot drain
-    /// while a synchronous test body owns the main actor. Spinning alone
-    /// makes every navigation look broken.
-    private func settle(_ seconds: TimeInterval = 2.0) async {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
+    /// Wait for the pane to finish landing on `url`, then report where it
+    /// actually is so a failure names the page it stopped on.
+    ///
+    /// Polling, not a fixed settle: a real WebKit navigation over loopback HTTP
+    /// takes as long as it takes, and on a loaded machine that routinely
+    /// outruns any budget short enough to be worth waiting for on an idle one.
+    ///
+    /// `currentURL` alone is NOT arrival — it is published on commit, while the
+    /// load is still running. Navigating again at that point replaces the
+    /// in-flight entry instead of pushing a new one, so the pane silently ends
+    /// up with no history and `canGoBack` stays false. Waiting for the load to
+    /// finish is what makes the next navigation a real history step.
+    @discardableResult
+    private func arrive(_ viewer: ViewerView, at url: String) async -> String {
+        await poll { viewer.currentURL == url && !viewer.webView.isLoading }
+        return viewer.currentURL
     }
 
     /// Serve pages over real HTTP so navigation and history are genuine.
@@ -120,25 +125,23 @@ struct ViewerNavigationTests {
 
         let (window, viewer) = makeViewer(location: "\(base)/one.html")
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-        await settle()
-        #expect(viewer.currentURL == "\(base)/one.html")
+        #expect(await arrive(viewer, at: "\(base)/one.html") == "\(base)/one.html")
         #expect(!viewer.canGoBack)
         #expect(!viewer.canGoForward)
 
         viewer.navigate(to: "\(base)/two.html")
-        await settle()
+        await poll { viewer.currentURL == "\(base)/two.html" && !viewer.webView.isLoading && viewer.canGoBack }
         #expect(viewer.currentURL == "\(base)/two.html")
         #expect(viewer.canGoBack)
         #expect(!viewer.canGoForward)
 
         viewer.goBack()
-        await settle()
+        await poll { viewer.currentURL == "\(base)/one.html" && !viewer.webView.isLoading && viewer.canGoForward }
         #expect(viewer.currentURL == "\(base)/one.html")
         #expect(viewer.canGoForward)
 
         viewer.goForward()
-        await settle()
-        #expect(viewer.currentURL == "\(base)/two.html")
+        #expect(await arrive(viewer, at: "\(base)/two.html") == "\(base)/two.html")
     }
 
     /// A same-document navigation (pushState) changes no page, so only the
@@ -149,8 +152,7 @@ struct ViewerNavigationTests {
 
         let (window, viewer) = makeViewer(location: "\(base)/push.html")
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-        await settle(3.0)
-        #expect(viewer.currentURL == "\(base)/pushed")
+        #expect(await arrive(viewer, at: "\(base)/pushed") == "\(base)/pushed")
     }
 
     /// The blank browser pane shows an empty field, so the "Enter URL"
@@ -171,8 +173,7 @@ struct ViewerNavigationTests {
         let file = try makeMarkdownFile()
         let (window, viewer) = makeViewer(location: file.path)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-        await settle(1.5)
-        #expect(viewer.currentURL == file.absoluteString)
+        #expect(await arrive(viewer, at: file.absoluteString) == file.absoluteString)
         #expect(!viewer.isWebURL)
     }
 
@@ -185,17 +186,17 @@ struct ViewerNavigationTests {
 
         let (window, viewer) = makeViewer(location: file.path)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-        await settle(1.5)
+        await arrive(viewer, at: file.absoluteString)
         #expect(!viewer.isWebURL)
 
         viewer.navigate(to: "\(base)/one.html")
-        await settle()
+        await poll { viewer.isWebURL && viewer.currentURL == "\(base)/one.html" && !viewer.webView.isLoading }
         #expect(viewer.isWebURL)
         #expect(viewer.currentURL == "\(base)/one.html")
         #expect(viewer.location == "\(base)/one.html")
 
         viewer.goHome()
-        await settle(2.5)
+        await poll { !viewer.isWebURL && viewer.currentURL == file.absoluteString && !viewer.webView.isLoading }
         #expect(!viewer.isWebURL)
         #expect(viewer.currentURL == file.absoluteString)
         #expect(viewer.location == file.path)
@@ -210,14 +211,14 @@ struct ViewerNavigationTests {
 
         let (window, viewer) = makeViewer(location: file.path)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-        await settle(1.5)
+        await arrive(viewer, at: file.absoluteString)
 
         viewer.navigate(to: "\(base)/one.html")
-        await settle()
+        await poll { viewer.currentURL == "\(base)/one.html" && !viewer.webView.isLoading && viewer.canGoBack }
         #expect(viewer.canGoBack)
 
         viewer.goBack()
-        await settle(2.5)
+        await poll { !viewer.isWebURL && viewer.currentURL == file.absoluteString && !viewer.webView.isLoading }
         #expect(!viewer.isWebURL)
         #expect(viewer.currentURL == file.absoluteString)
     }
@@ -230,16 +231,15 @@ struct ViewerNavigationTests {
 
         let (window, viewer) = makeViewer(location: "\(base)/one.html")
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-        await settle()
+        await arrive(viewer, at: "\(base)/one.html")
 
         viewer.navigate(to: "\(base)/two.html")
-        await settle()
+        await arrive(viewer, at: "\(base)/two.html")
         viewer.navigate(to: "\(base)/push.html")
-        await settle()
+        await arrive(viewer, at: "\(base)/pushed")
 
         viewer.goHome()
-        await settle()
-        #expect(viewer.currentURL == "\(base)/one.html")
+        #expect(await arrive(viewer, at: "\(base)/one.html") == "\(base)/one.html")
         #expect(viewer.homeLocation == "\(base)/one.html")
     }
 
