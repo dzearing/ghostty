@@ -1,0 +1,13 @@
+{
+  "version": "1.27.0",
+  "sections": [
+    {
+      "title": "Fork Changes",
+      "items": [
+        { "title": "Viewer zoom", "text": "Zoom viewer panes browser-style with a trackpad pinch or Cmd+/Cmd−, and Cmd+0 to reset back to 100%." },
+        { "title": "Agent-restart \"What's new\"", "text": "When the background terminal process needs a restart, the dialog now explains why it's asking and shows an offline summary of what actually changed in that update, so you can decide with full context. Clearer copy throughout." },
+        { "title": "Reliable viewer copy/paste & focus", "text": "Copy and paste now work correctly in viewer panes, with browser-like focus behavior." }
+      ]
+    }
+  ]
+}
