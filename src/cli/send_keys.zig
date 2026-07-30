@@ -80,6 +80,15 @@ pub const Options = struct {
 ///   * Named keys: `Enter`, `Tab`, `Escape`, `Space`
 ///   * Escape sequences in text: `\n`, `\t`, `\r`, `\\`, `\e`
 ///
+/// Argument boundaries are preserved. When a send mixes text with
+/// keys, the text runs are delivered to the pane as a bracketed
+/// paste and the keys are delivered bare, so a program that treats
+/// pasted input differently from typed input — most full-screen
+/// TUIs do — can tell them apart. That is what makes the trailing
+/// `Enter` in `"some message" Enter` submit rather than land in the
+/// buffer as a newline. Panes whose program has not enabled
+/// bracketed paste receive the bytes unwrapped, exactly as before.
+///
 /// Examples:
 ///
 ///   ghoztty +send-keys --target=term "ls -la" Enter
@@ -143,24 +152,32 @@ fn runArgs(
     }
 
     // Process each text argument: resolve key notation and escape sequences
-    var keys_buf: std.ArrayList(u8) = .empty;
-    for (text_args.items) |text_arg| {
-        try resolveArgument(alloc, &keys_buf, text_arg);
-    }
+    const resolved = try resolveSegments(alloc, text_args.items);
 
-    if (keys_buf.items.len == 0) {
+    if (resolved.bytes.len == 0) {
         try stderr.print("+send-keys: resolved text is empty\n", .{});
         return 1;
     }
 
     // Build the IPC arguments: --target=<name> --keys=<processed bytes>
     const prefix = "--keys=";
-    const keys_arg = try alloc.allocSentinel(u8, prefix.len + keys_buf.items.len, 0);
+    const keys_arg = try alloc.allocSentinel(u8, prefix.len + resolved.bytes.len, 0);
     @memcpy(keys_arg[0..prefix.len], prefix);
-    @memcpy(keys_arg[prefix.len..][0..keys_buf.items.len], keys_buf.items);
+    @memcpy(keys_arg[prefix.len..][0..resolved.bytes.len], resolved.bytes);
 
-    var ipc_args_buf: [2][:0]const u8 = .{ target_arg.?, keys_arg };
-    const ipc_args: [][:0]const u8 = &ipc_args_buf;
+    var ipc_args_buf: [3][:0]const u8 = .{ target_arg.?, keys_arg, undefined };
+    var ipc_args: [][:0]const u8 = ipc_args_buf[0..2];
+
+    // Only send the segmented payload when there is a boundary worth
+    // preserving. A send that is all text or all keys has nothing to
+    // disambiguate, so it stays byte-for-byte what it has always been —
+    // and `--keys=` alone is what an older Ghoztty build understands, so
+    // a CLI newer than the app it is driving degrades to that behaviour
+    // rather than failing.
+    if (resolved.segments.len > 1) {
+        ipc_args_buf[2] = try encodeSegments(alloc, resolved.segments);
+        ipc_args = ipc_args_buf[0..3];
+    }
 
     if (opts.when_idle) {
         waitForIdle(
@@ -210,46 +227,154 @@ fn waitForIdle(alloc: Allocator, name: []const u8, timeout_secs: u32, stderr: *s
     }
 }
 
+/// A run of resolved bytes, tagged with how the receiving program should
+/// understand it.
+const Segment = struct {
+    kind: Kind,
+    bytes: []const u8,
+
+    const Kind = enum {
+        /// Content, from a text positional. Delivered as a paste.
+        text,
+        /// A keypress, from `Enter` / `C-c` / `Tab` / … Delivered bare.
+        key,
+
+        /// The tag this kind is encoded with on the wire.
+        fn tag(self: Kind) u8 {
+            return switch (self) {
+                .text => 't',
+                .key => 'k',
+            };
+        }
+    };
+};
+
+const Resolved = struct {
+    /// Every resolved byte, concatenated in argument order.
+    bytes: []const u8,
+
+    /// The same bytes, split at every text↔key boundary.
+    segments: []const Segment,
+};
+
+/// Resolve the positional arguments into ordered segments, merging runs of
+/// the same kind so the result alternates strictly between text and keys.
+///
+/// The boundary between a text run and the key run after it is the whole
+/// point: flattening `"some message" Enter` into one buffer hands the
+/// receiving program a single burst of bytes ending in `\r`, which paste
+/// detection reads as a pasted newline instead of a submit.
+///
+/// The returned segments point into the returned `bytes`, and the scratch
+/// used along the way is never freed, so pass an arena.
+fn resolveSegments(
+    alloc: Allocator,
+    text_args: []const []const u8,
+) Allocator.Error!Resolved {
+    // Record spans rather than slices while filling `buf`: appending to it
+    // can reallocate, which would dangle any slice taken earlier.
+    const Span = struct { kind: Segment.Kind, start: usize, end: usize };
+
+    var buf: std.ArrayList(u8) = .empty;
+    var spans: std.ArrayList(Span) = .empty;
+
+    for (text_args) |arg| {
+        const start = buf.items.len;
+        const kind = try resolveArgument(alloc, &buf, arg);
+
+        // An empty argument resolves to no bytes and so is not a segment.
+        if (buf.items.len == start) continue;
+
+        if (spans.items.len > 0) {
+            const prev = &spans.items[spans.items.len - 1];
+            if (prev.kind == kind) {
+                prev.end = buf.items.len;
+                continue;
+            }
+        }
+
+        try spans.append(alloc, .{
+            .kind = kind,
+            .start = start,
+            .end = buf.items.len,
+        });
+    }
+
+    const segments = try alloc.alloc(Segment, spans.items.len);
+    for (spans.items, segments) |span, *segment| segment.* = .{
+        .kind = span.kind,
+        .bytes = buf.items[span.start..span.end],
+    };
+
+    return .{ .bytes = buf.items, .segments = segments };
+}
+
+/// Encode segments as the `--segments=` IPC argument: a kind tag (`t`/`k`)
+/// followed by the segment's bytes in lowercase hex, segments joined by `,`.
+///
+/// Hex because the payload travels as a JSON string, and these bytes are
+/// arbitrary — control characters and non-UTF-8 sequences are exactly what
+/// `+send-keys` exists to deliver, and neither survives that trip raw.
+fn encodeSegments(alloc: Allocator, segments: []const Segment) Allocator.Error![:0]const u8 {
+    const hex = "0123456789abcdef";
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(alloc, "--segments=");
+
+    for (segments, 0..) |segment, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, segment.kind.tag());
+        for (segment.bytes) |byte| {
+            try out.append(alloc, hex[byte >> 4]);
+            try out.append(alloc, hex[byte & 0x0f]);
+        }
+    }
+
+    return try out.toOwnedSliceSentinel(alloc, 0);
+}
+
 /// Resolve a single argument: if it matches a key name, append its byte(s);
-/// otherwise process escape sequences in the text.
-fn resolveArgument(alloc: Allocator, buf: *std.ArrayList(u8), arg: []const u8) Allocator.Error!void {
+/// otherwise process escape sequences in the text. Returns which of the two
+/// it was.
+fn resolveArgument(alloc: Allocator, buf: *std.ArrayList(u8), arg: []const u8) Allocator.Error!Segment.Kind {
     // Ctrl key notation: C-a through C-z (case insensitive)
     if (arg.len == 3 and arg[0] == 'C' and arg[1] == '-') {
         const ch = arg[2];
         if (ch >= 'a' and ch <= 'z') {
             try buf.append(alloc, ch - 'a' + 1);
-            return;
+            return .key;
         }
         if (ch >= 'A' and ch <= 'Z') {
             try buf.append(alloc, ch - 'A' + 1);
-            return;
+            return .key;
         }
     }
 
     // Named keys
     if (eqlIgnoreCase(arg, "Enter") or eqlIgnoreCase(arg, "Return") or eqlIgnoreCase(arg, "CR")) {
         try buf.append(alloc, '\r');
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "Tab")) {
         try buf.append(alloc, '\t');
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "Escape") or eqlIgnoreCase(arg, "Esc")) {
         try buf.append(alloc, 0x1b);
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "Space")) {
         try buf.append(alloc, ' ');
-        return;
+        return .key;
     }
     if (eqlIgnoreCase(arg, "BSpace") or eqlIgnoreCase(arg, "Backspace")) {
         try buf.append(alloc, 0x7f);
-        return;
+        return .key;
     }
 
     // Not a key name — process escape sequences in the text
     try processEscapes(alloc, buf, arg);
+    return .text;
 }
 
 /// Process escape sequences within a text string.
@@ -309,7 +434,7 @@ test "resolveArgument C-c" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try resolveArgument(alloc, &buf, "C-c");
+    try std.testing.expectEqual(Segment.Kind.key, try resolveArgument(alloc, &buf, "C-c"));
     try std.testing.expectEqual(@as(usize, 1), buf.items.len);
     try std.testing.expectEqual(@as(u8, 3), buf.items[0]);
 }
@@ -319,7 +444,7 @@ test "resolveArgument Enter" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try resolveArgument(alloc, &buf, "Enter");
+    try std.testing.expectEqual(Segment.Kind.key, try resolveArgument(alloc, &buf, "Enter"));
     try std.testing.expectEqualStrings("\r", buf.items);
 }
 
@@ -328,7 +453,7 @@ test "resolveArgument plain text with escapes" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try resolveArgument(alloc, &buf, "hello\\nworld");
+    try std.testing.expectEqual(Segment.Kind.text, try resolveArgument(alloc, &buf, "hello\\nworld"));
     try std.testing.expectEqualStrings("hello\nworld", buf.items);
 }
 
@@ -339,4 +464,78 @@ test "processEscapes tab" {
 
     try processEscapes(alloc, &buf, "col1\\tcol2");
     try std.testing.expectEqualStrings("col1\tcol2", buf.items);
+}
+
+// The invariant this whole change exists to protect: a text argument
+// followed by a key argument must survive as two ordered segments. Flatten
+// them and the receiving program cannot tell the trailing `\r` apart from a
+// newline inside a paste, so `"some message" Enter` never submits.
+test "resolveSegments keeps text and a following key apart" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try resolveSegments(alloc, &.{ "some message", "Enter" });
+
+    try std.testing.expectEqualStrings("some message\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+    try std.testing.expectEqual(Segment.Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqualStrings("some message", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Segment.Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r", resolved.segments[1].bytes);
+}
+
+test "resolveSegments merges runs of the same kind" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Adjacent text args concatenate, as do adjacent keys, so the segment
+    // list alternates and single-kind sends stay a single segment.
+    const resolved = try resolveSegments(alloc, &.{ "vim", " -p", "Enter", "Escape", "iabc" });
+
+    try std.testing.expectEqualStrings("vim -p\r\x1biabc", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 3), resolved.segments.len);
+    try std.testing.expectEqual(Segment.Kind.text, resolved.segments[0].kind);
+    try std.testing.expectEqualStrings("vim -p", resolved.segments[0].bytes);
+    try std.testing.expectEqual(Segment.Kind.key, resolved.segments[1].kind);
+    try std.testing.expectEqualStrings("\r\x1b", resolved.segments[1].bytes);
+    try std.testing.expectEqual(Segment.Kind.text, resolved.segments[2].kind);
+    try std.testing.expectEqualStrings("iabc", resolved.segments[2].bytes);
+}
+
+test "resolveSegments single-argument forms stay one segment" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // These are the forms that must keep working byte-for-byte. One segment
+    // means the CLI sends only `--keys=`, which is exactly the old payload.
+    for ([_][]const u8{ "text", "Enter", "C-c" }) |arg| {
+        const resolved = try resolveSegments(alloc, &.{arg});
+        try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
+    }
+}
+
+test "resolveSegments skips arguments that resolve to nothing" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try resolveSegments(alloc, &.{ "", "hi", "", "Enter" });
+
+    try std.testing.expectEqualStrings("hi\r", resolved.bytes);
+    try std.testing.expectEqual(@as(usize, 2), resolved.segments.len);
+}
+
+test "encodeSegments" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const resolved = try resolveSegments(alloc, &.{ "hi", "Enter" });
+    try std.testing.expectEqualStrings(
+        "--segments=t6869,k0d",
+        try encodeSegments(alloc, resolved.segments),
+    );
 }

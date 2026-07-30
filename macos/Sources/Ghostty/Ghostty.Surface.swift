@@ -86,6 +86,37 @@ extension Ghostty {
             }
         }
 
+        /// Write raw bytes directly to the PTY. The byte-array form: unlike
+        /// the `String` overload this carries a length, so a NUL in the
+        /// payload doesn't truncate the write.
+        @MainActor
+        func writePtyRaw(_ bytes: [UInt8]) {
+            writeBytes(bytes, ghostty_surface_write_pty)
+        }
+
+        /// Write bytes to the PTY as pasted content: framed in
+        /// bracketed-paste fenceposts when the program running in the pane
+        /// has enabled them, verbatim when it hasn't. Used by +send-keys for
+        /// its text arguments, so a receiving TUI can tell them apart from
+        /// the keys sent alongside them.
+        @MainActor
+        func writePtyBracketed(_ bytes: [UInt8]) {
+            writeBytes(bytes, ghostty_surface_write_pty_bracketed)
+        }
+
+        @MainActor
+        private func writeBytes(
+            _ bytes: [UInt8],
+            _ write: (ghostty_surface_t?, UnsafePointer<CChar>?, UInt) -> Void
+        ) {
+            if bytes.isEmpty { return }
+            bytes.withUnsafeBufferPointer { buf in
+                buf.withMemoryRebound(to: CChar.self) { ptr in
+                    write(surface, ptr.baseAddress, UInt(bytes.count))
+                }
+            }
+        }
+
         /// Send text to the terminal as if it was typed. This doesn't send the key events so keyboard
         /// shortcuts and other encodings do not take effect.
         @MainActor

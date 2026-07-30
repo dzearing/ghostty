@@ -88,7 +88,7 @@ ghoztty +send-keys --target=<name> <text|key>...
 
 - `--target`: Named pane or window to send input to. Required.
 - `--when-idle`: Poll the target pane's recent output every 500ms until it no longer contains `esc to interrupt` (Claude Code's busy marker) before sending; sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
-- Positional arguments are text or key names, concatenated and written to the PTY.
+- Positional arguments are text or key names, written to the PTY in order.
 - Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
 - Named keys: `Enter`, `Tab`, `Escape`, `Space`, `Backspace`
 - Escape sequences in text: `\n`, `\t`, `\r`, `\\`, `\e`
@@ -98,6 +98,17 @@ ghoztty +send-keys --target=term "ls -la" Enter
 ghoztty +send-keys --target=term C-c
 ghoztty +send-keys --target=term "hello\tworld\n"
 ```
+
+**Text and keys stay distinguishable.** Argument boundaries survive all the way to the write. When a call mixes text with keys, adjacent arguments of the same kind merge into a run, and each **text** run is written to the pane as a **bracketed paste** (`ESC[200~` … `ESC[201~`) while each **key** run is written bare, outside the frame.
+
+This is what makes `+send-keys --target=t "some message" Enter` actually submit. Flattened into one burst of bytes ending in `\r`, a TUI's paste detection reads that `\r` as a newline inside pasted text — correctly, since that is exactly how a real multi-line paste looks — and the message sits unsent in the composer. Framing states which bytes were pasted, so the `\r` after the closing fencepost is unambiguously a keypress. It is a property of the bytes, not of their timing, so there is no delay anywhere in the path.
+
+Two consequences worth knowing:
+
+- A text run is framed **in a single PTY write**. Splitting the frame across writes lets the opening fencepost land in its own `read()` on the far side, and a receiver that sees a lone `ESC[200~` does not reliably associate it with the content after it (measured against Claude Code, which then falls back to its length heuristic and swallows the `\r` again).
+- Framing only happens when the program running in the pane has **enabled bracketed paste** (DEC mode 2004) — which every modern TUI and interactive shell does. A pane running something that has not (`cat`, a shell script's `read`) gets the bytes verbatim, so nothing can inject literal `[200~` junk into a program that would not understand it. Text containing `ESC[201~` is also sent unframed, rather than emitting a frame that would close early.
+
+Single-kind calls — `"text"` on its own, `Enter` on its own, `C-c` on its own — have no boundary to disambiguate and are sent byte-for-byte as they always were.
 
 ### `ghoztty +set-state`
 
