@@ -455,9 +455,19 @@ Work these first, in order, before falling back to first-todo-in-table:
    are filed (**T169** `+version`'s Running Instance section, **T170** `+list
    --pid`, both Mac-seat; `+reload`'s Windows absence stays with T127).
    `ipc-relay-login.ps1` → `relay-account.ps1`, ALL PASS (53) ×3. Also filed
-   **T171** for one unreproduced harness flake) → **T140**
-   (rebuild the Ctrl+Shift+N chooser to Mac parity) → **T142** (banner overlay
-   z-order self-healing). Then 3d.
+   **T171** for one unreproduced harness flake) → ~~**T140**~~ (rebuild the
+   Ctrl+Shift+N chooser to Mac parity — **split 2026-07-30**, too big for one
+   context: **T172** → **T173** → **T174**. ~~T172~~ DONE 2026-07-30
+   (4e5c2e149: owner-drawn rows — status shape, drawn machine glyph, name +
+   dimmed subline, and an INSET rounded accent pill instead of the full-width
+   system-blue bar; cue-banner filter; a footer that wraps and grows the dialog
+   by exactly its extra lines. `ipc-machine-chooser.ps1` ALL PASS (23) ×3 with
+   a pixel oracle proven by a negative control — and two probes that lied
+   first: DPI-virtualized `GetWindowRect` vs physical `CopyFromScreen`, and
+   desktop-DC `GetPixel` being ~1000x slower than a blit). **Next: T173**
+   (master-detail structure + the per-row `⋯` menu), then **T174** (per-host
+   defaults store + Host Settings dialog — Windows has never had one)) →
+   **T142** (banner overlay z-order self-healing). Then 3d.
 
 3f. **USER LIVE-REVIEW #2, 2026-07-29 (same day, later) — "The goal is
    complete parity with the macOS client."** The user named three gaps by
