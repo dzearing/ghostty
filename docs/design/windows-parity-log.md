@@ -1999,3 +1999,16 @@ section's panes. Both fixed; the sweep of the other ~28 scripts is T158.
 Floor for this turn: both test lanes exit 0, `test-agent` exit 0, P1/P2/P3 ALL
 PASS, `split-divider.ps1` ALL PASS (25) x3, and `split-dim` (23),
 `split-zoom-nav` (16), `pane-banner` (45) ALL PASS.
+
+DELIVERED to all 3 install locations (user-reported and visible on every split):
+ReleaseFast gnu `-Dstrip=false` staged to `zig-out-release` (`+version` =
+`+f30ae30e9`); Desktop portable + `\homeassistant\share` swapped; installed
+release via the detached upgrade script at the task boundary (default
+`-ResumeCommand`, so its relaunch is also this turn's context reset). The
+resumed session verifies `%TEMP%\ghoztty-upgrade.log`, then `+version`, then
+that a split shows ONE hairline divider and still shows one after nudging the
+window edge a few px. Next: T130.
+
+Note for whoever runs the next delivery: `scratchpad/deliver.ps1`'s backup tag
+is hardcoded per-task, so it overwrote the previous `.bak-20260729-t154` files.
+The live binaries were never at risk; only one generation of backup was lost.
