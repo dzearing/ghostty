@@ -73,6 +73,34 @@ recommended approaches where they exist.
 
 Work these first, in order, before falling back to first-todo-in-table:
 
+0. **TOP OF THE LIST as of 2026-07-30 (user directive, mid-turn):**
+   **T207 → T210 → T208 → T209.**
+
+   - **T207** — the user, verbatim, while a test run was grabbing their
+     screen: *"you KEEP STEALING FOCUS USE ANOTHER DESKTOP for testing"*.
+     Until it lands, **do not run any `test/win32/*.ps1` GUI script on the
+     interactive desktop.** The unit lanes (`zig build test
+     -Dapp-runtime=none|win32`) never steal focus and are always fine; to
+     LOOK at a window use `PrintWindow` with `PW_RENDERFULLCONTENT`, never
+     `SetForegroundWindow` + `CopyFromScreen`. Spike the DWM question FIRST —
+     DWM composes only the input desktop, so `CopyFromScreen` may return
+     nothing on a background one, and the answer decides the shape of the
+     whole task.
+   - **T210** — a resume prompt beginning with `/reset-context` was mangled
+     on the way into the pane, the reset silently never fired, and the
+     session ran to ~250k. Take it before any further long-prompt resumes.
+     Until it is fixed, **keep resume prompts SHORT** (`/reset-context read
+     go.md and go`) and leave briefing text in the tracker, where the fresh
+     session reads it anyway — which is what this entry is for.
+   - **T208** — the delivery path can ship a stale binary. Until it lands,
+     build `--prefix zig-out-release` yourself and check `+version` against
+     `git rev-parse --short HEAD` before AND after.
+   - **T209** — the on-box pixel assertions T204/T206 could not run. Blocked
+     on T207.
+
+   T203 (system accent + light/dark) and T205 (tabs inside the titlebar) are
+   the remaining tab-strip cosmetics and come after these four.
+
 1. ~~T50~~ — DONE 2026-07-15 (real "Rename Window" dialog).
 2. ~~T54~~ — DONE 2026-07-15 (this doc restructure; resume read is now
    small).
