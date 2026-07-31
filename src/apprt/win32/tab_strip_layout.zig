@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const icon_button = @import("icon_button.zig");
 
 /// Negative control for `test/win32/tab-strip.ps1` (project standard: an
 /// acceptance script has to be SHOWN to fail, or it is not evidence). Flip to
@@ -38,27 +39,10 @@ const testing = std.testing;
 /// below pin the shipped (`false`) behavior on every build.
 const T202_NEUTERED = false;
 
-/// A rectangle in physical pixels, right/bottom exclusive. Mirrors `w32.RECT`
-/// field-for-field so Window.zig can copy one into the other; declared here so
-/// this module needs no OS import.
-pub const Rect = struct {
-    left: i32 = 0,
-    top: i32 = 0,
-    right: i32 = 0,
-    bottom: i32 = 0,
-
-    pub fn width(self: Rect) i32 {
-        return self.right - self.left;
-    }
-
-    pub fn isEmpty(self: Rect) bool {
-        return self.right <= self.left or self.bottom <= self.top;
-    }
-
-    pub fn contains(self: Rect, x: i32) bool {
-        return x >= self.left and x < self.right;
-    }
-};
+/// The strip speaks the same rectangle the rest of the chrome does — one
+/// definition, in `icon_button.zig`, re-exported here so existing
+/// `tab_strip.Rect` call sites are unchanged.
+pub const Rect = icon_button.Rect;
 
 /// Every DIP constant the strip is built from, resolved to physical pixels for
 /// one DPI scale. Values and their rationale: `docs/design/win32-tab-strip.md`.
@@ -86,23 +70,33 @@ pub const Metrics = struct {
     strip_pad_r: i32,
     /// Separation last-tab → "+", and "+" → menu button.
     group_gap: i32,
-    /// Width of the "+" and "≡" buttons (T190 kept them equal).
+    /// Width of the "+" and "≡" buttons (T190 kept them equal). This is the
+    /// HIT box, deliberately wider than the painted target — a forgiving
+    /// click area costs nothing, and `icon_button.targetBox` centers the
+    /// paint inside it.
     btn_w: i32,
-    /// Close-button hit box inside a tab.
+    /// Close-button hit box inside a tab. Must be at least
+    /// `icon_button.Metrics.target` or the shared square would be clamped
+    /// down and the close button would paint smaller than its two neighbours
+    /// — which is the misalignment T204 removed.
     close_btn_w: i32,
+    /// Gap between two adjacent tabs (T206 — "tabs should have gaps in
+    /// between"). Tabs used to tile edge to edge with a 1px rule between
+    /// them, which is why they read as one continuous bar of text rather than
+    /// as separate surfaces. The gap replaces that rule.
+    tab_gap: i32,
     /// Leading padding before the title.
     text_pad: i32,
     /// T72 user tab-color tag thickness.
     stripe_h: i32,
     /// A 1 DIP rule (the inter-tab separator), never thinner than a pixel.
     hairline: i32,
-    /// Corner radius of the "+"/"≡" hover fill. Windows 11 lights a button
-    /// as a rounded rect inset inside its hit box, not as a full-bleed
-    /// square — the square is what made the two read as one slab.
-    btn_corner_r: i32,
-    /// Inset of that fill inside the button's hit box.
-    btn_inset_x: i32,
-    btn_inset_y: i32,
+    //
+    // NOTE: the hover fill's corner radius and inset used to live here as
+    // `btn_corner_r`/`btn_inset_x`/`btn_inset_y`. They moved to
+    // `icon_button.Metrics` (T204) because the banner's chevron needs the
+    // same numbers and cannot reasonably import the tab strip's metrics to
+    // get them. Ask `icon_button.fillRegion` for the shape instead.
 
     pub fn init(scale: f32) Metrics {
         return .{
@@ -115,13 +109,11 @@ pub const Metrics = struct {
             .strip_pad_r = px(4.0, scale),
             .group_gap = px(8.0, scale),
             .btn_w = px(36.0, scale),
-            .close_btn_w = px(20.0, scale),
+            .close_btn_w = px(26.0, scale),
+            .tab_gap = px(4.0, scale),
             .text_pad = px(10.0, scale),
             .stripe_h = @max(px(3.0, scale), 2),
             .hairline = @max(px(1.0, scale), 1),
-            .btn_corner_r = px(4.0, scale),
-            .btn_inset_x = px(2.0, scale),
-            .btn_inset_y = px(4.0, scale),
         };
     }
 
@@ -133,14 +125,18 @@ pub const Metrics = struct {
     /// hit tests. It used to be recomputed in three places from two loose
     /// constants, which is how a geometry change could silently move the
     /// glyph away from the thing you click.
+    /// Spans the tab's FULL height on purpose. It is a hit box; the centering
+    /// is `icon_button.targetBox`'s job, and doing it here as well used to
+    /// round differently: at 1.25x the box came out `2 * (33/2) = 32` tall
+    /// against the "+"'s 33, so the close button painted one pixel short of
+    /// its neighbours at exactly the scales most likely to be in use.
     pub fn closeRect(self: Metrics, tab: Rect) Rect {
         const left = tab.right - self.close_btn_w - @divTrunc(self.text_pad, 2);
-        const mid = @divTrunc(tab.top + tab.bottom, 2);
         return .{
             .left = left,
-            .top = mid - @divTrunc(self.close_btn_w, 2),
+            .top = tab.top,
             .right = left + self.close_btn_w,
-            .bottom = mid + @divTrunc(self.close_btn_w, 2),
+            .bottom = tab.bottom,
         };
     }
 
@@ -188,10 +184,15 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
     const menu_left = menu_right - m.btn_w;
     const plus_limit = menu_left - m.group_gap - m.btn_w;
 
+    // The buttons live in the SAME vertical band as the tabs
+    // (`tab_top_pad`..`bar_h`), not in the full bar. T204: the close "×" is
+    // centered inside a tab, so unless the "+" and "≡" share the tab's band
+    // their shared square lands one pixel higher and the three controls miss
+    // each other by exactly the amount the user could see.
     var s: Strip = .{
         .tabs_right = m.strip_pad_l,
-        .menu = .{ .left = menu_left, .top = 0, .right = menu_right, .bottom = m.bar_h },
-        .new_tab = .{ .left = plus_limit, .top = 0, .right = plus_limit + m.btn_w, .bottom = m.bar_h },
+        .menu = .{ .left = menu_left, .top = m.tab_top_pad, .right = menu_right, .bottom = m.bar_h },
+        .new_tab = .{ .left = plus_limit, .top = m.tab_top_pad, .right = plus_limit + m.btn_w, .bottom = m.bar_h },
     };
 
     // Width the tabs may occupy: up to `group_gap` short of the "+"'s limit.
@@ -220,15 +221,22 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
             @max(m.strip_pad_l + tabs_avail - x, m.min_tab_w)
         else
             w;
-        r.* = .{ .left = x, .top = m.tab_top_pad, .right = x + this_w, .bottom = m.bar_h };
+        // The slot is `this_w`; the tab itself gives up `tab_gap` of it, so
+        // the gap comes out of the tab rather than being added between them
+        // (which would make N tabs wider than the space they were fitted to).
+        const drawn_w = @max(this_w - m.tab_gap, 1);
+        r.* = .{ .left = x, .top = m.tab_top_pad, .right = x + drawn_w, .bottom = m.bar_h };
         x += this_w;
     }
 
     s.visible = visible;
     s.tab_w = w;
-    s.tabs_right = x;
-    const plus_left = @min(x + m.group_gap, plus_limit);
-    s.new_tab = .{ .left = plus_left, .top = 0, .right = plus_left + m.btn_w, .bottom = m.bar_h };
+    // The last tab's own right EDGE, not the end of its slot: the slot ends
+    // one `tab_gap` further right, and measuring the "+" gap from there would
+    // silently widen it by the gap.
+    s.tabs_right = out[visible - 1].right;
+    const plus_left = @min(s.tabs_right + m.group_gap, plus_limit);
+    s.new_tab = .{ .left = plus_left, .top = m.tab_top_pad, .right = plus_left + m.btn_w, .bottom = m.bar_h };
     return s;
 }
 
@@ -236,17 +244,11 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
 /// `CreateRoundRectRgn`. The bottom is pushed past the strip so only the TOP
 /// corners round — the tab merges into the pane below it, which is how a
 /// WinUI TabView marks selection (and why it needs no underline).
-pub const RoundRegion = struct {
-    left: i32,
-    top: i32,
-    /// Exclusive, already +1'd for `CreateRoundRectRgn`.
-    right: i32,
-    /// Exclusive, already +1'd, and past `bar_h` so the bottom corners are
-    /// clipped away by the strip's own bitmap.
-    bottom: i32,
-    /// The `w`/`h` arguments (diameter, not radius).
-    ellipse: i32,
-};
+/// Shared with `icon_button.zig` so the chiclet and the button fills are
+/// handed to `CreateRoundRectRgn` through one type with one off-by-one rule.
+/// For the chiclet the `bottom` is pushed past `bar_h`, so only the TOP
+/// corners round and the rest is clipped away by the strip's own bitmap.
+pub const RoundRegion = icon_button.RoundRegion;
 
 pub fn chicletRegion(m: Metrics, tab: Rect) RoundRegion {
     return .{
@@ -258,17 +260,15 @@ pub fn chicletRegion(m: Metrics, tab: Rect) RoundRegion {
     };
 }
 
-/// The rounded fill lit under a hovered/open "+" or "≡", inset inside the
-/// button's hit box. Returned as a `RoundRegion` for the same reason the
-/// chiclet is — one `CreateRoundRectRgn` call site.
-pub fn buttonFillRegion(m: Metrics, btn: Rect) RoundRegion {
-    return .{
-        .left = btn.left + m.btn_inset_x,
-        .top = btn.top + m.btn_inset_y,
-        .right = btn.right - m.btn_inset_x + 1,
-        .bottom = btn.bottom - m.btn_inset_y + 1,
-        .ellipse = m.btn_corner_r * 2,
-    };
+/// The rounded fill lit under ANY of the strip's icon buttons — the "+", the
+/// "≡", and (since T204) the close "×".
+///
+/// This used to inset the button's own hit box, which made the fill as wide
+/// as the box: a 36x24 slab under the "+" that read as a second tab. It now
+/// defers to the shared square in `icon_button.zig`, so all three strip
+/// buttons and the banner's chevron light the same shape.
+pub fn buttonFillRegion(ib: icon_button.Metrics, btn: Rect) RoundRegion {
+    return icon_button.fillRegion(ib, btn);
 }
 
 /// The 1px separator drawn between two adjacent tabs when neither is selected
@@ -303,7 +303,10 @@ test "one tab is clamped to max width, not stretched across the window" {
     for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
         const m, const s = layoutN(scale, WIDE, 1, &buf);
         try testing.expectEqual(@as(usize, 1), s.visible);
-        try testing.expectEqual(m.max_tab_w, buf[0].width());
+        // The SLOT is clamped to max_tab_w; the drawn tab gives up `tab_gap`
+        // of it (T206), so every tab is the same width and every tab is
+        // followed by the same gap — including the last one, before the "+".
+        try testing.expectEqual(m.max_tab_w - m.tab_gap, buf[0].width());
         // ... and there is real dead strip space left over.
         try testing.expect(s.tabs_right < @divTrunc(WIDE, 2));
     }
@@ -369,13 +372,18 @@ test "tabs shrink with count, then overflow instead of running off the end" {
     for (buf[flood.visible..64]) |r| try testing.expect(r.isEmpty());
 }
 
-test "tabs tile the strip left to right with no gaps or overlaps" {
+test "tabs are separated by exactly one gap, and are all the same width" {
+    // T206 replaced edge-to-edge tiling with a real gap ("tabs should have
+    // gaps in between"): what used to be `buf[i].right == r.left` is now
+    // `+ tab_gap`. Equal widths still hold — a gap that came out of only some
+    // tabs would make them different sizes.
     var buf: [MAX_TABS]Rect = undefined;
     for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
         const m, const s = layoutN(scale, WIDE, 6, &buf);
         try testing.expectEqual(m.strip_pad_l, buf[0].left);
+        try testing.expect(m.tab_gap > 0);
         for (buf[1..s.visible], 0..) |r, i| {
-            try testing.expectEqual(buf[i].right, r.left);
+            try testing.expectEqual(buf[i].right + m.tab_gap, r.left);
             try testing.expectEqual(buf[i].width(), r.width());
         }
         // Tabs hang below the strip top by the pad, and reach the bottom so
@@ -435,19 +443,56 @@ test "the chiclet rounds only its top corners" {
     try testing.expectEqual(m.corner_r * 2, rr.ellipse);
 }
 
-test "a button's hover fill is inset inside its hit box, on both buttons" {
+test "a button's hover fill is inset inside its hit box, on every button" {
     var buf: [MAX_TABS]Rect = undefined;
     for ([_]f32{ 1.0, 1.5, 2.0 }) |scale| {
         const m, const s = layoutN(scale, WIDE, 2, &buf);
-        for ([_]Rect{ s.new_tab, s.menu }) |btn| {
-            const f = buttonFillRegion(m, btn);
-            try testing.expect(f.left > btn.left);
-            try testing.expect(f.right - 1 < btn.right);
-            try testing.expect(f.top > btn.top);
-            try testing.expect(f.bottom - 1 < btn.bottom);
+        const ib = icon_button.Metrics.init(scale);
+        // T204: the close "×" is in this list now. It used to be the one
+        // strip control with no fill at all.
+        for ([_]Rect{ s.new_tab, s.menu, m.closeRect(buf[0]) }) |btn| {
+            const f = buttonFillRegion(ib, btn);
+            try testing.expect(f.left >= btn.left);
+            try testing.expect(f.right - 1 <= btn.right);
+            try testing.expect(f.top >= btn.top);
+            try testing.expect(f.bottom - 1 <= btn.bottom);
             try testing.expect(f.ellipse > 0);
         }
     }
+}
+
+test "T204: all three strip buttons paint one square on one vertical frame" {
+    // The user's complaint as an assertion. Whatever their hit boxes are, the
+    // three controls must paint identical squares at identical heights — that
+    // is what "consistent design" means here, and it is checkable.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m, const s = layoutN(scale, WIDE, 3, &buf);
+        const ib = icon_button.Metrics.init(scale);
+        const plus = icon_button.targetBox(ib, s.new_tab);
+        const menu = icon_button.targetBox(ib, s.menu);
+        const close = icon_button.targetBox(ib, m.closeRect(buf[0]));
+
+        try testing.expectEqual(plus.top, menu.top);
+        try testing.expectEqual(plus.top, close.top);
+        try testing.expectEqual(plus.bottom, menu.bottom);
+        try testing.expectEqual(plus.bottom, close.bottom);
+        try testing.expectEqual(plus.width(), menu.width());
+        try testing.expectEqual(plus.width(), close.width());
+        try testing.expectEqual(plus.width(), plus.height());
+        // And the close box is wide enough that the shared square is not
+        // clamped down inside it — the pre-T204 20 DIP box would clamp.
+        try testing.expectEqual(ib.target, close.width());
+    }
+}
+
+test "the buttons share the tabs' vertical band, not the full bar" {
+    var buf: [MAX_TABS]Rect = undefined;
+    const m, const s = layoutN(1.0, WIDE, 2, &buf);
+    try testing.expectEqual(m.tab_top_pad, s.new_tab.top);
+    try testing.expectEqual(m.tab_top_pad, s.menu.top);
+    try testing.expectEqual(buf[0].top, s.new_tab.top);
+    try testing.expectEqual(m.bar_h, s.menu.bottom);
 }
 
 test "the separator is a 1px hairline inset inside the tab" {

@@ -84,6 +84,8 @@ const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
 const split_geometry = @import("split_geometry.zig");
 const tab_strip = @import("tab_strip_layout.zig");
+const icon_button = @import("icon_button.zig");
+const tab_shape = @import("tab_shape.zig");
 const color_math = @import("color_math.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
@@ -2650,23 +2652,58 @@ fn paintWindow(self: *Window) void {
 
 /// Light a strip button ("+" or "≡") the way Windows 11 does: a rounded rect
 /// inset inside the hit box, not a full-bleed square across it (T202).
-fn paintStripButtonFill(
+/// Paint ONE icon button: the shared rounded fill for its state, then its
+/// glyph stroked centered in the shared square (T204).
+///
+/// Every icon button in the strip goes through here — the "+", the "≡", and
+/// the close "×". That is the whole point: the user's report was three
+/// controls with three independently invented treatments ("icon buttons
+/// should have a consistent design with consistent hover and centered
+/// icons"), and the fix is not three careful edits, it is one code path they
+/// all have to use.
+///
+/// `base` is the color the fill shades FROM, so the strip and the banner can
+/// light the same button shape against their own backgrounds.
+fn paintIconButton(
     mem_dc: w32.HDC,
-    m: tab_strip.Metrics,
-    btn: tab_strip.Rect,
-    color: u32,
+    ib: icon_button.Metrics,
+    box: tab_strip.Rect,
+    glyph: icon_button.Glyph,
+    state: icon_button.State,
+    base_r: u8,
+    base_g: u8,
+    base_b: u8,
+    glyph_color: u32,
 ) void {
-    const f = tab_strip.buttonFillRegion(m, btn);
-    const rgn = w32.CreateRoundRectRgn(f.left, f.top, f.right, f.bottom, f.ellipse, f.ellipse);
-    defer if (rgn) |r| {
-        _ = w32.SelectClipRgn(mem_dc, null);
-        _ = w32.DeleteObject(r);
-    };
-    if (rgn) |r| _ = w32.SelectClipRgn(mem_dc, r);
-    var rect = w32.RECT{ .left = f.left, .top = f.top, .right = f.right, .bottom = f.bottom };
-    if (w32.CreateSolidBrush(color)) |brush| {
-        _ = w32.FillRect(mem_dc, &rect, brush);
-        _ = w32.DeleteObject(@ptrCast(brush));
+    // FillRgn, not SelectClipRgn+FillRect: the close button is painted inside
+    // the tab loop, which already holds the chiclet clip, and clearing that
+    // clip here would un-clip everything drawn after it.
+    if (icon_button.paintsFill(state) and icon_button.universalHover()) {
+        const d = icon_button.fillDelta(state, true);
+        const color = w32.RGB(
+            icon_button.shadeChannel(base_r, d),
+            icon_button.shadeChannel(base_g, d),
+            icon_button.shadeChannel(base_b, d),
+        );
+        const f = icon_button.fillRegion(ib, box);
+        if (w32.CreateRoundRectRgn(f.left, f.top, f.right, f.bottom, f.ellipse, f.ellipse)) |rgn| {
+            defer _ = w32.DeleteObject(rgn);
+            if (w32.CreateSolidBrush(color)) |brush| {
+                defer _ = w32.DeleteObject(@ptrCast(brush));
+                _ = w32.FillRgn(mem_dc, rgn, @ptrCast(brush));
+            }
+        }
+    }
+
+    const target = icon_button.targetBox(ib, box);
+    var strokes: [icon_button.max_strokes]icon_button.Stroke = undefined;
+    const pen = w32.CreatePen(0, ib.stroke_w, glyph_color) orelse return;
+    defer _ = w32.DeleteObject(pen);
+    const prev = w32.SelectObject(mem_dc, pen);
+    defer _ = w32.SelectObject(mem_dc, prev);
+    for (icon_button.glyphStrokes(ib, target, glyph, &strokes)) |s| {
+        _ = w32.MoveToEx(mem_dc, s.x0, s.y0, null);
+        _ = w32.LineTo(mem_dc, s.x1, s.y1);
     }
 }
 
@@ -2691,12 +2728,34 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
     defer _ = w32.DeleteDC(mem_dc);
 
-    const mem_bmp = w32.CreateCompatibleBitmap(hdc_screen, client_w, bar_h) orelse return;
+    // A DIB SECTION, not a compatible bitmap: T206 composites the tab
+    // silhouettes into these pixels directly. GDI has no antialiased shape,
+    // no gradient rim and no concave corner, so the tabs are drawn the way
+    // the banner card is — per pixel — and the GDI text/icon passes then draw
+    // on top of the same memory.
+    var bits: ?*anyopaque = null;
+    const bmi = w32.BITMAPINFO{
+        .bmiHeader = .{
+            .biWidth = client_w,
+            // Negative height = TOP-DOWN, so row 0 is the top of the strip
+            // and the pixel index arithmetic below is the obvious one.
+            .biHeight = -bar_h,
+            .biPlanes = 1,
+            .biBitCount = 32,
+            .biCompression = w32.BI_RGB,
+        },
+    };
+    const mem_bmp = w32.CreateDIBSection(mem_dc, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse return;
     const old_bmp = w32.SelectObject(mem_dc, mem_bmp);
     defer {
         _ = w32.SelectObject(mem_dc, old_bmp);
         _ = w32.DeleteObject(mem_bmp);
     }
+    const px_count: usize = @intCast(client_w * bar_h);
+    const pixels: []u32 = if (bits) |p|
+        @as([*]u32, @ptrCast(@alignCast(p)))[0..px_count]
+    else
+        return;
 
     // --- Colors ---
     const bg = self.app.config.background;
@@ -2704,27 +2763,18 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     const bar_r: u8 = @min(@as(u16, bg.r) + 20, 255);
     const bar_g: u8 = @min(@as(u16, bg.g) + 20, 255);
     const bar_b: u8 = @min(@as(u16, bg.b) + 20, 255);
-    const bar_color = w32.RGB(bar_r, bar_g, bar_b);
-
-    // Hover background: bar bg + 15 more (total +35 from terminal bg).
+    // Hover background: bar bg + 15 more (total +35 from terminal bg). Still
+    // the base an icon button's fill shades from; the TABS' own hover is
+    // `tab_shape.Surface.hovered` now, which lifts a surface rather than
+    // swapping a flat color.
     const hover_r: u8 = @min(@as(u16, bar_r) + 15, 255);
     const hover_g: u8 = @min(@as(u16, bar_g) + 15, 255);
     const hover_b: u8 = @min(@as(u16, bar_b) + 15, 255);
-    const hover_color = w32.RGB(hover_r, hover_g, hover_b);
 
-    // Active tab background: terminal bg (darker than bar). Filling the
-    // selected tab with the CONTENT background is the whole selection cue in
-    // a WinUI TabView — the tab merges into the pane below it, which is why
-    // T202 deleted the accent underline that used to be painted here (a
-    // NavigationView/Pivot idiom, and stretched full-bleed at that).
-    const active_bg_color = w32.RGB(bg.r, bg.g, bg.b);
-
-    // Hairline between two adjacent plain tabs. Measured off live Windows
-    // Terminal: strip background + 17 per channel.
-    const sep_r: u8 = @min(@as(u16, bar_r) + 17, 255);
-    const sep_g: u8 = @min(@as(u16, bar_g) + 17, 255);
-    const sep_b: u8 = @min(@as(u16, bar_b) + 17, 255);
-    const sep_color = w32.RGB(sep_r, sep_g, sep_b);
+    // NOTE: the selected tab's fill and the inter-tab hairline used to be
+    // computed here. T206 moved both into `tab_shape.zig` — the fill because
+    // it is now composited with an antialiased silhouette and a rim, and the
+    // hairline because gaps replaced it.
 
     // Text colors.
     const active_text_color = w32.RGB(230, 230, 230);
@@ -2735,10 +2785,12 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     const close_hover_color = w32.RGB(232, 65, 65);
 
     // --- Fill bar background ---
-    var bar_rect = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h };
-    const bar_brush = w32.CreateSolidBrush(bar_color) orelse return;
-    _ = w32.FillRect(mem_dc, &bar_rect, bar_brush);
-    _ = w32.DeleteObject(@ptrCast(bar_brush));
+    // Straight into the DIB rather than FillRect: the tab compositing below
+    // reads these pixels back, and GDI writes are not guaranteed visible to a
+    // direct read without a GdiFlush. Writing them ourselves removes the
+    // ordering hazard instead of documenting it.
+    const bar_packed: u32 = (@as(u32, bar_r) << 16) | (@as(u32, bar_g) << 8) | bar_b;
+    @memset(pixels, bar_packed);
 
     // --- Select font and set text mode ---
     var old_font: ?*anyopaque = null;
@@ -2757,6 +2809,10 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     // the same rects back out of `tab_rects` / `new_tab_rect` /
     // `menu_btn_rect`, so what you see and what you can click cannot drift.
     const m = tab_strip.Metrics.init(self.scale);
+    // The icon buttons' own metrics (T204). Separate from the strip's because
+    // the pane banner's chevron needs exactly these numbers and has no
+    // business importing the tab strip to get them.
+    const ib = icon_button.Metrics.init(self.scale);
     var tabs: [MAX_TABS]tab_strip.Rect = undefined;
     const strip = tab_strip.layout(m, client_w, self.tab_count, &tabs);
 
@@ -2767,7 +2823,41 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     self.new_tab_rect = stripRect(strip.new_tab);
     self.menu_btn_rect = stripRect(strip.menu);
 
-    // --- Draw each tab ---
+    // --- Composite the tab SHAPES (T206) ---
+    //
+    // Per-pixel, before any GDI: rounded top corners, a specular rim that
+    // fades top→bottom with the banner card's own constants, a visible
+    // surface on unselected tabs, and the selected tab's bottom corners
+    // flaring out into the strip baseline. None of those are expressible with
+    // FillRect + CreateRoundRectRgn, which is what the strip used to be.
+    //
+    // Unselected first, selected LAST: the selected tab's flares reach into
+    // the gaps on either side of it, and they have to land on top of whatever
+    // is there rather than under it.
+    {
+        const sm = tab_shape.Metrics.init(self.scale);
+        const strip_rgb = tab_shape.Rgb{ .r = bar_r, .g = bar_g, .b = bar_b };
+        const content_rgb = tab_shape.Rgb{ .r = bg.r, .g = bg.g, .b = bg.b };
+        var pass: usize = 0;
+        while (pass < 2) : (pass += 1) {
+            for (0..strip.visible) |i| {
+                const active = (i == self.active_tab);
+                if ((pass == 1) != active) continue;
+                const hovered = (@as(isize, @intCast(i)) == self.hover_tab);
+                tab_shape.renderTab(pixels, client_w, bar_h, .{
+                    .left = tabs[i].left,
+                    .top = tabs[i].top,
+                    .right = tabs[i].right,
+                    .bottom = tabs[i].bottom,
+                    .surface = if (active)
+                        .active
+                    else if (hovered) .hovered else .inactive,
+                }, sm, strip_rgb, content_rgb);
+            }
+        }
+    }
+
+    // --- Draw each tab's CONTENT ---
     for (0..strip.visible) |i| {
         const is_active = (i == self.active_tab);
         const is_hovered = (@as(isize, @intCast(i)) == self.hover_tab);
@@ -2787,18 +2877,10 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         };
         if (rgn) |r| _ = w32.SelectClipRgn(mem_dc, r);
 
-        // Selected: filled with the CONTENT background so the tab merges into
-        // the pane below it (the WinUI TabView selection cue — no underline).
-        // Hovered: the same shape in the subtle hover fill. Unselected: the
-        // strip shows through, exactly as Windows Terminal draws it.
-        if (is_active or is_hovered) {
-            var fill = stripRect(tab);
-            if (w32.CreateSolidBrush(if (is_active) active_bg_color else hover_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &fill, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
-        }
-
+        // The fill is already composited (T206, above). What still needs the
+        // chiclet clip is the color tag, which runs across the tab's top edge
+        // and would otherwise square the rounded corners back off.
+        //
         // The user-assigned accent-color tag (T72, Mac tab-color parity),
         // across the top of the chiclet. Painted on active and inactive tabs
         // alike — the tag identifies the tab, not focus.
@@ -2829,38 +2911,40 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
             );
         }
 
-        // Draw close button (x) — visible on active or hovered tabs.
+        // Draw close button (×) — visible on active or hovered tabs.
+        //
+        // T204: this is a real icon button now. It used to be the odd one out
+        // — the only strip control whose hover was a color change rather than
+        // a lit fill ("why doesn't the x to close a tab have a similar
+        // hover?"), and drawn as a U+00D7 text character in the tab TITLE
+        // font, left-aligned in its box.
         if (is_active or is_hovered) {
-            const close_text_color = if (is_hovered and self.hover_close and @as(isize, @intCast(i)) == self.hover_tab)
-                close_hover_color
+            const close_hot = is_hovered and self.hover_close and
+                @as(isize, @intCast(i)) == self.hover_tab;
+            // A close button lights against whatever the tab under it is
+            // filled with, not against the strip — otherwise its hover would
+            // be computed off a surface it is not sitting on.
+            const under: struct { r: u8, g: u8, b: u8 } = if (is_active)
+                .{ .r = bg.r, .g = bg.g, .b = bg.b }
             else
-                close_normal_color;
-
-            _ = w32.SetTextColor(mem_dc, close_text_color);
-            const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}"); // multiplication sign as close
-            var close_rect = stripRect(m.closeRect(tab));
-            _ = w32.DrawTextW(
+                .{ .r = hover_r, .g = hover_g, .b = hover_b };
+            paintIconButton(
                 mem_dc,
-                x_char,
-                1,
-                &close_rect,
-                w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+                ib,
+                m.closeRect(tab),
+                .close,
+                if (close_hot) .hover else .normal,
+                under.r,
+                under.g,
+                under.b,
+                if (close_hot) close_hover_color else close_normal_color,
             );
         }
 
-        // A hairline between two adjacent PLAIN tabs. Without it, transparent
-        // tabs read as one run of text; Windows Terminal draws the same rule.
-        if (i + 1 < strip.visible and !is_active and !is_hovered) {
-            const next_active = (i + 1 == self.active_tab);
-            const next_hovered = (@as(isize, @intCast(i + 1)) == self.hover_tab);
-            if (!next_active and !next_hovered) {
-                var sep = stripRect(tab_strip.separatorRect(m, tab));
-                if (w32.CreateSolidBrush(sep_color)) |brush| {
-                    _ = w32.FillRect(mem_dc, &sep, brush);
-                    _ = w32.DeleteObject(@ptrCast(brush));
-                }
-            }
-        }
+        // T206 removed the inter-tab hairline: it existed only because
+        // adjacent transparent tabs read as one run of text, and tabs now
+        // have a real GAP and a real surface, so a rule between them would be
+        // a third separator doing a job two others already do.
     }
 
     // --- Draw the strip's buttons ---
@@ -2870,41 +2954,34 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     // by a real gap — pinning both right made them read as one slab. Tabs can
     // no longer overrun into this band at any count (see the layout module),
     // so there is nothing to repaint over first.
-    {
-        const plus = strip.new_tab;
-        if (self.hover_new_tab) paintStripButtonFill(mem_dc, m, plus, hover_color);
-
-        _ = w32.SetTextColor(mem_dc, inactive_text_color);
-        const plus_char = std.unicode.utf8ToUtf16LeStringLiteral("+");
-        var plus_rect = stripRect(plus);
-        _ = w32.DrawTextW(
-            mem_dc,
-            plus_char,
-            1,
-            &plus_rect,
-            w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
-        );
-    }
+    paintIconButton(
+        mem_dc,
+        ib,
+        strip.new_tab,
+        .add,
+        if (self.hover_new_tab) .hover else .normal,
+        bar_r,
+        bar_g,
+        bar_b,
+        inactive_text_color,
+    );
 
     // --- Draw menu (≡) button (T190) ---
-    {
-        const menu = strip.menu;
-        // The menu being OPEN keeps it lit, which is how every Windows menu
-        // button signals its popup belongs to it.
-        if (self.hover_menu_btn or self.menu_open) paintStripButtonFill(mem_dc, m, menu, hover_color);
-
-        _ = w32.SetTextColor(mem_dc, inactive_text_color);
-        // U+2261 IDENTICAL TO — the hamburger glyph, present in Segoe UI.
-        const menu_char = std.unicode.utf8ToUtf16LeStringLiteral("≡");
-        var menu_rect = stripRect(menu);
-        _ = w32.DrawTextW(
-            mem_dc,
-            menu_char,
-            1,
-            &menu_rect,
-            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
-        );
-    }
+    // The menu being OPEN keeps it lit, which is how every Windows menu
+    // button signals its popup belongs to it.
+    paintIconButton(
+        mem_dc,
+        ib,
+        strip.menu,
+        .menu,
+        if (self.menu_open)
+            .active
+        else if (self.hover_menu_btn) .hover else .normal,
+        bar_r,
+        bar_g,
+        bar_b,
+        inactive_text_color,
+    );
 
     // --- BitBlt to screen ---
     _ = w32.BitBlt(hdc_screen, 0, 0, client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);

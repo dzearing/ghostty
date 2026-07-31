@@ -56,8 +56,12 @@ pub const FILL_DARKEN: f32 = 0.04;
 
 /// Specular rim (hairline border) alpha, brightest at the top and nearly
 /// gone along the bottom. Mac: elliptical gradient 0.28 → 0.10 → 0.04.
-const RIM_TOP: f32 = 0.28;
-const RIM_BOT: f32 = 0.04;
+/// Public because the tab strip's rim is the SAME rim (T206 — "tabs should
+/// have similar borders to the banner. It should feel cohesive"). Importing
+/// these beats copying them: a copy stops matching the first time either side
+/// is tuned, and nobody notices until the user does.
+pub const RIM_TOP: f32 = 0.28;
+pub const RIM_BOT: f32 = 0.04;
 
 /// Specular sheen: white at 10% bulging down into the top of the card and
 /// falling away, plus a faint darkening along the bottom edge to ground it.

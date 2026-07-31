@@ -1302,6 +1302,12 @@ pub const HALFTONE: i32 = 4;
 // BLENDFUNCTION is defined below (UpdateLayeredWindow section).
 pub extern "msimg32" fn AlphaBlend(hdcDest: HDC, xoriginDest: i32, yoriginDest: i32, wDest: i32, hDest: i32, hdcSrc: HDC, xoriginSrc: i32, yoriginSrc: i32, wSrc: i32, hSrc: i32, ftn: BLENDFUNCTION) callconv(.winapi) i32;
 pub extern "gdi32" fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) callconv(.winapi) ?*anyopaque;
+/// Fill a region directly. Preferred over SelectClipRgn+FillRect when
+/// painting inside code that already holds a clip (the tab loop holds the
+/// chiclet clip): this leaves the current clip untouched, where clearing it
+/// with `SelectClipRgn(dc, null)` would silently un-clip everything drawn
+/// after.
+pub extern "gdi32" fn FillRgn(hdc: HDC, hrgn: *anyopaque, hbr: *anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn SelectClipRgn(hdc: HDC, hrgn: ?*anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) i32;
 pub const NULL_BRUSH: i32 = 5;

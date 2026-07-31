@@ -31,6 +31,7 @@ const markdown = @import("banner_markdown.zig");
 const card = @import("banner_card.zig");
 const banner_layout = @import("banner_layout.zig");
 const color_math = @import("color_math.zig");
+const icon_button = @import("icon_button.zig");
 
 const log = std.log.scoped(.win32_banner);
 
@@ -100,6 +101,15 @@ pub const BannerOverlay = struct {
 
     /// Multi-line banners collapse/expand on click (Mac chevron parity).
     collapsible: bool = false,
+    /// Is the pointer over the collapse chevron? (T204 — the chevron had no
+    /// hover state at all, which is why the user asked "why doesn't the
+    /// chevron in the banner have a similar hover?". It is an icon button
+    /// like every other one now, so it needs the hot-tracking every other one
+    /// already had.)
+    hover_chevron: bool = false,
+    /// Whether `TrackMouseEvent` is armed, so WM_MOUSELEAVE arrives and the
+    /// hover can be dropped when the pointer leaves the overlay.
+    mouse_tracked: bool = false,
     collapsed: bool = false,
     /// Expanded content height in px (excludes padding), lazily computed;
     /// -1 means stale (recompute on next use).
@@ -1021,14 +1031,24 @@ pub const BannerOverlay = struct {
 
     /// Chevron toggle hit rect (the card's top-right corner), in client
     /// coords — inside the card, not the band (T131).
-    fn chevronRect(self: *BannerOverlay, client_w: i32) w32.RECT {
-        const side = self.px(24.0);
+    /// The chevron button's box — ONE definition, used by both the paint and
+    /// the hit test. Keeping these in two places is precisely how a button
+    /// ends up looking right and being unclickable (T204 deliverable 5).
+    fn chevronBox(self: *BannerOverlay, client_w: i32) icon_button.Rect {
+        // The shared chrome icon-button target (T204), not a local 24px
+        // guess — this button has to be the same size and shape as the tab
+        // strip's, because the user reads them as one set of controls.
+        const side = icon_button.Metrics.init(self.scale).target;
         const margin = self.px(MARGIN);
+        // Vertically centered on the card's first content line, which is
+        // where the chevron has always sat.
+        const cy = margin + self.px(PAD) + @divTrunc(self.px(LINE_H), 2);
+        const top = cy - @divTrunc(side, 2);
         return .{
             .left = client_w - margin - side,
-            .top = margin,
+            .top = top,
             .right = client_w - margin,
-            .bottom = margin + side,
+            .bottom = top + side,
         };
     }
 
@@ -1211,30 +1231,57 @@ pub const BannerOverlay = struct {
     /// The collapse/expand chevron in the top-right corner (Mac parity:
     /// chevron.up when expanded, chevron.down when collapsed).
     fn paintChevron(self: *BannerOverlay, hdc: w32.HDC, client: w32.RECT) void {
-        const rect = self.chevronRect(client.right);
-        const cx = @divTrunc(rect.left + rect.right, 2);
-        // Vertically centered on the card's first content line (the card
-        // starts one margin down from the band top, T131).
-        const cy = self.px(MARGIN) + self.px(PAD) + @divTrunc(self.px(LINE_H), 2);
-        const half = self.px(CHEV_W);
-        const rise = self.px(CHEV_H);
-        const pen = w32.CreatePen(0, @max(1, self.px(1.6)), self.secondary());
-        if (pen) |p| {
-            const prev = w32.SelectObject(hdc, p);
-            if (self.collapsed) {
-                // chevron.down: apex below the ends.
-                _ = w32.MoveToEx(hdc, cx - half, cy - rise, null);
-                _ = w32.LineTo(hdc, cx, cy + rise);
-                _ = w32.LineTo(hdc, cx + half, cy - rise);
-            } else {
-                // chevron.up: apex above the ends.
-                _ = w32.MoveToEx(hdc, cx - half, cy + rise, null);
-                _ = w32.LineTo(hdc, cx, cy - rise);
-                _ = w32.LineTo(hdc, cx + half, cy + rise);
+        const ib = icon_button.Metrics.init(self.scale);
+        const box = self.chevronBox(client.right);
+
+        // T204: the same lit fill every other icon button gets. The chevron
+        // used to have none, so it was the one control in the chrome that
+        // gave no feedback that it was a button at all.
+        const state: icon_button.State = if (self.hover_chevron) .hover else .normal;
+        if (icon_button.paintsFill(state) and icon_button.universalHover()) {
+            // Shade from the CARD's fill, not the pane background: the
+            // chevron sits on the card, so that is the surface its hover has
+            // to lift off.
+            const base = card.fillColor(self.pane_bg_rgb);
+            const d = icon_button.fillDelta(state, !color_math.isLight(self.pane_bg_rgb));
+            const color = w32.RGB(
+                icon_button.shadeChannel(base.r, d),
+                icon_button.shadeChannel(base.g, d),
+                icon_button.shadeChannel(base.b, d),
+            );
+            const f = icon_button.fillRegion(ib, box);
+            if (w32.CreateRoundRectRgn(f.left, f.top, f.right, f.bottom, f.ellipse, f.ellipse)) |rgn| {
+                defer _ = w32.DeleteObject(rgn);
+                if (w32.CreateSolidBrush(color)) |brush| {
+                    defer _ = w32.DeleteObject(@ptrCast(brush));
+                    _ = w32.FillRgn(hdc, rgn, @ptrCast(brush));
+                }
             }
-            _ = w32.SelectObject(hdc, prev);
-            _ = w32.DeleteObject(p);
         }
+
+        const target = icon_button.targetBox(ib, box);
+        var strokes: [icon_button.max_strokes]icon_button.Stroke = undefined;
+        const pen = w32.CreatePen(0, ib.stroke_w, self.secondary()) orelse return;
+        defer _ = w32.DeleteObject(pen);
+        const prev = w32.SelectObject(hdc, pen);
+        defer _ = w32.SelectObject(hdc, prev);
+        const glyph: icon_button.Glyph = if (self.collapsed) .chevron_down else .chevron_up;
+        for (icon_button.glyphStrokes(ib, target, glyph, &strokes)) |s| {
+            _ = w32.MoveToEx(hdc, s.x0, s.y0, null);
+            _ = w32.LineTo(hdc, s.x1, s.y1);
+        }
+    }
+
+    /// Hot-track the chevron. Returns true when the hover changed, so the
+    /// caller can repaint only then — a banner that invalidates on every
+    /// WM_MOUSEMOVE would repaint its whole composited card continuously.
+    fn updateChevronHover(self: *BannerOverlay, x: i32, y: i32) bool {
+        var client: w32.RECT = undefined;
+        if (w32.GetClientRect(self.hwnd, &client) == 0) return false;
+        const hot = self.collapsible and self.chevronBox(client.right).containsPoint(x, y);
+        if (hot == self.hover_chevron) return false;
+        self.hover_chevron = hot;
+        return true;
     }
 
     fn toggleCollapsed(self: *BannerOverlay) void {
@@ -1300,6 +1347,35 @@ fn bannerWndProc(
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
             defer _ = w32.EndPaint(hwnd, &ps);
             self.paint(hdc);
+            return 0;
+        },
+
+        // T204: the chevron is an icon button, so it hot-tracks like one.
+        // The overlay had no WM_MOUSEMOVE handling at all before this — which
+        // is the mechanical reason the chevron could not have a hover, not a
+        // styling oversight.
+        w32.WM_MOUSEMOVE => {
+            const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam))))));
+            const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) >> 16))));
+            if (!self.mouse_tracked) {
+                var tme = w32.TRACKMOUSEEVENT{
+                    .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+                    .dwFlags = w32.TME_LEAVE,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                if (w32.TrackMouseEvent(&tme) != 0) self.mouse_tracked = true;
+            }
+            if (self.updateChevronHover(x, y)) _ = w32.InvalidateRect(hwnd, null, 0);
+            return 0;
+        },
+
+        w32.WM_MOUSELEAVE => {
+            self.mouse_tracked = false;
+            if (self.hover_chevron) {
+                self.hover_chevron = false;
+                _ = w32.InvalidateRect(hwnd, null, 0);
+            }
             return 0;
         },
 

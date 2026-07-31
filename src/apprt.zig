@@ -105,6 +105,14 @@ test {
     // Pure win32 tab-strip geometry (T202), same no-OS-imports deal.
     _ = @import("apprt/win32/tab_strip_layout.zig");
 
+    // Pure win32 icon-button geometry shared by the tab strip and the pane
+    // banner (T204), same no-OS-imports deal.
+    _ = @import("apprt/win32/icon_button.zig");
+
+    // Pure win32 per-pixel tab silhouette + rim (T206), same no-OS-imports
+    // deal.
+    _ = @import("apprt/win32/tab_shape.zig");
+
     // Pure win32 layered-overlay z-order policy (T142), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/overlay_zorder.zig");
