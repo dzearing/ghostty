@@ -3381,3 +3381,47 @@ through `SendInput`, which a posted-key port would turn into a different
 quantity. Decide that deliberately rather than converting it mechanically.
 
 Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.
+
+## 2026-07-31 - T217 batch 7: relay-account + ipc-machine-chooser onto the test desktop
+
+Two more keyboard-only GUI scripts migrated, 18 of 22 done. `relay-account`
+ALL PASS (61) x3 and `ipc-machine-chooser` ALL PASS (45) x3, both negative
+controls FAIL as required (1 failure, exit 1, each inverting a normally-passing
+load-bearing claim: the account row flipping to "Sign Out", and T175's detail
+pane following the selection).
+
+The headline is what the migration DELETED. `ipc-machine-chooser` ended with
+`if ($aborted) { "SKIPPED (foreground unavailable)"; exit 0 }` - a busy box
+scored a green exit 0 having asserted nothing at all, and no suite driver could
+tell. `relay-account` had the same shape per-section ("those sections need the
+foreground; they SKIP, never fail"), which quietly removed its entire GUI half.
+Both are gone: on the test desktop a chooser that does not open is a SETUP
+FAIL. Grep a candidate for `exit 0` before migrating it.
+
+Measured, not assumed: the chooser's pixel probes port unchanged. The accent
+pill and its gutter, the column wash, the hairline rule, the empty filter's cue
+banner, the wrapped status strip and the detail-pane region signature all give
+the same verdicts through `Get-TestWindowPixels` (PrintWindow) as they did
+through `CopyFromScreen` - 64 distinct colors, pill tint 47, gutter 0. The
+CAPTURE LIMIT is about the OpenGL terminal surface, not native dialogs, and
+this is the demonstration.
+
+Three harness additions: `Send-TestControlClick` (BM_CLICK, sent so the handler
+has run when it returns), `Invoke-TestMessage` (a SENT message returning its
+RESULT - `Send-TestRawMessage` posts and returns a bool, which cannot answer
+"how many rows does this listbox have"), and `Get-TestWindowStyle`. Both
+scripts also gained the modality pair via `Test-TestWindowEnabled` - the owner
+window is disabled while the chooser is up - which neither asserted before.
+
+Filed **T224**: `overlay-zorder` and `profile-latency` are not mechanical
+conversions and must not be treated as such. `overlay-zorder`'s entire oracle
+is "the overlay sits BELOW the FOREGROUND window", and there is no foreground
+on a background desktop; whether SetActiveWindow is a faithful stand-in (z-order
+and WM_ACTIVATE both) has to be measured before a line of it is ported, or the
+assertions invert quietly. That leaves `pane-banner` as T217's only remaining
+plain migration.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green. Harness
+regression after the three additions: `test-desktop-harness` (19),
+`split-zoom-nav` (20), `confirm-dialogs` (27), `window-title` (50),
+`command-registry` (22) all ALL PASS.

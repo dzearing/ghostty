@@ -28,8 +28,24 @@
 # Sections 5-7 SEED the account store directly (a DPAPI blob in the current
 # shape) instead of re-driving the GUI: what they exercise is the reader/renew
 # tier, and keeping the chord grabs to sections 2-4 keeps the script fast and
-# deterministic. Those sections need the foreground; they SKIP (never fail) if
-# another window owns it, exactly like ipc-machine-chooser.ps1.
+# deterministic.
+#
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1), so
+# it never takes the user's foreground - asserted at the end, not assumed. The
+# private win32 driver (AcctDrv) this script used to carry is gone. Three notes
+# on what the migration changed beyond the mechanics:
+#
+#   * the chooser sections no longer SKIP. They used to bail out whenever the
+#     foreground grab lost its race ("those sections need the foreground; they
+#     SKIP, never fail"), which quietly took the whole GUI half of this script
+#     out of a run. On the test desktop the chord always lands, so a chooser
+#     that does not open is now a hard SETUP FAIL.
+#   * the account button is still activated with Send-TestControlClick
+#     (BM_CLICK) rather than a synthetic mouse click, for the original reason:
+#     it keeps the assertions about the ROW - its label flipping, its enabled
+#     state - independent of whether a click landed on the right pixel.
+#   * sections 5-7 used to let `+new-window` AUTO-SPAWN the GUI, which puts a
+#     window on the user's desktop. They launch it on the test desktop now.
 #
 # Self-contained and non-interactive. A raw-TCP "fake relay" serves the
 # brokered endpoints (POST /oauth/exchange | /oauth/renew | /oauth/signout) and
@@ -42,13 +58,23 @@ param(
     [string]$RelaySrc = 'D:\git\ghoztty\relay',
     [int]$FakeAPort = 47921,
     [int]$FakeBPort = 47922,
-    [int]$RelayPort = 47912
+    [int]$RelayPort = 47912,
+    [switch]$NegativeControl,
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Security
+# Isolate the IPC endpoint (inherited through CreateProcessW by the GUI, and
+# through the environment by every Run-Cli): an instance answering the shared
+# pipe would answer this run's +list about somebody else's windows.
+$env:GHOZTTY_PIPE_SUFFIX = '-relayacct'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $script:failures = 0
 $script:skipped = 0
+$script:negReached = $false
 $tmp = Join-Path $env:TEMP "ghoztty-relay-acct-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 New-Item -ItemType Directory -Force "$tmp\state" | Out-Null
@@ -66,8 +92,12 @@ $HitsB = "$tmp\hits-b.log"
 # Google...").
 $SignInLabel = "Sign in with Google$([char]0x2026)"
 
+# Write-Host, not the pipeline: a helper that both asserts and RETURNS a value
+# would otherwise hand its caller @('  PASS ...', $value) (the T217 batch-5
+# trap), and Launch-Gui below does exactly that.
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { Write-Host "  PASS $name" }
+    else { Write-Host "  FAIL $name" -ForegroundColor Red; $script:failures++ }
 }
 
 function Get-Out($outfile) {
@@ -101,207 +131,59 @@ function Stop-TestProcs {
     Start-Sleep -Seconds 1
 }
 
-# --- win32 driver: foreground grab + chord + control lookup/click ------------
-# Chord mechanics are ipc-machine-chooser.ps1's (T86-hardened). Buttons are
-# activated with BM_CLICK sent straight to the control HWND: deterministic, and
-# it keeps the assertions about the ROW (its label flipping, its enabled state)
-# independent of whether a synthetic mouse click landed on the right pixel.
-Add-Type @'
-using System;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class AcctDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO gti);
-    [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct GUITHREADINFO {
-        public int cbSize; public uint flags;
-        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
-        public RECT rcCaret;
-    }
-
-    // The keyboard-focus HWND of the thread that owns `win`. Cross-process:
-    // GetFocus() is per-thread-queue, so a harness in another process must ask
-    // via GetGUIThreadInfo. Zero means NOTHING has focus - which is exactly the
-    // state in which the dialog's Enter/Escape/Tab routing goes deaf, because
-    // WM_KEYDOWN then arrives with hwnd == NULL and the app's message loop only
-    // routes dialog keys when msg.hwnd is non-null.
-    public static IntPtr FocusedIn(IntPtr win) {
-        uint pid; uint tid = GetWindowThreadProcessId(win, out pid);
-        var gti = new GUITHREADINFO();
-        gti.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
-        if (!GetGUIThreadInfo(tid, ref gti)) return IntPtr.Zero;
-        return gti.hwndFocus;
-    }
-
-    // True when `h` is `ancestor` or one of its children.
-    public static bool IsInside(IntPtr h, IntPtr ancestor) {
-        while (h != IntPtr.Zero) {
-            if (h == ancestor) return true;
-            h = GetParent(h);
+# --- chooser control lookup --------------------------------------------------
+# All descendants of `$parent` with the given class, as {Hwnd, Text, Top,
+# Enabled}. Text comes from WM_GETTEXT (Get-TestControlText), not GetWindowTextW,
+# which is cross-process cached and reads stale for a label the app just changed
+# - and "the label changed in place" is exactly this script's claim.
+function Get-ChooserControls([IntPtr]$parent, [string]$cls) {
+    return @(Get-TestChildWindows -Window $parent -Class $cls | ForEach-Object {
+        $h = [IntPtr]$_.Hwnd
+        [pscustomobject]@{
+            Hwnd    = $h
+            Text    = (Get-TestControlText -Control $h)
+            Top     = $_.Top
+            Enabled = (Test-TestWindowEnabled -Window $h)
         }
-        return false;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FindByClass(string cls) {
-        return FindWindowExW(IntPtr.Zero, IntPtr.Zero, cls, null);
-    }
-
-    public static string WindowText(IntPtr h) {
-        var sb = new StringBuilder(512);
-        GetWindowTextW(h, sb, 512);
-        return sb.ToString();
-    }
-
-    // Child controls of `parent` whose class is `cls`, as
-    // "hwnd|text|left|top|right|bottom|enabled" rows.
-    public static string[] Children(IntPtr parent, string cls) {
-        var rows = new System.Collections.Generic.List<string>();
-        EnumChildWindows(parent, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase)) {
-                RECT r; GetWindowRect(h, out r);
-                rows.Add(h.ToInt64() + "|" + WindowText(h) + "|" + r.left + "|" + r.top +
-                         "|" + r.right + "|" + r.bottom + "|" + (IsWindowEnabled(h) ? "1" : "0"));
-            }
-            return true;
-        }, IntPtr.Zero);
-        return rows.ToArray();
-    }
-
-    public static void Click(IntPtr btn) {
-        SendMessageW(btn, 0x00F5 /* BM_CLICK */, IntPtr.Zero, IntPtr.Zero);
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground owner's
-    // thread + an Alt tap (last-input source), retried.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-
-    public static void PressForeground(IntPtr win, ushort vk) {
-        GrabForeground(win);
-        Key(vk, false); Thread.Sleep(20); Key(vk, true);
-        Thread.Sleep(60);
-    }
+    })
 }
-'@
 
-# The chooser's account button: the BUTTON child that is neither Open nor
-# Cancel. Identified by exclusion so it survives a label change - its label is
-# exactly what the assertions are about.
-function Get-AccountButton($chooser) {
-    foreach ($row in [AcctDrv]::Children($chooser, 'Button')) {
-        $f = $row -split '\|'
-        # The chooser's other buttons: the detail pane's primary action (T175
-        # renamed it from "Open" to Mac's "New Window") and the footer's Cancel.
-        if ($f[1] -ne 'New Window' -and $f[1] -ne 'Open' -and $f[1] -ne 'Cancel') {
-            return [pscustomobject]@{
-                Hwnd    = [IntPtr][int64]$f[0]
-                Text    = $f[1]
-                Enabled = ($f[6] -eq '1')
-            }
-        }
+# The chooser's account button: the BUTTON child that is neither the detail
+# pane's primary action (T175 renamed it from "Open" to Mac's "New Window") nor
+# the footer's Cancel. Identified by exclusion so it survives a label change -
+# its label is exactly what the assertions are about.
+function Get-AccountButton([IntPtr]$chooser) {
+    foreach ($b in Get-ChooserControls $chooser 'Button') {
+        if ($b.Text -ne 'New Window' -and $b.Text -ne 'Open' -and $b.Text -ne 'Cancel') { return $b }
     }
     return $null
 }
 
 # The account status STATIC is the topmost one; the footer hint is the lowest.
-function Get-StaticText($chooser, $topmost) {
+function Get-StaticText([IntPtr]$chooser, [bool]$topmost) {
     $best = $null
     $bestTop = if ($topmost) { [int]::MaxValue } else { -1 }
-    foreach ($row in [AcctDrv]::Children($chooser, 'Static')) {
-        $f = $row -split '\|'
-        $t = [int]$f[3]
-        if (($topmost -and $t -lt $bestTop) -or ((-not $topmost) -and $t -gt $bestTop)) {
-            $bestTop = $t; $best = $f[1]
+    foreach ($s in Get-ChooserControls $chooser 'Static') {
+        if (($topmost -and $s.Top -lt $bestTop) -or ((-not $topmost) -and $s.Top -gt $bestTop)) {
+            $bestTop = $s.Top; $best = $s.Text
         }
     }
     return $best
 }
-function Get-AccountStatusText($chooser) { Get-StaticText $chooser $true }
-function Get-HintText($chooser) { Get-StaticText $chooser $false }
+function Get-AccountStatusText([IntPtr]$chooser) { Get-StaticText $chooser $true }
+function Get-HintText([IntPtr]$chooser) { Get-StaticText $chooser $false }
+
+# Is `$h` the chooser itself or one of its descendants? Replaces the driver's
+# GetParent walk: EnumChildWindows (Get-TestChildWindows) is recursive, so the
+# membership test is the same statement without a second mechanism.
+function Test-InsideChooser([IntPtr]$chooser, [IntPtr]$h) {
+    if ($h -eq [IntPtr]::Zero) { return $false }
+    if ($h -eq $chooser) { return $true }
+    foreach ($c in Get-TestChildWindows -Window $chooser -Class '*') {
+        if (([IntPtr]$c.Hwnd) -eq $h) { return $true }
+    }
+    return $false
+}
 
 # Start a raw-TCP fake relay serving the brokered OAuth endpoints (avoids
 # HttpListener's URL-ACL admin requirement). Routes on the request line, logs
@@ -371,45 +253,40 @@ function Wait-Listening($port) {
     return $false
 }
 
-# Launch a GUI wired to a fake relay + a temp account store, with the browser
-# open suppressed so the harness plays the browser itself. Session persistence
-# off so a restore cannot hand this run a previous run's window (the T131
-# lesson).
-function Start-Gui($relayBase, $errlog) {
+# Launch a GUI ON THE TEST DESKTOP, wired to a fake relay + a temp account
+# store, with the browser open suppressed so the harness plays the browser
+# itself. Session persistence off so a restore cannot hand this run a previous
+# run's window (the T131 lesson). Returns { App, Pid, Top, Surface }.
+function Launch-Gui($relayBase, $errlog) {
     Remove-Item $errlog -ErrorAction SilentlyContinue
     $env:GHOSTTY_ACCOUNT_STORE = $AccountStore
     $env:GHOSTTY_RELAY_BASE = $relayBase
     $env:GHOSTTY_GOOGLE_CLIENT_ID = 'cid-e2e'
     $env:GHOSTTY_OAUTH_AUTH_ENDPOINT = "$FakeABase/authorize"
     $env:GHOZTTY_ENROLL_NO_OPEN = '1'
-    $p = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $errlog `
-        -ArgumentList '--session-persistence=false'
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
     foreach ($k in 'GHOSTTY_ACCOUNT_STORE', 'GHOSTTY_RELAY_BASE', 'GHOSTTY_GOOGLE_CLIENT_ID',
         'GHOSTTY_OAUTH_AUTH_ENDPOINT', 'GHOZTTY_ENROLL_NO_OPEN') {
         Remove-Item "env:$k" -ErrorAction SilentlyContinue
     }
-    return $p
+    Start-Sleep -Seconds 3
+    if ($app.Process -and $app.Process.HasExited) { return $null }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+    if ($top -eq [IntPtr]::Zero) { return $null }
+    $surface = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
+    if ($surface -eq [IntPtr]::Zero) { return $null }
+    return @{ App = $app; Pid = $app.Pid; Top = $top; Surface = $surface }
 }
 
-# Open the chooser in a freshly launched GUI. Returns the chooser HWND, or
-# [IntPtr]::Zero with $script:choordAbort set when the foreground was unavailable.
-function Open-Chooser($gui) {
-    $script:chordAbort = $null
-    $top = [AcctDrv]::FindTop([uint32]$gui.Id)
-    $surface = [AcctDrv]::FindWindowExW($top, [IntPtr]::Zero, 'GhozttyTerminal', $null)
-    if ($top -eq [IntPtr]::Zero -or $surface -eq [IntPtr]::Zero) {
-        $script:chordAbort = 'ABORT: GhozttyWindow/GhozttyTerminal not found'
+# Open the chooser with ctrl+shift+n. Returns the chooser HWND, or
+# [IntPtr]::Zero - which on the test desktop means the product did not open it,
+# not that the harness lost a foreground race.
+function Open-Chooser($g) {
+    if (-not (Send-TestKeys -Window $g.Top -Target $g.Surface -Modifiers ctrl, shift -Key N)) {
         return [IntPtr]::Zero
     }
-    $r = [AcctDrv]::Chord($top, $surface, @([uint16]0x11, [uint16]0x10), [uint16]0x4E)
-    if ($r -like 'ABORT*' -or $r -like 'ATTACH*') { $script:chordAbort = $r; return [IntPtr]::Zero }
-    $chooser = [IntPtr]::Zero
-    for ($t = 0; $t -lt 150; $t++) {
-        Start-Sleep -Milliseconds 20
-        $chooser = [AcctDrv]::FindByClass('GhozttyMachineChooser')
-        if ($chooser -ne [IntPtr]::Zero) { break }
-    }
-    Start-Sleep -Milliseconds 400
+    $chooser = Wait-TestWindow -ProcessId $g.Pid -Class 'GhozttyMachineChooser' -TimeoutMs 4000
+    if ($chooser -ne [IntPtr]::Zero) { Start-Sleep -Milliseconds 400 }
     return $chooser
 }
 
@@ -475,249 +352,291 @@ Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
 $savedTok = $env:GHOSTTY_RELAY_TOKEN
 Remove-Item env:GHOSTTY_RELAY_TOKEN -ErrorAction SilentlyContinue
 
-"== 0: start the fake brokered relays"
-$jobA = Start-FakeRelay $FakeAPort $SessTok 3600 $RenewedTok $HitsA
-$jobB = Start-FakeRelay $FakeBPort $SessTok 30 $RenewedTok $HitsB
-Assert "fake relay A listening" (Wait-Listening $FakeAPort)
-$fakeBUp = Wait-Listening $FakeBPort
-Assert "fake relay B listening" $fakeBUp
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$jobA = $null; $jobB = $null
 
-"== 1: the +relay-login / +relay-logout CLI verbs are gone (T141)"
-$code = Run-Cli '+relay-login --no-browser' 'gone1.out' 10
-Assert "+relay-login rejected" ($code -ne 0 -and $null -ne $code)
-Assert "+relay-login is reported as unrecognized" (
-    (Get-Out 'gone1.out') -match 'unknown|invalid|no such|[Uu]nrecognized|not a valid')
-$code = Run-Cli '+relay-logout' 'gone2.out' 10
-Assert "+relay-logout rejected" ($code -ne 0 -and $null -ne $code)
-$code = Run-Cli '+help' 'help.out' 15
-$help = Get-Out 'help.out'
-Assert "+help does not advertise relay-login" (-not ($help -match 'relay-login'))
-Assert "+help does not advertise relay-logout" (-not ($help -match 'relay-logout'))
-Assert "+help still lists new-remote-window (positive control)" ($help -match 'new-remote-window')
+try {
+    "== 0: start the fake brokered relays"
+    $jobA = Start-FakeRelay $FakeAPort $SessTok 3600 $RenewedTok $HitsA
+    $jobB = Start-FakeRelay $FakeBPort $SessTok 30 $RenewedTok $HitsB
+    Assert "fake relay A listening" (Wait-Listening $FakeAPort)
+    $fakeBUp = Wait-Listening $FakeBPort
+    Assert "fake relay B listening" $fakeBUp
 
-"== 2/3: GUI sign-in then sign-out from the chooser's account row"
-$errlog = "$tmp\gui-a.stderr.log"
-Remove-Item $AccountStore -ErrorAction SilentlyContinue
-$gui = Start-Gui $FakeABase $errlog
-Start-Sleep -Seconds 3
-$guiAborted = $false
-if ($gui.HasExited) {
-    Assert "GUI launched" $false
-} else {
-    $chooser = Open-Chooser $gui
-    if ($script:chordAbort) {
-        "  SKIP GUI sign-in drive: $($script:chordAbort)"
-        $script:skipped++
-        $guiAborted = $true
-    } else {
-        Assert "chooser opened" ($chooser -ne [IntPtr]::Zero)
-        if ($chooser -ne [IntPtr]::Zero) {
-            $btn = Get-AccountButton $chooser
-            Assert "account row has a button" ($null -ne $btn)
-            Assert "signed-out label is the Google sign-in" ($null -ne $btn -and $btn.Text -eq $SignInLabel)
-            Assert "signed-out status says 'Not signed in'" ((Get-AccountStatusText $chooser) -eq 'Not signed in')
+    "== 1: the +relay-login / +relay-logout CLI verbs are gone (T141)"
+    $code = Run-Cli '+relay-login --no-browser' 'gone1.out' 10
+    Assert "+relay-login rejected" ($code -ne 0 -and $null -ne $code)
+    Assert "+relay-login is reported as unrecognized" (
+        (Get-Out 'gone1.out') -match 'unknown|invalid|no such|[Uu]nrecognized|not a valid')
+    $code = Run-Cli '+relay-logout' 'gone2.out' 10
+    Assert "+relay-logout rejected" ($code -ne 0 -and $null -ne $code)
+    $code = Run-Cli '+help' 'help.out' 15
+    $help = Get-Out 'help.out'
+    Assert "+help does not advertise relay-login" (-not ($help -match 'relay-login'))
+    Assert "+help does not advertise relay-logout" (-not ($help -match 'relay-logout'))
+    Assert "+help still lists new-remote-window (positive control)" ($help -match 'new-remote-window')
 
-            if ($null -ne $btn) {
-                [AcctDrv]::Click($btn.Hwnd)
-                # The flow runs off the GUI thread, so the chooser must still be
-                # up (and its button in a disabled pending state) while the
-                # "browser" is open. A synchronous sign-in would fail this.
-                Start-Sleep -Milliseconds 800
-                Assert "chooser still up while signing in" ([AcctDrv]::FindByClass('GhozttyMachineChooser') -ne [IntPtr]::Zero)
-                $busy = Get-AccountButton $chooser
-                Assert "button disabled while signing in" ($null -ne $busy -and -not $busy.Enabled)
-                # Disabling the focused button would drop keyboard focus for the
-                # whole dialog (WM_KEYDOWN then arrives with hwnd == NULL and
-                # Enter/Escape/Tab stop being routed). The row must hand focus
-                # off before it disables the button.
-                $busyFocus = [AcctDrv]::FocusedIn($chooser)
-                Assert "keyboard focus stays inside the chooser while busy" (
-                    $busyFocus -ne [IntPtr]::Zero -and [AcctDrv]::IsInside($busyFocus, $chooser))
+    "== 2/3: GUI sign-in then sign-out from the chooser's account row"
+    $errlog = "$tmp\gui-a.stderr.log"
+    Remove-Item $AccountStore -ErrorAction SilentlyContinue
+    $g = Launch-Gui $FakeABase $errlog
+    if (-not $g) { Write-Host 'SETUP FAIL: GUI did not come up for the sign-in section'; exit 1 }
+    Assert "sign-in GUI is NOT enumerable on the interactive desktop" (
+        -not (Test-TestDesktopLeak -ProcessId $g.Pid))
 
-                Assert "browser redirect delivered" (Complete-BrowserRedirect $errlog)
-                Assert "GUI reports sign_in ok" (Wait-Stderr $errlog 'relay account: sign_in ok')
-                Assert "exchange hit the relay" ((Get-Hits $HitsA) -match 'POST /oauth/exchange')
-                Assert "account.dat written" (Test-Path $AccountStore)
-                $blob = if (Test-Path $AccountStore) { Get-Content $AccountStore -Raw } else { '' }
-                Assert "account.dat is not plaintext" (-not ($blob -match 'session_token'))
+    $chooser = Open-Chooser $g
+    if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: ctrl+shift+n opened no chooser'; exit 1 }
+    Assert "chooser opened" ($chooser -ne [IntPtr]::Zero)
+    # A chooser is modal over its own window: the owner is disabled for exactly
+    # as long as it is up. Cross-process, that is the only checkable form of
+    # "modal", and nothing in the old script asserted it.
+    Assert "owner window is disabled while the chooser is up" (
+        -not (Test-TestWindowEnabled -Window $g.Top))
 
-                # The row updates IN PLACE - no reopen.
-                Start-Sleep -Milliseconds 600
-                $after = Get-AccountButton $chooser
-                Assert "button flipped to 'Sign Out'" ($null -ne $after -and $after.Text -eq 'Sign Out')
-                Assert "button re-enabled" ($null -ne $after -and $after.Enabled)
-                Assert "status shows the signed-in email" ((Get-AccountStatusText $chooser) -eq 'e2e@example.com')
-                Assert "device list refetched after sign-in" ((Get-Hits $HitsA) -match 'GET /v1/client/devices')
+    $btn = Get-AccountButton $chooser
+    Assert "account row has a button" ($null -ne $btn)
+    Assert "signed-out label is the Google sign-in" ($null -ne $btn -and $btn.Text -eq $SignInLabel)
+    Assert "signed-out status says 'Not signed in'" ((Get-AccountStatusText $chooser) -eq 'Not signed in')
 
-                "  -- 3: sign out on the same row"
-                if ($null -ne $after) {
-                    [AcctDrv]::Click($after.Hwnd)
-                    Assert "GUI reports sign_out ok" (Wait-Stderr $errlog 'relay account: sign_out ok')
-                    Assert "signout hit with the session bearer" (
-                        (Get-Hits $HitsA) -match [regex]::Escape("POST /oauth/signout HTTP/1.1|auth=$SessTok"))
-                    Assert "account.dat gone" (-not (Test-Path $AccountStore))
-                    Start-Sleep -Milliseconds 500
-                    $out = Get-AccountButton $chooser
-                    Assert "button back to the Google sign-in" ($null -ne $out -and $out.Text -eq $SignInLabel)
-                    Assert "status back to 'Not signed in'" ((Get-AccountStatusText $chooser) -eq 'Not signed in')
-                    Assert "hint says signed out" ((Get-HintText $chooser) -match 'Signed out|Already signed out')
-                }
-            }
+    if ($null -ne $btn) {
+        Send-TestControlClick -Control $btn.Hwnd | Out-Null
+        # The flow runs off the GUI thread, so the chooser must still be up (and
+        # its button in a disabled pending state) while the "browser" is open. A
+        # synchronous sign-in would fail this.
+        Start-Sleep -Milliseconds 800
+        Assert "chooser still up while signing in" (Test-TestWindowExists -Window $chooser)
+        $busy = Get-AccountButton $chooser
+        Assert "button disabled while signing in" ($null -ne $busy -and -not $busy.Enabled)
+        # Disabling the focused button would drop keyboard focus for the whole
+        # dialog (WM_KEYDOWN then arrives with hwnd == NULL and Enter/Escape/Tab
+        # stop being routed). The row must hand focus off before it disables the
+        # button.
+        $busyFocus = Get-TestFocusedWindow -Window $chooser
+        Assert "keyboard focus stays inside the chooser while busy" (
+            $busyFocus -ne [IntPtr]::Zero -and (Test-InsideChooser $chooser $busyFocus))
 
-            [AcctDrv]::PressForeground($chooser, [uint16]0x1B) # Escape
-            Start-Sleep -Milliseconds 300
-            Assert "Escape closed the chooser" ([AcctDrv]::FindByClass('GhozttyMachineChooser') -eq [IntPtr]::Zero)
+        Assert "browser redirect delivered" (Complete-BrowserRedirect $errlog)
+        Assert "GUI reports sign_in ok" (Wait-Stderr $errlog 'relay account: sign_in ok')
+        Assert "exchange hit the relay" ((Get-Hits $HitsA) -match 'POST /oauth/exchange')
+        Assert "account.dat written" (Test-Path $AccountStore)
+        $blob = if (Test-Path $AccountStore) { Get-Content $AccountStore -Raw } else { '' }
+        Assert "account.dat is not plaintext" (-not ($blob -match 'session_token'))
+
+        # The row updates IN PLACE - no reopen.
+        Start-Sleep -Milliseconds 600
+        $after = Get-AccountButton $chooser
+        # -NegativeControl inverts THIS one: "signing in through the chooser's
+        # account row flips the row to signed-in, in place" is the claim T141
+        # exists for, and it normally passes, so the control discriminates.
+        $flipped = ($null -ne $after -and $after.Text -eq 'Sign Out')
+        $script:negReached = $true
+        if ($NegativeControl) {
+            Assert "NEGATIVE CONTROL: button did NOT flip to 'Sign Out'" (-not $flipped)
+        } else {
+            Assert "button flipped to 'Sign Out'" $flipped
         }
-        Assert "app survived the account flow" (-not $gui.HasExited)
-    }
-}
-if ($gui -and -not $gui.HasExited) { Stop-Process -Id $gui.Id -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 800
+        Assert "button re-enabled" ($null -ne $after -and $after.Enabled)
+        Assert "status shows the signed-in email" ((Get-AccountStatusText $chooser) -eq 'e2e@example.com')
+        Assert "device list refetched after sign-in" ((Get-Hits $HitsA) -match 'GET /v1/client/devices')
 
-"== 4: sign-in against a dead relay -> fails, no account, chooser says so"
-if ($guiAborted) {
-    "  SKIP dead-relay sign-in (foreground unavailable)"
-    $script:skipped++
-} else {
+        "  -- 3: sign out on the same row"
+        if ($null -ne $after) {
+            Send-TestControlClick -Control $after.Hwnd | Out-Null
+            Assert "GUI reports sign_out ok" (Wait-Stderr $errlog 'relay account: sign_out ok')
+            Assert "signout hit with the session bearer" (
+                (Get-Hits $HitsA) -match [regex]::Escape("POST /oauth/signout HTTP/1.1|auth=$SessTok"))
+            Assert "account.dat gone" (-not (Test-Path $AccountStore))
+            Start-Sleep -Milliseconds 500
+            $out = Get-AccountButton $chooser
+            Assert "button back to the Google sign-in" ($null -ne $out -and $out.Text -eq $SignInLabel)
+            Assert "status back to 'Not signed in'" ((Get-AccountStatusText $chooser) -eq 'Not signed in')
+            Assert "hint says signed out" ((Get-HintText $chooser) -match 'Signed out|Already signed out')
+        }
+    }
+
+    # The chooser reads raw WM_KEYDOWN through App.run's routing (it is not a
+    # standard #32770), so a POSTED Escape reaches it.
+    Send-TestControlKey -Control $chooser -Key Escape | Out-Null
+    Start-Sleep -Milliseconds 400
+    Assert "Escape closed the chooser" (-not (Test-TestWindowExists -Window $chooser))
+    Assert "owner window is enabled again once the chooser is gone" (
+        Test-TestWindowEnabled -Window $g.Top)
+    Assert "app survived the account flow" (-not ($g.App.Process -and $g.App.Process.HasExited))
+
+    if ($g.App.Process -and -not $g.App.Process.HasExited) {
+        Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 800
+
+    "== 4: sign-in against a dead relay -> fails, no account, chooser says so"
     $errlog2 = "$tmp\gui-dead.stderr.log"
     Remove-Item $AccountStore -ErrorAction SilentlyContinue
-    $gui2 = Start-Gui 'http://127.0.0.1:1' $errlog2
-    Start-Sleep -Seconds 3
-    $ch2 = Open-Chooser $gui2
-    if ($script:chordAbort) {
-        "  SKIP dead-relay sign-in: $($script:chordAbort)"
+    $g2 = Launch-Gui 'http://127.0.0.1:1' $errlog2
+    if (-not $g2) { Write-Host 'SETUP FAIL: GUI did not come up for the dead-relay section'; exit 1 }
+    Assert "dead-relay GUI is NOT enumerable on the interactive desktop" (
+        -not (Test-TestDesktopLeak -ProcessId $g2.Pid))
+    $ch2 = Open-Chooser $g2
+    Assert "chooser opened (dead relay)" ($ch2 -ne [IntPtr]::Zero)
+    if ($ch2 -ne [IntPtr]::Zero) {
+        $b2 = Get-AccountButton $ch2
+        if ($null -ne $b2) { Send-TestControlClick -Control $b2.Hwnd | Out-Null }
+        Assert "browser redirect delivered (dead relay)" (Complete-BrowserRedirect $errlog2)
+        Assert "GUI reports sign_in failed" (Wait-Stderr $errlog2 'relay account: sign_in failed')
+        Assert "no account.dat after failed sign-in" (-not (Test-Path $AccountStore))
+        Start-Sleep -Milliseconds 500
+        Assert "chooser survived the failure" (Test-TestWindowExists -Window $ch2)
+        Assert "the failure is reported in the chooser" ((Get-HintText $ch2) -match "ouldn't|failed|not completed")
+        $b2b = Get-AccountButton $ch2
+        Assert "button re-enabled after failure" (
+            $null -ne $b2b -and $b2b.Enabled -and $b2b.Text -eq $SignInLabel)
+    }
+    Assert "app survived a failed sign-in" (-not ($g2.App.Process -and $g2.App.Process.HasExited))
+    if ($g2.App.Process -and -not $g2.App.Process.HasExited) {
+        Stop-Process -Id $g2.Pid -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 800
+
+    # Sections 5-7 are CLI/reader-tier claims, but they still need a GUI for
+    # +new-window / +new-remote-window to land in. Launching it here (rather
+    # than letting the CLI auto-spawn it) is what keeps the window off the
+    # user's desktop - an auto-spawn inherits the CLI's desktop, not this one.
+    "== 5: legacy pre-T93 store -> the GUI account tier treats it as signed out"
+    Write-LegacyStore
+    Assert "legacy store staged" (Test-Path $AccountStore)
+    $env:GHOSTTY_ACCOUNT_STORE = $AccountStore
+    $g3 = Launch-Gui $FakeABase "$tmp\gui-cli.stderr.log"
+    if (-not $g3) { Write-Host 'SETUP FAIL: GUI did not come up for the CLI sections'; exit 1 }
+    Assert "CLI-section GUI is NOT enumerable on the interactive desktop" (
+        -not (Test-TestDesktopLeak -ProcessId $g3.Pid))
+    $env:GHOSTTY_ACCOUNT_STORE = $AccountStore
+    $code = Run-Cli '+new-window --target=acctbase' 'acctbase.out'
+    Assert "base window exit 0" ($code -eq 0)
+    Start-Sleep -Seconds 2
+    $code = Run-Cli "+new-remote-window --relay=$FakeABase --device=zzz" 'legacyopen.out' 30
+    $legacyOut = Get-Out 'legacyopen.out'
+    Assert "legacy account tier refuses" ($code -ne 0 -and $legacyOut -match 'not signed in')
+    Assert "refusal points at the chooser, not a deleted CLI verb" (
+        $legacyOut -match 'machine chooser' -and -not ($legacyOut -match 'relay-login'))
+
+    "== 6: near-expiry stored session -> renewed at the stored relay, rotation persisted"
+    if (-not $fakeBUp) {
+        "  SKIP renew case (fake relay B did not start)"
         $script:skipped++
     } else {
-        Assert "chooser opened (dead relay)" ($ch2 -ne [IntPtr]::Zero)
-        if ($ch2 -ne [IntPtr]::Zero) {
-            $b2 = Get-AccountButton $ch2
-            if ($null -ne $b2) { [AcctDrv]::Click($b2.Hwnd) }
-            Assert "browser redirect delivered (dead relay)" (Complete-BrowserRedirect $errlog2)
-            Assert "GUI reports sign_in failed" (Wait-Stderr $errlog2 'relay account: sign_in failed')
-            Assert "no account.dat after failed sign-in" (-not (Test-Path $AccountStore))
-            Start-Sleep -Milliseconds 500
-            Assert "chooser survived the failure" ([AcctDrv]::FindByClass('GhozttyMachineChooser') -ne [IntPtr]::Zero)
-            Assert "the failure is reported in the chooser" ((Get-HintText $ch2) -match "ouldn't|failed|not completed")
-            $b2b = Get-AccountButton $ch2
-            Assert "button re-enabled after failure" (
-                $null -ne $b2b -and $b2b.Enabled -and $b2b.Text -eq $SignInLabel)
-        }
-        Assert "app survived a failed sign-in" (-not $gui2.HasExited)
-    }
-    if ($gui2 -and -not $gui2.HasExited) { Stop-Process -Id $gui2.Id -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 800
-}
-
-"== 5: legacy pre-T93 store -> the GUI account tier treats it as signed out"
-Write-LegacyStore
-Assert "legacy store staged" (Test-Path $AccountStore)
-$env:GHOSTTY_ACCOUNT_STORE = $AccountStore
-$code = Run-Cli '+new-window --target=acctbase' 'acctbase.out'
-Assert "base window exit 0" ($code -eq 0)
-Start-Sleep -Seconds 2
-$code = Run-Cli "+new-remote-window --relay=$FakeABase --device=zzz" 'legacyopen.out' 30
-$legacyOut = Get-Out 'legacyopen.out'
-Assert "legacy account tier refuses" ($code -ne 0 -and $legacyOut -match 'not signed in')
-Assert "refusal points at the chooser, not a deleted CLI verb" (
-    $legacyOut -match 'machine chooser' -and -not ($legacyOut -match 'relay-login'))
-
-"== 6: near-expiry stored session -> renewed at the stored relay, rotation persisted"
-if (-not $fakeBUp) {
-    "  SKIP renew case (fake relay B did not start)"
-    $script:skipped++
-} else {
-    Write-AccountStore $SessTok 30 $FakeBBase
-    # The dial itself fails (fake relay has no ws endpoint) - what matters is
-    # that the GUI RENEWED first (Bearer = the old token) instead of refusing.
-    $code = Run-Cli "+new-remote-window --relay=$FakeBBase --device=zzz" 'renewopen.out' 30
-    Assert "renew hit with the old bearer" (
-        (Get-Hits $HitsB) -match [regex]::Escape("POST /oauth/renew HTTP/1.1|auth=$SessTok"))
-    Assert "dial proceeded past auth (not 'not signed in')" ((Get-Out 'renewopen.out') -match 'failed to reach zzz')
-    $plain = ''
-    try {
-        $raw = [IO.File]::ReadAllBytes($AccountStore)
-        $plain = [Text.Encoding]::UTF8.GetString(
-            [Security.Cryptography.ProtectedData]::Unprotect($raw, $null, 'CurrentUser'))
-    } catch {}
-    Assert "rotated token persisted" ($plain -match [regex]::Escape($RenewedTok))
-}
-
-"== 7: account tier -> +new-remote-window with NO --token (live relay+agent)"
-$haveGo = [bool](Get-Command go -ErrorAction SilentlyContinue)
-$haveAgent = Test-Path $AgentExe
-if (-not ($haveGo -and $haveAgent)) {
-    "  SKIP account-tier open (need go + ghoztty-agent; go=$haveGo agent=$haveAgent)"
-    $script:skipped++
-} else {
-    Push-Location $RelaySrc
-    & go build -o "$tmp\ghoztty-relay-acct-e2e.exe" . 2>&1 | Select-Object -Last 2
-    $goExit = $LASTEXITCODE
-    Pop-Location
-    Assert "relay builds" ($goExit -eq 0)
-
-    if ($goExit -eq 0) {
-        # The relay's DEV_AUTH accepts a client bearer only if it exactly equals
-        # DEV_CLIENT_TOKEN. The account tier presents the stored relay session
-        # token, so set DEV_CLIENT_TOKEN to that same value - then the
-        # account-tier bearer is accepted end to end.
-        $env:LISTEN_ADDR = "127.0.0.1:$RelayPort"; $env:METRICS_ADDR = '127.0.0.1:0'
-        $env:DEV_AUTH = 'true'; $env:DEV_CLIENT_TOKEN = $SessTok
-        $env:DEV_EMAIL = 'dev@example.com'; $env:STATE_DIR = "$tmp\state"
-        $relay = Start-Process -FilePath "$tmp\ghoztty-relay-acct-e2e.exe" -PassThru -WindowStyle Hidden
-        foreach ($k in 'LISTEN_ADDR', 'METRICS_ADDR', 'DEV_AUTH', 'DEV_CLIENT_TOKEN', 'DEV_EMAIL', 'STATE_DIR') {
-            Remove-Item "env:$k" -ErrorAction SilentlyContinue
-        }
-        $healthy = $false
-        foreach ($i in 1..20) {
-            try { if ((Invoke-WebRequest -UseBasicParsing -Uri "$RelayBase/healthz" -TimeoutSec 2).StatusCode -eq 200) { $healthy = $true; break } }
-            catch { Start-Sleep -Milliseconds 500 }
-        }
-        Assert "relay healthy" $healthy
-
-        $dev = $null
+        Write-AccountStore $SessTok 30 $FakeBBase
+        # The dial itself fails (fake relay has no ws endpoint) - what matters is
+        # that the GUI RENEWED first (Bearer = the old token) instead of refusing.
+        $code = Run-Cli "+new-remote-window --relay=$FakeBBase --device=zzz" 'renewopen.out' 30
+        Assert "renew hit with the old bearer" (
+            (Get-Hits $HitsB) -match [regex]::Escape("POST /oauth/renew HTTP/1.1|auth=$SessTok"))
+        Assert "dial proceeded past auth (not 'not signed in')" ((Get-Out 'renewopen.out') -match 'failed to reach zzz')
+        $plain = ''
         try {
-            $dev = Invoke-RestMethod -Method Post -Uri "$RelayBase/v1/client/devices" `
-                -Headers @{ Authorization = "Bearer $SessTok" } `
-                -ContentType 'application/json' -Body '{"name":"acct-e2e"}'
+            $raw = [IO.File]::ReadAllBytes($AccountStore)
+            $plain = [Text.Encoding]::UTF8.GetString(
+                [Security.Cryptography.ProtectedData]::Unprotect($raw, $null, 'CurrentUser'))
         } catch {}
-        Assert "device enrolled" ($null -ne $dev -and $dev.id)
-
-        if ($healthy -and $dev) {
-            # A fresh (long expiry) stored session so the account tier serves
-            # the cached token without a renew.
-            Write-AccountStore $SessTok 3600 $RelayBase
-
-            $env:GHOSTTY_DEVICE_TOKEN = $dev.token
-            $env:GHOSTTY_AGENT_HEARTBEAT = "$tmp\agent.heartbeat"
-            $agent = Start-Process -FilePath $AgentExe -PassThru -WindowStyle Hidden `
-                -ArgumentList "--relay=$RelayBase", "--headless"
-            Remove-Item env:GHOSTTY_DEVICE_TOKEN -ErrorAction SilentlyContinue
-            Remove-Item env:GHOSTTY_AGENT_HEARTBEAT -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
-            Assert "agent running" (-not $agent.HasExited)
-
-            $code = Run-Cli "+new-remote-window --relay=$RelayBase --device=$($dev.id) --name=acctwin" 'acctopen.out' 30
-            Assert "account-tier open exit 0 (no --token)" ($code -eq 0)
-            Start-Sleep -Seconds 2
-            $code = Run-Cli '+list' 'acctlist.out'
-            Assert "account-tier window registered" ((Get-Out 'acctlist.out') -match '\[target: acctwin\]')
-
-            Run-Cli '+close --target=acctwin' 'acctclose.out' | Out-Null
-            if ($agent) { Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue }
-        }
-        if ($relay) { Stop-Process -Id $relay.Id -Force -ErrorAction SilentlyContinue }
+        Assert "rotated token persisted" ($plain -match [regex]::Escape($RenewedTok))
     }
+
+    "== 7: account tier -> +new-remote-window with NO --token (live relay+agent)"
+    $haveGo = [bool](Get-Command go -ErrorAction SilentlyContinue)
+    $haveAgent = Test-Path $AgentExe
+    if (-not ($haveGo -and $haveAgent)) {
+        "  SKIP account-tier open (need go + ghoztty-agent; go=$haveGo agent=$haveAgent)"
+        $script:skipped++
+    } else {
+        Push-Location $RelaySrc
+        & go build -o "$tmp\ghoztty-relay-acct-e2e.exe" . 2>&1 | Select-Object -Last 2
+        $goExit = $LASTEXITCODE
+        Pop-Location
+        Assert "relay builds" ($goExit -eq 0)
+
+        if ($goExit -eq 0) {
+            # The relay's DEV_AUTH accepts a client bearer only if it exactly equals
+            # DEV_CLIENT_TOKEN. The account tier presents the stored relay session
+            # token, so set DEV_CLIENT_TOKEN to that same value - then the
+            # account-tier bearer is accepted end to end.
+            $env:LISTEN_ADDR = "127.0.0.1:$RelayPort"; $env:METRICS_ADDR = '127.0.0.1:0'
+            $env:DEV_AUTH = 'true'; $env:DEV_CLIENT_TOKEN = $SessTok
+            $env:DEV_EMAIL = 'dev@example.com'; $env:STATE_DIR = "$tmp\state"
+            $relay = Start-Process -FilePath "$tmp\ghoztty-relay-acct-e2e.exe" -PassThru -WindowStyle Hidden
+            foreach ($k in 'LISTEN_ADDR', 'METRICS_ADDR', 'DEV_AUTH', 'DEV_CLIENT_TOKEN', 'DEV_EMAIL', 'STATE_DIR') {
+                Remove-Item "env:$k" -ErrorAction SilentlyContinue
+            }
+            $healthy = $false
+            foreach ($i in 1..20) {
+                try { if ((Invoke-WebRequest -UseBasicParsing -Uri "$RelayBase/healthz" -TimeoutSec 2).StatusCode -eq 200) { $healthy = $true; break } }
+                catch { Start-Sleep -Milliseconds 500 }
+            }
+            Assert "relay healthy" $healthy
+
+            $dev = $null
+            try {
+                $dev = Invoke-RestMethod -Method Post -Uri "$RelayBase/v1/client/devices" `
+                    -Headers @{ Authorization = "Bearer $SessTok" } `
+                    -ContentType 'application/json' -Body '{"name":"acct-e2e"}'
+            } catch {}
+            Assert "device enrolled" ($null -ne $dev -and $dev.id)
+
+            if ($healthy -and $dev) {
+                # A fresh (long expiry) stored session so the account tier serves
+                # the cached token without a renew.
+                Write-AccountStore $SessTok 3600 $RelayBase
+
+                $env:GHOSTTY_DEVICE_TOKEN = $dev.token
+                $env:GHOSTTY_AGENT_HEARTBEAT = "$tmp\agent.heartbeat"
+                $agent = Start-Process -FilePath $AgentExe -PassThru -WindowStyle Hidden `
+                    -ArgumentList "--relay=$RelayBase", "--headless"
+                Remove-Item env:GHOSTTY_DEVICE_TOKEN -ErrorAction SilentlyContinue
+                Remove-Item env:GHOSTTY_AGENT_HEARTBEAT -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+                Assert "agent running" (-not $agent.HasExited)
+
+                $code = Run-Cli "+new-remote-window --relay=$RelayBase --device=$($dev.id) --name=acctwin" 'acctopen.out' 30
+                Assert "account-tier open exit 0 (no --token)" ($code -eq 0)
+                Start-Sleep -Seconds 2
+                $code = Run-Cli '+list' 'acctlist.out'
+                Assert "account-tier window registered" ((Get-Out 'acctlist.out') -match '\[target: acctwin\]')
+
+                Run-Cli '+close --target=acctwin' 'acctclose.out' | Out-Null
+                if ($agent) { Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue }
+            }
+            if ($relay) { Stop-Process -Id $relay.Id -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    "== cleanup"
+    Run-Cli '+close --target=acctbase' 'acctclosebase.out' | Out-Null
+} finally {
+    Remove-TestDesktop
+    Remove-Item env:GHOSTTY_ACCOUNT_STORE -ErrorAction SilentlyContinue
+    if ($null -ne $savedTok) { $env:GHOSTTY_RELAY_TOKEN = $savedTok }
+    Stop-TestProcs
+    foreach ($j in @($jobA, $jobB)) {
+        if ($j) { Stop-Job $j -ErrorAction SilentlyContinue; Remove-Job $j -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
-"== cleanup"
-Run-Cli '+close --target=acctbase' 'acctclosebase.out' | Out-Null
-Remove-Item env:GHOSTTY_ACCOUNT_STORE -ErrorAction SilentlyContinue
-if ($null -ne $savedTok) { $env:GHOSTTY_RELAY_TOKEN = $savedTok }
-Stop-TestProcs
-foreach ($j in @($jobA, $jobB)) {
-    if ($j) { Stop-Job $j -ErrorAction SilentlyContinue; Remove-Job $j -Force -ErrorAction SilentlyContinue }
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live pid list: Remove-TestDesktop has run by
+    # now and emptied the live one, which would score this against nothing.
+    $launched = @(Get-TestLaunchedPids)
+    Assert "the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
+    Assert "the run actually launched apps on the test desktop" ($launched.Count -gt 0)
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert "no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
 }
-Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+
+# A -NegativeControl run that never reached the inverted assertion proves
+# nothing, so say so instead of exiting green.
+if ($NegativeControl -and -not $script:negReached) {
+    Assert "NEGATIVE CONTROL never reached its inverted assertion" $false
+}
 
 if ($script:skipped -gt 0) { "($($script:skipped) section(s) SKIPPED)" }
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 }

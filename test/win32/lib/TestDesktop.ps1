@@ -141,6 +141,7 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int ht, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT p);
+    [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr h, int idx);
     [DllImport("user32.dll")] static extern bool SystemParametersInfoW(uint action, uint p, out RECT r, uint winini);
     // SendMessage, never plain: a SYNCHRONOUS cross-process send into a wedged
     // app would block the ONE worker thread the whole harness marshals through,
@@ -528,6 +529,26 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // Send an arbitrary message and hand back its RESULT - for the standard
+    // controls' getters (LB_GETCOUNT, LB_GETITEMHEIGHT, CB_*, EM_*), whose
+    // whole point is the return value. Sent through the timeout-guarded Send,
+    // so a wedged app fails the call instead of blocking the worker thread;
+    // long.MinValue means the send itself failed, which no getter returns.
+    public long MessageResult(IntPtr h, uint msg, IntPtr wp, IntPtr lp) {
+        return (long)Run(delegate() {
+            IntPtr res;
+            if (!Send(h, msg, wp, lp, out res)) return long.MinValue;
+            return (long)res;
+        });
+    }
+
+    // GetWindowLongW, for the style bits a test asserts directly (an
+    // owner-drawn listbox is LBS_OWNERDRAWFIXED without LBS_HASSTRINGS, and
+    // that IS the claim - there is no pixel that says it).
+    public long WindowLong(IntPtr h, int index) {
+        return (long)Run(delegate() { return (long)GetWindowLongW(h, index); });
+    }
+
     public string WindowText(IntPtr h) {
         return (string)Run(delegate() {
             var sb = new StringBuilder(512);
@@ -824,6 +845,20 @@ public class GhozttyTestDesktop {
     // manager's TranslateMessage, which nothing runs for a posted message).
     public bool CloseWindow(IntPtr h) {
         return (bool)Run(delegate() { return PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero); });
+    }
+
+    // BM_CLICK straight to a BUTTON control. Deliberately NOT a synthetic mouse
+    // click: it keeps an assertion about what the button DOES independent of
+    // whether a posted click landed on the right pixel, and it is unaffected by
+    // the control's z-order or by anything overlapping it. SENT (through the
+    // timeout-guarded Send, so a wedged app fails the call instead of blocking
+    // the worker thread) rather than posted, so the handler has already run when
+    // this returns - a posted BM_CLICK would race every assertion after it.
+    public bool ControlClick(IntPtr h) {
+        return (bool)Run(delegate() {
+            IntPtr res;
+            return Send(h, 0x00F5, IntPtr.Zero, IntPtr.Zero, out res); // BM_CLICK
+        });
     }
 
     // Post an ARBITRARY message. For the app's own private WM_APP+n protocol
@@ -1330,6 +1365,38 @@ function Set-TestControlText {
 
 # Win32 class of any hwnd - how a script checks that an hwnd it got from
 # somewhere else (e.g. `+list --json`'s window id) really is what it claims.
+<#
+Send a message to a control and return its RESULT - the standard controls'
+getters (LB_GETCOUNT, LB_GETITEMHEIGHT, EM_*, CB_*), where the answer IS the
+return value. Returns [int64]::MinValue if the app did not answer in time.
+
+Not for input, and not for anything whose effect is asynchronous: use
+Send-TestRawMessage to POST into the app's own WM_APP+n protocol.
+#>
+function Invoke-TestMessage {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][uint32]$Message,
+        [IntPtr]$WParam = [IntPtr]::Zero,
+        [IntPtr]$LParam = [IntPtr]::Zero,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).MessageResult($Window, $Message, $WParam, $LParam)
+}
+
+# A window's style bits: -Style (GWL_STYLE, the default) or -ExStyle.
+# For claims that have no pixel - "this listbox is owner-drawn", "this popup
+# does not carry WS_EX_TOPMOST".
+function Get-TestWindowStyle {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [switch]$ExStyle,
+        $Desktop
+    )
+    $idx = if ($ExStyle) { -20 } else { -16 }
+    return (Resolve-TestDesktop $Desktop).WindowLong($Window, $idx)
+}
+
 function Get-TestWindowClass {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).ClassName($Window)
@@ -1463,6 +1530,19 @@ function Send-TestControlKey {
 function Send-TestWindowClose {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).CloseWindow($Window)
+}
+
+<#
+Activate a BUTTON control (BM_CLICK), for a script whose claim is about what
+the button DOES rather than about hit testing. Sent, not posted, so the
+handler has already run when this returns.
+
+Prefer Send-TestMouse when the assertion IS about the click landing (hit
+testing, a control's own hover/press feedback, a custom-drawn hot zone).
+#>
+function Send-TestControlClick {
+    param([Parameter(Mandatory = $true)][IntPtr]$Control, $Desktop)
+    return (Resolve-TestDesktop $Desktop).ControlClick($Control)
 }
 
 <#

@@ -26,20 +26,45 @@
 #
 #   powershell -NoProfile -File test\win32\ipc-machine-chooser.ps1
 #
-# Mechanics mirror kb-actions.ps1: SetForegroundWindow + AttachThreadInput +
-# SetFocus(surface) then a short SendInput burst; foreground is verified before
-# injection and the run ABORTS-to-SKIP (never fails, never leaks keys) if
-# another window owns the foreground. Run on an idle desktop for a real pass.
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1), so
+# it never takes the user's foreground - asserted at the end, not assumed. The
+# private win32 driver (McDrv) is gone. What the migration changed beyond the
+# mechanics:
+#
+#   * it no longer SKIPs. The whole script used to exit 0 with "SKIPPED
+#     (foreground unavailable)" whenever another window owned the foreground,
+#     so a busy box scored a green run that had asserted nothing. On the test
+#     desktop the chord always lands and a missing chooser is a SETUP FAIL.
+#   * the pixel probes moved from CopyFromScreen (dead off the input desktop)
+#     to PrintWindow via Get-TestWindowPixels. Everything they read is the
+#     dialog's own GDI chrome - the list's owner-drawn rows, the column wash,
+#     the rule, the cue banner, the status strip - which is exactly the half of
+#     the CAPTURE LIMIT that migrates. Each capture is guarded with
+#     Get-TestDistinctColors: a window captured mid-paint comes back solid
+#     black, and black satisfies a "was anything drawn?" probe while proving
+#     nothing (T216).
+#
 # Only touches ghoztty processes running from this repo's zig-out.
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
-    [int]$DirPort = 47921
+    [int]$DirPort = 47931,
+    [switch]$NegativeControl,
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = 'Continue'
+$repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
+# Isolate the IPC endpoint (inherited through CreateProcessW): an instance
+# answering the shared pipe would let another run's windows into this one.
+$env:GHOZTTY_PIPE_SUFFIX = '-mctest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $script:pass = 0
 $script:fail = 0
 $script:skip = 0
+$script:negReached = $false
 # Signed-in geometry, captured in run 1 and compared against the signed-out
 # run's (T172 wrapping footer).
 $script:chooserH1 = 0
@@ -47,292 +72,114 @@ $script:hintH1 = 0
 $script:hintLineH = 0
 $script:listH1 = 0
 $script:rowH1 = 0
+# Write-Host, not the pipeline: a helper that asserts must never also return a
+# value, or its caller gets @('  PASS ...', $value) (the T217 batch-5 trap).
 function Assert($cond, $name) {
-    if ($cond) { "  PASS $name"; $script:pass++ } else { "  FAIL $name"; $script:fail++ }
+    if ($cond) { Write-Host "  PASS $name"; $script:pass++ }
+    else { Write-Host "  FAIL $name" -ForegroundColor Red; $script:fail++ }
 }
-$repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
-Add-Type @'
-using System;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class McDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
+# --- window/control helpers (all through the test-desktop worker thread) ------
+function Get-Rect([IntPtr]$h) { Get-TestWindowRect -Window $h }
+function Get-Height([IntPtr]$h) {
+    if ($h -eq [IntPtr]::Zero) { return -1 }
+    return (Get-TestWindowRect -Window $h).Height
+}
 
-    // --- T172 row-rendering probes -------------------------------------
-    // Pixel probes only line up if this process measures in the SAME physical
-    // pixels the app draws in: GetWindowRect is DPI-virtualized for an unaware
-    // process while Graphics.CopyFromScreen is not, so an unaware probe reads
-    // the wrong part of the screen entirely (measured: 189px off at 125%).
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr h, int idx);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT { public int x, y; }
+# The nth (0-based) descendant of $parent with class $cls, in z-order.
+function Get-NthChild([IntPtr]$parent, [string]$cls, [int]$nth) {
+    $all = @(Get-TestChildWindows -Window $parent -Class $cls)
+    if ($all.Count -le $nth) { return [IntPtr]::Zero }
+    return [IntPtr]$all[$nth].Hwnd
+}
 
-    // Screen coordinates of a window's client origin, so client-space layout
-    // numbers (which is what MachineChooser.layout produces) can be probed on
-    // the captured screenshot without guessing the caption height.
-    public static POINT ClientOrigin(IntPtr h) {
-        POINT p; p.x = 0; p.y = 0;
-        ClientToScreen(h, ref p);
-        return p;
+# The $cls child sitting LOWEST in the dialog (largest top edge). The chooser
+# has two STATICs - the account status at the top and the footer hint at the
+# bottom - and this picks the hint without depending on creation order.
+function Get-LowestChild([IntPtr]$parent, [string]$cls) {
+    $best = [IntPtr]::Zero
+    $bestTop = [int]::MinValue
+    foreach ($c in Get-TestChildWindows -Window $parent -Class $cls) {
+        if ($c.Top -gt $bestTop) { $bestTop = $c.Top; $best = [IntPtr]$c.Hwnd }
     }
+    return $best
+}
 
-    // "text|left|top|right|bottom" (screen coords) for every `cls` child, so a
-    // test can find a control by its LABEL instead of by creation order.
-    public static string[] ChildInfo(IntPtr parent, string cls) {
-        var rows = new System.Collections.Generic.List<string>();
-        EnumChildWindows(parent, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase)) {
-                var t = new StringBuilder(256);
-                GetWindowTextW(h, t, 256);
-                RECT r; GetWindowRect(h, out r);
-                rows.Add(t.ToString() + "|" + r.left + "|" + r.top + "|" + r.right + "|" + r.bottom);
-            }
-            return true;
-        }, IntPtr.Zero);
-        return rows.ToArray();
-    }
-
-    // The nth (0-based) direct child of `parent` whose class is `cls`, in
-    // z-order. Returns IntPtr.Zero when there is no such child.
-    public static IntPtr FindChild(IntPtr parent, string cls, int nth) {
-        IntPtr found = IntPtr.Zero;
-        int seen = 0;
-        EnumChildWindows(parent, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase)) {
-                if (seen == nth) { found = h; return false; }
-                seen++;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // The `cls` child sitting LOWEST in the dialog (largest top edge). The
-    // chooser has two STATICs - the account status at the top and the footer
-    // hint at the bottom - and this picks the hint without depending on
-    // creation order.
-    public static IntPtr LowestChild(IntPtr parent, string cls) {
-        IntPtr found = IntPtr.Zero;
-        int best = int.MinValue;
-        EnumChildWindows(parent, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase)) {
-                RECT r; GetWindowRect(h, out r);
-                if (r.top > best) { best = r.top; found = h; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static int Height(IntPtr h) {
-        RECT r; if (!GetWindowRect(h, out r)) return -1;
-        return r.bottom - r.top;
-    }
-
-    public static bool Raise(IntPtr h) { return GrabForeground(h); }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FindByClass(string cls) {
-        return FindWindowExW(IntPtr.Zero, IntPtr.Zero, cls, null);
-    }
-
-    public static string WindowText(IntPtr h) {
-        var sb = new StringBuilder(256);
-        GetWindowTextW(h, sb, 256);
-        return sb.ToString();
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
+# {Text, Left, Top, Right, Bottom} for every $cls child, so a test can find a
+# control by its LABEL instead of by creation order. Text via WM_GETTEXT, which
+# unlike GetWindowTextW is not a stale cross-process cache.
+function Get-Controls([IntPtr]$parent, [string]$cls) {
+    return @(Get-TestChildWindows -Window $parent -Class $cls | ForEach-Object {
+        [pscustomobject]@{
+            Text   = (Get-TestControlText -Control ([IntPtr]$_.Hwnd))
+            Left   = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
         }
-        return fg;
-    }
-
-    // Send mods+vk to the surface. Returns "SENT" or an ABORT reason.
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-
-    // Best-effort single key to whatever the foreground window has focused.
-    public static void PressForeground(IntPtr win, ushort vk) {
-        GrabForeground(win);
-        Key(vk, false); Thread.Sleep(20); Key(vk, true);
-        Thread.Sleep(60);
-    }
+    })
 }
-'@
-
-# --- screen capture ----------------------------------------------------------
-# One BitBlt per probe SET, then managed pixel reads. Per-pixel GetPixel on the
-# desktop DC is ~1000x slower under DWM (it made this script take minutes).
-Add-Type -AssemblyName System.Drawing
-[void][McDrv]::SetProcessDPIAware()
 
 # The chooser's client width is `px(840, scale)` by construction (T175, see
 # chooser_layout.layout), so the live DPI scale - and with it the one-line
 # status-strip height, `px(16, scale)` - is derivable from the window itself
 # instead of hardcoded per box.
-function Get-ChooserScale {
-    param([IntPtr]$Hwnd)
-    $r = New-Object McDrv+RECT
-    if (-not [McDrv]::GetClientRect($Hwnd, [ref]$r)) { return 1.0 }
-    if ($r.right -le 0) { return 1.0 }
-    return $r.right / 840.0
+function Get-ChooserScale([IntPtr]$h) {
+    $c = Get-TestWindowRect -Window $h -Client
+    if ($c.Width -le 0) { return 1.0 }
+    return $c.Width / 840.0
 }
 
 # A DIP measurement in the chooser's physical pixels.
 function Dip($scale, $v) { return [int][Math]::Round($v * $scale) }
 
-# Parse one ChildInfo row into an object with screen-space edges.
-function Get-Controls($chooser, $cls) {
-    foreach ($row in [McDrv]::ChildInfo($chooser, $cls)) {
-        $f = $row -split '\|'
-        [pscustomobject]@{
-            Text   = $f[0]
-            Left   = [int]$f[1]
-            Top    = [int]$f[2]
-            Right  = [int]$f[3]
-            Bottom = [int]$f[4]
-        }
+# --- capture -----------------------------------------------------------------
+# PrintWindow(PW_RENDERFULLCONTENT) - CopyFromScreen is dead off the input
+# desktop. Retried until the capture holds real content: a window captured
+# mid-paint comes back solid black, and black would satisfy every
+# drawn-pixel/tint probe below while proving nothing (T216).
+function Get-Shot([IntPtr]$h) {
+    $shot = $null
+    for ($t = 0; $t -lt 15; $t++) {
+        if ($shot) { Close-TestWindowPixels $shot }
+        Start-Sleep -Milliseconds 200
+        $shot = Get-TestWindowPixels -Window $h
+        if ((Get-TestDistinctColors -Shot $shot) -ge 8) { break }
     }
+    return $shot
+}
+
+# Screen-coordinate pixel from a shot, as @(r, g, b).
+function Get-ShotPixel($Shot, [int]$X, [int]$Y) {
+    $px = Get-TestPixel -Shot $Shot -X $X -Y $Y
+    if ($null -eq $px) { return @(-1, -1, -1) }
+    return @([int]$px.R, [int]$px.G, [int]$px.B)
 }
 
 # A cheap position-weighted checksum of a screen rect: two different strings
 # rendered in the same box give different values, where a bare drawn-pixel
 # COUNT can collide.
-function Get-RegionSignature {
-    param($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1)
+function Get-RegionSignature($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1) {
     $sig = 0
     for ($y = $Y0; $y -lt $Y1; $y++) {
         for ($x = $X0; $x -lt $X1; $x++) {
             $lx = $x - $Shot.Left
             $ly = $y - $Shot.Top
-            if ($lx -lt 0 -or $ly -lt 0 -or $lx -ge $Shot.W -or $ly -ge $Shot.H) { continue }
-            $px = $Shot.Bmp.GetPixel($lx, $ly)
+            if ($lx -lt 0 -or $ly -lt 0 -or $lx -ge $Shot.Width -or $ly -ge $Shot.Height) { continue }
+            $px = $Shot.Bitmap.GetPixel($lx, $ly)
             $sig = ($sig + ($lx + 1) * [int]$px.R + ($ly + 1) * [int]$px.B) % 2147483647
         }
     }
     return $sig
 }
 
-function Get-WindowShot {
-    param([IntPtr]$Hwnd)
-    $r = New-Object McDrv+RECT
-    if (-not [McDrv]::GetWindowRect($Hwnd, [ref]$r)) { return $null }
-    $w = $r.right - $r.left
-    $h = $r.bottom - $r.top
-    if ($w -le 0 -or $h -le 0) { return $null }
-    $bmp = New-Object System.Drawing.Bitmap($w, $h)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($r.left, $r.top, 0, 0, (New-Object System.Drawing.Size($w, $h)))
-    $g.Dispose()
-    return @{ Bmp = $bmp; Left = $r.left; Top = $r.top; W = $w; H = $h }
-}
-
-# Screen-coordinate pixel from a shot, as @(r, g, b).
-function Get-ShotPixel {
-    param($Shot, [int]$X, [int]$Y)
-    $px = $Shot.Bmp.GetPixel($X - $Shot.Left, $Y - $Shot.Top)
-    return @([int]$px.R, [int]$px.G, [int]$px.B)
-}
-
 # How many pixels in a screen rect differ from (R,G,B) by more than Tol in any
 # channel - i.e. how much was actually DRAWN there.
-function Measure-DrawnPixels {
-    param($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int]$R, [int]$G, [int]$B, [int]$Tol)
+function Measure-DrawnPixels($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int]$R, [int]$G, [int]$B, [int]$Tol) {
     $n = 0
     for ($y = $Y0; $y -lt $Y1; $y++) {
         for ($x = $X0; $x -lt $X1; $x++) {
             $lx = $x - $Shot.Left
             $ly = $y - $Shot.Top
-            if ($lx -lt 0 -or $ly -lt 0 -or $lx -ge $Shot.W -or $ly -ge $Shot.H) { continue }
-            $px = $Shot.Bmp.GetPixel($lx, $ly)
+            if ($lx -lt 0 -or $ly -lt 0 -or $lx -ge $Shot.Width -or $ly -ge $Shot.Height) { continue }
+            $px = $Shot.Bitmap.GetPixel($lx, $ly)
             if ([Math]::Abs([int]$px.R - $R) -gt $Tol -or
                 [Math]::Abs([int]$px.G - $G) -gt $Tol -or
                 [Math]::Abs([int]$px.B - $B) -gt $Tol) { $n++ }
@@ -346,6 +193,28 @@ function Stop-DebugGhoztty {
         Where-Object { $_.CommandLine -like '*zig-out*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 700
+}
+
+# Open the chooser with ctrl+shift+n and wait for the window. On the test
+# desktop there is no foreground race, so a zero return is the PRODUCT not
+# opening it.
+function Open-Chooser($g) {
+    if (-not (Send-TestKeys -Window $g.Top -Target $g.Surface -Modifiers ctrl, shift -Key N)) {
+        return [IntPtr]::Zero
+    }
+    return (Wait-TestWindow -ProcessId $g.Pid -Class 'GhozttyMachineChooser' -TimeoutMs 4000)
+}
+
+# Launch a GUI on the test desktop and find its window + surface.
+function Launch-Gui($errlog) {
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
+    Start-Sleep -Seconds 3
+    if ($app.Process -and $app.Process.HasExited) { return $null }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+    if ($top -eq [IntPtr]::Zero) { return $null }
+    $surface = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
+    if ($surface -eq [IntPtr]::Zero) { return $null }
+    return @{ App = $app; Pid = $app.Pid; Top = $top; Surface = $surface }
 }
 
 # --- Fake relay device directory (loopback HTTP; records each request) -------
@@ -380,295 +249,276 @@ $dirJob = Start-Job -ScriptBlock {
 } -ArgumentList $DirPort, $devicesJson, $hitFile
 Start-Sleep -Milliseconds 600
 
-# --- Launch a debug GUI signed in via the env token, isolated from any real
-# account so GHOSTTY_RELAY_TOKEN is what resolves. ---------------------------
-Stop-DebugGhoztty
 $errlog = Join-Path $env:TEMP "ghoztty-mc-stderr-$PID.log"
 Remove-Item $errlog -ErrorAction SilentlyContinue
 $acctDir = Join-Path $env:TEMP "ghoztty-mc-acct-$PID"
-$env:GHOSTTY_RELAY_BASE = "http://127.0.0.1:$DirPort"
-$env:GHOSTTY_RELAY_TOKEN = 'faketoken-e2e'
-$env:GHOSTTY_ACCOUNT_STORE = (Join-Path $acctDir 'account.dat')
-$proc = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $errlog
-foreach ($k in 'GHOSTTY_RELAY_BASE', 'GHOSTTY_RELAY_TOKEN', 'GHOSTTY_ACCOUNT_STORE') {
-    Remove-Item "env:$k" -ErrorAction SilentlyContinue
-}
-Start-Sleep -Seconds 3
+$acctDir2 = Join-Path $env:TEMP "ghoztty-mc-acct2-$PID"
 
-$aborted = $false
-if ($proc.HasExited) {
-    "SETUP FAIL: GUI died at launch"
-    $script:fail++
-} else {
-    $top = [McDrv]::FindTop([uint32]$proc.Id)
-    $surface = [McDrv]::FindWindowExW($top, [IntPtr]::Zero, 'GhozttyTerminal', $null)
-    if ($top -eq [IntPtr]::Zero -or $surface -eq [IntPtr]::Zero) {
-        "SETUP FAIL: GhozttyWindow/GhozttyTerminal not found"
-        $script:fail++
-    } else {
-        # ctrl(0x11)+shift(0x10)+N(0x4E)
-        $r = [McDrv]::Chord($top, $surface, @([uint16]0x11, [uint16]0x10), [uint16]0x4E)
-        if ($r -like 'ABORT*') {
-            "  SKIP machine-chooser drive: $r"
-            $script:skip++
-            $aborted = $true
-        } else {
-            $chooser = [IntPtr]::Zero
-            for ($t = 0; $t -lt 150; $t++) {
-                Start-Sleep -Milliseconds 20
-                $chooser = [McDrv]::FindByClass('GhozttyMachineChooser')
-                if ($chooser -ne [IntPtr]::Zero) { break }
-            }
-            Start-Sleep -Milliseconds 300
-            $err = Get-Content $errlog -Raw -ErrorAction SilentlyContinue
-            $hits = Get-Content $hitFile -ErrorAction SilentlyContinue
-
-            Assert ($err -match 'machine chooser: opening via ctrl\+shift\+n') 'ctrl+shift+n reached openMachineChooser (stderr)'
-            Assert ($chooser -ne [IntPtr]::Zero) 'GhozttyMachineChooser window opened'
-            if ($chooser -ne [IntPtr]::Zero) {
-                Assert ([McDrv]::WindowText($chooser) -eq 'New Remote Window') 'chooser caption is "New Remote Window"'
-            }
-            Assert (($hits -join "`n") -match '/v1/client/devices') 'chooser fetched the device directory (GET /v1/client/devices)'
-            Assert (-not $proc.HasExited) 'app survived opening the chooser'
-
-            # --- T172: rows carry machine identity, not a system-blue bar ----
-            if ($chooser -ne [IntPtr]::Zero) {
-                $GWL_STYLE = -16
-                $LBS_OWNERDRAWFIXED = 0x0010
-                $LBS_HASSTRINGS = 0x0040
-                $LB_GETITEMHEIGHT = 0x01A1
-                $LB_GETCOUNT = 0x018B
-
-                $list = [McDrv]::FindChild($chooser, 'ListBox', 0)
-                $edit = [McDrv]::FindChild($chooser, 'Edit', 0)
-                Assert ($list -ne [IntPtr]::Zero) 'chooser has a machine list'
-
-                if ($list -ne [IntPtr]::Zero) {
-                    $style = [McDrv]::GetWindowLongW($list, $GWL_STYLE)
-                    Assert (($style -band $LBS_OWNERDRAWFIXED) -ne 0) 'list rows are owner-drawn (LBS_OWNERDRAWFIXED)'
-                    Assert (($style -band $LBS_HASSTRINGS) -eq 0) 'list no longer stores single-line strings (no LBS_HASSTRINGS)'
-
-                    $rowH = [int][McDrv]::SendMessageW($list, $LB_GETITEMHEIGHT, [IntPtr]::Zero, [IntPtr]::Zero)
-                    Assert ($rowH -ge 40) "row height fits a name + subline (got $rowH, want >= 40)"
-
-                    $count = [int][McDrv]::SendMessageW($list, $LB_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero)
-                    Assert ($count -eq 2) "list shows Local + the fetched device (got $count rows)"
-
-                    # Pixel oracle: the selected row is an INSET rounded accent
-                    # pill. Probe the gutter beside it (must stay list
-                    # background) and the pill itself (must be accent-tinted),
-                    # then an unselected row at the same x as a negative
-                    # control. This is exactly what the T140 screenshot got
-                    # wrong: a full-width system-blue selection bar.
-                    [void][McDrv]::Raise($chooser)
-                    Start-Sleep -Milliseconds 350
-                    $shot = Get-WindowShot -Hwnd $chooser
-                    $lr = New-Object McDrv+RECT
-                    [void][McDrv]::GetWindowRect($list, [ref]$lr)
-                    $yRow0 = $lr.top + 1 + [int]($rowH / 2)
-                    $yRow1 = $lr.top + 1 + $rowH + [int]($rowH / 2)
-                    $gutter = Get-ShotPixel $shot ($lr.left + 3) $yRow0
-                    $pill = Get-ShotPixel $shot ($lr.left + 14) $yRow0
-                    $unsel = Get-ShotPixel $shot ($lr.left + 14) $yRow1
-
-                    $gutterTint = $gutter[2] - $gutter[0]
-                    $pillTint = $pill[2] - $pill[0]
-                    $unselTint = $unsel[2] - $unsel[0]
-                    Assert ($pillTint -ge 25) "selected row is accent-tinted (b-r = $pillTint at the pill)"
-                    Assert ($gutterTint -le 10) "selection is inset, not full-width (b-r = $gutterTint in the gutter)"
-                    Assert ($unselTint -le 10) "unselected row stays untinted (b-r = $unselTint)"
-                }
-
-                if ($edit -ne [IntPtr]::Zero) {
-                    # Cue banner: the filter's TEXT is empty, yet its interior
-                    # has drawn pixels - the placeholder the old unlabeled box
-                    # lacked.
-                    $er = New-Object McDrv+RECT
-                    [void][McDrv]::GetWindowRect($edit, [ref]$er)
-                    if (-not $shot) { $shot = Get-WindowShot -Hwnd $chooser }
-                    $drawn = Measure-DrawnPixels $shot ($er.left + 4) ($er.top + 4) ($er.right - 4) ($er.bottom - 4) 30 30 30 12
-                    Assert ([McDrv]::WindowText($edit) -eq '') 'filter field is empty'
-                    Assert ($drawn -ge 40) "filter shows a cue banner while empty ($drawn drawn pixels)"
-                }
-
-                $script:chooserH1 = [McDrv]::Height($chooser)
-                $scale = Get-ChooserScale -Hwnd $chooser
-                $script:hintLineH = Dip $scale 16
-                $hint1 = [McDrv]::LowestChild($chooser, 'Static')
-                if ($hint1 -ne [IntPtr]::Zero) { $script:hintH1 = [McDrv]::Height($hint1) }
-                Assert ($script:hintH1 -eq $script:hintLineH) "signed-in status strip is one line (line=$($script:hintLineH), got $($script:hintH1))"
-                if ($list -ne [IntPtr]::Zero) {
-                    $script:listH1 = [McDrv]::Height($list)
-                    $script:rowH1 = $rowH
-                }
-
-                # --- T175: the master-detail shell -----------------------
-                # T140's report was that the dialog "looks nothing like the mac
-                # dialog". Mac's is 840x540 with a washed machine column at the
-                # left, a detail pane at the right carrying the machine's
-                # identity and its primary action, and Cancel alone in the
-                # footer. Each of those is asserted here against the real
-                # window, not against the layout function.
-                $cr = New-Object McDrv+RECT
-                [void][McDrv]::GetClientRect($chooser, [ref]$cr)
-                Assert ([Math]::Abs($cr.bottom - (Dip $scale 540)) -le 2) "chooser client is Mac's 540 tall at this DPI (got $($cr.bottom), want $(Dip $scale 540))"
-
-                $org = [McDrv]::ClientOrigin($chooser)
-                $masterRight = Dip $scale 260
-                $footerY = Dip $scale 480
-                if (-not $shot) { $shot = Get-WindowShot -Hwnd $chooser }
-
-                # The column is a wash: brighter than the dialog surface beside
-                # it, at the same height, below the last row.
-                $yBody = $org.y + (Dip $scale 300)
-                $washPx = Get-ShotPixel $shot ($org.x + (Dip $scale 200)) $yBody
-                $panePx = Get-ShotPixel $shot ($org.x + (Dip $scale 600)) $yBody
-                Assert (($washPx[0] - $panePx[0]) -ge 4) "machine column sits on a wash (col r=$($washPx[0]) vs pane r=$($panePx[0]))"
-
-                # ...and a hairline rule divides them. Sample the 3 candidate
-                # columns so a rounding-off-by-one does not read as absence.
-                $ruleR = 0
-                foreach ($dx in -1, 0, 1) {
-                    $p = Get-ShotPixel $shot ($org.x + $masterRight + $dx) $yBody
-                    if ($p[0] -gt $ruleR) { $ruleR = $p[0] }
-                }
-                Assert (($ruleR - $washPx[0]) -ge 8) "a rule separates the columns (rule r=$ruleR vs wash r=$($washPx[0]))"
-
-                # The primary action is Mac's "New Window", it lives in the
-                # detail pane, and the footer holds Cancel alone.
-                $buttons = @(Get-Controls $chooser 'Button')
-                $primary = $buttons | Where-Object { $_.Text -eq 'New Window' }
-                $cancel = $buttons | Where-Object { $_.Text -eq 'Cancel' }
-                Assert ($null -ne $primary) "the primary action is labeled 'New Window' (saw: $(($buttons | ForEach-Object { $_.Text }) -join ', '))"
-                Assert ($null -ne $cancel) 'the footer has a Cancel button'
-                if ($primary) {
-                    Assert ((($primary.Left - $org.x) -gt $masterRight)) "the primary action is in the detail pane (left=$($primary.Left - $org.x), column ends at $masterRight)"
-                    Assert ((($primary.Bottom - $org.y) -lt $footerY)) 'the primary action is above the footer, not in it'
-                }
-                $inFooter = @($buttons | Where-Object { ($_.Top - $org.y) -ge $footerY })
-                Assert ($inFooter.Count -eq 1 -and $inFooter[0].Text -eq 'Cancel') "Cancel is alone in the footer (found: $(($inFooter | ForEach-Object { $_.Text }) -join ', '))"
-
-                # The detail pane names the selected machine, and it FOLLOWS
-                # the selection: arrowing onto the relay device must repaint it.
-                $dx0 = $org.x + (Dip $scale 300)
-                $dx1 = $org.x + (Dip $scale 620)
-                $dy0 = $org.y + (Dip $scale 60)
-                $dy1 = $org.y + (Dip $scale 110)
-                $headDrawn = Measure-DrawnPixels $shot $dx0 $dy0 $dx1 $dy1 32 32 32 12
-                Assert ($headDrawn -ge 40) "the detail pane renders the machine's identity ($headDrawn drawn pixels)"
-                $sigLocal = Get-RegionSignature $shot $dx0 $dy0 $dx1 $dy1
-
-                [McDrv]::PressForeground($chooser, [uint16]0x28) # VK_DOWN
-                Start-Sleep -Milliseconds 350
-                $shotDown = Get-WindowShot -Hwnd $chooser
-                $sigDevice = Get-RegionSignature $shotDown $dx0 $dy0 $dx1 $dy1
-                Assert ($sigDevice -ne $sigLocal) "the detail pane follows the selection (signature $sigLocal -> $sigDevice)"
-            }
-
-            # Escape closes the chooser (routed via handleKey), best effort.
-            if ($chooser -ne [IntPtr]::Zero) {
-                [McDrv]::PressForeground($chooser, [uint16]0x1B) # VK_ESCAPE
-                Start-Sleep -Milliseconds 300
-                $gone = ([McDrv]::FindByClass('GhozttyMachineChooser') -eq [IntPtr]::Zero)
-                Assert $gone 'Escape closed the chooser'
-            }
-            Assert (-not $proc.HasExited) 'app survived closing the chooser'
-        }
-    }
-}
-
-# --- T172: signed out, the footer WRAPS and the dialog grows to fit ----------
-# The T140 screenshot's footer was clipped mid-sentence ("...to list your"):
-# the hint was a fixed one-line slot. Signed out, that hint is a long sentence,
-# so it must occupy more lines than the signed-in case (whose hint is empty),
-# the dialog must be taller by exactly that much, and the wrapped remainder
-# must actually be painted INSIDE the control.
-if (-not $aborted -and $script:chooserH1 -gt 0 -and $script:hintH1 -gt 0 -and $script:listH1 -gt 0) {
-    Stop-DebugGhoztty
-    $acctDir2 = Join-Path $env:TEMP "ghoztty-mc-acct2-$PID"
-    $env:GHOSTTY_ACCOUNT_STORE = (Join-Path $acctDir2 'account.dat')
-    $proc2 = Start-Process -FilePath $Exe -PassThru
-    Remove-Item 'env:GHOSTTY_ACCOUNT_STORE' -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-
-    $top2 = [McDrv]::FindTop([uint32]$proc2.Id)
-    $surface2 = [McDrv]::FindWindowExW($top2, [IntPtr]::Zero, 'GhozttyTerminal', $null)
-    if ($top2 -eq [IntPtr]::Zero -or $surface2 -eq [IntPtr]::Zero) {
-        "  SKIP signed-out footer run: no window"
-        $script:skip++
-    } else {
-        $r2 = [McDrv]::Chord($top2, $surface2, @([uint16]0x11, [uint16]0x10), [uint16]0x4E)
-        if ($r2 -like 'ABORT*') {
-            "  SKIP signed-out footer run: $r2"
-            $script:skip++
-        } else {
-            $chooser2 = [IntPtr]::Zero
-            for ($t = 0; $t -lt 150; $t++) {
-                Start-Sleep -Milliseconds 20
-                $chooser2 = [McDrv]::FindByClass('GhozttyMachineChooser')
-                if ($chooser2 -ne [IntPtr]::Zero) { break }
-            }
-            Assert ($chooser2 -ne [IntPtr]::Zero) 'chooser opens with no credential'
-            if ($chooser2 -ne [IntPtr]::Zero) {
-                [void][McDrv]::Raise($chooser2)
-                Start-Sleep -Milliseconds 400
-                $hint2 = [McDrv]::LowestChild($chooser2, 'Static')
-                $hintH2 = [McDrv]::Height($hint2)
-                $chooserH2 = [McDrv]::Height($chooser2)
-                $list2 = [McDrv]::FindChild($chooser2, 'ListBox', 0)
-                $listH2 = if ($list2 -ne [IntPtr]::Zero) { [McDrv]::Height($list2) } else { 0 }
-
-                Assert ($hintH2 -ge 2 * $script:hintLineH) "signed-out status strip wraps to 2+ lines (line=$($script:hintLineH), got $hintH2)"
-                # Since T175 the dialog is Mac's fixed 840x540, so the extra
-                # lines come out of the LIST's height instead of the window's -
-                # same no-clipping invariant, measured on the thing that flexes.
-                Assert ($chooserH2 -eq $script:chooserH1) "dialog stayed a fixed size (was $($script:chooserH1), now $chooserH2)"
-                # The list sheds the room in WHOLE rows (an owner-drawn listbox
-                # must never render a clipped half row), so the accounting is
-                # "the extra strip height, to the nearest row" - and the list
-                # must end above the strip, which is the actual no-overlap
-                # invariant the old grow-the-dialog assertion stood for.
-                $shed = $script:listH1 - $listH2
-                $grew = $hintH2 - $script:hintH1
-                Assert ($shed -ge ($grew - $script:rowH1) -and $shed -le ($grew + $script:rowH1)) "the list gave up the extra strip height, to the nearest row (list -$shed, strip +$grew, row $($script:rowH1))"
-                Assert ($script:rowH1 -gt 0 -and ($listH2 % $script:rowH1) -eq 0) "the list still holds whole rows only ($listH2 / row $($script:rowH1))"
-                $lr2 = New-Object McDrv+RECT
-                [void][McDrv]::GetWindowRect($list2, [ref]$lr2)
-                $hr2 = New-Object McDrv+RECT
-                [void][McDrv]::GetWindowRect($hint2, [ref]$hr2)
-                Assert ($lr2.bottom -le $hr2.top) "the list stops above the wrapped strip (list ends $($lr2.bottom), strip starts $($hr2.top))"
-
-                # The wrapped remainder is painted inside the control, not cut
-                # off: the strip's bottom half has text pixels on the column
-                # wash it sits on.
-                $hr = New-Object McDrv+RECT
-                [void][McDrv]::GetWindowRect($hint2, [ref]$hr)
-                $mid = $hr.top + [int]($hintH2 / 2)
-                $shot2 = Get-WindowShot -Hwnd $chooser2
-                $tail = Measure-DrawnPixels $shot2 $hr.left $mid $hr.right $hr.bottom 40 40 40 12
-                Assert ($tail -ge 20) "the wrapped tail of the strip is rendered ($tail drawn pixels below the first line)"
-            }
-            Assert (-not $proc2.HasExited) 'app survived the signed-out chooser'
-        }
-    }
-    Remove-Item -Recurse -Force $acctDir2 -ErrorAction SilentlyContinue
-}
-
-# --- teardown ----------------------------------------------------------------
-"== teardown"
 Stop-DebugGhoztty
-Stop-Job $dirJob -ErrorAction SilentlyContinue
-Remove-Job $dirJob -Force -ErrorAction SilentlyContinue
-Remove-Item $hitFile, $errlog -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force $acctDir -ErrorAction SilentlyContinue
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
 
-if ($aborted) {
-    "MACHINE-CHOOSER ACCEPTANCE: SKIPPED (foreground unavailable; rerun on an idle desktop)"
-    exit 0
-} elseif ($script:fail -eq 0) {
-    "MACHINE-CHOOSER ACCEPTANCE: ALL PASS"
+try {
+    # --- Launch a debug GUI signed in via the env token, isolated from any real
+    # account so GHOSTTY_RELAY_TOKEN is what resolves. -----------------------
+    $env:GHOSTTY_RELAY_BASE = "http://127.0.0.1:$DirPort"
+    $env:GHOSTTY_RELAY_TOKEN = 'faketoken-e2e'
+    $env:GHOSTTY_ACCOUNT_STORE = (Join-Path $acctDir 'account.dat')
+    $g = Launch-Gui $errlog
+    foreach ($k in 'GHOSTTY_RELAY_BASE', 'GHOSTTY_RELAY_TOKEN', 'GHOSTTY_ACCOUNT_STORE') {
+        Remove-Item "env:$k" -ErrorAction SilentlyContinue
+    }
+    if (-not $g) { Write-Host 'SETUP FAIL: GUI did not come up'; exit 1 }
+    Assert (-not (Test-TestDesktopLeak -ProcessId $g.Pid)) 'signed-in GUI is NOT enumerable on the interactive desktop'
+
+    $chooser = Open-Chooser $g
+    Start-Sleep -Milliseconds 300
+    $err = Get-Content $errlog -Raw -ErrorAction SilentlyContinue
+    $hits = Get-Content $hitFile -ErrorAction SilentlyContinue
+
+    Assert ($err -match 'machine chooser: opening via ctrl\+shift\+n') 'ctrl+shift+n reached openMachineChooser (stderr)'
+    Assert ($chooser -ne [IntPtr]::Zero) 'GhozttyMachineChooser window opened'
+    if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no chooser to score'; exit 1 }
+    Assert ((Get-TestControlText -Control $chooser) -eq 'New Remote Window') 'chooser caption is "New Remote Window"'
+    # The chooser is modal over its own window - cross-process, a disabled owner
+    # is the only checkable form of that, and nothing here asserted it before.
+    Assert (-not (Test-TestWindowEnabled -Window $g.Top)) 'the owner window is disabled while the chooser is up'
+    Assert (($hits -join "`n") -match '/v1/client/devices') 'chooser fetched the device directory (GET /v1/client/devices)'
+    Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app survived opening the chooser'
+
+    # --- T172: rows carry machine identity, not a system-blue bar ------------
+    $LBS_OWNERDRAWFIXED = 0x0010
+    $LBS_HASSTRINGS = 0x0040
+    $LB_GETITEMHEIGHT = 0x01A1
+    $LB_GETCOUNT = 0x018B
+
+    $list = Get-NthChild $chooser 'ListBox' 0
+    $edit = Get-NthChild $chooser 'Edit' 0
+    Assert ($list -ne [IntPtr]::Zero) 'chooser has a machine list'
+
+    $shot = Get-Shot $chooser
+    Assert ((Get-TestDistinctColors -Shot $shot) -ge 8) "the chooser capture holds real content ($(Get-TestDistinctColors -Shot $shot) distinct colors)"
+
+    $rowH = 0
+    if ($list -ne [IntPtr]::Zero) {
+        $style = Get-TestWindowStyle -Window $list
+        Assert (($style -band $LBS_OWNERDRAWFIXED) -ne 0) 'list rows are owner-drawn (LBS_OWNERDRAWFIXED)'
+        Assert (($style -band $LBS_HASSTRINGS) -eq 0) 'list no longer stores single-line strings (no LBS_HASSTRINGS)'
+
+        $rowH = [int](Invoke-TestMessage -Window $list -Message $LB_GETITEMHEIGHT)
+        Assert ($rowH -ge 40) "row height fits a name + subline (got $rowH, want >= 40)"
+
+        $count = [int](Invoke-TestMessage -Window $list -Message $LB_GETCOUNT)
+        Assert ($count -eq 2) "list shows Local + the fetched device (got $count rows)"
+
+        # Pixel oracle: the selected row is an INSET rounded accent pill. Probe
+        # the gutter beside it (must stay list background) and the pill itself
+        # (must be accent-tinted), then an unselected row at the same x as a
+        # negative control. This is exactly what the T140 screenshot got wrong:
+        # a full-width system-blue selection bar.
+        $lr = Get-Rect $list
+        $yRow0 = $lr.Top + 1 + [int]($rowH / 2)
+        $yRow1 = $lr.Top + 1 + $rowH + [int]($rowH / 2)
+        $gutter = Get-ShotPixel $shot ($lr.Left + 3) $yRow0
+        $pill = Get-ShotPixel $shot ($lr.Left + 14) $yRow0
+        $unsel = Get-ShotPixel $shot ($lr.Left + 14) $yRow1
+
+        $gutterTint = $gutter[2] - $gutter[0]
+        $pillTint = $pill[2] - $pill[0]
+        $unselTint = $unsel[2] - $unsel[0]
+        Assert ($pillTint -ge 25) "selected row is accent-tinted (b-r = $pillTint at the pill)"
+        Assert ($gutterTint -le 10) "selection is inset, not full-width (b-r = $gutterTint in the gutter)"
+        Assert ($unselTint -le 10) "unselected row stays untinted (b-r = $unselTint)"
+    }
+
+    if ($edit -ne [IntPtr]::Zero) {
+        # Cue banner: the filter's TEXT is empty, yet its interior has drawn
+        # pixels - the placeholder the old unlabeled box lacked.
+        $er = Get-Rect $edit
+        $drawn = Measure-DrawnPixels $shot ($er.Left + 4) ($er.Top + 4) ($er.Right - 4) ($er.Bottom - 4) 30 30 30 12
+        Assert ((Get-TestControlText -Control $edit) -eq '') 'filter field is empty'
+        Assert ($drawn -ge 40) "filter shows a cue banner while empty ($drawn drawn pixels)"
+    }
+
+    $script:chooserH1 = Get-Height $chooser
+    $scale = Get-ChooserScale $chooser
+    $script:hintLineH = Dip $scale 16
+    $hint1 = Get-LowestChild $chooser 'Static'
+    if ($hint1 -ne [IntPtr]::Zero) { $script:hintH1 = Get-Height $hint1 }
+    Assert ($script:hintH1 -eq $script:hintLineH) "signed-in status strip is one line (line=$($script:hintLineH), got $($script:hintH1))"
+    if ($list -ne [IntPtr]::Zero) {
+        $script:listH1 = Get-Height $list
+        $script:rowH1 = $rowH
+    }
+
+    # --- T175: the master-detail shell --------------------------------------
+    # T140's report was that the dialog "looks nothing like the mac dialog".
+    # Mac's is 840x540 with a washed machine column at the left, a detail pane
+    # at the right carrying the machine's identity and its primary action, and
+    # Cancel alone in the footer. Each of those is asserted here against the
+    # real window, not against the layout function.
+    $cr = Get-TestWindowRect -Window $chooser -Client
+    Assert ([Math]::Abs($cr.Height - (Dip $scale 540)) -le 2) "chooser client is Mac's 540 tall at this DPI (got $($cr.Height), want $(Dip $scale 540))"
+
+    $orgX = $cr.Left
+    $orgY = $cr.Top
+    $masterRight = Dip $scale 260
+    $footerY = Dip $scale 480
+
+    # The column is a wash: brighter than the dialog surface beside it, at the
+    # same height, below the last row.
+    $yBody = $orgY + (Dip $scale 300)
+    $washPx = Get-ShotPixel $shot ($orgX + (Dip $scale 200)) $yBody
+    $panePx = Get-ShotPixel $shot ($orgX + (Dip $scale 600)) $yBody
+    Assert (($washPx[0] - $panePx[0]) -ge 4) "machine column sits on a wash (col r=$($washPx[0]) vs pane r=$($panePx[0]))"
+
+    # ...and a hairline rule divides them. Sample the 3 candidate columns so a
+    # rounding-off-by-one does not read as absence.
+    $ruleR = 0
+    foreach ($dx in -1, 0, 1) {
+        $p = Get-ShotPixel $shot ($orgX + $masterRight + $dx) $yBody
+        if ($p[0] -gt $ruleR) { $ruleR = $p[0] }
+    }
+    Assert (($ruleR - $washPx[0]) -ge 8) "a rule separates the columns (rule r=$ruleR vs wash r=$($washPx[0]))"
+
+    # The primary action is Mac's "New Window", it lives in the detail pane, and
+    # the footer holds Cancel alone.
+    $buttons = @(Get-Controls $chooser 'Button')
+    $primary = $buttons | Where-Object { $_.Text -eq 'New Window' }
+    $cancel = $buttons | Where-Object { $_.Text -eq 'Cancel' }
+    Assert ($null -ne $primary) "the primary action is labeled 'New Window' (saw: $(($buttons | ForEach-Object { $_.Text }) -join ', '))"
+    Assert ($null -ne $cancel) 'the footer has a Cancel button'
+    if ($primary) {
+        Assert ((($primary.Left - $orgX) -gt $masterRight)) "the primary action is in the detail pane (left=$($primary.Left - $orgX), column ends at $masterRight)"
+        Assert ((($primary.Bottom - $orgY) -lt $footerY)) 'the primary action is above the footer, not in it'
+    }
+    $inFooter = @($buttons | Where-Object { ($_.Top - $orgY) -ge $footerY })
+    Assert ($inFooter.Count -eq 1 -and $inFooter[0].Text -eq 'Cancel') "Cancel is alone in the footer (found: $(($inFooter | ForEach-Object { $_.Text }) -join ', '))"
+
+    # The detail pane names the selected machine, and it FOLLOWS the selection:
+    # arrowing onto the relay device must repaint it.
+    $dx0 = $orgX + (Dip $scale 300)
+    $dx1 = $orgX + (Dip $scale 620)
+    $dy0 = $orgY + (Dip $scale 60)
+    $dy1 = $orgY + (Dip $scale 110)
+    $headDrawn = Measure-DrawnPixels $shot $dx0 $dy0 $dx1 $dy1 32 32 32 12
+    Assert ($headDrawn -ge 40) "the detail pane renders the machine's identity ($headDrawn drawn pixels)"
+    $sigLocal = Get-RegionSignature $shot $dx0 $dy0 $dx1 $dy1
+    Close-TestWindowPixels $shot
+
+    # The chooser reads raw WM_KEYDOWN through App.run's routing (it is not a
+    # standard #32770), so posted arrows and Escape reach it.
+    Send-TestControlKey -Control $chooser -Key Down | Out-Null
+    Start-Sleep -Milliseconds 350
+    $shotDown = Get-Shot $chooser
+    $sigDevice = Get-RegionSignature $shotDown $dx0 $dy0 $dx1 $dy1
+    Close-TestWindowPixels $shotDown
+    # -NegativeControl inverts THIS one: "the detail pane follows the selection"
+    # is T175's behavioural claim, it normally passes, and it can only pass when
+    # the chord landed, the list holds both machines and the pane repainted - so
+    # inverting it discriminates instead of riding an already-red assertion.
+    $follows = ($sigDevice -ne $sigLocal)
+    $script:negReached = $true
+    if ($NegativeControl) {
+        Assert (-not $follows) "NEGATIVE CONTROL: the detail pane did NOT follow the selection (signature $sigLocal -> $sigDevice)"
+    } else {
+        Assert $follows "the detail pane follows the selection (signature $sigLocal -> $sigDevice)"
+    }
+
+    # Escape closes the chooser (routed via handleKey).
+    Send-TestControlKey -Control $chooser -Key Escape | Out-Null
+    Start-Sleep -Milliseconds 400
+    Assert (-not (Test-TestWindowExists -Window $chooser)) 'Escape closed the chooser'
+    Assert (Test-TestWindowEnabled -Window $g.Top) 'the owner window is enabled again once the chooser is gone'
+    Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app survived closing the chooser'
+
+    # --- T172: signed out, the footer WRAPS and the list gives up the room ----
+    # The T140 screenshot's footer was clipped mid-sentence ("...to list your"):
+    # the hint was a fixed one-line slot. Signed out, that hint is a long
+    # sentence, so it must occupy more lines than the signed-in case (whose hint
+    # is empty), the dialog must stay its fixed size, and the wrapped remainder
+    # must actually be painted INSIDE the control.
+    if ($script:chooserH1 -gt 0 -and $script:hintH1 -gt 0 -and $script:listH1 -gt 0) {
+        Stop-DebugGhoztty
+        $env:GHOSTTY_ACCOUNT_STORE = (Join-Path $acctDir2 'account.dat')
+        $g2 = Launch-Gui (Join-Path $env:TEMP "ghoztty-mc-stderr2-$PID.log")
+        Remove-Item 'env:GHOSTTY_ACCOUNT_STORE' -ErrorAction SilentlyContinue
+        if (-not $g2) { Write-Host 'SETUP FAIL: signed-out GUI did not come up'; exit 1 }
+        Assert (-not (Test-TestDesktopLeak -ProcessId $g2.Pid)) 'signed-out GUI is NOT enumerable on the interactive desktop'
+
+        $chooser2 = Open-Chooser $g2
+        Assert ($chooser2 -ne [IntPtr]::Zero) 'chooser opens with no credential'
+        if ($chooser2 -ne [IntPtr]::Zero) {
+            Start-Sleep -Milliseconds 400
+            $hint2 = Get-LowestChild $chooser2 'Static'
+            $hintH2 = Get-Height $hint2
+            $chooserH2 = Get-Height $chooser2
+            $list2 = Get-NthChild $chooser2 'ListBox' 0
+            $listH2 = if ($list2 -ne [IntPtr]::Zero) { Get-Height $list2 } else { 0 }
+
+            Assert ($hintH2 -ge 2 * $script:hintLineH) "signed-out status strip wraps to 2+ lines (line=$($script:hintLineH), got $hintH2)"
+            # Since T175 the dialog is Mac's fixed 840x540, so the extra lines
+            # come out of the LIST's height instead of the window's - same
+            # no-clipping invariant, measured on the thing that flexes.
+            Assert ($chooserH2 -eq $script:chooserH1) "dialog stayed a fixed size (was $($script:chooserH1), now $chooserH2)"
+            # The list sheds the room in WHOLE rows (an owner-drawn listbox must
+            # never render a clipped half row), so the accounting is "the extra
+            # strip height, to the nearest row" - and the list must end above the
+            # strip, which is the actual no-overlap invariant the old
+            # grow-the-dialog assertion stood for.
+            $shed = $script:listH1 - $listH2
+            $grew = $hintH2 - $script:hintH1
+            Assert ($shed -ge ($grew - $script:rowH1) -and $shed -le ($grew + $script:rowH1)) "the list gave up the extra strip height, to the nearest row (list -$shed, strip +$grew, row $($script:rowH1))"
+            Assert ($script:rowH1 -gt 0 -and ($listH2 % $script:rowH1) -eq 0) "the list still holds whole rows only ($listH2 / row $($script:rowH1))"
+            $lr2 = Get-Rect $list2
+            $hr2 = Get-Rect $hint2
+            Assert ($lr2.Bottom -le $hr2.Top) "the list stops above the wrapped strip (list ends $($lr2.Bottom), strip starts $($hr2.Top))"
+
+            # The wrapped remainder is painted inside the control, not cut off:
+            # the strip's bottom half has text pixels on the column wash it sits
+            # on.
+            $mid = $hr2.Top + [int]($hintH2 / 2)
+            $shot2 = Get-Shot $chooser2
+            Assert ((Get-TestDistinctColors -Shot $shot2) -ge 8) "the signed-out capture holds real content ($(Get-TestDistinctColors -Shot $shot2) distinct colors)"
+            $tail = Measure-DrawnPixels $shot2 $hr2.Left $mid $hr2.Right $hr2.Bottom 40 40 40 12
+            Close-TestWindowPixels $shot2
+            Assert ($tail -ge 20) "the wrapped tail of the strip is rendered ($tail drawn pixels below the first line)"
+        }
+        Assert (-not ($g2.App.Process -and $g2.App.Process.HasExited)) 'app survived the signed-out chooser'
+    }
+} finally {
+    Remove-TestDesktop
+    Stop-DebugGhoztty
+    Stop-Job $dirJob -ErrorAction SilentlyContinue
+    Remove-Job $dirJob -Force -ErrorAction SilentlyContinue
+    Remove-Item $hitFile, $errlog -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $acctDir, $acctDir2 -ErrorAction SilentlyContinue
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live pid list: Remove-TestDesktop has run by
+    # now and emptied the live one, which would score this against nothing.
+    $launched = @(Get-TestLaunchedPids)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    Assert ($launched.Count -gt 0) 'the run actually launched apps on the test desktop'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
+
+# A -NegativeControl run that never reached the inverted assertion proves
+# nothing, so say so instead of exiting green.
+if ($NegativeControl -and -not $script:negReached) {
+    Assert $false 'NEGATIVE CONTROL never reached its inverted assertion'
+}
+
+Write-Host ''
+if ($script:skip -gt 0) { Write-Host "($($script:skip) section(s) SKIPPED)" }
+if ($script:fail -eq 0) {
+    Write-Host "MACHINE-CHOOSER ACCEPTANCE: ALL PASS ($script:pass assertions)"
     exit 0
 } else {
-    "MACHINE-CHOOSER ACCEPTANCE: $($script:fail) FAILURE(S)"
+    Write-Host "MACHINE-CHOOSER ACCEPTANCE: $($script:fail) FAILURE(S) ($script:pass passed)" -ForegroundColor Red
     exit 1
 }
