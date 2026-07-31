@@ -3148,3 +3148,43 @@ since posted messages skip hit testing), `Wait-TestPopupMenu`, and
 240/244), `-NegativeControl` fails 2 of 8 as required, isolation asserted per
 launch and across the run. Floor: both `zig build test` lanes, `test-agent`,
 P1-P3 green.
+
+## 2026-07-31 - T217 batch 1: four keyboard-only scripts off the user's desktop
+
+`reset-window-size`, `font-inherit`, `ipc-version`, `ipc-child-exited` now run
+on the T211 background desktop. 4 of 23 done; the remaining 19 are listed in
+the task file.
+
+Two of the four never had a `Start-Process` to convert: they let
+`+new-window` AUTO-SPAWN the app, which puts the GUI on the user's desktop no
+matter what the harness does. They now start it with `Start-OnTestDesktop`
+first (config env inherits through `CreateProcessW`) and drive that instance.
+All four also set `GHOZTTY_PIPE_SUFFIX` unconditionally - several only
+isolated the endpoint when `-ExePath` was passed, so a default run talked to
+whatever answered the shared pipe.
+
+Harness gained `Set-TestWindowSize` / `Test-TestWindowZoomed` (the size
+tests' oracle and their posted-key positive control), `Send-TestWindowClose`
+(posted WM_CLOSE - a posted Enter/Escape never reaches a standard dialog,
+which only sees translated messages), and `Get-TestWindowClass`. Its worker
+now asks for per-monitor-v2 DPI awareness before falling back to
+`SetProcessDPIAware`, so another process's window rect is never virtualized -
+`reset-window-size` compares exact pixels.
+
+What the migration found: `ipc-version` was asserting the About box is a
+`#32770` MessageBox. It has been a native `GhozttyConfirmDialog` since the
+T50 chrome pass. Nobody noticed because the old foreground grab kept losing
+the race and the whole section took its `SKIP palette test` branch - on the
+test desktop the chord always lands, so a section that had been silently
+skipping started asserting. Assume every SKIP-able section has un-run
+assertions in it.
+
+Also cost one false FAIL: `@()` must wrap the CALL, not live inside the
+helper. PowerShell unrolls a function's array return, and a one-element
+result then arrives as a scalar whose `.Count` is `$null`, which reads as
+"0 panes".
+
+All four ALL PASS x3 (12 runs), negative controls fail as required, and every
+run asserts - not assumes - that no test-desktop app ever took foreground on
+the interactive desktop. Floor: both `zig build test` lanes, `test-agent`,
+P1-P3 green.

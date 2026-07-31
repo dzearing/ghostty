@@ -13,16 +13,25 @@
 # T76 verdict), per the T55 pattern.
 #
 # Two GUI launches: default (inherit on) and --window-inherit-font-size=false.
+#
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted at the end, not assumed.
+# The private win32 driver (FontDrv, with its own GrabForeground + SendInput)
+# is gone; the harness supplies the equivalents.
+#
 # Only touches ghoztty processes running from this repo's zig-out*.
-param([string]$ExePath)
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
-if ($ExePath) {
-    $exe = $ExePath
-    $env:GHOZTTY_PIPE_SUFFIX = '-fontinherittest'
-}
+if ($ExePath) { $exe = $ExePath }
+# Isolate the IPC endpoint unconditionally: the app inherits this through
+# CreateProcessW and so does every `& $exe +...` below, so the user's own
+# instance is never queried or disturbed.
+$env:GHOZTTY_PIPE_SUFFIX = '-fontinherittest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -31,136 +40,25 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class FontDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    // All visible top-level GhozttyWindow hwnds for a pid.
-    public static long[] Tops(uint pid) {
-        var found = new List<long>();
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") found.Add(h.ToInt64());
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found.ToArray();
-    }
-
-    // Visible GhozttyTerminal children: "hwnd:left,top,right,bottom" lines.
-    public static string[] Panes(IntPtr top) {
-        var lines = new List<string>();
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) {
-                RECT r; GetWindowRect(h, out r);
-                lines.Add(h.ToInt64() + ":" + r.left + "," + r.top + "," + r.right + "," + r.bottom);
-            }
-            return true;
-        }, IntPtr.Zero);
-        return lines.ToArray();
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise (e.g. when a
-    // browser owns foreground, or the previous run's window is closing).
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    // Press ctrl+<vk> `count` times with the target pane focused.
-    public static string Chord(IntPtr top, IntPtr surface, ushort vk, int count) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        if (!GrabForeground(top)) return "ABORT: foreground owned by another window";
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            for (int n = 0; n < count; n++) {
-                Key(0x11, false);
-                Thread.Sleep(20);
-                Key(vk, false); Thread.Sleep(20); Key(vk, true);
-                Thread.Sleep(20);
-                Key(0x11, true);
-                Thread.Sleep(80);
-            }
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-}
-'@
-
-function Parse-Panes([string[]]$lines) {
-    $lines | ForEach-Object {
-        $hw, $r = $_ -split ':'
-        $c = $r -split ','
-        [pscustomobject]@{
-            Hwnd = [int64]$hw
-            Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
-            Width = [int]$c[2] - [int]$c[0]
-        }
-    }
-}
-
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
         Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
+}
+
+# Visible terminal panes of a window, with the pixel width the cell-size
+# estimates need. ALWAYS call as @(Get-Panes ...): PowerShell unrolls a
+# function's array return, and a lone pane then arrives as a scalar whose
+# .Count is $null - which reads as "0 panes" in an assertion.
+function Get-Panes([IntPtr]$top) {
+    @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' |
+        Where-Object Visible |
+        ForEach-Object {
+            [pscustomobject]@{
+                Hwnd = $_.Hwnd; Top = $_.Top; Width = ($_.Right - $_.Left)
+            }
+        })
 }
 
 # Run `mode con` in a named pane and return the Columns value for THIS
@@ -188,36 +86,44 @@ function Get-Cols([string]$pane) {
 function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectInherit) {
     Kill-RepoInstances
 
-    $sp = @{ FilePath = $exe; PassThru = $true }
-    if ($extraArgs.Count) { $sp.ArgumentList = $extraArgs }
-    $proc = Start-Process @sp
+    # Mandatory: each launch writes a session-layout manifest the next one
+    # would restore, so case 2 would come up with case 1's panes (T131).
+    $app = Start-OnTestDesktop -Exe $exe -Arguments (@('--session-persistence=false') + $extraArgs)
     Start-Sleep -Seconds 3
-    if ($proc.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
-    $tops = [FontDrv]::Tops([uint32]$proc.Id)
-    if ($tops.Count -ne 1) { Write-Host "SETUP FAIL ($label): expected 1 top window, got $($tops.Count)"; exit 1 }
-    $top = [IntPtr]$tops[0]
+    if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+    if ($top -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): top window not found"; exit 1 }
+    if ((Get-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -Exclude $top) -ne [IntPtr]::Zero) {
+        Write-Host "SETUP FAIL ($label): more than one top window"; exit 1
+    }
+
+    # Isolation, asserted per launch.
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
+        "$label window is NOT enumerable on the interactive desktop"
 
     # Pane t76a: full-width down-split running cmd (mode con needs cmd).
     & $exe +split --direction=down --name=t76a --shell=cmd "--command=echo ready-a" 2>$null | Out-Null
     Start-Sleep -Milliseconds 1200
-    $panes = @(Parse-Panes ([FontDrv]::Panes($top)))
+    $panes = @(Get-Panes $top)
     Assert ($panes.Count -eq 2) "$label setup: 2 panes after split"
-    if ($panes.Count -ne 2) { Stop-Process -Id $proc.Id -Force; exit 1 }
+    if ($panes.Count -ne 2) { exit 1 }
     $paneA = $panes | Sort-Object Top | Select-Object -Last 1   # bottom = t76a
 
     $colsBefore = Get-Cols 't76a'
     Assert ($colsBefore -gt 0) "$label t76a default columns readable ($colsBefore)"
-    if ($colsBefore -le 0) { Stop-Process -Id $proc.Id -Force; exit 1 }
+    if ($colsBefore -le 0) { exit 1 }
 
     # Zoom t76a: ctrl+= x6 (increase_font_size). Columns must shrink —
     # this doubles as the input-injection positive control.
-    $r = [FontDrv]::Chord($top, [IntPtr]$paneA.Hwnd, 0xBB, 6)
-    if ($r -ne 'SENT') { Write-Host "ABORT: zoom chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
+    for ($n = 0; $n -lt 6; $n++) {
+        $r = Send-TestKeys -Window $top -Target ([IntPtr]$paneA.Hwnd) -Modifiers ctrl -Key plus
+        if (-not $r) { Write-Host "ABORT: zoom chord not sent"; exit 1 }
+    }
     Start-Sleep -Milliseconds 800
     $colsZoom = Get-Cols 't76a'
     if ($colsZoom -le 0 -or $colsZoom -ge $colsBefore) {
         Write-Host "ABORT: ctrl+= did not shrink columns ($colsBefore -> $colsZoom) - injection/zoom broken, not a T76 verdict"
-        Stop-Process -Id $proc.Id -Force; exit 1
+        exit 1
     }
     Write-Host "OK    positive control: ctrl+= zoom shrank columns ($colsBefore -> $colsZoom)"
 
@@ -240,12 +146,11 @@ function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectInherit) {
     $newTop = [IntPtr]::Zero
     for ($t = 0; $t -lt 25; $t++) {
         Start-Sleep -Milliseconds 200
-        $tops = [FontDrv]::Tops([uint32]$proc.Id)
-        $other = @($tops | Where-Object { $_ -ne $top.ToInt64() })
-        if ($other.Count -eq 1) { $newTop = [IntPtr]$other[0]; break }
+        $newTop = Get-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -Exclude $top
+        if ($newTop -ne [IntPtr]::Zero) { break }
     }
     Assert ($newTop -ne [IntPtr]::Zero) "$label new window opened"
-    if ($newTop -eq [IntPtr]::Zero) { Stop-Process -Id $proc.Id -Force; exit 1 }
+    if ($newTop -eq [IntPtr]::Zero) { exit 1 }
 
     $listJson = & $exe +list --json 2>$null | ConvertFrom-Json
     $win = $listJson.data.windows | Where-Object { $_.target -eq 't76w' }
@@ -256,10 +161,9 @@ function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectInherit) {
 
     # Cell-width estimates. Pane A keeps full window width through the
     # down-splits; measure fresh rects now.
-    $panesNow = @(Parse-Panes ([FontDrv]::Panes($top)))
-    $widthA = ($panesNow | Where-Object { $_.Hwnd -eq $paneA.Hwnd }).Width
-    $wPanes = @(Parse-Panes ([FontDrv]::Panes($newTop)))
-    Assert ($wPanes.Count -eq 1) "$label new window has 1 pane"
+    $widthA = (@(Get-Panes $top) | Where-Object { $_.Hwnd -eq $paneA.Hwnd }).Width
+    $wPanes = @(Get-Panes $newTop)
+    Assert ($wPanes.Count -eq 1) "$label new window has 1 pane ($($wPanes.Count))"
     $widthW = $wPanes[0].Width
     $cellBefore = $widthA / $colsBefore
     $cellZoom = $widthA / $colsZoom
@@ -272,13 +176,37 @@ function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectInherit) {
         Assert ([math]::Abs($cellW / $cellBefore - 1) -le 0.08) "$label new window kept CONFIG font ($msg)"
     }
 
-    Assert (-not $proc.HasExited) "$label no crash"
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Assert (-not ($app.Process -and $app.Process.HasExited)) "$label no crash"
+    Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 300
 }
 
-Run-Case 'inherit-on'  @() $true
-Run-Case 'inherit-off' @('--window-inherit-font-size=false') $false
+Kill-RepoInstances
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$launched = @()
+
+try {
+    # -NegativeControl inverts run 1's expectation, so a passing run proves
+    # the assertion still discriminates rather than being true of everything.
+    if ($NegativeControl) { Write-Host 'NEGATIVE CONTROL: run 1 asserts inherit is OFF - this run MUST fail' }
+    Run-Case 'inherit-on' @() (-not $NegativeControl)
+    $launched += $script:GhozttyTestDesktopPids
+    Run-Case 'inherit-off' @('--window-inherit-font-size=false') $false
+    $launched += $script:GhozttyTestDesktopPids
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @($launched | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }

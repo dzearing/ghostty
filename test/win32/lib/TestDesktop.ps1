@@ -112,6 +112,7 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern IntPtr SetActiveWindow(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetFocus();
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] static extern bool GetKeyboardState(byte[] s);
     [DllImport("user32.dll")] static extern bool SetKeyboardState(byte[] s);
@@ -122,6 +123,8 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int ht, uint flags);
 
     // ---------------- gdi ----------------
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
@@ -195,7 +198,11 @@ public class GhozttyTestDesktop {
 
     void WorkerLoop(ManualResetEvent ready) {
         try {
-            SetProcessDPIAware();
+            // Per-monitor-v2 first (what the pre-migration probes used, and
+            // the only awareness under which another process's window rect is
+            // never virtualized); SetProcessDPIAware is the pre-1703 fallback.
+            // Both are no-ops once awareness is set, so calling twice is safe.
+            if (!SetProcessDpiAwarenessContext(new IntPtr(-4))) SetProcessDPIAware();
             if (Interactive) {
                 Ready = true;
             } else {
@@ -392,10 +399,31 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // Maximized state - the oracle several size tests use as their positive
+    // control (toggle_maximize is observable without reading any pixels).
+    public bool Zoomed(IntPtr h) { return (bool)Run(delegate() { return IsZoomed(h); }); }
+
+    // Resize the WINDOW rect, keeping position and z-order. Marshalled like
+    // everything else: a window on another desktop is not this thread's to
+    // poke at directly.
+    public bool SetSize(IntPtr h, int w, int ht) {
+        return (bool)Run(delegate() {
+            return SetWindowPos(h, IntPtr.Zero, 0, 0, w, ht, 0x0004 | 0x0002); // NOZORDER|NOMOVE
+        });
+    }
+
     public string WindowText(IntPtr h) {
         return (string)Run(delegate() {
             var sb = new StringBuilder(512);
             GetWindowTextW(h, sb, 512);
+            return sb.ToString();
+        });
+    }
+
+    public string ClassName(IntPtr h) {
+        return (string)Run(delegate() {
+            var sb = new StringBuilder(128);
+            GetClassNameW(h, sb, 128);
             return sb.ToString();
         });
     }
@@ -628,6 +656,13 @@ public class GhozttyTestDesktop {
             Thread.Sleep(60);
             return true;
         });
+    }
+
+    // WM_CLOSE, posted. The polite way to dismiss a dialog or window we did
+    // not open a keyboard path to (a posted Enter/Escape needs the dialog
+    // manager's TranslateMessage, which nothing runs for a posted message).
+    public bool CloseWindow(IntPtr h) {
+        return (bool)Run(delegate() { return PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero); });
     }
 
     public bool SendControlKey(IntPtr ctl, ushort vk, ushort[] mods) {
@@ -1012,9 +1047,42 @@ function Test-TestWindowExists {
     return (Resolve-TestDesktop $Desktop).Exists($Window)
 }
 
+# Is the window maximized? (IsZoomed - no pixels involved, so it works on a
+# background desktop and is the usual positive control for size tests.)
+function Test-TestWindowZoomed {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).Zoomed($Window)
+}
+
+# Resize the window rect (position and z-order unchanged). -Grow adds to the
+# current rect instead of setting it, which is what the size tests want when
+# they stretch a window away from its default.
+function Set-TestWindowSize {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [int]$Width, [int]$Height,
+        [switch]$Grow,
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    if ($Grow) {
+        $r = $td.Rect($Window)
+        $Width += ($r[2] - $r[0])
+        $Height += ($r[3] - $r[1])
+    }
+    return $td.SetSize($Window, $Width, $Height)
+}
+
 function Get-TestWindowText {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).WindowText($Window)
+}
+
+# Win32 class of any hwnd - how a script checks that an hwnd it got from
+# somewhere else (e.g. `+list --json`'s window id) really is what it claims.
+function Get-TestWindowClass {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).ClassName($Window)
 }
 
 # The focused HWND of $Window's GUI thread (GetGUIThreadInfo, no attach). Poll
@@ -1118,6 +1186,14 @@ function Send-TestControlKey {
     $td = Resolve-TestDesktop $Desktop
     $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
     return $td.SendControlKey($Control, (ConvertTo-TestVk $Key), [uint16[]]$mods)
+}
+
+# Post WM_CLOSE to a window or dialog. Use this rather than a posted
+# Enter/Escape for standard dialogs: dialog keyboard handling runs through
+# the dialog manager, which never sees a posted message.
+function Send-TestWindowClose {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).CloseWindow($Window)
 }
 
 <#

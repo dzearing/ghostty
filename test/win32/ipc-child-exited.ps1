@@ -1,5 +1,5 @@
 # T65 acceptance: child-exited UI is the core in-terminal fallback, not a
-# modal MessageBox. Runs the debug build with a private config
+# modal dialog. Runs the debug build with a private config
 # (wait-after-command=true, abnormal-command-exit-runtime=5000) via
 # XDG_CONFIG_HOME so exits keep the pane open and fast nonzero exits count
 # as abnormal deterministically.
@@ -8,17 +8,30 @@
 #
 # Covers: clean exit + wait-after-command shows the press-any-key notice
 # (previously showed NOTHING), abnormal exit shows the rich in-terminal
-# diagnostic (command + runtime), no #32770 modal dialog exists, and a
-# REAL key press (SendInput, kb-actions.ps1 recipe — +send-keys writes to
-# the PTY and cannot exercise the close-on-key path) closes the waited pane.
+# diagnostic (command + runtime), no modal dialog exists, and a REAL key
+# press (posted to the surface — `+send-keys` writes to the PTY and cannot
+# exercise the close-on-key path) closes the waited pane.
+#
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted at the end, not assumed.
+# The private T65Drv driver (GrabForeground + SendInput) is gone; the harness
+# supplies the equivalents. The app is launched ONTO the desktop rather than
+# auto-spawned by `+new-window`, which would have put it on the user's.
 param(
-    [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe'
+    [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
+    [switch]$NegativeControl,
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $tmp = Join-Path $env:TEMP "ghoztty-ipc-t65-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
+# Isolate the IPC endpoint: the app inherits this through CreateProcessW and
+# so does every `& $Exe +...` below.
+$env:GHOZTTY_PIPE_SUFFIX = '-childexitedtest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
@@ -58,99 +71,6 @@ function Read-Pane($name, $lines) {
     Get-Content "$tmp\read.txt" -Raw
 }
 
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public static class T65Drv {
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lp);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
-    [StructLayout(LayoutKind.Sequential)]
-    struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    delegate bool EnumProc(IntPtr h, IntPtr lp);
-
-    public static string ClassName(IntPtr h) {
-        var sb = new StringBuilder(64);
-        GetClassNameW(h, sb, 64);
-        return sb.ToString();
-    }
-
-    public static int CountDialogsForPids(uint[] pids) {
-        var set = new HashSet<uint>(pids);
-        int count = 0;
-        EnumWindows((h, lp) => {
-            if (!IsWindowVisible(h)) return true;
-            if (ClassName(h) != "#32770") return true;
-            uint pid; GetWindowThreadProcessId(h, out pid);
-            if (set.Contains(pid)) count++;
-            return true;
-        }, IntPtr.Zero);
-        return count;
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    // Real single-key press into the surface (kb-actions.ps1 recipe:
-    // hardened grab + AttachThreadInput + SetFocus + SendInput).
-    // Returns "SENT" or an ABORT/failure reason.
-    public static string PressKey(IntPtr top, IntPtr surface, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-}
-'@
-
 Stop-DebugGhoztty
 
 "== setup: private config (wait-after-command, generous abnormal window)"
@@ -161,6 +81,23 @@ New-Item -ItemType Directory -Force $cfgDir | Out-Null
     'abnormal-command-exit-runtime = 5000'
 ) | Set-Content -Path (Join-Path $cfgDir 'config') -Encoding ascii
 $env:XDG_CONFIG_HOME = Join-Path $tmp 'xdg'
+
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$launched = @()
+
+try {
+
+# The app is started here (inheriting XDG_CONFIG_HOME and the pipe suffix)
+# so that every window it opens lives on the test desktop; letting
+# `+new-window` auto-spawn it would put the GUI on the user's desktop.
+$app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false')
+Start-Sleep -Seconds 3
+Assert "app launched" (-not ($app.Process -and $app.Process.HasExited))
+$launched += $app.Pid
+$boot = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+if ($boot -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
+Assert "window is NOT enumerable on the interactive desktop" (-not (Test-TestDesktopLeak -ProcessId $app.Pid))
 
 "== 1: clean exit 0 + wait-after-command -> press-any-key notice"
 & $Exe +new-window --target=ce0 -e cmd /c exit 0 2>&1 | Out-Null
@@ -185,23 +122,33 @@ Assert "command echoed" ($txt3 -match 'exit 3')
 Assert "runtime shown" ($txt3 -match 'Runtime:')
 
 "== 3: no modal dialog anywhere"
-$pids = @(Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-    Where-Object { $_.ExecutablePath -eq $Exe } |
-    ForEach-Object { [uint32]$_.ProcessId })
-Assert "app process running" ($pids.Count -ge 1)
-$dialogs = [T65Drv]::CountDialogsForPids($pids)
-Assert "no #32770 dialog owned by ghoztty" ($dialogs -eq 0)
+Assert "app process still running" (-not ($app.Process -and $app.Process.HasExited))
+# Both dialog flavors: the win32 MessageBox class AND the native dialog the
+# app has used for its own modals since T50. Checking only '#32770' would
+# pass against a GhozttyConfirmDialog that had regressed into existence.
+$modal = [IntPtr]::Zero
+foreach ($cls in '#32770', 'GhozttyConfirmDialog') {
+    $h = Get-TestWindow -ProcessId $app.Pid -Class $cls
+    if ($h -ne [IntPtr]::Zero) { $modal = $h; break }
+}
+Assert "no modal dialog owned by ghoztty" ($modal -eq [IntPtr]::Zero)
 & $Exe +list 2>&1 | Out-Null
 Assert "IPC responsive" ($LASTEXITCODE -eq 0)
 
 "== 4: real key press closes the waited pane"
 $win0 = $list.data.windows | Where-Object { $_.target -eq 'ce0' }
 $top0 = [IntPtr][int64]$win0.id
-Assert "list id is the top hwnd" ([T65Drv]::ClassName($top0) -eq 'GhozttyWindow')
-$surf0 = [T65Drv]::FindWindowExW($top0, [IntPtr]::Zero, 'GhozttyTerminal', $null)
+Assert "list id is the top hwnd" ((Get-TestWindowClass -Window $top0) -eq 'GhozttyWindow')
+$surf0 = Get-TestChildWindow -Window $top0 -Class 'GhozttyTerminal'
 Assert "surface child found" ($surf0 -ne [IntPtr]::Zero)
-$r = [T65Drv]::PressKey($top0, $surf0, 0x41)  # plain 'a'
-Assert "key injected" ($r -eq 'SENT')
+# -NegativeControl skips the key press while still asserting the pane
+# closed, so the run MUST fail - proof the assertion discriminates.
+if ($NegativeControl) {
+    Write-Host 'NEGATIVE CONTROL: asserting ce0 closed WITHOUT pressing a key - this run MUST fail'
+} else {
+    $r = Send-TestKeys -Window $top0 -Target $surf0 -Key A   # plain 'a'
+    Assert "key injected" $r
+}
 Start-Sleep -Seconds 2
 $list = Get-ListJson
 Assert "ce0 closed by key press" ($null -eq ($list.data.windows | Where-Object { $_.target -eq 'ce0' }))
@@ -209,9 +156,22 @@ Assert "ce3 still open (abnormal path waits)" ($null -ne ($list.data.windows | W
 
 "== teardown"
 & $Exe +close --target=ce3 2>&1 | Out-Null
-Stop-DebugGhoztty
-Remove-Item Env:XDG_CONFIG_HOME -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+
+} finally {
+    Remove-TestDesktop
+    Stop-DebugGhoztty
+    Remove-Item Env:XDG_CONFIG_HOME -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+"foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @($launched | Select-Object -Unique)
+    Assert "the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert "no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
+}
 
 if ($script:failures -eq 0) { "ALL PASS" ; exit 0 }
 else { "$script:failures FAILURE(S)" ; exit 1 }
