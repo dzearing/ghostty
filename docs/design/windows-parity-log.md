@@ -3104,3 +3104,47 @@ Two findings, both filed rather than left as lore:
 
 Floor: both `zig build test` lanes, `test-agent`, P1-P3, and the T207 spike
 all green.
+
+## 2026-07-30 - T212 split, and T216 answers the mouse question: yes
+
+T212 (migrate every SendInput-driving GUI script) was one task over 65 files
+and would not fit a context, so it is split three ways: **T216** prove the
+mouse, **T217** the 23 keyboard-only scripts, **T218** the 12 mouse-driven
+ones. T216 done here.
+
+**The verdict is YES, on both counts that were in doubt.** Posted mouse
+messages reach the app (a posted left click moved keyboard focus to the
+clicked pane), and `TrackPopupMenuEx` runs perfectly well on a background
+desktop - the `#32768` window appears, paints, and dismisses on a posted
+Escape. `PrintWindow` reads it with real content (52 distinct colors), because
+a menu is GDI chrome, which is the half of the capture limit that survives.
+So **nothing routes to the T207 option-B bucket**; T218 can convert all 12.
+
+Two things stood between that answer and a working `dark-menus.ps1`:
+
+- **A product bug (fixed here).** `SetCursorPos`/`GetCursorPos` are dead off
+  the input desktop, and `Surface.getCursorPos` answered a failed
+  `GetCursorPos` with an error. That error came back out of
+  `mouseButtonCallback`, `handleMouseButton` read it as "consumed", and the
+  apprt only opens the context menu when the core returns UNCONSUMED - so
+  right-click did nothing at all. The surface now caches the client position
+  each mouse MESSAGE carries and falls back to it, which is the more accurate
+  number anyway (queue-synchronized with the event, where `GetCursorPos`
+  reports where the pointer is now). Not test-only: `GetCursorPos` also fails
+  on a locked workstation, the secure desktop, and a disconnected RDP session.
+- **A capture trap.** The first green run read `dark surface menu is dark
+  (avg 0)` - a capture taken mid-paint is solid black, and solid black
+  satisfies "is it dark?" for the wrong reason. Same menu: meanLum 0 / 1
+  color at 350ms, meanLum 52 / 53 colors at 400ms. `Get-TestDistinctColors`
+  is now in the harness and `dark-menus` polls for real content before
+  scoring. Every migrated brightness probe needs the same guard.
+
+Harness gained `Send-TestMouse` (posted, screen coords, converted per target;
+`-Target` must name the window that would really have received the click,
+since posted messages skip hit testing), `Wait-TestPopupMenu`, and
+`Get-TestDistinctColors`.
+
+`dark-menus.ps1` ALL PASS (10) x3 with stable readings (dark 52/49, light
+240/244), `-NegativeControl` fails 2 of 8 as required, isolation asserted per
+launch and across the run. Floor: both `zig build test` lanes, `test-agent`,
+P1-P3 green.

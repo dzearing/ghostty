@@ -10,23 +10,43 @@
 #   run 1: --window-theme=dark  -> both menus render DARK  (avg lum < 90)
 #   run 2: --window-theme=light -> both menus render LIGHT (avg lum > 160)
 #
-# Menus are found as visible '#32768' (menu-class) windows in the GUI's
-# pid, opened by REAL right-clicks (SetCursorPos + SendInput, foreground
-# verified) — the surface menu via a click in the pane, the tab-bar menu
-# via a click in the tab strip (window-show-tab-bar=always keeps it
-# visible with one tab). The interior is screenshotted (8px inset skips
-# the shadow/rounded border) and averaged. A menu that never appears is a
-# SETUP FAIL (injection broken), not a theme verdict.
-# Only touches ghoztty processes running from this repo's zig-out.
-param([string]$ExePath)
+# Menus are found as visible '#32768' (menu-class) windows in the GUI's pid,
+# opened by right-clicks - the surface menu via a click in the pane, the
+# tab-bar menu via a click in the tab strip (window-show-tab-bar=always keeps
+# it visible with one tab). The menu window is captured and its interior
+# averaged. A menu that never appears is a SETUP FAIL (injection broken), not
+# a theme verdict.
+#
+# T216: migrated onto the BACKGROUND test desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted here, not assumed. This is
+# the worked example for the mouse half of the migration, and it settled the
+# two questions T212 could not answer from the keyboard spike:
+#
+#   * TrackPopupMenuEx DOES run on a background desktop. The menu appears,
+#     paints, and dismisses on a posted Escape.
+#   * PrintWindow reads a '#32768' menu with real content - menus are
+#     GDI-painted chrome, which is exactly the half of the CAPTURE LIMIT that
+#     survives (the OpenGL terminal surface is the half that does not).
+#
+# Clicks are POSTED (SendInput is refused off the input desktop), so they must
+# name the window that would really have received them: the pane child for the
+# surface menu, the top-level window for the tab strip. Menu keys go through
+# Send-TestControlKey, which posts without touching focus - Send-TestKeys would
+# SetFocus first and dismiss the menu it was meant to drive.
+#
+# -NegativeControl inverts run 1's expectation and MUST fail; it is how a run
+# proves the brightness assertions still discriminate.
+#
+# Only touches ghoztty processes running from this repo's zig-out*.
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
-if ($ExePath) {
-    $exe = $ExePath
-    $env:GHOZTTY_PIPE_SUFFIX = '-darkmenutest'
-}
+if ($ExePath) { $exe = $ExePath }
+$env:GHOZTTY_PIPE_SUFFIX = '-darkmenutest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -35,129 +55,6 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type -AssemblyName System.Drawing
-Add-Type @'
-using System;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class MenuDrv {
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT { public int x, y; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public MOUSEKEYBD u; }
-    // Union of MOUSEINPUT and KEYBDINPUT on x64: the IntPtr at offset 24
-    // forces 8-alignment so INPUT is the required 40 bytes.
-    [StructLayout(LayoutKind.Explicit, Size = 32)]
-    public struct MOUSEKEYBD {
-        [FieldOffset(0)] public int dx;
-        [FieldOffset(4)] public int dy;
-        [FieldOffset(8)] public uint mouseData;
-        [FieldOffset(12)] public uint mouseFlags;
-        [FieldOffset(16)] public uint time;
-        [FieldOffset(24)] public IntPtr extra;
-        [FieldOffset(0)] public ushort wVk;
-        [FieldOffset(2)] public ushort wScan;
-        [FieldOffset(4)] public uint kbFlags;
-    }
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static IntPtr FindClass(uint pid, string cls, bool topOnly) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == cls) { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FindChild(IntPtr top, string cls) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == cls && IsWindowVisible(h)) { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    static void Mouse(uint flags) {
-        var i = new INPUT[1];
-        i[0].type = 0; // INPUT_MOUSE
-        i[0].u.mouseFlags = flags;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    public static void RightClickAt(int x, int y) {
-        SetCursorPos(x, y);
-        Thread.Sleep(80);
-        Mouse(0x0008); // RIGHTDOWN
-        Thread.Sleep(40);
-        Mouse(0x0010); // RIGHTUP
-    }
-
-    public static void PressEscape() {
-        var i = new INPUT[1];
-        i[0].type = 1; i[0].u.wVk = 0x1B;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-        i[0].u.kbFlags = 2; // KEYUP
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1; i[0].u.wVk = vk;
-        i[0].u.kbFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    public static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-}
-'@
-[void][MenuDrv]::SetProcessDPIAware()
-
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
         Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
@@ -165,99 +62,123 @@ function Kill-RepoInstances {
     Start-Sleep -Milliseconds 500
 }
 
-# Average brightness (0-255) of the interior of a screen rect,
-# 8px inset, sampled on a 4px grid.
-function Get-RectBrightness([MenuDrv+RECT]$r) {
-    $w = $r.right - $r.left - 16
-    $h = $r.bottom - $r.top - 16
-    if ($w -le 0 -or $h -le 0) { return -1 }
-    $bmp = New-Object System.Drawing.Bitmap($w, $h)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($r.left + 8, $r.top + 8, 0, 0, $bmp.Size)
-    $g.Dispose()
-    $sum = 0.0; $n = 0
-    for ($y = 0; $y -lt $h; $y += 4) {
-        for ($x = 0; $x -lt $w; $x += 4) {
-            $c = $bmp.GetPixel($x, $y)
-            $sum += (0.2126 * $c.R + 0.7152 * $c.G + 0.0722 * $c.B)
-            $n++
+# Right-click at a screen point, wait for a '#32768' menu window in $gpid,
+# average its interior brightness, Escape it closed. Returns -1 if no menu
+# appeared. $target is the hwnd the click is POSTED to (posted messages skip
+# hit testing, so it has to be named explicitly).
+function Measure-Menu([int]$gpid, [IntPtr]$top, [IntPtr]$target, [int]$sx, [int]$sy) {
+    [void](Send-TestMouse -Window $top -Target $target -X $sx -Y $sy -Button right -Action click)
+    $menu = Wait-TestPopupMenu -ProcessId $gpid -TimeoutMs 4000
+    if ($menu -eq [IntPtr]::Zero) { return -1 }
+
+    # Poll until the menu has actually PAINTED. A capture taken mid-paint comes
+    # back solid black, and "solid black" satisfies the dark assertion below
+    # for entirely the wrong reason - measured at 350ms in T216, where the same
+    # menu read 0/1 color then and 52/53 colors a moment later. Requiring real
+    # content is what keeps a dark verdict from being a capture-timing artifact.
+    $b = -1
+    for ($t = 0; $t -lt 20; $t++) {
+        Start-Sleep -Milliseconds 150
+        $shot = Get-TestWindowPixels -Window $menu
+        try {
+            $colors = Get-TestDistinctColors -Shot $shot
+            if ($colors -ge 8) {
+                # Default rect = the whole capture, inset 8px to skip the shadow
+                # and the rounded border - the same inset the pre-migration
+                # screen-grab used.
+                $b = Get-TestBrightness -Shot $shot
+                break
+            }
+        } finally {
+            Close-TestWindowPixels $shot
         }
     }
-    $bmp.Dispose()
-    if ($n -eq 0) { return -1 }
-    return [int]($sum / $n)
-}
-
-# Right-click at a screen point, wait for a '#32768' menu window in $pid,
-# measure its interior brightness, Escape it closed. Returns -1 if no
-# menu appeared.
-function Measure-Menu([uint32]$gpid, [int]$sx, [int]$sy) {
-    [MenuDrv]::RightClickAt($sx, $sy)
-    $menu = [IntPtr]::Zero
-    for ($t = 0; $t -lt 25; $t++) {
-        Start-Sleep -Milliseconds 100
-        $menu = [MenuDrv]::FindClass($gpid, '#32768', $true)
-        if ($menu -ne [IntPtr]::Zero) { break }
-    }
-    if ($menu -eq [IntPtr]::Zero) { return -1 }
-    Start-Sleep -Milliseconds 250   # let the menu finish painting
-    $r = New-Object MenuDrv+RECT
-    [void][MenuDrv]::GetWindowRect($menu, [ref]$r)
-    $b = Get-RectBrightness $r
-    [MenuDrv]::PressEscape()
-    Start-Sleep -Milliseconds 300
+    [void](Send-TestControlKey -Control $menu -Key Escape)
+    Start-Sleep -Milliseconds 400
     return $b
 }
 
 function Run-Case([string]$label, [string]$themeArg, [bool]$expectDark) {
     Kill-RepoInstances
-    $proc = Start-Process -FilePath $exe -PassThru -ArgumentList @(
-        $themeArg, '--window-show-tab-bar=always'
+    # --session-persistence=false: each launch would otherwise write a layout
+    # manifest that the next one restores (T131).
+    $app = Start-OnTestDesktop -Exe $exe -Arguments @(
+        '--session-persistence=false', $themeArg, '--window-show-tab-bar=always'
     )
     Start-Sleep -Seconds 3
-    if ($proc.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
-    $top = [MenuDrv]::FindClass([uint32]$proc.Id, 'GhozttyWindow', $true)
+    if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): top window not found"; exit 1 }
-    $surface = [MenuDrv]::FindChild($top, 'GhozttyTerminal')
+    $surface = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
     if ($surface -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): surface not found"; exit 1 }
 
-    [void][MenuDrv]::GrabForeground($top)
-    if ([MenuDrv]::GetForegroundWindow() -ne $top) {
-        Write-Host "SETUP FAIL ($label): could not foreground the GUI"; Stop-Process -Id $proc.Id -Force; exit 1
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
+        "$label window is NOT enumerable on the interactive desktop"
+
+    if (-not (Focus-TestWindow -Window $top -Child $surface)) {
+        Write-Host "SETUP FAIL ($label): could not focus the GUI"; Stop-Process -Id $app.Pid -Force; exit 1
     }
 
-    # --- Surface context menu: right-click the middle of the pane.
-    $sr = New-Object MenuDrv+RECT
-    [void][MenuDrv]::GetWindowRect($surface, [ref]$sr)
-    $b = Measure-Menu ([uint32]$proc.Id) ([int](($sr.left + $sr.right) / 2)) ([int](($sr.top + $sr.bottom) / 2))
+    # --- Surface context menu: right-click the middle of the pane. The click
+    # is posted to the PANE, which is where a real one would land.
+    $sr = Get-TestWindowRect -Window $surface
+    $b = Measure-Menu $app.Pid $top $surface `
+        ([int](($sr.Left + $sr.Right) / 2)) ([int](($sr.Top + $sr.Bottom) / 2))
     if ($b -lt 0) {
-        Write-Host "SETUP FAIL ($label): surface menu never appeared (injection broken, not a theme verdict)"
-        Stop-Process -Id $proc.Id -Force; exit 1
+        Write-Host "SETUP FAIL ($label): surface menu never appeared or never painted (injection/capture broken, not a theme verdict)"
+        Stop-Process -Id $app.Pid -Force; exit 1
     }
     if ($expectDark) { Assert ($b -lt 90) "$label surface menu is dark (avg $b < 90)" }
     else { Assert ($b -gt 160) "$label surface menu is light (avg $b > 160)" }
 
-    # --- Tab-bar context menu: right-click inside the tab strip. The tab
-    # bar is at the top of the CLIENT area (always visible via config).
-    # y=12 device px sits inside the bar at any DPI scale >= 100%.
-    $pt = New-Object MenuDrv+POINT; $pt.x = 60; $pt.y = 12
-    [void][MenuDrv]::ClientToScreen($top, [ref]$pt)
-    $b = Measure-Menu ([uint32]$proc.Id) $pt.x $pt.y
+    # --- Tab-bar context menu: right-click inside the tab strip, which the
+    # top-level window paints and handles (Window.zig WM_RBUTTONUP), so the
+    # click is posted THERE. The bar is at the top of the client area (always
+    # visible via config); y=12 device px sits inside it at any DPI >= 100%.
+    $cr = Get-TestWindowRect -Window $top -Client
+    $b = Measure-Menu $app.Pid $top $top ($cr.Left + 60) ($cr.Top + 12)
     if ($b -lt 0) {
-        Write-Host "SETUP FAIL ($label): tab-bar menu never appeared (injection broken, not a theme verdict)"
-        Stop-Process -Id $proc.Id -Force; exit 1
+        Write-Host "SETUP FAIL ($label): tab-bar menu never appeared or never painted (injection/capture broken, not a theme verdict)"
+        Stop-Process -Id $app.Pid -Force; exit 1
     }
     if ($expectDark) { Assert ($b -lt 90) "$label tab-bar menu is dark (avg $b < 90)" }
     else { Assert ($b -gt 160) "$label tab-bar menu is light (avg $b > 160)" }
 
-    Assert (-not $proc.HasExited) "$label no crash"
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Assert (-not ($app.Process -and $app.Process.HasExited)) "$label no crash"
+    Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
 }
 
-Run-Case 'dark' '--window-theme=dark' $true
-Run-Case 'light' '--window-theme=light' $false
-
 Kill-RepoInstances
+
+# Watch the user's desktop for the whole run: nothing we launch may ever take
+# foreground there. That is the complaint the test desktop exists to fix.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$launched = @()
+
+try {
+    # -NegativeControl flips run 1 to assert the DARK-themed menus are light,
+    # so a passing run would mean the brightness probe reads everything.
+    $run1Dark = -not $NegativeControl
+    if ($NegativeControl) { Write-Host 'NEGATIVE CONTROL: run 1 asserts the dark-theme menus are LIGHT - this run MUST fail' }
+    Run-Case 'dark' '--window-theme=dark' $run1Dark
+    $launched += $script:GhozttyTestDesktopPids
+    Run-Case 'light' '--window-theme=light' $false
+    $launched += $script:GhozttyTestDesktopPids
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @($launched | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) "no test-desktop app ever became foreground on the interactive desktop"
+}
+
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
 else { Write-Host "$script:fail FAILED / $script:pass passed" -ForegroundColor Red; exit 1 }

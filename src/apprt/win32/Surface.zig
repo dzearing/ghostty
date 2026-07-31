@@ -89,6 +89,20 @@ high_surrogate: u16 = 0,
 /// (replacing capture) and the next button-up would release prematurely.
 mouse_button_mask: u3 = 0,
 
+/// Last cursor position this surface saw in a mouse MESSAGE, in client
+/// coordinates. `getCursorPos` falls back to it when `GetCursorPos` fails,
+/// which it does whenever the calling thread's desktop is not the input
+/// desktop — a locked workstation, the secure desktop, a disconnected RDP
+/// session, or (T216) an acceptance run on a background test desktop. Before
+/// this the failure propagated out of `mouseButtonCallback` and killed the
+/// whole click: the right-click context menu never opened, because the
+/// apprt only shows it when the core returns "unconsumed".
+///
+/// A message-derived position is not a downgrade: it is queue-synchronized
+/// with the event being handled, whereas `GetCursorPos` reports where the
+/// pointer is *now*, which may already have moved on.
+last_cursor_client: ?w32.POINT = null,
+
 /// Whether an IME composition session is active. When true, handleKeyEvent
 /// skips VK_PROCESSKEY events (the IME is intercepting keys), and composed
 /// text is extracted from WM_IME_COMPOSITION instead.
@@ -877,9 +891,18 @@ pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
             };
         }
     }
-    // Signal failure rather than returning a bogus {0,0} origin, so the
-    // core skips the mouse computation instead of resolving it against the
-    // top-left cell (which produced spurious hover/selection at 0,0).
+    // GetCursorPos failed (not the input desktop: locked workstation, secure
+    // desktop, disconnected RDP, or a background test desktop). The last
+    // position carried by a mouse message is the right answer there — and is
+    // in fact the more accurate one, being synchronized with the event.
+    if (self.last_cursor_client) |p| return .{
+        .x = @floatFromInt(p.x),
+        .y = @floatFromInt(p.y),
+    };
+    // Nothing to fall back on. Signal failure rather than returning a bogus
+    // {0,0} origin, so the core skips the mouse computation instead of
+    // resolving it against the top-left cell (which produced spurious
+    // hover/selection at 0,0).
     return error.GetCursorPosFailed;
 }
 
@@ -2700,6 +2723,42 @@ pub fn handleCharEvent(self: *Surface, wparam: usize) void {
     };
 }
 
+/// Remember the client-coordinate cursor position a mouse message carried,
+/// so `getCursorPos` has an answer when `GetCursorPos` cannot give one.
+/// Mouse-message lparams are SIGNED 16-bit halves: a drag past the left or
+/// top edge (with capture held) legitimately reports negative coordinates,
+/// so they must be sign-extended, not masked.
+pub fn noteCursorFromLparam(self: *Surface, lparam: isize) void {
+    self.last_cursor_client = cursorFromLparam(lparam);
+}
+
+pub fn cursorFromLparam(lparam: isize) w32.POINT {
+    return .{
+        .x = @as(i16, @truncate(@as(isize, lparam & 0xFFFF))),
+        .y = @as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))),
+    };
+}
+
+test "cursorFromLparam decodes signed 16-bit halves" {
+    const testing = std.testing;
+    // Ordinary in-window point.
+    var p = cursorFromLparam(@as(isize, (40 << 16) | 10));
+    try testing.expectEqual(@as(i32, 10), p.x);
+    try testing.expectEqual(@as(i32, 40), p.y);
+
+    // Dragging past the top-left with capture held: both halves are
+    // negative, and masking instead of sign-extending would read them as
+    // ~65500 and send the selection off to the far corner.
+    p = cursorFromLparam(@as(isize, @bitCast(@as(usize, 0xFFF6_FFFB))));
+    try testing.expectEqual(@as(i32, -5), p.x);
+    try testing.expectEqual(@as(i32, -10), p.y);
+
+    // Right/bottom edge of a wide window stays positive.
+    p = cursorFromLparam(@as(isize, (0x7FFF << 16) | 0x7FFF));
+    try testing.expectEqual(@as(i32, 32767), p.x);
+    try testing.expectEqual(@as(i32, 32767), p.y);
+}
+
 /// Handle WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN /
 /// WM_LBUTTONUP / WM_RBUTTONUP / WM_MBUTTONUP. `wparam` is the mouse
 /// message's MK_* modifier word: shift/ctrl come from it (queue-synchronized
@@ -2715,6 +2774,7 @@ pub fn handleMouseButton(
     if (!self.core_surface_ready) return;
     const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
+    self.noteCursorFromLparam(lparam);
 
     var mods = getModifiers();
     mods.shift = (wparam & w32.MK_SHIFT) != 0;
@@ -3070,6 +3130,7 @@ pub fn handleMouseMove(self: *Surface, lparam: isize) void {
     if (!self.core_surface_ready) return;
     const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
+    self.noteCursorFromLparam(lparam);
 
     if (self.app.config.@"focus-follows-mouse") self.focusFollowsMouse(lparam);
 

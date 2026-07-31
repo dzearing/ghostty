@@ -74,7 +74,24 @@ recommended approaches where they exist.
 Work these first, in order, before falling back to first-todo-in-table:
 
 0. **TOP OF THE LIST as of 2026-07-30 (user directive, mid-turn):**
-   **~~T211~~ → T212 → T210 → T208 → T213 → T214 → T209.**
+   **~~T211~~ → ~~T212~~ (split) → ~~T216~~ → T217 → T218 → T210 → T208 →
+   T213 → T214 → T209.**
+
+   - **~~T212~~** — split 2026-07-30, too big for one context (65 scripts,
+     35 grabbing foreground, 36 driving SendInput): **T216** (prove the
+     mouse), **T217** (23 keyboard-only scripts), **T218** (12 mouse-driven
+     scripts).
+
+   - **~~T216~~** — DONE 2026-07-30. The verdict is **YES**: posted mouse
+     input reaches the app and `TrackPopupMenuEx` runs on a background
+     desktop, so no script routes to the T207 option-B bucket.
+     `dark-menus.ps1` is the worked example for the mouse half.
+     It found and fixed a product bug (`Surface.getCursorPos` erroring when
+     `GetCursorPos` fails killed EVERY click, so right-click opened no menu —
+     which also affects a locked workstation / secure desktop / disconnected
+     RDP) and a test trap (an all-black mid-paint capture satisfies a "is it
+     dark?" assertion; `Get-TestDistinctColors` is the guard). Read T216
+     before doing T217/T218.
 
    - **~~T211~~** — DONE 2026-07-30. The shared harness is
      `test/win32/lib/TestDesktop.ps1`; dot-source it and read its header

@@ -119,6 +119,9 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+    [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
 
     // ---------------- gdi ----------------
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
@@ -145,6 +148,13 @@ public class GhozttyTestDesktop {
 
     const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102;
     const uint WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
+    const uint WM_MOUSEMOVE = 0x0200;
+    const uint WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203;
+    const uint WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205;
+    const uint WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208;
+    const uint WM_MOUSEWHEEL = 0x020A;
+    const uint MK_LBUTTON = 0x0001, MK_RBUTTON = 0x0002, MK_SHIFT = 0x0004;
+    const uint MK_CONTROL = 0x0008, MK_MBUTTON = 0x0010;
     const uint PW_RENDERFULLCONTENT = 2;
 
     // ================= worker thread =================
@@ -634,6 +644,114 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // ================= mouse =================
+    // SendInput is dead here (T207), so mouse input is POSTED too. Two things
+    // make that survivable rather than a fiction:
+    //
+    //   * The app reads shift/ctrl for a click from the message's own MK_*
+    //     wparam (Surface.handleMouseButton), not from GetKeyState, so a
+    //     posted click carries its modifiers correctly.
+    //   * `SetCursorPos` DOES work on a background desktop - the cursor
+    //     position is a property of the desktop, and the worker thread is
+    //     bound to ours. So code that reads GetCursorPos (menu placement,
+    //     hover, TrackPopupMenuEx's own modal loop) sees a coherent position
+    //     even though no physical pointer moved.
+    //
+    // What is NOT reproduced: hit-testing. A posted message goes to the hwnd
+    // you name, whatever is on top of it. That is a feature for tests (no
+    // z-order flake) and a trap if you post to the parent expecting a child
+    // to get it.
+    static IntPtr PackPoint(int x, int y) {
+        return (IntPtr)((int)(((uint)y << 16) | ((uint)x & 0xFFFF)));
+    }
+
+    static uint MouseMk(ushort[] mods, uint buttons) {
+        uint mk = buttons;
+        if (mods != null) {
+            foreach (ushort m in mods) {
+                if (m == 0x10) mk |= MK_SHIFT;
+                if (m == 0x11) mk |= MK_CONTROL;
+            }
+        }
+        return mk;
+    }
+
+    // button: 0 left, 1 right, 2 middle.
+    // action: 0 move, 1 down, 2 up, 3 click, 4 double-click, 5 wheel.
+    // x/y are SCREEN coordinates - the same math the pre-migration scripts
+    // already do with GetWindowRect - and are converted per target hwnd.
+    public bool MouseEvent(IntPtr top, IntPtr target, int sx, int sy,
+                           int button, int action, int holdMs,
+                           ushort[] mods, int wheelDelta) {
+        return (bool)Run(delegate() {
+            uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
+            uint cur = GetCurrentThreadId();
+            bool attached = AttachThreadInput(cur, tid, true);
+            try {
+                IntPtr dst = (target == IntPtr.Zero) ? top : target;
+                var ks = new byte[256];
+                bool haveMods = (mods != null && mods.Length > 0);
+                if (haveMods) { GetKeyboardState(ks); ApplyMods(ks, mods, true); SetKeyboardState(ks); }
+
+                SetCursorPos(sx, sy);
+
+                var p = new POINT(); p.x = sx; p.y = sy;
+                ScreenToClient(dst, ref p);
+                IntPtr lp = PackPoint(p.x, p.y);
+
+                uint down = WM_LBUTTONDOWN, up = WM_LBUTTONUP, dbl = WM_LBUTTONDBLCLK, held = MK_LBUTTON;
+                if (button == 1) { down = WM_RBUTTONDOWN; up = WM_RBUTTONUP; dbl = WM_RBUTTONDOWN; held = MK_RBUTTON; }
+                else if (button == 2) { down = WM_MBUTTONDOWN; up = WM_MBUTTONUP; dbl = WM_MBUTTONDOWN; held = MK_MBUTTON; }
+
+                PostMessageW(dst, WM_MOUSEMOVE, (IntPtr)MouseMk(mods, 0), lp);
+                Thread.Sleep(20);
+
+                if (action == 0) {
+                    // move only
+                } else if (action == 5) {
+                    // WM_MOUSEWHEEL's lparam is SCREEN coordinates, not client.
+                    uint wp = (uint)((wheelDelta << 16) | (int)MouseMk(mods, 0));
+                    PostMessageW(dst, WM_MOUSEWHEEL, (IntPtr)(int)wp, PackPoint(sx, sy));
+                } else {
+                    if (action == 1 || action == 3 || action == 4) {
+                        PostMessageW(dst, down, (IntPtr)MouseMk(mods, held), lp);
+                    }
+                    if (action == 3 || action == 4) {
+                        Thread.Sleep(holdMs);
+                        PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
+                    }
+                    if (action == 4) {
+                        Thread.Sleep(30);
+                        PostMessageW(dst, dbl, (IntPtr)MouseMk(mods, held), lp);
+                        Thread.Sleep(holdMs);
+                        PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
+                    }
+                    if (action == 2) {
+                        PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
+                    }
+                }
+
+                if (haveMods) { ApplyMods(ks, mods, false); SetKeyboardState(ks); }
+                Thread.Sleep(40);
+                return true;
+            } finally { if (attached) AttachThreadInput(cur, tid, false); }
+        });
+    }
+
+    // Cursor position on the TEST desktop (per-desktop state; the worker
+    // thread is the one bound to it, so this must be marshalled).
+    public bool MoveCursor(int x, int y) {
+        return (bool)Run(delegate() { return SetCursorPos(x, y); });
+    }
+
+    public int[] CursorPos() {
+        return (int[])Run(delegate() {
+            POINT p;
+            if (!GetCursorPos(out p)) return new int[] { -1, -1 };
+            return new int[] { p.x, p.y };
+        });
+    }
+
     // ================= capture =================
     // PrintWindow(PW_RENDERFULLCONTENT) is the ONLY capture that works on a
     // background desktop: DWM composes the input desktop only, so BitBlt off
@@ -1003,6 +1121,75 @@ function Send-TestControlKey {
 }
 
 <#
+Post a mouse event at a SCREEN coordinate.
+
+    Send-TestMouse -Window $top -Target $pane -X $cx -Y $cy -Button right
+    Send-TestMouse -Window $top -Target $tabstrip -X $x -Y $y -Action down
+    Send-TestMouse -Window $top -Target $top -X $x -Y $y -Action move
+
+-Target is the hwnd the message is POSTED to: posted messages skip hit
+testing, so name the window that would really have received the click (the
+child pane, not its parent). Defaults to -Window.
+
+-Action is click (default) / down / up / move / doubleclick / wheel.
+-Button is left (default) / right / middle. -Delta applies to wheel only.
+#>
+function Send-TestMouse {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [IntPtr]$Target = [IntPtr]::Zero,
+        [Parameter(Mandatory = $true)][int]$X,
+        [Parameter(Mandatory = $true)][int]$Y,
+        [ValidateSet('left', 'right', 'middle')][string]$Button = 'left',
+        [ValidateSet('click', 'down', 'up', 'move', 'doubleclick', 'wheel')][string]$Action = 'click',
+        [string[]]$Modifiers = @(),
+        [int]$HoldMs = 40,
+        [int]$Delta = 0,
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    $b = switch ($Button) { 'left' { 0 } 'right' { 1 } 'middle' { 2 } }
+    $a = switch ($Action) {
+        'move' { 0 } 'down' { 1 } 'up' { 2 } 'click' { 3 } 'doubleclick' { 4 } 'wheel' { 5 }
+    }
+    $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
+    return $td.MouseEvent($Window, $Target, $X, $Y, $b, $a, $HoldMs, [uint16[]]$mods, $Delta)
+}
+
+# Move the TEST desktop's cursor without posting anything. Useful when the
+# product reads GetCursorPos on its own schedule (menu placement, hover).
+function Set-TestCursorPos {
+    param([Parameter(Mandatory = $true)][int]$X, [Parameter(Mandatory = $true)][int]$Y, $Desktop)
+    return (Resolve-TestDesktop $Desktop).MoveCursor($X, $Y)
+}
+
+function Get-TestCursorPos {
+    param($Desktop)
+    $p = (Resolve-TestDesktop $Desktop).CursorPos()
+    return [pscustomobject]@{ X = $p[0]; Y = $p[1] }
+}
+
+<#
+Wait for a popup menu (win32 class '#32768') owned by $ProcessId.
+
+TrackPopupMenuEx runs a MODAL loop on the app's GUI thread, so while a menu
+is up the app answers no messages - but our worker thread is a different
+thread, and EnumWindows/GetWindowRect/PrintWindow do not need the app's.
+Dismiss with Send-TestControlKey (which posts without touching focus);
+Send-TestKeys would SetFocus first and close the menu out from under you.
+
+Returns IntPtr::Zero if no menu appeared.
+#>
+function Wait-TestPopupMenu {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [int]$TimeoutMs = 3000,
+        $Desktop
+    )
+    return Wait-TestWindow -ProcessId $ProcessId -Class '#32768' -TimeoutMs $TimeoutMs -Desktop $Desktop
+}
+
+<#
 Capture a window's pixels via PrintWindow(PW_RENDERFULLCONTENT) - the only
 capture path that works on a background desktop, and only for GDI-painted
 chrome (see CAPTURE LIMIT in this file's header; the OpenGL terminal surface
@@ -1078,6 +1265,41 @@ function Get-TestBrightness {
     }
     if ($n -eq 0) { return -1 }
     return [int]($sum / $n)
+}
+
+<#
+Number of distinct colors in a capture - the guard against scoring a probe
+against nothing.
+
+Two ways a capture is empty here, and BOTH sail through a naive threshold:
+the OpenGL terminal surface always comes back as a flat fill (see CAPTURE
+LIMIT above), and a window captured mid-paint comes back solid black, which
+happily satisfies any "is it dark?" assertion. Measured in T216: the same
+dark context menu read meanLum 0 / 1 color when captured 350ms after opening
+and meanLum 52 / 53 colors at 400ms.
+
+So a brightness probe should require real content before believing its own
+number. Real GDI chrome (text, borders, separators) is always well into the
+double digits.
+#>
+function Get-TestDistinctColors {
+    param(
+        [Parameter(Mandatory = $true)]$Shot,
+        [int]$Inset = 8,
+        [int]$Step = 3,
+        [int]$Max = 64
+    )
+    $seen = @{}
+    $x1 = $Shot.Width - $Inset
+    $y1 = $Shot.Height - $Inset
+    for ($y = $Inset; $y -lt $y1; $y += $Step) {
+        for ($x = $Inset; $x -lt $x1; $x += $Step) {
+            $c = $Shot.Bitmap.GetPixel($x, $y)
+            $seen["$($c.R),$($c.G),$($c.B)"] = 1
+            if ($seen.Count -ge $Max) { return $seen.Count }
+        }
+    }
+    return $seen.Count
 }
 
 # Watch the INTERACTIVE desktop for the whole run. Every migrated script should
