@@ -61,6 +61,31 @@ Three things follow, and they are not negotiable:
   build the native equivalent and record the divergence in the row, so the gap
   is a decision on the record rather than an omission.
 
+**THE BAR, RESTATED AND SHARPENED (user, 2026-07-31, verbatim):** *"Your idea
+of parity is not the same as mine. I mean, pixel parity, the UX looks and feels
+cohesive and polished and scrubbed, and it isn't just buttons that exist in the
+same place, but it looks like a posh win32 version of the MacOS app. The borders
+look nice. There's a master details view. There are ways to get to the activity
+viewer. If you haven't even built the activity monitor, then you don't have
+parity with the dialogue in the MacOS app."*
+
+This is a **correction**, and it retires the reading that had been in force:
+
+- **A control that exists in the same place is not parity.** T172/T175/T176
+  shipped the chooser's rows, master-detail and row menu and the tracker read
+  that as the chooser being done. It is not done: the Activity Monitor behind
+  its detail row was never built (T226), its button was never filed until
+  T177, and nothing has been judged for finish.
+- **Pixel parity and polish are part of the deliverable, not a follow-up.**
+  Borders, seams, selection states, type ramp, DPI. Measure the target the way
+  T202 did (`win32-tab-strip.md`) rather than eyeballing it.
+- **"Posh win32 version of the macOS app"** is the phrase to design to — a
+  Windows-native execution held to the Mac original's level of finish, not a
+  cloned macOS dialog and not a functional stand-in.
+- **A missing panel is a missing feature, even when its host dialog looks
+  right.** Before calling any surface parity-complete, ask what every control
+  on the Mac side OPENS, and whether that thing exists here.
+
 **THE GOAL (user, 2026-07-15, verbatim intent):** Windows Ghoztty at full
 parity with Mac Ghoztty, *very reliable and usable for long contexts*.
 Thoroughly test it, optimize, fine-tune, make the Windows things look
@@ -72,6 +97,41 @@ recommended approaches where they exist.
 ## Current priorities (user directive 2026-07-15, overrides table order)
 
 Work these first, in order, before falling back to first-todo-in-table:
+
+00. **TOP OF THE LIST as of 2026-07-31 (user directive).** Verbatim: *"Let's
+    get the test infrastructure complete, but prioritize the new window parity
+    and activity viewer immediately next."* So the 2026-07-30 chain below runs
+    to completion, and then the Ctrl+Shift+N surface is next — ahead of
+    anything else in this list or the table:
+
+    **finish test infra (T217 → T218 → T213 → T214 → T225 → T209, with T210
+    and T208 kept in that block because the loop's own reliability gates
+    everything) → then T226 → T177 → T227 → T146.**
+
+    - **T226 (new, 2026-07-31)** — port the Mac **Activity Monitor**. Windows
+      has ZERO of it; it was never filed anywhere until now. Ordered FIRST of
+      the three because T177 is the button that opens it, and a button that
+      opens nothing is not worth landing on its own. The data plane is already
+      cross-platform (`metrics.zig`, `proc.zig`, `proc_control.zig`,
+      `proc_spawn.zig` all have Windows branches — verified by reading them),
+      so this is a win32 UI task in the shape of `MachineChooser.zig`, not a
+      systems task.
+    - **T177** — the chooser detail row's missing **Activity** button (and a
+      note that **Restore All** belongs to T146). Its "trace the Mac side
+      first, and fold into T146 if it depends on session browsing" question is
+      **answered: it does not.** The Activity panel is process/metrics
+      monitoring, independent of T146, which is why T226 exists as its own
+      task.
+    - **T227 (new, 2026-07-31)** — the **pixel-parity and polish pass** over
+      the whole Ctrl+Shift+N surface (chooser + Host Settings + account row),
+      judged as one cohesive surface. This is where the restated BAR above
+      gets discharged. Deliberately ordered AFTER T226/T177, since both change
+      the detail row's composition and a polish pass run before them runs
+      twice.
+    - **T146** — the other half of the chooser's *function* (cross-machine
+      session browse/resume, Kill, Restore All). Still todo, still 4 Mac
+      commits with zero Windows references, and it also owns the correction of
+      CLAUDE.md's stale "scoped but not yet built" claim.
 
 0. **TOP OF THE LIST as of 2026-07-30 (user directive, mid-turn):**
    **~~T211~~ → ~~T212~~ (split) → ~~T216~~ → T217 → T218 → T210 → T208 →
