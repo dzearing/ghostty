@@ -2953,3 +2953,40 @@ incident, one platform later.
 - Floor at this change: `zig build -Dapp-runtime=win32 -Doptimize=Debug`, both
   test lanes, `zig build test-agent` all exit 0; P1/P2/P3 each `ACCEPTANCE: ALL
   PASS`.
+
+## 2026-07-30 - T202 done: the tab strip stops stretching, and starts looking like a tab strip
+
+The user screenshotted a single-tab window and named four things: a weird blue
+line at the bottom, a "+" butt up against the tab and looking clipped, a
+misaligned hamburger, and "HORRIBLY amateur ... like a backend developer built
+the ui." Three of the four came from **one** rule: `paintTabBar` handed the
+LAST tab whatever width was left, so a single tab spanned the window, which
+flung the close button to the far edge, jammed the "+" against it, and
+stretched the selection accent into a full-width blue rule.
+
+- **Measured the target instead of quoting it.** Live Windows Terminal via
+  `PrintWindow(PW_RENDERFULLCONTENT)`, read pixel by pixel: three tabs took
+  900 px of a 1610 px strip and left ~700 px empty; the selected tab is a
+  rounded-top chiclet filled with the CONTENT background; unselected tabs have
+  no fill; there is no accent underline anywhere. Written up as
+  `docs/design/win32-tab-strip.md` so T203/T204/T206 paint to one agreed
+  target.
+- Geometry extracted to a pure `tab_strip_layout.zig` (11 unit tests): equal
+  share clamped to [60, 200] DIP, no remainder rule, tabs that do not fit get a
+  zero rect rather than a rect under the buttons, the "+" travels with the last
+  tab, the menu button is pinned right. The close box had been recomputed in
+  three places; it is one function now, so paint and hit test cannot drift.
+- The right-edge padding defect from the same live review landed here rather
+  than in T204, because T202 had not been committed yet: `strip_pad_r` makes
+  the strip inset the same at both ends.
+- **Negative control, run for real:** `T202_NEUTERED = true` restores the
+  remainder rule; rebuilt and re-ran `test/win32/tab-strip.ps1` — exactly the
+  6 geometry assertions failed, the accent-rule / dead-space / many-tab /
+  menu assertions still passed. Restored and rebuilt.
+- Harness lesson worth keeping: `tab-color.ps1` and `window-title.ps1` fail
+  on this box right now, and an A/B against parked pre-change sources proved
+  the failures are identical at `HEAD`. A fullscreen Unreal title holds the
+  foreground with `GameInputSvc` running — the documented input wedge, and
+  the thing **T207** exists to fix. Do not attribute a keyboard-driven GUI
+  failure to a code change without that A/B; it costs one rebuild and it is the
+  difference between a real regression and a wasted day.

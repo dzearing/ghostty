@@ -278,24 +278,34 @@ for ($t = 0; $t -lt 25; $t++) {
 Assert ($barH -gt 0) "positive control: ctrl+t made a 2nd tab and the tab bar appeared (barH=$barH)"
 if ($barH -le 0) { Stop-Process -Id $proc.Id -Force; exit 1 }
 
-# Geometry: scale from barH (= round(32*scale)); tab widths mirror
-# paintTabBar (2 tabs: clamp((clientW-36*scale)/2, 60*scale, 200*scale)).
+# Geometry: scale from barH (= round(32*scale)); the rest mirrors
+# tab_strip_layout.zig (T202) — tabs start at a 4 DIP inset, take an EQUAL
+# share of the strip clamped to [60, 200] DIP (no last-tab remainder), and the
+# strip reserves two 36 DIP buttons plus two 8 DIP group gaps on the right.
+# The T72 stripe now rides the chiclet, which starts 3 DIP down from the strip
+# top. See docs/design/win32-tab-strip.md.
 $scale = $barH / 32.0
 $vis = @(Parse-Panes ([TabDrv]::Panes($top)) | Where-Object Visible)
 $clientLeft = $vis[0].Left
 $clientTop = $paneTop1
 $clientW = $vis[0].Right - $vis[0].Left
-$tabW = [math]::Floor(($clientW - [math]::Round(36 * $scale)) / 2)
+$padL = [math]::Round(4 * $scale)
+$btnW = [math]::Round(36 * $scale)
+$gap = [math]::Round(8 * $scale)
+$topPad = [math]::Round(3 * $scale)
+$tabsAvail = $clientW - 2 * $btnW - 2 * $gap - $padL
+$tabW = [math]::Floor($tabsAvail / 2)
 $tabW = [math]::Max($tabW, [math]::Round(60 * $scale))
 $tabW = [math]::Min($tabW, [math]::Round(200 * $scale))
 $stripeH = [math]::Max([math]::Round(3 * $scale), 2)
-$tab0x = [int]($clientLeft + [math]::Floor($tabW / 2))
-$tab1x = [int]($clientLeft + $tabW + [math]::Floor($tabW / 2))
+$stripeTop = [int]($clientTop + $topPad)
+$tab0x = [int]($clientLeft + $padL + [math]::Floor($tabW / 2))
+$tab1x = [int]($clientLeft + $padL + $tabW + [math]::Floor($tabW / 2))
 $barMidY = [int]($clientTop + [math]::Floor($barH / 2))
-Write-Host "INFO  scale=$scale tabW=$tabW stripeH=$stripeH clientTop=$clientTop tab0x=$tab0x tab1x=$tab1x"
+Write-Host "INFO  scale=$scale tabW=$tabW stripeH=$stripeH stripeTop=$stripeTop tab0x=$tab0x tab1x=$tab1x"
 
 # Baseline: no stripe anywhere before tagging.
-Assert (-not (Stripe-HasColor $tab0x $clientTop $stripeH 255 69 58)) 'baseline: tab 0 has no red stripe'
+Assert (-not (Stripe-HasColor $tab0x $stripeTop $stripeH 255 69 58)) 'baseline: tab 0 has no red stripe'
 
 # ---------------------------------------------------------------------------
 # Tag tab 0 red via the context menu
@@ -318,12 +328,12 @@ Start-Sleep -Milliseconds 300
 
 $red = $false
 for ($t = 0; $t -lt 15; $t++) {
-    if (Stripe-HasColor $tab0x $clientTop $stripeH 255 69 58) { $red = $true; break }
+    if (Stripe-HasColor $tab0x $stripeTop $stripeH 255 69 58) { $red = $true; break }
     Start-Sleep -Milliseconds 200
 }
 Assert $red 'red: tab 0 shows the red accent stripe'
-if (-not $red) { Dump-Stripe $tab0x $clientTop $stripeH 'red' }
-Assert (-not (Stripe-HasColor $tab1x $clientTop $stripeH 255 69 58)) 'red: tab 1 (untagged) has no stripe'
+if (-not $red) { Dump-Stripe $tab0x $stripeTop $stripeH 'red' }
+Assert (-not (Stripe-HasColor $tab1x $stripeTop $stripeH 255 69 58)) 'red: tab 1 (untagged) has no stripe'
 
 # ---------------------------------------------------------------------------
 # Persistence: activate tab 1; tab 0 keeps its stripe while inactive
@@ -332,8 +342,8 @@ Assert (-not (Stripe-HasColor $tab1x $clientTop $stripeH 255 69 58)) 'red: tab 1
 Start-Sleep -Milliseconds 500
 [TabDrv]::SetCursorPos([int]($clientLeft + 50), [int]($clientTop + $barH + 80)) | Out-Null
 Start-Sleep -Milliseconds 300
-Assert (Stripe-HasColor $tab0x $clientTop $stripeH 255 69 58) 'persist: inactive tab 0 keeps its red stripe'
-Assert (-not (Stripe-HasColor $tab1x $clientTop $stripeH 255 69 58)) 'persist: active tab 1 still unstriped'
+Assert (Stripe-HasColor $tab0x $stripeTop $stripeH 255 69 58) 'persist: inactive tab 0 keeps its red stripe'
+Assert (-not (Stripe-HasColor $tab1x $stripeTop $stripeH 255 69 58)) 'persist: active tab 1 still unstriped'
 
 # ---------------------------------------------------------------------------
 # Clear: set tab 0 back to None
@@ -351,11 +361,11 @@ Select-TabColor 0x4E   # 'N' -> None
 Start-Sleep -Milliseconds 400
 $cleared = $false
 for ($t = 0; $t -lt 15; $t++) {
-    if (-not (Stripe-HasColor $tab0x $clientTop $stripeH 255 69 58)) { $cleared = $true; break }
+    if (-not (Stripe-HasColor $tab0x $stripeTop $stripeH 255 69 58)) { $cleared = $true; break }
     Start-Sleep -Milliseconds 200
 }
 Assert $cleared 'clear: None removes the stripe'
-if (-not $cleared) { Dump-Stripe $tab0x $clientTop $stripeH 'clear' }
+if (-not $cleared) { Dump-Stripe $tab0x $stripeTop $stripeH 'clear' }
 
 Assert (-not $proc.HasExited) 'no crash'
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue

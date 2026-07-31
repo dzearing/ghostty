@@ -626,6 +626,92 @@ Work these first, in order, before falling back to first-todo-in-table:
    **T158** (the ~28 other scripts that launch without
    `--session-persistence=false`). Next: **T130** per 3d.
 
+3h. **USER LIVE-REVIEW #4, 2026-07-30 — the tab strip. DO THESE FIRST, ahead
+   of everything in 3d–3g.** The user screenshotted a single-tab window and
+   named four things by hand: *"there's some weird blue line ... why is the
+   blue line on the bottom???? and then there's a + button which is butt up
+   against the edge of the tab and looks clipped and a weird hamburger button
+   which is misaligned from the x button. It just looks HORRIBLY amateur. Like
+   a backend developer built the ui."* Plus the standing bar: *"You need to
+   use expert design skills to build something that feels well designed and
+   native to windows, but retains the functionality of ghoztty. We have a high
+   bar for quality."*
+
+   All four complaints are real and all four were read out of the code, not
+   guessed — `drawTabBar` in `src/apprt/win32/Window.zig`. The strip was grown
+   feature-by-feature (T72 stripe, T78 font, T190 menu button) and has never
+   had a visual design pass. Filed as three tasks, in this order:
+   - **T202** (geometry, shape, selection idiom) — do FIRST, it sets the
+     layout model the other two paint into. One structural bug causes three of
+     the four symptoms: a single tab is stretched to the full client width
+     (`Window.zig:2741` hands the last tab the remainder, bypassing the
+     `max_tab_w` computed 16 lines above), which is what throws the close
+     button to the far edge, jams the "+" against it, and stretches the
+     selection accent into the full-width blue rule the user asked about. The
+     accent itself is the wrong idiom: a bottom underline is Fluent's
+     NavigationView/Pivot selection cue, where it is short and centered — a
+     TabView marks selection with a rounded-top chiclet filled in the content
+     background and needs no line. Extract the geometry to a pure
+     `tab_strip_layout.zig`; it is inline in a 300-line paint function today,
+     which is why none of it is testable.
+   - **T203** (system accent + light/dark theming) — the accent is a hardcoded
+     `RGB(0x3D,0x8E,0xF8)` literal (`Window.zig:2683`, and the same literal is
+     duplicated in the chooser's selection pill from T172), and every other
+     color is `background + 20/+35` per channel, which assumes a dark
+     background and collapses to near-white in a light theme.
+   - **T204** (the control glyphs) — the user's "misaligned" is exact: close,
+     "+" and menu are text characters drawn `DT_LEFT` in three
+     differently-sized boxes, with the close button vertically framed
+     differently from the other two. `DT_CENTER` appears nowhere in the
+     function. Needs one shared icon-button helper so alignment is structural.
+
+   - **T205** (tabs belong INSIDE the titlebar) — filed from the user's
+     follow-up the same evening, sent with a stock Windows Terminal screenshot
+     as the reference: *"this is normal terminal and it looks more polished
+     than what you've built ... the hamburger icon is too small and doesn't
+     horizontally align under the X above it, icons still feel too small."*
+     The alignment half is not a T204 nudge — that X is the WINDOW's caption
+     button on a separate row, and Terminal/Edge/Explorer all put tabs *in*
+     the titlebar. Two rows with two owners (DWM owns the caption, we own the
+     strip) can only ever approximately align, and the approximation drifts
+     with DPI and caption width. T205 removes the second row. Highest risk of
+     the band (custom `WM_NCCALCSIZE` frame — dragging, Snap Layouts,
+     maximize padding, high contrast), so it goes LAST, after T202–T204 have
+     settled the strip's own painting. The icon-size half of that quote is
+     T204's: the glyphs inherit T78's tab TITLE font (~12 px) instead of being
+     chrome-sized 16 DIP in a >=32 DIP square.
+
+   - **T206** (tab chrome shares the banner card's language) — *"the tab
+     should have similar borders to the banner. It should feel cohesive"* plus
+     *"they don't show shadowing around the active tab, and i really can't
+     make the tab out on the background."* The legibility half is measurable,
+     not taste: the strip is `background + 20` and the active tab is the raw
+     `background`, ~8% apart, with no rim and no shadow reinforcing it. Derive
+     the contrast target by MEASURING the banner card against its own pane
+     background — that surface is already legible and signed off, so it keeps
+     the two cohesive by construction. Deps T202+T203.
+
+   Note these are cosmetic-looking but rank above the 3f cosmetics on purpose:
+   this is the chrome the user sees every time the app opens, and it is the
+   specific thing they called amateur.
+
+3i. **USER LIVE-REVIEW #5, 2026-07-30 — the harness takes the box hostage.**
+   *"when you're running tests, you keep stealing focus. is there any way they
+   could be run in docker image so i can use my compute."* Filed as **T207**.
+   Docker is a dead end for the scripts that hurt (Windows containers have no
+   DWM, no window station, no display adapter — the 6 pixel-probe scripts and
+   every T202–T206 visual assertion need real composition); the pure lanes
+   would containerize fine but never steal focus anyway. The workable fix is a
+   separate Win32 **desktop** (`CreateDesktopW` + `STARTUPINFO.lpDesktop`),
+   which is an input-isolation boundary — 35 of 63 scripts grab foreground and
+   36 send input, and none of them can take the foreground from a desktop the
+   user is not on. One risk decides the shape of the whole task and must be
+   spiked first: DWM composes only the INPUT desktop, so `CopyFromScreen` may
+   return nothing on a background one. Slot T207 by how much it costs the
+   user: it is not a parity item, but it is the reason the box is unusable
+   while the loop runs, so treat it as infrastructure ahead of the cosmetics
+   if the spike comes back cheap.
+
 4. **Post-merge parity band (T118–T128), filed 2026-07-27 by ~~T117~~** (merge
    of origin/main `1e1cdbbd2`, 70 commits). These do NOT displace T113/T38/T39
    above — slot them in as follows:

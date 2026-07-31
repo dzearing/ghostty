@@ -83,6 +83,7 @@ const HeroCarousel = @import("HeroCarousel.zig");
 const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
 const split_geometry = @import("split_geometry.zig");
+const tab_strip = @import("tab_strip_layout.zig");
 const color_math = @import("color_math.zig");
 const tab_color = @import("tab_color.zig");
 const title_font = @import("title_font.zig");
@@ -766,10 +767,23 @@ pub fn tabBarHeight(self: *const Window) i32 {
 }
 
 /// Width of the tab strip's "≡" menu button at a given DPI scale (T190).
-/// Same 36pt square as the "+" beside it, so the two controls read as a
-/// group and the strip's arithmetic stays one expression.
+/// Same square as the "+" beside it; the number itself lives with the rest
+/// of the strip's geometry in `tab_strip_layout.zig` (T202).
 pub fn menuButtonWidth(scale: f32) i32 {
-    return @intFromFloat(@round(36.0 * scale));
+    return tab_strip.Metrics.init(scale).btn_w;
+}
+
+/// `tab_strip_layout.Rect` as the `RECT` the GDI and hit-test paths want.
+/// The two structs are field-for-field identical; the layout module declares
+/// its own so it can stay free of OS imports and run in the none lane.
+fn stripRect(r: tab_strip.Rect) w32.RECT {
+    return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
+}
+
+/// A stored `w32.RECT` back as the layout module's own `Rect`, so the hit
+/// tests can ask it where the close button is instead of re-deriving it.
+fn layoutRect(r: w32.RECT) tab_strip.Rect {
+    return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
 }
 
 /// Returns the client rect available for the active surface, which is
@@ -2634,6 +2648,28 @@ fn paintWindow(self: *Window) void {
     }
 }
 
+/// Light a strip button ("+" or "≡") the way Windows 11 does: a rounded rect
+/// inset inside the hit box, not a full-bleed square across it (T202).
+fn paintStripButtonFill(
+    mem_dc: w32.HDC,
+    m: tab_strip.Metrics,
+    btn: tab_strip.Rect,
+    color: u32,
+) void {
+    const f = tab_strip.buttonFillRegion(m, btn);
+    const rgn = w32.CreateRoundRectRgn(f.left, f.top, f.right, f.bottom, f.ellipse, f.ellipse);
+    defer if (rgn) |r| {
+        _ = w32.SelectClipRgn(mem_dc, null);
+        _ = w32.DeleteObject(r);
+    };
+    if (rgn) |r| _ = w32.SelectClipRgn(mem_dc, r);
+    var rect = w32.RECT{ .left = f.left, .top = f.top, .right = f.right, .bottom = f.bottom };
+    if (w32.CreateSolidBrush(color)) |brush| {
+        _ = w32.FillRect(mem_dc, &rect, brush);
+        _ = w32.DeleteObject(@ptrCast(brush));
+    }
+}
+
 /// Paint the tab bar using double-buffered GDI painting.
 /// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
 fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
@@ -2676,11 +2712,19 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     const hover_b: u8 = @min(@as(u16, bar_b) + 15, 255);
     const hover_color = w32.RGB(hover_r, hover_g, hover_b);
 
-    // Active tab background: terminal bg (darker than bar).
+    // Active tab background: terminal bg (darker than bar). Filling the
+    // selected tab with the CONTENT background is the whole selection cue in
+    // a WinUI TabView — the tab merges into the pane below it, which is why
+    // T202 deleted the accent underline that used to be painted here (a
+    // NavigationView/Pivot idiom, and stretched full-bleed at that).
     const active_bg_color = w32.RGB(bg.r, bg.g, bg.b);
 
-    // Accent line color (blue).
-    const accent_color = w32.RGB(0x3D, 0x8E, 0xF8);
+    // Hairline between two adjacent plain tabs. Measured off live Windows
+    // Terminal: strip background + 17 per channel.
+    const sep_r: u8 = @min(@as(u16, bar_r) + 17, 255);
+    const sep_g: u8 = @min(@as(u16, bar_g) + 17, 255);
+    const sep_b: u8 = @min(@as(u16, bar_b) + 17, 255);
+    const sep_color = w32.RGB(sep_r, sep_g, sep_b);
 
     // Text colors.
     const active_text_color = w32.RGB(230, 230, 230);
@@ -2706,91 +2750,64 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     }
     _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
 
-    // --- Calculate tab geometry ---
-    const new_tab_btn_w: i32 = @intFromFloat(@round(36.0 * self.scale));
-    const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
-    const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
-    const accent_h: i32 = @intFromFloat(@round(2.0 * self.scale));
+    // --- Resolve the strip's geometry (T202) ---
+    //
+    // Pure, unit-tested module (`tab_strip_layout.zig`); the measured target
+    // it paints to is `docs/design/win32-tab-strip.md`. The hit tests read
+    // the same rects back out of `tab_rects` / `new_tab_rect` /
+    // `menu_btn_rect`, so what you see and what you can click cannot drift.
+    const m = tab_strip.Metrics.init(self.scale);
+    var tabs: [MAX_TABS]tab_strip.Rect = undefined;
+    const strip = tab_strip.layout(m, client_w, self.tab_count, &tabs);
 
-    const tab_count_i32: i32 = @intCast(self.tab_count);
-    // The menu button (T190) sits at the far right, past the "+" — Windows
-    // Terminal / VS Code / Edge all put this control there. Its width comes
-    // out of the tab area exactly like the "+"'s, so the strip reflows
-    // around it at any tab count and any DPI.
-    const menu_btn_w: i32 = menuButtonWidth(self.scale);
-    const available_w = client_w - new_tab_btn_w - menu_btn_w;
-
-    // Calculate each tab's width: proportional, min 60px.
-    const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
-    const max_tab_w: i32 = @intFromFloat(@round(200.0 * self.scale));
-
-    var tab_w: i32 = if (tab_count_i32 > 0)
-        @divTrunc(available_w, tab_count_i32)
-    else
-        0;
-    tab_w = @max(tab_w, min_tab_w);
-    tab_w = @min(tab_w, max_tab_w);
+    // Publish hit-test rects. Tabs past `strip.visible` did not fit and get a
+    // ZERO rect on purpose — invisible and unhittable — instead of being laid
+    // out under the button band the way the old last-tab remainder rule was.
+    for (0..self.tab_count) |i| self.tab_rects[i] = stripRect(tabs[i]);
+    self.new_tab_rect = stripRect(strip.new_tab);
+    self.menu_btn_rect = stripRect(strip.menu);
 
     // --- Draw each tab ---
-    var x: i32 = 0;
-    for (0..self.tab_count) |i| {
+    for (0..strip.visible) |i| {
         const is_active = (i == self.active_tab);
         const is_hovered = (@as(isize, @intCast(i)) == self.hover_tab);
+        const tab = tabs[i];
 
-        // Last tab gets remainder width to fill the available area.
-        const this_tab_w: i32 = if (i == self.tab_count - 1 and tab_count_i32 > 0)
-            @max(available_w - x, min_tab_w)
-        else
-            tab_w;
-
-        // Store hit-test rect.
-        self.tab_rects[i] = w32.RECT{
-            .left = x,
-            .top = 0,
-            .right = x + this_tab_w,
-            .bottom = bar_h,
+        // Everything inside a tab is clipped to its rounded-top chiclet, so
+        // the fill AND the T72 color tag take the corners instead of the tag
+        // squaring the tab back off. CreateSolidBrush/CreateRoundRectRgn
+        // failures are rare (GDI handle exhaustion) and must never `continue`
+        // — the geometry is precomputed now, but the clip still has to be
+        // released on every path, which is what the defer is for.
+        const rr = tab_strip.chicletRegion(m, tab);
+        const rgn = w32.CreateRoundRectRgn(rr.left, rr.top, rr.right, rr.bottom, rr.ellipse, rr.ellipse);
+        defer if (rgn) |r| {
+            _ = w32.SelectClipRgn(mem_dc, null);
+            _ = w32.DeleteObject(r);
         };
+        if (rgn) |r| _ = w32.SelectClipRgn(mem_dc, r);
 
-        // Draw tab background. CreateSolidBrush failures are rare (GDI
-        // handle exhaustion) and must NOT skip the loop body's geometry
-        // update at the bottom — `continue`ing would leave subsequent
-        // tabs sharing the same x position.
-        if (is_active) {
-            var tab_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
-            if (w32.CreateSolidBrush(active_bg_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &tab_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
-
-            // Draw accent line at bottom.
-            var accent_rect = w32.RECT{
-                .left = x,
-                .top = bar_h - accent_h,
-                .right = x + this_tab_w,
-                .bottom = bar_h,
-            };
-            if (w32.CreateSolidBrush(accent_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &accent_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
-        } else if (is_hovered) {
-            var hover_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
-            if (w32.CreateSolidBrush(hover_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &hover_rect, brush);
+        // Selected: filled with the CONTENT background so the tab merges into
+        // the pane below it (the WinUI TabView selection cue — no underline).
+        // Hovered: the same shape in the subtle hover fill. Unselected: the
+        // strip shows through, exactly as Windows Terminal draws it.
+        if (is_active or is_hovered) {
+            var fill = stripRect(tab);
+            if (w32.CreateSolidBrush(if (is_active) active_bg_color else hover_color)) |brush| {
+                _ = w32.FillRect(mem_dc, &fill, brush);
                 _ = w32.DeleteObject(@ptrCast(brush));
             }
         }
 
-        // Draw the user-assigned accent-color stripe across the top of the
-        // tab (T72, Mac tab-color parity). Painted on active and inactive
-        // tabs alike — the tag identifies the tab, not focus.
+        // The user-assigned accent-color tag (T72, Mac tab-color parity),
+        // across the top of the chiclet. Painted on active and inactive tabs
+        // alike — the tag identifies the tab, not focus.
         if (tab_color.rgb(self.tab_colors[i])) |tc| {
-            const stripe_h: i32 = @max(@as(i32, @intFromFloat(@round(3.0 * self.scale))), 2);
             var stripe_rect = w32.RECT{
-                .left = x,
-                .top = 0,
-                .right = x + this_tab_w,
-                .bottom = stripe_h,
+                .left = tab.left,
+                .top = tab.top,
+                .right = tab.right,
+                .bottom = tab.top + m.stripe_h,
             };
             if (w32.CreateSolidBrush(w32.RGB(tc.r, tc.g, tc.b))) |brush| {
                 _ = w32.FillRect(mem_dc, &stripe_rect, brush);
@@ -2802,12 +2819,7 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         const title_len = self.tab_title_lens[i];
         if (title_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
-            var text_rect = w32.RECT{
-                .left = x + text_pad,
-                .top = 0,
-                .right = x + this_tab_w - close_btn_w - text_pad,
-                .bottom = bar_h,
-            };
+            var text_rect = stripRect(m.titleRect(tab));
             _ = w32.DrawTextW(
                 mem_dc,
                 @ptrCast(&self.tab_titles[i]),
@@ -2819,8 +2831,6 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
 
         // Draw close button (x) — visible on active or hovered tabs.
         if (is_active or is_hovered) {
-            const close_x = x + this_tab_w - close_btn_w - @divTrunc(text_pad, 2);
-            const close_y_center = @divTrunc(bar_h, 2);
             const close_text_color = if (is_hovered and self.hover_close and @as(isize, @intCast(i)) == self.hover_tab)
                 close_hover_color
             else
@@ -2828,12 +2838,7 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
 
             _ = w32.SetTextColor(mem_dc, close_text_color);
             const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}"); // multiplication sign as close
-            var close_rect = w32.RECT{
-                .left = close_x,
-                .top = close_y_center - @divTrunc(close_btn_w, 2),
-                .right = close_x + close_btn_w,
-                .bottom = close_y_center + @divTrunc(close_btn_w, 2),
-            };
+            var close_rect = stripRect(m.closeRect(tab));
             _ = w32.DrawTextW(
                 mem_dc,
                 x_char,
@@ -2843,57 +2848,35 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
             );
         }
 
-        x += this_tab_w;
+        // A hairline between two adjacent PLAIN tabs. Without it, transparent
+        // tabs read as one run of text; Windows Terminal draws the same rule.
+        if (i + 1 < strip.visible and !is_active and !is_hovered) {
+            const next_active = (i + 1 == self.active_tab);
+            const next_hovered = (@as(isize, @intCast(i + 1)) == self.hover_tab);
+            if (!next_active and !next_hovered) {
+                var sep = stripRect(tab_strip.separatorRect(m, tab));
+                if (w32.CreateSolidBrush(sep_color)) |brush| {
+                    _ = w32.FillRect(mem_dc, &sep, brush);
+                    _ = w32.DeleteObject(@ptrCast(brush));
+                }
+            }
+        }
     }
 
     // --- Draw the strip's buttons ---
     //
-    // Pinned to the right EDGE, not to wherever the last tab ended. Tabs stop
-    // shrinking at `min_tab_w`, so past ~20 tabs they overrun `available_w`
-    // and anything drawn after them lands off-screen — which used to cost only
-    // the "+" and would now cost the app's whole menu. Repaint the band first
-    // so an overrunning tab does not show through it.
+    // The "+" travels with the last tab (WinUI `AddTabButton`) and the menu
+    // button is pinned to the right edge (WinUI `TabStripFooter`), separated
+    // by a real gap — pinning both right made them read as one slab. Tabs can
+    // no longer overrun into this band at any count (see the layout module),
+    // so there is nothing to repaint over first.
     {
-        const btns_left = client_w - new_tab_btn_w - menu_btn_w;
-        if (x > btns_left) {
-            var band = w32.RECT{ .left = btns_left, .top = 0, .right = client_w, .bottom = bar_h };
-            if (w32.CreateSolidBrush(bar_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &band, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
-        }
-        x = btns_left;
-    }
-
-    // --- Draw new-tab (+) button ---
-    {
-        const btn_left = x;
-        const btn_right = x + new_tab_btn_w;
-        self.new_tab_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
-
-        // Hover highlight for new-tab button.
-        if (self.hover_new_tab) {
-            var btn_rect = w32.RECT{ .left = btn_left, .top = 0, .right = btn_right, .bottom = bar_h };
-            const nt_brush = w32.CreateSolidBrush(hover_color);
-            if (nt_brush) |brush| {
-                _ = w32.FillRect(mem_dc, &btn_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
-        }
+        const plus = strip.new_tab;
+        if (self.hover_new_tab) paintStripButtonFill(mem_dc, m, plus, hover_color);
 
         _ = w32.SetTextColor(mem_dc, inactive_text_color);
         const plus_char = std.unicode.utf8ToUtf16LeStringLiteral("+");
-        var plus_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
+        var plus_rect = stripRect(plus);
         _ = w32.DrawTextW(
             mem_dc,
             plus_char,
@@ -2905,35 +2888,15 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
 
     // --- Draw menu (≡) button (T190) ---
     {
-        const btn_left = x + new_tab_btn_w;
-        const btn_right = btn_left + menu_btn_w;
-        self.menu_btn_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
-
-        // Same hover treatment as the "+" so the two read as one control
-        // group. The menu being OPEN keeps it lit, which is how every
-        // Windows menu button signals its popup belongs to it.
-        if (self.hover_menu_btn or self.menu_open) {
-            var btn_rect = w32.RECT{ .left = btn_left, .top = 0, .right = btn_right, .bottom = bar_h };
-            if (w32.CreateSolidBrush(hover_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &btn_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
-        }
+        const menu = strip.menu;
+        // The menu being OPEN keeps it lit, which is how every Windows menu
+        // button signals its popup belongs to it.
+        if (self.hover_menu_btn or self.menu_open) paintStripButtonFill(mem_dc, m, menu, hover_color);
 
         _ = w32.SetTextColor(mem_dc, inactive_text_color);
         // U+2261 IDENTICAL TO — the hamburger glyph, present in Segoe UI.
         const menu_char = std.unicode.utf8ToUtf16LeStringLiteral("≡");
-        var menu_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
+        var menu_rect = stripRect(menu);
         _ = w32.DrawTextW(
             mem_dc,
             menu_char,
@@ -3163,14 +3126,15 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
         return;
     }
 
-    // Check each tab.
-    const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
-    const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
+    // Check each tab. A tab that did not fit has a zero rect (T202), so this
+    // loop cannot find it — which is the point.
+    const m = tab_strip.Metrics.init(self.scale);
     for (0..self.tab_count) |i| {
         const rect = self.tab_rects[i];
+        if (rect.right <= rect.left) continue;
         if (x >= rect.left and x < rect.right) {
             // Check close button area (right side of tab).
-            const close_left = rect.right - close_btn_w - @divTrunc(text_pad, 2);
+            const close_left = m.closeRect(layoutRect(rect)).left;
             if (x >= close_left) {
                 self.closeTabByIndex(i);
             } else {
@@ -3287,15 +3251,14 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
             // Check new-tab button.
             new_new_tab = true;
         } else {
-            // Check tabs.
-            const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
-            const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
+            // Check tabs. A tab that did not fit has a zero rect (T202).
+            const m = tab_strip.Metrics.init(self.scale);
             for (0..self.tab_count) |i| {
                 const rect = self.tab_rects[i];
+                if (rect.right <= rect.left) continue;
                 if (x >= rect.left and x < rect.right) {
                     new_hover = @intCast(i);
-                    const close_left = rect.right - close_btn_w - @divTrunc(text_pad, 2);
-                    new_close = x >= close_left;
+                    new_close = x >= m.closeRect(layoutRect(rect)).left;
                     break;
                 }
             }
@@ -3478,6 +3441,7 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
     var clicked_tab: ?usize = null;
     for (0..self.tab_count) |i| {
         const rect = self.tab_rects[i];
+        if (rect.right <= rect.left) continue;
         if (x >= rect.left and x < rect.right) {
             clicked_tab = i;
             break;
@@ -3673,7 +3637,11 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
     // tab_rects is zeroed/stale and the editor would be created invisible
     // while still stealing keyboard focus (an un-dismissable "mystery
     // box"). Anchor a visible strip at the top of the client area instead.
-    const rect: w32.RECT = if (self.tab_bar_visible) self.tab_rects[tab_idx] else blk: {
+    // A tab that did not fit in the strip (T202) also has no rect, and takes
+    // the same fallback as a hidden bar for the same reason.
+    const has_rect = self.tab_bar_visible and
+        self.tab_rects[tab_idx].right > self.tab_rects[tab_idx].left;
+    const rect: w32.RECT = if (has_rect) self.tab_rects[tab_idx] else blk: {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(hwnd, &client) == 0) return;
         const h: i32 = @intFromFloat(@round(32.0 * self.scale));
@@ -4295,6 +4263,7 @@ pub fn windowWndProc(
             if (y < window.tabBarHeight()) {
                 for (0..window.tab_count) |i| {
                     const rect = window.tab_rects[i];
+                    if (rect.right <= rect.left) continue;
                     if (x >= rect.left and x < rect.right) {
                         window.startTabRename(i);
                         return 0;
@@ -4338,14 +4307,17 @@ pub fn windowWndProc(
                     window.drag_active = true;
                 }
                 if (window.drag_active and window.tab_count > 1) {
-                    // Use uniform tab widths for drag target calculation,
-                    // not the painted widths (the last tab gets stretched
-                    // to fill remaining space, skewing its midpoint).
+                    // Tab slots are uniform (T202 removed the last-tab
+                    // remainder rule), so the first tab's rect gives both the
+                    // slot width AND the strip's left inset — the inset is
+                    // why this cannot assume the run starts at x = 0.
                     const from: usize = @intCast(window.drag_tab);
-                    const first_w = window.tab_rects[0].right - window.tab_rects[0].left;
+                    const first = window.tab_rects[0];
+                    const first_w = first.right - first.left;
+                    if (first_w <= 0) return 0;
                     var target: usize = 0;
                     for (0..window.tab_count) |i| {
-                        const slot_left: i32 = @intCast(@as(i32, @intCast(i)) * first_w);
+                        const slot_left = first.left + @as(i32, @intCast(i)) * first_w;
                         const slot_mid = slot_left + @divTrunc(first_w, 2);
                         if (x >= slot_mid) {
                             target = i;
