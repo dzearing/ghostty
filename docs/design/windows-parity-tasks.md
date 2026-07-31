@@ -173,7 +173,27 @@ Work these first, in order, before falling back to first-todo-in-table:
 
     Then the tasks that bring the chrome into compliance:
 
-    **~~T232~~ → ~~T242~~ → T235 → T233 → T234.**
+    **~~T232~~ → ~~T242~~ → ~~T235~~ → T233 → T234.**
+
+    - **T235 (done, 2026-07-31)** — *"you have tons of horiz realestate, and
+      yet you are truncating the tab text here."* `max_tab_w = 200 DIP` is
+      retired: a tab is its measured title plus padding, floored at 60 DIP and
+      capped at **50% of the tab run**, falling back to T202's equal share only
+      under pressure. The anti-stretch rule survives untouched. Measured at the
+      user's 125%: a long-titled tab 690 px against the retired cap's 245 — and
+      the *default* title already wanted 344, so the cap was truncating
+      essentially every tab, not just long ones.
+
+      Two lessons. **A one-title window cannot test a width rule** — under a
+      single shell-set title a fixed cap and a content-derived width are
+      indistinguishable, which is why `tab-strip.ps1` was green through the
+      whole defect; it now puts two different titles in one window. And T202's
+      reasoning was wrong in a way worth naming: the Windows Terminal
+      measurement was right, but *"equal-share-capped needs no text measurement
+      in the layout module"* was **convenience presented as a design rule**.
+      The module is still text-free — the caller measures and passes widths in.
+      Follow-up **T249**: a tab's width is now a function of a string the shell
+      rewrites constantly.
 
     - **T242 (done, 2026-07-31)** — *"the active tab seems to have a horizontal
       line at the bottom, making it feel disconnected from the pane below."*
