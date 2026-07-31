@@ -143,6 +143,7 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT p);
     [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr h, int idx);
     [DllImport("user32.dll")] static extern bool SystemParametersInfoW(uint action, uint p, out RECT r, uint winini);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
     // SendMessage, never plain: a SYNCHRONOUS cross-process send into a wedged
     // app would block the ONE worker thread the whole harness marshals through,
     // and every later call with it. The timeout form degrades to a failed call.
@@ -386,6 +387,33 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // Every top-level window of `pid` matching `cls`, in the same line format
+    // as Children. FindTop answers "the window"; this answers "how many, and
+    // where" - which is what a test asserting that a popup class is GONE, or
+    // that there is exactly one of them, actually needs.
+    public string[] Tops(int pid, string clsArg, bool requireVisible) {
+        string cls = NoFilter(clsArg);
+        return (string[])Run(delegate() {
+            var lines = new List<string>();
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                uint p; GetWindowThreadProcessId(h, out p);
+                if (p != (uint)pid) return true;
+                bool vis = IsWindowVisible(h);
+                if (requireVisible && !vis) return true;
+                var sb = new StringBuilder(128);
+                GetClassNameW(h, sb, 128);
+                if (cls == null || sb.ToString() == cls) {
+                    RECT r; GetWindowRect(h, out r);
+                    lines.Add(h.ToInt64() + ":" + (vis ? 1 : 0) + ":" +
+                              r.left + "," + r.top + "," + r.right + "," + r.bottom + ":" +
+                              sb.ToString());
+                }
+                return true;
+            }, IntPtr.Zero);
+            return lines.ToArray();
+        });
+    }
+
     public IntPtr FirstChild(IntPtr top, string clsArg, bool requireVisible) {
         string cls = NoFilter(clsArg);
         return (IntPtr)Run(delegate() {
@@ -442,6 +470,33 @@ public class GhozttyTestDesktop {
     public bool SetSize(IntPtr h, int w, int ht) {
         return (bool)Run(delegate() {
             return SetWindowPos(h, IntPtr.Zero, 0, 0, w, ht, 0x0004 | 0x0002); // NOZORDER|NOMOVE
+        });
+    }
+
+    // Move (and optionally resize) the window, z-order unchanged. The MOVE is
+    // the point: a test that only ever resizes never exercises the WM_MOVE
+    // path, and overlay popups glued to a pane are re-placed from it.
+    public bool SetPos(IntPtr h, int x, int y, int w, int ht, bool resize) {
+        return (bool)Run(delegate() {
+            uint flags = 0x0004; // NOZORDER
+            if (!resize) flags |= 0x0001; // NOSIZE
+            return SetWindowPos(h, IntPtr.Zero, x, y, w, ht, flags);
+        });
+    }
+
+    // The layered-window alpha, which on a background desktop is the ONLY way
+    // left to ask "is this popup opaque?": there is no screen composite to
+    // compare a painted pixel against (see the CAPTURE LIMIT header). Returns
+    // { ok, alpha, flags, colorkey }; flags bit 0 is LWA_COLORKEY, bit 1 is
+    // LWA_ALPHA, so fully opaque with nothing keyed out is alpha 255 / flags 2.
+    public int[] LayeredAttrs(IntPtr h) {
+        return (int[])Run(delegate() {
+            uint key, flags; byte alpha;
+            if (!GetLayeredWindowAttributes(h, out key, out alpha, out flags)) {
+                LastError = "GetLayeredWindowAttributes failed: " + Marshal.GetLastWin32Error();
+                return new int[] { 0, 0, 0, 0 };
+            }
+            return new int[] { 1, alpha, (int)flags, (int)key };
         });
     }
 
@@ -1199,8 +1254,33 @@ function ConvertTo-TestFilter($Value) {
     return $s
 }
 
+# All TOP-LEVEL windows of $ProcessId matching $Class, same object shape as
+# Get-TestChildWindows. Get-TestWindow answers "the window"; this answers "how
+# many, and where" - which is what an assertion like "no overlay windows remain"
+# or "the strip glued above pane 1" needs. Wrap the call site in @(): PowerShell
+# unrolls a one-element array return into a scalar whose .Count is $null.
+function Get-TestWindows {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        $Class = 'GhozttyWindow',
+        [switch]$AllowHidden,
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    return @($td.Tops($ProcessId, (ConvertTo-TestFilter $Class), (-not $AllowHidden)) | ForEach-Object {
+        $hw, $vis, $r, $cls = $_ -split ':'
+        $c = $r -split ','
+        [pscustomobject]@{
+            Hwnd = [int64]$hw; Visible = ($vis -eq '1')
+            Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
+            Width = [int]$c[2] - [int]$c[0]; Height = [int]$c[3] - [int]$c[1]
+            Class = $cls
+        }
+    })
+}
+
 # All child windows of $Class as objects: Hwnd, Visible, Left/Top/Right/Bottom,
-# Class. -Class '*' returns every child, class name included.
+# Width/Height, Class. -Class '*' returns every child, class name included.
 function Get-TestChildWindows {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,
@@ -1214,6 +1294,11 @@ function Get-TestChildWindows {
         [pscustomobject]@{
             Hwnd = [int64]$hw; Visible = ($vis -eq '1')
             Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
+            # Width/Height are carried here and on Get-TestWindows so the two
+            # shapes are interchangeable. Without them a `$child.Width` reads
+            # $null, and `$null -eq <number>` is a quiet FAIL rather than an
+            # error - which is exactly how it was found.
+            Width = [int]$c[2] - [int]$c[0]; Height = [int]$c[3] - [int]$c[1]
             Class = $cls
         }
     })
@@ -1292,6 +1377,41 @@ function Set-TestWindowSize {
         $Height += ($r[3] - $r[1])
     }
     return $td.SetSize($Window, $Width, $Height)
+}
+
+# Move the window (z-order unchanged); -Width/-Height resize it in the same
+# call. Set-TestWindowSize deliberately never moves, so this is what a test uses
+# when the MOVE is the thing under test - e.g. an overlay popup that has to
+# re-glue itself to its pane from WM_MOVE.
+function Set-TestWindowPos {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][int]$X,
+        [Parameter(Mandatory = $true)][int]$Y,
+        [int]$Width = 0, [int]$Height = 0,
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    $resize = ($Width -gt 0 -and $Height -gt 0)
+    return $td.SetPos($Window, $X, $Y, $Width, $Height, $resize)
+}
+
+<#
+A layered popup's alpha, as { Ok, Alpha, Flags, ColorKey }. Flags bit 0 is
+LWA_COLORKEY, bit 1 is LWA_ALPHA.
+
+This is the background-desktop replacement for "composited screen pixel ==
+own-DC pixel", the way an opaque overlay used to be asserted: there is no
+screen composite off the input desktop to compare against (CAPTURE LIMIT,
+above), so opacity is read from the window attribute that decides it. Fully
+opaque with nothing keyed out is Alpha 255, Flags 2.
+#>
+function Get-TestLayeredAttrs {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    $a = (Resolve-TestDesktop $Desktop).LayeredAttrs($Window)
+    return [pscustomobject]@{
+        Ok = ($a[0] -eq 1); Alpha = $a[1]; Flags = $a[2]; ColorKey = $a[3]
+    }
 }
 
 # The RESTORED window rect, valid while the window is maximized.

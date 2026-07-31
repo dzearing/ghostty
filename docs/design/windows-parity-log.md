@@ -3425,3 +3425,48 @@ Floor: both `zig build test` lanes, `test-agent`, P1-P3 green. Harness
 regression after the three additions: `test-desktop-harness` (19),
 `split-zoom-nav` (20), `confirm-dialogs` (27), `window-title` (50),
 `command-registry` (22) all ALL PASS.
+
+## 2026-07-31 - T217 batch 8: pane-banner, and the last plain migration
+
+`pane-banner` onto the test desktop: **ALL PASS (65) x3**, negative control 1
+FAILURE. 54 `Assert` call sites before, six of them behind a foreground-grab
+SKIP - the whole ctrl+shift+b editor section, which on a busy box scored a
+green exit having run none of it. That section now also asserts the editor is
+MODAL, arrives PREFILLED with the current banner, and that its prefill is
+SELECTED (a single posted WM_CHAR replaces it).
+
+**This is the batch that pins down what the CAPTURE LIMIT is about: the OpenGL
+surface, and nothing else.** Every pixel oracle here reads the banner overlay's
+own GDI chrome - a WS_EX_LAYERED popup painting in WM_PAINT - and every one
+produces the same verdict through `PrintWindow` as it did through
+`GetDC`/`CopyFromScreen`: 64 distinct colors, card wash 30,30,34, band corner
+16,16,20, shadow 12,12,15, 31 green pixels in the checkbox gutter. Measured
+first, then asserted. A layered popup is not a special case for PrintWindow -
+worth saying, because the old script needed `CopyFromScreen` precisely because
+a raw screen-DC `GetPixel` skips layered windows.
+
+The one oracle that could not survive the move was REPLACED, not relabelled:
+T131's "composited pixel == own-DC pixel" (the proof the glass card is opaque)
+has no meaning where there is no composite, so it became
+`GetLayeredWindowAttributes` reporting alpha 255 / LWA_ALPHA / no colour key -
+the state that made the two sides equal in the first place.
+
+Harness: `Get-TestWindows` (all top-level windows of a class - "no overlay
+windows remain" needs a count, not a first hit), `Set-TestWindowPos` (a MOVE;
+`Set-TestWindowSize` deliberately never moves, and the move is what exercises
+`WM_MOVE -> updatePaneBanners`), `Get-TestLayeredAttrs`, and **`Width`/`Height`
+on `Get-TestChildWindows`** - missing, which cost two red lines reading
+`"the pane really shrank ( -> px)"`. A `$null` property is a silent wrong
+answer in PowerShell, and an empty interpolation in a FAIL message is the tell.
+
+T217 closes at **19 of 22**: that is every script it can migrate. The other
+three are each blocked on a mechanism decision owned elsewhere, so they moved
+to **T225** (deps T214 + T224) rather than lingering as an open thread behind a
+closed task - `split-dim` on T214, `overlay-zorder` and `profile-latency` on
+T224.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green. Harness
+regression - wider than previous batches, since `Get-TestChildWindows` is used
+by every migrated script: `test-desktop-harness` (19), `split-zoom-nav` (20),
+`confirm-dialogs` (27), `window-title` (50), `command-registry` (22),
+`font-inherit` (25), `new-window-cwd` all ALL PASS.
