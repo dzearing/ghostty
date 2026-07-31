@@ -3976,3 +3976,53 @@ Evidence: both test lanes + `test-agent` + the GUI Debug link green;
 and no others; P1–P3 ALL PASS. Follow-up T249 filed: a tab's width is now a
 function of a string the shell rewrites constantly — observe whether the strip
 visibly jumps before adding machinery to stop it.
+
+## 2026-07-31 - T233: the divider was a hairline that only the cursor reacted to
+
+User, walking the chrome: *"I think the splitter lines should be 2px and have a
+hover color that emphasizes it. 'lights it up in dark' or 'darkens it' in light
+modes."* Both halves checked out. `bandPx` was 1 DIP (Mac's `SplitView.swift`
+1 pt, ported literally), and 1 DIP rounds to a SINGLE physical pixel at both
+100% and 125% — the two scales most users run — so the control read as a
+rendering artifact. And hovering it changed only the mouse cursor, which tells
+nobody who is looking at the divider and shows up on no screenshot.
+
+`bandPx` is now `max(round(2 * scale), 2)`, a **deliberate divergence from Mac**
+recorded in `win32-design-system.md` §5 so a later parity sweep does not undo
+it. `split_geometry.zig` gained the color half beside the geometry: `HOVER_DELTA`
+(25) and `dividerColor(rest, dark, hot)`, whose SIGN convention is asserted
+against `icon_button.fillDelta` rather than restated — only the magnitude
+differs (25 vs 15), because a 2 DIP mark needs more delta to read than a 28 DIP
+button fill. Which way to shade comes from the PANE background, not the OS
+theme: a light terminal under a dark Windows theme is ordinary, and the divider
+has to read against the panes it separates. A drag outranks hover, since the
+pointer routinely leaves the band mid-drag and the mark must not flicker back
+to rest under the hand holding it.
+
+**A second defect surfaced only because the test could not see the first fix.**
+The hover repainted through `layoutSplits`' `GetDC` + `paintDividers` shortcut,
+looked right on screen, and was invisible to a `PrintWindow` capture: that path
+draws straight to the window DC and never marks the region dirty, so the pixels
+never reach the backing store. It is correct for its own job — a band that MOVED
+has no dirty region to mark, because a child already covers its old spot — and
+wrong for a band that only changed COLOR. Now `refreshDividerBand` invalidates
+that one band's rect and lets the normal paint cycle do it.
+
+**And a harness limit that had to be measured, not assumed.** A posted
+`WM_MOUSEMOVE` cannot hold a hover on the background test desktop: a debug log
+on both sides shows `divider hover=0`, then `WM_MOUSELEAVE` within one frame,
+then `divider hover=null` — `TrackMouseEvent` watches the REAL cursor and there
+is none there (`SetCursorPos` fails off the input desktop). The band is back to
+rest before the first capture 60ms later. Not a product defect; on a real
+desktop that leave IS the un-hover. So the claim is proved in two halves: the
+COLOR by pixels mid-DRAG (`dragging_split` does not depend on the cursor and
+runs through the same one hot color), read rest → hot → rest from one probe at
+three moments, and the TRIGGER by the debug-log oracle.
+
+Evidence: both test lanes + `test-agent` + the GUI Debug link green;
+`split-divider.ps1` ALL PASS (38, from 30) with `-NegativeControl` still
+failing; P1–P3 ALL PASS. Measured at 125%: band 3px, where the retired formula
+gave 1px. The PowerShell mirror of `bandPx` must pass
+`[MidpointRounding]::AwayFromZero` — .NET defaults to banker's rounding and
+125% lands exactly on the midpoint, so the naive form expects 2px where the
+product correctly paints 3.

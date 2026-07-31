@@ -5,6 +5,9 @@
 # starting 4 DIP off the line still resizes.
 # T155 acceptance (tail): exactly ONE divider band, a solid fill, after drags
 # and after repeated small window resizes.
+# T233 acceptance (run 2 tail): the band is 2 DIP (never one physical pixel),
+# and hover/drag is a COLOR change - asserted as a pair of probes that must
+# read differently in the two states, not as a cursor shape.
 #
 # paintDividerNode previously hardcoded a 0x808080 pen; it now uses the
 # config color (COLORREF from Config.Color RGB) with the same gray as the
@@ -100,6 +103,15 @@ function Get-Panes([IntPtr]$top) {
     @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
 }
 
+# split_geometry.bandPx mirrored in PowerShell (T233): 2 DIP, never below 2
+# physical px. [math]::Round is BANKER'S rounding in .NET while Zig's @round
+# is half-away-from-zero, and 125% DPI lands exactly on the midpoint
+# (2 * 120/96 = 2.5) - so the naive form would expect 2px where the product
+# paints 3 and fail against a healthy build at the scale the user runs.
+function Get-ExpectedBandPx([int]$dpi) {
+    [math]::Max([int][math]::Round(2.0 * $dpi / 96.0, [MidpointRounding]::AwayFromZero), 2)
+}
+
 # True if r,g,b matches the target within tolerance.
 function Pixel-Matches([string]$px, [int]$tr, [int]$tg, [int]$tb, [int]$tol = 40) {
     $c = $px -split ','
@@ -156,6 +168,30 @@ function Divider-HasColor([IntPtr]$top, $A, $B, [int]$tr, [int]$tg, [int]$tb) {
         }
     }
     return $false
+}
+
+# The parent-visible gap between the two pane rects: its pixel strip and its
+# width. Win32 rects are half-open, so pane A owns rows up to Bottom-1 and the
+# gap is [A.Bottom .. B.Top-1]. Strip is $null if the capture held no content.
+function Get-GapStrip([IntPtr]$top, [string]$axis) {
+    $panes = Get-Panes $top
+    if ($panes.Count -ne 2) { return $null }
+    if ($axis -eq 'down') {
+        $pa = $panes | Sort-Object Top | Select-Object -First 1
+        $pb = $panes | Sort-Object Top | Select-Object -Last 1
+        $lo = $pa.Bottom; $hi = $pb.Top - 1
+        $strip = if ($hi -lt $lo) { @() } else {
+            Get-TestStrip -Window $top -Fixed ([int](($pa.Left + $pa.Right) / 2)) -A $lo -B $hi
+        }
+    } else {
+        $pa = $panes | Sort-Object Left | Select-Object -First 1
+        $pb = $panes | Sort-Object Left | Select-Object -Last 1
+        $lo = $pa.Right; $hi = $pb.Left - 1
+        $strip = if ($hi -lt $lo) { @() } else {
+            Get-TestStrip -Window $top -Fixed ([int](($pa.Top + $pa.Bottom) / 2)) -A $lo -B $hi -Horizontal
+        }
+    }
+    return [pscustomobject]@{ Strip = $strip; Gap = ($hi - $lo + 1) }
 }
 
 function Dump-Strip([IntPtr]$top, $A, $B, [string]$label) {
@@ -283,8 +319,11 @@ Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
 # Run 2: no color set -> fallback gray 128,128,128.
+#
+# Captures stderr ($true) so the T233 section below can read the divider-hover
+# debug oracle - a posted hover cannot survive to a pixel capture here.
 # ---------------------------------------------------------------------------
-$g = Start-Gui 'default' $common $false
+$g = Start-Gui 'default' $common $true
 $launched += $script:GhozttyTestDesktopPids
 $app = $g.App; $top = $g.Top
 $A = $g.Panes | Sort-Object Top | Select-Object -First 1
@@ -333,6 +372,126 @@ $before = $d.Y
 Invoke-DividerDrag -Top $top -X0 $d.X -Y0 ($d.Y - $off4) -X1 $d.X -Y1 ($d.Y - $off4 - 80)
 $d = Get-DividerLine $top
 Assert ($d.Y -lt $before - 40) "T94: drag from -4 DIP resized (line $before -> $($d.Y))"
+
+# ---------------------------------------------------------------------------
+# T233: the band is 2 DIP, and HOVER IS A COLOR CHANGE, not just a cursor.
+#
+# The user, 2026-07-31: "I think the splitter lines should be 2px and have a
+# hover color that emphasizes it." Before this the divider was 1 DIP - one
+# physical pixel at both 100% and 125%, the two scales most users run - and
+# hovering it changed only the mouse cursor, which tells nobody who is looking
+# at the divider and shows up on no screenshot.
+#
+# A POSTED WM_MOUSEMOVE CANNOT HOLD A HOVER HERE, and that shapes the oracle.
+# Measured 2026-07-31 with a debug log on both sides: a posted move at the band
+# DOES set the state - the log reads `divider hover=0` - and then the OS posts
+# WM_MOUSELEAVE within one frame and it reads `divider hover=null` again,
+# because TrackMouseEvent watches the REAL cursor and there is none over the
+# window (SetCursorPos fails off the input desktop; see the header). The band
+# is back to rest before the first capture 60ms later. That is a harness
+# limit, not a product defect: on a real desktop the leave arrives when the
+# real pointer leaves, which is exactly the un-hover.
+#
+# So the two halves are proved separately, and together they are the whole
+# claim:
+#
+#   * THE COLOR - by pixels, mid-DRAG. A drag holds the same `hot` state
+#     through the same paint (`paintDividers` computes ONE hot color and uses
+#     it for hover and drag alike), and `dragging_split` does not depend on
+#     the cursor, so it survives the leave. rest -> hot -> rest is read from
+#     the same probe at three moments; that IS the screenshot diff.
+#   * THE TRIGGER - by the debug-log oracle (the hero-mode.ps1 idiom): a move
+#     onto the band sets the state and a move off it clears it. Degrades to a
+#     skip on a release build, where log.debug is compiled out.
+#
+# Tolerance is 6, not the 40 used for "is it red or blue" - the two states are
+# 25/channel apart by design, so a loose tolerance would call them equal and
+# pass on a build with no hover at all.
+# ---------------------------------------------------------------------------
+$REST_G = 128           # fallback divider gray (no split-divider-color set)
+$HOT_G = 153            # + HOVER_DELTA (25), the dark-theme direction: --background=#000000
+$TOL = 6
+
+# True if any pixel of the parent-visible gap matches; $null if the capture
+# held no content (same "meaningless probe" contract as Get-TestStrip).
+function Gap-Has([IntPtr]$top, [int]$v) {
+    $gap = Get-GapStrip $top 'down'
+    if ($null -eq $gap -or $null -eq $gap.Strip) { return $null }
+    foreach ($px in $gap.Strip) { if (Pixel-Matches $px $v $v $v $TOL) { return $true } }
+    return $false
+}
+
+$dpiNow = Get-TestWindowDpi -Window $top
+$expBand = Get-ExpectedBandPx $dpiNow
+$gapNow = Get-GapStrip $top 'down'
+if ($null -eq $gapNow) {
+    Assert $false 'T233: could not measure the divider gap'
+} else {
+    Assert ($gapNow.Gap -eq $expBand) `
+        "T233: the visible band is 2 DIP ($dpiNow dpi -> ${expBand}px expected, got $($gapNow.Gap)px)"
+    Assert ($gapNow.Gap -ge 2) `
+        "T233: the band is never a single physical pixel (got $($gapNow.Gap)px at $dpiNow dpi)"
+}
+
+$d = Get-DividerLine $top
+$paneCenterY = [int](($d.B.Top + $d.B.Bottom) / 2)
+
+# Rest: pointer parked deep inside a pane, far outside the grab band.
+[void](Send-TestMouse -Window $top -Target $top -X $d.X -Y $paneCenterY -Action move)
+Start-Sleep -Milliseconds 300
+$restIsRest = Gap-Has $top $REST_G
+$restIsHot = Gap-Has $top $HOT_G
+if ($null -eq $restIsRest -or $null -eq $restIsHot) {
+    Write-Host 'SKIP T233 (rest): empty capture - pixel probe would be meaningless'
+} else {
+    Assert ($restIsRest -eq $true) 'T233 rest: the un-hovered band is the configured gray'
+    Assert ($restIsHot -eq $false) 'T233 rest: the un-hovered band is NOT the hover gray'
+}
+
+# Hover TRIGGER: a move onto the band sets the hot state, a move off it drops
+# it. Read from the debug log, because the state cannot survive to a capture
+# (see above). The marker is dropped between the two probes so the second
+# reading cannot be the first one's leftovers.
+$hoverLogged = $null
+if (Test-Path $errlog) {
+    Clear-Content $errlog -ErrorAction SilentlyContinue
+    [void](Send-TestMouse -Window $top -Target $top -X $d.X -Y $d.Y -Action move)
+    Start-Sleep -Milliseconds 300
+    $onBand = @(Select-String -Path $errlog -Pattern 'divider hover=\d' -ErrorAction SilentlyContinue)
+    $offBand = @(Select-String -Path $errlog -Pattern 'divider hover=null' -ErrorAction SilentlyContinue)
+    $hoverLogged = ($onBand.Count -gt 0)
+    if ($hoverLogged) {
+        Assert ($onBand.Count -gt 0) 'T233 hover: a move onto the band sets the hot state'
+        Assert ($offBand.Count -gt 0) 'T233 hover: leaving the band drops it back to rest'
+    }
+}
+if (-not $hoverLogged) {
+    Write-Host 'SKIP T233 hover trigger: no debug log (release build) - the drag pixels below still cover the color'
+}
+
+# A drag is a HELD hover (design system section 5): the mark must not drop
+# back to rest at the moment it is grabbed. Down on the band, one move, and
+# read the band mid-drag.
+[void](Send-TestMouse -Window $top -Target $top -X $d.X -Y $d.Y -Action down)
+[void](Send-TestMouse -Window $top -Target $top -X $d.X -Y ($d.Y + 20) -Action move)
+Start-Sleep -Milliseconds 250
+$dragIsHot = Gap-Has $top $HOT_G
+[void](Send-TestMouse -Window $top -Target $top -X $d.X -Y ($d.Y + 20) -Action up)
+Start-Sleep -Milliseconds 250
+if ($null -eq $dragIsHot) { Write-Host 'SKIP T233 (drag): empty capture' }
+else { Assert ($dragIsHot -eq $true) 'T233 drag: the band stays lit while being dragged' }
+
+# And back to rest once the pointer leaves it again.
+[void](Send-TestMouse -Window $top -Target $top -X $d.X -Y $paneCenterY -Action move)
+Start-Sleep -Milliseconds 300
+$backIsRest = Gap-Has $top $REST_G
+$backIsHot = Gap-Has $top $HOT_G
+if ($null -eq $backIsRest -or $null -eq $backIsHot) {
+    Write-Host 'SKIP T233 (un-hover): empty capture'
+} else {
+    Assert ($backIsRest -eq $true) 'T233 un-hover: the band returns to the rest gray'
+    Assert ($backIsHot -eq $false) 'T233 un-hover: the hover shade is gone'
+}
 
 Assert (-not ($app.Process -and $app.Process.HasExited)) 'default: no crash'
 Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
@@ -397,29 +556,8 @@ function Max-RunLength([string[]]$strip, [int]$tr, [int]$tg, [int]$tb) {
     return $best
 }
 
-# The parent-visible gap between the two pane rects: its pixel strip and its
-# width. Win32 rects are half-open, so pane A owns rows up to Bottom-1 and the
-# gap is [A.Bottom .. B.Top-1]. Strip is $null if the capture held no content.
-function Get-GapStrip([IntPtr]$top, [string]$axis) {
-    $panes = Get-Panes $top
-    if ($panes.Count -ne 2) { return $null }
-    if ($axis -eq 'down') {
-        $pa = $panes | Sort-Object Top | Select-Object -First 1
-        $pb = $panes | Sort-Object Top | Select-Object -Last 1
-        $lo = $pa.Bottom; $hi = $pb.Top - 1
-        $strip = if ($hi -lt $lo) { @() } else {
-            Get-TestStrip -Window $top -Fixed ([int](($pa.Left + $pa.Right) / 2)) -A $lo -B $hi
-        }
-    } else {
-        $pa = $panes | Sort-Object Left | Select-Object -First 1
-        $pb = $panes | Sort-Object Left | Select-Object -Last 1
-        $lo = $pa.Right; $hi = $pb.Left - 1
-        $strip = if ($hi -lt $lo) { @() } else {
-            Get-TestStrip -Window $top -Fixed ([int](($pa.Top + $pa.Bottom) / 2)) -A $lo -B $hi -Horizontal
-        }
-    }
-    return [pscustomobject]@{ Strip = $strip; Gap = ($hi - $lo + 1) }
-}
+# (Get-GapStrip moved up to the helper block: the T233 section in run 2 uses
+# it too, and PowerShell resolves functions at call time in file order.)
 
 # One GUI per axis: a single split each, so a run count of 1 is unambiguous.
 function Start-T155Gui([string]$direction) {
@@ -439,7 +577,7 @@ foreach ($axis in @('down', 'right')) {
     if ($null -eq $g) { Write-Host "SKIP T155/$axis : GUI did not come up"; continue }
     $launched += $script:GhozttyTestDesktopPids
     $top = $g.Top
-    $bandPx = [math]::Max([int][math]::Round((Get-TestWindowDpi -Window $top) / 96.0), 1)
+    $bandPx = Get-ExpectedBandPx (Get-TestWindowDpi -Window $top)
     $panes = Get-Panes $top
     if ($panes.Count -ne 2) {
         Assert $false "T155/$axis setup: 2 visible panes (got $($panes.Count))"

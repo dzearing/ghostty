@@ -173,7 +173,29 @@ Work these first, in order, before falling back to first-todo-in-table:
 
     Then the tasks that bring the chrome into compliance:
 
-    **~~T232~~ → ~~T242~~ → ~~T235~~ → T233 → T234.**
+    **~~T232~~ → ~~T242~~ → ~~T235~~ → ~~T233~~ → T234.**
+
+    - **T233 (done, 2026-07-31)** — *"I think the splitter lines should be 2px
+      and have a hover color that emphasizes it."* Both halves were real:
+      `bandPx` was 1 DIP, which rounds to a **single physical pixel at both
+      100% and 125%** — the two scales most users run — and hovering changed
+      only the cursor, which tells nobody who is looking at the divider. Now
+      `max(round(2 * scale), 2)` (a deliberate Mac divergence, recorded in
+      design system §5) plus a hover/drag shade whose SIGN is asserted against
+      `icon_button.fillDelta` rather than restated. Shade direction comes from
+      the PANE background, not the OS theme.
+
+      Two lessons. **A `GetDC` paint never marks the region dirty**, so the
+      hover was correct on screen and invisible to `PrintWindow` — the pixels
+      never reached the backing store, and two assertions failed against a
+      build that was behaving correctly (**T252** audits the other sites).
+      And **a posted `WM_MOUSEMOVE` cannot hold a hover on the test desktop**:
+      `TrackMouseEvent` watches the REAL cursor, so `WM_MOUSELEAVE` lands
+      within one frame — proved with a debug log on both sides rather than
+      assumed, and the oracle was split into the COLOR (pixels, mid-drag) and
+      the TRIGGER (debug log). Follow-ups **T250** (the hero divider still
+      disagrees with §5 in the same window) and **T251** (a user's
+      `split-divider-color` has no contrast floor).
 
     - **T235 (done, 2026-07-31)** — *"you have tons of horiz realestate, and
       yet you are truncating the tab text here."* `max_tab_w = 200 DIP` is

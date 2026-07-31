@@ -252,6 +252,13 @@ drag_split_handle: SplitTree(Surface).Node.Handle = .root,
 drag_split_layout: SplitTree(Surface).Split.Layout = .horizontal,
 drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 
+/// The split node whose divider grab band the pointer is currently over
+/// (T233). Design system §5: hover is a COLOR change, not only a cursor
+/// change — a cursor tells nobody who is looking at the divider, and shows
+/// up on no screenshot. Active-tab state, so it is dropped alongside the
+/// hero transients whenever the tab or the tree changes.
+hover_split: ?SplitTree(Surface).Node.Handle = null,
+
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
 /// and the dispatch, queued mouse/keyboard messages can otherwise reach
@@ -1269,7 +1276,7 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     // Hero animations/hover/drag are active-tab state — drop them before
     // the switch (a mid-slide switch would otherwise leave the old tab's
     // panes hidden with no timer to show them).
-    self.heroResetTransients();
+    self.resetPointerTransients();
     // Clear any in-progress tab drag
     if (self.drag_tab >= 0) {
         self.drag_tab = -1;
@@ -1327,7 +1334,7 @@ pub fn toggleHeroMode(self: *Window) void {
     const tab = self.active_tab;
     if (self.tab_hero_active[tab]) {
         self.tab_hero_active[tab] = false;
-        self.heroResetTransients();
+        self.resetPointerTransients();
     } else {
         if (self.leafCount(tab) <= 1) return;
         const focused = self.tab_active_surface[tab];
@@ -1374,7 +1381,7 @@ fn heroSelect(self: *Window, index: isize) void {
 /// animations and drops transient hover/drag state — leaf indices (and
 /// tile geometry) are no longer what they referred to.
 pub fn heroOnTreeChanged(self: *Window, tab: usize) void {
-    self.heroResetTransients();
+    self.resetPointerTransients();
     if (!self.tab_hero_active[tab]) return;
     const n = self.leafCount(tab);
     if (n <= 1) {
@@ -1516,13 +1523,16 @@ fn heroCancelAnims(self: *Window) void {
     if (had_slide) self.heroShowSelected(false);
 }
 
-/// Reset every transient hero interaction: animations, hover chrome, and
-/// a divider drag (releasing the mouse capture). Called on tab switch,
-/// tree change, and hero-mode exit.
-fn heroResetTransients(self: *Window) void {
+/// Reset every transient pointer interaction: hero animations, hero hover
+/// chrome, a hero divider drag (releasing the mouse capture), and the split
+/// divider hover (T233). Called on tab switch, tree change, and hero-mode
+/// exit — all three invalidate the handles and leaf indices this state
+/// refers to.
+fn resetPointerTransients(self: *Window) void {
     self.heroCancelAnims();
     self.hero_hover_tile = -1;
     self.hero_divider_hover = false;
+    self.hover_split = null;
     if (self.hero_divider_drag) {
         self.hero_divider_drag = false;
         _ = w32.ReleaseCapture();
@@ -1985,17 +1995,44 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
     if (!tree.isSplit()) return;
     if (tree.zoomed != null) return;
     const rect = self.surfaceRect();
-    const color: u32 = if (self.app.config.@"split-divider-color") |c|
-        w32.RGB(c.r, c.g, c.b)
+    const rest: color_math.Rgb = if (self.app.config.@"split-divider-color") |c|
+        .{ .r = c.r, .g = c.g, .b = c.b }
     else
-        0x00808080;
-    const brush = w32.CreateSolidBrush(color) orelse return;
+        .{ .r = 0x80, .g = 0x80, .b = 0x80 };
+    const brush = w32.CreateSolidBrush(w32.RGB(rest.r, rest.g, rest.b)) orelse return;
     defer _ = w32.DeleteObject(brush);
-    self.paintDividerNode(hdc, tree, .root, rect, brush);
+
+    // T233: the hovered/dragged divider paints shaded. Which way to shade is
+    // decided by the PANE background, not the OS theme — the divider has to
+    // read against the two panes it separates, and a light terminal in a dark
+    // Windows theme is an ordinary configuration.
+    const bg = self.app.config.background;
+    const dark = !color_math.isLight(.{ .r = bg.r, .g = bg.g, .b = bg.b });
+    const hot_rgb = split_geometry.dividerColor(rest, dark, true);
+    const hot_brush = w32.CreateSolidBrush(w32.RGB(hot_rgb.r, hot_rgb.g, hot_rgb.b));
+    defer if (hot_brush) |hb| {
+        _ = w32.DeleteObject(hb);
+    };
+    // A drag is a held hover (design system §5), and it outranks the pointer's
+    // last hover position: mid-drag the pointer can leave the band entirely.
+    const hot_handle: ?SplitTree(Surface).Node.Handle =
+        if (self.dragging_split) self.drag_split_handle else self.hover_split;
+
+    self.paintDividerNode(hdc, tree, .root, rect, brush, hot_brush orelse brush, hot_handle);
 }
 
-fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT, brush: w32.HBRUSH) void {
+fn paintDividerNode(
+    self: *Window,
+    hdc: w32.HDC,
+    tree: SplitTree(Surface),
+    handle: SplitTree(Surface).Node.Handle,
+    rect: w32.RECT,
+    rest_brush: w32.HBRUSH,
+    hot_brush: w32.HBRUSH,
+    hot_handle: ?SplitTree(Surface).Node.Handle,
+) void {
     if (handle.idx() >= tree.nodes.len) return;
+    const brush = if (hot_handle) |h| (if (h == handle) hot_brush else rest_brush) else rest_brush;
     switch (tree.nodes[handle.idx()]) {
         .leaf => {},
         .split => |s| {
@@ -2008,16 +2045,16 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
                 _ = w32.FillRect(hdc, &band, brush);
                 const left_rect = w32.RECT{ .left = a.lo_start, .top = rect.top, .right = a.band_lo, .bottom = rect.bottom };
                 const right_rect = w32.RECT{ .left = a.band_hi, .top = rect.top, .right = a.hi_end, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, left_rect, brush);
-                self.paintDividerNode(hdc, tree, s.right, right_rect, brush);
+                self.paintDividerNode(hdc, tree, s.left, left_rect, rest_brush, hot_brush, hot_handle);
+                self.paintDividerNode(hdc, tree, s.right, right_rect, rest_brush, hot_brush, hot_handle);
             } else {
                 const a = split_geometry.axis(rect.top, rect.bottom, s.ratio, self.scale);
                 var band = w32.RECT{ .left = rect.left, .top = a.band_lo, .right = rect.right, .bottom = a.band_hi };
                 _ = w32.FillRect(hdc, &band, brush);
                 const top_rect = w32.RECT{ .left = rect.left, .top = a.lo_start, .right = rect.right, .bottom = a.band_lo };
                 const bottom_rect = w32.RECT{ .left = rect.left, .top = a.band_hi, .right = rect.right, .bottom = a.hi_end };
-                self.paintDividerNode(hdc, tree, s.left, top_rect, brush);
-                self.paintDividerNode(hdc, tree, s.right, bottom_rect, brush);
+                self.paintDividerNode(hdc, tree, s.left, top_rect, rest_brush, hot_brush, hot_handle);
+                self.paintDividerNode(hdc, tree, s.right, bottom_rect, rest_brush, hot_brush, hot_handle);
             }
         },
     }
@@ -2080,11 +2117,130 @@ fn hitTestDividerNode(
     }
 }
 
+/// The client-coordinate rect of ONE split's divider band in the active
+/// tab, or null when the handle is not a visible split there.
+fn dividerBandRect(self: *Window, target: SplitTree(Surface).Node.Handle) ?w32.RECT {
+    if (self.tab_count == 0) return null;
+    if (self.tab_hero_active[self.active_tab]) return null;
+    const tree = self.tab_trees[self.active_tab];
+    if (!tree.isSplit()) return null;
+    if (tree.zoomed != null) return null;
+    return self.dividerBandRectNode(tree, .root, self.surfaceRect(), target);
+}
+
+fn dividerBandRectNode(
+    self: *Window,
+    tree: SplitTree(Surface),
+    handle: SplitTree(Surface).Node.Handle,
+    rect: w32.RECT,
+    target: SplitTree(Surface).Node.Handle,
+) ?w32.RECT {
+    if (handle.idx() >= tree.nodes.len) return null;
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => return null,
+        .split => |s| {
+            if (s.layout == .horizontal) {
+                const a = split_geometry.axis(rect.left, rect.right, s.ratio, self.scale);
+                if (handle == target) return .{
+                    .left = a.band_lo,
+                    .top = rect.top,
+                    .right = a.band_hi,
+                    .bottom = rect.bottom,
+                };
+                const left_rect = w32.RECT{ .left = a.lo_start, .top = rect.top, .right = a.band_lo, .bottom = rect.bottom };
+                const right_rect = w32.RECT{ .left = a.band_hi, .top = rect.top, .right = a.hi_end, .bottom = rect.bottom };
+                return self.dividerBandRectNode(tree, s.left, left_rect, target) orelse
+                    self.dividerBandRectNode(tree, s.right, right_rect, target);
+            } else {
+                const a = split_geometry.axis(rect.top, rect.bottom, s.ratio, self.scale);
+                if (handle == target) return .{
+                    .left = rect.left,
+                    .top = a.band_lo,
+                    .right = rect.right,
+                    .bottom = a.band_hi,
+                };
+                const top_rect = w32.RECT{ .left = rect.left, .top = a.lo_start, .right = rect.right, .bottom = a.band_lo };
+                const bottom_rect = w32.RECT{ .left = rect.left, .top = a.band_hi, .right = rect.right, .bottom = a.hi_end };
+                return self.dividerBandRectNode(tree, s.left, top_rect, target) orelse
+                    self.dividerBandRectNode(tree, s.right, bottom_rect, target);
+            }
+        },
+    }
+}
+
+/// Repaint ONE divider band through the normal paint cycle (T233).
+///
+/// InvalidateRect + UpdateWindow, deliberately NOT the `GetDC` + `paintDividers`
+/// shortcut `layoutSplits` uses. That shortcut exists for a band that MOVED —
+/// its old pixels are already covered by a child and nothing would invalidate
+/// them — and it draws straight to the window DC without ever marking the
+/// region dirty. For a band that only changed COLOR that is not enough:
+/// measured 2026-07-31, the pixels never reach the window's backing store, so
+/// the next `PrintWindow` (and anything else that re-renders rather than
+/// re-composites) still shows the rest color. The hover looked correct on
+/// screen and was invisible to the capture — a state that exists on the glass
+/// and nowhere else. Only the band rect is invalidated, so the panes never
+/// repaint and there is no flicker.
+fn refreshDividerBand(self: *Window, handle: ?SplitTree(Surface).Node.Handle) void {
+    const hwnd = self.hwnd orelse return;
+    const h = handle orelse return;
+    var r = self.dividerBandRect(h) orelse return;
+    _ = w32.InvalidateRect(hwnd, &r, 0);
+    _ = w32.UpdateWindow(hwnd);
+}
+
+/// Set (or clear) the hovered split divider, repainting when it changed.
+/// Idempotent — WM_MOUSEMOVE fires for every pixel of travel, and only a
+/// transition is worth a repaint.
+fn setDividerHover(self: *Window, handle: ?SplitTree(Surface).Node.Handle) void {
+    const same = if (self.hover_split) |old|
+        (if (handle) |new| old == new else false)
+    else
+        handle == null;
+    if (same) return;
+    const old = self.hover_split;
+    self.hover_split = handle;
+    // Debug-build oracle for split-divider.ps1 (the hero-mode.ps1 idiom):
+    // the hot state is a paint decision, so a test that cannot hold a real
+    // pointer still has something to read.
+    log.debug("divider hover={?d}", .{if (handle) |h| @as(?u16, @intFromEnum(h)) else null});
+    self.refreshDividerBand(old);
+    self.refreshDividerBand(handle);
+}
+
+/// Pointer moved over the content area (not the tab bar, not hero mode):
+/// light the divider whose grab band it is in. Registers TrackMouseEvent
+/// (shared `tracking_mouse` flag with the tab bar and hero chrome) so
+/// WM_MOUSELEAVE puts the band back.
+///
+/// The band's outer edges lie OVER the pane children; they reach here
+/// because those panes answer HTTRANSPARENT there (App.surfaceWndProc's
+/// WM_NCHITTEST, T94) — the same fall-through the resize cursor rides on.
+fn updateDividerHover(self: *Window, x: i32, y: i32) void {
+    if (!self.tracking_mouse) {
+        if (self.hwnd) |hwnd| {
+            var tme = w32.TRACKMOUSEEVENT{
+                .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+                .dwFlags = w32.TME_LEAVE,
+                .hwndTrack = hwnd,
+                .dwHoverTime = 0,
+            };
+            _ = w32.TrackMouseEvent(&tme);
+            self.tracking_mouse = true;
+        }
+    }
+    self.setDividerHover(if (self.hitTestDivider(x, y)) |hit| hit.handle else null);
+}
+
 fn startDividerDrag(self: *Window, handle: SplitTree(Surface).Node.Handle, layout: SplitTree(Surface).Split.Layout) void {
     self.dragging_split = true;
     self.drag_split_handle = handle;
     self.drag_split_layout = layout;
     self.drag_start_rect = self.surfaceRect();
+    // Held hover: the band must not drop back to rest the instant it is
+    // grabbed, and mid-drag the pointer routinely leaves the band.
+    self.hover_split = handle;
+    self.refreshDividerBand(handle);
     if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
 }
 
@@ -2114,6 +2270,22 @@ fn endDividerDrag(self: *Window) void {
     if (!self.dragging_split) return;
     self.dragging_split = false;
     _ = w32.ReleaseCapture();
+    // Re-derive hover from where the pointer actually ended up: the ratio is
+    // clamped to [0.1, 0.9], so a drag pushed to the limit leaves the band
+    // behind and it must go back to rest. No readable cursor (a background
+    // desktop) reads as "not hovered", which is the safe answer.
+    var pt: w32.POINT = undefined;
+    var hover: ?SplitTree(Surface).Node.Handle = null;
+    if (w32.GetCursorPos_(&pt) != 0) {
+        if (self.hwnd) |hwnd| {
+            _ = w32.ScreenToClient(hwnd, &pt);
+            if (self.hitTestDivider(pt.x, pt.y)) |hit| hover = hit.handle;
+        }
+    }
+    const was = self.drag_split_handle;
+    self.hover_split = hover;
+    self.refreshDividerBand(was);
+    self.refreshDividerBand(hover);
     // T110: persist the dragged split ratio. Armed at drag END (not on every
     // motion tick) so a drag is one debounced write, the same coalescing
     // `persistPlacement` does for window frames at WM_EXITSIZEMOVE.
@@ -4431,8 +4603,13 @@ pub fn windowWndProc(
             }
             if (y < window.tabBarHeight()) {
                 window.handleTabBarMouseMove(@truncate(x), @truncate(y));
+                // Leaving the content area upward is a divider un-hover: the
+                // pointer never crosses WM_MOUSELEAVE to get here.
+                window.setDividerHover(null);
             } else if (window.tab_count > 0 and window.tab_hero_active[window.active_tab]) {
                 window.heroMouseMove(x, y);
+            } else {
+                window.updateDividerHover(x, y);
             }
             return 0;
         },
@@ -4472,6 +4649,7 @@ pub fn windowWndProc(
         w32.WM_MOUSELEAVE => {
             window.handleTabBarMouseLeave();
             window.heroMouseLeave();
+            window.setDividerHover(null);
             return 0;
         },
         w32.WM_ACTIVATE => {

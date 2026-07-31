@@ -15,13 +15,55 @@
 
 const std = @import("std");
 const testing = std.testing;
+const color_math = @import("color_math.zig");
+const icon_button = @import("icon_button.zig");
 
 /// Width (horizontal split) or height (vertical split) of the divider band
-/// in physical pixels, for a given DPI scale. Mac's divider is 1pt; 1 DIP
-/// scaled is the direct analog (1px at 100%/125%, 2px at 150%/200%), and it
-/// is never zero.
+/// in physical pixels, for a given DPI scale (design system §5).
+///
+/// **2 DIP, and a deliberate divergence from Mac's 1 pt** (T233). Windows'
+/// common fractional scales round 1 DIP down to a SINGLE physical pixel at
+/// both 100% and 125% — the two scales most users run — and a one-pixel line
+/// against a dark pane reads as a rendering artifact rather than as a control
+/// you can grab. macOS has no 125% and composites its 1 pt line differently,
+/// so the number that is right there is wrong here. Recorded in
+/// `docs/design/win32-design-system.md` §5 so a later parity sweep does not
+/// "fix" it back.
 pub fn bandPx(scale: f32) i32 {
-    return @max(@as(i32, @intFromFloat(@round(1.0 * scale))), 1);
+    return @max(@as(i32, @intFromFloat(@round(2.0 * scale))), 2);
+}
+
+/// Per-channel shade applied to the divider while its grab band is hovered
+/// or being dragged (design system §5).
+///
+/// The SIGN convention is `icon_button.fillDelta`'s and is asserted against
+/// it below: shade toward the foreground in dark themes, away from it in
+/// light ones. The MAGNITUDE is deliberately larger than a button's 15 —
+/// a button fill is a 28 DIP square, while this is a 2 DIP mark, and the
+/// same delta spread over ~1/20th of the area does not read as a state
+/// change at a glance.
+pub const HOVER_DELTA: i32 = 25;
+
+/// Signed per-channel delta for the divider's hover/drag state.
+pub fn hoverDelta(dark: bool) i32 {
+    return if (dark) HOVER_DELTA else -HOVER_DELTA;
+}
+
+/// The divider's painted color. `rest` is the configured (or fallback)
+/// divider color; `dark` says which way to shade — take it from the pane
+/// background the divider separates (`!color_math.isLight(bg)`), not from
+/// the OS theme: the divider has to read against the panes it sits between.
+///
+/// Hover and drag paint identically — a drag is a held hover, so the mark
+/// must not change under the pointer at the moment it is grabbed.
+pub fn dividerColor(rest: color_math.Rgb, dark: bool, hot: bool) color_math.Rgb {
+    if (!hot) return rest;
+    const d = hoverDelta(dark);
+    return .{
+        .r = icon_button.shadeChannel(rest.r, d),
+        .g = icon_button.shadeChannel(rest.g, d),
+        .b = icon_button.shadeChannel(rest.b, d),
+    };
 }
 
 /// Half-width of the invisible grab band around the divider (T94, Mac's
@@ -83,13 +125,93 @@ pub fn inGrabBand(a: Axis, coord: i32, scale: f32) bool {
     return coord >= a.split_pos - half and coord <= a.split_pos + half;
 }
 
-test "bandPx: 1 DIP, never zero, Mac-equivalent at each common scale" {
-    try testing.expectEqual(@as(i32, 1), bandPx(1.0));
-    try testing.expectEqual(@as(i32, 1), bandPx(1.25));
-    try testing.expectEqual(@as(i32, 2), bandPx(1.5));
-    try testing.expectEqual(@as(i32, 2), bandPx(2.0));
-    // Absurdly small scales still leave a visible divider.
-    try testing.expectEqual(@as(i32, 1), bandPx(0.1));
+test "bandPx: 2 DIP, and never a single physical pixel at any scale" {
+    try testing.expectEqual(@as(i32, 2), bandPx(1.0));
+    try testing.expectEqual(@as(i32, 3), bandPx(1.25));
+    try testing.expectEqual(@as(i32, 3), bandPx(1.5));
+    try testing.expectEqual(@as(i32, 4), bandPx(2.0));
+    // THE regression T233 fixes: at the two scales most users run, the old
+    // 1 DIP band rounded to one pixel and read as an artifact.
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        try testing.expect(bandPx(scale) >= 2);
+    }
+    // Absurdly small scales still leave a grabbable divider.
+    try testing.expectEqual(@as(i32, 2), bandPx(0.1));
+}
+
+test "hoverDelta: icon_button's sign convention, a divider's magnitude" {
+    // Same DIRECTION as every other chrome hover, so the whole UI reacts the
+    // same way to the pointer.
+    try testing.expect(hoverDelta(true) > 0);
+    try testing.expect(hoverDelta(false) < 0);
+    try testing.expectEqual(
+        std.math.sign(icon_button.fillDelta(.hover, true)),
+        std.math.sign(hoverDelta(true)),
+    );
+    try testing.expectEqual(
+        std.math.sign(icon_button.fillDelta(.hover, false)),
+        std.math.sign(hoverDelta(false)),
+    );
+    // Bigger than a button's, on purpose (see HOVER_DELTA).
+    try testing.expect(@abs(hoverDelta(true)) > @abs(icon_button.fillDelta(.hover, true)));
+}
+
+test "dividerColor: rest is untouched, hover lightens in dark and darkens in light" {
+    const gray: color_math.Rgb = .{ .r = 128, .g = 128, .b = 128 };
+    try testing.expect(gray.eql(dividerColor(gray, true, false)));
+    try testing.expect(gray.eql(dividerColor(gray, false, false)));
+
+    const on_dark = dividerColor(gray, true, true);
+    try testing.expectEqual(@as(u8, 153), on_dark.r);
+    try testing.expect(on_dark.r > gray.r and on_dark.g > gray.g and on_dark.b > gray.b);
+
+    const on_light = dividerColor(gray, false, true);
+    try testing.expectEqual(@as(u8, 103), on_light.r);
+    try testing.expect(on_light.r < gray.r and on_light.g < gray.g and on_light.b < gray.b);
+
+    // Channels clamp rather than wrap — a near-white divider on a light
+    // theme must not roll over to black.
+    const white: color_math.Rgb = .{ .r = 255, .g = 255, .b = 250 };
+    const w_hot = dividerColor(white, true, true);
+    try testing.expectEqual(@as(u8, 255), w_hot.r);
+    const black: color_math.Rgb = .{ .r = 0, .g = 0, .b = 5 };
+    const b_hot = dividerColor(black, false, true);
+    try testing.expectEqual(@as(u8, 0), b_hot.r);
+}
+
+test "dividerColor: rest AND hover clear the 3:1 chrome floor on both themes" {
+    // Design system §2.3/§5: a divider is a meaningful boundary, so 3:1
+    // against BOTH panes it separates, in every state. Asserted rather than
+    // eyeballed — the hover delta moves the mark toward the background it
+    // has to stay legible against in one of the two themes.
+    const fallback: color_math.Rgb = .{ .r = 128, .g = 128, .b = 128 };
+    const dark_bg: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 };
+    const light_bg: color_math.Rgb = .{ .r = 255, .g = 255, .b = 255 };
+
+    inline for (.{
+        .{ dark_bg, true },
+        .{ light_bg, false },
+    }) |case| {
+        const bg: color_math.Rgb = case[0];
+        const dark: bool = case[1];
+        const bg_lum = color_math.wcagLuminance(bg);
+        for ([_]bool{ false, true }) |hot| {
+            const c = dividerColor(fallback, dark, hot);
+            const ratio = color_math.wcagContrastRatio(color_math.wcagLuminance(c), bg_lum);
+            try testing.expect(ratio >= 3.0);
+        }
+    }
+
+    // And the hover state must be DISTINGUISHABLE from rest, not merely
+    // legible: a hover nobody can see is the defect T233 exists to fix.
+    for ([_]bool{ true, false }) |dark| {
+        const rest = dividerColor(fallback, dark, false);
+        const hot = dividerColor(fallback, dark, true);
+        try testing.expect(!rest.eql(hot));
+        const delta = @abs(@as(i32, hot.r) - @as(i32, rest.r));
+        try testing.expect(delta >= 20);
+    }
 }
 
 test "axis: panes and divider tile the rect with no leftover gap" {
@@ -113,16 +235,16 @@ test "axis: panes and divider tile the rect with no leftover gap" {
 test "axis: band is centered and respects a non-zero rect origin" {
     const a = axis(100, 300, 0.5, 1.0);
     try testing.expectEqual(@as(i32, 200), a.split_pos);
-    try testing.expectEqual(@as(i32, 200), a.band_lo);
+    try testing.expectEqual(@as(i32, 199), a.band_lo);
     try testing.expectEqual(@as(i32, 201), a.band_hi);
-    try testing.expectEqual(@as(i32, 1), a.bandWidth());
+    try testing.expectEqual(@as(i32, 2), a.bandWidth());
 
-    // At 2x the band is 2px and still straddles the split position.
+    // At 2x the band is 4px and still straddles the split position.
     const b = axis(100, 300, 0.5, 2.0);
     try testing.expectEqual(@as(i32, 200), b.split_pos);
-    try testing.expectEqual(@as(i32, 199), b.band_lo);
-    try testing.expectEqual(@as(i32, 201), b.band_hi);
-    try testing.expectEqual(@as(i32, 2), b.bandWidth());
+    try testing.expectEqual(@as(i32, 198), b.band_lo);
+    try testing.expectEqual(@as(i32, 202), b.band_hi);
+    try testing.expectEqual(@as(i32, 4), b.bandWidth());
 }
 
 test "axis: a small ratio change moves the band by more than its width" {
