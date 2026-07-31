@@ -74,7 +74,18 @@ recommended approaches where they exist.
 Work these first, in order, before falling back to first-todo-in-table:
 
 0. **TOP OF THE LIST as of 2026-07-30 (user directive, mid-turn):**
-   **T211 → T212 → T210 → T208 → T213 → T209.**
+   **~~T211~~ → T212 → T210 → T208 → T213 → T214 → T209.**
+
+   - **~~T211~~** — DONE 2026-07-30. The shared harness is
+     `test/win32/lib/TestDesktop.ps1`; dot-source it and read its header
+     before writing or migrating any GUI script. `split-zoom-nav.ps1` is the
+     worked example and `test-desktop-harness.ps1` is the harness's own
+     acceptance script. It found and fixed a product bug (deferred focus was
+     dead on a non-input desktop → sweep is **T215**) and narrowed T207's
+     capture answer (PrintWindow gets chrome, not the terminal surface →
+     **T214**, which now blocks T209 instead of T213 alone).
+     **The no-GUI-tests-on-the-interactive-desktop rule still stands until
+     T212 has migrated the rest of the scripts.**
 
    - **~~T207~~** — the user, verbatim, while a test run was grabbing their
      screen: *"you KEEP STEALING FOCUS USE ANOTHER DESKTOP for testing"*.

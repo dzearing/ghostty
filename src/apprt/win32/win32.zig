@@ -1530,6 +1530,32 @@ pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
 
 pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 
+// Desktop objects. Only used to answer "am I on the INPUT desktop?" — a
+// process on a background desktop (CreateDesktopW, as the T211 acceptance
+// harness does) has no foreground window at all, so foreground-based guards
+// have to know not to apply there.
+pub const HDESK = HANDLE;
+pub const UOI_NAME: i32 = 2;
+pub const DESKTOP_READOBJECTS: u32 = 0x0001;
+
+pub extern "user32" fn GetThreadDesktop(dwThreadId: u32) callconv(.winapi) ?HDESK;
+
+pub extern "user32" fn OpenInputDesktop(
+    dwFlags: u32,
+    fInherit: i32,
+    dwDesiredAccess: u32,
+) callconv(.winapi) ?HDESK;
+
+pub extern "user32" fn CloseDesktop(hDesktop: HDESK) callconv(.winapi) i32;
+
+pub extern "user32" fn GetUserObjectInformationW(
+    hObj: HDESK,
+    nIndex: i32,
+    pvInfo: ?*anyopaque,
+    nLength: u32,
+    lpnLengthNeeded: ?*u32,
+) callconv(.winapi) i32;
+
 pub const GA_ROOT: u32 = 2;
 
 pub extern "user32" fn GetAncestor(

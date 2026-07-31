@@ -3068,3 +3068,39 @@ NOT run — they `Start-Process` a GUI window, which steals focus, and this
 change touches no product code.
 
 Commit: `dfb0fa54c`.
+
+## 2026-07-30 — T211: the shared test-desktop harness, and two things it found
+
+`test/win32/lib/TestDesktop.ps1` ships. GUI acceptance scripts can now run on
+a background `CreateDesktopW` desktop: one persistent worker thread bound to
+it (SetThreadDesktop is per-thread and fails on a thread that owns windows),
+with every desktop-side call marshalled onto it. `Focus-TestWindow` replaces
+the T86 `GrabForeground` copies, `Send-TestKeys`/`Send-TestText` replace
+SendInput with posted messages plus `SetKeyboardState` over the shared input
+queue, and `Get-TestWindowPixels` replaces `CopyFromScreen` with
+`PrintWindow(PW_RENDERFULLCONTENT)`. `-Interactive` /
+`GHOZTTY_TEST_INTERACTIVE=1` is the documented debug escape hatch.
+
+Two acceptance scripts: `test-desktop-harness.ps1` (the harness's own, 19
+assertions, capture negative control built in) and `split-zoom-nav.ps1`
+migrated as the proof-of-concept (20 assertions, `-NegativeControl` still
+FAILS). Both ALL PASS x3, and the interactive-desktop foreground watcher never
+once saw a harness-launched pid.
+
+Two findings, both filed rather than left as lore:
+
+- **A product bug (fixed here).** `App.performDeferredFocus` required
+  `GetForegroundWindow() == root` (the T89f2 ping-pong guard), and a
+  background desktop has NO foreground window — so every deferred focus was
+  dropped and keyboard focus could not move at all. Now decided by the pure,
+  unit-tested `shouldPerformDeferredFocus` plus a cached `onInputDesktop()`;
+  the interactive path is unchanged. Sweep for siblings: **T215**.
+- **T207's capture answer was too generous.** `PrintWindow` returns GDI
+  chrome only; the OpenGL terminal surface reads as a flat fill (child window
+  captured meanLum 255 / 1 distinct color, unchanged after typing). The
+  spike's 64 distinct colors were its tab strip. Chrome probes (T213) are
+  fine — a titlebar band separates light from dark at 240 vs 34. Terminal-
+  content probes are **T214**, which T209 now depends on.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3, and the T207 spike
+all green.

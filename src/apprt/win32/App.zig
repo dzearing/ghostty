@@ -486,8 +486,95 @@ pub fn deferSetFocus(hwnd: w32.HWND) void {
 /// next genuine activation of its window.
 pub fn performDeferredFocus(hwnd: w32.HWND) void {
     const root = w32.GetAncestor(hwnd, w32.GA_ROOT) orelse return;
-    if (w32.GetForegroundWindow() != root) return;
+    if (!shouldPerformDeferredFocus(
+        onInputDesktop(),
+        w32.GetForegroundWindow(),
+        root,
+    )) return;
     _ = w32.SetFocus(hwnd);
+}
+
+/// The `performDeferredFocus` decision, split out so it is unit-testable
+/// (the win32 calls around it are not).
+///
+/// On the input desktop the rule is the T89f2 one: only forward focus the
+/// window ALREADY holds. Off it — a background desktop created with
+/// `CreateDesktopW`, which is how the acceptance harness runs the GUI
+/// without stealing the user's foreground — there is no foreground window
+/// at all: `GetForegroundWindow` returns null for every window on it. The
+/// guard would then drop every deferred focus, so keyboard focus could
+/// never move (splits, tabs, dialogs), and the guard's own reason for
+/// existing is moot there because a `SetFocus` cannot steal activation
+/// from a window that cannot have it.
+fn shouldPerformDeferredFocus(
+    on_input_desktop: bool,
+    foreground: ?w32.HWND,
+    root: w32.HWND,
+) bool {
+    if (!on_input_desktop) return true;
+    return foreground == root;
+}
+
+/// Whether this process's GUI thread runs on the INPUT desktop (the one the
+/// user sees). Cached: a thread's desktop is bound at startup and never
+/// changes for the app. Failure to determine it is reported as `true`, so
+/// the interactive path keeps its exact behavior when the query is denied.
+var on_input_desktop_cache: ?bool = null;
+
+fn onInputDesktop() bool {
+    if (on_input_desktop_cache) |v| return v;
+    const v = queryOnInputDesktop();
+    on_input_desktop_cache = v;
+    return v;
+}
+
+fn queryOnInputDesktop() bool {
+    const mine = w32.GetThreadDesktop(w32.GetCurrentThreadId()) orelse return true;
+    const input_desk = w32.OpenInputDesktop(0, 0, w32.DESKTOP_READOBJECTS) orelse return true;
+    defer _ = w32.CloseDesktop(input_desk);
+
+    // Handles differ even for the same desktop object, so compare names.
+    var mine_name: [256]u16 = undefined;
+    var input_name: [256]u16 = undefined;
+    var mine_len: u32 = 0;
+    var input_len: u32 = 0;
+    if (w32.GetUserObjectInformationW(
+        mine,
+        w32.UOI_NAME,
+        &mine_name,
+        @sizeOf(@TypeOf(mine_name)),
+        &mine_len,
+    ) == 0) return true;
+    if (w32.GetUserObjectInformationW(
+        input_desk,
+        w32.UOI_NAME,
+        &input_name,
+        @sizeOf(@TypeOf(input_name)),
+        &input_len,
+    ) == 0) return true;
+    if (mine_len != input_len) return false;
+    const n = mine_len / @sizeOf(u16);
+    return std.mem.eql(u16, mine_name[0..n], input_name[0..n]);
+}
+
+test "shouldPerformDeferredFocus: input desktop forwards only to the foreground window" {
+    const root: w32.HWND = @ptrFromInt(0x1000);
+    const other: w32.HWND = @ptrFromInt(0x2000);
+    try std.testing.expect(shouldPerformDeferredFocus(true, root, root));
+    try std.testing.expect(!shouldPerformDeferredFocus(true, other, root));
+    // No foreground window at all still means "not ours" on the input
+    // desktop (a transient state there, e.g. the window being destroyed).
+    try std.testing.expect(!shouldPerformDeferredFocus(true, null, root));
+}
+
+test "shouldPerformDeferredFocus: background desktop always forwards" {
+    const root: w32.HWND = @ptrFromInt(0x1000);
+    const other: w32.HWND = @ptrFromInt(0x2000);
+    // A background desktop has no foreground window, so the guard cannot
+    // apply — without this, focus never moves anywhere on a test desktop.
+    try std.testing.expect(shouldPerformDeferredFocus(false, null, root));
+    try std.testing.expect(shouldPerformDeferredFocus(false, root, root));
+    try std.testing.expect(shouldPerformDeferredFocus(false, other, root));
 }
 
 /// Re-run the split layout of the window owning the given terminal-surface

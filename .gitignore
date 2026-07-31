@@ -12,6 +12,9 @@ zig-cache/
 zig-out/
 zig-out-release/
 zig-out-prof/
+# Ad-hoc per-task prefixes (zig-out-t206/ etc). Without this a `git add -A`
+# stages a whole build tree.
+zig-out-*/
 build-cmake/
 CMakeCache.txt
 CMakeFiles/
