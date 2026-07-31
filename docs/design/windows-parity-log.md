@@ -3067,4 +3067,4 @@ Floor: both `zig build test` lanes and `test-agent` green. P1-P3 deliberately
 NOT run — they `Start-Process` a GUI window, which steals focus, and this
 change touches no product code.
 
-Commit: pending.
+Commit: `dfb0fa54c`.
