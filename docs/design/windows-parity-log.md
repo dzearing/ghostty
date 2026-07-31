@@ -2990,3 +2990,36 @@ stretched the selection accent into a full-width blue rule.
   the thing **T207** exists to fix. Do not attribute a keyboard-driven GUI
   failure to a code change without that A/B; it costs one rebuild and it is the
   difference between a real regression and a wasted day.
+## 2026-07-30 — T204 + T206: the tab strip stops looking hand-assembled
+
+Live user review drove both. On the icon buttons: *"icon buttons should have a
+consistent design with consistent hover and centered icons … why doesn't the
+chevron in the banner have a similar hover? why doesn't the x to close a tab
+have a similar hover?"* On the tabs: *"don't you see how the edge of the banner
+has this gradient highlight border? tabs should too, and inactive tabs should
+be visible somewhat and tabs should have gaps in between. And the bottom
+corners of the selected tab should curve into the edge."*
+
+**T204** — new pure `icon_button.zig`: one shared square target, one rounded
+fill, one per-state shade, glyphs centered on both axes. All four icon buttons
+use it (the banner chevron was pulled into scope — it had no hover because the
+overlay had no `WM_MOUSEMOVE` handler at all). Glyphs are stroked rather than
+font characters, which drops T204's Segoe-Fluent-Icons deliverable along with
+its tofu risk and decouples glyph size from the tab-title font.
+
+**T206** — new pure `tab_shape.zig`: the strip's back buffer became a DIB
+section and tabs are composited per pixel, the way `banner_card.zig` composites
+the banner. Rim constants and the inactive-surface lift are *imported* from
+that module, not copied. Selected-tab bottom corners flare concave into the
+baseline; tabs gained a real `tab_gap` and lost the inter-tab hairline.
+
+Tests: 26 new unit tests across the two modules, both lanes green, negative
+controls `T204_NEUTERED` / `T206_NEUTERED`. Verified visually with a
+`PrintWindow` capture (no focus steal).
+
+**Not done, deliberately:** the on-box pixel assertions. Mid-task the user said
+*"you KEEP STEALING FOCUS USE ANOTHER DESKTOP for testing"*, so the GUI scripts
+were stopped. Filed as **T209**, blocked on **T207**. T207 is now the top
+priority — it is infrastructure the visual tasks depend on, not a nicety.
+
+Commit: `4565e4e42`.
