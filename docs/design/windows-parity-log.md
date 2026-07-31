@@ -3880,3 +3880,58 @@ this class of defect. That script's section D asserted the old behavior as
 and paired with a new D2 (reporting + `paste` = no menu) so "a menu appeared"
 can no longer pass on a fixture whose console mode never landed. Both test
 lanes + test-agent + P1-P3 green.
+
+## 2026-07-31 - T150: the picker set a background and left the text behind
+
+The user asked for the context menu's *Background Color...* to come with "a
+bunch of logic for remapping foreground colors to adapt". The menu and the
+`ChooseColorW` picker already existed (T67); the adaptation was one third of
+the way there. Ported the rest of Mac's `c3e9999e7` and closed a hole it does
+not have:
+
+- **Palette 16-255 was never revisited.** `applyBackgroundTint` adjusted ANSI
+  0-15 and stopped, so 256-color content - prompt greys off the grayscale
+  ramp, cube colors - kept the OLD background's lightness. Now regenerated in
+  the same mutex hold via `terminal.color.generate256Color(..., harmonious)`,
+  the base 16 kept as adjusted. Measured on box: index 250 on a `#f0f0f0`
+  background goes 1.67:1 -> 10.6:1.
+- **Truecolor was unreachable by any palette work.** A program that emitted
+  `38;2;r;g;b` chose those channels for the background it saw at startup and
+  is never told it moved. Push `min_contrast = 3.0` to the renderer, which
+  adjusts per cell at draw time (the shared hue-preserving `contrasted_color`
+  was already in the tree). Measured: `230,230,230` on `#f0f0f0` renders as
+  `138,138,138` = 3.03:1, against a `minimum-contrast` default of 1.
+- **`contrastForeground` could return a foreground UNDER the floor.** It
+  picked black/white by Rec.601 lightness, which disagrees with WCAG across a
+  band of mid-tones: `#777777` reads "dark", so it chose white at 4.42:1 when
+  black gives 4.76:1. Now chosen by contrast, which is self-correcting for all
+  16.7M colors the picker accepts - the worst case is the crossover
+  background, and there both sides are 4.58:1. Mac has the same hole; **T247**
+  carries it over.
+- **`contrastAdjusted` could return a still-failing color.** Its hue-preserving
+  L* search only ever moved AWAY from the background, and a saturated color
+  clamps against the sRGB gamut before reaching the luminance it needs, so
+  against a mid-tone background neither side has room. It now tries the other
+  side and falls back to black/white - the same order of preference as
+  `contrasted_color`. Found by the sweep test, not by inspection.
+
+New: `test/win32/color-contrast.ps1` + `lib/paint-blocks.ps1`, ALL PASS (14).
+None of this is visible in `+list --json`, so the oracle is a screen-pixel
+read of a pane painted entirely in one color class at a time.
+
+Three ways that script was green while proving nothing, all fixed in it:
+**a block glyph cannot test minimum contrast** (`renderer/cell.zig:
+noMinContrast` exempts every graphics element on purpose, so the band
+rendered its raw color and would have called a working renderer broken);
+**ConPTY reports a row count the app does not render** (66 vs ~53), so band
+arithmetic off `[Console]::WindowHeight` aimed the probe into the neighbouring
+band, which asserted fine - the fixture now paints the whole screen per step
+and the probe needs no row math; and **`+new-window --target=` is idempotent
+against a PERSISTED session**, so after the first run the fixture never ran
+and the probe read the previous run's pixels - the harness now kills the
+repo's agent too and launches with `--session-persistence=off`. That last one
+is a trap for every acceptance script that reuses a target name.
+
+Unit side: sweep tests over the full lightness range rather than handpicked
+themes. Both test lanes + test-agent + P1-P3 green; `window-color.ps1` (T67)
+still ALL PASS (14).

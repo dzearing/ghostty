@@ -62,8 +62,19 @@ pub fn isLight(rgb: Rgb) bool {
 }
 
 /// Black-on-light / white-on-dark foreground (applyColorScheme parity).
+///
+/// The side is chosen by WCAG contrast against `bg`, NOT by `isLight`: the
+/// two disagree across a band of mid-tones where the Rec.601 answer lands
+/// UNDER the 4.5:1 text floor (#777777 reads "dark", so Rec.601 picks white
+/// at 4.42:1, while black gives 4.76:1). Choosing the better side is
+/// self-correcting for every one of the 16.7M colors the picker accepts:
+/// the worst case is the crossover background where both sides are equal,
+/// and there both are 4.58:1. See the sweep test below.
 pub fn contrastForeground(bg: Rgb) Rgb {
-    return if (isLight(bg))
+    const bg_lum = wcagLuminance(bg);
+    const on_black = wcagContrastRatio(0.0, bg_lum);
+    const on_white = wcagContrastRatio(1.0, bg_lum);
+    return if (on_black > on_white)
         .{ .r = 0, .g = 0, .b = 0 }
     else
         .{ .r = 255, .g = 255, .b = 255 };
@@ -284,30 +295,50 @@ pub fn contrastAdjusted(base: Rgb, bg: Rgb) Rgb {
     const ratio = wcagContrastRatio(wcagLuminance(base), bg_lum);
     if (ratio >= contrast_target) return base;
 
-    var lab: Lab = .fromRgb(base);
+    // Move away from the background first (darker on a light background),
+    // then try the other side, and only then give up on the hue. A
+    // hue-preserving L* move can miss the target on BOTH sides: a
+    // saturated color clamps against the sRGB gamut long before its
+    // luminance gets where it needs to be, and against a mid-tone
+    // background neither direction has the room. Returning the best-effort
+    // (still-failing) color there is how an under-contrast palette entry
+    // survives a "contrast-adjusted" palette — so fall back to plain
+    // black/white, which always clears the floor. Same order of preference
+    // as `contrasted_color` in the shaders.
     const bg_is_light = bg_lum > 0.18;
+    if (searchLightness(base, bg_lum, bg_is_light)) |c| return c;
+    if (searchLightness(base, bg_lum, !bg_is_light)) |c| return c;
+    return contrastForeground(bg);
+}
 
-    var lo: f64 = undefined;
-    var hi: f64 = undefined;
-    if (bg_is_light) {
-        lo = 0;
-        hi = lab.l;
-    } else {
-        lo = lab.l;
-        hi = 100;
-    }
-    var best_l: f64 = if (bg_is_light) lo else hi;
+/// Binary-search `base`'s CIELAB lightness toward black (`darker`) or white,
+/// hue and chroma preserved, for the SMALLEST change that clears
+/// `contrast_target` against `bg_lum`. Null when even the endpoint of that
+/// direction misses the target, which is the caller's cue to try elsewhere.
+fn searchLightness(base: Rgb, bg_lum: f64, darker: bool) ?Rgb {
+    var lab: Lab = .fromRgb(base);
+    const base_l = lab.l;
+    const endpoint: f64 = if (darker) 0 else 100;
+
+    // The endpoint bounds what this direction can do, so it decides
+    // reachability up front — a binary search converging toward it never
+    // evaluates it, and would otherwise report its last (failing) probe as
+    // a success.
+    lab.l = endpoint;
+    if (ratioAgainst(lab, bg_lum) < contrast_target) return null;
+
+    var lo: f64 = if (darker) endpoint else base_l;
+    var hi: f64 = if (darker) base_l else endpoint;
+    var best_l: f64 = endpoint;
 
     for (0..30) |_| {
         const mid = (lo + hi) / 2.0;
         lab.l = mid;
-        const tr, const tg, const tb = lab.toSrgb();
-        const test_lum = 0.2126 * srgbLinearize(tr) + 0.7152 * srgbLinearize(tg) + 0.0722 * srgbLinearize(tb);
-        if (wcagContrastRatio(test_lum, bg_lum) >= contrast_target) {
+        if (ratioAgainst(lab, bg_lum) >= contrast_target) {
             best_l = mid;
-            if (bg_is_light) lo = mid else hi = mid;
+            if (darker) lo = mid else hi = mid;
         } else {
-            if (bg_is_light) hi = mid else lo = mid;
+            if (darker) hi = mid else lo = mid;
         }
     }
 
@@ -315,11 +346,69 @@ pub fn contrastAdjusted(base: Rgb, bg: Rgb) Rgb {
     return lab.toRgb();
 }
 
+/// WCAG contrast of a Lab color against an already-computed background
+/// luminance. Works off `toSrgb` (not `toRgb`) so gamut clamping is seen
+/// but 8-bit quantization is not.
+fn ratioAgainst(lab: Lab, bg_lum: f64) f64 {
+    const r, const g, const b = lab.toSrgb();
+    const lum = 0.2126 * srgbLinearize(r) +
+        0.7152 * srgbLinearize(g) +
+        0.0722 * srgbLinearize(b);
+    return wcagContrastRatio(lum, bg_lum);
+}
+
 /// The full 16-color palette adjusted against `bg`.
 pub fn adjustedPalette(bg: Rgb) [16]Rgb {
     var out: [16]Rgb = undefined;
     for (default_ansi_colors, 0..) |base, i| out[i] = contrastAdjusted(base, bg);
     return out;
+}
+
+/// The draw-time contrast floor requested after a runtime background change
+/// (Mac `ghostty_surface_set_min_contrast(surface, 3.0)`).
+///
+/// No palette work can reach TRUECOLOR content: a program that emitted
+/// `38;2;r;g;b` chose those channels for the background it saw at startup,
+/// and it never hears that the background moved. The renderer enforces this
+/// ratio per cell at draw time instead, adjusting an under-contrast
+/// foreground hue-preservingly (`contrasted_color` in the shaders). It only
+/// ever STRENGTHENS the configured `minimum-contrast`, never weakens it.
+///
+/// 3.0 rather than 4.5 on purpose: this reaches every cell including
+/// decorative and dim text, where forcing the full text floor would flatten
+/// deliberate contrast hierarchies. The colors we control ourselves --
+/// foreground and the base-16 palette below -- still meet 4.5.
+pub const runtime_min_contrast: f64 = 3.0;
+
+/// Every color derived from a runtime background pick, computed in ONE
+/// shot so the caller can apply them under a single renderer-mutex hold.
+///
+/// Staggering them is the defect this shape exists to prevent: applying the
+/// background first and the foreground a frame (or a debounce) later leaves
+/// the pane showing the OLD theme's text on the NEW background, which is
+/// exactly the unreadable intermediate state the user sees as a flash.
+///
+/// Selection and cursor are deliberately absent: with nothing configured
+/// the renderer derives selection as a straight fg/bg swap and the cursor
+/// as the foreground (`renderer/generic.zig`), so both follow this pair in
+/// the same pass and the selection's contrast ratio is identical to the
+/// text's. When the user HAS configured them explicitly, their choice wins
+/// -- same as Mac.
+pub const Scheme = struct {
+    background: Rgb,
+    foreground: Rgb,
+    /// ANSI 0-15, each shifted to clear `contrast_target` against the
+    /// background while keeping its hue and chroma.
+    palette: [16]Rgb,
+};
+
+/// The complete accessible color scheme for a background.
+pub fn scheme(bg: Rgb) Scheme {
+    return .{
+        .background = bg,
+        .foreground = contrastForeground(bg),
+        .palette = adjustedPalette(bg),
+    };
 }
 
 // -----------------------------------------------------------------------------
@@ -359,6 +448,39 @@ test "isLight: Rec.601 threshold" {
 test "contrastForeground: black on light, white on dark" {
     try testing.expectEqual(Rgb{ .r = 255, .g = 255, .b = 255 }, contrastForeground(.{ .r = 0x10, .g = 0x10, .b = 0x20 }));
     try testing.expectEqual(Rgb{ .r = 0, .g = 0, .b = 0 }, contrastForeground(.{ .r = 0xF0, .g = 0xF0, .b = 0xE0 }));
+}
+
+test "contrastForeground: clears the 4.5:1 text floor for EVERY background" {
+    // The picker accepts any of the 16.7M colors, so "usually readable" is
+    // not a property -- sweep the whole grey ramp (where the Rec.601
+    // lightness test and the WCAG answer disagree) plus saturated hues at
+    // every lightness.
+    for (0..256) |i| {
+        const v: u8 = @intCast(i);
+        const greys = [_]Rgb{
+            .{ .r = v, .g = v, .b = v },
+            .{ .r = v, .g = 0, .b = 0 },
+            .{ .r = 0, .g = v, .b = 0 },
+            .{ .r = 0, .g = 0, .b = v },
+            .{ .r = v, .g = @intCast(255 - i), .b = v },
+            .{ .r = @intCast(255 - i), .g = v, .b = 0 },
+        };
+        for (greys) |bg| {
+            const ratio = wcagContrastRatio(
+                wcagLuminance(contrastForeground(bg)),
+                wcagLuminance(bg),
+            );
+            try testing.expect(ratio >= contrast_target);
+        }
+    }
+}
+
+test "contrastForeground: mid-greys take the higher-contrast side" {
+    // #777777 is the regression: Rec.601 luminance 0.4667 reads "dark" and
+    // picks white at 4.42:1 -- under the floor -- while black gives 4.76:1.
+    const grey: Rgb = .{ .r = 0x77, .g = 0x77, .b = 0x77 };
+    try testing.expect(!isLight(grey)); // Rec.601 still says dark...
+    try testing.expectEqual(Rgb{ .r = 0, .g = 0, .b = 0 }, contrastForeground(grey));
 }
 
 test "rgb<->hsb round-trip" {
@@ -434,6 +556,56 @@ test "contrastAdjusted: failing colors reach the 4.5 target" {
     const wr = wcagContrastRatio(wcagLuminance(bright_white), wcagLuminance(light_bg));
     try testing.expect(wr >= contrast_target - 0.1);
     try testing.expect(luminance(bright_white) < luminance(default_ansi_colors[15]));
+}
+
+test "scheme: every derived color clears its floor across the lightness range" {
+    // The picker's whole range, not a couple of handpicked themes: greys
+    // every 8 steps plus saturated mid-tones, which is where a "pick the
+    // light/dark side" rule is weakest.
+    var bgs: std.ArrayList(Rgb) = .empty;
+    defer bgs.deinit(testing.allocator);
+    var v: u16 = 0;
+    while (v <= 255) : (v += 8) {
+        const c: u8 = @intCast(v);
+        const inv: u8 = @intCast(255 - v);
+        try bgs.appendSlice(testing.allocator, &.{
+            .{ .r = c, .g = c, .b = c },
+            .{ .r = c, .g = inv, .b = 0x80 },
+            .{ .r = 0x80, .g = c, .b = inv },
+            .{ .r = inv, .g = 0x40, .b = c },
+        });
+    }
+
+    for (bgs.items) |bg| {
+        const s = scheme(bg);
+        try testing.expectEqual(bg, s.background);
+
+        const bg_lum = wcagLuminance(s.background);
+
+        // Text floor (design system 2.3) for the default foreground...
+        const fg_ratio = wcagContrastRatio(wcagLuminance(s.foreground), bg_lum);
+        try testing.expect(fg_ratio >= contrast_target);
+
+        // ...and for every ANSI color a program can select.
+        for (s.palette) |c| {
+            const ratio = wcagContrastRatio(wcagLuminance(c), bg_lum);
+            try testing.expect(ratio >= contrast_target - 0.1);
+        }
+
+        // Unconfigured selection is a straight fg/bg swap, so its text
+        // contrast is the foreground ratio by construction. Assert the
+        // identity rather than trusting the comment.
+        const sel_ratio = wcagContrastRatio(bg_lum, wcagLuminance(s.foreground));
+        try testing.expectEqual(fg_ratio, sel_ratio);
+    }
+}
+
+test "runtime_min_contrast: strengthens without reaching the text floor" {
+    // Deliberately between "no floor" and the text floor -- see the doc
+    // comment. A change here is a behavior change, not a tidy-up.
+    try testing.expectEqual(@as(f64, 3.0), runtime_min_contrast);
+    try testing.expect(runtime_min_contrast > 1.0);
+    try testing.expect(runtime_min_contrast < contrast_target);
 }
 
 test "adjustedPalette: all 16 meet the target against both extremes" {

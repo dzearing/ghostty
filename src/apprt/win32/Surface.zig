@@ -3104,16 +3104,45 @@ pub fn applyBackgroundTint(
     {
         // Terminal color state is shared with the IO thread — mutate under
         // the renderer mutex like every other GUI-thread terminal access.
+        //
+        // ONE hold for the whole scheme, deliberately: the renderer can
+        // draw between two holds, and a frame that has the new background
+        // but the old foreground is the unreadable flash T150 exists to
+        // remove (Mac `applyBackgroundForColor`).
         self.core_surface.renderer_state.mutex.lock();
         defer self.core_surface.renderer_state.mutex.unlock();
         const t = &self.core_surface.io.terminal;
         t.colors.background.set(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
         if (adjust_palette) {
-            const fg = color_math.contrastForeground(rgb);
-            t.colors.foreground.set(.{ .r = fg.r, .g = fg.g, .b = fg.b });
-            for (color_math.adjustedPalette(rgb), 0..) |c, i| {
+            const s = color_math.scheme(rgb);
+            const fg: terminal.color.RGB = .{
+                .r = s.foreground.r,
+                .g = s.foreground.g,
+                .b = s.foreground.b,
+            };
+            t.colors.foreground.set(fg);
+            for (s.palette, 0..) |c, i| {
                 t.colors.palette.set(@intCast(i), .{ .r = c.r, .g = c.g, .b = c.b });
             }
+
+            // The base 16 are readable now, but 256-color content — prompt
+            // greys from the grayscale ramp, cube colors — still carries
+            // the OLD background's lightness, and nothing else ever
+            // revisits indices 16–255. Regenerate them from the adjusted
+            // base-16 and the new bg/fg; `harmonious` keeps each entry's
+            // contrast RELATIVE to the background, which is what lets a
+            // dark-theme prompt stay legible when the background goes
+            // light (Mac `ghostty_surface_regenerate_palette`).
+            const generated = terminal.color.generate256Color(
+                t.colors.palette.current,
+                .initEmpty(),
+                .{ .r = rgb.r, .g = rgb.g, .b = rgb.b },
+                fg,
+                true,
+            );
+            // Adopt only the cube/ramp — the base 16 were just adjusted.
+            @memcpy(t.colors.palette.current[16..], generated[16..]);
+
             t.flags.dirty.palette = true;
         }
     }
@@ -3122,6 +3151,17 @@ pub fn applyBackgroundTint(
     if (self.scrollbar) |sb| {
         const fg = self.app.config.foreground.toTerminalRGB();
         sb.setTheme(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b }, fg);
+    }
+
+    // Truecolor content is beyond every palette above: a program that
+    // emitted `38;2;r;g;b` picked those channels for the background it saw
+    // at startup and is never told the background moved. Have the renderer
+    // enforce a floor per cell at draw time instead — it clamps upward
+    // only, so it can never weaken the user's `minimum-contrast`.
+    if (adjust_palette) {
+        _ = self.core_surface.renderer_thread.mailbox.push(.{
+            .min_contrast = @floatCast(color_math.runtime_min_contrast),
+        }, .{ .forever = {} });
     }
 
     self.core_surface.renderer_thread.wakeup.notify() catch {};
