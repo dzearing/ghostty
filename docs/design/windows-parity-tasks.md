@@ -712,6 +712,22 @@ Work these first, in order, before falling back to first-todo-in-table:
    while the loop runs, so treat it as infrastructure ahead of the cosmetics
    if the spike comes back cheap.
 
+3j. **T208 — the delivery path can silently ship a stale binary. Rank it
+   above the 3h cosmetics.** Hit for real delivering T202 on 2026-07-30:
+   `launch-upgrade.ps1` said `LAUNCH OK`, the upgrade log said `exe swapped`
+   and `UPGRADE OK`, and the installed release still reported `+9968a62d9`
+   — the binary from that afternoon. `upgrade-ghoztty-windows.ps1` has **no
+   build step** (its header says so) and `launch-upgrade.ps1` only checks that
+   `zig-out-release` *exists*, so the delivery copies whatever the previous
+   delivery left there. go.md documents the launch invocation in detail and
+   never says to build first, so a turn that follows it exactly ships stale
+   bits and gets "success" from every signal it has. T203/T204/T206 exist
+   because the user cannot see fixes; this is the mechanism that keeps them
+   from seeing *any* fix, so it goes first. Until it lands, **build
+   `--prefix zig-out-release` yourself before calling `launch-upgrade.ps1`,
+   and check `ghoztty +version` against `git rev-parse --short HEAD`
+   afterwards.**
+
 4. **Post-merge parity band (T118–T128), filed 2026-07-27 by ~~T117~~** (merge
    of origin/main `1e1cdbbd2`, 70 commits). These do NOT displace T113/T38/T39
    above — slot them in as follows:

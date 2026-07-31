@@ -196,6 +196,22 @@ line did not fail — re-run it unfiltered before believing it.
   unless `-AllowPlainResume` is passed. Also finish the turn (commit,
   tracker updated) BEFORE launching the script — it kills Claude after
   `-DelaySeconds`.
+- **BUILD THE STAGING RELEASE FIRST — the upgrade never builds** (2026-07-30,
+  T208). `upgrade-ghoztty-windows.ps1` copies whatever is already sitting in
+  `zig-out-release`, and `launch-upgrade.ps1` only checks that the directory
+  *exists*. Skip the build and the delivery ships the PREVIOUS delivery's
+  binary while `LAUNCH OK`, `exe swapped` and `UPGRADE OK` all report success.
+  That happened delivering T202: the installed release still reported
+  `+9968a62d9` afterwards. So, before the launch:
+
+  ```powershell
+  zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast `
+      -Dtarget=x86_64-windows-gnu -Dstrip=false --prefix zig-out-release
+  ```
+
+  and after it, `ghoztty +version` must report `git rev-parse --short HEAD`.
+  A delivery is not done until you have READ that commit back.
+
 - **Launch that upgrade through `scripts/launch-upgrade.ps1`, never with a
   hand-rolled `Start-Process`** (2026-07-30, T200). Call it IN-PROCESS from
   the turn's last tool call so the prompt binds as one string:
