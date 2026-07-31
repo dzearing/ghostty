@@ -26,14 +26,21 @@
 #     -StaleMinutes (30)
 #   - otherwise               -> BUSY, exit 3
 #
-# Actions: acquire | heartbeat | release | status
+# Actions: acquire | heartbeat | release | status | adopt
 # Exit codes: 0 ok, 2 usage/error, 3 BUSY (another live owner), 4 not owner.
+#
+# `adopt` is acquire's small cousin, for the watchdog (T241): a claude that was
+# relaunched IN the owning pane is the same loop slot with a new pid, and until
+# it runs step 0 the lock points at a corpse. Adopt re-points claude_pid at the
+# live process without touching the pane, the turn counter, or acquire's
+# takeover rules - the caller must already have established that the new
+# process really is the one in that pane.
 #
 #   powershell -NoProfile -File scripts\go-loop-lock.ps1 acquire
 #   powershell -NoProfile -File scripts\go-loop-lock.ps1 status -Json
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('acquire', 'heartbeat', 'release', 'status')]
+    [ValidateSet('acquire', 'heartbeat', 'release', 'status', 'adopt')]
     [string]$Action = 'status',
 
     [string]$Repo,
@@ -208,6 +215,30 @@ switch ($Action) {
         $lock.heartbeat = Now-Iso
         Write-Lock $lock
         Emit $lock "HEARTBEAT pane=$($lock.pane_id) pid=$($lock.claude_pid) turn=$($lock.turn)"
+        exit 0
+    }
+
+    'adopt' {
+        $lock = Read-Lock
+        if (-not $lock) { Emit $null 'NOTOWNER no lock file'; exit 4 }
+        if (-not (Test-Mine $lock) -and -not $Force) {
+            Emit $lock "NOTOWNER owner_pane=$($lock.pane_id) owner_pid=$($lock.claude_pid)"
+            exit 4
+        }
+        if ($myPid -le 0) { Emit $lock 'ERROR no claude pid to adopt'; exit 2 }
+        if (-not $myStamp) { Emit $lock "ERROR pid $myPid is not a live process"; exit 2 }
+        # Add-Member -Force, not property assignment: a lock written by an
+        # older build may not carry every field, and assigning to a missing
+        # property on a PSCustomObject throws.
+        $startIso = ''
+        if ($myStamp.Start) { $startIso = $myStamp.Start.ToString($IsoFmt) }
+        $lock | Add-Member -NotePropertyName claude_pid -NotePropertyValue $myPid -Force
+        $lock | Add-Member -NotePropertyName claude_name -NotePropertyValue $myStamp.Name -Force
+        $lock | Add-Member -NotePropertyName claude_start -NotePropertyValue $startIso -Force
+        $lock | Add-Member -NotePropertyName reason -NotePropertyValue 'adopted' -Force
+        $lock | Add-Member -NotePropertyName heartbeat -NotePropertyValue (Now-Iso) -Force
+        Write-Lock $lock
+        Emit $lock "ADOPTED pane=$($lock.pane_id) pid=$($lock.claude_pid) turn=$($lock.turn)"
         exit 0
     }
 

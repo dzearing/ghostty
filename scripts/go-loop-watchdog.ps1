@@ -12,13 +12,22 @@
 #      nothing - the loop is finished, not stuck.
 #   2. Read the lock. Healthy (owner alive AND heartbeat fresh) -> do nothing.
 #   3. Otherwise re-enter, choosing the cheapest action that fits:
-#        owner claude alive, pane alive, pane not producing output
+#        a claude is alive IN THE PANE, pane not producing output
 #                              -> send-keys "read go.md and go" + Enter
 #                                 (the turn ended with a report; nudge it)
-#        owner claude dead, pane alive
+#        pane alive but sitting at a shell prompt
 #                              -> send-keys the resume shim + Enter
 #        no lock / pane gone   -> +new-window running the resume shim
 #      then hold off for -RearmMinutes so a wedged box is not spammed.
+#
+# "A claude is alive IN THE PANE" is deliberately not "the pid I recorded is
+# alive" (T241). A claude relaunched in the pane has a new pid and has not
+# claimed the lock yet, so the recorded pid is a corpse while the pane is
+# occupied - and on 2026-07-31 that made this script type the shim's PATH into
+# a live Claude Code TUI, where it became a chat message. send-keys exit=0,
+# nothing re-entered, no error anywhere. So the pane is asked directly
+# (scripts\go-loop-pane-probe.ps1), and every typed re-entry is verified by
+# reading the pane back afterwards.
 #
 # Run detached so it survives the terminal that started it:
 #   Start-Process powershell -WindowStyle Hidden -ArgumentList `
@@ -42,6 +51,7 @@ param(
     [int]$StaleMinutes = 45,
     [int]$RearmMinutes = 20,
     [int]$ProbeGapSeconds = 8,
+    [int]$VerifySeconds = 6,    # how long to give a shim'd pane to paint claude
     [string]$LogPath,
     [string]$StatePath,
     [switch]$Once,          # single tick then exit (used by the acceptance test)
@@ -58,6 +68,8 @@ if (-not $LogPath) { $LogPath = Join-Path $env:TEMP 'ghoztty-go-loop-watchdog.lo
 if (-not $StatePath) { $StatePath = Join-Path (Join-Path $Repo 'temp') 'go-loop.watchdog.json' }
 
 $lockScript = Join-Path $PSScriptRoot 'go-loop-lock.ps1'
+$probeScript = Join-Path $PSScriptRoot 'go-loop-pane-probe.ps1'
+. $probeScript      # Get-PaneOccupant / Read-PaneOccupant
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValue = 'GhozttyGoLoopWatchdog'
 
@@ -172,6 +184,33 @@ function New-ResumeShim {
     return $path
 }
 
+# The lock names a dead pid but the pane holds a live claude (T241): point the
+# lock at that claude so the next tick reads `healthy` instead of re-deciding.
+# Only when it is unambiguous - guessing an owner is worse than leaving the
+# lock stale, because the nudged session rewrites it at go.md step 0 anyway.
+function Invoke-Adopt($lock, $paneId) {
+    if (-not $lock -or -not $paneId) { return }
+    $recorded = $null
+    if ($lock.claude_start) {
+        try {
+            $recorded = [datetime]::Parse($lock.claude_start, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind)
+        } catch { $recorded = $null }
+    }
+    $cands = @(Get-Process claude -ErrorAction SilentlyContinue | Where-Object {
+        $start = $null
+        try { $start = $_.StartTime } catch { $start = $null }
+        (-not $recorded) -or (-not $start) -or ($start -gt $recorded)
+    })
+    if ($cands.Count -ne 1) {
+        Log "  adopt skipped: $($cands.Count) candidate claude process(es); the nudged session will reclaim the lock itself"
+        return
+    }
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $lockScript adopt `
+        -Repo $Repo -LockPath $LockPath -PaneId $paneId -ClaudePid $cands[0].Id 2>&1 | Out-String
+    Log "  adopt pid=$($cands[0].Id): $($out.Trim())"
+}
+
 function Read-State {
     if (-not (Test-Path $StatePath)) { return $null }
     try { return (Get-Content $StatePath -Raw | ConvertFrom-Json) } catch { return $null }
@@ -218,25 +257,45 @@ function Invoke-Tick {
     $ownerAlive = $false
     if ($lock -and $null -ne $lock.owner_alive) { $ownerAlive = [bool]$lock.owner_alive }
 
-    if ($paneAlive -and $ownerAlive) {
+    # T241: ask the PANE who is listening, not the lock. The recorded pid is
+    # stale for the whole window between a claude relaunching in the pane and
+    # that session running go.md step 0, and typing a shell command into a TUI
+    # is a silent no-op.
+    $occupant = 'unknown'
+    if ($paneAlive) {
+        $occupant = Read-PaneOccupant -PaneId $paneId -GhozttyExe $GhozttyExe
+        Log "pane $paneId occupant=$occupant (lock owner_alive=$ownerAlive)"
+    }
+
+    if ($paneAlive -and ($ownerAlive -or $occupant -eq 'claude')) {
         if (Test-PaneProducing $paneId) {
             Log "stale heartbeat but pane $paneId is still producing output; not nudging"
             return 'none'
         }
-        Log "re-entering: nudge live session in pane $paneId (state=$state, remaining=$remaining)"
+        Log "re-entering: nudge live session in pane $paneId (state=$state, occupant=$occupant, remaining=$remaining)"
         if ($DryRun) { return 'nudge' }
         $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", $ResumePrompt, 'Enter')
         Log "  send-keys exit=$($r.Code) $($r.Out)"
+        # The lock still names a dead pid, so every later tick would re-decide
+        # from scratch. Hand it the pane's own claude when that is unambiguous.
+        if (-not $ownerAlive) { Invoke-Adopt $lock $paneId }
         Write-State 'nudge'
         return 'nudge'
     }
 
     $shim = New-ResumeShim
     if ($paneAlive) {
-        Log "re-entering: owner claude is gone, restarting it in pane $paneId (remaining=$remaining)"
+        Log "re-entering: no claude in pane $paneId (occupant=$occupant), running the resume shim there (remaining=$remaining)"
         if ($DryRun) { return 'restart-in-pane' }
-        $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", $shim, 'Enter')
+        $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", (ConvertTo-SendKeysLiteral $shim), 'Enter')
         Log "  send-keys exit=$($r.Code) $($r.Out)"
+        # Verify rather than assume: a shim path that landed in a TUI shows up
+        # as text and re-enters nothing, which is the T241 failure exactly.
+        Start-Sleep -Seconds $VerifySeconds
+        $after = Read-PaneOccupant -PaneId $paneId -GhozttyExe $GhozttyExe
+        if ($after -eq 'claude') { Log "  RESTART-IN-PANE OK: pane $paneId is running claude" }
+        elseif ($after -eq 'shell') { Log "  RESTART-IN-PANE UNVERIFIED: pane $paneId is still at a shell prompt after ${VerifySeconds}s" }
+        else { Log "  RESTART-IN-PANE UNVERIFIED: pane $paneId occupant is $after" }
         Write-State 'restart-in-pane'
         return 'restart-in-pane'
     }

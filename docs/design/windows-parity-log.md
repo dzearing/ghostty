@@ -3802,3 +3802,41 @@ Filed **T243** on the way through: `zig build` on this box panics inside the
 build runner - no diagnostic, no `error:` line - unless `ZIG_GLOBAL_CACHE_DIR`
 is on the repo's drive. That knowledge lived only in a private session memory
 and cost time again this turn, so build.zig should say it out loud.
+
+## 2026-07-31 - T241: ask the pane who is listening, not the lock
+
+The watchdog decided how to re-enter the loop by asking "is the pid I recorded
+still alive?" - a question about a process, when the one that matters is about
+the PANE. On 2026-07-31 that made it type the resume shim's PATH into a pane
+running Claude Code, where it became a chat message: `send-keys exit=0`, no
+error, nothing re-entered.
+
+The lock's pid is stale for the whole window between a claude relaunching in
+the pane and that session reaching go.md step 0. Correcting T241's own premise
+on the way: the upgrade's `reuse` path did NOT cause it - the log reads
+`UPGRADE OK (reused claude pid=22928)`, the pid the lock already held. Claude
+22928 exited and 13060 started seven seconds before the watchdog fired. The
+skew is general, so the fix had to be too.
+
+New `scripts/go-loop-pane-probe.ps1` classifies a pane's tail as
+claude/shell/unknown, with one rule doing the work: a shell prompt on the last
+non-empty line WINS, because a live TUI always owns the bottom of the screen -
+so Claude output above a prompt reads as "claude exited", not "claude is here".
+The watchdog nudges on `owner_alive OR occupant == claude`, reserves the shim
+for a real shell prompt, verifies the pane afterwards, and logs
+`occupant=<who>` every tick. `go-loop-lock.ps1` gained `adopt` so a relaunched
+claude in the owning pane can keep the lock.
+
+`+list --pid` was the exact probe and could not be used: on a
+session-persistence box every pane reports `pid: 0`, so it matches nothing
+(**T244**). Building the negative control also surfaced that `+send-keys`
+eats backslash escapes, so the shim path was typed raw - `C:\Users\tom\...`
+arrives with a TAB in it; now escaped, and reproduced live before fixing.
+**T245**: ghoztty CLI output redirected with `>` from PowerShell writes an
+empty file (a pipe or cmd.exe is fine) - silent, and it cost two detours here.
+
+Proved rather than argued: same scenario, old watchdog `ACTION
+restart-in-pane`, new watchdog `ACTION nudge`. `go-loop-guard.ps1` ALL PASS
+(103), with N2/N3 as the positive control that a genuine shell prompt still
+gets the shim; its GUI sections now run on the T211 background desktop. Both
+test lanes + test-agent + P1-P3 green.

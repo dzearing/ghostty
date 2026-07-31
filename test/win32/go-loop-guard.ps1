@@ -46,6 +46,10 @@ $lockScript = Join-Path $Repo 'scripts\go-loop-lock.ps1'
 $dogScript = Join-Path $Repo 'scripts\go-loop-watchdog.ps1'
 $execScript = Join-Path $Repo 'scripts\go-loop-exec.ps1'
 
+# Get-PaneOccupant / ConvertTo-SendKeysLiteral (section M drives them directly,
+# section N needs the escaper to type a path into a pane).
+. (Join-Path $Repo 'scripts\go-loop-pane-probe.ps1')
+
 New-Item -ItemType Directory -Force $root | Out-Null
 
 function Assert($name, $cond) {
@@ -294,7 +298,22 @@ Remove-Item $state -Force -ErrorAction SilentlyContinue
 ""
 "I. real re-entry (new window)"
 Stop-DebugGhoztty
-$gui = Start-Process $Exe -PassThru -ArgumentList '--session-persistence=false'
+# T211 desktop: every window these sections open is driven over IPC, never by
+# SendInput or screen capture, so this migrates off the interactive desktop
+# cleanly - and a watchdog test that yanks the user's foreground while they
+# work is exactly what they asked us to stop doing.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = $null
+try {
+    $td = New-TestDesktop
+    Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -WorkingDirectory $Repo | Out-Null
+} catch {
+    # A desktop we cannot create must not cost the whole suite; say so loudly
+    # and fall back, rather than reporting a green run that never happened.
+    "  NOTE test desktop unavailable ($_); falling back to the interactive desktop"
+    $td = $null
+    Start-Process $Exe -ArgumentList '--session-persistence=false' | Out-Null
+}
 $ready = $false
 for ($i = 0; $i -lt 40; $i++) {
     Start-Sleep -Milliseconds 500
@@ -446,11 +465,96 @@ if ($ready) {
         Ghoz @('+close', '--target=exec-a') | Out-Null
         Ghoz @('+close', '--target=plain-c') | Out-Null
     }
+
+    ""
+    "N. a live Claude TUI is never sent a shell command (T241)"
+    # The 2026-07-31 near-miss: the lock named a DEAD pid while a claude was
+    # running in the pane, so the watchdog typed the resume shim's PATH into a
+    # TUI. It became a chat message; send-keys reported 0; nothing re-entered.
+    $paneN = New-TestWindow 'go-loop-tui'
+    Assert 'N0 a stand-in loop pane is open' ($null -ne $paneN)
+    if ($paneN) {
+        $dead = Start-Sleeper; $sleepers += $dead
+        Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
+        Lock-Run @('acquire', '-PaneId', $paneN.id, '-ClaudePid', $dead.Id) | Out-Null
+        Stop-Process -Id $dead.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 600
+        Assert 'N1 the lock now reads stale-dead' ((Lock-Run @('status', '-PaneId', $paneN.id)).Out -match '^stale-dead')
+
+        # Positive control first: a pane genuinely at a shell prompt still gets
+        # the shim, so N3 is not just "the watchdog stopped doing anything".
+        $r = Dog-Run @('-DryRun', '-GhozttyExe', $Exe)
+        Assert 'N2 a dead owner at a shell prompt still gets the shim' ($r.Out -match 'ACTION restart-in-pane')
+        Assert 'N3 and the pane was classified as a shell' ($r.Out -match 'occupant=shell')
+
+        # Now put a stand-in TUI in the pane and re-decide. It must keep the
+        # bottom of the screen (a plain `echo` scrolls a shell prompt back
+        # under it, which is the "claude exited" case, not this one), and it
+        # must be quiet so the still-producing check does not veto the nudge.
+        $fake = Join-Path $root 'fake-tui.cmd'
+        @(
+            '@echo off',
+            'echo   bypass permissions on (shift+tab to cycle)',
+            'ping -n 120 127.0.0.1 >nul'
+        ) -join "`r`n" | Out-File -FilePath $fake -Encoding ascii
+        Ghoz @('+send-keys', "--target=$($paneN.id)", (ConvertTo-SendKeysLiteral $fake), 'Enter') | Out-Null
+        Start-Sleep -Seconds 3
+        $r = Dog-Run @('-DryRun', '-GhozttyExe', $Exe, '-ProbeGapSeconds', 3)
+        Assert 'N4 a live claude in the pane is nudged, not shim''d' ($r.Out -match 'ACTION nudge')
+        Assert 'N5 and the watchdog says who it found' ($r.Out -match 'occupant=claude')
+        Assert 'N6 the shim was never typed into it' ($r.Out -notmatch 'ACTION restart-in-pane')
+        Ghoz @('+send-keys', "--target=$($paneN.id)", 'C-c') | Out-Null
+        Ghoz @('+close', '--target=go-loop-tui') | Out-Null
+    }
 }
+
+# --- M / O: pure, so they run even when no GUI came up --------------------
+""
+"O. adopt: a relaunched claude in the owning pane keeps the lock"
+$adopter = Start-Sleeper; $sleepers += $adopter
+Remove-Item $lock -Force -ErrorAction SilentlyContinue
+Lock-Run @('acquire', '-PaneId', 'PANE-O', '-ClaudePid', $PID) | Out-Null
+$r = Lock-Run @('adopt', '-PaneId', 'PANE-O', '-ClaudePid', $adopter.Id)
+Assert 'O1 adopt succeeds for the owning pane' ($r.Code -eq 0 -and $r.Out -match '^ADOPTED')
+$L = Read-LockFile
+Assert 'O2 the lock now names the new pid' ([int]$L.claude_pid -eq $adopter.Id)
+Assert 'O3 the pane is unchanged' ($L.pane_id -eq 'PANE-O')
+Assert 'O4 the reason records the adoption' ($L.reason -eq 'adopted')
+Assert 'O5 the lock reads healthy again' ((Lock-Run @('status', '-PaneId', 'PANE-O')).Out -match '^held')
+$r = Lock-Run @('adopt', '-PaneId', 'PANE-STRANGER', '-ClaudePid', $adopter.Id)
+Assert 'O6 adopt from another pane is refused' ($r.Code -eq 4 -and $r.Out -match '^NOTOWNER')
+$r = Lock-Run @('adopt', '-PaneId', 'PANE-O', '-ClaudePid', 999999)
+Assert 'O7 adopting a dead pid is refused' ($r.Code -eq 2 -and $r.Out -match 'not a live process')
+
+# --- M. pane occupancy classifier (pure) ----------------------------------
+""
+"M. pane occupancy classifier"
+Assert 'M1 a cmd prompt is a shell' ((Get-PaneOccupant -Tail "some output`r`nD:\git\ghoztty>") -eq 'shell')
+Assert 'M2 a powershell prompt is a shell' ((Get-PaneOccupant -Tail "PS D:\git\ghoztty> ") -eq 'shell')
+Assert 'M3 a git-bash prompt is a shell' ((Get-PaneOccupant -Tail "David@BOX MINGW64 /d/git`r`n$ ") -eq 'shell')
+Assert 'M4 the Claude composer is claude' `
+    ((Get-PaneOccupant -Tail "  bypass permissions on (shift+tab to cycle)") -eq 'claude')
+Assert 'M5 an interrupt hint is claude' ((Get-PaneOccupant -Tail "Determining... (esc to interrupt)") -eq 'claude')
+Assert 'M6 an empty pane is unknown' ((Get-PaneOccupant -Tail '') -eq 'unknown')
+Assert 'M7 unrecognised output is unknown' ((Get-PaneOccupant -Tail "building...`r`nlink ok") -eq 'unknown')
+# The whole point of rule 1: claude output in the SCROLLBACK with a shell
+# prompt at the bottom means claude exited. Shim it, do not nudge it.
+Assert 'M8 claude output above a shell prompt is a shell' `
+    ((Get-PaneOccupant -Tail "esc to interrupt`r`nbypass permissions on`r`nD:\git\ghoztty>") -eq 'shell')
+# ...and a composer line must never read as a prompt just because it ends in
+# '>' (the loose "ends with >" regex is the trap this anchored rule replaces).
+Assert 'M9 the composer line is not a shell prompt' `
+    ((Get-PaneOccupant -Tail "  bypass permissions on`r`n| > run: dir D:\git >") -eq 'claude')
+# send-keys eats backslash escapes, so a shim path under a user called "tom"
+# would arrive with a TAB in it. Double them or the re-entry types nonsense.
+Assert 'M10 a path with \t survives send-keys escaping' `
+    ((ConvertTo-SendKeysLiteral 'C:\Users\tom\AppData\Local\Temp\go.cmd') -eq 'C:\\Users\\tom\\AppData\\Local\\Temp\\go.cmd')
+Assert 'M11 a path with no backslash is unchanged' ((ConvertTo-SendKeysLiteral 'go.cmd') -eq 'go.cmd')
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers
 Stop-DebugGhoztty
+if ($td) { Remove-TestDesktop }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $env:TEMP 'ghoztty-go-loop-resume.cmd') -Force -ErrorAction SilentlyContinue
 
