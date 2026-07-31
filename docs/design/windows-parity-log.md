@@ -3740,3 +3740,26 @@ Filed: **T239** (the banner chevron measures its arm thickness vertically at
 45°, so it paints ~0.71x the stroke width the other three glyphs do - the same
 class of one-control-disagreeing-with-the-set defect, found by the arithmetic
 rather than by eye).
+
+## 2026-07-31 - T232 delivered, and a near-miss the delivery itself caused
+
+Installed release verified at `+de07541ee` == HEAD, so the T232 chrome fix is
+on the box.
+
+The delivery then exposed a loop-killer, filed as **T241** and put at the very
+top of Current priorities. The upgrade's `reuse` path relaunches claude in-pane
+but never updates the lock's `claude_pid`, so the lock kept the pre-upgrade pid
+(22928, genuinely dead) while the live session was 13060. Five minutes later
+the watchdog read that stale pid, correctly concluded the recorded owner was
+gone, and took its `restart-in-pane` branch - which types a `.cmd` PATH into the
+pane. The pane runs a Claude Code TUI, so the path landed in the prompt box as
+text. `send-keys exit=0`. Nothing re-entered, nothing logged an error.
+
+The loop survived only because the user saw the stray path and pasted it back.
+That is the same silent-death mode that cost six days in July, arriving through
+the supervisor that was built to prevent it - so it outranks the UI block.
+
+`Test-OwnerAlive` is not at fault; it was handed a stale pid. Both halves need
+fixing: the upgrade must hand the lock its new pid, and the watchdog must not
+use the shell-prompt shim on a pane that already has a live claude (its `nudge`
+branch is already right for that case).
