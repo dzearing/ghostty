@@ -3332,3 +3332,52 @@ right pane within a window; here it picks the right **window**, where every
 pane is an indistinguishable `cmd.exe`.
 
 Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.
+
+## 2026-07-31 - T217 batch 6: two more scripts, and a product bug the move found
+
+`agent-upgrade` and `session-reattach` onto the test desktop; 16 of 22 done, 6
+left. `agent-upgrade` is ALL PASS (53 assertions, up from 45) x3 with its
+negative control failing as required. `session-reattach` is **migrated and RED
+on a new task, T223**, which the migration is what found.
+
+T223: `App.performDeferredFocus` bypasses the T105 foreground guard off the
+input desktop - `shouldPerformDeferredFocus(false, ...)` returns true
+unconditionally, which is T215's fix and whose stated reason is sound (a
+background desktop has no foreground window, so the guard would drop every
+focus change and keyboard focus could never move). The assumption underneath it
+was that the T105 two-window restore ping-pong needed foreground activation and
+so could not happen there. It does not, and it does: focusFlips measured 34-40
+in 3s across three runs, against a pre-T105 baseline of 36 and a post-fix 0.
+`onInputDesktop()` is also false on a locked workstation, behind a secure
+desktop, and in a disconnected RDP session, so this is a user-facing path -
+the same shape of mistake as T216's `GetCursorPos`. The script keeps F10/F11
+red and named for T223 rather than relaxing the bound; everything else in it
+(A-E, F1-F9) passes.
+
+The general lesson for the rest of T217: before trusting a green on the test
+desktop, ask what the PRODUCT does differently off the input desktop.
+`onInputDesktop()` in `App.zig` is the list of places to ask. Here the feared
+outcome was a vacuous PASS (guard bypassed, every assert dropped, oracle proves
+nothing) and the actual outcome was a genuine RED - both need the same question
+asked. Corollary: `GetForegroundWindow` is null for EVERY window on a
+background desktop, so any assertion built on it scores zero and passes
+silently. `session-reattach`'s F11b ("foreground stays parked") was deleted for
+that reason rather than relabelled; grep a candidate script for
+`GetForegroundWindow` before migrating it.
+
+Cheaper than expected: `session-reattach` drives everything through
+`+list`/`+sessions`/`+read` and the on-disk manifest, so only its three
+`Start-Process` GUI launches touched the desktop, and its 120-line private
+`T105Drv` became four harness calls plus a 12-line `Measure-FocusFlips`. One
+new harness primitive was needed - `Send-TestRawMessage`, a raw `PostMessage`
+for the app's private `WM_APP+n` protocol (F11 seeds a co-pending pair of
+`WM_APP_SETFOCUS` asserts; no user gesture produces that).
+
+Also noted for later: `profile-latency` is at-risk like `split-dim`. Its
+scroll positive control is a PrintWindow pixel hash of the TERMINAL surface -
+the CAPTURE LIMIT case, where the two hashes would come back equal and the
+assertion inverts rather than merely weakening - and it measures input latency
+through `SendInput`, which a posted-key port would turn into a different
+quantity. Decide that deliberately rather than converting it mechanically.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.

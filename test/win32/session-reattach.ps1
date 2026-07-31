@@ -1,4 +1,4 @@
-# Session-layout re-attach (tracker T89f — same-PID restore). The WRITE half
+# Session-layout re-attach (tracker T89f - same-PID restore). The WRITE half
 # (T89f1) proves the win32 viewer-side manifest
 # (%LOCALAPPDATA%\ghoztty\session-layout[-debug].json) is captured + atomically
 # written as the topology changes; the RESTORE half (T89f2, section F) proves a
@@ -24,24 +24,57 @@
 #      pane's IPC name + scrollback and the window title pin.
 #
 # Non-interactive; asserts and exits nonzero on any failure. Fully hermetic: a
-# per-run $env:LOCALAPPDATA + per-run GHOSTTY_LOCAL_AGENT_BIN, and it ONLY ever
-# kills ghoztty / ghoztty-agent processes launched from the repo zig-out (never
-# the user's real release instance, which uses a different IPC socket + agent
-# lineage).
+# per-run $env:LOCALAPPDATA, a per-run GHOSTTY_LOCAL_AGENT_BIN, a private IPC
+# pipe suffix, and it ONLY ever kills ghoztty / ghoztty-agent processes launched
+# from the repo zig-out (never the user's real release instance, which uses a
+# different IPC endpoint + agent lineage).
+#
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1), so
+# it never takes the user's foreground - asserted at the end, not assumed. A-E
+# and F1-F9 drive everything through the `+...` CLI and the on-disk manifest, so
+# the migration only moves the three GUI LAUNCHES onto the test desktop; those
+# CLI calls stay on cmd.exe, being console-only and windowless.
+#
+# F10/F11 ARE RED ON THE TEST DESKTOP, AND THAT IS A PRODUCT BUG (T223), NOT A
+# HARNESS FAULT. `App.performDeferredFocus` BYPASSES the T105 guard off the input
+# desktop - `shouldPerformDeferredFocus(false, ...)` is unconditionally true,
+# because a background desktop has no foreground window and the guard would
+# otherwise drop every focus change (T215's fix, which this whole harness rests
+# on). The expectation going in was that the storm needed foreground activation
+# and so could not reproduce there. It does: measured focusFlips 43 and 39 in 3s,
+# against a pre-T105 baseline of 36 and a post-fix 0. Since `onInputDesktop()`
+# is also false on a LOCKED workstation, behind a secure desktop, and in a
+# disconnected RDP session, this is a real user-facing path - see T223, which
+# owns the fix and names these two assertions as its oracle. Everything else in
+# this script is green, so the migration itself is done (same shape as
+# `remote-inherit` sitting RED on T178 in T217 batch 3).
+#
+# The old F11b (foreground stays parked) is GONE rather than relabelled:
+# GetForegroundWindow returns null for every window on a background desktop, so
+# its oracle could only ever have scored zero.
 #
 #   powershell -NoProfile -File test\win32\session-reattach.ps1
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
-    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe'
+    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    [switch]$NegativeControl,
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
+$script:passes = 0
 $root = Join-Path $env:TEMP "ghoztty-session-reattach-$PID"
 
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Write-Host, not the pipeline: a helper that both asserts and returns a value
+# would otherwise hand its caller @('  PASS ...', $realValue).
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { Write-Host "  PASS $name"; $script:passes++ }
+    else { Write-Host "  FAIL $name" -ForegroundColor Red; $script:failures++ }
 }
+function Say($m) { Write-Host $m }
 
 # Kill ONLY zig-out ghoztty/agent processes (never the user's release build).
 function Stop-TestProcs {
@@ -54,7 +87,7 @@ function Stop-TestProcs {
 }
 
 # Kill ONLY the zig-out ghoztty APP (leave ghoztty-agent alive so its PTYs
-# survive — the crash/upgrade re-attach scenario the restore half tests).
+# survive - the crash/upgrade re-attach scenario the restore half tests).
 function Stop-AppOnly {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
         Where-Object { $_.CommandLine -like '*zig-out*' } |
@@ -238,162 +271,83 @@ function Count-Leaf-Nodes($node) {
 # Pre-fix, a 2-window restore live-locked: each restored window queued a
 # WM_APP_SETFOCUS assert whose execution stole activation from the other
 # window; every steal re-fired the loser's WM_SETFOCUS forwarding, queueing
-# the next assert — a perpetual activation ping-pong that made the app
-# uncontrollable. The oracle samples the GUI thread's focus window (wedge-
-# immune: needs no foreground) and the global foreground window, counting
-# transitions between the two restored top-levels.
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class T105Drv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct GUITHREADINFO {
-        public uint cbSize; public uint flags;
-        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
-        public RECT rcCaret;
-    }
-    [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
+# the next assert. The oracle samples the GUI thread's focus window
+# (GetGUIThreadInfo, via the harness - wedge-immune, needs no foreground) and
+# counts transitions between the two restored top-levels. See the header for
+# what this does and does not prove off the input desktop.
 
-    // All visible GhozttyWindow top-levels of a process.
-    public static IntPtr[] TopWindows(uint pid) {
-        var wins = new List<IntPtr>();
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") wins.Add(h);
-            }
-            return true;
-        }, IntPtr.Zero);
-        return wins.ToArray();
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab (best-effort; the wedge may swallow it).
-    public static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
+# hwnd -> index of the restored top-level it belongs to. Built once from each
+# window's descendants (EnumChildWindows is recursive), which is what turns a
+# focused PANE hwnd back into "which window".
+function Get-WindowOwnerMap($wins) {
+    $map = @{}
+    for ($i = 0; $i -lt $wins.Count; $i++) {
+        $map[[int64]$wins[$i]] = $i
+        foreach ($c in @(Get-TestChildWindows -Window $wins[$i] -Class '*')) {
+            $map[[int64]$c.Hwnd] = $i
         }
-        return fg;
     }
-
-    // First GhozttyTerminal child of a top-level (a pane surface HWND).
-    public static IntPtr FirstTerminal(IntPtr top) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal") { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Which of the app top-levels does hwnd belong to (itself or via root)?
-    static IntPtr Belongs(IntPtr[] wins, IntPtr h) {
-        if (h == IntPtr.Zero) return IntPtr.Zero;
-        IntPtr root = GetAncestor(h, 2); // GA_ROOT
-        foreach (var w in wins) if (w == h || w == root) return w;
-        return IntPtr.Zero;
-    }
-
-    // Sample for totalMs at stepMs; count transitions of (a) the global
-    // foreground window and (b) the GUI thread's focus window between
-    // DIFFERENT app top-levels. Returns { fgFlips, focusFlips }.
-    public static int[] SampleFlips(IntPtr[] wins, int totalMs, int stepMs) {
-        uint pid; uint tid = GetWindowThreadProcessId(wins[0], out pid);
-        int fgFlips = 0, focFlips = 0;
-        IntPtr lastFg = IntPtr.Zero, lastFoc = IntPtr.Zero;
-        for (int t = 0; t < totalMs; t += stepMs) {
-            IntPtr fgApp = Belongs(wins, GetForegroundWindow());
-            if (fgApp != IntPtr.Zero) {
-                if (lastFg != IntPtr.Zero && fgApp != lastFg) fgFlips++;
-                lastFg = fgApp;
-            }
-            var gi = new GUITHREADINFO();
-            gi.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
-            if (GetGUIThreadInfo(tid, ref gi)) {
-                IntPtr focApp = Belongs(wins, gi.hwndFocus);
-                if (focApp != IntPtr.Zero) {
-                    if (lastFoc != IntPtr.Zero && focApp != lastFoc) focFlips++;
-                    lastFoc = focApp;
-                }
-            }
-            Thread.Sleep(stepMs);
-        }
-        return new int[] { fgFlips, focFlips };
-    }
+    return $map
 }
-'@
 
-# One hermetic GUI launch (fresh LOCALAPPDATA + agent-bin override).
+# Transitions of the app GUI thread's focus window between the two top-levels.
+# Both windows live on one GUI thread, so sampling via $wins[0] covers the app.
+function Measure-FocusFlips($wins, $totalMs, $stepMs) {
+    $map = Get-WindowOwnerMap $wins
+    $flips = 0
+    $last = -1
+    $n = [int]($totalMs / $stepMs)
+    for ($t = 0; $t -lt $n; $t++) {
+        $f = [int64](Get-TestFocusedWindow -Window $wins[0])
+        if ($map.ContainsKey($f)) {
+            $idx = $map[$f]
+            if ($last -ge 0 -and $idx -ne $last) { $flips++ }
+            $last = $idx
+        }
+        Start-Sleep -Milliseconds $stepMs
+    }
+    return $flips
+}
+
+# One hermetic GUI launch ON THE TEST DESKTOP (fresh LOCALAPPDATA + agent-bin
+# override, both inherited through CreateProcessW).
 function Start-Backed($label, $title) {
     $tmp = Join-Path $root $label
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @("--title=$title") | Out-Null
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @("--title=$title")
     $pane = Wait-FirstPane $tmp 25
     $rows = Wait-AliveCount $tmp 'setup' 1 18
     $ok = ($null -ne $pane -and (Count-Alive $rows) -eq 1)
-    return @{ Tmp = $tmp; Ok = $ok }
+    return @{ Tmp = $tmp; Ok = $ok; Pid = $app.Pid }
 }
 
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
+$savedPipe = $env:GHOZTTY_PIPE_SUFFIX
+# Isolate the IPC endpoint unconditionally: every assertion below is read back
+# through `+list` / `+sessions` / `+read`, and an instance answering the shared
+# pipe would answer them about somebody else's windows.
+$env:GHOZTTY_PIPE_SUFFIX = '-reattach'
+
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+
+try {
 
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 
 # ============================================================================
-"== A: startup window is captured with its agent session id"
+Say "== A: startup window is captured with its agent session id"
 # ============================================================================
 $g = Start-Backed 'capture' 't89f-reattach'
 Assert "A1 startup pane is agent-backed (one live session)" $g.Ok
+Assert "A1b the launched app has no window on the interactive desktop" `
+    (-not (Test-TestDesktopLeak -ProcessId $g.Pid))
 $tmp = $g.Tmp
 $sid0 = @(Alive-Ids (Get-Sessions $tmp 'a'))[0]
 
@@ -407,7 +361,7 @@ Assert "A4 captured leaf session_id matches the live agent session" (
 Assert "A5 manifest declares schema version 1" ($null -ne $mA -and $mA.version -eq 1)
 
 # ============================================================================
-"== B: +split grows the captured tree to a split + two leaves"
+Say "== B: +split grows the captured tree to a split + two leaves"
 # ============================================================================
 Run-Cli '+split --direction=right --name=f89sib' "$tmp\split.txt" 15 | Out-Null
 $rowsB = Wait-AliveCount $tmp 'b' 2 15
@@ -427,7 +381,7 @@ Assert "B6 both captured leaf session_ids are live agent sessions" (
     $sidsB.Count -eq 2 -and ($aliveB -contains $sidsB[0]) -and ($aliveB -contains $sidsB[1]))
 
 # ============================================================================
-"== C: +new-window adds a second captured window with its IPC name"
+Say "== C: +new-window adds a second captured window with its IPC name"
 # ============================================================================
 Run-Cli '+new-window --target=second' "$tmp\neww.txt" 15 | Out-Null
 $mC = Wait-Manifest $tmp { param($m) @($m.windows).Count -ge 2 } 10
@@ -438,7 +392,7 @@ Assert "C3 the second window's id equals its IPC name" (
     $second.Count -eq 1 -and $second[0].id -eq 'second')
 
 # ============================================================================
-"== D: +rename --title captures the window title pin"
+Say "== D: +rename --title captures the window title pin"
 # ============================================================================
 Run-Cli '+rename --target=second --title=HelloTitle' "$tmp\rename.txt" 12 | Out-Null
 $mD = Wait-Manifest $tmp {
@@ -451,7 +405,7 @@ Assert "D1 the title pin was captured into title_override" (
     $w2.Count -eq 1 -and $w2[0].title_override -eq 'HelloTitle')
 
 # ============================================================================
-"== E: every captured window has a real frame + boolean maximized"
+Say "== E: every captured window has a real frame + boolean maximized"
 # ============================================================================
 $mE = Read-Manifest $tmp
 $framesOk = $true
@@ -466,7 +420,7 @@ Assert "E1 every window records a frame with positive width/height" $framesOk
 Assert "E2 every window records a boolean maximized flag" $maxOk
 
 # ============================================================================
-"== F: quit-keep-sessions then relaunch re-ATTACHes the whole layout"
+Say "== F: quit-keep-sessions then relaunch re-ATTACHes the whole layout"
 # ============================================================================
 # Reuse the A-E state: window 1 (startup pane + the f89sib split) + window
 # 'second' (title 'HelloTitle') = a 2-window / 3-pane layout with 3 live
@@ -476,9 +430,9 @@ Assert "E2 every window records a boolean maximized flag" $maxOk
 # A single space-free token: send-keys concatenates positional args (and cmd's
 # /c nesting would collapse a quoted space anyway), so a bare marker + Enter is
 # the robust way to plant text. cmd echoes it + errors ("'MARKER' is not
-# recognized..."), both landing the token in scrollback. The minimized window's
-# client area is a few columns wide, so cmd's line WRAPS the marker across rows —
-# match with all whitespace stripped (the T99 section-D narrow-pane technique).
+# recognized..."), both landing the token in scrollback. Matched with all
+# whitespace stripped (the T99 section-D narrow-pane technique), so a marker
+# that cmd wrapped across rows still counts.
 $marker = "REATTACHMARKER$($PID)XYZ"  # no separators: survives per-glyph wrapping
 function Read-HasMarker($f) { return ((Out-Text $f) -replace '\s', '') -match $marker }
 Run-Cli "+send-keys --target=f89sib $marker Enter" "$tmp\mark.txt" 12 | Out-Null
@@ -512,36 +466,47 @@ Assert "F4 the agent kept all 3 sessions alive after the app died" (
     $agentIds.Count -eq 3 -and ($beforeIds | Where-Object { $agentIds -contains $_ }).Count -eq 3)
 
 # Relaunch (same LOCALAPPDATA + agent bin). Restore must suppress the blank
-# startup window and rebuild both windows by re-ATTACHing. VISIBLE relaunch on
-# purpose (T106): real relaunches are visible, and pre-T106 the replayed
-# scrollback only survived a minimized cycle (the raw ring replay parsed at the
-# restored window's transient/live grid instead of the geometry it was drawn
-# at, so the recorded scrolls never pushed content into scrollback and
-# conhost's post-attach ESC[2J fresh-paint erased it). F8 is the oracle:
-# baseline-proven RED on a visible relaunch pre-fix, green post-fix.
+# startup window and rebuild both windows by re-ATTACHing. The relaunch is
+# VISIBLE on purpose (T106): pre-T106 the replayed scrollback only survived a
+# minimized cycle (the raw ring replay parsed at the restored window's
+# transient/live grid instead of the geometry it was drawn at, so the recorded
+# scrolls never pushed content into scrollback and conhost's post-attach
+# ESC[2J fresh-paint erased it). F8 is the oracle: baseline-proven RED on a
+# visible relaunch pre-fix, green post-fix. On the test desktop every launch is
+# a normal visible one, so this is the shape that runs.
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-$relaunched = Start-Process -FilePath $Exe -PassThru
+$relaunched = Start-OnTestDesktop -Exe $Exe
 
 $winCount = Wait-Windows $tmp 'f-post' 2 30
 Assert "F5 relaunch restored exactly two windows (no extra blank)" ($winCount -eq 2)
 $leafCount = Count-Leaves $tmp 'f-post'
 Assert "F6 relaunch restored all three panes" ($leafCount -eq 3)
+Assert "F6b the relaunched app has no window on the interactive desktop" `
+    (-not (Test-TestDesktopLeak -ProcessId $relaunched.Pid))
 
 # ATTACH proof: the agent still has EXACTLY the same 3 sessions alive (a fresh
 # OPEN per pane would have spawned new ones on top of the survivors).
 $afterIds = @(Alive-Ids (Wait-AliveCount $tmp 'f-after' 3 20))
-Assert "F7 the same 3 sessions are alive after relaunch (ATTACH, not re-OPEN)" (
-    $afterIds.Count -eq 3 -and ($beforeIds | Where-Object { $afterIds -contains $_ }).Count -eq 3)
+$sameThree = ($afterIds.Count -eq 3 -and ($beforeIds | Where-Object { $afterIds -contains $_ }).Count -eq 3)
+if ($NegativeControl) {
+    # Invert the claim the whole restore half exists for: that the panes were
+    # RE-ATTACHED rather than freshly re-OPENed. A control that passes here is
+    # scoring a build that threw the user's live sessions away.
+    Say 'NEGATIVE CONTROL: asserting restore re-OPENed new sessions instead of attaching - this run MUST fail'
+    Assert "F7 restore replaced the live sessions with new ones (inverted)" (-not $sameThree)
+} else {
+    Assert "F7 the same 3 sessions are alive after relaunch (ATTACH, not re-OPEN)" $sameThree
+}
 
 # The restored split pane kept its IPC name (re-registered on restore) AND its
 # scrollback (gap-fill replay from the agent ring). Whitespace-stripped match,
-# same narrow-pane wrapping as F1.
+# same wrapping tolerance as F1.
 $postOk = $false
 $deadline = (Get-Date).AddSeconds(25)
 while ((Get-Date) -lt $deadline) {
     # 2000 lines (was 200): headroom against reflow/repaint after re-attach
-    # pushing the narrow-wrapped replayed marker deeper into the tail.
+    # pushing the wrapped replayed marker deeper into the tail.
     $code = Run-Cli '+read --name=f89sib --lines=2000' "$tmp\read-post.txt" 10
     if ($code -eq 0 -and (Read-HasMarker "$tmp\read-post.txt")) { $postOk = $true; break }
     Start-Sleep -Milliseconds 700
@@ -550,7 +515,7 @@ Assert "F8 restored pane keeps its IPC name and its pre-quit scrollback" $postOk
 
 # The window title pin survived the round-trip (rewritten manifest post-restore).
 # Direct poll (not Wait-Manifest): the manifest is rewritten atomically as the
-# restored panes publish their session ids, so a single racy read can miss it —
+# restored panes publish their session ids, so a single racy read can miss it -
 # re-read until the 'second' window shows its restored title_override.
 $f9 = $false
 $deadline = (Get-Date).AddSeconds(20)
@@ -565,83 +530,89 @@ while ((Get-Date) -lt $deadline) {
 Assert "F9 the restored window's title pin came back" $f9
 
 # ============================================================================
-"== F10: restore-time focus stability across a VISIBLE relaunch (T105)"
-# The pre-fix live-lock needs the app to be foreground while restore builds
-# both windows back-to-back (baseline-proven: fgFlips=38/focusFlips=36 in 3s
-# pre-fix, 0/0 post-fix). Do a SECOND app-only kill + relaunch, this time
-# visible, grabbing foreground onto the first restored window the moment it
-# exists, and sample before any Run-Cli cmd.exe perturbs activation. The
-# scrollback asserts live in the F5-F9 cycle above (visible since T106) —
-# THIS cycle asserts focus stability only.
+Say "== F10: restore-time focus settling across a second relaunch (T105, RED on T223)"
+# Do a SECOND app-only kill + relaunch and watch the GUI thread's focus window
+# while restore builds both windows back-to-back. Pre-T105 this live-locked
+# (baseline: fgFlips=38/focusFlips=36 in 3s pre-fix, 0/0 post-fix). Off the
+# input desktop the T105 guard is bypassed (T215), and the storm comes back with
+# it: this assertion is the oracle T223 has to turn green. Do NOT relax the
+# bound to make the suite quiet - the number IS the finding.
 Stop-AppOnly
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-$relaunch2 = Start-Process -FilePath $Exe -PassThru
+$relaunch2 = Start-OnTestDesktop -Exe $Exe
 $wins = @()
-$grabbedEarly = $false
-$deadline = (Get-Date).AddSeconds(25)
+$deadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $deadline) {
-    $wins = @([T105Drv]::TopWindows([uint32]$relaunch2.Id))
-    if (-not $grabbedEarly -and $wins.Count -ge 1) {
-        $grabbedEarly = [T105Drv]::GrabForeground($wins[0])
+    $w1 = Get-TestWindow -ProcessId $relaunch2.Pid -Class 'GhozttyWindow'
+    if ($w1 -ne [IntPtr]::Zero) {
+        $w2 = Get-TestWindow -ProcessId $relaunch2.Pid -Class 'GhozttyWindow' -Exclude $w1
+        if ($w2 -ne [IntPtr]::Zero) { $wins = @($w1, $w2); break }
     }
-    if ($wins.Count -ge 2) { break }
     Start-Sleep -Milliseconds 100
 }
-Assert "F10a both restored top-level windows enumerated (visible relaunch)" ($wins.Count -eq 2)
+Assert "F10a both restored top-level windows enumerated on the test desktop" ($wins.Count -eq 2)
 if ($wins.Count -eq 2) {
-    $storm = [T105Drv]::SampleFlips($wins, 3000, 40)
-    "  (restore-time fgFlips=$($storm[0]) focusFlips=$($storm[1]) grabbedEarly=$grabbedEarly)"
-    Assert "F10 no restore-time focus storm between the two windows" ($storm[1] -le 2)
+    $storm = Measure-FocusFlips $wins 3000 40
+    Say "  (restore-time focusFlips=$storm)"
+    Assert "F10 restore-time focus does not churn between the two windows (RED on T223)" ($storm -le 2)
 }
 
 # F11 (T105 floor): seed one pending WM_APP_SETFOCUS (0x8005 = WM_APP+5)
-# assert per window, queued back-to-back with no drain gap, then require
-# focus/foreground to settle. This is an invariant floor, not the
-# discriminating oracle (F10 is: the perpetual storm needs the app to be
-# foreground DURING restore — baseline-proven). Post-fix the guard drops any
-# assert whose window is not foreground, so the pair must always settle.
-# PostMessage needs no foreground rights: wedge-immune.
-"== F11: seeded co-pending focus asserts must settle, not ping-pong (T105)"
+# assert per window, queued back-to-back with no drain gap, then require focus
+# to settle. PostMessage needs no foreground rights, so this is wedge-immune
+# and works identically on either desktop. The old F11b (foreground stays
+# parked) is gone: GetForegroundWindow is null for every window on a background
+# desktop, so its oracle could only ever have scored zero (see the header).
+Say "== F11: seeded co-pending focus asserts must settle, not ping-pong (T105, RED on T223)"
 if ($wins.Count -eq 2) {
-    $grabbed = [T105Drv]::GrabForeground($wins[0])  # realism, best-effort
-    $surf0 = [T105Drv]::FirstTerminal($wins[0])
-    $surf1 = [T105Drv]::FirstTerminal($wins[1])
+    $surf0 = Get-TestChildWindow -Window $wins[0] -Class 'GhozttyTerminal'
+    $surf1 = Get-TestChildWindow -Window $wins[1] -Class 'GhozttyTerminal'
     Assert "F11a a terminal surface found in each restored window" (
         $surf0 -ne [IntPtr]::Zero -and $surf1 -ne [IntPtr]::Zero)
     if ($surf0 -ne [IntPtr]::Zero -and $surf1 -ne [IntPtr]::Zero) {
-        [T105Drv]::PostMessageW($surf0, 0x8005, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-        [T105Drv]::PostMessageW($surf1, 0x8005, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        Send-TestRawMessage -Window $surf0 -Message 0x8005 | Out-Null
+        Send-TestRawMessage -Window $surf1 -Message 0x8005 | Out-Null
         Start-Sleep -Milliseconds 300
-        $flips = [T105Drv]::SampleFlips($wins, 3000, 40)
-        "  (post-seed fgFlips=$($flips[0]) focusFlips=$($flips[1]) grabbed=$grabbed)"
-        Assert "F11 GUI-thread focus settles after seeded asserts" ($flips[1] -le 2)
-        if ($grabbed) {
-            Assert "F11b foreground stays parked after seeded asserts" ($flips[0] -le 2)
-        } else {
-            "  SKIP F11b (foreground grab failed - box wedge); focus oracle still ran"
-        }
+        $flips = Measure-FocusFlips $wins 3000 40
+        Say "  (post-seed focusFlips=$flips)"
+        Assert "F11 GUI-thread focus settles after seeded asserts (RED on T223)" ($flips -le 2)
     }
 } else {
-    "  SKIP F11 (restored windows not enumerated)"
+    Assert "F11 could not run: the restored windows were not enumerated" $false
 }
 
 # ============================================================================
 if ($script:failures -gt 0) {
-    "== DIAG: final manifest =="
+    Say "== DIAG: final manifest =="
     $dp = Manifest-Path $tmp
-    if (Test-Path $dp) { Get-Content $dp -Raw } else { "NO MANIFEST FILE at $dp" }
-    "== DIAG: sid0=$sid0"
+    if (Test-Path $dp) { Say (Get-Content $dp -Raw) } else { Say "NO MANIFEST FILE at $dp" }
+    Say "== DIAG: sid0=$sid0"
 }
 
-# ============================================================================
-"== cleanup"
-Stop-TestProcs
-$env:LOCALAPPDATA = $savedLocalAppData
-if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
-else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
-if ($script:failures -eq 0) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
-else { "artifacts preserved at $root" }
+} finally {
+    Say "== cleanup"
+    Remove-TestDesktop
+    Stop-TestProcs
+    $env:LOCALAPPDATA = $savedLocalAppData
+    if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
+    else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
+    $env:GHOZTTY_PIPE_SUFFIX = $savedPipe
+    if ($script:failures -eq 0) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+    else { Say "artifacts preserved at $root" }
+}
 
-if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
-else { "$($script:failures) FAILURE(S)"; exit 1 }
+$fgSeen = @(Stop-TestForegroundWatch)
+Say "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live pid list: Remove-TestDesktop has run by
+    # now and emptied the live one, which would score this against nothing.
+    $launched = @(Get-TestLaunchedPids)
+    Assert "G1 the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert "G2 no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
+}
+
+Say ""
+if ($script:failures -eq 0) { Say "ALL PASS ($script:passes assertions)"; exit 0 }
+else { Say "$($script:failures) FAILURE(S) / $script:passes passed"; exit 1 }

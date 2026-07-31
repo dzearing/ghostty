@@ -32,13 +32,34 @@
 # so there is no way to fabricate an old agent from a new tree. The decision and
 # the restart it drives are the shipping ones.
 #
-# Hermetic: per-run $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN, and it only
-# ever kills ghoztty / ghoztty-agent processes launched from the repo zig-out.
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1), so
+# it never takes the user's foreground - asserted at the end, not assumed. The
+# private win32 driver this script used to carry (its own T86 GrabForeground +
+# SendInput + EnumWindows) is gone. Notes on what the harness changes here:
+#
+#   * The GUI is launched with Start-OnTestDesktop, so its window is created on
+#     the test desktop. The env this script sets (LOCALAPPDATA,
+#     GHOSTTY_LOCAL_AGENT_BIN, GHOZTTY_AGENT_BUNDLED_VERSION,
+#     GHOZTTY_PIPE_SUFFIX) still reaches it - CreateProcessW inherits the
+#     harness process's block.
+#   * ConfirmDialog is NOT a standard #32770: it runs its own nested pump
+#     (ConfirmDialog.runModal) reading WM_KEYDOWN straight off the queue, so a
+#     POSTED Escape/Tab/Enter drives it (Send-TestControlKey) with no foreground
+#     grab and no focus call.
+#   * The `+...` CLI invocations stay on Start-Process. They are console-only
+#     and windowless; nothing about them can steal foreground, and routing them
+#     through the desktop would buy nothing.
+#
+# Hermetic: per-run $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN + a private IPC
+# pipe suffix, and it only ever kills ghoztty / ghoztty-agent processes launched
+# from the repo zig-out.
 #
 #   powershell -NoProfile -File test\win32\agent-upgrade.ps1
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
-    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe'
+    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    [switch]$NegativeControl,
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = 'Continue'
@@ -46,96 +67,17 @@ $script:failures = 0
 $script:passes = 0
 $root = Join-Path $env:TEMP "ghoztty-agent-upgrade-$PID"
 
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Write-Host, never the pipeline: a helper that asserts AND returns a value
+# would otherwise hand its caller an array of @('  PASS ...', $realValue), and
+# the caller's `.Pid` / `-eq` silently reads the wrong element. Start-App below
+# does exactly that pairing.
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name"; $script:passes++ }
-    else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { Write-Host "  PASS $name"; $script:passes++ }
+    else { Write-Host "  FAIL $name" -ForegroundColor Red; $script:failures++ }
 }
-
-Add-Type @'
-using System;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class UpgDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    // The visible ConfirmDialog of ANY of the given pids (0 = any process).
-    public static IntPtr FindDialog(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if ((pid == 0 || p == pid) && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyConfirmDialog") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static string TitleOf(IntPtr h) {
-        var sb = new StringBuilder(512);
-        GetWindowTextW(h, sb, 512);
-        return sb.ToString();
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab (kb-actions.ps1 recipe): attach to the
-    // current foreground owner's thread + an Alt tap, retried. The
-    // already-foreground guard is load-bearing - re-grabbing a window that is
-    // already foreground can drop it.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true);
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    // Press a sequence of VKs into `dlg` after taking the foreground.
-    public static string PressInto(IntPtr dlg, ushort[] vks) {
-        if (!GrabForeground(dlg)) return "ABORT: could not foreground";
-        foreach (var vk in vks) {
-            Key(vk, false); Thread.Sleep(40); Key(vk, true);
-            Thread.Sleep(120);
-        }
-        return "SENT";
-    }
-}
-'@
+function Say($m) { Write-Host $m }
 
 function Stop-TestProcs {
     foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
@@ -229,19 +171,19 @@ function Test-PaneResponsive($tmp, $target, $tag, $timeoutSec = 25) {
     return $false
 }
 
+# The confirmation, on the test desktop. Class-filtered by the harness, so
+# "found" already means it is a GhozttyConfirmDialog owned by this app.
+function Find-Dialog($appPid) {
+    return Get-TestWindow -ProcessId ([int]$appPid) -Class 'GhozttyConfirmDialog'
+}
 function Wait-Dialog($appPid, $timeoutSec = 30) {
-    $deadline = (Get-Date).AddSeconds($timeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        $h = [UpgDrv]::FindDialog([uint32]$appPid)
-        if ($h -ne [IntPtr]::Zero) { return $h }
-        Start-Sleep -Milliseconds 400
-    }
-    return [IntPtr]::Zero
+    return Wait-TestWindow -ProcessId ([int]$appPid) -Class 'GhozttyConfirmDialog' `
+        -TimeoutMs ($timeoutSec * 1000)
 }
 function Wait-NoDialog($appPid, $timeoutSec = 12) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
-        if ([UpgDrv]::FindDialog([uint32]$appPid) -eq [IntPtr]::Zero) { return $true }
+        if ((Find-Dialog $appPid) -eq [IntPtr]::Zero) { return $true }
         Start-Sleep -Milliseconds 400
     }
     return $false
@@ -275,22 +217,21 @@ function Wait-LogMatch($path, $pattern, $timeoutSec = 25) {
     return $false
 }
 
-# Launch the GUI and wait until it answers +list with at least one pane.
-# Sets $script:AppLog to this launch's captured stderr.
+# Launch the GUI ON THE TEST DESKTOP and wait for its window. Sets
+# $script:AppLog (this launch's captured stderr, which is also its stdout - the
+# harness points both handles at one file) and $script:AppTop (the owner hwnd,
+# needed for the modality assertions). Returns the pid, or 0.
 function Start-App($tmp, $title, $extraArgs = @()) {
     $argv = @("--title=$title") + $extraArgs
     $script:AppLog = Join-Path $tmp "applog-$title.err.txt"
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $argv `
-        -RedirectStandardError $script:AppLog `
-        -RedirectStandardOutput (Join-Path $tmp "applog-$title.out.txt") | Out-Null
-    $deadline = (Get-Date).AddSeconds(40)
-    while ((Get-Date) -lt $deadline) {
-        $proc = @(Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-            Where-Object { $_.CommandLine -like "*$title*" })
-        if ($proc.Count -gt 0) { return [int]$proc[0].ProcessId }
-        Start-Sleep -Milliseconds 400
-    }
-    return 0
+    $script:AppTop = [IntPtr]::Zero
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments $argv -StdErr $script:AppLog
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -TimeoutMs 40000
+    $script:AppTop = $top
+    if ($top -eq [IntPtr]::Zero) { return 0 }
+    Assert "leak: '$title' has no window on the interactive desktop" `
+        (-not (Test-TestDesktopLeak -ProcessId $app.Pid))
+    return [int]$app.Pid
 }
 function Wait-Panes($tmp, $tag, $target, $timeoutSec = 40) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -302,10 +243,6 @@ function Wait-Panes($tmp, $tag, $target, $timeoutSec = 40) {
     return (Get-List $tmp "$tag-last" 10)
 }
 
-$VK_ESCAPE = [uint16]0x1B
-$VK_TAB = [uint16]0x09
-$VK_RETURN = [uint16]0x0D
-
 # A stamp that is unambiguously NEWER than any real build, so the policy's
 # never-downgrade rule can't quietly turn the test into a no-op.
 $FAKE_NEW = '29991231-t147fake'
@@ -315,18 +252,28 @@ New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedOverride = $env:GHOZTTY_AGENT_BUNDLED_VERSION
+$savedPipe = $env:GHOZTTY_PIPE_SUFFIX
 
 $tmp = Join-Path $root 'run'
 New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
+# Isolate the IPC endpoint unconditionally: every `+list` / `+read` /
+# `+send-keys` below is an oracle, and an instance answering the shared pipe
+# would answer them about somebody else's windows.
+$env:GHOZTTY_PIPE_SUFFIX = '-agentupg'
+
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+
+try {
 
 Assert "setup: ghoztty exe exists in zig-out" (Test-Path $Exe)
 Assert "setup: agent exe exists in zig-out" (Test-Path $AgentExe)
 
 # ============================================================================
-"== A: premise - the agent reports a parseable build stamp"
+Say "== A: premise - the agent reports a parseable build stamp"
 # ============================================================================
 $verOut = Join-Path $tmp 'version.txt'
 $vp = Start-Process -FilePath $AgentExe -ArgumentList @('--version') -WindowStyle Hidden -PassThru `
@@ -334,17 +281,17 @@ $vp = Start-Process -FilePath $AgentExe -ArgumentList @('--version') -WindowStyl
 $null = $vp.Handle
 $vp.WaitForExit()
 $verText = (Out-Text $verOut).Trim()
-"    --version => '$verText'"
+Say "    --version => '$verText'"
 Assert "A1 --version exits 0" ($vp.ExitCode -eq 0)
 Assert "A2 --version prints 'ghoztty-agent <stamp>'" ($verText -match '^ghoztty-agent\s+\S+$')
 $stamp = ($verText -split '\s+')[-1]
 Assert "A3 the stamp is non-empty" ($stamp.Length -gt 0)
 # The date prefix is what the never-downgrade rule orders on; a build with no
 # date ('dev') still works, but say so out loud rather than silently.
-if ($stamp -notmatch '^\d{8}-') { "    NOTE: stamp '$stamp' has no YYYYMMDD prefix (dev build)" }
+if ($stamp -notmatch '^\d{8}-') { Say "    NOTE: stamp '$stamp' has no YYYYMMDD prefix (dev build)" }
 
 # ============================================================================
-"== B: negative control - a CURRENT agent is never touched"
+Say "== B: negative control - a CURRENT agent is never touched"
 # ============================================================================
 $appPidB = Start-App $tmp 't147-current'
 $logB = $script:AppLog
@@ -356,7 +303,7 @@ Assert "B3 an agent is running for this run" ($agentB -ne 0)
 # The launch check has already run by the time +list answers; give it room
 # anyway, then assert nothing happened.
 Start-Sleep -Seconds 6
-Assert "B4 no confirmation dialog for a current agent" ([UpgDrv]::FindDialog([uint32]$appPidB) -eq [IntPtr]::Zero)
+Assert "B4 no confirmation dialog for a current agent" ((Find-Dialog $appPidB) -eq [IntPtr]::Zero)
 Assert "B5 the agent was NOT restarted (same pid)" ((Agent-Pid $tmp) -eq $agentB)
 $leafB = (All-Leaves (Get-List $tmp 'b1' 10))[0]
 Assert "B6 the pane still works" (Test-PaneResponsive $tmp $leafB.id 'b')
@@ -368,11 +315,12 @@ Assert "B7 the no-op decision is logged with its reason" `
 Stop-TestProcs
 
 # ============================================================================
-"== C: stale + a live session => mandatory confirmation, nothing killed yet"
+Say "== C: stale + a live session => mandatory confirmation, nothing killed yet"
 # ============================================================================
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
 $appPidC = Start-App $tmp 't147-stale-decline'
 $logC = $script:AppLog
+$topC = $script:AppTop
 Assert "C1 the GUI came up" ($appPidC -ne 0)
 $agentC = Wait-AgentPid $tmp 25
 Assert "C2 an agent is running for this run" ($agentC -ne 0)
@@ -380,12 +328,23 @@ Assert "C2 an agent is running for this run" ($agentC -ne 0)
 $dlgC = Wait-Dialog $appPidC 40
 Assert "C3 the mandatory confirmation appeared" ($dlgC -ne [IntPtr]::Zero)
 if ($dlgC -ne [IntPtr]::Zero) {
-    $title = [UpgDrv]::TitleOf($dlgC)
-    "    dialog title: '$title'"
+    $title = Get-TestWindowText -Window $dlgC
+    Say "    dialog title: '$title'"
     Assert "C4 it names the background process restart" ($title -like '*background terminal process*')
+    # "Mandatory" is a modality claim, and IsWindowEnabled on the owner is the
+    # only cross-process-safe way to check it: ConfirmDialog.show disables its
+    # owner for exactly as long as it is up. Nothing asserted this before the
+    # T217 migration - the old script could only see that a window existed.
+    Assert "C4b the owner window is DISABLED while the confirmation is up" `
+        (($topC -ne [IntPtr]::Zero) -and (-not (Test-TestWindowEnabled -Window $topC)))
 }
 # THE contract assert: consent comes BEFORE the destruction, not after.
-Assert "C5 the agent is still alive and unchanged while the dialog is up" ((Agent-Pid $tmp) -eq $agentC)
+if ($NegativeControl) {
+    Say 'NEGATIVE CONTROL: asserting the agent was killed BEFORE the user answered - this run MUST fail'
+    Assert "C5 the agent was destroyed while the dialog was still up (inverted)" ((Agent-Pid $tmp) -ne $agentC)
+} else {
+    Assert "C5 the agent is still alive and unchanged while the dialog is up" ((Agent-Pid $tmp) -eq $agentC)
+}
 
 # THE T201 assert, and it must run HERE -- before the dialog is answered.
 # `ConfirmDialog.show` pumps its own loop and does not return until the user
@@ -399,13 +358,17 @@ Assert "C9 the decision is logged while the dialog is STILL UP" `
 Assert "C10 the pending modal announces itself before it blocks" `
     (Wait-LogMatch $logC 'showing mandatory restart confirmation.*waiting for the user' 20)
 Assert "C11 the dialog is still up after those asserts (they did not race it)" `
-    ([UpgDrv]::FindDialog([uint32]$appPidC) -ne [IntPtr]::Zero)
+    ((Find-Dialog $appPidC) -ne [IntPtr]::Zero)
 
 if ($dlgC -ne [IntPtr]::Zero) {
-    $r = [UpgDrv]::PressInto($dlgC, @($VK_ESCAPE))
-    "    Escape => $r"
+    # ConfirmDialog reads WM_KEYDOWN off its own nested pump, so a posted
+    # Escape reaches it without any foreground grab.
+    $r = Send-TestControlKey -Control $dlgC -Key Escape
+    Say "    Escape => $r"
 }
 Assert "C6 the dialog closed on 'Later'" (Wait-NoDialog $appPidC 15)
+Assert "C6b the owner window is enabled again once the modal is gone" `
+    (($topC -ne [IntPtr]::Zero) -and (Test-TestWindowEnabled -Window $topC))
 Start-Sleep -Seconds 3
 Assert "C7 declining left the agent running (same pid)" ((Agent-Pid $tmp) -eq $agentC)
 $treeC = Wait-Panes $tmp 'c0' 1
@@ -414,7 +377,7 @@ Assert "C8 the live pane survived the decline" (Test-PaneResponsive $tmp $leafC.
 Stop-TestProcs
 
 # ============================================================================
-"== D: stale + 'Update Now' => the agent is replaced and panes come back"
+Say "== D: stale + 'Update Now' => the agent is replaced and panes come back"
 # ============================================================================
 $appPidD = Start-App $tmp 't147-stale-accept'
 Assert "D1 the GUI came up" ($appPidD -ne 0)
@@ -425,8 +388,10 @@ Assert "D3 the confirmation appeared" ($dlgD -ne [IntPtr]::Zero)
 if ($dlgD -ne [IntPtr]::Zero) {
     # Focus starts on the dismissive button (MB_DEFBUTTON2 parity), so Tab
     # moves to "Update Now" and Enter takes it.
-    $r = [UpgDrv]::PressInto($dlgD, @($VK_TAB, $VK_RETURN))
-    "    Tab+Enter => $r"
+    Send-TestControlKey -Control $dlgD -Key Tab | Out-Null
+    Start-Sleep -Milliseconds 200
+    $r = Send-TestControlKey -Control $dlgD -Key Enter
+    Say "    Tab+Enter => $r"
 }
 Assert "D4 the dialog closed on 'Update Now'" (Wait-NoDialog $appPidD 15)
 $agentD2 = Wait-AgentPid $tmp 30 $agentD
@@ -441,7 +406,7 @@ Assert "D9 the rebuilt pane is responsive on the new agent" (Test-PaneResponsive
 Stop-TestProcs
 
 # ============================================================================
-"== E: the deferral promise - idle after a decline refreshes SILENTLY"
+Say "== E: the deferral promise - idle after a decline refreshes SILENTLY"
 # ============================================================================
 $appPidE = Start-App $tmp 't147-idle'
 $logE = $script:AppLog
@@ -450,7 +415,7 @@ $agentE = Wait-AgentPid $tmp 25
 Assert "E2 an agent is running for this run" ($agentE -ne 0)
 $dlgE = Wait-Dialog $appPidE 40
 Assert "E3 the confirmation appeared (a session is live)" ($dlgE -ne [IntPtr]::Zero)
-if ($dlgE -ne [IntPtr]::Zero) { [UpgDrv]::PressInto($dlgE, @($VK_ESCAPE)) | Out-Null }
+if ($dlgE -ne [IntPtr]::Zero) { Send-TestControlKey -Control $dlgE -Key Escape | Out-Null }
 Assert "E4 the dialog closed on 'Later'" (Wait-NoDialog $appPidE 15)
 $treeE = Wait-Panes $tmp 'e0' 1
 $winE = (Windows-Of $treeE)[0]
@@ -468,7 +433,7 @@ while ((Get-Date) -lt $deadline) {
 Assert "E5 the window actually closed (the agent is now idle)" $closed
 $agentE2 = Wait-AgentPid $tmp 40 $agentE
 Assert "E6 the idle agent was refreshed without asking again (new pid)" ($agentE2 -ne 0 -and $agentE2 -ne $agentE)
-Assert "E7 no second dialog was shown" ([UpgDrv]::FindDialog([uint32]$appPidE) -eq [IntPtr]::Zero)
+Assert "E7 no second dialog was shown" ((Find-Dialog $appPidE) -eq [IntPtr]::Zero)
 # The silent arm is the one most in need of a log line: it restarts the agent
 # with no UI at all, so the log is the ONLY record that it happened.
 Assert "E8 the silent idle refresh is logged with its reason" `
@@ -476,14 +441,14 @@ Assert "E8 the silent idle refresh is logged with its reason" `
 Stop-TestProcs
 
 # ============================================================================
-"== F: negative control - session-persistence=off never runs the check"
+Say "== F: negative control - session-persistence=off never runs the check"
 # ============================================================================
 $appPidF = Start-App $tmp 't147-nopersist' @('--session-persistence=false')
 $logF = $script:AppLog
 Assert "F1 the GUI came up" ($appPidF -ne 0)
 Wait-Panes $tmp 'f0' 1 | Out-Null
 Start-Sleep -Seconds 6
-Assert "F2 no dialog with persistence off" ([UpgDrv]::FindDialog([uint32]$appPidF) -eq [IntPtr]::Zero)
+Assert "F2 no dialog with persistence off" ((Find-Dialog $appPidF) -eq [IntPtr]::Zero)
 Assert "F3 no agent was spawned at all" ((Agent-Pid $tmp) -eq 0)
 # The other half of B7: now that a decision always logs, "the check never ran"
 # is a checkable claim rather than the default silence.
@@ -491,11 +456,27 @@ Assert "F4 no decision line at all with persistence off" `
     ((Read-AppLog $logF) -notmatch 'agent upgrade check:')
 Stop-TestProcs
 
-$env:LOCALAPPDATA = $savedLocalAppData
-$env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
-$env:GHOZTTY_AGENT_BUNDLED_VERSION = $savedOverride
-Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+} finally {
+    Remove-TestDesktop
+    Stop-TestProcs
+    $env:LOCALAPPDATA = $savedLocalAppData
+    $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
+    $env:GHOZTTY_AGENT_BUNDLED_VERSION = $savedOverride
+    $env:GHOZTTY_PIPE_SUFFIX = $savedPipe
+    Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+}
 
-""
-if ($script:failures -eq 0) { "AGENT-UPGRADE: ALL PASS ($script:passes)"; exit 0 }
-else { "AGENT-UPGRADE: $script:failures FAILURE(S) / $script:passes passed"; exit 1 }
+$fgSeen = @(Stop-TestForegroundWatch)
+Say "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live pid list: Remove-TestDesktop has run by
+    # now and emptied the live one, which would score this against nothing.
+    $launched = @(Get-TestLaunchedPids)
+    Assert "G1 the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert "G2 no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
+}
+
+Say ""
+if ($script:failures -eq 0) { Say "AGENT-UPGRADE: ALL PASS ($script:passes)"; exit 0 }
+else { Say "AGENT-UPGRADE: $script:failures FAILURE(S) / $script:passes passed"; exit 1 }

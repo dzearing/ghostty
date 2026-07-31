@@ -826,6 +826,15 @@ public class GhozttyTestDesktop {
         return (bool)Run(delegate() { return PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero); });
     }
 
+    // Post an ARBITRARY message. For the app's own private WM_APP+n protocol
+    // messages, which a test seeds directly to drive an internal code path
+    // (e.g. WM_APP_SETFOCUS, whose co-pending pair is the T105 oracle). Posted,
+    // never sent: these are handled at the top of the app's run loop, and a
+    // synchronous send would block this worker thread on the app's GUI thread.
+    public bool PostRaw(IntPtr h, uint msg, IntPtr wp, IntPtr lp) {
+        return (bool)Run(delegate() { return PostMessageW(h, msg, wp, lp); });
+    }
+
     public bool SendControlKey(IntPtr ctl, ushort vk, ushort[] mods) {
         return (bool)Run(delegate() {
             var ks = new byte[256];
@@ -1454,6 +1463,27 @@ function Send-TestControlKey {
 function Send-TestWindowClose {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).CloseWindow($Window)
+}
+
+<#
+Post a raw message to a window - for the app's PRIVATE WM_APP+n protocol, where
+the test is deliberately seeding an internal code path rather than simulating a
+user (session-reattach seeds a co-pending pair of WM_APP_SETFOCUS asserts, which
+is the T105 oracle). Posted, never sent: the app handles these at the top of its
+run loop, and a synchronous send would block the harness's one worker thread.
+
+Not for input. Keys and clicks go through Send-TestKeys / Send-TestMouse, which
+carry the modifier state and lParam encoding those messages need.
+#>
+function Send-TestRawMessage {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][uint32]$Message,
+        [IntPtr]$WParam = [IntPtr]::Zero,
+        [IntPtr]$LParam = [IntPtr]::Zero,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).PostRaw($Window, $Message, $WParam, $LParam)
 }
 
 <#
