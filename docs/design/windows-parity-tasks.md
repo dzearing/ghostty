@@ -140,11 +140,24 @@ Work these first, in order, before falling back to first-todo-in-table:
     mean Mac suppresses the menu under reporting too. **T246** has the Mac seat
     settle it empirically in minutes.
 
-    **T150** rides directly behind it: the user wants the menu's *Background
-    Color…* to actually adapt (*"plus a bunch of logic for remapping foreground
-    colors to adapt"*). The picker exists; Mac's single-pass accessible
-    recompute (`c3e9999e7`) was never ported, so a live background change can
-    leave text below the contrast floor. **T240 → T150.**
+    **~~T150~~ (done, 2026-07-31)** rode directly behind it: the user wanted
+    the menu's *Background Color…* to actually adapt (*"plus a bunch of logic
+    for remapping foreground colors to adapt"*). The picker already set a
+    background and a contrast foreground; what was missing was everything
+    underneath — palette 16–255 was never regenerated (index 250 sat at 1.67:1
+    on a light pick, now 10.6:1), truecolor was beyond every palette until
+    `min_contrast = 3.0` reached it at draw time (230,230,230 → 138,138,138 =
+    3.03:1), and two sub-floor holes in the color math itself — a Rec.601
+    side-choice that put `#777777` on white at 4.42:1, and a one-sided L*
+    search that returned still-failing colors. Both of those last two are in
+    the Mac code it was ported from: **T247**.
+
+    Its process lesson is **T248**, and it is not confined to color:
+    `+new-window --target=` is idempotent against a **persisted** session, and
+    killing `ghoztty.exe` does not remove one. So from the second run onward,
+    an acceptance script that reuses a target name never runs its fixture — it
+    focuses last run's pane and measures last run's pixels. The fix is to kill
+    the repo's agent too and launch with `--session-persistence=off`.
 
 0000. **THE UI QUALITY BLOCK (user, 2026-07-31, with screenshots).** The user
     walked the tab strip pixel by pixel and every complaint checks out as
