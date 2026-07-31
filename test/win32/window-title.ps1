@@ -272,7 +272,9 @@ try {
 $fgSeen = @(Stop-TestForegroundWatch)
 Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
 if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
-    $launched = @($script:GhozttyTestDesktopPids | Select-Object -Unique)
+    # Get-TestLaunchedPids, not the live pid list: Remove-TestDesktop has run
+    # by now and emptied the live one, which would score this against nothing.
+    $launched = @(Get-TestLaunchedPids)
     Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'

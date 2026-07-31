@@ -965,7 +965,14 @@ public class GhozttyTestDesktop {
 # ---------------------------------------------------------------------------
 
 $script:GhozttyTestDesktop = $null
+# Live processes, emptied by Remove-TestDesktop as it kills them...
 $script:GhozttyTestDesktopPids = @()
+# ...and every pid this run ever launched, which Remove-TestDesktop does NOT
+# touch. The end-of-run leak assertion has to compare against the second list:
+# it runs AFTER the cleanup, and reading the live list there silently scores
+# an empty set - an assertion that passes because it checked nothing.
+# Read it with Get-TestLaunchedPids.
+$script:GhozttyTestDesktopAllPids = @()
 
 # VK codes by friendly name. Single characters fall through to VkKeyScan-free
 # uppercase mapping, which is what every existing script already assumes.
@@ -1015,6 +1022,7 @@ function New-TestDesktop {
     if (-not $td.Ready) { throw "New-TestDesktop failed: $($td.SetupError)" }
     $script:GhozttyTestDesktop = $td
     $script:GhozttyTestDesktopPids = @()
+    $script:GhozttyTestDesktopAllPids = @()
     if ($interactiveMode) {
         Write-Host "NOTE  test desktop DISABLED (-Interactive): running on the interactive desktop, this WILL steal focus"
     }
@@ -1039,6 +1047,7 @@ function Start-OnTestDesktop {
     $procId = $td.StartProcess($Exe, $argLine, $WorkingDirectory, $StdErr)
     if ($procId -eq 0) { throw "Start-OnTestDesktop failed: $($td.LastError)" }
     $script:GhozttyTestDesktopPids += $procId
+    $script:GhozttyTestDesktopAllPids += $procId
     $p = $null
     try { $p = [System.Diagnostics.Process]::GetProcessById($procId) } catch { }
     return [pscustomobject]@{ Pid = $procId; Process = $p }
@@ -1547,6 +1556,17 @@ function Start-TestForegroundWatch { [GhozttyTestDesktop]::StartForegroundWatch(
 function Stop-TestForegroundWatch {
     $raw = [GhozttyTestDesktop]::StopForegroundWatch()
     return @($raw.Split(',') | Where-Object { $_ } | ForEach-Object { [int]$_ })
+}
+
+# Every pid this run launched onto the test desktop, dead ones included. This
+# is what the end-of-run leak assertion compares the foreground samples
+# against - it survives Remove-TestDesktop, which the live pid list does not:
+#
+#     $fgSeen = @(Stop-TestForegroundWatch)
+#     $leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
+#     Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground'
+function Get-TestLaunchedPids {
+    return @($script:GhozttyTestDesktopAllPids | Select-Object -Unique)
 }
 
 # Is any window of $ProcessId visible on the INTERACTIVE desktop? Must be

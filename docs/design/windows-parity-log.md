@@ -9,6 +9,41 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-31 - **T217 batch 3** (10 of 23): `confirm-dialogs`, `config-errors`,
+  `remote-inherit` migrated onto the background test desktop. The two dialog
+  scripts are ALL PASS x3 (27 and 15 assertions) with FAILING negative
+  controls; `remote-inherit` is migrated but stays RED on **T178** (3
+  identical failures x3, all downstream of section 3's missing
+  `t68-split-marker`) - a product bug, not a harness one, and its gate.
+  - **A batch-2 assertion was vacuous and is fixed.** `Remove-TestDesktop`
+    empties the live pid list as it kills processes, and the foreground-leak
+    assertion runs *after* the `finally` that calls it - so `command-registry`
+    and `window-title` were asserting "no test-desktop app ever became
+    foreground" against an EMPTY list. It could not have failed. The harness
+    now keeps a separate never-cleared list behind `Get-TestLaunchedPids`;
+    both scripts re-run green with the assertion actually scoring something.
+    (Batch 1's scripts were never affected - they snapshot inside the try.)
+  - `config-errors` printed its failure count and **exited 0**, so a red run
+    scored as green to any exit-code-reading driver. It exits 1 now.
+  - T178 gains measured evidence rather than the old guesses: the app logs
+    `surface child exited exit_code=0 runtime=6ms wait_after_command=true`
+    and the pane holds only the exit notice, so the command IS forwarded and
+    DOES run - what goes missing is its OUTPUT. That rules out two of the
+    three filed hypotheses and points at the attach/replay seam for a
+    short-lived remote command. Its old fourth red (`new tab pane appeared`)
+    now passes: the harness lands ctrl+t where the foreground grab used to
+    race.
+  - **T183 reproduced on the win32 lane** (it was filed as a none-lane flake):
+    same `session_meta ... FileNotFound` then `panic: attempt to use null
+    value`, this time with the line pinned (`fc.last_resize.?`,
+    server.zig:3480), triggered by running the floor lanes while acceptance
+    scripts ran - the normal thing to do on this box. Solo re-run green.
+  - `split-dim` is **blocked on T214**, not merely pending: it probes the
+    terminal surface's own pixels, which PrintWindow returns as a flat fill.
+    Recorded in T217 so a later batch does not "migrate" it into an assertion
+    that passes against nothing.
+  - Next: T217 batch 4 (13 remain, `split-dim` excluded).
+
 - 2026-07-30 (later still) - **T200 DONE**, and a correction to the entry below.
   **The T196 delivery to the installed release never ran.** The previous turn
   launched `upgrade-ghoztty-windows.ps1` detached at the boundary, reported it as
