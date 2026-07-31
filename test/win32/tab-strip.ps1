@@ -253,6 +253,36 @@ try {
     Assert ($px.R -ge 10 -and $px.R -le 40) "strip: dead space right of the tab is bar background, not tab or accent (R=$($px.R))"
 
     # -----------------------------------------------------------------------
+    # 2c. T242: the selected chiclet's SEAM row carries no rim.
+    #
+    #     User report, 2026-07-31: "the active tab seems to have a horizontal
+    #     line at the bottom, making it feel disconnected from the pane below."
+    #     The whole selection idiom is that the chiclet MERGES into the pane, so
+    #     a line across its baseline undoes section 2 above by another means.
+    #     Cause: the rim was derived from the baseline-CLIPPED distance field,
+    #     so it traced the clip - RIM_BOT (0.04) of white over a (0,0,0) fill is
+    #     ~10 levels, across the tab's full width.
+    #
+    #     Oracle: the strip's LAST row inside the chiclet must be no brighter
+    #     than an interior row of the same fill. Sampled at several x so a
+    #     single stray pixel neither passes nor fails it.
+    # -----------------------------------------------------------------------
+    $seamY  = $offY + $barH - 1
+    $innerY = $offY + $barH - 5
+    $seamMax = 0; $innerMax = 0; $seamAt = -1
+    for ($x = $tabLeft + 8; $x -lt $tabRight - 8; $x += 4) {
+        $ps = $shot.Bitmap.GetPixel($offX + $x, $seamY)
+        $pi = $shot.Bitmap.GetPixel($offX + $x, $innerY)
+        $sl = [int]$ps.R + $ps.G + $ps.B
+        $il = [int]$pi.R + $pi.G + $pi.B
+        if ($sl -gt $seamMax) { $seamMax = $sl; $seamAt = $x }
+        if ($il -gt $innerMax) { $innerMax = $il }
+    }
+    Write-Host "INFO  seam row: max=$seamMax (x=$seamAt) vs interior max=$innerMax"
+    Assert ($seamMax -le ($innerMax + 6)) `
+        "selection: the chiclet's seam row is the pane's own fill, not a rim (seam=$seamMax interior=$innerMax)"
+
+    # -----------------------------------------------------------------------
     # 2b. T232, in pixels: the "+" glyph's own margins, and its symmetry.
     #
     #     The user's report was "the plus icon has a huge left gap and no

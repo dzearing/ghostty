@@ -153,9 +153,20 @@ Work these first, in order, before falling back to first-todo-in-table:
     belongs to the terminal, horizontal chrome sizes to content with a
     proportional cap.
 
-    Then the four tasks that bring the chrome into compliance:
+    Then the tasks that bring the chrome into compliance:
 
-    **T232 → T235 → T233 → T234.**
+    **~~T232~~ → ~~T242~~ → T235 → T233 → T234.**
+
+    - **T242 (done, 2026-07-31)** — *"the active tab seems to have a horizontal
+      line at the bottom, making it feel disconnected from the pane below."*
+      Root-caused: `sdTab` clips the silhouette square at the baseline with a
+      half-plane (`max(body_round, y - b)`), and the rim is derived from that
+      same field — so it faithfully traces an edge that isn't real. At the
+      bottom row `sd = -1`, so `rim = 1.0 * RIM_BOT (0.04)`, lightening the
+      seam row by ~9 levels across the tab's full width. Fix: derive the rim
+      from the UN-clipped shape; keep coverage clipped. Goes right after T232
+      because it is the same surface and it defeats T202's entire selection
+      idiom (the selected chiclet is supposed to MERGE into the pane).
 
     - **T232** — the strip's spacing and glyph geometry. Measured at the
       user's 125%: the "+" square sits **16 px** from the tab and **1 px**

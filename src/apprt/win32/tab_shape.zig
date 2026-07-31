@@ -153,17 +153,37 @@ fn sdFlare(x: f32, y: f32, cx: f32, cy: f32, r: f32, box_l: f32, box_r: f32, box
     return @max(in_box, outside_disc);
 }
 
-/// Signed distance to the whole tab silhouette: a top-rounded body plus a
-/// flare at each bottom corner.
-pub fn sdTab(x: f32, y: f32, t: Tab, m: Metrics) f32 {
+/// Signed distance to the tab silhouette WITHOUT its baseline — the field the
+/// RIM is drawn from (T242).
+///
+/// The baseline is not an edge of the tab. It is the seam where the tab meets
+/// the pane below, and the whole selection idiom (T202) is that the selected
+/// chiclet MERGES into that pane. `sdTab` clips the shape square there so the
+/// fill cannot paint past `bar_h`, but a rim derived from that clipped field
+/// faithfully traces the clip — a ~9-level-brighter line spanning the tab's
+/// full width, sitting exactly on the seam, which is the user's report:
+///
+/// > "the active tab seems to have a horizontal line at the bottom, making it
+/// >  feel disconnected from the pane below."
+///
+/// So COVERAGE is clipped and the RIM is not. Here the body extends below the
+/// baseline and each flare's box does too, which leaves the rim ring with only
+/// real edges to trace: the rounded top corners, the two sides, and the
+/// outboard concave curve of each flare. Along the baseline the ring falls
+/// below the drawn area and vanishes.
+///
+/// The alternative — setting `RIM_BOT` to 0 — was rejected: it dims the rim up
+/// the tab's whole height to hide one row of it, and the artifact returns the
+/// moment anyone tunes `RIM_BOT` back above zero.
+pub fn sdTabRim(x: f32, y: f32, t: Tab, m: Metrics) f32 {
     const l: f32 = @floatFromInt(t.left);
     const tp: f32 = @floatFromInt(t.top);
     const r: f32 = @floatFromInt(t.right);
     const b: f32 = @floatFromInt(t.bottom);
 
     // Body: round the TOP corners only. Extending the rounded rect below the
-    // baseline puts its bottom corners' rounding out of view, then the
-    // half-plane clip cuts it off square at the baseline — which is where the
+    // baseline puts its bottom corners' rounding out of view; `sdTab`'s
+    // half-plane then cuts it off square at the baseline — which is where the
     // flares take over.
     const rt = m.corner_top;
     const body_round = card.sdRoundRect(x, y, .{
@@ -172,7 +192,6 @@ pub fn sdTab(x: f32, y: f32, t: Tab, m: Metrics) f32 {
         .right = r,
         .bottom = b + rt,
     }, rt);
-    const body = @max(body_round, y - b);
 
     // Flares, outboard of each bottom corner — on the SELECTED tab only.
     //
@@ -183,13 +202,27 @@ pub fn sdTab(x: f32, y: f32, t: Tab, m: Metrics) f32 {
     // have neighbouring feet meeting in the middle of every gap and closing
     // it back up. The selected tab flares into the empty space beside it; the
     // others stay clear of each other.
-    if (t.surface != .active) return body;
+    if (t.surface != .active) return body_round;
 
+    // The flare boxes run BELOW the baseline for the same reason the body
+    // does: their bottom edge is the seam, so it must not be an edge here
+    // either. `sdTab`'s clip brings them back to `b`.
     const rb = m.corner_bottom;
-    const left_flare = sdFlare(x, y, l - rb, b - rb, rb, l - rb, l, b - rb, b);
-    const right_flare = sdFlare(x, y, r + rb, b - rb, rb, r, r + rb, b - rb, b);
+    const left_flare = sdFlare(x, y, l - rb, b - rb, rb, l - rb, l, b - rb, b + rb);
+    const right_flare = sdFlare(x, y, r + rb, b - rb, rb, r, r + rb, b - rb, b + rb);
 
-    return @min(body, @min(left_flare, right_flare));
+    return @min(body_round, @min(left_flare, right_flare));
+}
+
+/// Signed distance to the whole tab silhouette: a top-rounded body plus a
+/// flare at each bottom corner, clipped square at the baseline.
+///
+/// Defined as `sdTabRim` plus the clip rather than as its own field, so the
+/// two can never drift apart — the fill and the rim must always be the same
+/// shape, differing only in whether the seam counts as an edge.
+pub fn sdTab(x: f32, y: f32, t: Tab, m: Metrics) f32 {
+    const b: f32 = @floatFromInt(t.bottom);
+    return @max(sdTabRim(x, y, t, m), y - b);
 }
 
 /// The rim's alpha at height `y` within a tab: brightest along the top edge,
@@ -293,7 +326,12 @@ pub fn renderTab(
             // the shape shrunk by one hairline. Doing it as a difference of
             // coverages keeps it antialiased on both of its own edges, which
             // a stroked outline never is.
-            const rim = if (T206_NEUTERED) 0.0 else (cov - coverage(sd + m.rim_w)) * rim_a;
+            //
+            // Drawn from the UN-clipped field (T242): the baseline is a seam,
+            // not an edge, so it gets no rim. Everywhere else the two fields
+            // agree, so this is the same ring it always was.
+            const sd_rim = if (T206_NEUTERED) sd else sdTabRim(fx, fy, t, m);
+            const rim = if (T206_NEUTERED) 0.0 else (coverage(sd_rim) - coverage(sd_rim + m.rim_w)) * rim_a;
 
             const i = row + @as(usize, @intCast(x));
             const dst = pixels[i];
@@ -475,6 +513,83 @@ test "renderTab paints a rim brighter than both the fill and the strip" {
     }
     try testing.expect(brightest > lumOf(strip_packed));
     try testing.expect(brightest > lumOf(inside));
+}
+
+test "the rim field keeps the tab's real edges and drops its baseline" {
+    // T242, at the mechanism. Everywhere there IS an edge the two fields must
+    // agree, because the rim has to keep tracing the silhouette; along the
+    // baseline only the clipped field has one, and that is the difference.
+    const m = Metrics.init(1.25);
+    const t = testTab(.active);
+    const l: f32 = @floatFromInt(t.left);
+    const tp: f32 = @floatFromInt(t.top);
+    const b: f32 = @floatFromInt(t.bottom);
+
+    // Mid-width on the bottom row: the clipped field says "edge here" (which
+    // is what drew the line), the rim field says "deep inside".
+    try testing.expect(sdTab(70.0, b - 0.5, t, m) > -m.rim_w);
+    try testing.expect(sdTabRim(70.0, b - 0.5, t, m) < -m.rim_w);
+
+    // The same holds inside a flare — its box bottom is the seam too, so the
+    // line used to run the full flared width, not just the tab's.
+    try testing.expect(sdTab(l - 2.0, b - 0.5, t, m) > -m.rim_w);
+    try testing.expect(sdTabRim(l - 2.0, b - 0.5, t, m) < -m.rim_w);
+
+    // Real edges are identical in both: the top, the sides, the flare's
+    // outboard concave curve.
+    try testing.expectApproxEqAbs(sdTab(70.0, tp + 0.5, t, m), sdTabRim(70.0, tp + 0.5, t, m), 0.001);
+    try testing.expectApproxEqAbs(sdTab(l + 0.5, 20.0, t, m), sdTabRim(l + 0.5, 20.0, t, m), 0.001);
+    // ...and each of those is within a hairline of the boundary, i.e. IS rim.
+    try testing.expect(@abs(sdTabRim(l + 0.5, 20.0, t, m)) < m.rim_w);
+}
+
+test "the selected tab's baseline carries NO rim - it merges into the pane" {
+    // The user's report, 2026-07-31: "the active tab seems to have a
+    // horizontal line at the bottom, making it feel disconnected from the
+    // pane below." Before T242 the bottom row was lightened by RIM_BOT (0.04,
+    // ~9 levels on a dark theme) across the tab's whole width — undoing
+    // T202's selection idiom, where the merge into the pane IS the cue.
+    const w: i32 = 200;
+    const h: i32 = 32;
+    const fill = fillColor(.active, STRIP, DARK);
+    const fill_packed: u32 = (@as(u32, fill.r) << 16) | (@as(u32, fill.g) << 8) | fill.b;
+    const strip_packed: u32 = (@as(u32, STRIP.r) << 16) | (@as(u32, STRIP.g) << 8) | STRIP.b;
+    const t = testTab(.active);
+
+    // Every DPI the box actually runs at — the user's is 125%, where most of
+    // these defects are invisible at 1.0 and obvious in life.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        var pixels = [_]u32{0} ** (200 * 32);
+        for (&pixels) |*p| p.* = strip_packed;
+        renderTab(&pixels, w, h, t, Metrics.init(scale), STRIP, DARK);
+
+        // Clear of the side rims at either end, which trace REAL edges and
+        // must survive: the seam row is exactly the pane's own color.
+        var x: i32 = t.left + 4;
+        while (x < t.right - 4) : (x += 1) {
+            try testing.expectEqual(fill_packed, px(&pixels, w, x, t.bottom - 1));
+        }
+    }
+}
+
+test "an unselected tab's baseline carries no rim either" {
+    // Inactive tabs meet the pane too, so the seam is a seam there as well.
+    // What separates selected from unselected stays the FILL, as designed.
+    const w: i32 = 200;
+    const h: i32 = 32;
+    var pixels = [_]u32{0} ** (200 * 32);
+    const strip_packed: u32 = (@as(u32, STRIP.r) << 16) | (@as(u32, STRIP.g) << 8) | STRIP.b;
+    for (&pixels) |*p| p.* = strip_packed;
+
+    const t = testTab(.inactive);
+    renderTab(&pixels, w, h, t, Metrics.init(1.25), STRIP, DARK);
+
+    const fill = fillColor(.inactive, STRIP, DARK);
+    const fill_packed: u32 = (@as(u32, fill.r) << 16) | (@as(u32, fill.g) << 8) | fill.b;
+    var x: i32 = t.left + 4;
+    while (x < t.right - 4) : (x += 1) {
+        try testing.expectEqual(fill_packed, px(&pixels, w, x, t.bottom - 1));
+    }
 }
 
 test "renderTab antialiases its curves instead of hard-stepping" {

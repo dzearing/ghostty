@@ -3763,3 +3763,42 @@ the supervisor that was built to prevent it - so it outranks the UI block.
 fixing: the upgrade must hand the lock its new pid, and the watchdog must not
 use the shell-prompt shim on a pane that already has a live claude (its `nudge`
 branch is already right for that case).
+
+## 2026-07-31 - T242: the selected tab's rim was tracing a seam, not an edge
+
+*"the active tab seems to have a horizontal line at the bottom, making it feel
+disconnected from the pane below."* Real, and it quietly undid T202: the whole
+selection idiom is that the selected chiclet is filled with the CONTENT
+background and MERGES into the pane, which is why there is no underline and no
+accent bar. A line across its baseline puts the separation back.
+
+The cause was a shape being asked to do two jobs. `sdTab` clips the silhouette
+square at the baseline with a half-plane so the fill cannot paint past `bar_h`,
+and the rim was derived from that same clipped field - so it faithfully traced
+the clip. At the bottom row `sd = -1`, giving `rim = 1.0 * RIM_BOT (0.04)`:
+about 10 levels of white across the tab's full width, and across the flares'
+width too, since each flare box also stopped dead at the baseline.
+
+Fix: coverage stays clipped, the rim does not. `sdTabRim()` is the un-clipped
+field (body below the baseline as before, flare boxes now running to `b + rb`),
+and `sdTab` is *defined as* `@max(sdTabRim(...), y - b)` so the two can never
+drift apart. The rim then has only real edges left to trace - top corners,
+sides, and each flare's outboard concave curve.
+
+Not fixed by setting `RIM_BOT` to 0: that dims the rim up the tab's whole
+height to hide one row of it, and the artifact returns the moment anyone tunes
+it back above zero.
+
+Measured both ways rather than assumed. `test/win32/tab-strip.ps1` gained
+section 2c (the seam row must be no brighter than an interior row of the same
+fill); rebuilt with the old math it reports `seam=33 interior=0` and FAILS -
+(11,11,11) over a (0,0,0) fill, matching the predicted `0.04 * 255` to within
+rounding - and with the fix, `seam=0 interior=0`. ALL PASS x3, negative control
+still failing 1/26, P1-P3 ALL PASS, both test lanes + test-agent + the GUI link
+green. The two new unit tests fail (and only those two) when the rim is put
+back on the clipped field.
+
+Filed **T243** on the way through: `zig build` on this box panics inside the
+build runner - no diagnostic, no `error:` line - unless `ZIG_GLOBAL_CACHE_DIR`
+is on the repo's drive. That knowledge lived only in a private session memory
+and cost time again this turn, so build.zig should say it out loud.
