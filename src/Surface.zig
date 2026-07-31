@@ -4312,6 +4312,81 @@ fn isMouseReporting(self: *const Surface) bool {
         self.io.terminal.flags.mouse_event != .none;
 }
 
+/// Whether a right-button PRESS would be swallowed by mouse reporting —
+/// i.e. sent to the terminal application, clearing the selection, and
+/// consumed — instead of falling through to the apprt's context menu.
+///
+/// This exists for apprts that show their right-click menu even while the
+/// running application has mouse reporting on (T240). Every pane a user
+/// actually keeps open is a TUI — Claude Code, vim, lazygit — and they all
+/// turn reporting on, so a menu gated on "the core did not consume it" is a
+/// menu that never appears. An apprt calls this BEFORE handing the press to
+/// `mouseButtonCallback`: asking afterwards is too late, because by then the
+/// press has been reported and the selection the menu would act on is gone.
+///
+/// Only the `context-menu` disposition is affected. Under `paste`/`copy`/
+/// `copy-or-paste`/`ignore` the app keeps the click, reporting or not.
+pub fn rightPressWouldReport(self: *Surface, mods: input.Mods) bool {
+    // mouseShiftCapture takes the renderer lock itself, so it must be asked
+    // before we take it below.
+    const shift_capture = self.mouseShiftCapture(true);
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    return rightPressWouldReportLogic(
+        self.config.right_click_action,
+        self.isMouseReporting(),
+        mods.shift,
+        shift_capture,
+    );
+}
+
+/// The decision behind `rightPressWouldReport`, split out so it is testable
+/// without a live terminal. Mirrors the ordering in `mouseButtonCallback`:
+/// shift that the terminal is not allowed to capture skips the mouse report
+/// entirely, so such a press was never going to be consumed in the first
+/// place.
+fn rightPressWouldReportLogic(
+    action: configpkg.RightClickAction,
+    reporting: bool,
+    shift: bool,
+    shift_capture: bool,
+) bool {
+    if (action != .@"context-menu") return false;
+    if (!reporting) return false;
+    if (shift and !shift_capture) return false;
+    return true;
+}
+
+test "rightPressWouldReportLogic only diverts the context-menu disposition" {
+    const testing = std.testing;
+
+    // The case the user hits: a TUI with reporting on. Without this the
+    // context menu is unreachable in every pane they run.
+    try testing.expect(rightPressWouldReportLogic(.@"context-menu", true, false, false));
+
+    // No reporting: unchanged path, the core does its word-select and the
+    // apprt shows the menu off the "unconsumed" verdict as before.
+    try testing.expect(!rightPressWouldReportLogic(.@"context-menu", false, false, false));
+
+    // Other dispositions keep giving the click to the app under reporting -
+    // `right-click-action = paste` is an opt-in to WT-style behavior and is
+    // not ours to reinterpret.
+    try testing.expect(!rightPressWouldReportLogic(.paste, true, false, false));
+    try testing.expect(!rightPressWouldReportLogic(.copy, true, false, false));
+    try testing.expect(!rightPressWouldReportLogic(.@"copy-or-paste", true, false, false));
+    try testing.expect(!rightPressWouldReportLogic(.ignore, true, false, false));
+
+    // Shift the terminal may not capture already bypassed the report, so the
+    // old path still applies (and still ends at the menu).
+    try testing.expect(!rightPressWouldReportLogic(.@"context-menu", true, true, false));
+
+    // ...but when the terminal DID ask to capture shift, the press would have
+    // been reported, so the menu takes it.
+    try testing.expect(rightPressWouldReportLogic(.@"context-menu", true, true, true));
+}
+
 fn mouseReport(
     self: *Surface,
     button: ?input.MouseButton,

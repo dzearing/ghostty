@@ -3840,3 +3840,43 @@ restart-in-pane`, new watchdog `ACTION nudge`. `go-loop-guard.ps1` ALL PASS
 (103), with N2/N3 as the positive control that a genuine shell prompt still
 gets the shim; its GUI sections now run on the T211 background desktop. Both
 test lanes + test-agent + P1-P3 green.
+
+## 2026-07-31 - T240: the menu was there, the workflow just never reached it
+
+*"there is no right click context menu like in the mac version. WTF."* The
+menu has shipped since T102, all 17 items in Mac order. It never appeared
+because the win32 apprt showed it only when the core returned *unconsumed*,
+and mouse reporting consumes a right-press - so the feature existed everywhere
+except in the panes anyone actually uses.
+
+Measured rather than assumed, and the measurement nearly went the wrong way
+twice. A probe against a freshly launched Claude Code reported "mouse
+reporting NOT active", which would have refuted the whole task; the pane was
+still on the trust dialog. Past it, at the real prompt (v2.1.220): reporting
+on, right-click consumed, no menu. Then a physical-input probe "reproduced"
+the bug in a *plain* pane too - a false positive from the probe's own
+oversized `INPUT` struct, which made `SendInput` accept 0 events and send
+nothing. Hence the rule now written into the new script: **a synthetic-input
+probe asserts a positive control first, or its negative result means nothing.**
+
+The fix asks the core *before* it sees the press - `rightPressWouldReport` -
+because asking afterwards is too late: the click is already reported and the
+selection the menu would act on is already cleared. Only the `context-menu`
+disposition diverts; `right-click-action = paste` still hands the click to the
+app, reporting or not.
+
+T240's own first lesson landed on T240: it cited the Mac source line but
+modeled the framework calling it, and AppKit's documented right-click path
+runs `NSView.rightMouseDown` -> `menuForEvent:`, not the reverse - which would
+mean Mac suppresses the menu under reporting too. Unverifiable from this seat,
+so it ships as the user asked for and **T246** has the Mac seat check it in
+minutes.
+
+New: `test/win32/context-menu-real-input.ps1` - physical SendInput on the
+interactive desktop, ALL PASS (11), `-NegativeControl` 1 FAILURE. It exists
+because `context-menu.ps1` is PostMessage-driven and structurally cannot see
+this class of defect. That script's section D asserted the old behavior as
+"Mac parity"; it is inverted, gated on the fixture printing `MOUSEMODE-ON`,
+and paired with a new D2 (reporting + `paste` = no menu) so "a menu appeared"
+can no longer pass on a fixture whose console mode never landed. Both test
+lanes + test-agent + P1-P3 green.

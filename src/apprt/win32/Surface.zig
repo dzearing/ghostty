@@ -2805,6 +2805,26 @@ pub fn handleMouseButton(
         }
     }
 
+    // T240: a right-press that mouse reporting would swallow opens the
+    // context menu instead of reaching the terminal application. Every pane
+    // the user keeps open is a TUI (Claude Code, vim, lazygit) and they all
+    // turn reporting on, so the old `!consumed` gate below made the menu
+    // unreachable in practice — the feature read as missing because it was.
+    //
+    // The decision has to happen BEFORE the core sees the press: once
+    // reported, the click is gone to the app and the selection the menu
+    // would act on has been cleared. Nothing is synthesized to the core
+    // here either — it never saw the press, so there is no click state to
+    // unstick, and a lone synthesized release would be REPORTED to the app
+    // as a release with no press.
+    if (button == .right and
+        action == .press and
+        self.core_surface.rightPressWouldReport(mods))
+    {
+        self.showContextMenuUnreported(lparam);
+        return;
+    }
+
     // Update cursor position first
     self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
         log.err("cursor pos callback error: {}", .{err});
@@ -2824,18 +2844,34 @@ pub fn handleMouseButton(
     }
 }
 
+/// Show the context menu for a right-press the core never saw (T240: the
+/// mouse-reporting bypass). Same capture cleanup as `showContextMenu`, minus
+/// the synthesized release — there is no press to balance, and the release
+/// would be reported to the application as an orphan.
+fn showContextMenuUnreported(self: *Surface, lparam: isize) void {
+    self.releaseMouseForMenu();
+    self.openContextMenu(
+        @intCast(@as(i16, @truncate(@as(isize, lparam & 0xFFFF)))),
+        @intCast(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF)))),
+    );
+}
+
+/// The press handler took mouse capture; release it and clear the mask
+/// before the modal menu loop, otherwise the pending button-up is captured
+/// and immediately dismisses the menu.
+fn releaseMouseForMenu(self: *Surface) void {
+    if (self.mouse_button_mask != 0) {
+        self.mouse_button_mask = 0;
+        _ = w32.ReleaseCapture();
+    }
+}
+
 /// Show the surface right-click context menu at the given client coords
 /// (packed in lparam like a mouse message). Press-path entry: cleans up
 /// mouse capture and synthesizes the right-button release before the modal
 /// menu loop.
 fn showContextMenu(self: *Surface, lparam: isize) void {
-    // The press handler took mouse capture; release it and clear the mask
-    // before the modal menu loop, otherwise the pending button-up is
-    // captured and immediately dismisses the menu.
-    if (self.mouse_button_mask != 0) {
-        self.mouse_button_mask = 0;
-        _ = w32.ReleaseCapture();
-    }
+    self.releaseMouseForMenu();
 
     // TrackPopupMenuEx's modal loop takes capture and swallows the physical
     // WM_RBUTTONUP, so the core would never see the right-button release and

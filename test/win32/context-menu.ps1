@@ -9,11 +9,18 @@
 #      sentinel lands in the pane (TrackPopupMenuEx TPM_RETURNCMD wiring).
 #   C: "T" toggles Terminal Read-only; reopened menu shows MF_CHECKED;
 #      toggling again clears it.
-#   D: with SGR mouse reporting active in the pane (ConPTY passthrough of
-#      ?1002h/?1006h), a plain right-click is reported to the app (NO menu -
-#      the TUI wins, Mac parity) but shift+right-click bypasses the report
-#      and opens the menu (works because handleMouseButton reads shift from
-#      the message wparam).
+#   D: with mouse reporting active in the pane, a plain right-click STILL
+#      opens the context menu (T240). This section asserted the opposite
+#      until 2026-07-31 - that every pane running a TUI loses the menu - and
+#      that is precisely the state the user reported as "there is no right
+#      click context menu like in the mac version". Every pane they keep open
+#      (Claude Code, vim, lazygit) turns reporting on, so a menu gated on the
+#      core's "unconsumed" verdict is a menu that never appears.
+#      Shift+right-click still opens it too (now redundant, not wrong).
+#   D2: the same reporting fixture with `right-click-action = paste` shows NO
+#      menu - the click goes to the app. That is both the documented opt-out
+#      and this run's ORACLE that reporting is genuinely active: without it,
+#      D's assertion would pass trivially on a pane whose mode never landed.
 #   E: `right-click-action = paste` opt-out - right-click pastes, no menu
 #      (the Windows-Terminal-style behavior, as a config choice).
 #   G: T129 discoverability - the menu carries "Set Pane Banner..." labeled
@@ -399,6 +406,7 @@ $h=$k::GetStdHandle(-10)
 $m=0
 $k::GetConsoleMode($h,[ref]$m)|Out-Null
 $k::SetConsoleMode($h, ($m -bor 0x10 -bor 0x80) -band (-bnot 0x40))|Out-Null
+Write-Host "MOUSEMODE-ON"
 Start-Sleep 120
 '@
 $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
@@ -408,19 +416,20 @@ $g = Start-Gui 'mouse-reporting' @("--command=powershell -NoProfile -EncodedComm
 $launched += $g.Pid
 $gpid = $g.Pid; $pane = $g.Pane
 
-# The mode lands once the child's Add-Type finishes (a few seconds). Poll
-# with plain right-clicks until one is consumed (no menu) - that IS the
-# behavior under test; retries just absorb child-startup latency.
-$suppressed = $false
-for ($try = 0; $try -lt 6; $try++) {
-    Send-PaneRight -Top $g.Top -Pane $pane -Action down
-    $menuWnd = Wait-Menu $gpid 1500
-    if ($menuWnd -eq [IntPtr]::Zero) { $suppressed = $true; break }
-    Cancel-Menu $pane
-    [void](Test-MenuGone $gpid 2000)
-    Start-Sleep -Seconds 2
+# Wait for the child to say the console mode is set, rather than guessing at
+# startup latency. The marker is printed AFTER SetConsoleMode, so seeing it
+# means conhost has already emitted the outward DECSET.
+$modeOn = $false
+for ($t = 0; $t -lt 30; $t++) {
+    if ((Read-Pane $g.PaneName 40) -match 'MOUSEMODE-ON') { $modeOn = $true; break }
+    Start-Sleep -Milliseconds 500
 }
-Assert $suppressed 'D: plain right-click is reported to the TUI (no menu)'
+Assert $modeOn 'D: fixture pane really did enable mouse reporting'
+
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 3000
+Assert ($menuWnd -ne [IntPtr]::Zero) 'D: plain right-click opens the menu under mouse reporting (T240)'
+if ($menuWnd -ne [IntPtr]::Zero) { Cancel-Menu $pane; [void](Test-MenuGone $gpid 2000) }
 Send-PaneRight -Top $g.Top -Pane $pane -Action up
 Start-Sleep -Milliseconds 300
 
@@ -431,6 +440,36 @@ Cancel-Menu $pane
 [void](Test-MenuGone $gpid 2000)
 
 Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'run 2: no crash'
+Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+# Run 2b: section D2 - the SAME reporting fixture under
+# `right-click-action = paste`. No menu: only the context-menu disposition
+# was changed by T240, the opt-out still hands the click to the app.
+#
+# This is also the oracle for section D. D asserts a menu APPEARS, which is
+# what a pane with no reporting at all does too - so without a case that
+# proves the fixture's reporting is live and still able to swallow a click,
+# D could pass on a broken fixture.
+# ---------------------------------------------------------------------------
+$g = Start-Gui 'mouse-reporting-paste' @("--command=powershell -NoProfile -EncodedCommand $b64", '--right-click-action=paste')
+$launched += $g.Pid
+$gpid = $g.Pid; $pane = $g.Pane
+
+$modeOn = $false
+for ($t = 0; $t -lt 30; $t++) {
+    if ((Read-Pane $g.PaneName 40) -match 'MOUSEMODE-ON') { $modeOn = $true; break }
+    Start-Sleep -Milliseconds 500
+}
+Assert $modeOn 'D2: fixture pane really did enable mouse reporting'
+
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 1500
+Assert ($menuWnd -eq [IntPtr]::Zero) 'D2: right-click-action=paste still gives the click to the reporting app (no menu)'
+if ($menuWnd -ne [IntPtr]::Zero) { Cancel-Menu $pane; [void](Test-MenuGone $gpid 2000) }
+Send-PaneRight -Top $g.Top -Pane $pane -Action up
+
+Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'run 2b: no crash'
 Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------

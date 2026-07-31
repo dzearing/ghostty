@@ -115,25 +115,30 @@ Work these first, in order, before falling back to first-todo-in-table:
     pane that already has a live claude in it (its `nudge` branch is already
     correct for that case).
 
-00000. **T240 — the right-click context menu is unreachable, and T102 closed it
-    with a false premise (user, 2026-07-31).** *"there is no right click context
-    menu like in the mac version. WTF."* The menu exists (17 items, Mac order,
-    T102). It never appears, because `Surface.zig:2822` gates it on
-    `!consumed` and every pane the user runs has mouse reporting on.
+00000. **~~T240~~ (done, 2026-07-31) — the right-click context menu was
+    unreachable in every pane the user runs.** *"there is no right click
+    context menu like in the mac version. WTF."* The menu existed (17 items,
+    Mac order, T102) but was gated on the core returning `!consumed`, and
+    mouse reporting consumes a right-press — verified live: Claude Code at its
+    prompt (v2.1.220) has reporting ON. A right-press that reporting would
+    swallow now opens the menu instead (`Surface.rightPressWouldReport`, asked
+    BEFORE the core sees the press); `right-click-action = paste` still hands
+    the click to the app.
 
-    **T102's "Mac-identical" claim is refuted by the Mac source.** The Mac menu
-    comes from `menu(for:)` (`SurfaceView_AppKit.swift:1646`), which AppKit
-    consults BEFORE the mouse event and whose `.rightMouseDown` case builds the
-    menu with **no consumed check and no capture check** — the `mouseCaptured`
-    guard is in the `.leftMouseDown` branch, for ctrl+click. Mac shows the menu
-    unconditionally; we don't.
+    Two process lessons survive it. **An acceptance script that synthesizes
+    the trigger cannot validate the trigger** — `context-menu.ps1` is
+    PostMessage-driven, so its 19 green assertions could never see this; the
+    new `test/win32/context-menu-real-input.ps1` clicks for real. And **a
+    synthetic-input probe needs a positive control**: a broken `INPUT` struct
+    made `SendInput` send nothing and produced a confident, wrong
+    "reproduction" in a pane that was fine.
 
-    Two process lessons, both filed in T240: **a parity claim about Mac
-    behavior must cite the Mac source line** (this one was inferred about a
-    path nobody read, and reading it takes a minute), and **an acceptance
-    script that synthesizes the trigger cannot validate the trigger** —
-    `context-menu.ps1` is PostMessage-driven, so its 19 green assertions could
-    never see this.
+    T240's own first lesson — *a parity claim about Mac behavior must cite the
+    Mac source line* — then landed on T240: it cited the line but modeled the
+    framework wrong. AppKit's documented right-click path is
+    `NSView.rightMouseDown` → `menuForEvent:`, not the reverse, which would
+    mean Mac suppresses the menu under reporting too. **T246** has the Mac seat
+    settle it empirically in minutes.
 
     **T150** rides directly behind it: the user wants the menu's *Background
     Color…* to actually adapt (*"plus a bunch of logic for remapping foreground
