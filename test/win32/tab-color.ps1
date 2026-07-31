@@ -186,21 +186,24 @@ try {
     Assert $twoTabs 'positive control: ctrl+t made a 2nd tab'
     if (-not $twoTabs) { exit 1 }
 
-    # Geometry: scale from barH (= round(32*scale)); the rest mirrors
+    # Geometry: scale from barH (= round(40*scale) since T232 - 4 + 4 + 28 + 4,
+    # the shared icon-button square plus its clearances); the rest mirrors
     # tab_strip_layout.zig (T202) - tabs start at a 4 DIP inset, take an EQUAL
     # share of the strip clamped to [60, 200] DIP (no last-tab remainder), and
-    # the strip reserves two 36 DIP buttons plus two 8 DIP group gaps on the
-    # right. The T72 stripe rides the chiclet, which starts 3 DIP down from the
-    # strip top. See docs/design/win32-tab-strip.md.
-    $scale = $barH / 32.0
+    # the strip reserves two 28 DIP PAINTED button squares plus two 8 DIP group
+    # gaps and the 4 DIP right inset. The T72 stripe rides the chiclet, which
+    # starts 4 DIP down from the strip top. See docs/design/win32-tab-strip.md
+    # and docs/design/win32-design-system.md.
+    $scale = $barH / 40.0
     $vis = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
     $clientLeft = $vis[0].Left
     $clientW = $vis[0].Right - $vis[0].Left
     $padL = [math]::Round(4 * $scale)
-    $btnW = [math]::Round(36 * $scale)
+    $padR = $padL
+    $btnPaint = [math]::Round(28 * $scale)
     $gap = [math]::Round(8 * $scale)
-    $topPad = [math]::Round(3 * $scale)
-    $tabsAvail = $clientW - 2 * $btnW - 2 * $gap - $padL
+    $topPad = [math]::Round(4 * $scale)
+    $tabsAvail = $clientW - $padR - 2 * $btnPaint - 2 * $gap - $padL
     $tabW = [math]::Floor($tabsAvail / 2)
     $tabW = [math]::Max($tabW, [math]::Round(60 * $scale))
     $tabW = [math]::Min($tabW, [math]::Round(200 * $scale))

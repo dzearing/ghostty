@@ -124,10 +124,16 @@ try {
     }
 
     # Every constant is derived from the measured bar height, so this holds at
-    # any DPI (bar_h is 32 DIP by definition - docs/design/win32-tab-strip.md).
-    $scale   = $barH / 32.0
+    # any DPI (bar_h is 40 DIP by definition since T232 - it is 4 + 4 + 28 + 4,
+    # the shared icon-button square plus its clearances; see
+    # docs/design/win32-design-system.md and docs/design/win32-tab-strip.md).
+    $scale   = $barH / 40.0
     $maxTabW = [int][math]::Round(200 * $scale)
-    $btnW    = [int][math]::Round(36 * $scale)
+    # The PAINTED square, which is what every gap is measured against (T232).
+    # The hit box is this plus btnPad a side, and is deliberately invisible.
+    $btnPaint = [int][math]::Round(28 * $scale)
+    $btnPad   = [int][math]::Round(2 * $scale)
+    $btnW    = $btnPaint + 2 * $btnPad
     $gap     = [int][math]::Round(8 * $scale)
     $padL    = [int][math]::Round(4 * $scale)
     $padR    = $padL   # the strip is inset the SAME at both ends
@@ -242,9 +248,73 @@ try {
     # 2. No full-width accent rule under the strip
     # -----------------------------------------------------------------------
     Assert (-not (Any-Accent-Blue $shot)) 'selection: the full-width blue accent rule is gone (no accent pixels in the strip)'
-    $midStripX = [int](($tabRight + $clientW - 2 * $btnW - $padR) / 2)
+    $midStripX = [int](($tabRight + $clientW - $padR - 2 * $btnPaint - $gap) / 2)
     $px = $shot.Bitmap.GetPixel($offX + $midStripX, $offY + $barH - 2)
     Assert ($px.R -ge 10 -and $px.R -le 40) "strip: dead space right of the tab is bar background, not tab or accent (R=$($px.R))"
+
+    # -----------------------------------------------------------------------
+    # 2b. T232, in pixels: the "+" glyph's own margins, and its symmetry.
+    #
+    #     The user's report was "the plus icon has a huge left gap and no
+    #     bottom gap ... it looks like its left half of the horizontal line of
+    #     the plus is shorter than the right half". Both are measurable off the
+    #     capture, and both were true: at 125% the plus square sat 16 px from
+    #     the tab and 1 px from the strip's bottom edge, and the mark itself
+    #     was a pen stroke, whose trailing pixel `LineTo` drops.
+    # -----------------------------------------------------------------------
+    # Everything lit inside the "+"'s slot. The menu button is far to the
+    # right, so a window this wide cannot catch it in the scan.
+    $scanL = $tabRight + 1
+    $scanR = [math]::Min($tabRight + $gap + $btnPaint + $gap, $clientW - 1)
+    $mLeft = -1; $mRight = -1; $mTop = -1; $mBot = -1
+    $rowW = @{}; $colH = @{}
+    for ($x = $scanL; $x -le $scanR; $x++) {
+        for ($y = 0; $y -lt $barH; $y++) {
+            $p = $shot.Bitmap.GetPixel($offX + $x, $offY + $y)
+            if (($p.R + $p.G + $p.B) -lt 150) { continue }
+            if ($mLeft -lt 0 -or $x -lt $mLeft) { $mLeft = $x }
+            if ($x -gt $mRight) { $mRight = $x }
+            if ($mTop -lt 0 -or $y -lt $mTop) { $mTop = $y }
+            if ($y -gt $mBot) { $mBot = $y }
+            if ($rowW.ContainsKey($y)) { $rowW[$y] += 1 } else { $rowW[$y] = 1 }
+            if ($colH.ContainsKey($x)) { $colH[$x] += 1 } else { $colH[$x] = 1 }
+        }
+    }
+    Assert ($mLeft -ge 0) 'plus glyph: found lit pixels in the + button slot (positive control for 2b)'
+    if ($mLeft -ge 0) {
+        $gapLeft = $mLeft - $tabRight       # tab's painted edge -> mark
+        $gapBot  = $barH - 1 - $mBot        # mark -> strip's bottom edge
+        $gapTop  = $mTop
+        Write-Host "INFO  + glyph: x=$mLeft..$mRight y=$mTop..$mBot gapLeft=$gapLeft gapTop=$gapTop gapBot=$gapBot"
+        Assert ($gapBot -ge 2) "plus: has a real BOTTOM gap, not 1px (gapBot=$gapBot)"
+        # The headline number. Before T232 this pair was 26:11 for the mark and
+        # 16:1 for the square it sits in.
+        $lo = [math]::Min($gapLeft, $gapBot); $hi = [math]::Max($gapLeft, $gapBot)
+        Assert ($hi -le [int]([math]::Ceiling($lo * 1.5))) `
+            "plus: left and bottom gaps are within 1.5x of each other ($gapLeft vs $gapBot)"
+
+        # Symmetry: the widest lit row is the "+"'s horizontal bar, the tallest
+        # lit column its vertical bar. The two arms of the horizontal bar must
+        # be the same length either side of the vertical bar.
+        $barRow = ($rowW.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+        $stemCol = ($colH.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+        $hL = $clientW; $hR = -1
+        for ($x = $scanL; $x -le $scanR; $x++) {
+            $p = $shot.Bitmap.GetPixel($offX + $x, $offY + $barRow)
+            if (($p.R + $p.G + $p.B) -lt 150) { continue }
+            if ($x -lt $hL) { $hL = $x }
+            if ($x -gt $hR) { $hR = $x }
+        }
+        # The stem is `stroke_w` wide; take its whole extent so the two arms
+        # are measured from the same object.
+        $sL = $clientW; $sR = -1
+        foreach ($k in $colH.Keys) { if ($colH[$k] -ge ($colH[$stemCol] - 1)) { if ($k -lt $sL) { $sL = $k }; if ($k -gt $sR) { $sR = $k } } }
+        $armL = $sL - $hL
+        $armR = $hR - $sR
+        Write-Host "INFO  + arms: row=$barRow h=$hL..$hR stem=$sL..$sR armL=$armL armR=$armR"
+        Assert ([math]::Abs($armL - $armR) -le 1) `
+            "plus: the two halves of the horizontal bar are the same length (armL=$armL armR=$armR)"
+    }
 
     # -----------------------------------------------------------------------
     # 3. There is a real gap between the last tab and the "+", and clicking in
@@ -258,7 +328,9 @@ try {
     # -----------------------------------------------------------------------
     # 4. The "+" follows the last tab - and moves right when a tab is added
     # -----------------------------------------------------------------------
-    $plusX = $tabRight + $gap + [int]($btnW / 2)
+    # `$gap` past the tab's PAINTED right edge is the "+"'s painted left edge,
+    # so half a painted square further right is its centre.
+    $plusX = $tabRight + $gap + [int]($btnPaint / 2)
     Strip-Click $plusX
     Start-Sleep -Milliseconds 300
     Close-TestWindowPixels $shot; $shot = Get-Shot
@@ -271,7 +343,7 @@ try {
     # The second "+" is one tab width further right. If it had stayed pinned
     # where it was, this click would land on tab 2 and create nothing.
     $tabRight2 = $ext[1]
-    $plusX2 = $tabRight2 + $gap + [int]($btnW / 2)
+    $plusX2 = $tabRight2 + $gap + [int]($btnPaint / 2)
     Assert ($plusX2 -gt $plusX) "+ : moved right with the new tab ($plusX -> $plusX2)"
     Strip-Click $plusX2
     Start-Sleep -Milliseconds 300
@@ -291,24 +363,26 @@ try {
     $manyW = $ext[1] - $ext[0]
     Write-Host "INFO  many tabs: left=$($ext[0]) right=$($ext[1]) w=$manyW"
     Assert ($manyW -gt 0 -and $manyW -lt $maxTabW) "many tabs: tab width shrank below max ($manyW < $maxTabW)"
-    $bandLeft = $clientW - $padR - 2 * $btnW - $gap
+    $bandLeft = $clientW - $padR - 2 * $btnPaint - $gap
     Assert ($ext[1] -le $bandLeft) "many tabs: the tab run never reaches the button band ($($ext[1]) <= $bandLeft)"
     Assert (-not (Any-Accent-Blue $shot)) 'many tabs: still no accent rule anywhere in the strip'
     Close-TestWindowPixels $shot
 
     # -----------------------------------------------------------------------
-    # 6. The menu button is pinned to the right END OF THE STRIP - inset by the
-    #    same padding the first tab gets on the left, not flush against the
-    #    window border ("the hamburger button has no gap between it and the
-    #    border"). Clicking one pad in from the edge must therefore MISS it,
-    #    and clicking the button's centre must hit.
+    # 6. The menu button is pinned to the right END OF THE STRIP - its PAINTED
+    #    square inset by the same padding the first tab gets on the left, not
+    #    flush against the window border ("the hamburger button has no gap
+    #    between it and the border"). Its hit box is allowed to reach into that
+    #    pad (T232: a forgiving click target is free precisely because it is
+    #    invisible), so the miss is asserted at the outermost pixel column -
+    #    past the hit box, which no amount of forgiveness may cross.
     # -----------------------------------------------------------------------
-    Strip-Click ($clientW - [int]($padR / 2) - 1)
+    Strip-Click ($clientW - 1)
     Start-Sleep -Milliseconds 300
     Assert ((Get-TestWindow -ProcessId $app.Pid -Class '#32768') -eq [IntPtr]::Zero) `
-        'right inset: the strip does not run flush to the window border (a click in the pad opens nothing)'
+        'right inset: the strip does not run flush to the window border (a click at the edge opens nothing)'
 
-    Strip-Click ($clientW - $padR - [int]($btnW / 2))
+    Strip-Click ($clientW - $padR - [int]($btnPaint / 2))
     $menu = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 3000
     Assert ($menu -ne [IntPtr]::Zero) 'menu button: still pinned to the right edge and still opens its popup'
     if ($menu -ne [IntPtr]::Zero) {

@@ -32,6 +32,7 @@ const card = @import("banner_card.zig");
 const banner_layout = @import("banner_layout.zig");
 const color_math = @import("color_math.zig");
 const icon_button = @import("icon_button.zig");
+const icon_paint = @import("icon_button_paint.zig");
 
 const log = std.log.scoped(.win32_banner);
 
@@ -1259,17 +1260,8 @@ pub const BannerOverlay = struct {
             }
         }
 
-        const target = icon_button.targetBox(ib, box);
-        var strokes: [icon_button.max_strokes]icon_button.Stroke = undefined;
-        const pen = w32.CreatePen(0, ib.stroke_w, self.secondary()) orelse return;
-        defer _ = w32.DeleteObject(pen);
-        const prev = w32.SelectObject(hdc, pen);
-        defer _ = w32.SelectObject(hdc, prev);
         const glyph: icon_button.Glyph = if (self.collapsed) .chevron_down else .chevron_up;
-        for (icon_button.glyphStrokes(ib, target, glyph, &strokes)) |s| {
-            _ = w32.MoveToEx(hdc, s.x0, s.y0, null);
-            _ = w32.LineTo(hdc, s.x1, s.y1);
-        }
+        icon_paint.glyph(hdc, ib, icon_button.targetBox(ib, box), glyph, self.secondary());
     }
 
     /// Hot-track the chevron. Returns true when the hover changed, so the

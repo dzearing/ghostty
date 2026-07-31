@@ -3694,3 +3694,49 @@ panic, passed on an immediate re-run).
 T229's own half - the app disappearing after the confirm - is NOT closed by
 this, but the user has explicitly downgraded it: an app reboot on agent upgrade
 is acceptable to them, so long as nothing re-executes.
+
+## 2026-07-31 - T232: the tab strip's gaps and glyphs, measured instead of intended
+
+The user walked the strip pixel by pixel and every complaint was arithmetic.
+Two independent root causes, both now named in `win32-design-system.md`:
+**gaps were measured to the HIT BOX** (8 DIP of constant plus 5 DIP of
+invisible slack per side, painting as 13 at 100% and 16 px at their 125%), and
+**the band was too short for the control** (a 29 DIP band centering a 26 DIP
+square, so its "padding" truncated to 1-2 px and landed differently at every
+scale). A 16:1 ratio between two gaps that should both be on the 4 DIP scale.
+
+So the numbers are derived now, not chosen. `bar_h` is
+`tab_top_pad + pad_sm + icon_button.target + pad_sm` = 4 + 4 + 28 + 4 = **40
+DIP**; `layout()` computes in painted edges and derives hit boxes at the end;
+`hitBox()` is the exact inverse of `targetBox()` so the call sites never had to
+learn a new convention. `tab_top_pad` 3 -> 4 and `text_pad` 10 -> 8, both of
+which were off the spacing scale. `tabBarHeight()` stopped keeping a second
+copy of the constant.
+
+Glyphs became filled quads (`Polygon` + `NULL_PEN`, in the new shared
+`icon_button_paint.zig`) instead of `CreatePen`/`LineTo`, whose dropped
+endpoint and wide-pen bias were literally the "left half of the plus is shorter
+than the right half" report. Every mark extent is **parity-matched to its
+square's side**, which is what makes the centering exact arithmetic rather than
+luck - and that corrected a rule the design system had written as "round to an
+even number of pixels", the right instinct applied to the wrong quantity.
+
+Mid-task the user caught the close "x" rendering as a **filled bowtie**: the
+first cut read the 45° relation backwards, setting the corner offset `k` to
+`1.5 * stroke_w` as though thickness were `k/sqrt2` when it is `k*sqrt2`. 2x
+too heavy. Fixed to `k ~= 3t/4`, pinned by a test, and written up as design
+system §4.3 - the arithmetic is not obvious and it will be met again by the
+next diagonal glyph.
+
+Evidence: both lanes + `test-agent` + P1-P3 green. `tab-strip.ps1` ALL PASS
+(25) x3 at 125% including a new pixel section that measures the "+" off the
+capture - `gapLeft=21 gapBot=15` (1.4:1, was 26:11 on the mark and 16:1 on the
+square) and `armL=6 armR=6`. Negative control: `T202_NEUTERED = true` ->
+6 FAILED / 15 passed, exactly the named assertions. `tab-color.ps1` (15),
+`title-font.ps1` (12) after their DPI oracle moved to `/40.0`, `pane-banner.ps1`
+(65).
+
+Filed: **T239** (the banner chevron measures its arm thickness vertically at
+45°, so it paints ~0.71x the stroke width the other three glyphs do - the same
+class of one-control-disagreeing-with-the-set defect, found by the arithmetic
+rather than by eye).

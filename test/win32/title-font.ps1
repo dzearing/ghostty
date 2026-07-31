@@ -112,17 +112,18 @@ function Get-ColSig($shot, [int]$x0, [int]$x1, [int]$y0, [int]$y1, [int]$step) {
 }
 
 # Signature across the single tab (title text region) + the "+" button.
-# 1 tab: tabW = clamp(clientW-36s, 60s, 200s) = 200s on any normal window.
+# 1 tab: tabW = clamp(clientW-..., 60s, 200s) = 200s on any normal window.
+# barH is 40 DIP since T232 (4 + 4 + 28 + 4), and the strip's text pad is 8.
 #
 # The capture is retried until it holds real content: PrintWindow taken while
 # the window is still painting returns a flat fill, and a flat fill scores a
 # perfectly stable all-zero signature that would make every "same raster"
 # assertion pass for the wrong reason (the T216 lesson).
 function Get-Signature($g) {
-    $scale = $g.BarH / 32.0
+    $scale = $g.BarH / 40.0
     $tabW = [math]::Round(200 * $scale)
-    $plusW = [math]::Round(36 * $scale)
-    $x0 = $g.ClientLeft + [math]::Round(10 * $scale)   # text pad
+    $plusW = [math]::Round(8 * $scale) + [math]::Round(28 * $scale)
+    $x0 = $g.ClientLeft + [math]::Round(8 * $scale)    # text pad
     $x1 = $g.ClientLeft + $tabW + $plusW - 2           # through the + glyph
     $y0 = $g.ClientTop + 4
     $y1 = $g.ClientTop + $g.BarH - 5                   # skip accent-stripe rows

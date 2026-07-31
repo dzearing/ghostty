@@ -98,6 +98,40 @@ recommended approaches where they exist.
 
 Work these first, in order, before falling back to first-todo-in-table:
 
+0000. **THE UI QUALITY BLOCK (user, 2026-07-31, with screenshots).** The user
+    walked the tab strip pixel by pixel and every complaint checks out as
+    arithmetic. The systemic answer landed first:
+    **`docs/design/win32-design-system.md` is now mandatory reading before any
+    win32 chrome change**, and CLAUDE.md points at it. The rules it fixes —
+    one 4 DIP spacing scale, nothing touches anything, **gaps measured between
+    PAINTED edges not hit boxes**, size the container to the control, one icon
+    button size, contrast floors, a radius/elevation scale, glyphs as filled
+    shapes with optical widths, 2 DIP dividers with real hover, vertical space
+    belongs to the terminal, horizontal chrome sizes to content with a
+    proportional cap.
+
+    Then the four tasks that bring the chrome into compliance:
+
+    **T232 → T235 → T233 → T234.**
+
+    - **T232** — the strip's spacing and glyph geometry. Measured at the
+      user's 125%: the "+" square sits **16 px** from the tab and **1 px**
+      from the strip's bottom edge (a 16:1 ratio between two gaps that should
+      be equal), and the close "×" clears the tab's top edge by 1–2 px. Root
+      causes are gaps measured to hit boxes and a 29 DIP band holding a 26 DIP
+      square. Also replaces `LineTo` pen strokes (which drop the endpoint and
+      bias wide pens) with filled shapes, and gives the hamburger its own
+      optical width. **Carries a blast radius: `bar_h` is the DPI oracle for
+      three acceptance scripts.**
+    - **T235** — tabs truncate titles at a fixed 200 DIP cap while the strip
+      sits half empty. Size to content, cap at 50% of the run, keep T202's
+      anti-stretch rule.
+    - **T233** — split dividers: 2 DIP (1 DIP rounds to an invisible single
+      pixel at 100/125%) with a real hover color change, not a cursor change.
+    - **T234** — the big one: **no tab strip at one tab** (Mac shows none) and
+      a "…" button in the caption bar left of minimize. Reclaims 32–40 DIP of
+      every window. Sequence against T205, which targets the same region.
+
 000. **AHEAD OF EVERYTHING as of 2026-07-31 (user bug report, same day).**
     The agent-upgrade path is broken in two ways the user hit for real, and it
     fires on every upgrade with live sessions:

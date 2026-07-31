@@ -806,10 +806,22 @@ pub extern "kernel32" fn CloseHandle(
 
 // Stock object indices for GetStockObject
 pub const BLACK_BRUSH: i32 = 4;
+/// A pen that draws nothing, so `Polygon` fills its interior WITHOUT also
+/// outlining it. Chrome glyphs are filled shapes (T232) and an outline would
+/// re-introduce exactly the wide-pen bias the fill exists to remove.
+pub const NULL_PEN: i32 = 8;
 
 pub extern "gdi32" fn GetStockObject(
     i: i32,
 ) callconv(.winapi) ?*anyopaque;
+
+/// Fill a closed polygon with the current brush, outlined with the current
+/// pen. Right and bottom boundaries are EXCLUSIVE, like `Rectangle`.
+pub extern "gdi32" fn Polygon(
+    hdc: HDC,
+    apt: [*]const POINT,
+    cpt: i32,
+) callconv(.winapi) i32;
 
 /// COLORREF is 0x00BBGGRR (blue in high byte, red in low byte).
 pub fn RGB(r: u8, g: u8, b: u8) u32 {

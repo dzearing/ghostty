@@ -53,10 +53,17 @@ side benefit of needing no text measurement in the layout module.
 Same idiom, with two deliberate deviations, both recorded here so a later
 reader does not "fix" them back:
 
-- **Strip height stays 32 DIP** (not WT's 40). WT's strip replaces the
-  titlebar and spends 8 DIP of its height on a drag region; ours sits *below* a
-  real caption bar, which already provides that. `tabBarHeight()` is also the
-  scale oracle for a dozen acceptance scripts (`scale = barH / 32`).
+- **Strip height is 40 DIP**, which is also WT's measured height — arrived at
+  from the other direction. It used to be 32 on the reasoning that WT's strip
+  replaces the titlebar and spends 8 DIP of its height on a drag region, while
+  ours sits *below* a real caption bar. That reasoning was sound and the
+  conclusion was still wrong: the 8 DIP it saved came out of the buttons'
+  breathing room, not out of a drag region we do not have, and the result was a
+  29 DIP band holding a 26 DIP square — 1–2 px of "padding" that landed
+  differently at every scale (T232). The height is now *derived*, not chosen:
+  `tab_top_pad + pad_sm + icon_button.target + pad_sm` = 4 + 4 + 28 + 4.
+  `tabBarHeight()` is also the scale oracle for three acceptance scripts, which
+  compute `scale = barH / 40`.
 - **Maximum tab width is 200 DIP** (not WT's measured 240), the documented
   WinUI `TabViewItemMaxWidth` default. Our tabs carry no icon, so 200 DIP holds
   as much title as WT's 240 does.
@@ -65,17 +72,20 @@ reader does not "fix" them back:
 
 | Name | DIP | Meaning |
 |---|---|---|
-| `bar_h` | 32 | strip height |
-| `tab_top_pad` | 3 | strip background above the chiclet, so the corner reads |
+| `bar_h` | 40 | strip height — *derived*: `tab_top_pad + pad_sm + 28 + pad_sm` |
+| `tab_top_pad` | 4 | strip background above the chiclet, so the corner reads |
+| `pad_sm` | 4 | the 4 DIP spacing step, once — every default gap reads it |
 | `min_tab_w` | 60 | tabs stop shrinking here, then overflow instead |
 | `max_tab_w` | 200 | tabs stop growing here — the anti-stretch rule |
 | `corner_r` | 6 | top corners only |
 | `strip_pad_l` | 4 | inset before the first tab |
 | `strip_pad_r` | 4 | inset after the menu button — the strip is inset the *same* at both ends. Kept a named metric because T205 turns it into the gap to the caption buttons |
-| `group_gap` | 8 | last tab → "+", and "+" → menu |
-| `btn_w` | 36 | "+" and "≡" (square-ish, unchanged from T190) |
-| `close_btn_w` | 20 | close hit box inside a tab |
-| `text_pad` | 10 | leading title padding |
+| `group_gap` | 8 | last tab → "+", and "+" → menu, **between painted edges** |
+| `btn_paint` | 28 | the PAINTED square of "+"/"≡"/"×" — every gap is measured against this |
+| `btn_pad` | 2 | how far each button's hit box grows past its square, per side |
+| `btn_w` | 32 | "+"/"≡" hit box = `btn_paint + 2 * btn_pad` |
+| `close_btn_w` | 32 | close hit box inside a tab — the same square, the same padding |
+| `text_pad` | 8 | leading title padding |
 | `stripe_h` | 3 (min 2 px) | T72 user tab-color tag |
 
 ### Rules

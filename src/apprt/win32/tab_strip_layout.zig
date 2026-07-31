@@ -47,13 +47,28 @@ pub const Rect = icon_button.Rect;
 /// Every DIP constant the strip is built from, resolved to physical pixels for
 /// one DPI scale. Values and their rationale: `docs/design/win32-tab-strip.md`.
 pub const Metrics = struct {
-    /// Strip height. Deliberately 32 DIP, not Windows Terminal's measured 40:
-    /// WT's strip IS the titlebar and spends 8 DIP of it on a drag region,
-    /// while ours sits under a real caption bar.
+    /// Strip height, 40 DIP. It is NOT a free number: the band below
+    /// `tab_top_pad` has to hold the shared 28 DIP icon-button square with
+    /// `pad_sm` clear above and below it, which is 4 + 4 + 28 + 4 = 40. Size
+    /// the container to the control, never the reverse — centering a 26 DIP
+    /// square in the old 29 DIP band produced 1-2 px of "padding" that landed
+    /// differently at every scale, which is the user's "no bottom gap" (T232,
+    /// design system §0).
+    ///
+    /// It used to be 32 DIP, chosen against Windows Terminal's measured 40 on
+    /// the grounds that WT's strip IS its titlebar and spends 8 DIP of it on a
+    /// drag region. That reasoning was sound and the conclusion still wrong:
+    /// the 8 DIP it saved came out of the buttons' breathing room, not out of
+    /// a drag region we do not have.
     bar_h: i32,
     /// Strip background left above the chiclet, so its rounded top corners
     /// have something to read against.
     tab_top_pad: i32,
+    /// The 4 DIP spacing step, once. Everything on the chrome's default gap —
+    /// strip insets, inter-tab gap, the close button's clearance inside a tab
+    /// — reads it from here, so two gaps that are equal in DIP cannot round
+    /// apart at fractional DPI (design system §1).
+    pad_sm: i32,
     min_tab_w: i32,
     max_tab_w: i32,
     /// Top-corner radius of the selected/hovered chiclet (bottom corners stay
@@ -68,17 +83,27 @@ pub const Metrics = struct {
     /// buttons (T205) this becomes the gap to the caption group rather than
     /// to the window edge.
     strip_pad_r: i32,
-    /// Separation last-tab → "+", and "+" → menu button.
+    /// Separation last-tab → "+", and "+" → menu button. Measured between
+    /// PAINTED edges (design system §0 rule 2). It used to be applied to the
+    /// button's HIT box, which carried 5 DIP of invisible slack per side, so
+    /// an 8 DIP constant painted as a 13 DIP gap at 100% and 16 px at the
+    /// user's 125% — against 1 px of clearance below the same button. That
+    /// 16:1 ratio is what T232 exists to remove.
     group_gap: i32,
-    /// Width of the "+" and "≡" buttons (T190 kept them equal). This is the
-    /// HIT box, deliberately wider than the painted target — a forgiving
-    /// click area costs nothing, and `icon_button.targetBox` centers the
-    /// paint inside it.
+    /// The PAINTED square of the "+" and "≡" buttons (T190 kept them equal).
+    /// The shared chrome square, from `icon_button.Metrics.target` — this is
+    /// what the eye sees and therefore what every gap is measured against.
+    btn_paint: i32,
+    /// How far each button's HIT box grows past its painted square on every
+    /// side. A forgiving click target costs nothing; it just must never be
+    /// mistaken for the button.
+    btn_pad: i32,
+    /// Width of the "+"/"≡" HIT box: the painted square plus `btn_pad` a
+    /// side. Kept as its own field because every hit test and every call site
+    /// already speaks in these boxes.
     btn_w: i32,
-    /// Close-button hit box inside a tab. Must be at least
-    /// `icon_button.Metrics.target` or the shared square would be clamped
-    /// down and the close button would paint smaller than its two neighbours
-    /// — which is the misalignment T204 removed.
+    /// Close-button hit box inside a tab. Same square, same padding, so the
+    /// three strip buttons cannot land at three sizes (T204).
     close_btn_w: i32,
     /// Gap between two adjacent tabs (T206 — "tabs should have gaps in
     /// between"). Tabs used to tile edge to edge with a 1px rule between
@@ -99,19 +124,29 @@ pub const Metrics = struct {
     // get them. Ask `icon_button.fillRegion` for the shape instead.
 
     pub fn init(scale: f32) Metrics {
+        // The button geometry is NOT re-derived here. The strip's gaps are
+        // measured against the shared chrome square, so the square has to be
+        // the same object the painter uses, not a number that happens to
+        // agree with it today.
+        const ib = icon_button.Metrics.init(scale);
+        const sm = px(4.0, scale);
         return .{
-            .bar_h = px(32.0, scale),
-            .tab_top_pad = px(3.0, scale),
+            // 4 (top pad) + 4 (clear) + 28 (square) + 4 (clear) = 40 DIP.
+            .bar_h = sm + sm + ib.target + sm,
+            .tab_top_pad = sm,
+            .pad_sm = sm,
             .min_tab_w = px(60.0, scale),
             .max_tab_w = px(200.0, scale),
             .corner_r = px(6.0, scale),
-            .strip_pad_l = px(4.0, scale),
-            .strip_pad_r = px(4.0, scale),
+            .strip_pad_l = sm,
+            .strip_pad_r = sm,
             .group_gap = px(8.0, scale),
-            .btn_w = px(36.0, scale),
-            .close_btn_w = px(26.0, scale),
-            .tab_gap = px(4.0, scale),
-            .text_pad = px(10.0, scale),
+            .btn_paint = ib.target,
+            .btn_pad = ib.hit_pad,
+            .btn_w = ib.target + 2 * ib.hit_pad,
+            .close_btn_w = ib.target + 2 * ib.hit_pad,
+            .tab_gap = sm,
+            .text_pad = px(8.0, scale),
             .stripe_h = @max(px(3.0, scale), 2),
             .hairline = @max(px(1.0, scale), 1),
         };
@@ -125,29 +160,47 @@ pub const Metrics = struct {
     /// hit tests. It used to be recomputed in three places from two loose
     /// constants, which is how a geometry change could silently move the
     /// glyph away from the thing you click.
-    /// Spans the tab's FULL height on purpose. It is a hit box; the centering
-    /// is `icon_button.targetBox`'s job, and doing it here as well used to
-    /// round differently: at 1.25x the box came out `2 * (33/2) = 32` tall
-    /// against the "+"'s 33, so the close button painted one pixel short of
-    /// its neighbours at exactly the scales most likely to be in use.
+    ///
+    /// Positioned by its PAINTED square, which keeps `pad_sm` clear of the
+    /// tab's right edge; the returned HIT box is that square grown by
+    /// `btn_pad` horizontally and the tab's full height vertically. Before
+    /// T232 the box was placed directly and the paint fell where it fell —
+    /// which is why the "×" cleared the tab's top edge by 1-2 px ("the x
+    /// button's gap on the top touches the edge of the tab!").
     pub fn closeRect(self: Metrics, tab: Rect) Rect {
-        const left = tab.right - self.close_btn_w - @divTrunc(self.text_pad, 2);
+        const paint_right = tab.right - self.pad_sm;
         return .{
-            .left = left,
+            .left = paint_right - self.btn_paint - self.btn_pad,
             .top = tab.top,
-            .right = left + self.close_btn_w,
+            .right = paint_right + self.btn_pad,
             .bottom = tab.bottom,
         };
     }
 
     /// The title's box inside a tab: after the leading padding, stopping
-    /// before the close button.
+    /// `pad_sm` before the close button's PAINTED left edge — not before its
+    /// hit box, which would push the ellipsis in by an invisible amount.
     pub fn titleRect(self: Metrics, tab: Rect) Rect {
+        const close_paint_left = tab.right - self.pad_sm - self.btn_paint;
         return .{
             .left = tab.left + self.text_pad,
             .top = tab.top,
-            .right = tab.right - self.close_btn_w - self.text_pad,
+            .right = close_paint_left - self.pad_sm,
             .bottom = tab.bottom,
+        };
+    }
+
+    /// The HIT box for a strip button whose painted square starts at
+    /// `paint_left`: the square grown by `btn_pad` horizontally, and the tabs'
+    /// full vertical band. `icon_button.targetBox` recovers exactly the
+    /// painted square from it, so the layout can place paint and the painter
+    /// can consume boxes without either knowing the other's convention.
+    pub fn buttonHit(self: Metrics, paint_left: i32) Rect {
+        return .{
+            .left = paint_left - self.btn_pad,
+            .top = self.tab_top_pad,
+            .right = paint_left + self.btn_paint + self.btn_pad,
+            .bottom = self.bar_h,
         };
     }
 };
@@ -177,26 +230,33 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
     std.debug.assert(out.len >= tab_count);
     for (out[0..tab_count]) |*r| r.* = .{};
 
-    // The menu button is pinned to the right END OF THE STRIP — inset by
-    // `strip_pad_r`, matching the inset the first tab gets on the left. The
-    // "+" may travel, but never past `group_gap` short of the menu button.
-    const menu_right = client_w - m.strip_pad_r;
-    const menu_left = menu_right - m.btn_w;
-    const plus_limit = menu_left - m.group_gap - m.btn_w;
+    // EVERY number below is a PAINTED edge. The hit boxes are derived from
+    // them at the end, never the other way round — that inversion is the
+    // whole of the "+ has a huge left gap" bug (design system §0 rule 2).
+    //
+    // The menu button is pinned to the right END OF THE STRIP — its painted
+    // square inset by `strip_pad_r`, matching the inset the first tab gets on
+    // the left. The "+" may travel, but never past `group_gap` short of it.
+    const menu_paint_right = client_w - m.strip_pad_r;
+    const menu_paint_left = menu_paint_right - m.btn_paint;
+    const plus_paint_limit = menu_paint_left - m.group_gap - m.btn_paint;
 
     // The buttons live in the SAME vertical band as the tabs
     // (`tab_top_pad`..`bar_h`), not in the full bar. T204: the close "×" is
     // centered inside a tab, so unless the "+" and "≡" share the tab's band
     // their shared square lands one pixel higher and the three controls miss
-    // each other by exactly the amount the user could see.
+    // each other by exactly the amount the user could see. Their clearance
+    // from the strip's TOP edge is therefore `tab_top_pad + pad_sm` rather
+    // than `pad_sm` — a deliberate asymmetry (design system §0 rule 3), and
+    // the price of the three buttons agreeing with each other.
     var s: Strip = .{
         .tabs_right = m.strip_pad_l,
-        .menu = .{ .left = menu_left, .top = m.tab_top_pad, .right = menu_right, .bottom = m.bar_h },
-        .new_tab = .{ .left = plus_limit, .top = m.tab_top_pad, .right = plus_limit + m.btn_w, .bottom = m.bar_h },
+        .menu = m.buttonHit(menu_paint_left),
+        .new_tab = m.buttonHit(plus_paint_limit),
     };
 
     // Width the tabs may occupy: up to `group_gap` short of the "+"'s limit.
-    const tabs_avail = plus_limit - m.group_gap - m.strip_pad_l;
+    const tabs_avail = plus_paint_limit - m.group_gap - m.strip_pad_l;
     if (tab_count == 0 or tabs_avail < m.min_tab_w) return s;
 
     // Equal share, clamped. This is the whole anti-stretch rule: with one tab
@@ -235,8 +295,7 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
     // one `tab_gap` further right, and measuring the "+" gap from there would
     // silently widen it by the gap.
     s.tabs_right = out[visible - 1].right;
-    const plus_left = @min(s.tabs_right + m.group_gap, plus_limit);
-    s.new_tab = .{ .left = plus_left, .top = m.tab_top_pad, .right = plus_left + m.btn_w, .bottom = m.bar_h };
+    s.new_tab = m.buttonHit(@min(s.tabs_right + m.group_gap, plus_paint_limit));
     return s;
 }
 
@@ -296,6 +355,14 @@ fn layoutN(scale: f32, client_w: i32, n: usize, buf: []Rect) struct { Metrics, S
     return .{ m, layout(m, client_w, n, buf) };
 }
 
+/// What a button's hit box actually PAINTS. Every gap assertion below is
+/// written against this and never against the hit box — the tests have to
+/// measure the strip the way the user's eye does, or they would have passed
+/// against the 16:1 gap ratio that produced T232 (they did).
+fn painted(scale: f32, hit: Rect) Rect {
+    return icon_button.targetBox(icon_button.Metrics.init(scale), hit);
+}
+
 test "one tab is clamped to max width, not stretched across the window" {
     // THE bug this module exists for. `Window.zig` used to hand the last tab
     // `available - x`, so with one tab it took the entire strip.
@@ -318,17 +385,87 @@ test "the tab area never reaches the button band" {
         for ([_]usize{ 1, 2, 3, 8, 20, 40, 64 }) |n| {
             const m, const s = layoutN(scale, WIDE, n, &buf);
             if (s.visible == 0) continue;
-            try testing.expect(s.tabs_right + m.group_gap <= s.new_tab.left);
-            try testing.expect(s.new_tab.right + m.group_gap <= s.menu.left);
+            const plus = painted(scale, s.new_tab);
+            const menu = painted(scale, s.menu);
+            try testing.expect(s.tabs_right + m.group_gap <= plus.left);
+            try testing.expect(plus.right + m.group_gap <= menu.left);
             // The strip is inset by the SAME amount at both ends. Without a
             // right inset the menu button sat flush on the window border
             // while the first tab was inset by 4 — asymmetric by omission,
             // and the user caught it.
             try testing.expectEqual(m.strip_pad_l, m.strip_pad_r);
-            try testing.expectEqual(WIDE, s.menu.right + m.strip_pad_r);
-            // Every laid-out tab is left of the "+".
-            for (buf[0..s.visible]) |r| try testing.expect(r.right <= s.new_tab.left);
+            try testing.expectEqual(WIDE, menu.right + m.strip_pad_r);
+            // Every laid-out tab is left of the "+" it paints.
+            for (buf[0..s.visible]) |r| try testing.expect(r.right <= plus.left);
         }
+    }
+}
+
+test "T232: every painted gap in the strip is its DIP constant, exactly" {
+    // The regression this module now exists to prevent, stated as arithmetic.
+    // Measured at the user's 125% before the fix: the "+" square sat 16 px
+    // from the tab and 1 px from the strip's bottom edge — a 16:1 ratio
+    // between two gaps that should both have been on the 4 DIP scale.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 1.75, 2.0 }) |scale| {
+        for ([_]usize{ 1, 2, 3, 8 }) |n| {
+            const m, const s = layoutN(scale, WIDE, n, &buf);
+            if (s.visible == 0) continue;
+            const plus = painted(scale, s.new_tab);
+            const menu = painted(scale, s.menu);
+            const close = painted(scale, m.closeRect(buf[0]));
+
+            // Horizontal: tab → "+" → "≡" → window edge. The "+" TRAVELS with
+            // the last tab, so its gap to the tab is the constant and its gap
+            // to the pinned menu button is whatever strip is left over — the
+            // reverse of what the pre-T202 strip did.
+            try testing.expectEqual(m.group_gap, plus.left - s.tabs_right);
+            try testing.expect(menu.left - plus.right >= m.group_gap);
+            try testing.expectEqual(m.strip_pad_r, WIDE - menu.right);
+            try testing.expectEqual(m.strip_pad_l, buf[0].left);
+
+            // Vertical: every button square clears the band it sits in by
+            // `pad_sm` above AND below. This is the "no bottom gap" half.
+            for ([_]Rect{ plus, menu, close }) |sq| {
+                try testing.expectEqual(m.pad_sm, sq.top - m.tab_top_pad);
+                try testing.expectEqual(m.pad_sm, m.bar_h - sq.bottom);
+            }
+            // ...and the "×" clears the tab's own right edge by the same
+            // amount ("the x button's gap on the top touches the edge").
+            try testing.expectEqual(m.pad_sm, buf[0].right - close.right);
+
+            // No gap anywhere in the strip is more than 2x any other. Before
+            // T232 the worst pair was 16:1.
+            var lo: i32 = m.pad_sm;
+            var hi: i32 = m.pad_sm;
+            for ([_]i32{ m.group_gap, m.strip_pad_l, m.tab_gap, plus.top - m.tab_top_pad }) |g| {
+                lo = @min(lo, g);
+                hi = @max(hi, g);
+            }
+            try testing.expect(hi <= 2 * lo);
+        }
+    }
+}
+
+test "T232: hit boxes may overlap the gaps, but never each other" {
+    // The other half of rule 2: a forgiving click target is free precisely
+    // BECAUSE it is invisible — so it is allowed to reach into a gap, and it
+    // is never allowed to steal a neighbour's clicks.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m, const s = layoutN(scale, WIDE, 3, &buf);
+        try testing.expect(s.new_tab.right <= s.menu.left);
+        try testing.expect(buf[s.visible - 1].right <= s.new_tab.left);
+        try testing.expect(s.menu.right <= WIDE);
+        // The close button's hit box stays inside its tab.
+        for (buf[0..s.visible]) |tab| {
+            const close = m.closeRect(tab);
+            try testing.expect(close.right <= tab.right);
+            try testing.expect(close.left > tab.left);
+        }
+        // Hit boxes really are more forgiving than the paint, or none of the
+        // above would be saying anything.
+        try testing.expect(s.new_tab.width() > painted(scale, s.new_tab).width());
     }
 }
 
@@ -342,14 +479,15 @@ test "the + follows the last tab and stops at its limit" {
     // Adding a tab moves the "+" right by exactly one tab width...
     try testing.expectEqual(one.new_tab.left + m.max_tab_w, two.new_tab.left);
     try testing.expectEqual(two.new_tab.left + m.max_tab_w, three.new_tab.left);
-    // ... and it is a real gap, not zero (the "clipped" look).
-    try testing.expect(one.new_tab.left - one.tabs_right == m.group_gap);
+    // ... and it is a real gap, not zero (the "clipped" look) — measured
+    // between painted edges, which is the only measurement the user can see.
+    try testing.expectEqual(m.group_gap, painted(1.0, one.new_tab).left - one.tabs_right);
 
     // Once the tabs fill the strip the "+" stops at its limit and stays put.
     const many = layout(m, WIDE, 40, &buf);
     const more = layout(m, WIDE, 64, &buf);
     try testing.expectEqual(many.new_tab.left, more.new_tab.left);
-    try testing.expect(many.new_tab.right + m.group_gap <= many.menu.left);
+    try testing.expect(painted(1.0, many.new_tab).right + m.group_gap <= painted(1.0, many.menu).left);
 }
 
 test "tabs shrink with count, then overflow instead of running off the end" {
@@ -403,11 +541,11 @@ test "a window too narrow for a tab still lays out its buttons" {
     for ([_]i32{ 0, 10, 60, 100, 130 }) |w| {
         const s = layout(m, w, 3, &buf);
         try testing.expectEqual(@as(usize, 0), s.visible);
-        try testing.expectEqual(w - m.strip_pad_r, s.menu.right);
+        try testing.expectEqual(w - m.strip_pad_r, painted(1.0, s.menu).right);
         for (buf[0..3]) |r| try testing.expect(r.isEmpty());
     }
     // Just wide enough for one minimum tab, and it appears.
-    const ok = layout(m, m.strip_pad_l + m.strip_pad_r + m.min_tab_w + m.group_gap * 2 + m.btn_w * 2, 3, &buf);
+    const ok = layout(m, m.strip_pad_l + m.strip_pad_r + m.min_tab_w + m.group_gap * 2 + m.btn_paint * 2, 3, &buf);
     try testing.expectEqual(@as(usize, 1), ok.visible);
     try testing.expectEqual(m.min_tab_w, ok.tab_w);
 }

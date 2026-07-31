@@ -85,6 +85,7 @@ const dim_math = @import("dim_math.zig");
 const split_geometry = @import("split_geometry.zig");
 const tab_strip = @import("tab_strip_layout.zig");
 const icon_button = @import("icon_button.zig");
+const icon_paint = @import("icon_button_paint.zig");
 const tab_shape = @import("tab_shape.zig");
 const color_math = @import("color_math.zig");
 const tab_color = @import("tab_color.zig");
@@ -765,7 +766,11 @@ pub fn deinit(self: *Window) void {
 /// Returns 0 if the tab bar is not visible.
 pub fn tabBarHeight(self: *const Window) i32 {
     if (!self.tab_bar_visible) return 0;
-    return @intFromFloat(@round(32.0 * self.scale));
+    // From the layout module, not a second copy of the constant: `bar_h` is
+    // derived from the icon-button square it has to hold (T232), so a local
+    // `32.0 * scale` here would silently disagree with every rect the strip
+    // lays out — and it did.
+    return tab_strip.Metrics.init(self.scale).bar_h;
 }
 
 /// Width of the tab strip's "≡" menu button at a given DPI scale (T190).
@@ -2695,16 +2700,7 @@ fn paintIconButton(
         }
     }
 
-    const target = icon_button.targetBox(ib, box);
-    var strokes: [icon_button.max_strokes]icon_button.Stroke = undefined;
-    const pen = w32.CreatePen(0, ib.stroke_w, glyph_color) orelse return;
-    defer _ = w32.DeleteObject(pen);
-    const prev = w32.SelectObject(mem_dc, pen);
-    defer _ = w32.SelectObject(mem_dc, prev);
-    for (icon_button.glyphStrokes(ib, target, glyph, &strokes)) |s| {
-        _ = w32.MoveToEx(mem_dc, s.x0, s.y0, null);
-        _ = w32.LineTo(mem_dc, s.x1, s.y1);
-    }
+    icon_paint.glyph(mem_dc, ib, icon_button.targetBox(ib, box), glyph, glyph_color);
 }
 
 /// Paint the tab bar using double-buffered GDI painting.

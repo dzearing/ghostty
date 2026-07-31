@@ -107,40 +107,101 @@ pub const State = enum {
 
 /// Every DIP constant an icon button is built from, resolved to physical
 /// pixels for one DPI scale.
+///
+/// Two rules from `docs/design/win32-design-system.md` are baked in here, and
+/// they are why the fields look the way they do (T232):
+///
+///   1. The PAINTED square is 28 DIP; the HIT box is that square grown by
+///      `hit_pad` on every side. A hit box may be more forgiving than the
+///      paint — that costs nothing — but it is invisible, so it must never
+///      contribute to a gap. Measuring the strip's gaps to the hit box is
+///      what made the "+" look 16 px from a tab it was 8 DIP from.
+///   2. Every mark extent is forced to the same PARITY as the square's side,
+///      so `(side - extent) / 2` is an exact integer and the mark is centered
+///      BY CONSTRUCTION rather than by rounding luck. A mark whose parity
+///      differs from its container can only land half a pixel off-center, and
+///      that half pixel is the "left half of the plus is shorter than the
+///      right half" report.
 pub const Metrics = struct {
-    /// The square target every icon button shares. Chrome buttons are square;
-    /// making this one number is what stops three controls from landing at
-    /// three unrelated sizes.
+    /// The square every icon button PAINTS. Chrome buttons are square; making
+    /// this one number is what stops three controls from landing at three
+    /// unrelated sizes.
     target: i32,
-    /// Inset of the rounded fill inside that target, so two adjacent lit
-    /// buttons never touch.
+    /// How far the hit box grows past the painted square on EACH side, so a
+    /// 28 DIP paint yields a >= 32 DIP click target. Symmetric on purpose:
+    /// an asymmetric hit box moves the painted square when a site derives one
+    /// from the other.
+    hit_pad: i32,
+    /// Inset of the rounded fill inside that square (`xs`), so two adjacent
+    /// lit buttons never touch.
     inset: i32,
     /// Corner radius of the fill. Windows 11 lights a button as a rounded
     /// rect inset in its hit box, not as a full-bleed square — the square is
     /// what made the "+" and "≡" read as one slab.
     corner_r: i32,
-    /// Glyph em height. Deliberately INDEPENDENT of the tab title font: the
-    /// glyphs used to inherit T78's `window-title-font-family` at ~9pt, which
-    /// is why the user said the icons "feel too small". Chrome glyphs are
-    /// sized as chrome, not as text the user chose.
-    glyph_px: i32,
-    /// Pen width for a stroked glyph, never thinner than a pixel.
+    /// Mark thickness, ~2 DIP, parity-matched to `target`.
     stroke_w: i32,
+    /// Mark extents, tuned OPTICALLY per glyph rather than shared: equal
+    /// geometric width does not read as equal width. A horizontal-only mark
+    /// (the hamburger) reads narrower than one with a vertical member (the
+    /// plus) at the same extent, and a diagonal cross reads wider than its
+    /// bounding box. Design system §4.2.
+    mark_add: i32,
+    mark_close: i32,
+    mark_menu: i32,
+    /// Chevron width and total rise.
+    mark_chevron_w: i32,
+    mark_chevron_h: i32,
+    /// Vertical pitch between the hamburger's three rules. Applied
+    /// symmetrically about the middle rule, so it needs no parity match.
+    menu_pitch: i32,
 
     pub fn init(scale: f32) Metrics {
+        const side = px(28.0, scale);
         return .{
-            .target = px(26.0, scale),
-            .inset = px(1.0, scale),
+            .target = side,
+            .hit_pad = px(2.0, scale),
+            .inset = px(2.0, scale),
             .corner_r = px(4.0, scale),
-            .glyph_px = px(16.0, scale),
-            .stroke_w = @max(px(1.5, scale), 1),
+            .stroke_w = markPx(2.0, scale, side),
+            .mark_add = markPx(12.0, scale, side),
+            .mark_close = markPx(11.0, scale, side),
+            .mark_menu = markPx(14.0, scale, side),
+            .mark_chevron_w = markPx(12.0, scale, side),
+            .mark_chevron_h = markPx(6.0, scale, side),
+            .menu_pitch = px(4.0, scale),
         };
     }
 
     fn px(dip: f32, scale: f32) i32 {
         return @intFromFloat(@round(dip * scale));
     }
+
+    /// A mark extent in physical pixels, forced to the same parity as `side`.
+    ///
+    /// Rounds DOWN on a parity mismatch, never up: rounding up collapses the
+    /// optical order (close < add < menu) at half the scales, and a mark one
+    /// pixel under its nominal DIP is invisible while a mis-centered one is
+    /// exactly what the user reported.
+    fn markPx(dip: f32, scale: f32, side: i32) i32 {
+        var e = @max(px(dip, scale), 1);
+        if (((side - e) & 1) != 0) e = if (e > 1) e - 1 else e + 1;
+        return e;
+    }
 };
+
+/// The HIT box for a painted square: the square grown by `hit_pad` on every
+/// side. The inverse of `targetBox`, and exactly so — `targetBox(m,
+/// hitBox(m, sq)) == sq` at every scale, which is what lets a layout reason in
+/// painted edges while its call sites keep hit-testing the box they always had.
+pub fn hitBox(m: Metrics, painted: Rect) Rect {
+    return .{
+        .left = painted.left - m.hit_pad,
+        .top = painted.top - m.hit_pad,
+        .right = painted.right + m.hit_pad,
+        .bottom = painted.bottom + m.hit_pad,
+    };
+}
 
 /// The shared square target, centered inside whatever box a site has for the
 /// button. Sites keep their own (often wider, more forgiving) HIT box; the
@@ -210,8 +271,22 @@ pub fn shadeChannel(base: u8, delta: i32) u8 {
     return @intCast(std.math.clamp(v, 0, 255));
 }
 
-/// One line of a stroked glyph, in physical pixels.
-pub const Stroke = struct { x0: i32, y0: i32, x1: i32, y1: i32 };
+/// A point in physical pixels, matching `w32.POINT` field-for-field so a
+/// `Quad` can be handed straight to `Polygon` without a copy loop.
+pub const Point = extern struct { x: i32, y: i32 };
+
+/// One FILLED convex quad of a glyph, in GDI `Polygon` coordinates — which
+/// means right/bottom exclusive, like every other rect in this module.
+///
+/// Filled, not stroked. `CreatePen` + `MoveToEx`/`LineTo` cannot draw a
+/// symmetric mark: `LineTo` excludes its endpoint, so a stroke from `cx-h` to
+/// `cx+h` paints one pixel short on the trailing side, and a pen wider than
+/// 1 px biases its extra pixel up/left at even widths. Together they are the
+/// "left half of the horizontal line of the plus is shorter than the right
+/// half" report, and they cannot be fixed by nudging coordinates because the
+/// bias flips with DPI. A filled quad has explicit extents, so symmetry is
+/// arithmetic rather than a hope. (Design system §4.1.)
+pub const Quad = extern struct { pts: [4]Point };
 
 /// The icons the chrome draws. Names follow the Fluent icon they stand in for
 /// (ChromeClose, Add, GlobalNavButton) so a later switch to a real icon font
@@ -229,12 +304,64 @@ pub const Glyph = enum {
     chevron_down,
 };
 
-/// The maximum strokes any glyph needs, so callers can size a stack buffer.
-pub const max_strokes: usize = 3;
+/// The maximum quads any glyph needs, so callers can size a stack buffer.
+pub const max_quads: usize = 3;
 
-/// The line segments for `glyph`, centered in `target`.
+/// `e` trimmed to fit inside `side` AND to share its parity, so the clearance
+/// `(side - e) / 2` is the same integer on both sides with no rounding.
 ///
-/// STROKED, not a font character. Two reasons, and they are the same two T172
+/// `Metrics.markPx` already guarantees the parity against the FULL square, so
+/// normally this changes nothing. It earns its keep when `targetBox` had to
+/// clamp — a strip too cramped for the shared square shrinks its buttons, and
+/// a glyph must stay centered in the smaller square rather than inheriting the
+/// parity of a square it is no longer in.
+fn fitParity(side: i32, e: i32) i32 {
+    var v = @min(e, side);
+    if (((side - v) & 1) != 0) v -= 1;
+    // A mark trimmed out of existence still has to be visible AND keep the
+    // parity, so it falls back to the smallest extent of the right parity.
+    if (v < 1) v = @min(2 - (side & 1), @max(side, 1));
+    return v;
+}
+
+/// A rect centered inside `target`, `w` x `h`, right/bottom exclusive.
+fn centered(target: Rect, w: i32, h: i32) Rect {
+    const cw = fitParity(target.width(), w);
+    const ch = fitParity(target.height(), h);
+    const left = target.left + @divTrunc(target.width() - cw, 2);
+    const top = target.top + @divTrunc(target.height() - ch, 2);
+    return .{ .left = left, .top = top, .right = left + cw, .bottom = top + ch };
+}
+
+/// An axis-aligned filled bar as a quad, wound clockwise.
+fn bar(r: Rect) Quad {
+    return .{ .pts = .{
+        .{ .x = r.left, .y = r.top },
+        .{ .x = r.right, .y = r.top },
+        .{ .x = r.right, .y = r.bottom },
+        .{ .x = r.left, .y = r.bottom },
+    } };
+}
+
+/// `q` reflected through the vertical line `x = m/2`. Used to build the second
+/// half of a symmetric glyph FROM the first, so the two halves cannot disagree
+/// — which is the whole lesson of the asymmetric "+".
+fn mirrorX(q: Quad, m: i32) Quad {
+    var r: Quad = undefined;
+    for (q.pts, 0..) |p, i| r.pts[i] = .{ .x = m - p.x, .y = p.y };
+    return r;
+}
+
+/// `q` reflected through the horizontal line `y = m/2`.
+fn mirrorY(q: Quad, m: i32) Quad {
+    var r: Quad = undefined;
+    for (q.pts, 0..) |p, i| r.pts[i] = .{ .x = p.x, .y = m - p.y };
+    return r;
+}
+
+/// The filled quads for `glyph`, centered in `target`.
+///
+/// DRAWN, not a font character. Two reasons, and they are the same two T172
 /// had for drawing the machine-chooser icons by hand:
 ///
 ///   1. A symbol font that is missing renders as tofu. Segoe Fluent Icons
@@ -246,50 +373,106 @@ pub const max_strokes: usize = 3;
 ///      font — so their size tracked a setting that has nothing to do with
 ///      chrome, which is the "icons still feel too small" half of the report.
 ///
-/// Drawing them means the size is a number in this module and the three
-/// glyphs are optically consistent by construction.
+/// Drawing them means the size is a number in this module and the glyphs are
+/// optically consistent by construction.
 ///
-/// Returns the used prefix of `out`, which must hold `max_strokes` entries.
-pub fn glyphStrokes(m: Metrics, target: Rect, glyph: Glyph, out: []Stroke) []const Stroke {
-    std.debug.assert(out.len >= max_strokes);
-    const cx = @divTrunc(target.left + target.right, 2);
-    const cy = @divTrunc(target.top + target.bottom, 2);
-    // Half-extent of the drawn mark inside the glyph box. A third of the em
-    // gives a 10px mark in a 16px box, which is the proportion Fluent's
-    // ChromeClose/Add use inside their own em square.
-    const h = @max(@divTrunc(m.glyph_px, 3), 2);
+/// Returns the used prefix of `out`, which must hold `max_quads` entries.
+pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Quad {
+    std.debug.assert(out.len >= max_quads);
+    const t = m.stroke_w;
 
     switch (glyph) {
-        .close => {
-            out[0] = .{ .x0 = cx - h, .y0 = cy - h, .x1 = cx + h, .y1 = cy + h };
-            out[1] = .{ .x0 = cx - h, .y0 = cy + h, .x1 = cx + h, .y1 = cy - h };
-            return out[0..2];
-        },
         .add => {
-            out[0] = .{ .x0 = cx - h, .y0 = cy, .x1 = cx + h, .y1 = cy };
-            out[1] = .{ .x0 = cx, .y0 = cy - h, .x1 = cx, .y1 = cy + h };
+            out[0] = bar(centered(target, m.mark_add, t));
+            out[1] = bar(centered(target, t, m.mark_add));
             return out[0..2];
         },
         .menu => {
-            // Three rules, evenly spaced about the center.
-            const gap = @max(@divTrunc(m.glyph_px, 4), 2);
-            out[0] = .{ .x0 = cx - h, .y0 = cy - gap, .x1 = cx + h, .y1 = cy - gap };
-            out[1] = .{ .x0 = cx - h, .y0 = cy, .x1 = cx + h, .y1 = cy };
-            out[2] = .{ .x0 = cx - h, .y0 = cy + gap, .x1 = cx + h, .y1 = cy + gap };
+            const mid = centered(target, m.mark_menu, t);
+            out[0] = bar(.{
+                .left = mid.left,
+                .top = mid.top - m.menu_pitch,
+                .right = mid.right,
+                .bottom = mid.bottom - m.menu_pitch,
+            });
+            out[1] = bar(mid);
+            // The third rule is the FIRST one mirrored through the middle
+            // rule's own center line, so the outer two are equidistant by
+            // construction instead of by two independent additions.
+            out[2] = mirrorY(out[0], mid.top + mid.bottom);
             return out[0..3];
+        },
+        .close => {
+            // Two diagonal bars across the mark box.
+            //
+            // `k` is how far each corner vertex sits from the diagonal ALONG
+            // an axis, and the arithmetic is the whole reason this glyph is
+            // easy to get wrong: the band's two long edges are `2k` apart
+            // vertically, so at 45° its PERPENDICULAR thickness is `2k/√2 =
+            // k·√2`. Setting `k` to a multiple of the stroke width makes an ×
+            // ~1.4x heavier than intended, which paints a filled bowtie
+            // instead of a close icon ("what is wrong with the x icon on the
+            // tab??? it should be the standard X close icon, not some weird
+            // variant", user, 2026-07-31). So k ≈ 3t/4 ≈ t/√2, which lands
+            // the × at the same visual weight as the "+" beside it.
+            const b = centered(target, m.mark_close, m.mark_close);
+            const k = @max(@divTrunc(t * 3, 4), 1);
+            // Top-left → bottom-right. The quad is its own 180° rotation
+            // about the box center, so the two arms of the cross and the two
+            // ends of each arm are all symmetric.
+            out[0] = .{ .pts = .{
+                .{ .x = b.left, .y = b.top + k },
+                .{ .x = b.left + k, .y = b.top },
+                .{ .x = b.right, .y = b.bottom - k },
+                .{ .x = b.right - k, .y = b.bottom },
+            } };
+            out[1] = mirrorY(out[0], b.top + b.bottom);
+            return out[0..2];
         },
         .chevron_up, .chevron_down => {
             // A shallower rise than the arms are wide — a chevron, not a
-            // caret. `rise` is half `h` so the two legs read as one angle.
-            const rise = @max(@divTrunc(h, 2), 1);
-            const apex_up = (glyph == .chevron_up);
-            const y_end: i32 = if (apex_up) cy + rise else cy - rise;
-            const y_apex: i32 = if (apex_up) cy - rise else cy + rise;
-            out[0] = .{ .x0 = cx - h, .y0 = y_end, .x1 = cx, .y1 = y_apex };
-            out[1] = .{ .x0 = cx, .y0 = y_apex, .x1 = cx + h, .y1 = y_end };
+            // caret. One arm is built, the other is its mirror.
+            const b = centered(target, m.mark_chevron_w, m.mark_chevron_h);
+            // Where the arm meets the apex. `+1` so an odd-width chevron's
+            // two arms overlap by a pixel at the apex rather than leaving a
+            // hole there.
+            const apex_x = b.left + @divTrunc(b.width() + 1, 2);
+            // Arm as it runs down-left for `chevron_up`: thick vertically by
+            // `t`, low at the left edge and high at the apex.
+            const left_arm: Quad = .{ .pts = .{
+                .{ .x = b.left, .y = b.bottom - t },
+                .{ .x = apex_x, .y = b.top },
+                .{ .x = apex_x, .y = b.top + t },
+                .{ .x = b.left, .y = b.bottom },
+            } };
+            out[0] = left_arm;
+            out[1] = mirrorX(left_arm, b.left + b.right);
+            if (glyph == .chevron_down) {
+                out[0] = mirrorY(out[0], b.top + b.bottom);
+                out[1] = mirrorY(out[1], b.top + b.bottom);
+            }
             return out[0..2];
         },
     }
+}
+
+/// The pixel extent a set of quads actually paints, right/bottom EXCLUSIVE
+/// (GDI's polygon fill excludes those edges, which is why the quads are
+/// authored in that convention in the first place).
+pub fn paintedBounds(quads: []const Quad) Rect {
+    var r: Rect = .{
+        .left = std.math.maxInt(i32),
+        .top = std.math.maxInt(i32),
+        .right = std.math.minInt(i32),
+        .bottom = std.math.minInt(i32),
+    };
+    for (quads) |q| for (q.pts) |p| {
+        r.left = @min(r.left, p.x);
+        r.top = @min(r.top, p.y);
+        r.right = @max(r.right, p.x);
+        r.bottom = @max(r.bottom, p.y);
+    };
+    return r;
 }
 
 /// Are glyphs centered in their target? Always yes in the shipped build; the
@@ -312,25 +495,62 @@ pub fn universalHover() bool {
 
 test "targetBox is square and centered in its box" {
     const m = Metrics.init(1.0);
-    // The "+"/"≡" box: 36 wide, the full 3..32 band.
-    const t = targetBox(m, .{ .left = 100, .top = 3, .right = 136, .bottom = 32 });
-    try testing.expectEqual(@as(i32, 26), t.width());
-    try testing.expectEqual(@as(i32, 26), t.height());
-    // Centered horizontally on the box's own center (118).
-    try testing.expectEqual(@as(i32, 105), t.left);
-    try testing.expectEqual(@as(i32, 131), t.right);
+    // The "+"/"≡" hit box: 32 wide, the full 4..40 band.
+    const t = targetBox(m, .{ .left = 100, .top = 4, .right = 132, .bottom = 40 });
+    try testing.expectEqual(@as(i32, 28), t.width());
+    try testing.expectEqual(@as(i32, 28), t.height());
+    // Centered horizontally on the box's own center (116).
+    try testing.expectEqual(@as(i32, 102), t.left);
+    try testing.expectEqual(@as(i32, 130), t.right);
+}
+
+test "hitBox and targetBox are exact inverses at every scale" {
+    // The rule that makes painted-edge layout possible (T232): a layout can
+    // place the PAINTED square, hand its call sites `hitBox` of it, and know
+    // the painter — which only ever sees the hit box — recovers the same
+    // square. If this drifts by a pixel every gap in the strip drifts with it.
+    for ([_]f32{ 1.0, 1.25, 1.5, 1.75, 2.0, 3.0 }) |scale| {
+        const m = Metrics.init(scale);
+        for ([_]i32{ 0, 1, 7, 100, 1001 }) |left| {
+            for ([_]i32{ 0, 3, 4, 17 }) |top| {
+                const sq: Rect = .{
+                    .left = left,
+                    .top = top,
+                    .right = left + m.target,
+                    .bottom = top + m.target,
+                };
+                const got = targetBox(m, hitBox(m, sq));
+                try testing.expectEqual(sq.left, got.left);
+                try testing.expectEqual(sq.top, got.top);
+                try testing.expectEqual(sq.right, got.right);
+                try testing.expectEqual(sq.bottom, got.bottom);
+            }
+        }
+    }
+}
+
+test "the hit box clears the 32 DIP floor without moving the paint" {
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const sq: Rect = .{ .left = 0, .top = 0, .right = m.target, .bottom = m.target };
+        const h = hitBox(m, sq);
+        // >= 32 DIP, and grown by the SAME amount on both sides.
+        try testing.expect(@as(f32, @floatFromInt(h.width())) >= 32.0 * scale - 0.5);
+        try testing.expectEqual(sq.left - h.left, h.right - sq.right);
+        try testing.expectEqual(sq.top - h.top, h.bottom - sq.bottom);
+    }
 }
 
 test "every icon button lands on ONE vertical frame" {
     const m = Metrics.init(1.0);
-    // The three strip controls, given the same 3..32 band but different
+    // The three strip controls, given the same 4..40 band but different
     // widths. This is the user's "misaligned" complaint, as an assertion:
     // whatever their widths, their vertical extents must be identical.
-    const band_top: i32 = 3;
-    const band_bottom: i32 = 32;
-    const plus = targetBox(m, .{ .left = 0, .top = band_top, .right = 36, .bottom = band_bottom });
-    const menu = targetBox(m, .{ .left = 900, .top = band_top, .right = 936, .bottom = band_bottom });
-    const close = targetBox(m, .{ .left = 300, .top = band_top, .right = 326, .bottom = band_bottom });
+    const band_top: i32 = 4;
+    const band_bottom: i32 = 40;
+    const plus = targetBox(m, .{ .left = 0, .top = band_top, .right = 32, .bottom = band_bottom });
+    const menu = targetBox(m, .{ .left = 900, .top = band_top, .right = 932, .bottom = band_bottom });
+    const close = targetBox(m, .{ .left = 300, .top = band_top, .right = 332, .bottom = band_bottom });
 
     try testing.expectEqual(plus.top, menu.top);
     try testing.expectEqual(plus.top, close.top);
@@ -346,7 +566,7 @@ test "the fill is a square inset inside the target, not a tab-shaped slab" {
     // The pre-T204 "+" fill was the full 36-wide button box inset by 2, i.e.
     // 32x24 — wider than tall, which is exactly why a hovered "+" read as a
     // second tab. The shared fill is square.
-    const f = fillRegion(m, .{ .left = 0, .top = 3, .right = 36, .bottom = 32 });
+    const f = fillRegion(m, .{ .left = 0, .top = 4, .right = 32, .bottom = 40 });
     const w = f.right - 1 - f.left;
     const h = f.bottom - 1 - f.top;
     try testing.expectEqual(w, h);
@@ -356,7 +576,7 @@ test "the fill is a square inset inside the target, not a tab-shaped slab" {
 
 test "fill region round-trips CreateRoundRectRgn's inclusive edges" {
     const m = Metrics.init(1.0);
-    const box = Rect{ .left = 10, .top = 3, .right = 46, .bottom = 32 };
+    const box = Rect{ .left = 10, .top = 4, .right = 42, .bottom = 40 };
     const t = targetBox(m, box);
     const f = fillRegion(m, box);
     try testing.expectEqual(t.left + m.inset, f.left);
@@ -377,20 +597,39 @@ test "a box smaller than the target clamps instead of overflowing" {
 
 test "targetBox scales with DPI" {
     const m = Metrics.init(2.0);
-    try testing.expectEqual(@as(i32, 52), m.target);
-    try testing.expectEqual(@as(i32, 32), m.glyph_px);
+    try testing.expectEqual(@as(i32, 56), m.target);
     const t = targetBox(m, .{ .left = 0, .top = 0, .right = 72, .bottom = 64 });
-    try testing.expectEqual(@as(i32, 52), t.width());
+    try testing.expectEqual(@as(i32, 56), t.width());
 }
 
 test "glyph size does not track the tab title font" {
-    // The regression this pins: glyph_px is derived from the DPI scale alone.
-    // Nothing about a user-chosen title font can reach it, which is what
-    // "icons still feel too small" was.
+    // The regression this pins: every mark extent is derived from the DPI
+    // scale alone. Nothing about a user-chosen title font can reach it, which
+    // is what "icons still feel too small" was.
     const a = Metrics.init(1.0);
     const b = Metrics.init(1.0);
-    try testing.expectEqual(a.glyph_px, b.glyph_px);
-    try testing.expectEqual(@as(i32, 16), a.glyph_px);
+    try testing.expectEqual(a.mark_add, b.mark_add);
+    try testing.expectEqual(@as(i32, 12), a.mark_add);
+    try testing.expectEqual(@as(i32, 28), a.target);
+}
+
+test "every mark shares its square's parity, so it can be centered exactly" {
+    // The arithmetic that makes symmetry constructive rather than hopeful: an
+    // extent whose parity differs from the square's cannot be centered on an
+    // integer grid, and the leftover half pixel is the "one arm shorter"
+    // report. Checked over a wide sweep of scales, not just the pretty ones.
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        const m = Metrics.init(scale);
+        for ([_]i32{
+            m.stroke_w,   m.mark_add,        m.mark_close,
+            m.mark_menu,  m.mark_chevron_w,  m.mark_chevron_h,
+        }) |e| {
+            try testing.expect(e >= 1);
+            try testing.expect(e <= m.target);
+            try testing.expectEqual(@as(i32, 0), (m.target - e) & 1);
+        }
+    }
 }
 
 test "every non-normal state paints a fill" {
@@ -422,98 +661,195 @@ test "shadeChannel clamps at both ends" {
     try testing.expectEqual(@as(u8, 0), shadeChannel(5, -15));
 }
 
-test "every glyph is centered on its target's center" {
-    // The user's "centered icons", as an assertion. Each glyph's own bounding
-    // box must be centered on the target it was given — for all five, at
-    // several DPI scales, including odd-sized targets where a naive
-    // implementation drifts by a pixel.
-    var buf: [max_strokes]Stroke = undefined;
-    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+const all_glyphs = [_]Glyph{ .close, .add, .menu, .chevron_up, .chevron_down };
+
+/// The painted square a strip button gets at `scale`, i.e. what the glyph
+/// tests below are actually drawing into. Derived from the metrics rather
+/// than hard-coded, because a hard-coded 32x36 box silently CLAMPS the square
+/// at 2.0 and then the test is measuring a cramped button, not the shipped
+/// one.
+fn squareAt(m: Metrics) Rect {
+    const sq: Rect = .{ .left = 0, .top = m.hit_pad, .right = m.target, .bottom = m.hit_pad + m.target };
+    return targetBox(m, hitBox(m, sq));
+}
+
+test "every glyph is symmetric inside its target, on both axes" {
+    // The user's "the left half of the plus is shorter than the right half",
+    // as an assertion — and the reason `glyphQuads` replaced pen strokes.
+    // Symmetry is stated as EQUAL CLEARANCE inside the square rather than
+    // `min + max == 2 * center`: the square's side can be even, in which case
+    // its "center" is between two pixels and the old formula silently
+    // tolerated a half-pixel bias. This one cannot.
+    //
+    // Swept finely, not at four hand-picked scales: most of these defects are
+    // invisible at 1.0 and obvious at 1.25.
+    var buf: [max_quads]Quad = undefined;
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
         const m = Metrics.init(scale);
         for ([_]Rect{
-            .{ .left = 0, .top = 3, .right = 36, .bottom = 32 },
-            .{ .left = 101, .top = 4, .right = 128, .bottom = 33 }, // odd sizes
-        }) |box| {
-            const t = targetBox(m, box);
-            const cx = @divTrunc(t.left + t.right, 2);
-            const cy = @divTrunc(t.top + t.bottom, 2);
-            for ([_]Glyph{ .close, .add, .menu, .chevron_up, .chevron_down }) |g| {
-                const strokes = glyphStrokes(m, t, g, &buf);
-                try testing.expect(strokes.len >= 2);
-                var min_x: i32 = std.math.maxInt(i32);
-                var max_x: i32 = std.math.minInt(i32);
-                var min_y: i32 = std.math.maxInt(i32);
-                var max_y: i32 = std.math.minInt(i32);
-                for (strokes) |s| {
-                    min_x = @min(min_x, @min(s.x0, s.x1));
-                    max_x = @max(max_x, @max(s.x0, s.x1));
-                    min_y = @min(min_y, @min(s.y0, s.y1));
-                    max_y = @max(max_y, @max(s.y0, s.y1));
-                }
-                try testing.expectEqual(cx * 2, min_x + max_x);
-                try testing.expectEqual(cy * 2, min_y + max_y);
+            squareAt(m), // the square the strip actually paints
+            targetBox(m, .{ .left = 0, .top = 4, .right = 32, .bottom = 40 }),
+            targetBox(m, .{ .left = 101, .top = 5, .right = 134, .bottom = 41 }), // odd, clamped
+        }) |t| {
+            for (all_glyphs) |g| {
+                const quads = glyphQuads(m, t, g, &buf);
+                try testing.expect(quads.len >= 2);
+                const b = paintedBounds(quads);
+                // Right/bottom are exclusive, so the last painted pixel is
+                // `right - 1`; clearance on each side must match exactly.
+                try testing.expectEqual(b.left - t.left, t.right - b.right);
+                try testing.expectEqual(b.top - t.top, t.bottom - b.bottom);
             }
         }
     }
 }
 
-test "every glyph fits inside its target" {
-    var buf: [max_strokes]Stroke = undefined;
-    for ([_]f32{ 1.0, 1.5, 2.0 }) |scale| {
+test "every glyph keeps real clearance inside its square" {
+    // Fitting is not enough — a mark that reaches its square's edge reads as
+    // touching the button. Design system §0: nothing touches anything.
+    var buf: [max_quads]Quad = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
         const m = Metrics.init(scale);
-        const t = targetBox(m, .{ .left = 0, .top = 3, .right = 36, .bottom = 32 });
-        for ([_]Glyph{ .close, .add, .menu, .chevron_up, .chevron_down }) |g| {
-            for (glyphStrokes(m, t, g, &buf)) |s| {
-                try testing.expect(s.x0 >= t.left and s.x1 >= t.left);
-                try testing.expect(s.x0 <= t.right and s.x1 <= t.right);
-                try testing.expect(s.y0 >= t.top and s.y1 >= t.top);
-                try testing.expect(s.y0 <= t.bottom and s.y1 <= t.bottom);
-            }
+        const t = squareAt(m);
+        for (all_glyphs) |g| {
+            const b = paintedBounds(glyphQuads(m, t, g, &buf));
+            try testing.expect(b.left > t.left);
+            try testing.expect(b.right < t.right);
+            try testing.expect(b.top > t.top);
+            try testing.expect(b.bottom < t.bottom);
         }
     }
 }
 
-test "close, add and menu share one optical width" {
-    // Three controls side by side must not be three different sizes — that
-    // was half of "misaligned".
-    var buf: [max_strokes]Stroke = undefined;
-    const m = Metrics.init(1.0);
-    const t = targetBox(m, .{ .left = 0, .top = 3, .right = 36, .bottom = 32 });
-    var widths: [3]i32 = undefined;
-    for ([_]Glyph{ .close, .add, .menu }, 0..) |g, i| {
-        const strokes = glyphStrokes(m, t, g, &buf);
-        var min_x: i32 = std.math.maxInt(i32);
-        var max_x: i32 = std.math.minInt(i32);
-        for (strokes) |s| {
-            min_x = @min(min_x, @min(s.x0, s.x1));
-            max_x = @max(max_x, @max(s.x0, s.x1));
+test "the glyphs keep their OPTICAL order, not one shared width" {
+    // This test used to assert `close == add == menu` exactly. That is the
+    // wrong invariant and it is why the user could see the hamburger was "not
+    // wide enough by maybe 2px": equal geometric width does NOT read as equal
+    // width. A horizontal-only mark reads narrow and a diagonal cross reads
+    // wide, so the sizes are deliberately ordered close < add < menu — and
+    // the ORDER is what has to hold at every scale. (Design system §4.2.)
+    var buf: [max_quads]Quad = undefined;
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        var w: [3]i32 = undefined;
+        for ([_]Glyph{ .close, .add, .menu }, 0..) |g, i| {
+            w[i] = paintedBounds(glyphQuads(m, t, g, &buf)).width();
         }
-        widths[i] = max_x - min_x;
+        try testing.expect(w[0] < w[1]);
+        try testing.expect(w[1] < w[2]);
+        // ...and none of them runs away from the others: the three still read
+        // as one set of controls, which is what T204 was about.
+        try testing.expect(w[2] - w[0] <= @divTrunc(m.target, 3));
     }
-    try testing.expectEqual(widths[0], widths[1]);
-    try testing.expectEqual(widths[0], widths[2]);
 }
 
 test "the two chevrons mirror each other" {
-    var up: [max_strokes]Stroke = undefined;
-    var down: [max_strokes]Stroke = undefined;
-    const m = Metrics.init(1.0);
-    const t = targetBox(m, .{ .left = 0, .top = 0, .right = 26, .bottom = 26 });
-    const a = glyphStrokes(m, t, .chevron_up, &up);
-    const b = glyphStrokes(m, t, .chevron_down, &down);
-    try testing.expectEqual(a.len, b.len);
-    const cy = @divTrunc(t.top + t.bottom, 2);
-    for (a, b) |sa, sb| {
-        try testing.expectEqual(sa.x0, sb.x0);
-        try testing.expectEqual(sa.x1, sb.x1);
-        try testing.expectEqual(cy * 2, sa.y0 + sb.y0);
-        try testing.expectEqual(cy * 2, sa.y1 + sb.y1);
+    var up: [max_quads]Quad = undefined;
+    var down: [max_quads]Quad = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const t = targetBox(m, .{ .left = 0, .top = 0, .right = m.target, .bottom = m.target });
+        const a = glyphQuads(m, t, .chevron_up, &up);
+        const b = glyphQuads(m, t, .chevron_down, &down);
+        try testing.expectEqual(a.len, b.len);
+        const ab = paintedBounds(a);
+        const bb = paintedBounds(b);
+        // Same footprint, flipped: every vertex of `up` reflects onto one of
+        // `down` through the shared bounding box's horizontal axis.
+        try testing.expectEqual(ab.left, bb.left);
+        try testing.expectEqual(ab.right, bb.right);
+        try testing.expectEqual(ab.top, bb.top);
+        try testing.expectEqual(ab.bottom, bb.bottom);
+        const my = ab.top + ab.bottom;
+        for (a, b) |qa, qb| for (qa.pts, qb.pts) |pa, pb| {
+            try testing.expectEqual(pa.x, pb.x);
+            try testing.expectEqual(my, pa.y + pb.y);
+        };
     }
 }
 
-test "a stroke is never hairline-invisible at any DPI" {
+test "a mark is never hairline-invisible at any DPI" {
     for ([_]f32{ 1.0, 1.25, 1.5, 2.0, 3.0 }) |scale| {
-        try testing.expect(Metrics.init(scale).stroke_w >= 1);
+        try testing.expect(Metrics.init(scale).stroke_w >= 2);
+    }
+}
+
+test "the plus is exactly as long as it is tall" {
+    // Cheap, and it would have caught the reported asymmetry on its own: the
+    // "+" is two bars of the same extent crossing at the square's center.
+    var buf: [max_quads]Quad = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const q = glyphQuads(m, t, .add, &buf);
+        try testing.expectEqual(@as(usize, 2), q.len);
+        const b = paintedBounds(q);
+        try testing.expectEqual(b.width(), b.height());
+        try testing.expectEqual(m.mark_add, b.width());
+        // Each bar is `stroke_w` across its short axis.
+        const h_bar = paintedBounds(q[0..1]);
+        const v_bar = paintedBounds(q[1..2]);
+        try testing.expectEqual(m.stroke_w, h_bar.height());
+        try testing.expectEqual(m.stroke_w, v_bar.width());
+        // ...and the two halves of each bar are the same length, which is the
+        // literal complaint.
+        try testing.expectEqual(v_bar.left - h_bar.left, h_bar.right - v_bar.right);
+        try testing.expectEqual(h_bar.top - v_bar.top, v_bar.bottom - h_bar.bottom);
+    }
+}
+
+test "the close X is a cross, not a bowtie" {
+    // Shipped once as a solid blob: `k` was set from the stroke width as
+    // though a 45° band's perpendicular thickness were `k/√2`, when it is
+    // `k·√2` — a 2x error, which fattened the arms until they merged into a
+    // filled bowtie everywhere except the four tips.
+    //
+    // Asserted as arithmetic on the quad itself: `k` is the corner offset
+    // along an axis, `k·√2` the thickness the eye sees, and that has to land
+    // within a pixel of the "+"'s bar thickness or the two glyphs do not read
+    // as one set of controls.
+    var buf: [max_quads]Quad = undefined;
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const q = glyphQuads(m, t, .close, &buf);
+        try testing.expectEqual(@as(usize, 2), q.len);
+        const k = q[0].pts[1].x - q[0].pts[0].x;
+        try testing.expect(k >= 1);
+        // |k*√2 - stroke_w| <= 1, in hundredths so it stays integer math.
+        try testing.expect(@abs(k * 141 - m.stroke_w * 100) <= 100);
+        // The arms must still be thin enough to leave a real notch: the
+        // vertical gap between the two long edges (2k) is well under the
+        // mark's own extent, or the middle of the X fills solid.
+        try testing.expect(2 * k < @divTrunc(m.mark_close, 2));
+        // Square footprint, exactly the mark box.
+        const b = paintedBounds(q);
+        try testing.expectEqual(b.width(), b.height());
+        try testing.expectEqual(m.mark_close, b.width());
+    }
+}
+
+test "the hamburger's three rules are evenly spaced and never merge" {
+    var buf: [max_quads]Quad = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const q = glyphQuads(m, t, .menu, &buf);
+        try testing.expectEqual(@as(usize, 3), q.len);
+        const top = paintedBounds(q[0..1]);
+        const mid = paintedBounds(q[1..2]);
+        const bot = paintedBounds(q[2..3]);
+        try testing.expectEqual(mid.top - top.top, bot.top - mid.top);
+        // A real gap between rules, or it reads as a slab.
+        try testing.expect(mid.top > top.bottom);
+        try testing.expect(bot.top > mid.bottom);
+        // All three the same length.
+        try testing.expectEqual(top.width(), mid.width());
+        try testing.expectEqual(top.width(), bot.width());
     }
 }
 
