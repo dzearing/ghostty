@@ -1931,7 +1931,7 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func showHelp(_ sender: Any) {
-        guard let url = URL(string: "https://ghostty.org/docs") else { return }
+        guard let url = URL(string: "https://dzearing.github.io/ghoztty/") else { return }
         NSWorkspace.shared.open(url)
     }
 
