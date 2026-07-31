@@ -3300,3 +3300,35 @@ that sweep, neither from this change: `ipc-version` compared the binary's
 baked commit against HEAD and the exe was three commits stale (green after a
 rebuild - a reminder that this assertion doubles as a stale-build detector),
 and `remote-inherit`'s 3 are the known pre-existing T178.
+
+## 2026-07-31 - T217 batch 5: the first batch the harness already covered
+
+`claude-integration` and `new-window-cwd` migrated onto the test desktop; 14
+of 22, 8 remain (one of them, `split-dim`, still blocked on T214). Both are
+ALL PASS x3 - 36 assertions and 53 - and both negative controls fail with
+exactly 1 failure. This is the first batch that needed **no**
+`lib/TestDesktop.ps1` addition at all: batches 1-4 each hit a mechanism the
+harness lacked, and this one was the mechanical conversion T212 predicted.
+So there is no harness regression sweep in this entry, because nothing in the
+harness changed.
+
+The one real trap was self-inflicted and general: `new-window-cwd`'s `Assert`
+wrote its PASS/FAIL line to the **pipeline**, and the migration put the
+per-launch leak assertion inside `Launch`, which RETURNS the launched app. The
+return value silently became `@('  PASS ...', $app)` and `$app.Pid` read
+`$null`. `Assert`/`AssertEq` use `Write-Host` now. Any remaining script whose
+helpers both assert and return has the same hole.
+
+Two things the migration exposed rather than invented. `claude-integration`
+now asserts the first-run prompt is **modal** (`Test-TestWindowEnabled` on the
+owner window, up and down) - added to the harness in batch 4 and unused until
+now - and its two palette sections no longer hide behind
+`if (...) {} else { Assert $false }`. `new-window-cwd` stopped hunting for its
+seeded window by pinned title: `+list --json`'s window `id` is the hwnd, so it
+addresses the window by NAME and confirms the hwnd with
+`Get-TestWindowClass`, then `Focus-TestWindow` + `Get-TestFocusedWindow` names
+the pane ctrl+n actually inherits from. Batch 3 used that pairing to pick the
+right pane within a window; here it picks the right **window**, where every
+pane is an indistinguishable `cmd.exe`.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.

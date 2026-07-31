@@ -24,13 +24,34 @@
 # touched. State/plugins-registry paths are redirected via
 # GHOZTTY_CLAUDE_STATE_DIR / GHOZTTY_CLAUDE_PLUGINS_JSON; the config is
 # isolated via XDG_CONFIG_HOME (the T69 pattern).
+#
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted at the end, not assumed.
+# The private win32 driver this script used to carry is gone. Notes on the
+# mechanics:
+#
+#   * Every env var above is inherited through CreateProcessW, so it reaches
+#     the test-desktop child exactly as it reached Start-Process.
+#   * The prompt/outcome dialogs are GhozttyConfirmDialog, which reads RAW
+#     WM_KEYDOWN in its own nested pump, so a POSTED Enter/Escape reaches them
+#     (Send-TestControlKey). The old script pressed a GLOBAL key and trusted
+#     focus to be on the dialog; posting names the window instead.
+#   * The palette popup is a top-level owned GhozttyTerminal window, found with
+#     Get-TestWindow -Exclude $top; its query field is a standard EDIT, which
+#     needs WM_CHAR - Send-TestControlText, not Send-TestText.
+#
 # Only touches ghoztty processes running from this repo's zig-out.
-param([string]$ExePath)
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
+# Isolate the IPC endpoint (inherited through CreateProcessW) so a stray
+# instance answering the shared pipe cannot open windows in this run.
+$env:GHOZTTY_PIPE_SUFFIX = '-claudetest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -39,173 +60,6 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Text;
-using System.Threading;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-public class ClaudeDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
-    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static void BeDpiAware() {
-        SetProcessDpiAwarenessContext((IntPtr)(-4)); // PER_MONITOR_AWARE_V2
-    }
-
-    public static IntPtr FindClass(uint pid, string cls) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == cls) { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FindChild(IntPtr top, string cls) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == cls && IsWindowVisible(h)) { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // The visible palette popup: a top-level (owned, WS_POPUP) window of
-    // the same pid using the terminal class — not a child of `top`.
-    public static IntPtr FindPalettePopup(uint pid, IntPtr top) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && h != top && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyTerminal") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static string WindowText(IntPtr h) {
-        var sb = new StringBuilder(256);
-        GetWindowTextW(h, sb, 256);
-        return sb.ToString();
-    }
-
-    // Captions of all BUTTON children, in z-order.
-    public static string[] ButtonTexts(IntPtr top) {
-        var texts = new List<string>();
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "Button" || sb.ToString() == "BUTTON") {
-                var tb = new StringBuilder(128);
-                GetWindowTextW(h, tb, 128);
-                texts.Add(tb.ToString());
-            }
-            return true;
-        }, IntPtr.Zero);
-        return texts.ToArray();
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    public static void Press(ushort vk) {
-        Key(vk, false); Thread.Sleep(30); Key(vk, true);
-    }
-
-    // Type plain VKs (letters/Enter) into `edit` in one attachment burst.
-    public static string TypeKeys(IntPtr owner, IntPtr edit, ushort[] vks) {
-        uint pid; uint tid = GetWindowThreadProcessId(owner, out pid);
-        uint cur = GetCurrentThreadId();
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(edit);
-            Thread.Sleep(60);
-            foreach (var vk in vks) {
-                Key(vk, false); Thread.Sleep(15); Key(vk, true); Thread.Sleep(30);
-            }
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    // Send mods+vk with focus on `surface`. Returns "SENT" or a reason.
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        if (!GrabForeground(top)) return "ABORT: could not foreground";
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground lost";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-}
-'@
-[ClaudeDrv]::BeDpiAware()
-
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
         Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
@@ -213,15 +67,25 @@ function Kill-RepoInstances {
     Start-Sleep -Milliseconds 500
 }
 
-# Wait for a visible window of $cls in $gpid (or its disappearance).
-function Wait-Class([uint32]$gpid, [string]$cls, [bool]$appear, [int]$tries = 30) {
-    for ($t = 0; $t -lt $tries; $t++) {
-        $d = [ClaudeDrv]::FindClass($gpid, $cls)
-        $vis = ($d -ne [IntPtr]::Zero)
-        if ($vis -eq $appear) { return $d }
+# Wait for a visible window of $cls in $gpid to appear (or to go away).
+function Wait-Class([int]$gpid, [string]$cls, [bool]$appear, [int]$timeoutMs = 3000) {
+    if ($appear) { return Wait-TestWindow -ProcessId $gpid -Class $cls -TimeoutMs $timeoutMs }
+    $waited = 0
+    while ($waited -lt $timeoutMs) {
+        $d = Get-TestWindow -ProcessId $gpid -Class $cls
+        if ($d -eq [IntPtr]::Zero) { return $d }
         Start-Sleep -Milliseconds 100
+        $waited += 100
     }
-    if ($appear) { return [IntPtr]::Zero } else { return $d }
+    return (Get-TestWindow -ProcessId $gpid -Class $cls)
+}
+
+# Captions of every BUTTON child, read with WM_GETTEXT (GetWindowTextW is
+# cross-process cached). Class comparison in the harness is exact, so
+# enumerate every child and match case-insensitively.
+function Get-ButtonTexts([IntPtr]$dlg) {
+    $btns = @(Get-TestChildWindows -Window $dlg -Class '*' | Where-Object { $_.Class -match '^button$' })
+    return @($btns | ForEach-Object { Get-TestControlText -Control ([IntPtr]$_.Hwnd) })
 }
 
 # ---------------------------------------------------------------- fixtures
@@ -267,8 +131,12 @@ function Launch-Gui([string]$stateDir, [string]$claudeExe, [string]$stubMode) {
     $env:GHOZTTY_CLAUDE_PLUGINS_JSON = $pluginsJson
     $env:CLAUDE_STUB_MODE = $stubMode
     $env:CLAUDE_STUB_LOG = $stubLog
-    try { $proc = Start-Process -FilePath $exe -PassThru }
-    finally {
+    try {
+        # --session-persistence=false: every case here relaunches the app, and
+        # a restored layout manifest would hand a later case the previous
+        # case's panes while its write races the kill in between.
+        $app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false')
+    } finally {
         'XDG_CONFIG_HOME', 'GHOZTTY_CLAUDE_SETUP', 'GHOZTTY_CLAUDE_EXE',
         'GHOZTTY_CLAUDE_STATE_DIR', 'GHOZTTY_CLAUDE_PLUGINS_JSON',
         'CLAUDE_STUB_MODE', 'CLAUDE_STUB_LOG' | ForEach-Object {
@@ -276,30 +144,38 @@ function Launch-Gui([string]$stateDir, [string]$claudeExe, [string]$stubMode) {
         }
     }
     Start-Sleep -Seconds 2
-    if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
-    $top = [ClaudeDrv]::FindClass([uint32]$proc.Id, 'GhozttyWindow')
-    if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; Stop-Process -Id $proc.Id -Force; exit 1 }
-    return @{ Proc = $proc; Top = $top }
+    if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+    if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) 'window is NOT enumerable on the interactive desktop'
+    return @{ App = $app; Pid = $app.Pid; Top = $top }
 }
 
 # Open the palette, type "claude", Enter. Returns $true when everything
 # was injected (palette opening doubles as the chord positive control).
 function Invoke-PaletteClaude($g) {
-    $surface = [ClaudeDrv]::FindChild($g.Top, 'GhozttyTerminal')
+    $surface = Get-TestChildWindow -Window $g.Top -Class 'GhozttyTerminal'
     if ($surface -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: surface not found'; return $false }
-    $r = [ClaudeDrv]::Chord($g.Top, $surface, [uint16[]]@(0x11, 0x10), 0x50)  # ctrl+shift+p
-    if ($r -ne 'SENT') { Write-Host "SETUP FAIL: palette chord not injected ($r)"; return $false }
+    # The window hands WM_KEYDOWN to DefWindowProc and only forwards FOCUS to
+    # the active pane, so the chord has to be aimed at the surface itself.
+    Focus-TestWindow -Window $g.Top -Child $surface | Out-Null
+    $r = Send-TestKeys -Window $g.Top -Target $surface -Modifiers ctrl, shift -Key P
+    if (-not $r) { Write-Host 'SETUP FAIL: palette chord not injected'; return $false }
+    # The palette is a top-level owned GhozttyTerminal popup, not a child of
+    # the window - exclude the main window so the search cannot return it.
     $popup = [IntPtr]::Zero
     for ($t = 0; $t -lt 50 -and $popup -eq [IntPtr]::Zero; $t++) {
-        Start-Sleep -Milliseconds 20
-        $popup = [ClaudeDrv]::FindPalettePopup([uint32]$g.Proc.Id, $g.Top)
+        Start-Sleep -Milliseconds 40
+        $popup = Get-TestWindow -ProcessId $g.Pid -Class 'GhozttyTerminal' -Exclude $g.Top
     }
     if ($popup -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: palette popup did not open'; return $false }
-    $edit = [ClaudeDrv]::FindWindowExW($popup, [IntPtr]::Zero, 'EDIT', $null)
+    $edit = Find-TestWindowEx -Parent $popup -Class 'EDIT'
     if ($edit -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: palette edit not found'; return $false }
-    # C L A U D E then Enter
-    $r = [ClaudeDrv]::TypeKeys($popup, $edit, [uint16[]]@(0x43, 0x4C, 0x41, 0x55, 0x44, 0x45, 0x0D))
-    if ($r -ne 'SENT') { Write-Host "SETUP FAIL: palette keys not typed ($r)"; return $false }
+    # A standard EDIT needs WM_CHAR, which nothing generates for a posted key.
+    if (-not (Send-TestControlText -Control $edit -Text 'claude')) { Write-Host 'SETUP FAIL: palette query not typed'; return $false }
+    Start-Sleep -Milliseconds 200
+    if (-not (Send-TestControlKey -Control $edit -Key Enter)) { Write-Host 'SETUP FAIL: palette Enter not posted'; return $false }
+    Start-Sleep -Milliseconds 200
     return $true
 }
 
@@ -318,123 +194,149 @@ function Wait-StubLines([int]$count, [int]$tries = 150) {
     return (Get-StubLines)
 }
 
-$VK_ESCAPE = [uint16]0x1B
-$VK_RETURN = [uint16]0x0D
-
 Kill-RepoInstances
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
 
-# ---------------------------------------------------------------- case 1:
-# first run -> prompt with Set Up / Not Now; Escape declines, no CLI run.
-$state1 = Join-Path $base 'state1'
-$g = Launch-Gui $state1 $stub 'ok'
-$gpid = [uint32]$g.Proc.Id
+try {
+    # ------------------------------------------------------------ case 1:
+    # first run -> prompt with Set Up / Not Now; Escape declines, no CLI run.
+    $state1 = Join-Path $base 'state1'
+    $g = Launch-Gui $state1 $stub 'ok'
+    $gpid = $g.Pid
 
-$dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 80
-Assert ($dlg -ne [IntPtr]::Zero) 'first run shows the Set Up Claude Code Integration prompt'
-if ($dlg -eq [IntPtr]::Zero) { Stop-Process -Id $gpid -Force; exit 1 }
+    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 8000
+    Assert ($dlg -ne [IntPtr]::Zero) 'first run shows the Set Up Claude Code Integration prompt'
+    if ($dlg -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no prompt to score'; exit 1 }
 
-Assert ([ClaudeDrv]::WindowText($dlg) -eq 'Set Up Claude Code Integration?') 'prompt title is Set Up Claude Code Integration?'
-$btns = [ClaudeDrv]::ButtonTexts($dlg)
-Assert (($btns -contains 'Set Up') -and ($btns -contains 'Not Now')) "buttons are Set Up / Not Now (got: $($btns -join ', '))"
+    Assert ((Get-TestWindowText -Window $dlg) -eq 'Set Up Claude Code Integration?') 'prompt title is Set Up Claude Code Integration?'
+    $btns = Get-ButtonTexts $dlg
+    Assert (($btns -contains 'Set Up') -and ($btns -contains 'Not Now')) "buttons are Set Up / Not Now (got: $($btns -join ', '))"
+    # Modality is the dialog's other observable half, and IsWindowEnabled is
+    # the only cross-process-safe way to see it.
+    Assert (-not (Test-TestWindowEnabled -Window $g.Top)) 'the prompt is modal: its owner window is disabled'
 
-[ClaudeDrv]::Press($VK_ESCAPE)
-$gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
-Assert ($gone -eq [IntPtr]::Zero) 'Escape (Not Now) dismisses the prompt'
-Start-Sleep -Milliseconds 500
-Assert ((Get-StubLines).Count -eq 0) 'declining runs no claude command'
-$stateFile = Join-Path $state1 'claude_setup'
-Assert ((Test-Path $stateFile) -and ((Get-Content $stateFile -Raw).Trim() -eq 'declined')) 'state file records declined'
-Assert (-not $g.Proc.HasExited) 'app keeps running after declining'
-Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
+    Send-TestControlKey -Control $dlg -Key Escape | Out-Null
+    $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
+    Assert ($gone -eq [IntPtr]::Zero) 'Escape (Not Now) dismisses the prompt'
+    Assert (Test-TestWindowEnabled -Window $g.Top) 'owner window is enabled again once the prompt closes'
+    Start-Sleep -Milliseconds 500
+    Assert ((Get-StubLines).Count -eq 0) 'declining runs no claude command'
+    $stateFile = Join-Path $state1 'claude_setup'
+    Assert ((Test-Path $stateFile) -and ((Get-Content $stateFile -Raw).Trim() -eq 'declined')) 'state file records declined'
+    Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app keeps running after declining'
+    Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
 
-# ---------------------------------------------------------------- case 2:
-# relaunch with the declined answer -> no prompt (case 1 proved this env
-# shows one when unanswered, so the negative is trustworthy).
-$g = Launch-Gui $state1 $stub 'ok'
-$gpid = [uint32]$g.Proc.Id
-$dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 40
-Assert ($dlg -eq [IntPtr]::Zero) 'declined answer is remembered: no prompt on relaunch'
-Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
-
-# ---------------------------------------------------------------- case 3:
-# fresh state, accept via Enter -> both claude commands run, silent success.
-$state3 = Join-Path $base 'state3'
-$g = Launch-Gui $state3 $stub 'ok'
-$gpid = [uint32]$g.Proc.Id
-
-$dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 80
-Assert ($dlg -ne [IntPtr]::Zero) 'fresh state shows the prompt again'
-if ($dlg -eq [IntPtr]::Zero) { Stop-Process -Id $gpid -Force; exit 1 }
-[ClaudeDrv]::Press($VK_RETURN)  # Set Up is the Enter default
-$gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
-Assert ($gone -eq [IntPtr]::Zero) 'Enter (Set Up) dismisses the prompt'
-
-$lines = Wait-StubLines 2
-Assert ($lines.Count -eq 2) "accepting runs exactly two claude commands (got $($lines.Count))"
-Assert (@($lines | Where-Object { $_ -match [regex]::Escape("plugin marketplace add $MARKETPLACE") }).Count -eq 1) 'marketplace add ran with the exact id'
-Assert (@($lines | Where-Object { $_ -match [regex]::Escape("plugin install $PLUGIN") }).Count -eq 1) 'plugin install ran with the exact id'
-
-$stateFile3 = Join-Path $state3 'claude_setup'
-$stateOk = $false
-for ($t = 0; $t -lt 30 -and -not $stateOk; $t++) {
-    if ((Test-Path $stateFile3) -and ((Get-Content $stateFile3 -Raw).Trim() -eq 'accepted')) { $stateOk = $true }
-    Start-Sleep -Milliseconds 100
-}
-Assert $stateOk 'state file records accepted'
-
-# First-run success is silent: no outcome dialog shows up afterwards.
-Start-Sleep -Milliseconds 1500
-Assert (([ClaudeDrv]::FindClass($gpid, 'GhozttyConfirmDialog')) -eq [IntPtr]::Zero) 'first-run success shows no outcome dialog'
-
-# ---------------------------------------------------------------- case 4:
-# palette entry reruns the flow and reports the outcome (same instance).
-if (Invoke-PaletteClaude $g) {
-    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 200
-    Assert ($dlg -ne [IntPtr]::Zero) 'palette install reports an outcome dialog'
-    if ($dlg -ne [IntPtr]::Zero) {
-        Assert ([ClaudeDrv]::WindowText($dlg) -eq 'Claude Code Integration Ready') 'palette outcome title is Claude Code Integration Ready'
-        [ClaudeDrv]::Press($VK_ESCAPE)
-        $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
-        Assert ($gone -eq [IntPtr]::Zero) 'outcome dialog dismisses'
+    # ------------------------------------------------------------ case 2:
+    # relaunch with the declined answer -> no prompt (case 1 proved this env
+    # shows one when unanswered, so the negative is trustworthy).
+    $g = Launch-Gui $state1 $stub 'ok'
+    $gpid = $g.Pid
+    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 4000
+    # -NegativeControl inverts the load-bearing "silence means remembered"
+    # claim, so a passing run proves the assertion discriminates rather than
+    # being true of any outcome.
+    if ($NegativeControl) {
+        Write-Host 'NEGATIVE CONTROL: asserting a DECLINED answer still prompts - this run MUST fail'
+        Assert ($dlg -ne [IntPtr]::Zero) 'declined answer prompts again on relaunch (inverted)'
+    } else {
+        Assert ($dlg -eq [IntPtr]::Zero) 'declined answer is remembered: no prompt on relaunch'
     }
-    $lines = Wait-StubLines 4
-    Assert ($lines.Count -eq 4) "palette run adds two more claude commands (got $($lines.Count))"
-} else {
-    Assert $false 'palette claude flow injectable'
-}
-Assert (-not $g.Proc.HasExited) 'app alive after palette flow'
-Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
+    Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
 
-# ---------------------------------------------------------------- case 5:
-# claude missing: no prompt, nothing burned; palette says Not Found.
-$state5 = Join-Path $base 'state5'
-$g = Launch-Gui $state5 (Join-Path $base 'no-such-claude.exe') 'ok'
-$gpid = [uint32]$g.Proc.Id
-$dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 40
-Assert ($dlg -eq [IntPtr]::Zero) 'no claude CLI: no first-run prompt'
-Assert (-not (Test-Path (Join-Path $state5 'claude_setup'))) 'no claude CLI: prompt not burned (no state file)'
+    # ------------------------------------------------------------ case 3:
+    # fresh state, accept via Enter -> both claude commands run, silent success.
+    $state3 = Join-Path $base 'state3'
+    $g = Launch-Gui $state3 $stub 'ok'
+    $gpid = $g.Pid
 
-if (Invoke-PaletteClaude $g) {
-    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 100
-    Assert ($dlg -ne [IntPtr]::Zero) 'palette install without claude reports a dialog'
-    if ($dlg -ne [IntPtr]::Zero) {
-        Assert ([ClaudeDrv]::WindowText($dlg) -eq 'Claude Code Not Found') 'outcome title is Claude Code Not Found'
-        [ClaudeDrv]::Press($VK_ESCAPE)
-        $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
-        Assert ($gone -eq [IntPtr]::Zero) 'not-found dialog dismisses'
+    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 8000
+    Assert ($dlg -ne [IntPtr]::Zero) 'fresh state shows the prompt again'
+    if ($dlg -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no prompt to accept'; exit 1 }
+    Send-TestControlKey -Control $dlg -Key Enter | Out-Null  # Set Up is the Enter default
+    $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
+    Assert ($gone -eq [IntPtr]::Zero) 'Enter (Set Up) dismisses the prompt'
+
+    $lines = Wait-StubLines 2
+    Assert ($lines.Count -eq 2) "accepting runs exactly two claude commands (got $($lines.Count))"
+    Assert (@($lines | Where-Object { $_ -match [regex]::Escape("plugin marketplace add $MARKETPLACE") }).Count -eq 1) 'marketplace add ran with the exact id'
+    Assert (@($lines | Where-Object { $_ -match [regex]::Escape("plugin install $PLUGIN") }).Count -eq 1) 'plugin install ran with the exact id'
+
+    $stateFile3 = Join-Path $state3 'claude_setup'
+    $stateOk = $false
+    for ($t = 0; $t -lt 30 -and -not $stateOk; $t++) {
+        if ((Test-Path $stateFile3) -and ((Get-Content $stateFile3 -Raw).Trim() -eq 'accepted')) { $stateOk = $true }
+        Start-Sleep -Milliseconds 100
     }
-} else {
-    Assert $false 'palette claude flow injectable (no-claude case)'
-}
-Assert (-not (Test-Path (Join-Path $state5 'claude_setup'))) 'not-found leaves no state file'
-Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+    Assert $stateOk 'state file records accepted'
 
-Kill-RepoInstances
-Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
+    # First-run success is silent: no outcome dialog shows up afterwards.
+    Start-Sleep -Milliseconds 1500
+    Assert ((Get-TestWindow -ProcessId $gpid -Class 'GhozttyConfirmDialog') -eq [IntPtr]::Zero) 'first-run success shows no outcome dialog'
+
+    # ------------------------------------------------------------ case 4:
+    # palette entry reruns the flow and reports the outcome (same instance).
+    $paletteOk = Invoke-PaletteClaude $g
+    Assert $paletteOk 'palette claude flow injectable'
+    if ($paletteOk) {
+        $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 20000
+        Assert ($dlg -ne [IntPtr]::Zero) 'palette install reports an outcome dialog'
+        if ($dlg -ne [IntPtr]::Zero) {
+            Assert ((Get-TestWindowText -Window $dlg) -eq 'Claude Code Integration Ready') 'palette outcome title is Claude Code Integration Ready'
+            Send-TestControlKey -Control $dlg -Key Escape | Out-Null
+            $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
+            Assert ($gone -eq [IntPtr]::Zero) 'outcome dialog dismisses'
+        }
+        $lines = Wait-StubLines 4
+        Assert ($lines.Count -eq 4) "palette run adds two more claude commands (got $($lines.Count))"
+    }
+    Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'app alive after palette flow'
+    Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    # ------------------------------------------------------------ case 5:
+    # claude missing: no prompt, nothing burned; palette says Not Found.
+    $state5 = Join-Path $base 'state5'
+    $g = Launch-Gui $state5 (Join-Path $base 'no-such-claude.exe') 'ok'
+    $gpid = $g.Pid
+    $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 4000
+    Assert ($dlg -eq [IntPtr]::Zero) 'no claude CLI: no first-run prompt'
+    Assert (-not (Test-Path (Join-Path $state5 'claude_setup'))) 'no claude CLI: prompt not burned (no state file)'
+
+    $paletteOk = Invoke-PaletteClaude $g
+    Assert $paletteOk 'palette claude flow injectable (no-claude case)'
+    if ($paletteOk) {
+        $dlg = Wait-Class $gpid 'GhozttyConfirmDialog' $true 10000
+        Assert ($dlg -ne [IntPtr]::Zero) 'palette install without claude reports a dialog'
+        if ($dlg -ne [IntPtr]::Zero) {
+            Assert ((Get-TestWindowText -Window $dlg) -eq 'Claude Code Not Found') 'outcome title is Claude Code Not Found'
+            Send-TestControlKey -Control $dlg -Key Escape | Out-Null
+            $gone = Wait-Class $gpid 'GhozttyConfirmDialog' $false
+            Assert ($gone -eq [IntPtr]::Zero) 'not-found dialog dismisses'
+        }
+    }
+    Assert (-not (Test-Path (Join-Path $state5 'claude_setup'))) 'not-found leaves no state file'
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+    Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live pid list: Remove-TestDesktop has run
+    # by now and emptied the live one, which would score this against nothing.
+    $launched = @(Get-TestLaunchedPids)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }
-else { Write-Host "$script:fail FAILURE(S), $script:pass pass" }
+# The old copy of this script printed its failure count and exited 0, so a
+# suite run scored a red script as green. It exits 1 now.
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
+else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)" -ForegroundColor Red; exit 1 }

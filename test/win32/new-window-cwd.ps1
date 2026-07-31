@@ -49,13 +49,37 @@
 # the user's real release instance, which uses a different agent lineage, state
 # dir, and IPC pipe).
 #
+# T217: the GUI half runs on a BACKGROUND Win32 desktop
+# (test/win32/lib/TestDesktop.ps1), so it never takes the user's foreground -
+# asserted at the end, not assumed. Notes on the mechanics:
+#
+#   * Every app launch goes through Start-OnTestDesktop, which passes the
+#     launcher directory as the child's cwd exactly as -WorkingDirectory did -
+#     which matters here more than anywhere, since System32 IS the trap.
+#   * Section D no longer hunts for the window by its pinned title. `+list
+#     --json`'s window `id` IS the hwnd (IpcHandlers.zig formats
+#     @intFromPtr(hwnd)), so the seeded window is addressed by its NAME and the
+#     hwnd is confirmed with Get-TestWindowClass. The --title=PROJWIN pin stays
+#     as documentation of which window is which in a +list dump.
+#   * A posted chord must be aimed at the SURFACE: GhozttyWindow hands
+#     WM_KEYDOWN to DefWindowProc and only forwards FOCUS to the active pane.
+#   * The PEB reader below stays - reading another process's cwd is not a GUI
+#     mechanism and the test desktop changes nothing about it.
+#
 #   powershell -NoProfile -File test\win32\new-window-cwd.ps1
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
-    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe'
+    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    [switch]$NegativeControl,
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = 'Continue'
+# Isolate the IPC endpoint (inherited through CreateProcessW) so a stray
+# instance answering the shared pipe cannot serve this run's +list.
+$env:GHOZTTY_PIPE_SUFFIX = '-nwcwdtest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-new-window-cwd-$PID"
 
@@ -69,24 +93,27 @@ $homeDir = "$env:HOMEDRIVE$env:HOMEPATH"
 # The directory a config file / an inheriting pane points at.
 $workDir = Join-Path $root 'workdir'
 
+# Write-Host, not the pipeline: these are called from inside functions that
+# RETURN something (Launch), and a pipeline-emitted line would be part of the
+# return value.
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { Write-Host "  PASS $name" } else { Write-Host "  FAIL $name"; $script:failures++ }
 }
 function AssertEq($name, $expected, $actual) {
-    if ($expected -eq $actual) { "  PASS $name" }
-    else { "  FAIL $name (expected '$expected', got '$actual')"; $script:failures++ }
+    if ($expected -eq $actual) { Write-Host "  PASS $name" }
+    else { Write-Host "  FAIL $name (expected '$expected', got '$actual')"; $script:failures++ }
 }
 function Norm($p) {
     if ($null -eq $p) { return '' }
     return ($p.Trim().TrimEnd('\').ToLowerInvariant())
 }
 
-# ---- native helpers ---------------------------------------------------------
-# Two things this script cannot do from PowerShell alone:
-#   * read ANOTHER process's current directory (no supported API; the whole
-#     premise here is that the AGENT's cwd is the trap, so it is read out of
-#     the PEB rather than assumed), and
-#   * press a real ctrl+n (the CLI cannot reproduce the reported defect).
+# ---- native helper ----------------------------------------------------------
+# One thing this script cannot do from PowerShell alone: read ANOTHER process's
+# current directory. There is no supported API, and the whole premise here is
+# that the AGENT's cwd is the trap - so it is read out of the PEB rather than
+# assumed. (Pressing ctrl+n used to live here too; that is the harness's job
+# now.)
 $nativeSrc = @'
 using System;
 using System.Text;
@@ -130,99 +157,6 @@ public static class T144 {
                 return Encoding.Unicode.GetString(str);
             } finally { Marshal.FreeHGlobal(pbi); }
         } finally { CloseHandle(h); }
-    }
-
-    // ---- window + keyboard ----
-    delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    /// The Ghoztty top-level window of `pid` whose title contains `titlePart`
-    /// (empty matches the first one found).
-    public static IntPtr FindWindow(uint pid, string titlePart) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p != pid || !IsWindowVisible(h)) return true;
-            var cls = new StringBuilder(64);
-            GetClassNameW(h, cls, 64);
-            if (cls.ToString() != "GhozttyWindow") return true;
-            if (titlePart.Length > 0) {
-                var t = new StringBuilder(512);
-                GetWindowTextW(h, t, 512);
-                if (t.ToString().IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) < 0) return true;
-            }
-            found = h; return false;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static string ForegroundClass() {
-        IntPtr fg = GetForegroundWindow();
-        if (fg == IntPtr.Zero) return "<none>";
-        var cls = new StringBuilder(64);
-        GetClassNameW(fg, cls, 64);
-        return cls.ToString();
-    }
-
-    // T86-hardened foreground grab, with the load-bearing already-foreground
-    // guard (a SetForegroundWindow storm on a window that is ALREADY foreground
-    // is what used to make these harnesses flaky).
-    public static bool GrabForeground(IntPtr top) {
-        ShowWindow(top, 9); // SW_RESTORE
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // ALT: unblocks SetForegroundWindow
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    /// ctrl+<vk> to `top`, as real injected keystrokes. Returns "SENT" or the
-    /// reason it refused - never a silent no-op, since a swallowed chord would
-    /// otherwise read as "the feature is broken".
-    public static string Ctrl(IntPtr top, ushort vk) {
-        if (!GrabForeground(top)) return "ABORT: foreground owned by " + ForegroundClass();
-        Thread.Sleep(120);
-        Key(0x11, false);            // VK_CONTROL
-        Thread.Sleep(25);
-        Key(vk, false); Thread.Sleep(25); Key(vk, true);
-        Thread.Sleep(25);
-        Key(0x11, true);
-        Thread.Sleep(200);
-        return "SENT";
     }
 }
 '@
@@ -301,6 +235,15 @@ function Window-Ids($tree) {
     foreach ($w in (Windows-Of $tree)) { $ids += $w.id }
     return ,$ids
 }
+# A window's `id`, which IS its hwnd (IpcHandlers.zig formats @intFromPtr), so a
+# named window can be addressed directly instead of guessed at by z-order or
+# by title text.
+function Window-IdOf($tree, $target) {
+    foreach ($w in (Windows-Of $tree)) {
+        if ($w.target -eq $target) { return $w.id }
+    }
+    return $null
+}
 function Pane-ById($tree, $id) {
     foreach ($w in (Windows-Of $tree)) {
         if ($w.id -ne $id) { continue }
@@ -356,21 +299,22 @@ function New-State($name, $configBody) {
     }
     return $tmp
 }
-function Launch($tmp, $persistence, $visible = $false) {
+# The launcher directory is passed as the child's cwd, which is the whole point:
+# it is inherited by the app and (with persistence on) by the agent it spawns.
+function Launch($tmp, $persistence) {
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-    $style = if ($visible) { 'Normal' } else { 'Minimized' }
-    # Start-Process rejects an empty -ArgumentList, so the two flavors are two
-    # calls rather than one call with a maybe-empty argument.
-    if ($persistence) {
-        Start-Process -FilePath $Exe -WindowStyle $style -WorkingDirectory $launcherDir | Out-Null
-    } else {
-        Start-Process -FilePath $Exe -WindowStyle $style -WorkingDirectory $launcherDir `
-            -ArgumentList '--session-persistence=false' | Out-Null
-    }
+    $extra = if ($persistence) { @() } else { @('--session-persistence=false') }
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments $extra -WorkingDirectory $launcherDir
+    Start-Sleep -Milliseconds 500
+    Assert "launch $($app.Pid) is NOT enumerable on the interactive desktop" `
+        (-not (Test-TestDesktopLeak -ProcessId $app.Pid))
+    return $app
 }
 
 Stop-TestProcs
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
 New-Item -ItemType Directory -Force $root | Out-Null
 New-Item -ItemType Directory -Force $workDir | Out-Null
 
@@ -384,7 +328,7 @@ Assert "HOME is not the launcher directory (the test would be vacuous)" `
 "== A: persistence ON, no config - the startup window is in HOME, not System32"
 # ============================================================================
 $tmpA = New-State 'a' $null
-Launch $tmpA $true
+$appA = Launch $tmpA $true
 $treeA = Wait-WindowCount $tmpA 'a' 1 60
 Assert "A1 the app opened its startup window" ((Windows-Of $treeA).Count -ge 1)
 
@@ -419,7 +363,7 @@ Stop-TestProcs
 "== B: persistence OFF lands in the SAME directory (the invariant)"
 # ============================================================================
 $tmpB = New-State 'b' $null
-Launch $tmpB $false
+$appB = Launch $tmpB $false
 $treeB = Wait-WindowCount $tmpB 'b' 1 60
 Assert "B1 the app opened its startup window" ((Windows-Of $treeB).Count -ge 1)
 Assert "B2 no agent is running (persistence is off)" ((TestProcs 'ghoztty-agent.exe').Count -eq 0)
@@ -437,7 +381,7 @@ Assert "C0 the configured directory is neither HOME nor the launcher's" `
 $body = "working-directory = $workDir"
 
 $tmpC = New-State 'c' $body
-Launch $tmpC $true
+$appC = Launch $tmpC $true
 $treeC = Wait-WindowCount $tmpC 'c' 1 60
 Assert "C1 the app opened with a config present" ((Windows-Of $treeC).Count -ge 1)
 $targetC = Target-NotIn $treeC '___none___'
@@ -446,7 +390,7 @@ AssertEq "C2 persistence ON honors the configured working-directory" (Norm $work
 Stop-TestProcs
 
 $tmpC2 = New-State 'c2' $body
-Launch $tmpC2 $false
+$appC2 = Launch $tmpC2 $false
 $treeC2 = Wait-WindowCount $tmpC2 'c2' 1 60
 Assert "C3 the app opened with a config present (persistence off)" ((Windows-Of $treeC2).Count -ge 1)
 $targetC2 = Target-NotIn $treeC2 '___none___'
@@ -463,7 +407,7 @@ Stop-TestProcs
 # `+new-window` cannot test this: the CLI always inserts the caller's cwd as
 # --working-directory. The user's report is about the keybind, so press it.
 $tmpD = New-State 'd' $null
-Launch $tmpD $true $true
+$appD = Launch $tmpD $true
 $treeD0 = Wait-WindowCount $tmpD 'd0' 1 60
 Assert "D1 the app opened its startup window" ((Windows-Of $treeD0).Count -ge 1)
 
@@ -478,14 +422,30 @@ Assert "D2 the seeded window opened" ($null -ne (Pane-In $treeD1 'proj'))
 $shellD1 = Shell-Cwd $tmpD 'd1' 'proj' 45
 AssertEq "D3 the seeded pane is where it was asked to be" (Norm $workDir) (Norm $shellD1)
 
-$appPid = (TestProcs 'ghoztty.exe')[0].ProcessId
 $before = Window-Ids $treeD1
-$hwndProj = [T144]::FindWindow([uint32]$appPid, 'PROJWIN')
-Assert "D4 the seeded window was found by its pinned title" ($hwndProj -ne [IntPtr]::Zero)
-$sent = [T144]::Ctrl($hwndProj, 0x4E)  # 'N'
-Assert "D5 ctrl+n was injected (harness positive control): $sent" ($sent -eq 'SENT')
+# `+list --json`'s window id IS the hwnd, so the seeded window is addressed by
+# NAME - no title hunting, no z-order guessing about which cmd.exe is which.
+$idProj = Window-IdOf $treeD1 'proj'
+Assert "D4 the seeded window is addressable by name in +list" ($null -ne $idProj)
+$hwndProj = if ($null -ne $idProj) { [IntPtr][int64]$idProj } else { [IntPtr]::Zero }
+Assert "D4b the +list window id really is a GhozttyWindow" `
+    ((Get-TestWindowClass -Window $hwndProj) -eq 'GhozttyWindow')
+
+# The chord must go to the SURFACE: the window hands WM_KEYDOWN to
+# DefWindowProc and only forwards FOCUS on. Focus first, then ask the app which
+# pane it considers active - that is the one whose directory ctrl+n inherits.
+Focus-TestWindow -Window $hwndProj | Out-Null
+Start-Sleep -Milliseconds 300
+$surfD = [IntPtr](Get-TestFocusedWindow -Window $hwndProj)
+Assert "D4c the window forwarded focus to a terminal surface" `
+    (($surfD -ne [IntPtr]::Zero) -and ((Get-TestWindowClass -Window $surfD) -eq 'GhozttyTerminal'))
+$sent = Send-TestKeys -Window $hwndProj -Target $surfD -Modifiers ctrl -Key N
+Assert "D5 ctrl+n was injected (harness positive control)" $sent
 
 $treeD2 = Wait-WindowCount $tmpD 'd2' 3 40
+# -NegativeControl inverts D10, the load-bearing claim (a new window inherits
+# the focused pane's directory), so a passing run proves the assertion
+# discriminates rather than being true of any directory.
 Assert "D6 ctrl+n created a window (if not, the chord never landed)" `
     ((Windows-Of $treeD2).Count -ge 3)
 $newId = $null
@@ -495,7 +455,12 @@ $paneD = Pane-ById $treeD2 $newId
 Assert "D8 the new window has a pane" ($null -ne $paneD)
 $cwdD = if ($null -ne $paneD) { $paneD.working_directory } else { '' }
 Assert "D9 ctrl+n did NOT land in the agent's directory" ((Norm $cwdD) -ne (Norm $launcherDir))
-AssertEq "D10 ctrl+n inherited the focused pane's directory" (Norm $workDir) (Norm $cwdD)
+if ($NegativeControl) {
+    Write-Host 'NEGATIVE CONTROL: asserting ctrl+n lands in the LAUNCHER dir - this run MUST fail'
+    AssertEq "D10 ctrl+n inherited the focused pane's directory (inverted)" (Norm $launcherDir) (Norm $cwdD)
+} else {
+    AssertEq "D10 ctrl+n inherited the focused pane's directory" (Norm $workDir) (Norm $cwdD)
+}
 if ($null -ne $paneD) {
     $shellD2 = Shell-Cwd $tmpD 'd2' $paneD.name 45
     AssertEq "D11 the new pane's SHELL agrees with what +list reported" (Norm $cwdD) (Norm $shellD2)
@@ -509,7 +474,7 @@ $tmpE = New-State 'e' $null
 $cfgE = Join-Path $tmpE 'ghostty\config.ghostty'
 New-Item -ItemType File -Force $cfgE | Out-Null
 AssertEq "E1 the config file starts at zero bytes" 0 ((Get-Item $cfgE).Length)
-Launch $tmpE $true
+$appE = Launch $tmpE $true
 Wait-WindowCount $tmpE 'e' 1 60 | Out-Null
 Assert "E2 the zero-byte config was replaced by the template" ((Get-Item $cfgE).Length -gt 0)
 Assert "E3 the template content is the documented one" `
@@ -517,6 +482,7 @@ Assert "E3 the template content is the documented one" `
 Stop-TestProcs
 
 # ---- teardown --------------------------------------------------------------
+Remove-TestDesktop
 $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -eq $savedAgentBin) {
     Remove-Item Env:\GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue
@@ -524,6 +490,17 @@ if ($null -eq $savedAgentBin) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
 }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live pid list: Remove-TestDesktop has run by
+    # now and emptied the live one, which would score this against nothing.
+    $launched = @(Get-TestLaunchedPids)
+    Assert "the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert "no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
+}
 
 ""
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }
