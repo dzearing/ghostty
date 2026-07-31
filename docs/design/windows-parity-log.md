@@ -2918,3 +2918,38 @@ incident, one platform later.
   must treat null as not-stale", both contradicting `agent_upgrade.isStale`,
   which treats null as stale on purpose. The code is right; the comments invite
   someone to "fix" the policy backwards.
+
+## 2026-07-30 - T201 done: the agent-upgrade decision now says what it decided, before it acts
+
+- The policy returns **why** as well as **what**: `agent_upgrade.Reason` +
+  `Decision` + `evaluate()`, with `decide()` reduced to a projection of it so
+  every existing unit test still means what it did. `isStale` remains the sole
+  authority on staleness and `evaluate` only classifies the *not*-stale case, so
+  the two cannot drift apart.
+- `refreshLocalAgentIfStale` logs the decision **at the point of decision**,
+  with all four inputs, and `promptAndRefreshLocalAgent` announces the modal
+  **before** `ConfirmDialog.show` blocks. Both silent early returns now speak —
+  including the attempt ceiling, which the T147 comment already claimed was
+  "logged rather than silently absorbed" and wasn't.
+- Why it mattered: three distinct box states (`current`, `newer, don't
+  downgrade`, `bundled unknown`) all collapsed to a `.none` that logged nothing,
+  and the `confirm_first` arm logged only *after* the user answered a modal that
+  can sit there forever. So "waiting on the user", "decided nothing" and "never
+  ran" were one indistinguishable silence — which is exactly how a working
+  dialog got mistaken for a failed delivery earlier the same day.
+- `agent-upgrade.ps1` **ALL PASS (44)**, up from 38. The load-bearing three are
+  C9/C10/C11: the decision line and the pending-modal line are asserted **while
+  the dialog is still up**, and C11 re-checks the dialog is *still* up
+  afterwards — so the ordering is proven, not assumed.
+- **Negative control, run for real:** with both log calls stubbed and the GUI
+  rebuilt, the suite failed **exactly** B7, C9, C10, E8 (4 / 40 passed). C11 and
+  F4 still passed, so they are controls rather than filler, and no pre-existing
+  assertion moved.
+- Harness lesson: the exe under test is a **Debug** build, so `std.log` goes to
+  **stderr** — the `%LOCALAPPDATA%\ghoztty\ghoztty.log` sink is release-only and
+  drops `.debug` lines besides. Asserting against that file would have matched
+  nothing forever and looked like a code failure. `Start-App` now captures
+  per-arm stderr (read with `FileShare.ReadWrite`, since the app holds it).
+- Floor at this change: `zig build -Dapp-runtime=win32 -Doptimize=Debug`, both
+  test lanes, `zig build test-agent` all exit 0; P1/P2/P3 each `ACCEPTANCE: ALL
+  PASS`.

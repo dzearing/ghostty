@@ -402,8 +402,15 @@ pub const Hello = struct {
     /// `--version`). Set by the AGENT so the app can detect at runtime that the
     /// running agent is a different build than the one it bundles and lazily
     /// refresh it (non-destructive agent upgrade). Additive/optional: older peers
-    /// omit it (→ null → "unknown build", never treated as stale), and readers
-    /// ignore it when absent. Never load-bearing for the protocol itself.
+    /// omit it and readers must tolerate its absence — never a parse error.
+    /// Never load-bearing for the protocol itself.
+    ///
+    /// Absent ⇒ null, and the win32 policy (`agent_upgrade.isStale`) reads that
+    /// as **STALE**, not as "unknown, leave alone": a peer too old to advertise
+    /// a stamp necessarily predates the feature, so it is by definition an
+    /// older build than any app that knows to look for one. (This comment used
+    /// to claim the opposite — "never treated as stale" — which contradicted
+    /// the code it describes; T201.)
     build_version: ?[]const u8 = null,
 
     /// Serialize to a JSON byte slice owned by `alloc`. Null optionals are
@@ -1664,8 +1671,10 @@ test "HELLO build_version: additive + back-compat" {
     defer np.deinit();
     try testing.expectEqualStrings("20260718-574fe0805", np.value.build_version.?);
 
-    // An OLDER peer's HELLO has no build_version → decodes to null ("unknown
-    // build"), never a parse error. The app must treat null as not-stale.
+    // An OLDER peer's HELLO has no build_version → decodes to null, never a
+    // parse error. What the app DOES with that null is `agent_upgrade.isStale`'s
+    // business (it treats it as stale); all this layer promises is that the
+    // absence decodes cleanly.
     const legacy =
         \\{"proto_version":1,"transfer_encoding":"raw","capabilities":["rpc"]}
     ;

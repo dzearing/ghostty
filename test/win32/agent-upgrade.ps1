@@ -247,10 +247,42 @@ function Wait-NoDialog($appPid, $timeoutSec = 12) {
     return $false
 }
 
+# The app's decision log (T201). The exe under test is a DEBUG build, i.e. the
+# Console subsystem, so std.log goes to STDERR -- the
+# %LOCALAPPDATA%\ghoztty\ghoztty.log sink is release-only. Each arm therefore
+# captures its own stderr file, which also means no offset bookkeeping across
+# arms. Opened with FileShare.ReadWrite because the app still holds it.
+function Read-AppLog($path) {
+    if (-not $path -or -not (Test-Path $path)) { return '' }
+    try {
+        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        try {
+            if ($fs.Length -le 0) { return '' }
+            $buf = New-Object byte[] $fs.Length
+            $n = $fs.Read($buf, 0, $buf.Length)
+            return [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
+        } finally { $fs.Dispose() }
+    } catch { return '' }
+}
+# Poll rather than read once: the line we want may not be flushed yet, and a
+# bare read would turn a timing gap into a false failure.
+function Wait-LogMatch($path, $pattern, $timeoutSec = 25) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if ((Read-AppLog $path) -match $pattern) { return $true }
+        Start-Sleep -Milliseconds 400
+    }
+    return $false
+}
+
 # Launch the GUI and wait until it answers +list with at least one pane.
+# Sets $script:AppLog to this launch's captured stderr.
 function Start-App($tmp, $title, $extraArgs = @()) {
     $argv = @("--title=$title") + $extraArgs
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $argv | Out-Null
+    $script:AppLog = Join-Path $tmp "applog-$title.err.txt"
+    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $argv `
+        -RedirectStandardError $script:AppLog `
+        -RedirectStandardOutput (Join-Path $tmp "applog-$title.out.txt") | Out-Null
     $deadline = (Get-Date).AddSeconds(40)
     while ((Get-Date) -lt $deadline) {
         $proc = @(Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
@@ -315,6 +347,7 @@ if ($stamp -notmatch '^\d{8}-') { "    NOTE: stamp '$stamp' has no YYYYMMDD pref
 "== B: negative control - a CURRENT agent is never touched"
 # ============================================================================
 $appPidB = Start-App $tmp 't147-current'
+$logB = $script:AppLog
 Assert "B1 the GUI came up" ($appPidB -ne 0)
 $treeB = Wait-Panes $tmp 'b0' 1
 Assert "B2 it has a pane" ((Leaf-Count $treeB) -ge 1)
@@ -327,6 +360,11 @@ Assert "B4 no confirmation dialog for a current agent" ([UpgDrv]::FindDialog([ui
 Assert "B5 the agent was NOT restarted (same pid)" ((Agent-Pid $tmp) -eq $agentB)
 $leafB = (All-Leaves (Get-List $tmp 'b1' 10))[0]
 Assert "B6 the pane still works" (Test-PaneResponsive $tmp $leafB.id 'b')
+# T201: "nothing happened" must be SAID, not inferred from an absence. Before
+# this, the .none arm logged nothing at all, so a current agent and a check that
+# never ran produced identical logs.
+Assert "B7 the no-op decision is logged with its reason" `
+    (Wait-LogMatch $logB 'agent upgrade check: no action, running agent is the bundled build' 20)
 Stop-TestProcs
 
 # ============================================================================
@@ -334,6 +372,7 @@ Stop-TestProcs
 # ============================================================================
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
 $appPidC = Start-App $tmp 't147-stale-decline'
+$logC = $script:AppLog
 Assert "C1 the GUI came up" ($appPidC -ne 0)
 $agentC = Wait-AgentPid $tmp 25
 Assert "C2 an agent is running for this run" ($agentC -ne 0)
@@ -347,6 +386,20 @@ if ($dlgC -ne [IntPtr]::Zero) {
 }
 # THE contract assert: consent comes BEFORE the destruction, not after.
 Assert "C5 the agent is still alive and unchanged while the dialog is up" ((Agent-Pid $tmp) -eq $agentC)
+
+# THE T201 assert, and it must run HERE -- before the dialog is answered.
+# `ConfirmDialog.show` pumps its own loop and does not return until the user
+# acts, which can be never; every message the old code emitted was contingent on
+# that answer. So a live, correctly-working confirmation left the log ending at
+# "bundled agent build is ..." and nothing more, indistinguishable from a check
+# that decided nothing or never ran. (Field case, 2026-07-30: a dialog sat on a
+# second monitor for ~20 minutes and the log gave no evidence it existed.)
+Assert "C9 the decision is logged while the dialog is STILL UP" `
+    (Wait-LogMatch $logC 'agent upgrade check: stale with live sessions, confirmation required' 20)
+Assert "C10 the pending modal announces itself before it blocks" `
+    (Wait-LogMatch $logC 'showing mandatory restart confirmation.*waiting for the user' 20)
+Assert "C11 the dialog is still up after those asserts (they did not race it)" `
+    ([UpgDrv]::FindDialog([uint32]$appPidC) -ne [IntPtr]::Zero)
 
 if ($dlgC -ne [IntPtr]::Zero) {
     $r = [UpgDrv]::PressInto($dlgC, @($VK_ESCAPE))
@@ -391,6 +444,7 @@ Stop-TestProcs
 "== E: the deferral promise - idle after a decline refreshes SILENTLY"
 # ============================================================================
 $appPidE = Start-App $tmp 't147-idle'
+$logE = $script:AppLog
 Assert "E1 the GUI came up" ($appPidE -ne 0)
 $agentE = Wait-AgentPid $tmp 25
 Assert "E2 an agent is running for this run" ($agentE -ne 0)
@@ -415,17 +469,26 @@ Assert "E5 the window actually closed (the agent is now idle)" $closed
 $agentE2 = Wait-AgentPid $tmp 40 $agentE
 Assert "E6 the idle agent was refreshed without asking again (new pid)" ($agentE2 -ne 0 -and $agentE2 -ne $agentE)
 Assert "E7 no second dialog was shown" ([UpgDrv]::FindDialog([uint32]$appPidE) -eq [IntPtr]::Zero)
+# The silent arm is the one most in need of a log line: it restarts the agent
+# with no UI at all, so the log is the ONLY record that it happened.
+Assert "E8 the silent idle refresh is logged with its reason" `
+    (Wait-LogMatch $logE 'agent upgrade check: stale and idle, refreshing now' 20)
 Stop-TestProcs
 
 # ============================================================================
 "== F: negative control - session-persistence=off never runs the check"
 # ============================================================================
 $appPidF = Start-App $tmp 't147-nopersist' @('--session-persistence=false')
+$logF = $script:AppLog
 Assert "F1 the GUI came up" ($appPidF -ne 0)
 Wait-Panes $tmp 'f0' 1 | Out-Null
 Start-Sleep -Seconds 6
 Assert "F2 no dialog with persistence off" ([UpgDrv]::FindDialog([uint32]$appPidF) -eq [IntPtr]::Zero)
 Assert "F3 no agent was spawned at all" ((Agent-Pid $tmp) -eq 0)
+# The other half of B7: now that a decision always logs, "the check never ran"
+# is a checkable claim rather than the default silence.
+Assert "F4 no decision line at all with persistence off" `
+    ((Read-AppLog $logF) -notmatch 'agent upgrade check:')
 Stop-TestProcs
 
 $env:LOCALAPPDATA = $savedLocalAppData

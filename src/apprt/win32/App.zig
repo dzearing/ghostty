@@ -1441,12 +1441,21 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
     // Nothing dialed ⇒ no agent whose build we can judge. Deliberately does NOT
     // spawn one: a freshly spawned agent is by definition current, so spawning
     // to ask would only ever answer "not stale".
-    if (!self.local_agent.hasSharedConnection()) return;
+    if (!self.local_agent.hasSharedConnection()) {
+        log.debug("agent upgrade check: no shared agent connection, nothing to judge [{s}]", .{reason});
+        return;
+    }
 
     // A restart that doesn't cure staleness must not retry forever (e.g. an
     // agent from a different install still holding the single-instance guard).
     // Bounded, and the ceiling is logged rather than silently absorbed.
-    if (self.agent_upgrade_attempts >= max_agent_upgrade_attempts) return;
+    if (self.agent_upgrade_attempts >= max_agent_upgrade_attempts) {
+        log.info(
+            "agent upgrade check: attempt ceiling reached ({d}/{d}), not retrying this run [{s}]",
+            .{ self.agent_upgrade_attempts, max_agent_upgrade_attempts, reason },
+        );
+        return;
+    }
 
     const bundled = self.local_agent.bundledVersion();
     const running = self.local_agent.runningVersion();
@@ -1458,13 +1467,27 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
         return;
     };
 
-    switch (agent_upgrade.decide(running, bundled, live)) {
+    // Log the decision WHERE IT IS MADE, before acting on it (T201). Every arm
+    // used to report only after the fact — and `.confirm_first` reports only
+    // once the user answers a modal that can sit there indefinitely, while
+    // `.none` reported nothing ever. That made a correctly-working mandatory
+    // confirmation indistinguishable in the log from a check that decided
+    // nothing, and from one that never ran.
+    const decision = agent_upgrade.evaluate(running, bundled, live);
+    log.info(
+        "agent upgrade check: {s} (running {s}, bundled {s}, {d} live session(s)) [{s}]",
+        .{
+            decision.reason.description(),
+            agent_upgrade.stampForLog(running),
+            agent_upgrade.stampForLog(bundled),
+            live,
+            reason,
+        },
+    );
+
+    switch (decision.action) {
         .none => return,
         .refresh_now => {
-            log.info(
-                "local agent stale (running {s} != bundled {s}); idle → refreshing [{s}]",
-                .{ running orelse "<pre-versioned>", bundled orelse "?", reason },
-            );
             self.agent_upgrade_attempts += 1;
             _ = self.local_agent.restartForUpgrade();
             // Re-dial straight away so the fresh agent is warm before the next
@@ -1509,6 +1532,17 @@ fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bun
     defer alloc.free(title_w);
 
     const owner: ?*Window = if (self.windows.items.len > 0) self.windows.items[0] else null;
+
+    // Announce the modal BEFORE it blocks (T201). `ConfirmDialog.show` pumps its
+    // own loop and does not return until the user answers, which can be never —
+    // so without this line a dialog sitting on a second monitor leaves no trace
+    // at all, and the log simply stops. Every message after this one is
+    // contingent on an answer; this one is the evidence that we asked.
+    log.info(
+        "agent upgrade: showing mandatory restart confirmation ({d} live session(s), running {s} → bundled {s}); waiting for the user",
+        .{ live, agent_upgrade.stampForLog(running), bundled },
+    );
+
     const result = ConfirmDialog.show(
         self,
         if (owner) |win| win.hwnd else null,

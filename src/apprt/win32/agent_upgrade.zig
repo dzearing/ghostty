@@ -99,13 +99,78 @@ pub const Action = enum {
     confirm_first,
 };
 
+/// WHY the policy reached its `Action`. Exists because three of the five
+/// outcomes below map to the same `.none`, and a log line that says only
+/// "nothing to do" cannot be audited afterwards: "current", "newer, leave it
+/// alone", and "we couldn't read the binary we ship" are very different states
+/// to find a user's box in (T201).
+pub const Reason = enum {
+    /// Rule 1: no readable bundled stamp, so there is nothing to judge against.
+    bundled_unknown,
+    /// The running agent is exactly the build we ship beside. The steady state.
+    current,
+    /// Rule 2: the running agent is NEWER than ours — a dev/debug agent, or an
+    /// app rolled back under a newer agent. Never downgraded.
+    running_newer,
+    /// Stale with nothing to lose: restart silently.
+    stale_idle,
+    /// Stale with live sessions: restarting would end them, so consent first.
+    stale_live,
+
+    /// One clause, written to be read in a log line after "agent upgrade
+    /// check:".
+    pub fn description(self: Reason) []const u8 {
+        return switch (self) {
+            .bundled_unknown => "no action, bundled agent build unknown (nothing to compare against)",
+            .current => "no action, running agent is the bundled build",
+            .running_newer => "no action, running agent is NEWER than bundled (never downgrade)",
+            .stale_idle => "stale and idle, refreshing now",
+            .stale_live => "stale with live sessions, confirmation required",
+        };
+    }
+};
+
+/// An `Action` and the `Reason` that produced it. Returned together so the
+/// caller logs the decision it is about to act on, rather than reconstructing
+/// it from which branch happened to run.
+pub const Decision = struct {
+    action: Action,
+    reason: Reason,
+};
+
 /// The whole policy in one pure function. `bundled == null` is "we could not
 /// read the binary we ship" (rule 1).
+///
+/// `isStale` stays the single authority on staleness; this only classifies WHY
+/// a not-stale agent was left alone, so the two can never disagree.
+pub fn evaluate(running: ?[]const u8, bundled: ?[]const u8, live_sessions: usize) Decision {
+    const b = bundled orelse return .{ .action = .none, .reason = .bundled_unknown };
+    if (b.len == 0) return .{ .action = .none, .reason = .bundled_unknown };
+    if (!isStale(running, b)) {
+        // Not stale ⇒ `running` is non-null, non-empty, and either equal to
+        // `b` or newer than it. Those are the only two ways to get here.
+        const r = running orelse "";
+        return .{
+            .action = .none,
+            .reason = if (std.mem.eql(u8, r, b)) .current else .running_newer,
+        };
+    }
+    return if (live_sessions == 0)
+        .{ .action = .refresh_now, .reason = .stale_idle }
+    else
+        .{ .action = .confirm_first, .reason = .stale_live };
+}
+
+/// The action alone, for callers that don't log (and every existing test).
 pub fn decide(running: ?[]const u8, bundled: ?[]const u8, live_sessions: usize) Action {
-    const b = bundled orelse return .none;
-    if (b.len == 0) return .none;
-    if (!isStale(running, b)) return .none;
-    return if (live_sessions == 0) .refresh_now else .confirm_first;
+    return evaluate(running, bundled, live_sessions).action;
+}
+
+/// What to print for a stamp that may be absent. `running == null` is an agent
+/// too old to advertise one; `bundled == null` is an unreadable binary.
+pub fn stampForLog(stamp: ?[]const u8) []const u8 {
+    const s = stamp orelse return "<pre-versioned>";
+    return if (s.len == 0) "<pre-versioned>" else s;
 }
 
 /// The mandatory-confirmation body, Mac's wording (`makeUpgradeAlert`) with the
@@ -207,6 +272,72 @@ test "decide: unknown never restarts, idle refreshes, live always confirms" {
     // A pre-versioned agent takes the same two arms.
     try testing.expectEqual(Action.refresh_now, decide(null, bundled, 0));
     try testing.expectEqual(Action.confirm_first, decide(null, bundled, 2));
+}
+
+test "evaluate: every .none carries the reason that produced it" {
+    const bundled = "20260730-e69d41755";
+    const old = "20260719-574fe0805";
+
+    // The three states that all collapse to `.none` are told apart. This is the
+    // whole point of T201: a log line saying only "nothing to do" cannot
+    // distinguish "we couldn't read our own binary" from "all is well".
+    try testing.expectEqual(Reason.bundled_unknown, evaluate(old, null, 0).reason);
+    try testing.expectEqual(Reason.bundled_unknown, evaluate(old, "", 0).reason);
+    try testing.expectEqual(Reason.bundled_unknown, evaluate(null, null, 3).reason);
+    try testing.expectEqual(Reason.current, evaluate(bundled, bundled, 0).reason);
+    try testing.expectEqual(Reason.current, evaluate(bundled, bundled, 7).reason);
+    try testing.expectEqual(Reason.running_newer, evaluate("20260801-zzz", bundled, 0).reason);
+    try testing.expectEqual(Reason.running_newer, evaluate("20260801-zzz", bundled, 4).reason);
+
+    // The two stale arms, including the pre-versioned peer.
+    try testing.expectEqual(Reason.stale_idle, evaluate(old, bundled, 0).reason);
+    try testing.expectEqual(Reason.stale_live, evaluate(old, bundled, 1).reason);
+    try testing.expectEqual(Reason.stale_idle, evaluate(null, bundled, 0).reason);
+    try testing.expectEqual(Reason.stale_live, evaluate(null, bundled, 9).reason);
+    try testing.expectEqual(Reason.stale_live, evaluate("", bundled, 2).reason);
+}
+
+test "evaluate and decide can never disagree" {
+    // `decide` is a projection of `evaluate`, and the reasons map onto exactly
+    // one action each — so a future edit that changes one without the other
+    // fails here rather than in the field.
+    const stamps = [_]?[]const u8{ null, "", "dev", "20260719-aaa", "20260730-e69d41755", "20260801-zzz" };
+    const bundles = [_]?[]const u8{ null, "", "dev", "20260730-e69d41755" };
+    for (stamps) |r| for (bundles) |b| for ([_]usize{ 0, 1, 5 }) |live| {
+        const d = evaluate(r, b, live);
+        try testing.expectEqual(decide(r, b, live), d.action);
+        const expected: Action = switch (d.reason) {
+            .bundled_unknown, .current, .running_newer => .none,
+            .stale_idle => .refresh_now,
+            .stale_live => .confirm_first,
+        };
+        try testing.expectEqual(expected, d.action);
+        // A `.none` must never be reported as stale, and vice versa.
+        if (b) |bb| if (bb.len > 0) {
+            try testing.expectEqual(isStale(r, bb), d.action != .none);
+        };
+    };
+}
+
+test "Reason.description is a distinct non-empty clause for every reason" {
+    // Logged verbatim, so an empty or duplicated clause would silently make two
+    // different box states read identically — the defect T201 exists to fix.
+    const all = [_]Reason{ .bundled_unknown, .current, .running_newer, .stale_idle, .stale_live };
+    for (all, 0..) |a, i| {
+        try testing.expect(a.description().len > 0);
+        for (all[i + 1 ..]) |b| {
+            try testing.expect(!std.mem.eql(u8, a.description(), b.description()));
+        }
+    }
+    // The two arms an operator greps for must say what they mean.
+    try testing.expect(std.mem.indexOf(u8, Reason.stale_live.description(), "confirmation") != null);
+    try testing.expect(std.mem.indexOf(u8, Reason.running_newer.description(), "NEWER") != null);
+}
+
+test "stampForLog never yields an empty field in a log line" {
+    try testing.expectEqualStrings("<pre-versioned>", stampForLog(null));
+    try testing.expectEqualStrings("<pre-versioned>", stampForLog(""));
+    try testing.expectEqualStrings("20260730-e69d41755", stampForLog("20260730-e69d41755"));
 }
 
 test "formatConfirmText pluralizes and names the count" {
