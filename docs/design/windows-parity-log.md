@@ -3506,3 +3506,40 @@ T84 fixed that, it passes every run, comment removed.
 Floor: both `zig build test` lanes, `test-agent`, P1-P3 green. Harness
 regression after the doubleclick change: `dark-menus` (10),
 `test-desktop-harness` (19), `split-zoom-nav` (20) all ALL PASS.
+
+## 2026-07-31 - T218 batch 2: the tab-strip chrome trio, and three stale assumptions
+
+`title-font`, `tab-color` and `tab-strip` onto the test desktop, taken as one
+batch because all three read the same GDI-painted strip. 12 / 15 / 21
+assertions, each ALL PASS x3, each negative control FAILS. 5 of 13 done; 8
+remain (chooser-menu, context-menu, focus-follows-mouse, hero-mode,
+host-settings, menu-bar, split-divider, window-color).
+
+The migration was the plain recipe: PrintWindow for the probes (the tab strip
+is chrome, the half of the CAPTURE LIMIT that survives), clicks POSTED at the
+TOP-LEVEL window because that is what paints and hit-tests the strip,
+`Send-TestControlKey` for the tab-color menu's first-letter matching, and the
+cursor parking deleted outright - it existed so hover chrome could not pollute
+a sample, and a background desktop has no pointer to park.
+
+Everything that took real time was rot the migration exposed, and none of it
+was a migration artifact - all three would fail on the interactive desktop
+today. `tab-color` derived the bar height from the jump when a second tab
+appears; since T190 the strip is up from the FIRST window on Windows, so the
+pane never moves and `barH` came out 0 before a single tab-color assertion ran.
+`tab-strip` compared the measured chiclet against `max_tab_w`, but the SLOT is
+`max_tab_w` and the drawn chiclet gives up `tab_gap` of it - 243 measured
+against 250 expected, tolerance 3. And `tab-strip` read the selected tab as
+"first dark pixel until the first light one", which the chiclet's antialiased
+rounded edge turns into a 1px-wide tab: it now takes the LONGEST dark run on
+the scanline. The old scan got away with it on a screen grab, where that edge
+blended differently - same claim, different pixels, which is the class of
+difference a capture-path change is guaranteed to expose.
+
+The rule that generalises: a geometry constant a script hard-codes is a claim
+about the product, and an unrun script's claims rot silently. When a migrated
+script's positive control fails, check the product's current geometry BEFORE
+weakening the assertion - twice out of three here the script was wrong and the
+product was right.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.

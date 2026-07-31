@@ -19,15 +19,37 @@
 #   4. Edit the config file back to Segoe UI + ctrl+shift+comma reload ->
 #      signature changes live without a relaunch (onConfigChange path).
 #
-# DPI-aware (PER_MONITOR_AWARE_V2) so GetPixel sees physical pixels (the
-# tab-color.ps1 lesson). Only touches ghoztty processes from this repo's
-# zig-out.
-param([string]$ExePath)
+# T218: migrated onto the BACKGROUND test desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted here, not assumed. Three
+# mechanism swaps, all forced by the desktop:
+#
+#   * The signature is read from PrintWindow(PW_RENDERFULLCONTENT) instead of a
+#     screen-DC GetPixel sweep. The tab bar is GDI-painted CHROME, which is the
+#     half of the CAPTURE LIMIT that survives on a background desktop (the
+#     OpenGL terminal surface is the half that does not) - so this probe
+#     migrates as-is, and Get-TestDistinctColors guards every signature against
+#     scoring a mid-paint flat fill.
+#   * The reload chord goes through Send-TestKeys (posted, focus set in a
+#     shared input queue) instead of SendInput behind a foreground grab.
+#   * The cursor parking is GONE, and deliberately: it existed so tab hover
+#     chrome could not pollute the sample, and a background desktop has no
+#     pointer over the window at all. SetCursorPos there is also a no-op the
+#     app cannot read back (T216).
+#
+# -NegativeControl inverts assertion 2 (asserts Times New Roman reproduces the
+# DEFAULT raster) and MUST fail; it is how a run proves the signature actually
+# discriminates fonts rather than reading noise.
+#
+# Only touches ghoztty processes from this repo's zig-out.
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
+$env:GHOZTTY_PIPE_SUFFIX = '-titlefonttest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -36,153 +58,6 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class TFDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
-    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
-    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
-    [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr dc, int x, int y);
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT { public int x, y; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static void BeDpiAware() {
-        SetProcessDpiAwarenessContext((IntPtr)(-4)); // PER_MONITOR_AWARE_V2
-    }
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Screen coords of the window's client-area origin.
-    public static int[] ClientOrigin(IntPtr top) {
-        POINT p = new POINT { x = 0, y = 0 };
-        ClientToScreen(top, ref p);
-        return new int[] { p.x, p.y };
-    }
-
-    // First visible GhozttyTerminal child: "hwnd:left,top,right,bottom".
-    public static string Pane(IntPtr top) {
-        string line = "";
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) {
-                RECT r; GetWindowRect(h, out r);
-                line = h.ToInt64() + ":" + r.left + "," + r.top + "," + r.right + "," + r.bottom;
-                return false;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return line;
-    }
-
-    // Per-column count of "lit" (text-colored) pixels in the given screen
-    // rect: R+G+B > 300 against the dark bar. One GetDC for the whole scan.
-    public static int[] ColSig(int x0, int x1, int y0, int y1, int step) {
-        var cols = new List<int>();
-        IntPtr dc = GetDC(IntPtr.Zero);
-        for (int x = x0; x <= x1; x += step) {
-            int lit = 0;
-            for (int y = y0; y <= y1; y++) {
-                uint c = GetPixel(dc, x, y); // COLORREF 0x00BBGGRR
-                int sum = (int)(c & 0xFF) + (int)((c >> 8) & 0xFF) + (int)((c >> 16) & 0xFF);
-                if (sum > 300) lit++;
-            }
-            cols.Add(lit);
-        }
-        ReleaseDC(IntPtr.Zero, dc);
-        return cols.ToArray();
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-}
-'@
-
-[TFDrv]::BeDpiAware()
-
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
         Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
@@ -190,33 +65,59 @@ function Kill-RepoInstances {
     Start-Sleep -Milliseconds 500
 }
 
-# Launch the GUI with the given extra args; returns geometry + a signature
-# sampler closure's inputs. The tab bar is up (always + 1 tab), text row
-# sampled with the cursor parked away from hover chrome.
+# Launch the GUI onto the test desktop with the given extra args and measure
+# the geometry the signature is sampled from. The tab bar is up (always + 1
+# tab). Returns $null if the launch died or never showed a window.
 function Launch-Gui([string[]]$extraArgs) {
-    $args_ = @('--config-default-files=false', '--background=#000000', '--window-show-tab-bar=always') + $extraArgs
-    $proc = Start-Process -FilePath $exe -PassThru -ArgumentList $args_
+    # --session-persistence=false: each launch would otherwise write a layout
+    # manifest that the next one restores (T131).
+    $args_ = @(
+        '--config-default-files=false', '--background=#000000',
+        '--window-show-tab-bar=always', '--session-persistence=false'
+    ) + $extraArgs
+    $app = Start-OnTestDesktop -Exe $exe -Arguments $args_
     Start-Sleep -Seconds 3
-    if ($proc.HasExited) { return $null }
-    $top = [TFDrv]::FindTop([uint32]$proc.Id)
-    if ($top -eq [IntPtr]::Zero) { Stop-Process -Id $proc.Id -Force; return $null }
-    $paneLine = [TFDrv]::Pane($top)
-    if (-not $paneLine) { Stop-Process -Id $proc.Id -Force; return $null }
-    $hw, $r = $paneLine -split ':'
-    $c = $r -split ','
-    $origin = [TFDrv]::ClientOrigin($top)
-    $barH = [int]$c[1] - $origin[1]
-    # Park the cursor below the bar so hover chrome can't pollute sampling.
-    [TFDrv]::SetCursorPos(([int]$c[0] + 60), ([int]$c[1] + 120)) | Out-Null
-    Start-Sleep -Milliseconds 400
+    if ($app.Process -and $app.Process.HasExited) { return $null }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+    if ($top -eq [IntPtr]::Zero) { Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; return $null }
+    $pane = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
+    if ($pane -eq [IntPtr]::Zero) { Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; return $null }
+    $pr = Get-TestWindowRect -Window $pane
+    $cr = Get-TestWindowRect -Window $top -Client
     [pscustomobject]@{
-        Proc = $proc; Top = $top; Surface = [IntPtr][int64]$hw
-        ClientLeft = $origin[0]; ClientTop = $origin[1]; BarH = $barH
+        App = $app; Top = $top; Surface = $pane
+        ClientLeft = $cr.Left; ClientTop = $cr.Top; BarH = ($pr.Top - $cr.Top)
     }
+}
+
+# Per-column count of "lit" (text-colored) pixels in a screen rect of a
+# PrintWindow capture: R+G+B > 300 against the dark bar. Screen coordinates in,
+# window-relative reads out - the bitmap is addressed directly rather than
+# through Get-TestPixel because this is thousands of samples per signature.
+function Get-ColSig($shot, [int]$x0, [int]$x1, [int]$y0, [int]$y1, [int]$step) {
+    $cols = New-Object System.Collections.Generic.List[int]
+    for ($x = $x0; $x -le $x1; $x += $step) {
+        $lx = $x - $shot.Left
+        if ($lx -lt 0 -or $lx -ge $shot.Width) { $cols.Add(0); continue }
+        $lit = 0
+        for ($y = $y0; $y -le $y1; $y++) {
+            $ly = $y - $shot.Top
+            if ($ly -lt 0 -or $ly -ge $shot.Height) { continue }
+            $c = $shot.Bitmap.GetPixel($lx, $ly)
+            if (($c.R + $c.G + $c.B) -gt 300) { $lit++ }
+        }
+        $cols.Add($lit)
+    }
+    return $cols.ToArray()
 }
 
 # Signature across the single tab (title text region) + the "+" button.
 # 1 tab: tabW = clamp(clientW-36s, 60s, 200s) = 200s on any normal window.
+#
+# The capture is retried until it holds real content: PrintWindow taken while
+# the window is still painting returns a flat fill, and a flat fill scores a
+# perfectly stable all-zero signature that would make every "same raster"
+# assertion pass for the wrong reason (the T216 lesson).
 function Get-Signature($g) {
     $scale = $g.BarH / 32.0
     $tabW = [math]::Round(200 * $scale)
@@ -225,7 +126,16 @@ function Get-Signature($g) {
     $x1 = $g.ClientLeft + $tabW + $plusW - 2           # through the + glyph
     $y0 = $g.ClientTop + 4
     $y1 = $g.ClientTop + $g.BarH - 5                   # skip accent-stripe rows
-    [TFDrv]::ColSig([int]$x0, [int]$x1, [int]$y0, [int]$y1, 2)
+    for ($t = 0; $t -lt 20; $t++) {
+        $shot = Get-TestWindowPixels -Window $g.Top
+        try {
+            if ((Get-TestDistinctColors -Shot $shot) -ge 8) {
+                return (Get-ColSig $shot ([int]$x0) ([int]$x1) ([int]$y0) ([int]$y1) 2)
+            }
+        } finally { Close-TestWindowPixels $shot }
+        Start-Sleep -Milliseconds 150
+    }
+    return @()
 }
 
 function Sig-Diff([int[]]$a, [int[]]$b) {
@@ -235,69 +145,94 @@ function Sig-Diff([int[]]$a, [int[]]$b) {
     $d + [math]::Abs($a.Count - $b.Count) * 10
 }
 
-$VK_CTRL = [uint16]0x11; $VK_SHIFT = [uint16]0x10; $VK_OEM_COMMA = [uint16]0xBC
-
-# ---------------------------------------------------------------------------
-# Launch A: default font
-# ---------------------------------------------------------------------------
 Kill-RepoInstances
-$a = Launch-Gui @()
-if ($null -eq $a) { Write-Host 'SETUP FAIL: launch A died'; exit 1 }
-Assert ($a.BarH -ge 20 -and $a.BarH -le 80) "positive control: tab bar visible with 1 tab + always (barH=$($a.BarH))"
-$sigA = Get-Signature $a
-$litA = ($sigA | Measure-Object -Sum).Sum
-Assert ($litA -gt 20) "default font: tab bar draws text (lit=$litA)"
-Stop-Process -Id $a.Proc.Id -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
 
-# ---------------------------------------------------------------------------
-# Launch B: Times New Roman via CLI
-# ---------------------------------------------------------------------------
-$b = Launch-Gui @('--window-title-font-family=Times New Roman')
-if ($null -eq $b) { Write-Host 'SETUP FAIL: launch B died'; exit 1 }
-Assert ($b.BarH -eq $a.BarH) "bar height unchanged by font family (barH=$($b.BarH))"
-$sigB = Get-Signature $b
-$dAB = Sig-Diff $sigA $sigB
-Assert ($dAB -ge 25) "font family changes the tab bar raster (diff A-vs-B=$dAB)"
-Stop-Process -Id $b.Proc.Id -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
-
-# ---------------------------------------------------------------------------
-# Launch C: same family via --config-file, then live reload back to Segoe UI
-# ---------------------------------------------------------------------------
+# Watch the user's desktop for the whole run: nothing we launch may ever take
+# foreground there. That is the complaint the test desktop exists to fix.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
 $conf = Join-Path $env:TEMP 'ghoztty-titlefont-test.conf'
-Set-Content -Path $conf -Value 'window-title-font-family = Times New Roman' -Encoding ascii
-$c = Launch-Gui @("--config-file=$conf")
-if ($null -eq $c) { Write-Host 'SETUP FAIL: launch C died'; Remove-Item $conf -ErrorAction SilentlyContinue; exit 1 }
-$sigC = Get-Signature $c
-$dBC = Sig-Diff $sigB $sigC
-Assert ($dBC -le 15) "same family reproduces the raster / config-file path works (diff B-vs-C=$dBC)"
-
-Set-Content -Path $conf -Value 'window-title-font-family = Segoe UI' -Encoding ascii
-$r = ''
-for ($t = 0; $t -lt 4; $t++) {
-    $r = [TFDrv]::Chord($c.Top, $c.Surface, @($VK_CTRL, $VK_SHIFT), $VK_OEM_COMMA)
-    if ($r -eq 'SENT') { break }
-    Start-Sleep -Milliseconds 900
-}
-Assert ($r -eq 'SENT') "reload chord injected ($r)"
-$reloaded = $false
-$dCD = 0
-for ($t = 0; $t -lt 15; $t++) {
-    Start-Sleep -Milliseconds 300
-    $sigD = Get-Signature $c
-    $dCD = Sig-Diff $sigC $sigD
-    if ($dCD -ge 25) { $reloaded = $true; break }
-}
-Assert $reloaded "config reload re-fonts the tab bar live (diff C-vs-D=$dCD)"
-if ($reloaded) {
-    $dAD = Sig-Diff $sigA $sigD
-    Assert ($dAD -le 15) "reloaded Segoe UI matches the default raster (diff A-vs-D=$dAD)"
+if ($NegativeControl) {
+    Write-Host 'NEGATIVE CONTROL: asserts Times New Roman reproduces the DEFAULT raster - this run MUST fail'
 }
 
-Assert (-not $c.Proc.HasExited) 'no crash'
-Stop-Process -Id $c.Proc.Id -Force -ErrorAction SilentlyContinue
-Remove-Item $conf -ErrorAction SilentlyContinue
+try {
+    # -----------------------------------------------------------------------
+    # Launch A: default font
+    # -----------------------------------------------------------------------
+    $a = Launch-Gui @()
+    if ($null -eq $a) { Write-Host 'SETUP FAIL: launch A died'; exit 1 }
+    Assert (-not (Test-TestDesktopLeak -ProcessId $a.App.Pid)) `
+        'launch A is NOT enumerable on the interactive desktop'
+    Assert ($a.BarH -ge 20 -and $a.BarH -le 80) "positive control: tab bar visible with 1 tab + always (barH=$($a.BarH))"
+    $sigA = Get-Signature $a
+    $litA = ($sigA | Measure-Object -Sum).Sum
+    Assert ($litA -gt 20) "default font: tab bar draws text (lit=$litA)"
+    Stop-Process -Id $a.App.Pid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    # -----------------------------------------------------------------------
+    # Launch B: Times New Roman via CLI
+    # -----------------------------------------------------------------------
+    $b = Launch-Gui @('--window-title-font-family=Times New Roman')
+    if ($null -eq $b) { Write-Host 'SETUP FAIL: launch B died'; exit 1 }
+    Assert ($b.BarH -eq $a.BarH) "bar height unchanged by font family (barH=$($b.BarH))"
+    $sigB = Get-Signature $b
+    $dAB = Sig-Diff $sigA $sigB
+    if ($NegativeControl) {
+        Assert ($dAB -le 15) "NEGATIVE CONTROL: font family leaves the raster alone (diff A-vs-B=$dAB)"
+    } else {
+        Assert ($dAB -ge 25) "font family changes the tab bar raster (diff A-vs-B=$dAB)"
+    }
+    Stop-Process -Id $b.App.Pid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    # -----------------------------------------------------------------------
+    # Launch C: same family via --config-file, then live reload back to Segoe UI
+    # -----------------------------------------------------------------------
+    Set-Content -Path $conf -Value 'window-title-font-family = Times New Roman' -Encoding ascii
+    $c = Launch-Gui @("--config-file=$conf")
+    if ($null -eq $c) { Write-Host 'SETUP FAIL: launch C died'; exit 1 }
+    $sigC = Get-Signature $c
+    $dBC = Sig-Diff $sigB $sigC
+    Assert ($dBC -le 15) "same family reproduces the raster / config-file path works (diff B-vs-C=$dBC)"
+
+    Set-Content -Path $conf -Value 'window-title-font-family = Segoe UI' -Encoding ascii
+    if (-not (Focus-TestWindow -Window $c.Top -Child $c.Surface)) {
+        Write-Host 'SETUP FAIL: could not focus launch C'; exit 1
+    }
+    $r = Send-TestKeys -Window $c.Top -Target $c.Surface -Modifiers ctrl, shift -Key comma
+    Assert $r "reload chord injected (ctrl+shift+comma)"
+    $reloaded = $false
+    $dCD = 0
+    $sigD = @()
+    for ($t = 0; $t -lt 15; $t++) {
+        Start-Sleep -Milliseconds 300
+        $sigD = Get-Signature $c
+        $dCD = Sig-Diff $sigC $sigD
+        if ($dCD -ge 25) { $reloaded = $true; break }
+    }
+    Assert $reloaded "config reload re-fonts the tab bar live (diff C-vs-D=$dCD)"
+    if ($reloaded) {
+        $dAD = Sig-Diff $sigA $sigD
+        Assert ($dAD -le 15) "reloaded Segoe UI matches the default raster (diff A-vs-D=$dAD)"
+    }
+
+    Assert (-not ($c.App.Process -and $c.App.Process.HasExited)) 'no crash'
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+    Remove-Item $conf -ErrorAction SilentlyContinue
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @(Get-TestLaunchedPids)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
