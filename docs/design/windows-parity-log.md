@@ -2880,3 +2880,41 @@ incident, one platform later.
   the mechanism that makes future agent fixes reach users exists only in
   zig-out) and **T197**; annotated **T125**, whose correctness half this closes,
   leaving the What's-new accessory and protocol-SKEW gating.
+
+## 2026-07-30 - T196 field outcome: the dialog was working the whole time; the log just never said so
+
+- **T196 delivery verified.** `%TEMP%\ghoztty-upgrade.log` ends `UPGRADE OK`, and
+  `ghoztty +version` reports `1.4.0-users-dzearing-windows-amd64-+9968a62d9` —
+  the installed release really is on the delivered commit, through the new
+  `scripts/launch-upgrade.ps1` path (T200).
+- **T147's field check came back as outcome 2, the contract-correct one:** the
+  mandatory `GhozttyConfirmDialog` ("Restart the Ghoztty background terminal
+  process?") was up, owner window disabled, body naming **4 open terminal
+  sessions**. Answered **Later** — confirming would have relaunched all four as
+  tombstones, including this loop's own pane. Agent pid **27568 unchanged**
+  throughout; after the decline the log records `user deferred destructive agent
+  refresh (4 live session(s))`. Consent before destruction held in the field,
+  not just in the harness.
+- Inputs measured rather than assumed: the running agent's HELLO advertises
+  `build_version` **`20260728-349eba4f6`**, the bundled binary prints
+  **`20260730-e69d41755`** ⇒ `confirm_first`. An agent from *two days* earlier
+  had survived four binary swaps — precisely the gap T147 exists to close.
+- **It read as the third outcome ("delivery did not take") for twenty minutes,
+  and the diagnosis is the finding.** Two false negatives stacked: `Get-Process |
+  Where MainWindowTitle` never surfaces an *owned* dialog (and this one sat on a
+  second monitor), and a pending modal writes **no log line at all** — every
+  message in `refreshLocalAgentIfStale` after `bundled agent build is …` is
+  emitted only once the user answers, and the `.none` arm logs nothing ever. So
+  "a correct confirmation is waiting" and "the check decided nothing" and "the
+  check never ran" are one indistinguishable silence. Filed as **T201**.
+- Durable probes, both cheap: read a running agent's build straight from its
+  HELLO by opening the `pipe` in `port.json` with `NamedPipeClientStream` and
+  dumping the first frame (`"build_version"` is plain-text JSON); enumerate an
+  app's dialogs with `EnumWindows` by pid using **`CharSet=CharSet.Unicode`** —
+  the Ansi default truncates every wide string to its first character, which is
+  how the first pass printed `class=[G] title=[R]` and looked like garbage.
+- T201 also carries a doc correction: `protocol.zig` claims a null
+  `build_version` is "never treated as stale" and its test comment says "the app
+  must treat null as not-stale", both contradicting `agent_upgrade.isStale`,
+  which treats null as stale on purpose. The code is right; the comments invite
+  someone to "fix" the policy backwards.
