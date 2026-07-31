@@ -3262,3 +3262,41 @@ assertions had simply never run.
 
 Floor: both `zig build test` lanes, `test-agent`, P1-P3 green, and all six
 previously-migrated scripts re-run green against the changed harness.
+
+## 2026-07-31 - T217 batch 4: two more scripts, and the second mechanism limit
+
+`clipboard-paste` (22 assertions) and `kb-actions` (42, up from 24) migrated
+onto the test desktop, ALL PASS x3 each, negative controls FAIL. Harness gains
+`Test-TestWindowEnabled` (modality: an owner window is disabled exactly while
+its modal dialog is up) and `Send-TestInjectedChar`.
+
+The batch's real finding is a **second measured mechanism limit**, alongside
+the capture one: `SendInput(KEYEVENTF_UNICODE)` has no faithful replacement
+off the input desktop. The obvious substitute - post
+`WM_KEYDOWN(VK_PACKET, char in the lParam HIWORD)` - looks documented and
+silently does nothing; the character never arrives, because a real packet
+carries its 16-bit character out of band while a posted lParam has only an
+8-bit scan-code field. A posted `WM_CHAR` to the same surface does arrive.
+So `kb-actions`'s T64 section still covers the app's injected-WM_CHAR
+handling but NOT `App.run`'s TranslateMessage exemption for VK_PACKET. The
+assertions were renamed to say what they prove and the residue is filed as
+**T222** (proposal: factor the `skip_translate` switch into a pure predicate
+and unit-test it, which covers it with no desktop at all). Relabelling them
+instead would have been exactly the vacuous assertion batch 3 warned about.
+Measured in a throwaway probe rather than reasoned about, and written into
+`lib/TestDesktop.ps1` as "MECHANISM LIMIT - VK_PACKET" so it is not
+re-derived.
+
+Second finding: **`keybinds-t01` is not a keyboard-only script.** Its "ctrl+c
+WITH selection" section word-selects with a real SendInput MOUSE double-click,
+and that section is live. T212's split misfiled it; it moved to T218 and
+T217's denominator went 23 -> 22 (10 remain). Third: `kb-actions` went from 24
+to 42 assertions with no new coverage written - three sections had silent SKIP
+branches, same shape as batch 2's `window-title`.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green; all eleven
+previously-migrated scripts re-run against the changed harness. Two reds in
+that sweep, neither from this change: `ipc-version` compared the binary's
+baked commit against HEAD and the exe was three commits stale (green after a
+rebuild - a reminder that this assertion doubles as a stale-build detector),
+and `remote-inherit`'s 3 are the known pre-existing T178.

@@ -44,6 +44,20 @@
 # native chrome migrate; probes of rendered terminal content cannot, and must
 # not be "migrated" into an assertion that passes against a blank fill.
 #
+# MECHANISM LIMIT - VK_PACKET (measured here 2026-07-31, T217 batch 4):
+# SendInput(KEYEVENTF_UNICODE) is how screen readers, on-screen keyboards and
+# automation inject text; the app sees it as a WM_KEYDOWN with wParam
+# VK_PACKET that TranslateMessage turns into a WM_CHAR. That cannot be
+# reproduced by posting, and the obvious trick does NOT work: a posted
+# WM_KEYDOWN(VK_PACKET, char in the lParam HIWORD) is never translated -
+# measured on box, the character simply never arrives (the real packet
+# carries its 16-bit character out of band, not in the 8-bit scan-code field
+# of a posted lParam). A posted WM_CHAR to the same surface DOES arrive.
+# So Send-TestInjectedChar posts WM_CHAR, which covers the app's injected-text
+# handling (App.zig's WM_CHAR handler names direct posts as one of its two
+# sources) but NOT App.run's TranslateMessage exemption for VK_PACKET. Do not
+# label a WM_CHAR assertion as covering the packet path.
+#
 # Everything that touches the test desktop runs on ONE persistent worker
 # thread: SetThreadDesktop is per-thread, and it fails outright on a thread
 # that already owns windows or hooks - which the PowerShell host thread does.
@@ -99,6 +113,7 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
@@ -163,6 +178,7 @@ public class GhozttyTestDesktop {
     delegate bool EnumProc(IntPtr h, IntPtr l);
 
     const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102;
+    const ushort VK_PACKET = 0xE7;
     const uint WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
     const uint WM_MOUSEMOVE = 0x0200;
     const uint WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203;
@@ -392,6 +408,9 @@ public class GhozttyTestDesktop {
 
     public bool IsVisible(IntPtr h) { return (bool)Run(delegate() { return IsWindowVisible(h); }); }
     public bool Exists(IntPtr h) { return (bool)Run(delegate() { return IsWindow(h); }); }
+    // Modality's observable side: an owner window is DISABLED for as long as
+    // its modal dialog is up, and re-enabled when the dialog closes.
+    public bool Enabled(IntPtr h) { return (bool)Run(delegate() { return IsWindowEnabled(h); }); }
 
     public int[] Rect(IntPtr h) {
         return (int[])Run(delegate() {
@@ -589,6 +608,17 @@ public class GhozttyTestDesktop {
         SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
     }
 
+    // KEYEVENTF_UNICODE: what a screen reader / on-screen keyboard / automation
+    // tool actually injects. Interactive mode only - see SendInjectedChar.
+    static void SendInputUnicode(char c, bool up) {
+        var i = new INPUT[1];
+        i[0].type = 1;
+        i[0].ki.wVk = 0;
+        i[0].ki.wScan = (ushort)c;
+        i[0].ki.dwFlags = (up ? 2u : 0u) | 4u; // KEYEVENTF_UNICODE -> VK_PACKET
+        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
+    }
+
     // ================= input =================
     // Extended keys need bit 24 of lparam set, or the app reads them as their
     // numpad twins (Surface.handleKeyEvent reads it explicitly).
@@ -731,6 +761,40 @@ public class GhozttyTestDesktop {
                         PostMessageW(dst, WM_KEYDOWN, (IntPtr)vk, KeyLParam(vk, false));
                         PostMessageW(dst, WM_KEYUP, (IntPtr)vk, KeyLParam(vk, true));
                         if (shift) { ks[0x10] = 0; ks[0xA0] = 0; SetKeyboardState(ks); }
+                    }
+                    Thread.Sleep(perKeyMs);
+                }
+                Thread.Sleep(80);
+                return true;
+            } finally { AttachThreadInput(cur, tid, false); }
+        });
+    }
+
+    // INJECTED text into a terminal surface: a WM_CHAR that did NOT come from
+    // this surface's own WM_KEYDOWN. That is the shape screen readers,
+    // on-screen keyboards and automation produce, and App.zig's WM_CHAR
+    // handler names its two sources: VK_PACKET translation and direct
+    // WM_CHAR posts. On the test desktop only the second is available, and
+    // that is a MECHANISM LIMIT, not a preference - see the header.
+    //
+    // Interactive mode uses the real KEYEVENTF_UNICODE, so a run with
+    // -Interactive covers the packet path as well.
+    public bool SendInjectedChar(IntPtr top, IntPtr target, string text, int perKeyMs) {
+        return (bool)Run(delegate() {
+            uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
+            uint cur = GetCurrentThreadId();
+            if (!AttachThreadInput(cur, tid, true)) { LastError = "AttachThreadInput failed"; return false; }
+            try {
+                SetActiveWindow(top);
+                SetFocus(target == IntPtr.Zero ? top : target);
+                Thread.Sleep(40);
+                IntPtr dst = (target == IntPtr.Zero) ? top : target;
+                foreach (char c in text) {
+                    if (Interactive) {
+                        SendInputUnicode(c, false);
+                        SendInputUnicode(c, true);
+                    } else {
+                        PostMessageW(dst, WM_CHAR, (IntPtr)(int)c, (IntPtr)1);
                     }
                     Thread.Sleep(perKeyMs);
                 }
@@ -1155,6 +1219,13 @@ function Test-TestWindowExists {
 
 # Is the window maximized? (IsZoomed - no pixels involved, so it works on a
 # background desktop and is the usual positive control for size tests.)
+# IsWindowEnabled: false while a modal dialog owns the window, true again once
+# it closes. The cross-process-safe way to assert modality.
+function Test-TestWindowEnabled {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).Enabled($Window)
+}
+
 function Test-TestWindowZoomed {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).Zoomed($Window)
@@ -1325,6 +1396,25 @@ function Send-TestText {
         $Desktop
     )
     return (Resolve-TestDesktop $Desktop).SendText($Window, $Target, $Text, $PerKeyMs)
+}
+
+<#
+Inject text into a TERMINAL surface as something other than its own typing -
+the screen-reader / on-screen-keyboard / automation case (T64).
+
+Off the input desktop this is a posted WM_CHAR, which covers the app's
+injected-text handling but NOT the VK_PACKET half of the real path. See
+"MECHANISM LIMIT" in this file's header before writing an assertion on it.
+#>
+function Send-TestInjectedChar {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [IntPtr]$Target = [IntPtr]::Zero,
+        [Parameter(Mandatory = $true)][string]$Text,
+        [int]$PerKeyMs = 25,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).SendInjectedChar($Window, $Target, $Text, $PerKeyMs)
 }
 
 # Type into a STANDARD control (EDIT in a dialog or the command palette).

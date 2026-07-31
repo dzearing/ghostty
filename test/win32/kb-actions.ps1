@@ -8,20 +8,41 @@
 #        rename-edit assertions (no crash in a single-tab window).
 #   T47: ctrl+k clears the primary screen (+ scrollback); on the alternate
 #        screen the performable binding is unconsumed and falls through.
+#   T64: injected character input (screen readers, on-screen keyboards,
+#        automation) lands in both terminal input modes.
 #
-# Mechanics: SetForegroundWindow + AttachThreadInput + SetFocus(surface)
-# then a short SendInput burst. Foreground is verified immediately before
-# each injection and the test ABORTS (not fails) if another window owns
-# it, so keystrokes can never leak into other apps. Run on an idle desktop
-# for reliable results.
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted at the end, not assumed.
+# The private KbDrv driver (T86 GrabForeground + SendInput) is gone.
+#
+# T64 is the one section the move genuinely narrows, and it says so where the
+# assertions are: SendInput(KEYEVENTF_UNICODE) is exactly what a background
+# desktop refuses, and a posted VK_PACKET is not a substitute (it is never
+# translated - measured, see MECHANISM LIMIT in lib/TestDesktop.ps1). The
+# injected-WM_CHAR handling is still covered; App.run's TranslateMessage
+# exemption for VK_PACKET is not, and that residue is T222 rather than a
+# label quietly left claiming more than it tests.
 #
 # Only touches ghoztty processes running from this repo's zig-out.
-$ErrorActionPreference = 'Stop'
+#
+#   powershell -NoProfile -File test\win32\kb-actions.ps1
+param(
+    [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
+    [switch]$NegativeControl,
+    [switch]$Interactive
+)
+
+$ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-$exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
-if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
-$errlog = Join-Path $env:TEMP "ghoztty-kb-actions-stderr.log"
+if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
+$errlog = Join-Path $env:TEMP 'ghoztty-kb-actions-stderr.log'
 Remove-Item $errlog -ErrorAction SilentlyContinue
+
+# Isolate the IPC endpoint unconditionally - inherited by the app through
+# CreateProcessW and by every `& $Exe +...` below.
+$env:GHOZTTY_PIPE_SUFFIX = '-kbactionstest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -30,360 +51,229 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class KbDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, string l);
-    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int L; public int T; public int R; public int B; }
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    static void Uni(char c, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = 0;
-        i[0].ki.wScan = (ushort)c;
-        i[0].ki.dwFlags = (up ? 2u : 0u) | 4u; // KEYEVENTF_UNICODE -> VK_PACKET
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    // T64: type prefixVk via plain VK events (arms the produced-text flag
-    // like real typing does), then the uni string via KEYEVENTF_UNICODE
-    // (VK_PACKET). Returns "SENT" or an ABORT/failure reason.
-    public static string TypeUni(IntPtr top, IntPtr surface, string prefixVk, string uni) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (char c in prefixVk) {
-                ushort vk = (ushort)char.ToUpperInvariant(c);
-                Key(vk, false); Thread.Sleep(5); Key(vk, true); Thread.Sleep(5);
-            }
-            foreach (char c in uni) { Uni(c, false); Thread.Sleep(5); Uni(c, true); Thread.Sleep(5); }
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-
-    // Send mods+vk to the surface. Returns "SENT" or an ABORT/failure reason.
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-
-    // The "Rename Window" dialog is a top-level popup of its own class.
-    public static IntPtr FindDialog() {
-        return FindWindowExW(IntPtr.Zero, IntPtr.Zero, "GhozttyRenameDialog", null);
-    }
-
-    // Send ctrl+shift+r and wait for the rename dialog to appear.
-    public static string OpenRenameDialog(IntPtr top, IntPtr surface) {
-        string r = Chord(top, surface, new ushort[] { 0x11, 0x10 }, 0x52); // ctrl+shift+r
-        if (r != "SENT") return r;
-        for (int t = 0; t < 100; t++) {
-            Thread.Sleep(10);
-            if (FindDialog() != IntPtr.Zero) return "OPEN";
-        }
-        return "NO DIALOG within 1s";
-    }
-
-    public static string WindowText(IntPtr h) {
-        var sb = new StringBuilder(512);
-        GetWindowTextW(h, sb, 512);
-        return sb.ToString();
-    }
-
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-
-    // Deterministic direct-child lookup by class name (case-insensitive).
-    // Avoids FindWindowExW's title-matching ambiguity when the title arg is
-    // a PowerShell $null (which marshals to "" and only matches empty
-    // titles) — the dialog's edit is prefilled, so it has a non-empty title.
-    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
-    public static IntPtr ChildByClass(IntPtr parent, string cls) {
-        IntPtr c = GetWindow(parent, 5); // GW_CHILD
-        while (c != IntPtr.Zero) {
-            var sb = new StringBuilder(64);
-            GetClassNameW(c, sb, 64);
-            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase))
-                return c;
-            c = GetWindow(c, 2); // GW_HWNDNEXT
-        }
-        return IntPtr.Zero;
-    }
-
-    public static string DumpChildren(IntPtr parent) {
-        var outp = new StringBuilder();
-        EnumChildWindows(parent, (h, l) => {
-            var cls = new StringBuilder(64); GetClassNameW(h, cls, 64);
-            var txt = new StringBuilder(128); GetWindowTextW(h, txt, 128);
-            outp.AppendLine("  " + h.ToString("X") + "  class=[" + cls + "]  text=[" + txt + "]");
-            return true;
-        }, IntPtr.Zero);
-        return outp.ToString();
-    }
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, StringBuilder sb);
-
-    // GetWindowTextW cannot read another process's edit control - WM_GETTEXT
-    // is marshaled cross-process for standard controls.
-    public static string ControlText(IntPtr h) {
-        var sb = new StringBuilder(512);
-        SendMessageW(h, 0x000D, (IntPtr)512, sb); // WM_GETTEXT
-        return sb.ToString();
-    }
+function Stop-RepoGhoztty {
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
+        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out\*') -or $_.ExecutablePath -eq $Exe } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 800
 }
-'@
 
-# --- Setup: fresh debug instance with stderr captured -----------------------
-Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-    Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out\*') } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+# ctrl+shift+r, retried: the chord can land while the window is still
+# settling. Returns the dialog HWND, or IntPtr::Zero.
+function Open-RenameDialog {
+    foreach ($try in 1..3) {
+        if (-not (Send-TestKeys -Window $script:top -Target $script:surface -Modifiers ctrl,shift -Key R)) { continue }
+        $d = Wait-TestWindow -ProcessId $script:appPid -Class 'GhozttyRenameDialog' -TimeoutMs 3000
+        if ($d -ne [IntPtr]::Zero) { return $d }
+    }
+    return [IntPtr]::Zero
+}
 
-$proc = Start-Process -FilePath $exe -PassThru -RedirectStandardError $errlog
+function Get-Dialog {
+    return (Get-TestWindow -ProcessId $script:appPid -Class 'GhozttyRenameDialog')
+}
+
+# --- Setup: fresh debug instance on the test desktop -------------------------
+# --session-persistence=false: a restored layout manifest would carry a
+# previous run's window title into the assertions below (batch-2 lesson).
+Stop-RepoGhoztty
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$app = $null
+
+try {
+
+$app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
+$script:appPid = $app.Pid
 Start-Sleep -Seconds 3
-if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
-$top = [KbDrv]::FindTop([uint32]$proc.Id)
-$surface = [KbDrv]::FindWindowExW($top, [IntPtr]::Zero, 'GhozttyTerminal', $null)
-if ($top -eq [IntPtr]::Zero -or $surface -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: windows not found'; exit 1 }
+if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+$script:top = Wait-TestWindow -ProcessId $script:appPid -Class 'GhozttyWindow'
+if ($script:top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
+Assert (-not (Test-TestDesktopLeak -ProcessId $script:appPid)) 'window is NOT enumerable on the interactive desktop'
 
-$listJson = & $exe +list --json | ConvertFrom-Json
+# The surface the app itself considers active: GhozttyWindow gives WM_KEYDOWN
+# to DefWindowProc and only forwards FOCUS to the active pane, so a chord
+# posted at the window is silently dropped (batch-3 lesson).
+Focus-TestWindow -Window $script:top | Out-Null
+Start-Sleep -Milliseconds 500
+$script:surface = [IntPtr](Get-TestFocusedWindow -Window $script:top)
+Assert ((Get-TestWindowClass -Window $script:surface) -eq 'GhozttyTerminal') 'window forwarded focus to a terminal surface'
+
+$listJson = & $Exe +list --json | ConvertFrom-Json
 $pane = $listJson.data.windows[0].tabs[0].splits.terminal.name
 $win = $listJson.data.windows[0].target
+Assert (-not [string]::IsNullOrEmpty($pane)) 'pane name resolved from +list'
 
 # --- T50: "Rename Window" dialog (supersedes the T44 rename-edit path) ------
-$r = [KbDrv]::OpenRenameDialog($top, $surface)
-if ($r -like 'ABORT*') { Write-Host "SKIP T50: $r"; }
-else {
-    Assert ($r -eq 'OPEN') "T50 dialog opened on ctrl+shift+r ($r)"
-    Assert (-not $proc.HasExited) 'T50 no crash after ctrl+shift+r (single tab)'
-    $dlg = [KbDrv]::FindDialog()
-    if ($dlg -ne [IntPtr]::Zero) {
-        # T92: ctrl+shift+r is prompt_window_title; the T50 dialog caption
-        # follows the Mac prompt naming.
-        Assert ([KbDrv]::WindowText($dlg) -eq 'Change Window Title') 'T50 dialog caption is "Change Window Title"'
-        $edit = [KbDrv]::ChildByClass($dlg, 'Edit')
-        $okBtn = [KbDrv]::FindWindowExW($dlg, [IntPtr]::Zero, 'BUTTON', 'OK')
-        $cancelBtn = [KbDrv]::FindWindowExW($dlg, [IntPtr]::Zero, 'BUTTON', 'Cancel')
-        Assert ($edit -ne [IntPtr]::Zero) 'T50 dialog has an edit box'
-        Assert ($okBtn -ne [IntPtr]::Zero) 'T50 dialog has an OK button'
-        Assert ($cancelBtn -ne [IntPtr]::Zero) 'T50 dialog has a Cancel button'
-        Assert (-not [KbDrv]::IsWindowEnabled($top)) 'T50 owner window disabled while dialog open (modal)'
-        $dr = New-Object KbDrv+RECT; $tr = New-Object KbDrv+RECT
-        [KbDrv]::GetWindowRect($dlg, [ref]$dr) | Out-Null
-        [KbDrv]::GetWindowRect($top, [ref]$tr) | Out-Null
-        $dcx = ($dr.L + $dr.R) / 2; $tcx = ($tr.L + $tr.R) / 2
-        $dcy = ($dr.T + $dr.B) / 2; $tcy = ($tr.T + $tr.B) / 2
-        Assert (([Math]::Abs($dcx - $tcx) -le 3) -and ([Math]::Abs($dcy - $tcy) -le 3)) 'T50 dialog centered on owner'
+$dlg = Open-RenameDialog
+Assert ($dlg -ne [IntPtr]::Zero) 'T50 dialog opened on ctrl+shift+r'
+Assert (-not ($app.Process -and $app.Process.HasExited)) 'T50 no crash after ctrl+shift+r (single tab)'
+if ($dlg -eq [IntPtr]::Zero) {
+    # In -NegativeControl mode the inverted assertion below is the whole
+    # point of the run; if the section never reaches it, fail loudly rather
+    # than let the control pass by skipping.
+    if ($NegativeControl) { Assert $false 'NEGATIVE CONTROL never reached its inverted assertion' }
+} else {
+    # T92: ctrl+shift+r is prompt_window_title; the T50 dialog caption
+    # follows the Mac prompt naming.
+    Assert ((Get-TestWindowText -Window $dlg) -eq 'Change Window Title') 'T50 dialog caption is "Change Window Title"'
+    $edit = Find-TestWindowEx -Parent $dlg -Class 'Edit'
+    $okBtn = Find-TestWindowEx -Parent $dlg -Class 'BUTTON' -Title 'OK'
+    $cancelBtn = Find-TestWindowEx -Parent $dlg -Class 'BUTTON' -Title 'Cancel'
+    Assert ($edit -ne [IntPtr]::Zero) 'T50 dialog has an edit box'
+    Assert ($okBtn -ne [IntPtr]::Zero) 'T50 dialog has an OK button'
+    Assert ($cancelBtn -ne [IntPtr]::Zero) 'T50 dialog has a Cancel button'
+    Assert (-not (Test-TestWindowEnabled -Window $script:top)) 'T50 owner window disabled while dialog open (modal)'
+    $dr = Get-TestWindowRect -Window $dlg
+    $tr = Get-TestWindowRect -Window $script:top
+    $dcx = ($dr.Left + $dr.Right) / 2; $tcx = ($tr.Left + $tr.Right) / 2
+    $dcy = ($dr.Top + $dr.Bottom) / 2; $tcy = ($tr.Top + $tr.Bottom) / 2
+    Assert (([Math]::Abs($dcx - $tcx) -le 3) -and ([Math]::Abs($dcy - $tcy) -le 3)) 'T50 dialog centered on owner'
 
-        # Enter commits via titleOverride.
-        [KbDrv]::SendMessageW($edit, 0x000C, [IntPtr]::Zero, 'KBTEST_TITLE') | Out-Null  # WM_SETTEXT
-        [KbDrv]::PostMessageW($edit, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001) | Out-Null # Enter
-        Start-Sleep -Milliseconds 500
-        Assert ([KbDrv]::FindDialog() -eq [IntPtr]::Zero) 'T50 dialog closed on Enter'
-        Assert (-not $proc.HasExited) 'T50 no crash after commit'
-        Assert ([KbDrv]::IsWindowEnabled($top)) 'T50 owner re-enabled after close'
-        $list = & $exe +list --json | Out-String
+    # Enter commits via titleOverride. The dialog arrives PREFILLED, so the
+    # value goes in with WM_SETTEXT rather than by typing (batch-2 lesson);
+    # RenameDialog's keys are routed from the App.run intercept, so a posted
+    # Enter does reach it (batch-3 lesson).
+    Set-TestControlText -Control $edit -Text 'KBTEST_TITLE' | Out-Null
+    Send-TestControlKey -Control $edit -Key Enter | Out-Null
+    Start-Sleep -Milliseconds 500
+    Assert ((Get-Dialog) -eq [IntPtr]::Zero) 'T50 dialog closed on Enter'
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'T50 no crash after commit'
+    Assert (Test-TestWindowEnabled -Window $script:top) 'T50 owner re-enabled after close'
+    $list = & $Exe +list --json | Out-String
+    # -NegativeControl inverts the claim the whole T50 block exists for -
+    # that the dialog's commit actually renames the window. The run MUST
+    # fail here; that is what proves the assertion discriminates.
+    if ($NegativeControl) {
+        Write-Host 'NEGATIVE CONTROL: asserting the rename does NOT commit - this run MUST fail'
+        Assert ($list -notmatch 'KBTEST_TITLE') 'T50 (inverted) window title NOT committed'
+    } else {
         Assert ($list -match 'KBTEST_TITLE') 'T50 window title committed (visible in +list)'
+    }
 
-        # titleOverride precedence (T10): a shell-set title updates the TAB
-        # label but the window caption keeps the override.
-        & $exe +send-keys --target=$win "title SHELLSET_TITLE" Enter | Out-Null
-        Start-Sleep -Seconds 2
-        $listJson2 = & $exe +list --json | ConvertFrom-Json
-        $tabTitle = $listJson2.data.windows[0].tabs[0].title
-        if ($tabTitle -notmatch 'SHELLSET_TITLE') { Write-Host 'SKIP T50-precedence: shell title did not land' }
-        else {
-            Assert ([KbDrv]::WindowText($top) -match 'KBTEST_TITLE') 'T50 override beats shell title (T10 precedence)'
-        }
+    # titleOverride precedence (T10): a shell-set title updates the TAB
+    # label but the window caption keeps the override.
+    & $Exe +send-keys --target=$win 'title SHELLSET_TITLE' Enter | Out-Null
+    Start-Sleep -Seconds 2
+    $listJson2 = & $Exe +list --json | ConvertFrom-Json
+    $tabTitle = $listJson2.data.windows[0].tabs[0].title
+    Assert ($tabTitle -match 'SHELLSET_TITLE') 'T50 shell-set title reached the tab label'
+    Assert ((Get-TestWindowText -Window $script:top) -match 'KBTEST_TITLE') 'T50 override beats shell title (T10 precedence)'
 
-        # Reopen: edit prefilled with the current override; Escape cancels
-        # without applying.
-        $r2 = [KbDrv]::OpenRenameDialog($top, $surface)
-        if ($r2 -like 'ABORT*') { Write-Host "SKIP T50-cancel: $r2" }
-        else {
-            Assert ($r2 -eq 'OPEN') "T50 dialog reopened ($r2)"
-            $dlg2 = [KbDrv]::FindDialog()
-            $edit2 = [KbDrv]::ChildByClass($dlg2, 'Edit')
-            Assert ([KbDrv]::ControlText($edit2) -eq 'KBTEST_TITLE') 'T50 edit prefilled with current title'
-            [KbDrv]::SendMessageW($edit2, 0x000C, [IntPtr]::Zero, 'SHOULD_NOT_APPLY') | Out-Null
-            [KbDrv]::PostMessageW($edit2, 0x0100, [IntPtr]0x1B, [IntPtr]0x00010001) | Out-Null # Escape
-            Start-Sleep -Milliseconds 500
-            Assert ([KbDrv]::FindDialog() -eq [IntPtr]::Zero) 'T50 dialog closed on Escape'
-            $list3 = & $exe +list --json | Out-String
-            Assert (($list3 -match 'KBTEST_TITLE') -and ($list3 -notmatch 'SHOULD_NOT_APPLY')) 'T50 Escape discarded the edit'
-            Assert ([KbDrv]::IsWindowEnabled($top)) 'T50 owner re-enabled after cancel'
-        }
+    # Reopen: edit prefilled with the current override; Escape cancels
+    # without applying.
+    $dlg2 = Open-RenameDialog
+    Assert ($dlg2 -ne [IntPtr]::Zero) 'T50 dialog reopened'
+    if ($dlg2 -ne [IntPtr]::Zero) {
+        $edit2 = Find-TestWindowEx -Parent $dlg2 -Class 'Edit'
+        # WM_GETTEXT, not GetWindowTextW: the latter is cross-process cached
+        # for a standard control and reads stale.
+        Assert ((Get-TestControlText -Control $edit2) -eq 'KBTEST_TITLE') 'T50 edit prefilled with current title'
+        Set-TestControlText -Control $edit2 -Text 'SHOULD_NOT_APPLY' | Out-Null
+        Send-TestControlKey -Control $edit2 -Key Escape | Out-Null
+        Start-Sleep -Milliseconds 500
+        Assert ((Get-Dialog) -eq [IntPtr]::Zero) 'T50 dialog closed on Escape'
+        $list3 = & $Exe +list --json | Out-String
+        Assert (($list3 -match 'KBTEST_TITLE') -and ($list3 -notmatch 'SHOULD_NOT_APPLY')) 'T50 Escape discarded the edit'
+        Assert (Test-TestWindowEnabled -Window $script:top) 'T50 owner re-enabled after cancel'
+    }
 
-        # Reopen: empty text clears the override (reverts to shell title).
-        $r3 = [KbDrv]::OpenRenameDialog($top, $surface)
-        if ($r3 -like 'ABORT*') { Write-Host "SKIP T50-clear: $r3" }
-        else {
-            $dlg3 = [KbDrv]::FindDialog()
-            $edit3 = [KbDrv]::ChildByClass($dlg3, 'Edit')
-            [KbDrv]::SendMessageW($edit3, 0x000C, [IntPtr]::Zero, '') | Out-Null
-            [KbDrv]::PostMessageW($edit3, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001) | Out-Null # Enter
-            Start-Sleep -Milliseconds 500
-            Assert ([KbDrv]::FindDialog() -eq [IntPtr]::Zero) 'T50 dialog closed on empty commit'
-            Assert ([KbDrv]::WindowText($top) -notmatch 'KBTEST_TITLE') 'T50 empty text cleared the override'
-        }
+    # Reopen: empty text clears the override (reverts to shell title).
+    $dlg3 = Open-RenameDialog
+    Assert ($dlg3 -ne [IntPtr]::Zero) 'T50 dialog reopened for the clear case'
+    if ($dlg3 -ne [IntPtr]::Zero) {
+        $edit3 = Find-TestWindowEx -Parent $dlg3 -Class 'Edit'
+        Set-TestControlText -Control $edit3 -Text '' | Out-Null
+        Send-TestControlKey -Control $edit3 -Key Enter | Out-Null
+        Start-Sleep -Milliseconds 500
+        Assert ((Get-Dialog) -eq [IntPtr]::Zero) 'T50 dialog closed on empty commit'
+        Assert ((Get-TestWindowText -Window $script:top) -notmatch 'KBTEST_TITLE') 'T50 empty text cleared the override'
     }
 }
 
 # --- T47: ctrl+k clears primary screen ---------------------------------------
-& $exe +send-keys --target=$win "dir C:\Windows\System32\drivers& echo KBFILL_MARKER" Enter | Out-Null
+& $Exe +send-keys --target=$win "dir C:\Windows\System32\drivers& echo KBFILL_MARKER" Enter | Out-Null
 Start-Sleep -Seconds 2
-$before = & $exe +read --name=$pane --lines=40 | Out-String
-if ($before -notmatch 'KBFILL_MARKER') { Write-Host 'SKIP T47: fill did not land'; }
-else {
-    $r = [KbDrv]::Chord($top, $surface, @([uint16]0x11), 0x4B)  # ctrl+k
-    if ($r -like 'ABORT*') { Write-Host "SKIP T47: $r" }
-    else {
-        Start-Sleep -Milliseconds 800
-        Assert (-not $proc.HasExited) 'T47 no crash after ctrl+k'
-        $after = & $exe +read --name=$pane --lines=40 | Out-String
-        Assert ($after -notmatch 'KBFILL_MARKER') 'T47 primary screen cleared'
-        Assert ((Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -Quiet)) 'T47 clear_screen io message logged'
-
-        # Alternate screen: the performable binding must be unconsumed.
-        & $exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?1049h')`"" Enter | Out-Null
-        Start-Sleep -Seconds 3
-        $clearsBefore = (Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -AllMatches | Measure-Object).Count
-        $r2 = [KbDrv]::Chord($top, $surface, @([uint16]0x11), 0x4B)
-        if ($r2 -like 'ABORT*') { Write-Host "SKIP T47-alt: $r2" }
-        else {
-            Start-Sleep -Milliseconds 800
-            Assert (-not $proc.HasExited) 'T47 no crash after alt-screen ctrl+k'
-            $clearsAfter = (Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -AllMatches | Measure-Object).Count
-            Assert ($clearsAfter -eq $clearsBefore) 'T47 alt screen: clear_screen NOT consumed (fell through)'
-        }
-    }
-}
-
-# --- T64: SendInput-unicode (VK_PACKET) text injection ------------------------
-# Screen readers, on-screen keyboards, and automation inject text as
-# KEYEVENTF_UNICODE -> VK_PACKET keydown + WM_CHAR. Both terminal input
-# modes are forced explicitly so the test does not depend on whether
-# ConPTY enabled win32-input mode (9001) on its own.
-
-# T47 left the pane on the alt screen; leave it, then force mode 9001 OFF.
-& $exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?1049l')`"" Enter | Out-Null
-Start-Sleep -Seconds 2
-& $exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?9001l')`"" Enter | Out-Null
-Start-Sleep -Seconds 2
-
-$r = [KbDrv]::TypeUni($top, $surface, 'a', 'uni1ok')
-if ($r -like 'ABORT*') { Write-Host "SKIP T64: $r" }
-else {
+$before = & $Exe +read --name=$pane --lines=40 | Out-String
+Assert ($before -match 'KBFILL_MARKER') 'T47 fill landed in the pane'
+if ($before -match 'KBFILL_MARKER') {
+    Assert (Send-TestKeys -Window $script:top -Target $script:surface -Modifiers ctrl -Key K) 'T47 ctrl+k injected'
     Start-Sleep -Milliseconds 800
-    $tail = & $exe +read --name=$pane --lines=5 | Out-String
-    # 'a' goes through the plain-VK path (arms the produced-text flag);
-    # the unicode chars must still land right after it.
-    Assert ($tail -match 'auni1ok') 'T64 unicode injection lands in normal mode (after a real VK key)'
-    [KbDrv]::Chord($top, $surface, [uint16[]]@(), 0x1B) | Out-Null  # ESC clears the input line
-    Start-Sleep -Milliseconds 300
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'T47 no crash after ctrl+k'
+    $after = & $Exe +read --name=$pane --lines=40 | Out-String
+    Assert ($after -notmatch 'KBFILL_MARKER') 'T47 primary screen cleared'
+    Assert (Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -Quiet) 'T47 clear_screen io message logged'
 
-    # Force win32-input mode (9001) ON and inject again.
-    & $exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?9001h')`"" Enter | Out-Null
-    Start-Sleep -Seconds 2
-    $r2 = [KbDrv]::TypeUni($top, $surface, 'b', 'uni2ok')
-    if ($r2 -like 'ABORT*') { Write-Host "SKIP T64-9001: $r2" }
-    else {
-        Start-Sleep -Milliseconds 800
-        $tail2 = & $exe +read --name=$pane --lines=5 | Out-String
-        Assert ($tail2 -match 'buni2ok') 'T64 unicode injection lands in win32-input mode (9001)'
-        Assert ((Select-String -Path $errlog -Pattern 'injected WM_CHAR in win32-input mode' -Quiet)) 'T64 injected char routed via win32-input encoding (log oracle)'
-    }
+    # Alternate screen: the performable binding must be unconsumed.
+    & $Exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?1049h')`"" Enter | Out-Null
+    Start-Sleep -Seconds 3
+    $clearsBefore = (Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -AllMatches | Measure-Object).Count
+    Assert (Send-TestKeys -Window $script:top -Target $script:surface -Modifiers ctrl -Key K) 'T47 alt-screen ctrl+k injected'
+    Start-Sleep -Milliseconds 800
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'T47 no crash after alt-screen ctrl+k'
+    $clearsAfter = (Select-String -Path $errlog -Pattern 'mailbox message=clear_screen' -AllMatches | Measure-Object).Count
+    Assert ($clearsAfter -eq $clearsBefore) 'T47 alt screen: clear_screen NOT consumed (fell through)'
 }
 
-# --- Teardown ----------------------------------------------------------------
-if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+# --- T64: INJECTED character input -------------------------------------------
+# Screen readers, on-screen keyboards, and automation inject text that did not
+# come from this surface's own WM_KEYDOWN. Both terminal input modes are forced
+# explicitly so the test does not depend on whether ConPTY enabled win32-input
+# mode (9001) on its own.
+#
+# COVERAGE NOTE, and it is a narrowing: on the interactive desktop this used
+# SendInput(KEYEVENTF_UNICODE), so it covered the VK_PACKET keydown AND
+# App.run's TranslateMessage exemption for it AND the WM_CHAR that exemption
+# produces. Off the input desktop only the last is reachable - a posted
+# VK_PACKET is never translated (measured; see MECHANISM LIMIT in
+# lib/TestDesktop.ps1), so the packet half of the path is NOT covered here.
+# Tracked as T222; the assertions below are named for what they actually
+# prove rather than inheriting the old labels.
+& $Exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?1049l')`"" Enter | Out-Null
+Start-Sleep -Seconds 2
+& $Exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?9001l')`"" Enter | Out-Null
+Start-Sleep -Seconds 2
+
+# 'a' goes in as a plain VK key: it proves the surface is live and taking real
+# keys, so a failure below is about the INJECTED characters and not about
+# focus having drifted.
+Assert (Send-TestText -Window $script:top -Target $script:surface -Text 'a') 'T64 prefix VK key injected'
+Assert (Send-TestInjectedChar -Window $script:top -Target $script:surface -Text 'uni1ok') 'T64 injected chars posted'
+Start-Sleep -Milliseconds 800
+$tail = & $Exe +read --name=$pane --lines=5 | Out-String
+Assert ($tail -match 'auni1ok') 'T64 injected characters land in normal mode (after a real VK key)'
+Send-TestKeys -Window $script:top -Target $script:surface -Key Escape | Out-Null  # clear the input line
+Start-Sleep -Milliseconds 300
+
+# Force win32-input mode (9001) ON and inject again. This is the half T64
+# actually fixed: in 9001 mode an injected WM_CHAR must be re-encoded as a
+# synthetic win32-input sequence rather than dropped.
+& $Exe +send-keys --target=$win "powershell -nop -c `"[console]::Write([char]27+'[?9001h')`"" Enter | Out-Null
+Start-Sleep -Seconds 2
+Assert (Send-TestText -Window $script:top -Target $script:surface -Text 'b') 'T64 prefix VK key injected (9001)'
+Assert (Send-TestInjectedChar -Window $script:top -Target $script:surface -Text 'uni2ok') 'T64 injected chars posted (9001)'
+Start-Sleep -Milliseconds 800
+$tail2 = & $Exe +read --name=$pane --lines=5 | Out-String
+Assert ($tail2 -match 'buni2ok') 'T64 injected characters land in win32-input mode (9001)'
+Assert (Select-String -Path $errlog -Pattern 'injected WM_CHAR in win32-input mode' -Quiet) 'T64 injected char routed via win32-input encoding (log oracle)'
+
+} finally {
+    # Read the launched pids BEFORE cleanup: Remove-TestDesktop empties the
+    # live pid list as it kills, and an emptied list makes the leak assertion
+    # below vacuous (the batch-3 lesson).
+    $script:launched = @(Get-TestLaunchedPids)
+    Remove-TestDesktop
+    Stop-RepoGhoztty
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($script:launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
+
 Write-Host ''
-if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
+if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)"; exit 0 }
 else { Write-Host "$script:fail FAILED / $script:pass passed" -ForegroundColor Red; exit 1 }
