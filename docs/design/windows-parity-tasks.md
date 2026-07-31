@@ -74,18 +74,25 @@ recommended approaches where they exist.
 Work these first, in order, before falling back to first-todo-in-table:
 
 0. **TOP OF THE LIST as of 2026-07-30 (user directive, mid-turn):**
-   **T207 → T210 → T208 → T209.**
+   **T211 → T212 → T210 → T208 → T213 → T209.**
 
-   - **T207** — the user, verbatim, while a test run was grabbing their
+   - **~~T207~~** — the user, verbatim, while a test run was grabbing their
      screen: *"you KEEP STEALING FOCUS USE ANOTHER DESKTOP for testing"*.
-     Until it lands, **do not run any `test/win32/*.ps1` GUI script on the
-     interactive desktop.** The unit lanes (`zig build test
-     -Dapp-runtime=none|win32`) never steal focus and are always fine; to
-     LOOK at a window use `PrintWindow` with `PW_RENDERFULLCONTENT`, never
-     `SetForegroundWindow` + `CopyFromScreen`. Spike the DWM question FIRST —
-     DWM composes only the input desktop, so `CopyFromScreen` may return
-     nothing on a background one, and the answer decides the shape of the
-     whole task.
+     **Spiked and split 2026-07-30 → T211 / T212 / T213.** The answer is a
+     background `CreateDesktopW` desktop, and the spike
+     (`test/win32/test-desktop-spike.ps1`, ALL PASS ×3) settled every
+     mechanism question on box:
+     isolation is **total**; `PrintWindow(PW_RENDERFULLCONTENT)` **works**
+     there (so the pixel probes CAN move — that was the feared blocker and it
+     is not one); `CopyFromScreen`/`BitBlt` is **dead** there; and the real
+     blocker is **`SendInput`, which win32 refuses off the input desktop**
+     (0 events accepted, ACCESS_DENIED) — posted `WM_KEYDOWN` plus
+     `SetKeyboardState` over an `AttachThreadInput`-shared queue replaces it,
+     chords included.
+     **The rule stays in force until T212 lands: do not run any
+     `test/win32/*.ps1` GUI script on the interactive desktop.** The unit
+     lanes (`zig build test -Dapp-runtime=none|win32`, `test-agent`) never
+     steal focus and are always fine.
    - **T210** — a resume prompt beginning with `/reset-context` was mangled
      on the way into the pane, the reset silently never fired, and the
      session ran to ~250k. Take it before any further long-prompt resumes.
@@ -96,7 +103,8 @@ Work these first, in order, before falling back to first-todo-in-table:
      build `--prefix zig-out-release` yourself and check `+version` against
      `git rev-parse --short HEAD` before AND after.
    - **T209** — the on-box pixel assertions T204/T206 could not run. Blocked
-     on T207.
+     on T213 (which gives them a capture path that works off the interactive
+     desktop), not on T207 any more.
 
    T203 (system accent + light/dark) and T205 (tabs inside the titlebar) are
    the remaining tab-strip cosmetics and come after these four.

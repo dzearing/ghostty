@@ -3023,3 +3023,48 @@ were stopped. Filed as **T209**, blocked on **T207**. T207 is now the top
 priority — it is infrastructure the visual tasks depend on, not a nicety.
 
 Commit: `4565e4e42`.
+
+## 2026-07-30 — T207 spiked and split (T211 / T212 / T213)
+
+The "use another desktop for testing" question is answered, measured rather
+than argued. `test/win32/test-desktop-spike.ps1` launches a real ghoztty onto a
+background `CreateDesktopW` desktop and tests every mechanism the harness needs:
+**ALL PASS (12 assertions) x3**.
+
+Isolation is total — the window is not enumerable on the interactive desktop
+and never becomes foreground there (sampled every 150ms throughout).
+
+The two surprises both cut against the task as written:
+
+- **Capture is fine.** T207 expected the pixel probes to be the casualty, since
+  DWM composes only the input desktop. Half right: `CopyFromScreen`/`BitBlt`
+  off the desktop DC is dead (BitBlt returns false outright), but
+  `PrintWindow(PW_RENDERFULLCONTENT)` returns real content — mean luminance 246
+  and 64 distinct colors off a `--window-theme=light` window, against the same
+  OpenGL surface. So the probes migrate; they just cannot screenshot. No VM
+  needed for them.
+- **`SendInput` is the actual blocker.** Win32 refuses it off the input desktop:
+  0 of 12 events accepted, `GetLastError` = 5 ACCESS_DENIED. All 36 driving
+  scripts must switch to posted `WM_KEYDOWN` — which works, and so do modifier
+  chords (`ctrl+shift+t` fired its keybind, tabs 1 -> 2) once the key state is
+  set with `SetKeyboardState` on the input queue shared via
+  `AttachThreadInput`. That contradicts the interactive-desktop lesson that
+  faked key state never sticks: with no raw-input thread to overwrite it, it
+  does.
+
+Post only `WM_KEYDOWN`, never `WM_CHAR` as well — the terminal window class
+skips `TranslateMessage` and calls `ToUnicode` itself, so posting both doubles
+every character (the spike produced `sSpPiIkKeEbB` before that was understood).
+
+Split into **T211** (shared harness: persistent worker thread bound to the
+desktop, `Focus-TestWindow` replacing the 30 private `GrabForeground` copies,
+`Send-TestKeys`, `Get-TestWindowPixels`), **T212** (migrate the driving
+scripts; posted MOUSE input is still unproven and carries the risk), **T213**
+(migrate the pixel probes, rebasing every screen-coordinate probe to
+window-relative). T209 now blocks on T213 rather than T207.
+
+Floor: both `zig build test` lanes and `test-agent` green. P1-P3 deliberately
+NOT run — they `Start-Process` a GUI window, which steals focus, and this
+change touches no product code.
+
+Commit: pending.
