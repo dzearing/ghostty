@@ -20,14 +20,28 @@
 #
 # A positive control (ctrl+k clear_screen, the T55 pattern) runs first, so an
 # injection failure aborts instead of reading as a T189 regression.
+#
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted at the end, not assumed.
+# The private win32 driver this script used to carry is gone. Note the split
+# the harness enforces: the palette is OPENED with a chord on the terminal
+# surface (Send-TestKeys), but its search box is a standard EDIT, so the
+# filter goes in as WM_CHAR and Enter/Escape as posted navigation keys
+# (Send-TestControlText / Send-TestControlKey).
+#
 # Only touches ghoztty processes running from this repo's zig-out*.
-param([string]$ExePath)
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 $errlog = Join-Path $env:TEMP 'ghoztty-command-registry-stderr.log'
+# Isolate the IPC endpoint (inherited through CreateProcessW): Tab-Count must
+# count THIS instance's tabs, not whatever answers the shared pipe.
+$env:GHOZTTY_PIPE_SUFFIX = '-cmdregtest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -36,170 +50,11 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class CmdDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // The top-level window, visible or not (toggle_visibility hides it).
-    public static IntPtr FindTopAny(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FirstPane(IntPtr top) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // The palette popup: a visible top-level GhozttyTerminal that is not the
-    // window itself (hero-mode.ps1's finder).
-    public static IntPtr FindPalettePopup(uint pid, IntPtr top) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && h != top && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyTerminal") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab (already-foreground guard included: an
-    // unguarded Alt tap self-latches menu mode).
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true);
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-
-    // Type plain VKs (letters/space/Enter) into `edit` in one attachment.
-    public static string TypeKeys(IntPtr owner, IntPtr edit, ushort[] vks) {
-        uint pid; uint tid = GetWindowThreadProcessId(owner, out pid);
-        uint cur = GetCurrentThreadId();
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(edit);
-            Thread.Sleep(60);
-            foreach (var vk in vks) {
-                Key(vk, false); Thread.Sleep(15); Key(vk, true); Thread.Sleep(30);
-            }
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-}
-'@
-
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
         Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
-}
-
-# VK codes for a palette filter string (letters, digits, space only).
-function Vks([string]$text) {
-    $out = @()
-    foreach ($c in $text.ToUpper().ToCharArray()) {
-        if ($c -eq ' ') { $out += [uint16]0x20 }
-        elseif ($c -match '[A-Z0-9]') { $out += [uint16][int][char]$c }
-        else { throw "Vks: unsupported character '$c'" }
-    }
-    return [uint16[]]$out
 }
 
 # Count tabs in the first window reported by `+list --json`.
@@ -212,112 +67,136 @@ function Tab-Count {
     return @($wins[0].tabs).Count
 }
 
+# The palette popup: a top-level GhozttyTerminal (the window itself is a
+# GhozttyWindow, so there is nothing to exclude).
+function Find-Palette {
+    Get-TestWindow -ProcessId $script:app.Pid -Class 'GhozttyTerminal'
+}
+
 # Open the palette, type a filter, press Enter. Returns $true when the whole
 # sequence was delivered.
-function Invoke-Palette([IntPtr]$top, [IntPtr]$pane, [uint32]$procId, [string]$filter, [string]$label) {
-    $r = [CmdDrv]::Chord($top, $pane, [uint16[]]@(0x11, 0x10), 0x50)  # ctrl+shift+p
-    if ($r -ne 'SENT') { Write-Host "SKIP ${label}: palette chord not sent ($r)"; return $false }
+function Invoke-Palette([IntPtr]$top, [IntPtr]$pane, [string]$filter, [string]$label) {
     $popup = [IntPtr]::Zero
-    for ($t = 0; $t -lt 50 -and $popup -eq [IntPtr]::Zero; $t++) {
-        Start-Sleep -Milliseconds 20
-        $popup = [CmdDrv]::FindPalettePopup($procId, $top)
+    foreach ($try in 1..3) {
+        if (-not (Send-TestKeys -Window $top -Target $pane -Modifiers ctrl, shift -Key P)) { continue }
+        $popup = Wait-TestWindow -ProcessId $script:app.Pid -Class 'GhozttyTerminal' -TimeoutMs 5000
+        if ($popup -ne [IntPtr]::Zero) { break }
     }
     Assert ($popup -ne [IntPtr]::Zero) "$label palette opened"
     if ($popup -eq [IntPtr]::Zero) { return $false }
-    $edit = [CmdDrv]::FindWindowExW($popup, [IntPtr]::Zero, 'EDIT', $null)
+    $edit = Find-TestWindowEx -Parent $popup -Class 'EDIT'
     Assert ($edit -ne [IntPtr]::Zero) "$label palette search box found"
     if ($edit -eq [IntPtr]::Zero) { return $false }
-    $keys = @(Vks $filter) + [uint16]0x0D
-    $r = [CmdDrv]::TypeKeys($popup, $edit, [uint16[]]$keys)
-    Assert ($r -eq 'SENT') "$label filter '$filter' + Enter delivered ($r)"
+    Send-TestControlText -Control $edit -Text $filter | Out-Null
+    $sent = Send-TestControlKey -Control $edit -Key Enter
+    Assert $sent "$label filter '$filter' + Enter delivered"
     Start-Sleep -Milliseconds 800
-    return ($r -eq 'SENT')
+    return $sent
 }
 
 Kill-RepoInstances
 Remove-Item $errlog -ErrorAction SilentlyContinue
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
 
-# --session-persistence=false: a restored manifest would hand this run a
-# previous section's panes (the T131/T155 trap).
-$sp = @{ FilePath = $exe; PassThru = $true; ArgumentList = @('--session-persistence=false') }
-if (-not $ExePath) { $sp.RedirectStandardError = $errlog }
-$proc = Start-Process @sp
-Start-Sleep -Seconds 3
-if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
-$pid32 = [uint32]$proc.Id
-$top = [CmdDrv]::FindTop($pid32)
-if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
-$pane = [CmdDrv]::FirstPane($top)
-if ($pane -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no pane'; exit 1 }
+try {
+    # --session-persistence=false: a restored manifest would hand this run a
+    # previous section's panes (the T131/T155 trap).
+    $script:app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false') -StdErr $errlog
+    Start-Sleep -Seconds 3
+    if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+    if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
+    $pane = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
+    if ($pane -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no pane'; exit 1 }
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) 'window is NOT enumerable on the interactive desktop'
+    Assert ((Tab-Count) -eq 1) 'setup: one tab'
 
-Assert ((Tab-Count) -eq 1) 'setup: one tab'
-
-# --- Positive control: injection reaches binding dispatch ---------------------
-$r = [CmdDrv]::Chord($top, $pane, [uint16[]]@(0x11), 0x4B)   # ctrl+k
-if ($r -ne 'SENT') { Write-Host "ABORT: control chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
-Start-Sleep -Milliseconds 300
-if (Test-Path $errlog) {
-    if (-not (Select-String -Path $errlog -Pattern 'clear_screen' -Quiet)) {
-        Write-Host 'ABORT: positive control failed (clear_screen never dispatched) - injection broken, not a T189 verdict'
-        Stop-Process -Id $proc.Id -Force; exit 1
+    # --- Positive control: injection reaches binding dispatch ----------------
+    $r = Send-TestKeys -Window $top -Target $pane -Modifiers ctrl -Key K   # ctrl+k
+    if (-not $r) { Write-Host 'ABORT: control chord not sent'; exit 1 }
+    Start-Sleep -Milliseconds 500
+    if (Test-Path $errlog) {
+        if (-not (Select-String -Path $errlog -Pattern 'clear_screen' -Quiet)) {
+            Write-Host 'ABORT: positive control failed (clear_screen never dispatched) - injection broken, not a T189 verdict'
+            exit 1
+        }
+        Write-Host 'OK    positive control: injection reaches bindings (clear_screen dispatched)'
+    } else {
+        Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
     }
-    Write-Host 'OK    positive control: injection reaches bindings (clear_screen dispatched)'
-} else {
-    Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
-}
 
-# --- A. A pre-existing palette command still dispatches -----------------------
-# "New Tab" shipped in the palette long before T189; after the refactor it
-# resolves through commands.registry -> Surface.performCommand. Outcome: a
-# second tab.
-if (Invoke-Palette $top $pane $pid32 'NEW TAB' 'A') {
-    Assert (-not $proc.HasExited) 'A no crash dispatching a registry command'
-    Assert ((Tab-Count) -eq 2) 'A pre-existing command "New Tab" dispatched (2 tabs)'
-}
-
-# --- B. Negative control: a filter that matches nothing does nothing ----------
-# Runs BEFORE the visibility test, which leaves the window hidden. Without
-# this, A and C could both pass on an app that ran *something* on Enter.
-$before = Tab-Count
-if (Invoke-Palette $top $pane $pid32 'ZZZZ' 'B') {
-    Assert (-not $proc.HasExited) 'B no crash on an empty filter'
-    Assert ((Tab-Count) -eq $before) "B empty filter dispatched nothing (still $before tabs)"
-    # Enter with nothing selected returns before the close, so the palette
-    # STAYS OPEN for the user to fix their filter (Surface.handlePaletteKey ->
-    # executePaletteSelection, unchanged by T189 and what VS Code and Windows
-    # Terminal both do). Asserted so a future "close on Enter" change has to
-    # be a decision rather than a silent one.
-    $stillOpen = ([CmdDrv]::FindPalettePopup($pid32, $top) -ne [IntPtr]::Zero)
-    Assert $stillOpen 'B palette stays open when the filter matches nothing'
-    # Close it so the next section opens a palette rather than toggling one.
-    $popup = [CmdDrv]::FindPalettePopup($pid32, $top)
-    if ($popup -ne [IntPtr]::Zero) {
-        $edit = [CmdDrv]::FindWindowExW($popup, [IntPtr]::Zero, 'EDIT', $null)
-        if ($edit -ne [IntPtr]::Zero) { [CmdDrv]::TypeKeys($popup, $edit, [uint16[]]@(0x1B)) | Out-Null }
-        Start-Sleep -Milliseconds 300
-        Assert ([CmdDrv]::FindPalettePopup($pid32, $top) -eq [IntPtr]::Zero) 'B Escape closes the palette'
+    # --- A. A pre-existing palette command still dispatches ------------------
+    # "New Tab" shipped in the palette long before T189; after the refactor it
+    # resolves through commands.registry -> Surface.performCommand. Outcome: a
+    # second tab.
+    if (Invoke-Palette $top $pane 'NEW TAB' 'A') {
+        Assert (-not ($app.Process -and $app.Process.HasExited)) 'A no crash dispatching a registry command'
+        $tabs = Tab-Count
+        # -NegativeControl inverts this one, so a passing run proves the
+        # assertion discriminates rather than being true of any outcome.
+        if ($NegativeControl) {
+            Write-Host 'NEGATIVE CONTROL: asserting "New Tab" opened NO tab - this run MUST fail'
+            Assert ($tabs -eq 1) "A (inverted): New Tab dispatched nothing (still $tabs tabs)"
+        } else {
+            Assert ($tabs -eq 2) "A pre-existing command `"New Tab`" dispatched (got $tabs tabs)"
+        }
     }
-}
 
-# --- C. A command that only the shared registry put in the palette ------------
-# `Show/Hide All Terminals` (toggle_visibility) had a binding and NO palette
-# row before T189. Outcome: the window is hidden. Asserted last because it
-# leaves the app with nothing on screen to type into.
-$pane2 = [CmdDrv]::FirstPane($top)
-if ($pane2 -eq [IntPtr]::Zero) { $pane2 = $pane }
-if (Invoke-Palette $top $pane2 $pid32 'HIDE ALL' 'C') {
-    $hidden = $false
-    for ($t = 0; $t -lt 30 -and -not $hidden; $t++) {
-        Start-Sleep -Milliseconds 100
-        $hidden = -not [CmdDrv]::IsWindowVisible([CmdDrv]::FindTopAny($pid32))
+    # --- B. Negative control: a filter that matches nothing does nothing -----
+    # Runs BEFORE the visibility test, which leaves the window hidden. Without
+    # this, A and C could both pass on an app that ran *something* on Enter.
+    $before = Tab-Count
+    if (Invoke-Palette $top $pane 'ZZZZ' 'B') {
+        Assert (-not ($app.Process -and $app.Process.HasExited)) 'B no crash on an empty filter'
+        Assert ((Tab-Count) -eq $before) "B empty filter dispatched nothing (still $before tabs)"
+        # Enter with nothing selected returns before the close, so the palette
+        # STAYS OPEN for the user to fix their filter (Surface.handlePaletteKey ->
+        # executePaletteSelection, unchanged by T189 and what VS Code and Windows
+        # Terminal both do). Asserted so a future "close on Enter" change has to
+        # be a decision rather than a silent one.
+        $popup = Find-Palette
+        Assert ($popup -ne [IntPtr]::Zero) 'B palette stays open when the filter matches nothing'
+        # Close it so the next section opens a palette rather than toggling one.
+        if ($popup -ne [IntPtr]::Zero) {
+            $edit = Find-TestWindowEx -Parent $popup -Class 'EDIT'
+            if ($edit -ne [IntPtr]::Zero) { Send-TestControlKey -Control $edit -Key Escape | Out-Null }
+            Start-Sleep -Milliseconds 500
+            Assert ((Find-Palette) -eq [IntPtr]::Zero) 'B Escape closes the palette'
+        }
     }
-    Assert (-not $proc.HasExited) 'C app alive after Show/Hide All Terminals'
-    Assert $hidden 'C new registry command "Show/Hide All Terminals" dispatched (window hidden)'
-    Assert ([CmdDrv]::IsWindow([CmdDrv]::FindTopAny($pid32))) 'C window hidden, not destroyed'
+
+    # --- C. A command that only the shared registry put in the palette -------
+    # `Show/Hide All Terminals` (toggle_visibility) had a binding and NO palette
+    # row before T189. Outcome: the window is hidden. Asserted last because it
+    # leaves the app with nothing on screen to type into.
+    $pane2 = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
+    if ($pane2 -eq [IntPtr]::Zero) { $pane2 = $pane }
+    if (Invoke-Palette $top $pane2 'HIDE ALL' 'C') {
+        $hidden = $false
+        for ($t = 0; $t -lt 30 -and -not $hidden; $t++) {
+            Start-Sleep -Milliseconds 100
+            $any = Get-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -AllowHidden
+            $hidden = ($any -ne [IntPtr]::Zero) -and (-not (Test-TestWindowVisible -Window $any))
+        }
+        Assert (-not ($app.Process -and $app.Process.HasExited)) 'C app alive after Show/Hide All Terminals'
+        Assert $hidden 'C new registry command "Show/Hide All Terminals" dispatched (window hidden)'
+        $any = Get-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow' -AllowHidden
+        Assert (($any -ne [IntPtr]::Zero) -and (Test-TestWindowExists -Window $any)) 'C window hidden, not destroyed'
+    }
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
 }
 
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @($script:GhozttyTestDesktopPids | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }

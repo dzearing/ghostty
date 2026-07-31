@@ -125,6 +125,13 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int ht, uint flags);
+    [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT p);
+    [DllImport("user32.dll")] static extern bool SystemParametersInfoW(uint action, uint p, out RECT r, uint winini);
+    // SendMessage, never plain: a SYNCHRONOUS cross-process send into a wedged
+    // app would block the ONE worker thread the whole harness marshals through,
+    // and every later call with it. The timeout form degrades to a failed call.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr wp, IntPtr lp, uint flags, uint timeout, out IntPtr result);
 
     // ---------------- gdi ----------------
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
@@ -137,6 +144,12 @@ public class GhozttyTestDesktop {
 
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINDOWPLACEMENT {
+        public uint length, flags, showCmd;
+        public int ptMinX, ptMinY, ptMaxX, ptMaxY;
+        public RECT rcNormal;
+    }
     [StructLayout(LayoutKind.Sequential)]
     public struct GUITHREADINFO {
         public uint cbSize; public uint flags;
@@ -409,6 +422,90 @@ public class GhozttyTestDesktop {
     public bool SetSize(IntPtr h, int w, int ht) {
         return (bool)Run(delegate() {
             return SetWindowPos(h, IntPtr.Zero, 0, 0, w, ht, 0x0004 | 0x0002); // NOZORDER|NOMOVE
+        });
+    }
+
+    // The RESTORED size, readable while the window is maximized - what a
+    // placement-memory test needs, since GetWindowRect on a maximized window
+    // reports the monitor, not the size that will be remembered.
+    public int[] NormalRect(IntPtr h) {
+        return (int[])Run(delegate() {
+            var p = new WINDOWPLACEMENT();
+            p.length = (uint)Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+            if (!GetWindowPlacement(h, ref p)) return new int[] { 0, 0, 0, 0 };
+            return new int[] { p.rcNormal.left, p.rcNormal.top, p.rcNormal.right, p.rcNormal.bottom };
+        });
+    }
+
+    // The work area OF THE TEST DESKTOP. It is not the interactive desktop's:
+    // a background desktop has no taskbar, so its work area is the whole
+    // monitor. A clamp assertion measured on the host thread would compare the
+    // app's answer against the wrong rectangle.
+    public int[] WorkArea() {
+        return (int[])Run(delegate() {
+            RECT r;
+            if (!SystemParametersInfoW(0x0030, 0, out r, 0)) return new int[] { 0, 0, 0, 0 }; // SPI_GETWORKAREA
+            return new int[] { r.left, r.top, r.right, r.bottom };
+        });
+    }
+
+    // Timed-out SendMessage; returns false if the app did not answer.
+    bool Send(IntPtr h, uint msg, IntPtr wp, IntPtr lp, out IntPtr result) {
+        // SMTO_ABORTIFHUNG | SMTO_NORMAL
+        return SendMessageTimeoutW(h, msg, wp, lp, 0x0002, 10000, out result) != IntPtr.Zero;
+    }
+
+    // Simulate a USER drag-resize: the exact message sequence a mouse drag
+    // produces around the size change. Product code that persists a size reads
+    // GetWindowRect at WM_EXITSIZEMOVE, so a bare SetWindowPos (SetSize) is a
+    // PROGRAMMATIC resize and deliberately does not look like this one.
+    public bool DragResize(IntPtr h, int dw, int dh) {
+        return (bool)Run(delegate() {
+            IntPtr res;
+            Send(h, 0x0231, IntPtr.Zero, IntPtr.Zero, out res); // WM_ENTERSIZEMOVE
+            RECT r;
+            if (!GetWindowRect(h, out r)) return false;
+            SetWindowPos(h, IntPtr.Zero, 0, 0, (r.right - r.left) + dw, (r.bottom - r.top) + dh, 0x0004 | 0x0002);
+            Thread.Sleep(100);
+            return Send(h, 0x0232, IntPtr.Zero, IntPtr.Zero, out res); // WM_EXITSIZEMOVE
+        });
+    }
+
+    // WM_SYSCOMMAND - the real maximize/restore path (SC_MAXIMIZE 0xF030,
+    // SC_RESTORE 0xF120), as opposed to ShowWindow, which skips it.
+    public bool SysCommand(IntPtr h, int cmd) {
+        return (bool)Run(delegate() {
+            IntPtr res;
+            return Send(h, 0x0112, (IntPtr)cmd, IntPtr.Zero, out res);
+        });
+    }
+
+    // Read a control's text with WM_GETTEXT. NOT GetWindowTextW: across a
+    // process boundary that returns a cached copy the app never refreshes, so
+    // an EDIT the user has typed into reads back stale (or empty).
+    public string ControlText(IntPtr h) {
+        return (string)Run(delegate() {
+            IntPtr buf = Marshal.AllocHGlobal(2048);
+            try {
+                Marshal.WriteInt16(buf, 0);
+                IntPtr res;
+                if (!Send(h, 0x000D, (IntPtr)1024, buf, out res)) return ""; // WM_GETTEXT
+                return Marshal.PtrToStringUni(buf);
+            } finally { Marshal.FreeHGlobal(buf); }
+        });
+    }
+
+    // Set a control's text with WM_SETTEXT. The way to put an EXACT string in
+    // an EDIT that is already prefilled - typing appends, and select-all needs
+    // a modifier chord, which does not reach a standard control (see
+    // SendControlKey).
+    public bool SetControlText(IntPtr h, string text) {
+        return (bool)Run(delegate() {
+            IntPtr buf = Marshal.StringToHGlobalUni(text == null ? "" : text);
+            try {
+                IntPtr res;
+                return Send(h, 0x000C, IntPtr.Zero, buf, out res); // WM_SETTEXT
+            } finally { Marshal.FreeHGlobal(buf); }
         });
     }
 
@@ -1073,9 +1170,73 @@ function Set-TestWindowSize {
     return $td.SetSize($Window, $Width, $Height)
 }
 
+# The RESTORED window rect, valid while the window is maximized.
+function Get-TestWindowNormalRect {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    $r = (Resolve-TestDesktop $Desktop).NormalRect($Window)
+    return [pscustomobject]@{
+        Left = $r[0]; Top = $r[1]; Right = $r[2]; Bottom = $r[3]
+        Width = $r[2] - $r[0]; Height = $r[3] - $r[1]
+    }
+}
+
+# The TEST desktop's work area (no taskbar there, so it is not the user's).
+function Get-TestWorkArea {
+    param($Desktop)
+    $r = (Resolve-TestDesktop $Desktop).WorkArea()
+    return [pscustomobject]@{
+        Left = $r[0]; Top = $r[1]; Right = $r[2]; Bottom = $r[3]
+        Width = $r[2] - $r[0]; Height = $r[3] - $r[1]
+    }
+}
+
+# Resize the way a USER drag does: WM_ENTERSIZEMOVE -> SetWindowPos ->
+# WM_EXITSIZEMOVE. Use this (not Set-TestWindowSize) when the behaviour under
+# test distinguishes an interactive resize from a programmatic one.
+function Invoke-TestDragResize {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [int]$DeltaWidth = 0, [int]$DeltaHeight = 0,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).DragResize($Window, $DeltaWidth, $DeltaHeight)
+}
+
+# Maximize / restore through the real WM_SYSCOMMAND path.
+function Send-TestSysCommand {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][ValidateSet('maximize', 'restore', 'minimize', 'close')][string]$Command,
+        $Desktop
+    )
+    $cmd = switch ($Command) {
+        'maximize' { 0xF030 } 'restore' { 0xF120 } 'minimize' { 0xF020 } 'close' { 0xF060 }
+    }
+    return (Resolve-TestDesktop $Desktop).SysCommand($Window, $cmd)
+}
+
 function Get-TestWindowText {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).WindowText($Window)
+}
+
+# Read a CONTROL's text (WM_GETTEXT). Get-TestWindowText uses GetWindowTextW,
+# which is cross-process cached and reads stale for an EDIT the app has
+# updated - use this one for anything a dialog or the palette owns.
+function Get-TestControlText {
+    param([Parameter(Mandatory = $true)][IntPtr]$Control, $Desktop)
+    return (Resolve-TestDesktop $Desktop).ControlText($Control)
+}
+
+# Replace a control's whole text (WM_SETTEXT) - how to commit an EXACT value
+# into a prefilled EDIT, including the empty string.
+function Set-TestControlText {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Control,
+        [AllowEmptyString()][string]$Text,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).SetControlText($Control, $Text)
 }
 
 # Win32 class of any hwnd - how a script checks that an hwnd it got from

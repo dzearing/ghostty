@@ -3188,3 +3188,42 @@ All four ALL PASS x3 (12 runs), negative controls fail as required, and every
 run asserts - not assumes - that no test-desktop app ever took foreground on
 the interactive desktop. Floor: both `zig build test` lanes, `test-agent`,
 P1-P3 green.
+
+## 2026-07-31 - T217 batch 2: three more scripts off the user's desktop
+
+`window-size-memory`, `window-title` and `command-registry` migrated onto the
+background test desktop; 7 of 23 done. Each ALL PASS x3, each with a new
+`-NegativeControl` switch that fails as required (none of the three had one),
+and each asserting - not assuming - that no test-desktop app ever took
+foreground on the interactive desktop.
+
+Harness gained the primitives a placement test needs: `Invoke-TestDragResize`
+(WM_ENTERSIZEMOVE -> SetWindowPos -> WM_EXITSIZEMOVE) and
+`Send-TestSysCommand` (WM_SYSCOMMAND), because the behaviour under test is
+precisely that a USER resize persists and a programmatic one does not, so
+`Set-TestWindowSize` cannot stand in for a drag. Plus
+`Get-TestWindowNormalRect` (the restored size, readable while maximized),
+`Get-TestWorkArea`, and `Get-TestControlText` / `Set-TestControlText`
+(WM_GETTEXT / WM_SETTEXT). All of them route through one new
+`SendMessageTimeoutW` helper - a plain synchronous send into a wedged app
+would block the single worker thread the whole harness marshals through.
+
+`Get-TestWorkArea` has to run on the worker thread rather than the host: the
+work area is per-desktop and a background desktop has no taskbar, so the
+interactive desktop's rectangle is the wrong thing to clamp-check the app
+against.
+
+What the migration found: `window-size-memory` is nondeterministic with
+session persistence ON. Each section's app re-attaches to the surviving agent
+and restores the layout manifest, whose geometry competes with the placement
+memory the test is about - and the manifest write races the force-kill
+between sections. It failed 6 assertions on its first run and passed the next
+three; `--session-persistence=false` makes it deterministic. Note
+`Kill-RepoInstances` does not close that hole: it kills `ghoztty.exe`, not
+`ghoztty-agent.exe`. Second finding, same shape as batch 1's: deleting
+`window-title`'s S3 SKIP branch took it from 39 to 50 assertions with no new
+coverage written. The old foreground grab kept losing its race, and 11
+assertions had simply never run.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green, and all six
+previously-migrated scripts re-run green against the changed harness.

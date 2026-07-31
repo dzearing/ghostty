@@ -13,26 +13,37 @@
 # Interactive resizes are simulated with the real message sequence a drag
 # produces: WM_ENTERSIZEMOVE -> SetWindowPos -> WM_EXITSIZEMOVE (the
 # product code reads GetWindowRect at WM_EXITSIZEMOVE, exactly what a
-# mouse drag exercises). Maximize/restore transitions go through the real
-# WM_SYSCOMMAND path.
+# mouse drag exercises) - Invoke-TestDragResize. Maximize/restore go
+# through the real WM_SYSCOMMAND path - Send-TestSysCommand. The
+# distinction is the whole test: Set-TestWindowSize is the programmatic
+# resize that must NOT persist.
 #
-# NO focus stealing: this script must run while the user works. Instead
-# of SendInput chords (which need foreground and are denied/rude when the
-# user is active), actions are bound to bare F-keys and delivered with
-# PostMessage WM_KEYDOWN/WM_KEYUP to the surface HWND — handleKeyEvent
-# reads the VK from wparam and modifiers from GetKeyState (none held in
-# the GUI thread's queue), so the binding dispatches without focus.
-# Positive control (T55 pattern): f8=toggle_maximize with an IsZoomed
-# oracle proves posted-key dispatch works before the reset assert depends
-# on it; on failure the script ABORTS (not a T85 verdict).
+# Actions are bound to bare F-keys and delivered as posted WM_KEYDOWN/UP to
+# the surface HWND - handleKeyEvent reads the VK from wparam and modifiers
+# from GetKeyState, so no modifier state is needed. Positive control (T55
+# pattern): f8=toggle_maximize with an IsZoomed oracle proves posted-key
+# dispatch works before the reset assert depends on it; on failure the
+# script ABORTS (not a T85 verdict).
+#
+# T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1),
+# so it never takes the user's foreground - asserted at the end, not assumed.
+# The private win32 driver this script used to carry is gone. Case E's work
+# area is read from the TEST desktop (Get-TestWorkArea): a background desktop
+# has no taskbar, so the interactive desktop's work area is the wrong
+# rectangle to clamp-check the app against.
 #
 # Only touches ghoztty processes running from this repo's zig-out*.
-param([string]$ExePath)
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
+# Isolate the IPC endpoint (inherited through CreateProcessW): a launch that
+# found the user's instance on the shared pipe would forward and exit.
+$env:GHOZTTY_PIPE_SUFFIX = '-winsizememtest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -40,127 +51,6 @@ function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
-
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class WszDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT p);
-    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint flags);
-    [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-    [DllImport("user32.dll")] public static extern bool SystemParametersInfoW(uint action, uint p, out RECT r, uint winini);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct WINDOWPLACEMENT { public uint length, flags, showCmd; public int ptMinX, ptMinY, ptMaxX, ptMaxY; public RECT rcNormal; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static void BeDpiAware() {
-        SetProcessDpiAwarenessContext((IntPtr)(-4)); // PER_MONITOR_AWARE_V2
-    }
-
-    public static long[] Tops(uint pid) {
-        var found = new List<long>();
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") found.Add(h.ToInt64());
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found.ToArray();
-    }
-
-    public static IntPtr Pane(IntPtr top) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // "width,height" of the OUTER window rect.
-    public static string Outer(IntPtr top) {
-        RECT r; GetWindowRect(top, out r);
-        return (r.right - r.left) + "," + (r.bottom - r.top);
-    }
-
-    public static string Client(IntPtr top) {
-        RECT r; GetClientRect(top, out r);
-        return (r.right - r.left) + "," + (r.bottom - r.top);
-    }
-
-    // Restored (normal) outer size, valid while maximized.
-    public static string NormalSize(IntPtr top) {
-        var p = new WINDOWPLACEMENT();
-        p.length = (uint)Marshal.SizeOf(typeof(WINDOWPLACEMENT));
-        GetWindowPlacement(top, ref p);
-        return (p.rcNormal.right - p.rcNormal.left) + "," + (p.rcNormal.bottom - p.rcNormal.top);
-    }
-
-    public static string WorkArea() {
-        RECT r; SystemParametersInfoW(0x0030, 0, out r, 0); // SPI_GETWORKAREA
-        return (r.right - r.left) + "," + (r.bottom - r.top);
-    }
-
-    // Simulate a user drag-resize: the exact message sequence a real drag
-    // produces around the size change.
-    public static void DragResize(IntPtr top, int dw, int dh) {
-        SendMessageW(top, 0x0231, IntPtr.Zero, IntPtr.Zero); // WM_ENTERSIZEMOVE
-        RECT r; GetWindowRect(top, out r);
-        SetWindowPos(top, IntPtr.Zero, 0, 0, (r.right - r.left) + dw, (r.bottom - r.top) + dh, 0x0004 | 0x0002);
-        Thread.Sleep(100);
-        SendMessageW(top, 0x0232, IntPtr.Zero, IntPtr.Zero); // WM_EXITSIZEMOVE
-    }
-
-    // Real maximize/restore via the system command path.
-    public static void SysMaximize(IntPtr top) { SendMessageW(top, 0x0112, (IntPtr)0xF030, IntPtr.Zero); }
-    public static void SysRestore(IntPtr top)  { SendMessageW(top, 0x0112, (IntPtr)0xF120, IntPtr.Zero); }
-
-    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint mapType);
-
-    // Deliver a bare (modifier-less) key press to the surface HWND via
-    // posted WM_KEYDOWN/WM_KEYUP. No focus/foreground needed.
-    public static void PostKey(IntPtr surface, ushort vk) {
-        uint scan = MapVirtualKeyW(vk, 0); // MAPVK_VK_TO_VSC
-        IntPtr down = (IntPtr)(1 | (scan << 16));
-        IntPtr up = (IntPtr)unchecked((long)(1u | (scan << 16) | 0xC0000000u));
-        PostMessageW(surface, 0x0100, (IntPtr)vk, down); // WM_KEYDOWN
-        Thread.Sleep(40);
-        PostMessageW(surface, 0x0101, (IntPtr)vk, up);   // WM_KEYUP
-        Thread.Sleep(60);
-    }
-}
-'@
-[WszDrv]::BeDpiAware()
 
 # Throwaway LOCALAPPDATA so the real user memory is never touched.
 $fakeLocal = Join-Path $env:TEMP ("ghoztty-t85-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -178,6 +68,12 @@ function Kill-RepoInstances {
     Start-Sleep -Milliseconds 500
 }
 
+# "width,height" of the OUTER window rect / the client area / the RESTORED
+# (normal) size, which stays readable while the window is maximized.
+function Get-Outer([IntPtr]$h) { $r = Get-TestWindowRect -Window $h; "$($r.Width),$($r.Height)" }
+function Get-Client([IntPtr]$h) { $r = Get-TestWindowRect -Window $h -Client; "$($r.Width),$($r.Height)" }
+function Get-Normal([IntPtr]$h) { $r = Get-TestWindowNormalRect -Window $h; "$($r.Width),$($r.Height)" }
+
 # Poll until the memory file's content equals $want, return last content.
 function Wait-Mem([string]$want, [int]$ms = 4000) {
     $last = ''
@@ -189,126 +85,167 @@ function Wait-Mem([string]$want, [int]$ms = 4000) {
     return $last
 }
 
-# Launch with LOCALAPPDATA redirected; sets $script:proc / $script:top.
+# Launch with LOCALAPPDATA redirected; sets $script:app / $script:top.
 function Launch([string[]]$configArgs) {
     Kill-RepoInstances
     $savedLocal = $env:LOCALAPPDATA
     $env:LOCALAPPDATA = $fakeLocal
     try {
+        # --session-persistence=false: with it ON, a section's app re-attaches
+        # to the still-running agent and restores the LAYOUT MANIFEST, whose
+        # geometry then competes with the placement memory this test is about.
+        # The manifest write races the force-kill between sections, so the
+        # relaunch size becomes nondeterministic (observed 2026-07-31: case B
+        # opened 800x600 once in three runs). The T131/T155 trap.
         $cliArgs = @(
+            '--session-persistence=false'
             '--keybind=f9=reset_window_size'
             '--keybind=f8=toggle_maximize'
         ) + $configArgs
-        $p = Start-Process -FilePath $exe -ArgumentList $cliArgs -PassThru
+        $a = Start-OnTestDesktop -Exe $exe -Arguments $cliArgs
     } finally {
         $env:LOCALAPPDATA = $savedLocal
     }
     Start-Sleep -Seconds 3
-    if ($p.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
-    $tops = [WszDrv]::Tops([uint32]$p.Id)
-    if ($tops.Count -ne 1) { Write-Host "SETUP FAIL: expected 1 top window, got $($tops.Count)"; exit 1 }
-    $script:proc = $p
-    $script:top = [IntPtr]$tops[0]
+    if ($a.Process -and $a.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+    $t = Wait-TestWindow -ProcessId $a.Pid -Class 'GhozttyWindow'
+    if ($t -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
+    $extra = Get-TestWindow -ProcessId $a.Pid -Class 'GhozttyWindow' -Exclude $t
+    if ($extra -ne [IntPtr]::Zero) { Write-Host 'SETUP FAIL: more than one top window'; exit 1 }
+    # Isolation, asserted per launch: the window was found on the test desktop
+    # and it must NOT be enumerable on the user's.
+    Assert (-not (Test-TestDesktopLeak -ProcessId $a.Pid)) 'launch: window is NOT enumerable on the interactive desktop'
+    $script:app = $a
+    $script:top = $t
+    $script:launched += $a.Pid
 }
 
 function Stop-Instance {
-    Stop-Process -Id $script:proc.Id -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $script:app.Pid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 400
 }
 
-# --- Case A: fresh memory -> default, drag-resize persists ----------------
-Launch @()
-Assert ((Read-Mem) -eq '<absent>') 'A: fresh profile has no memory file'
-$init = [WszDrv]::Outer($top)
-Assert ($init -eq '800,600') "A: no config + no memory opens at the 800x600 default (got $init)"
-
-[WszDrv]::DragResize($top, 150, 100)
-$mem = Wait-Mem '950 700 0'
-Assert ($mem -eq '950 700 0') "A: drag-resize persisted '950 700 0' (got '$mem')"
-Assert (-not $proc.HasExited) 'A: no crash'
-Stop-Instance
-
-# --- Case B: new window opens at the remembered size ----------------------
-Launch @()
-$outer = [WszDrv]::Outer($top)
-Assert ($outer -eq '950,700') "B: relaunch opened at remembered 950,700 (got $outer)"
-
-# Positive control: posted f8 (toggle_maximize) must zoom the window —
-# proves posted-key binding dispatch works before Case C's reset assert
-# depends on it. Also persists the maximize via the real action path.
-$pane = [WszDrv]::Pane($top)
-if ($pane -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no terminal pane'; exit 1 }
-[WszDrv]::PostKey($pane, 0x77)   # VK_F8
-$zoomed = $false
-for ($t = 0; $t -lt 15; $t++) { Start-Sleep -Milliseconds 200; if ([WszDrv]::IsZoomed($top)) { $zoomed = $true; break } }
-if (-not $zoomed) {
-    Write-Host 'ABORT: posted f8 did not maximize - key injection/binding broken, not a T85 verdict'
-    Stop-Instance; exit 1
+function Post-Key([string]$key) {
+    $pane = Get-TestChildWindow -Window $script:top -Class 'GhozttyTerminal'
+    if ($pane -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no terminal pane'; exit 1 }
+    Send-TestKeys -Window $script:top -Target $pane -Key $key | Out-Null
 }
-Write-Host 'OK    positive control: posted f8 maximized the window'
-$mem = Wait-Mem '950 700 1'
-Assert ($mem -eq '950 700 1') "B: maximize persisted flag + RESTORED size (got '$mem')"
-Stop-Instance   # killed while maximized -> memory says maximized
 
-# --- Case C: maximized memory -> opens maximized, restores to normal size -
-Launch @()
-Assert ([WszDrv]::IsZoomed($top)) 'C: relaunch with maximized memory opened maximized'
-$normal = [WszDrv]::NormalSize($top)
-Assert ($normal -eq '950,700') "C: restored size underneath is the remembered 950,700 (got $normal)"
-[WszDrv]::SysRestore($top)
-$mem = Wait-Mem '950 700 0'
-Assert ($mem -eq '950 700 0') "C: restore transition persisted maximized=0 (got '$mem')"
-$outer = [WszDrv]::Outer($top)
-Assert ($outer -eq '950,700') "C: restore returned to 950,700 (got $outer)"
+$script:launched = @()
+Kill-RepoInstances
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
 
-# reset_window_size is the escape hatch: client returns to the 800x600
-# default (no config), and the MEMORY FILE is untouched (programmatic).
-$pane = [WszDrv]::Pane($top)
-if ($pane -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: no terminal pane (case C)'; exit 1 }
-[WszDrv]::PostKey($pane, 0x78)   # VK_F9 = reset_window_size
-$client = ''
-for ($t = 0; $t -lt 20; $t++) { Start-Sleep -Milliseconds 200; $client = [WszDrv]::Client($top); if ($client -eq '800,600') { break } }
-Assert ($client -eq '800,600') "C: reset_window_size still resets to the default client size (got $client)"
-$mem = Read-Mem
-Assert ($mem -eq '950 700 0') "C: reset did NOT rewrite the memory (got '$mem')"
-Assert (-not $proc.HasExited) 'C: no crash'
-Stop-Instance
+try {
+    # --- Case A: fresh memory -> default, drag-resize persists ----------------
+    Launch @()
+    Assert ((Read-Mem) -eq '<absent>') 'A: fresh profile has no memory file'
+    $init = Get-Outer $top
+    Assert ($init -eq '800,600') "A: no config + no memory opens at the 800x600 default (got $init)"
 
-# --- Case D: explicit config wins over the memory -------------------------
-# Reference: config size with NO memory.
-Remove-Item $memFile -Force
-Launch @('--window-width=120', '--window-height=20')
-$cfgRef = [WszDrv]::Client($top)
-Assert ($cfgRef -ne '800,600') "D: configured 120x20 produces a non-default client ($cfgRef)"
-Stop-Instance
-# Same config with a very different memory: client must be identical.
-Set-Content -Path $memFile -Value '950 700 0' -Encoding Ascii
-Launch @('--window-width=120', '--window-height=20')
-$cfgMem = [WszDrv]::Client($top)
-Assert ($cfgMem -eq $cfgRef) "D: config beat the memory ($cfgMem == $cfgRef)"
-Assert (-not $proc.HasExited) 'D: no crash'
-Stop-Instance
+    Invoke-TestDragResize -Window $top -DeltaWidth 150 -DeltaHeight 100 | Out-Null
+    $mem = Wait-Mem '950 700 0'
+    Assert ($mem -eq '950 700 0') "A: drag-resize persisted '950 700 0' (got '$mem')"
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'A: no crash'
+    Stop-Instance
 
-# --- Case E: remembered size is clamped to the work area ------------------
-Set-Content -Path $memFile -Value '25000 25000 0' -Encoding Ascii
-Launch @()
-$outer = [WszDrv]::Outer($top)
-$ow, $oh = ($outer -split ',') | ForEach-Object { [int]$_ }
-$wa = [WszDrv]::WorkArea()
-$ww, $wh = ($wa -split ',') | ForEach-Object { [int]$_ }
-Assert ($ow -le $ww -and $oh -le $wh) "E: oversized memory clamped to work area ($outer <= $wa)"
-Assert (-not $proc.HasExited) 'E: no crash'
-Stop-Instance
+    # --- Case B: new window opens at the remembered size ----------------------
+    Launch @()
+    $outer = Get-Outer $top
+    Assert ($outer -eq '950,700') "B: relaunch opened at remembered 950,700 (got $outer)"
 
-# --- Case F: corrupt memory file falls back to the default ----------------
-Set-Content -Path $memFile -Value 'not a placement' -Encoding Ascii
-Launch @()
-$outer = [WszDrv]::Outer($top)
-Assert ($outer -eq '800,600') "F: corrupt memory ignored, default used (got $outer)"
-Assert (-not $proc.HasExited) 'F: no crash'
-Stop-Instance
+    # Positive control: posted f8 (toggle_maximize) must zoom the window -
+    # proves posted-key binding dispatch works before Case C's reset assert
+    # depends on it. Also persists the maximize via the real action path.
+    Post-Key 'F8'
+    $zoomed = $false
+    for ($t = 0; $t -lt 15; $t++) { Start-Sleep -Milliseconds 200; if (Test-TestWindowZoomed -Window $top) { $zoomed = $true; break } }
+    if (-not $zoomed) {
+        Write-Host 'ABORT: posted f8 did not maximize - key injection/binding broken, not a T85 verdict'
+        Stop-Instance; exit 1
+    }
+    Write-Host 'OK    positive control: posted f8 maximized the window'
+    $mem = Wait-Mem '950 700 1'
+    Assert ($mem -eq '950 700 1') "B: maximize persisted flag + RESTORED size (got '$mem')"
+    Stop-Instance   # killed while maximized -> memory says maximized
 
-Remove-Item -Recurse -Force $fakeLocal -ErrorAction SilentlyContinue
+    # --- Case C: maximized memory -> opens maximized, restores to normal size -
+    Launch @()
+    Assert (Test-TestWindowZoomed -Window $top) 'C: relaunch with maximized memory opened maximized'
+    $normal = Get-Normal $top
+    Assert ($normal -eq '950,700') "C: restored size underneath is the remembered 950,700 (got $normal)"
+    Send-TestSysCommand -Window $top -Command restore | Out-Null
+    $mem = Wait-Mem '950 700 0'
+    Assert ($mem -eq '950 700 0') "C: restore transition persisted maximized=0 (got '$mem')"
+    $outer = Get-Outer $top
+    Assert ($outer -eq '950,700') "C: restore returned to 950,700 (got $outer)"
+
+    # reset_window_size is the escape hatch: client returns to the 800x600
+    # default (no config), and the MEMORY FILE is untouched (programmatic).
+    Post-Key 'F9'
+    $client = ''
+    for ($t = 0; $t -lt 20; $t++) { Start-Sleep -Milliseconds 200; $client = Get-Client $top; if ($client -eq '800,600') { break } }
+    Assert ($client -eq '800,600') "C: reset_window_size still resets to the default client size (got $client)"
+    $mem = Read-Mem
+    # -NegativeControl inverts this expectation, so a passing run proves the
+    # assertion still discriminates rather than being true of everything.
+    if ($NegativeControl) {
+        Write-Host 'NEGATIVE CONTROL: asserting the programmatic reset DID rewrite the memory - this run MUST fail'
+        Assert ($mem -ne '950 700 0') "C (inverted): reset rewrote the memory (got '$mem')"
+    } else {
+        Assert ($mem -eq '950 700 0') "C: reset did NOT rewrite the memory (got '$mem')"
+    }
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'C: no crash'
+    Stop-Instance
+
+    # --- Case D: explicit config wins over the memory -------------------------
+    # Reference: config size with NO memory.
+    Remove-Item $memFile -Force
+    Launch @('--window-width=120', '--window-height=20')
+    $cfgRef = Get-Client $top
+    Assert ($cfgRef -ne '800,600') "D: configured 120x20 produces a non-default client ($cfgRef)"
+    Stop-Instance
+    # Same config with a very different memory: client must be identical.
+    Set-Content -Path $memFile -Value '950 700 0' -Encoding Ascii
+    Launch @('--window-width=120', '--window-height=20')
+    $cfgMem = Get-Client $top
+    Assert ($cfgMem -eq $cfgRef) "D: config beat the memory ($cfgMem == $cfgRef)"
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'D: no crash'
+    Stop-Instance
+
+    # --- Case E: remembered size is clamped to the work area ------------------
+    Set-Content -Path $memFile -Value '25000 25000 0' -Encoding Ascii
+    Launch @()
+    $outer = Get-Outer $top
+    $ow, $oh = ($outer -split ',') | ForEach-Object { [int]$_ }
+    # The TEST desktop's work area - the one the app itself is clamping to.
+    $wa = Get-TestWorkArea
+    Assert ($wa.Width -gt 0 -and $wa.Height -gt 0) "E: test-desktop work area readable ($($wa.Width)x$($wa.Height))"
+    Assert ($ow -le $wa.Width -and $oh -le $wa.Height) "E: oversized memory clamped to work area ($outer <= $($wa.Width),$($wa.Height))"
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'E: no crash'
+    Stop-Instance
+
+    # --- Case F: corrupt memory file falls back to the default ----------------
+    Set-Content -Path $memFile -Value 'not a placement' -Encoding Ascii
+    Launch @()
+    $outer = Get-Outer $top
+    Assert ($outer -eq '800,600') "F: corrupt memory ignored, default used (got $outer)"
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'F: no crash'
+    Stop-Instance
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+    Remove-Item -Recurse -Force $fakeLocal -ErrorAction SilentlyContinue
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @($script:launched | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
