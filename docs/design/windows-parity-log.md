@@ -3470,3 +3470,39 @@ regression - wider than previous batches, since `Get-TestChildWindows` is used
 by every migrated script: `test-desktop-harness` (19), `split-zoom-nav` (20),
 `confirm-dialogs` (27), `window-title` (50), `command-registry` (22),
 `font-inherit` (25), `new-window-cwd` all ALL PASS.
+
+## 2026-07-31 - T218 batch 1: the mouse half opens, and the synthetic double-click was a fiction
+
+First two of the 13 mouse-driving scripts onto the test desktop:
+`keybinds-t01` (30 assertions, ALL PASS x3) and `focus-defer` (11, ALL PASS
+x3). Both negative controls FAIL. 11 remain.
+
+`keybinds-t01` failed exactly one assertion on its first migrated run - the
+ctrl+c-copy one, the only section that needed the mouse - and the product was
+innocent. `Send-TestMouse -Action doubleclick` posted down / up /
+**WM_LBUTTONDBLCLK** / up, which is what the OS delivers only to a
+**CS_DBLCLKS** window. `GhozttyWindow` has that style (divider equalize); the
+`GhozttyTerminal` surface class does not, and counts its own clicks from plain
+button-downs. The posted DBLCLK went nowhere, the core saw one click, and no
+word-select happened. `MouseEvent` now reads the target's class style
+(`GetClassLongPtrW`) and sends the sequence that target would really get. T216
+established that a posted click has to name the window a real click would hit;
+this is the same rule for the message's identity, and `split-divider` (still
+ahead in this task) is the CS_DBLCLKS side of it.
+
+Two harness additions, both because `focus-defer` is a deadlock repro rather
+than a gesture test: `Send-TestClickStorm` (unpaced posted down/up pairs -
+`Send-TestMouse`'s ~100ms of per-click settling would stretch its 1500 focus
+changes to four minutes and destroy the load shape) and
+`Test-TestWindowResponsive` (the WM_NULL / SMTO_ABORTIFHUNG hang oracle).
+
+Two things the move surfaced in the scripts themselves. `keybinds-t01` went
+24 -> 30 assertions with no new coverage invented: nearly every section was
+wrapped in an `if ABORT { SKIP }` and the foreground grab lost that race often
+enough for whole sections to vanish from a "passing" run. And its ctrl+c/SIGINT
+assertion still carried "KNOWN FAIL until the ConPTY ^C-signal task is fixed" -
+T84 fixed that, it passes every run, comment removed.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green. Harness
+regression after the doubleclick change: `dark-menus` (10),
+`test-desktop-harness` (19), `split-zoom-nav` (20) all ALL PASS.

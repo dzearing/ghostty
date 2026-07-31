@@ -115,6 +115,18 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
+    // Class style, cross-process. Used to decide whether a target would really
+    // receive WM_*BUTTONDBLCLK (see the doubleclick branch in MouseEvent).
+    [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")] static extern UIntPtr GetClassLongPtr64(IntPtr h, int index);
+    [DllImport("user32.dll", EntryPoint = "GetClassLongW")] static extern uint GetClassLong32(IntPtr h, int index);
+    const int GCL_STYLE = -26;
+    const uint CS_DBLCLKS = 0x0008;
+    static bool WantsDblClk(IntPtr h) {
+        uint style = (IntPtr.Size == 8)
+            ? (uint)GetClassLongPtr64(h, GCL_STYLE).ToUInt64()
+            : GetClassLong32(h, GCL_STYLE);
+        return (style & CS_DBLCLKS) != 0;
+    }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
@@ -1016,8 +1028,18 @@ public class GhozttyTestDesktop {
                         PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
                     }
                     if (action == 4) {
+                        // What the OS would really deliver depends on the
+                        // TARGET's class: only a CS_DBLCLKS window ever sees
+                        // WM_*BUTTONDBLCLK. Without that style Windows sends a
+                        // plain second down/up pair, and a window that counts
+                        // its own clicks (the terminal surface does - the
+                        // GhozttyTerminal class is CS_OWNDC, not CS_DBLCLKS)
+                        // would silently drop a posted DBLCLK and read the
+                        // gesture as a single click. Posting the wrong one
+                        // costs a word-select that never happens.
                         Thread.Sleep(30);
-                        PostMessageW(dst, dbl, (IntPtr)MouseMk(mods, held), lp);
+                        uint second = WantsDblClk(dst) ? dbl : down;
+                        PostMessageW(dst, second, (IntPtr)MouseMk(mods, held), lp);
                         Thread.Sleep(holdMs);
                         PostMessageW(dst, up, (IntPtr)MouseMk(mods, 0), lp);
                     }
@@ -1030,6 +1052,36 @@ public class GhozttyTestDesktop {
                 Thread.Sleep(40);
                 return true;
             } finally { if (attached) AttachThreadInput(cur, tid, false); }
+        });
+    }
+
+    // Unpaced posted down/up pairs, round-robin across targets. This is a
+    // LOAD SHAPE, not a user gesture: the T48 deadlock repro needs thousands
+    // of focus changes arriving faster than the GUI thread drains them, which
+    // MouseEvent's per-click settling sleeps (~100ms) deliberately prevent.
+    // Client coordinates, since every target is a different window.
+    public bool ClickStorm(IntPtr[] targets, int rounds, int cx, int cy) {
+        return (bool)Run(delegate() {
+            IntPtr lp = PackPoint(cx, cy);
+            for (int r = 0; r < rounds; r++) {
+                foreach (IntPtr t in targets) {
+                    PostMessageW(t, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, lp);
+                    PostMessageW(t, WM_LBUTTONUP, IntPtr.Zero, lp);
+                }
+            }
+            return true;
+        });
+    }
+
+    // Does the window's GUI thread pump a WM_NULL within timeoutMs? The
+    // hang oracle: SMTO_ABORTIFHUNG gives up early on a thread Windows has
+    // already marked not-responding. This one call may block the worker for
+    // up to timeoutMs by design - that wait IS the measurement.
+    public bool Responsive(IntPtr h, uint timeoutMs) {
+        return (bool)Run(delegate() {
+            IntPtr res;
+            // SMTO_ABORTIFHUNG | SMTO_BLOCK
+            return SendMessageTimeoutW(h, 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002 | 0x0001, timeoutMs, out res) != IntPtr.Zero;
         });
     }
 
@@ -1699,6 +1751,13 @@ child pane, not its parent). Defaults to -Window.
 
 -Action is click (default) / down / up / move / doubleclick / wheel.
 -Button is left (default) / right / middle. -Delta applies to wheel only.
+
+-Action doubleclick follows the TARGET's class style, because the OS does:
+a CS_DBLCLKS window (GhozttyWindow - the split divider's equalize gesture)
+gets down/up/DBLCLK/up, and a window without that style (GhozttyTerminal, the
+terminal surface, which counts its own clicks) gets down/up/down/up. Posting
+the CS_DBLCLKS form at a surface loses the second click entirely, so the
+word-select it was meant to trigger never happens (measured in T218).
 #>
 function Send-TestMouse {
     param(
@@ -1720,6 +1779,41 @@ function Send-TestMouse {
     }
     $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
     return $td.MouseEvent($Window, $Target, $X, $Y, $b, $a, $HoldMs, [uint16[]]$mods, $Delta)
+}
+
+<#
+Hammer unpaced left down/up pairs round-robin across several targets.
+
+    Send-TestClickStorm -Targets $surfaces -Rounds 500
+
+This is a LOAD SHAPE, not a gesture. Send-TestMouse settles ~100ms per click
+so the app can act on it; a deadlock repro needs focus changes arriving faster
+than the GUI thread drains them, which the same 1500 clicks through
+Send-TestMouse would stretch to about four minutes. -X/-Y are CLIENT
+coordinates (every target is a different window) and default to a point that
+is inside any surface.
+#>
+function Send-TestClickStorm {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr[]]$Targets,
+        [int]$Rounds = 100,
+        [int]$X = 10,
+        [int]$Y = 10,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).ClickStorm($Targets, $Rounds, $X, $Y)
+}
+
+# Does the window's GUI thread still pump messages? The hang oracle for the
+# T48 class of bug: a wedged thread never answers WM_NULL, and because the IPC
+# listener lives on that thread, a wedge also silences +list.
+function Test-TestWindowResponsive {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [int]$TimeoutMs = 3000,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).Responsive($Window, [uint32]$TimeoutMs)
 }
 
 # Move the TEST desktop's cursor without posting anything. Useful when the
