@@ -768,6 +768,17 @@ fn resolveShellPath(
     return "/bin/sh";
 }
 
+/// Whether `path` names a directory this process can open. The spawn's own
+/// question, asked with the spawn's own privileges — an unreadable directory is
+/// reported false, because `CreateProcessW`/`chdir` would fail on it too and a
+/// "yes" here would just move the failure somewhere harder to see.
+fn dirExists(path: []const u8) bool {
+    if (path.len == 0) return false;
+    var dir = std.fs.cwd().openDir(path, .{}) catch return false;
+    dir.close();
+    return true;
+}
+
 /// Spawns a real pty-backed child per OPEN. The default shell is `$SHELL` (falling
 /// back to `/bin/sh`), invoked login+interactive (`-lic <command>`) when the OPEN
 /// carries a `command`, else just login+interactive (`-li`) for a plain shell —
@@ -827,6 +838,51 @@ pub const PtySpawner = struct {
         return .{ .ok = out.ok, .pid = out.pid, .@"error" = out.@"error", .free_error = out.free_error };
     }
 
+    /// Pick the directory to actually spawn in, given what the client ASKED for
+    /// (T230). Returns `requested` when it names a real, reachable directory;
+    /// the user's home when it does not (a stale recorded cwd, deleted while the
+    /// agent was down); and null when neither is usable, which leaves the child
+    /// in the agent's own inherited directory.
+    ///
+    /// The check is a plain `openDir` — cheap, and it answers exactly the
+    /// question the spawn is about to ask the kernel. It is deliberately not
+    /// merged into `spawnChild`'s body: this is the one decision in that
+    /// function that has to be re-read when a pane comes up in the wrong place.
+    fn resolveSpawnCwd(self: *PtySpawner, requested: ?[]const u8) ?[]const u8 {
+        const want = requested orelse return null;
+        if (want.len == 0) return null;
+        if (dirExists(want)) return want;
+
+        // `self.home` is resolved once at spawner init from the agent's own
+        // environment, so this costs nothing here.
+        const home = self.homeDir();
+        if (home) |h| if (dirExists(h)) {
+            log.warn(
+                "requested cwd '{s}' does not exist; spawning in '{s}' instead",
+                .{ want, h },
+            );
+            return h;
+        };
+
+        log.warn(
+            "requested cwd '{s}' does not exist and no usable home; spawning in the agent's own directory",
+            .{want},
+        );
+        return null;
+    }
+
+    /// The user's home directory as this agent sees it, or null. Windows agents
+    /// get `USERPROFILE` (an autostarted agent still inherits it); POSIX agents
+    /// get `HOME`.
+    fn homeDir(self: *PtySpawner) ?[]const u8 {
+        if (is_windows) {
+            if (self.env.get("USERPROFILE")) |p| if (p.len > 0) return p;
+            return null;
+        }
+        if (self.env.get("HOME")) |p| if (p.len > 0) return p;
+        return null;
+    }
+
     /// Open a pty, fork+exec the shell on its slave, return the owned `*PtyChild`.
     pub fn spawnChild(self: *PtySpawner, open: protocol.Open) !*PtyChild {
         const rows: u16 = if (open.rows == 0) 24 else open.rows;
@@ -868,6 +924,20 @@ pub const PtySpawner = struct {
 
         const pc = try self.alloc.create(PtyChild);
         errdefer self.alloc.destroy(pc);
+
+        // A requested cwd that no longer EXISTS must not kill the session (T230).
+        // `CreateProcessW`/`chdir` fail outright on a missing directory, so an
+        // OPEN carrying a stale path never replies OPENED and the user gets a
+        // dead pane instead of a shell — and stale paths are the normal case
+        // here: a persisted session's recorded cwd can be a build tree, a
+        // worktree, or a temp dir that was deleted while the agent was down.
+        // Measured on box: deleting a 3-pane layout's working directory left
+        // every pane un-interactive.
+        //
+        // Falling back is strictly better than failing: the whole point of the
+        // restore is to hand the user a working prompt, and `cd`-ing somewhere
+        // is a thing they can do; resurrecting a dead pane is not.
+        const spawn_cwd = self.resolveSpawnCwd(open.cwd);
 
         // POSIX only: the user's LOGIN shell (getpwuid `pw_shell`) is the correct
         // default when no OPEN.shell and no $SHELL is present — NOT /bin/sh. The
@@ -975,7 +1045,7 @@ pub const PtySpawner = struct {
                     .path = shell_z,
                     .args = args,
                     .env = &child_env,
-                    .cwd = open.cwd,
+                    .cwd = spawn_cwd,
                     .stdin = null,
                     .stdout = null,
                     .stderr = null,
@@ -1007,7 +1077,7 @@ pub const PtySpawner = struct {
                 .path = shell_z,
                 .args = args,
                 .env = &child_env,
-                .cwd = open.cwd,
+                .cwd = spawn_cwd,
                 .stdin = slave_file,
                 .stdout = slave_file,
                 .stderr = slave_file,
@@ -1238,6 +1308,48 @@ test "PtyChild: OPEN.env reaches the child and does not leak between spawns" {
     term_a = true;
     pc_b.child().terminate();
     term_b = true;
+}
+
+test "resolveSpawnCwd: a real directory is used verbatim" {
+    const alloc = testing.allocator;
+    const sp = try PtySpawner.init(alloc);
+    defer sp.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(path);
+
+    try testing.expectEqualStrings(path, sp.resolveSpawnCwd(path).?);
+}
+
+test "resolveSpawnCwd: a missing directory falls back to home, never to failure" {
+    const alloc = testing.allocator;
+    const sp = try PtySpawner.init(alloc);
+    defer sp.deinit();
+
+    // A path that cannot exist. The contract is "do not hand this to the spawn",
+    // which is what killed a restored pane whose worktree had been deleted.
+    const gone = if (is_windows)
+        "C:\\ghoztty-t230-definitely-not-here\\nope"
+    else
+        "/ghoztty-t230-definitely-not-here/nope";
+    const got = sp.resolveSpawnCwd(gone);
+    try testing.expect(got == null or !std.mem.eql(u8, got.?, gone));
+
+    // On any normal machine the agent inherits a home, so the fallback is it.
+    if (sp.homeDir()) |h| {
+        if (dirExists(h)) try testing.expectEqualStrings(h, got.?);
+    }
+}
+
+test "resolveSpawnCwd: null and empty stay null (spawn in the agent's own dir)" {
+    const alloc = testing.allocator;
+    const sp = try PtySpawner.init(alloc);
+    defer sp.deinit();
+
+    try testing.expect(sp.resolveSpawnCwd(null) == null);
+    try testing.expect(sp.resolveSpawnCwd("") == null);
 }
 
 test "PtyChild: OPEN.argv is exec'd verbatim instead of the -li synthesis" {

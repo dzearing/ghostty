@@ -834,12 +834,20 @@ pub const Server = struct {
             // Tombstone → dead + exit_code (§7.1/§7.4). `relaunchable` distinguishes
             // a session materialized from disk (T12b, no exit_code, RELAUNCH-able)
             // from a child that genuinely exited this run.
+            // cwd/argv ride the DEAD reply too (T230). The viewer's default
+            // policy no longer respawns the recorded command — it opens a FRESH
+            // shell in the recorded cwd and NAMES the old command in a notice —
+            // so both are display/placement inputs it can only get from here.
+            // Borrowing the session's strings is safe: we hold the store lock
+            // across the encode, exactly like the alive branch below.
             self.sendJson(.attached, s.channel, protocol.Attached{
                 .status = .dead,
                 .exit_code = s.exit_code,
                 .relaunchable = s.relaunchable,
                 .rows = s.rows,
                 .cols = s.cols,
+                .cwd = if (s.cwd) |c| c else null,
+                .argv = if (s.argv) |a| a else null,
             }) catch {};
             return;
         }

@@ -383,9 +383,24 @@ processes after a reboot.
   `.remote` surface with its `sessionID`) — a native, exact-ratio version of
   what `+split` + `+rearrange --layout` can already approximate over IPC.
   Dead sessions render with a "process exited / restarted after reboot"
-  banner (the sticky-banner feature is a natural fit) and either auto-
-  `RELAUNCH` (default) or wait for Enter (config: `session-relaunch =
-  auto | prompt`).
+  banner (the sticky-banner feature is a natural fit) and follow
+  `session-relaunch = notify | auto | prompt`.
+
+  **The default is `notify` (T230, 2026-07-31), and it does NOT respawn.**
+  A recorded command is never re-executed on the user's behalf: it was
+  captured in a world that no longer exists, it may be a build, a migration
+  or an agent loop that must not run twice, and it was never asked for a
+  second time. Under `notify` the pane comes up on a fresh shell in the
+  recorded working directory, with a notice naming the old command so it can
+  be copied and re-issued deliberately (`src/termio/session_notice.zig`,
+  emitted both as terminal text and as an OSC-7778 sticky banner, because a
+  ConPTY shell's startup repaint erases the former). `auto` keeps the old
+  `RELAUNCH`-with-divider behavior, `prompt` waits for a keystroke; both are
+  opt-ins now.
+
+  A recorded working directory that no longer EXISTS falls back to the user's
+  home rather than failing the spawn (`PtySpawner.resolveSpawnCwd`) — a
+  deleted worktree used to leave every restored pane dead.
 - **Sparkle:** no new hook strictly needed — the update path already sets
   `isQuitting` and preserves the manifest (§3.2). Add belt-and-braces: on
   `willInstallUpdateOnQuit`, flush the manifest and send explicit `DETACH`s

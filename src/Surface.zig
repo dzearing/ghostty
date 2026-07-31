@@ -1061,10 +1061,13 @@ pub fn init(
                     // remote device and could false-match local `+list --tty`
                     // self-lookups. Same signal as `pinned`.
                     .local = rb.local_shell_integration,
-                    // Reboot-floor policy (T12c): if this ATTACH target comes
-                    // back dead-but-relaunchable (the agent restarted), `auto`
-                    // respawns it in place; `prompt` shows the exited overlay.
+                    // Reboot-floor policy (T12c/T230): if this ATTACH target
+                    // comes back dead-but-relaunchable (the agent restarted),
+                    // `notify` (the default) opens a FRESH shell and names the
+                    // old command without running it, `auto` respawns it in
+                    // place, and `prompt` shows the exited overlay.
                     .relaunch_policy = switch (config.@"session-relaunch") {
+                        .notify => .notify,
                         .auto => .auto,
                         .prompt => .prompt,
                     },

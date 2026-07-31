@@ -1223,19 +1223,30 @@ command: ?Command = null,
 /// a restored window does when a pane's persisted session comes back from the
 /// agent as a DEAD-but-relaunchable tombstone — i.e. the agent itself restarted
 /// (a reboot, an agent upgrade) and materialized the session's recorded
-/// metadata from disk but the child process is not running. There are two
+/// metadata from disk but the child process is not running. There are three
 /// options:
 ///
-///   * `auto` (the default) - immediately `RELAUNCH` the recorded command/shell
-///     in the same pane and print a `--- session restarted ---` divider above
-///     the fresh output.
-///   * `prompt` - do NOT auto-respawn; the pane comes up in its exited state so
-///     the user decides whether to bring it back.
+///   * `notify` (the default) - do NOT re-run anything. The pane comes up on a
+///     fresh shell in the session's recorded working directory, above a notice
+///     saying the background process was restarted and naming the command that
+///     WAS running so it can be copied and re-issued deliberately.
+///   * `auto` - immediately `RELAUNCH` the recorded command/shell in the same
+///     pane and print a `--- session restarted ---` divider above the fresh
+///     output.
+///   * `prompt` - do NOT auto-respawn; the pane comes up in its exited state
+///     with a "press any key to relaunch" affordance, so the user decides
+///     whether to bring the old command back.
+///
+/// `notify` is the default because silently re-executing a recorded command is
+/// unsafe: it was recorded in a world that no longer exists (a different tree
+/// state, a build or migration or agent loop that must not run twice), and the
+/// user never asked for it a second time. `auto` and `prompt` remain available
+/// for anyone who wants the old behavior, but they are opt-ins.
 ///
 /// This has no effect when the agent kept running (the ordinary app-upgrade /
 /// crash case): the session is still alive and simply re-attaches with its
 /// scrollback intact. It only matters across an agent restart.
-@"session-relaunch": SessionRelaunch = .auto,
+@"session-relaunch": SessionRelaunch = .notify,
 
 /// Controls when command finished notifications are sent. There are
 /// three options:
@@ -10552,6 +10563,7 @@ pub const Scrollbar = enum {
 
 /// See session-relaunch
 pub const SessionRelaunch = enum {
+    notify,
     auto,
     prompt,
 };

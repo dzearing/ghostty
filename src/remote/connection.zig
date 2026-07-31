@@ -578,13 +578,20 @@ pub const AttachOutcome = struct {
     /// Duped from the reply and owned here (null when the reply omitted them).
     cwd: ?[]u8,
     title: ?[]u8,
+    /// The command the session was running, as the agent's recorded label
+    /// (`protocol.Attached.argv`). Only a DEAD reply carries it, and only from
+    /// an agent new enough to send it — it exists so the `notify` relaunch
+    /// policy (T230) can name the command it is deliberately NOT re-running.
+    /// Display text: never parsed, never executed.
+    argv: ?[]u8 = null,
     alloc: Allocator,
 
-    /// Free any owned strings (`cwd`/`title`). Does NOT free `pane` — a live pane is
-    /// torn down via `closeChannel`/`detachChannel`.
+    /// Free any owned strings (`cwd`/`title`/`argv`). Does NOT free `pane` — a live
+    /// pane is torn down via `closeChannel`/`detachChannel`.
     pub fn deinit(self: *AttachOutcome) void {
         if (self.cwd) |c| self.alloc.free(c);
         if (self.title) |t| self.alloc.free(t);
+        if (self.argv) |a| self.alloc.free(a);
         self.* = undefined;
     }
 };
@@ -1858,6 +1865,8 @@ pub const Connection = struct {
         errdefer if (cwd) |c| self.alloc.free(c);
         const title = if (a.title) |t| try self.alloc.dupe(u8, t) else null;
         errdefer if (title) |t| self.alloc.free(t);
+        const argv = if (a.argv) |v| try self.alloc.dupe(u8, v) else null;
+        errdefer if (argv) |v| self.alloc.free(v);
 
         var outcome: AttachOutcome = .{
             .pane = null,
@@ -1873,6 +1882,7 @@ pub const Connection = struct {
             .replay_cols = a.replay_cols,
             .cwd = cwd,
             .title = title,
+            .argv = argv,
             .alloc = self.alloc,
         };
 
@@ -2117,6 +2127,26 @@ pub const Connection = struct {
             return error.MalformedReply;
         defer parsed.deinit();
         return parsed.value.ok;
+    }
+
+    /// Fire-and-forget `CLOSE_SESSION`: same request as `closeSession`, but it
+    /// does NOT register an RPC slot and does not wait for the reply (the agent's
+    /// `CLOSE_SESSION_RESULT` lands on a channel nobody claimed and is dropped).
+    ///
+    /// For callers whose success does not depend on the answer, and who must not
+    /// pay for it. The T230 `notify` path is exactly that: it retires the dead
+    /// tombstone it is replacing as housekeeping, on the pane's IO thread, in the
+    /// middle of bringing a fresh shell up for a user who is watching. A bounded
+    /// RPC there costs the whole timeout on any hiccup — measured at 1.5 s per
+    /// pane on box — to learn something it would do nothing about.
+    pub fn closeSessionNoWait(self: *Connection, session_id: []const u8) !void {
+        if (!self.supportsCloseSession()) return error.Unsupported;
+
+        const json = try protocol.encodeJson(self.alloc, protocol.CloseSession{
+            .session_id = session_id,
+        });
+        defer self.alloc.free(json);
+        try self.writeControl(.close_session, std.crypto.random.int(u128), json);
     }
 
     /// Close a pane's session (§3.3): send `CLOSE` (terminate + free the remote

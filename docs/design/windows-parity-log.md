@@ -3638,3 +3638,59 @@ about the PAIRING.
 Floor: both `zig build test` lanes, `test-agent`, P1-P3 green. Harness
 regression after the `Send-TestSysKey` addition: dark-menus, test-desktop-harness
 and focus-defer all ALL PASS.
+
+## 2026-07-31 - T230: an agent restart never re-runs your command again
+
+User directive, verbatim: *"We should not ever re-execute the commands which
+were previously ran."* Reaffirmed mid-turn: *"the app can reboot, that's fine,
+but windows reopened should not try to rerun commands... some sort of session
+was interrupted by an upgrade message, and should leave the user at a shell
+prompt."* `session-relaunch` defaulted to `auto`, so every agent restart
+(reboot, T147 agent upgrade) RELAUNCHed each pane's recorded command - 15
+`relaunched dead session` lines in the on-box log, three of them in the single
+boot after the 2026-07-31 upgrade.
+
+New default `session-relaunch = notify`: the pane OPENs a brand-new session on a
+fresh shell in the tombstone's recorded cwd, retires the tombstone, and prints a
+notice naming the command it did NOT run. `auto`/`prompt` survive as opt-ins.
+Wire change is additive only (`Attached.argv`, plus `cwd`/`argv` on the DEAD
+reply) - an older agent omits them and the notice simply loses its command line.
+
+Two things this turn measured that were not obvious:
+
+- **The notice has to be written twice.** A fresh `cmd.exe` under ConPTY opens
+  with a full-screen repaint that erases whatever the notice printed a moment
+  earlier; printing it after the shell's paint would put it *below* the prompt.
+  So it also goes up as an OSC 7778 sticky banner - a native overlay a screen
+  clear cannot reach. Stream text = selectable/copyable; banner = guaranteed
+  visible. `+list --json`'s `banner` field is what the test scores.
+- **A recorded cwd that no longer exists killed the pane outright.** Arm C
+  deleted the layout's working directory and got 0/3 interactive panes:
+  `CreateProcessW` fails on a missing `lpCurrentDirectory`, so the OPEN never
+  replies. `PtySpawner.resolveSpawnCwd` now falls back to `$HOME` /
+  `%USERPROFILE%`. Pre-existing, and it hit `auto` (RELAUNCH) just as hard.
+
+New `test/win32/session-relaunch-notify.ps1` ALL PASS (45), scored on the
+process table (neither `ping -n <unique>` runs again), the per-pane banner (each
+names its OWN command, no cross-talk) and pane responsiveness (3/3), with arm B
+as the opt-in control (`auto` still respawns both). Harness trap re-learned the
+hard way: `Start-Process -ArgumentList` quotes nothing, so a bare
+`--command=ping -n 9749 127.0.0.1` was re-tokenized into four positional
+arguments and every marker assertion failed against a working product. Second
+trap: arms shared one `LOCALAPPDATA`, so arm C restored arm B's windows and
+`+new-window --target=nA` merely FOCUSED the existing one - each arm now gets a
+virgin state dir.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3, `session-relaunch`
+(T89g) and `agent-upgrade` (T147, 53) all green.
+
+Filed: **T236** (`auto-launch-cwd.ps1` B3 fails at HEAD - PRE-EXISTING, proved
+by A/B against a short-circuited `resolveSpawnCwd`), **T237** (the bounded
+`CLOSE_SESSION` RPC times out against the local agent even though the capability
+is negotiated; T230 sidesteps it fire-and-forget, T146's Kill cannot), **T238**
+(`terminal.PageList` "less rows trims blank lines" flaked once with exit 3 =
+panic, passed on an immediate re-run).
+
+T229's own half - the app disappearing after the confirm - is NOT closed by
+this, but the user has explicitly downgraded it: an app reboot on agent upgrade
+is acceptable to them, so long as nothing re-executes.

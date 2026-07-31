@@ -24,6 +24,7 @@ pub const backend = @import("termio/backend.zig");
 pub const mailbox = @import("termio/mailbox.zig");
 pub const Exec = @import("termio/Exec.zig");
 pub const Remote = @import("termio/Remote.zig");
+pub const session_notice = @import("termio/session_notice.zig");
 pub const Options = @import("termio/Options.zig");
 pub const Termio = @import("termio/Termio.zig");
 pub const Thread = @import("termio/Thread.zig");
@@ -37,4 +38,5 @@ test {
     @import("std").testing.refAllDecls(@This());
 
     _ = @import("termio/shell_integration.zig");
+    _ = @import("termio/session_notice.zig");
 }

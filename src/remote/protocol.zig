@@ -586,6 +586,20 @@ pub const Attached = struct {
     /// .alive`; see `Opened.tty`). Additive/optional (older agents omit it).
     tty: ?[]const u8 = null,
 
+    /// The command the session was running, as the human-readable label the
+    /// agent recorded at OPEN time (`SessionInfo.argv`). Sent with `status ==
+    /// .dead` so a viewer that refuses to re-execute it (T230's `notify`
+    /// policy, the default) can still NAME it in the notice it prints above the
+    /// fresh shell — the user's own words: "the console message which says the
+    /// session was closed could list the previous command executed so the user
+    /// can choose to copy/paste it".
+    ///
+    /// Additive/optional: an older agent omits it and the viewer prints the
+    /// notice without the command line rather than failing. Never load-bearing
+    /// for correctness — it is display text, and the viewer sanitizes it before
+    /// writing it to a terminal.
+    argv: ?[]const u8 = null,
+
     /// The geometry the session's retained ring tail was drawn at BEFORE this
     /// attach resized the pty to the client's seed (set with `status == .alive`;
     /// 0 = unknown). The raw ring replay is geometry-bound VT — conhost/pty

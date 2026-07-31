@@ -46,6 +46,7 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const connection = @import("../remote/connection.zig");
 const inbound_ring = @import("../remote/inbound_ring.zig");
 const protocol = @import("../remote/protocol.zig");
+const session_notice = @import("session_notice.zig");
 
 const log = std.log.scoped(.io_remote);
 
@@ -100,9 +101,11 @@ local: bool,
 
 /// What to do when an ATTACH finds the session a DEAD-but-relaunchable tombstone
 /// (the agent itself restarted and materialized it from disk, §5.4 reboot floor,
-/// T12c). `.auto` respawns it in place (`RELAUNCH`) and shows a restarted
-/// divider; `.prompt` leaves the pane in its exited state for the user to decide.
-/// Only meaningful for the LOCAL-agent ATTACH path; irrelevant on OPEN-new.
+/// T12c). `.notify` (the default) refuses to re-run it and opens a fresh shell
+/// with a notice instead (T230); `.auto` respawns it in place (`RELAUNCH`) and
+/// shows a restarted divider; `.prompt` leaves the pane in its exited state for
+/// the user to decide. Only meaningful for the LOCAL-agent ATTACH path;
+/// irrelevant on OPEN-new.
 relaunch_policy: RelaunchPolicy,
 
 /// Current grid/screen size, seeded by `initTerminal` and updated by `resize`.
@@ -305,7 +308,13 @@ pub fn openWorkingDirectory(
 /// What a restored pane does when its ATTACH target comes back as a
 /// dead-but-relaunchable tombstone across an agent restart (§5.4, T12c). Mirrors
 /// `config.SessionRelaunch`; kept local so this backend need not import config.
-pub const RelaunchPolicy = enum { auto, prompt };
+///
+/// `notify` is the default (T230) and is the only one of the three that never
+/// puts a recorded command back on a CPU: it opens a brand-new session on a
+/// fresh shell in the dead session's working directory and prints
+/// `session_notice` above it. `auto` respawns the recorded command; `prompt`
+/// respawns it on the first keystroke.
+pub const RelaunchPolicy = enum { notify, auto, prompt };
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
 /// (`Surface.zig`) can build the forwarded env list without importing the wire
@@ -457,6 +466,13 @@ pub fn threadEnter(
     // session respawned across an agent restart) rather than a live attach/open —
     // used after bring-up to print a "session restarted" divider (T12c).
     var did_relaunch = false;
+    // Set when the pane's persisted session was a dead tombstone and the
+    // `.notify` policy (T230) opened a FRESH session instead of respawning the
+    // recorded command. Holds the command we refused to re-run (arena-owned, so
+    // it outlives the ATTACH outcome), or null when the agent recorded none /
+    // is too old to report one. Drives the notice printed after bring-up.
+    var notice_command: ?[]const u8 = null;
+    var did_notify = false;
     // Set true when the agent ALREADY replayed pre-restart scrollback + the restart
     // divider from a ring disk snapshot (§5.4, T13) — the client then suppresses its
     // own snapshot-less divider so there is exactly one marker.
@@ -519,10 +535,73 @@ pub fn threadEnter(
         // No live pane. A DEAD-but-relaunchable tombstone means the AGENT itself
         // restarted (a reboot or an agent upgrade) and materialized this session
         // from its on-disk metadata (§5.4 reboot floor, T12b) — the recorded
-        // argv/cwd can bring the process back. With the `auto` policy (the
-        // default), RELAUNCH it in place on the SAME channel the dead ATTACHED
-        // arrived on and stream fresh output; `prompt` falls through to the
-        // exited overlay so the user decides.
+        // argv/cwd COULD bring the process back.
+        //
+        // T230: by default we refuse to. Re-executing a recorded command is
+        // unsafe as a default — it was recorded in a world that no longer
+        // exists, it may be a build/migration/agent loop that must not run
+        // twice, and the user never asked for it again ("We should not ever
+        // re-execute the commands which were previously ran"). So `notify` (the
+        // default) opens a BRAND-NEW session on a fresh shell, placed in the
+        // dead session's recorded working directory — a cwd is not a command; it
+        // re-creates no side effects — and prints a notice naming the command it
+        // did not run. `auto` and `prompt` keep the old respawning behavior for
+        // anyone who opts back in.
+        if (outcome.status == .dead and outcome.relaunchable and
+            self.relaunch_policy == .notify)
+        {
+            // Copy out of `outcome` before its `defer deinit()` frees it. The
+            // arena lives as long as this backend, which outlives the notice.
+            const aa = self.arena.allocator();
+            notice_command = if (outcome.argv) |v| aa.dupe(u8, v) catch null else null;
+            const cwd: ?[]const u8 = if (outcome.cwd) |c|
+                (aa.dupe(u8, c) catch self.working_directory)
+            else
+                self.working_directory;
+
+            // Retire the tombstone. It is pinned against the idle reaper (every
+            // persistent local pane is), the manifest is about to point at the
+            // NEW session id, and nothing will ever attach to it again — so
+            // without this it would sit in the agent's `sessions.json` forever
+            // and be re-offered on every subsequent restart.
+            //
+            // Fire-and-forget on purpose: we are on the pane's IO thread with a
+            // user waiting for a prompt, and the answer changes nothing. The
+            // bounded-RPC version of this cost 1.5 s per pane on box (measured,
+            // and it timed out) for a result we would only have logged. An agent
+            // too old to advertise CLOSE_SESSION just keeps the tombstone.
+            self.conn.closeSessionNoWait(sid) catch |err| {
+                log.info("notify policy: could not retire dead session err={} (harmless)", .{err});
+            };
+
+            const open: protocol.Open = .{
+                // The whole point: NO command. A fresh interactive shell.
+                .command = null,
+                .cwd = cwd,
+                .shell = self.shell,
+                .term = self.term,
+                .env = self.env,
+                .argv = self.argv,
+                .pinned = self.pinned,
+                .rows = rows,
+                .cols = cols,
+                .px_w = @intCast(@min(self.screen_size.width, std.math.maxInt(u16))),
+                .px_h = @intCast(@min(self.screen_size.height, std.math.maxInt(u16))),
+            };
+            const p = self.conn.openChannelCancellable(open, &self.canceller) catch |err| {
+                log.warn("notify policy: fresh session open failed err={}", .{err});
+                return error.RemoteAttachFailed;
+            };
+            did_notify = true;
+            log.info(
+                "dead relaunchable session NOT re-run (notify policy); opened a fresh shell instead",
+                .{},
+            );
+            break :pane p;
+        }
+
+        // `auto`: RELAUNCH it in place on the SAME channel the dead ATTACHED
+        // arrived on and stream fresh output.
         if (outcome.status == .dead and outcome.relaunchable and
             self.relaunch_policy == .auto)
         {
@@ -679,7 +758,24 @@ pub fn threadEnter(
     // inject is synchronous; the replay drains async from the channel ring). Only
     // when there was NO snapshot (blank relaunch) do we print the divider ourselves,
     // so the restart is visible rather than looking like a spontaneous new prompt.
-    if (did_relaunch and !relaunch_replayed) {
+    if (did_notify) {
+        // T230: this pane's session is gone and we deliberately did not put its
+        // command back on a CPU. Say so, name what it was, and leave the user on
+        // the fresh prompt below to decide.
+        //
+        // TWO carriers, for the reason spelled out in `session_notice`: the
+        // in-stream text is selectable scrollback the user can copy the old
+        // command out of, but a ConPTY shell's startup repaint (cmd.exe's
+        // `ESC[H ESC[2J`, measured) erases it — so the same notice also goes up
+        // as a sticky pane banner, which a screen clear cannot touch.
+        var notice_buf: [session_notice.max_len]u8 = undefined;
+        const notice = session_notice.format(&notice_buf, notice_command);
+        @call(.always_inline, termio.Termio.processOutput, .{ io, notice });
+
+        var banner_buf: [session_notice.max_len]u8 = undefined;
+        const banner = session_notice.formatBanner(&banner_buf, notice_command);
+        @call(.always_inline, termio.Termio.processOutput, .{ io, banner });
+    } else if (did_relaunch and !relaunch_replayed) {
         const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
         @call(.always_inline, termio.Termio.processOutput, .{ io, divider });
     } else if (self.awaiting_relaunch) {
@@ -718,7 +814,7 @@ pub fn threadEnter(
     // to the live grid exactly when the replay is fully applied (`applied_bytes`
     // reaches the ring head S carried by ATTACHED). An older agent omits the
     // capture geometry (0) → keep today's live-width replay.
-    if (!did_relaunch and !self.awaiting_relaunch and
+    if (!did_relaunch and !did_notify and !self.awaiting_relaunch and
         self.attach_offset == 0 and attach_snapshot_at > 0 and
         attach_replay_cols != 0 and attach_replay_rows != 0 and
         (attach_replay_cols != live_cols or attach_replay_rows != live_rows))
@@ -736,7 +832,13 @@ pub fn threadEnter(
     // This is our OWN clean VT repaint (palette+modes+styles+cursor+bounded
     // scrollback), NOT the agent's raw in-place-redraw ring, so it reflows to
     // the live width without smearing and parses in well under a frame.
-    if (!did_relaunch and !self.awaiting_relaunch and self.attach_offset > 0) {
+    //
+    // `did_notify` (T230) is excluded for the same reason as a relaunch: the
+    // pane is running a BRAND-NEW session that shares no byte stream with the
+    // snapshot, so painting the old screen under it would be a lie about what
+    // the pane is, and the offset bookkeeping the gap-fill depends on does not
+    // apply.
+    if (!did_relaunch and !did_notify and !self.awaiting_relaunch and self.attach_offset > 0) {
         if (self.restore_snapshot) |snap| {
             if (snap.len > 0) @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
         }

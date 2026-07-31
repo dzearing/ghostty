@@ -1210,9 +1210,11 @@ const restore_probe_timeout_ns: u64 = 2000 * std.time.ns_per_ms;
 /// gap-filled scrollback) OR a relaunchable TOMBSTONE (T89g): the agent
 /// restarted (reboot / agent upgrade) and materialized the session from disk as
 /// dead-but-relaunchable. ATTACHing a tombstone lets the shared termio path
-/// (`termio/Remote.zig`) fire RELAUNCH per `session-relaunch` (auto respawns
-/// in-place with a `--- session restarted ---` divider + ring-snapshot
-/// scrollback; prompt leaves a press-any-key pane). A leaf whose session is
+/// (`termio/Remote.zig`) apply `session-relaunch` (T230): `notify`, the default,
+/// opens a fresh shell in the recorded cwd with a notice naming the command and
+/// runs NOTHING; `auto` respawns in-place with a `--- session restarted ---`
+/// divider + ring-snapshot scrollback; `prompt` leaves a press-any-key pane).
+/// A leaf whose session is
 /// genuinely gone / has no id re-opens a FRESH agent-backed pane (the tree shape
 /// and the window are preserved), which is friendlier than a permanently-exited
 /// pane and keeps every restored pane persistable.
@@ -1233,9 +1235,10 @@ pub fn restoreSessionLayout(self: *App) bool {
     // Resolve (find-or-spawn) the local agent. Without a connection we cannot
     // ATTACH anything, so fall back to a blank window. A cold reboot spawns the
     // agent fresh; it re-materializes the sessions from disk as relaunchable
-    // tombstones, so the probe below finds them attachable and each leaf
-    // RELAUNCHes per `session-relaunch` (T89g). Only sessions the agent truly no
-    // longer knows re-open fresh.
+    // tombstones, so the probe below finds them attachable and each leaf applies
+    // `session-relaunch` (T89g/T230 — by default a fresh shell plus a notice,
+    // never a re-run). Only sessions the agent truly no longer knows re-open
+    // fresh.
     const conn = self.local_agent.sharedConnection() orelse {
         log.info("session-restore: no local agent; opening a blank window", .{});
         return false;
@@ -1605,9 +1608,15 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
 /// On confirm the local windows are rebuilt in place on the fresh agent: the
 /// terminated agent's children are gone, but its `sessions.json` survives, so
 /// the respawned agent materializes them as relaunchable tombstones and the
-/// re-ATTACH turns each into a RELAUNCH with the `--- session restarted ---`
-/// divider (T89g). That is the honest outcome the dialog promises — the panes
-/// come back, their processes do not.
+/// re-ATTACH finds each one dead.
+///
+/// What happens next is `session-relaunch` (T230), and the DEFAULT is `notify`:
+/// each pane comes back on a FRESH shell in its recorded working directory,
+/// above a notice naming the command that had been running. It is deliberately
+/// NOT re-run — "We should not ever re-execute the commands which were
+/// previously ran". (`auto` restores the old RELAUNCH-with-divider behavior for
+/// anyone who opts in.) That is the honest outcome the dialog promises: the
+/// panes come back, their processes do not, and nothing starts itself.
 fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bundled: []const u8) void {
     const alloc = self.core_app.alloc;
 
