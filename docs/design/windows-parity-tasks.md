@@ -98,6 +98,24 @@ recommended approaches where they exist.
 
 Work these first, in order, before falling back to first-todo-in-table:
 
+000. **AHEAD OF EVERYTHING as of 2026-07-31 (user bug report, same day).**
+    The agent-upgrade path is broken in two ways the user hit for real, and it
+    fires on every upgrade with live sessions:
+
+    **T229 → T230.**
+
+    - **T229** — confirming the mandatory upgrade dialog **kills the app**:
+      the windows never come back and the log stops mid-path (`in-place
+      recovery` has never once printed in the whole on-box log, across two
+      confirms). The user consents to losing their sessions and loses the app
+      too, silently. This outranks the test-infra chain: it is the one place
+      where a destructive confirmation ends in an empty desktop.
+    - **T230** — after an agent reset we RELAUNCH each pane's recorded
+      command (`session-relaunch = auto`). The user has explicitly rejected
+      this: *"We should not ever re-execute the commands which were previously
+      ran."* Replace the default with a fresh shell prompt plus a notice that
+      names the previous command for copy/paste.
+
 00. **TOP OF THE LIST as of 2026-07-31 (user directive).** Verbatim: *"Let's
     get the test infrastructure complete, but prioritize the new window parity
     and activity viewer immediately next."* So the 2026-07-30 chain below runs
