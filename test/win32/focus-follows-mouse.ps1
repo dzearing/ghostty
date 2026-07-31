@@ -6,190 +6,60 @@
 #
 # Two GUI launches:
 #   run 1 (--focus-follows-mouse=true): split down -> A (top), B (bottom,
-#     focused). Glide the REAL cursor (SetCursorPos steps) from B into A:
-#     focus must move to A with no click; glide back: focus returns to B.
+#     focused). Glide the pointer from B into A: focus must move to A with no
+#     click; glide back: focus returns to B.
 #   run 2 (default off): same layout, same glide -> focus must NOT move;
-#     then a real click on A must still focus it (positive control that the
-#     cursor genuinely traveled to A, so the no-op wasn't a dead mouse).
+#     then a click on A must still focus it (positive control that the glide
+#     genuinely reached pane A, so the no-op wasn't a dead mouse).
 # Focused HWND is read with GetGUIThreadInfo; the T48 deferred-SetFocus
 # path lands focus asynchronously, so assertions poll.
 #
-# A keyboard positive control (ctrl+k clear_screen, T55 pattern) runs first
-# in run 1 so an injection failure aborts instead of reading as a T75
-# regression. Only touches ghoztty processes running from this repo's
-# zig-out*.
-param([string]$ExePath)
+# T218 (batch 3): runs on a BACKGROUND Win32 desktop
+# (test/win32/lib/TestDesktop.ps1), so it never takes the user's foreground -
+# asserted at the end, not assumed. The private FfmDrv driver is gone.
+#
+# WHY THE GLIDE STILL MEANS SOMETHING WHEN NOTHING PHYSICAL MOVES. T218 named
+# this script as one to check first, because `SetCursorPos`/`GetCursorPos` are
+# not a usable channel off the input desktop and the product gates on "real
+# pointer motion". Read the gate (Surface.focusFollowsMouse) and it is
+# satisfied honestly by posted input: the motion test is
+#
+#     ClientToScreen(hwnd, lparam point) != app.ffm_last_screen_pos
+#
+# i.e. it compares the coordinates carried by the MESSAGE, not anything read
+# back from the cursor. So a posted WM_MOUSEMOVE with moving coordinates is the
+# same evidence a hardware move is - and `Send-TestMouse` sets the desktop's
+# cursor position alongside each post anyway, so the two stay coherent.
+#
+# What posting does NOT reproduce is hit-testing: a posted message goes to the
+# hwnd it names. Glide-TestPointer therefore names the pane that CONTAINS each
+# step point, which is what the OS would have picked. Naming the wrong one
+# would be the test lying to itself - the app would then focus whatever it was
+# told, and the assertion would pass on a broken product.
+#
+# -NegativeControl inverts run 1's hover assertion and MUST fail.
+#
+# Only touches ghoztty processes running from this repo's zig-out*.
+#   powershell -NoProfile -File test\win32\focus-follows-mouse.ps1
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
-if ($ExePath) {
-    $exe = $ExePath
-    $env:GHOZTTY_PIPE_SUFFIX = '-ffmtest'
-}
+if ($ExePath) { $exe = $ExePath }
+
+# Isolate the IPC endpoint unconditionally - inherited by the app through
+# CreateProcessW and by every `& $exe +...` below.
+$env:GHOZTTY_PIPE_SUFFIX = '-ffmtest'
 $errlog = Join-Path $env:TEMP 'ghoztty-ffm-stderr.log'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
-}
-
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class FfmDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct GUITHREADINFO {
-        public uint cbSize; public uint flags;
-        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
-        public RECT rcCaret;
-    }
-    [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MINPUT { public uint type; public MOUSEINPUT mi; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll", EntryPoint = "SendInput")] public static extern uint SendMouseInput(uint n, MINPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static string[] Panes(IntPtr top) {
-        var lines = new List<string>();
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal") {
-                RECT r; GetWindowRect(h, out r);
-                lines.Add(h.ToInt64() + ":" + (IsWindowVisible(h) ? 1 : 0) + ":" + r.left + "," + r.top + "," + r.right + "," + r.bottom);
-            }
-            return true;
-        }, IntPtr.Zero);
-        return lines.ToArray();
-    }
-
-    public static long FocusedHwnd(IntPtr top) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        var info = new GUITHREADINFO();
-        info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
-        if (!GetGUIThreadInfo(tid, ref info)) return 0;
-        return info.hwndFocus.ToInt64();
-    }
-
-    // Glide the REAL cursor from (x0,y0) to (x1,y1) in `steps` moves so the
-    // window under it receives genuine WM_MOUSEMOVE traffic (SetCursorPos
-    // synthesizes mouse-move input at each new position).
-    public static void Glide(int x0, int y0, int x1, int y1, int steps) {
-        for (int i = 1; i <= steps; i++) {
-            SetCursorPos(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
-            Thread.Sleep(30);
-        }
-    }
-
-    // Left-click at the current cursor position.
-    public static void Click() {
-        var i = new MINPUT[2];
-        i[0].type = 0; i[0].mi.dwFlags = 0x0002; // MOUSEEVENTF_LEFTDOWN
-        i[1].type = 0; i[1].mi.dwFlags = 0x0004; // MOUSEEVENTF_LEFTUP
-        SendMouseInput(2, i, Marshal.SizeOf(typeof(MINPUT)));
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    public static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-}
-'@
-
-function Parse-Panes([string[]]$lines) {
-    $lines | ForEach-Object {
-        $hw, $vis, $r = $_ -split ':'
-        $c = $r -split ','
-        [pscustomobject]@{
-            Hwnd = [int64]$hw; Visible = ($vis -eq '1')
-            Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
-        }
-    }
 }
 
 function Kill-RepoInstances {
@@ -199,38 +69,62 @@ function Kill-RepoInstances {
     Start-Sleep -Milliseconds 500
 }
 
-# Poll until the window's focused HWND equals $expected (T48 defers focus).
-function Wait-Focus([IntPtr]$top, [int64]$expected) {
-    for ($t = 0; $t -lt 20; $t++) {
-        if ([FfmDrv]::FocusedHwnd($top) -eq $expected) { return $true }
-        Start-Sleep -Milliseconds 100
-    }
-    return $false
-}
-
 function Center($pane) {
     @{ X = [int](($pane.Left + $pane.Right) / 2); Y = [int](($pane.Top + $pane.Bottom) / 2) }
+}
+
+function Get-Panes([IntPtr]$top) {
+    @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
+}
+
+# The pane whose rect contains a screen point, or IntPtr::Zero.
+function Resolve-PaneAt($panes, [int]$x, [int]$y) {
+    foreach ($p in $panes) {
+        if ($x -ge $p.Left -and $x -lt $p.Right -and $y -ge $p.Top -and $y -lt $p.Bottom) {
+            return [IntPtr]$p.Hwnd
+        }
+    }
+    return [IntPtr]::Zero
+}
+
+# Move the pointer from (x0,y0) to (x1,y1) in $Steps posted WM_MOUSEMOVEs,
+# each addressed to the pane that really sits under that step - see the header.
+# A step that lands outside every pane (the divider gap) is skipped rather than
+# posted to a neighbour: the OS would not have delivered it to one either.
+function Glide-TestPointer([IntPtr]$top, $panes, [int]$x0, [int]$y0, [int]$x1, [int]$y1, [int]$Steps = 8) {
+    for ($i = 1; $i -le $Steps; $i++) {
+        $x = [int]($x0 + ($x1 - $x0) * $i / $Steps)
+        $y = [int]($y0 + ($y1 - $y0) * $i / $Steps)
+        $target = Resolve-PaneAt $panes $x $y
+        if ($target -eq [IntPtr]::Zero) { continue }
+        [void](Send-TestMouse -Window $top -Target $target -X $x -Y $y -Action move)
+    }
 }
 
 function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectFollow, [bool]$control) {
     Kill-RepoInstances
     if ($control) { Remove-Item $errlog -ErrorAction SilentlyContinue }
 
-    $sp = @{ FilePath = $exe; PassThru = $true }
-    if ($extraArgs.Count) { $sp.ArgumentList = $extraArgs }
-    if (-not $ExePath -and $control) { $sp.RedirectStandardError = $errlog }
-    $proc = Start-Process @sp
+    # --session-persistence=false: each launch would otherwise write a layout
+    # manifest that the next one restores (T131).
+    $launchArgs = @('--session-persistence=false') + $extraArgs
+    $sp = @{ Exe = $exe; Arguments = $launchArgs }
+    if ($control) { $sp.StdErr = $errlog }
+    $app = Start-OnTestDesktop @sp
     Start-Sleep -Seconds 3
-    if ($proc.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
-    $top = [FfmDrv]::FindTop([uint32]$proc.Id)
+    if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): top window not found"; exit 1 }
+
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
+        "$label window is NOT enumerable on the interactive desktop"
 
     & $exe +split --direction=down | Out-Null
     Start-Sleep -Milliseconds 800
 
-    $panes = @(Parse-Panes ([FfmDrv]::Panes($top)))
-    Assert ($panes.Count -eq 2 -and @($panes | Where-Object Visible).Count -eq 2) "$label setup: 2 visible panes"
-    if ($panes.Count -ne 2) { Stop-Process -Id $proc.Id -Force; exit 1 }
+    $panes = Get-Panes $top
+    Assert ($panes.Count -eq 2) "$label setup: 2 visible panes"
+    if ($panes.Count -ne 2) { Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; exit 1 }
     $A = $panes | Sort-Object Top | Select-Object -First 1     # top pane
     $B = $panes | Sort-Object Top | Select-Object -Last 1      # bottom pane (focused after split)
     $ca = Center $A
@@ -238,13 +132,12 @@ function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectFollow, [bo
 
     if ($control) {
         # Positive control: ctrl+k reaches binding dispatch (debug log only).
-        $r = [FfmDrv]::Chord($top, [IntPtr]$B.Hwnd, [uint16[]]@(0x11), 0x4B)
-        if ($r -ne 'SENT') { Write-Host "ABORT: control chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
-        Start-Sleep -Milliseconds 300
+        [void](Send-TestKeys -Window $top -Target ([IntPtr]$B.Hwnd) -Modifiers ctrl -Key K)
+        Start-Sleep -Milliseconds 400
         if (Test-Path $errlog) {
             if (-not (Select-String -Path $errlog -Pattern 'clear_screen' -Quiet)) {
                 Write-Host 'ABORT: positive control failed (clear_screen never dispatched) - injection broken, not a T75 verdict'
-                Stop-Process -Id $proc.Id -Force; exit 1
+                Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; exit 1
             }
             Write-Host 'OK    positive control: injection reaches bindings (clear_screen dispatched)'
         } else {
@@ -252,42 +145,72 @@ function Run-Case([string]$label, [string[]]$extraArgs, [bool]$expectFollow, [bo
         }
     }
 
-    # Make the window foreground/active and confirm B has focus (the split
-    # focused it). Park the real cursor at B's center so the glide starts
-    # from a known in-window position.
-    [FfmDrv]::GrabForeground($top) | Out-Null
-    if ([FfmDrv]::GetForegroundWindow() -ne $top) {
-        Write-Host "ABORT ($label): could not foreground the ghoztty window"
-        Stop-Process -Id $proc.Id -Force; exit 1
+    # Share the app's input queue and put keyboard focus on B (which the split
+    # already focused). focusFollowsMouse also requires the parent to be the
+    # thread's ACTIVE window, which is the other half of what this does.
+    if (-not (Focus-TestWindow -Window $top -Child ([IntPtr]$B.Hwnd))) {
+        Write-Host "SETUP FAIL ($label): could not focus the GUI"
+        Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; exit 1
     }
-    [FfmDrv]::SetCursorPos($cb.X, $cb.Y) | Out-Null
-    Start-Sleep -Milliseconds 200
-    Assert (Wait-Focus $top $B.Hwnd) "$label setup: focus starts on pane B"
+    Assert (Wait-TestFocus -Window $top -Expected $B.Hwnd) "$label setup: focus starts on pane B"
 
-    # Glide the real cursor from B's center into A's center. No clicks.
-    [FfmDrv]::Glide($cb.X, $cb.Y, $ca.X, $ca.Y, 8)
+    # Park on B first. The gate records the first move it sees without acting
+    # (no motion proven yet), so the glide that follows starts from a known
+    # position instead of spending its first step on the record-only case.
+    [void](Send-TestMouse -Window $top -Target ([IntPtr]$B.Hwnd) -X $cb.X -Y $cb.Y -Action move)
+
+    # Glide from B's center into A's center. No clicks.
+    Glide-TestPointer $top $panes $cb.X $cb.Y $ca.X $ca.Y
     Start-Sleep -Milliseconds 300
 
     if ($expectFollow) {
-        Assert (Wait-Focus $top $A.Hwnd) "$label hover moved focus to pane A (no click)"
+        Assert (Wait-TestFocus -Window $top -Expected $A.Hwnd) "$label hover moved focus to pane A (no click)"
         # And back again.
-        [FfmDrv]::Glide($ca.X, $ca.Y, $cb.X, $cb.Y, 8)
-        Assert (Wait-Focus $top $B.Hwnd) "$label hover moved focus back to pane B"
+        Glide-TestPointer $top $panes $ca.X $ca.Y $cb.X $cb.Y
+        Assert (Wait-TestFocus -Window $top -Expected $B.Hwnd) "$label hover moved focus back to pane B"
     } else {
         Start-Sleep -Milliseconds 700
-        Assert ([FfmDrv]::FocusedHwnd($top) -eq $B.Hwnd) "$label hover did NOT move focus (config off)"
-        # Positive control: a real click at the same spot must focus A,
-        # proving the cursor genuinely reached pane A.
-        [FfmDrv]::Click()
-        Assert (Wait-Focus $top $A.Hwnd) "$label click control: click on A focuses A"
+        Assert ((Get-TestFocusedWindow -Window $top) -eq $B.Hwnd) "$label hover did NOT move focus (config off)"
+        # Positive control: a click at the same spot must focus A, proving the
+        # glide genuinely reached pane A.
+        [void](Send-TestMouse -Window $top -Target ([IntPtr]$A.Hwnd) -X $ca.X -Y $ca.Y -Action click)
+        Assert (Wait-TestFocus -Window $top -Expected $A.Hwnd) "$label click control: click on A focuses A"
     }
 
-    Assert (-not $proc.HasExited) "$label no crash"
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Assert (-not ($app.Process -and $app.Process.HasExited)) "$label no crash"
+    Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
 }
 
-Run-Case 'on ' @('--focus-follows-mouse=true') $true $true
-Run-Case 'off' @() $false $false
+Kill-RepoInstances
+
+# Watch the user's desktop for the whole run: nothing we launch may ever take
+# foreground there. That is the complaint the test desktop exists to fix.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$launched = @()
+
+try {
+    # -NegativeControl flips run 1 to assert the hover does NOT follow, so a
+    # passing run would mean the focus oracle reads the same answer either way.
+    $follow = -not $NegativeControl
+    if ($NegativeControl) { Write-Host 'NEGATIVE CONTROL: run 1 asserts hover does NOT move focus - this run MUST fail' }
+    Run-Case 'on ' @('--focus-follows-mouse=true') $follow $true
+    $launched += $script:GhozttyTestDesktopPids
+    Run-Case 'off' @() $false $false
+    $launched += $script:GhozttyTestDesktopPids
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @($launched | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }

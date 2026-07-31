@@ -140,6 +140,7 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern IntPtr GetFocus();
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] static extern bool GetKeyboardState(byte[] s);
     [DllImport("user32.dll")] static extern bool SetKeyboardState(byte[] s);
@@ -616,6 +617,13 @@ public class GhozttyTestDesktop {
         return (long)Run(delegate() { return (long)GetWindowLongW(h, index); });
     }
 
+    // Per-monitor DPI of a window. Any geometry a script hard-codes in DIP
+    // (grab bands, divider widths) has to be scaled by this before it can be
+    // compared against a pixel measurement.
+    public uint Dpi(IntPtr h) {
+        return (uint)Run(delegate() { return GetDpiForWindow(h); });
+    }
+
     public string WindowText(IntPtr h) {
         return (string)Run(delegate() {
             var sb = new StringBuilder(512);
@@ -958,11 +966,22 @@ public class GhozttyTestDesktop {
     //   * The app reads shift/ctrl for a click from the message's own MK_*
     //     wparam (Surface.handleMouseButton), not from GetKeyState, so a
     //     posted click carries its modifiers correctly.
-    //   * `SetCursorPos` DOES work on a background desktop - the cursor
-    //     position is a property of the desktop, and the worker thread is
-    //     bound to ours. So code that reads GetCursorPos (menu placement,
-    //     hover, TrackPopupMenuEx's own modal loop) sees a coherent position
-    //     even though no physical pointer moved.
+    //   * The coordinates travel IN the message. A posted WM_MOUSEMOVE is the
+    //     same evidence a hardware move is to any handler that reads its own
+    //     lparam - which is how the focus-follows-mouse motion gate works
+    //     (Surface.focusFollowsMouse compares ClientToScreen(lparam) against
+    //     the last one), so hover behavior migrates honestly.
+    //
+    // What is NOT available is the CURSOR ITSELF. Measured T218 batch 3
+    // (2026-07-31), correcting an earlier claim here: SetCursorPos returns
+    // FALSE off the input desktop and GetCursorPos returns -1,-1. The
+    // SetCursorPos call below is therefore best-effort and its result is
+    // ignored; nothing may depend on it. Product code that decides from
+    // GetCursorPos does not fire here at all - Window.zig's WM_SETCURSOR
+    // (the split-divider resize cursor) measured as returning 0 at every
+    // point on the grab band, because WM_SETCURSOR carries no coordinates and
+    // its handler has nothing to read. Assert the decision underneath such a
+    // handler (WM_NCHITTEST for the divider band), never the cursor.
     //
     // What is NOT reproduced: hit-testing. A posted message goes to the hwnd
     // you name, whatever is on top of it. That is a feature for tests (no
@@ -1816,8 +1835,16 @@ function Test-TestWindowResponsive {
     return (Resolve-TestDesktop $Desktop).Responsive($Window, [uint32]$TimeoutMs)
 }
 
-# Move the TEST desktop's cursor without posting anything. Useful when the
-# product reads GetCursorPos on its own schedule (menu placement, hover).
+# THE CURSOR IS NOT A CHANNEL HERE - MEASURED, T218 batch 3 (2026-07-31).
+# SetCursorPos returns FALSE on a background desktop (it requires the calling
+# thread's desktop to be the INPUT desktop) and GetCursorPos returns -1,-1.
+# Both wrappers are kept because they are the honest way to find that out, and
+# because -Interactive runs still have a real cursor - but do not build an
+# oracle on them. Anything the product decides from GetCursorPos (the
+# split-divider resize cursor is the worked example: WM_SETCURSOR carries no
+# coordinates, so its handler must read the cursor) simply does not fire off
+# the input desktop, and no amount of test-side setup makes it. Assert the
+# underlying decision instead - WM_NCHITTEST answers the divider band directly.
 function Set-TestCursorPos {
     param([Parameter(Mandatory = $true)][int]$X, [Parameter(Mandatory = $true)][int]$Y, $Desktop)
     return (Resolve-TestDesktop $Desktop).MoveCursor($X, $Y)
@@ -1827,6 +1854,13 @@ function Get-TestCursorPos {
     param($Desktop)
     $p = (Resolve-TestDesktop $Desktop).CursorPos()
     return [pscustomobject]@{ X = $p[0]; Y = $p[1] }
+}
+
+# Per-monitor DPI of a window - the scale for any DIP constant a script
+# hard-codes (grab-band widths, divider thickness).
+function Get-TestWindowDpi {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).Dpi($Window)
 }
 
 <#

@@ -3543,3 +3543,52 @@ weakening the assertion - twice out of three here the script was wrong and the
 product was right.
 
 Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.
+
+## 2026-07-31 - T218 batch 3: the pointer pair, and two oracles a background desktop cannot hold
+
+`focus-follows-mouse` (14 assertions, up from 11) and `split-divider` (29, up
+from ~25) onto the test desktop, ALL PASS x3 each, both negative controls FAIL.
+7 of 13 done; 6 remain (chooser-menu, context-menu, hero-mode, host-settings,
+menu-bar, window-color).
+
+These were the two T218 flagged to check first, because "SetCursorPos /
+GetCursorPos are dead off the input desktop". Measured, and it corrects a claim
+the harness header made: `SetCursorPos` returns FALSE on a background desktop
+and `GetCursorPos` returns -1,-1. The header said the opposite. Corrected in
+place.
+
+The pair then split on exactly that question. `focus-follows-mouse` never
+needed the cursor at all - `Surface.focusFollowsMouse` compares
+`ClientToScreen(lparam)` against the last screen position, so the coordinates
+travel IN the message and a posted move is the same evidence a hardware move
+is. What posting does not reproduce is hit-testing, so each glide step is
+addressed to the pane that CONTAINS it; naming the wrong pane would make the
+app focus whatever it was told and the assertion would pass on a broken
+product. `split-divider`'s four SIZENS assertions did need it and are gone
+(T228): `WM_SETCURSOR` carries no coordinates, so the handler must read
+`GetCursorPos`, and with nothing to read it falls through to DefWindowProc -
+measured returning 0 at every point on the band. Four `WM_NCHITTEST` probes on
+the pane replace them, reading the HTTRANSPARENT fall-through at the source.
+
+The more interesting loss (also T228) is T155's cross-pane stale-line scan. It
+counted divider-colored runs across both panes on the premise that a stale line
+under a pane has been overpainted by that pane - a COMPOSITED-SCREEN fact, and
+there is no composite here. A PrintWindow capture keeps every intermediate line
+a drag ever painted: 3 drags, 13 runs, against a healthy product, and neither a
+window move nor three resizes clears them. The scan now covers the
+parent-visible strip between the pane rects and asserts the gap IS the band
+plus the whole gap is one solid fill.
+
+The rule that generalises: an oracle whose validity rests on one window
+covering another is asserting something the capture path does not reproduce.
+The screen-pixel controls go the same way - "is my probe occluded?" is
+meaningless against a window capture, and becomes "did the capture hold real
+content".
+
+Also learned: `WM_NCHITTEST` is an underused oracle - the product's own
+decision function, answerable cross-process, needing neither pixels nor a
+cursor. And a posted down/moves/up drag on the TOP-LEVEL window is a faithful
+divider drag, because `updateDividerDrag` reads the WM_MOUSEMOVE lparam and
+consults neither MK_LBUTTON nor the cursor.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.
