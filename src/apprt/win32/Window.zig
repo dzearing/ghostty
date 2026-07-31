@@ -2810,7 +2810,30 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     // business importing the tab strip to get them.
     const ib = icon_button.Metrics.init(self.scale);
     var tabs: [MAX_TABS]tab_strip.Rect = undefined;
-    const strip = tab_strip.layout(m, client_w, self.tab_count, &tabs);
+
+    // T235: each tab asks for the width its own title needs, and the layout
+    // decides whether the strip can afford it. The measurement has to happen
+    // HERE and not in the layout module — that module owns no HDC and no font,
+    // which is exactly why it is unit-testable at four DPI scales with no
+    // window. Its input grows by one array; it still measures no text.
+    //
+    // `mem_dc` already has `tab_font` selected (above), so this is the same
+    // font `DrawTextW` renders the titles in a few lines further down. Measure
+    // with a different font and every tab is sized for a string it will not
+    // draw.
+    var prefer: [MAX_TABS]i32 = undefined;
+    for (0..self.tab_count) |i| {
+        const title_len = self.tab_title_lens[i];
+        var text_w: i32 = 0;
+        if (title_len > 0) {
+            var size: w32.SIZE = undefined;
+            if (w32.GetTextExtentPoint32W(mem_dc, @ptrCast(&self.tab_titles[i]), @intCast(title_len), &size) != 0) {
+                text_w = size.cx;
+            }
+        }
+        prefer[i] = m.preferredWidth(text_w);
+    }
+    const strip = tab_strip.layout(m, client_w, prefer[0..self.tab_count], &tabs);
 
     // Publish hit-test rects. Tabs past `strip.visible` did not fit and get a
     // ZERO rect on purpose — invisible and unhittable — instead of being laid

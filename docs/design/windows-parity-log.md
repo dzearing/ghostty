@@ -3935,3 +3935,44 @@ is a trap for every acceptance script that reuses a target name.
 Unit side: sweep tests over the full lightness range rather than handpicked
 themes. Both test lanes + test-agent + P1-P3 green; `window-color.ps1` (T67)
 still ALL PASS (14).
+
+## 2026-07-31 — T235: tabs size to content, capped by proportion
+
+The user, with a screenshot: *"in the tab control, you have tons of horiz
+realestate, and yet you are truncating the tab text here."* The cause was
+`max_tab_w = 200 DIP` from T202, doing exactly what it was written to do.
+Replaced by the design system's §6b rule: a tab's preferred width is its
+measured title plus padding, floored at `min_tab_w` and capped at **50% of the
+tab run** — a proportion of the container, not a DIP constant — falling back to
+T202's equal share only when the preferred widths do not all fit. The
+anti-stretch rule (a tab is never handed the remainder) is untouched.
+
+`tab_strip_layout.zig` stays text-free: `layout` takes a `[]const i32` of
+preferred widths and `tab_count` is gone (the array's length is the count, so
+the two cannot disagree). `paintTabBar` measures with `GetTextExtentPoint32W`
+against the DC that already has the tab font selected. `Metrics.preferredWidth`
+is written as the exact inverse of `titleRect` and a unit test pins that at
+five scales — a pixel of drift there means a tab sized to its own preference
+ellipsizes anyway.
+
+Measured on the box at 125%: the long-titled tab 690 px vs the retired cap's
+245, and the default-titled tab beside it 344 — i.e. **the ordinary default
+title was already ~275 DIP, so the 200 DIP cap was truncating essentially every
+tab the user had.** The screenshot was the general case, not an edge case.
+
+Two lessons. The acceptance script could not see this bug at all until it had
+**two different titles in one window** — every tab in it carried the same
+shell-set title, under which a fixed cap and a content-derived width are
+indistinguishable; section 7 now launches `-e cmd.exe /K title <long>` and
+opens a second default-titled tab beside it. And the original T202 reasoning
+was wrong in an instructive way: the Windows Terminal measurement was right,
+but "equal-share-capped needs no text measurement in the layout module" was
+*convenience* presented as a design rule. The module is still text-free; the
+caller measures and passes the widths in.
+
+Evidence: both test lanes + `test-agent` + the GUI Debug link green;
+`tab-strip.ps1` ALL PASS (35) x3; source-level negative control
+(`T202_NEUTERED = true`) 9 FAILED / 26 passed, failing exactly the width rules
+and no others; P1–P3 ALL PASS. Follow-up T249 filed: a tab's width is now a
+function of a string the shell rewrites constantly — observe whether the strip
+visibly jumps before adding machinery to stop it.

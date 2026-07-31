@@ -48,6 +48,15 @@ use it (measured: two tabs with visibly different title lengths came out the
 same width). Equal-share-capped is therefore what we implement, and it has the
 side benefit of needing no text measurement in the layout module.
 
+> **T235 overturned that last paragraph, and it is worth saying why.** The
+> measurement was right; the inference was not. Terminal's behavior is not a
+> target in itself — *not truncating a title while most of the strip sits empty*
+> is. "It needs no text measurement" was the reasoning's real driver, and
+> convenience is not a design rule. Ghoztty now sizes to content, capped at 50%
+> of the run, and keeps the layout module text-free by having the **caller**
+> measure and pass preferred widths in. Finding 1 above (tabs do not stretch)
+> is untouched and permanent; finding 2 is untouched.
+
 ## What Ghoztty draws
 
 Same idiom, with two deliberate deviations, both recorded here so a later
@@ -64,9 +73,15 @@ reader does not "fix" them back:
   `tab_top_pad + pad_sm + icon_button.target + pad_sm` = 4 + 4 + 28 + 4.
   `tabBarHeight()` is also the scale oracle for three acceptance scripts, which
   compute `scale = barH / 40`.
-- **Maximum tab width is 200 DIP** (not WT's measured 240), the documented
+- **~~Maximum tab width is 200 DIP~~** (not WT's measured 240), the documented
   WinUI `TabViewItemMaxWidth` default. Our tabs carry no icon, so 200 DIP holds
-  as much title as WT's 240 does.
+  as much title as WT's 240 does. **Retired by T235**: matching a platform
+  control's *algorithm* was never the goal, and a fixed DIP maximum truncated
+  titles with a thousand pixels of empty strip beside them. A tab is now its
+  own content's width, capped at **50% of the tab run** — a proportion of the
+  container. What survives from this measurement is the anti-stretch rule (a
+  tab is never handed the remainder), which was always the important half. See
+  `docs/design/win32-design-system.md` §6b.
 
 ### Metrics (DIP; all scaled by the window's DPI factor)
 
@@ -75,8 +90,8 @@ reader does not "fix" them back:
 | `bar_h` | 40 | strip height — *derived*: `tab_top_pad + pad_sm + 28 + pad_sm` |
 | `tab_top_pad` | 4 | strip background above the chiclet, so the corner reads |
 | `pad_sm` | 4 | the 4 DIP spacing step, once — every default gap reads it |
-| `min_tab_w` | 60 | tabs stop shrinking here, then overflow instead |
-| `max_tab_w` | 200 | tabs stop growing here — the anti-stretch rule |
+| `min_tab_w` | 60 | tabs stop shrinking here, then overflow instead — also the floor the proportional cap can never dip below |
+| ~~`max_tab_w`~~ | ~~200~~ | **gone (T235)**. The maximum is `capWidth(run) = max(run / 2, min_tab_w)`, computed per layout — not a metric |
 | `corner_r` | 6 | top corners only |
 | `strip_pad_l` | 4 | inset before the first tab |
 | `strip_pad_r` | 4 | inset after the menu button — the strip is inset the *same* at both ends. Kept a named metric because T205 turns it into the gap to the caption buttons |
@@ -90,8 +105,16 @@ reader does not "fix" them back:
 
 ### Rules
 
-1. `tab_w = clamp(tabs_avail / tab_count, min_tab_w, max_tab_w)`, applied to
-   **every** tab including the last. There is no remainder rule.
+1. **Size to content, cap by proportion** (T235, design system §6b). Each tab's
+   slot is `clamp(preferred_paint + tab_gap, min_tab_w, capWidth(tabs_avail))`,
+   where `preferred_paint` is the measured title plus padding — the caller
+   measures the text and passes an array in, so the layout module still owns no
+   font and no HDC. If the slots all fit, every tab gets its own; the leftover
+   strip stays **empty**, never stretched. Only when they do not all fit does
+   the strip fall back to `tab_w = clamp(tabs_avail / tab_count, min_tab_w,
+   capWidth(tabs_avail))` applied to **every** tab including the last, and only
+   then does `DT_END_ELLIPSIS` truncate. There is no remainder rule in either
+   branch.
 2. Tabs may occupy only up to `group_gap` short of where the "+" would sit at
    its rightmost allowed position, so a tab can never be painted under the
    button band. When even `min_tab_w` will not fit them all, the ones that do

@@ -3,11 +3,21 @@
 # The strip used to hand the LAST tab all the remaining width, so a single tab
 # spanned the whole window - which flung the close button to the far edge,
 # jammed the "+" against the tab, and stretched the selected-tab accent into a
-# full-width blue rule under the strip. That rule is gone: a tab is now its
-# equal share of the strip clamped to [60, 200] DIP, the selected tab is a
-# rounded-top chiclet filled with the CONTENT background (WinUI TabView's
-# selection cue - no underline), the "+" travels with the last tab and the "="
-# menu button stays pinned right, with a real gap between the groups.
+# full-width blue rule under the strip. That rule is gone: a tab NEVER takes
+# the remainder. The selected tab is a rounded-top chiclet filled with the
+# CONTENT background (WinUI TabView's selection cue - no underline), the "+"
+# travels with the last tab and the "=" menu button stays pinned right, with a
+# real gap between the groups.
+#
+# T235 replaced the other half of that rule. A tab used to be its equal share
+# of the strip clamped to [60, 200] DIP, and the 200 truncated titles while
+# most of the strip sat empty (". Fix background p..." on a wide window). A tab
+# is now its OWN CONTENT's width, floored at 60 DIP and capped at 50% OF THE
+# TAB RUN - a proportion of the container, not a DIP constant - and falls back
+# to the equal share only when the preferred widths do not all fit. So this
+# script derives its expectations from the MEASURED tab and the measured run;
+# the only place 200 DIP still appears is section 7, as the retired constant a
+# long title must now be allowed to exceed.
 # Measured target: docs/design/win32-tab-strip.md. Geometry: tab_strip_layout.zig.
 #
 # One hermetic GUI launch (--config-default-files=false, black background,
@@ -50,9 +60,11 @@
 # (asserts the tab DOES span the client width) and MUST fail. The deeper
 # source-level control still stands for the geometry claims: flip T202_NEUTERED
 # in src/apprt/win32/tab_strip_layout.zig to `true`, rebuild
-# `-Dapp-runtime=win32`, re-run - the single-tab-width, width-clamp and
-# last-tab->"+" gap assertions must fail; the accent-rule and click/hit-test
-# assertions must not.
+# `-Dapp-runtime=win32`, re-run - the single-tab-width, the 50%-of-the-run cap
+# and the last-tab->"+" gap assertions must fail; the accent-rule and
+# click/hit-test assertions must not. (T235 changed WHAT bounds a tab's width,
+# not the neuter: the neuter restores "last tab takes the remainder", which is
+# still the rule the cap assertions catch.)
 #
 # Only touches ghoztty processes running from this repo's zig-out.
 param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
@@ -128,7 +140,9 @@ try {
     # the shared icon-button square plus its clearances; see
     # docs/design/win32-design-system.md and docs/design/win32-tab-strip.md).
     $scale   = $barH / 40.0
-    $maxTabW = [int][math]::Round(200 * $scale)
+    # The RETIRED fixed cap (T202's max_tab_w). Kept only so section 7 can
+    # assert a long title is no longer pinned to it.
+    $maxTabWOld = [int][math]::Round(200 * $scale)
     # The PAINTED square, which is what every gap is measured against (T232).
     # The hit box is this plus btnPad a side, and is deliberately invisible.
     $btnPaint = [int][math]::Round(28 * $scale)
@@ -137,14 +151,19 @@ try {
     $gap     = [int][math]::Round(8 * $scale)
     $padL    = [int][math]::Round(4 * $scale)
     $padR    = $padL   # the strip is inset the SAME at both ends
-    # A tab's SLOT is max_tab_w when clamped; the drawn chiclet gives up
-    # `tab_gap` of it (tab_strip_layout.zig: drawn_w = this_w - tab_gap), so the
-    # pixels measure max_tab_w - tab_gap. Comparing the measured chiclet against
-    # max_tab_w itself - which is what this script did before T218 - is off by
-    # exactly one gap and fails against a correct strip.
+    $minTabW = [int][math]::Round(60 * $scale)
+    # A tab's SLOT includes the inter-tab gap; the drawn chiclet gives it up
+    # (tab_strip_layout.zig: drawn_w = this_w - tab_gap), so a chiclet always
+    # measures one gap narrower than the slot it sits in. Comparing a measured
+    # chiclet against a slot width - which is what this script did before T218 -
+    # is off by exactly one gap and fails against a correct strip.
     $tabGap  = [int][math]::Round(4 * $scale)
-    $chiclet = $maxTabW - $tabGap
-    Write-Host "INFO  scale=$scale clientW=$clientW maxTabW=$maxTabW chiclet=$chiclet btnW=$btnW gap=$gap pad=$padL"
+    # The tab RUN: the client width less both insets and the "+"/"=" band. This
+    # is tab_strip_layout.runWidth, and the proportional cap is half of it, so
+    # the script and the layout module have to mean the same run.
+    $runW    = $clientW - $padR - $btnPaint - $gap - $btnPaint - $gap - $padL
+    $capW    = [math]::Max([int][math]::Floor($runW / 2), $minTabW)
+    Write-Host "INFO  scale=$scale clientW=$clientW runW=$runW cap=$capW (retired maxTabW=$maxTabWOld) btnW=$btnW gap=$gap pad=$padL"
 
     # --- Pixel helpers -----------------------------------------------------
     # A scanline 2px above the strip's bottom: below the title/close baseline,
@@ -239,9 +258,17 @@ try {
     } else {
         Assert ($tabW -gt 0 -and $tabW -lt ($clientW / 2)) "single tab: does NOT span the client width (w=$tabW of $clientW)"
     }
-    Assert ([math]::Abs($tabW - $chiclet) -le 3) "single tab: width is clamped to max_tab_w ($tabW vs $chiclet = $maxTabW - $tabGap)"
+    # T235: the width is the title's, so the script cannot predict it - but it
+    # is bounded on both sides, and those bounds are the rule.
+    Assert ($tabW -le ($capW - $tabGap + 3)) `
+        "single tab: never wider than 50% of the tab run ($tabW <= $capW - $tabGap)"
+    Assert ($tabW -ge ($minTabW - $tabGap - 3)) `
+        "single tab: never narrower than the floor ($tabW >= $minTabW - $tabGap)"
     Assert ([math]::Abs($tabLeft - $padL) -le 2) "single tab: starts at the strip's left inset ($tabLeft vs $padL)"
-    # Slot pitch, which is what a tab INDEX is measured in below.
+    # Slot pitch, which is what a tab INDEX is measured in below. Every tab in
+    # this window runs the same shell in the same directory, so they all carry
+    # the same title and the run is uniform - which is what lets a left edge be
+    # read back as an index at all.
     $slotW = $tabW + $tabGap
 
     # -----------------------------------------------------------------------
@@ -368,7 +395,10 @@ try {
     $idx = Selected-Index $ext[0] $slotW
     Write-Host "INFO  after + click #1: left=$($ext[0]) right=$($ext[1]) index=$idx"
     Assert ($idx -eq 1) "+ : clicking one gap past the last tab creates tab 2 (selected index=$idx)"
-    Assert (($ext[1] - $ext[0]) -le ($chiclet + 3)) 'two tabs: still clamped at max_tab_w'
+    # Two tabs of the same title still fit their preferred width, so neither
+    # shrank: content sizing, not an equal share of whatever is left.
+    Assert ([math]::Abs(($ext[1] - $ext[0]) - $tabW) -le 3) `
+        "two tabs: each is still its own content's width ($($ext[1] - $ext[0]) vs $tabW)"
 
     # The second "+" is one tab width further right. If it had stayed pinned
     # where it was, this click would land on tab 2 and create nothing.
@@ -385,14 +415,21 @@ try {
     # -----------------------------------------------------------------------
     # 5. Many tabs shrink instead of running off the end of the strip
     # -----------------------------------------------------------------------
-    $want = [int][math]::Ceiling($clientW / $maxTabW) + 4
+    # T235: "enough tabs" is derived from the MEASURED slot, not from a
+    # constant. A content-sized tab can be far narrower than the retired 200
+    # DIP cap, in which case ceil(clientW / 200) tabs would not fill the run at
+    # all and this section would assert nothing.
+    $want = [int][math]::Ceiling($runW / $slotW) + 4
     for ($i = 0; $i -lt $want; $i++) { New-Tab }
     Start-Sleep -Milliseconds 800
     Close-TestWindowPixels $shot; $shot = Get-Shot
     $ext = Selected-Extent $shot
     $manyW = $ext[1] - $ext[0]
-    Write-Host "INFO  many tabs: left=$($ext[0]) right=$($ext[1]) w=$manyW"
-    Assert ($manyW -gt 0 -and $manyW -lt $maxTabW) "many tabs: tab width shrank below max ($manyW < $maxTabW)"
+    Write-Host "INFO  many tabs: left=$($ext[0]) right=$($ext[1]) w=$manyW (preferred was $tabW)"
+    # Shrink only UNDER PRESSURE, and this is the pressure: the same title that
+    # got its preferred width above now gets less.
+    Assert ($manyW -gt 0 -and $manyW -lt $tabW) "many tabs: tab width shrank below its preferred width ($manyW < $tabW)"
+    Assert ($manyW -ge ($minTabW - $tabGap - 3)) "many tabs: never below the floor ($manyW >= $minTabW - $tabGap)"
     $bandLeft = $clientW - $padR - 2 * $btnPaint - $gap
     Assert ($ext[1] -le $bandLeft) "many tabs: the tab run never reaches the button band ($($ext[1]) <= $bandLeft)"
     Assert (-not (Any-Accent-Blue $shot)) 'many tabs: still no accent rule anywhere in the strip'
@@ -424,6 +461,90 @@ try {
     }
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash'
+
+    # -----------------------------------------------------------------------
+    # 7. T235: a long title GROWS its tab instead of being ellipsized.
+    #
+    #    The user's report, in pixels: ". Fix background p..." truncated in a
+    #    single tab on a wide window with most of the strip empty. Sections 1-6
+    #    above cannot see this - every tab in that window carries the SAME
+    #    shell-set title, so a fixed cap and a content-derived width are
+    #    indistinguishable there. This needs two DIFFERENT titles in one window.
+    #
+    #    Fresh instance, tab 1 launched with `-e cmd.exe /K title <long token>`
+    #    so its title is known and long. Then ctrl+t opens tab 2 on the default
+    #    shell (a short title) and TAKES the selection - which is what makes
+    #    both widths readable off one capture: the selected chiclet is the only
+    #    thing the pixel oracle can measure directly, and tab 1's SLOT is
+    #    exactly where tab 2's left edge starts.
+    # -----------------------------------------------------------------------
+    Kill-RepoInstances
+    $longTitle = 'TabTitleLongEnoughToHaveBeenTruncatedByTheOldTwoHundredDipCap'
+    $app2 = Start-OnTestDesktop -Exe $exe -Arguments @(
+        '--config-default-files=false',
+        '--background=#000000',
+        '--window-show-tab-bar=always',
+        '--session-persistence=false',
+        '-e', 'cmd.exe', '/K', 'title', $longTitle
+    )
+    Start-Sleep -Seconds 4
+    if ($app2.Process -and $app2.Process.HasExited) { Write-Host 'SETUP FAIL: long-title GUI died at launch'; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app2.Pid -Class 'GhozttyWindow'
+    if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: long-title top window not found'; exit 1 }
+
+    # Re-derive the geometry for THIS window: the pixel helpers above read
+    # these script-scope variables at call time, so reassigning them re-points
+    # them at the new instance.
+    $cr = Get-TestWindowRect -Window $top -Client
+    $wr = Get-TestWindowRect -Window $top
+    $clientX = $cr.Left; $clientY = $cr.Top; $clientW = $cr.Width
+    $offX = $clientX - $wr.Left
+    $offY = $clientY - $wr.Top
+    $panes2 = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
+    if ($panes2.Count -lt 1) { Write-Host 'SETUP FAIL: long-title pane not found'; exit 1 }
+    $barH = $panes2[0].Top - $clientY
+    $runW = $clientW - $padR - $btnPaint - $gap - $btnPaint - $gap - $padL
+    $capW = [math]::Max([int][math]::Floor($runW / 2), $minTabW)
+    if (-not (Focus-TestWindow -Window $top -Child ([IntPtr]$panes2[0].Hwnd))) {
+        Write-Host 'SETUP FAIL: could not focus the long-title GUI'; exit 1
+    }
+
+    $shot = Get-Shot
+    $ext = Selected-Extent $shot
+    $longW = $ext[1] - $ext[0]
+    Write-Host "INFO  long title: left=$($ext[0]) right=$($ext[1]) w=$longW runW=$runW cap=$capW"
+    Assert ($ext[0] -ge 0) 'long title: the selected chiclet is painted (positive control for section 7)'
+    Assert ($longW -le ($capW - $tabGap + 3)) `
+        "long title: still capped at 50% of the run ($longW <= $capW - $tabGap)"
+
+    # Second tab, default shell, short title - and it takes the selection.
+    Close-TestWindowPixels $shot
+    New-Tab
+    Start-Sleep -Milliseconds 600
+    $shot = Get-Shot
+    $ext2 = Selected-Extent $shot
+    $shortW = $ext2[1] - $ext2[0]
+    $longSlot = $ext2[0] - $padL
+    Write-Host "INFO  short title: left=$($ext2[0]) right=$($ext2[1]) w=$shortW; long slot=$longSlot"
+    Assert ($shortW -gt 0) 'two titles: the new short-titled tab is selected and measurable'
+    # THE assertion. Under a fixed cap both tabs would be the same width; under
+    # content sizing the long one is wider, and it is wider by roughly the
+    # difference in the two titles.
+    Assert ($longSlot -gt ($shortW + $tabGap)) `
+        "T235: the long-titled tab is WIDER than the short-titled one (slot=$longSlot vs $($shortW + $tabGap))"
+    Assert ([math]::Abs($longSlot - ($longW + $tabGap)) -le 3) `
+        "T235: tab 2's left edge is exactly tab 1's slot ($longSlot vs $($longW + $tabGap))"
+    # ... and it is allowed past the retired 200 DIP constant. Only checkable
+    # when the proportional cap is the looser of the two; say so when it is not,
+    # rather than scoring a pass that asserted nothing.
+    if (($capW - $tabGap) -gt ($maxTabWOld - $tabGap)) {
+        Assert ($longW -gt ($maxTabWOld - $tabGap)) `
+            "T235: the long title is no longer pinned to the retired 200 DIP cap ($longW > $($maxTabWOld - $tabGap))"
+    } else {
+        Write-Host "INFO  skipped the retired-cap comparison: this window's 50% cap ($capW) is tighter than 200 DIP ($maxTabWOld)"
+    }
+    Close-TestWindowPixels $shot
+    Assert (-not ($app2.Process -and $app2.Process.HasExited)) 'no crash (long-title instance)'
 } finally {
     Remove-TestDesktop
     Kill-RepoInstances

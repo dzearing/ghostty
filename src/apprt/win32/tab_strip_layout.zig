@@ -8,13 +8,22 @@
 //! Target and measurements: `docs/design/win32-tab-strip.md`. The short
 //! version, from reading pixels off a live Windows Terminal:
 //!
-//!   * A tab's width is its EQUAL SHARE of the strip, clamped to
-//!     [min, max] — never the remainder. Three tabs on a 1610px strip took
-//!     900px and left 700px empty. The old code handed the last tab
-//!     `available - x`, so a single tab spanned the whole window; that one
-//!     rule produced three of the four things the user called amateur (close
-//!     button flung to the far edge, "+" jammed against the tab, and a
-//!     full-width accent rule).
+//!   * A tab is NEVER handed the remainder of the strip. The old code gave
+//!     the last tab `available - x`, so a single tab spanned the whole window;
+//!     that one rule produced three of the four things the user called amateur
+//!     (close button flung to the far edge, "+" jammed against the tab, and a
+//!     full-width accent rule). That anti-stretch rule is permanent.
+//!   * What a tab IS: its own content's width (title + padding), capped at
+//!     **50% of the tab run** and floored at `min_tab_w`. Only when the
+//!     preferred widths do not all fit does the strip fall back to the equal
+//!     share T202 shipped, clamped to `[min_tab_w, cap]`, and only then does a
+//!     title ellipsize. T202's fixed `max_tab_w = 200 DIP` is gone: it
+//!     truncated titles with 1000px of empty strip beside them (T235, design
+//!     system §6b). Measuring Windows Terminal's `TabWidthMode="Equal"` was
+//!     right; concluding we had to copy its *algorithm* was too literal.
+//!   * This module still measures no text. The caller measures the titles and
+//!     passes preferred widths IN, which is what keeps the whole strip
+//!     unit-testable with no window, no font and no DPI.
 //!   * The "+" travels with the last tab (WinUI `AddTabButton`); the menu
 //!     button is pinned right (WinUI `TabStripFooter`). Pinning both right
 //!     made them read as one undifferentiated cluster.
@@ -69,8 +78,15 @@ pub const Metrics = struct {
     /// — reads it from here, so two gaps that are equal in DIP cannot round
     /// apart at fractional DPI (design system §1).
     pad_sm: i32,
+    /// The narrowest a tab's SLOT may be. Also the floor the proportional cap
+    /// can never dip below, so a strip too narrow for 50%-of-the-run to hold a
+    /// tab still shows one.
+    ///
+    /// There is deliberately no `max_tab_w` beside it any more (T235). A fixed
+    /// DIP maximum is a truncation rule wearing a layout rule's clothes: it
+    /// ellipsized `. Fix background p...` while most of the strip sat empty.
+    /// The maximum is now `capWidth` — a proportion of the run.
     min_tab_w: i32,
-    max_tab_w: i32,
     /// Top-corner radius of the selected/hovered chiclet (bottom corners stay
     /// square — the tab merges into the pane below it).
     corner_r: i32,
@@ -136,7 +152,6 @@ pub const Metrics = struct {
             .tab_top_pad = sm,
             .pad_sm = sm,
             .min_tab_w = px(60.0, scale),
-            .max_tab_w = px(200.0, scale),
             .corner_r = px(6.0, scale),
             .strip_pad_l = sm,
             .strip_pad_r = sm,
@@ -190,6 +205,18 @@ pub const Metrics = struct {
         };
     }
 
+    /// The PAINTED width a tab needs so a `text_w`-pixel title fits with no
+    /// ellipsis: the leading pad, the title, then the close button's painted
+    /// square with `pad_sm` either side.
+    ///
+    /// This is the exact inverse of `titleRect` and must stay that way — if
+    /// the two ever disagree, a tab sized to its own stated preference would
+    /// still ellipsize, which is the entire bug T235 exists to remove. The
+    /// unit test "preferredWidth is the exact inverse of titleRect" pins it.
+    pub fn preferredWidth(self: Metrics, text_w: i32) i32 {
+        return self.text_pad + @max(text_w, 0) + self.pad_sm + self.btn_paint + self.pad_sm;
+    }
+
     /// The HIT box for a strip button whose painted square starts at
     /// `paint_left`: the square grown by `btn_pad` horizontally, and the tabs'
     /// full vertical band. `icon_button.targetBox` recovers exactly the
@@ -215,7 +242,11 @@ pub const MAX_TABS: usize = 64;
 pub const Strip = struct {
     /// How many tabs fit. Never greater than the requested count.
     visible: usize = 0,
-    /// Uniform tab width actually used. 0 when nothing fit.
+    /// The uniform tab SLOT width used when the strip is UNDER PRESSURE — the
+    /// preferred widths did not all fit, so every tab took the same equal
+    /// share instead. **0 when each tab took its own preferred width** (and
+    /// when nothing fit at all): there is no single width to report then, and
+    /// a caller that wants tab `i`'s width reads `out[i]`.
     tab_w: i32 = 0,
     /// Right edge of the last laid-out tab (== `strip_pad_l` when none fit).
     tabs_right: i32 = 0,
@@ -223,12 +254,42 @@ pub const Strip = struct {
     menu: Rect = .{},
 };
 
-/// Resolve the strip for `client_w` pixels of client width and `tab_count`
-/// tabs, writing tab rects into `out` (which must hold at least `tab_count`
-/// entries; entries past `visible` are zeroed).
-pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
-    std.debug.assert(out.len >= tab_count);
-    for (out[0..tab_count]) |*r| r.* = .{};
+/// The width the tab run may occupy on a `client_w`-wide strip: everything
+/// left after the two insets and the "+"/"≡" band. Named because the
+/// proportional cap is a fraction OF THIS, so `layout`, the tests and the
+/// acceptance script all have to mean the same run.
+pub fn runWidth(m: Metrics, client_w: i32) i32 {
+    const menu_paint_left = client_w - m.strip_pad_r - m.btn_paint;
+    const plus_paint_limit = menu_paint_left - m.group_gap - m.btn_paint;
+    return plus_paint_limit - m.group_gap - m.strip_pad_l;
+}
+
+/// The most any ONE tab's slot may take: 50% of the run it sits in (design
+/// system §6b rule 2) — a proportion of the container, never a DIP constant.
+/// Wide window, long title: the tab grows. Narrow window: the same tab yields.
+///
+/// Floored at `min_tab_w` so a run too narrow for half of it to hold a tab
+/// still shows one rather than none.
+pub fn capWidth(m: Metrics, tabs_avail: i32) i32 {
+    return @max(@divTrunc(tabs_avail, 2), m.min_tab_w);
+}
+
+/// One tab's preferred SLOT: its preferred PAINTED width plus the inter-tab
+/// gap it gives up (T206), floored and capped. Exposed so the caller and the
+/// tests can reason about a single tab without replaying `layout`.
+pub fn slotWidth(m: Metrics, tabs_avail: i32, preferred_paint: i32) i32 {
+    return std.math.clamp(preferred_paint + m.tab_gap, m.min_tab_w, capWidth(m, tabs_avail));
+}
+
+/// Resolve the strip for `client_w` pixels of client width and one entry per
+/// tab in `prefer` — each the PAINTED width that tab's title wants, from
+/// `Metrics.preferredWidth` (the caller measures the text; this module never
+/// does). Tab rects go into `out`, which must hold at least `prefer.len`
+/// entries; entries past `visible` are zeroed.
+pub fn layout(m: Metrics, client_w: i32, prefer: []const i32, out: []Rect) Strip {
+    std.debug.assert(out.len >= prefer.len);
+    const tab_count = @min(prefer.len, MAX_TABS);
+    for (out[0..prefer.len]) |*r| r.* = .{};
 
     // EVERY number below is a PAINTED edge. The hit boxes are derived from
     // them at the end, never the other way round — that inversion is the
@@ -256,21 +317,39 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
     };
 
     // Width the tabs may occupy: up to `group_gap` short of the "+"'s limit.
-    const tabs_avail = plus_paint_limit - m.group_gap - m.strip_pad_l;
+    const tabs_avail = runWidth(m, client_w);
     if (tab_count == 0 or tabs_avail < m.min_tab_w) return s;
 
-    // Equal share, clamped. This is the whole anti-stretch rule: with one tab
-    // and a wide window the share is enormous and the clamp cuts it to
-    // `max_tab_w`, leaving dead strip space exactly as Windows Terminal does.
-    const count_i: i32 = @intCast(@min(tab_count, MAX_TABS));
-    var w = @divTrunc(tabs_avail, count_i);
-    w = @max(w, m.min_tab_w);
-    w = @min(w, m.max_tab_w);
+    // SIZE TO CONTENT FIRST (T235, design system §6b). Every tab asks for what
+    // its own title needs, floored at `min_tab_w` and capped at half the run.
+    // Nothing is ever stretched to fill: if they all fit, the leftover strip
+    // stays empty, which is the T202 rule this replacement had to preserve.
+    var want: [MAX_TABS]i32 = undefined;
+    var wanted_total: i32 = 0;
+    for (prefer[0..tab_count], want[0..tab_count]) |p, *slot| {
+        slot.* = slotWidth(m, tabs_avail, p);
+        wanted_total += slot.*;
+    }
+
+    // ONLY SHRINK UNDER PRESSURE. When the preferred widths do not all fit,
+    // fall back to T202's equal share clamped to [min, cap] — and only then
+    // does `DT_END_ELLIPSIS` get to truncate anything. `uniform == 0` is the
+    // sentinel for "no pressure, everyone got what they asked for".
+    const count_i: i32 = @intCast(tab_count);
+    const uniform: i32 = if (wanted_total <= tabs_avail) 0 else blk: {
+        var w = @divTrunc(tabs_avail, count_i);
+        w = @max(w, m.min_tab_w);
+        w = @min(w, capWidth(m, tabs_avail));
+        break :blk w;
+    };
 
     // At `min_tab_w` some tabs may still not fit. Those get no rect rather
-    // than a rect under the button band.
-    const fits: usize = @intCast(@divTrunc(tabs_avail, w));
-    const visible = @min(tab_count, fits);
+    // than a rect under the button band. Content-sized tabs fit by
+    // construction — that is what `wanted_total <= tabs_avail` means.
+    const visible = if (uniform == 0)
+        tab_count
+    else
+        @min(tab_count, @as(usize, @intCast(@divTrunc(tabs_avail, uniform))));
 
     var x = m.strip_pad_l;
     for (out[0..visible], 0..) |*r, i| {
@@ -279,8 +358,10 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
         // across the whole window.
         const this_w = if (T202_NEUTERED and i + 1 == visible)
             @max(m.strip_pad_l + tabs_avail - x, m.min_tab_w)
+        else if (uniform == 0)
+            want[i]
         else
-            w;
+            uniform;
         // The slot is `this_w`; the tab itself gives up `tab_gap` of it, so
         // the gap comes out of the tab rather than being added between them
         // (which would make N tabs wider than the space they were fitted to).
@@ -290,7 +371,7 @@ pub fn layout(m: Metrics, client_w: i32, tab_count: usize, out: []Rect) Strip {
     }
 
     s.visible = visible;
-    s.tab_w = w;
+    s.tab_w = uniform;
     // The last tab's own right EDGE, not the end of its slot: the slot ends
     // one `tab_gap` further right, and measuring the "+" gap from there would
     // silently widen it by the gap.
@@ -350,9 +431,29 @@ pub fn separatorRect(m: Metrics, tab: Rect) Rect {
 
 const WIDE: i32 = 1600;
 
+/// A middling title, in DIP of TEXT — wide enough that a few tabs of it are a
+/// real content-sized run, narrow enough that a wide strip fits several.
+const TITLE_DIP: f32 = 120.0;
+
+/// Lay out `n` tabs that all want the same title width. Most assertions below
+/// are about geometry rather than about text, and a uniform preference is what
+/// lets them keep saying what they said before T235 turned the width into an
+/// input.
 fn layoutN(scale: f32, client_w: i32, n: usize, buf: []Rect) struct { Metrics, Strip } {
+    return layoutTitles(scale, client_w, n, TITLE_DIP, buf);
+}
+
+fn layoutTitles(scale: f32, client_w: i32, n: usize, text_dip: f32, buf: []Rect) struct { Metrics, Strip } {
     const m = Metrics.init(scale);
-    return .{ m, layout(m, client_w, n, buf) };
+    var prefer: [MAX_TABS]i32 = undefined;
+    const p = m.preferredWidth(@intFromFloat(@round(text_dip * scale)));
+    for (prefer[0..n]) |*e| e.* = p;
+    return .{ m, layout(m, client_w, prefer[0..n], buf) };
+}
+
+/// The slot one `TITLE_DIP` tab takes, i.e. the strip's pitch in these tests.
+fn slotOf(m: Metrics, scale: f32) i32 {
+    return m.preferredWidth(@intFromFloat(@round(TITLE_DIP * scale))) + m.tab_gap;
 }
 
 /// What a button's hit box actually PAINTS. Every gap assertion below is
@@ -363,20 +464,122 @@ fn painted(scale: f32, hit: Rect) Rect {
     return icon_button.targetBox(icon_button.Metrics.init(scale), hit);
 }
 
-test "one tab is clamped to max width, not stretched across the window" {
+test "one tab is its title's width, not stretched across the window" {
     // THE bug this module exists for. `Window.zig` used to hand the last tab
-    // `available - x`, so with one tab it took the entire strip.
+    // `available - x`, so with one tab it took the entire strip. Since T235
+    // the width it DOES take is its content's, not a constant.
     var buf: [MAX_TABS]Rect = undefined;
     for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
         const m, const s = layoutN(scale, WIDE, 1, &buf);
         try testing.expectEqual(@as(usize, 1), s.visible);
-        // The SLOT is clamped to max_tab_w; the drawn tab gives up `tab_gap`
-        // of it (T206), so every tab is the same width and every tab is
-        // followed by the same gap — including the last one, before the "+".
-        try testing.expectEqual(m.max_tab_w - m.tab_gap, buf[0].width());
+        // The SLOT is the preferred width; the drawn tab gives up `tab_gap`
+        // of it (T206), so every tab is followed by the same gap — including
+        // the last one, before the "+".
+        try testing.expectEqual(slotOf(m, scale) - m.tab_gap, buf[0].width());
+        // Nothing was stretched to fill: no pressure, so no uniform width.
+        try testing.expectEqual(@as(i32, 0), s.tab_w);
         // ... and there is real dead strip space left over.
         try testing.expect(s.tabs_right < @divTrunc(WIDE, 2));
     }
+}
+
+test "T235: preferredWidth is the exact inverse of titleRect" {
+    // The invariant the whole feature rests on. A tab sized to `preferredWidth
+    // (text_w)` must offer the title EXACTLY `text_w` — one pixel short and
+    // `DT_END_ELLIPSIS` truncates the very title we just sized the tab to fit,
+    // which is the T235 defect reappearing through the back door.
+    for ([_]f32{ 1.0, 1.25, 1.5, 1.75, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        for ([_]i32{ 0, 1, 37, 120, 512, 3000 }) |text_w| {
+            const tab: Rect = .{
+                .left = 100,
+                .top = m.tab_top_pad,
+                .right = 100 + m.preferredWidth(text_w),
+                .bottom = m.bar_h,
+            };
+            try testing.expectEqual(@max(text_w, 0), m.titleRect(tab).width());
+        }
+    }
+}
+
+test "T235: a tab grows with its title, and is capped at half the run" {
+    // The user's report, as arithmetic: ". Fix background p..." was truncated
+    // at a 200 DIP constant while most of a wide strip sat empty.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+
+        // Longer title => wider tab, monotonically, until the cap.
+        var prev: i32 = 0;
+        for ([_]f32{ 40, 80, 160, 240 }) |dip| {
+            _, const s = layoutTitles(scale, WIDE, 1, dip, &buf);
+            try testing.expectEqual(@as(usize, 1), s.visible);
+            try testing.expect(buf[0].width() > prev);
+            prev = buf[0].width();
+        }
+        // Past the old fixed 200 DIP cap, which is the point of the task.
+        try testing.expect(prev > Metrics.px(200.0, scale));
+
+        // A title long enough to swallow the window is capped at 50% of the
+        // run — a proportion, not a constant — and still leaves the strip's
+        // other half alone.
+        _, const huge = layoutTitles(scale, WIDE, 1, 5000, &buf);
+        const avail = runWidth(m, WIDE);
+        try testing.expectEqual(capWidth(m, avail) - m.tab_gap, buf[0].width());
+        try testing.expect(buf[0].width() <= @divTrunc(avail, 2));
+        try testing.expect(huge.tabs_right < @divTrunc(WIDE, 2) + m.strip_pad_l);
+
+        // Narrow window, SAME title: the cap yields with the container. This
+        // is what "proportional" buys over a DIP constant.
+        _ = layoutTitles(scale, @divTrunc(WIDE, 3), 1, 5000, &buf);
+        try testing.expect(buf[0].width() < capWidth(m, avail) - m.tab_gap);
+    }
+}
+
+test "T235: preferred widths that do not fit fall back to an equal share" {
+    // Rule 3: shrink only under pressure, and when it happens every tab is the
+    // same width again (T202's rule, kept for exactly this case).
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const slot = slotOf(m, scale);
+        const avail = runWidth(m, WIDE);
+        const fits: usize = @intCast(@divTrunc(avail, slot));
+
+        // One fewer than fits: no pressure, everyone gets their preference.
+        {
+            _, const s = layoutN(scale, WIDE, fits - 1, &buf);
+            try testing.expectEqual(fits - 1, s.visible);
+            try testing.expectEqual(@as(i32, 0), s.tab_w);
+            for (buf[0..s.visible]) |r| try testing.expectEqual(slot - m.tab_gap, r.width());
+        }
+        // Two more than fits: pressure. Uniform, narrower than preferred, and
+        // never below the floor.
+        {
+            _, const s = layoutN(scale, WIDE, fits + 2, &buf);
+            try testing.expect(s.tab_w > 0);
+            try testing.expect(s.tab_w < slot);
+            try testing.expect(s.tab_w >= m.min_tab_w);
+            for (buf[1..s.visible], 0..) |r, i| try testing.expectEqual(buf[i].width(), r.width());
+        }
+    }
+}
+
+test "T235: mixed titles each get their own width" {
+    // The content path is per-tab, not a single width applied to everyone —
+    // otherwise "size to content" would just be "size to the widest".
+    var buf: [MAX_TABS]Rect = undefined;
+    const m = Metrics.init(1.0);
+    const prefer = [_]i32{
+        m.preferredWidth(40),
+        m.preferredWidth(300),
+        m.preferredWidth(120),
+    };
+    const s = layout(m, WIDE, &prefer, &buf);
+    try testing.expectEqual(@as(usize, 3), s.visible);
+    for (prefer, buf[0..3]) |p, r| try testing.expectEqual(p, r.width());
+    // Laid out end to end with one gap between, in order.
+    for (buf[1..3], 0..) |r, i| try testing.expectEqual(buf[i].right + m.tab_gap, r.left);
 }
 
 test "the tab area never reaches the button band" {
@@ -472,20 +675,21 @@ test "T232: hit boxes may overlap the gaps, but never each other" {
 test "the + follows the last tab and stops at its limit" {
     var buf: [MAX_TABS]Rect = undefined;
     const m = Metrics.init(1.0);
+    const slot = slotOf(m, 1.0);
 
-    const one = layout(m, WIDE, 1, &buf);
-    const two = layout(m, WIDE, 2, &buf);
-    const three = layout(m, WIDE, 3, &buf);
-    // Adding a tab moves the "+" right by exactly one tab width...
-    try testing.expectEqual(one.new_tab.left + m.max_tab_w, two.new_tab.left);
-    try testing.expectEqual(two.new_tab.left + m.max_tab_w, three.new_tab.left);
+    _, const one = layoutN(1.0, WIDE, 1, &buf);
+    _, const two = layoutN(1.0, WIDE, 2, &buf);
+    _, const three = layoutN(1.0, WIDE, 3, &buf);
+    // Adding a tab moves the "+" right by exactly one tab slot...
+    try testing.expectEqual(one.new_tab.left + slot, two.new_tab.left);
+    try testing.expectEqual(two.new_tab.left + slot, three.new_tab.left);
     // ... and it is a real gap, not zero (the "clipped" look) — measured
     // between painted edges, which is the only measurement the user can see.
     try testing.expectEqual(m.group_gap, painted(1.0, one.new_tab).left - one.tabs_right);
 
     // Once the tabs fill the strip the "+" stops at its limit and stays put.
-    const many = layout(m, WIDE, 40, &buf);
-    const more = layout(m, WIDE, 64, &buf);
+    _, const many = layoutN(1.0, WIDE, 40, &buf);
+    _, const more = layoutN(1.0, WIDE, 64, &buf);
     try testing.expectEqual(many.new_tab.left, more.new_tab.left);
     try testing.expect(painted(1.0, many.new_tab).right + m.group_gap <= painted(1.0, many.menu).left);
 }
@@ -493,16 +697,21 @@ test "the + follows the last tab and stops at its limit" {
 test "tabs shrink with count, then overflow instead of running off the end" {
     var buf: [MAX_TABS]Rect = undefined;
     const m = Metrics.init(1.0);
+    const slot = slotOf(m, 1.0);
 
-    try testing.expectEqual(m.max_tab_w, layout(m, WIDE, 2, &buf).tab_w);
-    // Enough tabs to force a shrink below max...
-    const eight = layout(m, WIDE, 8, &buf);
-    try testing.expect(eight.tab_w < m.max_tab_w);
-    try testing.expect(eight.tab_w > m.min_tab_w);
-    try testing.expectEqual(@as(usize, 8), eight.visible);
+    // Two tabs of a middling title fit with room to spare, so neither shrinks
+    // and there is no uniform width to report.
+    try testing.expectEqual(@as(i32, 0), layoutN(1.0, WIDE, 2, &buf)[1].tab_w);
+    // Enough tabs to force a shrink below what they asked for — which since
+    // T235 is a count derived from the run and the title, not from a constant.
+    const fits: usize = @intCast(@divTrunc(runWidth(m, WIDE), slot));
+    _, const squeezed = layoutN(1.0, WIDE, fits + 3, &buf);
+    try testing.expect(squeezed.tab_w < slot);
+    try testing.expect(squeezed.tab_w > m.min_tab_w);
+    try testing.expectEqual(fits + 3, squeezed.visible);
     // ... and enough to hit the floor, after which tabs are dropped, not
     // painted under the buttons.
-    const flood = layout(m, WIDE, 64, &buf);
+    _, const flood = layoutN(1.0, WIDE, 64, &buf);
     try testing.expectEqual(m.min_tab_w, flood.tab_w);
     try testing.expect(flood.visible < 64);
     try testing.expect(flood.visible > 0);
@@ -539,13 +748,14 @@ test "a window too narrow for a tab still lays out its buttons" {
     var buf: [MAX_TABS]Rect = undefined;
     const m = Metrics.init(1.0);
     for ([_]i32{ 0, 10, 60, 100, 130 }) |w| {
-        const s = layout(m, w, 3, &buf);
+        _, const s = layoutN(1.0, w, 3, &buf);
         try testing.expectEqual(@as(usize, 0), s.visible);
         try testing.expectEqual(w - m.strip_pad_r, painted(1.0, s.menu).right);
         for (buf[0..3]) |r| try testing.expect(r.isEmpty());
     }
-    // Just wide enough for one minimum tab, and it appears.
-    const ok = layout(m, m.strip_pad_l + m.strip_pad_r + m.min_tab_w + m.group_gap * 2 + m.btn_paint * 2, 3, &buf);
+    // Just wide enough for one minimum tab, and it appears — at the floor,
+    // because three tabs that each want more than the whole run is pressure.
+    _, const ok = layoutN(1.0, m.strip_pad_l + m.strip_pad_r + m.min_tab_w + m.group_gap * 2 + m.btn_paint * 2, 3, &buf);
     try testing.expectEqual(@as(usize, 1), ok.visible);
     try testing.expectEqual(m.min_tab_w, ok.tab_w);
 }
