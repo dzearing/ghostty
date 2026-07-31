@@ -9,6 +9,38 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-07-30 (later still) - **T200 DONE**, and a correction to the entry below.
+  **The T196 delivery to the installed release never ran.** The previous turn
+  launched `upgrade-ghoztty-windows.ps1` detached at the boundary, reported it as
+  "upgrading now", and ended. 45 minutes later the log had no new line and the
+  installed app/agent pids were unchanged; the T139 watchdog was the only thing
+  that noticed. Fixed the mechanism first (the T112/T187 precedent) and then
+  completed the delivery through it.
+  - Root cause, measured with a negative control: `Start-Process -ArgumentList
+    @(...)` does NOT quote its elements, so a multi-word `-ResumePrompt` is
+    re-tokenized by the child's parser. With a bare `-` in the text (an empty
+    parameter name) binding died BEFORE line 1 - nothing logged, and the hidden
+    detached child's stderr went nowhere. Without the hyphen it was worse: the
+    bind "succeeded" and assigned prose to three parameters at once
+    (`$Staging='Verify'`, `$ResumeCommand='It'`, `$LoopPaneId='did'`). It aborted
+    only by luck, on a staging dir that happened not to exist.
+  - Three layers, because any one alone still leaves a silent path:
+    `PositionalBinding=$false` (a bare `[CmdletBinding()]` was NOT enough - every
+    `[string]` param is positional, so a stray word still landed in
+    `$InstallDir` and ran), `-ResumePromptFile` so free text never touches argv,
+    and new `scripts/launch-upgrade.ps1` which gates success on the upgrade
+    script's own first log line rather than on `Start-Process` returning.
+  - New section **L** in `upgrade-no-fork.ps1` (31 assertions), **ALL PASS x3**.
+    It caught five real defects in the fix itself, including a launcher that
+    declared every HEALTHY launch a failure (it regex-escaped its marker and then
+    searched with `-SimpleMatch`, hunting for `===\ upgrade\ start`) and a test
+    that was itself pushing free text through argv - the disease reproducing
+    inside its own cure, which is what forced the in-process `-Prompt` /
+    command-line `-PromptFile` split now documented in `go.md`.
+  - The permanent oracle is L1/L2: the exact prompt that killed the real
+    delivery, still failing, still logging nothing. No care with argv can fix it;
+    only the file can.
+
 - 2026-07-30 (later) - **T196 DONE** (delivery of T145 + T147 to all 3 install
   locations; no product code changed). Floor re-run at HEAD `9968a62d9`: both
   lanes + `test-agent` exit 0, P1-P3 ALL PASS. ReleaseFast gnu `-Dstrip=false`

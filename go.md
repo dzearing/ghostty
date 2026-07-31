@@ -196,3 +196,24 @@ line did not fail — re-run it unfiltered before believing it.
   unless `-AllowPlainResume` is passed. Also finish the turn (commit,
   tracker updated) BEFORE launching the script — it kills Claude after
   `-DelaySeconds`.
+- **Launch that upgrade through `scripts/launch-upgrade.ps1`, never with a
+  hand-rolled `Start-Process`** (2026-07-30, T200). Call it IN-PROCESS from
+  the turn's last tool call so the prompt binds as one string:
+
+  ```powershell
+  & D:\git\ghoztty\scripts\launch-upgrade.ps1 `
+      -Prompt '/reset-context <verify this delivery…> Then read go.md and go'
+  ```
+
+  It writes the prompt to a file (never argv), starts the upgrade detached,
+  and then WAITS for the upgrade script's first log line before reporting
+  success — so a launch that dies fails in *this* turn, while someone is
+  still watching. Exit 0 = confirmed running; anything else = the installed
+  release was NOT upgraded, so do not report the delivery as done.
+
+  Why it exists: `Start-Process -ArgumentList @(…)` does not quote its
+  elements, so a multi-word `-ResumePrompt` is re-tokenized into positional
+  arguments. On 2026-07-30 that killed parameter binding *before* the
+  script's first line — nothing logged, stderr thrown away with the hidden
+  window — and the turn reported "upgrading now" over a delivery that never
+  happened. The loop then sat dead for 45 minutes until the watchdog fired.

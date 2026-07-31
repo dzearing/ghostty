@@ -25,6 +25,26 @@
 # kill and checks afterwards:
 #   survived -> type the prompt into its existing pane (no second session)
 #   gone     -> relaunch a window with the resume command, as before
+#
+# T200 - the launch itself is a compatibility boundary. `Start-Process
+# -ArgumentList @(...)` does NOT quote its elements: they are joined with spaces
+# and re-tokenized by this script's own parser, so a multi-word -ResumePrompt is
+# shredded into positional arguments. Measured 2026-07-30: a prompt containing a
+# bare `-` died in parameter BINDING (before line 1, so nothing could be logged,
+# and a detached hidden child discards stderr - the delivery vanished with zero
+# evidence); with the hyphen removed the same prompt bound prose to three
+# parameters at once ($Staging='Verify', $ResumeCommand='It', $LoopPaneId='did').
+# Hence: PositionalBinding=$false so a stray word is a loud error instead of a
+# silent mis-bind, -ResumePromptFile so free text never travels through argv at
+# all, and scripts/launch-upgrade.ps1 which refuses to believe the launch worked
+# until this script's first log line appears.
+#
+# PositionalBinding=$false, not a bare [CmdletBinding()]: every [string] param
+# here is positional by default, so plain CmdletBinding still let the shrapnel
+# land - measured, `-Staging x -NoResume aStrayWord` bound aStrayWord to
+# $InstallDir and ran. Nothing about this script should ever be passed by
+# position.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Staging = 'D:\git\ghoztty\zig-out-release',
     [string]$InstallDir = "$env:LOCALAPPDATA\Programs\Ghoztty",
@@ -49,6 +69,11 @@ param(
     # it from the trailing quoted prompt of $ResumeCommand, so the two paths
     # cannot drift apart.
     [string]$ResumePrompt = '',
+    # The SAME value, read from a file instead of argv. Prefer this from any
+    # caller: a file cannot be re-tokenized, so no quoting, hyphen, %VAR% or
+    # newline in the prompt can reach the parameter binder (T200). Wins over
+    # -ResumePrompt when both are given.
+    [string]$ResumePromptFile = '',
     # The Claude that owns the loop, and the pane it lives in. Both are
     # normally inherited from the launching tool shell ($env:CLAUDE_PID /
     # $env:GHOZTTY_PANE_ID); they are parameters so the T138 test can drive
@@ -70,6 +95,32 @@ function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content 
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 
 Log "=== upgrade start (staging=$Staging)"
+
+# T200: the full resolved parameter set, so a mis-bind is READABLE in the log
+# instead of inferred from a weird `pane=` value three lines down.
+if ($ResumePromptFile) {
+    if (-not (Test-Path -LiteralPath $ResumePromptFile -PathType Leaf)) {
+        Log "ABORT: -ResumePromptFile not found: $ResumePromptFile"
+        exit 1
+    }
+    # -Raw, then trim only the trailing newline the writer added: a prompt may
+    # legitimately contain blank lines and leading spaces.
+    $ResumePrompt = [IO.File]::ReadAllText($ResumePromptFile) -replace '\r?\n\z', ''
+    Log "resume prompt read from file ($($ResumePrompt.Length) chars): $ResumePromptFile"
+}
+Log ("params: install=[{0}] wd=[{1}] pane=[{2}] loopPid={3} delay={4} noResume={5} force={6} resumeCmd=[{7}] resumePrompt=[{8}]" -f `
+    $InstallDir, $WorkingDirectory, $LoopPaneId, $LoopClaudePid, $DelaySeconds, `
+    [bool]$NoResume, [bool]$ForceRelaunch, $ResumeCommand, $ResumePrompt)
+
+# Both of these are consumed by destructive steps (the kill is scoped to
+# $InstallDir, the swap reads $Staging). A mis-bound value must stop the run
+# here, not point the kill at some other tree.
+foreach ($pair in @(@{ n = 'Staging'; v = $Staging }, @{ n = 'InstallDir'; v = $InstallDir })) {
+    if (-not (Test-Path -LiteralPath $pair.v -PathType Container)) {
+        Log "ABORT: -$($pair.n) is not an existing directory: $($pair.v)"
+        exit 1
+    }
+}
 
 # T138: stamp the launching Claude FIRST, before anything can disturb it. Its
 # pid alone would not survive the wait (pids are recycled), so record the

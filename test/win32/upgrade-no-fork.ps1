@@ -203,6 +203,200 @@ AssertEq "A30 exit 0 without a window list is not ready" '' $junk.Json
 
 Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue
 
+# ============================================================================
+"== L: the launch contract (T200)"
+# ============================================================================
+# Out of alphabetical order on purpose: L needs no app, no agent and no sandbox
+# install - only stub scripts and a private log - so it lives above the
+# -PureOnly gate and runs on every invocation.
+#
+# What it pins: the delivery launch cannot fail silently. On 2026-07-30 a
+# boundary delivery was launched detached and never ran. `Start-Process
+# -ArgumentList @(...)` does not quote its elements, so the multi-word
+# -ResumePrompt was re-tokenized into positional arguments and PowerShell
+# rejected the bind BEFORE the script's first statement - nothing logged,
+# stderr discarded with the hidden window, and the turn reported success.
+
+$lRoot = Join-Path $env:TEMP "ghoztty-launch-t200-$PID"
+$lStaging = Join-Path $lRoot 'staging'
+$lInstall = Join-Path $lRoot 'install'
+foreach ($d in @($lRoot, $lStaging, $lInstall)) { New-Item -ItemType Directory -Force $d | Out-Null }
+$lLog = Join-Path $lRoot 'ghoztty-upgrade.log'
+$launcher = Join-Path $Repo 'scripts\launch-upgrade.ps1'
+
+# Every child here writes to the sandbox's own upgrade log, never the box's.
+function Invoke-InSandboxTemp([string[]]$Argv, [int]$TimeoutMs = 40000) {
+    $savedTemp, $savedTmp = $env:TEMP, $env:TMP
+    $env:TEMP, $env:TMP = $lRoot, $lRoot
+    try {
+        $o = Join-Path $lRoot "child-$([guid]::NewGuid().ToString('N').Substring(0,8)).out"
+        $e = "$o.err"
+        $p = Start-Process powershell -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $o -RedirectStandardError $e -ArgumentList $Argv
+        # Cache .Handle BEFORE the child exits or .ExitCode reads back empty
+        # (the trap that fabricated six failures in the T147 harness).
+        $null = $p.Handle
+        if (-not $p.WaitForExit($TimeoutMs)) { try { $p.Kill() } catch {} }
+        return [pscustomobject]@{
+            Code   = $p.ExitCode
+            Out    = (Get-Content -LiteralPath $o -Raw -ErrorAction SilentlyContinue)
+            Err    = (Get-Content -LiteralPath $e -Raw -ErrorAction SilentlyContinue)
+        }
+    } finally { $env:TEMP, $env:TMP = $savedTemp, $savedTmp }
+}
+function Get-LMarkerCount {
+    if (-not (Test-Path -LiteralPath $lLog)) { return 0 }
+    @(Select-String -LiteralPath $lLog -Pattern '=== upgrade start' -SimpleMatch).Count
+}
+function Get-LLog { Get-Content -LiteralPath $lLog -Raw -ErrorAction SilentlyContinue }
+
+$upgradeScript = Join-Path $Repo 'scripts\upgrade-ghoztty-windows.ps1'
+# Hostile on purpose: a bare `-` (an empty parameter name - this is the exact
+# token that killed the real delivery), an apostrophe, quotes, %VARS%,
+# parentheses, and a slash command at the front.
+$hostile = "/reset-context Verify (1) the log, (2) +version. It did not take - investigate %TEMP%\ghoztty-upgrade.log before moving on; the agent's pid `"27568`" is the tell. Then read go.md and go"
+
+# --- L1 PRE-FIX ORACLE: the same prompt through argv still gets shredded -----
+# Not a regression test of the fix - a permanent demonstration of WHY the fix is
+# a file. No amount of care in this script can make argv safe for free text.
+$before = Get-LMarkerCount
+$viaArgv = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgradeScript,
+    '-Staging', $lStaging, '-InstallDir', $lInstall, '-NoResume', '-ResumePrompt', $hostile)
+Assert "L1 PRE-FIX ORACLE: a hostile prompt through argv fails (exit $($viaArgv.Code))" ($viaArgv.Code -ne 0)
+AssertEq "L2 PRE-FIX ORACLE: and the script never ran, so nothing was logged" $before (Get-LMarkerCount)
+
+# The quieter half of the same disease, and the reason PositionalBinding=$false
+# matters: prose WITHOUT a bare `-` used to bind cleanly to real parameters
+# ($Staging='Verify', $LoopPaneId='did') and the script carried on with them.
+# Now it is refused by name.
+$before = Get-LMarkerCount
+$sneaky = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgradeScript,
+    '-Staging', $lStaging, '-InstallDir', $lInstall, '-NoResume',
+    '-ResumePrompt', 'Verify the delivery. It did not take, investigate.')
+Assert "L3 PRE-FIX ORACLE: prose that once bound SILENTLY is now rejected (exit $($sneaky.Code))" ($sneaky.Code -ne 0)
+Assert "L3b the rejection names a word from the prose" ($sneaky.Err -match 'the' -or $sneaky.Err -match 'positional')
+AssertEq "L3c and it never reached the script body" $before (Get-LMarkerCount)
+
+# --- L4 the fix: the prompt travels as a file -------------------------------
+$promptFile = Join-Path $lRoot 'prompt.txt'
+[IO.File]::WriteAllText($promptFile, $hostile, (New-Object Text.UTF8Encoding($false)))
+$before = Get-LMarkerCount
+# A staging DIRECTORY that exists but holds no bin\ghoztty.exe: the script gets
+# far enough to read and log the prompt, then aborts before anything is killed.
+$viaFile = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgradeScript,
+    '-Staging', $lStaging, '-InstallDir', $lInstall, '-NoResume', '-ResumePromptFile', $promptFile)
+$lLogText = Get-LLog
+AssertEq "L4 the script ran and logged its start" ($before + 1) (Get-LMarkerCount)
+Assert "L5 it reported reading the prompt from the file" ($lLogText -match 'resume prompt read from file')
+Assert "L6 the prompt round-tripped byte-for-byte, hyphen and quotes included" `
+    ($lLogText -match [regex]::Escape("resumePrompt=[$hostile]"))
+Assert "L7 the character count in the log matches the source" `
+    ($lLogText -match "resume prompt read from file \($($hostile.Length) chars\)")
+Assert "L8 it aborted on the empty staging dir instead of killing anything" `
+    ($lLogText -match 'ABORT: staging exe not found')
+
+# --- L9 a stray positional argument is LOUD, not silently bound -------------
+# Pre-fix, `Verify` bound to $Staging and `did` to $LoopPaneId while the script
+# carried on. [CmdletBinding()] makes that a hard error.
+$before = Get-LMarkerCount
+$stray = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgradeScript,
+    '-Staging', $lStaging, '-NoResume', 'anUnexpectedPositionalArgument')
+Assert "L9 a stray positional argument is rejected (exit $($stray.Code))" ($stray.Code -ne 0)
+Assert "L10 the error names the argument it refused" ($stray.Err -match 'anUnexpectedPositionalArgument')
+AssertEq "L11 and it never reached the script body" $before (Get-LMarkerCount)
+
+# --- L12 a mis-bound directory aborts before anything destructive -----------
+$before = Get-LMarkerCount
+$badDir = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgradeScript,
+    '-Staging', (Join-Path $lRoot 'no-such-dir'), '-InstallDir', $lInstall, '-NoResume')
+Assert "L12 a non-existent -Staging aborts (exit $($badDir.Code))" ($badDir.Code -ne 0)
+Assert "L13 and says which parameter was wrong" ((Get-LLog) -match 'ABORT: -Staging is not an existing directory')
+$badInstall = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgradeScript,
+    '-Staging', $lStaging, '-InstallDir', (Join-Path $lRoot 'no-such-install'), '-NoResume')
+Assert "L14 a non-existent -InstallDir aborts too (the kill is scoped to it)" ($badInstall.Code -ne 0)
+Assert "L15 and says so" ((Get-LLog) -match 'ABORT: -InstallDir is not an existing directory')
+
+# --- L16 the launcher gates on OUTPUT, not on Start-Process returning -------
+# A stub that exits before logging is the negative control for the whole point
+# of launch-upgrade.ps1: this is what a silently-dead delivery looks like.
+$stubDead = Join-Path $lRoot 'stub-dead.ps1'
+Set-Content -LiteralPath $stubDead -Encoding ascii -Value @(
+    'param([string]$Staging,[string]$ResumePromptFile,[int]$DelaySeconds,[int]$LoopClaudePid)',
+    '[Console]::Error.WriteLine("stub: died before logging")',
+    'exit 3'
+)
+# -PromptFile, not -Prompt: across a command line the launcher's own -Prompt is
+# subject to the very shredding it exists to prevent. Writing this test the
+# other way is what proved it (the free text bound 'arg' to -LoopClaudePid).
+$dead = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
+    '-PromptFile', $promptFile, '-Staging', $lStaging, '-UpgradeScript', $stubDead,
+    '-StartTimeoutSeconds', '6')
+Assert "L16 NEGATIVE CONTROL: a child that dies before logging fails the launch (exit $($dead.Code))" ($dead.Code -eq 1)
+Assert "L17 it says the upgrade did NOT happen" ($dead.Out -match 'LAUNCH FAILED')
+Assert "L18 it surfaces the child's stderr instead of swallowing it" ($dead.Out -match 'died before logging')
+
+# The healthy shape: a stub that logs the marker the way the real script does.
+$stubOk = Join-Path $lRoot 'stub-ok.ps1'
+Set-Content -LiteralPath $stubOk -Encoding ascii -Value @(
+    'param([string]$Staging,[string]$ResumePromptFile,[int]$DelaySeconds,[int]$LoopClaudePid)',
+    '$log = Join-Path $env:TEMP "ghoztty-upgrade.log"',
+    'Add-Content $log "$(Get-Date -Format ''yyyy-MM-dd HH:mm:ss'') === upgrade start (stub)"',
+    'Add-Content $log "stub read prompt: $([IO.File]::ReadAllText($ResumePromptFile))"',
+    'Start-Sleep -Seconds 2'
+)
+$before = Get-LMarkerCount
+$live = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
+    '-PromptFile', $promptFile, '-Staging', $lStaging, '-UpgradeScript', $stubOk,
+    '-StartTimeoutSeconds', '20')
+AssertEq "L19 a child that logs its start reports LAUNCH OK" 0 $live.Code
+Assert "L20 and says so on stdout" ($live.Out -match 'LAUNCH OK')
+AssertEq "L21 the marker really is in the log" ($before + 1) (Get-LMarkerCount)
+Assert "L22 the hostile prompt reached the child intact through the file" `
+    ((Get-LLog) -match [regex]::Escape("stub read prompt: $hostile"))
+
+# --- L23 the launcher refuses to put free text on a command line ------------
+# A path with a space is the realistic way a whitespace-bearing element reaches
+# $argv. This one must be driven IN-PROCESS - which is also the documented way
+# to call the launcher - because across a command line the spaces would be
+# shredded before the guard could ever see them (writing it the other way is
+# what proved the point: the launcher rejected the bind, exit 1, not the guard).
+$spacedDir = Join-Path $lRoot 'staging with spaces'
+New-Item -ItemType Directory -Force $spacedDir | Out-Null
+$wsOut = Join-Path $lRoot 'ws.out'
+$savedTemp, $savedTmp = $env:TEMP, $env:TMP
+$env:TEMP, $env:TMP = $lRoot, $lRoot
+try {
+    & $launcher -PromptFile $promptFile -Staging $spacedDir -UpgradeScript $stubOk *> $wsOut
+    $wsCode = $LASTEXITCODE
+} finally { $env:TEMP, $env:TMP = $savedTemp, $savedTmp }
+$wsText = Get-Content -LiteralPath $wsOut -Raw -ErrorAction SilentlyContinue
+Assert "L23 an argv element containing whitespace is refused (exit $wsCode)" ($wsCode -eq 2)
+Assert "L24 and it explains why (re-tokenization)" ($wsText -match 're-tokenized')
+
+# The same in-process call with a clean staging dir is the documented happy
+# path, and the only one where -Prompt (free text, no file) is safe.
+$okOut = Join-Path $lRoot 'inproc.out'
+$before = Get-LMarkerCount
+$env:TEMP, $env:TMP = $lRoot, $lRoot
+try {
+    & $launcher -Prompt $hostile -Staging $lStaging -UpgradeScript $stubOk -StartTimeoutSeconds 20 *> $okOut
+    $okCode = $LASTEXITCODE
+} finally { $env:TEMP, $env:TMP = $savedTemp, $savedTmp }
+AssertEq "L27 the documented in-process call with free text succeeds" 0 $okCode
+Assert "L28 and the free text survived without a file of the caller's own" `
+    ((Get-LLog) -match [regex]::Escape("stub read prompt: $hostile"))
+AssertEq "L29 it really started something (a new marker)" ($before + 1) (Get-LMarkerCount)
+
+# And the launcher's own binding is hardened the same way: free text through
+# argv must be REFUSED, never half-bound to -LoopClaudePid.
+$before = Get-LMarkerCount
+$launcherShred = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
+    '-Prompt', 'some free text that will be shredded', '-Staging', $lStaging, '-UpgradeScript', $stubOk)
+Assert "L25 the launcher rejects a shredded -Prompt instead of half-binding it" ($launcherShred.Code -ne 0)
+AssertEq "L26 and it did not start an upgrade off a mangled command line" $before (Get-LMarkerCount)
+
+if (-not $Keep) { Remove-Item -Recurse -Force $lRoot -ErrorAction SilentlyContinue }
+
 if ($PureOnly) {
     ""
     if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }
