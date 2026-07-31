@@ -959,6 +959,19 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // One HALF of a WM_SYSKEYDOWN/WM_SYSKEYUP pair - the messages F10 and
+    // Alt-modified keys arrive as. Deliberately not a "tap": the menu
+    // activation contract is a claim about the PAIRING (a lone Alt down-then-up
+    // opens the menu; the same Alt with any key in between must not), so the
+    // caller drives each half and decides what goes between them.
+    //
+    // up == false posts WM_SYSKEYDOWN, true posts WM_SYSKEYUP.
+    public bool SysKey(IntPtr h, ushort vk, bool up) {
+        return (bool)Run(delegate() {
+            return PostMessageW(h, up ? WM_SYSKEYUP : WM_SYSKEYDOWN, (IntPtr)vk, KeyLParam(vk, up));
+        });
+    }
+
     // ================= mouse =================
     // SendInput is dead here (T207), so mouse input is POSTED too. Two things
     // make that survivable rather than a fiction:
@@ -1713,6 +1726,31 @@ function Send-TestControlKey {
     $td = Resolve-TestDesktop $Desktop
     $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
     return $td.SendControlKey($Control, (ConvertTo-TestVk $Key), [uint16[]]$mods)
+}
+
+<#
+Post ONE half of a WM_SYSKEYDOWN/WM_SYSKEYUP pair.
+
+    Send-TestSysKey -Window $pane -Key F10 -Action down
+    Send-TestSysKey -Window $pane -Key F10 -Action up
+
+These are the messages F10 and Alt-modified keys arrive as, and the menu
+activation contract (menu-bar.ps1 section G) is a claim about the PAIRING: a
+lone Alt down-then-up opens the menu, the same Alt with a key pressed in
+between must not. Send-TestKeys cannot express that - it owns both halves - so
+this helper hands the caller each half and stays out of what goes between.
+
+Not a general input path: for an ordinary chord use Send-TestKeys.
+#>
+function Send-TestSysKey {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [ValidateSet('down', 'up')][string]$Action = 'down',
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    return $td.SysKey($Window, (ConvertTo-TestVk $Key), ($Action -eq 'up'))
 }
 
 # Post WM_CLOSE to a window or dialog. Use this rather than a posted

@@ -3592,3 +3592,49 @@ divider drag, because `updateDividerDrag` reads the WM_MOUSEMOVE lparam and
 consults neither MK_LBUTTON nor the cursor.
 
 Floor: both `zig build test` lanes, `test-agent`, P1-P3 green.
+
+## 2026-07-31 - T218 batch 4: the popup-menu pair, and a constant the product left behind
+
+`context-menu` (37 assertions) and `menu-bar` (60) onto the test desktop, each
+ALL PASS x3 with a failing negative control. 9 of 13 done; chooser-menu,
+hero-mode, host-settings and window-color remain.
+
+Both scripts were already 100% PostMessage-driven and neither ran on a
+background desktop. What is desktop-bound is not INPUT, it is window
+ENUMERATION: `EnumWindows`/`EnumChildWindows` walk the calling thread's
+desktop, so every FindTop/FindPane/MenuWindow returned nothing. HMENU reads do
+NOT move - a menu handle is not a desktop object - so both tree walks stay
+in-process. The rule for the next batch is to ask what a call takes: HWND means
+harness, a handle you already hold means local.
+
+Two measurements that removed work. `context-menu`'s section A parked the
+physical cursor before right-clicking, because the core resolves the clicked
+word through `getCursorPos`; T216 had already given win32 a fallback to
+`last_cursor_client`, so the posted click's own coordinates carry it and the
+SetCursorPos call is deleted rather than replaced. That is the counter-case to
+`split-divider`: a cursor-reading path CAN migrate when the product has a
+message-derived fallback. And the clipboard is a WINDOW STATION resource, not a
+desktop one, so both paste sections migrated untouched.
+
+The interesting failure was not a migration artifact. `menu-bar` clicked a
+hard-coded 46px left of the client's right edge to hit the "+", which encoded a
+layout the product abandoned in T202 (a lone tab no longer stretches, so the
+"+" travels with the last tab and sits ~260px from the LEFT) and was DPI-blind
+besides - at 125% that offset lands inside the menu button, so the "+" click
+opened the menu and no tab ever appeared. Five assertions failing against a
+healthy product, invisible because the script had not been re-run. Replaced by
+`Strip-Geometry`, `tab_strip_layout.zig`'s published model evaluated at the
+window's DPI, self-checking because every consumer asserts an outcome. T231
+filed to delete that duplication by having the product report its own hit
+regions.
+
+Two more SKIP branches retired, the batch-1 lesson again: A(pixels) dropped
+GrabForeground+CopyFromScreen for PrintWindow (the strip is GDI-painted chrome)
+so it always runs, and the alternate-screen setup became an assertion instead
+of silently dropping three F10 assertions. Harness gained `Send-TestSysKey`,
+one half of a WM_SYSKEYDOWN/UP pair at a time, because section G's contract is
+about the PAIRING.
+
+Floor: both `zig build test` lanes, `test-agent`, P1-P3 green. Harness
+regression after the `Send-TestSysKey` addition: dark-menus, test-desktop-harness
+and focus-defer all ALL PASS.

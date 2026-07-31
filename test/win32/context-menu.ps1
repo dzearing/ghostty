@@ -5,34 +5,58 @@
 #      pane; full Mac-parity item list with Copy grayed (no selection yet).
 #   A: posted right-click opens the menu; right-click ON text pre-selects
 #      the word (Mac parity) so Copy enables.
-#   B: keyboard selection dispatches — "P" picks Paste and the clipboard
+#   B: keyboard selection dispatches - "P" picks Paste and the clipboard
 #      sentinel lands in the pane (TrackPopupMenuEx TPM_RETURNCMD wiring).
 #   C: "T" toggles Terminal Read-only; reopened menu shows MF_CHECKED;
 #      toggling again clears it.
 #   D: with SGR mouse reporting active in the pane (ConPTY passthrough of
-#      ?1002h/?1006h), a plain right-click is reported to the app (NO menu —
+#      ?1002h/?1006h), a plain right-click is reported to the app (NO menu -
 #      the TUI wins, Mac parity) but shift+right-click bypasses the report
 #      and opens the menu (works because handleMouseButton reads shift from
 #      the message wparam).
-#   E: `right-click-action = paste` opt-out — right-click pastes, no menu
+#   E: `right-click-action = paste` opt-out - right-click pastes, no menu
 #      (the Windows-Terminal-style behavior, as a config choice).
-#   G: T129 discoverability — the menu carries "Set Pane Banner..." labeled
+#   G: T129 discoverability - the menu carries "Set Pane Banner..." labeled
 #      with its accelerator (Ctrl+Shift+B, NOT the Mac cmd+r), the label
 #      tracks the live keybind set (a rebind relabels it), and choosing the
 #      row opens the banner editor.
 #
-# All input is PostMessage-driven (client-coordinate mouse messages with
-# crafted MK_* wparam bits), so the script needs neither foreground nor
-# SendInput and is immune to the box's GameInputSvc input wedge (T95/T103).
-param([string]$ExePath)
+# T218: migrated onto the BACKGROUND test desktop (test/win32/lib/TestDesktop.ps1),
+# so the run never takes the user's foreground - asserted here, not assumed.
+#
+# The script was ALREADY all-PostMessage, so the input half needed nothing: it
+# is window ENUMERATION that is desktop-bound (EnumWindows walks the CALLING
+# thread's desktop), which is why every FindTop/FindPane/MenuWindow now goes
+# through the harness's worker thread. Two things worth carrying forward:
+#
+#   * Section A used to park the physical cursor with SetCursorPos because the
+#     core resolves the right-clicked word through `rt_surface.getCursorPos()`.
+#     SetCursorPos is dead off the input desktop (T218 batch 3) - and it is no
+#     longer needed: T216 gave `win32.Surface.getCursorPos` a fallback to
+#     `last_cursor_client`, the position carried by the last mouse MESSAGE, so
+#     the posted click's own coordinates are what the word-select resolves
+#     against. Verified in src/apprt/win32/Surface.zig (getCursorPos +
+#     noteCursorFromLparam). The SetCursorPos call is gone, not replaced.
+#   * The clipboard is a WINDOW STATION resource, not a desktop one, so the
+#     script (interactive desktop) and the app (test desktop) share it and the
+#     paste sections migrate unchanged.
+#
+# -NegativeControl flips section F's Copy expectation to "enabled" on a pane
+# that has no selection, which MUST fail; it is how a run proves the menu-state
+# read still discriminates.
+#
+# Only touches ghoztty processes running from this repo's zig-out*.
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
-if ($ExePath) {
-    $exe = $ExePath
-    $env:GHOZTTY_PIPE_SUFFIX = '-ctxmenutest'
-}
+if ($ExePath) { $exe = $ExePath }
+# Always isolated, not just under -ExePath: the IPC probes below (+list, +read)
+# must reach THIS run's app and nothing else on the box.
+$env:GHOZTTY_PIPE_SUFFIX = '-ctxmenutest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -47,170 +71,22 @@ function Assert([bool]$cond, [string]$label) {
 Add-Type -AssemblyName System.Windows.Forms
 function Set-ClipText([string]$s) { [System.Windows.Forms.Clipboard]::SetText($s) }
 
+# HMENU reads only. These take a menu HANDLE, not a window, so they are not
+# desktop-bound and run fine from this process; window enumeration is the part
+# that has to go through the harness.
 Add-Type @'
 using System;
 using System.Collections.Generic;
 using System.Text;
-using System.Threading;
 using System.Runtime.InteropServices;
-public class CtxMenuDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+public class CtxMenuRead {
     [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr menu);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuStringW(IntPtr menu, uint idItem, StringBuilder sb, int max, uint flags);
     [DllImport("user32.dll")] public static extern uint GetMenuState(IntPtr menu, uint id, uint flags);
-    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-    [DllImport("user32.dll", EntryPoint = "GetWindowRect")] public static extern bool GetWindowRectPub(IntPtr h, out RECT r);
-    [DllImport("user32.dll", EntryPoint = "SetCursorPos")] public static extern bool SetCursor(int x, int y);
-    [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO ci);
-    [DllImport("user32.dll")] public static extern IntPtr LoadCursorW(IntPtr inst, IntPtr name);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public int ptX, ptY; }
-    // With mouse reporting on, ghostty shows the plain arrow over the pane
-    // (instead of the I-beam). Match IDC_ARROW exactly so the transient
-    // app-starting/wait cursors during child spawn can't false-positive.
-    public static bool CursorIsArrow() {
-        var ci = new CURSORINFO();
-        ci.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
-        if (!GetCursorInfo(ref ci)) return false;
-        return ci.hCursor == LoadCursorW(IntPtr.Zero, (IntPtr)32512); // IDC_ARROW
-    }
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static void BeDpiAware() { SetProcessDpiAwarenessContext((IntPtr)(-4)); }
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FindPane(IntPtr top) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // The visible popup-menu window (class #32768) owned by pid, or zero.
-    public static IntPtr MenuWindow(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "#32768" && IsWindowVisible(h)) {
-                uint p; GetWindowThreadProcessId(h, out p);
-                if (p == pid) { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Visible top-level window of a class owned by pid (T129 uses it to see
-    // the banner editor the menu row opens), or zero.
-    public static IntPtr WindowOfClass(uint pid, string cls) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == cls && IsWindowVisible(h)) {
-                uint p; GetWindowThreadProcessId(h, out p);
-                if (p == pid) { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr WaitClass(uint pid, string cls, int ms) {
-        for (int t = 0; t < ms; t += 50) {
-            IntPtr h = WindowOfClass(pid, cls);
-            if (h != IntPtr.Zero) return h;
-            Thread.Sleep(50);
-        }
-        return IntPtr.Zero;
-    }
-
-    public static void CloseWindow(IntPtr h) {
-        PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero); // WM_CLOSE
-    }
-
-    public static IntPtr WaitMenu(uint pid, int ms) {
-        for (int t = 0; t < ms; t += 50) {
-            IntPtr h = MenuWindow(pid);
-            if (h != IntPtr.Zero) return h;
-            Thread.Sleep(50);
-        }
-        return IntPtr.Zero;
-    }
-
-    public static bool WaitMenuGone(uint pid, int ms) {
-        for (int t = 0; t < ms; t += 50) {
-            if (MenuWindow(pid) == IntPtr.Zero) return true;
-            Thread.Sleep(50);
-        }
-        return false;
-    }
-
-    // Post a right-button press at client (x, y); x < 0 means pane center.
-    public static void PostRightDown(IntPtr pane, uint mkExtra, int x, int y) {
-        RECT rc; GetClientRect(pane, out rc);
-        if (x < 0) { x = (rc.right - rc.left) / 2; y = (rc.bottom - rc.top) / 2; }
-        IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
-        PostMessageW(pane, 0x0204, (IntPtr)(0x0002 | mkExtra), lp); // WM_RBUTTONDOWN
-    }
-
-    public static void PostRightUp(IntPtr pane, uint mkExtra) {
-        RECT rc; GetClientRect(pane, out rc);
-        int x = (rc.right - rc.left) / 2, y = (rc.bottom - rc.top) / 2;
-        IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
-        PostMessageW(pane, 0x0205, (IntPtr)mkExtra, lp); // WM_RBUTTONUP
-    }
-
-    // Post WM_CONTEXTMENU as the keyboard path does (lparam = -1).
-    public static void PostKeyboardMenu(IntPtr pane) {
-        PostMessageW(pane, 0x007B, pane, (IntPtr)(-1));
-    }
-
-    // Post a key while the pane's thread is in the menu modal loop; the
-    // loop retrieves queue messages regardless of target hwnd.
-    public static void PostKey(IntPtr pane, ushort vk) {
-        PostMessageW(pane, 0x0100, (IntPtr)vk, IntPtr.Zero); // WM_KEYDOWN
-        PostMessageW(pane, 0x0101, (IntPtr)vk, IntPtr.Zero); // WM_KEYUP
-    }
-
-    // Cancel any active menu modal loop on the pane's thread.
-    public static void CancelMenu(IntPtr pane) {
-        IntPtr result;
-        SendMessageTimeoutW(pane, 0x001F, IntPtr.Zero, IntPtr.Zero, 2, 2000, out result); // WM_CANCELMODE
-    }
 
     // Item strings by position; separators come back as "---"; grayed and
     // checked states append ":grayed"/":checked".
-    public static string[] MenuItems(IntPtr menuWnd) {
-        IntPtr result;
-        SendMessageTimeoutW(menuWnd, 0x01E1, IntPtr.Zero, IntPtr.Zero, 2, 2000, out result); // MN_GETHMENU
-        IntPtr menu = result;
+    public static string[] Items(IntPtr menu) {
         if (menu == IntPtr.Zero) return new string[0];
         int n = GetMenuItemCount(menu);
         var items = new List<string>();
@@ -229,8 +105,6 @@ public class CtxMenuDrv {
 }
 '@
 
-[CtxMenuDrv]::BeDpiAware()
-
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
         Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
@@ -238,27 +112,88 @@ function Kill-RepoInstances {
     Start-Sleep -Milliseconds 500
 }
 
+# ---- menu helpers (harness-backed) ----------------------------------------
+
+function Wait-Menu([int]$gpid, [int]$ms = 3000) {
+    Wait-TestPopupMenu -ProcessId $gpid -TimeoutMs $ms
+}
+
+function Test-MenuGone([int]$gpid, [int]$ms = 2000) {
+    for ($t = 0; $t -lt $ms; $t += 50) {
+        if ((Get-TestWindow -ProcessId $gpid -Class '#32768') -eq [IntPtr]::Zero) { return $true }
+        Start-Sleep -Milliseconds 50
+    }
+    return $false
+}
+
+# The live popup's items. MN_GETHMENU is SENT: the app's GUI thread is inside
+# TrackPopupMenuEx's modal loop, which pumps messages, so a cross-process send
+# is answered (and SMTO_ABORTIFHUNG does not trip on a pumping thread).
+function Get-MenuItems([IntPtr]$menuWnd) {
+    $r = Invoke-TestMessage -Window $menuWnd -Message 0x01E1
+    if ($r -eq [long]::MinValue -or $r -eq 0) { return @() }
+    return [CtxMenuRead]::Items([IntPtr]$r)
+}
+
+# Cancel any active menu modal loop on the pane's thread.
+function Cancel-Menu([IntPtr]$pane) {
+    [void](Invoke-TestMessage -Window $pane -Message 0x001F) # WM_CANCELMODE
+}
+
+# Post a key into the menu's modal loop. The loop retrieves queue messages
+# regardless of target hwnd, and Send-TestControlKey posts without touching
+# focus (Send-TestKeys would SetFocus first and dismiss the menu).
+function Send-MenuKey([IntPtr]$pane, [string]$key) {
+    [void](Send-TestControlKey -Control $pane -Key $key)
+}
+
+# Right-button press at a CLIENT offset in the pane; -1,-1 means pane center.
+# Send-TestMouse takes SCREEN coordinates, so the offset is resolved against
+# the pane's client rect (which the harness already returns in screen space).
+function Send-PaneRight {
+    param(
+        [IntPtr]$Top, [IntPtr]$Pane,
+        [int]$X = -1, [int]$Y = -1,
+        [ValidateSet('down', 'up')][string]$Action = 'down',
+        [string[]]$Modifiers = @()
+    )
+    $pr = Get-TestWindowRect -Window $Pane -Client
+    if ($X -lt 0) {
+        $sx = [int](($pr.Left + $pr.Right) / 2); $sy = [int](($pr.Top + $pr.Bottom) / 2)
+    } else {
+        $sx = $pr.Left + $X; $sy = $pr.Top + $Y
+    }
+    [void](Send-TestMouse -Window $Top -Target $Pane -X $sx -Y $sy `
+        -Button right -Action $Action -Modifiers $Modifiers)
+}
+
 function Start-Gui([string]$label, [string[]]$extraArgs) {
     Kill-RepoInstances
-    $sp = @{ FilePath = $exe; PassThru = $true }
     # session-persistence=false (CLI bools take true/false, NOT on/off):
     # agent-backed panes would re-attach stale sessions across the script's
     # force-kills and leave the pane's shell dead/blank (paste has no live
     # pty to echo into; launch restore replaces the -e window). Also drop
     # any stale debug layout manifest so no prior test's layout restores.
     Remove-Item "$env:LOCALAPPDATA\ghoztty\session-layout-debug.json" -Force -ErrorAction SilentlyContinue
-    $sp.ArgumentList = @('--config-default-files=false', '--session-persistence=false') + $extraArgs
-    $proc = Start-Process @sp
+    $argList = @('--config-default-files=false', '--session-persistence=false') + $extraArgs
+    $app = Start-OnTestDesktop -Exe $exe -Arguments $argList
     Start-Sleep -Seconds 3
-    if ($proc.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
-    $top = [CtxMenuDrv]::FindTop([uint32]$proc.Id)
+    if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): top window not found"; exit 1 }
-    $pane = [CtxMenuDrv]::FindPane($top)
+    $pane = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
     if ($pane -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): pane not found"; exit 1 }
+
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
+        "$label window is NOT enumerable on the interactive desktop"
+    if (-not (Focus-TestWindow -Window $top -Child $pane)) {
+        Write-Host "SETUP FAIL ($label): could not focus the GUI"; Stop-Process -Id $app.Pid -Force; exit 1
+    }
+
     $listJson = & $exe +list --json | Out-String
     $paneName = $null
     if ($listJson -match '"name"\s*:\s*"([^"]+)"') { $paneName = $Matches[1] }
-    [pscustomobject]@{ Proc = $proc; Top = $top; Pane = $pane; PaneName = $paneName }
+    [pscustomobject]@{ App = $app; Pid = [int]$app.Pid; Top = $top; Pane = $pane; PaneName = $paneName }
 }
 
 function Read-Pane([string]$paneName, [int]$lines = 30) {
@@ -269,7 +204,7 @@ function Dump-Items([string[]]$items, [string]$label) {
     Write-Host "      $label items: $($items -join ' | ')"
 }
 
-# MenuItems returns "Base[<tab>Accel][:grayed][:checked]" (T129 added the
+# Get-MenuItems returns "Base[<tab>Accel][:grayed][:checked]" (T129 added the
 # accelerator half). Split it back apart so the item-list compare stays about
 # labels/flags and the accelerator gets its own assertions.
 function Split-Item([string]$s) {
@@ -308,21 +243,36 @@ $expected = @(
     'Background Color...', '---',
     'Change Tab Title...', 'Change Pane Title...', 'Set Pane Banner...'
 )
+if ($NegativeControl) {
+    Write-Host 'NEGATIVE CONTROL: section F asserts Copy is ENABLED on a pane with no selection - this run MUST fail'
+    $expected[0] = 'Copy'
+}
+
+Kill-RepoInstances
+
+# Watch the user's desktop for the whole run: nothing we launch may ever take
+# foreground there. That is the complaint the test desktop exists to fix.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$launched = @()
+
+try {
 
 # ---------------------------------------------------------------------------
 # Run 1: sections F, A, B, C (default config).
 # ---------------------------------------------------------------------------
 $g = Start-Gui 'default' @()
-$proc = $g.Proc; $pane = $g.Pane; $paneName = $g.PaneName
-$gpid = [uint32]$proc.Id
+$launched += $g.Pid
+$gpid = $g.Pid; $pane = $g.Pane; $paneName = $g.PaneName
 
-# F: keyboard path on a virgin pane — no selection exists, so this is the
+# F: keyboard path on a virgin pane - no selection exists, so this is the
 # deterministic Copy:grayed check plus the full item-list compare.
-[CtxMenuDrv]::PostKeyboardMenu($pane)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+# WM_CONTEXTMENU with lparam -1 is the VK_APPS / Shift+F10 shape.
+[void](Send-TestRawMessage -Window $pane -Message 0x007B -WParam $pane -LParam ([IntPtr](-1)))
+$menuWnd = Wait-Menu $gpid 3000
 Assert ($menuWnd -ne [IntPtr]::Zero) 'F: WM_CONTEXTMENU (VK_APPS path) opens the menu'
 if ($menuWnd -ne [IntPtr]::Zero) {
-    $items = [CtxMenuDrv]::MenuItems($menuWnd)
+    $items = Get-MenuItems $menuWnd
     $parsed = @(Split-Items $items)
     Assert ($items.Count -eq $expected.Count) "F: menu has $($expected.Count) rows (got $($items.Count))"
     $mismatch = @()
@@ -346,106 +296,101 @@ if ($menuWnd -ne [IntPtr]::Zero) {
     $unbound = @($parsed | Where-Object { $_.Base -eq 'Background Color...' })
     Assert ($unbound.Count -eq 1 -and $unbound[0].Accel -eq '') 'G: apprt-local row (Background Color...) shows no chord'
 }
-[CtxMenuDrv]::CancelMenu($pane)
-Assert ([CtxMenuDrv]::WaitMenuGone($gpid, 2000)) 'F: WM_CANCELMODE dismisses the menu'
+Cancel-Menu $pane
+Assert (Test-MenuGone $gpid 2000) 'F: WM_CANCELMODE dismisses the menu'
 
 # A: right-click ON text (the cmd banner on row 0) pre-selects the clicked
 # word (Mac parity: right-click-down selects for the menu), enabling Copy.
-# The core resolves the word under the REAL cursor (rt getCursorPos), so
-# park the physical cursor on the click point first (SetCursorPos is not
-# affected by the SendInput wedge).
-$wr = New-Object CtxMenuDrv+RECT
-[CtxMenuDrv]::GetWindowRectPub($pane, [ref]$wr) | Out-Null
-[CtxMenuDrv]::SetCursor($wr.left + 80, $wr.top + 16) | Out-Null
-Start-Sleep -Milliseconds 300
-[CtxMenuDrv]::PostRightDown($pane, 0, 80, 16)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+# The core resolves the word through getCursorPos, which off the input desktop
+# answers from the last mouse MESSAGE - i.e. from this click's own coordinates.
+Send-PaneRight -Top $g.Top -Pane $pane -X 80 -Y 16 -Action down
+$menuWnd = Wait-Menu $gpid 3000
 Assert ($menuWnd -ne [IntPtr]::Zero) 'A: right-click opens the context menu'
 if ($menuWnd -ne [IntPtr]::Zero) {
-    $items = [CtxMenuDrv]::MenuItems($menuWnd)
+    $items = Get-MenuItems $menuWnd
     $parsed = @(Split-Items $items)
     $copyOk = ($parsed.Count -gt 0 -and $parsed[0].Label -eq 'Copy')
     Assert $copyOk 'A: right-click on text selects the word (Copy enabled)'
     if (-not $copyOk) { Dump-Items $items 'A' }
 }
-[CtxMenuDrv]::CancelMenu($pane)
-[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+Cancel-Menu $pane
+[void](Test-MenuGone $gpid 2000)
 
-# B: keyboard selection dispatches — "P" = Paste; sentinel reaches the pty.
+# B: keyboard selection dispatches - "P" = Paste; sentinel reaches the pty.
 $sentinel = 'CTXMENU_PASTE_OK_77'
 Set-ClipText $sentinel
-[CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 3000
 Assert ($menuWnd -ne [IntPtr]::Zero) 'B: menu reopens for the paste test'
-[CtxMenuDrv]::PostKey($pane, 0x50) # 'P' -> unique match "Paste", executes
-Assert ([CtxMenuDrv]::WaitMenuGone($gpid, 2000)) 'B: typing P closes the menu (item executed)'
+Send-MenuKey $pane 'P'   # unique match "Paste", executes
+Assert (Test-MenuGone $gpid 2000) 'B: typing P closes the menu (item executed)'
 $pasted = $false
 for ($t = 0; $t -lt 20; $t++) {
     Start-Sleep -Milliseconds 250
     if ((Read-Pane $paneName) -match $sentinel) { $pasted = $true; break }
 }
 Assert $pasted 'B: menu Paste typed the clipboard sentinel into the pane'
-[CtxMenuDrv]::CancelMenu($pane)
-[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+Cancel-Menu $pane
+[void](Test-MenuGone $gpid 2000)
 
 # C: "T" toggles Terminal Read-only; reopened menu shows the check.
-[CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 3000
 Assert ($menuWnd -ne [IntPtr]::Zero) 'C: menu reopens for the readonly test'
-[CtxMenuDrv]::PostKey($pane, 0x54) # 'T' -> unique match "Terminal Read-only"
-[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+Send-MenuKey $pane 'T'   # unique match "Terminal Read-only"
+[void](Test-MenuGone $gpid 2000)
 Start-Sleep -Milliseconds 300
-[CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 3000
 $checked = $false
 if ($menuWnd -ne [IntPtr]::Zero) {
-    $items = [CtxMenuDrv]::MenuItems($menuWnd)
+    $items = Get-MenuItems $menuWnd
     $checked = ($items -contains 'Terminal Read-only:checked')
 }
 Assert $checked 'C: Terminal Read-only shows checked after toggle'
-[CtxMenuDrv]::PostKey($pane, 0x54) # toggle back off
-[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+Send-MenuKey $pane 'T'   # toggle back off
+[void](Test-MenuGone $gpid 2000)
 Start-Sleep -Milliseconds 300
-[CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 3000
 $unchecked = $false
 if ($menuWnd -ne [IntPtr]::Zero) {
-    $items = [CtxMenuDrv]::MenuItems($menuWnd)
+    $items = Get-MenuItems $menuWnd
     $unchecked = ($items -contains 'Terminal Read-only')
 }
 Assert $unchecked 'C: Terminal Read-only unchecked after second toggle'
-[CtxMenuDrv]::CancelMenu($pane)
-[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+Cancel-Menu $pane
+[void](Test-MenuGone $gpid 2000)
 
 # G: choosing the banner row opens the editor. The row is last, so Up from a
 # fresh menu lands on it (no letter key: Select All / the four Splits / Set
 # Pane Banner all start with S).
-[CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 3000
 Assert ($menuWnd -ne [IntPtr]::Zero) 'G: menu reopens for the banner-row test'
-[CtxMenuDrv]::PostKey($pane, 0x26) # VK_UP -> last item
-[CtxMenuDrv]::PostKey($pane, 0x0D) # VK_RETURN -> execute
-Assert ([CtxMenuDrv]::WaitMenuGone($gpid, 2000)) 'G: choosing the banner row closes the menu'
-$dlg = [CtxMenuDrv]::WaitClass($gpid, 'GhozttyBannerDialog', 3000)
+Send-MenuKey $pane 'Up'
+Send-MenuKey $pane 'Enter'
+Assert (Test-MenuGone $gpid 2000) 'G: choosing the banner row closes the menu'
+$dlg = Wait-TestWindow -ProcessId $gpid -Class 'GhozttyBannerDialog' -TimeoutMs 3000
 Assert ($dlg -ne [IntPtr]::Zero) 'G: banner row opens the banner editor (GhozttyBannerDialog)'
 if ($dlg -ne [IntPtr]::Zero) {
-    [CtxMenuDrv]::CloseWindow($dlg)
+    [void](Send-TestWindowClose -Window $dlg)
     $gone = $false
     for ($t = 0; $t -lt 40; $t++) {
         Start-Sleep -Milliseconds 50
-        if ([CtxMenuDrv]::WindowOfClass($gpid, 'GhozttyBannerDialog') -eq [IntPtr]::Zero) { $gone = $true; break }
+        if ((Get-TestWindow -ProcessId $gpid -Class 'GhozttyBannerDialog') -eq [IntPtr]::Zero) { $gone = $true; break }
     }
     Assert $gone 'G: banner editor closes again'
 }
 
-Assert (-not $proc.HasExited) 'run 1: no crash'
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'run 1: no crash'
+Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
-# Run 2: section D — the pane's command enables mouse reporting the way real
+# Run 2: section D - the pane's command enables mouse reporting the way real
 # Windows TUIs do: SetConsoleMode(ENABLE_MOUSE_INPUT), which conhost
 # translates into an outward DECSET on the ConPTY. (A raw ?1002h written by
-# the child does NOT propagate out of ConPTY — verified 2026-07-20.)
+# the child does NOT propagate out of ConPTY - verified 2026-07-20.)
 # ---------------------------------------------------------------------------
 $inner = @'
 $sig='[DllImport("kernel32.dll")]public static extern IntPtr GetStdHandle(int n);[DllImport("kernel32.dll")]public static extern bool GetConsoleMode(IntPtr h,out uint m);[DllImport("kernel32.dll")]public static extern bool SetConsoleMode(IntPtr h,uint m);'
@@ -457,60 +402,60 @@ $k::SetConsoleMode($h, ($m -bor 0x10 -bor 0x80) -band (-bnot 0x40))|Out-Null
 Start-Sleep 120
 '@
 $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-# PS5.1 Start-Process does NOT auto-quote ArgumentList elements containing
-# spaces — embed the quotes so --command survives as one argv entry.
-$g = Start-Gui 'mouse-reporting' @("`"--command=powershell -NoProfile -EncodedCommand $b64`"")
-$proc = $g.Proc; $pane = $g.Pane
-$gpid = [uint32]$proc.Id
+# Start-OnTestDesktop quotes any argument containing a space, so --command is
+# passed bare here (the pre-migration Start-Process needed the quotes inline).
+$g = Start-Gui 'mouse-reporting' @("--command=powershell -NoProfile -EncodedCommand $b64")
+$launched += $g.Pid
+$gpid = $g.Pid; $pane = $g.Pane
 
 # The mode lands once the child's Add-Type finishes (a few seconds). Poll
-# with plain right-clicks until one is consumed (no menu) — that IS the
+# with plain right-clicks until one is consumed (no menu) - that IS the
 # behavior under test; retries just absorb child-startup latency.
 $suppressed = $false
 for ($try = 0; $try -lt 6; $try++) {
-    [CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
-    $menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 1500)
+    Send-PaneRight -Top $g.Top -Pane $pane -Action down
+    $menuWnd = Wait-Menu $gpid 1500
     if ($menuWnd -eq [IntPtr]::Zero) { $suppressed = $true; break }
-    [CtxMenuDrv]::CancelMenu($pane)
-    [CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+    Cancel-Menu $pane
+    [void](Test-MenuGone $gpid 2000)
     Start-Sleep -Seconds 2
 }
 Assert $suppressed 'D: plain right-click is reported to the TUI (no menu)'
-[CtxMenuDrv]::PostRightUp($pane, 0)
+Send-PaneRight -Top $g.Top -Pane $pane -Action up
 Start-Sleep -Milliseconds 300
 
-[CtxMenuDrv]::PostRightDown($pane, 0x0004, -1, -1) # MK_SHIFT
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+Send-PaneRight -Top $g.Top -Pane $pane -Action down -Modifiers shift
+$menuWnd = Wait-Menu $gpid 3000
 Assert ($menuWnd -ne [IntPtr]::Zero) 'D: shift+right-click bypasses mouse reporting (menu opens)'
-[CtxMenuDrv]::CancelMenu($pane)
-[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+Cancel-Menu $pane
+[void](Test-MenuGone $gpid 2000)
 
-Assert (-not $proc.HasExited) 'run 2: no crash'
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'run 2: no crash'
+Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
-# Run 3: section E — right-click-action=paste opt-out (WT-style).
+# Run 3: section E - right-click-action=paste opt-out (WT-style).
 # ---------------------------------------------------------------------------
 $g = Start-Gui 'paste-optout' @('--right-click-action=paste')
-$proc = $g.Proc; $pane = $g.Pane; $paneName = $g.PaneName
-$gpid = [uint32]$proc.Id
+$launched += $g.Pid
+$gpid = $g.Pid; $pane = $g.Pane; $paneName = $g.PaneName
 
 $sentinel2 = 'CTXMENU_RCA_PASTE_88'
 Set-ClipText $sentinel2
-[CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 1500)
+Send-PaneRight -Top $g.Top -Pane $pane -Action down
+$menuWnd = Wait-Menu $gpid 1500
 Assert ($menuWnd -eq [IntPtr]::Zero) 'E: right-click-action=paste shows no menu'
-if ($menuWnd -ne [IntPtr]::Zero) { [CtxMenuDrv]::CancelMenu($pane); [CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null }
-[CtxMenuDrv]::PostRightUp($pane, 0)
+if ($menuWnd -ne [IntPtr]::Zero) { Cancel-Menu $pane; [void](Test-MenuGone $gpid 2000) }
+Send-PaneRight -Top $g.Top -Pane $pane -Action up
 # The clipboard read can transiently fail (CLIPBRD_E_CANT_OPEN contention
 # right after another process wrote it) and the shell may still be settling
-# this early in the run — retry the click a few times.
+# this early in the run - retry the click a few times.
 $pasted2 = $false
 for ($try = 0; $try -lt 3 -and -not $pasted2; $try++) {
     if ($try -gt 0) {
-        [CtxMenuDrv]::PostRightDown($pane, 0, -1, -1)
+        Send-PaneRight -Top $g.Top -Pane $pane -Action down
         Start-Sleep -Milliseconds 300
-        [CtxMenuDrv]::PostRightUp($pane, 0)
+        Send-PaneRight -Top $g.Top -Pane $pane -Action up
     }
     for ($t = 0; $t -lt 12; $t++) {
         Start-Sleep -Milliseconds 250
@@ -519,32 +464,48 @@ for ($try = 0; $try -lt 3 -and -not $pasted2; $try++) {
 }
 Assert $pasted2 'E: right-click-action=paste pastes the clipboard'
 
-Assert (-not $proc.HasExited) 'run 3: no crash'
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'run 3: no crash'
+Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
-# Run 4: section G — the accelerator label is read from the live keybind set,
+# Run 4: section G - the accelerator label is read from the live keybind set,
 # not hardcoded. A user bind added after the defaults wins the reverse map, so
 # the row must relabel itself (and the banner must still be reachable).
 # ---------------------------------------------------------------------------
 $g = Start-Gui 'rebind' @('--keybind=ctrl+alt+k=prompt_surface_banner')
-$proc = $g.Proc; $pane = $g.Pane
-$gpid = [uint32]$proc.Id
+$launched += $g.Pid
+$gpid = $g.Pid; $pane = $g.Pane
 
-[CtxMenuDrv]::PostKeyboardMenu($pane)
-$menuWnd = [CtxMenuDrv]::WaitMenu($gpid, 3000)
+[void](Send-TestRawMessage -Window $pane -Message 0x007B -WParam $pane -LParam ([IntPtr](-1)))
+$menuWnd = Wait-Menu $gpid 3000
 Assert ($menuWnd -ne [IntPtr]::Zero) 'G: menu opens under the rebind config'
 if ($menuWnd -ne [IntPtr]::Zero) {
-    $parsed = @(Split-Items ([CtxMenuDrv]::MenuItems($menuWnd)))
+    $parsed = @(Split-Items (Get-MenuItems $menuWnd))
     $accel = Accel-For $parsed 'Set Pane Banner...'
     Assert ($accel -eq 'Ctrl+Alt+K') "G: rebinding relabels the row (got '$accel')"
 }
-[CtxMenuDrv]::CancelMenu($pane)
-[CtxMenuDrv]::WaitMenuGone($gpid, 2000) | Out-Null
+Cancel-Menu $pane
+[void](Test-MenuGone $gpid 2000)
 
-Assert (-not $proc.HasExited) 'run 4: no crash'
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-Kill-RepoInstances
+Assert (-not ($g.App.Process -and $g.App.Process.HasExited)) 'run 4: no crash'
+Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
+
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live list: this runs AFTER Remove-TestDesktop
+    # has emptied that one, and comparing against an empty set is an assertion
+    # that passes because it checked nothing.
+    $launched = @(@($launched) + @(Get-TestLaunchedPids) | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }

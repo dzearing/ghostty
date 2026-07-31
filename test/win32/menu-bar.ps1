@@ -24,14 +24,40 @@
 #
 # Menu contents are read from the LIVE popup via MN_GETHMENU + cross-process
 # GetMenuItemInfo-family calls (never GetWindowTextW, which reads a cache the
-# app never sees). Mouse/keys are PostMessage-driven, so the run needs neither
-# foreground nor SendInput except for the one pixel section, which says so.
-param([string]$ExePath)
+# app never sees).
+#
+# T218: migrated onto the BACKGROUND test desktop (test/win32/lib/TestDesktop.ps1),
+# so the run never takes the user's foreground - asserted here, not assumed.
+# Everything except the A(pixels) probe was already PostMessage-driven, so the
+# migration is about WHERE those calls run:
+#
+#   * Window enumeration is desktop-bound (EnumWindows walks the CALLING
+#     thread's desktop), so FindTop/FindPane/MenuWindow/VisiblePanes now go
+#     through the harness's worker thread. HMENU reads are NOT - a menu handle
+#     is not a desktop object - so they stay in-process here.
+#   * A(pixels) dropped GrabForeground + CopyFromScreen for PrintWindow
+#     (Get-TestWindowPixels). The tab strip is GDI-painted chrome, which is the
+#     half of the CAPTURE LIMIT that survives a window capture (measured in
+#     T218 batch 2 by tab-strip/tab-color). That also retires the section's
+#     "SKIP if the box will not hand over the foreground" branch: the probe now
+#     always runs, and a capture with no real content in it is a FAIL rather
+#     than a silently-skipped assertion.
+#   * F10 and the lone-Alt press need WM_SYSKEYDOWN/UP as separate halves (the
+#     contract is about the pairing), which is what Send-TestSysKey exists for.
+#
+# -NegativeControl inverts the A(pixels) button-ink expectation and MUST fail;
+# it is how a run proves that probe reads ink rather than returning a constant.
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
+# Always isolated: every oracle below is an IPC probe (+list, +read,
+# +send-keys) and must reach THIS run's app, not whatever else is on the box.
+$env:GHOZTTY_PIPE_SUFFIX = '-menubartest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -46,166 +72,29 @@ $EL = [char]0x2026   # HORIZONTAL ELLIPSIS, as used by the "..." menu rows
 
 Add-Type -AssemblyName System.Drawing
 
+# HMENU reads only. A menu handle is not a desktop object, so these run in this
+# process; every WINDOW lookup goes through the harness instead.
 Add-Type @'
 using System;
 using System.Collections.Generic;
 using System.Text;
-using System.Threading;
 using System.Runtime.InteropServices;
-public class MenuDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+public class MenuRead {
     [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr menu);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuStringW(IntPtr menu, uint idItem, StringBuilder sb, int max, uint flags);
     [DllImport("user32.dll")] public static extern uint GetMenuState(IntPtr menu, uint id, uint flags);
     [DllImport("user32.dll")] public static extern IntPtr GetSubMenu(IntPtr menu, int pos);
-    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static void BeDpiAware() { SetProcessDpiAwarenessContext((IntPtr)(-4)); }
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64); GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FindPane(IntPtr top) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64); GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Every terminal child of a window, visible or not, and how many of them
-    // are visible (the Zoom Split oracle: zooming HIDES the other panes).
-    public static int VisiblePanes(IntPtr top) {
-        int n = 0;
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64); GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) n++;
-            return true;
-        }, IntPtr.Zero);
-        return n;
-    }
-
-    public static IntPtr MenuWindow(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            var sb = new StringBuilder(64); GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "#32768" && IsWindowVisible(h)) {
-                uint p; GetWindowThreadProcessId(h, out p);
-                if (p == pid) { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Visible top-level window of a class owned by pid, waited for.
-    public static IntPtr WindowOfClass(uint pid, string cls) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            var sb = new StringBuilder(64); GetClassNameW(h, sb, 64);
-            if (sb.ToString() == cls && IsWindowVisible(h)) {
-                uint p; GetWindowThreadProcessId(h, out p);
-                if (p == pid) { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-    public static IntPtr WaitClass(uint pid, string cls, int ms) {
-        for (int t = 0; t < ms; t += 50) {
-            IntPtr h = WindowOfClass(pid, cls);
-            if (h != IntPtr.Zero) return h;
-            Thread.Sleep(50);
-        }
-        return IntPtr.Zero;
-    }
-
-    public static IntPtr WaitMenu(uint pid, int ms) {
-        for (int t = 0; t < ms; t += 50) { IntPtr h = MenuWindow(pid); if (h != IntPtr.Zero) return h; Thread.Sleep(50); }
-        return IntPtr.Zero;
-    }
-
-    public static bool WaitMenuGone(uint pid, int ms) {
-        for (int t = 0; t < ms; t += 50) { if (MenuWindow(pid) == IntPtr.Zero) return true; Thread.Sleep(50); }
-        return false;
-    }
-
-    // Click in the tab strip at (x, y) in CLIENT coords; x < 0 counts back
-    // from the right edge.
-    public static void ClickStrip(IntPtr top, int x, int y) {
-        RECT rc; GetClientRect(top, out rc);
-        if (x < 0) x = (rc.right - rc.left) + x;
-        IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
-        PostMessageW(top, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
-        PostMessageW(top, 0x0202, IntPtr.Zero, lp); // WM_LBUTTONUP
-    }
-
-    public static void MoveInStrip(IntPtr top, int x, int y) {
-        RECT rc; GetClientRect(top, out rc);
-        if (x < 0) x = (rc.right - rc.left) + x;
-        IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
-        PostMessageW(top, 0x0200, IntPtr.Zero, lp); // WM_MOUSEMOVE
-    }
-
-    // Keys into the thread queue: the menu's modal loop and the pane's
-    // WndProc both read from it.
-    public static void PostKey(IntPtr h, ushort vk) {
-        PostMessageW(h, 0x0100, (IntPtr)vk, IntPtr.Zero);          // WM_KEYDOWN
-        PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)unchecked((int)0xC0000001)); // WM_KEYUP
-    }
-    public static void PostSysKeyDown(IntPtr h, ushort vk) {
-        PostMessageW(h, 0x0104, (IntPtr)vk, IntPtr.Zero);          // WM_SYSKEYDOWN
-    }
-    public static void PostSysKeyUp(IntPtr h, ushort vk) {
-        PostMessageW(h, 0x0105, (IntPtr)vk, (IntPtr)unchecked((int)0xC0000001)); // WM_SYSKEYUP
-    }
-
-    public static void CancelMenu(IntPtr h) {
-        IntPtr r; SendMessageTimeoutW(h, 0x001F, IntPtr.Zero, IntPtr.Zero, 2, 2000, out r); // WM_CANCELMODE
-    }
-
-    // The live popup's whole tree, one line per row:
+    // The whole tree, one line per row:
     //   "<path>/<label>[\t<accel>][:grayed][:checked]", submenus as "<label> >".
     //
     // GetSubMenu is checked BEFORE the MF_SEPARATOR bit on purpose: for a
     // popup row GetMenuState returns the submenu's ITEM COUNT in the high
     // byte, so any submenu with 8..15 items sets 0x800 and reads as a
     // separator. (That mis-read cost a debugging round on the first run.)
-    public static string[] Tree(IntPtr menuWnd) {
-        IntPtr result;
-        SendMessageTimeoutW(menuWnd, 0x01E1, IntPtr.Zero, IntPtr.Zero, 2, 2000, out result); // MN_GETHMENU
+    public static string[] Tree(IntPtr menu) {
         var acc = new List<string>();
-        if (result != IntPtr.Zero) Walk(result, "", acc);
+        if (menu != IntPtr.Zero) Walk(menu, "", acc);
         return acc.ToArray();
     }
     static void Walk(IntPtr menu, string prefix, List<string> acc) {
@@ -228,38 +117,8 @@ public class MenuDrv {
             }
         }
     }
-
-    // Client-rect origin in screen coords, for the pixel section.
-    public static POINT ClientOrigin(IntPtr h) {
-        POINT p; p.x = 0; p.y = 0; ClientToScreen(h, ref p); return p;
-    }
-    public static RECT Client(IntPtr h) { RECT r; GetClientRect(h, out r); return r; }
-    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
-
-    static void Key(byte vk, bool up) { keybd_event(vk, 0, up ? 2u : 0u, UIntPtr.Zero); }
-
-    public static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
 }
 '@
-
-[MenuDrv]::BeDpiAware()
 
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
@@ -274,14 +133,20 @@ function Start-Gui([string]$label, [string[]]$extraArgs) {
     # over the one under test (the T131 lesson).
     Remove-Item "$env:LOCALAPPDATA\ghoztty\session-layout-debug.json" -Force -ErrorAction SilentlyContinue
     $argList = @('--config-default-files=false') + $extraArgs
-    $proc = Start-Process -FilePath $exe -ArgumentList $argList -PassThru
+    $app = Start-OnTestDesktop -Exe $exe -Arguments $argList
     Start-Sleep -Seconds 3
-    if ($proc.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
-    $top = [MenuDrv]::FindTop([uint32]$proc.Id)
+    if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): top window not found"; exit 1 }
-    $pane = [MenuDrv]::FindPane($top)
+    $pane = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
     if ($pane -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): pane not found"; exit 1 }
-    [pscustomobject]@{ Proc = $proc; Top = $top; Pane = $pane; Pid = [uint32]$proc.Id }
+
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
+        "$label window is NOT enumerable on the interactive desktop"
+    if (-not (Focus-TestWindow -Window $top -Child $pane)) {
+        Write-Host "SETUP FAIL ($label): could not focus the GUI"; Stop-Process -Id $app.Pid -Force; exit 1
+    }
+    [pscustomobject]@{ App = $app; Proc = $app.Process; Top = $top; Pane = $pane; Pid = [int]$app.Pid }
 }
 
 function List-Json { & $exe +list --json 2>$null | ConvertFrom-Json }
@@ -341,19 +206,111 @@ function Focused-Pane-Name {
 }
 function Tab-Count { @((List-Json).data.windows[0].tabs).Count }
 
+# How many terminal children are VISIBLE (the Zoom Split oracle: zooming HIDES
+# the other panes).
+function Visible-Panes([IntPtr]$top) {
+    @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object { $_.Visible }).Count
+}
+
+# ---- menu helpers (harness-backed) ----------------------------------------
+
+function Wait-Menu([int]$gpid, [int]$ms = 3000) {
+    Wait-TestPopupMenu -ProcessId $gpid -TimeoutMs $ms
+}
+
+function Test-MenuGone([int]$gpid, [int]$ms = 2000) {
+    for ($t = 0; $t -lt $ms; $t += 50) {
+        if ((Get-TestWindow -ProcessId $gpid -Class '#32768') -eq [IntPtr]::Zero) { return $true }
+        Start-Sleep -Milliseconds 50
+    }
+    return $false
+}
+
+# The live popup's tree. MN_GETHMENU is SENT: the app's GUI thread is inside
+# TrackPopupMenuEx's modal loop, which pumps messages, so a cross-process send
+# is answered (and SMTO_ABORTIFHUNG does not trip on a pumping thread).
+function Get-MenuTree([IntPtr]$menuWnd) {
+    $r = Invoke-TestMessage -Window $menuWnd -Message 0x01E1
+    if ($r -eq [long]::MinValue -or $r -eq 0) { return @() }
+    return [MenuRead]::Tree([IntPtr]$r)
+}
+
+function Cancel-Menu([IntPtr]$w) {
+    [void](Invoke-TestMessage -Window $w -Message 0x001F) # WM_CANCELMODE
+}
+
+# Post a key into the menu's modal loop: the loop retrieves queue messages
+# regardless of target hwnd, and Send-TestControlKey posts without touching
+# focus (Send-TestKeys would SetFocus first and dismiss the menu).
+function Send-MenuKey([IntPtr]$w, [string]$key) {
+    [void](Send-TestControlKey -Control $w -Key $key)
+}
+
+# Click in the tab strip at CLIENT (x, y); x < 0 counts back from the right
+# edge. The strip is painted AND hit-tested by the top-level window, so that is
+# where the click is posted (T216: name the window a real click would reach).
+function Click-Strip([IntPtr]$top, [int]$x, [int]$y) {
+    $cr = Get-TestWindowRect -Window $top -Client
+    $sx = if ($x -lt 0) { $cr.Right + $x } else { $cr.Left + $x }
+    [void](Send-TestMouse -Window $top -Target $top -X $sx -Y ($cr.Top + $y) -Button left -Action click)
+}
+
+# Where the strip's three regions ARE, in client x, for a window at this DPI
+# with this many tabs - `tab_strip_layout.zig`'s published model evaluated
+# here rather than guessed.
+#
+# The section used to click a hard-coded "46px left of the right edge" for the
+# "+". That constant was written when a SINGLE tab stretched to fill the strip,
+# which parked the "+" hard against the menu button; T202 stopped the stretch
+# and the "+" now TRAVELS with the last tab, so with one tab it sits ~260px
+# from the LEFT. The offset was doubly wrong at 125% DPI, where the scaled
+# button group is wide enough that 46px from the right edge lands INSIDE the
+# menu button - which is what the migration measured (the "+" click opened the
+# menu and no tab ever appeared). The model below is self-checking: every user
+# of it asserts an outcome, so a wrong model fails the section rather than
+# quietly clicking dead space.
+function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
+    $dpi = Get-TestWindowDpi -Window $top
+    $scale = $dpi / 96.0
+    # Metrics.init's px(): round half AWAY from zero, which is @round in Zig -
+    # NOT PowerShell's default banker's rounding.
+    $px = { param([double]$dip) [int][Math]::Round($dip * $scale, [MidpointRounding]::AwayFromZero) }
+    $padL = & $px 4.0; $padR = & $px 4.0; $gap = & $px 8.0; $btnW = & $px 36.0
+    $tabGap = & $px 4.0; $maxTabW = & $px 200.0; $minTabW = & $px 60.0
+    $cw = (Get-TestWindowRect -Window $top -Client).Width
+
+    $menuLeft = $cw - $padR - $btnW
+    $plusLimit = $menuLeft - $gap - $btnW
+    $tabsAvail = $plusLimit - $gap - $padL
+    $n = [Math]::Max($tabCount, 1)
+    $w = [Math]::Min([Math]::Max([int][Math]::Truncate($tabsAvail / $n), $minTabW), $maxTabW)
+    $fits = [Math]::Max([int][Math]::Truncate($tabsAvail / $w), 1)
+    $visible = [Math]::Min($n, $fits)
+    $tabsRight = $padL + ($visible - 1) * $w + [Math]::Max($w - $tabGap, 1)
+    $plusLeft = [Math]::Min($tabsRight + $gap, $plusLimit)
+
+    [pscustomobject]@{
+        Dpi = $dpi; ClientW = $cw; BtnW = $btnW; MinTabW = $minTabW
+        MenuX = $menuLeft + [int]($btnW / 2)
+        PlusX = $plusLeft + [int]($btnW / 2)
+        # Strip that belongs to neither a tab, the "+", nor the menu button.
+        DeadX = [int](($plusLeft + $btnW + $menuLeft) / 2)
+    }
+}
+
 # Open the menu from the tab-strip button and return the live tree.
 function Open-Menu($g, [int]$waitMs = 3000) {
-    [MenuDrv]::ClickStrip($g.Top, -10, 8)
-    $m = [MenuDrv]::WaitMenu($g.Pid, $waitMs)
+    Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+    $m = Wait-Menu $g.Pid $waitMs
     if ($m -eq [IntPtr]::Zero) { return $null }
-    [MenuDrv]::Tree($m)
+    Get-MenuTree $m
 }
 
 function Close-Menu($g) {
-    [MenuDrv]::PostKey($g.Top, 0x1B) # VK_ESCAPE
-    if (-not [MenuDrv]::WaitMenuGone($g.Pid, 1500)) {
-        [MenuDrv]::CancelMenu($g.Top)
-        [MenuDrv]::WaitMenuGone($g.Pid, 2000) | Out-Null
+    Send-MenuKey $g.Top 'Escape'
+    if (-not (Test-MenuGone $g.Pid 1500)) {
+        Cancel-Menu $g.Top
+        [void](Test-MenuGone $g.Pid 2000)
     }
 }
 
@@ -473,6 +430,19 @@ $expectedTree = @(
     "&Reload Configuration"
 )
 
+if ($NegativeControl) {
+    Write-Host 'NEGATIVE CONTROL: A(pixels) asserts the menu button paints NOTHING - this run MUST fail'
+}
+
+Kill-RepoInstances
+
+# Watch the user's desktop for the whole run: nothing we launch may ever take
+# foreground there. That is the complaint the test desktop exists to fix.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+
+try {
+
 # ===========================================================================
 # Run 1: sections A, B, C, D, G (session-persistence off).
 # ===========================================================================
@@ -483,59 +453,69 @@ $tree = Open-Menu $g
 Assert ($null -ne $tree) 'A: clicking the right end of the tab strip opens the menu'
 Close-Menu $g
 
-# It is a button, not "the strip": mid-strip is dead space, and the rect just
-# left of it is still the "+".
+# It is a button, not "the strip": the bare strip between the "+" and the menu
+# button is dead space, and the "+" is its own hit box.
 $tabsBefore = Tab-Count
-[MenuDrv]::ClickStrip($g.Top, 200, 8)
-$m = [MenuDrv]::WaitMenu($g.Pid, 1200)
-Assert ($m -eq [IntPtr]::Zero) 'A: clicking mid-strip does NOT open the menu'
+$geo = Strip-Geometry $g.Top $tabsBefore
+Write-Host "      A: dpi=$($geo.Dpi) client=$($geo.ClientW) -> plus@$($geo.PlusX) dead@$($geo.DeadX) menu@$($geo.MenuX)"
+Click-Strip $g.Top $geo.DeadX 8
+$m = Wait-Menu $g.Pid 1200
+Assert ($m -eq [IntPtr]::Zero) 'A: clicking bare strip does NOT open the menu'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
+Assert ((Tab-Count) -eq $tabsBefore) 'A: ...and does not open a tab either (it is dead space)'
 
-[MenuDrv]::ClickStrip($g.Top, -46, 8)   # one button-width left of the "="
+Click-Strip $g.Top $geo.PlusX 8
 Start-Sleep -Milliseconds 900
-$m = [MenuDrv]::WaitMenu($g.Pid, 300)
+$m = Wait-Menu $g.Pid 300
 Assert ($m -eq [IntPtr]::Zero) 'A: the "+" button did not open the menu'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
 $tabsAfterPlus = Tab-Count
-Assert ($tabsAfterPlus -eq $tabsBefore + 1) "A: the rect left of the menu button is still the + (tabs $tabsBefore -> $tabsAfterPlus)"
+Assert ($tabsAfterPlus -eq $tabsBefore + 1) "A: the rect after the last tab is the + (tabs $tabsBefore -> $tabsAfterPlus)"
 
 # --- A(pixels): the glyph is painted --------------------------------------
 # Everything else here is hit-testing; this is the only assertion that the
-# button is VISIBLE. Needs the foreground, so it is skipped (not failed) if
-# the box refuses to hand it over.
-if ([MenuDrv]::GrabForeground($g.Top)) {
-    Start-Sleep -Milliseconds 400
-    $org = [MenuDrv]::ClientOrigin($g.Top)
-    $cr = [MenuDrv]::Client($g.Top)
-    $cw = $cr.right - $cr.left
+# button is VISIBLE. PrintWindow, not a screen grab: the strip is GDI-painted
+# chrome, so it survives a window capture on the background desktop.
+$shot = Get-TestWindowPixels -Window $g.Top
+try {
+    # A capture with nothing in it satisfies "no ink" for entirely the wrong
+    # reason, so real content is a precondition, not an assumption (T216).
+    $colors = Get-TestDistinctColors -Shot $shot
+    Assert ($colors -ge 8) "A: the window capture holds real content ($colors distinct colors)"
+
+    $cr = Get-TestWindowRect -Window $g.Top -Client
+    $cw = $cr.Width
+    # Ink = pixels far from the rect's own most-common color (the bar
+    # background), measured in SCREEN coordinates against the capture.
     function Ink([int]$xClient, [int]$w, [int]$h) {
-        $bmp = New-Object System.Drawing.Bitmap($w, $h)
-        $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-        $gfx.CopyFromScreen($org.x + $xClient, $org.y + 2, 0, 0, (New-Object System.Drawing.Size($w, $h)))
-        $gfx.Dispose()
         $counts = @{}
+        $px = New-Object 'System.Drawing.Color[,]' $w, $h
         for ($yy = 0; $yy -lt $h; $yy++) { for ($xx = 0; $xx -lt $w; $xx++) {
-            $c = $bmp.GetPixel($xx, $yy).ToArgb()
-            if ($counts.ContainsKey($c)) { $counts[$c]++ } else { $counts[$c] = 1 }
+            $c = Get-TestPixel -Shot $shot -X ($cr.Left + $xClient + $xx) -Y ($cr.Top + 2 + $yy)
+            if ($null -eq $c) { $c = [System.Drawing.Color]::Transparent }
+            $px[$xx, $yy] = $c
+            $k = $c.ToArgb()
+            if ($counts.ContainsKey($k)) { $counts[$k]++ } else { $counts[$k] = 1 }
         } }
-        # The rect's own most-common color is the bar background; anything
-        # far from it is ink.
         $modal = ($counts.GetEnumerator() | Sort-Object -Property Value -Descending)[0]
         $base = [System.Drawing.Color]::FromArgb($modal.Key)
         $ink = 0
         for ($yy = 0; $yy -lt $h; $yy++) { for ($xx = 0; $xx -lt $w; $xx++) {
-            $p = $bmp.GetPixel($xx, $yy)
+            $p = $px[$xx, $yy]
             if ([Math]::Abs($p.R - $base.R) -gt 24 -or [Math]::Abs($p.G - $base.G) -gt 24 -or [Math]::Abs($p.B - $base.B) -gt 24) { $ink++ }
         } }
-        $bmp.Dispose()
         $ink
     }
     $btnInk = Ink ($cw - 36) 34 26
     $blankInk = Ink ([int]($cw / 2)) 34 26
-    Assert ($btnInk -gt 8) "A: the menu button paints a glyph ($btnInk ink pixels)"
+    if ($NegativeControl) {
+        Assert ($btnInk -le 2) "A(neg): the menu button paints NO glyph ($btnInk ink pixels)"
+    } else {
+        Assert ($btnInk -gt 8) "A: the menu button paints a glyph ($btnInk ink pixels)"
+    }
     Assert ($blankInk -le 2) "A: blank strip control has no ink ($blankInk pixels) - the probe measures ink"
-} else {
-    Write-Host 'SKIP A(pixels): could not take the foreground'
+} finally {
+    Close-TestWindowPixels $shot
 }
 
 # --- B: the whole tree -----------------------------------------------------
@@ -579,13 +559,13 @@ if ($null -ne $tree) {
 Close-Menu $g
 
 # --- C: Edit>Select All dispatches, and Copy then enables ------------------
-[MenuDrv]::ClickStrip($g.Top, -10, 8)
-$m = [MenuDrv]::WaitMenu($g.Pid, 3000)
+Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+$m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the Select All dispatch'
-[MenuDrv]::PostKey($g.Top, 0x45) # 'E' -> Edit submenu
+Send-MenuKey $g.Top 'E'  # Edit submenu
 Start-Sleep -Milliseconds 300
-[MenuDrv]::PostKey($g.Top, 0x41) # 'A' -> Select All
-Assert ([MenuDrv]::WaitMenuGone($g.Pid, 2500)) 'C: choosing Select All closes the menu'
+Send-MenuKey $g.Top 'A'  # Select All
+Assert (Test-MenuGone $g.Pid 2500) 'C: choosing Select All closes the menu'
 Start-Sleep -Milliseconds 600
 $tree = Open-Menu $g
 Assert ($null -ne $tree -and (Row-Flags $tree "&Edit/&Copy") -eq '') 'C/D: Copy is enabled after menu>Edit>Select All (dispatch AND live state)'
@@ -593,36 +573,36 @@ Close-Menu $g
 
 # --- C: File>New Tab dispatches -------------------------------------------
 $before = Tab-Count
-[MenuDrv]::ClickStrip($g.Top, -10, 8)
-$m = [MenuDrv]::WaitMenu($g.Pid, 3000)
+Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+$m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the New Tab dispatch'
-[MenuDrv]::PostKey($g.Top, 0x46) # 'F' -> File submenu
+Send-MenuKey $g.Top 'F'  # File submenu
 Start-Sleep -Milliseconds 300
-[MenuDrv]::PostKey($g.Top, 0x54) # 'T' -> New Tab
-Assert ([MenuDrv]::WaitMenuGone($g.Pid, 2500)) 'C: choosing New Tab closes the menu'
+Send-MenuKey $g.Top 'T'  # New Tab
+Assert (Test-MenuGone $g.Pid 2500) 'C: choosing New Tab closes the menu'
 $grew = $false
 for ($t = 0; $t -lt 20; $t++) { Start-Sleep -Milliseconds 250; if ((Tab-Count) -gt $before) { $grew = $true; break } }
 Assert $grew "C: File>New Tab opened a tab ($before -> $(Tab-Count))"
 
 # --- C: View>Terminal Read-only round-trips through the check state --------
-[MenuDrv]::ClickStrip($g.Top, -10, 8)
-$m = [MenuDrv]::WaitMenu($g.Pid, 3000)
+Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+$m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the read-only toggle'
-[MenuDrv]::PostKey($g.Top, 0x56) # 'V' -> View
+Send-MenuKey $g.Top 'V'  # View
 Start-Sleep -Milliseconds 300
-[MenuDrv]::PostKey($g.Top, 0x4F) # 'o' -> Terminal Read-only
-[MenuDrv]::WaitMenuGone($g.Pid, 2500) | Out-Null
+Send-MenuKey $g.Top 'O'  # Terminal Read-only
+[void](Test-MenuGone $g.Pid 2500)
 Start-Sleep -Milliseconds 500
 $tree = Open-Menu $g
 Assert ($null -ne $tree -and (Row-Flags $tree "&View/Terminal Read-&only") -eq ':checked') 'C: View>Terminal Read-only performs and comes back CHECKED'
 Close-Menu $g
 # ...and off again, so the rest of the run types normally.
-[MenuDrv]::ClickStrip($g.Top, -10, 8)
-[MenuDrv]::WaitMenu($g.Pid, 3000) | Out-Null
-[MenuDrv]::PostKey($g.Top, 0x56)
+Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Wait-Menu $g.Pid 3000)
+Send-MenuKey $g.Top 'V'
 Start-Sleep -Milliseconds 300
-[MenuDrv]::PostKey($g.Top, 0x4F)
-[MenuDrv]::WaitMenuGone($g.Pid, 2500) | Out-Null
+Send-MenuKey $g.Top 'O'
+[void](Test-MenuGone $g.Pid 2500)
 Start-Sleep -Milliseconds 400
 $tree = Open-Menu $g
 Assert ($null -ne $tree -and (Row-Flags $tree "&View/Terminal Read-&only") -eq '') 'C: a second choice clears the check'
@@ -632,48 +612,51 @@ Close-Menu $g
 $paneName = Pane-Name
 & $exe +split --target=$paneName --direction=right 2>&1 | Out-Null
 Start-Sleep -Seconds 2
-$panesBefore = [MenuDrv]::VisiblePanes($g.Top)
+$panesBefore = Visible-Panes $g.Top
 Assert ($panesBefore -ge 2) "C: the tab has two panes to zoom (visible=$panesBefore)"
 $tree = Open-Menu $g
 Assert ($null -ne $tree -and (Row-Flags $tree "&Window/&Zoom Split") -eq '') 'D: Zoom Split is ENABLED once the tab has two panes'
 Close-Menu $g
-[MenuDrv]::ClickStrip($g.Top, -10, 8)
-[MenuDrv]::WaitMenu($g.Pid, 3000) | Out-Null
-[MenuDrv]::PostKey($g.Top, 0x57) # 'W' -> Window
+Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Wait-Menu $g.Pid 3000)
+Send-MenuKey $g.Top 'W'  # Window
 Start-Sleep -Milliseconds 300
-[MenuDrv]::PostKey($g.Top, 0x5A) # 'Z' -> Zoom Split
-Assert ([MenuDrv]::WaitMenuGone($g.Pid, 2500)) 'C: choosing Zoom Split closes the menu'
+Send-MenuKey $g.Top 'Z'  # Zoom Split
+Assert (Test-MenuGone $g.Pid 2500) 'C: choosing Zoom Split closes the menu'
 $zoomed = $false
 for ($t = 0; $t -lt 20; $t++) {
     Start-Sleep -Milliseconds 250
-    if ([MenuDrv]::VisiblePanes($g.Top) -lt $panesBefore) { $zoomed = $true; break }
+    if ((Visible-Panes $g.Top) -lt $panesBefore) { $zoomed = $true; break }
 }
-Assert $zoomed "C: Window>Zoom Split hid the other pane ($panesBefore -> $([MenuDrv]::VisiblePanes($g.Top)) visible)"
+Assert $zoomed "C: Window>Zoom Split hid the other pane ($panesBefore -> $(Visible-Panes $g.Top) visible)"
 
 # --- G: keyboard activation ------------------------------------------------
-$pane = [MenuDrv]::FindPane($g.Top)
-[MenuDrv]::PostSysKeyDown($pane, 0x79) # VK_F10
-[MenuDrv]::PostSysKeyUp($pane, 0x79)
-$m = [MenuDrv]::WaitMenu($g.Pid, 3000)
+# Re-resolve the surface: every tab open, split and zoom makes a NEW
+# GhozttyTerminal child, and a key posted at a stale HWND is silently dropped
+# (the T218 batch-1 lesson).
+$pane = Get-TestChildWindow -Window $g.Top -Class 'GhozttyTerminal'
+[void](Send-TestSysKey -Window $pane -Key F10 -Action down)
+[void](Send-TestSysKey -Window $pane -Key F10 -Action up)
+$m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'G: F10 opens the menu'
 Close-Menu $g
 
-[MenuDrv]::PostSysKeyDown($pane, 0x12) # VK_MENU down
+[void](Send-TestSysKey -Window $pane -Key alt -Action down)
 Start-Sleep -Milliseconds 150
-[MenuDrv]::PostSysKeyUp($pane, 0x12)   # ...and up, with nothing between
-$m = [MenuDrv]::WaitMenu($g.Pid, 3000)
+[void](Send-TestSysKey -Window $pane -Key alt -Action up)   # ...with nothing between
+$m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'G: a lone Alt press opens the menu'
 Close-Menu $g
 
-[MenuDrv]::PostSysKeyDown($pane, 0x12)
+[void](Send-TestSysKey -Window $pane -Key alt -Action down)
 Start-Sleep -Milliseconds 100
 # A non-printing key: a letter here would be typed at the shell prompt and
 # would then swallow the next command the script sends (which is exactly how
 # the alternate-screen check below silently skipped on its first run).
-[MenuDrv]::PostKey($pane, 0x25)        # VK_LEFT while Alt is down
+Send-MenuKey $pane 'Left'   # VK_LEFT while Alt is down
 Start-Sleep -Milliseconds 100
-[MenuDrv]::PostSysKeyUp($pane, 0x12)
-$m = [MenuDrv]::WaitMenu($g.Pid, 1500)
+[void](Send-TestSysKey -Window $pane -Key alt -Action up)
+$m = Wait-Menu $g.Pid 1500
 Assert ($m -eq [IntPtr]::Zero) 'G: alt+<key> does NOT open the menu (alt stays a modifier)'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
 
@@ -701,11 +684,12 @@ for ($t = 0; $t -lt 20; $t++) {
     Start-Sleep -Milliseconds 400
     if ((Read-Exit $paneName) -ne 0) { $onAlt = $true; break }
 }
+Assert $onAlt 'G: the pane switched to the alternate screen (setup for the F10 pass-through)'
 if ($onAlt) {
-    $pane = [MenuDrv]::FindPane($g.Top)
-    [MenuDrv]::PostSysKeyDown($pane, 0x79)
-    [MenuDrv]::PostSysKeyUp($pane, 0x79)
-    $m = [MenuDrv]::WaitMenu($g.Pid, 2000)
+    $pane = Get-TestChildWindow -Window $g.Top -Class 'GhozttyTerminal'
+    [void](Send-TestSysKey -Window $pane -Key F10 -Action down)
+    [void](Send-TestSysKey -Window $pane -Key F10 -Action up)
+    $m = Wait-Menu $g.Pid 2000
     Assert ($m -eq [IntPtr]::Zero) 'G: F10 is passed through on the alternate screen (no menu)'
     if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
 
@@ -718,14 +702,12 @@ if ($onAlt) {
     }
     Assert $backOnPrimary 'G: the pane is back on the primary screen (its own marker is visible)'
     if ($backOnPrimary) {
-        [MenuDrv]::PostSysKeyDown($pane, 0x79)
-        [MenuDrv]::PostSysKeyUp($pane, 0x79)
-        $m = [MenuDrv]::WaitMenu($g.Pid, 3000)
+        [void](Send-TestSysKey -Window $pane -Key F10 -Action down)
+        [void](Send-TestSysKey -Window $pane -Key F10 -Action up)
+        $m = Wait-Menu $g.Pid 3000
         Assert ($m -ne [IntPtr]::Zero) 'G: F10 opens the menu again on the primary screen (it is the screen, not a dead key)'
         Close-Menu $g
     }
-} else {
-    Write-Host 'SKIP G(alt screen): the pane never switched to the alternate screen'
 }
 
 # --- A(reflow): the button survives the strip filling up ------------------
@@ -735,16 +717,14 @@ if ($onAlt) {
 # count is computed from this window, not guessed: at 96 DPI and a 1810px
 # client, 21 tabs still fit and would have proved nothing.
 # Last in the run, because it leaves the window full of tabs.
-$dpi = [MenuDrv]::GetDpiForWindow($g.Top)
-$scale = $dpi / 96.0
-$cw = ([MenuDrv]::Client($g.Top)).right
-$btnW = [Math]::Round(36.0 * $scale)
-$minTabW = [Math]::Round(60.0 * $scale)
-$needTabs = [int][Math]::Floor(($cw - 2 * $btnW) / $minTabW) + 4
-Write-Host "      A(reflow): client=$cw dpi=$dpi -> opening $needTabs tabs (min tab ${minTabW}px)"
+$geo = Strip-Geometry $g.Top (Tab-Count)
+$needTabs = [int][Math]::Floor(($geo.ClientW - 2 * $geo.BtnW) / $geo.MinTabW) + 4
+Write-Host "      A(reflow): client=$($geo.ClientW) dpi=$($geo.Dpi) -> opening $needTabs tabs (min tab $($geo.MinTabW)px)"
 $have = Tab-Count
 while ((Tab-Count) -lt $needTabs -and $have -lt $needTabs + 8) {
-    [MenuDrv]::ClickStrip($g.Top, -($btnW + 10), 8)
+    # The "+" travels as tabs are added, so its x is re-derived every click
+    # rather than assumed to sit next to the menu button.
+    Click-Strip $g.Top (Strip-Geometry $g.Top (Tab-Count)).PlusX 8
     $have++
     Start-Sleep -Milliseconds 250
 }
@@ -754,8 +734,8 @@ $tree = Open-Menu $g 4000
 Assert ($null -ne $tree) 'A: the menu button is still reachable with the strip overrun by tabs'
 if ($null -ne $tree) { Close-Menu $g }
 
-Assert (-not $g.Proc.HasExited) 'run 1: no crash'
-Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue
+Assert (-not ($g.Proc -and $g.Proc.HasExited)) 'run 1: no crash'
+Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
 
 # ===========================================================================
 # Run 2: section E - Exit advertises session keeping when persistence is on.
@@ -770,11 +750,11 @@ if ($null -ne $tree) {
     Assert ($null -eq $plain) 'E: ...and the plain Exit row is gone (one row, relabeled)'
 }
 Close-Menu $g
-Assert (-not $g.Proc.HasExited) 'run 2: no crash'
+Assert (-not ($g.Proc -and $g.Proc.HasExited)) 'run 2: no crash'
 # Close via the window so the agent ENDS this run's session (T89e close intent)
 # instead of leaving it to re-attach into a later test.
-[MenuDrv]::CancelMenu($g.Top)
-Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue
+Cancel-Menu $g.Top
+Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
 
 # ===========================================================================
 # Run 3: section F - a rebind relabels its row.
@@ -787,36 +767,36 @@ if ($null -ne $tree) {
     Assert ($null -ne $banner -and $banner.Accel -eq 'Ctrl+Alt+K') "F: rebinding relabels the row (got '$($banner.Accel)')"
 }
 Close-Menu $g
-Assert (-not $g.Proc.HasExited) 'run 3: no crash'
+Assert (-not ($g.Proc -and $g.Proc.HasExited)) 'run 3: no crash'
 
 # --- C: File>Close Window, the row that destroys the window that owns the
 # menu. `Window.close()` calls DestroyWindow synchronously and `onDestroy`
 # frees the Window allocation, so anything the host touches after dispatch is
 # a use-after-free. This is the assertion for that: the app must go away
 # cleanly, not abort.
-[MenuDrv]::ClickStrip($g.Top, -10, 8)
-$m = [MenuDrv]::WaitMenu($g.Pid, 3000)
+Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+$m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the Close Window dispatch'
-[MenuDrv]::PostKey($g.Top, 0x46) # 'F' -> File
+Send-MenuKey $g.Top 'F'  # File
 Start-Sleep -Milliseconds 300
-[MenuDrv]::PostKey($g.Top, 0x57) # 'W' -> Close &Window
+Send-MenuKey $g.Top 'W'  # Close &Window
 # A pane with a live shell counts as a running process, so the close path
 # asks first (Window.confirmCloseIfNeeded). Take the affirmative - and note
 # that this makes the assertion stronger, since the dispatch now runs a modal
 # dialog before it destroys the window that owns the menu.
-$confirm = [MenuDrv]::WaitClass($g.Pid, 'GhozttyConfirmDialog', 3000)
+$confirm = Wait-TestWindow -ProcessId $g.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 3000
 if ($confirm -ne [IntPtr]::Zero) {
     Write-Host '      C: close confirmation shown, accepting'
     # Enter alone CANCELS by design (MB_DEFBUTTON2 parity - an accidental
     # Enter must never approve a close), and posted keys do not move the
     # dialog's focus cross-process. Post the OK command the dialog's own
     # WM_COMMAND handler reads (IDOK), which is what a click on Close does.
-    [MenuDrv]::PostMessageW($confirm, 0x0111, [IntPtr]1, [IntPtr]::Zero) | Out-Null
+    [void](Send-TestRawMessage -Window $confirm -Message 0x0111 -WParam ([IntPtr]1))
 }
 $windowGone = $false
 for ($t = 0; $t -lt 40; $t++) {
     Start-Sleep -Milliseconds 250
-    if ([MenuDrv]::FindTop($g.Pid) -eq [IntPtr]::Zero) { $windowGone = $true; break }
+    if ((Get-TestWindow -ProcessId $g.Pid -Class 'GhozttyWindow') -eq [IntPtr]::Zero) { $windowGone = $true; break }
 }
 Assert $windowGone 'C: File>Close Window destroyed the window that owns the menu'
 Start-Sleep -Milliseconds 800
@@ -824,7 +804,7 @@ Start-Sleep -Milliseconds 800
 # is off), so "still answering IPC" is the liveness check - and it is the one
 # that matters here, because the Window allocation was freed underneath the
 # menu host.
-if ($g.Proc.HasExited) {
+if ($g.Proc -and $g.Proc.HasExited) {
     Assert ($g.Proc.ExitCode -eq 0) "C: ...and the app exited cleanly (code $($g.Proc.ExitCode))"
 } else {
     $healthy = $false
@@ -832,8 +812,24 @@ if ($g.Proc.HasExited) {
     Assert $healthy 'C: ...and the app is still healthy afterwards (answers +list)'
 }
 
-Stop-Process -Id $g.Proc.Id -Force -ErrorAction SilentlyContinue
-Kill-RepoInstances
+Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
+
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live list: this runs AFTER Remove-TestDesktop
+    # has emptied that one, and comparing against an empty set is an assertion
+    # that passes because it checked nothing.
+    $launched = @(Get-TestLaunchedPids)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
