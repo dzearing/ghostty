@@ -36,6 +36,17 @@ struct ManagedFileTests {
         #expect(try String(contentsOf: url, encoding: .utf8) == "user's own file")
     }
 
+    @Test func updateEnforcesModeOnDestination() throws {
+        let dir = try tempDir()
+        let url = dir.appendingPathComponent("ghoztty.json")
+        try ManagedFile.write("v1 // ghoztty-managed", to: url, marker: "ghoztty-managed", mode: 0o600, fileManager: .default)
+        // Overwrite (update path) — replaceItemAt would otherwise inherit original permissions.
+        try ManagedFile.write("v2 // ghoztty-managed", to: url, marker: "ghoztty-managed", mode: 0o600, fileManager: .default)
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        let perms = attrs[.posixPermissions] as? Int
+        #expect(perms == 0o600)
+    }
+
     @Test func removeOnlyManaged() throws {
         let dir = try tempDir()
         let managed = dir.appendingPathComponent("a")

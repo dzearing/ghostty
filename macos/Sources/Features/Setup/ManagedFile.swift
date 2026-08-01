@@ -56,6 +56,9 @@ enum ManagedFile {
             try? fileManager.removeItem(at: tmp)
             throw error
         }
+        // replaceItemAt preserves the original file's permissions on update;
+        // re-apply mode to the destination to guarantee enforcement.
+        _ = url.path.withCString { chmod($0, mode) }
     }
 
     static func removeIfManaged(at url: URL, marker: String, fileManager: FileManager) throws {
