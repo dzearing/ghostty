@@ -145,9 +145,15 @@ try {
     # Launch (hermetic; black bg so the bar/stripe colors can't come from
     # content). --session-persistence=false: each launch would otherwise write
     # a layout manifest that the next one restores (T131).
+    #
+    # --window-show-tab-bar=always is REQUIRED since T234 (T259): `auto` now
+    # hides the strip at one tab, so the single-tab positive control below
+    # would otherwise be measuring the caption band. This script is about tab
+    # COLORS, not about the autohide rule - tab-strip-autohide.ps1 owns that.
     # -----------------------------------------------------------------------
     $app = Start-OnTestDesktop -Exe $exe -Arguments @(
-        '--config-default-files=false', '--background=#000000', '--session-persistence=false'
+        '--config-default-files=false', '--background=#000000', '--session-persistence=false',
+        '--window-show-tab-bar=always'
     )
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
@@ -165,10 +171,18 @@ try {
     # measured here rather than inferred from a jump when a second tab appears.
     # The pre-migration script derived it from that jump and would fail against
     # today's product for a reason that has nothing to do with tab colors.
-    $cr = Get-TestWindowRect -Window $top -Client
-    $clientTop = $cr.Top
-    $barH = $panes1[0].Top - $clientTop
-    Assert ($barH -ge 20 -and $barH -le 80) "positive control: the tab bar is visible with a single tab (barH=$barH)"
+    #
+    # T259 half 1 - the ORIGIN moved. Since T254 the caption band is CLIENT
+    # area, so `paneTop - clientTop` is `caption_h + bar_h`, not `bar_h`. This
+    # line reported 45 at this box's 1.25 scale (exactly caption_h) while the
+    # strip is 50, and the loose 20..80 band let that pass. The caption height
+    # is subtracted now, and the check is exact against the derived bar_h.
+    $m = Get-TestChromeMetrics -Window $top
+    $clientTop = $m.ClientTop
+    $stripTopScreen = $clientTop + $m.CaptionH
+    $barH = $panes1[0].Top - $stripTopScreen
+    Assert ($barH -eq $m.BarH) `
+        "positive control: the tab bar is visible with a single tab (capH=$($m.CaptionH) barH=$barH, expected $($m.BarH))"
     if ($barH -le 0) { exit 1 }
 
     # --- Positive control: ctrl+t creates tab 2 ----------------------------
@@ -186,33 +200,32 @@ try {
     Assert $twoTabs 'positive control: ctrl+t made a 2nd tab'
     if (-not $twoTabs) { exit 1 }
 
-    # Geometry: scale from barH (= round(40*scale) since T232 - 4 + 4 + 28 + 4,
-    # the shared icon-button square plus its clearances); the rest mirrors
-    # tab_strip_layout.zig (T202) - tabs start at a 4 DIP inset, take an EQUAL
-    # share of the strip clamped to [60, 200] DIP (no last-tab remainder), and
-    # the strip reserves two 28 DIP PAINTED button squares plus two 8 DIP group
-    # gaps and the 4 DIP right inset. The T72 stripe rides the chiclet, which
-    # starts 4 DIP down from the strip top. See docs/design/win32-tab-strip.md
-    # and docs/design/win32-design-system.md.
-    $scale = $barH / 40.0
-    $vis = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
-    $clientLeft = $vis[0].Left
-    $clientW = $vis[0].Right - $vis[0].Left
-    $padL = [math]::Round(4 * $scale)
-    $padR = $padL
-    $btnPaint = [math]::Round(28 * $scale)
-    $gap = [math]::Round(8 * $scale)
-    $topPad = [math]::Round(4 * $scale)
-    $tabsAvail = $clientW - $padR - 2 * $btnPaint - 2 * $gap - $padL
-    $tabW = [math]::Floor($tabsAvail / 2)
-    $tabW = [math]::Max($tabW, [math]::Round(60 * $scale))
-    $tabW = [math]::Min($tabW, [math]::Round(200 * $scale))
-    $stripeH = [math]::Max([math]::Round(3 * $scale), 2)
-    $stripeTop = [int]($clientTop + $topPad)
-    $tab0x = [int]($clientLeft + $padL + [math]::Floor($tabW / 2))
-    $tab1x = [int]($clientLeft + $padL + $tabW + [math]::Floor($tabW / 2))
-    $barMidY = [int]($clientTop + [math]::Floor($barH / 2))
-    Write-Host "INFO  scale=$scale tabW=$tabW stripeH=$stripeH stripeTop=$stripeTop tab0x=$tab0x tab1x=$tab1x"
+    # Geometry.
+    #
+    # T259 half 2 - a tab's WIDTH is not derivable. This block used to take the
+    # scale from `barH / 40` (1.125 instead of 1.25, because barH was really
+    # caption_h) and then rebuild the tab width from T202's RETIRED rule: an
+    # equal share of the run clamped to [60, 200] DIP. T235 retired that - a tab
+    # is its measured title plus padding now - so `tab0x`/`tab1x` pointed at the
+    # wrong columns and every right-click landed on empty strip.
+    #
+    # So the tabs are MEASURED off a capture (the lesson T256 taught
+    # menu-bar.ps1), and everything else comes from the one shared helper. The
+    # scale never comes from a chrome height again.
+    # The T72 stripe rides the chiclet, which starts tab_top_pad down from the
+    # strip top. See docs/design/win32-tab-strip.md and win32-design-system.md.
+    $scale = $m.Scale
+    $stripeH = $m.StripeH
+    $stripeTop = [int]($stripTopScreen + $m.TabTopPad)
+    $barMidY = [int]($stripTopScreen + [math]::Floor($barH / 2))
+
+    $tabs = @(Get-TestTabExtents -Window $top -Metrics $m)
+    Assert ($tabs.Count -eq 2) "positive control: both tab chiclets are measurable off the strip (found $($tabs.Count))"
+    if ($tabs.Count -lt 2) { exit 1 }
+    # Extents are CLIENT x; the probes below are in SCREEN x.
+    $tab0x = [int]($m.ClientLeft + $tabs[0].Center)
+    $tab1x = [int]($m.ClientLeft + $tabs[1].Center)
+    Write-Host "INFO  scale=$scale stripeH=$stripeH stripeTop=$stripeTop tab0=[$($tabs[0].Left),$($tabs[0].Right)) tab1=[$($tabs[1].Left),$($tabs[1].Right)) tab0x=$tab0x tab1x=$tab1x"
 
     # Baseline: no stripe anywhere before tagging.
     Assert (-not (Stripe-HasColor $top $tab0x $stripeTop $stripeH 255 69 58)) 'baseline: tab 0 has no red stripe'

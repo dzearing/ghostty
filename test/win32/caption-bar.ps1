@@ -75,8 +75,6 @@ $HTCAPTION = 2; $HTSYSMENU = 3; $HTMINBUTTON = 8; $HTMAXBUTTON = 9; $HTTOP = 12
 $HTTOPLEFT = 13; $HTTOPRIGHT = 14; $HTCLOSE = 20
 $WM_NCHITTEST = 0x0084; $WM_NCLBUTTONDOWN = 0x00A1; $WM_NCLBUTTONUP = 0x00A2
 
-function Px([double]$dip, [double]$scale) { [int][math]::Round($dip * $scale) }
-
 # lparam for a mouse/hit-test message: screen point packed lo=x, hi=y.
 function PackPoint([int]$x, [int]$y) {
     return [IntPtr](([int64]($y -band 0xFFFF) -shl 16) -bor [int64]($x -band 0xFFFF))
@@ -118,16 +116,22 @@ try {
     Set-TestWindowSize -Window $h -Width 1100 -Height 700 | Out-Null
     Start-Sleep -Milliseconds 1200
 
-    $dpi = [int](Get-TestWindowDpi -Window $h)
-    $scale = $dpi / 96.0
+    # T257: the DIP constants come from lib\ChromeGeometry.ps1 now, the same
+    # helper tab-strip.ps1 and tab-color.ps1 read. The oracle below is unchanged
+    # and is what keeps that helper honest: `$expectCapH` is DERIVED, the band
+    # is MEASURED off the pixels, and this script asserts they agree. That is
+    # the one place the derivation is checked against reality.
+    $m = Get-TestChromeMetrics -Window $h
+    $dpi = $m.Dpi
+    $scale = $m.Scale
     $win = Get-TestWindowRect -Window $h
     $cli = Get-TestWindowRect -Window $h -Client
     # The left/right frame survives NCCALCSIZE; only the top was reclaimed. So
     # the client's x origin inside the WINDOW rect is half the width lost.
     $borderX = [int](($win.Width - $cli.Width) / 2)
-    $padSm = Px 4 $scale
-    $btn = Px 28 $scale
-    $expectCapH = $padSm + $btn + $padSm
+    $padSm = $m.PadSm
+    $btn = $m.BtnPaint
+    $expectCapH = $m.CaptionH
     Write-Host "  dpi=$dpi scale=$scale window=$($win.Width)x$($win.Height) client=$($cli.Width)x$($cli.Height) borderX=$borderX expectCapH=$expectCapH"
 
     $shot = Get-TestWindowPixels -Window $h
@@ -166,7 +170,7 @@ try {
     # apart. Same arithmetic as caption_layout.layout, deliberately restated
     # here from the DIP constants rather than read out of the binary.
     $step = $btn + $padSm
-    $padMd = Px 8 $scale
+    $padMd = $m.PadMd
     $closeL = $cli.Width - $padSm - $btn
     $maxL = $closeL - $step
     $minL = $maxL - $step

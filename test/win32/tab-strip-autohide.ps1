@@ -62,7 +62,6 @@ function Check([bool]$c, [string]$m) { if ($c) { Ok $m } else { Bad $m } }
 $HTCAPTION = 2; $HTSYSMENU = 3; $HTMAXBUTTON = 9; $HTCLOSE = 20
 $WM_NCHITTEST = 0x0084; $WM_NCLBUTTONDOWN = 0x00A1
 
-function Px([double]$dip, [double]$scale) { [int][math]::Round($dip * $scale) }
 function PackPoint([int]$x, [int]$y) {
     return [IntPtr](([int64]($y -band 0xFFFF) -shl 16) -bor [int64]($x -band 0xFFFF))
 }
@@ -122,15 +121,16 @@ try {
     # --- 1. one tab, default config: no strip --------------------------------
     $auto = Start-Win @()
     $h = $auto.Top
-    $dpi = [int](Get-TestWindowDpi -Window $h)
-    $scale = $dpi / 96.0
-    # Restated from the DIP constants rather than read out of the binary, the
-    # way caption-bar.ps1 does. caption_h = pad_sm + 28 + pad_sm (T254);
-    # bar_h  = 4 + 4 + 28 + 4 (T232).
-    $padSm = Px 4 $scale
-    $padMd = Px 8 $scale
-    $btn = Px 28 $scale
-    $capH = $padSm + $btn + $padSm
+    # Derived from the DIP constants rather than read out of the binary, but no
+    # longer restated HERE - lib\ChromeGeometry.ps1 is the one copy (T257), and
+    # it rounds the way Zig's @round does, which `Px` above did not.
+    $m = Get-TestChromeMetrics -Window $h
+    $dpi = $m.Dpi
+    $scale = $m.Scale
+    $padSm = $m.PadSm
+    $padMd = $m.PadMd
+    $btn = $m.BtnPaint
+    $capH = $m.CaptionH
     Write-Host "  dpi=$dpi scale=$scale capH=$capH"
 
     $offAuto = Pane-Offset $h
@@ -200,8 +200,13 @@ try {
         # number: this script's job is the visibility rule, and pinning the
         # strip's height here would make it fail for a tab-strip change that
         # has nothing to do with T234 (the T256 lesson).
-        Check ($barH -ge (Px 30 $scale) -and $barH -le (Px 56 $scale)) `
-            "the strip that appeared is a plausible strip, not a stray offset ($barH px)"
+        # T257: this used to be a loose "between 30 and 56 DIP" plausibility
+        # band, because the exact number was not available here without keeping
+        # a fourth private copy of it. It is now the same measured-vs-derived
+        # positive control tab-strip.ps1 uses, so a strip that comes back at the
+        # WRONG height is a failure rather than a pass.
+        Check ($barH -eq $m.BarH) `
+            "the strip that appeared is exactly bar_h, not a stray offset ($barH px, expected $($m.BarH))"
 
         # ...and closing back to one tab hides it again. The new tab is the
         # active one and holds a single pane, so ctrl+w (close_surface) takes

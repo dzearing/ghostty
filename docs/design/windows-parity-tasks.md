@@ -192,12 +192,34 @@ Work these first, in order, before falling back to first-todo-in-table:
     Two follow-ups. **T260**: the strip's own hamburger was KEPT, and the why
     is the task — it is still the only menu host on a caption-less window, so
     it has to become *conditional*, which moves `runWidth`, the datum three
-    scripts key off. **T259**: `tab-color.ps1` has been red since T254/T235 for
-    exactly the reason T256 names, and T234 only changed which wrong number it
-    prints (`barH=45` now, 95 before; the strip is 50). Do it with **T257**.
+    scripts key off. **~~T259~~ (done, 2026-07-31, with T257)**.
+
+    **~~T257~~ + ~~T259~~ (done, 2026-07-31)** cleared the way for T205. The
+    chrome datum now lives once, in `test/win32/lib/ChromeGeometry.ps1`
+    (dot-sourced from `TestDesktop.ps1`, so every script already loads it), split
+    on the line that matters: positions and gaps are **derived** the way the
+    layout modules derive them, tab widths are **measured** off a capture
+    because they come from text metrics. Private copies went to zero across
+    **four** scripts, not the two T257 scoped.
+
+    Its lesson is the argument for hoisting at all, and it is not "less
+    duplication": the layout modules round with Zig's `@round` (half away from
+    zero) and PowerShell's `[math]::Round()` is BANKER'S rounding. One of the
+    five copies got that right. The two agree at 100/125/150/200% and diverge
+    at 112.5%, so four scripts carried a latent DPI bug that no run on this box
+    could surface. **Four copies meant four chances to be wrong and no way to
+    notice.** Two loose plausibility bands also became exact checks against
+    `bar_h`, because the exact number was finally reachable.
+
+    T259's own half — `tab-color.ps1` derived `scale` from a `barH` that was
+    really `caption_h` (1.125 vs a real 1.25) and rebuilt tab widths from
+    T202's retired rule: 225 px against real chiclets of 346 and 344, a ~120 px
+    error that put every right-click on empty strip. Deleted, not repaired.
 
     The next UI item is **T205** (tabs INSIDE the titlebar), whose scope T234
-    just shrank to "the 2+-tab case".
+    just shrank to "the 2+-tab case" — and which is now one edit in
+    `ChromeGeometry.ps1` plus whatever assertions genuinely change, instead of
+    a script-by-script hunt.
 
     **~~T256~~ (done, 2026-07-31)** unblocked it and closed T254. The caption
     band moved the strip off client `y = 0`, and both scripts that measured it

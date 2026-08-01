@@ -270,10 +270,12 @@ function Send-MenuKey([IntPtr]$w, [string]$key) {
 # has to be offset by this or it lands in the caption (where it drags the
 # window, or hits minimize/maximize/close). Derived, never a fixed 36: T205
 # moves this datum again when the strip goes INTO the caption row.
+#
+# T257: derived in lib\ChromeGeometry.ps1 now, which is also where tab-strip.ps1
+# and tab-color.ps1 read it from. This wrapper stays only because the call sites
+# below read better as `Caption-Height $top`.
 function Caption-Height([IntPtr]$top) {
-    $scale = (Get-TestWindowDpi -Window $top) / 96.0
-    $px = { param([double]$dip) [int][Math]::Round($dip * $scale, [MidpointRounding]::AwayFromZero) }
-    return 2 * (& $px 4.0) + (& $px 28.0)
+    return (Get-TestChromeMetrics -Window $top).CaptionH
 }
 
 # Click in the tab strip at (client x, STRIP-relative y); x < 0 counts back from
@@ -313,60 +315,25 @@ function Click-Strip([IntPtr]$top, [int]$x, [int]$y) {
 # the strip's BOTTOM, the first pixel that is not strip background is the tab.
 # That row is below the "+" glyph's extent, so nothing between the tab and the
 # menu button can be mistaken for it.
+#
+# T257: the derivation AND the leftward scan both moved to
+# lib\ChromeGeometry.ps1, because tab-strip.ps1 had its own copy of the first
+# and tab-color.ps1 needed both. What is left here is the part that is specific
+# to THIS script - naming the three click targets the sections below aim at.
 function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
-    $dpi = Get-TestWindowDpi -Window $top
-    $scale = $dpi / 96.0
-    # Metrics.init's px(): round half AWAY from zero, which is @round in Zig -
-    # NOT PowerShell's default banker's rounding.
-    $px = { param([double]$dip) [int][Math]::Round($dip * $scale, [MidpointRounding]::AwayFromZero) }
-    $padL = & $px 4.0; $padR = & $px 4.0; $gap = & $px 8.0
-    # The PAINTED square every chrome button is (icon_button.Metrics.target),
-    # which is what the gaps are measured against since T232.
-    $btnW = & $px 28.0
-    $capH = 2 * $padL + $btnW              # caption_layout.Metrics.caption_h
-    $barH = 3 * $padL + $btnW              # tab_strip_layout.Metrics.bar_h
-    $cr = Get-TestWindowRect -Window $top -Client
-    $wr = Get-TestWindowRect -Window $top
-    $cw = $cr.Width
-    $offX = $cr.Left - $wr.Left
-    # Window-relative row near the strip's bottom: inside a chiclet at its full
-    # width (the rounding is on the TOP corners only) and below the "+" glyph.
-    $rowY = ($cr.Top - $wr.Top) + $capH + $barH - 2
-
-    $menuLeft = $cw - $padR - $btnW
-    $plusLimit = $menuLeft - $gap - $btnW
-
-    # Measured: the last tab's painted right edge (exclusive).
-    $tabsRight = $padL
-    $shot = $null
-    for ($t = 0; $t -lt 20; $t++) {
-        $shot = Get-TestWindowPixels -Window $top
-        if ((Get-TestDistinctColors -Shot $shot) -ge 8) { break }
-        Close-TestWindowPixels $shot; $shot = $null
-        Start-Sleep -Milliseconds 150
-    }
-    if ($null -ne $shot) {
-        try {
-            # The strip background, sampled in the gap left of the menu button.
-            $bg = $shot.Bitmap.GetPixel($offX + $menuLeft - 2, $rowY)
-            for ($x = $menuLeft - 2; $x -ge $padL; $x--) {
-                $p = $shot.Bitmap.GetPixel($offX + $x, $rowY)
-                if ([Math]::Abs($p.R - $bg.R) -gt 8 -or [Math]::Abs($p.G - $bg.G) -gt 8 -or
-                    [Math]::Abs($p.B - $bg.B) -gt 8) { $tabsRight = $x + 1; break }
-            }
-        } finally { Close-TestWindowPixels $shot }
-    }
-    $plusLeft = [Math]::Min($tabsRight + $gap, $plusLimit)
+    $m = Get-TestChromeMetrics -Window $top
+    $tabsRight = Get-TestTabRunRight -Window $top -Metrics $m
+    $plusLeft = [Math]::Min($tabsRight + $m.Gap, $m.PlusLimit)
 
     [pscustomobject]@{
-        Dpi = $dpi; ClientW = $cw; BtnW = $btnW; TabsRight = $tabsRight
+        Dpi = $m.Dpi; ClientW = $m.ClientW; BtnW = $m.BtnPaint; TabsRight = $tabsRight
         # The floor a tab shrinks to under pressure - the one width constant
         # T235 kept. Used only to size the reflow section's tab count.
-        MinTabW = & $px 60.0
-        MenuX = $menuLeft + [int]($btnW / 2)
-        PlusX = $plusLeft + [int]($btnW / 2)
+        MinTabW = $m.MinTabW
+        MenuX = $m.MenuX
+        PlusX = $plusLeft + [int]($m.BtnPaint / 2)
         # Strip that belongs to neither a tab, the "+", nor the menu button.
-        DeadX = [int](($plusLeft + $btnW + $menuLeft) / 2)
+        DeadX = [int](($plusLeft + $m.BtnPaint + $m.MenuLeft) / 2)
     }
 }
 

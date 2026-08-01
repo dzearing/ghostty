@@ -4213,3 +4213,92 @@ and every keyboard-driven assertion was unrunnable. Changing that one flag to
 key does not fail where you can see it - it surfaces as an unrelated-looking
 harness failure two layers away. `caption-bar.ps1` was still passing `=off` in
 two places and is corrected.
+
+## 2026-07-31 - T257 + T259: four scripts each kept their own copy of where the chrome is
+
+The turn opened by verifying the T234 delivery the way a delivery has to be
+verified: `ghoztty +version` read back `+5ad81a99e`, then the installed release
+was actually looked at. A brand new window shows no tab strip (the pane starts
+at the caption's bottom edge) and the caption carries `...` immediately left of
+minimize, which opens the window menu; a second tab brings the strip back.
+`tab-strip-autohide.ps1` against the installed exe: ALL PASS (13).
+
+One note for whoever screenshots the chrome next: a real screen grab
+(`CopyFromScreen`) captures the caption and the banner but returns the terminal
+body as a flat fill, exactly like `PrintWindow` does. That is the CAPTURE LIMIT
+the harness already documents, not a rendering bug - proved by capturing a
+second window known to have visible content and getting the same flat body,
+while `+read` showed the pane's text was there all along.
+
+**T257 + T259 (done together, as T259 asked).** The datum moved twice - T254
+moved the strip off client `y = 0`, T235 changed what sizes a tab - and each
+time it cost a pile of failures in scripts that each re-derived it privately.
+The hoist is `test/win32/lib/ChromeGeometry.ps1`, dot-sourced from the end of
+`TestDesktop.ps1` (a sibling, not 200 more lines in a file already at 1910; every
+consumer gets it with no second load line). It draws one line explicitly:
+positions and gaps are DERIVED from DIP constants the way the layout modules
+derive them, and tab widths are MEASURED off a capture, because they come from
+text metrics and a script cannot reproduce them.
+
+Private copies went to **zero**, from four scripts rather than the two the task
+scoped - `tab-strip.ps1` and `menu-bar.ps1` as written up, plus
+`tab-strip-autohide.ps1` and `tab-color.ps1`. `menu-bar.ps1`'s `Strip-Geometry`
+went from ~55 lines to ~15; its leftward tab scan generalized into
+`Get-TestTabExtents` (every chiclet's left/right/center), so there is one scan
+implementation instead of two, and `Get-TestTabRunRight` is now the last
+extent's right edge.
+
+**A latent bug fell out of the hoist, which is the argument for doing it.** The
+layout modules round with Zig's `@round` - half away from zero. PowerShell's
+`[math]::Round()` is BANKER'S rounding. `menu-bar.ps1` had passed
+`MidpointRounding::AwayFromZero`; the other four had not. The two agree at
+100/125/150/200% because nothing lands on .5 there, which is precisely why four
+scripts carried it unnoticed, and they disagree at 112.5% where `4 * 1.125` is 4
+in PowerShell and 5 in the app. Four private copies meant four chances to be
+wrong and no way to notice; one copy means one place to be right.
+
+Two assertions got stronger rather than merely relocated, both where a loose
+bound existed only because the exact number was out of reach without another
+private copy: autohide's "plausible strip" (`barH` in 30..56 DIP) and
+tab-color's `barH` in 20..80 are both `-eq bar_h` now.
+
+**T259's second half is the one worth remembering.** `tab-color.ps1` derived
+`scale = barH / 40.0` from a `barH` that was really `caption_h`, getting 1.125
+against a real 1.25, then rebuilt the tab width from T202's retired
+equal-share-clamped-to-[60,200] rule: 225 px against real chiclets of 346 and
+344. A ~120 px error, which is why every right-click landed on empty strip. It
+was not repaired, it was deleted - the tabs are measured now. The INFO line
+reports `scale=1.25` and `tab0=[5,351) tab1=[357,701)`, identical across three
+runs while the screen-relative click points track the window, so the
+measurement is stable rather than accidentally passing.
+
+Evidence: `tab-strip.ps1` 35, `menu-bar.ps1` 60, `caption-bar.ps1` 17,
+`pane-banner.ps1` 65, `context-menu.ps1` 42, `tab-strip-autohide.ps1` 13, and
+`tab-color.ps1` 16 x3 - all ALL PASS, all five negative controls still failing.
+Floor: both lanes exit 0, `test-agent` exit 0, P1-P3 ALL PASS. The win32 lane's
+first run failed on `remote.agent.server.test.METRICS_SUB ...` and passed on
+re-run - **T258's known flake**, and this change touches no `.zig` at all.
+
+**Filed: T261 - `/reset-context` reports FAILED on a reset that fully worked.**
+Found as a live banner on the go-loop pane at the start of the turn, telling the
+user to recover by hand. The log shows `/clear` verified, the continuation typed
+and submitted, and the failure declared two seconds later - while the pane tail
+in that same log shows `ctx: 0k/1000k` and a `Frolicking...` spinner, i.e. a
+freshly cleared session already working on the continuation. The oracle greps
+the last **25** lines for the prompt's first 24 characters, and a submitted
+prompt scrolls out of that window the moment the model starts responding. The
+probe races the model and loses when the model is quick; the `sleep 2` before it
+makes losing more likely. This matters beyond noise: go.md's one allowed
+exception is a failed reset, so a false FAILED can stall the loop in exactly the
+way step 7 exists to prevent.
+
+**Filed: T262 - `zig build` panics when `ZIG_GLOBAL_CACHE_DIR` is unset.** The
+none lane's first run this turn did not fail, it panicked (`reached unreachable
+code` in `build_zcu.obj`, then `unable to read results of configure phase`),
+which reads like a compiler bug or a source error. Reproduced deliberately in
+both directions on the same HEAD: unset -> exit 1 + panic (twice, fresh cache
+tmp each time, so not one poisoned entry); set to `D:\zig-global-cache` -> exit
+0. `zig build --help` exits 0 unset, so a quick sanity check misses it. Same
+shape as the `-First N` warning already in go.md, which was mis-filed twice as a
+transient flake before someone wrote it down; this one is undocumented and will
+be misread the same way.

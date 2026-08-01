@@ -119,40 +119,39 @@ try {
     Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
         'the window is NOT enumerable on the interactive desktop'
 
-    $cr = Get-TestWindowRect -Window $top -Client
-    $wr = Get-TestWindowRect -Window $top
-    $clientX = $cr.Left; $clientY = $cr.Top; $clientW = $cr.Width
-    # Window-relative client origin, which is what the capture's bitmap uses.
-    $offX = $clientX - $wr.Left
-    $offY = $clientY - $wr.Top
-
     # T254/T256: the strip no longer begins at client y = 0. The caption band is
     # client area now, so the pane's top is caption + strip, and every y below
-    # is measured from `$stripTop` rather than from the client's own top.
+    # is measured from `$m.StripTop` rather than from the client's own top.
     #
-    # `$scale` comes from the window's own DPI - the same GetDpiForWindow the
-    # app derives `Window.scale` from - so the DIP constants below resolve
-    # exactly the way the layout modules resolve them. Nothing here is a fixed
-    # pixel count, which matters because T205 will move this datum again.
-    $scale = (Get-TestWindowDpi -Window $top) / 96.0
-    $sm    = [int][math]::Round(4 * $scale)    # the 4 DIP spacing step
-    $sq    = [int][math]::Round(28 * $scale)   # the shared icon-button square
-    # caption_layout.Metrics.caption_h = 4 + 28 + 4 DIP. Subtracted, not
-    # assumed: with `window-decoration = none` the OS keeps the caption and this
-    # is 0, and then the assertion below is what says so.
-    $capH  = 2 * $sm + $sq
+    # T257: this used to be ~20 lines of private DIP arithmetic, which is how
+    # T254 cost this script 7 failures and T235 cost menu-bar.ps1 4 more. It is
+    # one call now, and T205 - which moves the strip INTO the caption row -
+    # edits lib\ChromeGeometry.ps1, not this script. The metrics come from the
+    # window's own DPI by the same construction the layout modules use, so
+    # nothing here is a fixed pixel count.
+    $m = Get-TestChromeMetrics -Window $top
+    $clientX = $m.ClientLeft; $clientY = $m.ClientTop; $clientW = $m.ClientW
+    # Window-relative client origin, which is what the capture's bitmap uses.
+    $offX = $m.OffX
+    $offY = $m.OffY
+    $scale = $m.Scale
+    $sm    = $m.PadSm
+    $sq    = $m.BtnPaint
+    $capH  = $m.CaptionH
 
     $panes = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
     if ($panes.Count -ne 1) { Write-Host "SETUP FAIL: expected 1 visible pane, got $($panes.Count)"; exit 1 }
+    # MEASURED off the pane's own top, deliberately - the derived `$m.BarH` is
+    # what it is checked AGAINST. Comparing a measurement to its construction is
+    # the positive control for both numbers at once: a wrong `$capH` shows up
+    # here as a wrong `$barH`. (Reading both from the helper would assert the
+    # helper against itself and prove nothing.)
     $barH = $panes[0].Top - $clientY - $capH
     # Window-relative y of the strip's FIRST row, which is what the capture's
     # bitmap is indexed by.
-    $stripTop = $offY + $capH
-    # tab_strip_layout.Metrics.bar_h = 4 + 4 + 28 + 4 DIP. Measuring the strip
-    # and then checking it against its own construction is the positive control
-    # for both numbers at once: a wrong `$capH` shows up here as a wrong `$barH`.
-    Assert ($barH -eq (3 * $sm + $sq)) `
-        "positive control: the tab bar is visible under the caption band (capH=$capH barH=$barH, expected $(3 * $sm + $sq))"
+    $stripTop = $m.StripTop
+    Assert ($barH -eq $m.BarH) `
+        "positive control: the tab bar is visible under the caption band (capH=$capH barH=$barH, expected $($m.BarH))"
     if ($barH -le 0) { exit 1 }
 
     if (-not (Focus-TestWindow -Window $top -Child ([IntPtr]$panes[0].Hwnd))) {
@@ -163,27 +162,27 @@ try {
     # (see docs/design/win32-design-system.md and docs/design/win32-tab-strip.md).
     # The RETIRED fixed cap (T202's max_tab_w). Kept only so section 7 can
     # assert a long title is no longer pinned to it.
-    $maxTabWOld = [int][math]::Round(200 * $scale)
+    $maxTabWOld = Get-TestChromeDip -Dip 200.0 -Scale $scale
     # The PAINTED square, which is what every gap is measured against (T232).
     # The hit box is this plus btnPad a side, and is deliberately invisible.
-    $btnPaint = [int][math]::Round(28 * $scale)
-    $btnPad   = [int][math]::Round(2 * $scale)
-    $btnW    = $btnPaint + 2 * $btnPad
-    $gap     = [int][math]::Round(8 * $scale)
-    $padL    = [int][math]::Round(4 * $scale)
-    $padR    = $padL   # the strip is inset the SAME at both ends
-    $minTabW = [int][math]::Round(60 * $scale)
+    $btnPaint = $m.BtnPaint
+    $btnPad   = $m.BtnPad
+    $btnW    = $m.BtnW
+    $gap     = $m.Gap
+    $padL    = $m.PadL
+    $padR    = $m.PadR   # the strip is inset the SAME at both ends
+    $minTabW = $m.MinTabW
     # A tab's SLOT includes the inter-tab gap; the drawn chiclet gives it up
     # (tab_strip_layout.zig: drawn_w = this_w - tab_gap), so a chiclet always
     # measures one gap narrower than the slot it sits in. Comparing a measured
     # chiclet against a slot width - which is what this script did before T218 -
     # is off by exactly one gap and fails against a correct strip.
-    $tabGap  = [int][math]::Round(4 * $scale)
+    $tabGap  = $m.TabGap
     # The tab RUN: the client width less both insets and the "+"/"=" band. This
     # is tab_strip_layout.runWidth, and the proportional cap is half of it, so
     # the script and the layout module have to mean the same run.
-    $runW    = $clientW - $padR - $btnPaint - $gap - $btnPaint - $gap - $padL
-    $capW    = [math]::Max([int][math]::Floor($runW / 2), $minTabW)
+    $runW    = $m.RunW
+    $capW    = $m.TabCap
     Write-Host "INFO  scale=$scale clientW=$clientW runW=$runW cap=$capW (retired maxTabW=$maxTabWOld) btnW=$btnW gap=$gap pad=$padL"
 
     # --- Pixel helpers -----------------------------------------------------
@@ -516,23 +515,22 @@ try {
     # Re-derive the geometry for THIS window: the pixel helpers above read
     # these script-scope variables at call time, so reassigning them re-points
     # them at the new instance.
-    $cr = Get-TestWindowRect -Window $top -Client
-    $wr = Get-TestWindowRect -Window $top
-    $clientX = $cr.Left; $clientY = $cr.Top; $clientW = $cr.Width
-    $offX = $clientX - $wr.Left
-    $offY = $clientY - $wr.Top
+    # Same datum as above, re-measured for THIS window (a different window can
+    # be on a different monitor at a different DPI), from the one helper (T257).
+    $m = Get-TestChromeMetrics -Window $top
+    $clientX = $m.ClientLeft; $clientY = $m.ClientTop; $clientW = $m.ClientW
+    $offX = $m.OffX
+    $offY = $m.OffY
     $panes2 = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
     if ($panes2.Count -lt 1) { Write-Host 'SETUP FAIL: long-title pane not found'; exit 1 }
-    # Same datum as above, re-measured for this window: caption band first, then
-    # the strip under it (T256).
-    $scale = (Get-TestWindowDpi -Window $top) / 96.0
-    $sm    = [int][math]::Round(4 * $scale)
-    $sq    = [int][math]::Round(28 * $scale)
-    $capH  = 2 * $sm + $sq
+    $scale = $m.Scale
+    $sm    = $m.PadSm
+    $sq    = $m.BtnPaint
+    $capH  = $m.CaptionH
     $barH  = $panes2[0].Top - $clientY - $capH
-    $stripTop = $offY + $capH
-    $runW = $clientW - $padR - $btnPaint - $gap - $btnPaint - $gap - $padL
-    $capW = [math]::Max([int][math]::Floor($runW / 2), $minTabW)
+    $stripTop = $m.StripTop
+    $runW = $m.RunW
+    $capW = $m.TabCap
     if (-not (Focus-TestWindow -Window $top -Child ([IntPtr]$panes2[0].Hwnd))) {
         Write-Host 'SETUP FAIL: could not focus the long-title GUI'; exit 1
     }

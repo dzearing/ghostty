@@ -1901,6 +1901,19 @@ function Get-TestWindowDpi {
     return (Resolve-TestDesktop $Desktop).Dpi($Window)
 }
 
+# Where the win32 chrome IS - caption height, strip height and origin, the
+# right-anchored button band, and the tab run's measured right edge
+# (`Get-TestChromeMetrics` / `Get-TestTabRunRight`, T257).
+#
+# Dot-sourced from here rather than pasted in so every script that already
+# loads TestDesktop.ps1 gets it with no second load line, while this file stops
+# growing - the chrome datum is its own concern and it changes on a different
+# schedule (T205 moves it again).
+#
+# Dot-sourcing inside a dot-sourced script runs in the SAME scope, so these
+# land in the caller's scope exactly like the functions above.
+. (Join-Path $PSScriptRoot 'ChromeGeometry.ps1')
+
 <#
 Wait for a popup menu (win32 class '#32768') owned by $ProcessId.
 
