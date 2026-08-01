@@ -4586,3 +4586,45 @@ precisely to click for real, `test-desktop-spike` measures the desktop) and
 (T142) and `split-dim` (T74). Filed as **T272**, which also asks for the
 exception list to be DECLARED and enforced by a check - an undeclared exception
 is indistinguishable from a miss.
+
+## 2026-08-01 - T213 done: the migration had landed, the CONTROL had not
+
+T213's own work turned out to be already done - T216/T217/T218 each swept the
+pixel probes in their batch, so `CopyFromScreen` survives in comments only.
+Verified rather than assumed: all 8 chrome probes ALL PASS **x3** on the test
+desktop (dark-menus 10, confirm-dialogs 27, config-errors 15,
+ipc-machine-chooser 45, tab-strip 37, menu-bar 71, pane-banner 65, hero-mode
+63). The 9th, `profile-latency.ps1`, stays put - it hashes a `GhozttyTerminal`
+child, which PrintWindow flat-fills, and T214 already owns it.
+
+What the verification found is the entry worth keeping. `test-desktop-harness.ps1`
+- the script that proves `Get-TestWindowPixels` returns real chrome for all 8 -
+compared `--window-theme=light` against `--window-theme=dark` and the two now
+read the **identical** caption band, rgb 60,64,72. Since T254 client-painted
+the caption and T205 merged the tabs into it, the band derives from
+`background` (+20/channel) and neither painter reads `window-theme` at all;
+the `DwmSetWindowAttribute` calls still fire and paint nothing. **T273.**
+
+**It failed HALF green.** The light side (`> 150`) went red on 71 while the
+dark side (`< 100`) stayed PASS on those same pixels - so a discriminator that
+had stopped discriminating entirely still produced a green assertion, and that
+green was evidence of nothing. A two-sided control is only a control if the
+SEPARATION is asserted; that assertion (`light - dark >= 100`) is now there,
+and it is the one the regression could not have survived. Re-pointed at the
+input the band really derives from, it reads 243 vs 24 and the harness is ALL
+PASS (20).
+
+Reading the painters for that answer surfaced a second, independent defect:
+the band is derived but every foreground on it is a frozen constant chosen for
+a dark bar (title/active label/button glyphs `230,230,230`, inactive label and
+close glyph `150,150,150`). At `background = ffffff` the band clamps to white
+and those land at **1.25:1** and **2.96:1** against a mandatory 4.5:1 - an
+ordinary light config, not a corner case. **T274**, with the fix scoped as one
+resolver rather than five edits, and T150/T247's color-math bugs flagged so
+they are not ported in.
+
+Evidence: 8 scripts x3 ALL PASS as above; test-desktop-harness ALL PASS (20)
+with the new separation assertion; `zig build test` both lanes exit 0;
+`test-agent` failed run 1 on `remote.agent.server.test.client DATA reaches the
+child` and passed runs 2-3 - T258 again, same assertion, unchanged by this
+diff; P1-P3 ACCEPTANCE: ALL PASS.

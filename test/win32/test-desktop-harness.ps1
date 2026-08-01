@@ -26,8 +26,19 @@
 #               the only capture that survives off the input desktop.
 #
 # The capture assertion carries its own negative control: the SAME probe runs
-# against a light window and a dark one and must separate them. A blank or
-# stale bitmap cannot pass both.
+# against a light-chrome window and a dark-chrome one and must separate them.
+# A blank or stale bitmap cannot pass both.
+#
+# T213 (2026-08-01): that control used to flip `--window-theme=light|dark`,
+# and it stopped separating anything. Since T254/T205 the caption band is
+# CLIENT-painted by us and derives from `background` (+20 per channel), not
+# from the DWM caption `window-theme` used to restyle - so both halves read the
+# SAME meanLum 65-71. Note how it failed: the light half went red while the
+# dark half stayed GREEN on the identical pixels, because 71 satisfies "< 100".
+# A two-sided control is only a control if both sides are asserted against the
+# separation, so the halves now assert the gap between them as well.
+# Whether `window-theme` SHOULD still reach the caption is a product question,
+# filed as T273 - not something this harness gets to decide by measuring.
 #
 # Only touches ghoztty processes running from this repo's zig-out*.
 param([string]$ExePath, [switch]$Interactive)
@@ -66,11 +77,12 @@ function Get-TabCount {
     return @($j.data.windows[0].tabs).Count
 }
 
-# Mean luminance of the window's TITLEBAR band, via the harness's only working
-# capture path. The titlebar on purpose: PrintWindow on a background desktop
+# Mean luminance of the window's CAPTION band, via the harness's only working
+# capture path. The caption on purpose: PrintWindow on a background desktop
 # returns GDI-painted chrome and NOT the OpenGL terminal surface (see the
 # harness header), so a probe aimed at the terminal would read a flat fill and
-# "pass" against nothing.
+# "pass" against nothing. Since T254 that band is ours, not DWM's, which is
+# exactly why it is capturable at all.
 function Measure-TitlebarLuminance([IntPtr]$Window) {
     $shot = Get-TestWindowPixels -Window $Window
     try {
@@ -91,8 +103,11 @@ try {
     # A. desktop + focus + input, on a LIGHT window (also the bright half of
     #    the capture control).
     # ---------------------------------------------------------------------
+    # `--background=ffffff` is the input the caption band actually derives from
+    # (Window.paintCaption: bg + 20 per channel). Deliberately NOT
+    # `--window-theme=light`, which no longer reaches it - see the header.
     $app = Start-OnTestDesktop -Exe $exe -Arguments @(
-        '--session-persistence=false', '--window-theme=light', '--window-show-tab-bar=always')
+        '--session-persistence=false', '--background=ffffff', '--window-show-tab-bar=always')
     $launched += $app.Pid
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
@@ -136,8 +151,8 @@ try {
 
     # --- capture, bright half.
     $lightLum = Measure-TitlebarLuminance $top
-    Write-Host "capture: light titlebar meanLum=$lightLum"
-    Assert ($lightLum -gt 150) "Get-TestWindowPixels returns REAL chrome for a light window (meanLum=$lightLum)"
+    Write-Host "capture: light-chrome caption meanLum=$lightLum"
+    Assert ($lightLum -gt 150) "Get-TestWindowPixels returns REAL chrome for a light-chrome window (meanLum=$lightLum)"
 
     # --- standard controls: the rename dialog's EDIT. Opposite convention to
     #     the terminal - WM_CHAR, because nothing translates a posted message.
@@ -179,16 +194,21 @@ try {
     #    bitmap cannot pass both halves.
     # ---------------------------------------------------------------------
     $app2 = Start-OnTestDesktop -Exe $exe -Arguments @(
-        '--session-persistence=false', '--window-theme=dark', '--window-show-tab-bar=always')
+        '--session-persistence=false', '--background=000000', '--window-show-tab-bar=always')
     $launched += $app2.Pid
     Start-Sleep -Seconds 3
     $top2 = Wait-TestWindow -ProcessId $app2.Pid -Class 'GhozttyWindow'
     Assert ($top2 -ne [IntPtr]::Zero) 'second launch: window found on the test desktop'
     if ($top2 -ne [IntPtr]::Zero) {
         $darkLum = Measure-TitlebarLuminance $top2
-        Write-Host "capture: dark titlebar meanLum=$darkLum"
+        Write-Host "capture: dark-chrome caption meanLum=$darkLum"
         Assert ($darkLum -ge 0 -and $darkLum -lt 100) `
-            "capture separates dark chrome from light (dark meanLum=$darkLum vs light $lightLum)"
+            "capture reads dark chrome as dark (dark meanLum=$darkLum)"
+        # The SEPARATION, asserted in its own right. Without this, two halves
+        # reading the SAME number can still both be green - which is exactly
+        # how the retired window-theme control survived (both sides ~71).
+        Assert (($lightLum - $darkLum) -ge 100) `
+            "capture SEPARATES the two chromes (light $lightLum - dark $darkLum >= 100)"
     }
     Stop-Process -Id $app2.Pid -Force -ErrorAction SilentlyContinue
 } finally {
