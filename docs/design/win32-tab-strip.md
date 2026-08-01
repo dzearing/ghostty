@@ -73,6 +73,12 @@ reader does not "fix" them back:
   `tab_top_pad + pad_sm + icon_button.target + pad_sm` = 4 + 4 + 28 + 4.
   `tabBarHeight()` is also the scale oracle for three acceptance scripts, which
   compute `scale = barH / 40`.
+  **T205 collapsed the deviation entirely**: the strip no longer sits below a
+  caption bar — it IS the caption bar, exactly like WT's, complete with the
+  drag region the old reasoning said we did not have. `bar_h` is now also
+  `caption_layout.Metrics.caption_h` in `.with_tabs` mode, and the caption
+  buttons take their vertical frame from `buttonHit`/`targetBox` here so the
+  "+", the tab close "×" and minimize/maximize/close all paint on one baseline.
 - **~~Maximum tab width is 200 DIP~~** (not WT's measured 240), the documented
   WinUI `TabViewItemMaxWidth` default. Our tabs carry no icon, so 200 DIP holds
   as much title as WT's 240 does. **Retired by T235**: matching a platform
@@ -94,7 +100,7 @@ reader does not "fix" them back:
 | ~~`max_tab_w`~~ | ~~200~~ | **gone (T235)**. The maximum is `capWidth(run) = max(run / 2, min_tab_w)`, computed per layout — not a metric |
 | `corner_r` | 6 | top corners only |
 | `strip_pad_l` | 4 | inset before the first tab |
-| `strip_pad_r` | 4 | inset after the menu button — the strip is inset the *same* at both ends. Kept a named metric because T205 turns it into the gap to the caption buttons |
+| `strip_pad_r` | 4 | inset after the menu button — the strip is inset the *same* at both ends. Since **T205** it is the inset to the *seam* on a merged row: the caller hands `layout` a client width of `caption_layout.Layout.band_left + strip_pad_r`, which lands the "+"'s painted right edge exactly on `band_left` |
 | `group_gap` | 8 | last tab → "+", and "+" → menu, **between painted edges** |
 | `btn_paint` | 28 | the PAINTED square of "+"/"≡"/"×" — every gap is measured against this |
 | `btn_pad` | 2 | how far each button's hit box grows past its square, per side |

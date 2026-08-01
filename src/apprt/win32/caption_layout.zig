@@ -38,15 +38,37 @@
 //!     grown boxes are allowed to eat the gaps between squares (they must not
 //!     overlap each other, which `captionButtonHitBoxesNeverOverlap` asserts).
 //!
-//! ## What is deliberately NOT here
+//! ## The tab run shares the band (T205)
 //!
-//! The tab run (T205). It will be a slot in this same layout; leaving it out
-//! until its own task keeps this one auditable. The "…" overflow button
-//! arrived with T234 and IS here.
+//! `Mode.with_tabs` is the merged row: tabs, "+", then the drag gap, then the
+//! "…" and the system trio, all on ONE row — what Windows Terminal, Edge and
+//! Explorer do, and what the user asked for ("this is normal terminal and it
+//! looks more polished than what you've built … the hamburger icon doesn't
+//! horizontally align under the X above it"). Two rows of controls owned by
+//! two different layouts can only ever *approximately* line up; one row makes
+//! the alignment structural.
+//!
+//! Two things change in that mode and nothing else does:
+//!
+//!   * **The band is the STRIP's height, and the buttons sit on the strip's
+//!     button baseline** — `btn_top` comes from `tab_strip_layout`'s own
+//!     `buttonHit`/`targetBox` derivation, not from centering in the band. The
+//!     "+" and the close "×" are already on that frame (T204); a caption
+//!     button centered in the 40 DIP band instead would land 2 px higher and
+//!     miss all three by exactly the amount the eye catches.
+//!   * **The title is dropped.** The tabs are the title now, and painting a
+//!     window title behind them is the two-rows problem in one row.
+//!
+//! `band_left` is the seam: the strip paints `[0, band_left)`, the caption
+//! paints `[band_left, client_w)`, and the "+"'s painted right edge lands
+//! exactly on it. The caption's own arrangement — right-anchored, close
+//! outermost, "…" one group-gap inboard — is IDENTICAL in both modes, which
+//! is why merging changed no horizontal number.
 
 const std = @import("std");
 const testing = std.testing;
 const icon_button = @import("icon_button.zig");
+const tab_strip = @import("tab_strip_layout.zig");
 
 /// The caption speaks the same rectangle the rest of the chrome does — one
 /// definition, in `icon_button.zig`.
@@ -60,16 +82,36 @@ pub const Rect = icon_button.Rect;
 /// the top-right corner.
 pub const Button = enum { overflow, minimize, maximize, close };
 
+/// Does the band hold the tab run as well (T205)?
+///
+/// `standalone` is a window showing one tab (or none): no strip exists, so the
+/// band is its own 36 DIP row with the window title in it. `with_tabs` is the
+/// merged row.
+pub const Mode = enum { standalone, with_tabs };
+
 /// Every DIP constant the caption is built from, resolved to physical pixels
 /// for one DPI scale.
 pub const Metrics = struct {
-    /// Caption band height: `sm` + the shared 28 DIP square + `sm` = 36 DIP.
+    /// Which band this is. Carried so `layout` can drop the title without the
+    /// caller having to remember to, and so a `Metrics` and the `Layout` built
+    /// from it can never describe two different rows.
+    mode: Mode,
+    /// Caption band height: `sm` + the shared 28 DIP square + `sm` = 36 DIP
+    /// standalone; the tab strip's own `bar_h` (40 DIP) when the run shares it.
     ///
     /// Derived from the control, never the reverse (design system §0
     /// corollary). Centering a 28 DIP square inside a band sized from
     /// `SM_CYCAPTION` is exactly the mistake that produced the strip's 1 px
     /// bottom gap, and it would recur here at a different set of scales.
     caption_h: i32,
+    /// Top of every caption button's PAINTED square, band-local.
+    ///
+    /// Standalone that is `pad_sm`. Merged it is whatever y the strip's own
+    /// "+" paints at — asked of `tab_strip_layout` rather than restated, since
+    /// the strip's buttons sit in the TABS' band (`tab_top_pad`..`bar_h`) and
+    /// not in the full bar, a deliberate asymmetry that a local `(h - 28)/2`
+    /// would quietly undo.
+    btn_top: i32,
     /// The 4 DIP step. Button-to-button, and group-to-window-edge.
     pad_sm: i32,
     /// The 8 DIP step, for separating GROUPS: the title text from the button
@@ -85,13 +127,29 @@ pub const Metrics = struct {
     /// disagree with the square this module laid out.
     ib: icon_button.Metrics,
 
-    pub fn init(scale: f32) Metrics {
+    pub fn init(scale: f32, mode: Mode) Metrics {
         // Not re-derived: the caption's gaps are measured against the shared
         // chrome square, so it has to BE the shared square.
         const ib = icon_button.Metrics.init(scale);
         const sm = px(4.0, scale);
+        // The strip's band and its button baseline, asked for rather than
+        // restated. In `standalone` nothing here is used — but computing it
+        // unconditionally keeps the two branches to one expression each.
+        const ts = tab_strip.Metrics.init(scale);
         return .{
-            .caption_h = sm + ib.target + sm,
+            .mode = mode,
+            .caption_h = switch (mode) {
+                .standalone => sm + ib.target + sm,
+                .with_tabs => ts.bar_h,
+            },
+            .btn_top = switch (mode) {
+                .standalone => sm,
+                // `buttonHit(0)` is the strip's own hit box for a button whose
+                // painted square starts at x = 0; `targetBox` recovers that
+                // square. Its `top` is the baseline the "+", the "≡" and the
+                // tab close "×" already share.
+                .with_tabs => icon_button.targetBox(ib, ts.buttonHit(0)).top,
+            },
             .pad_sm = sm,
             .pad_md = px(8.0, scale),
             .btn_paint = ib.target,
@@ -121,8 +179,20 @@ pub const Layout = struct {
     close: Rect,
     /// Where the window title may draw. Empty when the band is too narrow to
     /// hold both the buttons and a title, in which case the title is dropped
-    /// rather than painted under the buttons.
+    /// rather than painted under the buttons — and always empty in
+    /// `.with_tabs`, where the tabs ARE the title.
     title: Rect,
+    /// The seam between the two painters (T205): the tab strip owns
+    /// `[0, band_left)` of the band and the caption owns `[band_left,
+    /// client_w)`. `0` in `.standalone` — the caption owns the whole row.
+    ///
+    /// It sits one `pad_md` left of the "…", which is exactly where the "+"'s
+    /// painted right edge lands when the run is full, so the two painters meet
+    /// on a painted edge instead of overlapping. Both fill with the same
+    /// chrome background, so the seam is invisible either way; what it really
+    /// buys is that neither BitBlt can erase the other's buttons, whatever
+    /// order they paint in.
+    band_left: i32,
     /// Everything left of `drag_right` in the band is `HTCAPTION`: drag to
     /// move, double-click to maximize. The button hit boxes own the rest.
     drag_right: i32,
@@ -140,7 +210,7 @@ pub const Layout = struct {
 /// reason that corner is where it is (Fitts' law, and Windows has trained it
 /// for thirty years).
 pub fn layout(m: Metrics, client_w: i32) Layout {
-    const top = m.pad_sm;
+    const top = m.btn_top;
     const bot = top + m.btn_paint;
 
     // Right to left: close, maximize, minimize. Built by stepping one
@@ -165,9 +235,10 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
     // The title stops `md` short of the button group, because they are
     // different groups of controls. A band with no room for both drops the
     // title; painting it under the buttons is worse than not painting it.
+    // In `.with_tabs` there is no title at all — the tab run has the space.
     const title_l = m.pad_md;
     const title_r = over.left - m.pad_md;
-    const title: Rect = if (title_r > title_l)
+    const title: Rect = if (m.mode == .standalone and title_r > title_l)
         .{ .left = title_l, .top = 0, .right = title_r, .bottom = m.caption_h }
     else
         .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
@@ -179,6 +250,10 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
         .close = close,
         .title = title,
         .drag_right = drag_right,
+        .band_left = switch (m.mode) {
+            .standalone => 0,
+            .with_tabs => @max(over.left - m.pad_md, 0),
+        },
         .client_w = client_w,
     };
 }
@@ -303,6 +378,16 @@ pub fn ncHitTest(
     sys_frame: i32,
     /// A maximized window has no resize edge; its top row is content.
     maximized: bool,
+    /// T205: how far right the CLIENT's own chrome reaches into the band —
+    /// the right edge of the strip's "+" hit box, i.e. everything the tab
+    /// strip lays out and hit-tests itself. `0` when the band holds no tabs.
+    ///
+    /// It is a parameter rather than a `Layout` field because the strip's
+    /// controls move with the tab TITLES: the "+" follows the last tab, whose
+    /// width comes from text this module never measures. The caller passes the
+    /// rect the strip actually published, so what you see, what the strip
+    /// clicks, and what `WM_NCHITTEST` hands to the client are one number.
+    client_right: i32,
 ) NcHit {
     if (y < 0 or y >= m.caption_h) return .client;
     // Outside the client area horizontally is the window's LEFT/RIGHT sizing
@@ -318,6 +403,13 @@ pub fn ncHitTest(
         if (x >= l.client_w - corner) return .top_right;
         return .top;
     }
+
+    // The strip's own controls, AFTER the resize edge (a tab must not make the
+    // window's top border un-grabbable — that is the same ordering rule the
+    // caption buttons already obey) and BEFORE the caption's, since the two
+    // regions are disjoint by construction and asking in this order means a
+    // stale `client_right` can never swallow the close button.
+    if (x < @min(client_right, l.band_left)) return .client;
 
     if (hitTest(m, l, x, y)) |b| return switch (b) {
         .overflow => .overflow,
@@ -366,7 +458,7 @@ const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
 
 test "caption_h is the shared square plus one spacing step above and below" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const ib = icon_button.Metrics.init(s);
         // Size the container to the control, never the reverse.
         try testing.expectEqual(ib.target + 2 * m.pad_sm, m.caption_h);
@@ -377,7 +469,7 @@ test "caption_h is the shared square plus one spacing step above and below" {
 
 test "every caption button paints the same square on one vertical frame" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         const all = [_]Rect{ l.overflow, l.minimize, l.maximize, l.close };
         for (all) |r| {
@@ -391,7 +483,7 @@ test "every caption button paints the same square on one vertical frame" {
 
 test "nothing touches: painted gaps are exactly one spacing step" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         // Button to button WITHIN the system trio, between PAINTED edges.
         try testing.expectEqual(m.pad_sm, l.maximize.left - l.minimize.right);
@@ -418,7 +510,7 @@ test "caption button hit boxes never overlap each other" {
     // `hit_pad` on both sides overlaps at 1.25 and nowhere else.
     var s: f32 = 1.0;
     while (s <= 3.0) : (s += 0.05) {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         const hover = hitBox(m, l, .overflow);
         const hmin = hitBox(m, l, .minimize);
@@ -438,7 +530,7 @@ test "caption button hit boxes never overlap each other" {
 
 test "hitTest finds each button and nothing between or outside them" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         const cy = @divTrunc(m.caption_h, 2);
         try testing.expectEqual(Button.overflow, hitTest(m, l, l.overflow.left + 1, cy).?);
@@ -460,7 +552,7 @@ test "the top-right corner lands on close, not on empty band" {
     // pointer into the corner must close the window. The 4 DIP inset means
     // the painted square does not reach the corner, so the HIT box has to.
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         // Every pixel of the last column inside the band, top row included.
         try testing.expectEqual(Button.close, hitTest(m, l, 1199, 0).?);
@@ -474,7 +566,7 @@ test "the top-right corner lands on close, not on empty band" {
 
 test "drag region ends at the leftmost button's hit box, not its paint" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         try testing.expect(isDragRegion(m, l, l.title.left + 1, 1));
         try testing.expect(isDragRegion(m, l, l.drag_right - 1, 1));
@@ -489,7 +581,7 @@ test "drag region ends at the leftmost button's hit box, not its paint" {
 
 test "ncHitTest: resize edges are asked BEFORE buttons, and only when restored" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         const frame: i32 = @intFromFloat(@round(8.0 * s));
         const border = resizeBorder(m, frame);
@@ -498,21 +590,21 @@ test "ncHitTest: resize edges are asked BEFORE buttons, and only when restored" 
         // Restored: the top rows are the resize edge, everywhere across the
         // band — including directly over the close button, exactly as a stock
         // frame behaves.
-        try testing.expectEqual(NcHit.top, ncHitTest(m, l, 600, 0, frame, false));
-        try testing.expectEqual(NcHit.top_left, ncHitTest(m, l, 0, 0, frame, false));
-        try testing.expectEqual(NcHit.top_right, ncHitTest(m, l, 1199, 0, frame, false));
-        try testing.expectEqual(NcHit.close, ncHitTest(m, l, 1199, border, frame, false));
+        try testing.expectEqual(NcHit.top, ncHitTest(m, l, 600, 0, frame, false, 0));
+        try testing.expectEqual(NcHit.top_left, ncHitTest(m, l, 0, 0, frame, false, 0));
+        try testing.expectEqual(NcHit.top_right, ncHitTest(m, l, 1199, 0, frame, false, 0));
+        try testing.expectEqual(NcHit.close, ncHitTest(m, l, 1199, border, frame, false, 0));
 
         // Maximized: no resize edge at all, so the very corner is close and
         // the band's top row is draggable/clickable all the way across.
-        try testing.expectEqual(NcHit.close, ncHitTest(m, l, 1199, 0, frame, true));
-        try testing.expectEqual(NcHit.caption, ncHitTest(m, l, 600, 0, frame, true));
+        try testing.expectEqual(NcHit.close, ncHitTest(m, l, 1199, 0, frame, true, 0));
+        try testing.expectEqual(NcHit.caption, ncHitTest(m, l, 600, 0, frame, true, 0));
 
         // Below the band is nobody's business here — and neither is the side
         // sizing border, which the OS still owns.
-        try testing.expectEqual(NcHit.client, ncHitTest(m, l, 600, m.caption_h, frame, false));
-        try testing.expectEqual(NcHit.client, ncHitTest(m, l, 1200, 1, frame, true));
-        try testing.expectEqual(NcHit.client, ncHitTest(m, l, -1, 1, frame, true));
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, 600, m.caption_h, frame, false, 0));
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, 1200, 1, frame, true, 0));
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, -1, 1, frame, true, 0));
 
         // The corner grab is wider than the edge, but never so wide that the
         // middle of a 1200 px band stops being a plain top edge.
@@ -520,11 +612,11 @@ test "ncHitTest: resize edges are asked BEFORE buttons, and only when restored" 
 
         // Each button answers for itself below the resize edge.
         const y = m.caption_h - 1;
-        try testing.expectEqual(NcHit.overflow, ncHitTest(m, l, l.overflow.left + 1, y, frame, false));
-        try testing.expectEqual(NcHit.minimize, ncHitTest(m, l, l.minimize.left + 1, y, frame, false));
-        try testing.expectEqual(NcHit.maximize, ncHitTest(m, l, l.maximize.left + 1, y, frame, false));
-        try testing.expectEqual(NcHit.close, ncHitTest(m, l, l.close.left + 1, y, frame, false));
-        try testing.expectEqual(NcHit.caption, ncHitTest(m, l, l.title.left + 1, y, frame, false));
+        try testing.expectEqual(NcHit.overflow, ncHitTest(m, l, l.overflow.left + 1, y, frame, false, 0));
+        try testing.expectEqual(NcHit.minimize, ncHitTest(m, l, l.minimize.left + 1, y, frame, false, 0));
+        try testing.expectEqual(NcHit.maximize, ncHitTest(m, l, l.maximize.left + 1, y, frame, false, 0));
+        try testing.expectEqual(NcHit.close, ncHitTest(m, l, l.close.left + 1, y, frame, false, 0));
+        try testing.expectEqual(NcHit.caption, ncHitTest(m, l, l.title.left + 1, y, frame, false, 0));
     }
 }
 
@@ -535,12 +627,12 @@ test "ncHitTest: the gap between two buttons drags, it never falls to client" {
     // seam and the window does not move.
     var s: f32 = 1.0;
     while (s <= 3.0) : (s += 0.05) {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200);
         const y = m.caption_h - 1;
         var x: i32 = l.drag_right;
         while (x < 1200) : (x += 1) {
-            const hit = ncHitTest(m, l, x, y, 8, false);
+            const hit = ncHitTest(m, l, x, y, 8, false, 0);
             try testing.expect(hit != .client);
         }
     }
@@ -548,7 +640,7 @@ test "ncHitTest: the gap between two buttons drags, it never falls to client" {
 
 test "a narrow window drops the title instead of painting it under the buttons" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         // Just wide enough for the four buttons and their insets, and no
         // more: there is nowhere for a title to go.
         const narrow = 4 * m.btn_paint + 4 * m.pad_sm + m.pad_md;
@@ -566,7 +658,7 @@ test "a narrow window drops the title instead of painting it under the buttons" 
 
 test "resizeBorder: honors the system metric, clamps, and never eats the band" {
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         try testing.expectEqual(@as(i32, 6), resizeBorder(m, 6));
         // A missing/absurd metric falls back rather than returning 0 — a
         // 0-thickness band means the window's top edge cannot be resized at
@@ -600,7 +692,7 @@ test "layout is stable under width changes: only the anchor moves" {
     // every button by exactly the delta and change nothing else. A layout
     // that recomputed gaps from the width would drift here.
     for (scales) |s| {
-        const m = Metrics.init(s);
+        const m = Metrics.init(s, .standalone);
         const a = layout(m, 800);
         const b = layout(m, 1000);
         try testing.expectEqual(@as(i32, 200), b.close.left - a.close.left);
@@ -609,5 +701,138 @@ test "layout is stable under width changes: only the anchor moves" {
         try testing.expectEqual(@as(i32, 200), b.drag_right - a.drag_right);
         try testing.expectEqual(a.title.left, b.title.left);
         try testing.expectEqual(@as(i32, 200), b.title.right - a.title.right);
+    }
+}
+
+// -- T205: the merged row ----------------------------------------------------
+
+test "with_tabs: the band IS the strip's band and the buttons sit on its baseline" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        const ts = tab_strip.Metrics.init(s);
+        // Not "about the same height" — the same number, from the same module.
+        // Two heights that agree at 1.0 and drift at 1.25 is exactly the class
+        // of defect the design system's §7 sweep exists to catch.
+        try testing.expectEqual(ts.bar_h, m.caption_h);
+
+        // The whole point of the merge: the caption buttons and the strip's
+        // "+" paint on ONE horizontal frame. The user's report was two rows
+        // that could not line up; a merged row that still missed by 2 px
+        // would be the same complaint with less excuse.
+        const l = layout(m, 1200);
+        const plus = icon_button.targetBox(m.ib, ts.buttonHit(0));
+        for ([_]Rect{ l.overflow, l.minimize, l.maximize, l.close }) |r| {
+            try testing.expectEqual(plus.top, r.top);
+            try testing.expectEqual(plus.bottom, r.bottom);
+            try testing.expectEqual(m.btn_paint, r.height());
+        }
+        // And the band still clears the buttons below, on the spacing scale.
+        try testing.expectEqual(ts.pad_sm, m.caption_h - l.close.bottom);
+    }
+}
+
+test "with_tabs: standalone's horizontal arrangement is untouched" {
+    // Merging is a VERTICAL change. Every x in the band — the right inset, the
+    // trio's internal gaps, the group separation to the "…" — must be the same
+    // number it was before, or the merge quietly became a redesign.
+    for (scales) |s| {
+        const a = layout(Metrics.init(s, .standalone), 1200);
+        const b = layout(Metrics.init(s, .with_tabs), 1200);
+        try testing.expectEqual(a.close.left, b.close.left);
+        try testing.expectEqual(a.maximize.left, b.maximize.left);
+        try testing.expectEqual(a.minimize.left, b.minimize.left);
+        try testing.expectEqual(a.overflow.left, b.overflow.left);
+        try testing.expectEqual(a.drag_right, b.drag_right);
+    }
+}
+
+test "with_tabs: the tabs are the title, so no title is laid out" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        try testing.expect(layout(m, 1200).title.isEmpty());
+        // ...and a standalone band of the same width still has one, so the
+        // emptiness is the mode and not the width.
+        try testing.expect(!layout(Metrics.init(s, .standalone), 1200).title.isEmpty());
+    }
+}
+
+test "band_left is the seam: one group gap left of the button cluster" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        const ts = tab_strip.Metrics.init(s);
+        const ib = icon_button.Metrics.init(s);
+        const l = layout(m, 1200);
+        try testing.expectEqual(l.overflow.left - m.pad_md, l.band_left);
+
+        // The contract with the strip: handed `band_left + strip_pad_r` as its
+        // client width, a menu-less strip lands the "+"'s PAINTED right edge
+        // exactly on the seam. If these two ever disagree the "+" either
+        // overlaps the "…" or floats short of it — and both painters fill the
+        // same background, so nothing on screen would say which.
+        const strip_w = l.band_left + ts.strip_pad_r;
+        var out: [4]tab_strip.Rect = undefined;
+        const prefer = [_]i32{ ts.min_tab_w, ts.min_tab_w };
+        const strip = tab_strip.layout(ts, strip_w, false, &prefer, &out);
+        const plus_paint = icon_button.targetBox(ib, strip.new_tab);
+        try testing.expect(plus_paint.right <= l.band_left);
+
+        // ...and the "+"'s own painted LIMIT — the furthest right the strip
+        // would ever put it — lands exactly ON the seam. Stated against
+        // `runWidth`, which is the public form of that limit, rather than
+        // against some particular set of tabs: a full run still ends one
+        // `tab_gap` short (the last tab gives that gap up), so a layout with
+        // wide tabs would measure 4 DIP shy and say nothing about the rule.
+        try testing.expectEqual(
+            l.band_left,
+            tab_strip.runWidth(ts, strip_w, false) + ts.group_gap + ts.strip_pad_l + ts.btn_paint,
+        );
+    }
+}
+
+test "with_tabs: the strip's own controls answer .client, the caption's do not" {
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        const l = layout(m, 1200);
+        const y = m.caption_h - 1; // below any resize edge
+        const frame: i32 = 8;
+        const client_right = l.band_left; // strip filled its whole half
+
+        // A tab, and the "+" beside it, are the strip's business.
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, 10, y, frame, false, client_right));
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, l.band_left - 1, y, frame, false, client_right));
+        // The empty middle still drags the window, which is what makes a
+        // merged row usable at all.
+        try testing.expectEqual(NcHit.caption, ncHitTest(m, l, l.band_left, y, frame, false, client_right));
+        // And the caption's own four are unchanged.
+        try testing.expectEqual(NcHit.overflow, ncHitTest(m, l, l.overflow.left + 1, y, frame, false, client_right));
+        try testing.expectEqual(NcHit.close, ncHitTest(m, l, l.close.left + 1, y, frame, false, client_right));
+    }
+}
+
+test "a stale client_right can never swallow a caption button" {
+    // `client_right` comes from the last paint, so a window that resized
+    // between a paint and a click can present one that is far too wide. The
+    // close button must still close: it is clamped to the seam.
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        const l = layout(m, 1200);
+        const y = m.caption_h - 1;
+        try testing.expectEqual(NcHit.close, ncHitTest(m, l, l.close.left + 1, y, 8, false, 100_000));
+        try testing.expectEqual(NcHit.overflow, ncHitTest(m, l, l.overflow.left + 1, y, 8, false, 100_000));
+    }
+}
+
+test "the resize edge still wins over a tab" {
+    // A tab reaching the window's top row must not make the top border
+    // un-grabbable — the same ordering rule the caption buttons obey, and the
+    // one a merged row is most likely to break.
+    for (scales) |s| {
+        const m = Metrics.init(s, .with_tabs);
+        const l = layout(m, 1200);
+        const frame: i32 = 8;
+        try testing.expectEqual(NcHit.top, ncHitTest(m, l, 600, 0, frame, false, l.band_left));
+        try testing.expectEqual(NcHit.top_left, ncHitTest(m, l, 0, 0, frame, false, l.band_left));
+        // Maximized there is no resize edge, so the same point is the strip's.
+        try testing.expectEqual(NcHit.client, ncHitTest(m, l, 600, 0, frame, true, l.band_left));
     }
 }

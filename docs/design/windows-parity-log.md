@@ -4353,3 +4353,76 @@ still failing on exactly the one ink assertion; tab-strip.ps1 37,
 tab-strip-autohide.ps1 13, caption-bar.ps1 17, tab-color.ps1 16, all ALL PASS;
 both zig test lanes exit 0; test-agent green on re-run after the known T258
 ConPTY flake; P1-P3 ALL PASS.
+
+## 2026-07-31 - T205: two rows of chrome could never line up, so there is one row now
+
+The user's complaint was an alignment one - *"the hamburger icon ... doesn't
+horizontally align under the X above it"*, sent with a screenshot of Windows
+Terminal as the reference. The alignment was the symptom. Ghoztty drew a caption
+row and a separate tab strip beneath it: two runs of controls owned by two
+layouts, which can only ever *approximate* each other, and the approximation
+drifts with DPI and with the caption button width. It is not fixable by nudging
+x coordinates.
+
+The tab run lives in the caption band now, on a window that owns its caption and
+has a strip. Measured at the user's 125%: chrome went from 95 physical px to 50,
+**45 px of terminal back on every multi-tab window**, and the alignment became
+structural rather than approximate.
+
+Two decisions carry the whole change:
+
+**Chrome that shares a row shares a baseline.** The caption buttons take
+`btn_top` from the STRIP's own derivation - `icon_button.targetBox` of
+`tab_strip_layout.buttonHit` - not from centering a 28 DIP square in the 40 DIP
+band. The "+" and the tab close "x" have been on that frame since T204;
+centering would have landed 2 px off it, i.e. reproduced the user's complaint
+inside the fix. `caption_h` is likewise `tab_strip_layout.bar_h`, one number
+from one module.
+
+**Two painters, one row, disjoint blits.** `Layout.band_left` is the seam: the
+strip paints and BitBlts `[0, band_left)`, the caption `[band_left, client_w)`,
+and `Window.stripClientWidth` hands the strip `band_left + strip_pad_r`, which
+is exactly the width at which a menu-less strip lands the "+"'s painted limit ON
+the seam (asserted, not assumed). Both fill the identical background so the seam
+is invisible; what it buys is that a caption repaint - a hover on close - cannot
+erase a tab, and the paint ORDER stops mattering.
+
+`ncHitTest` gained `client_right` so the strip's controls answer HTCLIENT in the
+band (otherwise every tab would drag the window). It is a parameter rather than
+a Layout field because the "+" travels with the last tab, whose width comes from
+text metrics that module never measures - so `Window` passes the rect the strip
+PUBLISHED, the same one `handleTabBarClick` reads, clamped to the seam so a
+stale rect can never swallow close.
+
+**T257's prediction paid out exactly.** Two app files, and one new argument
+(`-StripVisible`) across `lib\ChromeGeometry.ps1` and its nine call sites.
+
+It also charged interest, and that is the lesson worth keeping: **two scripts
+had never controlled their own window size** and had been inheriting
+`window_placement-debug` (T85) from whichever GUI script ran last, so their
+conditions depended on RUN ORDER. `tab-strip.ps1` went 3 red on a default 782 px
+client - every condition it sets up is a ratio OF THE TAB RUN and it was not
+controlling the input that ratio is taken of - and `menu-bar.ps1` went 2 red on
+ink probes that assumed a wide strip. Both size their window now; filed as T267,
+because nobody clears that file and the sweep is wider than these two.
+
+Two more script corrections T205 forced, both of which would have been GREEN and
+empty: `menu-bar.ps1`'s `StripRightX` was aiming at the caption's close button
+(a posted CLIENT click cannot press one, so "nothing happened" would have passed
+forever), and its blank-ink control probed `cw / 2`, which stopped being blank
+when the strip's half of the row shrank. The control is `Strip-Geometry`'s
+`DeadX` now - blank by construction, not by luck.
+
+Follow-ups: **T265** (a pinned window title has nowhere to paint on a merged
+row - matches WT, but ghoztty documents the pin, so the decision is recorded
+rather than drifted into), **T266** (the top resize edge now sits ON the tabs;
+almost certainly correct, but the thickness has not been measured against the
+reference), **T267** (above). **T258** gained new evidence: the win32 test lane
+HUNG on `remote.agent.server.test.FLOW pause`, 3400/3467 passed, flat CPU for
+six minutes - so that flake is not confined to `test-agent` and not confined to
+failing.
+
+Evidence: chrome-merged-row.ps1 ALL PASS (19) with its negative control failing
+as required; tab-strip.ps1 37, tab-strip-autohide.ps1 15, menu-bar.ps1 71,
+caption-bar.ps1 17, tab-color.ps1 16, all ALL PASS; both zig test lanes exit 0;
+test-agent exit 0; P1-P3 ALL PASS.

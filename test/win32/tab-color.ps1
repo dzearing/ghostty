@@ -177,12 +177,19 @@ try {
     # line reported 45 at this box's 1.25 scale (exactly caption_h) while the
     # strip is 50, and the loose 20..80 band let that pass. The caption height
     # is subtracted now, and the check is exact against the derived bar_h.
-    $m = Get-TestChromeMetrics -Window $top
+    #
+    # T205 half 2 - the origin moved BACK, and further. The strip is IN the
+    # caption row now, so it starts at client y = 0 again and the whole chrome
+    # is `bar_h`. `StripTopClient` is that number either way, which is why this
+    # reads it instead of `CaptionH` (which is the WHOLE band when merged, and
+    # subtracting it would land the probe below the strip entirely).
+    # -StripVisible $true: this window launches --window-show-tab-bar=always.
+    $m = Get-TestChromeMetrics -Window $top -StripVisible $true
     $clientTop = $m.ClientTop
-    $stripTopScreen = $clientTop + $m.CaptionH
+    $stripTopScreen = $clientTop + $m.StripTopClient
     $barH = $panes1[0].Top - $stripTopScreen
     Assert ($barH -eq $m.BarH) `
-        "positive control: the tab bar is visible with a single tab (capH=$($m.CaptionH) barH=$barH, expected $($m.BarH))"
+        "positive control: the tab bar is visible with a single tab (stripTop=$($m.StripTopClient) barH=$barH, expected $($m.BarH))"
     if ($barH -le 0) { exit 1 }
 
     # --- Positive control: ctrl+t creates tab 2 ----------------------------

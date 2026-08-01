@@ -15,8 +15,29 @@
 # button band. Same measurement, four implementations, four chances to be
 # wrong, and they were not even consistent with each other (see ROUNDING).
 #
-# T205 moves this datum a THIRD time when the tab strip goes into the caption
-# row. When it does, this file is the edit.
+# T205 moved this datum a THIRD time - the tab strip went INTO the caption row -
+# and this file was the edit, exactly as predicted. Total cost to the scripts:
+# one new argument each (`-StripVisible`), because the datum was in one place.
+#
+# ---------------------------------------------------------------------------
+# MERGED vs STANDALONE (T205) - and why -StripVisible is REQUIRED, not guessed
+#
+# A window that owns its caption now has TWO possible chrome shapes:
+#
+#   * MERGED (2+ tabs, or --window-show-tab-bar=always): one row. The band is
+#     the STRIP's height (40 DIP), the strip starts at client y = 0, there is
+#     no window title, and the tab run stops at a seam one `pad_md` left of the
+#     caption's "...". Total chrome above the terminal: 40 DIP.
+#   * STANDALONE (one tab, the T234 default): no strip at all. The band is its
+#     own 36 DIP with the window title in it. Total chrome: 36 DIP.
+#
+# Those two disagree about the y of EVERY strip pixel and about where the "+"
+# may sit, so the helper cannot pick one. It also cannot detect which it is
+# looking at: the deciding input is the window's tab COUNT, which lives in the
+# app and is not on the HWND. So the caller - which knows what it launched -
+# must say, and a caller that does not say gets a throw rather than a plausible
+# wrong offset. T259 is the reason that is not negotiable: a script that
+# silently modelled the wrong chrome measured last year's geometry and passed.
 #
 # ---------------------------------------------------------------------------
 # DERIVED vs MEASURED - the line this file draws, and why
@@ -99,7 +120,13 @@ prefer reading them straight rather than splatting.
 function Get-TestChromeMetrics {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,
-        $Desktop
+        $Desktop,
+        # T205. $true when this window is showing a tab strip (2+ tabs, or
+        # --window-show-tab-bar=always), $false when it is not. REQUIRED on a
+        # window that owns its caption - see the MERGED vs STANDALONE note in
+        # this file's header for why it cannot be inferred. Ignored on a
+        # caption-less window, where the strip is always its own row.
+        [object]$StripVisible
     )
 
     $dpi = [int](Get-TestWindowDpi -Window $Window -Desktop $Desktop)
@@ -125,12 +152,43 @@ function Get-TestChromeMetrics {
     # reason the right-anchored band below is conditional.
     $hasStripMenu = -not $hasCaption
 
+    # T205: is the tab run IN the caption band? Only a caption window can
+    # merge, and only while it has a strip to merge.
+    if ($hasCaption -and $null -eq $StripVisible) {
+        throw ("Get-TestChromeMetrics: -StripVisible is required on a window that owns its " +
+               "caption. Since T205 the tab run shares the caption ROW, so the strip's origin " +
+               "AND the '+'s right limit both depend on whether there is a run: with a strip " +
+               "the band is 40 DIP and the strip starts at client y=0; without one there is no " +
+               "strip and the band is its own 36 DIP with the window title in it. Pass " +
+               "-StripVisible `$true for a window showing 2+ tabs (or --window-show-tab-bar=" +
+               "always), `$false otherwise. It is not inferred because the deciding input is " +
+               "the tab COUNT, which lives in the app and is not on the HWND.")
+    }
+    # A caption-less window always shows its strip (`auto` is `tab_count > 1 or
+    # !customCaption`), and has no band to merge it into either way.
+    $stripShown = if ($hasCaption) { [bool]$StripVisible } else { $true }
+    $merged = $hasCaption -and $stripShown
+
     # caption_h and bar_h are built from the same two parts the modules build
     # them from, not from a literal 36/40, so `window-decoration = none` (no
     # caption) and any future change show up as a disagreement rather than a
-    # coincidence.
-    $captionH = if ($hasCaption) { 2 * $padSm + $btnPaint } else { 0 }
+    # coincidence. Merged, the band IS the strip's height - one row, one
+    # number, exactly as `caption_layout.Metrics.init(.with_tabs)` does it.
     $barH = 3 * $padSm + $btnPaint
+    $captionH = if (-not $hasCaption) { 0 } elseif ($merged) { $barH } else { 2 * $padSm + $btnPaint }
+    $stripTopClient = if ($merged) { 0 } else { $captionH }
+    # Everything above the terminal. NOT `CaptionH + BarH` at any call site:
+    # that stopped being the answer the moment the two became one row.
+    $chromeH = if ($merged) { $barH } elseif ($stripShown) { $captionH + $barH } else { $captionH }
+
+    # Top of a caption button's PAINTED square, band-local. Merged it is the
+    # strip's own button baseline (`icon_button.targetBox` of the strip's hit
+    # box, whose band is `tab_top_pad`..`bar_h`) - the whole point of the merge
+    # is that the caption's buttons and the strip's "+" sit on ONE frame, so a
+    # local `(band - square) / 2` here would assert the bug rather than the fix.
+    $capBtnTop = if ($merged) {
+        [int][Math]::Truncate(($padSm + $barH) / 2) - [int][Math]::Truncate($btnPaint / 2)
+    } else { $padSm }
 
     $cr = Get-TestWindowRect -Window $Window -Client
     $wr = Get-TestWindowRect -Window $Window
@@ -144,22 +202,30 @@ function Get-TestChromeMetrics {
     # does. `MenuLeft` is then $null: there is no such button, and a script that
     # clicks one on this window is aiming at nothing (better a $null-arithmetic
     # blow-up than a click that silently lands on empty strip).
+    # The caption's own "..." menu button (T234), in client x - the menu host
+    # on a caption window, and what `menu-bar.ps1` clicks there. Right-anchored
+    # like the system trio, one GROUP step (pad_md) clear of minimize, exactly
+    # as `caption_layout.layout` places it. T205 changed no x in this cluster:
+    # merging was a VERTICAL change.
+    $capCloseL = $clientW - $padSm - $btnPaint
+    $capMinL = $capCloseL - 2 * ($btnPaint + $padSm)
+    $capOverL = if ($hasCaption) { $capMinL - $padMd - $btnPaint } else { $null }
+    # The seam (`caption_layout.Layout.band_left`): the strip paints left of
+    # it, the caption right of it, and the "+"'s painted limit lands ON it.
+    $bandLeft = if ($merged) { $capOverL - $padMd } else { $null }
+
     if ($hasStripMenu) {
         $menuLeft = $clientW - $padSm - $btnPaint
         $plusLimit = $menuLeft - $gap - $btnPaint
+    } elseif ($merged) {
+        # The strip's right end is the seam, not the window edge.
+        $menuLeft = $null
+        $plusLimit = $bandLeft - $btnPaint
     } else {
         $menuLeft = $null
         $plusLimit = $clientW - $padSm - $btnPaint
     }
     $runW = $plusLimit - $gap - $padSm
-
-    # The caption's own "..." menu button (T234), in client x - the menu host
-    # on a caption window, and what `menu-bar.ps1` clicks there. Right-anchored
-    # like the system trio, one GROUP step (pad_md) clear of minimize, exactly
-    # as `caption_layout.layout` places it.
-    $capCloseL = $clientW - $padSm - $btnPaint
-    $capMinL = $capCloseL - 2 * ($btnPaint + $padSm)
-    $capOverL = if ($hasCaption) { $capMinL - $padMd - $btnPaint } else { $null }
 
     return [pscustomobject]@{
         Dpi = $dpi
@@ -184,6 +250,14 @@ function Get-TestChromeMetrics {
         HasCaption = $hasCaption
         # T260: is there a "menu" button in the strip at all?
         HasStripMenu = $hasStripMenu
+        # T205: is the tab run in the caption band? When it is, `CaptionH` and
+        # `BarH` are the SAME row and adding them is a bug.
+        Merged = $merged
+        StripVisible = $stripShown
+        # Everything above the terminal - what a pane's top offset should be.
+        ChromeH = $chromeH
+        # Band-local top of a caption button's painted square.
+        CaptionBtnTop = $capBtnTop
 
         # --- tab strip constants ---------------------------------------------
         PadL = $padSm                       # strip_pad_l
@@ -205,9 +279,10 @@ function Get-TestChromeMetrics {
         # a Get-TestWindowPixels bitmap index.
         OffX = $cr.Left - $wr.Left
         OffY = $cr.Top - $wr.Top
-        # The strip's first row, in both spaces that matter.
-        StripTopClient = $captionH
-        StripTop = ($cr.Top - $wr.Top) + $captionH
+        # The strip's first row, in both spaces that matter. NOT `CaptionH`
+        # since T205 - merged, the strip IS the band and starts at 0.
+        StripTopClient = $stripTopClient
+        StripTop = ($cr.Top - $wr.Top) + $stripTopClient
 
         # --- right-anchored band, client x -----------------------------------
         # $null on a caption window - the button does not exist there (T260).
@@ -221,6 +296,8 @@ function Get-TestChromeMetrics {
         # The caption's "..." (T234): the menu host on a caption window.
         CaptionOverflowLeft = $capOverL
         CaptionOverflowX = if ($null -ne $capOverL) { $capOverL + [int]($btnPaint / 2) } else { $null }
+        # T205's seam; $null on a window whose chrome is two rows.
+        BandLeft = $bandLeft
         # tab_strip_layout.runWidth: what the 50% proportional cap is half OF,
         # so the script and the layout module mean the same run.
         RunW = $runW
@@ -261,7 +338,9 @@ function Get-TestTabExtents {
     )
 
     $m = $Metrics
-    if (-not $m) { $m = Get-TestChromeMetrics -Window $Window -Desktop $Desktop }
+    # -StripVisible $true: asking where the tabs are only makes sense on a
+    # window that has a strip, so the answer is not a guess here.
+    if (-not $m) { $m = Get-TestChromeMetrics -Window $Window -Desktop $Desktop -StripVisible $true }
 
     $rowY = $m.StripTop + $m.BarH - 2
     $out = @()
@@ -332,7 +411,9 @@ function Get-TestTabRunRight {
     )
 
     $m = $Metrics
-    if (-not $m) { $m = Get-TestChromeMetrics -Window $Window -Desktop $Desktop }
+    # -StripVisible $true: asking where the tabs are only makes sense on a
+    # window that has a strip, so the answer is not a guess here.
+    if (-not $m) { $m = Get-TestChromeMetrics -Window $Window -Desktop $Desktop -StripVisible $true }
 
     $tabs = @(Get-TestTabExtents -Window $Window -Shot $Shot -Metrics $m -Desktop $Desktop)
     if ($tabs.Count -eq 0) { return $m.PadL }

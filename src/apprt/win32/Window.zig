@@ -861,19 +861,70 @@ pub fn stripHasMenu(self: *const Window) bool {
     return !self.customCaption();
 }
 
-/// Height of the caption band in physical pixels, or 0 when the OS still owns
-/// the caption. From the layout module, never a second copy of the constant.
-pub fn captionHeight(self: *const Window) i32 {
-    if (!self.customCaption()) return 0;
-    return caption_layout.Metrics.init(self.scale).caption_h;
+/// Does the caption band hold the tab run as well (T205)?
+///
+/// Every window that owns its caption and is showing a strip. That is the
+/// merged row: one chrome row instead of two, which is what the reference
+/// (Windows Terminal, Edge, Explorer) does and the only arrangement in which
+/// the app's buttons and the window's buttons can be made to line up at all —
+/// two rows owned by two layouts can only ever approximate each other, and the
+/// approximation drifts with DPI.
+///
+/// At ONE tab there is no strip (T234), so the band is standalone and shows
+/// the window title. A `window-decoration = none` window and the quick
+/// terminal own no caption, so their strip stays where it was.
+pub fn mergedChrome(self: *const Window) bool {
+    return self.customCaption() and self.tab_bar_visible;
 }
 
-/// Client y where the tab strip begins: directly under the caption band.
+/// The caption band's metrics for this window's current mode.
+fn captionMetrics(self: *const Window) caption_layout.Metrics {
+    return caption_layout.Metrics.init(
+        self.scale,
+        if (self.mergedChrome()) .with_tabs else .standalone,
+    );
+}
+
+/// Height of the caption band in physical pixels, or 0 when the OS still owns
+/// the caption. From the layout module, never a second copy of the constant.
+///
+/// Merged this IS the strip's `bar_h` — the band and the strip are the same
+/// row — which is why `chromeHeight` exists rather than callers adding this to
+/// `tabBarHeight()`.
+pub fn captionHeight(self: *const Window) i32 {
+    if (!self.customCaption()) return 0;
+    return self.captionMetrics().caption_h;
+}
+
+/// Total chrome above the terminal: the caption band plus, when it is a
+/// separate row, the tab strip. ONE place, because "caption + strip" stops
+/// being the answer the moment they are the same row (T205).
+pub fn chromeHeight(self: *const Window) i32 {
+    if (self.mergedChrome()) return self.captionHeight();
+    return self.captionHeight() + self.tabBarHeight();
+}
+
+/// Client y where the tab strip begins: directly under the caption band, or
+/// the top of the window when it shares that band (T205).
 /// Every strip rect is still computed with its own top at 0 — the strip is a
 /// self-contained coordinate space, and this is the one number that places it
 /// (paint destination in, mouse coordinates out).
 pub fn tabBarTop(self: *const Window) i32 {
+    if (self.mergedChrome()) return 0;
     return self.captionHeight();
+}
+
+/// The client width handed to `tab_strip.layout` (T205).
+///
+/// Merged, the strip stops at the seam: `band_left + strip_pad_r` is exactly
+/// the width at which a menu-less strip lands the "+"'s painted right edge ON
+/// `band_left` (asserted in `caption_layout`'s "band_left is the seam" test),
+/// so the run and the caption cluster meet on a painted edge and neither can
+/// paint over the other. Unmerged it is simply the client width.
+fn stripClientWidth(self: *const Window, client_w: i32) i32 {
+    if (!self.mergedChrome()) return client_w;
+    const l = self.captionLayout() orelse return client_w;
+    return @max(l.band_left + tab_strip.Metrics.init(self.scale).strip_pad_r, 0);
 }
 
 /// Is a CLIENT y inside the tab strip's band?
@@ -902,8 +953,7 @@ fn captionLayout(self: *const Window) ?caption_layout.Layout {
     const hwnd = self.hwnd orelse return null;
     var rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &rect) == 0) return null;
-    const m = caption_layout.Metrics.init(self.scale);
-    return caption_layout.layout(m, rect.right - rect.left);
+    return caption_layout.layout(self.captionMetrics(), rect.right - rect.left);
 }
 
 /// Returns the client rect available for the active surface, which is
@@ -915,7 +965,7 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
     if (w32.GetClientRect(hwnd, &rect) == 0) {
         return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     }
-    rect.top += self.captionHeight() + self.tabBarHeight();
+    rect.top += self.chromeHeight();
     return rect;
 }
 
@@ -2967,7 +3017,7 @@ fn handleNcCalcSize(self: *Window, wparam: usize, lparam: isize) ?isize {
 fn handleCaptionHitTest(self: *Window, lparam: isize) ?isize {
     const hwnd = self.hwnd orelse return null;
     const l = self.captionLayout() orelse return null;
-    const m = caption_layout.Metrics.init(self.scale);
+    const m = self.captionMetrics();
 
     var pt: w32.POINT = .{
         .x = @as(i16, @truncate(lparam & 0xFFFF)),
@@ -2982,6 +3032,13 @@ fn handleCaptionHitTest(self: *Window, lparam: isize) ?isize {
         pt.y,
         self.sysFrameY(),
         w32.IsZoomed(hwnd) != 0,
+        // The strip's own controls in the merged band, from the rect the
+        // strip PUBLISHED at its last paint — the same rect
+        // `handleTabBarClick` reads. Deriving a second copy here is how what
+        // you see and what you can click drift apart; and before the first
+        // paint it is 0, which means "the caption owns the whole band", the
+        // safe answer.
+        if (self.mergedChrome()) self.new_tab_rect.right else 0,
     )) {
         .client => null,
         .top => w32.HTTOP,
@@ -3146,7 +3203,7 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
     const client_w = client_rect.right - client_rect.left;
     if (client_w <= 0) return;
 
-    const m = caption_layout.Metrics.init(self.scale);
+    const m = self.captionMetrics();
     const l = caption_layout.layout(m, client_w);
 
     const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
@@ -3260,7 +3317,16 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
         );
     }
 
-    _ = w32.BitBlt(hdc_screen, 0, 0, client_w, cap_h, mem_dc, 0, 0, w32.SRCCOPY);
+    // Merged (T205), the caption owns only `[band_left, client_w)` of the row —
+    // the tab strip paints the rest, and blitting the full width here would
+    // erase the tabs on every caption repaint (a hover on close would blank
+    // them). Both painters fill the identical chrome background, so the seam
+    // itself is invisible; what this buys is that the two BitBlts are disjoint
+    // and their ORDER stops mattering.
+    const blit_x = l.band_left;
+    const blit_w = client_w - blit_x;
+    if (blit_w <= 0) return;
+    _ = w32.BitBlt(hdc_screen, blit_x, 0, blit_w, cap_h, mem_dc, blit_x, 0, w32.SRCCOPY);
 }
 
 /// The close button's red hover/pressed fill: the same rounded rect
@@ -3488,7 +3554,11 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         }
         prefer[i] = m.preferredWidth(text_w);
     }
-    const strip = tab_strip.layout(m, client_w, self.stripHasMenu(), prefer[0..self.tab_count], &tabs);
+    // NOT `client_w` when the caption shares this row (T205): the run has to
+    // stop at the seam, and `stripClientWidth` is the one place that width is
+    // decided. Everything downstream — the chiclets, the "+", every published
+    // hit rect — falls out of it unchanged.
+    const strip = tab_strip.layout(m, self.stripClientWidth(client_w), self.stripHasMenu(), prefer[0..self.tab_count], &tabs);
 
     // Publish hit-test rects. Tabs past `strip.visible` did not fit and get a
     // ZERO rect on purpose — invisible and unhittable — instead of being laid
@@ -3668,7 +3738,16 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     // (T254). Keeping the offset here rather than threading it through every
     // rect is what stops the paint and the hit tests from drifting apart —
     // `handleTabBarClick` and friends subtract the same `tabBarTop()`.
-    _ = w32.BitBlt(hdc_screen, 0, self.tabBarTop(), client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
+    //
+    // Merged (T205) the strip owns only `[0, band_left)` of the row and the
+    // caption owns the rest — the mirror image of `paintCaption`'s blit, and
+    // the reason a caption repaint cannot erase a tab.
+    const blit_w = if (self.mergedChrome()) blk: {
+        const l = self.captionLayout() orelse break :blk client_w;
+        break :blk @min(l.band_left, client_w);
+    } else client_w;
+    if (blit_w <= 0) return;
+    _ = w32.BitBlt(hdc_screen, 0, self.tabBarTop(), blit_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
 }
 
 /// Toggle fullscreen mode on the top-level window.
@@ -3740,6 +3819,13 @@ const RESIZE_OVERLAY_TIMER_ID: usize = 0x5247; // 'RG'
 
 fn handleResize(self: *Window) void {
     self.layoutSplits();
+    // The caption band too, and not only because its right-anchored buttons
+    // moved: `updateTabBarVisibility` routes through here, and since T205 the
+    // strip appearing or disappearing CHANGES THE BAND — 36 DIP with a title
+    // becomes 40 DIP of tabs and back. Invalidating only the strip's own rect
+    // leaves the band showing the other mode's pixels until something else
+    // happens to dirty it.
+    self.invalidateCaption();
     self.invalidateTabBar();
     self.showResizeOverlay();
 }

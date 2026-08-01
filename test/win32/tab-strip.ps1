@@ -116,6 +116,20 @@ try {
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: top window not found'; exit 1 }
 
+    # SIZE THE WINDOW. Not cosmetic and not optional (T205): every condition
+    # this script sets up is a RATIO of the tab run - "two tabs still get their
+    # preferred width", "enough tabs to force a shrink" - and the run is
+    # `clientW - 225` at this DPI. Left to the app's default the window came up
+    # at 782 client px, the run was 557, and three preferred tabs (281 each) no
+    # longer fit: three assertions went red against a correct build.
+    #
+    # It only surfaced now because the script never set a size and was silently
+    # inheriting whatever `window_placement-debug` (T85) remembered from the
+    # last GUI script that ran - so its conditions depended on RUN ORDER. That
+    # is the same class of hazard as T248's target reuse; see T267.
+    Set-TestWindowSize -Window $top -Width 1400 -Height 800 | Out-Null
+    Start-Sleep -Milliseconds 1200
+
     Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
         'the window is NOT enumerable on the interactive desktop'
 
@@ -129,7 +143,9 @@ try {
     # edits lib\ChromeGeometry.ps1, not this script. The metrics come from the
     # window's own DPI by the same construction the layout modules use, so
     # nothing here is a fixed pixel count.
-    $m = Get-TestChromeMetrics -Window $top
+    # -StripVisible $true: this window launches --window-show-tab-bar=always, so
+    # since T205 its strip lives IN the caption row and starts at client y = 0.
+    $m = Get-TestChromeMetrics -Window $top -StripVisible $true
     $clientX = $m.ClientLeft; $clientY = $m.ClientTop; $clientW = $m.ClientW
     # Window-relative client origin, which is what the capture's bitmap uses.
     $offX = $m.OffX
@@ -146,12 +162,14 @@ try {
     # the positive control for both numbers at once: a wrong `$capH` shows up
     # here as a wrong `$barH`. (Reading both from the helper would assert the
     # helper against itself and prove nothing.)
-    $barH = $panes[0].Top - $clientY - $capH
+    # T205: `StripTopClient`, not `$capH` - merged, the caption band IS the
+    # strip's row, so subtracting the band height would land below the strip.
+    $barH = $panes[0].Top - $clientY - $m.StripTopClient
     # Window-relative y of the strip's FIRST row, which is what the capture's
     # bitmap is indexed by.
     $stripTop = $m.StripTop
     Assert ($barH -eq $m.BarH) `
-        "positive control: the tab bar is visible under the caption band (capH=$capH barH=$barH, expected $($m.BarH))"
+        "positive control: the tab bar is visible IN the caption row (stripTop=$($m.StripTopClient) capH=$capH barH=$barH, expected $($m.BarH))"
     if ($barH -le 0) { exit 1 }
 
     if (-not (Focus-TestWindow -Window $top -Child ([IntPtr]$panes[0].Hwnd))) {
@@ -249,7 +267,7 @@ try {
 
     # A click on the strip, posted where a real one would land.
     function Strip-Click([int]$cx) {
-        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cx) -Y ($clientY + $capH + [int]($barH / 2)) -Button left -Action click)
+        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cx) -Y ($clientY + $m.StripTopClient + [int]($barH / 2)) -Button left -Action click)
         Start-Sleep -Milliseconds 300
     }
 
@@ -541,13 +559,16 @@ try {
     if ($app2.Process -and $app2.Process.HasExited) { Write-Host 'SETUP FAIL: long-title GUI died at launch'; exit 1 }
     $top = Wait-TestWindow -ProcessId $app2.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: long-title top window not found'; exit 1 }
+    # Same size as the first window, for the same reason (above).
+    Set-TestWindowSize -Window $top -Width 1400 -Height 800 | Out-Null
+    Start-Sleep -Milliseconds 1200
 
     # Re-derive the geometry for THIS window: the pixel helpers above read
     # these script-scope variables at call time, so reassigning them re-points
     # them at the new instance.
     # Same datum as above, re-measured for THIS window (a different window can
     # be on a different monitor at a different DPI), from the one helper (T257).
-    $m = Get-TestChromeMetrics -Window $top
+    $m = Get-TestChromeMetrics -Window $top -StripVisible $true
     $clientX = $m.ClientLeft; $clientY = $m.ClientTop; $clientW = $m.ClientW
     $offX = $m.OffX
     $offY = $m.OffY
@@ -557,7 +578,7 @@ try {
     $sm    = $m.PadSm
     $sq    = $m.BtnPaint
     $capH  = $m.CaptionH
-    $barH  = $panes2[0].Top - $clientY - $capH
+    $barH  = $panes2[0].Top - $clientY - $m.StripTopClient
     $stripTop = $m.StripTop
     $runW = $m.RunW
     $capW = $m.TabCap

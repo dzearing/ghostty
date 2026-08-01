@@ -121,7 +121,10 @@ try {
     # and is what keeps that helper honest: `$expectCapH` is DERIVED, the band
     # is MEASURED off the pixels, and this script asserts they agree. That is
     # the one place the derivation is checked against reality.
-    $m = Get-TestChromeMetrics -Window $h
+    # -StripVisible $false: this window launches with `--window-show-tab-bar=
+    # never`, so the band is STANDALONE - its own 36 DIP row with the title in
+    # it, which is what every assertion below measures (T205).
+    $m = Get-TestChromeMetrics -Window $h -StripVisible $false
     $dpi = $m.Dpi
     $scale = $m.Scale
     $win = Get-TestWindowRect -Window $h

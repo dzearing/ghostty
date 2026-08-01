@@ -332,6 +332,37 @@ host the "…", so its strip stays up and keeps being the menu host. A control
 surface with nothing to control may disappear; the *only* route to the app's
 commands may not.
 
+### The strongest form of the second bullet: one row, not two (T205)
+
+"Host chrome in space the window already spends" has a limit case, and **T205**
+is it: when the strip DOES have something to show, it goes **into** the caption
+band rather than under it. One row of chrome, holding tabs, the "+", a drag
+region, the "…" and the system trio — which is what Windows Terminal, Edge,
+Explorer and VS Code all do.
+
+Two rules fall out of it, and both are asserted:
+
+- **Chrome that shares a row shares a baseline.** The caption buttons take
+  their `btn_top` from the *strip's* own button derivation
+  (`icon_button.targetBox` of `tab_strip_layout`'s `buttonHit`), not from
+  centering a 28 DIP square in the 40 DIP band — the "+" and the tab close "×"
+  are already on that frame (T204), and centering would land 2 px off it. The
+  band's height likewise IS `tab_strip_layout.bar_h`, one number from one
+  module.
+- **Two painters, one row, disjoint blits.** `Layout.band_left` is the seam:
+  the strip paints `[0, band_left)`, the caption paints `[band_left,
+  client_w)`, and the "+"'s painted limit lands exactly on it. They fill the
+  identical chrome background so the seam is invisible; what it buys is that a
+  caption repaint (a hover on close) cannot erase a tab, whatever order the two
+  paint in.
+
+The alignment complaint that started this — *"the hamburger icon doesn't
+horizontally align under the X above it"* — was never fixable by nudging x
+coordinates. Two rows owned by two layouts can only ever *approximate* each
+other, and the approximation drifts with DPI and with the caption button width.
+One row makes the alignment structural. **Two rows of controls is the defect;
+the misalignment is only how you notice.**
+
 ---
 
 ## 6b. Horizontal space: size to content, cap by proportion

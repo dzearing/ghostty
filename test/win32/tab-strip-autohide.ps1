@@ -20,13 +20,16 @@
 #      strip's absence is only worth anything if the terminal GETS the rows,
 #      and that is a measured pane offset.
 #   2. POSITIVE CONTROL, same size window, --window-show-tab-bar=always: the
-#      same measurement is `caption_h + bar_h`. Without this an app that had
-#      simply stopped creating panes correctly would read as a pass, and the
-#      per-window row gain is the DIFFERENCE of the two, measured rather than
-#      quoted from the design doc.
-#   3. THE TRANSITION, live, in one window: ctrl+t drops the pane by exactly
-#      bar_h (the strip appeared), and closing back to one tab lifts it by
-#      exactly bar_h again. Panes are not lost or scrambled across either.
+#      same measurement is `bar_h` - the strip lives IN the caption row since
+#      T205, so a window WITH a strip spends one row, not two. Without this an
+#      app that had simply stopped creating panes correctly would read as a
+#      pass, and the per-window row gain is the DIFFERENCE of the two, measured
+#      rather than quoted from the design doc.
+#   3. THE TRANSITION, live, in one window: ctrl+t drops the pane to exactly
+#      `bar_h` (the strip appeared, in the band), and closing back to one tab
+#      lifts it to `caption_h` again. Panes are not lost or scrambled across
+#      either. The COST of that second tab is `bar_h - caption_h` = 4 DIP,
+#      asserted as itself: before T205 it was a whole 40 DIP row.
 #   4. THE "..." BUTTON: WM_NCHITTEST over its square answers HTSYSMENU, which
 #      is the code Windows itself uses for "the control that opens this
 #      window's menu"; pressing it opens a real popup menu (a #32768 window on
@@ -91,9 +94,10 @@ function Start-Win([string[]]$extra) {
 }
 
 # How far the first VISIBLE pane's top sits below the client area's top. This
-# is the whole oracle of sections 1-3: it is caption_h with no strip and
-# caption_h + bar_h with one, and it is the terminal's own geometry rather
-# than a guess about what was painted.
+# is the whole oracle of sections 1-3: it is caption_h with no strip and bar_h
+# with one (T205 put the strip IN the band, so it is not the sum of the two),
+# and it is the terminal's own geometry rather than a guess about what was
+# painted.
 function Pane-Offset($h) {
     $cli = Get-TestWindowRect -Window $h -Client
     $panes = @(Get-TestChildWindows -Window $h -Class 'GhozttyTerminal' | Where-Object Visible)
@@ -124,14 +128,18 @@ try {
     # Derived from the DIP constants rather than read out of the binary, but no
     # longer restated HERE - lib\ChromeGeometry.ps1 is the one copy (T257), and
     # it rounds the way Zig's @round does, which `Px` above did not.
-    $m = Get-TestChromeMetrics -Window $h
+    # -StripVisible $false: one tab, default config - no strip, so the caption
+    # band is STANDALONE (T205). `$merged` below is the same window's metrics
+    # for the two-tab state, where the run moves INTO the band.
+    $m = Get-TestChromeMetrics -Window $h -StripVisible $false
+    $merged = Get-TestChromeMetrics -Window $h -StripVisible $true
     $dpi = $m.Dpi
     $scale = $m.Scale
     $padSm = $m.PadSm
     $padMd = $m.PadMd
     $btn = $m.BtnPaint
     $capH = $m.CaptionH
-    Write-Host "  dpi=$dpi scale=$scale capH=$capH"
+    Write-Host "  dpi=$dpi scale=$scale capH=$capH mergedChromeH=$($merged.ChromeH)"
 
     $offAuto = Pane-Offset $h
     if ($offAuto -lt 0) { throw 'SETUP FAIL: no visible pane in the default-config window' }
@@ -193,20 +201,20 @@ try {
             $all = @(Get-TestChildWindows -Window $h -Class 'GhozttyTerminal')
             if ($all.Count -eq 2) { $offTwo = Pane-Offset $h; if ($offTwo -gt $capH) { break } }
         }
-        $barH = $offTwo - $capH
+        $cost = $offTwo - $capH
         Check ($offTwo -gt $capH) `
-            "a second tab brings the strip back (pane offset $capH -> $offTwo, bar_h $barH)"
-        # bar_h is 4+4+28+4 = 40 DIP (T232). Asserted as a RANGE, not the exact
-        # number: this script's job is the visibility rule, and pinning the
-        # strip's height here would make it fail for a tab-strip change that
-        # has nothing to do with T234 (the T256 lesson).
-        # T257: this used to be a loose "between 30 and 56 DIP" plausibility
-        # band, because the exact number was not available here without keeping
-        # a fourth private copy of it. It is now the same measured-vs-derived
-        # positive control tab-strip.ps1 uses, so a strip that comes back at the
-        # WRONG height is a failure rather than a pass.
-        Check ($barH -eq $m.BarH) `
-            "the strip that appeared is exactly bar_h, not a stray offset ($barH px, expected $($m.BarH))"
+            "a second tab brings the strip back (pane offset $capH -> $offTwo)"
+        # T205: the strip comes back INSIDE the caption row, so the whole chrome
+        # is now `bar_h` - NOT `caption_h + bar_h`. Before T205 this line read
+        # `$offTwo - $capH -eq $m.BarH`, i.e. it asserted the second row that
+        # T205 removed; against today's product that difference is 0 and the
+        # assertion would fail, which is exactly what it should have done.
+        Check ($offTwo -eq $merged.ChromeH) `
+            "the strip came back in the caption ROW: total chrome is bar_h ($offTwo px, expected $($merged.ChromeH))"
+        # And the user-visible win, stated as itself: a second tab costs the
+        # 4 DIP the strip's band is taller than the caption's, not a whole row.
+        Check ($cost -eq ($merged.ChromeH - $capH)) `
+            "...so a 2nd tab costs $cost px of terminal, not a whole $($m.BarH) px row"
 
         # ...and closing back to one tab hides it again. The new tab is the
         # active one and holds a single pane, so ctrl+w (close_surface) takes
@@ -258,8 +266,11 @@ try {
     # --- 2. positive control: the same window WITH the strip -----------------
     $always = Start-Win @('--window-show-tab-bar=always')
     $offAlways = Pane-Offset $always.Top
+    $mAlways = Get-TestChromeMetrics -Window $always.Top -StripVisible $true
     Check ($offAlways -gt $capH) `
         "positive control: --window-show-tab-bar=always still shows the strip at one tab (offset $offAlways)"
+    Check ($offAlways -eq $mAlways.ChromeH) `
+        "...merged into the caption row, so its whole chrome is bar_h ($offAlways px, expected $($mAlways.ChromeH))"
     $gain = $offAlways - $offAuto
     Check ($gain -gt 0) `
         "the default window really gains those rows back: $gain px of terminal, every window, forever"

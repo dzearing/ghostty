@@ -159,6 +159,16 @@ function Start-Gui([string]$label, [string[]]$extraArgs) {
     if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
     $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): top window not found"; exit 1 }
+    # SIZE IT (T205/T267). Section A probes two places it needs to be EMPTY -
+    # mid-strip and the strip's right end - and both are only empty if the tab
+    # run is short relative to the strip. Since T205 the strip's half of the
+    # merged row is `clientW - 175` at this DPI, so on the app's default ~800 px
+    # window two tabs reach past mid-strip and the "+" is pushed to its limit:
+    # both probes then measure real chrome and read 282 and 81 ink pixels
+    # against a correct build. The script never set a size and had been
+    # inheriting `window_placement-debug` from whatever ran before it (T267).
+    Set-TestWindowSize -Window $top -Width 1400 -Height 800 | Out-Null
+    Start-Sleep -Milliseconds 1200
     $pane = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
     if ($pane -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): pane not found"; exit 1 }
 
@@ -280,9 +290,15 @@ function Send-MenuKey([IntPtr]$w, [string]$key) {
 #
 # T257: derived in lib\ChromeGeometry.ps1 now, which is also where tab-strip.ps1
 # and tab-color.ps1 read it from. This wrapper stays only because the call sites
-# below read better as `Caption-Height $top`.
-function Caption-Height([IntPtr]$top) {
-    return (Get-TestChromeMetrics -Window $top).CaptionH
+# below read better as `Strip-Top $top`.
+#
+# T205 moved it a third time, exactly as predicted above - and renamed it, since
+# what both call sites always wanted was the STRIP's origin, which is no longer
+# the caption's height: merged, the strip IS the caption row and starts at
+# client y = 0 again. Every window this script launches passes
+# --window-show-tab-bar=always, so -StripVisible is $true throughout.
+function Strip-Top([IntPtr]$top) {
+    return (Get-TestChromeMetrics -Window $top -StripVisible $true).StripTopClient
 }
 
 # Click in the tab strip at (client x, STRIP-relative y); x < 0 counts back from
@@ -292,7 +308,7 @@ function Caption-Height([IntPtr]$top) {
 function Click-Strip([IntPtr]$top, [int]$x, [int]$y) {
     $cr = Get-TestWindowRect -Window $top -Client
     $sx = if ($x -lt 0) { $cr.Right + $x } else { $cr.Left + $x }
-    $sy = $cr.Top + (Caption-Height $top) + $y
+    $sy = $cr.Top + (Strip-Top $top) + $y
     [void](Send-TestMouse -Window $top -Target $top -X $sx -Y $sy -Button left -Action click)
 }
 
@@ -328,10 +344,14 @@ function Click-Strip([IntPtr]$top, [int]$x, [int]$y) {
 # and tab-color.ps1 needed both. What is left here is the part that is specific
 # to THIS script - naming the three click targets the sections below aim at.
 function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
-    $m = Get-TestChromeMetrics -Window $top
+    $m = Get-TestChromeMetrics -Window $top -StripVisible $true
     $tabsRight = Get-TestTabRunRight -Window $top -Metrics $m
     $plusLeft = [Math]::Min($tabsRight + $m.Gap, $m.PlusLimit)
-    $deadRight = if ($null -ne $m.MenuLeft) { $m.MenuLeft } else { $m.ClientW - $m.PadR }
+    # Where the strip's own half ENDS. On a merged row (T205) that is the seam,
+    # not the window edge: right of `BandLeft` is the caption's half, and a
+    # point picked there would be the close button rather than bare strip.
+    $stripRight = if ($null -ne $m.BandLeft) { $m.BandLeft } else { $m.ClientW - $m.PadR }
+    $deadRight = if ($null -ne $m.MenuLeft) { $m.MenuLeft } else { $stripRight }
 
     [pscustomobject]@{
         Dpi = $m.Dpi; ClientW = $m.ClientW; BtnW = $m.BtnPaint; TabsRight = $tabsRight
@@ -348,11 +368,17 @@ function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
         # right inset. Measuring it against MenuLeft alone stopped working the
         # moment MenuLeft could be $null (T260).
         DeadX = [int](($plusLeft + $m.BtnPaint + $deadRight) / 2)
-        # The center of the RIGHT-MOST square slot in the strip: where the "="
+        # The center of the RIGHT-MOST square slot in the STRIP: where the "="
         # button is on a caption-less window, and where it used to be on every
         # window. On a caption window this is bare strip and must behave like
         # it - that is T260's user-visible claim.
-        StripRightX = $m.ClientW - $m.PadR - [int]($m.BtnPaint / 2)
+        #
+        # T205: measured from the strip's own right end, which on a merged row
+        # is the seam. Keeping the old `ClientW - PadR` would have aimed this
+        # at the caption's CLOSE button - the assertion below would still have
+        # passed (a posted CLIENT click cannot press a caption button, which
+        # takes WM_NCLBUTTONDOWN), and it would have been asserting nothing.
+        StripRightX = $stripRight - [int]($m.BtnPaint / 2)
     }
 }
 
@@ -370,9 +396,9 @@ function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
 # rule is `!customCaption()`, read off the window's style bits, so this cannot
 # drift from it by the script believing something about how it launched.
 function Menu-Host([IntPtr]$top) {
-    $m = Get-TestChromeMetrics -Window $top
+    $m = Get-TestChromeMetrics -Window $top -StripVisible $true
     if ($m.HasStripMenu) {
-        return [pscustomobject]@{ Kind = 'strip'; X = $m.MenuX; Y = $m.CaptionH + 8; M = $m }
+        return [pscustomobject]@{ Kind = 'strip'; X = $m.MenuX; Y = $m.StripTopClient + 8; M = $m }
     }
     return [pscustomobject]@{ Kind = 'caption'; X = $m.CaptionOverflowX; Y = [int]($m.CaptionH / 2); M = $m }
 }
@@ -615,7 +641,7 @@ try {
     $cr = Get-TestWindowRect -Window $g.Top -Client
     $cw = $cr.Width
     # The strip's first row, not the client's (T256).
-    $stripTop = $cr.Top + (Caption-Height $g.Top)
+    $stripTop = $cr.Top + (Strip-Top $g.Top)
     # Ink = pixels far from the rect's own most-common color (the band
     # background), measured in SCREEN coordinates against the capture.
     # `$yTop` is a SCREEN y, because since T260 the two things this probes -
@@ -647,16 +673,32 @@ try {
     # happened to overlap one at this DPI: a caption button paints at
     # `pad_sm` below the band top, a strip button at `tab_top_pad + pad_sm`
     # below the strip top, and both are `btn_paint` on a side.
+    # T205: `CaptionBtnTop`, not `PadSm` - on a merged row the caption buttons
+    # drop onto the STRIP's button baseline (tab_top_pad + pad_sm) so they share
+    # one frame with the "+" and the tab close "x".
     $probeW = $hm.BtnPaint + 4
-    $capY = $cr.Top + $hm.PadSm
+    $capY = $cr.Top + $hm.CaptionBtnTop
     $stripY = $stripTop + $hm.TabTopPad + $hm.PadSm
-    $stripRightL = $cw - $hm.PadR - $hm.BtnPaint
+    # The strip's own right-most square. T205: on a merged row the strip ends at
+    # the seam, and `$cw - PadR - BtnPaint` is the caption's CLOSE button - which
+    # does paint a glyph, so the "no menu glyph here" probe below would have
+    # failed against a correct build.
+    $stripRightL = if ($null -ne $hm.BandLeft) {
+        $hm.BandLeft - $hm.BtnPaint
+    } else { $cw - $hm.PadR - $hm.BtnPaint }
     $hostInk = if ($host0.Kind -eq 'caption') {
         Ink ($hm.CaptionOverflowLeft - 2) $capY $probeW $hm.BtnPaint
     } else {
         Ink ($stripRightL - 2) $stripY $probeW $hm.BtnPaint
     }
-    $blankInk = Ink ([int]($cw / 2)) $stripY $probeW $hm.BtnPaint
+    # The "does this probe measure ink at all?" control, in a square that is
+    # blank BY CONSTRUCTION rather than by luck: `DeadX` is the midpoint between
+    # the "+"'s painted right edge and the next painted thing right of it, which
+    # `Strip-Geometry` derives from the MEASURED tab run. It used to be `cw / 2`,
+    # and that stopped being blank when T205 shortened the strip's half of the
+    # row - mid-strip landed inside a tab's title and read 63-282 ink pixels
+    # against a correct build.
+    $blankInk = Ink ((Strip-Geometry $g.Top).DeadX - [int]($probeW / 2)) $stripY $probeW $hm.BtnPaint
     # T260's pixel half: the strip's right-most square is BARE. The hit test
     # above says nothing lands there; this says nothing is drawn there either,
     # which is the part the user actually complained about seeing twice.
@@ -902,7 +944,7 @@ Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
 $g = Start-Gui 'no-decoration' @('--session-persistence=false', '--window-decoration=none')
 $hostN = Menu-Host $g.Top
 Assert ($hostN.Kind -eq 'strip') 'H: a caption-less window hosts the menu in the strip'
-Assert ((Get-TestChromeMetrics -Window $g.Top).CaptionH -eq 0) 'H: ...because it has no caption band at all'
+Assert ((Get-TestChromeMetrics -Window $g.Top -StripVisible $true).CaptionH -eq 0) 'H: ...because it has no caption band at all'
 $tree = Open-Menu $g 4000
 Assert ($null -ne $tree) 'H: the strip menu button opens the menu there'
 if ($null -ne $tree) {
