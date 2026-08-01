@@ -15,9 +15,9 @@ struct CopilotHookSpec: HookSpec {
         func hook(_ cmd: String, _ timeout: Int) -> String {
             "[ { \"type\": \"command\", \"bash\": \(jsonString(cmd)), \"timeoutSec\": \(timeout) } ]"
         }
-        let start = HookCommand.perEvent(purpose: .sessionStart, bannerScriptPath: bannerScriptPath)
-        let prompt = HookCommand.perEvent(purpose: .promptSubmit, bannerScriptPath: bannerScriptPath)
-        let stop = HookCommand.perEvent(purpose: .stop, bannerScriptPath: bannerScriptPath)
+        let start = HookCommand.perEvent(purpose: .sessionStart, bannerScriptPath: bannerScriptPath, runtime: .copilot)
+        let prompt = HookCommand.perEvent(purpose: .promptSubmit, bannerScriptPath: bannerScriptPath, runtime: .copilot)
+        let stop = HookCommand.perEvent(purpose: .stop, bannerScriptPath: bannerScriptPath, runtime: .copilot)
         return """
         {
           "version": 1,

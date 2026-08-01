@@ -43,7 +43,7 @@ struct HookComponent {
         case .mergedFragment:
             let json = readJSON()
             guard ClaudeHookSpec.fragmentState(in: json, bannerScriptPath: bannerScriptPath) != .notInstalled else { return }
-            try writeJSON(ClaudeHookSpec.removeFragment(from: json))
+            try writeJSON(ClaudeHookSpec.removeFragment(from: json, bannerScriptPath: bannerScriptPath))
         }
     }
 
