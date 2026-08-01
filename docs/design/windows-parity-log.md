@@ -4475,3 +4475,42 @@ restore+busy shape) and I (re-dial made impossible; must log the ABORT, show the
 dialog, stay up); log-append.ps1 ALL PASS with its pre-fix negative control
 failing as required; both zig test lanes exit 0; test-agent exit 0; P1-P3 ALL
 PASS.
+
+## 2026-08-01 - T218 batch 5: a dialog key posted at the dialog is a key the drop-down never sees
+
+The chooser pair - `chooser-menu` (37 assertions, was 34) and `host-settings`
+(65, was 60) - onto the background test desktop. 11 of 13 done; `hero-mode` and
+`window-color` remain. `ipc-machine-chooser` (T217) already drives the same
+Ctrl+Shift+N surface, so the mechanics were the plain recipe and everything
+interesting was in three places.
+
+**Post a dialog key at the FOCUSED control, not at the dialog.**
+`host-settings` A(3) asserts that Enter/Escape with the shell drop-down open
+belong to the LIST, and `HostSettingsDialog.handleKey` implements that by
+returning **false** while the combo is dropped - so the key falls through to
+`msg.hwnd`. Posted at the dialog, that fall-through goes to the dialog and the
+drop-down never sees it: the assertion still passes, having measured the
+harness. `Get-TestFocusedWindow` first, then post there, is what a hardware
+keystroke does. (Corollary, measured: both dialogs run the nested-modal-pump
+shape, which runs `TranslateMessage` over what it does not consume - so a posted
+`VK_BACK` still becomes a WM_CHAR and the "clear both fields" section needed no
+workaround.)
+
+**`Find-TestWindowEx` IS the direct-child filter.** An editable COMBOBOX owns an
+inner EDIT, so "the dialog's own Edit" cannot come from `Get-TestChildWindows`
+(EnumChildWindows walks every descendant). The old script hand-rolled a
+`GetParent` filter; `FindWindowExW` already enumerates direct children only. No
+harness addition - the fix was reading what the existing helper does.
+
+**Two more SKIP-on-a-busy-box branches retired**, and one of them was worse than
+batch 1's: `host-settings` printed `ALL PASS (0 assertions, 1 skipped)` and
+exited 0 whenever another window held the foreground. Its remaining skip (the
+fake relay port already in use) now exits 1 - box state that prevents every
+assertion is not a pass.
+
+First batch with no product bug and no harness change.
+
+Evidence: chooser-menu ALL PASS (37) x3, negative control 1 FAILED / 36 passed;
+host-settings ALL PASS (65) x3, negative control 1 FAILED / 64 passed; no
+launched pid ever seen on the interactive desktop; both zig test lanes exit 0;
+test-agent exit 0; P1-P3 ALL PASS.
