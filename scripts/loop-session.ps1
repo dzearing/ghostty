@@ -155,6 +155,64 @@ function Resolve-LoopResumePrompt {
     return 'read go.md and go'
 }
 
+# --- typing text into a pane (tracker T210) ---------------------------------
+#
+# NEVER hand generated text to `+send-keys` as a positional argument.
+# PowerShell 5.1 does not escape an embedded `"` when it builds a native command
+# line, so an argument containing one reaches the child with its quotes
+# stripped, re-tokenized and concatenated without separators, or broken outright
+# - and `+send-keys` concatenates its positional arguments with NO separator, so
+# a re-tokenized prompt arrives as run-together prose. Measured on box
+# 2026-08-01: `/reset-context settle the "DWM/PrintWindow" question ...` arrived
+# 2 chars short with both quotes gone; a prompt with several quoted runs exited
+# 1; and a trailing `\` breaks the child's argv outright. LENGTH is not a factor
+# - the transport is byte-exact at 1222, 2500, 5000 and 10000 characters.
+#
+# So: write the text to a file and pass `--keys-file=<path>`, which the CLI
+# sends verbatim (src/cli/send_keys.zig). Same reasoning as T200's
+# -ResumePromptFile, one hop further down the pipeline.
+
+# A BOM-less UTF-8 file holding exactly $Text - no trailing newline, because
+# `--keys-file` sends the bytes verbatim and a stray CR submits the prompt.
+function New-LoopPromptFile {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [string]$Tag = 'prompt'
+    )
+    $path = Join-Path $env:TEMP ("ghoztty-{0}-{1}-{2}.txt" -f $Tag, $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [IO.File]::WriteAllText($path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
+# Reduce a prompt (or a pane tail) to what the two can be compared on.
+#
+# A TUI wraps the prompt inside its input box, so the tail holds the same
+# characters with newlines, box borders and a prompt marker injected - an exact
+# IndexOf can never match a prompt longer than the pane is wide, which is why
+# the old echo check "failed" routinely and was therefore written as a shrug
+# instead of a gate. Both sides go through THIS function, so a prompt that
+# itself contains `|` or `>` still matches.
+#
+# Box-drawing borders are matched by RANGE, never by literal glyph: PS 5.1
+# mojibakes non-ASCII in a BOM-less script file (T241), so a literal box
+# character in this source would not survive.
+function Get-LoopPromptNeedle {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+    return (((($Text -replace '[^\x20-\x7E]', ' ') -replace '[|>]', ' ') -replace '\s+', ' ').Trim())
+}
+
+# Did $Text arrive in $Tail?
+function Test-LoopPromptArrived {
+    param(
+        [AllowEmptyString()][string]$Tail,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+    $needle = Get-LoopPromptNeedle $Text
+    if (-not $needle) { return $false }
+    if (-not $Tail) { return $false }
+    return ((Get-LoopPromptNeedle $Tail).IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
 # One BOUNDED `ghoztty +list --json` probe (tracker T187).
 #
 # Why this is not just `& $exe +list --json`: that call has no timeout of its

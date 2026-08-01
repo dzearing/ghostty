@@ -396,26 +396,69 @@ if ($action -eq 'reuse') {
     }
     Log "reuse: pane $LoopPaneId re-attached"
 
+    # T210: the prompt goes through a FILE, never argv - this was the LAST argv
+    # hop in the whole delivery. T200 moved the launch onto -ResumePromptFile and
+    # the identical defect survived one hop downstream, right here. See the
+    # `New-LoopPromptFile` header in loop-session.ps1 for the measurements.
+    $promptFile = New-LoopPromptFile -Text $prompt -Tag 'upgrade-resume'
+
+    # Type the prompt, VERIFY it, and only then submit it.
+    #
+    # T210: the old order was send-prompt-and-Enter-together, then look for the
+    # prompt in the tail, then log "the TUI may have consumed it" and report
+    # UPGRADE OK anyway. On 2026-07-30 that message WAS the symptom - the prompt
+    # had been shredded on the way in, the reset never fired, and the session ran
+    # to ~250k. A delivery step that reports OK while its real effect did not
+    # happen is the expensive kind (T200, T208, this).
+    #
+    # Checking BEFORE the Enter is what makes the gate trustworthy. After a
+    # submit the evidence is racing the session: `/reset-context` clears the pane
+    # on purpose, so a fast reset erases the very text we would be looking for
+    # and a correct delivery would fail its own check. Unsubmitted text just sits
+    # in the input box.
+    #
     # --when-idle: the session may still be finishing the turn that launched
     # this script. Polling for idle beats racing it.
-    & $oldExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" $prompt Enter 2>&1 |
+    & $oldExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" "--keys-file=$promptFile" 2>&1 |
         ForEach-Object { Log "reuse send-keys: $_" }
     $sendOk = ($LASTEXITCODE -eq 0)
     if (-not $sendOk) {
         Log "RESUME-REUSE FAIL: +send-keys to $LoopPaneId exited $LASTEXITCODE; the session is alive but was not nudged (watchdog will re-enter)."
+        exit 1
     }
 
-    # Confirm the prompt actually landed in the pane rather than assuming it.
+    # Compare through Get-LoopPromptNeedle: the input box wraps the prompt, so
+    # the tail holds the same characters with newlines and box borders injected.
+    # Without that normalization a long prompt can never match - which is the
+    # other reason the old check was written as a shrug.
+    $want = Get-LoopPromptNeedle $prompt
     $echoed = $false
-    for ($i = 0; $i -lt 8 -and $sendOk; $i++) {
-        Start-Sleep -Milliseconds 900
+    for ($i = 0; $i -lt 12; $i++) {
+        Start-Sleep -Milliseconds 700
         try {
             $tail = (& $oldExe +read "--name=$LoopPaneId" --lines=40 2>$null) | Out-String
-            if ($tail -and $tail.IndexOf($prompt, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $echoed = $true; break }
+            if (Test-LoopPromptArrived -Tail $tail -Text $prompt) { $echoed = $true; break }
         } catch {}
     }
-    if ($echoed) { Log "RESUME-REUSE OK: prompt '$prompt' delivered to pane $LoopPaneId (claude pid=$loopPid, no second session)" }
-    elseif ($sendOk) { Log "RESUME-REUSE SENT: prompt '$prompt' sent to pane $LoopPaneId but was not seen in the pane tail (the TUI may have consumed it); no second session was started" }
+    if (-not $echoed) {
+        # Do not submit a fragment: a half-arrived prompt is a chat message, and
+        # a leftover fragment would concatenate with the watchdog's next nudge.
+        & $oldExe +send-keys "--target=$LoopPaneId" Escape 2>&1 | ForEach-Object { Log "reuse clear: $_" }
+        # Deliberately does not spell the success tag: a log grep for it must
+        # never match a failure line (the acceptance test's E4 caught exactly
+        # that when this message said "NOT UPGRADE OK").
+        Log "RESUME-REUSE FAIL: the prompt did not arrive intact in pane $LoopPaneId - it is NOT being submitted, and this run is NOT a successful upgrade (the watchdog will re-enter). Wanted: '$want'"
+        Log "  prompt file kept for diagnosis: $promptFile"
+        exit 1
+    }
+
+    & $oldExe +send-keys "--target=$LoopPaneId" Enter 2>&1 | ForEach-Object { Log "reuse submit: $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Log "RESUME-REUSE FAIL: the prompt arrived intact in pane $LoopPaneId but the Enter exited $LASTEXITCODE, so it was never submitted."
+        exit 1
+    }
+    Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue
+    Log "RESUME-REUSE OK: prompt '$prompt' delivered AND submitted to pane $LoopPaneId (verified in the pane before Enter; claude pid=$loopPid, no second session)"
     Log "UPGRADE OK (reused claude pid=$loopPid in pane $LoopPaneId)"
     exit 0
 }

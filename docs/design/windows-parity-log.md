@@ -4766,3 +4766,66 @@ on the inverted fill oracle and reached it; `Test-TestDesktopLeak` false at ever
 launch and the sampled foreground watch saw no launched pid; no
 `lib\TestDesktop.ps1` change, so no harness regression surface; `zig build test`
 both lanes exit 0; `test-agent` exit 0; P1-P3 ACCEPTANCE: ALL PASS.
+
+## 2026-08-01 - T210: the resume prompt died on the last argv hop, and the echo check that saw it was written as a shrug
+
+The 2026-07-30 delivery reported `LAUNCH OK`, `exe swapped`, `UPGRADE OK`, and a
+correct `+version` - and the context was never reset. What arrived in the pane
+was the TAIL of the prompt as prose, submitted as an ordinary message; the
+session ran to ~250k.
+
+**Root cause: PowerShell 5.1 does not escape an embedded `"` when it builds a
+native command line.** Not MSYS, not length. T200 moved the launch onto
+`-ResumePromptFile` so free text never travels through argv; the prompt then
+reached the pane as a positional `+send-keys` argument - the one hop further
+down, and the identical defect. Measured with an argv oracle: `%VARS%`, `+`,
+`-Flag` and `'single quotes'` are safe; a `"` or a trailing `\` breaks the child
+outright. End to end into a raw-console capture, `/reset-context settle the
+"DWM/PrintWindow" ...` arrived 130 -> 128 chars with both quotes gone, exit 0.
+And `resolveArgument` concatenates positional arguments with NO separator, which
+is precisely the field signature `come after.read go.md and go`.
+
+The length theory is dead, measured: byte-exact at 1222, 2500, 5000 and 10000
+characters. The tracker's "keep resume prompts SHORT" mitigation was aimed at the
+wrong suspect and is withdrawn. A leading slash command is fine at every size.
+
+Shipped: `+send-keys --keys-file=<path>` sends a file's bytes VERBATIM (no key
+notation, no escape processing) and keeps its position among the positional
+arguments, so `--keys-file=p.txt Enter` sends the file and then the CR. Zero
+protocol change. `New-LoopPromptFile` / `Test-LoopPromptArrived` in
+`loop-session.ps1` are the one copy of the transport and the comparison, shared
+by the upgrade script, the watchdog and `go-loop-exec.ps1`.
+
+Two things worth keeping. **The gate had to move BEFORE the Enter.** The obvious
+fix - fail if the prompt is not in the tail after sending - would fail a correct
+delivery, because `/reset-context` clears the pane on purpose and erases its own
+evidence. Type, verify, then submit; and on failure do not submit at all, so no
+fragment concatenates with the watchdog's next nudge. **And the old check could
+never have passed anyway**: it did an exact `IndexOf` against a tail where the
+input box has wrapped the prompt across lines. It failed on healthy deliveries,
+which is *why* it had been written as "the TUI may have consumed it" instead of a
+gate. Fixing the oracle is what made the gate possible - a check that cries wolf
+gets demoted to a comment, and then the one real wolf walks past it.
+
+Evidence: `ipc-send-keys-fidelity.ps1` (new) ALL PASS 19 - byte-exact capture via
+`[Console]::ReadKey($true)`, and every keys-file case has a live
+positional-argument negative control with the same payload (130->128, 97->91),
+because otherwise green cannot distinguish "the fix works" from "this payload was
+never broken". `upgrade-no-fork.ps1` ALL PASS 118: new section M (the transport +
+the wrapped-tail oracle + its pre-fix `IndexOf` oracle) and new section E, the
+end-to-end gate control - a swallow process consumes input without echoing it, so
+the send succeeds and the text never appears, and the run must exit nonzero
+without logging `UPGRADE OK (`. Section B's E2E prompt is now hostile; the old
+`T138-REUSE-PROMPT` was a quoteless single token that argv could not break, so
+the E2E had been blind to the defect that mattered. Both lanes + `test-agent` exit
+0; P1-P3 + `go-loop-guard.ps1` ALL PASS.
+
+Two asserts first passed for the wrong reason and both were greps of prose: E4
+matched the new FAIL message's own words "NOT UPGRADE OK", and M14 matched the
+comment documenting the removal of the string it was looking for. Both now key on
+a log TAG. **Assert on the tag a program emits, never on the prose around it.**
+
+Follow-ups: **T279** (the same hazard at every other PowerShell -> CLI call site:
+`+rename --title`, `+set-banner`, `--command`) and **T280**
+(`ConvertTo-SendKeysLiteral` is redundant now - it existed only because the text
+was on argv).

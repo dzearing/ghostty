@@ -55,6 +55,8 @@ if (-not $GhozttyExe) {
     if (Test-Path $installed) { $GhozttyExe = $installed }
 }
 $lockScript = Join-Path $PSScriptRoot 'go-loop-lock.ps1'
+# New-LoopPromptFile (T210). Functions only, no side effects at load.
+. (Join-Path $PSScriptRoot 'loop-session.ps1')
 
 function Ghoz([string[]]$argList) {
     $out = & $GhozttyExe @argList 2>&1 | Out-String
@@ -105,7 +107,13 @@ function Clear-Mark($paneId) {
 }
 
 function Send-Note($paneId, $text) {
-    return Ghoz @('+send-keys', "--target=$paneId", $text, 'Enter')
+    # T210: through a file, never argv. This is the duplicate-window message and
+    # it is prose - PowerShell 5.1 does not escape an embedded `"` when it builds
+    # a native command line, and +send-keys concatenates positional arguments
+    # with NO separator, so a re-tokenized note arrives as run-together text.
+    $pf = New-LoopPromptFile -Text $text -Tag 'exec-note'
+    try { return Ghoz @('+send-keys', "--target=$paneId", "--keys-file=$pf", 'Enter') }
+    finally { Remove-Item -LiteralPath $pf -ErrorAction SilentlyContinue }
 }
 
 # Identity must be forwarded to the lock, not re-derived there: the lock script

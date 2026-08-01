@@ -441,12 +441,18 @@ Work these first, in order, before falling back to first-todo-in-table:
      `test/win32/*.ps1` GUI script on the interactive desktop.** The unit
      lanes (`zig build test -Dapp-runtime=none|win32`, `test-agent`) never
      steal focus and are always fine.
-   - **T210** — a resume prompt beginning with `/reset-context` was mangled
-     on the way into the pane, the reset silently never fired, and the
-     session ran to ~250k. Take it before any further long-prompt resumes.
-     Until it is fixed, **keep resume prompts SHORT** (`/reset-context read
-     go.md and go`) and leave briefing text in the tracker, where the fresh
-     session reads it anyway — which is what this entry is for.
+   - **~~T210~~ (done, 2026-08-01)** — a resume prompt beginning with
+     `/reset-context` was mangled on the way into the pane, the reset silently
+     never fired, and the session ran to ~250k. **The cause was QUOTING, not
+     length**: PowerShell 5.1 does not escape an embedded `"` when it builds a
+     native command line, and the prompt's last hop to the pane was a positional
+     `+send-keys` argument — T200 moved the *launch* onto a file and the
+     identical defect survived one hop downstream. Measured: the transport is
+     byte-exact at 1222, 2500, 5000 and 10000 characters, so the old
+     "keep resume prompts SHORT" mitigation was aimed at the wrong suspect and
+     is withdrawn. Prompts now travel by `--keys-file`, and the echo check is a
+     GATE — verified BEFORE the Enter, because `/reset-context` clears the pane
+     and a post-submit check would fail a correct delivery.
    - **T208** — the delivery path can ship a stale binary. Until it lands,
      build `--prefix zig-out-release` yourself and check `+version` against
      `git rev-parse --short HEAD` before AND after.

@@ -397,6 +397,84 @@ AssertEq "L26 and it did not start an upgrade off a mangled command line" $befor
 
 if (-not $Keep) { Remove-Item -Recurse -Force $lRoot -ErrorAction SilentlyContinue }
 
+# ============================================================================
+"== M: the PANE-transport contract (T210)"
+# ============================================================================
+# L covers the LAUNCH hop; this is the hop after it. The prompt reached the
+# upgrade script intact via -ResumePromptFile and was then handed to
+# `+send-keys` as a positional argument, where PowerShell 5.1's native-command
+# quoting shredded it: the pane got run-together prose, `/reset-context` was not
+# at the start of a line, the reset silently never fired, and the session ran to
+# ~250k. So the same rule applies one hop down - a file, never argv.
+
+$mPrompt = '/reset-context settle the "DWM/PrintWindow" question. Then read go.md and go'
+
+# --- M1 New-LoopPromptFile writes the bytes EXACTLY -------------------------
+$mFile = New-LoopPromptFile -Text $mPrompt -Tag 'nofork-m'
+$mBytes = [IO.File]::ReadAllBytes($mFile)
+$mBack = [IO.File]::ReadAllText($mFile)
+Assert "M1 the prompt file round-trips byte-for-byte, quotes included" ($mBack -ceq $mPrompt)
+AssertEq "M2 no trailing newline (a stray CR would submit the prompt early)" $mPrompt.Length $mBytes.Length
+Assert "M3 no BOM (the CLI sends the bytes verbatim, BOM included)" `
+    (-not ($mBytes.Length -ge 3 -and $mBytes[0] -eq 0xEF -and $mBytes[1] -eq 0xBB -and $mBytes[2] -eq 0xBF))
+Remove-Item -LiteralPath $mFile -ErrorAction SilentlyContinue
+
+# --- M4 the pane-tail oracle ------------------------------------------------
+# A TUI wraps the prompt inside its input box, so the tail holds the same
+# characters with newlines, box borders and a marker injected. An exact IndexOf
+# can never match a prompt longer than the pane is wide - which is why the old
+# echo check "failed" on healthy deliveries and was written as a shrug rather
+# than a gate.
+$wrapped = @'
+| /reset-context settle the "DWM/PrintWindow" question. Then    |
+| read go.md and go                                             |
+'@
+Assert "M4 a prompt wrapped across input-box lines still matches" `
+    (Test-LoopPromptArrived -Tail $wrapped -Text $mPrompt)
+Assert "M5 PRE-FIX ORACLE: a plain IndexOf does NOT match the same tail" `
+    ($wrapped.IndexOf($mPrompt, [StringComparison]::OrdinalIgnoreCase) -lt 0)
+
+# The mangling the gate has to catch: this is the 2026-07-30 field text, the
+# TAIL of the prompt with its head gone and its words run together.
+$mangled = "come after.read go.md and go"
+Assert "M6 THE GATE: the mangled field text does NOT satisfy the check" `
+    (-not (Test-LoopPromptArrived -Tail $mangled -Text $mPrompt))
+Assert "M7 quotes stripped by argv re-tokenization does NOT satisfy it either" `
+    (-not (Test-LoopPromptArrived -Tail ($mPrompt -replace '"', '') -Text $mPrompt))
+Assert "M8 an empty tail does not satisfy it" (-not (Test-LoopPromptArrived -Tail '' -Text $mPrompt))
+Assert "M9 an empty prompt is never 'arrived' (a no-op send must not read as OK)" `
+    (-not (Test-LoopPromptArrived -Tail $wrapped -Text ''))
+
+# Both sides go through the same reduction, so a prompt that itself contains the
+# characters the reduction drops still matches.
+Assert "M10 a prompt containing | and > still matches its own echo" `
+    (Test-LoopPromptArrived -Tail 'D:\x> run a | b > out.txt' -Text 'run a | b > out.txt')
+Assert "M11 and a DIFFERENT command in the same tail does not" `
+    (-not (Test-LoopPromptArrived -Tail 'D:\x> run a | b > out.txt' -Text 'run c | d > out.txt'))
+
+# --- M12 the send site uses the file transport ------------------------------
+# Grep the script, because this is the one property no unit can observe: the
+# argument that carries the prompt must be a --keys-file=, and the prompt must
+# not appear as a bare positional argument anywhere near +send-keys.
+$upgradeSrc = Get-Content -LiteralPath $upgradeScript -Raw
+Assert "M12 the reuse path sends the prompt as --keys-file=" `
+    ($upgradeSrc -match '\+send-keys[^\r\n]*--keys-file=')
+Assert "M13 and no longer passes `$prompt through argv" `
+    (-not ($upgradeSrc -match '\+send-keys[^\r\n]*\s\$prompt(\s|")'))
+# The shrug's own log tag, not the prose around it: the explanation of WHY it
+# was wrong quotes the old message, so a grep for the message would match the
+# comment that documents its removal.
+Assert "M14 the RESUME-REUSE SENT shrug branch is gone" `
+    (-not ($upgradeSrc -match "Log `"RESUME-REUSE SENT"))
+Assert "M15 a prompt that did not arrive is a FAIL, not an UPGRADE OK" `
+    ($upgradeSrc -match 'RESUME-REUSE FAIL: the prompt did not arrive intact')
+
+$watchdogSrc = Get-Content -LiteralPath (Join-Path $Repo 'scripts\go-loop-watchdog.ps1') -Raw
+Assert "M16 the watchdog's nudge also sends through a file" `
+    ($watchdogSrc -match '\+send-keys[^\r\n]*--keys-file=')
+Assert "M17 and no longer passes `$ResumePrompt through argv" `
+    (-not ($watchdogSrc -match "'\+send-keys'[^\r\n]*\`$ResumePrompt"))
+
 if ($PureOnly) {
     ""
     if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }
@@ -581,9 +659,16 @@ try {
     # If the script relaunches, THIS is what it would run. Nothing in the reuse
     # path may run it - the marker file must never appear.
     $markerB = Join-Path $root 'relaunched-b.marker'
-    $promptB = 'T138-REUSE-PROMPT'
+    # T210: a HOSTILE prompt, and it travels by file on both hops. The old
+    # single-token 'T138-REUSE-PROMPT' could not fail - it has no quotes, so argv
+    # delivered it intact and the E2E was blind to the defect that mattered.
+    # -ResumePromptFile for the parameter hop (L1 proves argv cannot carry this),
+    # and the script's own --keys-file for the pane hop.
+    $promptB = 'T210-REUSE settle the "capture" question, then read go.md and go'
+    $promptFileB = Join-Path $root 'prompt-b.txt'
+    [IO.File]::WriteAllText($promptFileB, $promptB, (New-Object Text.UTF8Encoding($false)))
     $codeU = Invoke-Upgrade 'b' @('-LoopClaudePid', $loop.Id, '-LoopPaneId', $paneId,
-        '-ResumePrompt', $promptB, '-AllowPlainResume',
+        '-ResumePromptFile', $promptFileB, '-AllowPlainResume',
         '-ResumeCommand', (New-ResumeCommand $markerB))
     AssertEq "B4 the upgrade script exited 0" 0 $codeU
 
@@ -607,17 +692,85 @@ try {
     AssertEq "B13 it is the SAME pane (re-attached, not recreated)" $paneId ([string]$paneB2.id)
     AssertEq "B14 no extra window was opened" $windowsBefore (Windows-Of $treeB2).Count
 
-    # The prompt must actually reach the pane. The pane runs cmd.exe, so an
-    # unknown command echoes back - proof of delivery, not of intent.
+    # The prompt must actually reach the pane, INTACT. The pane runs cmd.exe, so
+    # typed characters echo at its prompt - proof of delivery, not of intent.
     $tail = ''
     for ($i = 0; $i -lt 12; $i++) {
         Run-Sandbox "+read --name=$paneId --lines=60" (Join-Path $root 'read-b.txt') 25 | Out-Null
         $tail = Out-Text (Join-Path $root 'read-b.txt')
-        if ($tail -match $promptB) { break }
+        if (Test-LoopPromptArrived -Tail $tail -Text $promptB) { break }
         Start-Sleep -Milliseconds 900
     }
-    Assert "B15 the resume prompt was typed into the SURVIVING pane" ($tail -match $promptB)
-    Assert "B16 the script logged the delivery" ($logB -match 'RESUME-REUSE (OK|SENT)')
+    Assert "B15 the resume prompt was typed into the SURVIVING pane, quotes and all" `
+        (Test-LoopPromptArrived -Tail $tail -Text $promptB)
+    Assert "B15b the quotes really survived (the pre-T210 argv hop dropped them)" `
+        ($tail -match '"capture"')
+    # T210: OK now MEANS verified. There is no SENT-but-unseen outcome any more -
+    # that branch reported UPGRADE OK over a delivery that had not happened.
+    Assert "B16 the script logged the delivery as verified" `
+        ($logB -match 'RESUME-REUSE OK: .*delivered AND submitted')
+    Assert "B16b it verified BEFORE submitting (after a submit the evidence races the session)" `
+        ($logB -match 'verified in the pane before Enter')
+    Assert "B16c and it never took the old 'sent but not seen' branch" `
+        (-not ($logB -match 'RESUME-REUSE SENT'))
+
+    # ========================================================================
+    "== E: THE GATE - a prompt that does not arrive is not UPGRADE OK (T210)"
+    # ========================================================================
+    # The negative control for B16. Without it, "the gate is a gate" rests on a
+    # source grep: M15 proves the FAIL branch is written, not that it is
+    # reachable or that it stops the OK. So put the pane in the exact state the
+    # field failure produced - the send succeeds and the text does not appear -
+    # and require the script to fail.
+    #
+    # A swallow process is how to produce that state honestly:
+    # [Console]::ReadKey($true) consumes a key WITHOUT echoing it, so
+    # `+send-keys` reports success and the pane tail never shows the prompt.
+    # That is precisely the old branch's premise ("the TUI may have consumed
+    # it") - which used to end in UPGRADE OK.
+    $swallowPath = Join-Path $workDir 'swallow.ps1'
+    [IO.File]::WriteAllText($swallowPath, @'
+"SWALLOW-READY"
+$deadline = (Get-Date).AddSeconds(240)
+while ((Get-Date) -lt $deadline) {
+    if ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } else { Start-Sleep -Milliseconds 15 }
+}
+'@, (New-Object Text.UTF8Encoding($false)))
+    Run-Sandbox "+send-keys --target=$paneId `"powershell -NoProfile -File $swallowPath`" Enter" `
+        (Join-Path $root 'send-swallow.txt') 30 | Out-Null
+    $swallowUp = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        Run-Sandbox "+read --name=$paneId --lines=20" (Join-Path $root 'read-swallow.txt') 25 | Out-Null
+        if ((Out-Text (Join-Path $root 'read-swallow.txt')) -match 'SWALLOW-READY') { $swallowUp = $true; break }
+        Start-Sleep -Milliseconds 700
+    }
+    Assert "E1 the pane is swallowing input without echoing it" $swallowUp
+
+    $promptE = 'T210-GATE this prompt will be swallowed, so the run must FAIL'
+    $promptFileE = Join-Path $root 'prompt-e.txt'
+    [IO.File]::WriteAllText($promptFileE, $promptE, (New-Object Text.UTF8Encoding($false)))
+    $markerE = Join-Path $root 'relaunched-e.marker'
+    $codeE = Invoke-Upgrade 'e' @('-LoopClaudePid', $loop.Id, '-LoopPaneId', $paneId,
+        '-ResumePromptFile', $promptFileE, '-AllowPlainResume',
+        '-ResumeCommand', (New-ResumeCommand $markerE))
+    $logE = Out-Text (Join-Path $root 'upgrade-e.log')
+    Assert "E2 the upgrade script exited NONZERO (was: exit 0 with UPGRADE OK)" ($codeE -ne 0)
+    Assert "E3 and said the prompt did not arrive" `
+        ($logE -match 'RESUME-REUSE FAIL: the prompt did not arrive intact')
+    # Matched on the success TAG (`UPGRADE OK (<reason>)`), which every one of the
+    # script's five success sites emits, rather than the bare words: a failure
+    # message that mentions them would otherwise satisfy this by accident, and
+    # the first version of this assert did exactly that.
+    Assert "E4 THE GATE ASSERT: it did NOT report UPGRADE OK" (-not ($logE -match 'UPGRADE OK \('))
+    Assert "E5 the +send-keys itself succeeded, so the GATE is what failed the run" `
+        (-not ($logE -match 'RESUME-REUSE FAIL: \+send-keys'))
+    Assert "E6 it did not fork a session to compensate" (-not (Test-Path $markerE))
+    Assert "E7 the loop process is still the same one, still alive" `
+        ($null -ne (Get-Process -Id $loop.Id -ErrorAction SilentlyContinue))
+
+    # Free the pane again for C/D.
+    Run-Sandbox "+send-keys --target=$paneId C-c" (Join-Path $root 'send-swallow-stop.txt') 30 | Out-Null
+    Start-Sleep -Seconds 2
 
     # ========================================================================
     "== C: with nothing left alive, the relaunch behavior is intact"

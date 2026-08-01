@@ -33,6 +33,10 @@ pub const Options = struct {
             self.when_idle = true;
             return null;
         }
+        // NOTE: `--keys-file=` is deliberately NOT consumed here. It has to
+        // keep its position relative to the positional text arguments so
+        // `--keys-file=p.txt Enter` sends the file and THEN the newline, so it
+        // rides along in _arguments and is handled in runArgs like --target=.
         if (std.mem.startsWith(u8, arg, "--idle-timeout=")) {
             self.idle_timeout = std.fmt.parseInt(u32, arg["--idle-timeout=".len..], 10) catch return error.InvalidValue;
             return null;
@@ -74,6 +78,16 @@ pub const Options = struct {
 ///   * `--idle-timeout=<seconds>`: Max time to wait with `--when-idle`.
 ///     Default: 30.
 ///
+///   * `--keys-file=<path>`: Send the file's bytes VERBATIM — no key
+///     notation, no `\n` escape processing, no shell in the way. Use
+///     this for any text a caller did not author by hand: a prompt, a
+///     path, anything containing quotes or backslashes. It keeps its
+///     position among the positional arguments, so
+///     `--keys-file=p.txt Enter` sends the file and then a carriage
+///     return. May be given more than once. The file is sent exactly
+///     as it is on disk, trailing newline included, so write it with
+///     no trailing newline unless you want one typed.
+///
 /// Positional arguments are the text to send. Each argument is
 /// checked for key notation first, then processed for escape
 /// sequences:
@@ -82,11 +96,20 @@ pub const Options = struct {
 ///   * Named keys: `Enter`, `Tab`, `Escape`, `Space`
 ///   * Escape sequences in text: `\n`, `\t`, `\r`, `\\`, `\e`
 ///
+/// A positional argument is the WRONG transport for generated text.
+/// PowerShell 5.1 does not escape an embedded `"` when it builds a
+/// native command line, so an argument containing one arrives with
+/// its quotes stripped, re-tokenized and concatenated without
+/// separators, or broken outright — which is how a `/reset-context`
+/// resume prompt reached a pane as a fragment of prose and the reset
+/// silently never fired (T210). Use `--keys-file=` there.
+///
 /// Examples:
 ///
 ///   ghoztty +send-keys --target=term "ls -la" Enter
 ///   ghoztty +send-keys --target=term C-c
 ///   ghoztty +send-keys --target=term "hello\tworld\n"
+///   ghoztty +send-keys --target=term --keys-file=prompt.txt Enter
 ///
 /// Available since: 1.2.0
 pub fn run(alloc: Allocator) !u8 {
@@ -122,32 +145,40 @@ fn runArgs(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Extract --target and collect text arguments
+    // Extract --target and resolve the rest IN ORDER: a --keys-file= among
+    // the positional arguments contributes its bytes where it appears, so
+    // `--keys-file=p.txt Enter` sends the file and then the newline.
     var target_arg: ?[:0]const u8 = null;
-    var text_args: std.ArrayList([]const u8) = .empty;
+    var keys_buf: std.ArrayList(u8) = .empty;
+    var bad_file: ?[]const u8 = null;
 
-    for (opts._arguments.items) |arg| {
-        if (std.mem.startsWith(u8, arg, "--target=")) {
-            target_arg = arg;
+    const text_count = resolveArguments(
+        alloc,
+        &keys_buf,
+        opts._arguments.items,
+        &target_arg,
+        &bad_file,
+    ) catch |err| {
+        if (bad_file) |path| {
+            try stderr.print(
+                "+send-keys: cannot read --keys-file={s}: {s}\n",
+                .{ path, @errorName(err) },
+            );
         } else {
-            try text_args.append(alloc, arg);
+            try stderr.print("+send-keys: {s}\n", .{@errorName(err)});
         }
-    }
+        return 1;
+    };
+    const saw_text = text_count > 0;
 
     if (target_arg == null) {
         try stderr.print("+send-keys: --target is required\n", .{});
         return 1;
     }
 
-    if (text_args.items.len == 0) {
+    if (!saw_text) {
         try stderr.print("+send-keys: at least one text argument is required\n", .{});
         return 1;
-    }
-
-    // Process each text argument: resolve key notation and escape sequences
-    var keys_buf: std.ArrayList(u8) = .empty;
-    for (text_args.items) |text_arg| {
-        try resolveArgument(alloc, &keys_buf, text_arg);
     }
 
     if (keys_buf.items.len == 0) {
@@ -234,6 +265,54 @@ fn waitForIdle(alloc: Allocator, name: []const u8, timeout_secs: u32, stderr: *s
         }
         std.Thread.sleep(500 * std.time.ns_per_ms);
     }
+}
+
+/// The biggest `--keys-file=` we will send. The IPC request as a whole is
+/// capped at 1 MiB by the server (IpcServer.max_request_len), so this leaves
+/// room for the JSON envelope and says so with a clear error instead of a
+/// truncated write.
+const max_keys_file_bytes: usize = 512 * 1024;
+
+/// Append a file's bytes to the buffer VERBATIM: no key notation, no escape
+/// processing. This is the transport for text the caller did not author by
+/// hand, because a positional argument is not one — see the `--keys-file`
+/// note in this action's doc comment (T210).
+fn appendFile(alloc: Allocator, buf: *std.ArrayList(u8), path: []const u8) !void {
+    const bytes = try std.fs.cwd().readFileAlloc(alloc, path, max_keys_file_bytes);
+    defer alloc.free(bytes);
+    if (bytes.len == 0) return;
+    try buf.appendSlice(alloc, bytes);
+}
+
+/// Resolve the whole argument list into PTY bytes, IN ORDER, and pull the
+/// `--target=` argument out along the way. Returns the number of text
+/// arguments seen (everything that is not `--target=`); on a `--keys-file=`
+/// read failure, `bad_file` names the path so the caller can say which one.
+fn resolveArguments(
+    alloc: Allocator,
+    buf: *std.ArrayList(u8),
+    arguments: []const [:0]const u8,
+    target: *?[:0]const u8,
+    bad_file: *?[]const u8,
+) !usize {
+    var text_count: usize = 0;
+    for (arguments) |arg| {
+        if (std.mem.startsWith(u8, arg, "--target=")) {
+            target.* = arg;
+            continue;
+        }
+        text_count += 1;
+        if (std.mem.startsWith(u8, arg, "--keys-file=")) {
+            const path = arg["--keys-file=".len..];
+            appendFile(alloc, buf, path) catch |err| {
+                bad_file.* = path;
+                return err;
+            };
+            continue;
+        }
+        try resolveArgument(alloc, buf, arg);
+    }
+    return text_count;
 }
 
 /// Resolve a single argument: if it matches a key name, append its byte(s);
@@ -365,4 +444,125 @@ test "processEscapes tab" {
 
     try processEscapes(alloc, &buf, "col1\\tcol2");
     try std.testing.expectEqualStrings("col1\tcol2", buf.items);
+}
+
+// --- T210: --keys-file sends bytes verbatim --------------------------------
+//
+// The whole point of the flag is that NOTHING interprets the text: not a
+// shell, not key notation, not backslash escapes. These cases are the ones a
+// resume prompt actually contains — a leading slash command, embedded double
+// quotes, `\n` as two literal characters, a trailing backslash, and the words
+// `Enter`/`C-c` in prose.
+
+fn testKeysFile(alloc: Allocator, dir: std.fs.Dir, name: []const u8, contents: []const u8) ![:0]const u8 {
+    try dir.writeFile(.{ .sub_path = name, .data = contents });
+    const path = try dir.realpathAlloc(alloc, name);
+    defer alloc.free(path);
+    return try alloc.dupeZ(u8, path);
+}
+
+test "keys-file: bytes are verbatim, not escape-processed or key-matched" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const contents =
+        "/reset-context settle the \"DWM\\PrintWindow\" question. " ++
+        "Literal \\n stays two chars, Enter and C-c stay words, trailing slash: \\";
+    const path = try testKeysFile(alloc, tmp.dir, "prompt.txt", contents);
+    defer alloc.free(path);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var target: ?[:0]const u8 = null;
+    var bad: ?[]const u8 = null;
+    const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
+    defer alloc.free(keys_arg);
+
+    const n = try resolveArguments(alloc, &buf, &.{ "--target=x", keys_arg }, &target, &bad);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("--target=x", target.?);
+    try std.testing.expect(bad == null);
+    try std.testing.expectEqualStrings(contents, buf.items);
+}
+
+test "keys-file: keeps its position among positional arguments" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testKeysFile(alloc, tmp.dir, "prompt.txt", "hello");
+    defer alloc.free(path);
+    const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
+    defer alloc.free(keys_arg);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var target: ?[:0]const u8 = null;
+    var bad: ?[]const u8 = null;
+
+    // `pre` then the file then Enter: the CR must land LAST, or the prompt is
+    // submitted before its own text arrives.
+    const n = try resolveArguments(
+        alloc,
+        &buf,
+        &.{ "pre-", keys_arg, "--target=x", "Enter" },
+        &target,
+        &bad,
+    );
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("pre-hello\r", buf.items);
+}
+
+test "keys-file: an unreadable path names itself in bad_file" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var target: ?[:0]const u8 = null;
+    var bad: ?[]const u8 = null;
+
+    const missing = "--keys-file=t210-no-such-file-8fbb1c.txt";
+    try std.testing.expectError(
+        error.FileNotFound,
+        resolveArguments(alloc, &buf, &.{ "--target=x", missing }, &target, &bad),
+    );
+    try std.testing.expectEqualStrings("t210-no-such-file-8fbb1c.txt", bad.?);
+}
+
+test "keys-file: an empty file contributes nothing but still counts as text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testKeysFile(alloc, tmp.dir, "empty.txt", "");
+    defer alloc.free(path);
+    const keys_arg = try std.fmt.allocPrintSentinel(alloc, "--keys-file={s}", .{path}, 0);
+    defer alloc.free(keys_arg);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var target: ?[:0]const u8 = null;
+    var bad: ?[]const u8 = null;
+
+    const n = try resolveArguments(alloc, &buf, &.{ "--target=x", keys_arg }, &target, &bad);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "positional text is still key-matched and escape-processed" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var target: ?[:0]const u8 = null;
+    var bad: ?[]const u8 = null;
+
+    const n = try resolveArguments(
+        alloc,
+        &buf,
+        &.{ "--target=x", "a\\tb", "Enter", "C-c" },
+        &target,
+        &bad,
+    );
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("a\tb\r\x03", buf.items);
 }

@@ -70,6 +70,9 @@ if (-not $StatePath) { $StatePath = Join-Path (Join-Path $Repo 'temp') 'go-loop.
 $lockScript = Join-Path $PSScriptRoot 'go-loop-lock.ps1'
 $probeScript = Join-Path $PSScriptRoot 'go-loop-pane-probe.ps1'
 . $probeScript      # Get-PaneOccupant / Read-PaneOccupant
+# New-LoopPromptFile / Get-LoopPromptNeedle (T210). Functions only, no side
+# effects at load.
+. (Join-Path $PSScriptRoot 'loop-session.ps1')
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValue = 'GhozttyGoLoopWatchdog'
 
@@ -274,8 +277,16 @@ function Invoke-Tick {
         }
         Log "re-entering: nudge live session in pane $paneId (state=$state, occupant=$occupant, remaining=$remaining)"
         if ($DryRun) { return 'nudge' }
-        $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", $ResumePrompt, 'Enter')
+        # T210: the prompt goes through a file, never argv - PowerShell 5.1 does
+        # not escape an embedded `"` when it builds a native command line, and
+        # +send-keys concatenates its positional arguments with no separator, so
+        # a re-tokenized prompt arrives as run-together prose. The default prompt
+        # has no quotes, but a -ResumePrompt is caller text and this is the
+        # loop's safety net.
+        $pf = New-LoopPromptFile -Text $ResumePrompt -Tag 'watchdog-nudge'
+        $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", "--keys-file=$pf", 'Enter')
         Log "  send-keys exit=$($r.Code) $($r.Out)"
+        Remove-Item -LiteralPath $pf -ErrorAction SilentlyContinue
         # The lock still names a dead pid, so every later tick would re-decide
         # from scratch. Hand it the pane's own claude when that is unambiguous.
         if (-not $ownerAlive) { Invoke-Adopt $lock $paneId }

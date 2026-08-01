@@ -96,6 +96,15 @@ ghoztty +send-keys --target=<name> <text|key>...
 
 - `--target`: Named pane or window to send input to. Required.
 - `--when-idle`: Poll the target pane's recent output every 500ms until it looks idle before sending: no `esc to interrupt` in the tail (older Claude Code's busy marker) AND the tail unchanged across ~1s (busy TUIs animate spinners/timers every second; an idle prompt is static — this catches Claude Code ≥ 2.1.207, which dropped the marker). Sends anyway after `--idle-timeout=<seconds>` (default 30) or if the pane can't be read.
+- `--keys-file=<path>`: Send the file's bytes **verbatim** — no key notation, no
+  `\n` escape processing. It keeps its position among the positional arguments,
+  so `--keys-file=p.txt Enter` sends the file and then a carriage return. **Use
+  this for any text the caller did not author by hand** (a prompt, a path,
+  anything with quotes or backslashes): PowerShell 5.1 does not escape an
+  embedded `"` when it builds a native command line, so such text arrives as a
+  positional argument with its quotes stripped, re-tokenized and concatenated
+  without separators, or broken outright. Length is not the hazard — the
+  transport is byte-exact at 10,000 characters (T210).
 - Positional arguments are text or key names, concatenated and written to the PTY.
 - Key notation: `C-c` (Ctrl-C), `C-d` (Ctrl-D), `C-z` (Ctrl-Z), etc.
 - Named keys: `Enter`, `Tab`, `Escape`, `Space`, `Backspace`
