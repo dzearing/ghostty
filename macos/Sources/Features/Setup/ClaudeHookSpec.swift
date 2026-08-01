@@ -56,14 +56,19 @@ struct ClaudeHookSpec: HookSpec {
             return .notInstalled
         }
         let want = hooksBlock(bannerScriptPath: bannerScriptPath)
-        let wantData = try? JSONSerialization.data(withJSONObject: want, options: [.sortedKeys])
-        let haveData = try? JSONSerialization.data(withJSONObject: json["hooks"] ?? [:], options: [.sortedKeys])
+        guard let wantData = try? JSONSerialization.data(withJSONObject: want, options: [.sortedKeys]),
+              let haveData = try? JSONSerialization.data(
+                  withJSONObject: json["hooks"] ?? [:],
+                  options: [.sortedKeys]) else {
+            return .outdated
+        }
         return wantData == haveData ? .installed : .outdated
     }
 
     func isExternalPluginInstalled(homeDirectoryURL: URL, fileManager: FileManager) -> Bool {
         let url = homeDirectoryURL.appendingPathComponent(".claude/plugins/installed_plugins.json")
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return false }
+        guard let data = fileManager.contents(atPath: url.path),
+              let text = String(data: data, encoding: .utf8) else { return false }
         return text.contains("ghoztty")
     }
 }
