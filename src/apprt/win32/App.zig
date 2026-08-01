@@ -241,6 +241,14 @@ agent_settle_deadline_ms: ?i64 = null,
 /// arriving mid-rebuild must not start a second recovery on top of the first.
 agent_recovering: bool = false,
 
+/// Non-zero while a destructive agent refresh is tearing the app's terminals
+/// down and rebuilding them (T229). The app deliberately has zero — or
+/// half-built — windows in that window of time, and it must not read that as
+/// "the user closed the last window" and quit itself out from under the rebuild
+/// the confirmation dialog promised. A COUNT, not a flag, so a nested refresh
+/// cannot clear the outer one's guard.
+agent_refresh_depth: usize = 0,
+
 /// True once the user has declined a destructive agent refresh in this app run
 /// (T147). It suppresses further PROMPTS only — the silent idle refresh still
 /// happens the next time no sessions are live, which is exactly what the
@@ -1586,7 +1594,11 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
             // TOMBSTONES, and those panes must be re-ATTACHed (RELAUNCHed) onto
             // the new agent rather than left pointing at a retired connection.
             // With no windows at all it degrades to exactly a re-dial.
-            self.recoverLocalAgentInPlace();
+            // Same guard as the confirmed path: the rebuild empties and refills
+            // the window list, and the app must not quit itself in between.
+            self.beginAgentRefresh();
+            _ = self.recoverLocalAgentInPlace();
+            self.endAgentRefresh();
             log.info("local agent refreshed to bundled build {s} (idle, no live sessions affected)", .{bundled orelse "?"});
         },
         .confirm_first => {
@@ -1663,8 +1675,67 @@ fn promptAndRefreshLocalAgent(self: *App, live: usize, running: ?[]const u8, bun
         .{ running orelse "<pre-versioned>", bundled, live },
     );
     self.agent_upgrade_attempts += 1;
+
+    // The dialog PROMISED the panes come back, so nothing between here and the
+    // rebuild may end the app behind the user's back — a momentarily empty
+    // window list must not trip `quit-after-last-window-closed`, and neither
+    // must a WM_QUIT already sitting in the queue. Cleared unconditionally on
+    // the way out (see `endAgentRefresh`).
+    self.beginAgentRefresh();
+    defer self.endAgentRefresh();
+
     _ = self.local_agent.restartForUpgrade();
-    self.recoverLocalAgentInPlace();
+    const rebuilt = self.recoverLocalAgentInPlace();
+    log.warn("destructive agent refresh finished: {d} window(s) rebuilt", .{rebuilt orelse 0});
+
+    // The honest fallback. `recoverLocalAgentInPlace` returning null means the
+    // fresh agent could not be reached at all: every pane is now pointing at a
+    // retired connection and there is nothing behind them. Saying so is the
+    // whole point — the failure the user reported was INVISIBLE, and an empty
+    // desktop with no explanation is the worst outcome a confirmation can have.
+    if (rebuilt == null) self.showAgentRefreshFailed();
+}
+
+/// Guard the window of time in which the app is destroying and rebuilding its
+/// own terminals: it must not quit itself while it has legitimately zero (or
+/// half-built) windows. Re-entrant-safe by counting rather than flagging.
+fn beginAgentRefresh(self: *App) void {
+    self.agent_refresh_depth += 1;
+    self.stopQuitTimer();
+}
+
+fn endAgentRefresh(self: *App) void {
+    if (self.agent_refresh_depth > 0) self.agent_refresh_depth -= 1;
+    if (self.agent_refresh_depth > 0) return;
+    // Re-evaluate honestly: if the rebuild really did leave no windows, the
+    // normal policy applies again from here.
+    if (self.windows.items.len == 0) self.startQuitTimer();
+}
+
+/// Tell the user, in the same modal channel that asked for consent, that the
+/// restart they approved did not work. Never a silent disappearance (T229).
+fn showAgentRefreshFailed(self: *App) void {
+    const text = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Ghoztty could not restart the background terminal process.\n\n" ++
+            "Your open panes are no longer connected. Close and reopen Ghoztty " ++
+            "to start a fresh background process; the panes' previous working " ++
+            "directories are restored with it.",
+    );
+    const title = std.unicode.utf8ToUtf16LeStringLiteral("Background terminal process");
+    const owner: ?*Window = if (self.windows.items.len > 0) self.windows.items[0] else null;
+    log.warn("agent refresh failed; telling the user", .{});
+    _ = ConfirmDialog.show(
+        self,
+        if (owner) |win| win.hwnd else null,
+        if (owner) |win| win.scale else 1.0,
+        null,
+        .{
+            .title = title,
+            .text = text,
+            .icon = .warning,
+            .style = .ok_only,
+        },
+    );
 }
 
 // =============================================================================
@@ -1780,7 +1851,9 @@ fn tickAgentSettleWatch(self: *App) void {
                 "local agent is gone (was pid {d}, now {?d}); recovering local windows in place",
                 .{ d.previous_pid, d.current_pid },
             );
-            self.recoverLocalAgentInPlace();
+            self.beginAgentRefresh();
+            _ = self.recoverLocalAgentInPlace();
+            self.endAgentRefresh();
         },
         .transport_down => |d| {
             self.endAgentSettleWatch();
@@ -1788,7 +1861,9 @@ fn tickAgentSettleWatch(self: *App) void {
                 "local-agent transport failed but agent pid {d} is still alive; recovering local windows in place",
                 .{d.pid},
             );
-            self.recoverLocalAgentInPlace();
+            self.beginAgentRefresh();
+            _ = self.recoverLocalAgentInPlace();
+            self.endAgentRefresh();
         },
     }
 }
@@ -1810,8 +1885,18 @@ fn tickAgentSettleWatch(self: *App) void {
 /// .sessionSpared` states and the whole lesson of Mac `e65cfa4d5`: the leaves
 /// leave because we replaced the tree, and their sessions are the very ones the
 /// new leaves just re-ATTACHed.
-fn recoverLocalAgentInPlace(self: *App) void {
-    if (self.agent_recovering) return;
+/// Returns the number of windows rebuilt, or null when recovery could not run
+/// at all (already recovering, capture failed, or no agent could be reached).
+/// Every one of those used to be a bare `return` — and the bare
+/// `reconnectForRecovery() orelse return` on the confirmed-upgrade path is
+/// precisely what made T229's field failure invisible twice over. A caller that
+/// promised the user their panes would come back needs to know whether they
+/// did.
+fn recoverLocalAgentInPlace(self: *App) ?usize {
+    if (self.agent_recovering) {
+        log.warn("in-place recovery: skipped, a recovery is already running", .{});
+        return null;
+    }
     self.agent_recovering = true;
     defer self.agent_recovering = false;
 
@@ -1825,14 +1910,26 @@ fn recoverLocalAgentInPlace(self: *App) void {
     var pending = false;
     const captured = self.captureSessionLayout(arena, &pending) catch |err| {
         log.warn("in-place recovery: layout capture failed err={}", .{err});
-        return;
+        return null;
     };
 
     // Re-dial BEFORE rebuilding, and note the ordering is load-bearing:
     // retiring the old connection shuts it down, so when the departing surfaces
     // are freed below their DETACH teardown fails fast instead of blocking the
     // GUI thread on a pipe nobody is reading.
-    const conn = self.local_agent.reconnectForRecovery() orelse return;
+    // THE line T229 is about. This was `orelse return` — the one exit in the
+    // whole chain that said nothing at all, on the path where the app has just
+    // TERMINATED the agent every pane was riding. When it fired, every surface
+    // was left pointing at a retired connection with no record anywhere that it
+    // had happened.
+    const conn = self.local_agent.reconnectForRecovery() orelse {
+        log.err(
+            "in-place recovery ABORTED: no local agent could be re-dialed; " ++
+                "{d} window(s) are left on the retired connection",
+            .{captured.windows.len},
+        );
+        return null;
+    };
 
     // A respawned agent materializes its recorded sessions from disk as
     // relaunchable tombstones, so ATTACH is still the right verb — the shared
@@ -1884,6 +1981,7 @@ fn recoverLocalAgentInPlace(self: *App) void {
 
     log.info("in-place recovery: rebuilt {d} window(s) on the new agent connection", .{rebuilt});
     if (rebuilt > 0) self.markLayoutDirty();
+    return rebuilt;
 }
 
 /// Replace one live window's tab trees with fresh surfaces ATTACHed on `conn`.
@@ -3907,6 +4005,15 @@ fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
 pub fn startQuitTimer(self: *App) void {
     // Cancel any existing timer first.
     self.stopQuitTimer();
+
+    // A destructive agent refresh is in flight (T229): the window list is
+    // empty or half-built ON PURPOSE and is about to be rebuilt, so this is not
+    // "the user closed the last window". `endAgentRefresh` re-asks once the
+    // rebuild has settled.
+    if (self.agent_refresh_depth > 0) {
+        log.info("quit timer suppressed: a destructive agent refresh is in progress", .{});
+        return;
+    }
 
     // Check if we should quit at all.
     if (!self.config.@"quit-after-last-window-closed") return;

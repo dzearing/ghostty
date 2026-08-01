@@ -180,6 +180,25 @@ function Wait-Dialog($appPid, $timeoutSec = 30) {
     return Wait-TestWindow -ProcessId ([int]$appPid) -Class 'GhozttyConfirmDialog' `
         -TimeoutMs ($timeoutSec * 1000)
 }
+# Take "Update Now", verified. A blind Tab+Enter is NOT safe here: measured on
+# box, the confirmation can come up with focus on a control that is neither
+# button, and one Tab then lands on "Later" - so the run silently measures the
+# DECLINE path while asserting things about the accept path. Tab until the
+# focused control's own text says Update, then Enter.
+function Confirm-Update($dlg) {
+    for ($k = 0; $k -lt 4; $k++) {
+        $f = Get-TestFocusedWindow -Window $dlg
+        $t = if ($f -ne [IntPtr]::Zero) { Get-TestControlText -Control $f } else { '' }
+        if ($t -like '*Update*') { break }
+        Send-TestControlKey -Control $dlg -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 300
+    }
+    $f = Get-TestFocusedWindow -Window $dlg
+    $t = if ($f -ne [IntPtr]::Zero) { Get-TestControlText -Control $f } else { '' }
+    Assert "  (focus is on 'Update Now' before Enter)" ($t -like '*Update*')
+    return (Send-TestControlKey -Control $dlg -Key Enter)
+}
+
 function Wait-NoDialog($appPid, $timeoutSec = 12) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -385,14 +404,7 @@ $agentD = Wait-AgentPid $tmp 25
 Assert "D2 an agent is running for this run" ($agentD -ne 0)
 $dlgD = Wait-Dialog $appPidD 40
 Assert "D3 the confirmation appeared" ($dlgD -ne [IntPtr]::Zero)
-if ($dlgD -ne [IntPtr]::Zero) {
-    # Focus starts on the dismissive button (MB_DEFBUTTON2 parity), so Tab
-    # moves to "Update Now" and Enter takes it.
-    Send-TestControlKey -Control $dlgD -Key Tab | Out-Null
-    Start-Sleep -Milliseconds 200
-    $r = Send-TestControlKey -Control $dlgD -Key Enter
-    Say "    Tab+Enter => $r"
-}
+if ($dlgD -ne [IntPtr]::Zero) { Say "    Update Now => $(Confirm-Update $dlgD)" }
 Assert "D4 the dialog closed on 'Update Now'" (Wait-NoDialog $appPidD 15)
 $agentD2 = Wait-AgentPid $tmp 30 $agentD
 Assert "D5 the agent was REPLACED (new pid)" ($agentD2 -ne 0 -and $agentD2 -ne $agentD)
@@ -454,6 +466,133 @@ Assert "F3 no agent was spawned at all" ((Agent-Pid $tmp) -eq 0)
 # is a checkable claim rather than the default silence.
 Assert "F4 no decision line at all with persistence off" `
     ((Read-AppLog $logF) -notmatch 'agent upgrade check:')
+Stop-TestProcs
+
+# ============================================================================
+Say "== H: T229 - the user's shape: RESTORED windows, several BUSY sessions"
+# ============================================================================
+# Arm D above passes with ONE freshly-created window holding ONE idle pane, and
+# it passed right through the field failure. What the user actually hits is
+# different in three ways, all of which this arm reproduces:
+#
+#   * the app RESTORED its windows from the manifest, so every pane is an
+#     ATTACH to a session the agent already owned rather than a fresh spawn;
+#   * there is more than one window and more than one session; and
+#   * the sessions are STREAMING. An idle cmd.exe leaves the agent
+#     connection's reader/writer threads parked, which is the one state in
+#     which the blocking `Connection.shutdown` join on the GUI thread cannot
+#     wedge - i.e. the state arm D measures.
+#
+# The oracle is the same as D's (the app survives, the panes come back), plus
+# the T229 step trail: a hang inside the destructive restart used to leave the
+# log ending at the confirm, with no way to tell WHICH step it stopped in.
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
+$appPidH1 = Start-App $tmp 't229-build'
+Assert "H1 the layout GUI came up" ($appPidH1 -ne 0)
+Wait-Panes $tmp 'h0' 1 | Out-Null
+Run-CliArgs @('+new-window', '--target=t229w2') "$tmp\h-nw.txt" 20 | Out-Null
+Wait-Panes $tmp 'h1' 2 | Out-Null
+Run-CliArgs @('+split', '--target=t229w2', '--name=t229p2', '--direction=down') "$tmp\h-sp.txt" 20 | Out-Null
+$treeH = Wait-Panes $tmp 'h2' 3
+Assert "H2 three panes across two windows" `
+    (((Leaf-Count $treeH) -ge 3) -and ((Windows-Of $treeH).Count -ge 2))
+foreach ($lf in (All-Leaves $treeH)) {
+    Run-CliArgs @('+send-keys', "--target=$($lf.id)", 'for /l %i in (1,1,2000000) do @echo t229-noise %i', 'Enter') `
+        "$tmp\h-busy-$($lf.id).txt" 15 | Out-Null
+}
+Start-Sleep -Seconds 5
+$agentH = Wait-AgentPid $tmp 25
+Assert "H3 an agent is running for this run" ($agentH -ne 0)
+# Let the debounced session-layout manifest settle, then kill ONLY the app: the
+# agent keeps every session, which is what makes the relaunch a RESTORE.
+Start-Sleep -Seconds 4
+Stop-Process -Id $appPidH1 -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Assert "H4 killing the app left the agent (and its sessions) alive" ((Agent-Pid $tmp) -eq $agentH)
+
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
+$appPidH2 = Start-App $tmp 't229-restore'
+$logH = $script:AppLog
+Assert "H5 the restoring GUI came up" ($appPidH2 -ne 0)
+$dlgH = Wait-Dialog $appPidH2 40
+Assert "H6 launch-restore found the stale agent and asked" ($dlgH -ne [IntPtr]::Zero)
+if ($dlgH -ne [IntPtr]::Zero) { Confirm-Update $dlgH }
+Assert "H7 the dialog closed on 'Update Now'" (Wait-NoDialog $appPidH2 15)
+$agentH2 = Wait-AgentPid $tmp 40 $agentH
+Assert "H8 the agent was REPLACED (new pid)" ($agentH2 -ne 0 -and $agentH2 -ne $agentH)
+# THE assert this arm exists for. The field report is "the dialog disappears
+# and Ghoztty never comes back"; a survivor that logged nothing is what made it
+# undiagnosable.
+Assert "H9 the app SURVIVED the refresh it promised to survive" `
+    (@(Get-Process -Id $appPidH2 -ErrorAction SilentlyContinue).Count -eq 1)
+$treeH2 = Wait-Panes $tmp 'h3' 3 60
+Assert "H10 all three panes came back" ((Leaf-Count $treeH2) -ge 3)
+Assert "H11 the destructive restart leaves a step trail (begin)" `
+    (Wait-LogMatch $logH 'agent restart: begin' 20)
+Assert "H12 ... and names the step that can wedge (retiring the connection)" `
+    (Wait-LogMatch $logH 'agent restart: retiring the shared connection' 20)
+Assert "H13 ... and the step after it (terminate)" `
+    (Wait-LogMatch $logH 'agent restart: terminating agent pid' 20)
+Assert "H14 the refresh reports its OUTCOME, not just its intent" `
+    (Wait-LogMatch $logH 'destructive agent refresh finished: \d+ window\(s\) rebuilt' 30)
+Assert "H15 the in-place rebuild logged how many windows it rebuilt" `
+    (Wait-LogMatch $logH 'in-place recovery: rebuilt \d+ window\(s\)' 30)
+Stop-TestProcs
+
+# ============================================================================
+Say "== I: negative control - a refresh that CANNOT re-dial says so"
+# ============================================================================
+# The failure mode T229 is named for: consent to a destructive act, then
+# nothing. `reconnectForRecovery() orelse return` was the one exit in the whole
+# chain that logged nothing at all - on the path where the agent every pane was
+# riding has just been terminated. Here the re-dial is made impossible (the
+# agent binary is gone, so find-or-spawn cannot succeed) and the requirement is
+# that the app SAYS so and STAYS UP, rather than vanishing.
+#
+# The staleness input still comes from the debug stamp hook, which returns
+# before it ever touches the binary - so a missing binary breaks the SPAWN
+# without also disabling the check.
+#
+# The break has to be arranged BEFORE the app starts: a process gets a SNAPSHOT
+# of the environment at CreateProcess time, so changing GHOSTTY_LOCAL_AGENT_BIN
+# in this harness afterwards is invisible to it (measured - the first cut of
+# this arm did exactly that and the re-dial happily succeeded). So point the app
+# at a COPY, then move the copy out from under it once the dialog is up. A
+# running .exe cannot be deleted on Windows, but it CAN be renamed.
+# Keep the copy's FILE NAME - Win32_Process.Name is the image name recorded at
+# creation, and every agent-pid helper in this script filters on
+# 'ghoztty-agent.exe'. A copy called anything else is invisible to them.
+$agentCopyDir = Join-Path $tmp 'agentcopy'
+New-Item -ItemType Directory -Force $agentCopyDir | Out-Null
+$agentCopy = Join-Path $agentCopyDir 'ghoztty-agent.exe'
+Copy-Item $AgentExe $agentCopy -Force
+$env:GHOSTTY_LOCAL_AGENT_BIN = $agentCopy
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
+$appPidI = Start-App $tmp 't229-nodial'
+$logI = $script:AppLog
+Assert "I1 the GUI came up" ($appPidI -ne 0)
+$agentI = Wait-AgentPid $tmp 25
+Assert "I2 an agent is running for this run" ($agentI -ne 0)
+$dlgI = Wait-Dialog $appPidI 40
+Assert "I3 the confirmation appeared" ($dlgI -ne [IntPtr]::Zero)
+# Break the spawn between the ask and the answer. Rename, not delete: the copy
+# is the running agent's own image.
+Rename-Item $agentCopy (Join-Path $agentCopyDir 'ghoztty-agent.bak') -Force -ErrorAction SilentlyContinue
+Assert "I3b the agent binary really is gone from the path the app holds" `
+    (-not (Test-Path $agentCopy))
+if ($dlgI -ne [IntPtr]::Zero) { Confirm-Update $dlgI }
+# Not Wait-NoDialog: the FAILURE dialog (I7) is itself a GhozttyConfirmDialog,
+# so "no dialog" is never true here and would score a working fix as broken.
+Assert "I4 the confirmation was answered with 'Update Now'" `
+    (Wait-LogMatch $logI 'user confirmed destructive agent refresh' 25)
+Assert "I5 the app is STILL RUNNING after a failed refresh" `
+    (@(Get-Process -Id $appPidI -ErrorAction SilentlyContinue).Count -eq 1)
+Assert "I6 the failed re-dial is logged as an ABORT, not silence" `
+    (Wait-LogMatch $logI 'in-place recovery ABORTED: no local agent could be re-dialed' 40)
+Assert "I7 the user is TOLD, in the same modal channel that asked for consent" `
+    ((Wait-LogMatch $logI 'agent refresh failed; telling the user' 30) -and `
+     ((Wait-TestWindow -ProcessId $appPidI -Class 'GhozttyConfirmDialog' -TimeoutMs 20000) -ne [IntPtr]::Zero))
+$env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 Stop-TestProcs
 
 } finally {

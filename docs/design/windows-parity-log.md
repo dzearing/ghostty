@@ -4426,3 +4426,52 @@ Evidence: chrome-merged-row.ps1 ALL PASS (19) with its negative control failing
 as required; tab-strip.ps1 37, tab-strip-autohide.ps1 15, menu-bar.ps1 71,
 caption-bar.ps1 17, tab-color.ps1 16, all ALL PASS; both zig test lanes exit 0;
 test-agent exit 0; P1-P3 ALL PASS.
+
+## 2026-08-01 - T229: the confirmed agent upgrade that took the app with it
+
+Shipped both halves the task asked for, plus a third the investigation forced.
+The third is the interesting one: **the log sink was silently losing lines**.
+`ghoztty.log` is appended to concurrently by the GUI, the agent and every
+one-shot `ghoztty +...` CLI, and the writer did `createFile` + `seekFromEnd` +
+`write` - two writers that both resolve end-of-file to N both write AT N.
+Measured against the real release binary with a negative control: 24 concurrent
+`+list` runs, pre-fix 214 of 216 lines, fixed 216 of 216. That is the sink
+T229's own primary evidence ("the app never logged another line") was read
+from, and it would have defeated every diagnostic added for it.
+`FILE_APPEND_DATA` fixes it; `test/win32/log-append.ps1` guards it.
+
+The rest: the retired connection's teardown moved OFF the GUI thread
+(`Connection.shutdown` JOINS four peer threads, and a peer that does not exit
+wedges the app with no log line and no crash - the observed signature); a step
+trail through the destructive restart so a hang names the step it stopped in;
+`recoverLocalAgentInPlace` returns `?usize` with no silent exits, including the
+`orelse return` the task is named for; an explicit failure dialog instead of an
+empty desktop; and a refresh-in-progress guard so the app cannot quit itself
+mid-rebuild.
+
+**Not proven, and said out loud:** the field failure was never reproduced -
+four shapes on box (fresh window; restored windows with 3 live sessions across
+2; the same streaming; the same under a genuinely older agent binary) all
+rebuilt correctly. It did NOT crash, though: no WER event exists for
+`ghoztty.exe` near any of the three confirms. So it exited cleanly or hung, and
+the async teardown is a fix for the leading hypothesis. **T268** is the runbook
+for the next occurrence.
+
+Its other lesson is testability: **the release lineage cannot be tested on this
+box at all** while the user's agent runs - the single-instance guard is a named
+mutex keyed on the user SID with no Windows override (its POSIX sibling has
+one). The test-spawned release agent yielded only because the redirected
+LOCALAPPDATA also hid the heartbeat; with it visible and stale, the run would
+have killed the user's real agent. **T269**. And a harness lesson: a blind
+`Tab`+`Enter` on the confirmation can land on *Later*, so the run measures the
+decline path while asserting about the accept path - and passes.
+
+Follow-ups: **T268** (diagnose the next occurrence from the step trail),
+**T269** (release-lineage testability), **T270** (the log still has no
+timestamps or pids).
+
+Evidence: agent-upgrade.ps1 ALL PASS (82, was 53) with new arms H (the user's
+restore+busy shape) and I (re-dial made impossible; must log the ABORT, show the
+dialog, stay up); log-append.ps1 ALL PASS with its pre-fix negative control
+failing as required; both zig test lanes exit 0; test-agent exit 0; P1-P3 ALL
+PASS.

@@ -89,6 +89,12 @@ shared_pid: i64 = 0,
 /// run.
 retired: std.ArrayList(tcp_dial.Dialed) = .empty,
 
+/// Threads running `Connection.shutdown` for retired connections (see
+/// `retire`). Joined in `deinit` — and ONLY there — because `deinit` is also
+/// where `retired` is finally freed, so a teardown must not still be touching a
+/// connection when its allocation goes away.
+teardowns: std.ArrayList(std.Thread) = .empty,
+
 /// The link-state observer applied to EVERY connection this manager installs as
 /// shared (T145). Stored rather than set once, because recovery replaces the
 /// connection and the replacement needs watching just as much as the original —
@@ -124,6 +130,11 @@ pub fn deinit(self: *LocalAgent) void {
     self.shared = null;
     if (self.bundled_version) |v| self.alloc.free(v);
     self.bundled_version = null;
+    // Let every async teardown finish before the allocations it is walking are
+    // freed below.
+    for (self.teardowns.items) |t| t.join();
+    self.teardowns.deinit(self.alloc);
+    self.teardowns = .empty;
     // Safe here and ONLY here: `App.terminate` deinits every window (and thus
     // every surface that borrowed one of these) before calling us.
     for (self.retired.items) |*d| d.deinit();
@@ -148,14 +159,42 @@ fn retire(self: *LocalAgent, dialed: tcp_dial.Dialed) void {
     // Stop it observing first: a retired connection's dying transitions are
     // noise, and the watcher would otherwise re-open a settle window on a link
     // nobody is using. `clearStateHandler` returns only once any in-flight
-    // handler has finished, so this is also the teardown-safe ordering.
+    // handler has finished, so this is also the teardown-safe ordering. Cheap —
+    // it is one mutex take.
     d.conn.clearStateHandler();
-    d.conn.shutdown();
     self.retired.append(self.alloc, d) catch {
         // Out of memory while retiring: dropping the struct leaks it outright,
         // which is still strictly safer than destroying a borrowed connection.
         log.warn("retired local-agent connection could not be tracked; leaking it", .{});
     };
+
+    // `shutdown` JOINS the connection's writer, control-reader, data-reader and
+    // heartbeat threads. Every caller of `retire` is on the GUI THREAD, so a
+    // peer thread that does not exit promptly does not slow the app down — it
+    // WEDGES it, with no log line and no crash, which is exactly the shape of
+    // T229's field failure ("the dialog disappears and nothing comes back").
+    //
+    // Nothing here needs the join to have happened: a retired connection is
+    // deliberately never freed (see the doc comment above), and `deinit` — the
+    // one place it IS freed — joins these threads first. So run it off the GUI
+    // thread and let the message loop keep pumping.
+    const t = std.Thread.spawn(.{}, shutdownRetired, .{d.conn}) catch |err| {
+        // Spawn failed: fall back to the blocking teardown. No worse than the
+        // behavior this replaced, and said out loud rather than skipped.
+        log.warn("retired local-agent connection: async teardown unavailable ({}), shutting down inline", .{err});
+        d.conn.shutdown();
+        return;
+    };
+    self.teardowns.append(self.alloc, t) catch {
+        // Untracked ⇒ nobody can join it. Detach so the OS reclaims it, and
+        // accept that `deinit` will not wait for this one.
+        t.detach();
+        log.warn("retired local-agent teardown thread could not be tracked; detached", .{});
+    };
+}
+
+fn shutdownRetired(conn: *connection.Connection) void {
+    conn.shutdown();
 }
 
 /// Register the link-state observer for the shared connection, now and for
@@ -420,11 +459,19 @@ pub fn sharedConnectionIfWarm(self: *LocalAgent) ?*connection.Connection {
 pub fn restartForUpgrade(self: *LocalAgent) bool {
     if (comptime builtin.os.tag != .windows) return false;
 
+    // A STEP TRAIL, not a result line (T229). The three statements below can
+    // each block indefinitely — a `retire` teardown, a `TerminateProcess`, a
+    // bounded wait on a dying process — and a hang leaves NO record at all
+    // unless the step before it announced itself. The field failure this fixes
+    // stopped logging immediately after the confirm, and there was no way to
+    // tell which of these it stopped in.
+    log.info("agent restart: begin (reading agent info file)", .{});
     const info = self.readInfoFile();
     const pid: i64 = if (info) |i| i.pid else 0;
 
     // Shut our end down BEFORE the kill: a retired connection fails sends fast
     // instead of blocking the GUI thread on a pipe whose server just died.
+    log.info("agent restart: retiring the shared connection (agent pid {d})", .{pid});
     if (self.shared) |old| self.retire(old);
     self.shared = null;
     self.shared_pid = 0;
@@ -432,6 +479,7 @@ pub fn restartForUpgrade(self: *LocalAgent) bool {
     // very next resolve fall back to exec.
     self.last_failure_ms = null;
 
+    log.info("agent restart: terminating agent pid {d}", .{pid});
     const killed = if (pid > 0) terminateProcess(pid) else false;
     if (killed) {
         log.info("terminated local agent pid {d} to adopt the bundled build", .{pid});

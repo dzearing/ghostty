@@ -120,6 +120,30 @@ pub fn main() !MainReturn {
     try app_runtime.run();
 }
 
+/// Open `name` in `dir` for ATOMIC APPEND, creating it if absent (Windows).
+///
+/// `ghoztty.log` is a SHARED sink: the GUI app, the agent and every one-shot
+/// `ghoztty +…` CLI invocation append to the same file concurrently, and on this
+/// box there are often several a second. `createFile` + `seekFromEnd(0)` +
+/// `write` is not an append — two writers that both resolve end-of-file to N
+/// both write AT N, and the later one silently overwrites the earlier one's
+/// line. That is not theoretical: it is why T229's primary evidence ("the app
+/// logged nothing after the confirm") could not be trusted, and it would defeat
+/// every diagnostic line added for it.
+///
+/// `FILE_APPEND_DATA` *without* `FILE_WRITE_DATA` is the fix Windows documents:
+/// the file pointer is ignored and each write is placed at the current end of
+/// file as one operation, so concurrent writers interleave whole lines instead
+/// of clobbering bytes.
+fn openAppendW(dir: std.fs.Dir, name_w: []const u16) !std.fs.File {
+    const w = std.os.windows;
+    return .{ .handle = try w.OpenFile(name_w, .{
+        .dir = dir.fd,
+        .access_mask = w.SYNCHRONIZE | w.FILE_APPEND_DATA,
+        .creation = w.FILE_OPEN_IF,
+    }) };
+}
+
 // The function std.log will call.
 fn logFn(
     comptime level: std.log.Level,
@@ -176,9 +200,9 @@ fn logFn(
 
         var dir = std.fs.cwd().makeOpenPath(dir_path, .{}) catch break :windows_file;
         defer dir.close();
-        const file = dir.createFile("ghoztty.log", .{ .truncate = false }) catch break :windows_file;
+        const file = openAppendW(dir, std.unicode.utf8ToUtf16LeStringLiteral("ghoztty.log")) catch
+            break :windows_file;
         defer file.close();
-        file.seekFromEnd(0) catch break :windows_file;
 
         var msg_buf: [2048]u8 = undefined;
         const level_txt = comptime level.asText();
