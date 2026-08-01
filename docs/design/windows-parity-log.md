@@ -4575,3 +4575,14 @@ scripts score their capture's distinct-color guard before any pixel oracle; no
 launched pid ever seen on the interactive desktop; `zig build test` both lanes
 exit 0; `test-agent` exit 0 on run 3 (runs 1-2 are T258, above); P1-P3
 ACCEPTANCE: ALL PASS.
+
+**Post-batch sweep, same day.** With T217 and T218 both closed the fleet-wide
+claim became *"the acceptance scripts no longer steal the user's foreground"* -
+so it got checked instead of assumed. Five scripts still call
+`SendInput`/`SetForegroundWindow` without the harness; three are deliberate
+(`profile-latency` measures injection timing, `context-menu-real-input` exists
+precisely to click for real, `test-desktop-spike` measures the desktop) and
+**two are plain misses that T212's split never bucketed**: `overlay-zorder`
+(T142) and `split-dim` (T74). Filed as **T272**, which also asks for the
+exception list to be DECLARED and enforced by a check - an undeclared exception
+is indistinguishable from a miss.
