@@ -4939,3 +4939,41 @@ scan outboard of a tab reaches the "+" button unless it is bounded by
 red; and an `else` around the shape assertions let the T206 control show only
 ONE of four failing, because the silhouette claims need the selected tab and
 were gated on the inactive ones being measurable.
+
+## 2026-08-01 - T226 splits four ways, and T284's layout math found the panel's first paint bug before any paint existed
+
+Windows has zero lines of the Mac Activity Monitor, and T226 was one task for
+the whole thing. `RemoteActivityMonitorView.swift` is 1383 lines and the
+comparable win32 surface (`MachineChooser.zig`) is 1872, so it was split before
+starting rather than after blowing a context: **T284** (pure layout math) ->
+**T285** (owner-drawn window + registry + LOCAL metrics/proc table) -> **T286**
+(Kill with confirm, New Process, error banner) -> **T287** (remote sources, the
+card carousel switcher, and the chooser Activity button, which closes T177).
+
+T284 landed both pure modules: `activity_layout.zig` (24 tests) and
+`trend_gauge.zig` (10), registered in `src/apprt.zig` so they run in every
+app-runtime lane. Both test lanes, `test-agent`, and P1-P3 are green, and the
+counts are checkable: `-Dtest-filter` runs 84 and 98 against an unfilterable
+baseline of 74, i.e. exactly the 10 and 24 declared.
+
+**The interesting part is that the tests failed first, on a real defect.** Laid
+out with Mac's fixed 240-wide filter field, the control bar needs 730 px at 100%
+and the panel opens at 700 - so the badge slot inverted and the count label
+overlapped the checkbox. Ordering and the design system's "nothing touches
+anything" both failed on it. The fix follows Mac instead of patching the
+symptom: `.frame(maxWidth: 240)` is a MAXIMUM and a SwiftUI TextField yields
+under pressure, so the filter is now the row's one elastic control, capped at
+240 and floored at 120, asserted across 620..3000 px.
+
+That is the argument for building geometry as a pure module first, and it is
+stronger than "it is testable": this was a PAINT defect, and it was found and
+fixed before one line of GDI existed to paint it wrong. It would otherwise have
+shipped as a screenshot in a user bug report, which is precisely how the whole
+UI quality block got filed.
+
+Two decisions recorded so T285 does not relitigate them. Mac's ad-hoc 10 pt
+paddings are snapped to the 4 DIP scale (control rows `md`, the gauge band keeps
+Mac's own 12). And the intra-dialog separators stay 1 px hairlines like the
+sibling chooser: section 5's 2 DIP band governs the DRAGGABLE split lines
+between panes, where a vanishing line costs the user a grab target, and a rule
+inside a dialog has no grab band to lose.

@@ -128,6 +128,14 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_layout.zig");
 
+    // Pure win32 Activity Monitor panel layout (T284), same no-OS-imports
+    // deal.
+    _ = @import("apprt/win32/activity_layout.zig");
+
+    // Pure win32 Activity Monitor trend-chart geometry (T284), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/trend_gauge.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 
