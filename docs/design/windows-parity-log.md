@@ -4829,3 +4829,15 @@ Follow-ups: **T279** (the same hazard at every other PowerShell -> CLI call site
 `+rename --title`, `+set-banner`, `--command`) and **T280**
 (`ConvertTo-SendKeysLiteral` is redundant now - it existed only because the text
 was on argv).
+
+**Addendum, same turn.** The fix nearly shipped a regression worse than the bug.
+These scripts drive whichever ghoztty is INSTALLED, and the watchdog is a
+long-lived HKCU Run process; an exe that predates `--keys-file` treats it as
+ordinary TEXT and types the PATH into the pane - the T241 failure, recreated by
+its own fix, inside the watchdog that exists to catch it. Probed before pushing:
+the installed release (+96fbe40c7) did NOT support the flag. So the transport is
+now chosen at RUNTIME per exe (`+send-keys --help` exits 0 and touches no pane,
+so it is a side-effect-free capability probe), cached, and falls back to argv with
+a `WARNING:` naming the degradation - CLAUDE.md's app/agent HELLO rule applied to
+the CLI. **A new flag is a compatibility boundary the moment a script uses it
+against an exe it did not build.**

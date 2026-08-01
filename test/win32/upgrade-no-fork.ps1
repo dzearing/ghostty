@@ -457,9 +457,9 @@ Assert "M11 and a DIFFERENT command in the same tail does not" `
 # argument that carries the prompt must be a --keys-file=, and the prompt must
 # not appear as a bare positional argument anywhere near +send-keys.
 $upgradeSrc = Get-Content -LiteralPath $upgradeScript -Raw
-Assert "M12 the reuse path sends the prompt as --keys-file=" `
-    ($upgradeSrc -match '\+send-keys[^\r\n]*--keys-file=')
-Assert "M13 and no longer passes `$prompt through argv" `
+Assert "M12 the reuse path picks its transport with New-LoopSendKeysText" `
+    ($upgradeSrc -match 'New-LoopSendKeysText[^\r\n]*-Text \$prompt')
+Assert "M13 and no longer passes `$prompt through argv unconditionally" `
     (-not ($upgradeSrc -match '\+send-keys[^\r\n]*\s\$prompt(\s|")'))
 # The shrug's own log tag, not the prose around it: the explanation of WHY it
 # was wrong quotes the old message, so a grep for the message would match the
@@ -470,10 +470,40 @@ Assert "M15 a prompt that did not arrive is a FAIL, not an UPGRADE OK" `
     ($upgradeSrc -match 'RESUME-REUSE FAIL: the prompt did not arrive intact')
 
 $watchdogSrc = Get-Content -LiteralPath (Join-Path $Repo 'scripts\go-loop-watchdog.ps1') -Raw
-Assert "M16 the watchdog's nudge also sends through a file" `
-    ($watchdogSrc -match '\+send-keys[^\r\n]*--keys-file=')
-Assert "M17 and no longer passes `$ResumePrompt through argv" `
+Assert "M16 the watchdog's nudge picks its transport with New-LoopSendKeysText" `
+    ($watchdogSrc -match 'New-LoopSendKeysText')
+Assert "M17 and no longer passes `$ResumePrompt through argv unconditionally" `
     (-not ($watchdogSrc -match "'\+send-keys'[^\r\n]*\`$ResumePrompt"))
+
+# --- M18 the capability probe -----------------------------------------------
+# The flag is useless - worse, actively harmful - if the exe on the box predates
+# it: an older `+send-keys` treats `--keys-file=C:\...` as ordinary TEXT and
+# types the PATH into the pane, which is the T241 failure recreated by its own
+# fix. These scripts drive whichever ghoztty is INSTALLED, and the watchdog is a
+# long-lived Run-key process, so "the exe is my build" is never a safe
+# assumption. Measured when this shipped: the installed release did not support
+# the flag.
+Assert "M18 the built exe advertises --keys-file, so the probe can see it" `
+    (Test-LoopKeysFileSupported -Exe $Exe)
+$notAnExe = Join-Path $env:TEMP "t210-not-an-exe-$PID.txt"
+[IO.File]::WriteAllText($notAnExe, 'not an executable')
+Assert "M19 an exe that cannot answer the probe reads as UNSUPPORTED, not as a crash" `
+    (-not (Test-LoopKeysFileSupported -Exe $notAnExe))
+Remove-Item -LiteralPath $notAnExe -ErrorAction SilentlyContinue
+
+$supported = New-LoopSendKeysText -Exe $Exe -Text $mPrompt -Tag 'nofork-m18'
+Assert "M20 a supporting exe gets the file transport" `
+    ($supported.Args.Count -eq 1 -and $supported.Args[0] -like '--keys-file=*')
+Assert "M21 and it is not flagged degraded" (-not $supported.Degraded)
+Assert "M22 the file it names holds the prompt verbatim" `
+    ([IO.File]::ReadAllText($supported.File) -ceq $mPrompt)
+Remove-Item -LiteralPath $supported.File -ErrorAction SilentlyContinue
+
+$degraded = New-LoopSendKeysText -Exe 'C:\no-such-ghoztty-t210.exe' -Text $mPrompt -Tag 'nofork-m19'
+Assert "M23 a non-supporting exe falls back to argv rather than typing the flag" `
+    ($degraded.Args.Count -eq 1 -and $degraded.Args[0] -ceq $mPrompt)
+Assert "M24 the fallback SAYS it is degraded so the log can too" $degraded.Degraded
+AssertEq "M25 and it leaves no file to clean up" '' $degraded.File
 
 if ($PureOnly) {
     ""

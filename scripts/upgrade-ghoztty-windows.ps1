@@ -400,7 +400,16 @@ if ($action -eq 'reuse') {
     # hop in the whole delivery. T200 moved the launch onto -ResumePromptFile and
     # the identical defect survived one hop downstream, right here. See the
     # `New-LoopPromptFile` header in loop-session.ps1 for the measurements.
-    $promptFile = New-LoopPromptFile -Text $prompt -Tag 'upgrade-resume'
+    # The exe is the one the swap just installed, so it normally HAS the flag.
+    # Normally is not always: a stale staging build (T208's whole subject) would
+    # leave an older exe here, and an exe without the flag types
+    # `--keys-file=C:\...` into the pane as text. So ask, and say which transport
+    # was used - a degraded send is exactly when the gate below matters most.
+    $keys = New-LoopSendKeysText -Exe $oldExe -Text $prompt -Tag 'upgrade-resume'
+    $promptFile = $keys.File
+    if ($keys.Degraded) {
+        Log "WARNING: $oldExe does not support +send-keys --keys-file, so the prompt is going through argv where PowerShell can mangle its quotes (T210). The arrival gate below is what protects the run."
+    }
 
     # Type the prompt, VERIFY it, and only then submit it.
     #
@@ -419,7 +428,7 @@ if ($action -eq 'reuse') {
     #
     # --when-idle: the session may still be finishing the turn that launched
     # this script. Polling for idle beats racing it.
-    & $oldExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" "--keys-file=$promptFile" 2>&1 |
+    & $oldExe +send-keys "--target=$LoopPaneId" --when-idle "--idle-timeout=60" @($keys.Args) 2>&1 |
         ForEach-Object { Log "reuse send-keys: $_" }
     $sendOk = ($LASTEXITCODE -eq 0)
     if (-not $sendOk) {
@@ -448,7 +457,7 @@ if ($action -eq 'reuse') {
         # never match a failure line (the acceptance test's E4 caught exactly
         # that when this message said "NOT UPGRADE OK").
         Log "RESUME-REUSE FAIL: the prompt did not arrive intact in pane $LoopPaneId - it is NOT being submitted, and this run is NOT a successful upgrade (the watchdog will re-enter). Wanted: '$want'"
-        Log "  prompt file kept for diagnosis: $promptFile"
+        if ($promptFile) { Log "  prompt file kept for diagnosis: $promptFile" }
         exit 1
     }
 
@@ -457,7 +466,7 @@ if ($action -eq 'reuse') {
         Log "RESUME-REUSE FAIL: the prompt arrived intact in pane $LoopPaneId but the Enter exited $LASTEXITCODE, so it was never submitted."
         exit 1
     }
-    Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue
+    if ($promptFile) { Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue }
     Log "RESUME-REUSE OK: prompt '$prompt' delivered AND submitted to pane $LoopPaneId (verified in the pane before Enter; claude pid=$loopPid, no second session)"
     Log "UPGRADE OK (reused claude pid=$loopPid in pane $LoopPaneId)"
     exit 0

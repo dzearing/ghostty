@@ -277,16 +277,23 @@ function Invoke-Tick {
         }
         Log "re-entering: nudge live session in pane $paneId (state=$state, occupant=$occupant, remaining=$remaining)"
         if ($DryRun) { return 'nudge' }
-        # T210: the prompt goes through a file, never argv - PowerShell 5.1 does
-        # not escape an embedded `"` when it builds a native command line, and
-        # +send-keys concatenates its positional arguments with no separator, so
-        # a re-tokenized prompt arrives as run-together prose. The default prompt
-        # has no quotes, but a -ResumePrompt is caller text and this is the
-        # loop's safety net.
-        $pf = New-LoopPromptFile -Text $ResumePrompt -Tag 'watchdog-nudge'
-        $r = Invoke-Ghoztty @('+send-keys', "--target=$paneId", "--keys-file=$pf", 'Enter')
+        # T210: the prompt goes through a file when the exe supports it, never
+        # blindly - PowerShell 5.1 does not escape an embedded `"` when it builds
+        # a native command line, and +send-keys concatenates its positional
+        # arguments with no separator, so a re-tokenized prompt arrives as
+        # run-together prose. The default prompt has no quotes, but -ResumePrompt
+        # is caller text and this is the loop's safety net.
+        #
+        # The capability probe is not optional here: this watchdog is a long-lived
+        # HKCU Run process driving whichever ghoztty is INSTALLED, which is
+        # routinely older than the repo. An exe without the flag would type
+        # `--keys-file=C:\...` into the pane - the T241 failure, recreated by its
+        # own fix.
+        $keys = New-LoopSendKeysText -Exe $GhozttyExe -Text $ResumePrompt -Tag 'watchdog-nudge'
+        if ($keys.Degraded) { Log '  note: this ghoztty predates --keys-file; prompt sent through argv' }
+        $r = Invoke-Ghoztty (@('+send-keys', "--target=$paneId") + $keys.Args + @('Enter'))
         Log "  send-keys exit=$($r.Code) $($r.Out)"
-        Remove-Item -LiteralPath $pf -ErrorAction SilentlyContinue
+        if ($keys.File) { Remove-Item -LiteralPath $keys.File -ErrorAction SilentlyContinue }
         # The lock still names a dead pid, so every later tick would re-decide
         # from scratch. Hand it the pane's own claude when that is unambiguous.
         if (-not $ownerAlive) { Invoke-Adopt $lock $paneId }

@@ -184,6 +184,51 @@ function New-LoopPromptFile {
     return $path
 }
 
+# Does THIS exe understand `--keys-file`? Ask it, never assume.
+#
+# The scripts run against whichever ghoztty is INSTALLED, which is routinely an
+# older build than the repo - the watchdog especially, since it is a long-lived
+# HKCU Run process. An exe that predates the flag treats `--keys-file=C:\...` as
+# ordinary TEXT and types the path into the pane, which is the T241 failure
+# exactly: a path lands in a Claude Code prompt box, exit 0, nothing re-enters.
+# Measured 2026-08-01: the installed release at the moment this shipped
+# (+96fbe40c7) did NOT support it, so the probe is load-bearing on day one, not
+# a future-proofing gesture.
+#
+# `+send-keys --help` prints the action's doc comment and exits 0 without
+# touching a pane, so it is a side-effect-free capability probe. Same rule as the
+# app/agent HELLO handshake in CLAUDE.md: detect capability at RUNTIME, never at
+# compile time, and degrade rather than corrupt.
+$script:LoopKeysFileSupport = @{}
+function Test-LoopKeysFileSupported {
+    param([Parameter(Mandatory = $true)][string]$Exe)
+    if ($script:LoopKeysFileSupport.ContainsKey($Exe)) { return $script:LoopKeysFileSupport[$Exe] }
+    $ok = $false
+    try {
+        $help = (& $Exe +send-keys --help 2>&1 | Out-String)
+        $ok = ($help -match 'keys-file')
+    } catch { $ok = $false }
+    $script:LoopKeysFileSupport[$Exe] = $ok
+    return $ok
+}
+
+# The `+send-keys` argument(s) that carry $Text to a pane: the safe transport
+# when the exe has it, the old one when it does not. Returns Args (splat into the
+# call), File (delete it afterwards; '' if none) and Degraded (true = the text is
+# on argv and its quotes are at risk - say so in the log).
+function New-LoopSendKeysText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [string]$Tag = 'prompt'
+    )
+    if (Test-LoopKeysFileSupported -Exe $Exe) {
+        $p = New-LoopPromptFile -Text $Text -Tag $Tag
+        return @{ Args = @("--keys-file=$p"); File = $p; Degraded = $false }
+    }
+    return @{ Args = @($Text); File = ''; Degraded = $true }
+}
+
 # Reduce a prompt (or a pane tail) to what the two can be compared on.
 #
 # A TUI wraps the prompt inside its input box, so the tail holds the same

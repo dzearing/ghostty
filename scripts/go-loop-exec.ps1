@@ -107,13 +107,15 @@ function Clear-Mark($paneId) {
 }
 
 function Send-Note($paneId, $text) {
-    # T210: through a file, never argv. This is the duplicate-window message and
-    # it is prose - PowerShell 5.1 does not escape an embedded `"` when it builds
-    # a native command line, and +send-keys concatenates positional arguments
-    # with NO separator, so a re-tokenized note arrives as run-together text.
-    $pf = New-LoopPromptFile -Text $text -Tag 'exec-note'
-    try { return Ghoz @('+send-keys', "--target=$paneId", "--keys-file=$pf", 'Enter') }
-    finally { Remove-Item -LiteralPath $pf -ErrorAction SilentlyContinue }
+    # T210: through a file when the exe supports it, never argv otherwise. This is
+    # the duplicate-window message and it is prose - PowerShell 5.1 does not
+    # escape an embedded `"` when it builds a native command line, and +send-keys
+    # concatenates positional arguments with NO separator, so a re-tokenized note
+    # arrives as run-together text. $GhozttyExe here is usually the INSTALLED
+    # release, which can predate the flag, so the transport is probed not assumed.
+    $keys = New-LoopSendKeysText -Exe $GhozttyExe -Text $text -Tag 'exec-note'
+    try { return Ghoz (@('+send-keys', "--target=$paneId") + $keys.Args + @('Enter')) }
+    finally { if ($keys.File) { Remove-Item -LiteralPath $keys.File -ErrorAction SilentlyContinue } }
 }
 
 # Identity must be forwarded to the lock, not re-derived there: the lock script
