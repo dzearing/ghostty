@@ -157,15 +157,21 @@ function Get-DirectChild([IntPtr]$parent, [string]$cls) {
     return Find-TestWindowEx -Parent $parent -Class $cls
 }
 
-# The management button: the detail-pane button sharing the "New Window" row,
-# to its right. Found by geometry - its label is a non-ASCII ellipsis glyph.
+# The management button: the SQUARE glyph button in the detail pane's action
+# row. Found by shape - its label is a non-ASCII ellipsis glyph, and "the first
+# button right of New Window" stopped being it when T177 packed Activity into
+# the same row.
 function Get-MenuButton([IntPtr]$chooser) {
     $buttons = @(Get-Controls $chooser 'Button')
     $primary = $buttons | Where-Object { $_.Text -eq 'New Window' } | Select-Object -First 1
     if (-not $primary) { return $null }
-    $buttons |
-        Where-Object { $_.Left -ge $primary.Right -and $_.Top -eq $primary.Top -and $_.Text -ne 'New Window' } |
-        Sort-Object Left | Select-Object -First 1
+    $sq = @($buttons |
+        Where-Object {
+            $_.Top -eq $primary.Top -and $_.Bottom -eq $primary.Bottom -and
+            ($_.Right - $_.Left) -eq ($_.Bottom - $_.Top)
+        } | Sort-Object Left)
+    if ($sq.Count -eq 0) { return $null }
+    return $sq[$sq.Count - 1]
 }
 
 function Click-Control([IntPtr]$window, $ctl) {

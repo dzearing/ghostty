@@ -5094,3 +5094,75 @@ every spawn - and the comment above that flag records why the obvious
 `DETACHED_PROCESS` fix killed its own children), **T292** (above), **T293**
 (multi-row Kill is unit-tested but never exercised on the box). Next in the chain
 is **T287**: remote sources + the carousel, which also closes T177.
+
+## 2026-08-01 - T177: the chooser's action row becomes a run, and the button that opens a machine it cannot reach yet
+
+Mac's machine-chooser detail header is `[New Window] [Restore All]? [Activity]?
+[...]?` (`MachineChooserView.swift:456-494`). Windows had two of those, laid
+out as two named slots with the `...` pinned to the primary button's right
+edge. **Activity** was the gap this task was filed for (T226 built the panel it
+opens; T287 will connect it).
+
+**Slots became a run.** `Layout.primary_btn`/`menu_btn` are gone. `Layout` now
+carries the band plus three numbers - gap 8, caption padding 12, minimum button
+96, every one on the design system's 4 DIP scale (§1) - and
+`chooser_layout.actionRow(l, comp, text)` packs the row left to right. The
+composition is named, not implied: `Composition.restore_all` exists and is
+never set, because the whole value of a run is that the row grows by one
+without anything else moving, and a flag nobody sets is what keeps that true
+(T146's half is now "create the button and set the flag").
+
+**Composition changes with the machine, so PLACEMENT has to as well.** This is
+the part a slots-shaped mind gets wrong: hiding Activity does not just hide
+Activity, it MOVES the `...` beside it. `refreshDetail` re-packs on every
+selection change, not only on DPI change. The module also stays text-free -
+`ActionText` carries measured captions and the module adds the padding - which
+is T235's lesson applied before it could be re-learned rather than after.
+
+**The interesting decision is what the button refuses to do.** Mac dismisses
+the chooser and dials (`finish(nil)` then `presentDialing`, :1488-1492).
+Windows dismisses too, and here it is load-bearing rather than cosmetic: the
+chooser DISABLES its owner, so a panel opened over it would surface behind a
+dead window. But the dial itself is T287, and the panel's sampler is local.
+Wiring it up as-is would have produced a panel titled `Activity - E2E-Box`
+listing THIS machine's processes - a lie with no tell. So `buildSnapshot`
+returns `error.RemoteSourceNotConnected` for a remote source and the panel says
+"Couldn't connect / The E2E-Box source is unreachable." A degraded state the
+user can read beats a confident state that is wrong, and T287 replaces exactly
+one branch.
+
+Two smaller things that had to be right for that to be safe: the panel now owns
+its source strings (`Remote{id, name}` copied into the instance) because the
+chooser frees its device arena on the way out, and identity stayed the **id**
+while the label became the **name** - Mac's split, which is what stops a rename
+from opening a second panel on the same machine.
+
+**A test that could not have caught this before now can.** `chooser-menu.ps1`'s
+`Get-MenuButton` was "the first button to the right of New Window" - which is
+Activity now, so the helper would have silently scored the wrong control. It
+finds the SQUARE button in the row instead: shape, which the design system
+fixes, rather than a label that is a non-ASCII ellipsis. The script grew the
+composition (Local row = `New Window` alone; remote = three, in order, one gap,
+each sized to its own caption, whole run inside the pane), the click (panel
+titled for the SELECTED machine, chooser gone first, a second press focusing
+the same window), and the refusal - whose oracle is the log line, because the
+empty state is painted text, not a control.
+
+**And the same locator was copied into two more scripts.** T257's finding
+again, in a different subsystem: `host-settings.ps1` had its own
+"first button right of New Window" copy - which would have clicked **Activity**
+and opened a panel while asserting about a menu - and `relay-account.ps1`
+identified the account button by *excluding* the labels it is not
+(`New Window`, `Open`, `Cancel`), an exclusion list that grows silently and had
+just gained a fourth member. Both were repaired against something the design
+system fixes rather than against a label: the menu button is the SQUARE one in
+the action row, and the account button is the TOPMOST one in the dialog. Three
+copies of one locator meant three chances to be wrong, and two of them would
+have failed as confidently as the first.
+
+`chooser-menu.ps1` ALL PASS at 55 assertions (was 38), `host-settings.ps1` 65,
+`relay-account.ps1` and `ipc-machine-chooser.ps1` ALL PASS,
+`activity-monitor.ps1` ALL PASS at 82, P1-P3 ALL PASS, both test lanes +
+`test-agent` + the Debug GUI link green. Next in this chain is **T287** (dial +
+carousel), which now has the one-line diff it needs written down in its own
+file.

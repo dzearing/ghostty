@@ -135,16 +135,32 @@ function Get-NthChild([IntPtr]$parent, [string]$cls, [int]$nth) {
     return [IntPtr]$all[$nth].Hwnd
 }
 
-# The management button: the detail-pane button sharing the "New Window" row
-# and sitting to its right. Found by geometry because its label is a non-ASCII
-# ellipsis glyph.
-function Get-MenuButton([IntPtr]$chooser) {
+# Every button sharing the primary action's row, left to right - the detail
+# header's action RUN (T177: [New Window] [Restore All]? [Activity]? [...]).
+# Row membership is the shared baseline, which every packing keeps; the row's
+# composition is what changes with the selected machine.
+function Get-ActionRow([IntPtr]$chooser, [switch]$IncludeHidden) {
     $buttons = @(Get-Controls $chooser 'Button')
     $primary = $buttons | Where-Object { $_.Text -eq 'New Window' } | Select-Object -First 1
-    if (-not $primary) { return $null }
-    $buttons |
-        Where-Object { $_.Left -ge $primary.Right -and $_.Top -eq $primary.Top -and $_.Text -ne 'New Window' } |
-        Sort-Object Left | Select-Object -First 1
+    if (-not $primary) { return @() }
+    return @($buttons |
+        Where-Object { ($IncludeHidden -or $_.Visible) -and $_.Top -eq $primary.Top -and $_.Bottom -eq $primary.Bottom } |
+        Sort-Object Left)
+}
+
+# The management button: the SQUARE glyph button in that row. Found by shape,
+# not by label (its label is a non-ASCII ellipsis) and not by "the one after New
+# Window" (that is Activity now).
+function Get-MenuButton([IntPtr]$chooser) {
+    $sq = @(Get-ActionRow $chooser -IncludeHidden |
+        Where-Object { ($_.Right - $_.Left) -eq ($_.Bottom - $_.Top) })
+    if ($sq.Count -eq 0) { return $null }
+    return $sq[$sq.Count - 1]
+}
+
+function Get-ActivityButton([IntPtr]$chooser) {
+    @(Get-ActionRow $chooser -IncludeHidden | Where-Object { $_.Text -eq 'Activity' }) |
+        Select-Object -First 1
 }
 
 # Click the CENTRE of a control, posted at the control itself: posted messages
@@ -311,6 +327,14 @@ try {
     if ($mb) {
         Assert (-not $mb.Visible) 'management button is hidden while the Local row is selected'
     }
+    # T177: Activity is gated on the same thing the menu is (mac's single
+    # `if case .remote(let machine)`), so the Local row shows neither.
+    $ab = Get-ActivityButton $chooser
+    Assert ($null -ne $ab) 'the detail header has an Activity button'
+    if ($ab) { Assert (-not $ab.Visible) 'Activity is hidden while the Local row is selected' }
+    $localRow = @(Get-ActionRow $chooser)
+    Assert ($localRow.Count -eq 1 -and $localRow[0].Text -eq 'New Window') `
+        "the Local row's action row is New Window alone (got: $(($localRow | ForEach-Object { $_.Text }) -join ', '))"
 
     # --- arrow onto the relay device row. The chooser reads raw WM_KEYDOWN
     # through App.run's routing (it is not a standard #32770), so a posted arrow
@@ -319,6 +343,93 @@ try {
     Start-Sleep -Milliseconds 300
     $mb = Get-MenuButton $chooser
     Assert ($null -ne $mb -and $mb.Visible) 'management button appears on a relay device row'
+
+    # --- (1b) T177: the row's COMPOSITION and its PACKING on a remote row.
+    # mac's detail header is [New Window] [Activity] [...] at one spacing
+    # (MachineChooserView.swift:456-491); the win32 row is packed as a run, so
+    # what is asserted is the order, one shared baseline, and one gap - not
+    # three fixed slots.
+    $row = @(Get-ActionRow $chooser)
+    Assert ($row.Count -eq 3) "a remote row packs three actions (got $($row.Count): $(($row | ForEach-Object { $_.Text }) -join ', '))"
+    if ($row.Count -eq 3) {
+        Assert ($row[0].Text -eq 'New Window') "New Window leads the run (got '$($row[0].Text)')"
+        Assert ($row[1].Text -eq 'Activity') "Activity follows it (got '$($row[1].Text)')"
+        Assert (($row[2].Right - $row[2].Left) -eq ($row[2].Bottom - $row[2].Top)) `
+            'the management glyph button trails the run, and is square'
+        $gap1 = $row[1].Left - $row[0].Right
+        $gap2 = $row[2].Left - $row[1].Right
+        Assert ($gap1 -eq $gap2) "one gap across the run (got $gap1 and $gap2)"
+        Assert ($gap1 -gt 0) "the buttons do not touch (gap $gap1)"
+        # Sized to its own caption, not to the widest: Activity is the shorter
+        # word, so its button cannot be as wide as New Window's.
+        Assert (($row[1].Right - $row[1].Left) -lt ($row[0].Right - $row[0].Left)) `
+            'each button is sized to its own caption'
+        $crect = Get-TestWindowRect -Window $chooser
+        $inside = ($row | Where-Object { $_.Right -gt ($crect.Right - $crect.Left - $gap1) }).Count
+        Assert ($inside -eq 0) 'the whole run stays inside the detail pane'
+    }
+
+    # --- (1c) T177: Activity opens the Activity Monitor for THAT machine, and
+    # dismisses the chooser on the way (mac's `finish(nil)` then
+    # presentDialing, MachineChooserView.swift:1488-1492).
+    $ab = Get-ActivityButton $chooser
+    Assert ($null -ne $ab -and $ab.Visible) 'Activity appears on a relay device row'
+    if ($ab -and $ab.Visible) {
+        Click-Control $chooser $ab
+        $panel = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyActivityMonitor' -TimeoutMs 8000
+        Assert ($panel -ne [IntPtr]::Zero) 'Activity opens an Activity Monitor panel'
+        if ($panel -ne [IntPtr]::Zero) {
+            $ptitle = Get-TestWindowText -Window $panel
+            Assert ($ptitle -like '*E2E-Box*') "the panel is titled for the SELECTED machine (got '$ptitle')"
+            Assert (-not (Test-TestWindowExists -Window $chooser)) 'the chooser dismissed itself first'
+            # ...and it does NOT quietly show THIS machine's processes under
+            # that machine's name. Dialing is T287; until then the panel
+            # refuses to sample and reports "Couldn't connect". The log line is
+            # the oracle - the empty state is painted text, not a control.
+            Start-Sleep -Milliseconds 900
+            $refused = @(Select-String -Path $errlog -Pattern 'RemoteSourceNotConnected' -ErrorAction SilentlyContinue).Count
+            Assert ($refused -gt 0) 'a remote panel refuses to sample the LOCAL machine (no mislabeled rows)'
+        }
+
+        # Re-open the chooser, land back on the device row, and press Activity
+        # again: the registry is keyed per machine, so this focuses the panel
+        # that is already open instead of opening a second one.
+        [void](Send-TestKeys -Window $top -Target $surface -Modifiers ctrl, shift -Key N)
+        $chooser = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyMachineChooser' -TimeoutMs 4000
+        Assert ($chooser -ne [IntPtr]::Zero) 'the chooser re-opens after the panel took over'
+        if ($chooser -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: chooser did not re-open'; exit 1 }
+        $list = Get-NthChild $chooser 'ListBox' 0
+        Start-Sleep -Milliseconds 350
+        [void](Send-TestControlKey -Control $chooser -Key Down)
+        Start-Sleep -Milliseconds 300
+
+        $ab2 = Get-ActivityButton $chooser
+        if ($ab2 -and $ab2.Visible) {
+            Click-Control $chooser $ab2
+            Start-Sleep -Milliseconds 1200
+            $panels = @(Get-TestWindows -ProcessId $app.Pid -Class 'GhozttyActivityMonitor')
+            Assert ($panels.Count -eq 1) "a second Activity press focuses the same panel (got $($panels.Count) windows)"
+        } else {
+            Write-Host '  SKIP second-press: Activity button missing after re-open'
+            $script:skip++
+        }
+
+        # Put the desktop back the way the rest of this script expects it:
+        # panel closed, chooser open on the device row.
+        foreach ($p in @(Get-TestWindows -ProcessId $app.Pid -Class 'GhozttyActivityMonitor')) {
+            [void](Send-TestWindowClose -Window ([IntPtr]$p.Hwnd))
+        }
+        Start-Sleep -Milliseconds 500
+        if (-not (Test-TestWindowExists -Window $chooser)) {
+            [void](Send-TestKeys -Window $top -Target $surface -Modifiers ctrl, shift -Key N)
+            $chooser = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyMachineChooser' -TimeoutMs 4000
+            $list = Get-NthChild $chooser 'ListBox' 0
+            Start-Sleep -Milliseconds 350
+            [void](Send-TestControlKey -Control $chooser -Key Down)
+            Start-Sleep -Milliseconds 300
+        }
+        $mb = Get-MenuButton $chooser
+    }
 
     # --- (2) clicking it opens the mac item list
     if ($mb -and $mb.Visible) {

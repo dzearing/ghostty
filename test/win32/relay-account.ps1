@@ -148,15 +148,18 @@ function Get-ChooserControls([IntPtr]$parent, [string]$cls) {
     })
 }
 
-# The chooser's account button: the BUTTON child that is neither the detail
-# pane's primary action (T175 renamed it from "Open" to Mac's "New Window") nor
-# the footer's Cancel. Identified by exclusion so it survives a label change -
-# its label is exactly what the assertions are about.
+# The chooser's account button: the TOPMOST button child. The account row sits
+# above the header rule, with every other button below it (the detail pane's
+# action row, then the footer's Cancel) - so position identifies it while its
+# LABEL stays free to be what the assertions are about.
+#
+# It used to be identified by excluding the labels it is not, which is a list
+# that grows silently: T177 added "Activity" to the detail row and the exclusion
+# would have started returning it.
 function Get-AccountButton([IntPtr]$chooser) {
-    foreach ($b in Get-ChooserControls $chooser 'Button') {
-        if ($b.Text -ne 'New Window' -and $b.Text -ne 'Open' -and $b.Text -ne 'Cancel') { return $b }
-    }
-    return $null
+    $btns = @(Get-ChooserControls $chooser 'Button' | Sort-Object Top)
+    if ($btns.Count -eq 0) { return $null }
+    return $btns[0]
 }
 
 # The account status STATIC is the topmost one; the footer hint is the lowest.

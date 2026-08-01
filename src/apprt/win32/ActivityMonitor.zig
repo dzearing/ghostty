@@ -132,29 +132,45 @@ var field_brush: ?w32.HBRUSH = null;
 // Source + registry
 // ---------------------------------------------------------------------
 
-/// What a panel is showing. `.remote` carries the machine id and arrives with
-/// T287; it exists now so the registry is keyed correctly from the start rather
-/// than being retrofitted onto a `.local`-only assumption.
+/// A machine a panel can be pointed at: identity for the registry, display name
+/// for the chrome. Mac keys its window dictionary on the `Machine` and titles
+/// the window from `machine.name` (RemoteActivityMonitor.swift:41), which is the
+/// same split — a rename must not open a second panel on the same machine.
+pub const Remote = struct {
+    id: []const u8,
+    name: []const u8 = "",
+};
+
+/// Longest machine id / display name a panel copies in. Both are held in the
+/// instance (see `id_buf`), because the caller's copy is usually borrowed from a
+/// chooser arena that is freed before the panel opens.
+pub const max_source_id: usize = 128;
+pub const max_source_label: usize = 128;
+
+/// What a panel is showing. The remote source's DATA plane is T287; what exists
+/// here is the identity, so the registry is keyed correctly rather than being
+/// retrofitted onto a `.local`-only assumption.
 pub const Source = union(enum) {
     local,
-    remote: []const u8,
+    remote: Remote,
 
     pub fn eql(a: Source, b: Source) bool {
         return switch (a) {
             .local => b == .local,
-            .remote => |ida| switch (b) {
+            .remote => |ra| switch (b) {
                 .local => false,
-                .remote => |idb| std.mem.eql(u8, ida, idb),
+                .remote => |rb| std.mem.eql(u8, ra.id, rb.id),
             },
         };
     }
 
     /// The window title's subject — Mac titles the window "Activity — <label>"
-    /// (RemoteActivityMonitor.swift:41, :54).
+    /// (RemoteActivityMonitor.swift:41, :54). The id is the fallback: a machine
+    /// with no name still has to be namable on screen.
     pub fn label(self: Source) []const u8 {
         return switch (self) {
             .local => "Local",
-            .remote => |id| id,
+            .remote => |r| if (r.name.len > 0) r.name else r.id,
         };
     }
 };
@@ -208,7 +224,12 @@ const Snapshot = struct {
 // ---------------------------------------------------------------------
 
 app: *App,
+/// What this panel is showing. For a remote source its strings point into
+/// `id_buf`/`name_buf` below, never at the caller's memory: the chooser that
+/// opens the panel frees its device list on the way out (T177).
 source: Source,
+id_buf: [max_source_id]u8 = undefined,
+name_buf: [max_source_label]u8 = undefined,
 slot: usize,
 
 hwnd: w32.HWND,
@@ -301,6 +322,10 @@ thumb_drag_dy: i32 = -1,
 /// cannot re-enter it.
 closing: bool = false,
 
+/// Whether a sample failure has already been logged for this panel. Worker
+/// thread only.
+logged_sample_error: bool = false,
+
 // ---------------------------------------------------------------------
 // Open / close
 // ---------------------------------------------------------------------
@@ -347,6 +372,20 @@ pub fn open(window: *Window, src: Source) void {
         .kill_btn = undefined,
         .scale = window.scale,
     };
+    // Take ownership of a remote source's strings: the caller's copies belong to
+    // a chooser that is already closing (T177). Over-long ids are truncated
+    // rather than refused — the panel still opens, and the id is only ever
+    // compared against another copy of itself.
+    if (src == .remote) {
+        const id_len = @min(src.remote.id.len, self.id_buf.len);
+        const name_len = @min(src.remote.name.len, self.name_buf.len);
+        @memcpy(self.id_buf[0..id_len], src.remote.id[0..id_len]);
+        @memcpy(self.name_buf[0..name_len], src.remote.name[0..name_len]);
+        self.source = .{ .remote = .{
+            .id = self.id_buf[0..id_len],
+            .name = self.name_buf[0..name_len],
+        } };
+    }
 
     // The panel is its own top-level window, not an owned dialog: Mac's is a
     // plain resizable NSWindow the user can put anywhere and leave open behind
@@ -369,8 +408,8 @@ pub fn open(window: *Window, src: Source) void {
         }
     }
 
-    var title_buf: [128]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "Activity — {s}", .{src.label()}) catch "Activity";
+    var title_buf: [192]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "Activity — {s}", .{self.source.label()}) catch "Activity";
     var wtitle: [160]u16 = undefined;
     const tlen = std.unicode.utf8ToUtf16Le(&wtitle, title) catch 0;
     wtitle[tlen] = 0;
@@ -498,10 +537,12 @@ pub fn open(window: *Window, src: Source) void {
 
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    open_keys[slot] = src;
+    // The registry key points at the INSTANCE's copy, so it stays valid for as
+    // long as the slot is taken.
+    open_keys[slot] = self.source;
     open_wins[slot] = self;
 
-    log.info("activity monitor: opening source={s} slot={d}", .{ src.label(), slot });
+    log.info("activity monitor: opening source={s} slot={d}", .{ self.source.label(), slot });
 
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.SetForegroundWindow(hwnd);
@@ -652,7 +693,16 @@ fn kickSample(self: *ActivityMonitor) void {
 fn sampleWorker(self: *ActivityMonitor) void {
     const alloc = self.app.core_app.alloc;
     const snap = self.buildSnapshot(alloc) catch |err| {
-        log.warn("activity monitor: sample failed err={}", .{err});
+        // A source that is not connected fails EVERY tick, and a panel can sit
+        // open for hours — say it once. Only the worker touches this flag, and
+        // the previous worker is joined before the next one starts.
+        const spammy = err == error.RemoteSourceNotConnected;
+        if (!spammy or !self.logged_sample_error) {
+            log.warn("activity monitor: sample failed source={s} err={}", .{ self.source.label(), err });
+        }
+        // Only the always-fails case is silenced; a real sampling error stays
+        // loud every time it happens.
+        if (spammy) self.logged_sample_error = true;
         self.pending_mutex.lock();
         self.pending_failed = true;
         self.pending_mutex.unlock();
@@ -670,6 +720,12 @@ fn sampleWorker(self: *ActivityMonitor) void {
 }
 
 fn buildSnapshot(self: *ActivityMonitor, alloc: Allocator) !*Snapshot {
+    // A remote panel has no connection yet — dialing is T287. Sampling THIS
+    // machine and captioning it with another machine's name would be a lie the
+    // user has no way to catch, so the panel reports what is true: it cannot
+    // reach that source (`paintEmptyState`'s "Couldn't connect").
+    if (self.source == .remote) return error.RemoteSourceNotConnected;
+
     const snap = try alloc.create(Snapshot);
     errdefer alloc.destroy(snap);
     snap.* = .{
@@ -1996,11 +2052,24 @@ fn hiWordSigned(lparam: isize) i32 {
 
 const testing = std.testing;
 
+fn remoteSource(id: []const u8, name: []const u8) Source {
+    return .{ .remote = .{ .id = id, .name = name } };
+}
+
 test "Source.eql: local matches local, remotes match by id" {
     try testing.expect(Source.eql(.local, .local));
-    try testing.expect(!Source.eql(.local, .{ .remote = "winbox" }));
-    try testing.expect(Source.eql(.{ .remote = "winbox" }, .{ .remote = "winbox" }));
-    try testing.expect(!Source.eql(.{ .remote = "winbox" }, .{ .remote = "laptop" }));
+    try testing.expect(!Source.eql(.local, remoteSource("winbox", "Winbox")));
+    try testing.expect(Source.eql(remoteSource("winbox", "Winbox"), remoteSource("winbox", "Winbox")));
+    try testing.expect(!Source.eql(remoteSource("winbox", "Winbox"), remoteSource("laptop", "Laptop")));
+    // Identity is the id, not the label: renaming a machine must focus the panel
+    // that is already open on it rather than opening a second one.
+    try testing.expect(Source.eql(remoteSource("winbox", "Winbox"), remoteSource("winbox", "Front desk")));
+}
+
+test "Source.label: the display name, falling back to the id" {
+    try testing.expectEqualStrings("Local", Source.label(.local));
+    try testing.expectEqualStrings("Winbox", Source.label(remoteSource("dev-1", "Winbox")));
+    try testing.expectEqualStrings("dev-1", Source.label(remoteSource("dev-1", "")));
 }
 
 test "slotFor: a second open of the same source finds the open panel" {
@@ -2011,17 +2080,17 @@ test "slotFor: a second open of the same source finds the open panel" {
     try testing.expectEqual(@as(?usize, 0), slotFor(&keys, .local));
     // A different source is NOT the same panel — that is the whole point of
     // keying the registry rather than keeping one global window.
-    try testing.expect(slotFor(&keys, .{ .remote = "winbox" }) == null);
+    try testing.expect(slotFor(&keys, remoteSource("winbox", "Winbox")) == null);
 
-    keys[1] = .{ .remote = "winbox" };
-    try testing.expectEqual(@as(?usize, 1), slotFor(&keys, .{ .remote = "winbox" }));
+    keys[1] = remoteSource("winbox", "Winbox");
+    try testing.expectEqual(@as(?usize, 1), slotFor(&keys, remoteSource("winbox", "Winbox")));
 }
 
 test "freeSlot: the first hole, and null when full" {
-    var keys = [_]?Source{ .local, null, .{ .remote = "a" } };
+    var keys = [_]?Source{ .local, null, remoteSource("a", "A") };
     try testing.expectEqual(@as(?usize, 1), freeSlot(&keys));
 
-    keys[1] = .{ .remote = "b" };
+    keys[1] = remoteSource("b", "B");
     try testing.expect(freeSlot(&keys) == null);
 
     // A closed panel frees its slot for reuse.

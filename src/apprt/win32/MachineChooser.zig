@@ -43,6 +43,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const ActivityMonitor = @import("ActivityMonitor.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
@@ -62,6 +63,12 @@ const FILTER_ID: u16 = 100;
 const LIST_ID: u16 = 101;
 const ACCOUNT_ID: u16 = 102;
 const MENU_ID: u16 = 103;
+const ACTIVITY_ID: u16 = 104;
+
+/// The action row's captions. Measured (not assumed) to size their buttons, so
+/// they live where both the creation and the measurement can see them.
+const PRIMARY_LABEL = "New Window";
+const ACTIVITY_LABEL = "Activity";
 
 /// `Host Settings…` needs the per-host defaults store, which T174 built
 /// (`host_defaults.zig` + `HostSettingsDialog.zig`) — one bool, at the one place
@@ -118,6 +125,11 @@ hint: w32.HWND,
 /// The detail pane's primary action ("New Window"), Mac's `.borderedProminent`
 /// button — in the detail header, NOT the footer (which holds Cancel alone).
 primary_btn: w32.HWND,
+/// "Activity" — opens the Activity Monitor for the selected machine (T177).
+/// Mac gates it on the row being remote, in the same `if case .remote` that
+/// carries the `…` menu (MachineChooserView.swift:474-491), so the two appear
+/// and disappear together.
+activity_btn: w32.HWND,
 /// The `…` management-menu button, beside the primary action (T176). Hidden
 /// for rows that have no management actions (the Local row).
 menu_btn: w32.HWND,
@@ -241,6 +253,7 @@ pub fn open(window: *Window) void {
         .list = undefined,
         .hint = undefined,
         .primary_btn = undefined,
+        .activity_btn = undefined,
         .menu_btn = undefined,
         .cancel_btn = undefined,
         .account_status = undefined,
@@ -435,18 +448,24 @@ pub fn open(window: *Window) void {
         return;
     };
 
+    // The action row is packed from measured captions, which needs the dialog
+    // font — created further down. Every button here is therefore built at the
+    // row's leading edge and re-placed by the `applyLayout` at the end of this
+    // function; nothing is on screen until then.
+    const seed = rect(l.action_row);
+
     // Mac's primary action is labeled for what it does — "New Window" — and it
     // lives in the detail header beside the machine it acts on, not in the
     // footer (MachineChooserView.swift:456-466, 1410-1418).
     self.primary_btn = w32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
-        std.unicode.utf8ToUtf16LeStringLiteral("New Window"),
+        std.unicode.utf8ToUtf16LeStringLiteral(PRIMARY_LABEL),
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.BS_DEFPUSHBUTTON,
-        l.primary_btn.left,
-        l.primary_btn.top,
-        l.primary_btn.right - l.primary_btn.left,
-        l.primary_btn.bottom - l.primary_btn.top,
+        seed.left,
+        seed.top,
+        l.action_min_btn_w,
+        seed.bottom - seed.top,
         hwnd,
         @ptrFromInt(@as(usize, w32.IDOK)),
         window.app.hinstance,
@@ -456,6 +475,28 @@ pub fn open(window: *Window) void {
         self.destroyState();
         return;
     };
+    // "Open Activity Monitor for <machine>" (474-481). Created hidden: the row
+    // that is selected when the chooser opens may not be a remote one, and
+    // `refreshDetail` is what decides.
+    self.activity_btn = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        std.unicode.utf8ToUtf16LeStringLiteral(ACTIVITY_LABEL),
+        w32.WS_CHILD,
+        seed.left,
+        seed.top,
+        l.action_min_btn_w,
+        seed.bottom - seed.top,
+        hwnd,
+        @ptrFromInt(@as(usize, ACTIVITY_ID)),
+        window.app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        self.destroyState();
+        return;
+    };
+    _ = w32.SetWindowTheme(self.activity_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
     // Mac's per-row management menu (`ellipsis.circle`) lives in the same
     // action row (456-492). Labeled with the ellipsis CHARACTER rather than
     // three periods so it reads as one glyph at any DPI.
@@ -464,10 +505,10 @@ pub fn open(window: *Window) void {
         std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
         std.unicode.utf8ToUtf16LeStringLiteral("…"),
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
-        l.menu_btn.left,
-        l.menu_btn.top,
-        l.menu_btn.right - l.menu_btn.left,
-        l.menu_btn.bottom - l.menu_btn.top,
+        seed.left,
+        seed.top,
+        seed.bottom - seed.top,
+        seed.bottom - seed.top,
         hwnd,
         @ptrFromInt(@as(usize, MENU_ID)),
         window.app.hinstance,
@@ -519,9 +560,9 @@ pub fn open(window: *Window) void {
     );
     if (self.font) |f| {
         for ([_]w32.HWND{
-            self.filter,         self.list,        self.hint,
-            self.account_status, self.account_btn, self.primary_btn,
-            self.menu_btn,       self.cancel_btn,
+            self.filter,         self.list,         self.hint,
+            self.account_status, self.account_btn,  self.primary_btn,
+            self.activity_btn,   self.menu_btn,     self.cancel_btn,
         }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
@@ -806,8 +847,6 @@ fn applyLayout(self: *MachineChooser) void {
         .{ .hwnd = self.filter, .r = rect(l.filter) },
         .{ .hwnd = self.list, .r = rect(l.list) },
         .{ .hwnd = self.hint, .r = rect(l.hint) },
-        .{ .hwnd = self.primary_btn, .r = rect(l.primary_btn) },
-        .{ .hwnd = self.menu_btn, .r = rect(l.menu_btn) },
         .{ .hwnd = self.cancel_btn, .r = rect(l.cancel) },
     };
     for (placements) |p| {
@@ -820,6 +859,76 @@ fn applyLayout(self: *MachineChooser) void {
             1,
         );
     }
+    self.layoutActions(l);
+}
+
+/// Place the detail pane's action row for the CURRENT selection. The row is a
+/// run, not a set of fixed slots (T177): its composition changes with the
+/// machine, so the `…` button's position depends on whether Activity is in the
+/// row beside it — which means this has to run on every selection change, not
+/// only on a DPI change.
+fn layoutActions(self: *MachineChooser, l: Layout) void {
+    const row = chooser_layout.actionRow(l, self.actionComposition(), self.measureActions());
+    for (row.kinds[0..row.len], row.rects[0..row.len]) |kind, r| {
+        const hwnd = switch (kind) {
+            .primary => self.primary_btn,
+            .activity => self.activity_btn,
+            .menu => self.menu_btn,
+            // T146's "Restore All" has no control yet; the packer already knows
+            // where it goes, which is the point of naming it.
+            .restore_all => continue,
+        };
+        _ = w32.MoveWindow(hwnd, r.left, r.top, r.width(), r.height(), 1);
+    }
+}
+
+/// Which optional actions the selected row offers. Mac gates BOTH Activity and
+/// the `…` menu on `if case .remote(let machine)` (MachineChooserView.swift:
+/// 474-491) — the Local row gets neither.
+fn actionComposition(self: *const MachineChooser) chooser_layout.Composition {
+    return compositionFor(self.selectedRow());
+}
+
+/// Pure half of `actionComposition` — unit-tested. `null` is the empty list
+/// (the filter matched nothing), which offers no actions at all.
+fn compositionFor(row: ?Row) chooser_layout.Composition {
+    const r = row orelse return .{};
+    return .{
+        .activity = r != .local,
+        .menu = chooser_menu.hasMenu(menuState(r)),
+    };
+}
+
+/// Caption widths for the labeled action buttons, measured with the dialog's
+/// own font. The layout module is text-free by design, so the measuring belongs
+/// here (T235's lesson).
+fn measureActions(self: *const MachineChooser) chooser_layout.ActionText {
+    return .{
+        .primary = self.measureCaption(PRIMARY_LABEL),
+        .activity = self.measureCaption(ACTIVITY_LABEL),
+    };
+}
+
+/// Width of `text` in the dialog font, in physical pixels.
+fn measureCaption(self: *const MachineChooser, text: []const u8) i32 {
+    const hdc = w32.GetDC(self.hwnd) orelse return 0;
+    defer _ = w32.ReleaseDC(self.hwnd, hdc);
+    const old = if (self.font) |f| w32.SelectObject(hdc, f) else null;
+    defer if (old) |o| {
+        _ = w32.SelectObject(hdc, o);
+    };
+
+    var wbuf: [64]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return 0;
+    var r: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = w32.DrawTextW(
+        hdc,
+        &wbuf,
+        @intCast(wlen),
+        &r,
+        w32.DT_LEFT | w32.DT_SINGLELINE | w32.DT_CALCRECT | w32.DT_NOPREFIX,
+    );
+    return r.right - r.left;
 }
 
 // ---------------------------------------------------------------------
@@ -917,11 +1026,18 @@ fn refreshDetail(self: *MachineChooser) void {
         if (row == null) w32.SW_HIDE else w32.SW_SHOW,
     );
     // Hidden rather than greyed: Mac omits the menu on rows that have none,
-    // and a `…` that opens nothing is worse than no `…` at all.
-    const menu_visible = row != null and chooser_menu.hasMenu(menuState(row.?));
-    _ = w32.ShowWindow(self.menu_btn, if (menu_visible) w32.SW_SHOW else w32.SW_HIDE);
+    // and a `…` that opens nothing is worse than no `…` at all. Activity is
+    // gated on the same thing Mac gates it on — the row being remote.
+    const comp = self.actionComposition();
+    _ = w32.ShowWindow(self.activity_btn, if (comp.activity) w32.SW_SHOW else w32.SW_HIDE);
+    _ = w32.ShowWindow(self.menu_btn, if (comp.menu) w32.SW_SHOW else w32.SW_HIDE);
+    // The row is packed as a run, so dropping a button MOVES the ones after it.
+    self.layoutActions(l);
     // Focus must not be left on a control the user can no longer see.
-    if (!menu_visible and w32.GetFocus() == @as(?w32.HWND, self.menu_btn)) {
+    const focus = w32.GetFocus();
+    if ((!comp.menu and focus == @as(?w32.HWND, self.menu_btn)) or
+        (!comp.activity and focus == @as(?w32.HWND, self.activity_btn)))
+    {
         _ = w32.SetFocus(self.list);
     }
 }
@@ -1515,6 +1631,10 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
                         self.openRowMenuFromButton();
                         return 0;
                     },
+                    ACTIVITY_ID => {
+                        self.openActivityMonitor();
+                        return 0;
+                    },
                     else => {},
                 }
             } else if (control_id == FILTER_ID and notification == w32.EN_CHANGE) {
@@ -1614,14 +1734,15 @@ pub fn ownsHwnd(self: *const MachineChooser, hwnd: w32.HWND) bool {
     return hwnd == self.hwnd or hwnd == self.filter or hwnd == self.list or
         hwnd == self.hint or hwnd == self.primary_btn or hwnd == self.cancel_btn or
         hwnd == self.account_status or hwnd == self.account_btn or
-        hwnd == self.menu_btn;
+        hwnd == self.activity_btn or hwnd == self.menu_btn;
 }
 
-/// Keyboard focus targets, in Tab order. `menu` is the `…` management button
-/// (T176), immediately after the primary action it sits beside. `account` is
-/// the sign-in/out button (T141) — last in the cycle so Tab from the filter
-/// still reaches the list first, the common path.
-pub const Focusable = enum { filter, list, primary, menu, cancel, account };
+/// Keyboard focus targets, in Tab order — the same left-to-right order the
+/// action row is painted in, so Tab walks the row the way the eye does.
+/// `activity` (T177) and `menu` (T176) follow the primary action they sit
+/// beside; `account` is the sign-in/out button (T141), last in the cycle so Tab
+/// from the filter still reaches the list first, the common path.
+pub const Focusable = enum { filter, list, primary, activity, menu, cancel, account };
 
 /// Pure Tab-order cycle. Unit-tested.
 pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
@@ -1629,13 +1750,15 @@ pub fn nextFocus(cur: Focusable, backwards: bool) Focusable {
         .filter => .account,
         .list => .filter,
         .primary => .list,
-        .menu => .primary,
+        .activity => .primary,
+        .menu => .activity,
         .cancel => .menu,
         .account => .cancel,
     } else switch (cur) {
         .filter => .list,
         .list => .primary,
-        .primary => .menu,
+        .primary => .activity,
+        .activity => .menu,
         .menu => .cancel,
         .cancel => .account,
         .account => .filter,
@@ -1648,6 +1771,7 @@ fn hwndFor(self: *const MachineChooser, f: Focusable) w32.HWND {
         .filter => self.filter,
         .list => self.list,
         .primary => self.primary_btn,
+        .activity => self.activity_btn,
         .menu => self.menu_btn,
         .cancel => self.cancel_btn,
         .account => self.account_btn,
@@ -1682,6 +1806,8 @@ pub fn handleKey(self: *MachineChooser, vk: u16) bool {
                 self.onAccountClicked();
             } else if (focus == @as(?w32.HWND, self.menu_btn)) {
                 self.openRowMenuFromButton();
+            } else if (focus == @as(?w32.HWND, self.activity_btn)) {
+                self.openActivityMonitor();
             } else {
                 self.openSelection();
             }
@@ -1771,6 +1897,40 @@ fn openSelection(self: *MachineChooser) void {
             self.close(false);
         },
     }
+}
+
+/// Open the Activity Monitor for the selected machine (T177), Mac's
+/// `onActivityMonitor(machine)` — which dismisses the chooser first and then
+/// opens the panel (`MachineChooserView.swift:1488-1492`: `finish(nil)` then
+/// `RemoteActivityMonitor.presentDialing`). Dismissing first is not cosmetic
+/// here: the chooser DISABLES its owner window while it is up, and a panel
+/// opened over a disabled owner would come up behind a dead window.
+///
+/// The identity is copied out before the close — `close` frees the arena the
+/// device list is parsed into, and the panel keys its registry on the id.
+fn openActivityMonitor(self: *MachineChooser) void {
+    const row = self.selectedRow() orelse return;
+    const device_index = switch (row) {
+        .local => return, // Mac shows no Activity button on the local row
+        .device => |i| i,
+    };
+    const dev = self.devices[device_index];
+
+    var id_buf: [ActivityMonitor.max_source_id]u8 = undefined;
+    var name_buf: [ActivityMonitor.max_source_label]u8 = undefined;
+    if (dev.id.len > id_buf.len or dev.name.len > name_buf.len) {
+        log.warn("machine chooser: activity monitor id/name too long device={s}", .{dev.id});
+        self.setHint("Couldn't open Activity for that machine.");
+        return;
+    }
+    @memcpy(id_buf[0..dev.id.len], dev.id);
+    @memcpy(name_buf[0..dev.name.len], dev.name);
+    const id = id_buf[0..dev.id.len];
+    const name = name_buf[0..dev.name.len];
+
+    const window = self.window;
+    self.close(true);
+    ActivityMonitor.open(window, .{ .remote = .{ .id = id, .name = name } });
 }
 
 /// Dismiss without opening anything (returns focus to the owner window).
@@ -1900,10 +2060,11 @@ test "clampSelection: clamps within bounds and handles empty" {
     try testing.expectEqual(@as(i32, 0), clampSelection(-1, 1, 3)); // from no-selection
 }
 
-test "nextFocus: forward cycle filter -> list -> primary -> menu -> cancel -> account -> filter" {
+test "nextFocus: forward cycle filter -> list -> primary -> activity -> menu -> cancel -> account -> filter" {
     try testing.expectEqual(Focusable.list, nextFocus(.filter, false));
     try testing.expectEqual(Focusable.primary, nextFocus(.list, false));
-    try testing.expectEqual(Focusable.menu, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.activity, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.menu, nextFocus(.activity, false));
     try testing.expectEqual(Focusable.cancel, nextFocus(.menu, false));
     try testing.expectEqual(Focusable.account, nextFocus(.cancel, false));
     try testing.expectEqual(Focusable.filter, nextFocus(.account, false));
@@ -1913,16 +2074,51 @@ test "nextFocus: backward cycle reverses" {
     try testing.expectEqual(Focusable.account, nextFocus(.filter, true));
     try testing.expectEqual(Focusable.cancel, nextFocus(.account, true));
     try testing.expectEqual(Focusable.menu, nextFocus(.cancel, true));
-    try testing.expectEqual(Focusable.primary, nextFocus(.menu, true));
+    try testing.expectEqual(Focusable.activity, nextFocus(.menu, true));
+    try testing.expectEqual(Focusable.primary, nextFocus(.activity, true));
     try testing.expectEqual(Focusable.list, nextFocus(.primary, true));
     try testing.expectEqual(Focusable.filter, nextFocus(.list, true));
 }
 
-test "the management button sits with the primary action in the Tab order" {
-    // The `…` acts on the machine the primary button opens, so it must follow
-    // it directly rather than turning up after Cancel.
-    try testing.expectEqual(Focusable.menu, nextFocus(.primary, false));
-    try testing.expectEqual(Focusable.primary, nextFocus(.menu, true));
+test "the detail actions sit with the primary action in the Tab order" {
+    // Activity and the `…` act on the machine the primary button opens, so they
+    // must follow it directly rather than turning up after Cancel — and in the
+    // order they are painted in (T177).
+    try testing.expectEqual(Focusable.activity, nextFocus(.primary, false));
+    try testing.expectEqual(Focusable.menu, nextFocus(.activity, false));
+    try testing.expectEqual(Focusable.activity, nextFocus(.menu, true));
+    try testing.expectEqual(Focusable.primary, nextFocus(.activity, true));
+}
+
+test "compositionFor: Activity and the menu appear together, on remote rows only" {
+    // Mac gates both on the same `if case .remote(let machine)`
+    // (MachineChooserView.swift:474-491).
+    const local = compositionFor(.local);
+    try testing.expect(!local.activity);
+    try testing.expect(!local.menu);
+
+    const device = compositionFor(.{ .device = 0 });
+    try testing.expect(device.activity);
+    try testing.expect(device.menu);
+
+    // Nothing selected (the filter matched nothing): no actions at all.
+    const none = compositionFor(null);
+    try testing.expect(!none.activity);
+    try testing.expect(!none.menu);
+
+    // Restore All is T146's; the row must not claim it yet.
+    try testing.expect(!device.restore_all);
+}
+
+test "the action row's own packing puts Activity between New Window and the menu" {
+    const l = layout(1.0, 1);
+    const row = chooser_layout.actionRow(l, compositionFor(.{ .device = 0 }), .{
+        .primary = 70,
+        .activity = 44,
+    });
+    try testing.expectEqual(@as(usize, 3), row.len);
+    try testing.expect(row.rect(.primary).?.right <= row.rect(.activity).?.left);
+    try testing.expect(row.rect(.activity).?.right <= row.rect(.menu).?.left);
 }
 
 test "menuState: the Local row has no menu, a device row gets the relay menu" {
