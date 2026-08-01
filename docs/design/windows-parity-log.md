@@ -4089,3 +4089,56 @@ quietly. Two design-system amendments landed with the work: closed-outline
 glyphs use a **1 DIP** stroke (2 DIP on a 10 DIP box reads as a filled square —
 it shipped for one build), and §6's "host chrome in the caption bar" is now
 actually possible.
+
+## 2026-07-31 — T256: the scripts measured the strip from a datum that had moved (and one that had changed underneath them)
+
+T254 moved the tab strip off client `y = 0`, and the two scripts that derive the
+strip's band from the client rect's own top failed against a correct build —
+`tab-strip.ps1` 7, `menu-bar.ps1` 19. Repaired, and **T254 is now `done`**;
+the standing floor is green again.
+
+`tab-strip.ps1`'s scale came from `barH / 40.0`, so with the caption band folded
+into the measurement it reported **2.375 at a real 1.25** and every DIP constant
+in the script was wrong by 90%. Scale now comes from `Get-TestWindowDpi` — the
+same `GetDpiForWindow` the app derives `Window.scale` from — `$capH` is
+`caption_layout`'s own construction at that scale, and the strip's height is the
+REMAINDER up to the pane child's top. The old "the bar is visible" positive
+control became `barH == 3*sm + sq`: measuring the strip and checking it against
+its own construction catches a wrong caption offset instead of letting it skew
+silently. `menu-bar.ps1` needed one `Caption-Height` helper in the two places
+that turn a strip y into a screen y.
+
+**That fixed 15 of the 19 — and the remaining 4 were never about the caption.**
+`Strip-Geometry` re-implemented `tab_strip_layout`'s tab SIZING to find the "+",
+and T235 had changed that rule one task earlier: ~250 px modelled (equal share,
+capped at the retired 200 DIP) against a real content-sized ~344 px, so the "+"
+click landed back inside tab 1, no tab was ever created, and four assertions
+downstream of "a second tab exists" fell with it. **A script cannot re-derive a
+width that comes from text metrics, and it should not try** — T249's point,
+arriving early. The tab run is no longer modelled: only the right-anchored
+button band is derived, and the last tab's painted right edge is measured off a
+capture by scanning leftward from the menu button along a row below the "+"
+glyph's extent. `Start-Gui` gained `--background=#000000` to make that scan
+safe — an inactive tab's fill is the strip lifted by `INACTIVE_LIFT` (6% of
+white), ~14 levels on a dark strip and ~1 on a light one. Its `$btnW` was also
+still 36 DIP, the pre-T232 hit box; gaps are measured against the 28 DIP painted
+square.
+
+Green: `tab-strip.ps1` ALL PASS (35) and `menu-bar.ps1` ALL PASS (60), x3 each,
+both negative controls still failing; `caption-bar.ps1` ALL PASS (14) and P1-P3
+ALL PASS; both `zig build test` lanes first try.
+
+**Also filed: T258 — `zig build test-agent` is flaky, and it was found the hard
+way.** It went red on a two-`.ps1` diff, on a DIFFERENT assertion each time:
+`FLOW pause halts streaming` (expected 6, found 0), then `client DATA reaches
+the child`, then green on the third run. Both are `remote/agent/server.zig`
+ConPTY round-trip tests and both read a short buffer rather than a wrong one —
+the T89b timing lesson recurring. A floor lane that fails 2 runs in 3 trains the
+next turn to re-run until green, which is how a real regression gets waved
+through.
+
+**Filed: T257.** This is the second chrome change to break scripts that each
+re-derive the same datum privately, and after this repair both still carry their
+own copy of the caption height, the bar height, the button band and a tab-run
+pixel scan — two implementations of one measurement. Hoist it into
+`TestDesktop.ps1` before T205 moves the datum a third time.

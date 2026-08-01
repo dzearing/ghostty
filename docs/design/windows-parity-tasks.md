@@ -173,12 +173,23 @@ Work these first, in order, before falling back to first-todo-in-table:
 
     Then the tasks that bring the chrome into compliance:
 
-    **~~T232~~ → ~~T242~~ → ~~T235~~ → ~~T233~~ → T254 (built) → T256 → T234.**
+    **~~T232~~ → ~~T242~~ → ~~T235~~ → ~~T233~~ → ~~T254~~ → ~~T256~~ → T234.**
 
-    **T256 is the immediate next task**: T254's caption band moved the tab
-    strip off client `y = 0`, and `tab-strip.ps1` (7 failed) and `menu-bar.ps1`
-    (19 failed) still measure it from there. The standing floor is not green
-    until that lands, so nothing else goes first.
+    **T234 is the immediate next task** — the big one: no tab strip at one tab,
+    and a "…" button in the caption bar left of minimize. T254 built the caption
+    it needs; what remains is the button rect plus the visibility rule.
+
+    **~~T256~~ (done, 2026-07-31)** unblocked it and closed T254. The caption
+    band moved the strip off client `y = 0`, and both scripts that measured it
+    from there failed — `tab-strip.ps1` 7, `menu-bar.ps1` 19. Its lesson is
+    wider than the offset: 4 of those 19 were **T235's** width change, not
+    T254's origin change, because `Strip-Geometry` re-implemented the tab SIZING
+    rule to locate the "+". *A script cannot re-derive a width that comes from
+    text metrics.* The tab run is measured off a capture now. Follow-ups:
+    **T257** (both scripts still keep private copies of the same chrome datum —
+    hoist it before T205 moves it a third time) and **T258** (`test-agent` is
+    flaky: a different `remote/agent/server.zig` ConPTY assertion fails on ~2
+    runs in 3, which trains turns to re-run a floor lane until green).
 
     - **T233 (done, 2026-07-31)** — *"I think the splitter lines should be 2px
       and have a hover color that emphasizes it."* Both halves were real:

@@ -23,9 +23,10 @@
 # One hermetic GUI launch (--config-default-files=false, black background,
 # --window-show-tab-bar=always so a SINGLE tab still shows the strip - the
 # configuration the user screenshotted):
-#   1. Client origin + bar height from the client rect vs the pane child's rect
-#      -> DPI scale -> every DIP constant (self-relative, so this holds at any
-#      DPI; the pane-banner.ps1 section 6g rule).
+#   1. DPI scale from the window itself -> every DIP constant, including the
+#      caption band T254 moved into the client area; the strip's height is then
+#      the REMAINDER between that band and the pane child's top, so a wrong
+#      caption offset fails loudly instead of skewing every measurement (T256).
 #   2. A scanline near the BOTTOM of the strip (below the title baseline) is
 #      pure content-black inside the selected chiclet and bar-gray outside it,
 #      so one row of pixels yields the selected tab's exact extent.
@@ -125,21 +126,41 @@ try {
     $offX = $clientX - $wr.Left
     $offY = $clientY - $wr.Top
 
+    # T254/T256: the strip no longer begins at client y = 0. The caption band is
+    # client area now, so the pane's top is caption + strip, and every y below
+    # is measured from `$stripTop` rather than from the client's own top.
+    #
+    # `$scale` comes from the window's own DPI - the same GetDpiForWindow the
+    # app derives `Window.scale` from - so the DIP constants below resolve
+    # exactly the way the layout modules resolve them. Nothing here is a fixed
+    # pixel count, which matters because T205 will move this datum again.
+    $scale = (Get-TestWindowDpi -Window $top) / 96.0
+    $sm    = [int][math]::Round(4 * $scale)    # the 4 DIP spacing step
+    $sq    = [int][math]::Round(28 * $scale)   # the shared icon-button square
+    # caption_layout.Metrics.caption_h = 4 + 28 + 4 DIP. Subtracted, not
+    # assumed: with `window-decoration = none` the OS keeps the caption and this
+    # is 0, and then the assertion below is what says so.
+    $capH  = 2 * $sm + $sq
+
     $panes = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
     if ($panes.Count -ne 1) { Write-Host "SETUP FAIL: expected 1 visible pane, got $($panes.Count)"; exit 1 }
-    $barH = $panes[0].Top - $clientY
-    Assert ($barH -gt 0) "positive control: the tab bar is visible with a single tab (barH=$barH)"
+    $barH = $panes[0].Top - $clientY - $capH
+    # Window-relative y of the strip's FIRST row, which is what the capture's
+    # bitmap is indexed by.
+    $stripTop = $offY + $capH
+    # tab_strip_layout.Metrics.bar_h = 4 + 4 + 28 + 4 DIP. Measuring the strip
+    # and then checking it against its own construction is the positive control
+    # for both numbers at once: a wrong `$capH` shows up here as a wrong `$barH`.
+    Assert ($barH -eq (3 * $sm + $sq)) `
+        "positive control: the tab bar is visible under the caption band (capH=$capH barH=$barH, expected $(3 * $sm + $sq))"
     if ($barH -le 0) { exit 1 }
 
     if (-not (Focus-TestWindow -Window $top -Child ([IntPtr]$panes[0].Hwnd))) {
         Write-Host 'SETUP FAIL: could not focus the GUI'; exit 1
     }
 
-    # Every constant is derived from the measured bar height, so this holds at
-    # any DPI (bar_h is 40 DIP by definition since T232 - it is 4 + 4 + 28 + 4,
-    # the shared icon-button square plus its clearances; see
-    # docs/design/win32-design-system.md and docs/design/win32-tab-strip.md).
-    $scale   = $barH / 40.0
+    # Everything below is derived from `$scale` above, so it holds at any DPI
+    # (see docs/design/win32-design-system.md and docs/design/win32-tab-strip.md).
     # The RETIRED fixed cap (T202's max_tab_w). Kept only so section 7 can
     # assert a long title is no longer pinned to it.
     $maxTabWOld = [int][math]::Round(200 * $scale)
@@ -188,7 +209,7 @@ try {
     # and the old scan got away with it.) The fill is ~(3,3,3) against a
     # (20,20,20) bar here, hence the <10 threshold rather than pure black.
     function Selected-Extent($shot) {
-        $y = $offY + $barH - 2
+        $y = $stripTop + $barH - 2
         $left = -1; $right = -1
         $runStart = -1
         for ($x = 0; $x -le $clientW; $x++) {
@@ -218,7 +239,7 @@ try {
         # The deleted underline was RGB(0x3D,0x8E,0xF8). Sweep the bottom 3 rows
         # of the whole strip: nothing anywhere may still be painting it.
         for ($dy = 1; $dy -le 3; $dy++) {
-            $y = $offY + $barH - $dy
+            $y = $stripTop + $barH - $dy
             for ($x = 0; $x -lt $clientW; $x += 2) {
                 $p = $shot.Bitmap.GetPixel($offX + $x, $y)
                 if ([math]::Abs($p.R - 0x3D) -le 24 -and [math]::Abs($p.G - 0x8E) -le 24 -and [math]::Abs($p.B - 0xF8) -le 24) { return $true }
@@ -229,7 +250,7 @@ try {
 
     # A click on the strip, posted where a real one would land.
     function Strip-Click([int]$cx) {
-        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cx) -Y ($clientY + [int]($barH / 2)) -Button left -Action click)
+        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cx) -Y ($clientY + $capH + [int]($barH / 2)) -Button left -Action click)
         Start-Sleep -Milliseconds 300
     }
 
@@ -276,7 +297,7 @@ try {
     # -----------------------------------------------------------------------
     Assert (-not (Any-Accent-Blue $shot)) 'selection: the full-width blue accent rule is gone (no accent pixels in the strip)'
     $midStripX = [int](($tabRight + $clientW - $padR - 2 * $btnPaint - $gap) / 2)
-    $px = $shot.Bitmap.GetPixel($offX + $midStripX, $offY + $barH - 2)
+    $px = $shot.Bitmap.GetPixel($offX + $midStripX, $stripTop + $barH - 2)
     Assert ($px.R -ge 10 -and $px.R -le 40) "strip: dead space right of the tab is bar background, not tab or accent (R=$($px.R))"
 
     # -----------------------------------------------------------------------
@@ -294,8 +315,8 @@ try {
     #     than an interior row of the same fill. Sampled at several x so a
     #     single stray pixel neither passes nor fails it.
     # -----------------------------------------------------------------------
-    $seamY  = $offY + $barH - 1
-    $innerY = $offY + $barH - 5
+    $seamY  = $stripTop + $barH - 1
+    $innerY = $stripTop + $barH - 5
     $seamMax = 0; $innerMax = 0; $seamAt = -1
     for ($x = $tabLeft + 8; $x -lt $tabRight - 8; $x += 4) {
         $ps = $shot.Bitmap.GetPixel($offX + $x, $seamY)
@@ -327,7 +348,7 @@ try {
     $rowW = @{}; $colH = @{}
     for ($x = $scanL; $x -le $scanR; $x++) {
         for ($y = 0; $y -lt $barH; $y++) {
-            $p = $shot.Bitmap.GetPixel($offX + $x, $offY + $y)
+            $p = $shot.Bitmap.GetPixel($offX + $x, $stripTop + $y)
             if (($p.R + $p.G + $p.B) -lt 150) { continue }
             if ($mLeft -lt 0 -or $x -lt $mLeft) { $mLeft = $x }
             if ($x -gt $mRight) { $mRight = $x }
@@ -357,7 +378,7 @@ try {
         $stemCol = ($colH.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
         $hL = $clientW; $hR = -1
         for ($x = $scanL; $x -le $scanR; $x++) {
-            $p = $shot.Bitmap.GetPixel($offX + $x, $offY + $barRow)
+            $p = $shot.Bitmap.GetPixel($offX + $x, $stripTop + $barRow)
             if (($p.R + $p.G + $p.B) -lt 150) { continue }
             if ($x -lt $hL) { $hL = $x }
             if ($x -gt $hR) { $hR = $x }
@@ -502,7 +523,14 @@ try {
     $offY = $clientY - $wr.Top
     $panes2 = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
     if ($panes2.Count -lt 1) { Write-Host 'SETUP FAIL: long-title pane not found'; exit 1 }
-    $barH = $panes2[0].Top - $clientY
+    # Same datum as above, re-measured for this window: caption band first, then
+    # the strip under it (T256).
+    $scale = (Get-TestWindowDpi -Window $top) / 96.0
+    $sm    = [int][math]::Round(4 * $scale)
+    $sq    = [int][math]::Round(28 * $scale)
+    $capH  = 2 * $sm + $sq
+    $barH  = $panes2[0].Top - $clientY - $capH
+    $stripTop = $offY + $capH
     $runW = $clientW - $padR - $btnPaint - $gap - $btnPaint - $gap - $padL
     $capW = [math]::Max([int][math]::Floor($runW / 2), $minTabW)
     if (-not (Focus-TestWindow -Window $top -Child ([IntPtr]$panes2[0].Hwnd))) {

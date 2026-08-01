@@ -132,7 +132,11 @@ function Start-Gui([string]$label, [string[]]$extraArgs) {
     # A stale debug layout manifest would restore a previous run's windows
     # over the one under test (the T131 lesson).
     Remove-Item "$env:LOCALAPPDATA\ghoztty\session-layout-debug.json" -Force -ErrorAction SilentlyContinue
-    $argList = @('--config-default-files=false') + $extraArgs
+    # A black background makes the strip's three surfaces unmistakable in a
+    # capture - content-black chiclet, lifted inactive tab, bar-gray strip -
+    # which is what Strip-Geometry measures the tab run against (T256). On a
+    # light theme an inactive tab's 6% lift is ~1 level and unreadable.
+    $argList = @('--config-default-files=false', '--background=#000000') + $extraArgs
     $app = Start-OnTestDesktop -Exe $exe -Arguments $argList
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
@@ -246,18 +250,35 @@ function Send-MenuKey([IntPtr]$w, [string]$key) {
     [void](Send-TestControlKey -Control $w -Key $key)
 }
 
-# Click in the tab strip at CLIENT (x, y); x < 0 counts back from the right
-# edge. The strip is painted AND hit-tested by the top-level window, so that is
-# where the click is posted (T216: name the window a real click would reach).
+# Height of the caption band that T254 moved INTO the client area, in physical
+# pixels: `caption_layout.Metrics.caption_h`, which is 4 + 28 + 4 DIP resolved
+# at this window's own DPI - the same GetDpiForWindow the app derives
+# `Window.scale` from.
+#
+# T256: the tab strip used to start at client y = 0 and every y below was
+# written that way. It now starts at y = captionHeight, so a strip-relative y
+# has to be offset by this or it lands in the caption (where it drags the
+# window, or hits minimize/maximize/close). Derived, never a fixed 36: T205
+# moves this datum again when the strip goes INTO the caption row.
+function Caption-Height([IntPtr]$top) {
+    $scale = (Get-TestWindowDpi -Window $top) / 96.0
+    $px = { param([double]$dip) [int][Math]::Round($dip * $scale, [MidpointRounding]::AwayFromZero) }
+    return 2 * (& $px 4.0) + (& $px 28.0)
+}
+
+# Click in the tab strip at (client x, STRIP-relative y); x < 0 counts back from
+# the right edge. The strip is painted AND hit-tested by the top-level window,
+# so that is where the click is posted (T216: name the window a real click would
+# reach).
 function Click-Strip([IntPtr]$top, [int]$x, [int]$y) {
     $cr = Get-TestWindowRect -Window $top -Client
     $sx = if ($x -lt 0) { $cr.Right + $x } else { $cr.Left + $x }
-    [void](Send-TestMouse -Window $top -Target $top -X $sx -Y ($cr.Top + $y) -Button left -Action click)
+    $sy = $cr.Top + (Caption-Height $top) + $y
+    [void](Send-TestMouse -Window $top -Target $top -X $sx -Y $sy -Button left -Action click)
 }
 
 # Where the strip's three regions ARE, in client x, for a window at this DPI
-# with this many tabs - `tab_strip_layout.zig`'s published model evaluated
-# here rather than guessed.
+# with this many tabs.
 #
 # The section used to click a hard-coded "46px left of the right edge" for the
 # "+". That constant was written when a SINGLE tab stretched to fill the strip,
@@ -266,31 +287,72 @@ function Click-Strip([IntPtr]$top, [int]$x, [int]$y) {
 # from the LEFT. The offset was doubly wrong at 125% DPI, where the scaled
 # button group is wide enough that 46px from the right edge lands INSIDE the
 # menu button - which is what the migration measured (the "+" click opened the
-# menu and no tab ever appeared). The model below is self-checking: every user
-# of it asserts an outcome, so a wrong model fails the section rather than
-# quietly clicking dead space.
+# menu and no tab ever appeared).
+#
+# T256: what replaced it - a re-implementation of `tab_strip_layout`'s tab
+# SIZING - then broke the same way one rule change later. T235 made a tab's
+# width its measured TITLE plus padding, so the modelled "equal share, capped at
+# 200 DIP" width was ~250px against a real ~344px tab and the "+" click landed
+# back inside tab 1. A script cannot re-derive a width that comes from text
+# metrics, and it should not try (that is T249's point).
+#
+# So the tab run is no longer modelled at all - it is MEASURED. Only the two
+# right-anchored buttons are derived (`padR` + the shared 28 DIP square, which
+# is anchoring, not sizing), and the last tab's painted right edge is read off a
+# capture: scanning leftward from just inside the menu button along a row near
+# the strip's BOTTOM, the first pixel that is not strip background is the tab.
+# That row is below the "+" glyph's extent, so nothing between the tab and the
+# menu button can be mistaken for it.
 function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
     $dpi = Get-TestWindowDpi -Window $top
     $scale = $dpi / 96.0
     # Metrics.init's px(): round half AWAY from zero, which is @round in Zig -
     # NOT PowerShell's default banker's rounding.
     $px = { param([double]$dip) [int][Math]::Round($dip * $scale, [MidpointRounding]::AwayFromZero) }
-    $padL = & $px 4.0; $padR = & $px 4.0; $gap = & $px 8.0; $btnW = & $px 36.0
-    $tabGap = & $px 4.0; $maxTabW = & $px 200.0; $minTabW = & $px 60.0
-    $cw = (Get-TestWindowRect -Window $top -Client).Width
+    $padL = & $px 4.0; $padR = & $px 4.0; $gap = & $px 8.0
+    # The PAINTED square every chrome button is (icon_button.Metrics.target),
+    # which is what the gaps are measured against since T232.
+    $btnW = & $px 28.0
+    $capH = 2 * $padL + $btnW              # caption_layout.Metrics.caption_h
+    $barH = 3 * $padL + $btnW              # tab_strip_layout.Metrics.bar_h
+    $cr = Get-TestWindowRect -Window $top -Client
+    $wr = Get-TestWindowRect -Window $top
+    $cw = $cr.Width
+    $offX = $cr.Left - $wr.Left
+    # Window-relative row near the strip's bottom: inside a chiclet at its full
+    # width (the rounding is on the TOP corners only) and below the "+" glyph.
+    $rowY = ($cr.Top - $wr.Top) + $capH + $barH - 2
 
     $menuLeft = $cw - $padR - $btnW
     $plusLimit = $menuLeft - $gap - $btnW
-    $tabsAvail = $plusLimit - $gap - $padL
-    $n = [Math]::Max($tabCount, 1)
-    $w = [Math]::Min([Math]::Max([int][Math]::Truncate($tabsAvail / $n), $minTabW), $maxTabW)
-    $fits = [Math]::Max([int][Math]::Truncate($tabsAvail / $w), 1)
-    $visible = [Math]::Min($n, $fits)
-    $tabsRight = $padL + ($visible - 1) * $w + [Math]::Max($w - $tabGap, 1)
+
+    # Measured: the last tab's painted right edge (exclusive).
+    $tabsRight = $padL
+    $shot = $null
+    for ($t = 0; $t -lt 20; $t++) {
+        $shot = Get-TestWindowPixels -Window $top
+        if ((Get-TestDistinctColors -Shot $shot) -ge 8) { break }
+        Close-TestWindowPixels $shot; $shot = $null
+        Start-Sleep -Milliseconds 150
+    }
+    if ($null -ne $shot) {
+        try {
+            # The strip background, sampled in the gap left of the menu button.
+            $bg = $shot.Bitmap.GetPixel($offX + $menuLeft - 2, $rowY)
+            for ($x = $menuLeft - 2; $x -ge $padL; $x--) {
+                $p = $shot.Bitmap.GetPixel($offX + $x, $rowY)
+                if ([Math]::Abs($p.R - $bg.R) -gt 8 -or [Math]::Abs($p.G - $bg.G) -gt 8 -or
+                    [Math]::Abs($p.B - $bg.B) -gt 8) { $tabsRight = $x + 1; break }
+            }
+        } finally { Close-TestWindowPixels $shot }
+    }
     $plusLeft = [Math]::Min($tabsRight + $gap, $plusLimit)
 
     [pscustomobject]@{
-        Dpi = $dpi; ClientW = $cw; BtnW = $btnW; MinTabW = $minTabW
+        Dpi = $dpi; ClientW = $cw; BtnW = $btnW; TabsRight = $tabsRight
+        # The floor a tab shrinks to under pressure - the one width constant
+        # T235 kept. Used only to size the reflow section's tab count.
+        MinTabW = & $px 60.0
         MenuX = $menuLeft + [int]($btnW / 2)
         PlusX = $plusLeft + [int]($btnW / 2)
         # Strip that belongs to neither a tab, the "+", nor the menu button.
@@ -485,13 +547,15 @@ try {
 
     $cr = Get-TestWindowRect -Window $g.Top -Client
     $cw = $cr.Width
+    # The strip's first row, not the client's (T256).
+    $stripTop = $cr.Top + (Caption-Height $g.Top)
     # Ink = pixels far from the rect's own most-common color (the bar
     # background), measured in SCREEN coordinates against the capture.
     function Ink([int]$xClient, [int]$w, [int]$h) {
         $counts = @{}
         $px = New-Object 'System.Drawing.Color[,]' $w, $h
         for ($yy = 0; $yy -lt $h; $yy++) { for ($xx = 0; $xx -lt $w; $xx++) {
-            $c = Get-TestPixel -Shot $shot -X ($cr.Left + $xClient + $xx) -Y ($cr.Top + 2 + $yy)
+            $c = Get-TestPixel -Shot $shot -X ($cr.Left + $xClient + $xx) -Y ($stripTop + 2 + $yy)
             if ($null -eq $c) { $c = [System.Drawing.Color]::Transparent }
             $px[$xx, $yy] = $c
             $k = $c.ToArgb()
