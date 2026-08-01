@@ -126,6 +126,15 @@ if (-not $SkipBuild) {
         Fail-Launch "repo not found (needed to build the staging release): $Repo" 2
     }
     $buildLog = Join-Path $env:TEMP "ghoztty-staging-build-$buildStamp.log"
+    # The child inherits this process's environment, and the launching tool
+    # shell usually has no ZIG_GLOBAL_CACHE_DIR - which puts zig's cache on C:
+    # while the repo is on D: and kills the build in Run.zig's convertPathArg.
+    # See Get-ZigGlobalCacheDir; an explicit setting is always left alone.
+    $zigCache = Get-ZigGlobalCacheDir -Repo $Repo -Current $env:ZIG_GLOBAL_CACHE_DIR
+    if ($zigCache -and $zigCache -ne $env:ZIG_GLOBAL_CACHE_DIR) {
+        $env:ZIG_GLOBAL_CACHE_DIR = $zigCache
+        Write-Host "ZIG_GLOBAL_CACHE_DIR was unset; using $zigCache (it must be on the repo's drive)"
+    }
     Write-Host "building the staging release into $Staging (log: $buildLog)"
     $buildArgs = @(
         'build', '-Dapp-runtime=win32', '-Doptimize=ReleaseFast',

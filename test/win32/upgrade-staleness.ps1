@@ -106,6 +106,23 @@ AssertEq "A14 HEAD reads back as a short sha" $true `
     ((Get-RepoHeadCommit -Repo $Repo) -match '^[0-9a-f]{7,40}$')
 AssertEq "A15 a directory that is not a repo yields no HEAD" '' (Get-RepoHeadCommit -Repo $env:TEMP)
 
+# --- A16 the zig cache drive --------------------------------------------------
+# Found by running the launcher for real, which the sandbox above cannot do: with
+# no ZIG_GLOBAL_CACHE_DIR the cache lands on C: while the repo is on D:, a Run
+# step cannot express a cross-drive absolute path relative to its child cwd, and
+# zig panics in convertPathArg - surfacing as "unable to read results of
+# configure phase" under a build-runner stack trace. Every hand-run build here
+# exports the variable; a detached delivery child does not inherit that habit.
+AssertEq "A16 an unset cache defaults to the REPO's drive, not zig's %LOCALAPPDATA%" 'D:\zig-cache' `
+    (Get-ZigGlobalCacheDir -Repo 'D:\git\ghoztty')
+AssertEq "A17 a repo on another drive follows it there" 'E:\zig-cache' `
+    (Get-ZigGlobalCacheDir -Repo 'E:\somewhere\else')
+AssertEq "A18 an explicit setting is never overridden" 'X:\my-own-cache' `
+    (Get-ZigGlobalCacheDir -Repo 'D:\git\ghoztty' -Current 'X:\my-own-cache')
+$launcherSrc = Get-Content -LiteralPath (Join-Path $Repo 'scripts\launch-upgrade.ps1') -Raw
+Assert "A19 and the launcher actually applies it before building" `
+    ($launcherSrc -match '\$env:ZIG_GLOBAL_CACHE_DIR\s*=\s*\$zigCache')
+
 if ($PureOnly) {
     ""
     if ($script:failures -eq 0) { "ALL PASS (pure only)" } else { "$($script:failures) FAILURE(S)" }

@@ -1,4 +1,4 @@
-# The delivery's FRESHNESS gate (tracker T208).
+# The delivery's BUILD and FRESHNESS helpers (tracker T208).
 #
 # `upgrade-ghoztty-windows.ps1` has no build step by design - it copies whatever
 # is already sitting in `zig-out-release`. That contract was written down
@@ -103,6 +103,36 @@ function Resolve-GhozttyExeCommit {
     $commit = Get-CommitFromVersionText $r.Text
     $why = if ($commit) { '' } elseif ($r.Why) { $r.Why } else { "no version line in the output of '$Exe +version'" }
     return @{ Commit = $commit; Why = $why }
+}
+
+# Where zig's GLOBAL cache must live to build $Repo, given whatever the
+# environment already says ($Current, normally $env:ZIG_GLOBAL_CACHE_DIR).
+#
+# An explicit setting always wins - this only fills in a default, and the default
+# is NOT zig's own. Zig puts the global cache under %LOCALAPPDATA% (drive C:);
+# with the repo on D: the build dies:
+#
+#   thread N panic: reached unreachable code
+#     std\Build\Step\Run.zig:662 in convertPathArg
+#       assert(!std.fs.path.isAbsolute(child_cwd_rel));
+#   error: unable to read results of configure phase from '.zig-cache\tmp\...'
+#
+# A Run step rewrites absolute paths as child-cwd-relative, and a path rooted on
+# another drive HAS no relative form - so the assert fires and the real error is
+# buried under a build-runner stack trace. Measured on the box 2026-08-01, and it
+# is why every hand-run build here exports the variable first. A detached
+# delivery child inherits the launching tool shell's environment, where it is
+# usually absent, so the launcher must not rely on the caller having done it.
+function Get-ZigGlobalCacheDir {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [AllowEmptyString()][AllowNull()][string]$Current = ''
+    )
+    if ($Current) { return $Current }
+    $root = ''
+    try { $root = [IO.Path]::GetPathRoot($Repo) } catch { $root = '' }
+    if (-not $root) { return '' }
+    return (Join-Path $root 'zig-cache')
 }
 
 # `git rev-parse --short HEAD` in $Repo, or '' if git or the repo is unavailable.

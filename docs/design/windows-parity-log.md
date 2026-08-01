@@ -4880,3 +4880,17 @@ EMPTY staging directory, which is now refused before the launch mechanics it
 tests are reached. It stages a copy of the built exe and passes `-SkipBuild
 -ExpectedCommit`. The argv whitespace guard moved ahead of the build with it, so
 a mis-quoted path costs zero minutes instead of a full ReleaseFast build.
+
+**Addendum, same turn.** The suite never builds - that is what makes it hermetic
+- so the build step shipped untested by it. Running the launcher for real caught
+it in one go: with `ZIG_GLOBAL_CACHE_DIR` unset, zig's global cache lands under
+`%LOCALAPPDATA%` on C: while the repo is on D:, a `Run` step cannot express a
+cross-drive absolute path relative to its child cwd, and the build panics in
+`convertPathArg` - surfacing as "unable to read results of configure phase"
+under a build-runner stack trace. Every hand-run build here exports the variable
+first, which is precisely why it was invisible: **a habit of the operator is not
+a property of the script**, and a detached delivery child inherits the launching
+tool shell's environment, not the operator's habits. The launcher now fills the
+default itself, on the repo's own drive, and never overrides an explicit setting.
+Verified end to end afterwards from a shell with the variable unset: cache
+pinned, build a no-op, gate green against real HEAD, `LAUNCH OK`.
