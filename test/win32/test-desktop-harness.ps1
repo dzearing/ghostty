@@ -24,6 +24,12 @@
 #               changes.
 #   capture     Get-TestWindowPixels via PrintWindow(PW_RENDERFULLCONTENT),
 #               the only capture that survives off the input desktop.
+#   limit       and where that capture STOPS: the GhozttyTerminal surface.
+#               T214 (2026-08-01) turned the header's prose into three
+#               measured assertions - the guard refuses it by class, the
+#               forced capture is a flat fill, and the fill does not move when
+#               the pane renders. The last two are the negative control for
+#               the first: without them the refusal is a superstition.
 #
 # The capture assertion carries its own negative control: the SAME probe runs
 # against a light-chrome window and a dark-chrome one and must separate them.
@@ -142,6 +148,48 @@ try {
     if ($paneName) { $paneText = (& $exe +read --name=$paneName --lines=20 2>&1 | Out-String) }
     Assert ($paneText -match [regex]::Escape($token)) "Send-TestText delivered '$token' to the terminal"
     Assert (-not ($paneText -match 'hhaarrnneessss')) 'Send-TestText did NOT double characters (no WM_CHAR)'
+
+    # --- THE CAPTURE LIMIT, measured rather than asserted from the header
+    #     (T214). The pane has just echoed a token, so it is definitely
+    #     rendering content. Three assertions, in the order that makes the
+    #     trap visible:
+    #
+    #       1. the guard refuses the capture BY CLASS, before anything can be
+    #          measured - a flat fill is a valid bitmap, so there is nothing to
+    #          detect after the fact;
+    #       2. -AllowTerminalSurface gets through, and what comes back is a
+    #          flat fill on a pane full of text;
+    #       3. it is the SAME flat fill after more text renders.
+    #
+    #     (2) and (3) are the negative control for (1): they prove the refusal
+    #     guards a real limit. They are also the trap itself, stated as a
+    #     measurement - a probe here does not fail loudly, it passes against
+    #     nothing.
+    $refused = $false
+    try { Get-TestWindowPixels -Window $pane | Out-Null }
+    catch { $refused = ($_.Exception.Message -match 'GhozttyTerminal') }
+    Assert $refused 'Get-TestWindowPixels REFUSES the GhozttyTerminal surface by class'
+
+    $shot = Get-TestWindowPixels -Window $pane -AllowTerminalSurface
+    try {
+        $surfColors = Get-TestDistinctColors -Shot $shot
+        $surfLum = Get-TestBrightness -Shot $shot
+    } finally { Close-TestWindowPixels $shot }
+    Write-Host "capture: terminal surface distinct=$surfColors meanLum=$surfLum"
+    Assert ($surfColors -le 2) `
+        "the terminal surface captures as a FLAT FILL ($surfColors distinct colors on a pane that just echoed '$token')"
+
+    Send-TestText -Window $top -Target $pane -Text 'echo ZZZZZZZZZZZZZZZZ' | Out-Null
+    Send-TestKeys -Window $top -Target $pane -Key Enter | Out-Null
+    Start-Sleep -Milliseconds 1200
+    $shot2 = Get-TestWindowPixels -Window $pane -AllowTerminalSurface
+    try {
+        $surfColors2 = Get-TestDistinctColors -Shot $shot2
+        $surfLum2 = Get-TestBrightness -Shot $shot2
+    } finally { Close-TestWindowPixels $shot2 }
+    Write-Host "capture: terminal surface after more output distinct=$surfColors2 meanLum=$surfLum2"
+    Assert (($surfColors2 -le 2) -and ([math]::Abs($surfLum2 - $surfLum) -le 1)) `
+        "the flat fill does not move when the terminal renders (distinct=$surfColors2 meanLum=$surfLum2 vs $surfLum)"
 
     # --- a modifier CHORD: ctrl+shift+t must add a tab.
     Assert ((Get-TabCount) -eq 1) 'setup: one tab before the chord'

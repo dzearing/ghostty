@@ -4628,3 +4628,47 @@ with the new separation assertion; `zig build test` both lanes exit 0;
 `test-agent` failed run 1 on `remote.agent.server.test.client DATA reaches the
 child` and passed runs 2-3 - T258 again, same assertion, unchanged by this
 diff; P1-P3 ACCEPTANCE: ALL PASS.
+
+## 2026-08-01 - T214: the capture limit is now refused by class, not remembered
+
+The open half of T214 was a decision, and a decision that lives only in a
+header regrows. Finished question 1 by reading all 22 pixel-probing scripts'
+capture targets rather than inferring them: 20 probe chrome, and the terminal-
+content set is `profile-latency.ps1`'s scroll hash plus **`color-contrast.ps1`,
+which every previous sweep missed** - including T272's, whose pattern was
+"grabs foreground". That script grabs none; it reads `GetDC(NULL)` + `GetPixel`,
+which is dead off the input desktop for an entirely different reason. Being
+un-runnable in the loop is the property that matters, and stealing focus is
+only one cause of it. **T276.**
+
+Question 2 is answered as four ordered routes, written where the next author
+will be standing (`lib\TestDesktop.ps1`'s CAPTURE LIMIT header): ask which
+thread PAINTED the pixels; substitute another native painter of the same value;
+drop the assertion in place with its reason; or declare it interactive by
+design. Route 0 - an app-side GL readback over IPC - is deliberately not built
+for 3 assertions and 2 scripts that all had a cheaper route, and it is filed
+as **T275** rather than left implicit, with the observation that makes it cheap
+when it comes: `Surface.heroSnap` already crosses the GL->GDI boundary, so what
+is missing is a way to ASK for the snapshot, not a way to take one.
+
+The enforceable half is the point. `Get-TestWindowPixels` now REFUSES a
+`GhozttyTerminal` capture by class, up front - a flat fill is a perfectly valid
+bitmap, so there is nothing to detect after the fact, and refusing by class is
+the only place the check can work. All 29 existing call sites audited: none
+targets a terminal child, so the guard costs no migration.
+
+And the header's prose became three measured assertions in
+`test-desktop-harness.ps1`, on a pane that has just echoed a token: the guard
+refuses; a forced capture reads **1 distinct color, meanLum 255**; and it is
+the SAME 1 color and 255 after more output renders. That last one is the
+required negative control in its stronger form - the fill is shown not to move
+AT ALL while the pane renders, so a probe there does not fail loudly, it passes
+against nothing. The positive control sits in the same run: chrome separates
+light caption from dark by 219 levels.
+
+T209 was recorded as blocked on this answer. It is not: all nine of its
+assertions are GDI-painted chrome, which is the half that captures. Said so in
+its file.
+
+Evidence: `test-desktop-harness.ps1` ALL PASS (23, up from 20); `zig build
+test` both lanes exit 0; `test-agent` exit 0; P1-P3 ACCEPTANCE: ALL PASS.

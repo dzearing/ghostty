@@ -44,6 +44,47 @@
 # native chrome migrate; probes of rendered terminal content cannot, and must
 # not be "migrated" into an assertion that passes against a blank fill.
 #
+# THE ROUTE for a terminal-content probe (T214, decided 2026-08-01). In order,
+# and the first one that applies wins:
+#
+#   1. ASK WHICH THREAD PAINTED THE PIXELS, not which technology produced
+#      them. GL content that the app itself moves onto the GDI side is
+#      capturable: the hero carousel's thumbnails are renderer output, but the
+#      renderer thread snapshots them into a DIB (Surface.heroSnap*) and the
+#      GUI thread blits them into the PARENT's DC inside BeginPaint, so
+#      PrintWindow sees them (101 distinct colors, measured). Probe the window
+#      that PAINTED, not the surface that RENDERED.
+#   2. FIND ANOTHER NATIVE PAINTER OF THE SAME VALUE. window-color's pane
+#      centre tint probe became the banner band, a different consumer of the
+#      same effective background (Surface.refreshBannerColors). Label what the
+#      substitute does NOT cover - there, the glass itself.
+#   3. DROP THE ASSERTION, in place, with the measured reason in the script
+#      header. Never weaken it into something a flat fill can pass. hero-mode's
+#      two Get-PaneColorCount probes went this way.
+#   4. INTERACTIVE BY DESIGN - keep it on the input desktop and declare it
+#      below. Only for a script whose whole oracle is terminal content.
+#
+# Route 0 - an app-side GL readback exposed over IPC - is NOT built, and the
+# reason is that the app already has half of it: heroSnap proves the renderer
+# can hand a DIB to the GUI thread. If routes 1-4 ever stop being enough,
+# generalise heroSnap rather than inventing a second capture path (T275).
+#
+# TERMINAL-CONTENT PROBES THAT STAY ON THE INPUT DESKTOP (declared, not
+# missed - an undeclared exception is indistinguishable from an oversight):
+#
+#   color-contrast.ps1   (T150) The whole script reads back colors the
+#                        RENDERER chose - derived foreground, regenerated
+#                        palette, draw-time contrast floor. None of it exists
+#                        anywhere but in GL pixels. Screen-DC GetPixel.
+#   profile-latency.ps1  (T53b) One assertion: the scroll-viewport pixel hash.
+#                        The script is interactive anyway (SendInput timing IS
+#                        the measurement) - see T272.
+#
+# The guard that keeps this from regrowing is in Get-TestWindowPixels: it
+# REFUSES a GhozttyTerminal capture unless -AllowTerminalSurface is passed,
+# so a new probe cannot silently score itself against a flat fill.
+# terminal-capture-guard.ps1 is the measured proof that the fill is real.
+#
 # MECHANISM LIMIT - VK_PACKET (measured here 2026-07-31, T217 batch 4):
 # SendInput(KEYEVENTF_UNICODE) is how screen readers, on-screen keyboards and
 # automation inject text; the app sees it as a WM_KEYDOWN with wParam
@@ -1944,9 +1985,40 @@ Returns { Bitmap, Width, Height, Left, Top }. Bitmap is a System.Drawing.Bitmap
 in WINDOW coordinates, so a screen coordinate maps to ($x - $shot.Left,
 $y - $shot.Top). Dispose with Close-TestWindowPixels.
 #>
+<#
+PrintWindow capture of a window, as a disposable Bitmap + its screen origin.
+
+REFUSES the OpenGL terminal surface (T214). PrintWindow on a GhozttyTerminal
+child returns a flat fill on a background desktop - one color, unchanged after
+typing - so a probe aimed there reads a constant and scores green against a
+pane that renders nothing. That is not a capture failure this function can
+detect after the fact: a flat fill is a perfectly valid bitmap, and "is it
+dark?" style assertions pass against it happily. So the refusal is by CLASS,
+up front, before anyone can measure anything.
+
+Pass -AllowTerminalSurface only to MEASURE the limit itself (that is what
+terminal-capture-guard.ps1 does). For a real terminal-content probe, take one
+of the four routes in the CAPTURE LIMIT header instead.
+#>
 function Get-TestWindowPixels {
-    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        $Desktop,
+        [switch]$AllowTerminalSurface
+    )
     $td = Resolve-TestDesktop $Desktop
+    if (-not $AllowTerminalSurface) {
+        $cls = $td.ClassName($Window)
+        if ($cls -eq 'GhozttyTerminal') {
+            throw ("Get-TestWindowPixels: refusing to capture the GhozttyTerminal surface. " +
+                   "PrintWindow returns a flat fill for it off the input desktop, so any " +
+                   "assertion on this capture would pass against nothing (T214). Probe the " +
+                   "window that PAINTED the pixels, substitute another native painter of the " +
+                   "same value, drop the assertion with its reason, or declare the script " +
+                   "interactive-by-design - see the CAPTURE LIMIT header. " +
+                   "-AllowTerminalSurface is for measuring the limit itself.")
+        }
+    }
     $r = $td.CaptureWindow($Window)
     if ($r[0] -eq 0) { throw "Get-TestWindowPixels failed: $($td.LastError)" }
     $hbmp = [IntPtr]$r[0]
