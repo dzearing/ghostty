@@ -4026,3 +4026,31 @@ gave 1px. The PowerShell mirror of `bandPx` must pass
 `[MidpointRounding]::AwayFromZero` — .NET defaults to banker's rounding and
 125% lands exactly on the midpoint, so the naive form expects 2px where the
 product correctly paints 3.
+
+## 2026-07-31 - T233 delivery verified on the box; T241's last open item closed, T253 filed
+
+Verification pass, no product change.
+
+**T233 landed.** `ghoztty +version` reports `1.4.0-...-+efaa7f151` for both the
+installed binary and the running instance, matching HEAD. `test/win32/split-divider.ps1`
+is ALL PASS (38 assertions) with every T233 assertion green: the band measures
+3px at 120 dpi (2 DIP, never a single physical pixel), rest is the configured
+gray, a move onto the band sets the hot state, leaving drops it, and the band
+stays lit through a drag.
+
+**T241's "still open" item is now observed rather than predicted.** The lock's
+`claude_pid` (13060) is the claude that actually owns this pane - confirmed by
+walking the session's own ancestry from inside it, not by trusting the record -
+and `pane_id` matches `$GHOZTTY_PANE_ID`. The watchdog's pane probe logged
+`occupant=claude (lock owner_alive=True)` and took the nudge branch; the shim
+branch that caused T241 was never reached. Evidence written into T241.
+
+**What the same pass turned up: T253.** The tick that logged `occupant=claude`
+also re-entered, because the heartbeat had been stale since 16:31 - nothing
+refreshes it *during* a turn, and the T233 delivery ran 46 minutes past its
+step-6 heartbeat. So a healthy long turn draws a nudge, and that nudge types
+`read go.md and go` + Enter into a session that is still working, where it
+queues and starts a second task in a context that was supposed to reset.
+`Test-PaneProducing` does not catch it: five lines, 8 seconds apart. Filed with
+the sketch (beat the heartbeat from a hook that already fires, widen the probe,
+make the resume prompt reset-first so a wrong nudge is merely expensive).
