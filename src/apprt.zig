@@ -116,6 +116,10 @@ test {
     // deal.
     _ = @import("apprt/win32/tab_shape.zig");
 
+    // Pure win32 chrome color resolution — system accent + the derived
+    // bar/hover/text palette (T304), same no-OS-imports deal.
+    _ = @import("apprt/win32/chrome_theme.zig");
+
     // Pure win32 layered-overlay z-order policy (T142), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/overlay_zorder.zig");

@@ -80,6 +80,37 @@ pub fn contrastForeground(bg: Rgb) Rgb {
         .{ .r = 255, .g = 255, .b = 255 };
 }
 
+/// Composite white (over a dark background) or black (over a light one) at
+/// alpha `a` — "a wash", the one primitive every layered win32 chrome surface
+/// is built from: the banner card's fill, a tab's inactive/hovered lift, and
+/// the tab bar's own band.
+///
+/// This is an ALPHA COMPOSITE, not `lighten`/`darken` above: those are HSB
+/// brightness moves that preserve saturation and so land on a different color
+/// than Mac's `Color.white.opacity(a)` over the same backdrop.
+///
+/// It lives HERE because three call sites had privately reimplemented it
+/// (`banner_card.fillColor`, `tab_shape.lift`, and — as `bg + 20` per channel
+/// — `Window.paintTabBar`), and the third one got it wrong: a per-channel add
+/// clamps toward white on a light background instead of darkening, so the bar,
+/// its hover and the active tab all converge on the same near-white. That is
+/// T203's root cause #2, and the fix that lasts is one implementation, not
+/// three careful ones (the T257 lesson: four copies meant four chances to be
+/// wrong and no way to notice).
+pub fn wash(bg: Rgb, a: f32) Rgb {
+    const toward: f32 = if (isLight(bg)) 0.0 else 255.0;
+    return .{
+        .r = washChannel(bg.r, toward, a),
+        .g = washChannel(bg.g, toward, a),
+        .b = washChannel(bg.b, toward, a),
+    };
+}
+
+fn washChannel(c: u8, toward: f32, a: f32) u8 {
+    const v: f32 = @floatFromInt(c);
+    return @intFromFloat(std.math.clamp(@round(v + (toward - v) * a), 0.0, 255.0));
+}
+
 pub const Hsb = struct { h: f64, s: f64, b: f64 };
 
 pub fn rgbToHsb(rgb: Rgb) Hsb {
@@ -291,9 +322,19 @@ pub const contrast_target: f64 = 4.5;
 /// closest value that does (hue/chroma preserved) — the Mac
 /// adjustPaletteForContrast loop body.
 pub fn contrastAdjusted(base: Rgb, bg: Rgb) Rgb {
+    return contrastAdjustedTo(base, bg, contrast_target);
+}
+
+/// `contrastAdjusted` against an arbitrary floor. The palette work wants the
+/// 4.5 text ratio; chrome glyphs and meaningful boundaries want WCAG 1.4.11's
+/// 3.0 (the win32 design system's §"contrast floors"), and the accent has to
+/// stay recognizably the user's color, which a 4.5 search would push past.
+/// One search, two floors — a second copy tuned to 3.0 is how the two answers
+/// start disagreeing about what "hue-preserving" means.
+pub fn contrastAdjustedTo(base: Rgb, bg: Rgb, target: f64) Rgb {
     const bg_lum = wcagLuminance(bg);
     const ratio = wcagContrastRatio(wcagLuminance(base), bg_lum);
-    if (ratio >= contrast_target) return base;
+    if (ratio >= target) return base;
 
     // Move away from the background first (darker on a light background),
     // then try the other side, and only then give up on the hue. A
@@ -306,8 +347,8 @@ pub fn contrastAdjusted(base: Rgb, bg: Rgb) Rgb {
     // black/white, which always clears the floor. Same order of preference
     // as `contrasted_color` in the shaders.
     const bg_is_light = bg_lum > 0.18;
-    if (searchLightness(base, bg_lum, bg_is_light)) |c| return c;
-    if (searchLightness(base, bg_lum, !bg_is_light)) |c| return c;
+    if (searchLightness(base, bg_lum, bg_is_light, target)) |c| return c;
+    if (searchLightness(base, bg_lum, !bg_is_light, target)) |c| return c;
     return contrastForeground(bg);
 }
 
@@ -315,7 +356,7 @@ pub fn contrastAdjusted(base: Rgb, bg: Rgb) Rgb {
 /// hue and chroma preserved, for the SMALLEST change that clears
 /// `contrast_target` against `bg_lum`. Null when even the endpoint of that
 /// direction misses the target, which is the caller's cue to try elsewhere.
-fn searchLightness(base: Rgb, bg_lum: f64, darker: bool) ?Rgb {
+fn searchLightness(base: Rgb, bg_lum: f64, darker: bool, target: f64) ?Rgb {
     var lab: Lab = .fromRgb(base);
     const base_l = lab.l;
     const endpoint: f64 = if (darker) 0 else 100;
@@ -325,7 +366,7 @@ fn searchLightness(base: Rgb, bg_lum: f64, darker: bool) ?Rgb {
     // evaluates it, and would otherwise report its last (failing) probe as
     // a success.
     lab.l = endpoint;
-    if (ratioAgainst(lab, bg_lum) < contrast_target) return null;
+    if (ratioAgainst(lab, bg_lum) < target) return null;
 
     var lo: f64 = if (darker) endpoint else base_l;
     var hi: f64 = if (darker) base_l else endpoint;
@@ -334,7 +375,7 @@ fn searchLightness(base: Rgb, bg_lum: f64, darker: bool) ?Rgb {
     for (0..30) |_| {
         const mid = (lo + hi) / 2.0;
         lab.l = mid;
-        if (ratioAgainst(lab, bg_lum) >= contrast_target) {
+        if (ratioAgainst(lab, bg_lum) >= target) {
             best_l = mid;
             if (darker) lo = mid else hi = mid;
         } else {
@@ -556,6 +597,67 @@ test "contrastAdjusted: failing colors reach the 4.5 target" {
     const wr = wcagContrastRatio(wcagLuminance(bright_white), wcagLuminance(light_bg));
     try testing.expect(wr >= contrast_target - 0.1);
     try testing.expect(luminance(bright_white) < luminance(default_ansi_colors[15]));
+}
+
+test "contrastAdjustedTo: a lower floor moves the color less" {
+    // The accent case: a floor of 3.0 has to stop as soon as it clears 3.0,
+    // otherwise the user's color is dragged toward the text ramp and stops
+    // being recognizably theirs.
+    const bg: Rgb = .{ .r = 0x2A, .g = 0x2A, .b = 0x32 };
+    const accent: Rgb = .{ .r = 0x68, .g = 0x00, .b = 0x81 }; // this box's real accent
+    const at3 = contrastAdjustedTo(accent, bg, 3.0);
+    const at45 = contrastAdjustedTo(accent, bg, contrast_target);
+
+    const r3 = wcagContrastRatio(wcagLuminance(at3), wcagLuminance(bg));
+    const r45 = wcagContrastRatio(wcagLuminance(at45), wcagLuminance(bg));
+    try testing.expect(r3 >= 3.0 - 0.05);
+    try testing.expect(r45 >= contrast_target - 0.1);
+    // Both cleared their own floor, and the 3.0 answer stayed closer to the
+    // color the user picked.
+    try testing.expect(r3 < r45);
+}
+
+test "wash: direction follows the background, and a light background darkens" {
+    const dark: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x2E };
+    const light: Rgb = .{ .r = 0xF5, .g = 0xF5, .b = 0xF5 };
+
+    // Dark backgrounds lift toward white...
+    const dw = wash(dark, 0.08);
+    try testing.expect(dw.r > dark.r and dw.g > dark.g and dw.b > dark.b);
+
+    // ...and light ones fall toward black. This is the assertion `bg + 20`
+    // could never satisfy: a per-channel add moves a light background the
+    // WRONG WAY, which is how the bar, its hover and the active tab all
+    // converged on near-white in a light theme (T203 root cause #2).
+    const lw = wash(light, 0.08);
+    try testing.expect(lw.r < light.r and lw.g < light.g and lw.b < light.b);
+
+    // A wash of 0 is a no-op, and a wash of 1 reaches the endpoint.
+    try testing.expectEqual(dark, wash(dark, 0.0));
+    try testing.expectEqual(Rgb{ .r = 255, .g = 255, .b = 255 }, wash(dark, 1.0));
+    try testing.expectEqual(Rgb{ .r = 0, .g = 0, .b = 0 }, wash(light, 1.0));
+}
+
+test "wash: on a dark background it lands within a few levels of `bg + 20`" {
+    // The point of the port is that it is NOT a redesign of the dark look: on
+    // the default background the new band lands essentially where the old
+    // arithmetic put it, so the visible change is confined to light
+    // backgrounds.
+    //
+    // "Essentially", not "exactly", and the gap is structural rather than a
+    // tolerance nobody tightened: an add moves every channel by the same 20,
+    // while a wash moves each one 8% of ITS OWN distance from white — so the
+    // brighter a channel starts, the less it moves. On this background that is
+    // 2 levels on r/g and 3 on b. A test that demanded equality would be
+    // demanding the per-channel add back.
+    const bg: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x2E };
+    const w = wash(bg, 0.08);
+    const old: Rgb = .{ .r = 0x1E + 20, .g = 0x1E + 20, .b = 0x2E + 20 };
+    try testing.expect(@abs(@as(i32, w.r) - @as(i32, old.r)) <= 4);
+    try testing.expect(@abs(@as(i32, w.g) - @as(i32, old.g)) <= 4);
+    try testing.expect(@abs(@as(i32, w.b) - @as(i32, old.b)) <= 4);
+    // The blue channel started highest, so it moved least.
+    try testing.expect(@as(i32, w.b) - @as(i32, bg.b) < @as(i32, w.r) - @as(i32, bg.r));
 }
 
 test "scheme: every derived color clears its floor across the lightness range" {

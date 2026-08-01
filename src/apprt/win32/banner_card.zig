@@ -78,22 +78,11 @@ const SHEEN_BOTTOM_DARK: f32 = 0.05;
 /// lands on a different color than Mac's `Color.white.opacity(0.06)` over
 /// the same backdrop.
 pub fn fillColor(bg: Rgb) Rgb {
-    const q = struct {
-        fn ch(c: u8, toward: f32, a: f32) u8 {
-            const v: f32 = @floatFromInt(c);
-            return @intFromFloat(std.math.clamp(@round(v + (toward - v) * a), 0.0, 255.0));
-        }
-    };
-    if (color_math.isLight(bg)) return .{
-        .r = q.ch(bg.r, 0, FILL_DARKEN),
-        .g = q.ch(bg.g, 0, FILL_DARKEN),
-        .b = q.ch(bg.b, 0, FILL_DARKEN),
-    };
-    return .{
-        .r = q.ch(bg.r, 255, FILL_LIGHTEN),
-        .g = q.ch(bg.g, 255, FILL_LIGHTEN),
-        .b = q.ch(bg.b, 255, FILL_LIGHTEN),
-    };
+    // `color_math.wash` IS this composite (T304 hoisted it out of here, out of
+    // `tab_shape.lift`, and out of the tab bar's `bg + 20`). The two alphas
+    // stay here because they are the card's own design constants; only the
+    // arithmetic is shared.
+    return color_math.wash(bg, if (color_math.isLight(bg)) FILL_DARKEN else FILL_LIGHTEN);
 }
 
 /// Scaled-pixel geometry of one card inside its band.

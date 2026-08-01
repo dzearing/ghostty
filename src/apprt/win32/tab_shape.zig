@@ -270,19 +270,12 @@ pub fn fillColor(surface: Surface, strip_bg: Rgb, content_bg: Rgb) Rgb {
 /// Composite white (dark background) or black (light background) at `a` over
 /// `bg`. The same alpha composite `banner_card.fillColor` uses — NOT an HSB
 /// brightness lift, which keeps saturation and lands on a different color.
+/// The arithmetic itself now lives in `color_math.wash` (T304), where the
+/// chrome palette and the banner card read it from too.
 fn lift(bg: Rgb, a: f32) Rgb {
-    const toward: f32 = if (color_math.isLight(bg)) 0.0 else 255.0;
-    return .{
-        .r = ch(bg.r, toward, a),
-        .g = ch(bg.g, toward, a),
-        .b = ch(bg.b, toward, a),
-    };
+    return color_math.wash(bg, a);
 }
 
-fn ch(c: u8, toward: f32, a: f32) u8 {
-    const v: f32 = @floatFromInt(c);
-    return @intFromFloat(std.math.clamp(@round(v + (toward - v) * a), 0.0, 255.0));
-}
 
 /// Composite one tab into a top-down `w * h` buffer of `0x00RRGGBB`.
 ///

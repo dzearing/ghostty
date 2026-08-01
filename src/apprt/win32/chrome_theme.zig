@@ -1,0 +1,295 @@
+//! One resolution site for every flat color the win32 chrome paints (T304,
+//! the derivation half of T203).
+//!
+//! The chrome used to answer these questions three times over, and each
+//! answer was invented where it was needed: the tab bar as `background + 20`
+//! per channel, `chooser_rows.accent` as the literal `#3D8EF8`, and
+//! `ActivityMonitor.COLOR_ACCENT` as a DIFFERENT literal blue. Neither blue is
+//! the user's accent, and a per-channel add is not a color system — it clamps
+//! toward white on a light background, so the bar, its hover and the active
+//! tab converge on the same near-white and the fixed grey text goes
+//! illegible.
+//!
+//! This module answers them once, from two inputs the OS actually has: the
+//! color the chrome sits on, and the accent the user picked. Everything else
+//! is derived — washes whose DIRECTION follows the background's own luminance
+//! (`color_math.wash`), and contrast floors enforced by search rather than by
+//! hoping (`color_math.contrastAdjustedTo`).
+//!
+//! Pure: no `win32.zig` import, so the unit tests run in every app-runtime
+//! lane. The live registry read lives in `system_colors.zig`; the surfaces
+//! that consume this palette are rewired in T305.
+//!
+//! Floors, from `docs/design/win32-design-system.md`:
+//!   - text                          >= 4.5:1  (WCAG 1.4.3)
+//!   - accent, danger, chrome glyphs >= 3.0:1  (WCAG 1.4.11)
+
+const std = @import("std");
+const testing = std.testing;
+const color_math = @import("color_math.zig");
+
+pub const Rgb = color_math.Rgb;
+
+/// Windows 11's own default accent (`#0078D4`), used when the system accent
+/// cannot be read. Stated rather than invented: the previous fallbacks were
+/// two different hand-picked blues that matched nothing on the system.
+pub const default_accent: Rgb = .{ .r = 0x00, .g = 0x78, .b = 0xD4 };
+
+/// Fluent's solid window surface (`SolidBackgroundFillColorBase`): `#F3F3F3`
+/// light, `#202020` dark. Cited as DOCUMENTATION, never as a measurement —
+/// T302 established that `PrintWindow(PW_RENDERFULLCONTENT)` cannot capture a
+/// WinUI window at all (it returns a flat black bitmap and reports success),
+/// so nothing on this box can measure these two values.
+pub const surface_light: Rgb = .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 };
+pub const surface_dark: Rgb = .{ .r = 0x20, .g = 0x20, .b = 0x20 };
+
+/// The chrome band as a wash of the color behind it. 0.08 is not a new number:
+/// on the default dark background it lands within a few levels of the retired
+/// `background + 20`, so this is a light-theme FIX rather than a redesign of
+/// the dark look (asserted in color_math's wash tests).
+pub const bar_wash: f32 = 0.08;
+
+/// A hovered chrome control lifts one more step off the bar. Hover is a change
+/// of SURFACE, the same idiom `tab_shape.HOVER_LIFT` uses for tabs.
+pub const hover_wash: f32 = 0.07;
+
+/// Primary and de-emphasized chrome text, as washes of the bar toward its own
+/// contrasting side. A wash rather than a flat grey so the text ramp carries
+/// the bar's hue instead of sitting on it — and then clamped to the text floor
+/// below, so the ramp can never cost legibility.
+pub const text_wash: f32 = 0.90;
+pub const text_secondary_wash: f32 = 0.55;
+
+/// WCAG 1.4.11's floor for chrome glyphs and meaningful boundaries. The accent
+/// is clamped to THIS, not to 4.5: dragging a user's color up to the text
+/// ramp stops it being recognizably their color, and an accent rule is not
+/// text.
+pub const ui_contrast_target: f64 = 3.0;
+
+/// Windows' close-button red (`#C42B1C`), the one destructive color in the
+/// chrome. Shared so the caption's red fill and the tab close glyph stop being
+/// two different reds (`#C42B1C` vs `RGB(232,65,65)`).
+pub const danger_base: Rgb = .{ .r = 0xC4, .g = 0x2B, .b = 0x1C };
+
+/// Decode the DWORD Windows stores for the accent color. It is **ABGR**
+/// (`0xAABBGGRR`), not ARGB — read it as ARGB and every accent comes out with
+/// its red and blue swapped, which is the kind of bug that looks like a
+/// deliberate color choice.
+///
+/// MEASURED on this box (2026-08-01): `HKCU\Software\Microsoft\Windows\DWM\
+/// AccentColor` = 4286644328 = `0xFF810068` -> `#680081`, which is exactly the
+/// accent T302 recorded as this box's real one.
+pub fn accentFromDword(v: u32) Rgb {
+    return .{
+        .r = @truncate(v & 0xFF),
+        .g = @truncate((v >> 8) & 0xFF),
+        .b = @truncate((v >> 16) & 0xFF),
+    };
+}
+
+/// The color the chrome paints FROM, for a `window-theme` value.
+///
+/// `auto`/`ghostty` tint the caption to the terminal background
+/// (`Window.applyChromeTheme`), and T202's selected chiclet MERGES into the
+/// pane below it — both require the chrome to be derived from the terminal
+/// background. The explicit themes reset the caption to the system default
+/// instead, and a band tinted to the terminal background sitting next to a
+/// system-default caption is two colors pretending to be one; those follow the
+/// OS surface. `system` asks the OS which way it is.
+pub fn chromeBase(theme: anytype, terminal_bg: Rgb, system_light: bool) Rgb {
+    return switch (theme) {
+        .light => surface_light,
+        .dark => surface_dark,
+        .system => if (system_light) surface_light else surface_dark,
+        // `ghostty` is a Linux/GTK-only theme; treat it as auto on Windows —
+        // the same mapping `DarkMode.modeForTheme` makes.
+        .auto, .ghostty => terminal_bg,
+    };
+}
+
+/// Every flat color the chrome paints, resolved together.
+///
+/// Together, in one shot, on purpose: these colors are only correct RELATIVE
+/// to each other — text is legible against `bar`, the accent clears its floor
+/// against `bar`, `on_accent` against `accent`. A caller that resolved them
+/// one at a time against whatever background it happened to hold is how the
+/// three current answers ended up disagreeing.
+///
+/// Not here: the tab surfaces themselves. `tab_shape.fillColor` already
+/// derives active/inactive/hovered from the strip and content backgrounds,
+/// luminance-aware, and a second source for them would be the exact defect
+/// this module exists to remove.
+pub const Palette = struct {
+    /// The chrome band behind the tabs and the caption buttons.
+    bar: Rgb,
+    /// The base a hovered chrome control's fill shades from.
+    hover: Rgb,
+    /// Primary chrome text: the active tab's title, the window title.
+    text: Rgb,
+    /// De-emphasized chrome text: inactive tab titles, a resting close glyph.
+    text_secondary: Rgb,
+    /// The user's accent, as drawn — clamped to 3:1 against `bar`.
+    accent: Rgb,
+    /// A foreground that reads on top of `accent`.
+    on_accent: Rgb,
+    /// Destructive red, clamped to 3:1 against `bar`.
+    danger: Rgb,
+    /// A foreground that reads on top of `danger`.
+    on_danger: Rgb,
+};
+
+pub fn resolve(chrome_bg: Rgb, accent: Rgb) Palette {
+    const bar = color_math.wash(chrome_bg, bar_wash);
+    return .{
+        .bar = bar,
+        .hover = color_math.wash(bar, hover_wash),
+        .text = color_math.contrastAdjusted(color_math.wash(bar, text_wash), bar),
+        .text_secondary = color_math.contrastAdjusted(
+            color_math.wash(bar, text_secondary_wash),
+            bar,
+        ),
+        .accent = color_math.contrastAdjustedTo(accent, bar, ui_contrast_target),
+        .on_accent = color_math.contrastForeground(
+            color_math.contrastAdjustedTo(accent, bar, ui_contrast_target),
+        ),
+        .danger = color_math.contrastAdjustedTo(danger_base, bar, ui_contrast_target),
+        .on_danger = color_math.contrastForeground(
+            color_math.contrastAdjustedTo(danger_base, bar, ui_contrast_target),
+        ),
+    };
+}
+
+// --- tests ---
+
+fn ratio(a: Rgb, b: Rgb) f64 {
+    return color_math.wcagContrastRatio(
+        color_math.wcagLuminance(a),
+        color_math.wcagLuminance(b),
+    );
+}
+
+test "accentFromDword: ABGR, against the value measured on this box" {
+    // HKCU\Software\Microsoft\Windows\DWM\AccentColor = 4286644328.
+    try testing.expectEqual(
+        Rgb{ .r = 0x68, .g = 0x00, .b = 0x81 },
+        accentFromDword(4286644328),
+    );
+    // Read as ARGB the same DWORD would give #810068 — the swap this decode
+    // exists to prevent.
+    try testing.expect(!accentFromDword(4286644328).eql(.{ .r = 0x81, .g = 0x00, .b = 0x68 }));
+
+    // Channel isolation, so a future edit cannot quietly transpose two of them.
+    try testing.expectEqual(Rgb{ .r = 0xFF, .g = 0, .b = 0 }, accentFromDword(0xFF0000FF));
+    try testing.expectEqual(Rgb{ .r = 0, .g = 0xFF, .b = 0 }, accentFromDword(0xFF00FF00));
+    try testing.expectEqual(Rgb{ .r = 0, .g = 0, .b = 0xFF }, accentFromDword(0xFFFF0000));
+}
+
+test "chromeBase: explicit themes leave the terminal background behind" {
+    const Theme = enum { auto, system, light, dark, ghostty };
+    const term: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x2E };
+
+    // auto/ghostty follow the terminal so the selected chiclet can merge into
+    // the pane (T202).
+    try testing.expectEqual(term, chromeBase(Theme.auto, term, true));
+    try testing.expectEqual(term, chromeBase(Theme.ghostty, term, false));
+
+    // The explicit themes sit on the OS surface, whatever the terminal is.
+    try testing.expectEqual(surface_light, chromeBase(Theme.light, term, false));
+    try testing.expectEqual(surface_dark, chromeBase(Theme.dark, term, true));
+
+    // `system` asks the OS, and the answer moves with it — the live flip
+    // T305 wires to WM_SETTINGCHANGE.
+    try testing.expectEqual(surface_light, chromeBase(Theme.system, term, true));
+    try testing.expectEqual(surface_dark, chromeBase(Theme.system, term, false));
+}
+
+test "resolve: the light theme the old arithmetic could not express" {
+    // The concrete regression. On a light chrome background `bg + 20` moved
+    // everything toward white; the wash moves it toward black, so the band is
+    // visible, hover is a further step, and the text is dark.
+    const light: Rgb = .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 };
+    const p = resolve(light, .{ .r = 0x68, .g = 0x00, .b = 0x81 });
+
+    try testing.expect(p.bar.r < light.r);
+    try testing.expect(p.hover.r < p.bar.r);
+    try testing.expect(color_math.luminance(p.text) < 0.5);
+    try testing.expect(ratio(p.text, p.bar) >= 4.5);
+    try testing.expect(ratio(p.text_secondary, p.bar) >= 4.4);
+
+    // And on a dark one the same code lifts instead.
+    const dark: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x2E };
+    const d = resolve(dark, .{ .r = 0x68, .g = 0x00, .b = 0x81 });
+    try testing.expect(d.bar.r > dark.r);
+    try testing.expect(d.hover.r > d.bar.r);
+    try testing.expect(color_math.luminance(d.text) > 0.5);
+}
+
+test "resolve: the accent survives as the user's color when it already clears 3:1" {
+    // Contrast clamping must be a floor, not a filter: an accent that already
+    // reads against the bar comes back untouched.
+    const bg: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x2E };
+    const bright: Rgb = .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 };
+    try testing.expectEqual(bright, resolve(bg, bright).accent);
+
+    // This box's real accent (#680081) is too dark to read on a dark bar, so
+    // it IS moved — but only as far as the 3:1 floor, staying in its own hue.
+    const deep: Rgb = .{ .r = 0x68, .g = 0x00, .b = 0x81 };
+    const p = resolve(bg, deep);
+    try testing.expect(!p.accent.eql(deep));
+    try testing.expect(p.accent.b > p.accent.g);
+    try testing.expect(p.accent.r > p.accent.g);
+    try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
+    // Still well under the text floor — proof it stopped at the UI floor
+    // instead of being dragged onto the text ramp.
+    try testing.expect(ratio(p.accent, p.bar) < 4.5);
+}
+
+test "resolve: every floor holds across the whole background x accent space" {
+    // The sweep, and it is the point of the task. A single hand-picked pair
+    // proves nothing here: `bg + 20` looked fine against the one background
+    // anybody checked it against, and that is exactly how it survived.
+    var bgs: std.ArrayList(Rgb) = .empty;
+    defer bgs.deinit(testing.allocator);
+    var v: u16 = 0;
+    while (v <= 255) : (v += 8) {
+        const c: u8 = @intCast(v);
+        // Greys across the full range...
+        try bgs.append(testing.allocator, .{ .r = c, .g = c, .b = c });
+        // ...plus saturated backgrounds, where a per-channel rule skews hue.
+        try bgs.append(testing.allocator, .{ .r = c, .g = @intCast(255 - v), .b = 0x40 });
+        try bgs.append(testing.allocator, .{ .r = 0x20, .g = c, .b = @intCast(255 - v) });
+    }
+
+    const accents = [_]Rgb{
+        .{ .r = 0x68, .g = 0x00, .b = 0x81 }, // this box's real accent
+        default_accent,
+        .{ .r = 0x3D, .g = 0x8E, .b = 0xF8 }, // the retired literal
+        .{ .r = 0x00, .g = 0x00, .b = 0x00 }, // degenerate: pure black
+        .{ .r = 0xFF, .g = 0xFF, .b = 0xFF }, // degenerate: pure white
+        .{ .r = 0xFF, .g = 0xF0, .b = 0x00 }, // a very light saturated pick
+        .{ .r = 0x00, .g = 0x33, .b = 0x00 }, // a very dark saturated pick
+    };
+
+    for (bgs.items) |bg| {
+        for (accents) |a| {
+            const p = resolve(bg, a);
+
+            // Text floors.
+            try testing.expect(ratio(p.text, p.bar) >= 4.4);
+            try testing.expect(ratio(p.text_secondary, p.bar) >= 4.4);
+
+            // UI floors.
+            try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
+            try testing.expect(ratio(p.danger, p.bar) >= ui_contrast_target - 0.05);
+            try testing.expect(ratio(p.on_accent, p.accent) >= 4.4);
+            try testing.expect(ratio(p.on_danger, p.danger) >= 4.4);
+
+            // The band reads as a band, and hover reads as a lift off it —
+            // the "mutually distinguishable" half of T203's validation, which
+            // is what actually broke in a light theme.
+            try testing.expect(!p.bar.eql(bg));
+            try testing.expect(!p.hover.eql(p.bar));
+            try testing.expect(ratio(p.hover, p.bar) >= 1.02);
+        }
+    }
+}

@@ -5337,3 +5337,66 @@ still on the user's desktop. A reference fixture you cannot clean up is a bad
 fixture.
 
 Docs only; no lane re-run. `parity-tasks.ps1 validate` ALL PASS (333 tasks).
+
+## 2026-08-01 - T304 (T203 split): the chrome gets one color source, and the primitive it needed already existed twice
+
+T203 - the tab strip ignoring the system accent and breaking in light themes -
+is a color module, a five-file rewiring, live repaint on two system messages, a
+Mica judgment call, and an acceptance script that MUTATES the box's accent and
+apps theme and has to put both back. That is not one context, so it split:
+**T304** the derivation, **T305** the wiring plus the pixel assertions, **T306**
+the Mica decision. This is T304.
+
+The accent source settled quickly and empirically.
+`HKCU\Software\Microsoft\Windows\DWM\AccentColor` reads `4286644328` on this
+box, which is `0xFF810068` - **ABGR**, not ARGB - decoding to `#680081`, exactly
+the accent T302 measured through DWM. Explorer's `AccentColorMenu` holds the
+same DWORD and is the fallback. Two sources were REJECTED with their evidence in
+the source: `AccentPalette`'s eight shades, because its index semantics are
+reverse-engineered and index 3 - the one usually claimed to BE the accent - is
+`#A94DC1` here, a color the user never picked; and `DwmGetColorizationColor`,
+because `ColorizationColor` is `0xC4680081`, a composed value whose alpha byte a
+caller expecting an accent would read as a channel.
+
+The more useful finding is what the module needed and did not have to invent.
+"Composite white over a dark background or black over a light one" already
+existed **twice** - `banner_card.fillColor` and `tab_shape.lift`, character for
+character - and a third time as `Window.paintTabBar`'s `bg + 20` per channel.
+The third copy is T203's root cause #2: an add moves a light background the
+WRONG WAY, so bar, hover and active all converge on near-white and the fixed
+grey text goes illegible. So `wash` was hoisted into `color_math` and both
+survivors now call it, which is the T257 lesson applied one module earlier than
+usual: three copies meant three chances to be wrong, and the wrong one was the
+one nobody had a unit test for. Same shape for the contrast search -
+`contrastAdjusted` was hardwired to 4.5, and the accent needs WCAG 1.4.11's 3.0,
+so the existing CIELAB search took a `target` parameter rather than growing a
+sibling. A second search tuned to 3.0 is how two answers start disagreeing about
+what "hue-preserving" means.
+
+`chrome_theme.resolve` returns the whole palette in one shot, deliberately: bar,
+hover, text, text_secondary, accent, on_accent, danger, on_danger are each only
+correct RELATIVE to the others, and resolving them one at a time against
+whatever background the caller happened to hold is precisely how the app ended
+up with two different invented blues (`chooser_rows.accent = #3D8EF8` and
+`ActivityMonitor.COLOR_ACCENT = RGB(80,160,235)`) and two different reds.
+
+Validation is a sweep, not a swatch: ~96 backgrounds across the luminance range,
+greys plus saturated, x 7 accents including pure black, pure white and a very
+light saturated pick - every text pair >= 4.5:1, every accent/danger pair >=
+3.0:1, every on-accent foreground >= 4.5:1, and bar/hover always
+distinguishable. A single hand-picked pair proves nothing here; `bg + 20` looked
+fine against the one background anybody ever checked it against, which is how it
+survived to 2026-08-01.
+
+One thing done rather than assumed: the registry reader was verified END TO END
+with a temporary print in the win32 lane (`accent = #680081`), then the print
+was removed and the shipped test asserts only the machine-independent invariant,
+so it cannot fail on someone else's box. Decoding correctly in a unit test is
+not evidence that the key was read.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
+`zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0, `test-agent` exit 0.
+P1-P3 ALL PASS. Because `wash` changed two shipping call sites, the two pixel
+scripts that render them ran too: `tab-strip.ps1` ALL PASS (56),
+`pane-banner.ps1` ALL PASS (67). No surface consumes the palette yet - that is
+T305, and it is what makes any of this visible.
