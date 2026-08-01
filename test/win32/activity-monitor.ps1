@@ -1,4 +1,5 @@
-# T285 acceptance: the win32 Activity Monitor panel.
+# T285 + T286 acceptance: the win32 Activity Monitor panel and its process
+# control.
 #
 # T284 built the arithmetic (activity_layout.zig / trend_gauge.zig) and T285
 # built the window: an owner-drawn panel fed by the LOCAL process/metrics
@@ -15,7 +16,20 @@
 #      leaves exactly one panel and says so;
 #   D. the filter narrows the table, including against a KNOWN pid (the app's
 #      own), and a needle that matches nothing empties it;
-#   E. "Show all" widens it from the ghoztty-spawned tree to every process.
+#   E. "Show all" widens it from the ghoztty-spawned tree to every process;
+#   H. (T286) "New Process..." opens a modal dialog whose Start is disabled
+#      until a command is typed, and starting one puts a REAL process on the box
+#      and a row for it in the table;
+#   I. (T286) Kill appears only with a selection, its confirmation names the
+#      process and its pid, CANCELLING LEAVES THE PROCESS ALIVE (the negative
+#      control for "the confirmation is mandatory") and confirming terminates it;
+#   J. (T286) a failed action raises the dismissable error banner, and clicking
+#      its glyph removes it.
+#
+# NOTHING THE BOX NEEDS IS EVER A TARGET. H spawns `cmd.exe /C pause` - a
+# throwaway that blocks forever with no child process - and I only ever kills
+# the pid the confirmation dialog ITSELF named, so a mis-targeted row makes the
+# script fail rather than kill a bystander.
 #
 # ORACLE. A GDI-painted table has no text to read back, so the oracle is the
 # app's own log line, emitted by `ActivityMonitor.rebuild` on every input
@@ -56,6 +70,8 @@ $env:GHOZTTY_PIPE_SUFFIX = '-activitytest'
 
 $script:pass = 0
 $script:fail = 0
+# The T286 throwaway process, so the finally block can clean it up after an abort.
+$script:spawnPid = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
@@ -151,6 +167,94 @@ function Get-Panels {
     return @(Get-TestWindows -ProcessId $script:app.Pid -Class 'GhozttyActivityMonitor')
 }
 
+# The FIRST screen coordinate in the box whose pixel is exactly $Rgb, or $null.
+# Test-ExactPixel answers "is it there"; this answers "where", which is what a
+# click on a PAINTED control (the banner's dismiss glyph) needs.
+function Find-ExactPixel($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int[]]$Rgb) {
+    for ($y = $Y0; $y -lt $Y1; $y += 1) {
+        for ($x = $X0; $x -lt $X1; $x += 1) {
+            $c = Get-TestPixel -Shot $Shot -X $x -Y $y
+            if ($null -eq $c) { continue }
+            if ($c.R -eq $Rgb[0] -and $c.G -eq $Rgb[1] -and $c.B -eq $Rgb[2]) {
+                return [pscustomobject]@{ X = $x; Y = $y }
+            }
+        }
+    }
+    return $null
+}
+
+# Click a control by POSTING a mouse pair to it.
+#
+# Send-TestControlClick SENDS BM_CLICK, and every T286 action button opens a
+# MODAL dialog whose nested pump does not return until the user answers - a sent
+# click would sit in it until the harness's send timeout expired. Posted input is
+# also what a real click is.
+function Click-TestPosted([IntPtr]$Top, $Ctl) {
+    $h = [IntPtr]$Ctl.Hwnd
+    $r = Get-TestWindowRect -Window $h
+    return Send-TestMouse -Window $Top -Target $h `
+        -X ([int](($r.Left + $r.Right) / 2)) -Y ([int](($r.Top + $r.Bottom) / 2)) `
+        -Button left -Action click
+}
+
+# The most recent stderr line matching $Pattern, as a regex Match, or $null.
+function Get-LogMatch([string]$Pattern) {
+    if (-not (Test-Path $errlog)) { return $null }
+    $m = @(Select-String -Path $errlog -Pattern $Pattern) | Select-Object -Last 1
+    if (-not $m) { return $null }
+    return $m.Matches[0]
+}
+
+function Wait-LogMatch([string]$Pattern, [int]$TimeoutMs = 10000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $m = Get-LogMatch $Pattern
+        if ($m) { return $m }
+        Start-Sleep -Milliseconds 200
+    }
+    return $null
+}
+
+function Test-PidAlive([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $false }
+    return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+# The panel's action buttons, by caption. Hidden children are included (Kill is
+# created hidden), so a caller can assert visibility separately.
+function Get-PanelButton([IntPtr]$Panel, [string]$Like) {
+    return @(Get-TestChildWindows -Window $Panel -Class 'Button') |
+        Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -like $Like } |
+        Select-Object -First 1
+}
+
+# Screen Y of the table's FIRST row, FOUND rather than derived: scan down the
+# panel's right edge for the header band's fill (COLOR_HEADER_BG), then past it
+# and past its bottom rule (COLOR_DIVIDER). Re-deriving the layout module's band
+# offsets here is exactly what T257 is about.
+function Get-TestFirstRowY([IntPtr]$Panel, $Client, $Fr) {
+    $shot = Get-TestWindowPixels -Window $Panel
+    try {
+        $x = $Client.Right - 20
+        $headerY = -1
+        for ($y = [int]$Fr.Bottom; $y -lt $Client.Bottom; $y++) {
+            $c = Get-TestPixel -Shot $shot -X $x -Y $y
+            if ($null -ne $c -and $c.R -eq 40 -and $c.G -eq 40 -and $c.B -eq 40) { $headerY = $y; break }
+        }
+        if ($headerY -lt 0) { return @(-1, -1) }
+        for ($y = $headerY; $y -lt $Client.Bottom; $y++) {
+            $c = Get-TestPixel -Shot $shot -X $x -Y $y
+            if ($null -eq $c) { continue }
+            if ($c.R -eq 40 -and $c.G -eq 40 -and $c.B -eq 40) { continue }
+            if ($c.R -eq 60 -and $c.G -eq 60 -and $c.B -eq 60) { continue }
+            return @($headerY, $y)
+        }
+        return @($headerY, -1)
+    } finally {
+        Close-TestWindowPixels -Shot $shot
+    }
+}
+
 Kill-RepoInstances
 Remove-Item $errlog -ErrorAction SilentlyContinue
 Start-TestForegroundWatch
@@ -207,9 +311,16 @@ try {
     Assert ($null -ne $showAll) 'A the "Show all" checkbox exists'
     Assert ($null -ne $newProc) 'A the "New Process..." button exists'
     if ($newProc) {
-        # T286 enables it. A live button that does nothing would be the defect;
-        # a disabled one is an honest state (design system 2.2).
-        Assert (-not (Test-TestWindowEnabled -Window ([IntPtr]$newProc.Hwnd))) 'A "New Process..." is DISABLED until T286 wires it'
+        # T286 gave it something to do, so it is live now. (Until then it was
+        # deliberately disabled - an honest state, design system 2.2.)
+        Assert (Test-TestWindowEnabled -Window ([IntPtr]$newProc.Hwnd)) 'A "New Process..." is ENABLED (T286)'
+    }
+    # Kill is absent until rows are selected (Mac shows it only then). Created
+    # hidden rather than omitted, so it must not be VISIBLE.
+    $killBtn = $buttons | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -like 'Kill*' } | Select-Object -First 1
+    Assert ($null -ne $killBtn) 'A the Kill button exists as a control'
+    if ($killBtn) {
+        Assert (-not (Test-TestWindowVisible -Window ([IntPtr]$killBtn.Hwnd))) 'A Kill is HIDDEN while nothing is selected'
     }
 
     # The panel is resizable and opens at the layout module's default client.
@@ -353,6 +464,191 @@ try {
         Assert ($st.SortKey -eq 'path' -and $st.SortDir -eq 'desc') "G clicking it again flips the direction (got $($st.SortKey)/$($st.SortDir))"
     }
 
+    # --- H. New Process starts a real process (T286) --------------------------
+    # A THROWAWAY: `cmd.exe /C pause` blocks forever on its own console with no
+    # child process, so killing it in I leaves nothing orphaned and nothing this
+    # box needs is ever a target.
+    $newProcBtn = Get-PanelButton $panel 'New Process*'
+    Assert ($null -ne $newProcBtn) 'H the New Process button is reachable'
+    Click-TestPosted $panel $newProcBtn | Out-Null
+    $dlg = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyNewProcess' -TimeoutMs 8000
+    Assert ($dlg -ne [IntPtr]::Zero) 'H "New Process..." opens the GhozttyNewProcess dialog'
+    if ($dlg -ne [IntPtr]::Zero) {
+        # IsWindowEnabled on the owner is the cross-process-safe modality check.
+        Assert (-not (Test-TestWindowEnabled -Window $panel)) 'H the dialog is MODAL to the panel'
+
+        $edits = @(Get-TestChildWindows -Window $dlg -Class 'Edit') | Sort-Object Top
+        Assert ($edits.Count -eq 2) "H the dialog has a command field and a working-directory field (found $($edits.Count))"
+        $dlgBtns = @(Get-TestChildWindows -Window $dlg -Class 'Button')
+        $startBtn = $dlgBtns | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Start' } | Select-Object -First 1
+        Assert ($null -ne $startBtn) 'H the dialog has a Start button'
+        if ($startBtn) {
+            Assert (-not (Test-TestWindowEnabled -Window ([IntPtr]$startBtn.Hwnd))) 'H Start is DISABLED while the command is blank (Mac parity)'
+        }
+
+        if ($edits.Count -eq 2 -and $startBtn) {
+            Send-TestControlText -Control ([IntPtr]$edits[0].Hwnd) -Text 'pause' | Out-Null
+            Start-Sleep -Milliseconds 400
+            Assert (Test-TestWindowEnabled -Window ([IntPtr]$startBtn.Hwnd)) 'H typing a command ENABLES Start'
+            Send-TestControlClick -Control ([IntPtr]$startBtn.Hwnd) | Out-Null
+        } else {
+            Send-TestWindowClose -Window $dlg | Out-Null
+        }
+        Start-Sleep -Milliseconds 600
+    }
+    Assert (Test-TestWindowEnabled -Window $panel) 'H the panel is interactive again once the dialog closes'
+
+    $m = Wait-LogMatch 'activity monitor: spawn result ok=true pid=(\d+)'
+    Assert ($null -ne $m) 'H the spawn reported success with a pid'
+    $spawnPid = 0
+    if ($m) { $spawnPid = [int]$m.Groups[1].Value; $script:spawnPid = $spawnPid }
+    Assert (Test-PidAlive $spawnPid) "H the spawned process $spawnPid is really running"
+
+    # ...and it reaches the TABLE, which is the claim a log line alone cannot make.
+    $before = Count-PanelLines
+    Set-TestControlText -Control $filterEdit -Text "$spawnPid" | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.Shown -ge 1) "H the spawned pid $spawnPid appears in the table (shown=$($st.Shown))"
+
+    # --- I. Kill goes through a mandatory confirmation ------------------------
+    # Sort by PID ASCENDING first, so row 0 is deterministic: any OTHER pid whose
+    # decimal string contains this one's has more digits, hence is numerically
+    # larger. Without that, "the first row" is whatever the previous section's
+    # sort left behind.
+    $rowInfo = Get-TestFirstRowY $panel $client $fr
+    $headerY2 = $rowInfo[0]
+    Assert ($headerY2 -ge 0) 'I the table header band was located by its own paint'
+    if ($headerY2 -ge 0) {
+        $before = Count-PanelLines
+        Send-TestMouse -Window $panel -X ($client.Left + 20) -Y ($headerY2 + 4) -Button left -Action click | Out-Null
+        $st = Wait-PanelState $before
+        Assert ($st.SortKey -eq 'pid' -and $st.SortDir -eq 'asc') "I sorted by PID ascending (got $($st.SortKey)/$($st.SortDir))"
+    }
+
+    $rowInfo = Get-TestFirstRowY $panel $client $fr
+    $rowY = $rowInfo[1]
+    Assert ($rowY -ge 0) 'I the first table row was located by its own paint'
+    if ($rowY -ge 0) {
+        $before = Count-PanelLines
+        Send-TestMouse -Window $panel -X ($client.Left + 20) -Y ($rowY + 4) -Button left -Action click | Out-Null
+        $st = Wait-PanelState $before
+        Assert ($st.Selected -eq 1) "I clicking a row selects exactly one (selected=$($st.Selected))"
+    }
+
+    $killBtn2 = Get-PanelButton $panel 'Kill*'
+    Assert ($null -ne $killBtn2) 'I the Kill button is reachable'
+    if ($killBtn2) {
+        Assert (Test-TestWindowVisible -Window ([IntPtr]$killBtn2.Hwnd)) 'I Kill BECOMES visible once a row is selected'
+        Assert ((Get-TestControlText -Control ([IntPtr]$killBtn2.Hwnd)) -eq 'Kill') 'I one selected row labels it "Kill", not "Kill 1"'
+    }
+
+    # I.1 CANCEL - the negative control for "the confirmation is mandatory".
+    # If the dialog were cosmetic, this alone would kill the process.
+    $confirmedPid = 0
+    if ($killBtn2) {
+        Click-TestPosted $panel $killBtn2 | Out-Null
+        $confirm = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 8000
+        Assert ($confirm -ne [IntPtr]::Zero) 'I Kill opens a confirmation dialog'
+        if ($confirm -ne [IntPtr]::Zero) {
+            $ctitle = Get-TestWindowText -Window $confirm
+            Assert ($ctitle -like "*(PID $spawnPid)*") "I the confirmation names the process and its pid (got '$ctitle')"
+            if ($ctitle -like "*(PID $spawnPid)*") { $confirmedPid = $spawnPid }
+            $cbtns = @(Get-TestChildWindows -Window $confirm -Class 'Button')
+            $cancelBtn = $cbtns | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Cancel' } | Select-Object -First 1
+            Assert ($null -ne $cancelBtn) 'I the confirmation offers Cancel'
+            if ($cancelBtn) { Send-TestControlClick -Control ([IntPtr]$cancelBtn.Hwnd) | Out-Null }
+            else { Send-TestWindowClose -Window $confirm | Out-Null }
+            Start-Sleep -Milliseconds 700
+        }
+        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill dialog n=1 choice=cancel' 5000)) 'I cancelling is reported as a cancel'
+        Assert (Test-PidAlive $spawnPid) "I CANCELLING LEAVES THE PROCESS ALIVE ($spawnPid)"
+    }
+
+    # I.2 CONFIRM - and only against the pid the dialog itself named, so a
+    # mis-targeted row can never make this script kill something else.
+    if ($confirmedPid -eq $spawnPid -and $spawnPid -gt 0) {
+        Click-TestPosted $panel $killBtn2 | Out-Null
+        $confirm = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 8000
+        Assert ($confirm -ne [IntPtr]::Zero) 'I Kill opens the confirmation a second time'
+        if ($confirm -ne [IntPtr]::Zero) {
+            $ctitle = Get-TestWindowText -Window $confirm
+            $cbtns = @(Get-TestChildWindows -Window $confirm -Class 'Button')
+            $okBtn = $cbtns | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Kill' } | Select-Object -First 1
+            Assert ($null -ne $okBtn) 'I the affirmative button carries the Kill verb, not "OK"'
+            if ($okBtn -and $ctitle -like "*(PID $spawnPid)*") {
+                Send-TestControlClick -Control ([IntPtr]$okBtn.Hwnd) | Out-Null
+            } else {
+                Send-TestWindowClose -Window $confirm | Out-Null
+            }
+            Start-Sleep -Milliseconds 900
+        }
+        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=1 killed=1 failed=0' 6000)) 'I the kill reported one killed, none failed'
+        $gone = $false
+        $deadline = (Get-Date).AddSeconds(5)
+        while ((Get-Date) -lt $deadline) {
+            if (-not (Test-PidAlive $spawnPid)) { $gone = $true; break }
+            Start-Sleep -Milliseconds 200
+        }
+        Assert $gone "I CONFIRMING really terminates the process ($spawnPid)"
+        if ($gone) { $script:spawnPid = 0 }
+    }
+
+    # --- J. A failed action raises the dismissable error banner ---------------
+    # Forced honestly: a working directory that does not exist makes
+    # CreateProcessW fail, which is the same failure path an access-denied kill
+    # takes. Nothing is spawned, so there is nothing to clean up.
+    $before = Count-PanelLines
+    Set-TestControlText -Control $filterEdit -Text '' | Out-Null
+    Wait-PanelState $before | Out-Null
+
+    $newProcBtn = Get-PanelButton $panel 'New Process*'
+    Click-TestPosted $panel $newProcBtn | Out-Null
+    $dlg = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyNewProcess' -TimeoutMs 8000
+    Assert ($dlg -ne [IntPtr]::Zero) 'J the New Process dialog opens again'
+    if ($dlg -ne [IntPtr]::Zero) {
+        $edits = @(Get-TestChildWindows -Window $dlg -Class 'Edit') | Sort-Object Top
+        $dlgBtns = @(Get-TestChildWindows -Window $dlg -Class 'Button')
+        $startBtn = $dlgBtns | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Start' } | Select-Object -First 1
+        if ($edits.Count -eq 2 -and $startBtn) {
+            Send-TestControlText -Control ([IntPtr]$edits[0].Hwnd) -Text 'pause' | Out-Null
+            Send-TestControlText -Control ([IntPtr]$edits[1].Hwnd) -Text 'Z:\no\such\dir\ghoztty-t286' | Out-Null
+            Start-Sleep -Milliseconds 300
+            Send-TestControlClick -Control ([IntPtr]$startBtn.Hwnd) | Out-Null
+        } else {
+            Send-TestWindowClose -Window $dlg | Out-Null
+        }
+        Start-Sleep -Milliseconds 700
+    }
+    Assert ($null -ne (Wait-LogMatch 'activity monitor: spawn result ok=false' 6000)) 'J the spawn really failed'
+    Assert ($null -ne (Wait-LogMatch "activity monitor: action error: Couldn't start" 6000)) 'J the failure became an action error'
+
+    # It PAINTED. The log proves the model; this proves the band exists on
+    # screen, in ActivityMonitor.zig's COLOR_BANNER_BG.
+    $BANNER_BG = @(56, 47, 35)
+    $GLYPH = @(150, 150, 150)   # COLOR_SECONDARY - the dismiss glyph
+    $shotB = Get-TestWindowPixels -Window $panel
+    $xspot = $null
+    try {
+        Assert (Test-ExactPixel $shotB $client.Left ($client.Bottom - 60) $client.Right $client.Bottom $BANNER_BG) 'J the error banner painted at the panel bottom'
+        # Control: the banner is a BAND at the bottom, not a panel-wide tint.
+        Assert (-not (Test-ExactPixel $shotB $client.Left $client.Top $client.Right $fr.Bottom $BANNER_BG)) 'J (control) the banner tint is confined to the bottom band'
+        $xspot = Find-ExactPixel $shotB ($client.Right - 40) ($client.Bottom - 60) $client.Right $client.Bottom $GLYPH
+        Assert ($null -ne $xspot) 'J the banner has a dismiss glyph at its trailing edge'
+    } finally {
+        Close-TestWindowPixels -Shot $shotB
+    }
+
+    if ($null -ne $xspot) {
+        Send-TestMouse -Window $panel -X $xspot.X -Y $xspot.Y -Button left -Action click | Out-Null
+        Start-Sleep -Milliseconds 600
+        $shotC = Get-TestWindowPixels -Window $panel
+        try {
+            Assert (-not (Test-ExactPixel $shotC $client.Left ($client.Bottom - 60) $client.Right $client.Bottom $BANNER_BG)) 'J clicking the glyph DISMISSES the banner'
+        } finally {
+            Close-TestWindowPixels -Shot $shotC
+        }
+    }
+
     # --- F. Escape closes the panel ------------------------------------------
     Send-TestControlKey -Control $filterEdit -Key Escape | Out-Null
     Start-Sleep -Milliseconds 800
@@ -360,6 +656,10 @@ try {
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'F the app survives the panel closing'
     Assert (Select-String -Path $errlog -Pattern 'activity monitor: closed source=' -Quiet) 'F the panel tore itself down (sampler joined, registry slot freed)'
 } finally {
+    # The throwaway from H, if I never got to kill it (an abort mid-section).
+    if ($script:spawnPid -gt 0) {
+        Stop-Process -Id $script:spawnPid -Force -ErrorAction SilentlyContinue
+    }
     Remove-TestDesktop
     Kill-RepoInstances
 }

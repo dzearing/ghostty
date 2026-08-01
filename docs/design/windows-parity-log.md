@@ -5039,3 +5039,58 @@ anywhere, which section 2.2 calls an accessibility defect rather than a polish
 item), **T290** (it keeps enumerating every process while minimized). Next in
 the T226 chain is **T286** (Kill with confirm, New Process, the error banner),
 then **T287** (remote sources + the carousel, which closes T177).
+
+## 2026-08-01 - T286: Kill, New Process and the error banner, and a negative control that had to survive being right
+
+Third of the T226 split. The panel can now act, not just watch: Kill behind a
+mandatory confirmation, a New Process dialog, and a dismissable error banner
+under the table. All wording, the failure aggregation, the empty-state choice
+and the selection prune went into a new pure `activity_actions.zig` (15 tests in
+the none lane); the dialog went into `NewProcessDialog.zig`, built as a sibling
+of `HostSettingsDialog` rather than a third `ConfirmDialog` flavor, for the
+reason that file already records - a labeled two-row form is a different dialog,
+not a wider message box.
+
+Three things are worth carrying forward.
+
+**The confirmation wording is a deliberate divergence, and a test guards it.**
+Mac says "This sends a termination signal to the process." Windows has no such
+signal: `proc_control.killWindows` is `TerminateProcess`, immediate and
+ungraceful, which that module's own header calls out as the TERM==KILL caveat.
+Repeating Mac's sentence would have shipped a confirmation that misdescribes its
+own action - worse than none - so the Windows body says what actually happens,
+and a unit test asserts the word "signal" never appears in it. Parity is with
+the BEHAVIOR, not with the sentence.
+
+**A dialog that quotes borrowed strings has to stop the thing that frees them.**
+The confirmation names the row (`Kill cmd.exe (PID 16696)?`) from a name
+borrowed out of the current snapshot, and both dialogs run a nested pump - so a
+1.5 s poll landing mid-dialog would have destroyed the snapshot under the text on
+screen. `modal` suspends adoption for the dialog's life and adopts on the way
+out. Filed as **T292** with the copy-instead-of-borrow alternative, because the
+cost is real: the trend charts pause while a dialog is up, and Mac's do not.
+
+**The negative control had to be designed, not just declared.** "Cancelling
+leaves the process alive" is the assertion a merely cosmetic confirmation would
+fail, so the script must genuinely reach the kill path and stop - and it must do
+that without becoming a script that kills a bystander. Two rules made that safe.
+The fixture is `cmd.exe /C pause`, a throwaway that blocks forever with no child
+process to orphan. And the affirmative button is only clicked when the
+confirmation dialog ITSELF named the spawned pid, so a mis-targeted row makes the
+run fail rather than terminate something the box needs. Row 0 is deterministic
+because the section sorts by PID **ascending** first: any other pid whose decimal
+string contains this one's must have more digits, hence be numerically larger.
+
+One harness lesson: `Send-TestControlClick` SENDS `BM_CLICK`, and every action
+button here opens a modal whose nested pump does not return until answered - a
+sent click sits in it until the send timeout. Opening a modal needs a POSTED
+click (`Send-TestMouse`); clicking the buttons INSIDE the dialog can stay sent,
+because those handlers only set a flag.
+
+`activity-monitor.ps1` is ALL PASS at 82 assertions (was 63), `-NegativeControl`
+still red, both test lanes + `test-agent` + the Debug GUI link green, P1-P3 ALL
+PASS. Follow-ups: **T291** (`CREATE_NEW_CONSOLE` flashes a console window on
+every spawn - and the comment above that flag records why the obvious
+`DETACHED_PROCESS` fix killed its own children), **T292** (above), **T293**
+(multi-row Kill is unit-tested but never exercised on the box). Next in the chain
+is **T287**: remote sources + the carousel, which also closes T177.

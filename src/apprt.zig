@@ -140,6 +140,11 @@ test {
     // text (T285), same no-OS-imports deal.
     _ = @import("apprt/win32/activity_rows.zig");
 
+    // Pure win32 Activity Monitor process-control model — kill labels and
+    // wording, failure text, empty state and selection pruning (T286), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/activity_actions.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 

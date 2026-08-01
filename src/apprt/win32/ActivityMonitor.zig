@@ -27,13 +27,19 @@
 //! samplers are only ever touched by that worker, and `close` JOINS it before
 //! freeing anything it could still be writing to.
 //!
+//! ## Process control (T286)
+//! Kill and New Process run against `remote/agent/proc_control.zig` and
+//! `proc_spawn.zig` — the same two functions the agent's remote provider calls,
+//! so a local panel and a remote one cannot drift. Both are destructive or
+//! creative enough to be MODAL: `ConfirmDialog` / `NewProcessDialog` run a
+//! nested pump, and `modal` blocks snapshot adoption for its duration, so a poll
+//! landing mid-dialog cannot free the snapshot whose row names the confirmation
+//! is quoting. All wording, the failure aggregation, the empty state and the
+//! selection pruning are pure in `activity_actions.zig`.
+//!
 //! ## What is NOT here
-//! Process control (Kill / New Process) is T286, and the machine carousel plus
-//! remote sources are T287. The layout module already reserves both, so the
-//! "New Process…" button is created DISABLED rather than omitted: the control
-//! bar then has the geometry the layout module describes from day one (which the
-//! acceptance script measures), and a disabled control is an honest state
-//! (design system §2.2) where a live button that does nothing is not.
+//! The machine carousel plus remote sources are T287. The layout module already
+//! reserves the carousel band.
 
 const ActivityMonitor = @This();
 
@@ -46,12 +52,18 @@ const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const layout_mod = @import("activity_layout.zig");
 const rows_mod = @import("activity_rows.zig");
+const actions = @import("activity_actions.zig");
 const gauge = @import("trend_gauge.zig");
 const icon_button = @import("icon_button.zig");
+const icon_button_paint = @import("icon_button_paint.zig");
+const ConfirmDialog = @import("ConfirmDialog.zig");
+const NewProcessDialog = @import("NewProcessDialog.zig");
 const Scrollbar = @import("Scrollbar.zig");
 const remote_proc = @import("../../remote/agent/proc.zig");
 const remote_metrics = @import("../../remote/agent/metrics.zig");
 const remote_protocol = @import("../../remote/protocol.zig");
+const proc_control = @import("../../remote/agent/proc_control.zig");
+const proc_spawn = @import("../../remote/agent/proc_spawn.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -60,6 +72,7 @@ const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyActivityMonito
 const FILTER_ID: u16 = 100;
 const SHOW_ALL_ID: u16 = 101;
 const NEW_PROC_ID: u16 = 102;
+const KILL_ID: u16 = 103;
 
 /// The poll timer. `trend_gauge.sample_interval_ms` is the interval the ring was
 /// sized for, so the ring really does hold ~90 s.
@@ -102,6 +115,11 @@ const COLOR_MEM = w32.RGB(90, 190, 120);
 const COLOR_MEM_FILL = w32.RGB(40, 78, 52);
 /// The "List truncated" badge — Mac's `.secondary` label with a warning glyph.
 const COLOR_WARN = w32.RGB(220, 165, 90);
+/// The action-error banner's fill: Mac's `.orange.opacity(0.12)`
+/// (RemoteActivityMonitorView.swift:1077) composited onto `COLOR_BG` — GDI has
+/// no alpha here, so the blend is precomputed. Warning text on it reads 6.1:1
+/// and the message text 10.6:1, both past design system §2.3's floors.
+const COLOR_BANNER_BG = w32.RGB(56, 47, 35);
 /// The overlay scroll thumb, at rest and while grabbed.
 const COLOR_THUMB = w32.RGB(90, 90, 90);
 const COLOR_THUMB_ACTIVE = w32.RGB(130, 130, 130);
@@ -197,6 +215,10 @@ hwnd: w32.HWND,
 filter: w32.HWND,
 show_all_btn: w32.HWND,
 new_proc_btn: w32.HWND,
+/// Shown only while rows are selected (Mac's `if !selectedRows.isEmpty`), which
+/// is also what `Options.has_kill` drives — so the button and the geometry that
+/// makes room for it can never disagree.
+kill_btn: w32.HWND,
 
 /// DPI scale of the panel's own monitor, refreshed on WM_DPICHANGED.
 scale: f32 = 1.0,
@@ -222,8 +244,27 @@ host_sampler: remote_metrics.Sampler = remote_metrics.Sampler.init(),
 /// thread; `sampling` gates a second worker from starting.
 pending_mutex: std.Thread.Mutex = .{},
 pending: ?*Snapshot = null,
+/// The worker's verdict on the sample it just posted, taken with `pending`. A
+/// failed sample posts with no snapshot, so this is the only way the GUI thread
+/// learns the difference between "nothing new" and "the source is unreachable".
+pending_failed: bool = false,
 worker: ?std.Thread = null,
 sampling: bool = false,
+
+/// The last sample failed (Mac's `lastRefreshFailed`). Drives the "Refresh
+/// failed" badge over a stale table and the "Couldn't connect" overlay over an
+/// empty one.
+refresh_failed: bool = false,
+
+/// A modal dialog owned by this panel is pumping. Snapshot adoption is
+/// SUSPENDED for its duration: the confirmation quotes row names borrowed from
+/// `snap`, and adopting a new snapshot mid-dialog would free them under it. The
+/// deferred sample is adopted the moment the dialog returns.
+modal: bool = false,
+
+/// The action-error banner's text (Mac's `actionError`), empty when absent.
+err_buf: [256]u8 = @splat(0),
+err_len: usize = 0,
 
 /// Trend rings, oldest -> newest, both 0..100.
 cpu_ring: [gauge.ring_capacity]f32 = @splat(0),
@@ -303,6 +344,7 @@ pub fn open(window: *Window, src: Source) void {
         .filter = undefined,
         .show_all_btn = undefined,
         .new_proc_btn = undefined,
+        .kill_btn = undefined,
         .scale = window.scale,
     };
 
@@ -427,8 +469,30 @@ pub fn open(window: *Window, src: Source) void {
         return;
     };
     _ = w32.SetWindowTheme(self.new_proc_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
-    // Enabled by T286, which is the task that gives it something to do.
-    _ = w32.EnableWindow(self.new_proc_btn, 0);
+
+    // Kill: created HIDDEN, since nothing is selected yet. Mac omits the button
+    // entirely while the selection is empty; a win32 child is created once and
+    // shown/hidden, which is the same thing to the user and keeps the control
+    // out of the tab order while it is not actionable.
+    self.kill_btn = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        std.unicode.utf8ToUtf16LeStringLiteral("Kill"),
+        w32.WS_CHILD,
+        l.kill_btn.left,
+        l.kill_btn.top,
+        l.kill_btn.width(),
+        l.kill_btn.height(),
+        hwnd,
+        @ptrFromInt(@as(usize, KILL_ID)),
+        app.hinstance,
+        null,
+    ) orelse {
+        _ = w32.DestroyWindow(hwnd);
+        alloc.destroy(self);
+        return;
+    };
+    _ = w32.SetWindowTheme(self.kill_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
 
     self.createFonts(l);
 
@@ -501,7 +565,8 @@ pub fn owning(hwnd: w32.HWND) ?*ActivityMonitor {
 
 pub fn ownsHwnd(self: *const ActivityMonitor, hwnd: w32.HWND) bool {
     return hwnd == self.hwnd or hwnd == self.filter or
-        hwnd == self.show_all_btn or hwnd == self.new_proc_btn;
+        hwnd == self.show_all_btn or hwnd == self.new_proc_btn or
+        hwnd == self.kill_btn;
 }
 
 fn createFonts(self: *ActivityMonitor, l: layout_mod.Layout) void {
@@ -510,7 +575,7 @@ fn createFonts(self: *ActivityMonitor, l: layout_mod.Layout) void {
     self.title_font = makeFont(l.title_font_h, 600, "Segoe UI");
     self.caption_font = makeFont(l.caption_font_h, 400, "Segoe UI");
     if (self.font) |f| {
-        for ([_]w32.HWND{ self.filter, self.show_all_btn, self.new_proc_btn }) |c| {
+        for ([_]w32.HWND{ self.filter, self.show_all_btn, self.new_proc_btn, self.kill_btn }) |c| {
             _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
         }
     }
@@ -569,6 +634,9 @@ fn registerClass(app: *App) ?void {
 /// must not accumulate a backlog of enumerations.
 fn kickSample(self: *ActivityMonitor) void {
     if (self.sampling) return;
+    // A modal dialog is quoting the current snapshot; do not start work whose
+    // result cannot be adopted anyway.
+    if (self.modal) return;
     if (self.worker) |t| {
         t.join();
         self.worker = null;
@@ -585,6 +653,9 @@ fn sampleWorker(self: *ActivityMonitor) void {
     const alloc = self.app.core_app.alloc;
     const snap = self.buildSnapshot(alloc) catch |err| {
         log.warn("activity monitor: sample failed err={}", .{err});
+        self.pending_mutex.lock();
+        self.pending_failed = true;
+        self.pending_mutex.unlock();
         _ = w32.PostMessageW(self.hwnd, WM_APP_ACTIVITY_SAMPLE, 0, 0);
         return;
     };
@@ -592,6 +663,7 @@ fn sampleWorker(self: *ActivityMonitor) void {
     self.pending_mutex.lock();
     if (self.pending) |old| old.destroy(alloc);
     self.pending = snap;
+    self.pending_failed = false;
     self.pending_mutex.unlock();
 
     _ = w32.PostMessageW(self.hwnd, WM_APP_ACTIVITY_SAMPLE, 0, 0);
@@ -644,22 +716,45 @@ fn selfPid() i64 {
 }
 
 /// GUI thread: adopt whatever the worker parked.
+///
+/// A no-op while a dialog is up — see `modal`. The dialog calls this itself on
+/// the way out, so a sample that landed mid-dialog is adopted immediately after
+/// rather than waiting for the next tick.
 fn adoptPending(self: *ActivityMonitor) void {
+    if (self.modal) return;
     self.sampling = false;
 
     self.pending_mutex.lock();
     const taken = self.pending;
     self.pending = null;
+    const failed = self.pending_failed;
+    self.pending_failed = false;
     self.pending_mutex.unlock();
 
-    const snap = taken orelse return;
+    const snap = taken orelse {
+        if (!failed) return;
+        // A failure is an ANSWER: leaving `loading` set would sit on "Loading…"
+        // forever while the overlay has "Couldn't connect" to say instead.
+        self.refresh_failed = true;
+        self.loading = false;
+        _ = w32.InvalidateRect(self.hwnd, null, 0);
+        return;
+    };
     const alloc = self.app.core_app.alloc;
     if (self.snap) |old| old.destroy(alloc);
     self.snap = snap;
     self.loading = false;
+    self.refresh_failed = false;
+
+    // Prune before rebuilding: a selected process that exited must stop counting
+    // toward the Kill button and its confirmation (Mac prunes on every `procs`
+    // change, :1050-1056), and `rebuild` logs the count this produces.
+    const before = self.sel_len;
+    self.sel_len = actions.pruneSelection(&self.sel_pids, self.sel_len, snap.rows);
 
     self.pushSample(snap.host);
     self.rebuild();
+    if (self.sel_len != before) self.refreshChrome();
     _ = w32.InvalidateRect(self.hwnd, null, 0);
 }
 
@@ -792,25 +887,61 @@ fn layout(self: *const ActivityMonitor) layout_mod.Layout {
 }
 
 fn options(self: *const ActivityMonitor) layout_mod.Options {
-    _ = self; // every band is unconditional until T286/T287 make them state-driven
     return .{
         // One source until T287 adds the switcher, and chrome that controls
         // nothing does not appear (design system §6).
         .has_carousel = false,
-        .has_banner = false,
-        // The Kill button is T286's; it only exists while rows are selected.
-        .has_kill = false,
+        .has_banner = self.err_len > 0,
+        // Mac shows Kill only while rows are selected (:940). Reading the
+        // selection here — rather than tracking a second flag — is what stops
+        // the button and the room made for it from disagreeing.
+        .has_kill = self.sel_len > 0,
     };
 }
 
-/// Re-place the native controls after a resize or a DPI change.
+/// Re-place the native controls after a resize, a DPI change, or anything that
+/// changes which bands exist (a selection appearing makes room for Kill; a
+/// banner appearing shortens the table).
 fn applyLayout(self: *ActivityMonitor) void {
     const l = self.layout();
     _ = w32.MoveWindow(self.filter, l.filter.left, l.filter.top, l.filter.width(), l.filter.height(), 1);
     _ = w32.MoveWindow(self.show_all_btn, l.show_all.left, l.show_all.top, l.show_all.width(), l.show_all.height(), 1);
     _ = w32.MoveWindow(self.new_proc_btn, l.new_proc_btn.left, l.new_proc_btn.top, l.new_proc_btn.width(), l.new_proc_btn.height(), 1);
+    _ = w32.MoveWindow(self.kill_btn, l.kill_btn.left, l.kill_btn.top, l.kill_btn.width(), l.kill_btn.height(), 1);
     self.clampScroll();
     _ = w32.InvalidateRect(self.hwnd, null, 1);
+}
+
+/// Bring the Kill button in line with the selection: its caption counts the
+/// rows, and it is only visible while there are any. Every selection mutation
+/// funnels through here, so "the button says Kill 3" and "three rows are
+/// selected" are the same fact.
+fn refreshChrome(self: *ActivityMonitor) void {
+    var buf: [32]u8 = undefined;
+    var wbuf: [32]u16 = undefined;
+    const label = actions.killButtonLabel(&buf, self.sel_len);
+    const n = std.unicode.utf8ToUtf16Le(&wbuf, label) catch 0;
+    wbuf[n] = 0;
+    _ = w32.SetWindowTextW(self.kill_btn, @ptrCast(&wbuf));
+    _ = w32.ShowWindow(self.kill_btn, if (self.sel_len > 0) w32.SW_SHOW else w32.SW_HIDE);
+    self.applyLayout();
+}
+
+/// Raise the action-error banner. Truncates rather than failing: a banner that
+/// says most of what went wrong beats none at all.
+fn setError(self: *ActivityMonitor, text: []const u8) void {
+    const n = @min(text.len, self.err_buf.len);
+    @memcpy(self.err_buf[0..n], text[0..n]);
+    self.err_len = n;
+    log.warn("activity monitor: action error: {s}", .{self.err_buf[0..n]});
+    // The banner steals height from the table, so the layout has to run.
+    self.applyLayout();
+}
+
+fn clearError(self: *ActivityMonitor) void {
+    if (self.err_len == 0) return;
+    self.err_len = 0;
+    self.applyLayout();
 }
 
 // ---------------------------------------------------------------------
@@ -856,6 +987,7 @@ fn paint(self: *ActivityMonitor, hdc: w32.HDC) void {
     self.paintGauges(mem_dc, l);
     self.paintControlBar(mem_dc, l);
     self.paintTable(mem_dc, l);
+    self.paintBanner(mem_dc, l);
 
     // Dividers last so nothing paints over them.
     for ([_]i32{ l.header_divider_y, l.control_divider_y }) |y| {
@@ -964,15 +1096,16 @@ fn paintGauge(
 fn paintControlBar(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
     _ = w32.SelectObject(hdc, self.caption_font);
 
-    if (self.snap) |s| {
-        if (s.truncated and l.badge.width() > 0) {
+    const total = if (self.snap) |s| s.rows.len else 0;
+    const truncated = if (self.snap) |s| s.truncated else false;
+    if (l.badge.width() > 0) {
+        if (actions.badgeText(self.refresh_failed, truncated, total)) |badge| {
             _ = w32.SetTextColor(hdc, COLOR_WARN);
-            drawText(hdc, "⚠ List truncated", l.badge, text_flags | w32.DT_LEFT | w32.DT_END_ELLIPSIS);
+            drawText(hdc, badge, l.badge, text_flags | w32.DT_LEFT | w32.DT_END_ELLIPSIS);
         }
     }
 
     var buf: [64]u8 = undefined;
-    const total = if (self.snap) |s| s.rows.len else 0;
     const count = rows_mod.formatCount(&buf, self.filterSpec(), self.order_len, total);
     _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
     drawText(hdc, count, l.count, text_flags | w32.DT_RIGHT);
@@ -1142,10 +1275,99 @@ fn paintRow(
 }
 
 fn paintEmptyState(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    const total = if (self.snap) |s| s.rows.len else 0;
+    const state = actions.emptyState(self.loading, self.refresh_failed, total);
+    if (state != .unreachable_source) {
+        _ = w32.SelectObject(hdc, self.font);
+        _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
+        const text = if (state == .loading) "Loading…" else "No processes match";
+        drawText(hdc, text, l.table_rows, w32.DT_CENTER | w32.DT_SINGLELINE | w32.DT_VCENTER);
+        return;
+    }
+
+    // Mac's two-line "Couldn't connect" block (:1034-1045): a headline the eye
+    // lands on and a subtitle naming the source that is unreachable.
+    const mid = @divTrunc(l.table_rows.top + l.table_rows.bottom, 2);
+    const line_h = l.row_h;
     _ = w32.SelectObject(hdc, self.font);
+    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    drawText(hdc, "Couldn't connect", .{
+        .left = l.table_rows.left,
+        .top = mid - line_h,
+        .right = l.table_rows.right,
+        .bottom = mid,
+    }, w32.DT_CENTER | w32.DT_SINGLELINE | w32.DT_VCENTER);
+
+    var buf: [96]u8 = undefined;
+    const sub = std.fmt.bufPrint(
+        &buf,
+        "The {s} source is unreachable.",
+        .{self.source.label()},
+    ) catch "The source is unreachable.";
+    _ = w32.SelectObject(hdc, self.caption_font);
     _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
-    const text = if (self.loading) "Loading…" else "No processes match";
-    drawText(hdc, text, l.table_rows, w32.DT_CENTER | w32.DT_SINGLELINE | w32.DT_VCENTER);
+    drawText(hdc, sub, .{
+        .left = l.table_rows.left,
+        .top = mid,
+        .right = l.table_rows.right,
+        .bottom = mid + line_h,
+    }, w32.DT_CENTER | w32.DT_SINGLELINE | w32.DT_VCENTER);
+}
+
+/// The dismissable action-error banner under the table (Mac's `errorBanner`,
+/// :1059-1080): a warning glyph, the message, and an ✕ at the trailing edge.
+///
+/// Painted, not a native control: it is one band that appears and disappears
+/// with `Options.has_banner`, and a child window would have to be moved and
+/// shown/hidden in lockstep with a rect the layout module already computes.
+fn paintBanner(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    if (self.err_len == 0) return;
+
+    fill(hdc, rect(l.banner), COLOR_BANNER_BG);
+    // A rule along its top edge, so the banner reads as a band and not as the
+    // table's last row painted a different color.
+    fill(hdc, .{
+        .left = l.banner.left,
+        .top = l.banner.top,
+        .right = l.banner.right,
+        .bottom = l.banner.top + 1,
+    }, COLOR_DIVIDER);
+
+    const m = icon_button.Metrics.init(self.scale);
+    const glyph_box = icon_button.targetBox(m, .{
+        .left = l.banner_close.left,
+        .top = l.banner_close.top,
+        .right = l.banner_close.right,
+        .bottom = l.banner_close.bottom,
+    });
+    icon_button_paint.glyph(hdc, m, glyph_box, .close, COLOR_SECONDARY);
+
+    // The band's own margin, TAKEN from the layout module rather than
+    // re-derived from `pad_x` here: the ✕ sits one margin in from the trailing
+    // edge, so `client_w - banner_close.right` IS the margin (the T257 lesson —
+    // a second copy of a number is a second chance to be wrong).
+    const margin = l.client_w - l.banner_close.right;
+    const icon_w = margin;
+    const gap = @divTrunc(margin, 2);
+
+    _ = w32.SelectObject(hdc, self.caption_font);
+    _ = w32.SetTextColor(hdc, COLOR_WARN);
+    drawText(hdc, "\u{26A0}", .{
+        .left = l.banner.left + margin,
+        .top = l.banner.top,
+        .right = l.banner.left + margin + icon_w,
+        .bottom = l.banner.bottom,
+    }, text_flags | w32.DT_CENTER);
+
+    const text_left = l.banner.left + margin + icon_w + gap;
+    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    drawText(hdc, self.err_buf[0..self.err_len], .{
+        .left = text_left,
+        .top = l.banner.top,
+        // Clear of the ✕ by one gap — nothing touches anything (§0.1).
+        .right = @max(text_left, l.banner_close.left - gap),
+        .bottom = l.banner.bottom,
+    }, text_flags | w32.DT_LEFT | w32.DT_END_ELLIPSIS);
 }
 
 /// An overlay thumb on the table's trailing edge — the app's own scrollbar
@@ -1222,6 +1444,22 @@ fn onLeftDown(self: *ActivityMonitor, x: i32, y: i32, mods: usize) void {
     const l = self.layout();
     const widths = layout_mod.columnWidths(self.scale, l.table.width());
 
+    // The banner owns the bottom band while it is up; its ✕ dismisses it and
+    // the rest of the band swallows the click (it is not table).
+    if (self.err_len > 0 and y >= l.banner.top) {
+        const m = icon_button.Metrics.init(self.scale);
+        const hit = icon_button.hitBox(m, icon_button.targetBox(m, .{
+            .left = l.banner_close.left,
+            .top = l.banner_close.top,
+            .right = l.banner_close.right,
+            .bottom = l.banner_close.bottom,
+        }));
+        if (x >= hit.left and x < hit.right and y >= hit.top and y < hit.bottom) {
+            self.clearError();
+        }
+        return;
+    }
+
     // Header click: sort.
     if (y >= l.table_header.top and y < l.table_header.bottom) {
         if (columnAt(l.table, widths, x)) |col| {
@@ -1260,7 +1498,7 @@ fn onLeftDown(self: *ActivityMonitor, x: i32, y: i32, mods: usize) void {
     const idx = layout_mod.rowIndexAt(l, y, self.scroll) orelse return;
     const pid = self.pidAt(idx) orelse {
         self.clearSelection();
-        _ = w32.InvalidateRect(self.hwnd, null, 0);
+        self.refreshChrome();
         return;
     };
     if (mods & w32.MK_CONTROL != 0) {
@@ -1270,7 +1508,7 @@ fn onLeftDown(self: *ActivityMonitor, x: i32, y: i32, mods: usize) void {
     } else {
         self.selectOnly(pid);
     }
-    _ = w32.InvalidateRect(self.hwnd, null, 0);
+    self.refreshChrome();
 }
 
 /// Shift-click: select every display row between the anchor (the last row added
@@ -1430,7 +1668,7 @@ fn moveSelectionTo(self: *ActivityMonitor, index: i32) void {
     const pid = self.pidAt(clamped) orelse return;
     self.selectOnly(pid);
     self.scrollIntoView(clamped);
-    _ = w32.InvalidateRect(self.hwnd, null, 0);
+    self.refreshChrome();
 }
 
 fn scrollIntoView(self: *ActivityMonitor, index: i32) void {
@@ -1450,6 +1688,163 @@ fn onFilterChanged(self: *ActivityMonitor) void {
     self.scroll = 0;
     self.rebuild();
     _ = w32.InvalidateRect(self.hwnd, null, 0);
+}
+
+// ---------------------------------------------------------------------
+// Process control (Kill / New Process)
+// ---------------------------------------------------------------------
+
+/// UTF-8 → NUL-terminated UTF-16 in `buf`, or null when it does not fit.
+fn utf16z(buf: []u16, text: []const u8) ?[:0]const u16 {
+    if (text.len + 1 > buf.len) return null;
+    const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], text) catch return null;
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
+/// Kill every selected row, behind a mandatory confirmation
+/// (`RemoteActivityMonitorView.swift:940-952` + :762-780).
+///
+/// The kills run inline on the GUI thread rather than on a worker, unlike Mac's
+/// background hop: `killProc` is `OpenProcess` + `TerminateProcess`, two
+/// syscalls that do not block, and hopping threads would mean copying the
+/// targets to keep them alive across the hop for no gain. What DOES need care is
+/// the snapshot: `targets` borrows its names from `snap`, so `modal` holds off
+/// adoption for the dialog's whole nested pump.
+fn onKill(self: *ActivityMonitor) void {
+    if (self.sel_len == 0) return;
+    const snap = self.snap orelse return;
+
+    var target_buf: [max_rows]actions.Target = undefined;
+    const targets = actions.targetsFor(self.sel_pids[0..self.sel_len], snap.rows, &target_buf);
+    if (targets.len == 0) return;
+
+    var title_utf8: [192]u8 = undefined;
+    var title_w: [224]u16 = undefined;
+    const title = utf16z(&title_w, actions.killConfirmTitle(&title_utf8, targets)) orelse
+        std.unicode.utf8ToUtf16LeStringLiteral("Kill process?");
+
+    var body_w: [256]u16 = undefined;
+    const body = utf16z(&body_w, actions.killConfirmBody(targets.len)) orelse
+        std.unicode.utf8ToUtf16LeStringLiteral("This terminates the process immediately.");
+
+    var label_utf8: [32]u8 = undefined;
+    var label_w: [40]u16 = undefined;
+    const ok_label = utf16z(&label_w, actions.killButtonLabel(&label_utf8, targets.len)) orelse
+        std.unicode.utf8ToUtf16LeStringLiteral("Kill");
+
+    self.modal = true;
+    const choice = ConfirmDialog.show(self.app, self.hwnd, self.scale, self.filter, .{
+        .title = title.ptr,
+        .text = body,
+        .style = .ok_cancel,
+        .icon = .warning,
+        // MB_DEFBUTTON2: an accidental Enter must never kill anything.
+        .default_cancel = true,
+        .ok_label = ok_label,
+    });
+    self.modal = false;
+
+    log.info("activity monitor: kill dialog n={d} choice={s}", .{
+        targets.len,
+        if (choice == .ok) "ok" else "cancel",
+    });
+    if (choice != .ok) {
+        // Nothing was touched, but a sample may have landed behind the dialog.
+        self.adoptPending();
+        return;
+    }
+
+    var failed_buf: [max_rows]actions.Target = undefined;
+    var nfail: usize = 0;
+    for (targets) |t| {
+        const r = proc_control.killProc(t.pid, "TERM");
+        if (r.ok) continue;
+        log.warn("activity monitor: kill pid={d} failed err={s}", .{
+            t.pid,
+            r.@"error" orelse "unknown",
+        });
+        failed_buf[nfail] = t;
+        nfail += 1;
+    }
+    log.info("activity monitor: kill result total={d} killed={d} failed={d}", .{
+        targets.len,
+        targets.len - nfail,
+        nfail,
+    });
+
+    var err_utf8: [256]u8 = undefined;
+    if (actions.killFailureText(&err_utf8, targets.len, failed_buf[0..nfail])) |text| {
+        self.setError(text);
+    } else {
+        // Mac clears the selection only on a clean sweep (:592-594): rows that
+        // survived are still there, and still the ones the user meant.
+        self.clearSelection();
+        self.clearError();
+    }
+
+    // Adopt anything the dialog held off, then force a fresh sample so the
+    // casualties leave the table without waiting out the poll interval.
+    self.adoptPending();
+    self.refreshChrome();
+    self.kickSample();
+}
+
+/// Start a process on this panel's source (Mac's `NewProcessSheet` +
+/// `spawn(cmd:cwd:)`, :781-786 and :603-630).
+fn onNewProcess(self: *ActivityMonitor) void {
+    var cmd_buf: [NewProcessDialog.MAX_VALUE_LEN]u8 = undefined;
+    var cwd_buf: [NewProcessDialog.MAX_VALUE_LEN]u8 = undefined;
+
+    self.modal = true;
+    const res = NewProcessDialog.prompt(
+        self.app,
+        self.hwnd,
+        self.scale,
+        self.filter,
+        self.source.label(),
+        &cmd_buf,
+        &cwd_buf,
+    );
+    self.modal = false;
+
+    const r = res orelse {
+        log.info("activity monitor: spawn dialog choice=cancel", .{});
+        self.adoptPending();
+        return;
+    };
+    // The dialog reports its fields verbatim (the `ConfirmDialog.prompt`
+    // contract); trimming is ours.
+    const cmd = rows_mod.trim(r.command);
+    const cwd = rows_mod.trim(r.working_directory);
+    if (cmd.len == 0) {
+        self.adoptPending();
+        return;
+    }
+    log.info("activity monitor: spawn dialog choice=start cmd=\"{s}\"", .{cmd});
+
+    const alloc = self.app.core_app.alloc;
+    const out = proc_spawn.spawnDetached(alloc, cmd, if (cwd.len == 0) null else cwd);
+    // The Windows branch may hand back an ALLOCATED diagnostic note even on
+    // success (`SpawnOutcome.free_error`), so this is not a failure-only free.
+    defer if (out.free_error) {
+        if (out.@"error") |e| alloc.free(e);
+    };
+
+    if (out.ok) {
+        log.info("activity monitor: spawn result ok=true pid={?d} note={s}", .{
+            out.pid,
+            out.@"error" orelse "",
+        });
+        self.clearError();
+    } else {
+        log.warn("activity monitor: spawn result ok=false err={s}", .{out.@"error" orelse "unknown"});
+        var err_utf8: [256]u8 = undefined;
+        self.setError(actions.spawnFailureText(&err_utf8, cmd));
+    }
+
+    self.adoptPending();
+    self.kickSample();
 }
 
 // ---------------------------------------------------------------------
@@ -1524,6 +1919,14 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
                 self.scroll = 0;
                 self.rebuild();
                 _ = w32.InvalidateRect(hwnd, null, 0);
+                return 0;
+            }
+            if (control_id == KILL_ID and notification == w32.BN_CLICKED) {
+                self.onKill();
+                return 0;
+            }
+            if (control_id == NEW_PROC_ID and notification == w32.BN_CLICKED) {
+                self.onNewProcess();
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
