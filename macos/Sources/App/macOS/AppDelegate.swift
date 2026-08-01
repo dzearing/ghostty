@@ -1185,15 +1185,9 @@ class AppDelegate: NSObject,
         let agent = ReleaseNotesStore(directory: ReleaseNotesStore.agentNotesDirectory)
             .partitioned(previousSeen: previousSeen, current: current)
 
-        let view = WhatsNewWindowView(
+        let window = WhatsNewWindowView.makeWindow(WhatsNewWindowView(
             clientNew: client.new, clientInstalled: client.installed,
-            agentNew: agent.new, agentInstalled: agent.installed)
-
-        let window = NSWindow(contentViewController: NSHostingController(rootView: view))
-        window.title = "What’s New in Ghoztty"
-        window.styleMask = [.titled, .closable, .miniaturizable]
-        window.isReleasedWhenClosed = false
-        window.center()
+            agentNew: agent.new, agentInstalled: agent.installed))
         whatsNewWindow = window
         window.makeKeyAndOrderFront(sender)
         NSApp.activate(ignoringOtherApps: true)
