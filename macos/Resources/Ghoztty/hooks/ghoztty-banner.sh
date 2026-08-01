@@ -1,4 +1,5 @@
 #!/bin/bash
+# ghoztty-managed
 # ghoztty-banner.sh — keep a Ghoztty pane banner current for a Claude Code session.
 #
 # Banner layout: the title as an `## ` h2 heading on its own line (larger than
@@ -46,8 +47,29 @@ set -u
 
 [ "${TERM_PROGRAM:-}" = "ghostty" ] || exit 0
 
-STATE_DIR="$HOME/.claude/ghoztty-banner"
+STATE_DIR="$HOME/.config/ghoztty/banner-state"
 mkdir -p "$STATE_DIR"
+
+# Extract a top-level string field from a flat one-line JSON object WITHOUT jq.
+json_str_field() { # field  (reads stdin)
+    LC_ALL=C awk -v k="$1" '
+      { s = s $0 }
+      END {
+        p = "\"" k "\""; i = index(s, p); if (!i) { exit }
+        i += length(p); n = length(s)
+        while (i <= n && substr(s,i,1) ~ /[ \t\r\n]/) i++
+        if (substr(s,i,1) != ":") exit; i++
+        while (i <= n && substr(s,i,1) ~ /[ \t\r\n]/) i++
+        if (substr(s,i,1) != "\"") exit; i++
+        o = ""; e = 0
+        while (i <= n) { c = substr(s,i,1)
+          if (e) { o = o c; e = 0; i++; continue }
+          if (c == "\\") { o = o c; e = 1; i++; continue }
+          if (c == "\"") break
+          o = o c; i++ }
+        printf "%s", o
+      }'
+}
 
 # jq is required for the per-pane state file, which is what lets each call pass
 # only the fields that changed. Without it the hook cannot merge state — but it
@@ -316,7 +338,8 @@ prompt-hook)
     # Seed "You asked" with the raw prompt (first line, truncated) as a
     # default the model refines into a paraphrase during the turn.
     input=$(cat)
-    asked=$(printf '%s' "$input" | jq -r '.prompt // empty' 2>/dev/null | head -n1)
+    asked=$(printf '%s' "$input" | json_str_field prompt | head -n1)
+    asked=$(printf '%s' "$asked" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-500)
     asked=$(sanitize "$asked")
     [ ${#asked} -gt 100 ] && asked="${asked:0:97}..."
 
@@ -330,7 +353,7 @@ prompt-hook)
     # Detect a new session by its id and wipe the stale task identity, so a
     # fresh context begins with a blank banner instead of another session's
     # task. A resumed session keeps its id, so its banner is preserved.
-    session=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+    session=$(printf '%s' "$input" | json_str_field session_id)
     if [ -n "$session" ] && [ "$session" != "$(read_field session)" ]; then
         pairs+=(session "$session" title "" goal "" status "" pr "" bugs "" last "")
     fi
@@ -349,7 +372,7 @@ session-start-hook)
     # continue the same task, so their banners are left untouched (this hook
     # is registered with a `startup|clear` matcher, so it isn't called then).
     input=$(cat)
-    session=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+    session=$(printf '%s' "$input" | json_str_field session_id)
     pane=$(resolve_pane)
     [ -n "$pane" ] && ghoztty +set-banner --target="$pane" --clear >/dev/null 2>&1
     # Reset task fields but keep the resolved pane cache; record the new id so
