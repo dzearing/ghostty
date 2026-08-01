@@ -382,12 +382,33 @@ Work these first, in order, before falling back to first-todo-in-table:
       **answered: it does not.** The Activity panel is process/metrics
       monitoring, independent of T146, which is why T226 exists as its own
       task.
-    - **T227 (new, 2026-07-31)** — the **pixel-parity and polish pass** over
-      the whole Ctrl+Shift+N surface (chooser + Host Settings + account row),
-      judged as one cohesive surface. This is where the restated BAR above
-      gets discharged. Deliberately ordered AFTER T226/T177, since both change
-      the detail row's composition and a polish pass run before them runs
-      twice.
+    - **T227 (new, 2026-07-31; split 2026-08-01)** — the **pixel-parity and
+      polish pass** over the whole Ctrl+Shift+N surface (chooser + Host
+      Settings + account row), judged as one cohesive surface. This is where
+      the restated BAR above gets discharged. Deliberately ordered AFTER
+      T226/T177, since both change the detail row's composition and a polish
+      pass run before them runs twice.
+
+      **~~T302~~ (done, 2026-08-01)** is its measurement half, and the target
+      it paints to is now written down once, in
+      **`docs/design/win32-machine-chooser.md`** — Mac's 45 metrics with
+      `MachineChooserView.swift` line cites, Windows' measured through
+      `SystemParametersInfoForDpi` / `GetSystemMetrics` / `uxtheme` / DWM, and
+      a 13-item delta on the current chooser. Same move T202 made for the tab
+      strip.
+
+      Two things it settled. **T227's stated native-reference method does not
+      work**: `PrintWindow(PW_RENDERFULLCONTENT)` returns a flat black bitmap
+      for Task Manager / Settings / any WinUI app (DirectComposition, nothing
+      in the window DC) and reports success while doing it — T214's terminal
+      limit one class wider, and the same *empty rather than absent* failure.
+      **T303** makes it throw. And **the three biggest defects on the surface
+      belong to T203** — hardcoded dark, every wash/divider/hover blending
+      toward white unconditionally, a hardcoded `#3D8EF8` accent against this
+      box's real `#680081` — so T227 consumes that plumbing rather than
+      re-deriving it, and keeps the type ramp, the avatar/monogram, the radius
+      and icon column, the off-scale spacings, the list focus indicator, and
+      the `secondary_gray` contrast floor.
     - **T146** — the other half of the chooser's *function* (cross-machine
       session browse/resume, Kill, Restore All). Still todo, still 4 Mac
       commits with zero Windows references, and it also owns the correction of

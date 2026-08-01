@@ -5279,3 +5279,61 @@ its origin is the whole conversion. Follow-ups: **T298** (per-card metrics),
 (the carousel is not reachable by Tab), **T301** (switching back to a machine a
 remote WINDOW is already connected to re-dials through the relay and simply fails
 when signed out).
+
+## 2026-08-01 - T302 (T227 split): the chooser's numbers get written down, and the native reference turns out to be uncapturable
+
+T227 - the pixel-parity pass over the whole Ctrl+Shift+N surface - is measure +
+spec + implement + assert across three modules at four DPI scales and two
+themes. That is past one context, and T227's own text already named the spec doc
+as its first deliverable, so the measurement half split out as **T302** and
+landed as `docs/design/win32-machine-chooser.md`. Same move T202 made for the
+tab strip, for the same reason: write the numbers down once and every later task
+paints to one agreed target instead of to an opinion.
+
+Mac's side came out exact - 45 metrics read straight out of
+`MachineChooserView.swift` with line cites, because SwiftUI states its own
+paddings, radii and opacities numerically. Windows' side did not, and the
+interesting part of the turn is why.
+
+**T227's stated method for the Windows reference does not work, and it fails
+silently.** `PrintWindow(PW_RENDERFULLCONTENT)` against Task Manager returned a
+**flat black** 1379x1134 bitmap - one distinct color over a 7px grid, an 8 KB
+PNG - and reported success. The seam scan then found zero vertical seams, which
+reads as "this app has no master-detail seam" rather than "there is no capture".
+Cause is architectural: Task Manager, Settings and every other Win11
+master-detail app are WinUI/XAML compositing through DirectComposition, so
+nothing is ever painted into the window DC. Exactly T214's `GhozttyTerminal`
+limit, one class wider - and the same failure shape, *empty rather than absent*.
+The Win32 apps that DO capture are classic GDI dialogs, i.e. precisely the ones
+that do not show the Win11 idiom, so a capture that works is a capture of the
+wrong thing. Follow-up **T303** makes the flat capture throw instead of measure.
+
+So the doc sources the Windows side three ways and labels every claim with which
+one it came from: **measured** (`SystemParametersInfoForDpi` says the system
+font is Segoe UI 9 pt at 12/15/18/24 px across 96/120/144/192 dpi; DWM says this
+box's accent is `#680081`, a purple; `uxtheme` says BUTTON content margins are
+3 all round and has **no** Win11 answer for `LISTVIEW/LISTITEM`, returning
+`#FFFFFF` for every state including selected), **documented** (the Fluent
+12/14/20/28 ramp, marked as such on every use), and **read from our own source**
+for current state. Nothing eyeballed.
+
+The delta is 13 findings, each with a file and line. The three biggest are one
+defect wearing three hats - the surface is hardcoded dark (`COLOR_BG =
+RGB(32,32,32)` plus a literal `DWMWA_USE_IMMERSIVE_DARK_MODE = 1`, duplicated
+verbatim in `HostSettingsDialog.zig`), every wash/divider/hover composites
+`#FFFFFF` unconditionally so a light background erases the column wash and the
+rules outright, and the accent is a hardcoded `#3D8EF8` against the box's real
+purple. All three are **T203's** mechanism, not the chooser's, and the doc says
+so: T227 consumes that plumbing rather than re-deriving it. What stays with T227
+is the type ramp (15/20/12 against a 14/20/12 target and a 12 px system font),
+the missing avatar and monogram, a row radius and icon column off the design
+system's scale, five surviving off-scale spacings, no focus indicator on the
+owner-drawn list, and no contrast floor on `secondary_gray`.
+
+Cheap second lesson, recorded so nobody repeats it: **Task Manager launches
+elevated**, so a non-elevated session cannot close it again - `Stop-Process`,
+`CloseMainWindow` and `taskkill` all return Access Denied, and the window is
+still on the user's desktop. A reference fixture you cannot clean up is a bad
+fixture.
+
+Docs only; no lane re-run. `parity-tasks.ps1 validate` ALL PASS (333 tasks).
