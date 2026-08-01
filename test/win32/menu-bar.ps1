@@ -5,11 +5,14 @@
 # dispatch entry point; NONE of it was reachable. This script measures the
 # reachable half, always by OUTCOME:
 #
-#   A: the button exists at the right end of the tab strip and opens a menu -
-#      and it is a BUTTON, not "anywhere in the strip": clicking left of it
-#      hits the "+" (a tab appears) and clicking mid-strip does nothing.
-#      Plus a pixel check that the glyph is actually painted, with a blank
-#      strip region as its negative control.
+#   A: the menu HOST button exists and opens a menu - and it is a BUTTON, not
+#      "anywhere in the strip": clicking the "+" opens a tab instead, and
+#      clicking bare strip does nothing. Plus a pixel check that the glyph is
+#      actually painted, with a blank strip region as its negative control.
+#      Since T260 the host depends on the window: a window that draws its own
+#      caption hosts the menu in the caption's "..." and its strip carries NO
+#      second button (asserted here by hit test AND by pixels), while a
+#      caption-less window still hosts it in the strip - which is section H.
 #   B: the whole tree is there - walked RECURSIVELY, so a missing submenu
 #      cannot hide behind a matching item count.
 #   C: choosing a row performs its command, one representative per submenu,
@@ -21,6 +24,10 @@
 #   G: keyboard activation - F10 and a lone Alt open the menu; alt+<key> does
 #      not; and F10 is passed through to a full-screen TUI (alternate screen)
 #      instead of opening the menu, then works again on the primary screen.
+#   H: T260 - a `window-decoration = none` window has no caption to host the
+#      menu, so the strip keeps its "=" button there and it opens the same
+#      menu. The positive control for A's "the strip has no button": without
+#      it, a build that deleted the button outright would pass just as well.
 #
 # Menu contents are read from the LIVE popup via MN_GETHMENU + cross-process
 # GetMenuItemInfo-family calls (never GetWindowTextW, which reads a cache the
@@ -324,22 +331,85 @@ function Strip-Geometry([IntPtr]$top, [int]$tabCount = 1) {
     $m = Get-TestChromeMetrics -Window $top
     $tabsRight = Get-TestTabRunRight -Window $top -Metrics $m
     $plusLeft = [Math]::Min($tabsRight + $m.Gap, $m.PlusLimit)
+    $deadRight = if ($null -ne $m.MenuLeft) { $m.MenuLeft } else { $m.ClientW - $m.PadR }
 
     [pscustomobject]@{
         Dpi = $m.Dpi; ClientW = $m.ClientW; BtnW = $m.BtnPaint; TabsRight = $tabsRight
         # The floor a tab shrinks to under pressure - the one width constant
         # T235 kept. Used only to size the reflow section's tab count.
         MinTabW = $m.MinTabW
+        # $null on a caption window - there is no strip menu button there
+        # (T260); `Menu-Host` is what names the host that DOES exist.
         MenuX = $m.MenuX
         PlusX = $plusLeft + [int]($m.BtnPaint / 2)
-        # Strip that belongs to neither a tab, the "+", nor the menu button.
-        DeadX = [int](($plusLeft + $m.BtnPaint + $m.MenuLeft) / 2)
+        # Strip that belongs to neither a tab, the "+", nor any button: halfway
+        # between the "+"'s painted right edge and the next painted thing right
+        # of it - the menu button where there is one, else the strip's own
+        # right inset. Measuring it against MenuLeft alone stopped working the
+        # moment MenuLeft could be $null (T260).
+        DeadX = [int](($plusLeft + $m.BtnPaint + $deadRight) / 2)
+        # The center of the RIGHT-MOST square slot in the strip: where the "="
+        # button is on a caption-less window, and where it used to be on every
+        # window. On a caption window this is bare strip and must behave like
+        # it - that is T260's user-visible claim.
+        StripRightX = $m.ClientW - $m.PadR - [int]($m.BtnPaint / 2)
     }
 }
 
-# Open the menu from the tab-strip button and return the live tree.
+# WHERE this window's menu host button is, in CLIENT coordinates, and which
+# one it is (T260).
+#
+# There is exactly one menu host per window and it depends on the window, not
+# on the script's preference: a window that draws its own caption carries the
+# "..." button up there, and the strip's "=" is not painted at all - two
+# controls one band apart opening the same menu is the "undifferentiated
+# cluster" complaint in a new place. A caption-less window (`window-decoration
+# = none`) has no such button, and there the strip IS the host.
+#
+# Asking the metrics rather than the launch flags is deliberate: the app's own
+# rule is `!customCaption()`, read off the window's style bits, so this cannot
+# drift from it by the script believing something about how it launched.
+function Menu-Host([IntPtr]$top) {
+    $m = Get-TestChromeMetrics -Window $top
+    if ($m.HasStripMenu) {
+        return [pscustomobject]@{ Kind = 'strip'; X = $m.MenuX; Y = $m.CaptionH + 8; M = $m }
+    }
+    return [pscustomobject]@{ Kind = 'caption'; X = $m.CaptionOverflowX; Y = [int]($m.CaptionH / 2); M = $m }
+}
+
+# lparam for a mouse/hit-test message: screen point packed lo=x, hi=y.
+function PackPoint([int]$x, [int]$y) {
+    return [IntPtr](([int64]($y -band 0xFFFF) -shl 16) -bor [int64]($x -band 0xFFFF))
+}
+
+# Click this window's menu host, wherever it is, and return the hit-test code
+# the app answered for that point (0 for the strip, which is not hit-tested by
+# WM_NCHITTEST at all).
+#
+# The two hosts take DIFFERENT message paths and that is not an implementation
+# detail this can paper over: the caption band is client area the window claims
+# back through WM_NCHITTEST, so Windows delivers WM_NCLBUTTONDOWN there, and a
+# posted client WM_LBUTTONDOWN - which is what Send-TestMouse is - reaches
+# nothing (measured: every menu-open assertion failed while F10 still passed).
+# The CODE is asked of the app rather than assumed, so a "..." that stopped
+# answering HTSYSMENU makes this stop finding it instead of clicking blind.
+function Click-MenuHost([IntPtr]$top) {
+    $h = Menu-Host $top
+    $cr = Get-TestWindowRect -Window $top -Client
+    $sx = $cr.Left + $h.X
+    $sy = $cr.Top + $h.Y
+    if ($h.Kind -eq 'strip') {
+        [void](Send-TestMouse -Window $top -Target $top -X $sx -Y $sy -Button left -Action click)
+        return 0
+    }
+    $code = [int](Invoke-TestMessage -Window $top -Message 0x0084 -LParam (PackPoint $sx $sy))  # WM_NCHITTEST
+    [void](Send-TestRawMessage -Window $top -Message 0x00A1 -WParam ([IntPtr]$code) -LParam (PackPoint $sx $sy))
+    return $code
+}
+
+# Open the menu from this window's menu host button and return the live tree.
 function Open-Menu($g, [int]$waitMs = 3000) {
-    Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+    [void](Click-MenuHost $g.Top)
     $m = Wait-Menu $g.Pid $waitMs
     if ($m -eq [IntPtr]::Zero) { return $null }
     Get-MenuTree $m
@@ -488,15 +558,35 @@ try {
 $g = Start-Gui 'main' @('--session-persistence=false')
 
 # --- A: the button ---------------------------------------------------------
-$tree = Open-Menu $g
-Assert ($null -ne $tree) 'A: clicking the right end of the tab strip opens the menu'
+$host0 = Menu-Host $g.Top
+Write-Host "      A: menu host is the $($host0.Kind) button at client x=$($host0.X)"
+# The app's OWN hit test, at the point the metrics say the "..." is: HTSYSMENU
+# (3). Asserted before the click so a miss reads as "the button is not where
+# the layout module puts it" rather than as "the menu did not open".
+$hostCode = Click-MenuHost $g.Top
+Assert ($hostCode -eq 3) "A: the caption menu button hit-tests as HTSYSMENU (got $hostCode)"
+$m = Wait-Menu $g.Pid 3000
+$tree = if ($m -eq [IntPtr]::Zero) { $null } else { Get-MenuTree $m }
+Assert ($null -ne $tree) "A: clicking the $($host0.Kind) menu button opens the menu"
 Close-Menu $g
 
-# It is a button, not "the strip": the bare strip between the "+" and the menu
-# button is dead space, and the "+" is its own hit box.
+# T260: this window draws its own caption, so the caption's "..." IS the host
+# and the strip must NOT carry a second button doing the same thing. Clicking
+# the right-most square slot of the strip - where the "=" used to be, and still
+# is on a caption-less window (section H) - has to do nothing at all.
+Assert ($host0.Kind -eq 'caption') 'A: a normal window hosts the menu in its caption, not in the strip'
+$tabsAtStripRight = Tab-Count
+Click-Strip $g.Top (Strip-Geometry $g.Top).StripRightX 8
+$m = Wait-Menu $g.Pid 1200
+Assert ($m -eq [IntPtr]::Zero) 'A(T260): the strip has no menu button on a caption window'
+if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
+Assert ((Tab-Count) -eq $tabsAtStripRight) 'A(T260): ...and clicking there opens no tab either'
+
+# It is a button, not "the strip": the bare strip between the "+" and the
+# strip's right end is dead space, and the "+" is its own hit box.
 $tabsBefore = Tab-Count
 $geo = Strip-Geometry $g.Top $tabsBefore
-Write-Host "      A: dpi=$($geo.Dpi) client=$($geo.ClientW) -> plus@$($geo.PlusX) dead@$($geo.DeadX) menu@$($geo.MenuX)"
+Write-Host "      A: dpi=$($geo.Dpi) client=$($geo.ClientW) -> plus@$($geo.PlusX) dead@$($geo.DeadX) stripRight@$($geo.StripRightX)"
 Click-Strip $g.Top $geo.DeadX 8
 $m = Wait-Menu $g.Pid 1200
 Assert ($m -eq [IntPtr]::Zero) 'A: clicking bare strip does NOT open the menu'
@@ -526,13 +616,15 @@ try {
     $cw = $cr.Width
     # The strip's first row, not the client's (T256).
     $stripTop = $cr.Top + (Caption-Height $g.Top)
-    # Ink = pixels far from the rect's own most-common color (the bar
+    # Ink = pixels far from the rect's own most-common color (the band
     # background), measured in SCREEN coordinates against the capture.
-    function Ink([int]$xClient, [int]$w, [int]$h) {
+    # `$yTop` is a SCREEN y, because since T260 the two things this probes -
+    # the caption's "..." and the strip's right end - are in different bands.
+    function Ink([int]$xClient, [int]$yTop, [int]$w, [int]$h) {
         $counts = @{}
         $px = New-Object 'System.Drawing.Color[,]' $w, $h
         for ($yy = 0; $yy -lt $h; $yy++) { for ($xx = 0; $xx -lt $w; $xx++) {
-            $c = Get-TestPixel -Shot $shot -X ($cr.Left + $xClient + $xx) -Y ($stripTop + 2 + $yy)
+            $c = Get-TestPixel -Shot $shot -X ($cr.Left + $xClient + $xx) -Y ($yTop + $yy)
             if ($null -eq $c) { $c = [System.Drawing.Color]::Transparent }
             $px[$xx, $yy] = $c
             $k = $c.ToArgb()
@@ -547,14 +639,35 @@ try {
         } }
         $ink
     }
-    $btnInk = Ink ($cw - 36) 34 26
-    $blankInk = Ink ([int]($cw / 2)) 34 26
-    if ($NegativeControl) {
-        Assert ($btnInk -le 2) "A(neg): the menu button paints NO glyph ($btnInk ink pixels)"
+    # The HOST's square, wherever it is: the caption's "..." on this window.
+    # Both probes are the same 34x26 box around a 28 DIP square, just in
+    # different bands.
+    $hm = $host0.M
+    # The painted squares, from the metrics rather than from a 34x26 box that
+    # happened to overlap one at this DPI: a caption button paints at
+    # `pad_sm` below the band top, a strip button at `tab_top_pad + pad_sm`
+    # below the strip top, and both are `btn_paint` on a side.
+    $probeW = $hm.BtnPaint + 4
+    $capY = $cr.Top + $hm.PadSm
+    $stripY = $stripTop + $hm.TabTopPad + $hm.PadSm
+    $stripRightL = $cw - $hm.PadR - $hm.BtnPaint
+    $hostInk = if ($host0.Kind -eq 'caption') {
+        Ink ($hm.CaptionOverflowLeft - 2) $capY $probeW $hm.BtnPaint
     } else {
-        Assert ($btnInk -gt 8) "A: the menu button paints a glyph ($btnInk ink pixels)"
+        Ink ($stripRightL - 2) $stripY $probeW $hm.BtnPaint
+    }
+    $blankInk = Ink ([int]($cw / 2)) $stripY $probeW $hm.BtnPaint
+    # T260's pixel half: the strip's right-most square is BARE. The hit test
+    # above says nothing lands there; this says nothing is drawn there either,
+    # which is the part the user actually complained about seeing twice.
+    $stripRightInk = Ink ($stripRightL - 2) $stripY $probeW $hm.BtnPaint
+    if ($NegativeControl) {
+        Assert ($hostInk -le 2) "A(neg): the menu button paints NO glyph ($hostInk ink pixels)"
+    } else {
+        Assert ($hostInk -gt 8) "A: the $($host0.Kind) menu button paints a glyph ($hostInk ink pixels)"
     }
     Assert ($blankInk -le 2) "A: blank strip control has no ink ($blankInk pixels) - the probe measures ink"
+    Assert ($stripRightInk -le 2) "A(T260): the strip's right end paints no menu glyph ($stripRightInk ink pixels)"
 } finally {
     Close-TestWindowPixels $shot
 }
@@ -600,7 +713,7 @@ if ($null -ne $tree) {
 Close-Menu $g
 
 # --- C: Edit>Select All dispatches, and Copy then enables ------------------
-Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Click-MenuHost $g.Top)
 $m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the Select All dispatch'
 Send-MenuKey $g.Top 'E'  # Edit submenu
@@ -614,7 +727,7 @@ Close-Menu $g
 
 # --- C: File>New Tab dispatches -------------------------------------------
 $before = Tab-Count
-Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Click-MenuHost $g.Top)
 $m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the New Tab dispatch'
 Send-MenuKey $g.Top 'F'  # File submenu
@@ -626,7 +739,7 @@ for ($t = 0; $t -lt 20; $t++) { Start-Sleep -Milliseconds 250; if ((Tab-Count) -
 Assert $grew "C: File>New Tab opened a tab ($before -> $(Tab-Count))"
 
 # --- C: View>Terminal Read-only round-trips through the check state --------
-Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Click-MenuHost $g.Top)
 $m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the read-only toggle'
 Send-MenuKey $g.Top 'V'  # View
@@ -638,7 +751,7 @@ $tree = Open-Menu $g
 Assert ($null -ne $tree -and (Row-Flags $tree "&View/Terminal Read-&only") -eq ':checked') 'C: View>Terminal Read-only performs and comes back CHECKED'
 Close-Menu $g
 # ...and off again, so the rest of the run types normally.
-Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Click-MenuHost $g.Top)
 [void](Wait-Menu $g.Pid 3000)
 Send-MenuKey $g.Top 'V'
 Start-Sleep -Milliseconds 300
@@ -658,7 +771,7 @@ Assert ($panesBefore -ge 2) "C: the tab has two panes to zoom (visible=$panesBef
 $tree = Open-Menu $g
 Assert ($null -ne $tree -and (Row-Flags $tree "&Window/&Zoom Split") -eq '') 'D: Zoom Split is ENABLED once the tab has two panes'
 Close-Menu $g
-Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Click-MenuHost $g.Top)
 [void](Wait-Menu $g.Pid 3000)
 Send-MenuKey $g.Top 'W'  # Window
 Start-Sleep -Milliseconds 300
@@ -779,6 +892,28 @@ Assert (-not ($g.Proc -and $g.Proc.HasExited)) 'run 1: no crash'
 Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
 
 # ===========================================================================
+# Run 1b: section H - the strip KEEPS its button where nothing else hosts the
+# menu. T260's other half, and the reason the button is conditional rather
+# than deleted: `window-decoration = none` has no caption, so the strip is the
+# only host there. Its own window because the property is per-window - and
+# because an assertion that only ever ran on caption windows would pass just
+# as well against a build that deleted the button outright.
+# ===========================================================================
+$g = Start-Gui 'no-decoration' @('--session-persistence=false', '--window-decoration=none')
+$hostN = Menu-Host $g.Top
+Assert ($hostN.Kind -eq 'strip') 'H: a caption-less window hosts the menu in the strip'
+Assert ((Get-TestChromeMetrics -Window $g.Top).CaptionH -eq 0) 'H: ...because it has no caption band at all'
+$tree = Open-Menu $g 4000
+Assert ($null -ne $tree) 'H: the strip menu button opens the menu there'
+if ($null -ne $tree) {
+    Assert ((@(Rows $tree | ForEach-Object { $_.Path })).Count -eq $expectedTree.Count) `
+        'H: ...and it is the same menu, not a stub'
+    Close-Menu $g
+}
+Assert (-not ($g.Proc -and $g.Proc.HasExited)) 'run 1b: no crash'
+Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
+
+# ===========================================================================
 # Run 2: section E - Exit advertises session keeping when persistence is on.
 # ===========================================================================
 $g = Start-Gui 'persistence-on' @('--session-persistence=true')
@@ -815,7 +950,7 @@ Assert (-not ($g.Proc -and $g.Proc.HasExited)) 'run 3: no crash'
 # frees the Window allocation, so anything the host touches after dispatch is
 # a use-after-free. This is the assertion for that: the app must go away
 # cleanly, not abort.
-Click-Strip $g.Top (Strip-Geometry $g.Top).MenuX 8
+[void](Click-MenuHost $g.Top)
 $m = Wait-Menu $g.Pid 3000
 Assert ($m -ne [IntPtr]::Zero) 'C: menu opens for the Close Window dispatch'
 Send-MenuKey $g.Top 'F'  # File

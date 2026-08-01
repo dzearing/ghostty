@@ -450,28 +450,46 @@ try {
     # got its preferred width above now gets less.
     Assert ($manyW -gt 0 -and $manyW -lt $tabW) "many tabs: tab width shrank below its preferred width ($manyW < $tabW)"
     Assert ($manyW -ge ($minTabW - $tabGap - 3)) "many tabs: never below the floor ($manyW >= $minTabW - $tabGap)"
-    $bandLeft = $clientW - $padR - 2 * $btnPaint - $gap
+    # The run's own right limit, from the shared datum: one group gap short of
+    # where the "+" may paint. Restating it as "clientW - padR - 2*btn - gap"
+    # was a private copy of the button band, and it counted TWO buttons - which
+    # stopped being true the moment T260 made the "=" conditional.
+    $bandLeft = $m.RunRight - $gap
     Assert ($ext[1] -le $bandLeft) "many tabs: the tab run never reaches the button band ($($ext[1]) <= $bandLeft)"
     Assert (-not (Any-Accent-Blue $shot)) 'many tabs: still no accent rule anywhere in the strip'
     Close-TestWindowPixels $shot
 
     # -----------------------------------------------------------------------
-    # 6. The menu button is pinned to the right END OF THE STRIP - its PAINTED
-    #    square inset by the same padding the first tab gets on the left, not
-    #    flush against the window border ("the hamburger button has no gap
-    #    between it and the border"). Its hit box is allowed to reach into that
-    #    pad (T232: a forgiving click target is free precisely because it is
-    #    invisible), so the miss is asserted at the outermost pixel column -
-    #    past the hit box, which no amount of forgiveness may cross.
+    # 6. The right-anchored button is pinned to the right END OF THE STRIP -
+    #    its PAINTED square inset by the same padding the first tab gets on the
+    #    left, not flush against the window border ("the hamburger button has
+    #    no gap between it and the border"). Its hit box is allowed to reach
+    #    into that pad (T232: a forgiving click target is free precisely
+    #    because it is invisible), so the miss is asserted at the outermost
+    #    pixel column - past the hit box, which no amount of forgiveness may
+    #    cross.
+    #
+    #    WHICH button that is depends on the window (T260). This one draws its
+    #    own caption, so the caption's "..." hosts the menu and the strip's "="
+    #    is not painted at all: the "+" inherits the slot, and section 5 has
+    #    just filled the strip, so it is sitting at its limit. The assertion is
+    #    therefore that the right-most square opens a TAB and NO menu - which
+    #    is a stronger statement than the old one, because it fails both if the
+    #    inset is wrong and if the retired "=" came back.
     # -----------------------------------------------------------------------
+    $tabsBeforeEdge = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count
     Strip-Click ($clientW - 1)
     Start-Sleep -Milliseconds 300
     Assert ((Get-TestWindow -ProcessId $app.Pid -Class '#32768') -eq [IntPtr]::Zero) `
         'right inset: the strip does not run flush to the window border (a click at the edge opens nothing)'
+    Assert (@(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count -eq $tabsBeforeEdge) `
+        'right inset: ...and not a tab either - the hit box stops short of the border'
 
     Strip-Click ($clientW - $padR - [int]($btnPaint / 2))
-    $menu = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 3000
-    Assert ($menu -ne [IntPtr]::Zero) 'menu button: still pinned to the right edge and still opens its popup'
+    Start-Sleep -Milliseconds 500
+    $menu = Wait-TestPopupMenu -ProcessId $app.Pid -TimeoutMs 1200
+    Assert ($menu -eq [IntPtr]::Zero) `
+        'T260: the strip carries NO menu button on a window whose caption hosts the menu'
     if ($menu -ne [IntPtr]::Zero) {
         # Escape it back closed so teardown is clean. Send-TestControlKey posts
         # without touching focus; Send-TestKeys would SetFocus and dismiss it
@@ -479,6 +497,18 @@ try {
         [void](Send-TestControlKey -Control $menu -Key Escape)
         Start-Sleep -Milliseconds 400
     }
+
+    # ...and the "+" is still there and still works, wherever the run left it.
+    # MEASURED, not assumed at the limit: under pressure the tabs divide the run
+    # evenly and the remainder can leave the "+" most of a tab short of its
+    # limit, which is exactly the kind of re-derivation T256/T259 are about.
+    $tabsNow = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count
+    $runRight = Get-TestTabRunRight -Window $top -Metrics $m
+    $plusLeft = [Math]::Min($runRight + $gap, $m.PlusLimit)
+    Strip-Click ($plusLeft + [int]($btnPaint / 2))
+    Start-Sleep -Milliseconds 500
+    Assert (@(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal').Count -gt $tabsNow) `
+        'the "+" survives the strip being full and still opens a tab'
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash'
 

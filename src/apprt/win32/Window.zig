@@ -845,6 +845,22 @@ pub fn customCaption(self: *const Window) bool {
     return (style & w32.WS_CAPTION) != 0;
 }
 
+/// Does the tab strip paint its own "≡" menu button (T260)?
+///
+/// Only on a window where nothing else hosts the menu. Since T234 a window
+/// that draws its own caption carries a "…" button up there, so on those the
+/// strip's "≡" is a SECOND control, one band away, opening the same menu —
+/// which is the "undifferentiated cluster" complaint in a new place. It cannot
+/// simply be deleted, because a `window-decoration = none` window (and, before
+/// T234's rule, any caption-less one) has no caption to host the menu and the
+/// strip is the only host it has; hence conditional rather than gone.
+///
+/// Dropping it also hands the tab run back one painted square and one group
+/// gap, which is T235's direction — see `tab_strip_layout.runWidth`.
+pub fn stripHasMenu(self: *const Window) bool {
+    return !self.customCaption();
+}
+
 /// Height of the caption band in physical pixels, or 0 when the OS still owns
 /// the caption. From the layout module, never a second copy of the constant.
 pub fn captionHeight(self: *const Window) i32 {
@@ -3472,7 +3488,7 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         }
         prefer[i] = m.preferredWidth(text_w);
     }
-    const strip = tab_strip.layout(m, client_w, prefer[0..self.tab_count], &tabs);
+    const strip = tab_strip.layout(m, client_w, self.stripHasMenu(), prefer[0..self.tab_count], &tabs);
 
     // Publish hit-test rects. Tabs past `strip.visible` did not fit and get a
     // ZERO rect on purpose — invisible and unhittable — instead of being laid
@@ -3624,10 +3640,15 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
         inactive_text_color,
     );
 
-    // --- Draw menu (≡) button (T190) ---
+    // --- Draw menu (≡) button (T190, conditional since T260) ---
     // The menu being OPEN keeps it lit, which is how every Windows menu
     // button signals its popup belongs to it.
-    paintIconButton(
+    //
+    // The rect is ZERO on a window whose caption hosts the menu, and a zero
+    // rect is asked about here rather than assumed harmless: `paintIconButton`
+    // would happily paint a degenerate square at the origin, which is a glyph
+    // in the top-left corner of the strip.
+    if (!strip.menu.isEmpty()) paintIconButton(
         mem_dc,
         ib,
         strip.menu,
@@ -4064,7 +4085,16 @@ pub fn openMenuBarAt(self: *Window, anchor: MenuAnchor) void {
 
     const use_caption = switch (anchor) {
         .caption => true,
-        .strip => false,
+        // T260: the strip only paints a "≡" when there is no caption to host
+        // the menu, so a `.strip` request on a caption window means a hit test
+        // found a button that is not painted. Unreachable by construction —
+        // `menu_btn_rect` is zeroed there and every strip hit test is a
+        // half-open range — asserted so it stays that way, and still anchored
+        // somewhere the user is looking in a release build.
+        .strip => blk: {
+            std.debug.assert(self.stripHasMenu());
+            break :blk !self.stripHasMenu();
+        },
         .auto => self.customCaption(),
     };
 

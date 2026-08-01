@@ -61,6 +61,9 @@
 #                                 stripe_h  = max(px(3), 2)
 #                                 hairline  = max(px(1), 1)
 #   tab_strip_layout.runWidth     client_w - pad_r - btn - gap - btn - gap - pad_l
+#                                 ...MINUS the "= " square and one gap only when
+#                                 the strip HAS a menu button (T260: it does not
+#                                 when the caption's "..." hosts the menu)
 #   tab_strip_layout.tabCap       max(runWidth / 2, min_tab_w)
 
 # The layout modules' `px()`: `@intFromFloat(@round(dip * scale))`. Zig's
@@ -109,11 +112,24 @@ function Get-TestChromeMetrics {
     $btnPaint = & $px 28.0        # icon_button.Metrics.target - the PAINTED square
     $btnPad = & $px 2.0           # icon_button.Metrics.hit_pad
 
+    # Does this window draw its own caption band (T254)? `Window.customCaption`
+    # is `!quick_terminal && decoration != none && (style & WS_CAPTION)`, and
+    # both of the first two imply the third - a quick terminal is WS_POPUP and
+    # `setDecorations` strips WS_CAPTION - so the style bit answers the whole
+    # question, from the OS rather than from what the script thinks it launched.
+    $WS_CAPTION = 0x00C00000
+    $hasCaption = ((Get-TestWindowStyle -Window $Window -Desktop $Desktop) -band $WS_CAPTION) -ne 0
+
+    # T260: the strip paints its own "menu" button only when there is no
+    # caption to host the menu. Same rule as `Window.stripHasMenu`, and the
+    # reason the right-anchored band below is conditional.
+    $hasStripMenu = -not $hasCaption
+
     # caption_h and bar_h are built from the same two parts the modules build
     # them from, not from a literal 36/40, so `window-decoration = none` (no
     # caption) and any future change show up as a disagreement rather than a
     # coincidence.
-    $captionH = 2 * $padSm + $btnPaint
+    $captionH = if ($hasCaption) { 2 * $padSm + $btnPaint } else { 0 }
     $barH = 3 * $padSm + $btnPaint
 
     $cr = Get-TestWindowRect -Window $Window -Client
@@ -122,9 +138,28 @@ function Get-TestChromeMetrics {
 
     # Right-anchored button band. This is ANCHORING, not sizing - it is the
     # part of the strip a script may legitimately derive (see the header).
-    $menuLeft = $clientW - $padSm - $btnPaint
-    $plusLimit = $menuLeft - $gap - $btnPaint
+    #
+    # Without a strip menu the "+" IS the right-anchored control and takes the
+    # slot the menu had, which is exactly what `tab_strip_layout.plusPaintLimit`
+    # does. `MenuLeft` is then $null: there is no such button, and a script that
+    # clicks one on this window is aiming at nothing (better a $null-arithmetic
+    # blow-up than a click that silently lands on empty strip).
+    if ($hasStripMenu) {
+        $menuLeft = $clientW - $padSm - $btnPaint
+        $plusLimit = $menuLeft - $gap - $btnPaint
+    } else {
+        $menuLeft = $null
+        $plusLimit = $clientW - $padSm - $btnPaint
+    }
     $runW = $plusLimit - $gap - $padSm
+
+    # The caption's own "..." menu button (T234), in client x - the menu host
+    # on a caption window, and what `menu-bar.ps1` clicks there. Right-anchored
+    # like the system trio, one GROUP step (pad_md) clear of minimize, exactly
+    # as `caption_layout.layout` places it.
+    $capCloseL = $clientW - $padSm - $btnPaint
+    $capMinL = $capCloseL - 2 * ($btnPaint + $padSm)
+    $capOverL = if ($hasCaption) { $capMinL - $padMd - $btnPaint } else { $null }
 
     return [pscustomobject]@{
         Dpi = $dpi
@@ -142,8 +177,13 @@ function Get-TestChromeMetrics {
         BtnW = $btnPaint + 2 * $btnPad
 
         # --- band heights ----------------------------------------------------
+        # 0 when the OS still owns the caption, so a strip-relative y offset by
+        # this lands in the strip on BOTH kinds of window.
         CaptionH = $captionH
         BarH = $barH
+        HasCaption = $hasCaption
+        # T260: is there a "menu" button in the strip at all?
+        HasStripMenu = $hasStripMenu
 
         # --- tab strip constants ---------------------------------------------
         PadL = $padSm                       # strip_pad_l
@@ -170,9 +210,17 @@ function Get-TestChromeMetrics {
         StripTop = ($cr.Top - $wr.Top) + $captionH
 
         # --- right-anchored band, client x -----------------------------------
+        # $null on a caption window - the button does not exist there (T260).
         MenuLeft = $menuLeft
-        MenuX = $menuLeft + [int]($btnPaint / 2)
+        MenuX = if ($null -ne $menuLeft) { $menuLeft + [int]($btnPaint / 2) } else { $null }
         PlusLimit = $plusLimit
+        # The right edge of everything the tab run may occupy: the "+"'s own
+        # painted limit. The one boundary that means the same thing with and
+        # without a menu button, which is why the tab scan below uses it.
+        RunRight = $plusLimit
+        # The caption's "..." (T234): the menu host on a caption window.
+        CaptionOverflowLeft = $capOverL
+        CaptionOverflowX = if ($null -ne $capOverL) { $capOverL + [int]($btnPaint / 2) } else { $null }
         # tab_strip_layout.runWidth: what the 50% proportional cap is half OF,
         # so the script and the layout module mean the same run.
         RunW = $runW
@@ -231,15 +279,17 @@ function Get-TestTabExtents {
     if (-not $shot) { return $out }
 
     try {
-        # The strip background, sampled in the gap left of the menu button -
-        # strip that can belong to no tab.
-        $bg = $shot.Bitmap.GetPixel($m.OffX + $m.MenuLeft - 2, $rowY)
+        # The strip background, sampled just left of the "+"'s painted limit -
+        # strip that can belong to no tab, whether or not a menu button follows
+        # it (T260). The tab run ends one `group_gap` before this, so these
+        # pixels are background in every layout the module can produce.
+        $bg = $shot.Bitmap.GetPixel($m.OffX + $m.RunRight - 2, $rowY)
         $runStart = -1
-        # Runs to MenuLeft inclusive-exclusive so a run touching the right end
+        # Runs to RunRight inclusive-exclusive so a run touching the right end
         # is still closed off.
-        for ($x = $m.PadL; $x -le $m.MenuLeft; $x++) {
+        for ($x = $m.PadL; $x -le $m.RunRight; $x++) {
             $isTab = $false
-            if ($x -lt $m.MenuLeft) {
+            if ($x -lt $m.RunRight) {
                 $p = $shot.Bitmap.GetPixel($m.OffX + $x, $rowY)
                 $isTab = ([Math]::Abs($p.R - $bg.R) -gt 8 -or [Math]::Abs($p.G - $bg.G) -gt 8 -or
                           [Math]::Abs($p.B - $bg.B) -gt 8)

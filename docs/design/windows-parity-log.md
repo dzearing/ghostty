@@ -4302,3 +4302,54 @@ tmp each time, so not one poisoned entry); set to `D:\zig-global-cache` -> exit
 shape as the `-First N` warning already in go.md, which was mis-filed twice as a
 transient flake before someone wrote it down; this one is undocumented and will
 be misread the same way.
+
+## 2026-07-31 - T260: two buttons, one band apart, opening the same menu
+
+Taken ahead of T205, which is the UI block's next item, because T205 merges the
+tab strip INTO the caption row - and merging first would have put the strip's
+"hamburger" and the caption's "..." eight DIP apart in ONE row, which is the
+undifferentiated-cluster complaint at its worst. The `has_menu` plumbing this
+needed is also exactly what T205 needs.
+
+The strip's menu button is now conditional on there being no other host:
+`stripHasMenu() == !customCaption()`, the same rule the caption uses to decide
+whether IT hosts the menu. It could not simply be deleted - a
+`window-decoration = none` window has no caption, and the strip is the only
+menu host it has, which is why T234's visibility rule already read
+`tab_count > 1 or !customCaption()`. Dropping it hands the tab run back exactly
+one 28 DIP square and one 8 DIP group gap (asserted at four scales), so tabs
+get wider, which is T235's direction.
+
+Two things it turned up, both filed:
+
+**`Send-TestMouse` cannot click caption-band chrome (T263).** It posts CLIENT
+mouse messages; since T254 the caption band is client area that the window
+claims back through `WM_NCHITTEST`, so a real click there arrives as
+`WM_NCLBUTTONDOWN` and the harness sends nothing the app handles. Cost a full
+red run - 17 failures - while the pixel probe said the glyph was painted where
+the metrics put it and F10 opened the same menu. Worked around by asking the
+app for the hit code and posting the NC pair (`caption-bar.ps1`'s idiom), but
+it matters far more for T205: every strip click in four scripts moves into that
+band.
+
+**A private copy of the button band, again (T264).** `tab-strip.ps1` asserted
+the run against `clientW - padR - 2*btn - gap` - two buttons, restated locally,
+three weeks after T257 deleted four copies of the same kind of thing. It reads
+`RunRight - gap` from the shared module now. The last copy, in
+`caption-bar.ps1`, is T264.
+
+The decision T260 asked for, on `menu-bar.ps1`: NOT moving the whole script to
+a caption-less window. The window a user runs has a caption, and moving the
+script off it would leave the mainstream case untested. The script asks the
+WINDOW where its menu host is instead, so every content section is unchanged;
+section A gained the T260 assertions on the normal window, and a new section H
+runs one `--window-decoration=none` window to prove the strip KEEPS its button
+where nothing else hosts the menu. H is the load-bearing half - without it,
+every A assertion would pass just as well against a build that deleted the
+button outright.
+
+Evidence: menu-bar.ps1 ALL PASS (71, up from 54) with its negative control
+still failing on exactly the one ink assertion; tab-strip.ps1 37,
+tab-strip-autohide.ps1 13, caption-bar.ps1 17, tab-color.ps1 16, all ALL PASS;
+both zig test lanes exit 0; test-agent green on re-run after the known T258
+ConPTY flake; P1-P3 ALL PASS.

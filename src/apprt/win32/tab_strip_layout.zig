@@ -254,14 +254,32 @@ pub const Strip = struct {
     menu: Rect = .{},
 };
 
+/// The furthest right the "+"'s PAINTED square may start.
+///
+/// With a menu button the "+" stops one `group_gap` short of it; without one
+/// the "+" IS the right-anchored control and takes the menu's slot, which is
+/// why this is the single place the difference is expressed. `runWidth` and
+/// `layout` both read it, so a menu-less strip cannot end up with a run that
+/// disagrees with where the "+" actually lands.
+fn plusPaintLimit(m: Metrics, client_w: i32, has_menu: bool) i32 {
+    const band_right = client_w - m.strip_pad_r;
+    return if (has_menu)
+        band_right - m.btn_paint - m.group_gap - m.btn_paint
+    else
+        band_right - m.btn_paint;
+}
+
 /// The width the tab run may occupy on a `client_w`-wide strip: everything
 /// left after the two insets and the "+"/"≡" band. Named because the
 /// proportional cap is a fraction OF THIS, so `layout`, the tests and the
 /// acceptance script all have to mean the same run.
-pub fn runWidth(m: Metrics, client_w: i32) i32 {
-    const menu_paint_left = client_w - m.strip_pad_r - m.btn_paint;
-    const plus_paint_limit = menu_paint_left - m.group_gap - m.btn_paint;
-    return plus_paint_limit - m.group_gap - m.strip_pad_l;
+///
+/// `has_menu` is T260: on a window that draws its own caption the "…" button
+/// up there IS the menu host, so the strip's "≡" is a second control opening
+/// the same menu and does not paint. The run then reclaims exactly one painted
+/// square plus one group gap — wider tabs, which is T235's direction.
+pub fn runWidth(m: Metrics, client_w: i32, has_menu: bool) i32 {
+    return plusPaintLimit(m, client_w, has_menu) - m.group_gap - m.strip_pad_l;
 }
 
 /// The most any ONE tab's slot may take: 50% of the run it sits in (design
@@ -286,7 +304,12 @@ pub fn slotWidth(m: Metrics, tabs_avail: i32, preferred_paint: i32) i32 {
 /// `Metrics.preferredWidth` (the caller measures the text; this module never
 /// does). Tab rects go into `out`, which must hold at least `prefer.len`
 /// entries; entries past `visible` are zeroed.
-pub fn layout(m: Metrics, client_w: i32, prefer: []const i32, out: []Rect) Strip {
+///
+/// `has_menu` false (T260) drops the "≡": `Strip.menu` comes back a ZERO rect
+/// rather than an off-screen or negative one, so every existing hit test —
+/// each of which is a half-open `x >= left and x < right` — misses it by
+/// construction instead of by remembering to ask.
+pub fn layout(m: Metrics, client_w: i32, has_menu: bool, prefer: []const i32, out: []Rect) Strip {
     std.debug.assert(out.len >= prefer.len);
     const tab_count = @min(prefer.len, MAX_TABS);
     for (out[0..prefer.len]) |*r| r.* = .{};
@@ -298,9 +321,8 @@ pub fn layout(m: Metrics, client_w: i32, prefer: []const i32, out: []Rect) Strip
     // The menu button is pinned to the right END OF THE STRIP — its painted
     // square inset by `strip_pad_r`, matching the inset the first tab gets on
     // the left. The "+" may travel, but never past `group_gap` short of it.
-    const menu_paint_right = client_w - m.strip_pad_r;
-    const menu_paint_left = menu_paint_right - m.btn_paint;
-    const plus_paint_limit = menu_paint_left - m.group_gap - m.btn_paint;
+    const menu_paint_left = client_w - m.strip_pad_r - m.btn_paint;
+    const plus_paint_limit = plusPaintLimit(m, client_w, has_menu);
 
     // The buttons live in the SAME vertical band as the tabs
     // (`tab_top_pad`..`bar_h`), not in the full bar. T204: the close "×" is
@@ -312,12 +334,12 @@ pub fn layout(m: Metrics, client_w: i32, prefer: []const i32, out: []Rect) Strip
     // the price of the three buttons agreeing with each other.
     var s: Strip = .{
         .tabs_right = m.strip_pad_l,
-        .menu = m.buttonHit(menu_paint_left),
+        .menu = if (has_menu) m.buttonHit(menu_paint_left) else .{},
         .new_tab = m.buttonHit(plus_paint_limit),
     };
 
     // Width the tabs may occupy: up to `group_gap` short of the "+"'s limit.
-    const tabs_avail = runWidth(m, client_w);
+    const tabs_avail = runWidth(m, client_w, has_menu);
     if (tab_count == 0 or tabs_avail < m.min_tab_w) return s;
 
     // SIZE TO CONTENT FIRST (T235, design system §6b). Every tab asks for what
@@ -444,11 +466,18 @@ fn layoutN(scale: f32, client_w: i32, n: usize, buf: []Rect) struct { Metrics, S
 }
 
 fn layoutTitles(scale: f32, client_w: i32, n: usize, text_dip: f32, buf: []Rect) struct { Metrics, Strip } {
+    return layoutMenu(scale, client_w, n, text_dip, true, buf);
+}
+
+/// The same, with the T260 switch exposed: `has_menu` false is the strip on a
+/// window whose caption already hosts the menu. Every pre-T260 test keeps
+/// asking for the menu, so the geometry they pin is unchanged by construction.
+fn layoutMenu(scale: f32, client_w: i32, n: usize, text_dip: f32, has_menu: bool, buf: []Rect) struct { Metrics, Strip } {
     const m = Metrics.init(scale);
     var prefer: [MAX_TABS]i32 = undefined;
     const p = m.preferredWidth(@intFromFloat(@round(text_dip * scale)));
     for (prefer[0..n]) |*e| e.* = p;
-    return .{ m, layout(m, client_w, prefer[0..n], buf) };
+    return .{ m, layout(m, client_w, has_menu, prefer[0..n], buf) };
 }
 
 /// The slot one `TITLE_DIP` tab takes, i.e. the strip's pitch in these tests.
@@ -524,7 +553,7 @@ test "T235: a tab grows with its title, and is capped at half the run" {
         // run — a proportion, not a constant — and still leaves the strip's
         // other half alone.
         _, const huge = layoutTitles(scale, WIDE, 1, 5000, &buf);
-        const avail = runWidth(m, WIDE);
+        const avail = runWidth(m, WIDE, true);
         try testing.expectEqual(capWidth(m, avail) - m.tab_gap, buf[0].width());
         try testing.expect(buf[0].width() <= @divTrunc(avail, 2));
         try testing.expect(huge.tabs_right < @divTrunc(WIDE, 2) + m.strip_pad_l);
@@ -543,7 +572,7 @@ test "T235: preferred widths that do not fit fall back to an equal share" {
     for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
         const m = Metrics.init(scale);
         const slot = slotOf(m, scale);
-        const avail = runWidth(m, WIDE);
+        const avail = runWidth(m, WIDE, true);
         const fits: usize = @intCast(@divTrunc(avail, slot));
 
         // One fewer than fits: no pressure, everyone gets their preference.
@@ -575,7 +604,7 @@ test "T235: mixed titles each get their own width" {
         m.preferredWidth(300),
         m.preferredWidth(120),
     };
-    const s = layout(m, WIDE, &prefer, &buf);
+    const s = layout(m, WIDE, true, &prefer, &buf);
     try testing.expectEqual(@as(usize, 3), s.visible);
     for (prefer, buf[0..3]) |p, r| try testing.expectEqual(p, r.width());
     // Laid out end to end with one gap between, in order.
@@ -694,6 +723,82 @@ test "the + follows the last tab and stops at its limit" {
     try testing.expect(painted(1.0, many.new_tab).right + m.group_gap <= painted(1.0, many.menu).left);
 }
 
+test "T260: dropping the menu hands the run exactly one square and one gap" {
+    // The user-visible claim: on a window whose caption hosts the menu, the
+    // strip's "≡" is gone and the tabs get that space — not "about that much".
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const with = runWidth(m, WIDE, true);
+        const without = runWidth(m, WIDE, false);
+        try testing.expectEqual(m.btn_paint + m.group_gap, without - with);
+
+        // The "+" is still `group_gap` clear of the run in BOTH cases — the
+        // gap is the invariant, the button count is what changed. Measured
+        // between painted edges, because that is the gap the eye sees.
+        for ([_]bool{ true, false }) |has_menu| {
+            _, const s = layoutMenu(scale, WIDE, 1, TITLE_DIP, has_menu, &buf);
+            try testing.expectEqual(m.group_gap, painted(scale, s.new_tab).left - s.tabs_right);
+        }
+
+        // And with no menu the "+" becomes the right-anchored control, taking
+        // the square the "≡" used to hold — same inset from the window edge,
+        // so the strip does not become lopsided when the button disappears.
+        // Read off a strip with NO tabs, where the "+" sits at its limit
+        // instead of travelling with a last tab.
+        _, const bare = layoutMenu(scale, WIDE, 0, TITLE_DIP, false, &buf);
+        try testing.expectEqual(WIDE - m.strip_pad_r, painted(scale, bare.new_tab).right);
+        _, const bare_menu = layoutMenu(scale, WIDE, 0, TITLE_DIP, true, &buf);
+        try testing.expectEqual(WIDE - m.strip_pad_r, painted(scale, bare_menu.menu).right);
+        // A strip stuffed past its capacity still never pushes the "+" past
+        // that limit — the freed square is the tabs', not an overrun.
+        _, const full = layoutMenu(scale, WIDE, 40, TITLE_DIP, false, &buf);
+        try testing.expect(painted(scale, full.new_tab).right <= WIDE - m.strip_pad_r);
+        try testing.expect(full.tabs_right + m.group_gap <= painted(scale, full.new_tab).left);
+    }
+}
+
+test "T260: a menu-less strip reports a ZERO menu rect, which every hit test misses" {
+    // The hit tests are half-open `x >= left and x < right`, so a zero rect is
+    // unhittable at every x — including x = 0, the one a "just move it
+    // off-screen" answer gets wrong. This is why the rect is zeroed rather
+    // than parked somewhere harmless-looking.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        for ([_]usize{ 0, 1, 8, 40 }) |n| {
+            _, const s = layoutMenu(scale, WIDE, n, TITLE_DIP, false, &buf);
+            try testing.expect(s.menu.isEmpty());
+            for ([_]i32{ 0, 1, WIDE - 1, WIDE }) |x| {
+                try testing.expect(!(x >= s.menu.left and x < s.menu.right));
+            }
+        }
+    }
+    // A degenerate strip is where an "empty means zero-width" bug would hide:
+    // no tabs fit, so the buttons are all there is to get wrong.
+    const m = Metrics.init(1.0);
+    _, const narrow = layoutMenu(1.0, 60, 3, TITLE_DIP, false, &buf);
+    try testing.expect(narrow.menu.isEmpty());
+    try testing.expectEqual(@as(i32, 60) - m.strip_pad_r, painted(1.0, narrow.new_tab).right);
+}
+
+test "T260: tabs actually get wider on a menu-less strip" {
+    // The point of the change, not just its arithmetic: at the width where the
+    // run's 50% cap is what limits a tab, dropping the menu raises the cap.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        _, const with = layoutMenu(scale, WIDE, 1, 5000, true, &buf);
+        const w_capped = buf[0].width();
+        _, const without = layoutMenu(scale, WIDE, 1, 5000, false, &buf);
+        const wo_capped = buf[0].width();
+        try testing.expect(wo_capped > w_capped);
+        try testing.expectEqual(capWidth(m, runWidth(m, WIDE, false)) - m.tab_gap, wo_capped);
+        // Both still leave the "+" its landing spot rather than running under it.
+        try testing.expect(with.tabs_right + m.group_gap <= painted(scale, with.new_tab).left);
+        try testing.expect(without.tabs_right + m.group_gap <= painted(scale, without.new_tab).left);
+    }
+}
+
 test "tabs shrink with count, then overflow instead of running off the end" {
     var buf: [MAX_TABS]Rect = undefined;
     const m = Metrics.init(1.0);
@@ -704,7 +809,7 @@ test "tabs shrink with count, then overflow instead of running off the end" {
     try testing.expectEqual(@as(i32, 0), layoutN(1.0, WIDE, 2, &buf)[1].tab_w);
     // Enough tabs to force a shrink below what they asked for — which since
     // T235 is a count derived from the run and the title, not from a constant.
-    const fits: usize = @intCast(@divTrunc(runWidth(m, WIDE), slot));
+    const fits: usize = @intCast(@divTrunc(runWidth(m, WIDE, true), slot));
     _, const squeezed = layoutN(1.0, WIDE, fits + 3, &buf);
     try testing.expect(squeezed.tab_w < slot);
     try testing.expect(squeezed.tab_w > m.min_tab_w);
