@@ -188,6 +188,10 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll")] static extern uint MapVirtualKeyW(uint code, uint mapType);
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+    const uint GW_OWNER = 4;
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
@@ -690,6 +694,114 @@ public class GhozttyTestDesktop {
             info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
             if (!GetGUIThreadInfo(tid, ref info)) return 0L;
             return info.hwndFocus.ToInt64();
+        });
+    }
+
+    // The ACTIVE HWND of `top`'s GUI thread. On a background desktop
+    // GetForegroundWindow returns 0 for every window, so this is the stand-in
+    // an activation claim is expressed against - see the ACTIVATION note in
+    // the header (T224). Same GetGUIThreadInfo read as FocusedHwnd, so it is
+    // equally safe to poll.
+    public long ActiveHwnd(IntPtr top) {
+        return (long)Run(delegate() {
+            uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
+            var info = new GUITHREADINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (!GetGUIThreadInfo(tid, ref info)) return 0L;
+            return info.hwndActive.ToInt64();
+        });
+    }
+
+    // ================= z-order =================
+    // EnumWindows walks the CALLING THREAD's desktop top-down, so every
+    // z-order read is marshalled like everything else: run on the host thread
+    // it would enumerate the user's desktop and find none of these windows.
+
+    // Index of `target` among the VISIBLE top-level windows, top first; -1
+    // when it is not in the enumeration (hidden, or another desktop).
+    public int ZIndex(IntPtr target) {
+        return (int)Run(delegate() {
+            int idx = -1, i = 0;
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                if (!IsWindowVisible(h)) return true;
+                if (h == target) { idx = i; return false; }
+                i++;
+                return true;
+            }, IntPtr.Zero);
+            return idx;
+        });
+    }
+
+    // GetWindow(GW_OWNER) - the popup's owner, which is what pins it above one
+    // particular window and says nothing about the rest of the band.
+    public long Owner(IntPtr h) {
+        return (long)Run(delegate() { return GetWindow(h, GW_OWNER).ToInt64(); });
+    }
+
+    // The invariant an owned overlay must hold: it sits ABOVE its owner with
+    // nothing FOREIGN sandwiched between the two. Anything else means the
+    // overlay floats over a window that is in front of its own.
+    // Returns "<count>:<classes>", "-1:missing" or "-2:below-owner".
+    //
+    // Expressed from ownership data rather than by re-walking the way the
+    // product does: this is the specification, not a mirror of the
+    // implementation. Other popups owned by the same window (a sibling pane's
+    // overlay) are allowed in between - they belong to the same window.
+    public string Sandwich(IntPtr overlay, IntPtr owner) {
+        return (string)Run(delegate() {
+            var list = new List<IntPtr>();
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                if (IsWindowVisible(h)) list.Add(h);
+                return true;
+            }, IntPtr.Zero);
+            int io = list.IndexOf(overlay), iw = list.IndexOf(owner);
+            if (io < 0 || iw < 0) return "-1:missing";
+            if (io > iw) return "-2:below-owner";
+            int n = 0;
+            var names = new List<string>();
+            for (int i = io + 1; i < iw; i++) {
+                if (GetWindow(list[i], GW_OWNER) == owner) continue;
+                n++;
+                var sb = new StringBuilder(64);
+                GetClassNameW(list[i], sb, 64);
+                names.Add(sb.ToString());
+            }
+            return n + ":" + string.Join(",", names.ToArray());
+        });
+    }
+
+    // Inject (or clear) WS_EX_TOPMOST exactly the way a stray verification
+    // probe does - HWND_TOPMOST / HWND_NOTOPMOST, nothing else touched.
+    public bool SetTopmost(IntPtr h, bool on) {
+        return (bool)Run(delegate() {
+            return SetWindowPos(h, (IntPtr)(on ? -1 : -2), 0, 0, 0, 0, 0x0013); // NOSIZE|NOMOVE|NOACTIVATE
+        });
+    }
+
+    // Hide, or re-show with SWP_SHOWWINDOW and no z-order request. This is the
+    // probe for "does the window manager still lift a freshly shown popup to
+    // the top of its band when no window holds the foreground?" (T224).
+    public bool SetShown(IntPtr h, bool show) {
+        return (bool)Run(delegate() {
+            uint flags = 0x0001 | 0x0002 | 0x0004 | 0x0010; // NOSIZE|NOMOVE|NOZORDER|NOACTIVATE
+            flags |= show ? 0x0040u : 0x0080u;              // SHOWWINDOW : HIDEWINDOW
+            return SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, flags);
+        });
+    }
+
+    // Who is visibly on top at a SCREEN point: "<hwnd>:<rootHwnd>:<class>".
+    // WindowFromPoint respects the z-order and sees WS_EX_LAYERED popups, so
+    // it answers "is the overlay what you would see here?" without any pixels
+    // - which matters doubly on a desktop DWM never composites.
+    public string TopAt(int x, int y) {
+        return (string)Run(delegate() {
+            POINT p; p.x = x; p.y = y;
+            IntPtr h = WindowFromPoint(p);
+            if (h == IntPtr.Zero) return "0:0:(none)";
+            IntPtr root = GetAncestor(h, 2); // GA_ROOT
+            var sb = new StringBuilder(64);
+            GetClassNameW(h, sb, 64);
+            return (long)h + ":" + (long)root + ":" + sb.ToString();
         });
     }
 
@@ -1652,6 +1764,76 @@ function Get-TestWindowClass {
 function Get-TestFocusedWindow {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
     return (Resolve-TestDesktop $Desktop).FocusedHwnd($Window)
+}
+
+# The ACTIVE HWND of $Window's GUI thread. A background desktop has NO
+# foreground window (GetForegroundWindow is 0 for every window), so this is
+# what an activation claim is asserted against there - see ACTIVATION in the
+# header. Poll it: activation, like focus, is asynchronous.
+function Get-TestActiveWindow {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).ActiveHwnd($Window)
+}
+
+# Z-order index among the VISIBLE top-level windows of the test desktop, top
+# first; -1 when the window is not enumerated. "Above" is MEASURED as a
+# smaller index, never inferred.
+function Get-TestZIndex {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).ZIndex($Window)
+}
+
+# GetWindow(GW_OWNER): the window an owned popup is pinned above.
+function Get-TestWindowOwner {
+    param([Parameter(Mandatory = $true)][IntPtr]$Window, $Desktop)
+    return (Resolve-TestDesktop $Desktop).Owner($Window)
+}
+
+# "<count>:<classes>" of FOREIGN windows sandwiched between an owned overlay
+# and its owner; "0:" is the healthy answer. "-2:below-owner" means the
+# overlay fell behind its own window, "-1:missing" that one of them is gone.
+function Get-TestOverlaySandwich {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Overlay,
+        [Parameter(Mandatory = $true)][IntPtr]$Owner,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).Sandwich($Overlay, $Owner)
+}
+
+# Inject or clear WS_EX_TOPMOST the way a stray probe does. This is how the
+# T142 defect is REPRODUCED in a test; the product never sets it.
+function Set-TestWindowTopmost {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [bool]$On = $true,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).SetTopmost($Window, $On)
+}
+
+# Hide, or re-show with SWP_SHOWWINDOW and no z-order request - the probe for
+# whether the window manager still lifts a freshly shown popup to the top of
+# its band on a desktop with no foreground window.
+function Set-TestWindowShown {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [bool]$Show = $true,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).SetShown($Window, $Show)
+}
+
+# Who is visibly on top at a screen point, as "<hwnd>:<rootHwnd>:<class>".
+# The z-order-aware, pixel-free answer to "is the overlay in front here?" -
+# and off the input desktop there are no composited pixels to ask instead.
+function Get-TestWindowAt {
+    param(
+        [Parameter(Mandatory = $true)][int]$X,
+        [Parameter(Mandatory = $true)][int]$Y,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).TopAt($X, $Y)
 }
 
 function Wait-TestFocus {

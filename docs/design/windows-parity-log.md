@@ -4672,3 +4672,52 @@ its file.
 
 Evidence: `test-desktop-harness.ps1` ALL PASS (23, up from 20); `zig build
 test` both lanes exit 0; `test-agent` exit 0; P1-P3 ACCEPTANCE: ALL PASS.
+
+## 2026-08-01 - T224: the ACTIVE window is a measured stand-in for the foreground, and two product bugs fell out of validating it
+
+`overlay-zorder.ps1`'s whole oracle was expressed against
+`GetForegroundWindow`, which is 0 for every window on a background desktop.
+The stand-in is `GetGUIThreadInfo.hwndActive`, and the point of this task was
+to MEASURE that it is faithful before porting a line. It is: `Focus-TestWindow`
+really raises the window inside the band (oz2 active `ov=3 A=4 B=1`; activate
+oz1 and A goes above B), and it really delivers WM_ACTIVATE - an injected
+stray topmost heals on activation alone, and `Window.healOverlayZOrders` has
+exactly one caller in the tree, the WM_ACTIVATE handler. So section D ports as
+a proof rather than an approximation.
+
+Two things did NOT port, named with their measurements instead of weakened.
+The sandwich is no longer the section-B repro: topmosting the overlay also
+raises its OWNER, unopposed where no window holds the foreground, so `Sandwich`
+reads `0:` in the healthy AND the injected state. The repro is now z-index
+against the active window (healthy `ov=3 > B=1`, injected `ov=0 < B=4`) plus
+`WindowFromPoint` - both equally true on the interactive desktop, so the port
+did not fork the oracle. And the `SWP_SHOWWINDOW` lift does not reproduce at
+all: re-showing the overlay with the product's own flags put it back at the
+same index.
+
+The one that would have silently killed the migration: **`Focus-TestWindow`'s
+boolean return is not the activation oracle.** Without `-Child` it returns
+False on a ghoztty window, because the app moves focus to the terminal child.
+The old script aborted the run on `GrabForeground`'s return; a mechanical port
+of that gate aborts every run and prints no verdict.
+
+`profile-latency` is decided, not migrated: interactive by design, already
+declared in the harness header. `split-dim` is the last one left (T225/T272).
+
+Validation kept the T217 bar and then turned up two product defects. **T277**:
+section E needs a legitimately-topmost owner and the app cannot reach one -
+the bound `toggle_window_float_on_top` leaves `WS_EX_TOPMOST` clear (with a
+`new_window` control keybind proving the keybind path works), an injected
+`HWND_TOPMOST` does not stick either, and a plain `charmap` window in the same
+harness keeps it in every condition. E skips loudly and names T277 rather than
+failing the T142 heal for someone else's bug. **T278**: P2 and P3 failed on a
+CLEAN tree, and the cause was not their verbs - the debug agent had filled its
+256-session cap entirely with dead pinned tombstones, so every new pane came up
+with no child and nothing said so (`--session-persistence=false` was the
+control: `+read` exit 0, marker present). Sidelined the file; the reaper is the
+fix.
+
+Evidence: `overlay-zorder.ps1` ALL PASS (24) x3, `-NegativeControl` FAILS on
+the inverted new oracle; `pane-banner.ps1` ALL PASS (65) after the
+`lib\TestDesktop.ps1` additions; `zig build test` both lanes exit 0;
+`test-agent` exit 0; P1-P3 ACCEPTANCE: ALL PASS.
