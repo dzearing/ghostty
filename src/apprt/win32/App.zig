@@ -4627,6 +4627,18 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == ActivityMonitor.WM_APP_ACTIVITY_DIALED) {
+        // wparam = heap *DialResult owned by the handler. It lands HERE and not
+        // on the panel's own window on purpose: DestroyWindow discards a
+        // window's queued messages, and a discarded dial would leak the
+        // connection it just opened (T295).
+        if (wparam != 0) {
+            const res: *ActivityMonitor.DialResult = @ptrFromInt(wparam);
+            ActivityMonitor.onDialed(res);
+        }
+        return 0;
+    }
+
     if (msg == WM_APP_AGENT_UPGRADE_CHECK) {
         // T147: a persistent window closed; the agent may have just gone idle,
         // which is the safe moment to adopt a newer bundled build.

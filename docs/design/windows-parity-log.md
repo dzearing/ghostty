@@ -5166,3 +5166,61 @@ have failed as confidently as the first.
 `test-agent` + the Debug GUI link green. Next in this chain is **T287** (dial +
 carousel), which now has the one-line diff it needs written down in its own
 file.
+
+## 2026-08-01 - T295 (T287 split): the Activity Monitor reaches a real machine, and the dial had to land somewhere that outlives the panel
+
+**T287 was split first** — T295 (remote data plane) + T296 (in-panel machine
+carousel) — because the two halves answer different questions and only one of
+them was small. T296's bulk is not the cards: the panel has no machine list (the
+chooser's comes from a synchronous HTTPS GET a non-modal window cannot make) and
+win32 has **no `MachineMetricsProbe` equivalent at all**, so the per-card
+summaries are a subsystem.
+
+T295 is the half that closes what T177 left open: `buildSnapshot`'s first
+statement was `if (self.source == .remote) return
+error.RemoteSourceNotConnected`, and the chooser's Activity button opened a
+panel that said "Couldn't connect" on purpose. Both of Mac's connection-owning
+entry styles now exist — **dialed** (the chooser button, owned) and **reused**
+(the palette on a remote window, borrowed) — with remote `proc_list`,
+`metrics_sub`, `proc_kill` and `proc_spawn` behind them.
+
+**Where the dial LANDS is the decision worth recording.** The obvious shape — a
+detached thread posting its result to the panel's own HWND — leaks a live
+connection every time the user closes the panel mid-dial, because
+`DestroyWindow` DISCARDS a window's queued messages and that message is what
+carries ownership of the dialed transport. So it posts to the APP's
+message-only window, which outlives every panel, and a `(slot, serial)` pair
+says whether the panel that asked is still there. The serial is not decoration:
+slots are reused the instant they free, so a slot-only check would hand a NEW
+panel a connection to the OLD panel's machine and caption it with the new one's
+name. `panelMatches` is pure and unit-tested on exactly that case.
+
+**Close order is ownership order.** Unsubscribe metrics first — that return is
+the guarantee no further callback fires into `self` — then, for an OWNED
+connection only, `shutdown()` BEFORE joining the sample worker, since `shutdown`
+runs `failPendingRpcs` and an unresponsive agent would otherwise hold the GUI
+for the full 5 s RPC timeout. A borrowed connection is never shut down or
+freed: it is a window's shell.
+
+**A loopback agent enumerates the same box**, so "the table populated" proves
+nothing — a panel that silently sampled THIS process would look identical under
+another machine's name, which is the very lie the old refusal existed to
+prevent. The distinguishing field is the snapshot's ROOT PID (the agent's own
+for a remote sample, this process's for a local one), so `rebuild`'s state line
+gained `root=` and the new `test/win32/activity-monitor-remote.ps1` asserts it
+equals the agent pid the harness started: `source=127.0.0.1:47913 total=303
+shown=3 root=40288` against app pid 35688. Its last assertion is the ownership
+one — after the reused panel closes, the remote pane still round-trips through
+the agent.
+
+`chooser-menu.ps1`'s refusal assertion was replaced rather than kept: it was a
+claim about the gap. It now asserts the feature — the button DIALS, an
+unreachable machine reports `dial failed`, and no row is ever shown under a
+machine we could not reach.
+
+`activity-monitor-remote.ps1` ALL PASS at 17 (its `-NegativeControl` fails with
+exactly 1, as it must), `activity-monitor.ps1` ALL PASS at 82, `chooser-menu.ps1`
+ALL PASS at 57, P1-P3 ALL PASS, both test lanes + `test-agent` + the Debug GUI
+link green (`test-agent` needed one re-run for the known T258 ConPTY flake).
+Follow-ups: **T296** (carousel) and **T297** — the DIALED path still has no
+success-case coverage, and it is the only path that FREES what it owns.

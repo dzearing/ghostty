@@ -382,13 +382,19 @@ try {
             $ptitle = Get-TestWindowText -Window $panel
             Assert ($ptitle -like '*E2E-Box*') "the panel is titled for the SELECTED machine (got '$ptitle')"
             Assert (-not (Test-TestWindowExists -Window $chooser)) 'the chooser dismissed itself first'
-            # ...and it does NOT quietly show THIS machine's processes under
-            # that machine's name. Dialing is T287; until then the panel
-            # refuses to sample and reports "Couldn't connect". The log line is
-            # the oracle - the empty state is painted text, not a control.
-            Start-Sleep -Milliseconds 900
-            $refused = @(Select-String -Path $errlog -Pattern 'RemoteSourceNotConnected' -ErrorAction SilentlyContinue).Count
-            Assert ($refused -gt 0) 'a remote panel refuses to sample the LOCAL machine (no mislabeled rows)'
+            # T295: the button DIALS that machine. The fake directory relay
+            # here serves the device list but is not an agent endpoint, so the
+            # dial must fail - and the panel must say so rather than quietly
+            # showing THIS machine's processes under that machine's name.
+            # The log lines are the oracle; the empty state is painted text,
+            # not a control.
+            Start-Sleep -Seconds 3
+            Assert (Select-String -Path $errlog -Pattern 'activity monitor: dialing source=E2E-Box' -Quiet) `
+                'the Activity button DIALS the selected machine (T295)'
+            Assert (Select-String -Path $errlog -Pattern 'activity monitor: dial failed source=E2E-Box' -Quiet) `
+                'an unreachable machine reports the dial failure instead of falling back'
+            $mislabeled = @(Select-String -Path $errlog -Pattern 'activity monitor: source=E2E-Box total=[1-9]' -ErrorAction SilentlyContinue).Count
+            Assert ($mislabeled -eq 0) 'no rows are ever shown under a machine we could not reach (no mislabeled rows)'
         }
 
         # Re-open the chooser, land back on the device row, and press Activity

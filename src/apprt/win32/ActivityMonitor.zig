@@ -37,9 +37,32 @@
 //! is quoting. All wording, the failure aggregation, the empty state and the
 //! selection pruning are pure in `activity_actions.zig`.
 //!
+//! ## Remote sources (T295)
+//! A `.remote` panel samples through a `remote.Connection`, and who OWNS that
+//! connection is the whole design (Mac's `RemoteActivityMonitor.swift:8-16`):
+//!
+//! - **Dialed** (the chooser's Activity button) — the panel dials a fresh relay
+//!   connection and owns it, so `close` frees it.
+//! - **Reused** (the palette on a remote window) — the panel borrows the
+//!   WINDOW's connection and must never free it; closing the panel cannot be
+//!   allowed to take that window's session down with it.
+//!
+//! The dial blocks through a handshake, so it runs on a detached thread and
+//! lands via `WM_APP_ACTIVITY_DIALED` on the APP's message-only window, not on
+//! the panel's. That is the difference between a result that always arrives and
+//! one that Windows silently discards: `DestroyWindow` drops a window's queued
+//! messages, so a dial posted to a panel that closes first would leak the
+//! connection it just opened. The app's window outlives every panel, and the
+//! `(slot, serial)` pair tells it whether the panel that asked is still there.
+//!
+//! Host CPU% comes from the pushed `metrics` stream, NOT from the snapshot: the
+//! agent builds `PROC_SNAPSHOT.host` from a fresh sampler with no prior tick and
+//! says so at `agent/server.zig:1607`. Reading that as CPU% would paint a
+//! confident flat zero.
+//!
 //! ## What is NOT here
-//! The machine carousel plus remote sources are T287. The layout module already
-//! reserves the carousel band.
+//! The machine carousel (switching source in-panel) is T296. The layout module
+//! already reserves the carousel band.
 
 const ActivityMonitor = @This();
 
@@ -64,6 +87,10 @@ const remote_metrics = @import("../../remote/agent/metrics.zig");
 const remote_protocol = @import("../../remote/protocol.zig");
 const proc_control = @import("../../remote/agent/proc_control.zig");
 const proc_spawn = @import("../../remote/agent/proc_spawn.zig");
+const remote_connection = @import("../../remote/connection.zig");
+const relay_dial = @import("../../remote/relay_dial.zig");
+const relay_directory = @import("../../remote/relay_directory.zig");
+const IpcHandlers = @import("IpcHandlers.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -81,6 +108,15 @@ const SAMPLE_TIMER_ID: usize = 1;
 /// A worker thread finished a sample and parked it in `pending`. WM_APP+1..+12
 /// are taken (see App.zig / Window.zig / ClaudeIntegration.zig / RelayAccountRow.zig).
 pub const WM_APP_ACTIVITY_SAMPLE: u32 = w32.WM_APP + 13;
+
+/// A dial thread finished. Posted to the APP's message-only window (see the
+/// header), `wparam` = a heap `*DialResult` the handler owns.
+pub const WM_APP_ACTIVITY_DIALED: u32 = w32.WM_APP + 14;
+
+/// Bound on every remote RPC the panel makes. A machine slow enough to miss
+/// this is a machine the panel should report as unreachable rather than freeze
+/// its worker on.
+const rpc_timeout_ns: u64 = 5 * std.time.ns_per_s;
 
 /// Hard cap on rows carried into the view, matching the sampler's own
 /// `default_limit`. Fixed-size state (order/selection/spawned) is sized to it, so
@@ -181,6 +217,19 @@ const max_monitors: usize = 8;
 var open_keys: [max_monitors]?Source = @splat(null);
 var open_wins: [max_monitors]?*ActivityMonitor = @splat(null);
 
+/// Handed to each panel at open so an in-flight dial can tell "my panel is
+/// still there" from "a DIFFERENT panel took my slot after mine closed". A slot
+/// index alone cannot: slots are reused the moment they are freed.
+var next_serial: u64 = 1;
+
+/// The panel occupying `slot` iff it is still the one that owns `serial`. Pure —
+/// unit-tested against the slot-reuse case that motivates the serial.
+pub fn panelMatches(serials: []const ?u64, slot: usize, serial: u64) bool {
+    if (slot >= serials.len) return false;
+    const s = serials[slot] orelse return false;
+    return s == serial;
+}
+
 /// The slot already showing `src`, if any. Pure — unit-tested.
 pub fn slotFor(keys: []const ?Source, src: Source) ?usize {
     for (keys, 0..) |k, i| {
@@ -196,6 +245,66 @@ pub fn freeSlot(keys: []const ?Source) ?usize {
     }
     return null;
 }
+
+// ---------------------------------------------------------------------
+// Remote connection
+// ---------------------------------------------------------------------
+
+/// The connection a remote panel samples through, and who owns it.
+///
+/// `dialed != null` ⇒ this panel dialed it and MUST tear it down on close.
+/// `dialed == null` ⇒ borrowed from a remote window (Mac's `ownsConnection:
+/// false`), and closing the panel must leave that window's session untouched.
+const RemoteConn = struct {
+    conn: *remote_connection.Connection,
+    dialed: ?*relay_dial.Dialed = null,
+
+    fn owned(self: RemoteConn) bool {
+        return self.dialed != null;
+    }
+};
+
+/// A finished dial, in flight to the GUI thread as `WM_APP_ACTIVITY_DIALED`'s
+/// `wparam`. Owned by the handler, which frees it.
+pub const DialResult = struct {
+    alloc: Allocator,
+    /// Which panel asked, and which incarnation of that slot.
+    slot: usize,
+    serial: u64,
+    /// The dialed transport, or null when the dial failed.
+    dialed: ?*relay_dial.Dialed,
+
+    /// Free the result AND anything it still owns. Called when the panel that
+    /// asked is gone — otherwise the panel adopts `dialed` first.
+    fn destroy(self: *DialResult) void {
+        const alloc = self.alloc;
+        if (self.dialed) |d| {
+            d.deinit();
+            alloc.destroy(d);
+        }
+        alloc.destroy(self);
+    }
+};
+
+/// Everything the dial thread needs, heap-owned so it outlives the call that
+/// spawned it. The thread frees it.
+const DialRequest = struct {
+    alloc: Allocator,
+    hwnd: w32.HWND,
+    slot: usize,
+    serial: u64,
+    base: []u8,
+    device: []u8,
+    token: []u8,
+
+    fn destroy(self: *DialRequest) void {
+        const alloc = self.alloc;
+        alloc.free(self.base);
+        alloc.free(self.device);
+        alloc.free(self.token);
+        alloc.destroy(self);
+    }
+};
 
 // ---------------------------------------------------------------------
 // Snapshot
@@ -231,6 +340,8 @@ source: Source,
 id_buf: [max_source_id]u8 = undefined,
 name_buf: [max_source_label]u8 = undefined,
 slot: usize,
+/// This panel's identity within `slot`, for a dial landing after it closed.
+serial: u64,
 
 hwnd: w32.HWND,
 filter: w32.HWND,
@@ -257,9 +368,23 @@ snap: ?*Snapshot = null,
 /// True until the first snapshot arrives (Mac's `isLoading`, :125).
 loading: bool = true,
 
-/// Persistent samplers. Touched ONLY by the worker thread (see the header).
+/// Persistent samplers for the LOCAL source. Touched ONLY by the worker thread
+/// (see the header).
 proc_sampler: ?remote_proc.ProcSampler = null,
 host_sampler: remote_metrics.Sampler = remote_metrics.Sampler.init(),
+
+/// The connection a `.remote` panel samples through, null until a dial lands
+/// (and forever, if it fails). Set and cleared on the GUI thread only, while no
+/// sample worker is running — `dialing` keeps the timer from starting one.
+remote_conn: ?RemoteConn = null,
+/// A dial is in flight. Suspends sampling (there is nothing to sample yet) and
+/// makes the overlay say "Connecting…" rather than "Couldn't connect".
+dialing: bool = false,
+/// The newest pushed host-metrics reading, or null before the first one.
+/// Written by the connection's control-reader thread, read by the sample
+/// worker — hence its own mutex.
+metrics_mutex: std.Thread.Mutex = .{},
+last_metrics: ?remote_protocol.HostMetrics = null,
 
 /// Worker handoff. `pending` is written by the worker and taken by the GUI
 /// thread; `sampling` gates a second worker from starting.
@@ -330,15 +455,28 @@ logged_sample_error: bool = false,
 // Open / close
 // ---------------------------------------------------------------------
 
-/// Open (or focus) the panel for the LOCAL source. The command-palette entry
-/// point, mirroring `RemoteActivityMonitor.openFromPalette` (:132-141), minus
-/// the remote-window branch that T287 adds.
+/// Open (or focus) the panel for the LOCAL source
+/// (`RemoteActivityMonitor.presentLocal`).
 pub fn openLocal(window: *Window) void {
     open(window, .local);
 }
 
-/// Open (or focus) a panel for `src`.
+/// Open (or focus) a panel for `src`, DIALING its own connection if `src` is
+/// remote (`RemoteActivityMonitor.presentDialing`). The panel owns what it
+/// dials and frees it on close.
 pub fn open(window: *Window, src: Source) void {
+    openInner(window, src, null);
+}
+
+/// Open (or focus) a panel for `src` on an EXISTING connection this panel does
+/// NOT own (`RemoteActivityMonitor.presentReusing`). `conn` belongs to the
+/// remote window the user invoked this from; closing the panel must leave that
+/// window's session running, so the panel borrows and never frees it.
+pub fn openReusing(window: *Window, src: Source, conn: *remote_connection.Connection) void {
+    openInner(window, src, conn);
+}
+
+fn openInner(window: *Window, src: Source, borrow: ?*remote_connection.Connection) void {
     if (slotFor(&open_keys, src)) |i| {
         if (open_wins[i]) |existing| {
             log.info("activity monitor: focusing existing panel source={s}", .{src.label()});
@@ -365,6 +503,7 @@ pub fn open(window: *Window, src: Source) void {
         .app = app,
         .source = src,
         .slot = slot,
+        .serial = next_serial,
         .hwnd = undefined,
         .filter = undefined,
         .show_all_btn = undefined,
@@ -372,6 +511,7 @@ pub fn open(window: *Window, src: Source) void {
         .kill_btn = undefined,
         .scale = window.scale,
     };
+    next_serial += 1;
     // Take ownership of a remote source's strings: the caller's copies belong to
     // a chooser that is already closing (T177). Over-long ids are truncated
     // rather than refused — the panel still opens, and the id is only ever
@@ -548,10 +688,199 @@ pub fn open(window: *Window, src: Source) void {
     _ = w32.SetForegroundWindow(hwnd);
     _ = w32.SetFocus(self.filter);
 
+    // Wire the source's data plane BEFORE the first poll: a remote panel that
+    // samples before its connection exists just burns a tick reporting failure.
+    if (src == .remote) {
+        if (borrow) |conn| {
+            self.remote_conn = .{ .conn = conn, .dialed = null };
+            self.beginMetrics();
+            log.info("activity monitor: reusing caller's connection source={s}", .{self.source.label()});
+        } else {
+            self.startDial();
+        }
+    }
+
     // First poll immediately, then on the interval — a panel that shows nothing
-    // for a second and a half reads as broken.
+    // for a second and a half reads as broken. `kickSample` is a no-op while a
+    // dial is in flight.
     self.kickSample();
     _ = w32.SetTimer(hwnd, SAMPLE_TIMER_ID, @intCast(gauge.sample_interval_ms), null);
+}
+
+// ---------------------------------------------------------------------
+// Dialing
+// ---------------------------------------------------------------------
+
+/// Kick off a relay dial for this panel's remote source on a detached thread.
+/// The credentials are resolved HERE, on the GUI thread, because that is where
+/// the account store lives; the blocking part (TCP + TLS + WebSocket upgrade +
+/// HELLO) is all the thread does.
+fn startDial(self: *ActivityMonitor) void {
+    const alloc = self.app.core_app.alloc;
+    const msg_hwnd = self.app.msg_hwnd orelse {
+        log.warn("activity monitor: no message window, cannot dial", .{});
+        self.refresh_failed = true;
+        self.loading = false;
+        return;
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const token = IpcHandlers.resolveToken(arena) orelse {
+        // Mac's WP-B2 rule: signed out is not an error dialog here, it is a
+        // source that cannot be reached.
+        log.warn("activity monitor: no relay credential (signed out) source={s}", .{self.source.label()});
+        self.refresh_failed = true;
+        self.loading = false;
+        return;
+    };
+    const base = relay_directory.resolveBase(arena) catch {
+        self.refresh_failed = true;
+        self.loading = false;
+        return;
+    };
+
+    const req = alloc.create(DialRequest) catch return;
+    req.* = .{
+        .alloc = alloc,
+        .hwnd = msg_hwnd,
+        .slot = self.slot,
+        .serial = self.serial,
+        .base = alloc.dupe(u8, base) catch {
+            alloc.destroy(req);
+            return;
+        },
+        .device = undefined,
+        .token = undefined,
+    };
+    req.device = alloc.dupe(u8, self.source.remote.id) catch {
+        alloc.free(req.base);
+        alloc.destroy(req);
+        return;
+    };
+    req.token = alloc.dupe(u8, token) catch {
+        alloc.free(req.base);
+        alloc.free(req.device);
+        alloc.destroy(req);
+        return;
+    };
+
+    const thread = std.Thread.spawn(.{}, dialWorker, .{req}) catch |err| {
+        log.warn("activity monitor: dial thread spawn failed err={}", .{err});
+        req.destroy();
+        self.refresh_failed = true;
+        self.loading = false;
+        return;
+    };
+    thread.detach();
+
+    self.dialing = true;
+    log.info("activity monitor: dialing source={s} slot={d}", .{ self.source.label(), self.slot });
+}
+
+/// The detached dial. Owns `req`; hands its outcome to the GUI thread as a
+/// `*DialResult`, which the handler owns from that moment on.
+fn dialWorker(req: *DialRequest) void {
+    defer req.destroy();
+    const alloc = req.alloc;
+
+    var dialed: ?*relay_dial.Dialed = null;
+    if (alloc.create(relay_dial.Dialed)) |d| {
+        if (relay_dial.dial(alloc, req.base, req.device, req.token, .raw)) |ok| {
+            d.* = ok;
+            dialed = d;
+        } else |err| {
+            log.warn("activity monitor: dial failed device={s} err={}", .{ req.device, err });
+            alloc.destroy(d);
+        }
+    } else |_| {}
+
+    const res = alloc.create(DialResult) catch {
+        if (dialed) |d| {
+            d.deinit();
+            alloc.destroy(d);
+        }
+        return;
+    };
+    res.* = .{
+        .alloc = alloc,
+        .slot = req.slot,
+        .serial = req.serial,
+        .dialed = dialed,
+    };
+    if (w32.PostMessageW(req.hwnd, WM_APP_ACTIVITY_DIALED, @intFromPtr(res), 0) == 0) {
+        // The app is going away; nothing will ever collect this.
+        res.destroy();
+    }
+}
+
+/// GUI thread (App.msgWndProc): a dial finished. Takes ownership of `res`.
+pub fn onDialed(res: *DialResult) void {
+    var serials: [max_monitors]?u64 = @splat(null);
+    for (open_wins, 0..) |maybe, i| {
+        if (maybe) |p| {
+            if (!p.closing) serials[i] = p.serial;
+        }
+    }
+
+    if (panelMatches(&serials, res.slot, res.serial)) {
+        open_wins[res.slot].?.adoptDial(res.dialed);
+        res.dialed = null; // adopted (or mourned) by the panel
+        res.destroy();
+        return;
+    }
+
+    // The panel that asked is gone. Freeing here is the whole reason this
+    // lands on the app's window instead of the panel's.
+    log.info("activity monitor: dial landed after its panel closed slot={d}", .{res.slot});
+    res.destroy();
+}
+
+/// Adopt (or mourn) a finished dial. GUI thread.
+fn adoptDial(self: *ActivityMonitor, dialed: ?*relay_dial.Dialed) void {
+    self.dialing = false;
+    const d = dialed orelse {
+        // A dial failure is an ANSWER, same as a failed sample: stop loading so
+        // the overlay can say "Couldn't connect" instead of sitting on a
+        // spinner forever.
+        self.refresh_failed = true;
+        self.loading = false;
+        _ = w32.InvalidateRect(self.hwnd, null, 0);
+        log.warn("activity monitor: dial failed source={s}", .{self.source.label()});
+        return;
+    };
+    self.remote_conn = .{ .conn = d.conn, .dialed = d };
+    self.beginMetrics();
+    log.info("activity monitor: connected source={s}", .{self.source.label()});
+    self.kickSample();
+}
+
+/// Subscribe to the source's pushed host-metrics stream. Host CPU% is only
+/// truthful from this stream (see the header); everything else the snapshot
+/// already carries.
+fn beginMetrics(self: *ActivityMonitor) void {
+    const rc = self.remote_conn orelse return;
+    rc.conn.subscribeMetrics(
+        @intCast(gauge.sample_interval_ms),
+        self,
+        onMetrics,
+    ) catch |err| {
+        // Not fatal: the table still refreshes, the host CPU gauge just stays
+        // at whatever the snapshot reports.
+        log.warn("activity monitor: metrics subscribe failed err={}", .{err});
+    };
+}
+
+/// Control-reader thread: park the newest reading for the sample worker. It
+/// does NOT touch view state — see `Connection.MetricsHandler`'s threading
+/// contract.
+fn onMetrics(ctx: *anyopaque, host: remote_protocol.HostMetrics) void {
+    const self: *ActivityMonitor = @ptrCast(@alignCast(ctx));
+    self.metrics_mutex.lock();
+    defer self.metrics_mutex.unlock();
+    self.last_metrics = host;
 }
 
 /// Tear down: stop the timer, JOIN any in-flight sample (it is writing into
@@ -561,9 +890,34 @@ pub fn close(self: *ActivityMonitor) void {
     self.closing = true;
 
     _ = w32.KillTimer(self.hwnd, SAMPLE_TIMER_ID);
+
+    // Ownership order, and it is load-bearing:
+    //   1. UNSUBSCRIBE first — the metrics handler captures `self`, and
+    //      `unsubscribeMetrics` returning is the guarantee that no further
+    //      callback can fire (`connection.zig:1148-1162`).
+    //   2. JOIN the sample worker — it may be mid-RPC on this connection.
+    //   3. Only then free the transport, and only if we own it: a BORROWED
+    //      connection belongs to a remote window whose session must survive
+    //      this panel closing.
+    if (self.remote_conn) |rc| {
+        rc.conn.unsubscribeMetrics();
+        // Owned: cut the transport BEFORE the join. `shutdown` runs
+        // `failPendingRpcs`, so a worker parked on an unresponsive agent
+        // returns at once instead of holding the GUI for the whole
+        // `rpc_timeout_ns`. It is idempotent, so `Dialed.deinit` below is
+        // unaffected. Borrowed: never — that stream is a window's shell.
+        if (rc.owned()) rc.conn.shutdown();
+    }
     if (self.worker) |t| {
         t.join();
         self.worker = null;
+    }
+    if (self.remote_conn) |rc| {
+        if (rc.dialed) |d| {
+            d.deinit();
+            self.app.core_app.alloc.destroy(d);
+        }
+        self.remote_conn = null;
     }
 
     open_keys[self.slot] = null;
@@ -678,6 +1032,9 @@ fn kickSample(self: *ActivityMonitor) void {
     // A modal dialog is quoting the current snapshot; do not start work whose
     // result cannot be adopted anyway.
     if (self.modal) return;
+    // Mid-dial there is nothing to sample, and keeping the worker out of the
+    // way is what lets `adoptDial` publish `remote_conn` without a lock.
+    if (self.dialing) return;
     if (self.worker) |t| {
         t.join();
         self.worker = null;
@@ -720,11 +1077,14 @@ fn sampleWorker(self: *ActivityMonitor) void {
 }
 
 fn buildSnapshot(self: *ActivityMonitor, alloc: Allocator) !*Snapshot {
-    // A remote panel has no connection yet — dialing is T287. Sampling THIS
-    // machine and captioning it with another machine's name would be a lie the
-    // user has no way to catch, so the panel reports what is true: it cannot
-    // reach that source (`paintEmptyState`'s "Couldn't connect").
-    if (self.source == .remote) return error.RemoteSourceNotConnected;
+    if (self.source == .remote) {
+        // No connection means the dial failed (or we are signed out). Sampling
+        // THIS machine and captioning it with another machine's name would be a
+        // lie the user has no way to catch, so the panel reports what is true:
+        // it cannot reach that source (`paintEmptyState`'s "Couldn't connect").
+        const rc = self.remote_conn orelse return error.RemoteSourceNotConnected;
+        return self.buildRemoteSnapshot(alloc, rc.conn);
+    }
 
     const snap = try alloc.create(Snapshot);
     errdefer alloc.destroy(snap);
@@ -755,6 +1115,57 @@ fn buildSnapshot(self: *ActivityMonitor, alloc: Allocator) !*Snapshot {
             .mem_bytes = p.mem_bytes,
             .name = p.name,
             .cmd = p.cmd orelse "",
+        };
+    }
+    snap.rows = rows;
+    return snap;
+}
+
+/// One poll against a REMOTE source, on the worker thread. Same shape as the
+/// local path — one arena, strings copied into it — so adoption, retirement and
+/// every consumer downstream cannot tell the two apart.
+fn buildRemoteSnapshot(
+    self: *ActivityMonitor,
+    alloc: Allocator,
+    conn: *remote_connection.Connection,
+) !*Snapshot {
+    var remote = try conn.requestProcSnapshot(null, max_rows, rpc_timeout_ns);
+    defer remote.deinit();
+
+    const snap = try alloc.create(Snapshot);
+    errdefer alloc.destroy(snap);
+    snap.* = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .rows = &.{},
+        .host = remote.host,
+        .truncated = remote.truncated,
+        // The agent's own pid roots the "ghoztty-spawned" tree on THAT machine
+        // (`PROC_SNAPSHOT.agent_pid`); ours is meaningless there. 0 from an
+        // agent that predates the field, which the Show-all rule already
+        // treats as "unknown".
+        .root_pid = remote.agent_pid,
+    };
+    errdefer snap.arena.deinit();
+    const arena = snap.arena.allocator();
+
+    // Host CPU% comes from the pushed stream — the snapshot's is a one-shot
+    // read with no baseline (see the header). Everything else in `host` is
+    // instantaneous and already right.
+    {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        if (self.last_metrics) |m| snap.host.cpu_pct = m.cpu_pct;
+    }
+
+    const rows = try arena.alloc(rows_mod.Row, remote.procs.len);
+    for (remote.procs, 0..) |p, i| {
+        rows[i] = .{
+            .pid = p.pid,
+            .ppid = p.ppid,
+            .cpu_pct = p.cpu_pct,
+            .mem_bytes = p.mem_bytes,
+            .name = try arena.dupe(u8, p.name),
+            .cmd = if (p.cmd) |c| try arena.dupe(u8, c) else "",
         };
     }
     snap.rows = rows;
@@ -871,7 +1282,11 @@ fn rebuild(self: *ActivityMonitor) void {
     self.clampScroll();
 
     log.info(
-        "activity monitor: source={s} total={d} shown={d} needle=\"{s}\" show_all={} sort={s}/{s} selected={d}",
+        // `root` is the snapshot's own root pid — this process for a local
+        // sample, the AGENT's for a remote one. It is the field that tells the
+        // two apart from outside, which is what the T295 acceptance needs: a
+        // loopback agent enumerates the same box, so a row count cannot.
+        "activity monitor: source={s} total={d} shown={d} needle=\"{s}\" show_all={} sort={s}/{s} selected={d} root={d}",
         .{
             self.source.label(),
             snap.rows.len,
@@ -881,6 +1296,7 @@ fn rebuild(self: *ActivityMonitor) void {
             @tagName(self.sort.key),
             if (self.sort.ascending) "asc" else "desc",
             self.sel_len,
+            snap.root_pid,
         },
     );
 }
@@ -1332,11 +1748,15 @@ fn paintRow(
 
 fn paintEmptyState(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
     const total = if (self.snap) |s| s.rows.len else 0;
-    const state = actions.emptyState(self.loading, self.refresh_failed, total);
+    const state = actions.emptyState(self.dialing, self.loading, self.refresh_failed, total);
     if (state != .unreachable_source) {
         _ = w32.SelectObject(hdc, self.font);
         _ = w32.SetTextColor(hdc, COLOR_SECONDARY);
-        const text = if (state == .loading) "Loading…" else "No processes match";
+        const text = switch (state) {
+            .connecting => "Connecting\u{2026}",
+            .loading => "Loading\u{2026}",
+            else => "No processes match",
+        };
         drawText(hdc, text, l.table_rows, w32.DT_CENTER | w32.DT_SINGLELINE | w32.DT_VCENTER);
         return;
     }
@@ -1814,14 +2234,10 @@ fn onKill(self: *ActivityMonitor) void {
     var failed_buf: [max_rows]actions.Target = undefined;
     var nfail: usize = 0;
     for (targets) |t| {
-        const r = proc_control.killProc(t.pid, "TERM");
-        if (r.ok) continue;
-        log.warn("activity monitor: kill pid={d} failed err={s}", .{
-            t.pid,
-            r.@"error" orelse "unknown",
-        });
-        failed_buf[nfail] = t;
-        nfail += 1;
+        if (!self.killOne(t.pid)) {
+            failed_buf[nfail] = t;
+            nfail += 1;
+        }
     }
     log.info("activity monitor: kill result total={d} killed={d} failed={d}", .{
         targets.len,
@@ -1844,6 +2260,36 @@ fn onKill(self: *ActivityMonitor) void {
     self.adoptPending();
     self.refreshChrome();
     self.kickSample();
+}
+
+/// Terminate one pid on THIS panel's source, returning whether it died. The
+/// local and remote calls are the same request to two transports — the agent
+/// answers `PROC_KILL` with the very `proc_control.killProc` the local branch
+/// calls in-process — so a local panel and a remote one cannot drift.
+fn killOne(self: *ActivityMonitor, pid: i64) bool {
+    if (self.remote_conn) |rc| {
+        var out = rc.conn.killProc(pid, "TERM", rpc_timeout_ns) catch |err| {
+            log.warn("activity monitor: remote kill pid={d} err={}", .{ pid, err });
+            return false;
+        };
+        defer out.deinit();
+        if (!out.ok) {
+            log.warn("activity monitor: remote kill pid={d} failed err={s}", .{
+                pid,
+                out.error_msg orelse "unknown",
+            });
+        }
+        return out.ok;
+    }
+
+    const r = proc_control.killProc(pid, "TERM");
+    if (!r.ok) {
+        log.warn("activity monitor: kill pid={d} failed err={s}", .{
+            pid,
+            r.@"error" orelse "unknown",
+        });
+    }
+    return r.ok;
 }
 
 /// Start a process on this panel's source (Mac's `NewProcessSheet` +
@@ -1879,28 +2325,52 @@ fn onNewProcess(self: *ActivityMonitor) void {
     }
     log.info("activity monitor: spawn dialog choice=start cmd=\"{s}\"", .{cmd});
 
-    const alloc = self.app.core_app.alloc;
-    const out = proc_spawn.spawnDetached(alloc, cmd, if (cwd.len == 0) null else cwd);
-    // The Windows branch may hand back an ALLOCATED diagnostic note even on
-    // success (`SpawnOutcome.free_error`), so this is not a failure-only free.
-    defer if (out.free_error) {
-        if (out.@"error") |e| alloc.free(e);
-    };
-
-    if (out.ok) {
-        log.info("activity monitor: spawn result ok=true pid={?d} note={s}", .{
-            out.pid,
-            out.@"error" orelse "",
-        });
+    if (self.spawnOne(cmd, if (cwd.len == 0) null else cwd)) {
         self.clearError();
     } else {
-        log.warn("activity monitor: spawn result ok=false err={s}", .{out.@"error" orelse "unknown"});
         var err_utf8: [256]u8 = undefined;
         self.setError(actions.spawnFailureText(&err_utf8, cmd));
     }
 
     self.adoptPending();
     self.kickSample();
+}
+
+/// Start `cmd` on THIS panel's source, returning whether it started. Remote
+/// goes through `PROC_SPAWN`, whose agent-side handler is the same
+/// `proc_spawn.spawnDetached` the local branch calls.
+fn spawnOne(self: *ActivityMonitor, cmd: []const u8, cwd: ?[]const u8) bool {
+    const alloc = self.app.core_app.alloc;
+
+    if (self.remote_conn) |rc| {
+        var out = rc.conn.spawnProc(cmd, cwd, rpc_timeout_ns) catch |err| {
+            log.warn("activity monitor: remote spawn err={}", .{err});
+            return false;
+        };
+        defer out.deinit();
+        if (out.ok) {
+            log.info("activity monitor: remote spawn ok=true pid={?d}", .{out.pid});
+        } else {
+            log.warn("activity monitor: remote spawn ok=false err={s}", .{out.error_msg orelse "unknown"});
+        }
+        return out.ok;
+    }
+
+    const out = proc_spawn.spawnDetached(alloc, cmd, cwd);
+    // The Windows branch may hand back an ALLOCATED diagnostic note even on
+    // success (`SpawnOutcome.free_error`), so this is not a failure-only free.
+    defer if (out.free_error) {
+        if (out.@"error") |e| alloc.free(e);
+    };
+    if (out.ok) {
+        log.info("activity monitor: spawn result ok=true pid={?d} note={s}", .{
+            out.pid,
+            out.@"error" orelse "",
+        });
+    } else {
+        log.warn("activity monitor: spawn result ok=false err={s}", .{out.@"error" orelse "unknown"});
+    }
+    return out.ok;
 }
 
 // ---------------------------------------------------------------------
@@ -2096,6 +2566,21 @@ test "freeSlot: the first hole, and null when full" {
     // A closed panel frees its slot for reuse.
     keys[0] = null;
     try testing.expectEqual(@as(?usize, 0), freeSlot(&keys));
+}
+
+test "panelMatches: a dial landing on a REUSED slot is not adopted by the new panel" {
+    // The failure this exists to prevent: panel A (serial 7) dials, closes, and
+    // panel B opens into the very same slot. A slot-only check would hand B a
+    // connection to A's machine and caption it with B's name.
+    var serials = [_]?u64{ 7, null, 12 };
+    try testing.expect(panelMatches(&serials, 0, 7));
+    try testing.expect(!panelMatches(&serials, 0, 6));
+    try testing.expect(!panelMatches(&serials, 1, 7)); // slot empty
+    try testing.expect(!panelMatches(&serials, 9, 7)); // slot out of range
+
+    serials[0] = 13; // A closed, B took the slot
+    try testing.expect(!panelMatches(&serials, 0, 7));
+    try testing.expect(panelMatches(&serials, 0, 13));
 }
 
 test "columnAt: every column hits, and the gutters outside the table miss" {

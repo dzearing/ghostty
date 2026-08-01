@@ -144,6 +144,10 @@ pub fn spawnFailureText(buf: []u8, cmd: []const u8) []const u8 {
 /// What the table's overlay says when it has no rows to draw
 /// (`RemoteActivityMonitorView.swift:1030-1045`).
 pub const EmptyState = enum {
+    /// A remote source's connection is still being dialed (Mac's `switching` /
+    /// its connecting placeholder). Outranks `loading` because it says the same
+    /// thing with the reason attached.
+    connecting,
     /// The first sample has not landed yet.
     loading,
     /// The source could not be reached AND we have nothing from it.
@@ -157,7 +161,17 @@ pub const EmptyState = enum {
 /// `no_match`, and only a source that produced nothing at all is
 /// `unreachable_source` (Mac gates its "Couldn't connect" on
 /// `model.procs.isEmpty`, :1034).
-pub fn emptyState(loading: bool, refresh_failed: bool, total_rows: usize) EmptyState {
+///
+/// `dialing` wins outright: mid-dial a stale `refresh_failed` from the previous
+/// source would flash "Couldn't connect" at a machine we have not finished
+/// asking.
+pub fn emptyState(
+    dialing: bool,
+    loading: bool,
+    refresh_failed: bool,
+    total_rows: usize,
+) EmptyState {
+    if (dialing) return .connecting;
     if (loading) return .loading;
     if (refresh_failed and total_rows == 0) return .unreachable_source;
     return .no_match;
@@ -319,13 +333,28 @@ test "spawnFailureText: quotes the command and truncates a huge one" {
     try testing.expect(std.mem.indexOf(u8, text, "\u{2026}") != null);
 }
 
-test "emptyState: loading wins, then unreachable, then no-match" {
-    try testing.expectEqual(EmptyState.loading, emptyState(true, true, 0));
-    try testing.expectEqual(EmptyState.unreachable_source, emptyState(false, true, 0));
+test "emptyState: connecting wins, then loading, then unreachable, then no-match" {
+    try testing.expectEqual(EmptyState.loading, emptyState(false, true, true, 0));
+    try testing.expectEqual(EmptyState.unreachable_source, emptyState(false, false, true, 0));
     // A failed refresh over rows we already have is NOT "couldn't connect" —
     // the table is stale, not empty.
-    try testing.expectEqual(EmptyState.no_match, emptyState(false, true, 42));
-    try testing.expectEqual(EmptyState.no_match, emptyState(false, false, 0));
+    try testing.expectEqual(EmptyState.no_match, emptyState(false, false, true, 42));
+    try testing.expectEqual(EmptyState.no_match, emptyState(false, false, false, 0));
+}
+
+test "emptyState: a dial in flight never shows the previous source's failure" {
+    // Every combination of the other three inputs — mid-dial the panel has
+    // exactly one honest thing to say (T295).
+    for ([_]bool{ true, false }) |loading| {
+        for ([_]bool{ true, false }) |failed| {
+            for ([_]usize{ 0, 42 }) |rows| {
+                try testing.expectEqual(
+                    EmptyState.connecting,
+                    emptyState(true, loading, failed, rows),
+                );
+            }
+        }
+    }
 }
 
 test "badgeText: a failed refresh outranks a truncated list" {
