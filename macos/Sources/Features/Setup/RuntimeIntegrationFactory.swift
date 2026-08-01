@@ -22,7 +22,7 @@ enum RuntimeIntegrationFactory {
         // Hooks — skip Claude hooks entirely if the external plugin already owns them.
         let spec: HookSpec = agent == .claude ? ClaudeHookSpec() : CopilotHookSpec()
         let skipHooks = agent == .claude &&
-            ClaudeHookSpec().isExternalPluginInstalled(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
+            (spec as? ClaudeHookSpec)?.isExternalPluginInstalled(homeDirectoryURL: homeDirectoryURL, fileManager: fileManager) == true
         if !skipHooks {
             let hooks = HookComponent(spec: spec, homeDirectoryURL: homeDirectoryURL, fileManager: fileManager)
             components.append(IntegrationComponent(name: "hooks", state: hooks.state, install: hooks.install, uninstall: hooks.uninstall))
