@@ -4514,3 +4514,64 @@ Evidence: chooser-menu ALL PASS (37) x3, negative control 1 FAILED / 36 passed;
 host-settings ALL PASS (65) x3, negative control 1 FAILED / 64 passed; no
 launched pid ever seen on the interactive desktop; both zig test lanes exit 0;
 test-agent exit 0; P1-P3 ALL PASS.
+
+## 2026-08-01 - T218 batch 6: the capture limit is a property of the painter, and the task closes
+
+The last two mouse scripts - `hero-mode` (63 assertions) and `window-color`
+(22, was 14) - onto the background test desktop. **13 of 13; T218 is done.**
+Both were the ones earlier batches had flagged as *maybe not migratable*, and
+they resolved in opposite directions from the same rule.
+
+**`hero-mode`'s carousel oracle survives, and it is the best pixel evidence in
+the fleet.** The column has no child HWND: `HeroCarousel.paint` draws into the
+PARENT window's DC inside BeginPaint, and every thumbnail refresh goes through
+`InvalidateRect` - so it lands in the backing store PrintWindow reads, unlike a
+GetDC paint (T233). The tiles ARE terminal content, moved across the boundary by
+the app itself: each pane's renderer captures its GL output into a DIB
+(`Surface.heroSnap*`) and the GUI thread blits it with GDI. Measured: 101
+distinct colors in the column, signature changing while a busy TUI runs in a
+HIDDEN pane. **Ask which thread painted the pixels, not which technology
+produced them.**
+
+**Three assertions could not come across, all aimed at a `GhozttyTerminal` child
+directly** - `hero-mode`'s two `Get-PaneColorCount` probes and `window-color`'s
+composited pane-centre probe. Dropped in place with the reason in each script
+header, never weakened into something a flat fill could pass. That is now T214's
+whole remaining pixel scope, and its question 1 is answered for both scripts it
+named as candidates.
+
+**`window-color` shows the third route working.** Losing its only "the color
+reaches the pixels" oracle would have left the tint asserted only in
+`+list --json`. `Surface.refreshBannerColors` colors the pane banner from
+`background_tint orelse config.background`, and the banner is a GDI-painted
+layered popup `pane-banner.ps1` already pins to the pane background exactly - so
+the script raises a banner on the tinted pane and reads the band corner:
+`#334455` -> `51,68,85`. Labeled for what it is: the tint escapes the data model
+into painted pixels, NOT proof that the GL clear color changed. **When an
+app-side capture is not worth building, look for another consumer of the same
+value that the app already paints natively.**
+
+Two PowerShell 5.1 traps, one run each, both silent: a function's `return @(...)`
+UNROLLS, so a one-element result arrives as a scalar whose `.Count` is `$null`
+and `$null -eq 1` is a quiet FAIL (`return , @(...)` fixes it); and the comma
+binds tighter than `+` in an array literal, so `@($a + $x, $b + $y)` throws
+`op_Addition`.
+
+Two more SKIP branches retired - `hero-mode`'s palette section (silent), and
+`window-color`'s picker section, which is the inverse failure mode worth naming:
+it skipped AND incremented the failure count, producing an unexplained red with
+no assertion attached. A skip that swallows assertions is useless whichever way
+it scores.
+
+Filed onward rather than left loose: **T267** gains two more instances (neither
+script sizes its own window; `hero-mode`'s divider drag and pixel-signature
+bounds are absolute numbers under an inherited client size), and **T258** was
+reproduced a third time, identically - same two `remote/agent/server.zig`
+assertions, same order, 2 of 3 runs, on a diff of two `.ps1` files.
+
+Evidence: hero-mode ALL PASS (63) x3, negative control 1 FAILED / 62 passed;
+window-color ALL PASS (22) x3, negative control 1 FAILED / 21 passed; both
+scripts score their capture's distinct-color guard before any pixel oracle; no
+launched pid ever seen on the interactive desktop; `zig build test` both lanes
+exit 0; `test-agent` exit 0 on run 3 (runs 1-2 are T258, above); P1-P3
+ACCEPTANCE: ALL PASS.

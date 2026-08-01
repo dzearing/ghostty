@@ -4,8 +4,12 @@
 # Oracles:
 #   - `+list --json` panes carry an additive `background_tint` (#rrggbb)
 #     field when tinted (absent otherwise).
-#   - A screen-pixel probe at the pane center must read ~= the tint (proves
-#     the color reaches the glass, not just the data model).
+#   - A NATIVE-PIXEL probe proves the tint escapes the data model: the pane
+#     banner overlay paints the pane's EFFECTIVE background around its card
+#     (Surface.refreshBannerColors takes `background_tint orelse config
+#     background`), so a banner raised on a tinted pane must have the tint in
+#     its band corners. See the migration note below for why this replaced the
+#     old screen-pixel probe.
 #   - The plain-split inheritance value is pinned exactly: #334455 parent
 #     -> #384b5e child (the color_math.zig unit-test oracle, Mac
 #     shiftedTint parity: HSB brightness +5% toward white on dark parents).
@@ -14,13 +18,42 @@
 #     effective background) -> the untinted launch window gains an explicit
 #     tint equal to the configured background.
 #
+# T218 batch 6: migrated onto the BACKGROUND test desktop
+# (test/win32/lib/TestDesktop.ps1), so the run never takes the user's
+# foreground - asserted here, not assumed.
+#
+# THE ONE PROBE THAT COULD NOT MIGRATE AS-IS (flagged in T218 batch 2, and it
+# held): section 1 read the composited SCREEN pixel at the pane centre to prove
+# the tint reached the glass. The glass is the OpenGL terminal surface, which
+# is exactly the half of the harness's CAPTURE LIMIT that PrintWindow returns
+# as a flat fill - and there is no composite off the input desktop to GetPixel
+# either. Both halves of that probe are gone, so it is DROPPED, not weakened
+# into an assertion that scores a blank fill. What replaced it asserts a
+# strictly different claim and is labeled as such: the banner overlay is a
+# GDI-painted layered popup whose band is the pane's effective background
+# (pane-banner.ps1 pins the same corner pixel), so it proves the tint reaches
+# native painted output - NOT that the GL clear color changed. Capturing the
+# terminal surface itself remains open as T214; the glass is unasserted here.
+#
+# -NegativeControl expects the picker to apply #334455 (a color it never
+# picks) instead of the configured background, which MUST fail: that value is
+# only reachable through right-click -> menu -> mnemonic -> dialog -> Enter ->
+# IPC readback, so the run proves the whole chain ran.
+#
 # Only touches ghoztty processes running from this repo's zig-out*.
-param([string]$ExePath)
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
+# Always isolated, not just under -ExePath: every oracle here is an IPC probe,
+# and both ends inherit this (the CLI from this shell, the GUI through the
+# harness's CreateProcessW), so they address THIS run's instance and nothing
+# else on the box.
+$env:GHOZTTY_PIPE_SUFFIX = '-colortest'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -28,146 +61,6 @@ function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
-
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class ColorDrv {
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
-    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
-    [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr dc, int x, int y);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUTK { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [DllImport("user32.dll", EntryPoint = "SendInput")] public static extern uint SendInputK(uint n, INPUTK[] inputs, int size);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUTM { public uint type; public MOUSEINPUT mi; }
-    [DllImport("user32.dll", EntryPoint = "SendInput")] public static extern uint SendInputM(uint n, INPUTM[] inputs, int size);
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Visible GhozttyTerminal children: "left,top,right,bottom" lines.
-    public static string[] Panes(IntPtr top) {
-        var lines = new List<string>();
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal" && IsWindowVisible(h)) {
-                RECT r; GetWindowRect(h, out r);
-                lines.Add(r.left + "," + r.top + "," + r.right + "," + r.bottom);
-            }
-            return true;
-        }, IntPtr.Zero);
-        return lines.ToArray();
-    }
-
-    // Any visible standard dialog (#32770, ChooseColorW) owned by pid?
-    public static bool HasDialog(uint pid) {
-        bool found = false;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p != pid || !IsWindowVisible(h)) return true;
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "#32770") { found = true; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Composited screen pixel as "r,g,b".
-    public static string ScreenPixel(int x, int y) {
-        IntPtr dc = GetDC(IntPtr.Zero);
-        uint c = GetPixel(dc, x, y); // COLORREF 0x00BBGGRR
-        ReleaseDC(IntPtr.Zero, dc);
-        return (c & 0xFF) + "," + ((c >> 8) & 0xFF) + "," + ((c >> 16) & 0xFF);
-    }
-
-    public static void Key(ushort vk, bool up) {
-        var i = new INPUTK[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInputK(1, i, Marshal.SizeOf(typeof(INPUTK)));
-    }
-
-    public static void RightClick() {
-        var i = new INPUTM[1];
-        i[0].type = 0;
-        i[0].mi.dwFlags = 0x0008; // RIGHTDOWN
-        SendInputM(1, i, Marshal.SizeOf(typeof(INPUTM)));
-        Thread.Sleep(60);
-        i[0].mi.dwFlags = 0x0010; // RIGHTUP
-        SendInputM(1, i, Marshal.SizeOf(typeof(INPUTM)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    public static string Foreground(IntPtr top) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        AttachThreadInput(cur, tid, false);
-        if (GetForegroundWindow() != top) return "NOT FOREGROUND";
-        return "OK";
-    }
-}
-'@
 
 function Kill-RepoInstances {
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
@@ -177,8 +70,8 @@ function Kill-RepoInstances {
 }
 
 # +list --json -> the window object registered under $target, or (with an
-# 'id:<hwnd>' argument) the window whose id matches — window ids are the
-# decimal HWND, so a window found via FindTop can be addressed exactly.
+# 'id:<hwnd>' argument) the window whose id matches - window ids are the
+# decimal HWND, so a window found through the harness can be addressed exactly.
 function Get-Win($target) {
     $json = (& $exe +list --json 2>$null | Out-String).Trim()
     if (-not $json) { return $null }
@@ -220,48 +113,92 @@ function Wait-Tint($target, [int]$i, [string]$expect) {
     return '(absent)'
 }
 
-# Poll the composited pixel at fraction (fx,fy) of the FOREGROUND window's
-# pane area until within $tol per channel of $hex. Returns "r,g,b".
-function Wait-Pixel([IntPtr]$top, [double]$fx, [double]$fy, [string]$hex, [int]$tol = 8) {
-    $er = [Convert]::ToInt32($hex.Substring(1, 2), 16)
-    $eg = [Convert]::ToInt32($hex.Substring(3, 2), 16)
-    $eb = [Convert]::ToInt32($hex.Substring(5, 2), 16)
-    $px = ''
-    for ($t = 0; $t -lt 25; $t++) {
-        $panes = @([ColorDrv]::Panes($top))
-        if ($panes.Count -ge 1) {
-            $c = $panes[0] -split ','
-            $x = [int]([int]$c[0] + ([int]$c[2] - [int]$c[0]) * $fx)
-            $y = [int]([int]$c[1] + ([int]$c[3] - [int]$c[1]) * $fy)
-            $px = [ColorDrv]::ScreenPixel($x, $y)
-            $p = $px -split ','
-            if ([math]::Abs([int]$p[0] - $er) -le $tol -and
-                [math]::Abs([int]$p[1] - $eg) -le $tol -and
-                [math]::Abs([int]$p[2] - $eb) -le $tol) { return $px }
-        }
-        Start-Sleep -Milliseconds 200
+# The banner overlay glued above pane $Pane (same left edge, its bottom at the
+# pane's top - T101 reserves the band above the terminal), or $null.
+function Get-Overlay([int]$procId, $Pane) {
+    foreach ($o in @(Get-TestWindows -ProcessId $procId -Class 'GhozttyBannerOverlay')) {
+        if ([math]::Abs($o.Left - $Pane.Left) -le 2 -and
+            [math]::Abs($o.Bottom - $Pane.Top) -le 2) { return $o }
     }
-    return $px
+    return $null
+}
+
+# "r,g,b" at a WINDOW-coordinate point of a capture ('' when off the shot).
+function Get-ShotPx($shot, [int]$x, [int]$y) {
+    if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { return '' }
+    $c = $shot.Bitmap.GetPixel($x, $y)
+    return "$($c.R),$($c.G),$($c.B)"
+}
+
+# Raise a banner on $target's pane and read the band corner of its overlay,
+# which the product fills with the pane's EFFECTIVE background. Returns
+# @{ Px = 'r,g,b'; Colors = <distinct colors in the capture> } - the caller
+# scores the color guard itself, because "no ink" is satisfied for entirely
+# the wrong reason by an empty capture.
+function Measure-BannerBand([int]$procId, [IntPtr]$top, [string]$target) {
+    & $exe +set-banner --target=$target 'tint probe' | Out-Null
+    $overlay = $null
+    for ($t = 0; $t -lt 40 -and -not $overlay; $t++) {
+        Start-Sleep -Milliseconds 150
+        $pane = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal' | Where-Object Visible)
+        if ($pane.Count -ge 1) { $overlay = Get-Overlay $procId $pane[0] }
+    }
+    if (-not $overlay) { return @{ Px = '(no overlay)'; Colors = 0 } }
+    $shot = Get-TestWindowPixels -Window ([IntPtr]$overlay.Hwnd)
+    try {
+        return @{
+            Px = (Get-ShotPx $shot 2 2)
+            Colors = (Get-TestDistinctColors -Shot $shot -Inset 2)
+        }
+    } finally { Close-TestWindowPixels $shot }
 }
 
 Kill-RepoInstances
+Remove-Item "$env:LOCALAPPDATA\ghoztty\session-layout-debug.json" -Force -ErrorAction SilentlyContinue
 
-# Launch the GUI with a pinned config background so the picker section has
-# a deterministic effective (untinted) background.
-$proc = Start-Process $exe -ArgumentList '--background=#101014' -PassThru
+# Watch the user's desktop for the whole run: nothing we launch may ever take
+# foreground there. That is the complaint the test desktop exists to fix.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$launched = @()
+$appPid = 0
+
+try {
+
+# Launch the GUI with a pinned config background so the picker section has a
+# deterministic effective (untinted) background. session-persistence=false:
+# a persisted session makes `+new-window --target=` idempotent against LAST
+# run's pane, so the fixtures below would measure a window this run never
+# created (T248).
+$app = Start-OnTestDesktop -Exe $exe -Arguments @(
+    '--config-default-files=false', '--session-persistence=false', '--background=#101014')
+$appPid = [int]$app.Pid
+$launched += $appPid
 Start-Sleep -Seconds 3
-if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
-$launchTop = [ColorDrv]::FindTop([uint32]$proc.Id)
+if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+$launchTop = Wait-TestWindow -ProcessId $appPid -Class 'GhozttyWindow'
 if ($launchTop -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: launch window not found'; exit 1 }
+Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) `
+    'GUI is NOT enumerable on the interactive desktop'
 
-# --- 1. +new-window --color tints the first pane (model + glass) ---------
+# --- 1. +new-window --color tints the first pane (model + painted band) --
 & $exe +new-window --target=cw --color=`#334455 | Out-Null
 $tint = Wait-Tint 'cw' 0 '#334455'
 Assert ($tint -eq '#334455') "new-window --color: background_tint reported (got $tint)"
 
-$cwTop = [ColorDrv]::FindTop([uint32]$proc.Id)
-$px = Wait-Pixel $cwTop 0.7 0.6 '#334455'
-Assert ($px -eq '51,68,85') "new-window --color: screen pixel is the tint (got $px)"
+# The tint escapes the data model into pixels the app really paints. NOT the
+# glass: see the header - the GL surface cannot be captured here, and this
+# asserts the banner band, which the product fills with the pane's effective
+# background.
+# A window's `id` in +list --json IS its decimal HWND, so the tinted window is
+# addressable exactly rather than by "the one that is not the launch window".
+$cwWin = Get-Win 'cw'
+$cwTop = if ($cwWin) { [IntPtr][int64]$cwWin.id } else { [IntPtr]::Zero }
+Assert ($cwTop -ne [IntPtr]::Zero) 'the tinted window is addressable by its +list id'
+$band = Measure-BannerBand $appPid $cwTop 'cw'
+Assert ($band.Colors -ge 2) "banner capture holds real content ($($band.Colors) distinct colors)"
+Assert ($band.Px -eq '51,68,85') `
+    "new-window --color: the tint is the pane background the banner band paints (got $($band.Px))"
 
 # --- 2. plain +split inherits the shifted parent tint (exact oracle) -----
 & $exe +split --target=cw --name=cp1 | Out-Null
@@ -306,45 +243,74 @@ Assert ($null -eq (Get-Win 'cw4')) 'invalid --color: no window created'
 # The untinted LAUNCH window's effective background is the configured
 # #101014; CC_RGBINIT seeds the dialog with it, Enter (OK) applies it as an
 # explicit tint, observable in +list.
-$fg = [ColorDrv]::Foreground($launchTop)
-if ($fg -ne 'OK') {
-    Write-Host "SKIP  picker section: cannot foreground launch window ($fg)"
-    $script:fail++
-} else {
-    $panes = @([ColorDrv]::Panes($launchTop))
-    $c = $panes[0] -split ','
-    $x = [int](([int]$c[0] + [int]$c[2]) / 2)
-    $y = [int](([int]$c[1] + [int]$c[3]) / 2)
-    [ColorDrv]::SetCursorPos($x, $y) | Out-Null
+#
+# The old script wrapped this whole section in a SKIP branch when it could not
+# take the foreground - a green run that asserted nothing (T218 batch 1's
+# finding). On the test desktop focus always lands, so a failure here is a
+# failure.
+$expectPicked = if ($NegativeControl) { '#334455' } else { '#101014' }
+if ($NegativeControl) {
+    Write-Host 'NEGATIVE CONTROL: the picker is expected to apply #334455, which it never picks - this run MUST fail'
+}
+$launchPane = Get-TestChildWindow -Window $launchTop -Class 'GhozttyTerminal'
+Assert ($launchPane -ne [IntPtr]::Zero) 'picker: launch window pane found'
+Assert (Focus-TestWindow -Window $launchTop -Child $launchPane) 'picker: launch window focused'
+
+$pr = Get-TestWindowRect -Window $launchPane -Client
+$cx = [int](($pr.Left + $pr.Right) / 2)
+$cy = [int](($pr.Top + $pr.Bottom) / 2)
+[void](Send-TestMouse -Window $launchTop -Target $launchPane -X $cx -Y $cy -Button right)
+$menuWnd = Wait-TestPopupMenu -ProcessId $appPid -TimeoutMs 3000
+Assert ($menuWnd -ne [IntPtr]::Zero) 'picker: right-click opened the context menu'
+
+# Menu mnemonic: unique first letter executes "Background Color...".
+# Send-TestControlKey posts without touching focus; Send-TestKeys would
+# SetFocus first and dismiss the menu.
+[void](Send-TestControlKey -Control $launchPane -Key B)
+$dlg = [IntPtr]::Zero
+for ($t = 0; $t -lt 30 -and $dlg -eq [IntPtr]::Zero; $t++) {
     Start-Sleep -Milliseconds 150
-    [ColorDrv]::RightClick()
-    Start-Sleep -Milliseconds 500
-    # Menu mnemonic: unique first letter executes "Background Color...".
-    [ColorDrv]::Key(0x42, $false); [ColorDrv]::Key(0x42, $true)  # 'B'
-    $dlg = $false
-    for ($t = 0; $t -lt 20; $t++) {
-        if ([ColorDrv]::HasDialog([uint32]$proc.Id)) { $dlg = $true; break }
-        Start-Sleep -Milliseconds 150
-    }
-    Assert $dlg 'picker: ChooseColorW dialog opened from the context menu'
-    if ($dlg) {
-        Start-Sleep -Milliseconds 300
-        [ColorDrv]::Key(0x0D, $false); [ColorDrv]::Key(0x0D, $true)  # Enter = OK
-        $tint = Wait-Tint "id:$([int64]$launchTop)" 0 '#101014'
-        Assert ($tint -eq '#101014') "picker: OK applies the effective background as tint (got $tint)"
-    } else {
-        [ColorDrv]::Key(0x1B, $false); [ColorDrv]::Key(0x1B, $true)  # Escape any stray menu
-        $script:fail++
-    }
+    $dlg = Get-TestWindow -ProcessId $appPid -Class '#32770'
+}
+Assert ($dlg -ne [IntPtr]::Zero) 'picker: ChooseColorW dialog opened from the context menu'
+if ($dlg -ne [IntPtr]::Zero) {
+    Start-Sleep -Milliseconds 300
+    # Post Enter at the FOCUSED control, not at the dialog: comdlg32 runs the
+    # standard IsDialogMessage pump, and that is where a hardware Return lands
+    # (T218 batch 5). A key posted at the dialog itself is a key its focused
+    # child never sees.
+    $focused = Get-TestFocusedWindow -Window $dlg
+    if ($focused -eq [IntPtr]::Zero) { $focused = $dlg }
+    [void](Send-TestControlKey -Control $focused -Key Enter)
+    $tint = Wait-Tint "id:$([int64]$launchTop)" 0 $expectPicked
+    Assert ($tint -eq $expectPicked) "picker: OK applies the effective background as tint (got $tint)"
+} else {
+    # Never leave a stray menu up for the next section.
+    [void](Send-TestControlKey -Control $launchPane -Key Escape)
 }
 
 # --- 8. app still alive and responsive -----------------------------------
-$alive = -not $proc.HasExited
+$alive = -not ($app.Process -and $app.Process.HasExited)
 Assert $alive 'GUI process alive after all scenarios'
 $json = (& $exe +list --json 2>$null | Out-String).Trim()
 Assert ($json -match '"success":true') '+list still responds'
 
-Kill-RepoInstances
+} finally {
+    Remove-TestDesktop
+    Kill-RepoInstances
+}
+
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    # Get-TestLaunchedPids, not the live list: this runs AFTER Remove-TestDesktop
+    # has emptied that one, and comparing against an empty set is an assertion
+    # that passes because it checked nothing.
+    $launched = @(@($launched) + @(Get-TestLaunchedPids) | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }
