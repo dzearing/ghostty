@@ -17,6 +17,7 @@ const remote_connection = @import("../../remote/connection.zig");
 
 const App = @import("App.zig");
 const ClaudeIntegration = @import("ClaudeIntegration.zig");
+const ActivityMonitor = @import("ActivityMonitor.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
@@ -2126,6 +2127,12 @@ pub fn performCommand(self: *Surface, id: commands.Id) void {
             log.info("machine chooser: opening via command surface", .{});
             self.parent_window.openMachineChooser();
         },
+
+        // The Activity Monitor panel (T285), also apprt-local. Mac's palette
+        // entry opens it on the window's own connection when there is one and
+        // the LOCAL source otherwise (RemoteActivityMonitor.swift:132-141); the
+        // remote half of that branch arrives with T287.
+        .activity => ActivityMonitor.openLocal(self.parent_window),
 
         // Build provenance of this running instance (T52).
         .about => self.showAboutDialog(),

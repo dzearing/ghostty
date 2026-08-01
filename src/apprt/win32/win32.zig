@@ -884,6 +884,15 @@ pub extern "gdi32" fn Polygon(
     cpt: i32,
 ) callconv(.winapi) i32;
 
+/// Stroke an OPEN polyline with the current pen. Unlike `MoveToEx`/`LineTo`,
+/// every supplied point is drawn (§8 of the design system: `LineTo` drops its
+/// endpoint), which is what the Activity Monitor's trend charts need.
+pub extern "gdi32" fn Polyline(
+    hdc: HDC,
+    apt: [*]const POINT,
+    cpt: i32,
+) callconv(.winapi) i32;
+
 /// COLORREF is 0x00BBGGRR (blue in high byte, red in low byte).
 pub fn RGB(r: u8, g: u8, b: u8) u32 {
     return @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16);
@@ -1028,7 +1037,14 @@ pub const CB_SETCUEBANNER: u32 = 0x1703;
 
 // Button control styles / notifications
 pub const BS_DEFPUSHBUTTON: u32 = 0x00000001;
+/// A checkbox that toggles its own check state on click (no BM_SETCHECK from
+/// the WM_COMMAND handler needed).
+pub const BS_AUTOCHECKBOX: u32 = 0x00000003;
 pub const BN_CLICKED: u16 = 0;
+pub const BM_GETCHECK: u32 = 0x00F0;
+pub const BM_SETCHECK: u32 = 0x00F1;
+pub const BST_UNCHECKED: usize = 0;
+pub const BST_CHECKED: usize = 1;
 // STATIC control styles.
 pub const SS_CENTER: u32 = 0x0001;
 pub const SS_RIGHT: u32 = 0x0002;
@@ -1428,11 +1444,15 @@ pub const SRCCOPY: u32 = 0x00CC0020;
 pub const TRANSPARENT: i32 = 1;
 pub const DT_LEFT: u32 = 0;
 pub const DT_CENTER: u32 = 1;
+pub const DT_RIGHT: u32 = 2;
 pub const DT_VCENTER: u32 = 4;
 pub const DT_WORDBREAK: u32 = 0x10;
 pub const DT_SINGLELINE: u32 = 32;
 pub const DT_CALCRECT: u32 = 0x400;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;
+/// Ellipsize a PATH in the middle, keeping the leaf filename visible — the
+/// Path column's `.truncationMode(.head)` on the Mac.
+pub const DT_PATH_ELLIPSIS: u32 = 0x4000;
 pub const DT_NOPREFIX: u32 = 0x800;
 
 // STATIC control styles.

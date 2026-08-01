@@ -30,6 +30,10 @@ pub const Kind = enum {
     binding,
     /// Open the machine chooser (there is no "new remote window" binding).
     remote,
+    /// Open the Activity Monitor panel (T285). Like `remote`, apprt-local:
+    /// macOS registers it as a palette-only opener too
+    /// (TerminalCommandPalette.swift:179-188).
+    activity,
     /// Show the About box (T52).
     about,
     /// Run the Claude Code plugin install (T71).
@@ -47,6 +51,7 @@ pub const Kind = enum {
 pub const Id = enum {
     new_window,
     new_remote_window,
+    activity_monitor,
     new_tab,
     close_surface,
     close_tab,
@@ -149,6 +154,10 @@ pub const Command = struct {
 pub const registry = [_]Command{
     .{ .id = .new_window, .name = "New Window", .action = .new_window },
     .{ .id = .new_remote_window, .name = "New Remote Window", .action = .new_window, .kind = .remote },
+    // macOS names it "Open Remote Activity Monitor"; on Windows the panel opens
+    // on the LOCAL machine (T285) and grows remote sources in T287, so the name
+    // does not promise a remote-only surface.
+    .{ .id = .activity_monitor, .name = "Open Activity Monitor", .action = .new_window, .kind = .activity },
     .{ .id = .new_tab, .name = "New Tab", .action = .new_tab },
     .{ .id = .close_surface, .name = "Close Surface", .action = .close_surface },
     .{ .id = .close_tab, .name = "Close Tab", .action = .{ .close_tab = .this } },
@@ -269,13 +278,13 @@ test "names are unique and non-empty" {
 }
 
 test "only the local kinds carry a placeholder action" {
-    // `remote`/`about`/`claude` have no binding to perform, so their `action`
-    // is an unused placeholder and callers must not dispatch it. Everything
-    // else is dispatched verbatim, so a placeholder there would silently run
-    // the wrong command.
+    // `remote`/`activity`/`about`/`claude` have no binding to perform, so their
+    // `action` is an unused placeholder and callers must not dispatch it.
+    // Everything else is dispatched verbatim, so a placeholder there would
+    // silently run the wrong command.
     for (registry) |c| switch (c.kind) {
         .binding => {},
-        .remote, .about, .claude, .help => try std.testing.expectEqual(
+        .remote, .activity, .about, .claude, .help => try std.testing.expectEqual(
             input.Binding.Action.new_window,
             c.action,
         ),

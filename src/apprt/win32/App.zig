@@ -20,6 +20,7 @@ const PathInstaller = @import("PathInstaller.zig");
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
+const ActivityMonitor = @import("ActivityMonitor.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
@@ -786,6 +787,13 @@ pub fn run(self: *App) !void {
                 // to the multi-line edit as a newline. Exclusive, same
                 // reasoning as the rename dialog above.
                 if (dlg.handleKey(vk)) continue :loop;
+            } else if (ActivityMonitor.owning(msg.hwnd.?)) |monitor| {
+                // The Activity Monitor panel (T285): Escape closes and the
+                // arrow/page/home/end keys drive the table. Typing falls
+                // through to the filter EDIT. Exclusive for the same reason as
+                // the dialogs above — its children must never reach the
+                // Surface-cast popup-edit intercepts.
+                if (monitor.handleKey(vk)) continue :loop;
             } else if (self.machineChooserOwning(msg.hwnd.?)) |chooser| {
                 // Modal machine chooser: Enter/Escape/Tab/Up/Down handled by
                 // our code (typing falls through to the filter EDIT). Like the
@@ -897,6 +905,11 @@ pub fn run(self: *App) !void {
 
 pub fn terminate(self: *App) void {
     self.stopQuitTimer();
+
+    // Activity Monitor panels (T285) are independent top-level windows, so they
+    // are not torn down with any terminal window. Close them here so a sampling
+    // thread can never outlive the allocator it is writing into.
+    ActivityMonitor.closeAll();
 
     // Flush the session-layout manifest while every window/surface is still
     // alive (T89f). Quit DETACHES sessions (they survive under the agent), so

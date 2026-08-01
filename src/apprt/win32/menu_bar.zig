@@ -240,6 +240,11 @@ pub const Omitted = struct {
 
 pub const omitted = [_]Omitted{
     .{
+        .cmd = .activity_monitor,
+        .why = "palette-only on macOS too: TerminalCommandPalette.swift:179-188 " ++
+            "registers it as a palette entry and MainMenu.xib has no row for it",
+    },
+    .{
         .cmd = .copy_url_to_clipboard,
         .why = "hover/selection-scoped; macOS has no menu row and a menu " ++
             "cannot know which URL was meant",

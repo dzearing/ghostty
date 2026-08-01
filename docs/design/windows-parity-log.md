@@ -4977,3 +4977,65 @@ Mac's own 12). And the intra-dialog separators stay 1 px hairlines like the
 sibling chooser: section 5's 2 DIP band governs the DRAGGABLE split lines
 between panes, where a vanishing line costs the user a grab target, and a rule
 inside a dialog has no grab band to lose.
+
+## 2026-08-01 - T285: the Activity Monitor opens on Windows, and the capture found what no assertion would have
+
+The panel exists. `ActivityMonitor.zig` opens from the command palette as "Open
+Activity Monitor", paints T284's regions with GDI, and fills them from the LOCAL
+samplers `metrics.Sampler` / `proc.ProcSampler` - the two trend gauges, the
+filter/Show-all/count control bar, and a five-column process table with sorting,
+multi-select, wheel + keyboard scrolling and an overlay thumb. `activity_rows.zig`
+carries the pure half (28 tests: the filter composition, the spawned-tree
+marking, the sort order, every cell's text), registered in `src/apprt.zig`. One
+panel per SOURCE: a second open focuses the existing one, keyed on a `Source`
+union that already has its `.remote` arm so T287 does not have to retrofit the
+registry. All four zig lanes green, P1-P3 ALL PASS, and
+`test\win32\activity-monitor.ps1` is ALL PASS at 46 assertions with its
+`-NegativeControl` inversion failing as designed.
+
+**The defect this turn is proudest of was found by LOOKING at the panel.** The
+sort indicator was appended to the header title, and `"% CPU"` plus an arrow does
+not fit the 60-90 DIP CPU column - so `DT_END_ELLIPSIS` ate the arrow and the
+panel showed `"% CPU..."` with no indicator on the very column it was sorted by.
+No assertion in the script would ever have caught it: the script reads neither
+the title nor the arrow. It took one `PrintWindow` capture and one human look.
+The rule that follows is small and cheap: **a new pixel surface gets one look at
+a capture, on top of whatever the probes assert.** The arrow now has its own
+reserved slot and is a filled `Polygon` rather than a text glyph (section 4).
+
+The second find is section 2.3's own sentence, still the easiest to miss: the
+Path column's secondary gray clears 4.5:1 against the panel (5.4:1) and FAILS it
+against the selection fill (2.8:1). **The contrast floor is checked against the
+fill the text actually sits on.**
+
+Four harness traps were re-paid and are now written into the script so they are
+not paid a third time. `Get-TestChildWindows -Class 'BUTTON'` matches nothing -
+the harness compares class names exactly and the class is `Button`. A
+one-element array return unrolls in PS 5.1, so `(Get-Panels).Count` was `$null`
+and a correct app failed the "exactly ONE panel" assertion. `Send-TestMouse`
+takes SCREEN coordinates, so a header click passed in client coordinates landed
+past the table's right edge where `columnAt` correctly returns null. And the
+sharpest one: **a channel-dominance pixel probe is not a tint probe** - "bluer
+than it is red" passes on ClearType's color fringes, which appear wherever there
+is text, so the first chart probe passed against a panel whose charts had not
+drawn yet. GDI fills solid brushes with no antialiasing, so the tints land as
+their literal constants; the probe now matches them exactly, with control probes
+asserting each tint is absent from the other gauge's half and from the table -
+and it waits for a third poll first, because a chart with one sample correctly
+paints nothing.
+
+Two scoping decisions recorded rather than argued later. "New Process..." is
+created DISABLED instead of omitted: the layout module reserves its rect, so the
+control bar has the geometry the module describes from day one (which the script
+measures), and a disabled control is an honest state where a live button that
+does nothing is not - T286 enables it. And sampling runs off the GUI thread with
+`close` JOINing the worker, because a poll enumerates ~300 processes and opens
+each one; a dropped tick is deliberate, so a slow machine cannot accumulate a
+backlog of enumerations.
+
+Follow-ups: **T288** (two private copies of the same case-fold substring
+search), **T289** (the panel is keyboard-operable but has no visible focus
+anywhere, which section 2.2 calls an accessibility defect rather than a polish
+item), **T290** (it keeps enumerating every process while minimized). Next in
+the T226 chain is **T286** (Kill with confirm, New Process, the error banner),
+then **T287** (remote sources + the carousel, which closes T177).
