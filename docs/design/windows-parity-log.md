@@ -4841,3 +4841,42 @@ so it is a side-effect-free capability probe), cached, and falls back to argv wi
 a `WARNING:` naming the degradation - CLAUDE.md's app/agent HELLO rule applied to
 the CLI. **A new flag is a compatibility boundary the moment a script uses it
 against an exe it did not build.**
+
+## 2026-08-01 - T208: the delivery had no idea what it was delivering
+
+`upgrade-ghoztty-windows.ps1` never builds - by design, it copies whatever sits
+in `zig-out-release` - and `launch-upgrade.ps1` only checked that the directory
+EXISTED. So the contract was "the caller builds first", written down nowhere the
+caller reads. Delivering T202 on 2026-07-30 that shipped the previous delivery's
+binary while `LAUNCH OK`, `exe swapped` and `UPGRADE OK` all reported success;
+`+version` still said `+9968a62d9`.
+
+The fix is a number both ends can compare - the commit `GitVersion.zig` bakes in
+as semver build metadata - read and compared in ONE place
+(`scripts/delivery-version.ps1`) by three gates: the launcher builds and then
+refuses to launch a prefix that is not HEAD (exit 3, nothing started); the
+upgrade script re-checks before the kill and skips the entire destructive region
+on stale bits; and it reads the INSTALLED exe back afterwards, so `UPGRADE OK`
+means the right bits are on disk instead of "a file copy returned success". The
+other two install locations are mirrored automatically once the primary verifies,
+and skipped when it does not. `test\win32\upgrade-staleness.ps1` - ALL PASS, 45
+assertions, hermetic.
+
+Two decisions worth keeping. **Stale bits skip the swap but still RESUME**: the
+delivery must not happen, but a silently stalled loop is the more expensive
+failure (T200, T241), and `UPGRADE FAILED` plus exit 1 already make it
+unmistakable. And **the failure is asserted on the marker count, not the
+message** - "no upgrade was started" is the half that matters, and a script that
+only checks for the right words can pass while launching anyway.
+
+The lesson is not that the idea was missing. `publish-windows-release.ps1` - the
+MSI path - has always built first and thrown unless the exe reported
+`$Version+$hash`. The loop's own delivery path, which runs far more often and is
+the one the user sees, never inherited that discipline. **Two pipelines doing the
+same job, and only the one a human watches got the check.**
+
+One fallout in `upgrade-no-fork.ps1`: its L section drove the launcher at an
+EMPTY staging directory, which is now refused before the launch mechanics it
+tests are reached. It stages a copy of the built exe and passes `-SkipBuild
+-ExpectedCommit`. The argv whitespace guard moved ahead of the build with it, so
+a mis-quoted path costs zero minutes instead of a full ReleaseFast build.

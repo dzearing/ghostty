@@ -196,21 +196,35 @@ line did not fail — re-run it unfiltered before believing it.
   unless `-AllowPlainResume` is passed. Also finish the turn (commit,
   tracker updated) BEFORE launching the script — it kills Claude after
   `-DelaySeconds`.
-- **BUILD THE STAGING RELEASE FIRST — the upgrade never builds** (2026-07-30,
-  T208). `upgrade-ghoztty-windows.ps1` copies whatever is already sitting in
-  `zig-out-release`, and `launch-upgrade.ps1` only checks that the directory
-  *exists*. Skip the build and the delivery ships the PREVIOUS delivery's
-  binary while `LAUNCH OK`, `exe swapped` and `UPGRADE OK` all report success.
-  That happened delivering T202: the installed release still reported
-  `+9968a62d9` afterwards. So, before the launch:
+- **The launcher now BUILDS the staging release and refuses to ship anything
+  else** (2026-07-31, T208). `upgrade-ghoztty-windows.ps1` still never builds —
+  it copies whatever sits in `zig-out-release` — so `launch-upgrade.ps1` does it
+  first, with the exact incantation that used to be a remembered precondition:
 
   ```powershell
   zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast `
       -Dtarget=x86_64-windows-gnu -Dstrip=false --prefix zig-out-release
   ```
 
-  and after it, `ghoztty +version` must report `git rev-parse --short HEAD`.
-  A delivery is not done until you have READ that commit back.
+  It then reads the staged exe's `+version` and compares the baked commit
+  against `git rev-parse --short HEAD`. A mismatch is **STALE STAGING**: the
+  launcher exits 3 and nothing is delivered. The upgrade script re-checks the
+  same number before the kill (a stale prefix skips the swap entirely and the
+  installed release is left untouched) and reads the *installed* exe back after
+  the swap, so `UPGRADE OK` means the right bits are on disk rather than "a file
+  copy returned success". Then it mirrors to the Desktop portable and the
+  `\\homeassistant\share` copy, best-effort.
+
+  Why all that: skipping the build shipped the PREVIOUS delivery's binary while
+  `LAUNCH OK`, `exe swapped` and `UPGRADE OK` all reported success. That happened
+  delivering T202 — the installed release still reported `+9968a62d9`
+  afterwards. **A delivery is still not done until you have READ that commit
+  back** from `ghoztty +version`; the gates make a lie loud, not unnecessary.
+
+  Escape hatches, both loud in the log: `-SkipBuild` (I already built it — the
+  freshness check still runs) and `-AllowStaleStaging` (ship a commit that is
+  not HEAD, e.g. a deliberate rollback). Acceptance:
+  `test\win32\upgrade-staleness.ps1`.
 
 - **Launch that upgrade through `scripts/launch-upgrade.ps1`, never with a
   hand-rolled `Start-Process`** (2026-07-30, T200). Call it IN-PROCESS from
@@ -226,6 +240,13 @@ line did not fail — re-run it unfiltered before believing it.
   success — so a launch that dies fails in *this* turn, while someone is
   still watching. Exit 0 = confirmed running; anything else = the installed
   release was NOT upgraded, so do not report the delivery as done.
+
+  **Give that tool call a long timeout** (T208): it now builds first, and a cold
+  ReleaseFast build runs several minutes. A call that gets pushed to the
+  background takes the "fails while someone is watching" guarantee with it. The
+  cheap shape is to run the build in its own earlier tool call — the launcher's
+  rebuild is then a no-op of a few seconds, and the build path still gets
+  exercised, which `-SkipBuild` would skip.
 
   Why it exists: `Start-Process -ArgumentList @(…)` does not quote its
   elements, so a multi-word `-ResumePrompt` is re-tokenized into positional

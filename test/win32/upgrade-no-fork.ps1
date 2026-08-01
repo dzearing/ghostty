@@ -206,9 +206,10 @@ Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue
 # ============================================================================
 "== L: the launch contract (T200)"
 # ============================================================================
-# Out of alphabetical order on purpose: L needs no app, no agent and no sandbox
-# install - only stub scripts and a private log - so it lives above the
-# -PureOnly gate and runs on every invocation.
+# Out of alphabetical order on purpose: L launches nothing real - stub scripts,
+# a private log, and (since T208) a COPY of the built exe that is read for its
+# baked version and never executed as an app - so it lives above the -PureOnly
+# gate and runs on every invocation.
 #
 # What it pins: the delivery launch cannot fail silently. On 2026-07-30 a
 # boundary delivery was launched detached and never ran. `Start-Process
@@ -221,6 +222,21 @@ $lRoot = Join-Path $env:TEMP "ghoztty-launch-t200-$PID"
 $lStaging = Join-Path $lRoot 'staging'
 $lInstall = Join-Path $lRoot 'install'
 foreach ($d in @($lRoot, $lStaging, $lInstall)) { New-Item -ItemType Directory -Force $d | Out-Null }
+
+# T208: the launcher now verifies that the staged exe carries the commit being
+# delivered, so reaching its launch mechanics at all needs a REAL binary in the
+# prefix. $lStaging stays deliberately empty (the upgrade script's own
+# staging-exe-missing abort is asserted below); this second prefix is the one the
+# launcher gets. -SkipBuild + -ExpectedCommit drive the gate without a build -
+# the gate itself is the subject of test\win32\upgrade-staleness.ps1, not of this
+# suite, which is about the launch hop.
+. (Join-Path $Repo 'scripts\delivery-version.ps1')
+Assert "L0 the built exe is present (L stages a copy of it)" (Test-Path -LiteralPath $Exe)
+$lStagingReal = Join-Path $lRoot 'staging-real'
+New-Item -ItemType Directory -Force (Join-Path $lStagingReal 'bin') | Out-Null
+Copy-Item -LiteralPath $Exe (Join-Path $lStagingReal 'bin\ghoztty.exe') -Force
+$lStagedCommit = (Resolve-GhozttyExeCommit -Exe (Join-Path $lStagingReal 'bin\ghoztty.exe')).Commit
+$lFresh = @('-SkipBuild', '-ExpectedCommit', $lStagedCommit)
 $lLog = Join-Path $lRoot 'ghoztty-upgrade.log'
 $launcher = Join-Path $Repo 'scripts\launch-upgrade.ps1'
 
@@ -328,9 +344,9 @@ Set-Content -LiteralPath $stubDead -Encoding ascii -Value @(
 # -PromptFile, not -Prompt: across a command line the launcher's own -Prompt is
 # subject to the very shredding it exists to prevent. Writing this test the
 # other way is what proved it (the free text bound 'arg' to -LoopClaudePid).
-$dead = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
-    '-PromptFile', $promptFile, '-Staging', $lStaging, '-UpgradeScript', $stubDead,
-    '-StartTimeoutSeconds', '6')
+$dead = Invoke-InSandboxTemp (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
+    '-PromptFile', $promptFile, '-Staging', $lStagingReal, '-UpgradeScript', $stubDead,
+    '-StartTimeoutSeconds', '6') + $lFresh)
 Assert "L16 NEGATIVE CONTROL: a child that dies before logging fails the launch (exit $($dead.Code))" ($dead.Code -eq 1)
 Assert "L17 it says the upgrade did NOT happen" ($dead.Out -match 'LAUNCH FAILED')
 Assert "L18 it surfaces the child's stderr instead of swallowing it" ($dead.Out -match 'died before logging')
@@ -345,9 +361,9 @@ Set-Content -LiteralPath $stubOk -Encoding ascii -Value @(
     'Start-Sleep -Seconds 2'
 )
 $before = Get-LMarkerCount
-$live = Invoke-InSandboxTemp @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
-    '-PromptFile', $promptFile, '-Staging', $lStaging, '-UpgradeScript', $stubOk,
-    '-StartTimeoutSeconds', '20')
+$live = Invoke-InSandboxTemp (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launcher,
+    '-PromptFile', $promptFile, '-Staging', $lStagingReal, '-UpgradeScript', $stubOk,
+    '-StartTimeoutSeconds', '20') + $lFresh)
 AssertEq "L19 a child that logs its start reports LAUNCH OK" 0 $live.Code
 Assert "L20 and says so on stdout" ($live.Out -match 'LAUNCH OK')
 AssertEq "L21 the marker really is in the log" ($before + 1) (Get-LMarkerCount)
@@ -379,7 +395,8 @@ $okOut = Join-Path $lRoot 'inproc.out'
 $before = Get-LMarkerCount
 $env:TEMP, $env:TMP = $lRoot, $lRoot
 try {
-    & $launcher -Prompt $hostile -Staging $lStaging -UpgradeScript $stubOk -StartTimeoutSeconds 20 *> $okOut
+    & $launcher -Prompt $hostile -Staging $lStagingReal -UpgradeScript $stubOk -StartTimeoutSeconds 20 `
+        -SkipBuild -ExpectedCommit $lStagedCommit *> $okOut
     $okCode = $LASTEXITCODE
 } finally { $env:TEMP, $env:TMP = $savedTemp, $savedTmp }
 AssertEq "L27 the documented in-process call with free text succeeds" 0 $okCode

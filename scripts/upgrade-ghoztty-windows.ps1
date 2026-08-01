@@ -9,10 +9,19 @@
 #     '-NoProfile','-ExecutionPolicy','Bypass','-File',
 #     'D:\git\ghoztty\scripts\upgrade-ghoztty-windows.ps1'
 #
-# Sequence: wait -> kill release ghoztty processes (install dir only; debug
-# zig-out instances untouched) -> swap exe + share\ from the staging prefix
-# -> RESUME the loop. Every step is appended to %TEMP%\ghoztty-upgrade.log so
-# the resumed session can verify what happened.
+# Sequence: verify the staged bits ARE the delivery -> wait -> kill release
+# ghoztty processes (install dir only; debug zig-out instances untouched) ->
+# swap exe + share\ from the staging prefix -> verify the installed exe reports
+# the delivered commit -> mirror to the other install locations -> RESUME the
+# loop. Every step is appended to %TEMP%\ghoztty-upgrade.log so the resumed
+# session can verify what happened.
+#
+# T208 - this script deliberately does NOT build; it copies whatever is in
+# $Staging. That is why both ends are verified against a commit: on 2026-07-30 a
+# delivery copied the PREVIOUS delivery's binary and `exe swapped` + `UPGRADE OK`
+# both reported success over it. `UPGRADE OK` now means "the installed exe
+# answers with the commit this delivery was for", and a stale staging prefix
+# skips the swap entirely rather than shipping it.
 #
 # T138 - the resume is a decision, not a fixed action. This script was written
 # against the pre-session-persistence world, where "killing ghoztty.exe kills
@@ -81,6 +90,22 @@ param(
     [int]$LoopClaudePid = 0,
     [string]$LoopPaneId = $env:GHOZTTY_PANE_ID,
     [int]$DelaySeconds = 3,
+    # T208: the commit this delivery is supposed to ship. Normally handed down by
+    # launch-upgrade.ps1, which has already verified it; empty means "read it
+    # from git in $WorkingDirectory". A staged exe that does not carry it is a
+    # STALE delivery and the swap is skipped entirely.
+    [string]$ExpectedCommit = '',
+    [switch]$AllowStaleStaging,
+    # Kept in step with the primary install, best-effort, because a fix that
+    # only lives in one of the three locations does not exist as far as the user
+    # can tell. Never fatal: a sleeping NAS must not fail a delivery.
+    # The exe-bearing directory of each, NOT the wrapper folder: both portables
+    # nest one level (`Ghoztty-portable-x64\Ghoztty\ghoztty.exe`).
+    [string[]]$ExtraInstallDirs = @(
+        'D:\Users\David\Desktop\Ghoztty-portable-x64\Ghoztty',
+        '\\homeassistant\share\ghoztty-windows\Ghoztty-portable-x64\Ghoztty'
+    ),
+    [switch]$NoExtraInstalls,
     [switch]$NoResume,
     [switch]$AllowPlainResume,
     # Relaunch even if the launching session survived. Escape hatch for a
@@ -93,8 +118,24 @@ $log = Join-Path $env:TEMP 'ghoztty-upgrade.log'
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content $log }
 
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
+. (Join-Path $PSScriptRoot 'delivery-version.ps1')
 
 Log "=== upgrade start (staging=$Staging)"
+
+# T208: the delivery's verdict is decided in two places (before the swap, and
+# after it) and reported in ONE place, so `UPGRADE OK` cannot appear over a
+# delivery that did not happen. Every exit below goes through this.
+$script:deliveryFailure = ''
+function Complete-Upgrade([string]$note) {
+    if ($script:deliveryFailure) {
+        # Deliberately does not spell the success tag - a log grep for
+        # "UPGRADE OK" must never match a failure line.
+        Log "UPGRADE FAILED: $($script:deliveryFailure) ($note)"
+        exit 1
+    }
+    Log "UPGRADE OK ($note)"
+    exit 0
+}
 
 # T200: the full resolved parameter set, so a mis-bind is READABLE in the log
 # instead of inferred from a weird `pane=` value three lines down.
@@ -108,9 +149,10 @@ if ($ResumePromptFile) {
     $ResumePrompt = [IO.File]::ReadAllText($ResumePromptFile) -replace '\r?\n\z', ''
     Log "resume prompt read from file ($($ResumePrompt.Length) chars): $ResumePromptFile"
 }
-Log ("params: install=[{0}] wd=[{1}] pane=[{2}] loopPid={3} delay={4} noResume={5} force={6} resumeCmd=[{7}] resumePrompt=[{8}]" -f `
+Log ("params: install=[{0}] wd=[{1}] pane=[{2}] loopPid={3} delay={4} noResume={5} force={6} expect=[{7}] allowStale={8} resumeCmd=[{9}] resumePrompt=[{10}]" -f `
     $InstallDir, $WorkingDirectory, $LoopPaneId, $LoopClaudePid, $DelaySeconds, `
-    [bool]$NoResume, [bool]$ForceRelaunch, $ResumeCommand, $ResumePrompt)
+    [bool]$NoResume, [bool]$ForceRelaunch, $ExpectedCommit, [bool]$AllowStaleStaging, `
+    $ResumeCommand, $ResumePrompt)
 
 # Both of these are consumed by destructive steps (the kill is scoped to
 # $InstallDir, the swap reads $Staging). A mis-bound value must stop the run
@@ -145,6 +187,45 @@ $newExe = Join-Path $Staging 'bin\ghoztty.exe'
 $oldExe = Join-Path $InstallDir 'ghoztty.exe'
 if (-not (Test-Path $newExe)) { Log "ABORT: staging exe not found: $newExe"; exit 1 }
 if (-not (Test-Path $oldExe)) { Log "ABORT: installed exe not found: $oldExe"; exit 1 }
+
+# ---- T208: is the staged binary actually this tree? -------------------------
+#
+# launch-upgrade.ps1 checks this before it launches; this is the same check at
+# the last moment before anything destructive, for the direct-invocation path
+# and as the belt to that braces. It runs BEFORE the kill on purpose.
+#
+# On a mismatch the swap is SKIPPED but the resume still runs. Refusing to ship
+# stale bits is the point; stalling the loop is not - that is the failure mode
+# the whole T200/T208 family exists to prevent, and a silent stall costs more
+# than a delivery that has to be re-run. The log says FAILED and the exit code
+# is 1, so nothing downstream can read this as a successful delivery.
+$expected = $ExpectedCommit
+if (-not $expected) {
+    $expected = Get-RepoHeadCommit -Repo $WorkingDirectory
+    Log "expected commit not supplied; read HEAD in ${WorkingDirectory}: '$expected'"
+}
+$stagedInfo = Resolve-GhozttyExeCommit -Exe $newExe
+Log "staging freshness: staged=$($stagedInfo.Commit) expected=$expected$(if ($stagedInfo.Why) { " (staged probe: $($stagedInfo.Why))" })"
+$stale = $false
+if (-not $expected) {
+    Log 'WARNING: no expected commit (no -ExpectedCommit and git could not be read); the staged binary is UNVERIFIED. Proceeding.'
+} elseif (-not (Test-CommitsMatch $stagedInfo.Commit $expected)) {
+    if ($AllowStaleStaging) {
+        Log "WARNING: staged exe carries '$($stagedInfo.Commit)' but expected '$expected'; shipping anyway (-AllowStaleStaging)."
+    } else {
+        $stale = $true
+        $script:deliveryFailure = "STALE STAGING: $newExe carries '$($stagedInfo.Commit)' but the delivery is for '$expected'"
+        Log "STALE STAGING: $newExe carries '$($stagedInfo.Commit)', expected '$expected'. SKIPPING the kill and the swap - the installed release is untouched. Rebuild the staging prefix (zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu -Dstrip=false --prefix $Staging) and deliver again. The resume below still runs so the loop is not stalled."
+    }
+}
+
+# >>>>> the destructive region. Everything from here to `} # <<<<< end of the
+# destructive region` kills processes and overwrites the installed release, and
+# is skipped wholesale when the staged bits are not the ones being delivered.
+# Deliberately NOT re-indented: this guard was added around code that predates
+# it (T208), and an indentation-only diff over 120 lines hides the one line that
+# changed behaviour.
+if (-not $stale) {
 
 # Let the launching Claude turn finish so the session transcript is flushed
 # before its terminal is killed.
@@ -267,6 +348,81 @@ if ($preSessions.Count -gt 0) {
     Log 'SESSIONS-SURVIVE SKIP: no agent sessions before the kill'
 }
 
+# ---- T208: prove the RIGHT BITS are installed, not just that a copy returned -
+#
+# `exe swapped` only means Copy-Item did not throw. What the delivery promised is
+# that the installed exe now answers with this tree's commit, so read it back and
+# say which one it is. This is the line a later turn greps when it wants to know
+# what the user is actually running.
+$installedInfo = Resolve-GhozttyExeCommit -Exe $oldExe
+$want = if ($expected) { $expected } else { $stagedInfo.Commit }
+if (-not $installedInfo.Commit) {
+    Log "POST-SWAP VERIFY UNKNOWN: could not read the installed exe's commit ($($installedInfo.Why)); wanted '$want'"
+} elseif (Test-CommitsMatch $installedInfo.Commit $want) {
+    Log "POST-SWAP VERIFY OK: $oldExe now reports '$($installedInfo.Commit)'"
+} else {
+    $script:deliveryFailure = "POST-SWAP VERIFY FAILED: $oldExe reports '$($installedInfo.Commit)' but the delivery is for '$want'"
+    Log "POST-SWAP VERIFY FAILED: $oldExe reports '$($installedInfo.Commit)', wanted '$want'. The copy returned success and did NOT take - this run is NOT a successful delivery."
+}
+
+# ---- the other install locations --------------------------------------------
+#
+# The standing bar is that a fix lands everywhere the user might launch from;
+# the log shows those copies made BY HAND after every delivery, which is the same
+# staleness risk as this task's, with no automation at all. Best-effort by
+# design: a sleeping NAS or a running portable instance holding its exe open
+# must never fail (or slow) the delivery that already succeeded.
+if ($script:deliveryFailure) {
+    Log 'extra install locations: NOT PROPAGATED - the primary install did not verify, so there is nothing worth copying onward'
+} elseif ($NoExtraInstalls) {
+    Log 'extra install locations: skipped by request (-NoExtraInstalls)'
+} else {
+    foreach ($dir in $ExtraInstallDirs) {
+        if (-not $dir) { continue }
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            Log "extra install '$dir': not present, skipped"
+            continue
+        }
+        try {
+            # Same set the primary swap maintains, plus ghostty-vt.dll only where
+            # the target already has one (the portable ships it; the installed
+            # release does not - this is not the place to invent new layout).
+            $names = @('ghoztty.exe', 'ghoztty.pdb', 'ghoztty-agent.exe', 'ghoztty-agent.pdb')
+            if (Test-Path -LiteralPath (Join-Path $dir 'ghostty-vt.dll')) { $names += 'ghostty-vt.dll' }
+            $copied = @()
+            foreach ($n in $names) {
+                $src = Join-Path $Staging "bin\$n"
+                if (-not (Test-Path -LiteralPath $src)) { continue }
+                $dst = Join-Path $dir $n
+                try {
+                    # A mapped image can be renamed but not overwritten, so shove
+                    # a live one aside rather than failing the whole location.
+                    if (Test-Path -LiteralPath $dst) {
+                        try { Copy-Item $src $dst -Force -ErrorAction Stop; $copied += $n; continue }
+                        catch {
+                            Move-Item $dst ("$dst.bak-" + (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force -ErrorAction Stop
+                        }
+                    }
+                    Copy-Item $src $dst -Force -ErrorAction Stop
+                    $copied += $n
+                } catch {
+                    Log "extra install '$dir': $n FAILED ($($_.Exception.Message))"
+                }
+            }
+            if (Test-Path -LiteralPath $stagingShare) {
+                # /R:1 /W:1 so an unreachable share fails in seconds, not minutes.
+                robocopy $stagingShare (Join-Path $dir 'share') /MIR /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
+                $copied += "share\(robocopy $LASTEXITCODE)"
+            }
+            Log "extra install '$dir': $($copied -join ', ')"
+        } catch {
+            Log "extra install '$dir': FAILED ($($_.Exception.Message))"
+        }
+    }
+}
+
+} # <<<<< end of the destructive region (T208; opened at `if (-not $stale)`)
+
 # T138: the resume DECISION. Made here, once, and logged with the evidence
 # behind it so a forked or stalled loop can be diagnosed from the log alone.
 $claudeAlive = Test-LoopProcAlive $loopStamp
@@ -275,7 +431,7 @@ $action = Resolve-LoopResumeAction -NoResume:([bool]$NoResume) `
 Log ("resume decision: $action (loop claude pid=$loopPid alive=$claudeAlive " +
      "pane=$LoopPaneId force=$([bool]$ForceRelaunch))")
 
-if ($action -eq 'none') { Log 'UPGRADE OK (no-resume)'; exit 0 }
+if ($action -eq 'none') { Complete-Upgrade 'no-resume' }
 
 # Scrub Claude-harness env vars before the relaunch. This script is
 # normally Start-Process'd from a Claude Code tool shell, whose env
@@ -376,8 +532,7 @@ if ($action -eq 'reuse') {
 
     if (-not $LoopPaneId) {
         Log 'RESUME-REUSE PARTIAL: no pane id for the surviving session (script was not launched from a Ghoztty pane), so the prompt cannot be typed. App is up and the session re-attached; NOT relaunching.'
-        Log "UPGRADE OK (reuse, no pane id; claude pid=$loopPid still alive)"
-        exit 0
+        Complete-Upgrade "reuse, no pane id; claude pid=$loopPid still alive"
     }
 
     # Wait for restore to re-attach the pane before typing into it.
@@ -468,8 +623,7 @@ if ($action -eq 'reuse') {
     }
     if ($promptFile) { Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue }
     Log "RESUME-REUSE OK: prompt '$prompt' delivered AND submitted to pane $LoopPaneId (verified in the pane before Enter; claude pid=$loopPid, no second session)"
-    Log "UPGRADE OK (reused claude pid=$loopPid in pane $LoopPaneId)"
-    exit 0
+    Complete-Upgrade "reused claude pid=$loopPid in pane $LoopPaneId"
 }
 
 # ---- relaunch: nothing survived the kill -----------------------------------
@@ -569,5 +723,4 @@ if (-not $landed) {
 } else {
     Log "RELAUNCH-CWD FAIL: pane landed in '$landed', expected '$WorkingDirectory' -- the resumed session will not find its conversation and the loop is STALLED (see T132)"
 }
-Log "UPGRADE OK (relaunched, resume: $ResumeCommand)"
-exit 0
+Complete-Upgrade "relaunched, resume: $ResumeCommand"
