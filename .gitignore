@@ -42,3 +42,6 @@ macos/google-client-id.txt
 
 # Backfill drafts (raw GitHub bodies to curate from; not shipped)
 release-notes/.drafts/
+
+# Local, non-committed working files (dot-issues reviews, scratch)
+.local/
