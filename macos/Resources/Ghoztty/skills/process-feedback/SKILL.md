@@ -103,8 +103,8 @@ Set the pane banner now so the user can see what is being worked (the banner
 script ships with this plugin; skip this if it is not installed):
 
 ```bash
-[ -x ~/.claude/scripts/ghoztty-banner.sh ] && \
-  ~/.claude/scripts/ghoztty-banner.sh set --title 'process-feedback' \
+[ -x ~/.config/ghoztty/hooks/ghoztty-banner.sh ] && \
+  ~/.config/ghoztty/hooks/ghoztty-banner.sh set --title 'process-feedback' \
     --goal '<one-line restatement of the report>' \
     --status 'Claimed <stem> — investigating'
 ```
@@ -249,7 +249,7 @@ from them. Leave any partial work uncommitted for them to look at.
 After a **completed** report (only after Step 8's commit and move):
 
 1. Update the banner with what landed (if the banner script is installed):
-   `~/.claude/scripts/ghoztty-banner.sh set --status 'Completed <stem>' --did '<the actual fix>'`
+   `~/.config/ghoztty/hooks/ghoztty-banner.sh set --status 'Completed <stem>' --did '<the actual fix>'`
 2. Tell the user in one or two lines what the report asked and what changed.
 3. Invoke the `/reset-context` skill via the Skill tool with the continuation
    text `/process-feedback`. That clears this session and re-enters this skill with
