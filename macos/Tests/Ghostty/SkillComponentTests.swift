@@ -1,0 +1,30 @@
+// macos/Tests/Ghostty/SkillComponentTests.swift
+import Foundation
+import Testing
+@testable import Ghostty
+
+struct SkillComponentTests {
+    private func tempHome() throws -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    @Test func installsBothSkillsIdempotentlyAndDetectsDrift() throws {
+        let home = try tempHome()
+        let c = SkillComponent(agent: .copilot, homeDirectoryURL: home, fileManager: .default)
+        #expect(c.state() == .notInstalled)
+        try c.install()
+        #expect(c.state() == .installed)
+        let ghz = home.appendingPathComponent(".copilot/skills/ghoztty/SKILL.md")
+        let pf = home.appendingPathComponent(".copilot/skills/process-feedback/SKILL.md")
+        #expect(FileManager.default.fileExists(atPath: ghz.path))
+        #expect(FileManager.default.fileExists(atPath: pf.path))
+        try c.install() // idempotent
+        #expect(c.state() == .installed)
+        try "tampered <!-- ghoztty-managed -->".write(to: ghz, atomically: true, encoding: .utf8)
+        #expect(c.state() == .outdated)
+        try c.uninstall()
+        #expect(c.state() == .notInstalled)
+    }
+}
