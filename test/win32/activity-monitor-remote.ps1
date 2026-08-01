@@ -13,6 +13,14 @@
 #   D. closing that panel LEAVES THE REMOTE WINDOW'S SESSION ALIVE - the panel
 #      borrowed the window's connection and must never free it.
 #
+# T296 adds the switcher to the same fixture, because a carousel needs a second
+# source and this script is where one exists:
+#
+#   E. the machine-card carousel moves the panel to another source IN PLACE -
+#      one click, no second window, retitled, sampling the new machine - while
+#      ARROWING dials nothing, and switching away from a BORROWED connection
+#      leaves the window's session alive exactly as closing does.
+#
 # WHY B NEEDS AN ORACLE AT ALL. The loopback agent enumerates the same box, so
 # "the table populated" proves nothing: a panel that silently sampled THIS
 # process would produce an identical-looking table under another machine's
@@ -100,6 +108,34 @@ function Wait-PanelState([string]$SourceLike, [int]$TimeoutMs = 12000) {
 
 function Get-Panels {
     return @(Get-TestWindows -ProcessId $script:app.Pid -Class 'GhozttyActivityMonitor')
+}
+
+# The panel's most recent carousel line (T296). `rects` is the painter's own
+# card arithmetic, so a click can land on a painted card without this script
+# re-deriving a layout it would then be asserting against itself.
+function Get-Carousel {
+    if (-not (Test-Path $errlog)) { return $null }
+    $pat = 'activity monitor: carousel cards=(\d+) focus=(-?\d+) active=(-?\d+) scroll=(-?\d+) rects=(\S*)'
+    $m = @(Select-String -Path $errlog -Pattern $pat) | Select-Object -Last 1
+    if (-not $m) { return $null }
+    $g = $m.Matches[0].Groups
+    $rects = @()
+    foreach ($part in ($g[5].Value -split ';')) {
+        if (-not $part) { continue }
+        $c = $part -split ','
+        if ($c.Count -ne 4) { continue }
+        $rects += [pscustomobject]@{
+            Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
+        }
+    }
+    return [pscustomobject]@{
+        Cards  = [int]$g[1].Value
+        Focus  = [int]$g[2].Value
+        Active = [int]$g[3].Value
+        Scroll = [int]$g[4].Value
+        Rects  = $rects
+        Raw    = $g[5].Value
+    }
 }
 
 # Open the palette on $pane, type $filter, press Enter.
@@ -234,6 +270,76 @@ try {
     $after = Read-Pane 'remact'
     Assert ($after -match 'activity-remote-still-alive') 'D the remote pane STILL round-trips after the panel closed (the borrowed connection was not freed)'
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'D the app survives'
+
+    # --- E. The carousel switches source IN PLACE (T296) ---------------------
+    # Re-open the panel on the machine and drive its switcher. Everything here
+    # keys off the panel's own `carousel` log line, whose `rects=` field is the
+    # PAINTER's arithmetic - a script that re-derived the card geometry would be
+    # asserting a layout against itself (the T257 lesson).
+    if (-not (Invoke-Palette $remoteTop $remotePane 'ACTIVITY MONITOR' 'E')) {
+        Write-Host 'SETUP FAIL: palette dispatch not delivered for E'; exit 1
+    }
+    $panel = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyActivityMonitor' -TimeoutMs 8000
+    Assert ($panel -ne [IntPtr]::Zero) 'E the panel re-opened for the carousel section'
+    if ($panel -eq [IntPtr]::Zero) { throw 'no panel to test the carousel on' }
+    Wait-PanelState "127.0.0.1:$Port" | Out-Null
+
+    $car = Get-Carousel
+    Assert ($null -ne $car) 'E the panel logged its carousel'
+    if ($null -ne $car) {
+        Write-Host "      carousel: cards=$($car.Cards) focus=$($car.Focus) active=$($car.Active) rects=$($car.Raw)"
+        # Local plus the machine this panel is showing. The machine is NOT in
+        # the relay directory here (no account), which is exactly the case the
+        # active-source card exists for.
+        Assert ($car.Cards -ge 2) 'E the carousel offers at least Local and the active machine'
+        Assert ($car.Active -ge 0) 'E the active source has a card of its own'
+        Assert ($car.Rects.Count -eq $car.Cards) 'E every card reported a painted rect'
+    }
+
+    # Card rects are CLIENT coordinates; `Send-TestMouse` takes SCREEN ones (it
+    # SetCursorPos'es before posting). The client rect comes back in screen
+    # space, so its origin is the whole conversion.
+    $origin = Get-TestWindowRect -Window $panel -Client
+
+    # E1. Arrowing moves the FOCUS RING and nothing else - no dial, no switch.
+    $dialsBefore = @(Select-String -Path $errlog -Pattern 'activity monitor: dialing ').Count
+    $srcBefore = (Get-PanelState).Source
+    $focusBefore = $car.Focus
+    # Click below the carousel to put keyboard focus on the panel without
+    # landing on a card.
+    Send-TestMouse -Window $panel -Target $panel `
+        -X ($origin.Left + 8) -Y ($origin.Top + $car.Rects[0].Bottom + 8) -Action click | Out-Null
+    Start-Sleep -Milliseconds 300
+    Send-TestKeys -Window $panel -Target $panel -Key Left | Out-Null
+    Start-Sleep -Milliseconds 500
+    $car2 = Get-Carousel
+    Assert ($null -ne $car2 -and $car2.Focus -ne $focusBefore) "E1 arrowing moved the focus ring ($focusBefore -> $($car2.Focus))"
+    Assert ((Get-PanelState).Source -eq $srcBefore) 'E1 arrowing did NOT change the source'
+    Assert ((@(Select-String -Path $errlog -Pattern 'activity monitor: dialing ')).Count -eq $dialsBefore) 'E1 arrowing dialed NOTHING'
+
+    # E2. Clicking the Local card switches in place - one click, same window.
+    $panelsBefore = (@(Get-Panels)).Count
+    $localCard = $car.Rects[0]
+    $cx = $origin.Left + [int](($localCard.Left + $localCard.Right) / 2)
+    $cy = $origin.Top + [int](($localCard.Top + $localCard.Bottom) / 2)
+    Send-TestMouse -Window $panel -Target $panel -X $cx -Y $cy -Action click | Out-Null
+    Start-Sleep -Seconds 3
+    $sw = Wait-PanelState 'Local' 10000
+    Assert ($null -ne $sw -and $sw.Source -eq 'Local') "E2 the panel switched to Local (source=$($sw.Source))"
+    Assert ($null -ne $sw -and $sw.Root -eq $app.Pid) "E2 it is now sampling THIS process ($($app.Pid)), not the agent ($agentPid)"
+    Assert ((@(Get-Panels)).Count -eq $panelsBefore) 'E2 the switch did NOT open a second window'
+    Assert ((Get-TestWindowText -Window $panel) -like '*Local*') 'E2 the window retitled for the new source'
+    Assert (Select-String -Path $errlog -Pattern 'activity monitor: switching .* -> Local' -Quiet) 'E2 the panel logged the switch'
+
+    # E3. Switching away from a BORROWED connection must not free it - the same
+    # ownership rule D asserts for close, at the other place it can go wrong.
+    cmd /c "`"$exe`" +send-keys --target=remact `"echo activity-after-switch`" Enter > nul 2>&1" | Out-Null
+    Start-Sleep -Seconds 3
+    Assert ((Read-Pane 'remact') -match 'activity-after-switch') 'E3 the remote pane still round-trips after the panel switched away (the borrowed connection was not freed)'
+
+    Send-TestWindowClose -Window $panel | Out-Null
+    Start-Sleep -Seconds 2
+    Assert ((@(Get-Panels)).Count -eq 0) 'E the switched panel closed cleanly'
 } finally {
     # cmd, not `& $exe ... 2>&1`: under $ErrorActionPreference='Stop' a native
     # command writing to stderr inside a redirected pipeline is a TERMINATING

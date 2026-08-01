@@ -4639,6 +4639,17 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == ActivityMonitor.WM_APP_ACTIVITY_MACHINES) {
+        // wparam = heap *MachineListResult owned by the handler, landing here
+        // rather than on the panel for the same reason as the dial above
+        // (T296).
+        if (wparam != 0) {
+            const res: *ActivityMonitor.MachineListResult = @ptrFromInt(wparam);
+            ActivityMonitor.onMachines(res);
+        }
+        return 0;
+    }
+
     if (msg == WM_APP_AGENT_UPGRADE_CHECK) {
         // T147: a persistent window closed; the agent may have just gone idle,
         // which is the safe moment to adopt a newer bundled build.

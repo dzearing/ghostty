@@ -5224,3 +5224,58 @@ ALL PASS at 57, P1-P3 ALL PASS, both test lanes + `test-agent` + the Debug GUI
 link green (`test-agent` needed one re-run for the known T258 ConPTY flake).
 Follow-ups: **T296** (carousel) and **T297** — the DIALED path still has no
 success-case coverage, and it is the only path that FREES what it owns.
+
+## 2026-08-01 - T296 (T287 split): the carousel switches source in place, and the stale sample is dropped by generation rather than by waiting for it
+
+The panel can now move to any other source in one click without opening a second
+window - Local first, then every registered machine - which is the last piece of
+T226's Activity Monitor that a user can see.
+
+Three parts, and the interesting one is not the painting. The **machine list**
+comes from `relay_directory.listDevices`, a synchronous authenticated HTTPS GET
+the chooser can afford on the GUI thread because it is a modal dialog with a
+spinner; a non-modal panel cannot, so it runs on a detached thread and lands as
+`WM_APP_ACTIVITY_MACHINES` on the APP's message-only window - the same
+outlives-the-panel rule T295 established for the dial, because `DestroyWindow`
+discards a window's queued messages. Devices are copied BY VALUE out of the
+parse arena before it dies. The **cards** are pure (`activity_cards.zig`, 13
+tests) plus `activity_layout.cardContent`, whose text block is CENTERED so its
+padding is symmetric by construction instead of by two constants somebody has to
+keep equal. The **switch** is `switchToCard` / `teardownSource` /
+`resetForNewSource`.
+
+Three decisions carry it. **The active source always has a card**, even when the
+directory does not list it (a borrowed connection, a signed-out account, a failed
+fetch, a machine deleted while the panel sat open) - a carousel that cannot show
+you where you are is lying, and with Local pinned at index 0 there is always a
+way home. **A sample worker started for the old source is dropped by GENERATION,
+not by joining it**: joining would freeze the GUI for up to the 5 s RPC timeout
+on a BORROWED connection, which cannot be `shutdown` to cut the wait short
+because it is a live window's shell - and adopting it would paint one machine's
+processes under another's name. **The switch bumps `serial`**, which routes an
+in-flight dial for the abandoned source onto `onDialed`'s panel-is-gone path
+where it frees what it opened; that is T295's mechanism reused rather than a
+second one invented.
+
+Deliberately NOT shipped, and named rather than dropped: Mac's
+`MachineMetricsProbe` dials EVERY registered machine and holds a metrics
+subscription on each, live, for the panel's lifetime. That is a connection-budget
+design, not a paint pass, so it is **T298**. Inactive cards report the relay
+directory's own `online` flag and print no number they do not have - the state
+enum has an `.idle` case for exactly this. Missing information, not wrong
+information.
+
+`activity-monitor-remote.ps1` ALL PASS at 33 (up from 24), `activity-monitor.ps1`
+still ALL PASS at 82 (a one-source panel paints no carousel at all), P1-P3 ALL
+PASS, both test lanes + `test-agent` green. The oracle is the panel's own
+`carousel cards=N focus=i active=j scroll=x rects=...` line and the script clicks
+the rect the PAINTER reported - T257's lesson applied before it could bite. Its
+first run was red for a good reason worth writing down: **`Send-TestMouse` takes
+SCREEN coordinates** (it `SetCursorPos`es before posting) while those rects are
+CLIENT ones, so five assertions failed against a build that was fine -
+`Get-TestWindowRect -Client` returns the client rect already in screen space, and
+its origin is the whole conversion. Follow-ups: **T298** (per-card metrics),
+**T299** (`ActivityMonitor.zig` is ~3,000 lines and needs splitting), **T300**
+(the carousel is not reachable by Tab), **T301** (switching back to a machine a
+remote WINDOW is already connected to re-dials through the relay and simply fails
+when signed out).

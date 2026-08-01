@@ -1398,6 +1398,12 @@ pub extern "gdi32" fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: 
 /// after.
 pub extern "gdi32" fn FillRgn(hdc: HDC, hrgn: *anyopaque, hbr: *anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn SelectClipRgn(hdc: HDC, hrgn: ?*anyopaque) callconv(.winapi) i32;
+/// Intersect the DC's clip with a rect. Preferred over `SelectClipRgn(dc, null)`
+/// to restore, which un-clips everything rather than what the caller added —
+/// `SaveDC`/`RestoreDC` around this pair is what puts the previous clip back.
+pub extern "gdi32" fn IntersectClipRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) i32;
+pub extern "gdi32" fn SaveDC(hdc: HDC) callconv(.winapi) i32;
+pub extern "gdi32" fn RestoreDC(hdc: HDC, state: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) i32;
 pub const NULL_BRUSH: i32 = 5;
 

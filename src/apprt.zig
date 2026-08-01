@@ -145,6 +145,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/activity_actions.zig");
 
+    // Pure win32 Activity Monitor machine-card model — the carousel's ordering,
+    // per-card text, status dot and focus arithmetic (T296), same no-OS-imports
+    // deal.
+    _ = @import("apprt/win32/activity_cards.zig");
+
     // Pure win32 surface context-menu model (T102), same no-OS-imports deal.
     _ = @import("apprt/win32/context_menu.zig");
 

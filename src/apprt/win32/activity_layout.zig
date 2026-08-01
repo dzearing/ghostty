@@ -393,6 +393,69 @@ pub fn cardRect(l: Layout, index: i32, scroll_x: i32, scale: f32) Rect {
     };
 }
 
+/// One card's interior: the status dot and the three text lines Mac's
+/// `MachineCard` stacks (:1436-1460).
+pub const CardContent = struct {
+    dot: Rect,
+    label: Rect,
+    summary: Rect,
+    metric: Rect,
+};
+
+/// The dot's diameter (Mac's 7pt circle, rounded onto the 4 DIP scale's
+/// neighbour so it stays even and centers without a half pixel).
+const card_dot: f32 = 8;
+/// The three text rows. `label` carries `font_h` (15) and the two detail rows
+/// carry `caption_font_h` (12), each in a line box with room to sit in.
+const card_label_h: f32 = 18;
+const card_detail_h: f32 = 14;
+
+/// Lay out one card's contents inside its painted rect. The text block is
+/// CENTERED vertically, so the padding above and below it is symmetric by
+/// construction rather than by a pair of constants that have to be kept equal
+/// (§0.3). Pure — unit-tested.
+pub fn cardContent(card: Rect, scale: f32) CardContent {
+    const pad = px(pad_md, scale);
+    const gap = px(pad_sm, scale);
+    const dot_d = px(card_dot, scale);
+    const label_h = px(card_label_h, scale);
+    const detail_h = px(card_detail_h, scale);
+
+    const block_h = label_h + gap + detail_h + gap + detail_h;
+    const top = card.top + @divTrunc(card.height() - block_h, 2);
+    const text_left = card.left + pad + dot_d + pad;
+    const right = card.right - pad;
+
+    return .{
+        .dot = .{
+            .left = card.left + pad,
+            .top = top + @divTrunc(label_h - dot_d, 2),
+            .right = card.left + pad + dot_d,
+            .bottom = top + @divTrunc(label_h - dot_d, 2) + dot_d,
+        },
+        .label = .{ .left = text_left, .top = top, .right = right, .bottom = top + label_h },
+        .summary = .{
+            .left = card.left + pad,
+            .top = top + label_h + gap,
+            .right = right,
+            .bottom = top + label_h + gap + detail_h,
+        },
+        .metric = .{
+            .left = card.left + pad,
+            .top = top + label_h + gap + detail_h + gap,
+            .right = right,
+            .bottom = top + block_h,
+        },
+    };
+}
+
+/// The carousel's own left/right inset — the gap a scrolled-into-view card
+/// keeps from the band's edge, so the same number that PLACES the first card is
+/// the one that stops the last one from touching the edge (§0.1).
+pub fn cardMargin(scale: f32) i32 {
+    return px(pad_x, scale);
+}
+
 /// The index of the card under `(x, y)`, or null when the point is in the
 /// carousel's padding or outside it. Cards are hit on their PAINTED rect, so
 /// the gap between two cards belongs to neither (§0.2).
@@ -795,6 +858,57 @@ test "cards: laid out left to right with md between painted edges" {
         try testing.expectEqual(px(pad_x, scale), a.left - l.carousel.left);
         // Padded top and bottom inside the band, symmetrically (§0.3).
         try testing.expectEqual(a.top - l.carousel.top, l.carousel.bottom - a.bottom);
+    }
+}
+
+test "cardContent: the text block is centered, and nothing touches" {
+    for (scales) |scale| {
+        const d = defaultClient(scale);
+        const l = layout(scale, d.w, d.h, .{});
+        const card = cardRect(l, 0, 0, scale);
+        const c = cardContent(card, scale);
+
+        // Symmetric by construction: the padding above the block equals the
+        // padding below it (±1 px of integer centering).
+        const top_pad = c.label.top - card.top;
+        const bot_pad = card.bottom - c.metric.bottom;
+        try testing.expect(@abs(top_pad - bot_pad) <= 1);
+
+        // Every painted element clears its neighbour and the card's own edge by
+        // at least `sm` (§0.2 measured between PAINTED edges).
+        const min_gap = px(pad_sm, scale);
+        try testing.expect(c.dot.left - card.left >= min_gap);
+        try testing.expect(c.label.left - c.dot.right >= min_gap);
+        try testing.expect(card.right - c.label.right >= min_gap);
+        try testing.expect(c.summary.top - c.label.bottom >= min_gap);
+        try testing.expect(c.metric.top - c.summary.bottom >= min_gap);
+        try testing.expect(top_pad >= min_gap);
+        try testing.expect(bot_pad >= min_gap);
+
+        // The dot is square and rides the label's optical center.
+        try testing.expectEqual(c.dot.width(), c.dot.height());
+        try testing.expect(c.dot.top > c.label.top);
+        try testing.expect(c.dot.bottom < c.label.bottom);
+    }
+}
+
+test "cardContent: scales with the card, not with a fixed pixel count" {
+    const one = cardContent(cardRect(layout(1.0, 700, 480, .{}), 0, 0, 1.0), 1.0);
+    const two = cardContent(cardRect(layout(2.0, 1400, 960, .{}), 0, 0, 2.0), 2.0);
+    try testing.expectEqual(one.dot.width() * 2, two.dot.width());
+    try testing.expectEqual(one.label.height() * 2, two.label.height());
+    try testing.expectEqual(one.summary.height() * 2, two.summary.height());
+}
+
+test "cardMargin: the inset that places card 0 is the one the strip ends on" {
+    for (scales) |scale| {
+        const d = defaultClient(scale);
+        const l = layout(scale, d.w, d.h, .{});
+        try testing.expectEqual(cardMargin(scale), cardRect(l, 0, 0, scale).left - l.carousel.left);
+        try testing.expectEqual(
+            carouselContentWidth(3, scale),
+            cardRect(l, 2, 0, scale).right + cardMargin(scale),
+        );
     }
 }
 

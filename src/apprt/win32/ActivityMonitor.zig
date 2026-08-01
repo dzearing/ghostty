@@ -60,9 +60,42 @@
 //! says so at `agent/server.zig:1607`. Reading that as CPU% would paint a
 //! confident flat zero.
 //!
+//! ## The machine carousel (T296)
+//! Once open, the panel moves to any other source in ONE click, without opening
+//! a second window (Mac's `RemoteActivityMonitorModel.switchTo`,
+//! RemoteActivityMonitorView.swift:307). Three parts:
+//!
+//! - **The list.** Mac reads a local `MachineRegistry`; Windows' machine list is
+//!   the relay directory, and `relay_directory.listDevices` is a synchronous
+//!   authenticated HTTPS GET. The chooser can afford that on the GUI thread
+//!   because it is a modal dialog with a spinner; a non-modal panel cannot, so
+//!   the fetch runs on a detached thread and lands as
+//!   `WM_APP_ACTIVITY_MACHINES` on the APP's message-only window — the same
+//!   outlives-the-panel reasoning as the dial.
+//! - **The cards.** `activity_cards.zig` owns the ordering (Local first), the
+//!   three lines of text, the status dot and the focus arithmetic. The ACTIVE
+//!   source always gets a card even when the directory does not list it (a
+//!   borrowed connection, a signed-out account, a machine deleted while the
+//!   panel is open) — a carousel that cannot show you where you are is lying.
+//! - **The switch.** `switchTo` tears the current source down, resets every
+//!   view field so one machine's trend history can never bleed into another's,
+//!   and starts the new one. It BUMPS `serial`, which is what makes an
+//!   in-flight dial for the abandoned source land on `onDialed`'s
+//!   panel-is-gone path and free itself instead of being adopted under the new
+//!   machine's name.
+//!
+//! A sample worker started for the previous source is dropped by GENERATION
+//! (`source_gen`), not by joining: joining a worker parked on a BORROWED
+//! connection would freeze the GUI for up to `rpc_timeout_ns`, and a borrowed
+//! connection cannot be `shutdown` to cut it short — it is a live window's
+//! shell.
+//!
 //! ## What is NOT here
-//! The machine carousel (switching source in-panel) is T296. The layout module
-//! already reserves the carousel band.
+//! Live per-card metrics for INACTIVE machines (Mac's `MachineMetricsProbe`,
+//! :153-155) — that dials every registered machine and holds a metrics
+//! subscription on each, which is its own connection-budget design. Inactive
+//! remote cards report the relay directory's online flag and say so; they do
+//! not invent a reading.
 
 const ActivityMonitor = @This();
 
@@ -75,6 +108,7 @@ const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const layout_mod = @import("activity_layout.zig");
 const rows_mod = @import("activity_rows.zig");
+const cards_mod = @import("activity_cards.zig");
 const actions = @import("activity_actions.zig");
 const gauge = @import("trend_gauge.zig");
 const icon_button = @import("icon_button.zig");
@@ -112,6 +146,10 @@ pub const WM_APP_ACTIVITY_SAMPLE: u32 = w32.WM_APP + 13;
 /// A dial thread finished. Posted to the APP's message-only window (see the
 /// header), `wparam` = a heap `*DialResult` the handler owns.
 pub const WM_APP_ACTIVITY_DIALED: u32 = w32.WM_APP + 14;
+
+/// A machine-list fetch finished. Same landing rules as the dial: the APP's
+/// window, `wparam` = a heap `*MachineListResult` the handler owns.
+pub const WM_APP_ACTIVITY_MACHINES: u32 = w32.WM_APP + 15;
 
 /// Bound on every remote RPC the panel makes. A machine slow enough to miss
 /// this is a machine the panel should report as unreachable rather than freeze
@@ -159,6 +197,32 @@ const COLOR_BANNER_BG = w32.RGB(56, 47, 35);
 /// The overlay scroll thumb, at rest and while grabbed.
 const COLOR_THUMB = w32.RGB(90, 90, 90);
 const COLOR_THUMB_ACTIVE = w32.RGB(130, 130, 130);
+
+// --- Machine cards (T296) --------------------------------------------
+// Every number here is checked against design system §2.3's non-text floor
+// (3:1 for a boundary that carries meaning, 4.5:1 for text), on BOTH the rest
+// fill and the selected fill — a card is a control, and its border is what
+// tells the user where the click target is.
+/// Card fill at rest / under the pointer.
+const COLOR_CARD_BG = w32.RGB(44, 44, 44);
+const COLOR_CARD_HOVER = w32.RGB(56, 56, 56);
+/// The resting border: 3.6:1 on the card fill and 4.2:1 on the panel.
+const COLOR_CARD_BORDER = w32.RGB(130, 130, 130);
+/// The active card: Mac's accent fill + accent border. The border reads 3.1:1
+/// against its own fill and 5.9:1 against the panel.
+const COLOR_CARD_SELECT_BG = COLOR_SELECT;
+const COLOR_ACCENT = w32.RGB(80, 160, 235);
+/// Secondary text has to brighten on the accent fill: `COLOR_SECONDARY` is
+/// 4.7:1 on the resting card but only 2.9:1 on the selected one, which is under
+/// the 4.5:1 floor. Same role, two surfaces, two values.
+const COLOR_CARD_SECONDARY = COLOR_SECONDARY;
+const COLOR_CARD_SECONDARY_SEL = w32.RGB(190, 205, 225);
+/// Status dots. Green/amber/red are the same three states Mac paints, plus a
+/// neutral for "the directory says offline and we have not dialed it".
+const COLOR_DOT_GOOD = w32.RGB(90, 200, 120);
+const COLOR_DOT_PENDING = w32.RGB(225, 180, 80);
+const COLOR_DOT_BAD = w32.RGB(230, 100, 100);
+const COLOR_DOT_UNKNOWN = COLOR_SECONDARY;
 
 var class_registered: bool = false;
 var bg_brush: ?w32.HBRUSH = null;
@@ -307,6 +371,81 @@ const DialRequest = struct {
 };
 
 // ---------------------------------------------------------------------
+// Machine list (the carousel's sources)
+// ---------------------------------------------------------------------
+
+/// Machines the carousel offers besides Local. `activity_cards.max_cards`
+/// counts Local, so this is one fewer.
+pub const max_machines: usize = cards_mod.max_cards - 1;
+
+/// One machine, held BY VALUE. The relay's parsed device list lives in an arena
+/// that is freed the moment the fetch returns, and the panel outlives every
+/// fetch — so nothing here may be a slice into somebody else's memory. Fixed
+/// buffers also make the whole result one flat heap object to hand between
+/// threads, with no arena to keep alive and no per-string free to get wrong.
+pub const MachineEntry = struct {
+    id: [max_source_id]u8 = @splat(0),
+    id_len: usize = 0,
+    name: [max_source_label]u8 = @splat(0),
+    name_len: usize = 0,
+    /// The directory's own liveness flag — what an INACTIVE card reports,
+    /// because the panel has not dialed that machine and will not pretend it
+    /// has.
+    online: bool = false,
+
+    fn idSlice(self: *const MachineEntry) []const u8 {
+        return self.id[0..self.id_len];
+    }
+
+    fn nameSlice(self: *const MachineEntry) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    /// Copy one device in, truncating rather than refusing: a machine with an
+    /// absurd id is still switchable, and the id is only ever compared against
+    /// another copy of itself.
+    fn set(self: *MachineEntry, id: []const u8, name: []const u8, online: bool) void {
+        self.id_len = @min(id.len, self.id.len);
+        @memcpy(self.id[0..self.id_len], id[0..self.id_len]);
+        self.name_len = @min(name.len, self.name.len);
+        @memcpy(self.name[0..self.name_len], name[0..self.name_len]);
+        self.online = online;
+    }
+};
+
+/// A finished machine-list fetch, in flight to the GUI thread. Owned by the
+/// handler, which frees it.
+pub const MachineListResult = struct {
+    alloc: Allocator,
+    slot: usize,
+    serial: u64,
+    count: usize = 0,
+    entries: [max_machines]MachineEntry = @splat(.{}),
+
+    fn destroy(self: *MachineListResult) void {
+        self.alloc.destroy(self);
+    }
+};
+
+/// Everything the list thread needs, heap-owned so it outlives the call that
+/// spawned it. The thread frees it.
+const MachineListRequest = struct {
+    alloc: Allocator,
+    hwnd: w32.HWND,
+    slot: usize,
+    serial: u64,
+    base: []u8,
+    token: []u8,
+
+    fn destroy(self: *MachineListRequest) void {
+        const alloc = self.alloc;
+        alloc.free(self.base);
+        alloc.free(self.token);
+        alloc.destroy(self);
+    }
+};
+
+// ---------------------------------------------------------------------
 // Snapshot
 // ---------------------------------------------------------------------
 
@@ -386,10 +525,32 @@ dialing: bool = false,
 metrics_mutex: std.Thread.Mutex = .{},
 last_metrics: ?remote_protocol.HostMetrics = null,
 
+/// The machines the carousel can switch to, and the cards derived from them.
+/// `cards` slices point into `machines` (stable for the panel's life) or into
+/// `id_buf`/`name_buf` for the active source — never at a fetch's arena.
+machines: [max_machines]MachineEntry = @splat(.{}),
+machine_count: usize = 0,
+cards: [cards_mod.max_cards]cards_mod.Card = @splat(.{ .local = true, .label = "Local" }),
+card_count: usize = 0,
+/// The keyboard focus ring. Arrowing moves this and NOTHING else — a carousel
+/// that dialed on focus would open a connection per keystroke.
+card_focus: i32 = 0,
+carousel_scroll: i32 = 0,
+/// Card under the pointer, or -1.
+card_hover: i32 = -1,
+
+/// Bumped on every source switch. A sample worker started for the previous
+/// source tags its result with the generation it began under, and a result from
+/// an older generation is dropped rather than adopted under the new machine's
+/// name.
+source_gen: u32 = 0,
+
 /// Worker handoff. `pending` is written by the worker and taken by the GUI
 /// thread; `sampling` gates a second worker from starting.
 pending_mutex: std.Thread.Mutex = .{},
 pending: ?*Snapshot = null,
+/// The generation the parked sample was taken under. Read with `pending`.
+pending_gen: u32 = 0,
 /// The worker's verdict on the sample it just posted, taken with `pending`. A
 /// failed sample posts with no snapshot, so this is the only way the GUI thread
 /// learns the difference between "nothing new" and "the source is unreachable".
@@ -700,6 +861,12 @@ fn openInner(window: *Window, src: Source, borrow: ?*remote_connection.Connectio
         }
     }
 
+    // The carousel starts with what we know for free — Local, plus the active
+    // source when it is a machine — so a remote panel can always get home even
+    // if the directory fetch never answers. The fetch then fills in the rest.
+    self.rebuildCards();
+    self.startMachineList();
+
     // First poll immediately, then on the interval — a panel that shows nothing
     // for a second and a half reads as broken. `kickSample` is a no-op while a
     // dial is in flight.
@@ -847,6 +1014,7 @@ fn adoptDial(self: *ActivityMonitor, dialed: ?*relay_dial.Dialed) void {
         // spinner forever.
         self.refresh_failed = true;
         self.loading = false;
+        self.rebuildCards();
         _ = w32.InvalidateRect(self.hwnd, null, 0);
         log.warn("activity monitor: dial failed source={s}", .{self.source.label()});
         return;
@@ -854,6 +1022,7 @@ fn adoptDial(self: *ActivityMonitor, dialed: ?*relay_dial.Dialed) void {
     self.remote_conn = .{ .conn = d.conn, .dialed = d };
     self.beginMetrics();
     log.info("activity monitor: connected source={s}", .{self.source.label()});
+    self.rebuildCards();
     self.kickSample();
 }
 
@@ -881,6 +1050,444 @@ fn onMetrics(ctx: *anyopaque, host: remote_protocol.HostMetrics) void {
     self.metrics_mutex.lock();
     defer self.metrics_mutex.unlock();
     self.last_metrics = host;
+}
+
+// ---------------------------------------------------------------------
+// Machine list + carousel
+// ---------------------------------------------------------------------
+
+/// Kick off the relay device-list fetch on a detached thread. Credentials are
+/// resolved HERE, on the GUI thread, for the same reason the dial does it: the
+/// account store lives on this side.
+///
+/// Signed out is not an error — it is a panel with one source, which paints no
+/// carousel at all (design system §6).
+fn startMachineList(self: *ActivityMonitor) void {
+    const alloc = self.app.core_app.alloc;
+    const msg_hwnd = self.app.msg_hwnd orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const token = IpcHandlers.resolveToken(arena) orelse {
+        log.info("activity monitor: no relay credential, carousel shows local sources only", .{});
+        return;
+    };
+    const base = relay_directory.resolveBase(arena) catch return;
+
+    const req = alloc.create(MachineListRequest) catch return;
+    req.* = .{
+        .alloc = alloc,
+        .hwnd = msg_hwnd,
+        .slot = self.slot,
+        .serial = self.serial,
+        .base = alloc.dupe(u8, base) catch {
+            alloc.destroy(req);
+            return;
+        },
+        .token = undefined,
+    };
+    req.token = alloc.dupe(u8, token) catch {
+        alloc.free(req.base);
+        alloc.destroy(req);
+        return;
+    };
+
+    const thread = std.Thread.spawn(.{}, machineListWorker, .{req}) catch |err| {
+        log.warn("activity monitor: machine-list thread spawn failed err={}", .{err});
+        req.destroy();
+        return;
+    };
+    thread.detach();
+}
+
+/// The detached fetch. Owns `req`; copies every device out of the parsed arena
+/// BEFORE that arena dies, and hands the GUI thread one flat result.
+fn machineListWorker(req: *MachineListRequest) void {
+    defer req.destroy();
+    const alloc = req.alloc;
+
+    const res = alloc.create(MachineListResult) catch return;
+    res.* = .{ .alloc = alloc, .slot = req.slot, .serial = req.serial };
+
+    if (relay_directory.listDevices(alloc, req.base, req.token)) |parsed| {
+        defer parsed.deinit();
+        for (parsed.value.devices) |dev| {
+            if (res.count == res.entries.len) {
+                log.warn("activity monitor: more than {d} machines, carousel shows the first {d}", .{
+                    parsed.value.devices.len,
+                    res.entries.len,
+                });
+                break;
+            }
+            res.entries[res.count].set(dev.id, dev.name, dev.online);
+            res.count += 1;
+        }
+    } else |err| {
+        // A directory we cannot reach is a carousel with fewer cards, not a
+        // broken panel: the active source and Local are always switchable.
+        log.warn("activity monitor: machine list failed err={}", .{err});
+    }
+
+    if (w32.PostMessageW(req.hwnd, WM_APP_ACTIVITY_MACHINES, @intFromPtr(res), 0) == 0) {
+        res.destroy();
+    }
+}
+
+/// GUI thread (App.msgWndProc): a machine list arrived. Takes ownership of
+/// `res`.
+pub fn onMachines(res: *MachineListResult) void {
+    defer res.destroy();
+
+    var serials: [max_monitors]?u64 = @splat(null);
+    for (open_wins, 0..) |maybe, i| {
+        if (maybe) |p| {
+            if (!p.closing) serials[i] = p.serial;
+        }
+    }
+    if (!panelMatches(&serials, res.slot, res.serial)) {
+        log.info("activity monitor: machine list landed after its panel closed slot={d}", .{res.slot});
+        return;
+    }
+
+    const self = open_wins[res.slot].?;
+    self.machine_count = @min(res.count, self.machines.len);
+    for (self.machines[0..self.machine_count], res.entries[0..self.machine_count]) |*dst, src| {
+        dst.* = src;
+    }
+    self.rebuildCards();
+    _ = w32.InvalidateRect(self.hwnd, null, 0);
+}
+
+/// The summary a card paints. The ACTIVE card prefers what the panel actually
+/// knows (Mac's `summary(for:)`, :266); every other card reports the directory's
+/// flag, because nothing has dialed it.
+fn cardSummary(self: *const ActivityMonitor, local: bool, id: []const u8, online: bool) cards_mod.Summary {
+    const active = switch (self.source) {
+        .local => local,
+        .remote => |r| !local and std.mem.eql(u8, r.id, id),
+    };
+    if (!active) return .{ .state = .idle, .online = if (local) true else online };
+
+    if (self.dialing) return .{ .state = .connecting };
+    const snap = self.snap orelse return .{
+        .state = if (self.refresh_failed) .failed else .connecting,
+    };
+    if (self.refresh_failed and self.order_len == 0) return .{ .state = .failed };
+    return .{
+        .state = .live,
+        .online = true,
+        // An agent that does not report uptime leaves it null, and the card's
+        // second line falls back to "—" rather than claiming "up 0m".
+        .uptime_s = snap.host.uptime_s orelse 0,
+        .cpu_pct = snap.host.cpu_pct,
+        .mem_used = snap.host.mem_used,
+        .mem_total = snap.host.mem_total,
+    };
+}
+
+/// Re-derive the card list from the machine list and the active source, then
+/// re-place the chrome if the carousel appeared or disappeared.
+///
+/// Cheap and idempotent: called at open, when the machine list lands, on every
+/// adopted snapshot (the active card's numbers are live) and after a switch.
+fn rebuildCards(self: *ActivityMonitor) void {
+    const had = cards_mod.hasCarousel(self.card_count);
+    const first = self.card_count == 0;
+
+    var n: usize = 0;
+    self.cards[n] = .{
+        .local = true,
+        .label = "Local",
+        .summary = self.cardSummary(true, "", true),
+    };
+    n += 1;
+
+    for (self.machines[0..self.machine_count]) |*m| {
+        if (n == self.cards.len) break;
+        const id = m.idSlice();
+        self.cards[n] = .{
+            .local = false,
+            .id = id,
+            .label = if (m.name_len > 0) m.nameSlice() else id,
+            .summary = self.cardSummary(false, id, m.online),
+        };
+        n += 1;
+    }
+
+    // The active source ALWAYS has a card. It can be missing from the directory
+    // for reasons that are all normal: the panel borrowed a remote window's
+    // connection, the account is signed out, the fetch failed, or the machine
+    // was removed while the panel sat open.
+    if (self.source == .remote and n < self.cards.len) {
+        const id = self.source.remote.id;
+        if (cards_mod.indexOf(self.cards[0..n], false, id) == null) {
+            self.cards[n] = .{
+                .local = false,
+                .id = id,
+                .label = self.source.label(),
+                .summary = self.cardSummary(false, id, true),
+            };
+            n += 1;
+        }
+    }
+    self.card_count = n;
+
+    // The ring STARTS on the active card (Mac seeds it in `onAppear`, :838-841)
+    // and stays where the user left it afterwards — a list that grew under the
+    // ring must not yank it back and make the next arrow key go somewhere the
+    // user did not ask for. `moveFocus(…, 0, …)` is the clamp that keeps it on
+    // a card that still exists.
+    if (first) {
+        if (self.activeCardIndex()) |i| self.card_focus = @intCast(i);
+    }
+    self.card_focus = cards_mod.moveFocus(self.card_focus, 0, n);
+
+    if (cards_mod.hasCarousel(n) != had) self.applyLayout();
+    self.clampCarousel();
+    self.logCarousel();
+}
+
+/// The card index of the panel's current source, or null (which can only happen
+/// with no cards at all).
+fn activeCardIndex(self: *const ActivityMonitor) ?usize {
+    return switch (self.source) {
+        .local => cards_mod.indexOf(self.cards[0..self.card_count], true, ""),
+        .remote => |r| cards_mod.indexOf(self.cards[0..self.card_count], false, r.id),
+    };
+}
+
+fn clampCarousel(self: *ActivityMonitor) void {
+    const l = self.layout();
+    if (!cards_mod.hasCarousel(self.card_count)) {
+        self.carousel_scroll = 0;
+        return;
+    }
+    self.carousel_scroll = cards_mod.clampScroll(
+        self.carousel_scroll,
+        layout_mod.carouselContentWidth(@intCast(self.card_count), self.scale),
+        l.carousel.width(),
+    );
+}
+
+/// Scroll the focused card fully into view.
+fn scrollCardIntoView(self: *ActivityMonitor) void {
+    if (!cards_mod.hasCarousel(self.card_count)) return;
+    const l = self.layout();
+    // `cardRect` at scroll 0 is the card in CONTENT coordinates, which is what
+    // `scrollToShow` wants.
+    const r = layout_mod.cardRect(l, self.card_focus, 0, self.scale);
+    self.carousel_scroll = cards_mod.scrollToShow(
+        self.carousel_scroll,
+        r.left,
+        r.right,
+        l.carousel.width(),
+        layout_mod.cardMargin(self.scale),
+    );
+    self.clampCarousel();
+}
+
+/// The carousel's state, logged because a GDI-painted card has no text to read
+/// back. The RECTS are the painter's own arithmetic — an acceptance script
+/// clicks what this reports rather than re-deriving a layout it would then be
+/// asserting against itself (the T257 lesson).
+fn logCarousel(self: *ActivityMonitor) void {
+    var buf: [512]u8 = undefined;
+    var used: usize = 0;
+    if (cards_mod.hasCarousel(self.card_count)) {
+        const l = self.layout();
+        for (0..self.card_count) |i| {
+            const r = layout_mod.cardRect(l, @intCast(i), self.carousel_scroll, self.scale);
+            const part = std.fmt.bufPrint(buf[used..], "{s}{d},{d},{d},{d}", .{
+                @as([]const u8, if (used == 0) "" else ";"),
+                r.left,
+                r.top,
+                r.right,
+                r.bottom,
+            }) catch break;
+            used += part.len;
+        }
+    }
+    log.info("activity monitor: carousel cards={d} focus={d} active={d} scroll={d} rects={s}", .{
+        self.card_count,
+        self.card_focus,
+        if (self.activeCardIndex()) |i| @as(i64, @intCast(i)) else -1,
+        self.carousel_scroll,
+        buf[0..used],
+    });
+}
+
+// ---------------------------------------------------------------------
+// Source switching
+// ---------------------------------------------------------------------
+
+/// Switch the panel to the card at `index` (Mac's `switchTo`, :307). One click,
+/// no second window.
+fn switchToCard(self: *ActivityMonitor, index: i32) void {
+    if (index < 0 or index >= @as(i32, @intCast(self.card_count))) return;
+    const card = self.cards[@intCast(index)];
+
+    // Everything below rewrites `id_buf`/`name_buf`, and the ACTIVE card's
+    // slices point straight at them. Copy first, then decide.
+    var id_copy: [max_source_id]u8 = undefined;
+    var name_copy: [max_source_label]u8 = undefined;
+    const id_len = @min(card.id.len, id_copy.len);
+    const name_len = @min(card.label.len, name_copy.len);
+    @memcpy(id_copy[0..id_len], card.id[0..id_len]);
+    @memcpy(name_copy[0..name_len], card.label[0..name_len]);
+
+    const target: Source = if (card.local)
+        .local
+    else
+        .{ .remote = .{ .id = id_copy[0..id_len], .name = name_copy[0..name_len] } };
+
+    if (self.source.eql(target)) return;
+
+    // One panel per source is the registry's whole promise (`openInner`), and a
+    // switch has to keep it: if another panel is already showing this machine,
+    // focusing it is the honest answer — two panels keyed alike would leave one
+    // of them unreachable by `open` forever.
+    if (slotFor(&open_keys, target)) |other| {
+        if (other != self.slot) {
+            if (open_wins[other]) |existing| {
+                log.info("activity monitor: {s} is already open, focusing it", .{target.label()});
+                _ = w32.ShowWindow(existing.hwnd, w32.SW_SHOW);
+                _ = w32.SetForegroundWindow(existing.hwnd);
+                return;
+            }
+        }
+    }
+
+    log.info("activity monitor: switching {s} -> {s}", .{ self.source.label(), target.label() });
+
+    self.teardownSource();
+
+    // A dial or a machine-list fetch already in flight for the OLD source must
+    // not be adopted under the new one. Bumping the serial routes both onto
+    // their panel-is-gone path, which frees whatever they were carrying.
+    self.serial = next_serial;
+    next_serial += 1;
+
+    // Adopt the new identity into OUR buffers: `id_copy` dies with this frame.
+    self.source = target;
+    if (!card.local) {
+        @memcpy(self.id_buf[0..id_len], id_copy[0..id_len]);
+        @memcpy(self.name_buf[0..name_len], name_copy[0..name_len]);
+        self.source = .{ .remote = .{
+            .id = self.id_buf[0..id_len],
+            .name = self.name_buf[0..name_len],
+        } };
+    }
+    open_keys[self.slot] = self.source;
+    self.setTitle();
+
+    self.resetForNewSource();
+
+    if (self.source == .remote) {
+        // Always a FRESH, OWNED dial. A borrowed connection belongs to a window
+        // and was dropped by `teardownSource`; re-borrowing it would tie this
+        // panel's lifetime back to a window it can no longer see.
+        self.startDial();
+    }
+    self.rebuildCards();
+    self.kickSample();
+    _ = w32.InvalidateRect(self.hwnd, null, 0);
+}
+
+/// Stop everything the current source owns, leaving the panel ready to begin a
+/// new one. Reusable by `switchTo` — unlike `close`, this leaves the window,
+/// the timer and the panel itself alive.
+fn teardownSource(self: *ActivityMonitor) void {
+    // Any sample still running belongs to the old source. Retiring the
+    // generation is what makes its result droppable instead of adoptable.
+    self.source_gen +%= 1;
+
+    const rc = self.remote_conn orelse {
+        self.dialing = false;
+        return;
+    };
+    // Unsubscribe FIRST: `unsubscribeMetrics` returning is the guarantee that no
+    // further callback can fire (`connection.zig:1148-1162`).
+    rc.conn.unsubscribeMetrics();
+
+    if (rc.owned()) {
+        // Cut the transport before the join so a worker parked on an
+        // unresponsive agent returns at once. Then JOIN — the worker holds this
+        // connection and we are about to free it.
+        rc.conn.shutdown();
+        if (self.worker) |t| {
+            t.join();
+            self.worker = null;
+            self.sampling = false;
+        }
+        if (rc.dialed) |d| {
+            d.deinit();
+            self.app.core_app.alloc.destroy(d);
+        }
+    }
+    // Borrowed: nothing to free and nothing to join. The worker may still be
+    // mid-RPC on a connection that belongs to a live window, which is safe —
+    // and joining it could block the GUI for the whole `rpc_timeout_ns`, which
+    // is not.
+
+    self.remote_conn = null;
+    self.dialing = false;
+    self.metrics_mutex.lock();
+    self.last_metrics = null;
+    self.metrics_mutex.unlock();
+}
+
+/// Clear every view field the old source filled in. Trend history is the one
+/// that MUST be cleared (Mac clears `samples` for exactly this reason,
+/// :312-323): a chart that carried one machine's history under another's name
+/// would be a fabricated reading.
+fn resetForNewSource(self: *ActivityMonitor) void {
+    const alloc = self.app.core_app.alloc;
+    if (self.snap) |s| {
+        s.destroy(alloc);
+        self.snap = null;
+    }
+    // The parked sample belongs to the previous generation; drop it now rather
+    // than leaving it to be dropped later.
+    self.pending_mutex.lock();
+    if (self.pending) |p| {
+        p.destroy(alloc);
+        self.pending = null;
+    }
+    self.pending_failed = false;
+    self.pending_mutex.unlock();
+
+    // The local sampler's CPU deltas are differences against its previous tick.
+    // Keeping it across a trip to another machine would make the first sample
+    // home a delta over however long the detour took.
+    if (self.proc_sampler) |*p| {
+        p.deinit();
+        self.proc_sampler = null;
+    }
+    self.host_sampler = remote_metrics.Sampler.init();
+
+    self.ring_len = 0;
+    self.order_len = 0;
+    self.sel_len = 0;
+    self.scroll = 0;
+    self.hover_row = -1;
+    self.loading = true;
+    self.refresh_failed = false;
+    self.logged_sample_error = false;
+    self.err_len = 0;
+    self.refreshChrome();
+}
+
+/// Retitle the window for the current source — Mac retitles on every switch
+/// (`RemoteActivityMonitor.swift:41`, :54).
+fn setTitle(self: *ActivityMonitor) void {
+    var title_buf: [192]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "Activity — {s}", .{self.source.label()}) catch "Activity";
+    var wtitle: [160]u16 = undefined;
+    const tlen = std.unicode.utf8ToUtf16Le(&wtitle, title) catch 0;
+    wtitle[tlen] = 0;
+    _ = w32.SetWindowTextW(self.hwnd, @ptrCast(&wtitle));
 }
 
 /// Tear down: stop the timer, JOIN any in-flight sample (it is writing into
@@ -1040,14 +1647,16 @@ fn kickSample(self: *ActivityMonitor) void {
         self.worker = null;
     }
     self.sampling = true;
-    self.worker = std.Thread.spawn(.{}, sampleWorker, .{self}) catch |err| {
+    // The generation is captured HERE, on the GUI thread, so a switch that
+    // happens while this worker runs can retire its result without racing it.
+    self.worker = std.Thread.spawn(.{}, sampleWorker, .{ self, self.source_gen }) catch |err| {
         log.warn("activity monitor: sample thread spawn failed err={}", .{err});
         self.sampling = false;
         return;
     };
 }
 
-fn sampleWorker(self: *ActivityMonitor) void {
+fn sampleWorker(self: *ActivityMonitor, gen: u32) void {
     const alloc = self.app.core_app.alloc;
     const snap = self.buildSnapshot(alloc) catch |err| {
         // A source that is not connected fails EVERY tick, and a panel can sit
@@ -1062,6 +1671,7 @@ fn sampleWorker(self: *ActivityMonitor) void {
         if (spammy) self.logged_sample_error = true;
         self.pending_mutex.lock();
         self.pending_failed = true;
+        self.pending_gen = gen;
         self.pending_mutex.unlock();
         _ = w32.PostMessageW(self.hwnd, WM_APP_ACTIVITY_SAMPLE, 0, 0);
         return;
@@ -1071,6 +1681,7 @@ fn sampleWorker(self: *ActivityMonitor) void {
     if (self.pending) |old| old.destroy(alloc);
     self.pending = snap;
     self.pending_failed = false;
+    self.pending_gen = gen;
     self.pending_mutex.unlock();
 
     _ = w32.PostMessageW(self.hwnd, WM_APP_ACTIVITY_SAMPLE, 0, 0);
@@ -1196,7 +1807,16 @@ fn adoptPending(self: *ActivityMonitor) void {
     self.pending = null;
     const failed = self.pending_failed;
     self.pending_failed = false;
+    const gen = self.pending_gen;
     self.pending_mutex.unlock();
+
+    // A sample of the machine we just switched AWAY from. Adopting it would
+    // paint one machine's processes under another's name — the same lie the
+    // remote path refuses to tell when a dial has not landed.
+    if (gen != self.source_gen) {
+        if (taken) |s| s.destroy(self.app.core_app.alloc);
+        return;
+    }
 
     const snap = taken orelse {
         if (!failed) return;
@@ -1221,6 +1841,9 @@ fn adoptPending(self: *ActivityMonitor) void {
 
     self.pushSample(snap.host);
     self.rebuild();
+    // The ACTIVE card's readout is this snapshot's host metrics, so the cards
+    // are re-derived from the same data on the same tick.
+    self.rebuildCards();
     if (self.sel_len != before) self.refreshChrome();
     _ = w32.InvalidateRect(self.hwnd, null, 0);
 }
@@ -1360,9 +1983,9 @@ fn layout(self: *const ActivityMonitor) layout_mod.Layout {
 
 fn options(self: *const ActivityMonitor) layout_mod.Options {
     return .{
-        // One source until T287 adds the switcher, and chrome that controls
-        // nothing does not appear (design system §6).
-        .has_carousel = false,
+        // One source paints no switcher: chrome that controls nothing does not
+        // appear (design system §6).
+        .has_carousel = cards_mod.hasCarousel(self.card_count),
         .has_banner = self.err_len > 0,
         // Mac shows Kill only while rows are selected (:940). Reading the
         // selection here — rather than tracking a second flag — is what stops
@@ -1456,17 +2079,169 @@ fn paint(self: *ActivityMonitor, hdc: w32.HDC) void {
     fill(mem_dc, .{ .left = 0, .top = 0, .right = l.client_w, .bottom = l.client_h }, COLOR_BG);
     _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
 
+    self.paintCarousel(mem_dc, l);
     self.paintGauges(mem_dc, l);
     self.paintControlBar(mem_dc, l);
     self.paintTable(mem_dc, l);
     self.paintBanner(mem_dc, l);
 
-    // Dividers last so nothing paints over them.
-    for ([_]i32{ l.header_divider_y, l.control_divider_y }) |y| {
+    // Dividers last so nothing paints over them. A hidden band reports its rule
+    // at -1 and must not paint a line across the top of the window.
+    for ([_]i32{ l.carousel_divider_y, l.header_divider_y, l.control_divider_y }) |y| {
+        if (y < 0) continue;
         fill(mem_dc, .{ .left = 0, .top = y, .right = l.client_w, .bottom = y + 1 }, COLOR_DIVIDER);
     }
 
     _ = w32.BitBlt(hdc, 0, 0, l.client_w, l.client_h, mem_dc, 0, 0, w32.SRCCOPY);
+}
+
+/// The machine-card carousel (T296). Cards are clipped to the band so a
+/// scrolled strip cannot paint over the gauges below it.
+fn paintCarousel(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
+    if (!cards_mod.hasCarousel(self.card_count)) return;
+
+    // Save/restore rather than `SelectClipRgn(dc, null)`: clearing the clip
+    // outright would un-clip whatever the caller had set, not just what we add.
+    const saved = w32.SaveDC(hdc);
+    defer {
+        if (saved != 0) _ = w32.RestoreDC(hdc, saved);
+    }
+    _ = w32.IntersectClipRect(
+        hdc,
+        l.carousel.left,
+        l.carousel.top,
+        l.carousel.right,
+        l.carousel.bottom,
+    );
+
+    const active = self.activeCardIndex();
+    for (self.cards[0..self.card_count], 0..) |card, i| {
+        const idx: i32 = @intCast(i);
+        const r = layout_mod.cardRect(l, idx, self.carousel_scroll, self.scale);
+        if (r.right <= l.carousel.left or r.left >= l.carousel.right) continue;
+        const is_active = active != null and active.? == i;
+        self.paintCard(hdc, r, card, is_active, idx == self.card_focus, idx == self.card_hover);
+    }
+}
+
+fn paintCard(
+    self: *ActivityMonitor,
+    hdc: w32.HDC,
+    r: layout_mod.Rect,
+    card: cards_mod.Card,
+    is_active: bool,
+    is_focused: bool,
+    is_hover: bool,
+) void {
+    const radius = px(8, self.scale);
+    const fill_color: u32 = if (is_active)
+        COLOR_CARD_SELECT_BG
+    else if (is_hover)
+        COLOR_CARD_HOVER
+    else
+        COLOR_CARD_BG;
+    const border_color: u32 = if (is_active) COLOR_ACCENT else COLOR_CARD_BORDER;
+    const border_w: i32 = if (is_active) @max(2, px(2, self.scale)) else @max(1, px(1, self.scale));
+
+    roundRect(hdc, r, radius, fill_color, border_color, border_w);
+
+    // The focus ring lives OUTSIDE the card and only when focus is NOT already
+    // on the active card — otherwise the accent border and the ring stack into
+    // a double border that reads as a rendering bug (Mac makes the same call,
+    // :1481-1488).
+    if (is_focused and !is_active) {
+        const pad = @max(2, px(2, self.scale));
+        const ring: layout_mod.Rect = .{
+            .left = r.left - pad,
+            .top = r.top - pad,
+            .right = r.right + pad,
+            .bottom = r.bottom + pad,
+        };
+        strokeRoundRect(hdc, ring, radius + pad, COLOR_ACCENT, @max(2, px(2, self.scale)));
+    }
+
+    const c = layout_mod.cardContent(r, self.scale);
+    const switching = is_active and self.dialing;
+
+    // Status dot.
+    const dot_color: u32 = switch (cards_mod.dot(card.summary, switching)) {
+        .good => COLOR_DOT_GOOD,
+        .pending => COLOR_DOT_PENDING,
+        .bad => COLOR_DOT_BAD,
+        .unknown => COLOR_DOT_UNKNOWN,
+    };
+    ellipse(hdc, c.dot, dot_color);
+
+    const secondary: u32 = if (is_active) COLOR_CARD_SECONDARY_SEL else COLOR_CARD_SECONDARY;
+    const flags: u32 = text_flags | w32.DT_END_ELLIPSIS;
+
+    const old_font = if (self.font) |f| w32.SelectObject(hdc, f) else null;
+    _ = w32.SetTextColor(hdc, COLOR_TEXT);
+    drawText(hdc, card.label, c.label, flags);
+
+    if (self.caption_font) |f| _ = w32.SelectObject(hdc, f);
+    _ = w32.SetTextColor(hdc, secondary);
+    var sbuf: [48]u8 = undefined;
+    drawText(hdc, cards_mod.summaryLine(&sbuf, card.summary, switching), c.summary, flags);
+
+    // The metric line is tabular — a number that jitters sideways every 1.5 s
+    // is the reason `num_font` exists.
+    if (self.num_font) |f| _ = w32.SelectObject(hdc, f);
+    var mbuf: [64]u8 = undefined;
+    const metric = cards_mod.metricLine(&mbuf, card.summary);
+    if (metric.len > 0) drawText(hdc, metric, c.metric, flags);
+
+    if (old_font) |f| _ = w32.SelectObject(hdc, f);
+}
+
+fn px(v: f32, scale: f32) i32 {
+    return @intFromFloat(@round(v * scale));
+}
+
+/// A filled rounded rect with a border, in the GDI idiom the banner overlay
+/// already uses (`BannerOverlay.zig:524-529`).
+fn roundRect(
+    hdc: w32.HDC,
+    r: layout_mod.Rect,
+    radius: i32,
+    fill_color: u32,
+    border_color: u32,
+    border_w: i32,
+) void {
+    const brush = w32.CreateSolidBrush(fill_color) orelse return;
+    defer _ = w32.DeleteObject(brush);
+    const pen = w32.CreatePen(0, border_w, border_color) orelse return; // PS_SOLID
+    defer _ = w32.DeleteObject(pen);
+    const old_brush = w32.SelectObject(hdc, @ptrCast(brush));
+    defer _ = w32.SelectObject(hdc, old_brush);
+    const old_pen = w32.SelectObject(hdc, pen);
+    defer _ = w32.SelectObject(hdc, old_pen);
+    _ = w32.RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius * 2, radius * 2);
+}
+
+/// The same shape, stroked only — the focus ring must not paint over whatever
+/// is behind the card's corners.
+fn strokeRoundRect(hdc: w32.HDC, r: layout_mod.Rect, radius: i32, color: u32, width: i32) void {
+    const pen = w32.CreatePen(0, width, color) orelse return;
+    defer _ = w32.DeleteObject(pen);
+    const hollow = w32.GetStockObject(w32.NULL_BRUSH);
+    const old_brush = w32.SelectObject(hdc, hollow);
+    defer _ = w32.SelectObject(hdc, old_brush);
+    const old_pen = w32.SelectObject(hdc, pen);
+    defer _ = w32.SelectObject(hdc, old_pen);
+    _ = w32.RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius * 2, radius * 2);
+}
+
+fn ellipse(hdc: w32.HDC, r: layout_mod.Rect, color: u32) void {
+    const brush = w32.CreateSolidBrush(color) orelse return;
+    defer _ = w32.DeleteObject(brush);
+    const pen = w32.CreatePen(0, 1, color) orelse return;
+    defer _ = w32.DeleteObject(pen);
+    const old_brush = w32.SelectObject(hdc, @ptrCast(brush));
+    defer _ = w32.SelectObject(hdc, old_brush);
+    const old_pen = w32.SelectObject(hdc, pen);
+    defer _ = w32.SelectObject(hdc, old_pen);
+    _ = w32.Ellipse(hdc, r.left, r.top, r.right, r.bottom);
 }
 
 fn paintGauges(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
@@ -1920,6 +2695,25 @@ fn onLeftDown(self: *ActivityMonitor, x: i32, y: i32, mods: usize) void {
     const l = self.layout();
     const widths = layout_mod.columnWidths(self.scale, l.table.width());
 
+    // The carousel owns the top band. A click inside it switches source in ONE
+    // click (Mac's card `onSelect`, :828-831); a click in the band's padding
+    // just moves nothing, and never falls through to the table below.
+    if (cards_mod.hasCarousel(self.card_count) and y < l.carousel.bottom) {
+        if (layout_mod.cardIndexAt(
+            l,
+            @intCast(self.card_count),
+            x,
+            y,
+            self.carousel_scroll,
+            self.scale,
+        )) |idx| {
+            self.card_focus = idx;
+            self.switchToCard(idx);
+            _ = w32.InvalidateRect(self.hwnd, null, 0);
+        }
+        return;
+    }
+
     // The banner owns the bottom band while it is up; its ✕ dismisses it and
     // the rest of the band swallows the click (it is not table).
     if (self.err_len > 0 and y >= l.banner.top) {
@@ -2056,20 +2850,55 @@ fn onMouseMove(self: *ActivityMonitor, x: i32, y: i32) void {
     }
 
     const l = self.layout();
+
+    const card: i32 = if (cards_mod.hasCarousel(self.card_count))
+        (layout_mod.cardIndexAt(
+            l,
+            @intCast(self.card_count),
+            x,
+            y,
+            self.carousel_scroll,
+            self.scale,
+        ) orelse -1)
+    else
+        -1;
+
     const in_table = x >= l.table.left and x < l.table.right;
     const hovered: i32 = if (in_table)
         (layout_mod.rowIndexAt(l, y, self.scroll) orelse -1)
     else
         -1;
     const clamped: i32 = if (hovered >= 0 and @as(usize, @intCast(hovered)) < self.order_len) hovered else -1;
-    if (clamped == self.hover_row) return;
+    if (clamped == self.hover_row and card == self.card_hover) return;
     self.hover_row = clamped;
+    self.card_hover = card;
     _ = w32.InvalidateRect(self.hwnd, null, 0);
 }
 
-fn onWheel(self: *ActivityMonitor, delta: i16) void {
-    const lines: i32 = @divTrunc(@as(i32, delta), @as(i32, w32.WHEEL_DELTA)) * 3;
-    self.scroll -= lines;
+/// `screen_y` is in SCREEN coordinates — WM_MOUSEWHEEL is the one pointer
+/// message that does not carry client coordinates, and reading its lParam as
+/// client would scroll the carousel from the middle of the table.
+fn onWheel(self: *ActivityMonitor, delta: i16, screen_x: i32, screen_y: i32) void {
+    const notches: i32 = @divTrunc(@as(i32, delta), @as(i32, w32.WHEEL_DELTA));
+
+    if (cards_mod.hasCarousel(self.card_count)) {
+        var pt: w32.POINT = .{ .x = screen_x, .y = screen_y };
+        if (w32.ScreenToClient(self.hwnd, &pt) != 0) {
+            const l = self.layout();
+            if (pt.y >= l.carousel.top and pt.y < l.carousel.bottom) {
+                // One notch moves one card, so the wheel and the arrow keys
+                // agree about what a step is.
+                const step = layout_mod.cardRect(l, 1, 0, self.scale).left -
+                    layout_mod.cardRect(l, 0, 0, self.scale).left;
+                self.carousel_scroll -= notches * step;
+                self.clampCarousel();
+                _ = w32.InvalidateRect(self.hwnd, null, 0);
+                return;
+            }
+        }
+    }
+
+    self.scroll -= notches * 3;
     self.clampScroll();
     _ = w32.InvalidateRect(self.hwnd, null, 0);
 }
@@ -2089,6 +2918,35 @@ pub fn handleKey(self: *ActivityMonitor, vk: u16) bool {
     }
     if (w32.GetFocus()) |focus| {
         if (focus == @as(?w32.HWND, self.filter)) return false;
+    }
+
+    // The carousel's keys, and ONLY while the panel itself holds focus: Space
+    // and Enter belong to whichever button has focus otherwise, and a switcher
+    // that stole them would make the Kill button unpressable from the keyboard.
+    //
+    // Arrowing moves the ring and repaints. It never dials — committing is a
+    // separate keystroke precisely so that walking the list cannot open a
+    // connection per card (Mac makes the same split, :796-799).
+    if (cards_mod.hasCarousel(self.card_count) and w32.GetFocus() == @as(?w32.HWND, self.hwnd)) {
+        switch (vk) {
+            w32.VK_LEFT, w32.VK_RIGHT => {
+                const delta: i32 = if (vk == w32.VK_LEFT) -1 else 1;
+                const moved = cards_mod.moveFocus(self.card_focus, delta, self.card_count);
+                if (moved != self.card_focus) {
+                    self.card_focus = moved;
+                    self.scrollCardIntoView();
+                    self.logCarousel();
+                    _ = w32.InvalidateRect(self.hwnd, null, 0);
+                }
+                return true;
+            },
+            w32.VK_RETURN, w32.VK_SPACE => {
+                self.switchToCard(self.card_focus);
+                _ = w32.InvalidateRect(self.hwnd, null, 0);
+                return true;
+            },
+            else => {},
+        }
     }
 
     const l = self.layout();
@@ -2483,7 +3341,11 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
             return 0;
         },
         w32.WM_MOUSEWHEEL => {
-            self.onWheel(@bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF))));
+            self.onWheel(
+                @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF))),
+                loWordSigned(lparam),
+                hiWordSigned(lparam),
+            );
             return 0;
         },
         w32.WM_CTLCOLOREDIT => {
