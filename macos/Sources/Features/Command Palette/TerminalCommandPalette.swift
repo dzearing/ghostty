@@ -166,11 +166,11 @@ struct TerminalCommandPaletteView: View {
                 (NSApp.delegate as? AppDelegate)?.installCommandLineTool(nil)
             },
             CommandOption(
-                title: "Set Up Claude Code Integration",
-                description: "Install the Ghoztty plugin for Claude Code",
+                title: "Set Up Agent Integrations…",
+                description: "Install Ghoztty integration for detected coding agents",
                 leadingIcon: "puzzlepiece.extension"
             ) {
-                (NSApp.delegate as? AppDelegate)?.setupClaudeCodeIntegration(nil)
+                (NSApp.delegate as? AppDelegate)?.setupAgentIntegrations(nil)
             },
         ]
     }

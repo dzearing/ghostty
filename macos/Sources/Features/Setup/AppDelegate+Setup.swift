@@ -1,7 +1,7 @@
 import AppKit
 
-/// First-launch and on-demand setup for the ghoztty command-line tool and the
-/// Claude Code integration.
+/// First-launch and on-demand setup for the ghoztty command-line tool and
+/// available coding-agent integrations.
 extension AppDelegate {
     private enum SetupDefaults {
         /// The user answered the one-time setup dialog (either way).
@@ -39,14 +39,14 @@ extension AppDelegate {
 
             guard !defaults.bool(forKey: SetupDefaults.promptAnswered) else { return }
 
-            let claudeAvailable = ClaudeCodeIntegration.findClaude() != nil
+            let agents = AgentIntegrationService.availableAgents()
             DispatchQueue.main.async {
-                self.presentSetupDialog(probe: probe, claudeAvailable: claudeAvailable)
+                self.presentSetupDialog(probe: probe, agents: agents)
             }
         }
     }
 
-    private func presentSetupDialog(probe: CommandLineInstaller.Probe, claudeAvailable: Bool) {
+    private func presentSetupDialog(probe: CommandLineInstaller.Probe, agents: [RuntimeAgent]) {
         let defaults = UserDefaults.ghostty
         defaults.set(true, forKey: SetupDefaults.promptAnswered)
 
@@ -56,59 +56,50 @@ extension AppDelegate {
         alert.addButton(withTitle: "Set Up")
         alert.addButton(withTitle: "Not Now")
 
-        var claudeCheckbox: NSButton?
-        if claudeAvailable {
-            let checkbox = NSButton(
-                checkboxWithTitle: "Also set up Claude Code integration",
-                target: nil,
-                action: nil)
-            checkbox.state = .on
-            checkbox.sizeToFit()
-            alert.accessoryView = checkbox
-            claudeCheckbox = checkbox
+        var checkboxes: [(RuntimeAgent, NSButton)] = []
+        if !agents.isEmpty {
+            let stack = NSStackView()
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            for agent in agents {
+                let box = NSButton(checkboxWithTitle: "Also set up \(agent.displayName) integration", target: nil, action: nil)
+                box.state = .on
+                checkboxes.append((agent, box))
+                stack.addArrangedSubview(box)
+            }
+            stack.frame = NSRect(x: 0, y: 0, width: 320, height: CGFloat(agents.count) * 22)
+            alert.accessoryView = stack
         }
 
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-
         defaults.set(true, forKey: SetupDefaults.installAccepted)
-        let wantsClaude = claudeCheckbox?.state == .on
+        let chosen = checkboxes.filter { $0.1.state == .on }.map { $0.0 }
 
         DispatchQueue.global(qos: .userInitiated).async {
             var cliFailure: String?
             do {
-                try CommandLineInstaller.install(
-                    pathContainsUserBin: probe.pathContainsUserBin,
-                    allowAdminPrompt: true)
-            } catch {
-                cliFailure = error.localizedDescription
-            }
+                try CommandLineInstaller.install(pathContainsUserBin: probe.pathContainsUserBin, allowAdminPrompt: true)
+            } catch { cliFailure = error.localizedDescription }
 
-            var claudeFailure: String?
-            if cliFailure == nil, wantsClaude {
-                switch ClaudeCodeIntegration.install() {
-                case .installed, .alreadyInstalled:
-                    break
-                case .claudeNotFound:
-                    claudeFailure = "Claude Code was not found on this Mac."
-                case .failed(let detail):
-                    claudeFailure = detail
-                }
+            var results: [(RuntimeAgent, IntegrationOutcome)] = []
+            if cliFailure == nil {
+                for agent in chosen { results.append((agent, AgentIntegrationService.install(agent: agent))) }
             }
+            let jqMissing = !chosen.isEmpty && !AgentIntegrationService.jqAvailable
 
             DispatchQueue.main.async {
                 if let cliFailure {
-                    Self.showSetupAlert(
-                        title: "Command Setup Failed",
-                        message: "\(cliFailure) You can try again from the Ghoztty menu.",
-                        style: .warning)
-                } else if let claudeFailure {
-                    Self.showSetupAlert(
-                        title: "Claude Code Setup Failed",
-                        message: "The ghoztty command was set up, but the Claude Code plugin was not. \(claudeFailure)",
-                        style: .warning)
+                    Self.showSetupAlert(title: "Command Setup Failed",
+                        message: "\(cliFailure) You can try again from the Ghoztty menu.", style: .warning)
+                } else if results.contains(where: { if case .failed = $0.1 { return true } else { return false } }) {
+                    Self.showSetupAlert(title: "Some Integrations Failed",
+                        message: AgentIntegrationService.summary(results) + ". Re-run Set Up Agent Integrations… to try again.", style: .warning)
+                } else if jqMissing {
+                    Self.showSetupAlert(title: "Almost Done",
+                        message: "Integrations installed. The status banner needs jq — install it with: brew install jq")
                 }
-                // Success is silent so the first launch stays quiet.
+                // Otherwise success stays silent.
             }
         }
     }
@@ -167,29 +158,22 @@ extension AppDelegate {
         }
     }
 
-    @IBAction func setupClaudeCodeIntegration(_ sender: Any?) {
+    @IBAction func setupAgentIntegrations(_ sender: Any?) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let outcome = ClaudeCodeIntegration.install()
-            DispatchQueue.main.async {
-                switch outcome {
-                case .installed:
-                    Self.showSetupAlert(
-                        title: "Claude Code Integration Ready",
-                        message: "The Ghoztty plugin is installed in Claude Code.")
-                case .alreadyInstalled:
-                    Self.showSetupAlert(
-                        title: "Already Set Up",
-                        message: "The Ghoztty plugin is already installed in Claude Code.")
-                case .claudeNotFound:
-                    Self.showSetupAlert(
-                        title: "Claude Code Not Found",
-                        message: "This sets up the Ghoztty plugin for Claude Code. Install Claude Code on this Mac, then run this again.")
-                case .failed(let detail):
-                    Self.showSetupAlert(
-                        title: "Claude Code Setup Failed",
-                        message: detail,
-                        style: .warning)
+            let agents = AgentIntegrationService.availableAgents()
+            guard !agents.isEmpty else {
+                DispatchQueue.main.async {
+                    Self.showSetupAlert(title: "No Agents Found",
+                        message: "No supported coding-agent CLI (Claude Code, Copilot CLI) was found. Install one, then run this again.")
                 }
+                return
+            }
+            let results = agents.map { ($0, AgentIntegrationService.install(agent: $0)) }
+            let jqMissing = !AgentIntegrationService.jqAvailable
+            DispatchQueue.main.async {
+                var msg = AgentIntegrationService.summary(results)
+                if jqMissing { msg += "\n\nThe status banner needs jq — install it with: brew install jq" }
+                Self.showSetupAlert(title: "Agent Integrations", message: msg)
             }
         }
     }
