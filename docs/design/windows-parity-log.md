@@ -4721,3 +4721,48 @@ Evidence: `overlay-zorder.ps1` ALL PASS (24) x3, `-NegativeControl` FAILS on
 the inverted new oracle; `pane-banner.ps1` ALL PASS (65) after the
 `lib\TestDesktop.ps1` additions; `zig build test` both lanes exit 0;
 `test-agent` exit 0; P1-P3 ACCEPTANCE: ALL PASS.
+
+## 2026-08-01 - T225: the last GUI script migrates, and its "terminal-content" blocker was never terminal content
+
+`split-dim.ps1` was the final entry on T217's un-migratable list and T272's last
+miss. It had been blocked since T214 on one assertion: run 3 sampled the
+COMPOSITED SCREEN (`GetDC(NULL)` + `GetPixel`) at the dimmed pane's centre and
+asserted "red-tinted", and there is no composited screen off the input desktop.
+
+The blocker dissolves under T214's own first route. **Ask which thread PAINTED
+the pixels.** The dim overlay is not the terminal - it is its own top-level
+window that the app's GUI thread fills with a solid GDI brush (`DimOverlay.zig`
+WM_PAINT / WM_ERASEBKGND `FillRect`), so `Get-TestWindowPixels` on the
+`GhozttyDimOverlay` reads the real fill. Measured before a line was ported:
+`255,0,0` under `--unfocused-split-fill=#ff0000`, `16,16,20` under a defaulted
+fill on `--background=#101014`. Three tasks had carried this as a
+terminal-surface probe (T214's table, T225's own blocker table, T276 item 3)
+because it *sampled over* the terminal; what it sampled was a window in front of
+it. **Where a probe reads is not what it reads.**
+
+What the substitute does not cover is named in the header rather than assumed
+away: DWM's composite of fill and alpha - what the eye sees. Both INPUTS to that
+composite are asserted (painted fill, `GetLayeredWindowAttributes` alpha) and
+the blend is Windows' own, not app logic. The old check was the weaker of the
+two anyway: it asked whether one pixel leaned red; this pins the exact color.
+
+A uniform fill is 1 distinct color by design, so `Get-TestDistinctColors` is no
+guard here. The guard is that the SAME probe reads two DIFFERENT colors under
+two configs - which is why run 1's background is now pinned to `#101014`, and
+that turns "the fill defaults to the background color" from a header comment
+into an exact assertion the script never had.
+
+Also filed while auditing: **T262 is a duplicate of T243** (`zig build` panics
+opaquely without `ZIG_GLOBAL_CACHE_DIR`), marked
+`skipped(duplicate -> T243)` with its evidence folded in. It bit again at the
+top of this turn - the first `zig build` panicked, was re-run verbatim as a
+suspected transient, and panicked identically. Two turns hit that wall, neither
+found the other's task, and both filed: documentation that must be *found* keeps
+failing here, which is the argument for T243's fix (a real diagnostic from
+`build.zig` at the moment of the panic) over another note.
+
+Evidence: `split-dim.ps1` ALL PASS (29, up from 23) x3, `-NegativeControl` FAILS
+on the inverted fill oracle and reached it; `Test-TestDesktopLeak` false at every
+launch and the sampled foreground watch saw no launched pid; no
+`lib\TestDesktop.ps1` change, so no harness regression surface; `zig build test`
+both lanes exit 0; `test-agent` exit 0; P1-P3 ACCEPTANCE: ALL PASS.

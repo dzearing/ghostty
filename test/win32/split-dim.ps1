@@ -7,223 +7,85 @@
 # alpha = (1 - unfocused-split-opacity) * 255 (Mac parity).
 #
 # Three GUI launches:
-#   run 1 (defaults):        split -> exactly one overlay, over the
-#                            unfocused pane, alpha 77 (opacity 0.7),
-#                            click-through ex-style; focus flip moves the
+#   run 1 (defaults,         split -> exactly one overlay, over the
+#          background #101014) unfocused pane, alpha 77 (opacity 0.7),
+#                            click-through ex-style, and the overlay PAINTS
+#                            the background color; focus flip moves the
 #                            overlay to the other pane; zoom hides all
 #                            overlays, unzoom restores.
 #   run 2 (opacity=1):       feature off -> no overlay ever visible.
-#   run 3 (opacity=0.5,      alpha 128 + on-screen blend check: a red fill
-#          fill=#ff0000,     over a black terminal reads back as dark red
-#          background=#000)  at the dimmed pane's center.
+#   run 3 (opacity=0.5,      alpha 128, and the overlay paints #ff0000.
+#          fill=#ff0000,
+#          background=#000)
+#
+# T225: runs on the BACKGROUND test desktop (lib\TestDesktop.ps1), so it never
+# steals the user's foreground - asserted here, not assumed.
+#
+# THE BLEND ASSERTION, and what replaced it (T214 route 1, decided here).
+# Run 3 used to sample the COMPOSITED SCREEN with GetDC(NULL)+GetPixel at the
+# dimmed pane's centre and assert "red-tinted". There is no composited screen
+# off the input desktop (CAPTURE LIMIT), so that oracle had to be re-expressed
+# rather than ported. It is NOT a terminal-content probe, which is why route 1
+# applies and route 3/4 was not needed: the dim overlay is its own top-level
+# window and the app's GUI thread paints it with a solid GDI brush
+# (DimOverlay.zig's WM_PAINT/WM_ERASEBKGND FillRect), so PrintWindow reads the
+# real fill. Measured on the test desktop 2026-08-01: the overlay captures as
+# 255,0,0 under `--unfocused-split-fill=#ff0000` and as 16,16,20 under a
+# defaulted fill with `--background=#101014`.
+#
+# WHAT THE SUBSTITUTE DOES NOT COVER, named rather than quietly dropped: DWM's
+# composite of that fill at that alpha over the pane underneath - i.e. what the
+# user's eye actually sees. The two INPUTS to the composite are both asserted
+# (the painted fill here, the alpha from GetLayeredWindowAttributes), the
+# blending of them is Windows' own and is not app logic. The old screen-pixel
+# check was in fact the weaker statement of the two: it only asked whether the
+# centre pixel leaned red, where this pins the exact configured color.
+#
+# A uniform fill is 1 distinct color by design, so Get-TestDistinctColors is no
+# guard here. The guard is that the SAME probe reads two DIFFERENT colors under
+# two different configs (run 1: 16,16,20 / run 3: 255,0,0) - it tracks the
+# config rather than passing against a constant - and -NegativeControl inverts
+# run 3's expectation to prove it can fail.
 #
 # Focus lands via the T48 deferred-SetFocus path, so assertions poll.
 # A positive control (ctrl+k clear_screen, T55 pattern) runs first in run 1
 # so an injection failure aborts instead of reading as a T74 regression.
 # Only touches ghoztty processes running from this repo's zig-out*.
-param([string]$ExePath)
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
-if ($ExePath) {
-    $exe = $ExePath
-    $env:GHOZTTY_PIPE_SUFFIX = '-dimtest'
-}
+if ($ExePath) { $exe = $ExePath }
+# Always isolate the IPC endpoint: the app inherits this env through
+# CreateProcessW and so does every `& $exe +...` below, so the user's own
+# instance is never queried or disturbed.
+$env:GHOZTTY_PIPE_SUFFIX = '-dimtest'
 $errlog = Join-Path $env:TEMP 'ghoztty-split-dim-stderr.log'
+
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:pass = 0
 $script:fail = 0
+$script:negReached = $false
+
+# Write-Host, not the pipeline: a helper that asserts must never also return a
+# value, or its return silently becomes an array (T217 batch 5).
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Threading;
-using System.Runtime.InteropServices;
-public class DimDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr h, int idx);
-    [DllImport("user32.dll")] public static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
-    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
-    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
-    [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr dc, int x, int y);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int left, top, right, bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct GUITHREADINFO {
-        public uint cbSize; public uint flags;
-        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
-        public RECT rcCaret;
+# The AGENT too (T248): +new-window/+split are idempotent against a PERSISTED
+# session, and killing ghoztty.exe does not remove one, so from the second run
+# onward a surviving agent would hand this run last run's windows.
+function Stop-RepoInstances {
+    foreach ($name in @('ghoztty.exe', 'ghoztty-agent.exe')) {
+        Get-CimInstance Win32_Process -Filter "Name='$name'" |
+            Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     }
-    [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
-
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // ALL GhozttyTerminal children (visible or not):
-    // "hwnd:visible:left,top,right,bottom" lines.
-    public static string[] Panes(IntPtr top) {
-        var lines = new List<string>();
-        EnumChildWindows(top, (h, l) => {
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyTerminal") {
-                RECT r; GetWindowRect(h, out r);
-                lines.Add(h.ToInt64() + ":" + (IsWindowVisible(h) ? 1 : 0) + ":" + r.left + "," + r.top + "," + r.right + "," + r.bottom);
-            }
-            return true;
-        }, IntPtr.Zero);
-        return lines.ToArray();
-    }
-
-    // Dim overlays are OWNED POPUPS (top-level), not children:
-    // "hwnd:visible:alpha:exstyle:left,top,right,bottom" lines.
-    public static string[] Overlays(uint pid) {
-        var lines = new List<string>();
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p != pid) return true;
-            var sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            if (sb.ToString() == "GhozttyDimOverlay") {
-                RECT r; GetWindowRect(h, out r);
-                uint key; byte alpha; uint flags;
-                if (!GetLayeredWindowAttributes(h, out key, out alpha, out flags)) alpha = 0;
-                int ex = GetWindowLongW(h, -20); // GWL_EXSTYLE
-                lines.Add(h.ToInt64() + ":" + (IsWindowVisible(h) ? 1 : 0) + ":" + alpha + ":" + ex + ":" + r.left + "," + r.top + "," + r.right + "," + r.bottom);
-            }
-            return true;
-        }, IntPtr.Zero);
-        return lines.ToArray();
-    }
-
-    public static long FocusedHwnd(IntPtr top) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        var info = new GUITHREADINFO();
-        info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
-        if (!GetGUIThreadInfo(tid, ref info)) return 0;
-        return info.hwndFocus.ToInt64();
-    }
-
-    // Composited screen pixel as "r,g,b".
-    public static string ScreenPixel(int x, int y) {
-        IntPtr dc = GetDC(IntPtr.Zero);
-        uint c = GetPixel(dc, x, y); // COLORREF 0x00BBGGRR
-        ReleaseDC(IntPtr.Zero, dc);
-        return (c & 0xFF) + "," + ((c >> 8) & 0xFF) + "," + ((c >> 16) & 0xFF);
-    }
-
-    static void Key(ushort vk, bool up) {
-        var i = new INPUT[1];
-        i[0].type = 1;
-        i[0].ki.wVk = vk;
-        i[0].ki.dwFlags = up ? 2u : 0u;
-        SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    // T86-hardened foreground grab: attach to the current foreground
-    // owner's thread + an Alt tap (last-input source), retried - a
-    // background process may not steal foreground otherwise.
-    public static bool GrabForeground(IntPtr top) {
-        uint cur = GetCurrentThreadId();
-        bool fg = (GetForegroundWindow() == top);
-        for (int attempt = 0; attempt < 5 && !fg; attempt++) {
-            IntPtr curFg = GetForegroundWindow();
-            uint fgTid = 0;
-            if (curFg != IntPtr.Zero && curFg != top) {
-                uint fgPid; fgTid = GetWindowThreadProcessId(curFg, out fgPid);
-                if (fgTid != 0) AttachThreadInput(cur, fgTid, true);
-            }
-            Key(0x12, false); Key(0x12, true); // Alt tap
-            SetForegroundWindow(top);
-            if (fgTid != 0) AttachThreadInput(cur, fgTid, false);
-            Thread.Sleep(150 + attempt * 200);
-            fg = (GetForegroundWindow() == top);
-        }
-        return fg;
-    }
-
-    public static string Chord(IntPtr top, IntPtr surface, ushort[] mods, ushort vk) {
-        uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
-        uint cur = GetCurrentThreadId();
-        GrabForeground(top);
-        if (!AttachThreadInput(cur, tid, true)) return "ATTACH FAILED";
-        try {
-            SetFocus(surface);
-            Thread.Sleep(60);
-            if (GetForegroundWindow() != top) return "ABORT: foreground owned by another window";
-            foreach (var m in mods) Key(m, false);
-            Thread.Sleep(20);
-            Key(vk, false); Thread.Sleep(20); Key(vk, true);
-            Thread.Sleep(20);
-            for (int j = mods.Length - 1; j >= 0; j--) Key(mods[j], true);
-            Thread.Sleep(100);
-            return "SENT";
-        } finally { AttachThreadInput(cur, tid, false); }
-    }
-}
-'@
-
-function Parse-Panes([string[]]$lines) {
-    $lines | ForEach-Object {
-        $hw, $vis, $r = $_ -split ':'
-        $c = $r -split ','
-        [pscustomobject]@{
-            Hwnd = [int64]$hw; Visible = ($vis -eq '1')
-            Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
-        }
-    }
-}
-
-function Parse-Overlays([string[]]$lines) {
-    $lines | ForEach-Object {
-        $hw, $vis, $alpha, $ex, $r = $_ -split ':'
-        $c = $r -split ','
-        [pscustomobject]@{
-            Hwnd = [int64]$hw; Visible = ($vis -eq '1')
-            Alpha = [int]$alpha; ExStyle = [int64]$ex
-            Left = [int]$c[0]; Top = [int]$c[1]; Right = [int]$c[2]; Bottom = [int]$c[3]
-        }
-    }
-}
-
-function Kill-RepoInstances {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 800
 }
 
 # Same left/top/right/bottom within a small DPI/rounding slack.
@@ -234,135 +96,209 @@ function Rects-Match($a, $b, [int]$slack = 2) {
     ([math]::Abs($a.Bottom - $b.Bottom) -le $slack)
 }
 
+function Get-Overlays([int]$procId) {
+    return @(Get-TestWindows -ProcessId $procId -Class 'GhozttyDimOverlay')
+}
+
 # Poll until exactly one visible overlay covers $pane (T48 defers focus, so
 # the flip lands asynchronously). Returns the overlay list at success/timeout.
-function Wait-OverlayOver([uint32]$procId, $pane) {
+function Wait-OverlayOver([int]$procId, $pane) {
     for ($t = 0; $t -lt 25; $t++) {
-        $ov = @(Parse-Overlays ([DimDrv]::Overlays($procId)) | Where-Object Visible)
+        $ov = @(Get-Overlays $procId | Where-Object Visible)
         if ($ov.Count -eq 1 -and (Rects-Match $ov[0] $pane)) { return $ov }
         Start-Sleep -Milliseconds 100
     }
     Write-Host "DEBUG wait timeout: want pane $($pane.Left),$($pane.Top),$($pane.Right),$($pane.Bottom)"
-    [DimDrv]::Overlays($procId) | ForEach-Object { Write-Host "DEBUG raw overlay: $_" }
-    return @(Parse-Overlays ([DimDrv]::Overlays($procId)) | Where-Object Visible)
+    Get-Overlays $procId | ForEach-Object {
+        Write-Host "DEBUG raw overlay: $($_.Hwnd) vis=$($_.Visible) $($_.Left),$($_.Top),$($_.Right),$($_.Bottom)"
+    }
+    return @(Get-Overlays $procId | Where-Object Visible)
+}
+
+# The overlay's OWN painted fill, as "r,g,b" - see the header. $null if the
+# capture fails, so the caller can report that rather than score a guess.
+function Get-OverlayFill($overlay) {
+    $h = [IntPtr]$overlay.Hwnd
+    $shot = $null
+    try {
+        $shot = Get-TestWindowPixels -Window $h
+        $cx = [int](($overlay.Left + $overlay.Right) / 2)
+        $cy = [int](($overlay.Top + $overlay.Bottom) / 2)
+        $c = Get-TestPixel -Shot $shot -X $cx -Y $cy
+        if (-not $c) { return $null }
+        return "$($c.R),$($c.G),$($c.B)"
+    } catch {
+        Write-Host "DEBUG overlay capture failed: $_"
+        return $null
+    } finally {
+        if ($shot) { Close-TestWindowPixels -Shot $shot }
+    }
 }
 
 function Start-Gui([string]$label, [string[]]$extraArgs, [bool]$control) {
-    Kill-RepoInstances
+    Stop-RepoInstances
     if ($control) { Remove-Item $errlog -ErrorAction SilentlyContinue }
-    $sp = @{ FilePath = $exe; PassThru = $true }
     # --session-persistence=false is mandatory, not optional: this script
     # launches a GUI per section, and each launch WRITES a session-layout
-    # manifest that the NEXT launch would restore — so section 2 came up with
+    # manifest that the NEXT launch would restore - so section 2 came up with
     # section 1's panes and "2 visible panes" failed. Same trap T131 fixed for
     # pane-banner.ps1's bw window (found again here 2026-07-29 during T155).
-    $sp.ArgumentList = @('--session-persistence=false') + $extraArgs
-    if (-not $ExePath -and $control) { $sp.RedirectStandardError = $errlog }
-    $proc = Start-Process @sp
+    $sp = @{ Exe = $exe; Arguments = (@('--session-persistence=false') + $extraArgs) }
+    if (-not $ExePath -and $control) { $sp.StdErr = $errlog }
+    $app = Start-OnTestDesktop @sp
     Start-Sleep -Seconds 3
-    if ($proc.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
-    $top = [DimDrv]::FindTop([uint32]$proc.Id)
+    if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }
+    $top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
     if ($top -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): top window not found"; exit 1 }
+
+    # Isolation, asserted per launch: the window exists on the test desktop
+    # (we just found it there) and must NOT be enumerable on the user's.
+    Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) `
+        "$label window is NOT enumerable on the interactive desktop"
+
     & $exe +split --direction=down | Out-Null
     Start-Sleep -Milliseconds 800
-    $panes = @(Parse-Panes ([DimDrv]::Panes($top)))
+    $panes = @(Get-TestChildWindows -Window $top -Class 'GhozttyTerminal')
     Assert ($panes.Count -eq 2 -and @($panes | Where-Object Visible).Count -eq 2) "$label setup: 2 visible panes"
-    if ($panes.Count -ne 2) { Stop-Process -Id $proc.Id -Force; exit 1 }
-    [pscustomobject]@{ Proc = $proc; Top = $top; Panes = $panes }
+    if ($panes.Count -ne 2) { Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; exit 1 }
+    [pscustomobject]@{ App = $app; Top = $top; Panes = $panes }
 }
 
-# ---------------------------------------------------------------------------
-# Run 1: defaults (opacity 0.7 -> alpha 77, fill = background).
-# ---------------------------------------------------------------------------
-$g = Start-Gui 'default' @() $true
-$proc = $g.Proc; $top = $g.Top
-$A = $g.Panes | Sort-Object Top | Select-Object -First 1   # top pane
-$B = $g.Panes | Sort-Object Top | Select-Object -Last 1    # bottom pane (focused after split)
+Stop-RepoInstances
 
-# Positive control: ctrl+k reaches binding dispatch (debug log only).
-$r = [DimDrv]::Chord($top, [IntPtr]$B.Hwnd, [uint16[]]@(0x11), 0x4B)
-if ($r -ne 'SENT') { Write-Host "ABORT: control chord not sent ($r)"; Stop-Process -Id $proc.Id -Force; exit 1 }
-Start-Sleep -Milliseconds 300
-if (Test-Path $errlog) {
-    if (-not (Select-String -Path $errlog -Pattern 'clear_screen' -Quiet)) {
-        Write-Host 'ABORT: positive control failed (clear_screen never dispatched) - injection broken, not a T74 verdict'
-        Stop-Process -Id $proc.Id -Force; exit 1
+# Watch the user's desktop for the whole run: nothing we launch may ever take
+# foreground there. This is the complaint T211 exists to fix, asserted.
+Start-TestForegroundWatch
+$td = New-TestDesktop -Interactive:$Interactive
+$launched = @()
+
+try {
+    if ($NegativeControl) {
+        Write-Host 'NEGATIVE CONTROL: run 3 asserts the overlay paints the DEFAULT background instead of the configured fill - this run MUST fail'
     }
-    Write-Host 'OK    positive control: injection reaches bindings (clear_screen dispatched)'
-} else {
-    Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
+
+    # -----------------------------------------------------------------------
+    # Run 1: defaults (opacity 0.7 -> alpha 77, fill = background).
+    # The background is pinned so the "fill defaults to the background color"
+    # half is an exact color, and so it differs from run 3's fill.
+    # -----------------------------------------------------------------------
+    $g = Start-Gui 'default' @('--background=#101014') $true
+    $app = $g.App; $top = $g.Top
+    $launched += $script:GhozttyTestDesktopPids
+    $A = $g.Panes | Sort-Object Top | Select-Object -First 1   # top pane
+    $B = $g.Panes | Sort-Object Top | Select-Object -Last 1    # bottom pane (focused after split)
+
+    # Positive control: ctrl+k reaches binding dispatch (debug log only).
+    $r = Send-TestKeys -Window $top -Target ([IntPtr]$B.Hwnd) -Modifiers ctrl -Key K
+    if (-not $r) { Write-Host 'ABORT: control chord not sent'; Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; exit 1 }
+    Start-Sleep -Milliseconds 300
+    if (Test-Path $errlog) {
+        if (-not (Select-String -Path $errlog -Pattern 'clear_screen' -Quiet)) {
+            Write-Host 'ABORT: positive control failed (clear_screen never dispatched) - injection broken, not a T74 verdict'
+            Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue; exit 1
+        }
+        Write-Host 'OK    positive control: injection reaches bindings (clear_screen dispatched)'
+    } else {
+        Write-Host 'OK    positive control degraded: no debug log (release build), chord delivery only'
+    }
+
+    # @() wraps: PS 5.1 unrolls a one-element function return to a scalar
+    # pscustomobject, which has no intrinsic .Count.
+    $ov = @(Wait-OverlayOver $app.Pid $A)
+    Assert ($ov.Count -eq 1) "default: exactly one visible dim overlay ($($ov.Count))"
+    if ($ov.Count -eq 1) {
+        Assert (Rects-Match $ov[0] $A) "default: overlay covers the UNFOCUSED (top) pane"
+        Assert (-not (Rects-Match $ov[0] $B)) "default: overlay does not cover the focused pane"
+        $la = Get-TestLayeredAttrs -Window ([IntPtr]$ov[0].Hwnd)
+        Assert ($la.Ok -and $la.Alpha -eq 77) "default: layered alpha is 77 = (1-0.7)*255 (got $($la.Alpha))"
+        $ex = Get-TestWindowStyle -Window ([IntPtr]$ov[0].Hwnd) -ExStyle
+        # WS_EX_LAYERED(0x80000) + WS_EX_TRANSPARENT(0x20) + WS_EX_NOACTIVATE(0x8000000)
+        Assert (($ex -band 0x80000) -ne 0) "default: overlay is WS_EX_LAYERED"
+        Assert (($ex -band 0x20) -ne 0) "default: overlay is WS_EX_TRANSPARENT (click-through)"
+        Assert (($ex -band 0x8000000) -ne 0) "default: overlay is WS_EX_NOACTIVATE"
+        # The fill DEFAULTS to the background color, pinned exactly. Paired
+        # with run 3's #ff0000 this is what proves the capture tracks config.
+        $fill = Get-OverlayFill $ov[0]
+        Assert ($fill -eq '16,16,20') "default: overlay paints the background color #101014 (got $fill)"
+    }
+
+    # Focus flip: ctrl+alt+up focuses pane A -> overlay must move to pane B.
+    $r = Send-TestKeys -Window $top -Target ([IntPtr]$B.Hwnd) -Modifiers ctrl,alt -Key Up
+    Assert $r "default: goto-up chord delivered"
+    $ov = @(Wait-OverlayOver $app.Pid $B)
+    Assert ($ov.Count -eq 1 -and (Rects-Match $ov[0] $B)) "default: focus flip moved the overlay to pane B"
+
+    # Zoom pane A (now focused): overlays must all hide.
+    $r = Send-TestKeys -Window $top -Target ([IntPtr]$A.Hwnd) -Modifiers ctrl,shift -Key Enter
+    Assert $r "default: zoom chord delivered"
+    Start-Sleep -Milliseconds 600
+    $ov = @(Get-Overlays $app.Pid | Where-Object Visible)
+    Assert ($ov.Count -eq 0) "default: zoomed -> no visible overlay ($($ov.Count))"
+
+    # Unzoom: the dim overlay comes back over the unfocused pane B.
+    $r = Send-TestKeys -Window $top -Target ([IntPtr]$A.Hwnd) -Modifiers ctrl,shift -Key Enter
+    Assert $r "default: unzoom chord delivered"
+    $ov = @(Wait-OverlayOver $app.Pid $B)
+    Assert ($ov.Count -eq 1 -and (Rects-Match $ov[0] $B)) "default: unzoom restored the overlay over pane B"
+
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'default: no crash'
+    Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
+
+    # -----------------------------------------------------------------------
+    # Run 2: opacity=1 disables the feature entirely.
+    # -----------------------------------------------------------------------
+    $g = Start-Gui 'opacity=1' @('--unfocused-split-opacity=1') $false
+    $app = $g.App
+    $launched += $script:GhozttyTestDesktopPids
+    Start-Sleep -Milliseconds 500
+    $ov = @(Get-Overlays $app.Pid | Where-Object Visible)
+    Assert ($ov.Count -eq 0) "opacity=1: no visible overlay ($($ov.Count))"
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'opacity=1: no crash'
+    Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
+
+    # -----------------------------------------------------------------------
+    # Run 3: custom opacity + fill; verify alpha and the painted fill.
+    # -----------------------------------------------------------------------
+    $g = Start-Gui 'custom' @('--unfocused-split-opacity=0.5', '--unfocused-split-fill=#ff0000', '--background=#000000') $false
+    $app = $g.App
+    $launched += $script:GhozttyTestDesktopPids
+    $A = $g.Panes | Sort-Object Top | Select-Object -First 1
+    $ov = @(Wait-OverlayOver $app.Pid $A)
+    Assert ($ov.Count -eq 1) "custom: one visible overlay"
+    if ($ov.Count -eq 1) {
+        $la = Get-TestLayeredAttrs -Window ([IntPtr]$ov[0].Hwnd)
+        Assert ($la.Ok -and $la.Alpha -eq 128) "custom: layered alpha is 128 = (1-0.5)*255 (got $($la.Alpha))"
+        # The migrated oracle (see header), so this is what -NegativeControl
+        # inverts: if it cannot fail, the migration proved nothing.
+        $fill = Get-OverlayFill $ov[0]
+        $want = if ($NegativeControl) { '16,16,20' } else { '255,0,0' }
+        $script:negReached = $true
+        Assert ($fill -eq $want) "custom: overlay paints the configured fill #ff0000 (want $want, got $fill)"
+    }
+    Assert (-not ($app.Process -and $app.Process.HasExited)) 'custom: no crash'
+    Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
+} finally {
+    Remove-TestDesktop
+    Stop-RepoInstances
 }
 
-# @() wraps: PS 5.1 unrolls a one-element function return to a scalar
-# pscustomobject, which has no intrinsic .Count.
-$ov = @(Wait-OverlayOver ([uint32]$proc.Id) $A)
-Assert ($ov.Count -eq 1) "default: exactly one visible dim overlay ($($ov.Count))"
-if ($ov.Count -eq 1) {
-    Assert (Rects-Match $ov[0] $A) "default: overlay covers the UNFOCUSED (top) pane"
-    Assert (-not (Rects-Match $ov[0] $B)) "default: overlay does not cover the focused pane"
-    Assert ($ov[0].Alpha -eq 77) "default: layered alpha is 77 = (1-0.7)*255 (got $($ov[0].Alpha))"
-    # WS_EX_LAYERED(0x80000) + WS_EX_TRANSPARENT(0x20) + WS_EX_NOACTIVATE(0x8000000)
-    Assert (($ov[0].ExStyle -band 0x80000) -ne 0) "default: overlay is WS_EX_LAYERED"
-    Assert (($ov[0].ExStyle -band 0x20) -ne 0) "default: overlay is WS_EX_TRANSPARENT (click-through)"
-    Assert (($ov[0].ExStyle -band 0x8000000) -ne 0) "default: overlay is WS_EX_NOACTIVATE"
+# The user's actual complaint, asserted rather than assumed. Runs AFTER the
+# cleanup, so it reads the surviving all-pids list - the live one is emptied by
+# Remove-TestDesktop and would score against nothing (T217 batch 3).
+$fgSeen = @(Stop-TestForegroundWatch)
+Write-Host "foreground pids seen on the interactive desktop: $($fgSeen -join ' ')"
+if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
+    $launched = @($launched | Select-Object -Unique)
+    Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
+    $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
+    Assert ($leaked.Count -eq 0) "no test-desktop app ever became foreground on the interactive desktop (saw $($leaked -join ','))"
 }
 
-# Focus flip: ctrl+alt+up focuses pane A -> overlay must move to pane B.
-$r = [DimDrv]::Chord($top, [IntPtr]$B.Hwnd, [uint16[]]@(0x11, 0x12), 0x26)
-Assert ($r -eq 'SENT') "default: goto-up chord delivered ($r)"
-$ov = @(Wait-OverlayOver ([uint32]$proc.Id) $B)
-Assert ($ov.Count -eq 1 -and (Rects-Match $ov[0] $B)) "default: focus flip moved the overlay to pane B"
-
-# Zoom pane A (now focused): overlays must all hide.
-$r = [DimDrv]::Chord($top, [IntPtr]$A.Hwnd, [uint16[]]@(0x11, 0x10), 0x0D)
-Assert ($r -eq 'SENT') "default: zoom chord delivered ($r)"
-Start-Sleep -Milliseconds 600
-$ov = @(Parse-Overlays ([DimDrv]::Overlays([uint32]$proc.Id)) | Where-Object Visible)
-Assert ($ov.Count -eq 0) "default: zoomed -> no visible overlay ($($ov.Count))"
-
-# Unzoom: the dim overlay comes back over the unfocused pane B.
-$r = [DimDrv]::Chord($top, [IntPtr]$A.Hwnd, [uint16[]]@(0x11, 0x10), 0x0D)
-Assert ($r -eq 'SENT') "default: unzoom chord delivered ($r)"
-$ov = @(Wait-OverlayOver ([uint32]$proc.Id) $B)
-Assert ($ov.Count -eq 1 -and (Rects-Match $ov[0] $B)) "default: unzoom restored the overlay over pane B"
-
-Assert (-not $proc.HasExited) 'default: no crash'
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-
-# ---------------------------------------------------------------------------
-# Run 2: opacity=1 disables the feature entirely.
-# ---------------------------------------------------------------------------
-$g = Start-Gui 'opacity=1' @('--unfocused-split-opacity=1') $false
-$proc = $g.Proc
-Start-Sleep -Milliseconds 500
-$ov = @(Parse-Overlays ([DimDrv]::Overlays([uint32]$proc.Id)) | Where-Object Visible)
-Assert ($ov.Count -eq 0) "opacity=1: no visible overlay ($($ov.Count))"
-Assert (-not $proc.HasExited) 'opacity=1: no crash'
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-
-# ---------------------------------------------------------------------------
-# Run 3: custom opacity + fill; verify alpha and the on-screen blend.
-# ---------------------------------------------------------------------------
-$g = Start-Gui 'custom' @('--unfocused-split-opacity=0.5', '--unfocused-split-fill=#ff0000', '--background=#000000') $false
-$proc = $g.Proc; $top = $g.Top
-$A = $g.Panes | Sort-Object Top | Select-Object -First 1
-$ov = @(Wait-OverlayOver ([uint32]$proc.Id) $A)
-Assert ($ov.Count -eq 1) "custom: one visible overlay"
-if ($ov.Count -eq 1) {
-    Assert ($ov[0].Alpha -eq 128) "custom: layered alpha is 128 = (1-0.5)*255 (got $($ov[0].Alpha))"
-    # Blend check: red fill at 50% over a black terminal background reads
-    # back as dark red. Bring the window to front, sample below the pane
-    # center (away from the prompt line at the top).
-    [DimDrv]::GrabForeground($top) | Out-Null
-    Start-Sleep -Milliseconds 200
-    $cx = [int](($A.Left + $A.Right) / 2)
-    $cy = [int](($A.Top + $A.Bottom) / 2) + 30
-    $px = ([DimDrv]::ScreenPixel($cx, $cy)) -split ','
-    $rr = [int]$px[0]; $gg = [int]$px[1]; $bb = [int]$px[2]
-    Assert ($rr -ge 60 -and $rr -gt ($gg + 40) -and $rr -gt ($bb + 40)) "custom: dimmed pane pixel is red-tinted (got r=$rr g=$gg b=$bb)"
+# A -NegativeControl run that never reached the inverted assertion proves
+# nothing, and would otherwise report a clean pass.
+if ($NegativeControl -and -not $script:negReached) {
+    Assert $false 'NEGATIVE CONTROL never reached its inverted assertion'
 }
-Assert (-not $proc.HasExited) 'custom: no crash'
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
