@@ -339,6 +339,15 @@ pub const Glyph = enum {
     maximize,
     /// "❐" — restore a maximized window (ChromeRestore).
     restore,
+    /// "…" — the window menu, hosted in the caption bar (T234).
+    ///
+    /// A second glyph for the same command the hamburger opens, and
+    /// deliberately not the hamburger itself: "≡" reads as a menu BAR (the
+    /// strip's own control), while "…" is what Windows uses for "more
+    /// commands" in a titlebar/command-bar cluster. Sharing the glyph across
+    /// the two hosts would make the caption look like a duplicate of the
+    /// strip rather than its overflow.
+    overflow,
 };
 
 /// The maximum quads any glyph needs, so callers can size a stack buffer.
@@ -543,6 +552,33 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
                 .bottom = b.bottom - off,
             });
             return out[0 .. used.len + 2];
+        },
+        .overflow => {
+            // Three square dots on the mark box's center line, spanning the
+            // same `mark_caption` extent as the three system glyphs beside it
+            // — it is a fourth member of that cluster, so it is sized by the
+            // same number rather than by one of its own.
+            //
+            // Built middle-out and mirrored: the middle dot is centered, the
+            // left one is stepped off it, and the right one is the left one
+            // reflected. The two outer dots are therefore equidistant from
+            // the middle BY CONSTRUCTION, which is the same rule that fixed
+            // the hamburger's rules and the "+"'s arms.
+            const d = @max(t, 1);
+            const b = centered(target, m.mark_caption, d);
+            const mid = centered(b, d, d);
+            // Whatever is left of the box after the middle dot, split evenly
+            // between the two flanks: dot, gap, dot, gap, dot.
+            const step = @divTrunc(b.width() - d, 2);
+            out[0] = bar(.{
+                .left = mid.left - step,
+                .top = mid.top,
+                .right = mid.right - step,
+                .bottom = mid.bottom,
+            });
+            out[1] = bar(mid);
+            out[2] = mirrorX(out[0], b.left + b.right);
+            return out[0..3];
         },
     }
 }
@@ -773,6 +809,7 @@ const all_glyphs = [_]Glyph{
     .minimize,
     .maximize,
     .restore,
+    .overflow,
 };
 
 /// The painted square a strip button gets at `scale`, i.e. what the glyph
@@ -1045,6 +1082,49 @@ test "caption glyphs: restore's two squares fill the mark box between them" {
         // The offset always clears the stroke, or the back square's edges
         // merge into the front one's and the glyph is a blob.
         try testing.expect(front.top - b.top > m.stroke_outline);
+    }
+}
+
+test "caption glyphs: the overflow dots are three, even, and never merge" {
+    // Three dots is the whole glyph, so the two failure modes are: the dots
+    // touch (it reads as a dash, which is `minimize`) or they are unevenly
+    // spaced (which is what a hand-placed third dot always does). Both are
+    // arithmetic, and both are invisible at 1.0 — swept finely, per §7.
+    var buf: [max_quads]Quad = undefined;
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const q = glyphQuads(m, t, .overflow, &buf);
+        try testing.expectEqual(@as(usize, 3), q.len);
+
+        const b = paintedBounds(q);
+        // It is a member of the caption cluster, so it spans that cluster's
+        // one extent — not a fourth number that happens to look similar.
+        try testing.expectEqual(m.mark_caption, b.width());
+
+        // Left → middle → right, each a square dot of the shared stroke.
+        const left = paintedBounds(q[0..1]);
+        const mid = paintedBounds(q[1..2]);
+        const right = paintedBounds(q[2..3]);
+        for ([_]Rect{ left, mid, right }) |dot| {
+            try testing.expectEqual(m.stroke_w, dot.width());
+            try testing.expectEqual(m.stroke_w, dot.height());
+            // One horizontal line: three dots that drifted vertically would
+            // read as an ellipsis falling over.
+            try testing.expectEqual(left.top, dot.top);
+        }
+
+        // Evenly spaced, and with a real gap: dots that touch are a dash.
+        const gap_l = mid.left - left.right;
+        const gap_r = right.left - mid.right;
+        try testing.expectEqual(gap_l, gap_r);
+        try testing.expect(gap_l >= 1);
+
+        // Flush with the mark box on both flanks, so the glyph's extent is
+        // the dots themselves rather than the dots plus a stray margin.
+        try testing.expectEqual(b.left, left.left);
+        try testing.expectEqual(b.right, right.right);
     }
 }
 

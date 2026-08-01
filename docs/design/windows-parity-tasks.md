@@ -173,11 +173,31 @@ Work these first, in order, before falling back to first-todo-in-table:
 
     Then the tasks that bring the chrome into compliance:
 
-    **~~T232~~ → ~~T242~~ → ~~T235~~ → ~~T233~~ → ~~T254~~ → ~~T256~~ → T234.**
+    **~~T232~~ → ~~T242~~ → ~~T235~~ → ~~T233~~ → ~~T254~~ → ~~T256~~ →
+    ~~T234~~. The UI quality block is done.**
 
-    **T234 is the immediate next task** — the big one: no tab strip at one tab,
-    and a "…" button in the caption bar left of minimize. T254 built the caption
-    it needs; what remains is the button rect plus the visibility rule.
+    **~~T234~~ (done, 2026-07-31)** was the big one, and it returned **50
+    physical px of terminal to every window at the user's 125%** (40 DIP, 2-3
+    rows), measured as the pane's own top: 45 px below the client top with one
+    tab, 95 with `--window-show-tab-bar=always`. Both halves shipped together
+    because they ARE one change — the strip could not go away while it was the
+    app's only menu host, which is what pinned `auto => true` on Windows from
+    T190 until here. `auto` is now `tab_count > 1 or !customCaption()`, and the
+    menu lives in the caption as a "…" button that answers **`HTSYSMENU`** (so
+    it takes Windows' own non-client path and announces itself correctly),
+    opens on PRESS like every menu bar, and sits `pad_md` — not `pad_sm` —
+    clear of the system trio because ours and the OS's are different GROUPS.
+    It deliberately does NOT get the top-right corner: that belongs to close.
+
+    Two follow-ups. **T260**: the strip's own hamburger was KEPT, and the why
+    is the task — it is still the only menu host on a caption-less window, so
+    it has to become *conditional*, which moves `runWidth`, the datum three
+    scripts key off. **T259**: `tab-color.ps1` has been red since T254/T235 for
+    exactly the reason T256 names, and T234 only changed which wrong number it
+    prints (`barH=45` now, 95 before; the strip is 50). Do it with **T257**.
+
+    The next UI item is **T205** (tabs INSIDE the titlebar), whose scope T234
+    just shrank to "the 2+-tab case".
 
     **~~T256~~ (done, 2026-07-31)** unblocked it and closed T254. The caption
     band moved the strip off client `y = 0`, and both scripts that measured it

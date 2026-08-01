@@ -40,9 +40,9 @@
 //!
 //! ## What is deliberately NOT here
 //!
-//! The "…" overflow button (T234) and the tab run (T205). Both will be slots
-//! in this same layout; leaving them out until their own task keeps this one
-//! auditable.
+//! The tab run (T205). It will be a slot in this same layout; leaving it out
+//! until its own task keeps this one auditable. The "…" overflow button
+//! arrived with T234 and IS here.
 
 const std = @import("std");
 const testing = std.testing;
@@ -52,10 +52,13 @@ const icon_button = @import("icon_button.zig");
 /// definition, in `icon_button.zig`.
 pub const Rect = icon_button.Rect;
 
-/// The three system commands the caption hosts. Ordered left-to-right as they
-/// are laid out, which is also Windows' order, which is also the order the
-/// muscle memory of every Windows user expects.
-pub const Button = enum { minimize, maximize, close };
+/// Everything clickable in the caption, ordered left-to-right as it is laid
+/// out. The three system commands are in Windows' order, which is also the
+/// order the muscle memory of every Windows user expects; the app's own "…"
+/// sits OUTSIDE that group, to its left, so it can never be mistaken for a
+/// fourth system button and can never be the thing under a pointer thrown at
+/// the top-right corner.
+pub const Button = enum { overflow, minimize, maximize, close };
 
 /// Every DIP constant the caption is built from, resolved to physical pixels
 /// for one DPI scale.
@@ -106,6 +109,13 @@ pub const Metrics = struct {
 /// extents, right/bottom exclusive, in client coordinates with the band's top
 /// at y = 0.
 pub const Layout = struct {
+    /// The "…" window-menu button (T234). Left of `minimize`, separated from
+    /// the system trio by `pad_md` rather than `pad_sm`: it is a different
+    /// GROUP of controls (ours vs the OS's), and the design system's answer to
+    /// "these are different groups" is one step up the spacing scale. The
+    /// alternative — an evenly-spaced run of four — is exactly the
+    /// undifferentiated cluster the "+"/"≡" pair was reported as.
+    overflow: Rect,
     minimize: Rect,
     maximize: Rect,
     close: Rect,
@@ -142,23 +152,28 @@ pub fn layout(m: Metrics, client_w: i32) Layout {
     const max: Rect = .{ .left = close.left - step, .top = top, .right = close.right - step, .bottom = bot };
     const min: Rect = .{ .left = max.left - step, .top = top, .right = max.right - step, .bottom = bot };
 
+    // The app's own button, one GROUP separation left of the system trio.
+    const over_r = min.left - m.pad_md;
+    const over: Rect = .{ .left = over_r - m.btn_paint, .top = top, .right = over_r, .bottom = bot };
+
     // The drag region ends where the leftmost button's HIT box begins — not
     // where its paint begins. A hit box must never contribute to a visible
     // gap (design system §0 rule 2), but it is exactly what decides where a
     // click stops being a drag.
-    const drag_right = min.left - innerPad(m);
+    const drag_right = over.left - innerPad(m);
 
     // The title stops `md` short of the button group, because they are
     // different groups of controls. A band with no room for both drops the
     // title; painting it under the buttons is worse than not painting it.
     const title_l = m.pad_md;
-    const title_r = min.left - m.pad_md;
+    const title_r = over.left - m.pad_md;
     const title: Rect = if (title_r > title_l)
         .{ .left = title_l, .top = 0, .right = title_r, .bottom = m.caption_h }
     else
         .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
 
     return .{
+        .overflow = over,
         .minimize = min,
         .maximize = max,
         .close = close,
@@ -202,6 +217,7 @@ fn innerPad(m: Metrics) i32 {
 pub fn hitBox(m: Metrics, l: Layout, b: Button) Rect {
     const inner = innerPad(m);
     const painted = switch (b) {
+        .overflow => l.overflow,
         .minimize => l.minimize,
         .maximize => l.maximize,
         .close => l.close,
@@ -221,10 +237,14 @@ pub fn hitBox(m: Metrics, l: Layout, b: Button) Rect {
 /// the part most likely to be wrong in a way nothing notices — a maximize
 /// button that always sends `SC_MAXIMIZE` looks perfect until you click it on
 /// an already-maximized window and nothing happens.
-pub const Command = enum { minimize, maximize, restore, close };
+pub const Command = enum { minimize, maximize, restore, close, menu };
 
 pub fn command(b: Button, maximized: bool) Command {
     return switch (b) {
+        // Not a `WM_SYSCOMMAND` at all — the caller opens the app's own menu.
+        // It is in this enum anyway so that "what does this button do" has
+        // exactly one answer, decided in the pure module with the rest.
+        .overflow => .menu,
         .minimize => .minimize,
         .maximize => if (maximized) .restore else .maximize,
         .close => .close,
@@ -242,6 +262,7 @@ pub fn hitTest(m: Metrics, l: Layout, x: i32, y: i32) ?Button {
     if (hitBox(m, l, .close).containsPoint(x, y)) return .close;
     if (hitBox(m, l, .maximize).containsPoint(x, y)) return .maximize;
     if (hitBox(m, l, .minimize).containsPoint(x, y)) return .minimize;
+    if (hitBox(m, l, .overflow).containsPoint(x, y)) return .overflow;
     return null;
 }
 
@@ -263,6 +284,7 @@ pub const NcHit = enum {
     top,
     top_left,
     top_right,
+    overflow,
     minimize,
     maximize,
     close,
@@ -298,6 +320,7 @@ pub fn ncHitTest(
     }
 
     if (hitTest(m, l, x, y)) |b| return switch (b) {
+        .overflow => .overflow,
         .minimize => .minimize,
         .maximize => .maximize,
         .close => .close,
@@ -356,7 +379,7 @@ test "every caption button paints the same square on one vertical frame" {
     for (scales) |s| {
         const m = Metrics.init(s);
         const l = layout(m, 1200);
-        const all = [_]Rect{ l.minimize, l.maximize, l.close };
+        const all = [_]Rect{ l.overflow, l.minimize, l.maximize, l.close };
         for (all) |r| {
             try testing.expectEqual(m.btn_paint, r.width());
             try testing.expectEqual(m.btn_paint, r.height());
@@ -370,15 +393,19 @@ test "nothing touches: painted gaps are exactly one spacing step" {
     for (scales) |s| {
         const m = Metrics.init(s);
         const l = layout(m, 1200);
-        // Button to button, measured between PAINTED edges.
+        // Button to button WITHIN the system trio, between PAINTED edges.
         try testing.expectEqual(m.pad_sm, l.maximize.left - l.minimize.right);
         try testing.expectEqual(m.pad_sm, l.close.left - l.maximize.right);
+        // Our "…" to the system trio: a GROUP separation, so `md`. This is
+        // the one gap in the band that is deliberately NOT `sm`, and it is
+        // what keeps four squares from reading as one undifferentiated run.
+        try testing.expectEqual(m.pad_md, l.minimize.left - l.overflow.right);
         // Group to the window's right edge, and to the band's top/bottom.
         try testing.expectEqual(m.pad_sm, 1200 - l.close.right);
         try testing.expectEqual(m.pad_sm, l.close.top);
         try testing.expectEqual(m.pad_sm, m.caption_h - l.close.bottom);
         // Title to the button group: a GROUP separation, so `md`.
-        try testing.expectEqual(m.pad_md, l.minimize.left - l.title.right);
+        try testing.expectEqual(m.pad_md, l.overflow.left - l.title.right);
         try testing.expectEqual(m.pad_md, l.title.left);
     }
 }
@@ -393,13 +420,16 @@ test "caption button hit boxes never overlap each other" {
     while (s <= 3.0) : (s += 0.05) {
         const m = Metrics.init(s);
         const l = layout(m, 1200);
+        const hover = hitBox(m, l, .overflow);
         const hmin = hitBox(m, l, .minimize);
         const hmax = hitBox(m, l, .maximize);
         const hclose = hitBox(m, l, .close);
+        try testing.expect(hover.right <= hmin.left);
         try testing.expect(hmin.right <= hmax.left);
         try testing.expect(hmax.right <= hclose.left);
         // Each box still contains the whole square it stands for, or the
         // "forgiving target" has been forgiving in the wrong direction.
+        try testing.expect(hover.left <= l.overflow.left and hover.right >= l.overflow.right);
         try testing.expect(hmin.left <= l.minimize.left and hmin.right >= l.minimize.right);
         try testing.expect(hmax.left <= l.maximize.left and hmax.right >= l.maximize.right);
         try testing.expect(hclose.left <= l.close.left and hclose.right >= l.close.right);
@@ -411,6 +441,7 @@ test "hitTest finds each button and nothing between or outside them" {
         const m = Metrics.init(s);
         const l = layout(m, 1200);
         const cy = @divTrunc(m.caption_h, 2);
+        try testing.expectEqual(Button.overflow, hitTest(m, l, l.overflow.left + 1, cy).?);
         try testing.expectEqual(Button.minimize, hitTest(m, l, l.minimize.left + 1, cy).?);
         try testing.expectEqual(Button.maximize, hitTest(m, l, l.maximize.left + 1, cy).?);
         try testing.expectEqual(Button.close, hitTest(m, l, l.close.left + 1, cy).?);
@@ -449,8 +480,8 @@ test "drag region ends at the leftmost button's hit box, not its paint" {
         try testing.expect(isDragRegion(m, l, l.drag_right - 1, 1));
         try testing.expect(!isDragRegion(m, l, l.drag_right, 1));
         // The boundary is the hit box: a click one pixel left of the painted
-        // minimize square must still be a drag, not a lost click.
-        try testing.expectEqual(hitBox(m, l, .minimize).left, l.drag_right);
+        // "…" square must still be a drag, not a lost click.
+        try testing.expectEqual(hitBox(m, l, .overflow).left, l.drag_right);
         // And nothing in the drag region hit-tests as a button.
         try testing.expect(hitTest(m, l, l.drag_right - 1, 1) == null);
     }
@@ -489,6 +520,7 @@ test "ncHitTest: resize edges are asked BEFORE buttons, and only when restored" 
 
         // Each button answers for itself below the resize edge.
         const y = m.caption_h - 1;
+        try testing.expectEqual(NcHit.overflow, ncHitTest(m, l, l.overflow.left + 1, y, frame, false));
         try testing.expectEqual(NcHit.minimize, ncHitTest(m, l, l.minimize.left + 1, y, frame, false));
         try testing.expectEqual(NcHit.maximize, ncHitTest(m, l, l.maximize.left + 1, y, frame, false));
         try testing.expectEqual(NcHit.close, ncHitTest(m, l, l.close.left + 1, y, frame, false));
@@ -517,15 +549,18 @@ test "ncHitTest: the gap between two buttons drags, it never falls to client" {
 test "a narrow window drops the title instead of painting it under the buttons" {
     for (scales) |s| {
         const m = Metrics.init(s);
-        // Just wide enough for the three buttons and their insets, and no
+        // Just wide enough for the four buttons and their insets, and no
         // more: there is nowhere for a title to go.
-        const narrow = 3 * m.btn_paint + 4 * m.pad_sm;
+        const narrow = 4 * m.btn_paint + 4 * m.pad_sm + m.pad_md;
         const l = layout(m, narrow);
         try testing.expect(l.title.isEmpty());
         // The buttons themselves are still laid out correctly — a cramped
-        // window loses its title, never its close button.
+        // window loses its title, never its close button, and never the only
+        // route to the menu.
         try testing.expectEqual(m.pad_sm, narrow - l.close.right);
         try testing.expectEqual(m.pad_sm, l.maximize.left - l.minimize.right);
+        try testing.expectEqual(m.pad_md, l.minimize.left - l.overflow.right);
+        try testing.expect(l.overflow.left >= 0);
     }
 }
 
@@ -554,6 +589,10 @@ test "command: the maximize button is a TOGGLE, the other two are not" {
     try testing.expectEqual(Command.minimize, command(.minimize, true));
     try testing.expectEqual(Command.close, command(.close, false));
     try testing.expectEqual(Command.close, command(.close, true));
+    // ...and the "…" is the app's menu in either state — it is not a system
+    // command at all, which is why it has its own `Command`.
+    try testing.expectEqual(Command.menu, command(.overflow, false));
+    try testing.expectEqual(Command.menu, command(.overflow, true));
 }
 
 test "layout is stable under width changes: only the anchor moves" {
@@ -566,6 +605,7 @@ test "layout is stable under width changes: only the anchor moves" {
         const b = layout(m, 1000);
         try testing.expectEqual(@as(i32, 200), b.close.left - a.close.left);
         try testing.expectEqual(@as(i32, 200), b.minimize.left - a.minimize.left);
+        try testing.expectEqual(@as(i32, 200), b.overflow.left - a.overflow.left);
         try testing.expectEqual(@as(i32, 200), b.drag_right - a.drag_right);
         try testing.expectEqual(a.title.left, b.title.left);
         try testing.expectEqual(@as(i32, 200), b.title.right - a.title.right);

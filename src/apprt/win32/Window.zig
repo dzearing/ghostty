@@ -2865,16 +2865,24 @@ fn updateTabBarVisibility(self: *Window) void {
     const show_config = self.app.config.@"window-show-tab-bar";
     const should_show = switch (show_config) {
         .always => true,
-        // `auto` means "show the strip when it has something to show". On
-        // macOS that is tabs alone, because the app menu lives in the system
-        // menu bar, which is always there. Windows has no such bar, so since
-        // T190 the strip is ALSO the app's menu host (the ≡ button) — and a
-        // menu you can only see once you happen to open a second tab is the
-        // same "there's no way to get to the menu" the user reported in the
-        // first place. So on Windows the strip has something to show from the
-        // first window, and `never` remains the opt-out (F10 / a lone Alt /
-        // the command palette still reach the menu there).
-        .auto => true,
+        // `auto` means "show the strip when it has something to show", which
+        // is tabs — a strip at one tab spends 40 DIP (2-3 terminal rows, of
+        // every window, forever) displaying a choice that does not exist.
+        // Mac has never shown one, so this is parity.
+        //
+        // The catch, and why this was `=> true` between T190 and T234: on
+        // Windows there is no system menu bar, so the strip was ALSO the
+        // app's only menu host, and a menu you can reach only by opening a
+        // second tab is the "there's no way to get to the menu" report that
+        // put the "≡" there in the first place. T234 moved that duty to the
+        // caption's "…", so the strip is free to go — but ONLY on a window
+        // that draws its own caption. A `window-decoration = none` window has
+        // no caption to host the button, so there the strip stays and keeps
+        // being the menu host.
+        //
+        // (The quick terminal returned above, and `never` remains the opt-out
+        // — F10 / a lone Alt / the command palette still reach the menu.)
+        .auto => self.tab_count > 1 or !self.customCaption(),
         .never => false,
     };
     if (should_show != self.tab_bar_visible) {
@@ -2964,6 +2972,14 @@ fn handleCaptionHitTest(self: *Window, lparam: isize) ?isize {
         .top_left => w32.HTTOPLEFT,
         .top_right => w32.HTTOPRIGHT,
         .caption => w32.HTCAPTION,
+        // HTSYSMENU is Windows' own code for "the control that opens this
+        // window's menu" — normally the icon at the top LEFT. Reusing it
+        // rather than inventing a private code is what makes the button
+        // announce itself correctly to assistive tech and take the same
+        // non-client mouse path as its three neighbours. Its one piece of
+        // DefWindowProc baggage (double-click closes the window) is swallowed
+        // at the `WM_NCLBUTTONDBLCLK` site.
+        .overflow => w32.HTSYSMENU,
         .minimize => w32.HTMINBUTTON,
         // HTMAXBUTTON is not decoration: the Snap Layouts flyout is triggered
         // by the OS watching for this hit-test code. Return anything else and
@@ -2977,6 +2993,7 @@ fn handleCaptionHitTest(self: *Window, lparam: isize) ?isize {
 /// code Windows already computed for us in `wparam`.
 fn captionButtonFor(code: usize) ?caption_layout.Button {
     return switch (@as(isize, @bitCast(code))) {
+        w32.HTSYSMENU => .overflow,
         w32.HTMINBUTTON => .minimize,
         w32.HTMAXBUTTON => .maximize,
         w32.HTCLOSE => .close,
@@ -3045,6 +3062,18 @@ fn clearCaptionPress(self: *Window) void {
 fn handleNcLButtonDown(self: *Window, wparam: usize) bool {
     if (!self.customCaption()) return false;
     const btn = captionButtonFor(wparam) orelse return false;
+
+    // A menu button opens on PRESS, not on release — every Windows menu bar
+    // does, and so does the strip's own "≡", which this button duplicates.
+    // `openMenuBar` blocks in `TrackPopupMenuEx` and the popup swallows the
+    // matching release, so there is no press state to arm and nothing to
+    // clear afterwards. Nothing touches `self` after this call: a menu
+    // command can be Close Window, which frees this allocation.
+    if (btn == .overflow) {
+        self.openMenuBarAt(.caption);
+        return true;
+    }
+
     self.caption_pressed = btn;
     // Deliberately does NOT set `caption_hover`. Hover belongs to
     // `WM_NCMOUSEMOVE` alone; setting it here latched a hover fill that
@@ -3075,6 +3104,11 @@ fn handleNcLButtonUp(self: *Window, wparam: usize) bool {
         .maximize => w32.SC_MAXIMIZE,
         .restore => w32.SC_RESTORE,
         .close => w32.SC_CLOSE,
+        // The "…" never arms a press (it opened on the way down), so its
+        // release has nothing to fire. Handled rather than `unreachable`: a
+        // stray release is a message-ordering accident, not a bug worth
+        // crashing a terminal over.
+        .menu => return true,
     };
     _ = w32.PostMessageW(hwnd, w32.WM_SYSCOMMAND, cmd, 0);
     return true;
@@ -3157,6 +3191,7 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
         rect: caption_layout.Rect,
         glyph: icon_button.Glyph,
     }{
+        .{ .b = .overflow, .rect = l.overflow, .glyph = .overflow },
         .{ .b = .minimize, .rect = l.minimize, .glyph = .minimize },
         .{
             .b = .maximize,
@@ -3168,6 +3203,11 @@ fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
     for (buttons) |btn| {
         const state: icon_button.State = if (self.caption_pressed == btn.b)
             .pressed
+        else if (btn.b == .overflow and self.menu_open)
+            // Stays lit for the life of the popup, the Windows menu-button
+            // idiom the strip's "≡" already follows. Without it the button
+            // goes dark the instant the menu it opened appears.
+            .active
         else if (self.caption_hover == btn.b)
             .hover
         else
@@ -3813,7 +3853,7 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
     // right, so the two rects never overlap, but ordering the more specific
     // one first keeps a future layout change from silently swallowing it.
     if (x >= self.menu_btn_rect.left and x < self.menu_btn_rect.right) {
-        self.openMenuBar();
+        self.openMenuBarAt(.strip);
         return;
     }
 
@@ -3994,19 +4034,47 @@ const TAB_CTX_COLOR_BASE: usize = 9100;
 // (T189). Nothing below decides what a command DOES — it only builds the
 // HMENU, tracks it, and hands the result back to that one dispatcher.
 
-/// Open the menu system at the tab strip's "≡" button.
+/// Which control the menu popup hangs from (T234).
+///
+/// Since T234 there are two hosts for one menu — the caption's "…" and, when
+/// the strip is showing, its "≡" — and a popup must appear under the control
+/// the user actually clicked. Anchoring both at one of them puts the menu a
+/// band away from the pointer, which reads as the click having missed.
+pub const MenuAnchor = enum {
+    /// Whichever host this window has: the caption button when it draws its
+    /// own caption, else the strip. Used by F10 / a lone Alt, which have no
+    /// pointer to be near.
+    auto,
+    caption,
+    strip,
+};
+
+/// Open the menu system, hanging the popup off whichever button opened it.
 ///
 /// Also the target of F10 and a lone Alt press (Surface.handleKeyEvent), so
 /// the classic Windows menu-bar activation lands on the same popup as the
 /// click — the button is where the user is told to look.
 pub fn openMenuBar(self: *Window) void {
+    self.openMenuBarAt(.auto);
+}
+
+pub fn openMenuBarAt(self: *Window, anchor: MenuAnchor) void {
     const hwnd = self.hwnd orelse return;
     if (self.menu_open) return;
+
+    const use_caption = switch (anchor) {
+        .caption => true,
+        .strip => false,
+        .auto => self.customCaption(),
+    };
 
     // Bottom-left of the button, so the popup hangs off it the way a menu
     // bar's does. Before the first paint the rect is zeroed; the top-left of
     // the client area is the sane fallback and still lands under the strip.
-    var pt = w32.POINT{
+    var pt = if (use_caption) blk: {
+        const l = self.captionLayout() orelse break :blk w32.POINT{ .x = 0, .y = self.captionHeight() };
+        break :blk w32.POINT{ .x = l.overflow.left, .y = self.captionHeight() };
+    } else w32.POINT{
         .x = self.menu_btn_rect.left,
         // Strip-local → client: every strip rect has the strip's own top at
         // 0, and `tabBarTop()` is the one place that offset is applied.
@@ -4027,6 +4095,7 @@ pub fn openMenuBar(self: *Window) void {
     // idiom) and repaint immediately — TrackPopupMenuEx blocks below.
     self.menu_open = true;
     self.invalidateTabBar();
+    self.invalidateCaption(); // the "…" latches too, and it may be the only host
     _ = w32.UpdateWindow(hwnd);
 
     const cmd = w32.TrackPopupMenuEx(
@@ -4045,6 +4114,7 @@ pub fn openMenuBar(self: *Window) void {
     // use-after-free, so nothing does.
     self.menu_open = false;
     self.invalidateTabBar();
+    self.invalidateCaption();
 
     if (cmd <= 0) return; // 0 = dismissed without choosing
     const id = menu_bar.fromMenuCommandId(@intCast(cmd)) orelse {
@@ -4747,9 +4817,16 @@ pub fn windowWndProc(
             // maximize: Windows sends DOWN, UP, DBLCLK, UP for the pair, and
             // letting DefWindowProc see the DBLCLK over our close button
             // would maximize the window out from under the second click.
-            if (captionButtonFor(wparam) != null and window.customCaption()) {
-                _ = window.handleNcLButtonDown(wparam);
-                return 0;
+            if (captionButtonFor(wparam)) |btn| {
+                if (window.customCaption()) {
+                    // The "…" is HTSYSMENU, and DefWindowProc's meaning for a
+                    // double-click there is SC_CLOSE — the app-icon idiom.
+                    // Swallowed outright rather than re-opened: the first
+                    // press already opened the menu (and blocked), so this
+                    // message only ever arrives out of that order.
+                    if (btn != .overflow) _ = window.handleNcLButtonDown(wparam);
+                    return 0;
+                }
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },

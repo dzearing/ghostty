@@ -71,7 +71,7 @@ function Bad([string]$msg) { $script:fail++; Write-Host "  FAIL  $msg" }
 function Check([bool]$cond, [string]$msg) { if ($cond) { Ok $msg } else { Bad $msg } }
 
 # win32 hit-test codes (win32.zig).
-$HTCAPTION = 2; $HTMINBUTTON = 8; $HTMAXBUTTON = 9; $HTTOP = 12
+$HTCAPTION = 2; $HTSYSMENU = 3; $HTMINBUTTON = 8; $HTMAXBUTTON = 9; $HTTOP = 12
 $HTTOPLEFT = 13; $HTTOPRIGHT = 14; $HTCLOSE = 20
 $WM_NCHITTEST = 0x0084; $WM_NCLBUTTONDOWN = 0x00A1; $WM_NCLBUTTONUP = 0x00A2
 
@@ -102,7 +102,10 @@ try {
 
     $proc = Start-OnTestDesktop -Exe $exe -Arguments @(
         '--config-default-files=false',
-        '--session-persistence=off',
+        # `false`, not the documented `off`: the bool parser takes true/false
+        # only and swallows the error, so `=off` silently leaves persistence ON
+        # and this run restores the previous one's layout (T137).
+        '--session-persistence=false',
         '--background=#000000',
         # No strip: the row under the caption must be TERMINAL background, or
         # the band's bottom edge has no color boundary to scan for (the strip
@@ -163,13 +166,18 @@ try {
     # apart. Same arithmetic as caption_layout.layout, deliberately restated
     # here from the DIP constants rather than read out of the binary.
     $step = $btn + $padSm
+    $padMd = Px 8 $scale
     $closeL = $cli.Width - $padSm - $btn
     $maxL = $closeL - $step
     $minL = $maxL - $step
+    # T234's "..." sits one GROUP step (pad_md, not pad_sm) left of minimize:
+    # it is the app's button, not the OS's, and an evenly spaced run of four
+    # would read as one undifferentiated cluster.
+    $overL = $minL - $padMd - $btn
     $cy = $win.Top + [int]($expectCapH / 2)
-    $names = @('minimize', 'maximize', 'close')
-    $lefts = @($minL, $maxL, $closeL)
-    for ($i = 0; $i -lt 3; $i++) {
+    $names = @('overflow', 'minimize', 'maximize', 'close')
+    $lefts = @($overL, $minL, $maxL, $closeL)
+    for ($i = 0; $i -lt 4; $i++) {
         $cx = $win.Left + $borderX + $lefts[$i] + [int]($btn / 2)
         # A glyph pixel: bright against the ~20-level chrome. Sampled over the
         # square's middle row, because a 1 DIP outline stroke does not
@@ -186,10 +194,18 @@ try {
     $gapX = $win.Left + $borderX + $maxL - [int]($padSm / 2) - 1
     $gapC = Get-TestPixel -Shot $shot -X $gapX -Y $cy
     Check ($null -ne $gapC -and $gapC.R -lt 60) "the gap between minimize and maximize is plain chrome"
+    # ...and the WIDER gap that separates our button from the system trio. If
+    # "..." were laid out with pad_sm like a fourth system button, its square
+    # would reach into this column.
+    $groupX = $win.Left + $borderX + $minL - [int]($padMd / 2)
+    $groupC = Get-TestPixel -Shot $shot -X $groupX -Y $cy
+    Check ($null -ne $groupC -and $groupC.R -lt 60) `
+        "the '...' is one GROUP step clear of minimize, not jammed against it"
     Close-TestWindowPixels $shot
 
     # --- 3. WM_NCHITTEST, including the Snap Layouts code --------------------
     $bandY = $win.Top + $expectCapH - 2
+    $hitOver = HitAt $h ($win.Left + $borderX + $overL + [int]($btn / 2)) $bandY
     $hitMin = HitAt $h ($win.Left + $borderX + $minL + [int]($btn / 2)) $bandY
     $hitMax = HitAt $h ($win.Left + $borderX + $maxL + [int]($btn / 2)) $bandY
     $hitClose = HitAt $h ($win.Left + $borderX + $closeL + [int]($btn / 2)) $bandY
@@ -198,6 +214,7 @@ try {
     # The CLIENT area's top-right corner. Past it is the window's right sizing
     # border, which WM_NCCALCSIZE left with the OS on purpose.
     $hitCorner = HitAt $h ($win.Left + $borderX + $cli.Width - 1) ($win.Top + $expectCapH - 2)
+    Check ($hitOver -eq $HTSYSMENU) "hit test over the '...' -> HTSYSMENU (got $hitOver)"
     Check ($hitMin -eq $HTMINBUTTON) "hit test over minimize -> HTMINBUTTON (got $hitMin)"
     Check ($hitMax -eq $HTMAXBUTTON) "hit test over maximize -> HTMAXBUTTON, which is what Snap Layouts watches (got $hitMax)"
     Check ($hitClose -eq $HTCLOSE) "hit test over close -> HTCLOSE (got $hitClose)"
@@ -260,7 +277,7 @@ try {
     $canAdjudicate = -not (Test-TestWindowExists -Window $h)
     if ($canAdjudicate) {
         $proc2 = Start-OnTestDesktop -Exe $exe -Arguments @(
-            '--config-default-files=false', '--session-persistence=off',
+            '--config-default-files=false', '--session-persistence=false',
             '--background=#000000', '--window-show-tab-bar=never'
         )
         $h = Wait-TestWindow -ProcessId $proc2.Pid -Class 'GhozttyWindow' -TimeoutMs 25000

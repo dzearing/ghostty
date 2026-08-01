@@ -136,7 +136,17 @@ function Start-Gui([string]$label, [string[]]$extraArgs) {
     # capture - content-black chiclet, lifted inactive tab, bar-gray strip -
     # which is what Strip-Geometry measures the tab run against (T256). On a
     # light theme an inactive tab's 6% lift is ~1 level and unreadable.
-    $argList = @('--config-default-files=false', '--background=#000000') + $extraArgs
+    # --window-show-tab-bar=always because T234 made `auto` hide the strip at
+    # one tab. This script is about the STRIP's menu button, which only exists
+    # when the strip does; without the flag every section here would be
+    # measuring a window that has no strip at all. The caption's "..." host
+    # that replaced it as the default route is asserted in
+    # tab-strip-autohide.ps1, not here.
+    $argList = @(
+        '--config-default-files=false',
+        '--background=#000000',
+        '--window-show-tab-bar=always'
+    ) + $extraArgs
     $app = Start-OnTestDesktop -Exe $exe -Arguments $argList
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host "SETUP FAIL ($label): GUI died at launch"; exit 1 }

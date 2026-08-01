@@ -4142,3 +4142,74 @@ re-derive the same datum privately, and after this repair both still carry their
 own copy of the caption height, the bar height, the button band and a tab-run
 pixel scan — two implementations of one measurement. Hoist it into
 `TestDesktop.ps1` before T205 moves the datum a third time.
+
+## 2026-07-31 - T234: the strip was spending 40 DIP of every window to display a choice that did not exist
+
+The user's ask, and it was correct on all three counts: *"don't we own the
+header? can't we put a '...' button to the left of the minimize button, and use
+that space? Then we do not need to use tabs by default, wasting precious
+vertical space. The mac client does not use tabs by default."*
+
+Shipped as ONE change, because it is one change. The strip could not go away
+while it was the app's only menu host - that is exactly what pinned
+`window-show-tab-bar = auto` to `=> true` on Windows from T190 until now. So
+`auto` is now `tab_count > 1 or !customCaption()`, and the menu moved into the
+caption as a fourth button.
+
+**Measured on the box at 125%: the pane's top sits 45 px under the client top
+with one tab (that is `caption_h`, i.e. no strip) and 95 px with
+`--window-show-tab-bar=always`. 50 physical px - 40 DIP, 2-3 rows - returned to
+every window, permanently.** A second tab takes it 45 -> 95; closing back
+returns it to 45.
+
+Three decisions inside the button that were not obvious going in:
+
+* **`pad_md` (8), not `pad_sm` (4), between "..." and minimize.** Ours and the
+  OS's are different GROUPS of controls, and four evenly spaced squares is
+  precisely the undifferentiated cluster the "+"/hamburger pair was reported
+  as. Asserted between PAINTED edges in the unit test and as a plain-chrome
+  pixel in `caption-bar.ps1`.
+* **It answers `HTSYSMENU`** - Windows' own code for "the control that opens
+  this window's menu". Reusing it rather than inventing a private hit code is
+  what keeps the button on the same non-client mouse path as its neighbours and
+  announcing itself correctly. Its one piece of `DefWindowProc` baggage, that a
+  double-click there means `SC_CLOSE`, is swallowed at the DBLCLK site.
+* **It does not get the corner.** Fitts' law gives the top-right to close, so
+  the "..." sits left of the whole system trio and its hit box reaches no window
+  edge. A destructive button and a menu button must not be reachable by the same
+  careless throw of the pointer.
+
+The strip's own hamburger was **kept** - the second of the two answers T234
+allowed - and the why is filed as **T260**: it is still the only menu host on a
+caption-less window (`window-decoration = none`), so it has to become
+*conditional*, and conditional changes `runWidth`, the datum three acceptance
+scripts key off. Recorded as a deferral, not as "fine as is".
+
+Green: new `tab-strip-autohide.ps1` ALL PASS (13) x3 with its negative control
+failing; `caption-bar.ps1` ALL PASS (17); `tab-strip.ps1` (35) and `menu-bar.ps1`
+(60) still ALL PASS; both `zig build test` lanes, `test-agent` and the win32 GUI
+build green; P1-P3 ALL PASS.
+
+**The new glyph test was proved to run rather than assumed to.** Breaking its
+quad count made the none lane fail with `expected 4, found 3`; then it was
+reverted. A new test in a module reached only through `apprt.zig`'s test-root
+list is exactly the kind that can silently not be compiled in.
+
+**Filed: T259 - `tab-color.ps1` has been red since T254/T235, and T234 did not
+break it.** It measures the strip as `paneTop - clientTop`, which since T254 is
+`caption_h + bar_h`, then derives `scale = barH / 40` and rebuilds the tab width
+from T202's retired equal-share rule. On the box it printed `barH=45`
+(= `caption_h` exactly; the strip is 50) and `scale=1.125` against a real 1.25.
+Before T234 the same expression returned 95, giving `scale=2.375` - so it cannot
+have been right at either value. Same defect T256 fixed in the two scripts it
+did cover; do it with T257 so the count of private copies goes to zero.
+
+**T137, second sighting, and it cost an hour.** `--session-persistence=off` is
+swallowed by the bool parser, and the resulting persistence-ON window is **not
+focusable at all** on the background test desktop: `Focus-TestWindow` returned
+false five times running against a window with a perfectly good visible pane,
+and every keyboard-driven assertion was unrunnable. Changing that one flag to
+`=false` fixed it with nothing else touched. A swallowed bad value for a KNOWN
+key does not fail where you can see it - it surfaces as an unrelated-looking
+harness failure two layers away. `caption-bar.ps1` was still passing `=off` in
+two places and is corrected.

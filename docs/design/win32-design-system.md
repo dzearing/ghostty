@@ -304,6 +304,34 @@ present must justify its height every time:
   appearance must not shift the content underneath it jarringly; size the
   terminal from the space that remains, in one layout pass.
 
+**Both bullets are now shipped, by T234.** `window-show-tab-bar = auto` shows
+the strip only at 2+ tabs, and the window menu moved into the caption as a
+"…" button. The two are one change and cannot be separated: the strip could not
+go away while it was the app's only menu host, which is precisely what pinned
+`auto => true` on Windows from T190 until T234.
+
+Two rules the caption button had to obey, and one it had to break:
+
+- **Different GROUPS get the next step up the scale.** The "…" is ours; the
+  minimize/maximize/close trio is the OS's. Within the trio the gap is `sm` (4);
+  between "…" and minimize it is `md` (8). Four evenly-spaced squares would read
+  as one undifferentiated run — the same defect the "+"/"≡" pair was reported
+  as. (`caption_layout.zig`, asserted in "nothing touches".)
+- **It is the same 28 DIP square as everything else**, through the same
+  `paintIconButton`, with the same rest/hover/pressed/active states. `active` is
+  not decoration here: a menu button stays lit while its popup is up.
+- **The one break: it does not get the corner.** Fitts' law says the top-right
+  corner belongs to close, so the "…" sits to the LEFT of the whole system trio
+  rather than nearest the edge, and its hit box does not run to any window edge.
+  A destructive button and a menu button must not be reachable by the same
+  careless throw of the pointer.
+
+The visibility rule has an exception worth stating: a window with **no custom
+caption** (`window-decoration = none`, and the quick terminal) has nowhere to
+host the "…", so its strip stays up and keeps being the menu host. A control
+surface with nothing to control may disappear; the *only* route to the app's
+commands may not.
+
 ---
 
 ## 6b. Horizontal space: size to content, cap by proportion
