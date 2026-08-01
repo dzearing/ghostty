@@ -1261,7 +1261,9 @@ pub const BannerOverlay = struct {
         }
 
         const glyph: icon_button.Glyph = if (self.collapsed) .chevron_down else .chevron_up;
-        icon_paint.glyph(hdc, ib, icon_button.targetBox(ib, box), glyph, self.secondary());
+        // `glyphTarget`, not `targetBox` — see the note at Window.paintIconButton
+        // (T209): centering has to be something T204_NEUTERED can take away.
+        icon_paint.glyph(hdc, ib, icon_button.glyphTarget(ib, box, glyph), glyph, self.secondary());
     }
 
     /// Hot-track the chevron. Returns true when the hover changed, so the
@@ -1273,6 +1275,11 @@ pub const BannerOverlay = struct {
         const hot = self.collapsible and self.chevronBox(client.right).containsPoint(x, y);
         if (hot == self.hover_chevron) return false;
         self.hover_chevron = hot;
+        // Debug-build oracle for pane-banner.ps1's T209 chevron section. Same
+        // reason as the strip's (`tab hover ...` in Window.zig): the hover
+        // cannot survive to a capture on the background test desktop, so the
+        // TRIGGER is read from the log and the FILL is probed separately.
+        log.debug("banner chevron hover={}", .{hot});
         return true;
     }
 
@@ -1366,6 +1373,12 @@ fn bannerWndProc(
             self.mouse_tracked = false;
             if (self.hover_chevron) {
                 self.hover_chevron = false;
+                // Logged here as well as in `updateChevronHover` (T209): the
+                // un-hover reaches the state through EITHER path, and on the
+                // background test desktop it is almost always this one. A
+                // clear that happens without being reported reads, from the
+                // outside, exactly like a hover that latched forever.
+                log.debug("banner chevron hover={}", .{false});
                 _ = w32.InvalidateRect(hwnd, null, 0);
             }
             return 0;

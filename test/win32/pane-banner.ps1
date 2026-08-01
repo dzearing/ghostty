@@ -199,7 +199,13 @@ try {
     # is silently rejected and the default `true` stays in force.)
     # Launched onto the test desktop rather than by IPC auto-spawn, which would
     # put the GUI on the user's desktop — the whole thing being fixed.
-    $app = Start-OnTestDesktop -Exe $exe -Arguments @('--background=#101014', '--session-persistence=false')
+    # stderr captured for 6g's `banner chevron hover=` oracle (T209): the
+    # chevron's hover cannot survive to a pixel capture on this desktop, so the
+    # TRIGGER is read from the debug log. Empty on a release build, where
+    # log.debug is compiled out - 6g then skips rather than lying.
+    $errlog = Join-Path $env:TEMP 'ghoztty-pane-banner-stderr.log'
+    Remove-Item $errlog -ErrorAction SilentlyContinue
+    $app = Start-OnTestDesktop -Exe $exe -StdErr $errlog -Arguments @('--background=#101014', '--session-persistence=false')
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
     $appPid = $app.Pid
@@ -457,6 +463,113 @@ try {
         $script:fail += 3
         Write-Host 'FAIL  collapse overlay not found' -ForegroundColor Red
     }
+
+    # --- 6g. T209 / T204: the chevron is an ICON BUTTON, and hot-tracks ------
+    #
+    # The user's report named it directly: "why doesn't the chevron in the
+    # banner have a similar hover?" Pre-T204 it had no hover state at all - no
+    # `hover_chevron`, no `TrackMouseEvent`, no fill - so it gave no feedback
+    # that it was a button.
+    #
+    # Same split as tab-strip.ps1's 4c, and for the same measured reason: a
+    # posted WM_MOUSEMOVE cannot HOLD a hover here (TrackMouseEvent watches the
+    # real cursor, WM_MOUSELEAVE is posted, and posted messages are drained
+    # before the WM_PAINT the move dirtied), so the hovered frame is never
+    # painted at all. The TRIGGER is asserted from the debug oracle; the FILL
+    # is probed best-effort and skips when the race is lost - its co-witness is
+    # `paintIconButton`'s own pixels in caption-bar.ps1 (a pressed caption
+    # button, which does survive, on the identical fill path).
+    & $exe +set-banner --target=bw "chev1\nchev2\nchev3" | Out-Null
+    $null = Wait-Banner 'bw' 0 "chev1`nchev2`nchev3"
+    Start-Sleep -Milliseconds 500
+    $ovC = Get-Overlay $appPid $top
+    if (-not $ovC) {
+        $script:fail += 1
+        Write-Host 'FAIL  chevron overlay not found' -ForegroundColor Red
+    } else {
+        # `BannerOverlay.chevronBox`, in the overlay's own client space: the
+        # shared 28 DIP square, one card MARGIN in from the right, centered on
+        # the card's first content line.
+        $ovHwnd2 = [IntPtr]$ovC.Hwnd
+        $bScale = (Get-TestWindowDpi -Window $ovHwnd2) / 96.0
+        $side   = Get-TestChromeDip -Dip 28.0 -Scale $bScale
+        $margin = Get-TestChromeDip -Dip 12.0 -Scale $bScale
+        $pad    = Get-TestChromeDip -Dip 12.0 -Scale $bScale
+        $lineH  = Get-TestChromeDip -Dip 20.0 -Scale $bScale
+        $chCy   = $margin + $pad + [int][Math]::Truncate($lineH / 2)
+        $chL    = $ovC.Width - $margin - $side
+        $chCx   = $chL + [int][Math]::Truncate($side / 2)
+        Write-Host "INFO  chevron box: left=$chL cy=$chCy side=$side (overlay $($ovC.Width)x$($ovC.Height))"
+
+        $chevLogged = $false
+        if (Test-Path $errlog) {
+            # ONE window over both moves, deliberately. Clearing the log
+            # between them loses the un-hover: on this desktop WM_MOUSELEAVE
+            # arrives a frame after the move (there is no real pointer to
+            # leave with), so the `false` is already written - and then the
+            # second move finds the state ALREADY false, changes nothing, and
+            # logs nothing. What is being asserted is the state machine's
+            # shape: it goes lit, and it comes back, in that order.
+            Clear-Content $errlog -ErrorAction SilentlyContinue
+            Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $chCx) -Y ($ovC.Top + $chCy) -Action move | Out-Null
+            Start-Sleep -Milliseconds 300
+            Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy) -Action move | Out-Null
+            Start-Sleep -Milliseconds 300
+            $chevLines = @(Select-String -Path $errlog -Pattern 'banner chevron hover=(true|false)' -ErrorAction SilentlyContinue |
+                           ForEach-Object { $_.Matches[0].Groups[1].Value })
+            $chevLogged = ($chevLines -contains 'true')
+            if ($chevLogged) {
+                Write-Host "INFO  chevron hover log: $($chevLines -join ',')"
+                Assert ($chevLines[0] -eq 'true') `
+                    'T204: the banner chevron hot-tracks - a move onto it sets hover'
+                Assert ($chevLines -contains 'false') `
+                    'T204: ...and it un-hovers again rather than latching lit'
+            }
+        }
+        if (-not $chevLogged) {
+            Write-Host 'SKIP T209 chevron trigger: no debug oracle in the log (release build?)'
+        }
+
+        # The FILL, best effort. `fillRegion` insets the square by 2 DIP and
+        # rounds it by 4, so the fill's top edge at the square's horizontal
+        # center is lit and its top-left CORNER pixel is cut away - the same
+        # two probes tab-strip.ps1 uses, which is what distinguishes a rounded
+        # fill from a square one.
+        $inset = Get-TestChromeDip -Dip 2.0 -Scale $bScale
+        $chTop = $chCy - [int][Math]::Truncate($side / 2)
+        function Probe-Chev {
+            $s = Get-TestWindowPixels -Window $ovHwnd2
+            if ((Get-TestDistinctColors -Shot $s) -lt 8) { Close-TestWindowPixels $s; return $null }
+            $e = $s.Bitmap.GetPixel($chCx, $chTop + $inset + 1)
+            $c = $s.Bitmap.GetPixel($chL + $inset, $chTop + $inset)
+            Close-TestWindowPixels $s
+            return [pscustomobject]@{ Edge = [int]$e.R; Corner = [int]$c.R }
+        }
+        Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy) -Action move | Out-Null
+        Start-Sleep -Milliseconds 250
+        $chRest = Probe-Chev
+        $chHot = $null
+        if ($null -ne $chRest) {
+            for ($i = 0; $i -lt 12; $i++) {
+                for ($b = 0; $b -lt 25; $b++) {
+                    Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $chCx) -Y ($ovC.Top + $chCy) -Action move | Out-Null
+                }
+                $p = Probe-Chev
+                if ($null -ne $p -and $p.Edge -ge ($chRest.Edge + 6)) { $chHot = $p; break }
+                Send-TestMouse -Window $top -Target $ovHwnd2 -X ($ovC.Left + $margin + 4) -Y ($ovC.Top + $chCy) -Action move | Out-Null
+            }
+        }
+        Write-Host "INFO  chevron fill: rest=$(if($chRest){$chRest.Edge}) hot=$(if($chHot){$chHot.Edge})"
+        if ($null -eq $chHot) {
+            Write-Host 'SKIP T209 chevron fill: the hovered frame was never painted (harness limit, see the section header)'
+        } else {
+            Assert ($chHot.Edge -ge ($chRest.Edge + 6)) `
+                "T204: hovering the chevron lights a fill (rest=$($chRest.Edge) hot=$($chHot.Edge))"
+            Assert ($chHot.Corner -lt ($chHot.Edge - 4)) `
+                "T204: that fill is ROUNDED - its corner is cut away (corner=$($chHot.Corner) edge=$($chHot.Edge))"
+        }
+    }
+
     & $exe +set-banner --target=bw --clear | Out-Null
     $null = Wait-Banner 'bw' 0 'NONE'
 

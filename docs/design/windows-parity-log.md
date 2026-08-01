@@ -4894,3 +4894,48 @@ tool shell's environment, not the operator's habits. The launcher now fills the
 default itself, on the repo's own drive, and never overrides an explicit setting.
 Verified end to end afterwards from a shell with the variable unset: cache
 pinned, build a no-op, gate green against real HEAD, `LAUNCH OK`.
+
+## 2026-08-01 - T209: the pixel assertions landed, and both negative controls turned out to be hollow
+
+T204 and T206 shipped their geometry and their per-pixel math fully unit-tested
+and never asserted on the box - the user had just said "you KEEP STEALING FOCUS
+USE ANOTHER DESKTOP", so the GUI scripts stopped running at all. T211/T216-T218
+gave the desktop back and T214 settled that `PrintWindow` captures the GDI
+chrome, which is every claim T209 wanted. So this turn wrote them:
+`tab-strip.ps1` 38 -> 56 assertions, `pane-banner.ps1` 65 -> 67, ALL PASS x3.
+
+The interesting half is what the negative controls did when asked to fail.
+**Neither could.** `icon_button.T204_NEUTERED` moved no glyph at all -
+`glyphCentered()` was exported, documented and unit-tested, and both paint
+sites called `targetBox` directly, so the flag changed the fills and left every
+glyph exactly where the shipped build puts it. `tab_shape.T206_NEUTERED` left
+the flare and the antialiasing on while its own doc comment claimed it removed
+the flare. Between them, four of the assertions this task exists to write had
+no control whatsoever. Both are fixed (`glyphTarget(m, box, glyph)`, and a
+neuter branch in `sdTabRim`/`renderTab`); the audit of the two remaining flags
+is **T283**.
+
+The lesson is where the defect was VISIBLE. `icon_button.zig` reads perfectly:
+the predicate is declared, its doc comment is right, a unit test pins it. The
+whole failure is at the call sites, which is the one place nobody looks when
+reviewing a negative control. **A control that answers a question no paint site
+asks is decoration** - and it reads, in a task file, exactly like evidence.
+
+Second finding, sharper than T233's: the hover FILL is not merely hard to catch
+on the background desktop, **the hovered frame is never painted**.
+`WM_MOUSELEAVE` is a POSTED message and `WM_PAINT` is the lowest priority in
+the queue, so the leave is always drained before the paint the move dirtied.
+300 posted moves never caught a lit fill - not on the close "x", not on the "+"
+that has lit one since before T204. Both scripts therefore probe it with the
+"+" as the harness's own positive control and SKIP when it is not caught ("+
+caught, x not" is a defect; "neither" is the race), and the TRIGGER is asserted
+from new debug oracles instead. **T282** is the follow-up.
+
+Three test-authoring traps, all worth the next author's time: a tab's measured
+right edge reads one pixel SHORT because its last fill column carries the side
+rim (which doubles into a centering delta, so the shipped build sits at +2); a
+scan outboard of a tab reaches the "+" button unless it is bounded by
+`group_gap - btn_pad`, which is how the T204 control turned a healthy flare
+red; and an `else` around the shape assertions let the T206 control show only
+ONE of four failing, because the silhouette claims need the selected tab and
+were gated on the inactive ones being measurable.

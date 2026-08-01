@@ -57,6 +57,21 @@
 #     spans everything" AND "no accent pixels anywhere" - one false FAIL and
 #     one false PASS from the same bad frame.
 #
+# T209 added the APPEARANCE layer these geometry assertions never had -
+# section 2e (the glyphs sit on one frame, each centered in its square),
+# section 4b (the tab silhouette: inactive surface, gap, gradient rim, flare,
+# antialiasing) and section 4c (the close "x" hot-tracks and acts where it
+# paints). Both source-level controls were WIDENED to cover them, because both
+# were claiming more than they did: T204_NEUTERED left every glyph exactly
+# where the shipped build puts it (`glyphCentered()` was consumed by nobody),
+# and T206_NEUTERED left the flare and the antialiasing on.
+#
+#   * T204_NEUTERED (icon_button.zig) - centering fails; expect section 2b's
+#     "+ left and bottom gaps" to fail WITH it, since that gap is measured
+#     from the mark and the control is what moves the mark.
+#   * T206_NEUTERED (tab_shape.zig) - the four section-4b shape assertions
+#     fail; nothing in 1-3 or 5-7 does.
+#
 # NEGATIVE CONTROL: -NegativeControl inverts the single-tab-width assertion
 # (asserts the tab DOES span the client width) and MUST fail. The deeper
 # source-level control still stands for the geometry claims: flip T202_NEUTERED
@@ -105,7 +120,14 @@ try {
     # pixels: the selected chiclet is (0,0,0) and the strip around it is
     # (20,20,20).
     # -----------------------------------------------------------------------
-    $app = Start-OnTestDesktop -Exe $exe -Arguments @(
+    # stderr is captured so section 4c can read the `tab hover ...` debug
+    # oracle: a posted hover cannot survive to a pixel capture on this desktop
+    # (T233), so the TRIGGER is read from the log and the FILL is probed with a
+    # positive control. Empty on a release build, where log.debug is compiled
+    # out - that section then skips rather than lying.
+    $errlog = Join-Path $env:TEMP 'ghoztty-tabstrip-stderr.log'
+    Remove-Item $errlog -ErrorAction SilentlyContinue
+    $app = Start-OnTestDesktop -Exe $exe -StdErr $errlog -Arguments @(
         '--config-default-files=false',
         '--background=#000000',
         '--window-show-tab-bar=always',
@@ -412,6 +434,85 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # 2e. T209 / T204: the glyphs sit on ONE frame, each centered in its own
+    #     square.
+    #
+    #     T204 shipped the shared button model with its geometry unit-tested
+    #     in both lanes and NOTHING asserting that the PAINT uses it. That is
+    #     the gap this closes: the pure tests pin `targetBox`, these pin that
+    #     the marks actually land in it.
+    #
+    #     Two independent claims, and they fail for different reasons:
+    #       * the "+" and the active tab's close "x" share a vertical center,
+    #         which is what "one frame" means and what T205's merged row had
+    #         to preserve;
+    #       * each mark is centered on BOTH axes of its own painted square,
+    #         which is what the user asked for ("centered icons").
+    #
+    #     NEGATIVE CONTROL: T204_NEUTERED in icon_button.zig makes
+    #     `glyphTarget` leading-align every glyph, so the horizontal-centering
+    #     assertions fail by ~(square - mark)/2 px while the vertical ones and
+    #     everything in sections 1-7 stay green.
+    # -----------------------------------------------------------------------
+    # The close button's PAINTED square, from `Metrics.closeRect` +
+    # `icon_button.targetBox` - the same two steps Window.zig takes. Its y is
+    # exact (StripBtnTop is derived, not measured); its x rides on the measured
+    # tab edge, hence the wider tolerance on the horizontal claim below.
+    $closeHitL = $tabRight - $sm - $btnPaint - $btnPad
+    $closeHitR = $tabRight - $sm + $btnPad
+    $closeCx = [int][Math]::Truncate(($closeHitL + $closeHitR) / 2)
+    $closeSqL = $closeCx - [int][Math]::Truncate($btnPaint / 2)
+    $closeSqR = $closeSqL + $btnPaint
+    $btnTop = $m.StripBtnTop
+    $btnBot = $btnTop + $btnPaint
+
+    # Lit pixels inside that square. The title's box stops `pad_sm` short of
+    # the close button's painted left edge, so nothing in here is text.
+    $xL = -1; $xR = -1; $xT = -1; $xB = -1
+    for ($x = $closeSqL; $x -lt $closeSqR; $x++) {
+        for ($y = $btnTop; $y -lt $btnBot; $y++) {
+            $p = $shot.Bitmap.GetPixel($offX + $x, $stripTop + $y)
+            if (($p.R + $p.G + $p.B) -lt 150) { continue }
+            if ($xL -lt 0 -or $x -lt $xL) { $xL = $x }
+            if ($x -gt $xR) { $xR = $x }
+            if ($xT -lt 0 -or $y -lt $xT) { $xT = $y }
+            if ($y -gt $xB) { $xB = $y }
+        }
+    }
+    Assert ($xL -ge 0) 'close x: the active tab paints a close glyph (positive control for 2e)'
+    if ($xL -ge 0 -and $mLeft -ge 0) {
+        # 1. ONE FRAME. Both centers are measured, so no derived x or y enters
+        #    this at all - it is the purest form of the claim.
+        $plusCy = ($mTop + $mBot) / 2.0
+        $closeCy = ($xT + $xB) / 2.0
+        Write-Host "INFO  glyph rows: + cy=$plusCy (y=$mTop..$mBot), x cy=$closeCy (y=$xT..$xB)"
+        Assert ([math]::Abs($plusCy - $closeCy) -le 1.0) `
+            "T204: the + and the close x share a vertical center ($plusCy vs $closeCy)"
+
+        # 2. CENTERED IN ITS OWN SQUARE. Vertically the square is exact, so 1
+        #    px. Horizontally both edges ride on the measured `$tabRight`,
+        #    which reads ONE PIXEL SHORT by construction: the tab's last fill
+        #    column carries the side rim, and the rim is brighter than the
+        #    "is this the chiclet?" threshold. That 1 px moves the centering
+        #    delta by 2, so the shipped build sits at +2 and the bound is 3.
+        #    The neuter's leading alignment is ~13 px, so it is still nowhere
+        #    near this bound.
+        $closeDx = ($xL - $closeSqL) - (($closeSqR - 1) - $xR)
+        $closeDy = ($xT - $btnTop) - (($btnBot - 1) - $xB)
+        Write-Host "INFO  close x centering: dx=$closeDx dy=$closeDy (square x=$closeSqL..$closeSqR y=$btnTop..$btnBot)"
+        Assert ([math]::Abs($closeDx) -le 3) "T204: the close x is centered horizontally in its square (dx=$closeDx)"
+        Assert ([math]::Abs($closeDy) -le 1) "T204: the close x is centered vertically in its square (dy=$closeDy)"
+
+        $plusSqL = $tabRight + $gap
+        $plusSqR = $plusSqL + $btnPaint
+        $plusDx = ($mLeft - $plusSqL) - (($plusSqR - 1) - $mRight)
+        $plusDy = ($mTop - $btnTop) - (($btnBot - 1) - $mBot)
+        Write-Host "INFO  + centering: dx=$plusDx dy=$plusDy (square x=$plusSqL..$plusSqR)"
+        Assert ([math]::Abs($plusDx) -le 3) "T204: the + is centered horizontally in its square (dx=$plusDx)"
+        Assert ([math]::Abs($plusDy) -le 1) "T204: the + is centered vertically in its square (dy=$plusDy)"
+    }
+
+    # -----------------------------------------------------------------------
     # 3. There is a real gap between the last tab and the "+", and clicking in
     #    that gap does nothing
     # -----------------------------------------------------------------------
@@ -449,6 +550,326 @@ try {
     $ext = Selected-Extent $shot
     $idx = Selected-Index $ext[0] $slotW
     Assert ($idx -eq 2) "+ : clicking at its NEW position creates tab 3 (selected index=$idx)"
+
+    # -----------------------------------------------------------------------
+    # 4b. T209 / T206: the tab SHAPE, in pixels.
+    #
+    #     T206 answered the user's report - "inactive tabs should be visible
+    #     somewhat and tabs should have gaps in between ... the bottom corners
+    #     of the selected tab should curve into the edge ... don't you see how
+    #     the edge of the banner has this gradient highlight border? tabs
+    #     should too" - with a per-pixel composite, unit-tested and eyeballed
+    #     but never asserted on the box. Three tabs are open here, so there is
+    #     an inactive tab, a gap, and a selected tab with open strip to its
+    #     right, which is every condition the four claims need.
+    #
+    #     NEGATIVE CONTROL: T206_NEUTERED in tab_shape.zig restores the flat
+    #     pre-T206 look - no inactive fill, no rim, no flare, hard edges - so
+    #     all four fail together and sections 1-7 do not.
+    # -----------------------------------------------------------------------
+    Close-TestWindowPixels $shot; $shot = Get-Shot
+    $tabs = @(Get-TestTabExtents -Window $top -Shot $shot -Metrics $m)
+    Write-Host "INFO  shape: $($tabs.Count) tabs measured"
+    if ($tabs.Count -lt 3) {
+        # Three tabs are open (section 4 proved it by index), so "fewer than
+        # three are MEASURABLE" is not a setup problem - it is assertion 5
+        # failing in its bluntest form: an unselected tab that paints nothing
+        # is indistinguishable from the strip, which is the pre-T206 world and
+        # what T206_NEUTERED restores. Named as such so the control reports the
+        # claim rather than a shrug.
+        Assert $false ("T206: an inactive tab is invisible against the strip - " +
+                       "only $($tabs.Count) of 3 open tabs could be measured at all")
+    }
+    # NOT `else`. The inactive-surface claim above and the silhouette claims
+    # below are independent, and the silhouette ones only need the SELECTED
+    # tab - which is measurable in every world, including the one the neuter
+    # restores. Running them under an `else` meant the control could only ever
+    # show ONE of the four failing, which is precisely the "green because it
+    # never got there" shape these assertions exist to avoid.
+    if ($tabs.Count -ge 1) {
+        $rowY   = $stripTop + $barH - 2      # below the title baseline, inside every chiclet
+        $tabTop = $stripTop + $m.TabTopPad   # the tab's own top edge, where the rim is brightest
+        $sel = $tabs[$tabs.Count - 1]        # section 4 left the LAST tab selected
+        $stripBg = $shot.Bitmap.GetPixel($offX + $m.RunRight - 2, $rowY)
+        $selFill = $shot.Bitmap.GetPixel($offX + $sel.Center, $rowY)
+        Write-Host "INFO  shape: strip=$($stripBg.R) selected fill=$($selFill.R)"
+
+        if ($tabs.Count -ge 3) {
+            $ina = $tabs[0]
+            $inaFill = $shot.Bitmap.GetPixel($offX + $ina.Center, $rowY)
+            Write-Host "INFO  shape: inactive fill=$($inaFill.R)"
+
+            # 5. AN INACTIVE TAB IS A SURFACE. Pre-T206 it painted nothing at
+            #    all, so this delta was exactly zero and the strip read as one
+            #    bar with text on it. INACTIVE_LIFT is 0.06 of white over the
+            #    strip, ~14 levels on a (20,20,20) bar - so the floor is well
+            #    clear of noise and well under the real value.
+            $inaDelta = [math]::Abs([int]$inaFill.R - [int]$stripBg.R)
+            Assert ($inaDelta -ge 6) `
+                "T206: an inactive tab is visibly a surface, not bare strip (delta=$inaDelta)"
+            # ...and it is NOT the selected tab's fill either, or the selection
+            # cue would be gone in the other direction.
+            Assert ([math]::Abs([int]$inaFill.R - [int]$selFill.R) -ge 6) `
+                "T206: an inactive tab is distinguishable from the SELECTED tab ($($inaFill.R) vs $($selFill.R))"
+
+            # 7. THE GAP between two adjacent tabs is `tab_gap` of strip.
+            $gapW = $tabs[1].Left - $tabs[0].Right
+            $gapMid = $shot.Bitmap.GetPixel($offX + $tabs[0].Right + [int]($gapW / 2), $rowY)
+            Write-Host "INFO  shape: inter-tab gap=$gapW (tab_gap=$($m.TabGap)) mid=$($gapMid.R)"
+            Assert ([math]::Abs($gapW - $m.TabGap) -le 2) `
+                "T206: adjacent tabs are separated by tab_gap of strip ($gapW vs $($m.TabGap))"
+            Assert ([math]::Abs([int]$gapMid.R - [int]$stripBg.R) -le 4) `
+                "T206: the pixels in that gap ARE strip background ($($gapMid.R) vs $($stripBg.R))"
+        }
+
+        # 6. THE RIM, and that it is a GRADIENT rather than a border.
+        #    `rimAlpha` ramps banner_card's own RIM_TOP (0.28) -> RIM_BOT
+        #    (0.04) down the tab's height, so the top edge is a bright hairline
+        #    and the same rim near the baseline is nearly gone. Measured as a
+        #    max over a short scan so one antialiased pixel neither makes nor
+        #    breaks it.
+        function Max-Lum($shot, [int]$x0, [int]$x1, [int]$y) {
+            $best = -1
+            for ($x = $x0; $x -le $x1; $x++) {
+                $p = $shot.Bitmap.GetPixel($offX + $x, $y)
+                $l = [int]$p.R + $p.G + $p.B
+                if ($l -gt $best) { $best = $l }
+            }
+            return $best
+        }
+        $selMidY = $stripTop + $m.TabTopPad + [int](($barH - $m.TabTopPad) / 2)
+        # Two different pads, and they are not interchangeable. `$arcPad` steps
+        # INboard past a top corner's arc so a scan reads the tab's flat part.
+        # `$outPad` bounds how far OUTboard a scan may look, and it must stop
+        # short of the "+"'s own HIT box, which begins `group_gap - btn_pad`
+        # past the tab. A flare reaches `corner_bottom` (7 DIP) but only at
+        # the very baseline - it is under 5 px out one row up - so the two
+        # never actually collide, while a scan that overruns measures the +
+        # button instead of the tab. That is not hypothetical: it fired under
+        # the T204 negative control, where the "+" mark moves 13 px left into
+        # exactly that band, and turned a healthy flare red.
+        $arcPad = $m.CornerR + 4
+        $outPad = [Math]::Max([Math]::Min($arcPad, $gap - $btnPad - 1), 4)
+        # Top EDGE rim, sampled across the flat middle of the tab's top row -
+        # away from both corner arcs.
+        $topRim = Max-Lum $shot ($sel.Left + $arcPad) ($sel.Right - $arcPad) $tabTop
+        $selFillLum = [int]$selFill.R + $selFill.G + $selFill.B
+        $stripLum = [int]$stripBg.R + $stripBg.G + $stripBg.B
+        Write-Host "INFO  rim: top edge=$topRim vs fill=$selFillLum strip=$stripLum"
+        Assert ($topRim -gt ($selFillLum + 30) -and $topRim -gt ($stripLum + 30)) `
+            "T206: the tab's top edge carries a rim brighter than both its fill and the strip (rim=$topRim fill=$selFillLum strip=$stripLum)"
+        # The SAME rim, on the tab's right side, at half height and again just
+        # above the baseline. Same edge, same construction - only `y` differs,
+        # which is exactly what the gradient is a function of.
+        $sideHi = Max-Lum $shot ($sel.Right - 2) ($sel.Right + $outPad) $selMidY
+        $sideLo = Max-Lum $shot ($sel.Right - 2) ($sel.Right + $outPad) ($stripTop + $barH - 3)
+        Write-Host "INFO  rim gradient: side@mid=$sideHi side@baseline=$sideLo"
+        Assert ($sideHi -ge ($sideLo + 12)) `
+            "T206: the rim FADES down the tab - a gradient, not a border (mid=$sideHi baseline=$sideLo)"
+
+        # 8. THE FLARE. The selected tab's foot curves OUT into the baseline,
+        #    so its silhouette is wider at the last row than at its middle.
+        #    Measured on the RIGHT side, which faces open strip: the left side
+        #    faces a neighbour whose own edge would end the scan early.
+        function Right-Edge($shot, [int]$from, [int]$to, [int]$y, $bg) {
+            $last = $from - 1
+            for ($x = $from; $x -le $to; $x++) {
+                $p = $shot.Bitmap.GetPixel($offX + $x, $y)
+                if ([math]::Abs([int]$p.R - [int]$bg.R) -gt 8) { $last = $x }
+            }
+            return $last
+        }
+        $edgeMid = Right-Edge $shot ($sel.Right - 2) ($sel.Right + $outPad) $selMidY $stripBg
+        $edgeBot = Right-Edge $shot ($sel.Right - 2) ($sel.Right + $outPad) ($stripTop + $barH - 1) $stripBg
+        Write-Host "INFO  flare: right edge mid=$edgeMid baseline=$edgeBot"
+        Assert ($edgeBot -ge ($edgeMid + 3)) `
+            "T206: the selected tab FLARES at its baseline ($edgeBot vs $edgeMid at mid-height)"
+
+        # 9. ANTIALIASING on the top-left corner arc. Stated in the task as
+        #    "at least one pixel that is neither strip nor fill"; asserted as a
+        #    DISTINCT-VALUE COUNT instead, which is the same claim without the
+        #    flakiness - the narrow band between fill and strip is ~0.17px wide
+        #    in signed-distance terms, so whether a pixel lands in it is luck,
+        #    while "how many different values does this corner take" is not.
+        #    A GDI region gives exactly two (strip and fill); a hard-edged
+        #    region WITH a rim would give three. The composite gives a ramp.
+        $arc = @{}
+        $arcOther = 0
+        for ($x = $sel.Left; $x -le ($sel.Left + $arcPad); $x++) {
+            for ($y = $tabTop; $y -le ($tabTop + $arcPad); $y++) {
+                $p = $shot.Bitmap.GetPixel($offX + $x, $y)
+                $arc[[int]$p.R] = $true
+                if ([math]::Abs([int]$p.R - [int]$stripBg.R) -gt 3 -and
+                    [math]::Abs([int]$p.R - [int]$selFill.R) -gt 3) { $arcOther++ }
+            }
+        }
+        Write-Host "INFO  corner arc: $($arc.Count) distinct values, $arcOther neither-strip-nor-fill"
+        Assert ($arc.Count -ge 5) `
+            "T206: the top-left corner arc is ANTIALIASED, not a hard edge ($($arc.Count) distinct values)"
+        Assert ($arcOther -ge 1) `
+            "T206: the arc holds pixels that are neither strip nor fill ($arcOther)"
+    }
+
+    # -----------------------------------------------------------------------
+    # 4c. T209 / T204: the close "x" is a real icon button - it lights a
+    #     ROUNDED fill on hover, and it acts where it PAINTS.
+    #
+    #     Pre-T204 it was the odd one out: hover recolored the glyph red and
+    #     lit nothing ("why doesn't the x to close a tab have a similar
+    #     hover?"). The claim splits in two because the harness cannot hold a
+    #     hover (T233): TrackMouseEvent watches the REAL cursor, there is none
+    #     on this desktop, and WM_MOUSELEAVE is a POSTED message - so it is
+    #     drained before the WM_PAINT the move dirtied, and the hovered frame
+    #     may never be painted at all.
+    #
+    #       * THE TRIGGER - from the `tab hover ...` debug oracle: a move onto
+    #         the close button's box sets close=true, a move onto the tab's
+    #         title area clears it. That is the hit test agreeing with the
+    #         paint geometry, which is assertion 4's other half.
+    #       * THE FILL - by pixels, best-effort, with the "+" as the harness's
+    #         POSITIVE CONTROL. The "+" has lit a fill since long before T204
+    #         and both come from the same posted move, so "+ caught, x not" is
+    #         a product defect while "neither caught" is the race and skips.
+    # -----------------------------------------------------------------------
+    Close-TestWindowPixels $shot; $shot = Get-Shot
+    $selNow = @(Get-TestTabExtents -Window $top -Shot $shot -Metrics $m)
+    if ($selNow.Count -lt 1) {
+        Assert $false 'T204 hover: no measurable tab to hover'
+    } else {
+        $t3 = $selNow[$selNow.Count - 1]
+        $cHitL = $t3.Right - $sm - $btnPaint - $btnPad
+        $cHitR = $t3.Right - $sm + $btnPad
+        $cCx = [int][Math]::Truncate(($cHitL + $cHitR) / 2)
+        $cSqL = $cCx - [int][Math]::Truncate($btnPaint / 2)
+        $cSqT = $m.StripBtnTop
+        $cCy = $cSqT + [int]($btnPaint / 2)
+        $pSqL = $t3.Right + $gap
+        $pCx = $pSqL + [int]($btnPaint / 2)
+        $pCy = $cCy
+
+        # --- the TRIGGER ----------------------------------------------------
+        $hoverLogged = $false
+        if (Test-Path $errlog) {
+            Clear-Content $errlog -ErrorAction SilentlyContinue
+            [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cCx) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
+            Start-Sleep -Milliseconds 300
+            $onClose = @(Select-String -Path $errlog -Pattern 'tab hover .*close=true' -ErrorAction SilentlyContinue)
+            $hoverLogged = ($onClose.Count -gt 0)
+            if ($hoverLogged) {
+                Assert ($onClose.Count -gt 0) 'T204 trigger: a move onto the close button sets close=true'
+                Clear-Content $errlog -ErrorAction SilentlyContinue
+                [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $t3.Left + 6) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
+                Start-Sleep -Milliseconds 300
+                $offClose = @(Select-String -Path $errlog -Pattern 'tab hover .*close=false' -ErrorAction SilentlyContinue)
+                Assert ($offClose.Count -gt 0) 'T204 trigger: a move onto the tab title clears it again'
+                Clear-Content $errlog -ErrorAction SilentlyContinue
+                [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $pCx) -Y ($clientY + $m.StripTopClient + $pCy) -Action move)
+                Start-Sleep -Milliseconds 300
+                $onPlus = @(Select-String -Path $errlog -Pattern 'tab hover .*plus=true' -ErrorAction SilentlyContinue)
+                Assert ($onPlus.Count -gt 0) 'T204 trigger: a move onto the + sets plus=true (the same hit-test path)'
+            }
+        }
+        if (-not $hoverLogged) {
+            Write-Host 'SKIP T204 hover trigger: no debug oracle in the log (release build?)'
+        }
+
+        # --- the FILL, and that it is ROUNDED --------------------------------
+        # `fillRegion` insets the painted square by `inset` (xs) and rounds it
+        # by `corner_r`. Two probes per button: the fill's top EDGE at its
+        # horizontal center (lit, and clear of the centered mark) and the
+        # fill's top-left CORNER pixel (cut away by the radius, so it must
+        # stay the un-lit background - that is what separates a rounded fill
+        # from a square one).
+        $ibInset = Get-TestChromeDip -Dip 2.0 -Scale $scale
+        function Probe-Fill($sqL, [int]$cx, [int]$y0) {
+            $edgeX = $cx
+            $edgeY = $y0 + $ibInset + 1
+            $cornX = $sqL + $ibInset
+            $cornY = $y0 + $ibInset
+            $s = Get-TestWindowPixels -Window $top
+            if ((Get-TestDistinctColors -Shot $s) -lt 8) { Close-TestWindowPixels $s; return $null }
+            $e = $s.Bitmap.GetPixel($offX + $edgeX, $stripTop + $edgeY)
+            $c = $s.Bitmap.GetPixel($offX + $cornX, $stripTop + $cornY)
+            Close-TestWindowPixels $s
+            return [pscustomobject]@{ Edge = [int]$e.R; Corner = [int]$c.R }
+        }
+        # Rest readings first, with the pointer parked off both buttons.
+        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $t3.Left + 6) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
+        Start-Sleep -Milliseconds 250
+        $restClose = Probe-Fill $cSqL $cCx $cSqT
+        $restPlus  = Probe-Fill $pSqL $pCx $cSqT
+
+        # Then race the leave: post the move and capture immediately, over and
+        # over. A build with the fill only has to win ONCE; a build without it
+        # can never win, however many attempts it gets.
+        # A BURST of moves per attempt, not one. The leave is a single posted
+        # message; the moves are many, so the queue drains as
+        # move...leave...move...move and the LAST thing processed before the
+        # (lowest-priority) WM_PAINT is a move - which is the only ordering in
+        # which a hovered frame gets painted at all. The capture then has one
+        # frame to grab it before the next leave lands.
+        function Catch-Fill($sqL, [int]$cx, [int]$hotX, $rest) {
+            if ($null -eq $rest) { return $null }
+            $best = $null
+            for ($i = 0; $i -lt 12; $i++) {
+                for ($b = 0; $b -lt 25; $b++) {
+                    [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $hotX) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
+                }
+                $p = Probe-Fill $sqL $cx $cSqT
+                if ($null -eq $p) { continue }
+                if ($null -eq $best -or $p.Edge -gt $best.Edge) { $best = $p }
+                if ($p.Edge -ge ($rest.Edge + 8)) { return $p }
+                [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $t3.Left + 6) -Y ($clientY + $m.StripTopClient + $cCy) -Action move)
+            }
+            return $best
+        }
+        $hotPlus  = Catch-Fill $pSqL $pCx $pCx $restPlus
+        $hotClose = Catch-Fill $cSqL $cCx $cCx $restClose
+        $plusLit  = ($null -ne $hotPlus -and $null -ne $restPlus -and $hotPlus.Edge -ge ($restPlus.Edge + 8))
+        Write-Host ("INFO  hover fill: + rest=$(if($restPlus){$restPlus.Edge}) hot=$(if($hotPlus){$hotPlus.Edge}); " +
+                    "x rest=$(if($restClose){$restClose.Edge}) hot=$(if($hotClose){$hotClose.Edge})")
+        if (-not $plusLit) {
+            Write-Host 'SKIP T204 hover fill: the + fill (the positive control) was never caught - the harness lost every race, so the x probe would be meaningless'
+        } else {
+            Assert ($null -ne $hotClose -and $hotClose.Edge -ge ($restClose.Edge + 8)) `
+                "T204: hovering the close x lights a FILL, not just a red glyph (rest=$($restClose.Edge) hot=$($hotClose.Edge))"
+            Assert ($hotClose.Corner -lt ($hotClose.Edge - 5)) `
+                "T204: that fill is ROUNDED - its corner is cut away (corner=$($hotClose.Corner) edge=$($hotClose.Edge))"
+            Assert ($hotPlus.Corner -lt ($hotPlus.Edge - 5)) `
+                "T204: the +'s fill is rounded the same way (corner=$($hotPlus.Corner) edge=$($hotPlus.Edge))"
+        }
+
+        # --- CLICK-THROUGH at the PAINTED center (assertion 4) ---------------
+        # The regression the shared square risks is paint and hit test drifting
+        # apart. Section 4 already proved it for the "+"; this is the close
+        # button, aimed at the center of the square the pixels above were read
+        # from, not at a rect the script derived on its own terms.
+        # The oracle is the app's OWN tab list, over IPC. The two obvious local
+        # ones both lie in one direction or the other: the pane's child window
+        # is torn down on a refcount and can outlive the click by seconds
+        # (3 -> 3 against a tab that had already left the strip), and counting
+        # painted chiclets is blind under T206_NEUTERED, where an unselected
+        # tab paints nothing so the count is 1 before AND after. `+list --json`
+        # is neither - it reports the tab array, which is what closing a tab
+        # changes.
+        function Tab-Count {
+            $j = & $exe +list --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($null -eq $j) { return -1 }
+            $w = @($j.data.windows | Where-Object { [int64]$_.id -eq [int64]$top })
+            if ($w.Count -eq 0) { return -1 }
+            return @($w[0].tabs).Count
+        }
+        $beforeN = Tab-Count
+        [void](Send-TestMouse -Window $top -Target $top -X ($clientX + $cCx) -Y ($clientY + $m.StripTopClient + $cCy) -Button left -Action click)
+        $afterN = $beforeN
+        for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Milliseconds 250
+            $afterN = Tab-Count
+            if ($afterN -ge 0 -and $beforeN -gt 0 -and $afterN -lt $beforeN) { break }
+        }
+        Assert ($beforeN -gt 0 -and $afterN -ge 0 -and $afterN -lt $beforeN) `
+            "T204: a click at the close button's PAINTED center closes that tab ($beforeN -> $afterN tabs)"
+    }
 
     # -----------------------------------------------------------------------
     # 5. Many tabs shrink instead of running off the end of the strip

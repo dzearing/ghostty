@@ -43,10 +43,17 @@ const color_math = @import("color_math.zig");
 pub const Rgb = color_math.Rgb;
 
 /// Negative control for `test/win32/tab-strip.ps1`. Flip to `true`, rebuild
-/// `-Dapp-runtime=win32`, and re-run: tabs lose the rim, the flare and the
-/// inactive surface, restoring the flat pre-T206 look — so the rim,
-/// bottom-flare and inactive-visibility assertions must fail, and the
-/// geometry ones (T202's) must NOT.
+/// `-Dapp-runtime=win32`, and re-run: tabs lose the rim, the flare, the
+/// antialiasing and the inactive surface, restoring the flat pre-T206 look —
+/// so the rim, bottom-flare, antialiasing and inactive-visibility assertions
+/// must fail, and the geometry ones (T202's) must NOT.
+///
+/// T209 widened it. It used to zero only the rim and the inactive lift while
+/// this comment already claimed the flare, and `sdTabRim` kept flaring and
+/// `renderTab` kept antialiasing — so two of the assertions this control is
+/// supposed to adjudicate could not fail no matter how it was set. A negative
+/// control that does not cover a claim is worse than none: it is a green run
+/// that reads as evidence.
 pub const T206_NEUTERED = false;
 
 /// Top-corner radius, unscaled px. The tab's own rounding, kept smaller than
@@ -202,7 +209,9 @@ pub fn sdTabRim(x: f32, y: f32, t: Tab, m: Metrics) f32 {
     // have neighbouring feet meeting in the middle of every gap and closing
     // it back up. The selected tab flares into the empty space beside it; the
     // others stay clear of each other.
-    if (t.surface != .active) return body_round;
+    // Neutered: no flares at all, on any tab (T209 — the control's own
+    // comment has always said so).
+    if (T206_NEUTERED or t.surface != .active) return body_round;
 
     // The flare boxes run BELOW the baseline for the same reason the body
     // does: their bottom edge is the seam, so it must not be an edge here
@@ -319,7 +328,13 @@ pub fn renderTab(
         while (x < x1) : (x += 1) {
             const fx: f32 = @as(f32, @floatFromInt(x)) + 0.5;
             const sd = sdTab(fx, fy, t, m);
-            const cov = coverage(sd);
+            // Neutered: a hard edge, the way `CreateRoundRectRgn` fills — no
+            // partial coverage anywhere, so no pixel on a corner arc can be
+            // anything but strip or fill (T209's antialiasing assertion).
+            const cov = if (T206_NEUTERED)
+                @as(f32, if (sd < 0.0) 1.0 else 0.0)
+            else
+                coverage(sd);
             if (cov <= 0.0) continue;
 
             // The rim is the ring just INSIDE the silhouette: the shape minus

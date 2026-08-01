@@ -3421,7 +3421,10 @@ fn paintIconButton(
         }
     }
 
-    icon_paint.glyph(mem_dc, ib, icon_button.targetBox(ib, box), glyph, glyph_color);
+    // `glyphTarget`, not `targetBox`: the two differ only when T204_NEUTERED
+    // is set, and that difference is what the centering assertions in
+    // tab-strip.ps1 measure (T209).
+    icon_paint.glyph(mem_dc, ib, icon_button.glyphTarget(ib, box, glyph), glyph, glyph_color);
 }
 
 /// Paint the tab bar using double-buffered GDI painting.
@@ -4122,6 +4125,18 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
         self.hover_new_tab = new_new_tab;
         self.hover_menu_btn = new_menu_btn;
         self.invalidateTabBar();
+        // Debug-build oracle for tab-strip.ps1's T209 hover section, the
+        // `hero hover tile=` / `divider hover=` idiom. A posted WM_MOUSEMOVE
+        // cannot HOLD a hover on the background test desktop — TrackMouseEvent
+        // watches the real cursor, so WM_MOUSELEAVE lands within a frame
+        // (T233) — which makes the pixel probe a race and the TRIGGER
+        // unobservable without this line.
+        log.debug("tab hover tab={} close={} plus={} menu={}", .{
+            new_hover,
+            new_close,
+            new_new_tab,
+            new_menu_btn,
+        });
     }
 }
 

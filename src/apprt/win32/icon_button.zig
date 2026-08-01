@@ -621,6 +621,39 @@ pub fn glyphCentered() bool {
     return !T204_NEUTERED;
 }
 
+/// The square a glyph is actually PAINTED in — `targetBox`, except under the
+/// neuter, where it is pushed to the box's leading edge.
+///
+/// T209 added this because `glyphCentered()` was exported and then consumed by
+/// nobody: flipping `T204_NEUTERED` changed the fills and left every glyph
+/// exactly where the shipped build puts it, so the centering assertions the
+/// control exists to adjudicate could not fail. A negative control that
+/// answers a question no paint site asks is decoration.
+///
+/// Leading-aligned rather than "some other offset" because that is the world
+/// being restored: the "+" and the "×" were drawn `DT_LEFT` in their boxes,
+/// which is why a hovered "+" read as a second tab rather than a button.
+///
+/// It is the MARK's leading edge that is put on the box's, not the target
+/// square's — `DT_LEFT` aligned the drawn character, and the difference is the
+/// whole margin the control has to work with. Aligning the square instead
+/// moved a 28 DIP glyph by 3 px at 125%, which an acceptance script measuring
+/// off an antialiased tab edge cannot separate from noise. Aligning the mark
+/// moves it by ~13.
+pub fn glyphTarget(m: Metrics, box: Rect, glyph: Glyph) Rect {
+    const t = targetBox(m, box);
+    if (glyphCentered()) return t;
+    var quads: [max_quads]Quad = undefined;
+    const mark = paintedBounds(glyphQuads(m, t, glyph, &quads));
+    const dx = box.left - mark.left;
+    return .{
+        .left = t.left + dx,
+        .top = t.top,
+        .right = t.right + dx,
+        .bottom = t.bottom,
+    };
+}
+
 /// Do the close "×" and the banner chevron light a fill like the "+" and "≡"?
 /// Always yes in the shipped build; the neuter answers `false`, restoring the
 /// pre-T204 state where those two were the odd ones out.
@@ -1125,6 +1158,16 @@ test "caption glyphs: the overflow dots are three, even, and never merge" {
         // the dots themselves rather than the dots plus a stray margin.
         try testing.expectEqual(b.left, left.left);
         try testing.expectEqual(b.right, right.right);
+    }
+}
+
+test "glyphTarget is the centered target in the shipped build" {
+    // The paint sites call THIS, so a build where it stopped agreeing with
+    // `targetBox` would ship the neuter's leading alignment (T209).
+    const m = Metrics.init(1.0);
+    const box: Rect = .{ .left = 100, .top = 4, .right = 132, .bottom = 40 };
+    for ([_]Glyph{ .add, .close, .menu, .chevron_up }) |g| {
+        try testing.expectEqual(targetBox(m, box), glyphTarget(m, box, g));
     }
 }
 

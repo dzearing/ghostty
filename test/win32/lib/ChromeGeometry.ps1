@@ -181,14 +181,17 @@ function Get-TestChromeMetrics {
     # that stopped being the answer the moment the two became one row.
     $chromeH = if ($merged) { $barH } elseif ($stripShown) { $captionH + $barH } else { $captionH }
 
+    # Top of an icon button's PAINTED square inside the STRIP, strip-local.
+    # `icon_button.targetBox` centered in the strip's own button band, which is
+    # `tab_top_pad`..`bar_h` (NOT 0..bar_h - see tab_strip_layout.buttonHit):
+    # the "+", the "=" and a tab's close "x" all land on this row, which is
+    # what T204 means by "one frame".
+    $stripBtnTop = [int][Math]::Truncate(($padSm + $barH) / 2) - [int][Math]::Truncate($btnPaint / 2)
     # Top of a caption button's PAINTED square, band-local. Merged it is the
-    # strip's own button baseline (`icon_button.targetBox` of the strip's hit
-    # box, whose band is `tab_top_pad`..`bar_h`) - the whole point of the merge
-    # is that the caption's buttons and the strip's "+" sit on ONE frame, so a
-    # local `(band - square) / 2` here would assert the bug rather than the fix.
-    $capBtnTop = if ($merged) {
-        [int][Math]::Truncate(($padSm + $barH) / 2) - [int][Math]::Truncate($btnPaint / 2)
-    } else { $padSm }
+    # strip's own button baseline - the whole point of the merge is that the
+    # caption's buttons and the strip's "+" sit on ONE frame, so a local
+    # `(band - square) / 2` here would assert the bug rather than the fix.
+    $capBtnTop = if ($merged) { $stripBtnTop } else { $padSm }
 
     $cr = Get-TestWindowRect -Window $Window -Client
     $wr = Get-TestWindowRect -Window $Window
@@ -258,6 +261,9 @@ function Get-TestChromeMetrics {
         ChromeH = $chromeH
         # Band-local top of a caption button's painted square.
         CaptionBtnTop = $capBtnTop
+        # Strip-local top of ANY strip icon button's painted square: the "+",
+        # the "=", and a tab's close "x". T209 probes glyphs against it.
+        StripBtnTop = $stripBtnTop
 
         # --- tab strip constants ---------------------------------------------
         PadL = $padSm                       # strip_pad_l
