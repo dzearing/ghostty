@@ -4054,3 +4054,38 @@ queues and starts a second task in a context that was supposed to reset.
 `Test-PaneProducing` does not catch it: five lines, 8 seconds apart. Filed with
 the sketch (beat the heartbeat from a hook that already fires, widen the probe,
 make the resume prompt reset-first so a wrong nudge is merely expensive).
+
+**T234 turned out to be sized on a false premise, so it split: T254.** T234
+opened with *"we do own the caption bar ... a paint + hit-test change, not a
+new mechanism."* We do not: every window is plain `WS_OVERLAPPEDWINDOW`, there
+is no `WM_NCCALCSIZE` anywhere in `src/apprt/win32/`, and T78/T203 only ask DWM
+to restyle *its* caption. **T205 had recorded exactly that a day earlier and
+the two files never met.** The custom caption is now T254, built once for both
+callers; ordering settled as T254 -> T234 -> T205.
+
+**T254 is implemented.** `WM_NCCALCSIZE` hands the caption band to the client
+area (with the maximized frame inset), `caption_layout.zig` lays it out to the
+design system (36 DIP = 4 + 28 + 4, the shared 28 DIP square, 4 DIP between
+painted edges, hit boxes that reach the top-right corner for Fitts' law but
+never overlap), `WM_NCHITTEST` answers `HTTOP*`/`HTCAPTION`/`HTMINBUTTON`/
+`HTMAXBUTTON`/`HTCLOSE` — `HTMAXBUTTON` being what keeps Snap Layouts alive —
+and the three buttons paint through the same `paintIconButton` the strip's
+"+"/"≡"/"×" use. Green: all three zig lanes, `test/win32/caption-bar.ps1` ALL
+PASS (14) with a failing `-NegativeControl`, P1-P3 ALL PASS, plus a
+`PrintWindow` capture read at 125%.
+
+**It is not `done`, and the floor is not green: T256.** Moving the strip off
+client `y = 0` broke the two scripts that measure it from there —
+`tab-strip.ps1` 7 failed, `menu-bar.ps1` 19 failed. That is T232's recorded
+blast radius arriving one task late (it changed the strip's ORIGIN, not its
+height). T256 repairs them self-relatively and then closes T254; it is the next
+task ahead of everything.
+
+**Also filed: T255.** The caption buttons' `SC_*` effects cannot be adjudicated
+on the background test desktop — a *plain* `WM_CLOSE` is ignored there too on a
+long-lived window, though a fresh one closes fine. So `caption-bar.ps1` SKIPs
+that section behind a positive control and says so, rather than passing
+quietly. Two design-system amendments landed with the work: closed-outline
+glyphs use a **1 DIP** stroke (2 DIP on a 10 DIP box reads as a filled square —
+it shipped for one build), and §6's "host chrome in the caption bar" is now
+actually possible.

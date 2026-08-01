@@ -141,6 +141,21 @@ pub const Metrics = struct {
     corner_r: i32,
     /// Mark thickness, ~2 DIP, parity-matched to `target`.
     stroke_w: i32,
+    /// Mark thickness for CLOSED OUTLINE glyphs (maximize, restore) — 1 DIP,
+    /// floored at one physical pixel.
+    ///
+    /// A deliberate amendment to design system §4.2's "stroke thickness is
+    /// 2 DIP for every glyph", made when the first build shipped a maximize
+    /// box that read as a filled square with a dot in it. That rule was
+    /// written for OPEN marks (+, ×, hamburger, chevron), where the eye reads
+    /// the stroke. In a closed outline the eye reads the ENCLOSED AREA, and a
+    /// 2 DIP stroke on a 10 DIP box leaves 6 DIP of interior — 36% of the
+    /// glyph's area — so it reads as filled. Windows' own ChromeMaximize is a
+    /// 10x10 box with a 1 px stroke for exactly this reason.
+    ///
+    /// Same class of rule as §4.2's per-glyph mark widths: equal geometry
+    /// does not mean equal apparent weight.
+    stroke_outline: i32,
     /// Mark extents, tuned OPTICALLY per glyph rather than shared: equal
     /// geometric width does not read as equal width. A horizontal-only mark
     /// (the hamburger) reads narrower than one with a vertical member (the
@@ -152,24 +167,40 @@ pub const Metrics = struct {
     /// Chevron width and total rise.
     mark_chevron_w: i32,
     mark_chevron_h: i32,
+    /// Extent of the three CAPTION marks (minimize, maximize, restore), T254.
+    /// 10 DIP, one number for all three: they sit side by side in one cluster,
+    /// so any optical tuning between them would read as three different sizes
+    /// rather than as three different icons. It is under `mark_close` (11)
+    /// because two of the three are closed outlines, and a closed outline
+    /// reads larger than an open mark of the same extent — the same optical
+    /// rule that makes the hamburger need 14 (design system §4.2).
+    mark_caption: i32,
+    /// How far the restore glyph's two squares are offset from each other.
+    /// Floored at `stroke_w + 1` so the back square's edges never merge into
+    /// the front square's and turn the icon into a solid blob at 1.0.
+    restore_off: i32,
     /// Vertical pitch between the hamburger's three rules. Applied
     /// symmetrically about the middle rule, so it needs no parity match.
     menu_pitch: i32,
 
     pub fn init(scale: f32) Metrics {
         const side = px(28.0, scale);
+        const stroke = markPx(2.0, scale, side);
         return .{
             .target = side,
             .hit_pad = px(2.0, scale),
             .inset = px(2.0, scale),
             .corner_r = px(4.0, scale),
-            .stroke_w = markPx(2.0, scale, side),
+            .stroke_w = stroke,
+            .stroke_outline = @max(px(1.0, scale), 1),
             .mark_add = markPx(12.0, scale, side),
             .mark_close = markPx(11.0, scale, side),
             .mark_menu = markPx(14.0, scale, side),
             .mark_chevron_w = markPx(12.0, scale, side),
             .mark_chevron_h = markPx(6.0, scale, side),
             .menu_pitch = px(4.0, scale),
+            .mark_caption = markPx(10.0, scale, side),
+            .restore_off = @max(px(3.0, scale), stroke + 1),
         };
     }
 
@@ -302,10 +333,18 @@ pub const Glyph = enum {
     chevron_up,
     /// Expand chevron, apex down (the banner is collapsed).
     chevron_down,
+    /// "—" — minimize the window (T254, ChromeMinimize).
+    minimize,
+    /// "□" — maximize the window (ChromeMaximize).
+    maximize,
+    /// "❐" — restore a maximized window (ChromeRestore).
+    restore,
 };
 
 /// The maximum quads any glyph needs, so callers can size a stack buffer.
-pub const max_quads: usize = 3;
+/// `restore` is the worst case at 6: a four-bar outline for the front square
+/// plus two bars for the back one's visible corner.
+pub const max_quads: usize = 6;
 
 /// `e` trimmed to fit inside `side` AND to share its parity, so the clearance
 /// `(side - e) / 2` is the same integer on both sides with no rounding.
@@ -453,7 +492,71 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
             }
             return out[0..2];
         },
+        .minimize => {
+            // One rule, centered. The simplest glyph in the set, and the one
+            // most likely to be "just a LineTo" — which is exactly how it
+            // would end up a pixel off center at half the scales.
+            out[0] = bar(centered(target, m.mark_caption, t));
+            return out[0..1];
+        },
+        .maximize => {
+            // A square OUTLINE, built as four bars rather than as a filled
+            // rect punched with a background-colored one: the paint path fills
+            // every quad with a single brush, and a punch-out would show the
+            // button's REST color through a HOVERED fill.
+            const b = centered(target, m.mark_caption, m.mark_caption);
+            return squareOutline(b, m.stroke_outline, out);
+        },
+        .restore => {
+            // Two squares, the front one down-left of the back one, and the
+            // back one drawn only where it is not hidden (its top and right
+            // edges) so it reads as being behind rather than crossing through.
+            //
+            // Not symmetric internally — it is a depth cue, and a symmetric
+            // one would not read as two stacked windows. What IS symmetric,
+            // and what the glyph test asserts, is the UNION: the front square
+            // owns the left and bottom extents, the back one the top and
+            // right, so together they fill exactly the centered mark box.
+            const so = m.stroke_outline;
+            const off = @min(m.restore_off, @max(m.mark_caption - so - 1, 1));
+            const b = centered(target, m.mark_caption, m.mark_caption);
+            const front: Rect = .{
+                .left = b.left,
+                .top = b.top + off,
+                .right = b.right - off,
+                .bottom = b.bottom,
+            };
+            const used = squareOutline(front, so, out);
+            // Back square's top edge, from the front square's right edge
+            // across to the union's right — so the two never overlap-paint.
+            out[used.len] = bar(.{
+                .left = b.left + off,
+                .top = b.top,
+                .right = b.right,
+                .bottom = b.top + so,
+            });
+            // ...and its right edge, down to where the front square hides it.
+            out[used.len + 1] = bar(.{
+                .left = b.right - so,
+                .top = b.top,
+                .right = b.right,
+                .bottom = b.bottom - off,
+            });
+            return out[0 .. used.len + 2];
+        },
     }
+}
+
+/// Four filled bars forming the outline of `b`, `t` thick, drawn inward.
+/// The top/bottom bars span the FULL width and the left/right ones only the
+/// span between them, so no two bars overlap — overlapping quads are invisible
+/// with an opaque brush but paint twice under any future alpha blend.
+fn squareOutline(b: Rect, t: i32, out: []Quad) []const Quad {
+    out[0] = bar(.{ .left = b.left, .top = b.top, .right = b.right, .bottom = b.top + t });
+    out[1] = bar(.{ .left = b.left, .top = b.bottom - t, .right = b.right, .bottom = b.bottom });
+    out[2] = bar(.{ .left = b.left, .top = b.top + t, .right = b.left + t, .bottom = b.bottom - t });
+    out[3] = bar(.{ .left = b.right - t, .top = b.top + t, .right = b.right, .bottom = b.bottom - t });
+    return out[0..4];
 }
 
 /// The pixel extent a set of quads actually paints, right/bottom EXCLUSIVE
@@ -661,7 +764,16 @@ test "shadeChannel clamps at both ends" {
     try testing.expectEqual(@as(u8, 0), shadeChannel(5, -15));
 }
 
-const all_glyphs = [_]Glyph{ .close, .add, .menu, .chevron_up, .chevron_down };
+const all_glyphs = [_]Glyph{
+    .close,
+    .add,
+    .menu,
+    .chevron_up,
+    .chevron_down,
+    .minimize,
+    .maximize,
+    .restore,
+};
 
 /// The painted square a strip button gets at `scale`, i.e. what the glyph
 /// tests below are actually drawing into. Derived from the metrics rather
@@ -694,7 +806,9 @@ test "every glyph is symmetric inside its target, on both axes" {
         }) |t| {
             for (all_glyphs) |g| {
                 const quads = glyphQuads(m, t, g, &buf);
-                try testing.expect(quads.len >= 2);
+                // `minimize` is a single bar; everything else is at least two.
+                const min_quads: usize = if (g == .minimize) 1 else 2;
+                try testing.expect(quads.len >= min_quads);
                 const b = paintedBounds(quads);
                 // Right/bottom are exclusive, so the last painted pixel is
                 // `right - 1`; clearance on each side must match exactly.
@@ -850,6 +964,87 @@ test "the hamburger's three rules are evenly spaced and never merge" {
         // All three the same length.
         try testing.expectEqual(top.width(), mid.width());
         try testing.expectEqual(top.width(), bot.width());
+    }
+}
+
+test "caption glyphs: minimize is one centered rule of the shared thickness" {
+    var buf: [max_quads]Quad = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const q = glyphQuads(m, t, .minimize, &buf);
+        try testing.expectEqual(@as(usize, 1), q.len);
+        const b = paintedBounds(q);
+        try testing.expectEqual(m.stroke_w, b.height());
+        // Same extent as its two neighbours in the cluster, so the three read
+        // as one set of icons rather than three sizes.
+        try testing.expectEqual(m.mark_caption, b.width());
+    }
+}
+
+test "caption glyphs: maximize is a HOLLOW square, not a filled slab" {
+    // Four bars with a hole in the middle. A filled rect punched with a
+    // background-colored one would show the REST color through a HOVERED
+    // fill, which is the kind of bug that only appears on hover.
+    var buf: [max_quads]Quad = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const q = glyphQuads(m, t, .maximize, &buf);
+        try testing.expectEqual(@as(usize, 4), q.len);
+        const b = paintedBounds(q);
+        try testing.expectEqual(m.mark_caption, b.width());
+        try testing.expectEqual(m.mark_caption, b.height());
+        // The center pixel is inside no bar → the square is open.
+        const cx = @divTrunc(b.left + b.right, 2);
+        const cy = @divTrunc(b.top + b.bottom, 2);
+        for (q) |quad| {
+            const qb = paintedBounds(&[_]Quad{quad});
+            try testing.expect(!(cx >= qb.left and cx < qb.right and
+                cy >= qb.top and cy < qb.bottom));
+        }
+        // Every bar is exactly the OUTLINE stroke thick on its short axis —
+        // 1 DIP, not the 2 DIP open-mark stroke. At 2 DIP a 10 DIP box has a
+        // 6 DIP interior and reads as a filled square with a dot in it, which
+        // is what the first build actually shipped.
+        for (q) |quad| {
+            const qb = paintedBounds(&[_]Quad{quad});
+            try testing.expectEqual(m.stroke_outline, @min(qb.width(), qb.height()));
+        }
+        // The optical rule, as arithmetic: the enclosed area is the majority
+        // of the glyph. Anything less and the outline reads as a fill.
+        const interior = m.mark_caption - 2 * m.stroke_outline;
+        try testing.expect(interior * 2 > m.mark_caption);
+    }
+}
+
+test "caption glyphs: restore's two squares fill the mark box between them" {
+    // The glyph is asymmetric ON PURPOSE — it is a depth cue. What has to be
+    // symmetric, and what "every glyph is symmetric inside its target" checks,
+    // is the union: the front square owns left+bottom, the back one top+right.
+    // Asserted here directly so a future tweak to `restore_off` cannot quietly
+    // shrink the union and leave the whole glyph sitting off-center.
+    var buf: [max_quads]Quad = undefined;
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.05) {
+        const m = Metrics.init(scale);
+        const t = squareAt(m);
+        const q = glyphQuads(m, t, .restore, &buf);
+        try testing.expectEqual(@as(usize, 6), q.len);
+        const b = paintedBounds(q);
+        try testing.expectEqual(m.mark_caption, b.width());
+        try testing.expectEqual(m.mark_caption, b.height());
+        // The front square (the first four bars) is inset from the union's
+        // top and right, and flush with its left and bottom — i.e. it really
+        // is in front and down-left.
+        const front = paintedBounds(q[0..4]);
+        try testing.expectEqual(b.left, front.left);
+        try testing.expectEqual(b.bottom, front.bottom);
+        try testing.expect(front.top > b.top);
+        try testing.expect(front.right < b.right);
+        // The offset always clears the stroke, or the back square's edges
+        // merge into the front one's and the glyph is a blob.
+        try testing.expect(front.top - b.top > m.stroke_outline);
     }
 }
 

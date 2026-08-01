@@ -84,6 +84,7 @@ const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
 const split_geometry = @import("split_geometry.zig");
 const tab_strip = @import("tab_strip_layout.zig");
+const caption_layout = @import("caption_layout.zig");
 const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const tab_shape = @import("tab_shape.zig");
@@ -150,6 +151,18 @@ active_tab: usize = 0,
 
 /// Whether the tab bar is visible (shown when >1 tab).
 tab_bar_visible: bool = false,
+
+/// Caption button under the pointer, if any (T254). The band's pixels are
+/// client but its mouse messages arrive as NC, so this is driven by
+/// `WM_NCMOUSEMOVE`/`WM_NCMOUSELEAVE`, not by the strip's tracking.
+caption_hover: ?caption_layout.Button = null,
+/// Caption button the left button went down on. A click only fires when the
+/// release lands on the SAME button — press-then-slide-off must cancel, which
+/// is what every native button does and what makes a mis-aimed close
+/// recoverable.
+caption_pressed: ?caption_layout.Button = null,
+/// Whether `TME_NONCLIENT` tracking is armed, so a hover can un-hover.
+tracking_nc_mouse: bool = false,
 
 /// DPI scale factor (DPI / 96.0).
 scale: f32 = 1.0,
@@ -667,6 +680,22 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
 
     applyChromeTheme(hwnd, app.config.@"window-theme", app.config.background);
 
+    // T254: the first WM_NCCALCSIZE arrives before GWLP_USERDATA is set, so
+    // the frame the window was created with is still the stock one. Ask for a
+    // recalculation now that the wndproc can answer — without this the caption
+    // band is painted into client area the OS has not given us yet, i.e. under
+    // the DWM caption.
+    _ = w32.SetWindowPos(
+        hwnd,
+        null,
+        0,
+        0,
+        0,
+        0,
+        w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOZORDER |
+            w32.SWP_NOACTIVATE | w32.SWP_FRAMECHANGED,
+    );
+
     // Apply dark theme to common controls (scrollbar, etc.).
     _ = w32.SetWindowTheme(
         hwnd,
@@ -800,15 +829,77 @@ fn layoutRect(r: w32.RECT) tab_strip.Rect {
     return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
 }
 
+/// Is this window drawing its own caption bar (T254)?
+///
+/// Three windows are not: the quick terminal (a `WS_POPUP` with no frame at
+/// all), a `window-decoration = none` window (the user asked for no titlebar,
+/// and giving them ours instead would be a worse answer than the OS's), and
+/// any window whose style has lost `WS_CAPTION` at runtime — `setDecorations`
+/// strips it, and a caption band painted into a borderless window would be a
+/// 36 DIP bar hanging off the top of the terminal.
+pub fn customCaption(self: *const Window) bool {
+    if (self.is_quick_terminal) return false;
+    if (self.app.config.@"window-decoration" == .none) return false;
+    const hwnd = self.hwnd orelse return false;
+    const style: u32 = @bitCast(w32.GetWindowLongW(hwnd, w32.GWL_STYLE));
+    return (style & w32.WS_CAPTION) != 0;
+}
+
+/// Height of the caption band in physical pixels, or 0 when the OS still owns
+/// the caption. From the layout module, never a second copy of the constant.
+pub fn captionHeight(self: *const Window) i32 {
+    if (!self.customCaption()) return 0;
+    return caption_layout.Metrics.init(self.scale).caption_h;
+}
+
+/// Client y where the tab strip begins: directly under the caption band.
+/// Every strip rect is still computed with its own top at 0 — the strip is a
+/// self-contained coordinate space, and this is the one number that places it
+/// (paint destination in, mouse coordinates out).
+pub fn tabBarTop(self: *const Window) i32 {
+    return self.captionHeight();
+}
+
+/// Is a CLIENT y inside the tab strip's band?
+pub fn inTabBar(self: *const Window, y: i32) bool {
+    const top = self.tabBarTop();
+    return y >= top and y < top + self.tabBarHeight();
+}
+
+/// A CLIENT y expressed in the strip's own coordinate space (its top at 0).
+pub fn toStripY(self: *const Window, y: i32) i32 {
+    return y - self.tabBarTop();
+}
+
+/// `SM_CYSIZEFRAME + SM_CXPADDEDBORDER` at THIS window's DPI: the thickness
+/// of the resize edge the OS would have given us, which is what we hand back
+/// to `HTTOP` now that the top border is client area.
+fn sysFrameY(self: *const Window) i32 {
+    const dpi: u32 = @intFromFloat(@round(self.scale * 96.0));
+    return w32.GetSystemMetricsForDpi(w32.SM_CYSIZEFRAME, dpi) +
+        w32.GetSystemMetricsForDpi(w32.SM_CXPADDEDBORDER, dpi);
+}
+
+/// The caption band's layout for this window's current client width.
+fn captionLayout(self: *const Window) ?caption_layout.Layout {
+    if (!self.customCaption()) return null;
+    const hwnd = self.hwnd orelse return null;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0) return null;
+    const m = caption_layout.Metrics.init(self.scale);
+    return caption_layout.layout(m, rect.right - rect.left);
+}
+
 /// Returns the client rect available for the active surface, which is
-/// the full client area minus the tab bar height from the top.
+/// the full client area minus the caption band and the tab bar height from
+/// the top.
 pub fn surfaceRect(self: *const Window) w32.RECT {
     const hwnd = self.hwnd orelse return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     var rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &rect) == 0) {
         return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     }
-    rect.top += self.tabBarHeight();
+    rect.top += self.captionHeight() + self.tabBarHeight();
     return rect;
 }
 
@@ -2797,11 +2888,346 @@ pub fn invalidateTabBar(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     var rect = w32.RECT{
         .left = 0,
-        .top = 0,
+        .top = self.tabBarTop(),
         .right = 10000,
-        .bottom = self.tabBarHeight(),
+        .bottom = self.tabBarTop() + self.tabBarHeight(),
     };
     _ = w32.InvalidateRect(hwnd, &rect, 0);
+}
+
+/// Invalidate the caption band so it gets repainted (T254).
+///
+/// `InvalidateRect`, never a `GetDC` paint: a GetDC paint does not mark the
+/// region dirty, so its pixels never reach the backing store and
+/// `PrintWindow` — i.e. every acceptance script — sees the OLD frame while the
+/// screen shows the new one. That cost T233 two hours of debugging a build
+/// that was behaving correctly.
+pub fn invalidateCaption(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const h = self.captionHeight();
+    if (h <= 0) return;
+    var rect = w32.RECT{ .left = 0, .top = 0, .right = 10000, .bottom = h };
+    _ = w32.InvalidateRect(hwnd, &rect, 0);
+}
+
+/// `WM_NCCALCSIZE`: hand the caption band and the top border to the client
+/// area, keeping the left/right/bottom sizing borders (T254).
+///
+/// Returns null when the OS should keep doing its own thing.
+fn handleNcCalcSize(self: *Window, wparam: usize, lparam: isize) ?isize {
+    if (wparam == 0) return null;
+    if (!self.customCaption()) return null;
+    const hwnd = self.hwnd orelse return null;
+    const params: *w32.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+
+    // Let DefWindowProc compute the standard frame first, then take the top
+    // back. Doing the arithmetic ourselves would mean re-deriving the border
+    // widths for every DPI and every Windows build; this way only the one
+    // edge we actually want differs from stock.
+    const original_top = params.rgrc[0].top;
+    _ = w32.DefWindowProcW(hwnd, w32.WM_NCCALCSIZE, wparam, lparam);
+    params.rgrc[0].top = original_top;
+
+    // Maximized, a window's frame deliberately hangs off every edge of the
+    // monitor so the borders are not visible. Reclaiming the top unmodified
+    // would put the caption — and its close button — under the screen edge,
+    // which is the classic custom-titlebar bug: the window looks fine and the
+    // top row of controls is simply unreachable.
+    if (w32.IsZoomed(hwnd) != 0) params.rgrc[0].top += self.sysFrameY();
+
+    return 0;
+}
+
+/// `WM_NCHITTEST` for the caption band. Null = not ours, let the caller fall
+/// through to `DefWindowProc` (which still owns the side and bottom borders).
+fn handleCaptionHitTest(self: *Window, lparam: isize) ?isize {
+    const hwnd = self.hwnd orelse return null;
+    const l = self.captionLayout() orelse return null;
+    const m = caption_layout.Metrics.init(self.scale);
+
+    var pt: w32.POINT = .{
+        .x = @as(i16, @truncate(lparam & 0xFFFF)),
+        .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+    };
+    if (w32.ScreenToClient(hwnd, &pt) == 0) return null;
+
+    return switch (caption_layout.ncHitTest(
+        m,
+        l,
+        pt.x,
+        pt.y,
+        self.sysFrameY(),
+        w32.IsZoomed(hwnd) != 0,
+    )) {
+        .client => null,
+        .top => w32.HTTOP,
+        .top_left => w32.HTTOPLEFT,
+        .top_right => w32.HTTOPRIGHT,
+        .caption => w32.HTCAPTION,
+        .minimize => w32.HTMINBUTTON,
+        // HTMAXBUTTON is not decoration: the Snap Layouts flyout is triggered
+        // by the OS watching for this hit-test code. Return anything else and
+        // the flyout silently stops existing.
+        .maximize => w32.HTMAXBUTTON,
+        .close => w32.HTCLOSE,
+    };
+}
+
+/// Which caption button a non-client mouse message is over, from the hit-test
+/// code Windows already computed for us in `wparam`.
+fn captionButtonFor(code: usize) ?caption_layout.Button {
+    return switch (@as(isize, @bitCast(code))) {
+        w32.HTMINBUTTON => .minimize,
+        w32.HTMAXBUTTON => .maximize,
+        w32.HTCLOSE => .close,
+        else => null,
+    };
+}
+
+/// `WM_NCMOUSEMOVE`: hover feedback for the caption buttons.
+fn handleNcMouseMove(self: *Window, wparam: usize) void {
+    const hwnd = self.hwnd orelse return;
+    if (!self.customCaption()) return;
+
+    // TME_NONCLIENT, not the strip's plain TME_LEAVE. The band's PIXELS are
+    // client, but its mouse messages are non-client (that is what returning
+    // HTCAPTION & co. from the hit test does), so a plain TME_LEAVE never
+    // fires and the last hovered button stays lit forever.
+    if (!self.tracking_nc_mouse) {
+        var tme = w32.TRACKMOUSEEVENT{
+            .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+            .dwFlags = w32.TME_LEAVE | w32.TME_NONCLIENT,
+            .hwndTrack = hwnd,
+            .dwHoverTime = 0,
+        };
+        _ = w32.TrackMouseEvent(&tme);
+        self.tracking_nc_mouse = true;
+    }
+
+    const hovered = captionButtonFor(wparam);
+    if (hovered == self.caption_hover) return;
+    self.caption_hover = hovered;
+    self.invalidateCaption();
+}
+
+/// `WM_NCMOUSELEAVE`: the pointer left the non-client area entirely.
+///
+/// Clears the HOVER only. `caption_pressed` deliberately survives, for the
+/// same reason a native button's does: press-and-drag-off then back on is one
+/// click, not a cancelled one, and the release is where the decision is made
+/// (`handleNcLButtonUp` fires only when the codes match). Clearing it here
+/// also made the buttons unclickable outright whenever the real pointer was
+/// not sitting on the window — `TrackMouseEvent` watches the REAL cursor, so
+/// on a background test desktop the leave lands within one frame of the arm,
+/// between the press and the release (T233's lesson, in a new place).
+fn handleNcMouseLeave(self: *Window) void {
+    self.tracking_nc_mouse = false;
+    if (self.caption_hover == null) return;
+    self.caption_hover = null;
+    self.invalidateCaption();
+}
+
+/// A left-button release anywhere in the CLIENT area ends a caption press
+/// that never came back to the caption. Without this the press would latch
+/// until the next caption click, and that click would fire the LATCHED
+/// button rather than the one under the pointer.
+fn clearCaptionPress(self: *Window) void {
+    if (self.caption_pressed == null) return;
+    self.caption_pressed = null;
+    self.invalidateCaption();
+}
+
+/// `WM_NCLBUTTONDOWN` on a caption button. Returns true when consumed.
+///
+/// Consuming it matters for more than the visuals: `DefWindowProc` would
+/// enter its own modal button-tracking loop for HTMINBUTTON/HTMAXBUTTON/
+/// HTCLOSE and try to paint system buttons that no longer exist.
+fn handleNcLButtonDown(self: *Window, wparam: usize) bool {
+    if (!self.customCaption()) return false;
+    const btn = captionButtonFor(wparam) orelse return false;
+    self.caption_pressed = btn;
+    // Deliberately does NOT set `caption_hover`. Hover belongs to
+    // `WM_NCMOUSEMOVE` alone; setting it here latched a hover fill that
+    // nothing cleared once the press ended, because the only thing that
+    // clears hover is the pointer moving — and the pointer had never
+    // reported being there in the first place.
+    self.invalidateCaption();
+    return true;
+}
+
+/// `WM_NCLBUTTONUP`: fire the command only if the release lands on the same
+/// button the press did.
+fn handleNcLButtonUp(self: *Window, wparam: usize) bool {
+    if (!self.customCaption()) return false;
+    const pressed = self.caption_pressed orelse return false;
+    self.caption_pressed = null;
+    self.invalidateCaption();
+
+    const released = captionButtonFor(wparam) orelse return true;
+    if (released != pressed) return true;
+
+    const hwnd = self.hwnd orelse return true;
+    // Through WM_SYSCOMMAND rather than ShowWindow/DestroyWindow directly, so
+    // the window goes down exactly the path the system buttons used: the same
+    // close confirmation, the same animation, the same accessibility events.
+    const cmd: usize = switch (caption_layout.command(pressed, w32.IsZoomed(hwnd) != 0)) {
+        .minimize => w32.SC_MINIMIZE,
+        .maximize => w32.SC_MAXIMIZE,
+        .restore => w32.SC_RESTORE,
+        .close => w32.SC_CLOSE,
+    };
+    _ = w32.PostMessageW(hwnd, w32.WM_SYSCOMMAND, cmd, 0);
+    return true;
+}
+
+/// Paint the caption band: background, window title, and the three system
+/// buttons (T254).
+///
+/// Double-buffered like the strip. Same background color as the strip on
+/// purpose — the two are one continuous chrome surface, and T205 will merge
+/// them into one row entirely.
+fn paintCaption(self: *Window, hdc_screen: w32.HDC) void {
+    const hwnd = self.hwnd orelse return;
+    const cap_h = self.captionHeight();
+    if (cap_h <= 0) return;
+
+    var client_rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
+    const client_w = client_rect.right - client_rect.left;
+    if (client_w <= 0) return;
+
+    const m = caption_layout.Metrics.init(self.scale);
+    const l = caption_layout.layout(m, client_w);
+
+    const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
+    defer _ = w32.DeleteDC(mem_dc);
+    const mem_bmp = w32.CreateCompatibleBitmap(hdc_screen, client_w, cap_h) orelse return;
+    const old_bmp = w32.SelectObject(mem_dc, mem_bmp);
+    defer {
+        _ = w32.SelectObject(mem_dc, old_bmp);
+        _ = w32.DeleteObject(mem_bmp);
+    }
+
+    // Same derivation as the strip's `bar_*`: terminal background + 20 per
+    // channel. Not a second constant — a caption that shaded from its own
+    // number would be a visibly different grey one row above the strip.
+    const bg = self.app.config.background;
+    const cap_r: u8 = @min(@as(u16, bg.r) + 20, 255);
+    const cap_g: u8 = @min(@as(u16, bg.g) + 20, 255);
+    const cap_b: u8 = @min(@as(u16, bg.b) + 20, 255);
+
+    var band = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = cap_h };
+    if (w32.CreateSolidBrush(w32.RGB(cap_r, cap_g, cap_b))) |brush| {
+        _ = w32.FillRect(mem_dc, &band, brush);
+        _ = w32.DeleteObject(brush);
+    }
+
+    // --- Title ---
+    if (!l.title.isEmpty()) {
+        var title_buf: [256]u16 = undefined;
+        const n = w32.GetWindowTextW(hwnd, &title_buf, title_buf.len);
+        if (n > 0) {
+            const old_font = if (self.tab_font) |f| w32.SelectObject(mem_dc, f) else null;
+            defer if (old_font) |f| {
+                _ = w32.SelectObject(mem_dc, f);
+            };
+            _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
+            // Matches the ACTIVE tab's label, for the same reason the
+            // background matches the strip's: one chrome surface, one text
+            // color. A caption that picked its own grey would read as a
+            // different app's titlebar.
+            _ = w32.SetTextColor(mem_dc, w32.RGB(230, 230, 230));
+            var tr = stripRect(l.title);
+            _ = w32.DrawTextW(
+                mem_dc,
+                &title_buf,
+                n,
+                &tr,
+                w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS,
+            );
+        }
+    }
+
+    // --- Buttons ---
+    // Through `paintIconButton`, the same one path the strip's "+", "≡" and
+    // "×" go through. Three controls with three independently invented
+    // treatments is the exact report the design system exists to answer.
+    const buttons = [_]struct {
+        b: caption_layout.Button,
+        rect: caption_layout.Rect,
+        glyph: icon_button.Glyph,
+    }{
+        .{ .b = .minimize, .rect = l.minimize, .glyph = .minimize },
+        .{
+            .b = .maximize,
+            .rect = l.maximize,
+            .glyph = if (w32.IsZoomed(hwnd) != 0) .restore else .maximize,
+        },
+        .{ .b = .close, .rect = l.close, .glyph = .close },
+    };
+    for (buttons) |btn| {
+        const state: icon_button.State = if (self.caption_pressed == btn.b)
+            .pressed
+        else if (self.caption_hover == btn.b)
+            .hover
+        else
+            .normal;
+
+        // Close keeps Windows' red hover. A NAMED platform divergence from
+        // the design system's "hover is base ±15": every Windows user reads
+        // the red as "this one is destructive", and dropping it to be
+        // internally consistent would make our close button the only one on
+        // the desktop that does not warn. The glyph flips to white on it,
+        // which clears 4.5:1 against #C42B1C.
+        const red_hover = btn.b == .close and state != .normal;
+        const base_r: u8 = if (red_hover) 196 else cap_r;
+        const base_g: u8 = if (red_hover) 43 else cap_g;
+        const base_b: u8 = if (red_hover) 28 else cap_b;
+        const glyph_color = if (red_hover) w32.RGB(255, 255, 255) else w32.RGB(230, 230, 230);
+
+        // The red fill has to land BEFORE the glyph, and it is not a shade of
+        // the caption background, so it cannot come out of `fillDelta`. The
+        // glyph pass is still the shared one — the fill is the only thing
+        // that differs, which is the smallest divergence that expresses the
+        // rule.
+        if (red_hover) paintCaptionRedFill(mem_dc, m, btn.rect, state == .pressed);
+        paintIconButton(
+            mem_dc,
+            m.ib,
+            btn.rect,
+            btn.glyph,
+            if (red_hover) .normal else state,
+            base_r,
+            base_g,
+            base_b,
+            glyph_color,
+        );
+    }
+
+    _ = w32.BitBlt(hdc_screen, 0, 0, client_w, cap_h, mem_dc, 0, 0, w32.SRCCOPY);
+}
+
+/// The close button's red hover/pressed fill: the same rounded rect
+/// `paintIconButton` draws, in Windows' close red (#C42B1C, darkened for
+/// pressed the way every other button firms up).
+fn paintCaptionRedFill(
+    mem_dc: w32.HDC,
+    m: caption_layout.Metrics,
+    box: caption_layout.Rect,
+    pressed: bool,
+) void {
+    const d: i32 = if (pressed) -25 else 0;
+    const color = w32.RGB(
+        icon_button.shadeChannel(196, d),
+        icon_button.shadeChannel(43, d),
+        icon_button.shadeChannel(28, d),
+    );
+    const rr = icon_button.fillRegion(m.ib, box);
+    const rgn = w32.CreateRoundRectRgn(rr.left, rr.top, rr.right, rr.bottom, rr.ellipse, rr.ellipse) orelse return;
+    defer _ = w32.DeleteObject(rgn);
+    const brush = w32.CreateSolidBrush(color) orelse return;
+    defer _ = w32.DeleteObject(brush);
+    _ = w32.FillRgn(mem_dc, rgn, brush);
 }
 
 /// WM_PAINT: one BeginPaint/EndPaint cycle covering both the tab bar and
@@ -2813,6 +3239,7 @@ fn paintWindow(self: *Window) void {
     const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
 
+    self.paintCaption(hdc_screen);
     self.paintTabBar(hdc_screen);
     // Dividers are part of the paint cycle (T155). BeginPaint clips to the
     // invalid region, so this covers an exposed band; the post-layout
@@ -3175,7 +3602,12 @@ fn paintTabBar(self: *Window, hdc_screen: w32.HDC) void {
     );
 
     // --- BitBlt to screen ---
-    _ = w32.BitBlt(hdc_screen, 0, 0, client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
+    // The strip's whole coordinate space still has its own top at 0; this is
+    // the single place it is placed in the client area, under the caption band
+    // (T254). Keeping the offset here rather than threading it through every
+    // rect is what stops the paint and the hit tests from drifting apart —
+    // `handleTabBarClick` and friends subtract the same `tabBarTop()`.
+    _ = w32.BitBlt(hdc_screen, 0, self.tabBarTop(), client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
 }
 
 /// Toggle fullscreen mode on the top-level window.
@@ -3576,7 +4008,12 @@ pub fn openMenuBar(self: *Window) void {
     // the client area is the sane fallback and still lands under the strip.
     var pt = w32.POINT{
         .x = self.menu_btn_rect.left,
-        .y = if (self.menu_btn_rect.bottom > 0) self.menu_btn_rect.bottom else self.tabBarHeight(),
+        // Strip-local → client: every strip rect has the strip's own top at
+        // 0, and `tabBarTop()` is the one place that offset is applied.
+        .y = self.tabBarTop() + if (self.menu_btn_rect.bottom > 0)
+            self.menu_btn_rect.bottom
+        else
+            self.tabBarHeight(),
     };
     _ = w32.ClientToScreen(hwnd, &pt);
 
@@ -3909,14 +4346,32 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
     // the same fallback as a hidden bar for the same reason.
     const has_rect = self.tab_bar_visible and
         self.tab_rects[tab_idx].right > self.tab_rects[tab_idx].left;
-    const rect: w32.RECT = if (has_rect) self.tab_rects[tab_idx] else blk: {
+    // Strip rects are strip-local (their top at 0); the Edit is a child of the
+    // window, so it wants CLIENT coordinates — hence `tabBarTop()` (T254).
+    // Without it the editor would open UNDER the caption band, over the first
+    // row of the terminal.
+    const strip_top = self.tabBarTop();
+    const rect: w32.RECT = if (has_rect) blk: {
+        const r = self.tab_rects[tab_idx];
+        break :blk .{
+            .left = r.left,
+            .top = r.top + strip_top,
+            .right = r.right,
+            .bottom = r.bottom + strip_top,
+        };
+    } else blk: {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(hwnd, &client) == 0) return;
         const h: i32 = @intFromFloat(@round(32.0 * self.scale));
         const max_w: i32 = @intFromFloat(@round(400.0 * self.scale));
         const w: i32 = @min(client.right - client.left - 8, max_w);
         if (w <= 8) return;
-        break :blk .{ .left = 4, .top = 4, .right = 4 + w, .bottom = 4 + h };
+        break :blk .{
+            .left = 4,
+            .top = strip_top + 4,
+            .right = 4 + w,
+            .bottom = strip_top + 4 + h,
+        };
     };
 
     // tab_titles stores only `tab_title_lens` valid u16s; the rest is
@@ -4256,6 +4711,49 @@ pub fn windowWndProc(
     };
 
     switch (msg) {
+        // --- Custom caption bar (T254) ---------------------------------
+        //
+        // WM_NCCALCSIZE runs before GWLP_USERDATA is set on the very first
+        // messages of a window's life; the `window` lookup above already
+        // sends those to DefWindowProc, which is the correct stock behavior
+        // for a frame we have not configured yet. The SWP_FRAMECHANGED in
+        // `init` is what re-asks once we are ready.
+        w32.WM_NCCALCSIZE => {
+            if (window.handleNcCalcSize(wparam, lparam)) |r| return r;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_NCHITTEST => {
+            if (window.handleCaptionHitTest(lparam)) |r| return r;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_NCMOUSEMOVE => {
+            window.handleNcMouseMove(wparam);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_NCMOUSELEAVE => {
+            window.handleNcMouseLeave();
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_NCLBUTTONDOWN => {
+            if (window.handleNcLButtonDown(wparam)) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_NCLBUTTONUP => {
+            if (window.handleNcLButtonUp(wparam)) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_NCLBUTTONDBLCLK => {
+            // A double-click on a caption BUTTON is two clicks, not a
+            // maximize: Windows sends DOWN, UP, DBLCLK, UP for the pair, and
+            // letting DefWindowProc see the DBLCLK over our close button
+            // would maximize the window out from under the second click.
+            if (captionButtonFor(wparam) != null and window.customCaption()) {
+                _ = window.handleNcLButtonDown(wparam);
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_SETTINGCHANGE => {
             // An OS light/dark flip arrives here (a WM_SETTINGCHANGE
             // broadcast reaches TOP-LEVEL windows only — never the child
@@ -4352,6 +4850,10 @@ pub fn windowWndProc(
                 window.was_maximized = false;
                 window.savePlacement(false);
             }
+            // The caption spans the full width and its maximize glyph flips
+            // to "restore", so both a resize and a maximize/restore change
+            // what it should be showing (T254).
+            window.invalidateCaption();
             window.handleResize();
             return 0;
         },
@@ -4484,12 +4986,13 @@ pub fn windowWndProc(
                 window.startDividerDrag(hit.handle, hit.layout);
                 return 0;
             }
-            if (y < window.tabBarHeight()) {
-                window.handleTabBarClick(@truncate(x), @truncate(y));
+            if (window.inTabBar(y)) {
+                window.handleTabBarClick(@truncate(x), @truncate(window.toStripY(y)));
             }
             return 0;
         },
         w32.WM_LBUTTONUP => {
+            window.clearCaptionPress();
             if (window.hero_divider_drag) {
                 window.heroEndDividerDrag();
                 return 0;
@@ -4528,7 +5031,7 @@ pub fn windowWndProc(
                 return 0;
             }
             // Double-click on tab bar starts inline rename
-            if (y < window.tabBarHeight()) {
+            if (window.inTabBar(y)) {
                 for (0..window.tab_count) |i| {
                     const rect = window.tab_rects[i];
                     if (rect.right <= rect.left) continue;
@@ -4550,8 +5053,8 @@ pub fn windowWndProc(
         w32.WM_RBUTTONUP => {
             const x: i16 = @truncate(lparam & 0xFFFF);
             const y: i16 = @truncate((lparam >> 16) & 0xFFFF);
-            if (y < window.tabBarHeight()) {
-                window.handleTabBarRightClick(x, y);
+            if (window.inTabBar(y)) {
+                window.handleTabBarRightClick(x, @truncate(window.toStripY(y)));
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -4601,8 +5104,8 @@ pub fn windowWndProc(
                 }
                 return 0;
             }
-            if (y < window.tabBarHeight()) {
-                window.handleTabBarMouseMove(@truncate(x), @truncate(y));
+            if (window.inTabBar(y)) {
+                window.handleTabBarMouseMove(@truncate(x), @truncate(window.toStripY(y)));
                 // Leaving the content area upward is a divider un-hover: the
                 // pointer never crosses WM_MOUSELEAVE to get here.
                 window.setDividerHover(null);

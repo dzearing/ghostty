@@ -218,8 +218,20 @@ the *optical* relationship rather than raw equality:
 | `close` (x) | 11 | A diagonal cross reads wider than its bounding box |
 | `menu` (hamburger) | 14 | Horizontal-only marks read narrow |
 | `chevron` | 12 wide, 6 rise | Shallower than a caret |
+| `minimize`, `maximize`, `restore` | 10 | The caption cluster (T254). One number for all three — they sit side by side, so tuning between them would read as three sizes rather than three icons. Under `close` (11) because two of the three are *closed outlines*, and a closed outline reads larger than an open mark of the same extent |
 
-Stroke thickness is **2 DIP** for every glyph.
+Stroke thickness is **2 DIP** for every **open** mark (+, ×, hamburger,
+chevron, the minimize rule) and **1 DIP** for a **closed outline** (maximize,
+restore).
+
+That split is an amendment (T254), not an exception. The 2 DIP rule was
+written for marks where the eye reads the *stroke*; in a closed outline the eye
+reads the *enclosed area*, and 2 DIP on a 10 DIP box leaves a 6 DIP interior —
+the glyph reads as a filled square with a dot in it, which is exactly what the
+first T254 build shipped. Windows' own `ChromeMaximize` is a 10x10 box with a
+1 px stroke for the same reason. Same class of rule as the per-glyph mark
+widths above: equal geometry is not equal apparent weight. Asserted as
+`interior * 2 > mark_caption` in `icon_button.zig`.
 
 **Every extent — mark and stroke alike — is rounded to the PARITY of the
 square it sits in, not to an even number of pixels.** (This corrects the rule
@@ -283,6 +295,11 @@ present must justify its height every time:
 - Prefer **hosting chrome in space the window already spends** — the caption
   bar is already there and is mostly empty. Controls that must always be
   reachable (the window menu) belong there, left of the system minimize button.
+  Since **T254** that is actually possible: `WM_NCCALCSIZE` hands the caption
+  band to the client area and `caption_layout.zig` lays it out to the rules
+  above (36 DIP = 4 + 28 + 4, the shared 28 DIP square, 4 DIP between painted
+  edges). Before T254 the caption was stock DWM and there was no DC to draw
+  into — a fact two task files disagreed about for a day.
 - When a surface appears and disappears with content (the tab strip), its
   appearance must not shift the content underneath it jarringly; size the
   terminal from the space that remains, in one layout pass.

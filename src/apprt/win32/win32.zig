@@ -191,6 +191,67 @@ pub const WM_NCHITTEST: u32 = 0x0084;
 /// thread (siblings below in z-order, then the parent).
 pub const HTTRANSPARENT: isize = -1;
 
+// --- Custom caption bar (T254) ----------------------------------------------
+//
+// `WM_NCCALCSIZE` hands the caption band to the client area, so everything
+// that used to be DWM's job (paint, hover, click, the resize edge along the
+// top) becomes ours. Returning a non-`HTCLIENT` code from `WM_NCHITTEST` is
+// what makes Windows route NC mouse messages to those client pixels, and
+// returning `HTMAXBUTTON` in particular is what keeps the Snap Layouts flyout
+// working — the OS watches for that hit-test code, not for a real button.
+pub const HTCAPTION: isize = 2;
+pub const HTSYSMENU: isize = 3;
+pub const HTMINBUTTON: isize = 8;
+pub const HTMAXBUTTON: isize = 9;
+pub const HTTOP: isize = 12;
+pub const HTTOPLEFT: isize = 13;
+pub const HTTOPRIGHT: isize = 14;
+pub const HTCLOSE: isize = 20;
+
+pub const WM_NCCALCSIZE: u32 = 0x0083;
+pub const WM_NCMOUSEMOVE: u32 = 0x00A0;
+pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+pub const WM_NCLBUTTONUP: u32 = 0x00A2;
+pub const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
+pub const WM_NCMOUSELEAVE: u32 = 0x02A2;
+
+pub const WM_SYSCOMMAND: u32 = 0x0112;
+pub const SC_SIZE: usize = 0xF000;
+pub const SC_MOVE: usize = 0xF010;
+pub const SC_MINIMIZE: usize = 0xF020;
+pub const SC_MAXIMIZE: usize = 0xF030;
+pub const SC_CLOSE: usize = 0xF060;
+pub const SC_RESTORE: usize = 0xF120;
+/// wparam low 4 bits are flags on some SC_* values; mask before comparing.
+pub const SC_MASK: usize = 0xFFF0;
+
+/// `TRACKMOUSEEVENT.dwFlags` bit that asks for `WM_NCMOUSELEAVE` rather than
+/// `WM_MOUSELEAVE`. Without it a hover on a caption button never un-hovers,
+/// because the band's pixels are client but its mouse messages are NC.
+pub const TME_NONCLIENT: u32 = 0x00000010;
+
+pub const SM_CYSIZEFRAME: i32 = 33;
+pub const SM_CXPADDEDBORDER: i32 = 92;
+
+/// The parameter block `WM_NCCALCSIZE` passes in `lparam` when `wparam` is
+/// TRUE. `rgrc[0]` goes in as the proposed WINDOW rect and comes out as the
+/// new CLIENT rect.
+pub const NCCALCSIZE_PARAMS = extern struct {
+    rgrc: [3]RECT,
+    lppos: ?*anyopaque,
+};
+
+/// DPI-aware `GetSystemMetrics`. The frame thickness we hand back to the
+/// resize edge has to be the one for THIS window's DPI, not the primary
+/// monitor's — a window dragged to a 200% display would otherwise get a
+/// 100%-sized grab band. Windows 10 1607+, which this app already requires
+/// (the per-monitor-v2 DPI awareness it runs under arrived in the same
+/// release), so it is imported statically like the rest of user32.
+pub extern "user32" fn GetSystemMetricsForDpi(
+    nIndex: i32,
+    dpi: u32,
+) callconv(.winapi) i32;
+
 // IME messages
 pub const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
 pub const WM_IME_ENDCOMPOSITION: u32 = 0x010E;

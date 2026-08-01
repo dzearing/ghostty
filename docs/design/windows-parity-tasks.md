@@ -173,7 +173,12 @@ Work these first, in order, before falling back to first-todo-in-table:
 
     Then the tasks that bring the chrome into compliance:
 
-    **~~T232~~ → ~~T242~~ → ~~T235~~ → ~~T233~~ → T234.**
+    **~~T232~~ → ~~T242~~ → ~~T235~~ → ~~T233~~ → T254 (built) → T256 → T234.**
+
+    **T256 is the immediate next task**: T254's caption band moved the tab
+    strip off client `y = 0`, and `tab-strip.ps1` (7 failed) and `menu-bar.ps1`
+    (19 failed) still measure it from there. The standing floor is not green
+    until that lands, so nothing else goes first.
 
     - **T233 (done, 2026-07-31)** — *"I think the splitter lines should be 2px
       and have a hover color that emphasizes it."* Both halves were real:
@@ -242,9 +247,23 @@ Work these first, in order, before falling back to first-todo-in-table:
       anti-stretch rule.
     - **T233** — split dividers: 2 DIP (1 DIP rounds to an invisible single
       pixel at 100/125%) with a real hover color change, not a cursor change.
+    - **T254** — the prerequisite T234 assumed it already had. T234 sized
+      itself small on *"we do own the caption bar … a paint + hit-test change,
+      not a new mechanism"*; that is false, and **T205 had already written down
+      why** a day earlier: every window is plain `WS_OVERLAPPEDWINDOW`, there is
+      no `WM_NCCALCSIZE` anywhere in `src/apprt/win32/`, and T78/T203 only ask
+      DWM to restyle *its* caption. So T254 builds the caption we do not have —
+      NCCALCSIZE takeover, `caption_layout.zig`, our own min/max/close, and
+      `HTMAXBUTTON` so Snap Layouts survives — once, for both callers.
+      Ordering settled: **T254 → T234 → T205.** Its process lesson: *when a
+      task's summary makes a load-bearing claim about existing machinery, verify
+      it against the source before sizing the task, and read the sibling task
+      that covers the same subsystem.* A claim inherited from another task file
+      is not evidence.
     - **T234** — the big one: **no tab strip at one tab** (Mac shows none) and
       a "…" button in the caption bar left of minimize. Reclaims 32–40 DIP of
-      every window. Sequence against T205, which targets the same region.
+      every window. Now depends on T254; what remains here is the button rect
+      plus the visibility rule.
 
 000. **AHEAD OF EVERYTHING as of 2026-07-31 (user bug report, same day).**
     The agent-upgrade path is broken in two ways the user hit for real, and it

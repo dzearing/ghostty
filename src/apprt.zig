@@ -109,6 +109,9 @@ test {
     // banner (T204), same no-OS-imports deal.
     _ = @import("apprt/win32/icon_button.zig");
 
+    // Pure win32 caption-bar geometry (T254), same no-OS-imports deal.
+    _ = @import("apprt/win32/caption_layout.zig");
+
     // Pure win32 per-pixel tab silhouette + rim (T206), same no-OS-imports
     // deal.
     _ = @import("apprt/win32/tab_shape.zig");
