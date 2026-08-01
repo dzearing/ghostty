@@ -216,10 +216,32 @@ Work these first, in order, before falling back to first-todo-in-table:
     T202's retired rule: 225 px against real chiclets of 346 and 344, a ~120 px
     error that put every right-click on empty strip. Deleted, not repaired.
 
-    The next UI item is **T205** (tabs INSIDE the titlebar), whose scope T234
-    just shrank to "the 2+-tab case" — and which is now one edit in
-    `ChromeGeometry.ps1` plus whatever assertions genuinely change, instead of
-    a script-by-script hunt.
+    **~~T205~~ (done, 2026-07-31) — the tabs are in the titlebar.** The
+    prediction held to the letter: two app files, and ONE new argument
+    (`-StripVisible`) across `ChromeGeometry.ps1` and its nine call sites.
+    Measured at the user's 125%, chrome went from 95 physical px to 50 — **45
+    px of terminal back on every multi-tab window**, on top of T234's 50.
+
+    Two decisions carry it. **Chrome that shares a row shares a baseline:** the
+    caption buttons take `btn_top` from the STRIP's own derivation, because the
+    "+" and the tab close "×" have been on that frame since T204 and centering
+    the square in the 40 DIP band would have landed 2 px off it — reproducing
+    the user's complaint inside the fix. And **two painters, one row, disjoint
+    blits:** `band_left` is the seam, so a caption repaint cannot erase a tab
+    and the paint ORDER stops mattering.
+
+    Its interest is the lesson: **two scripts had never controlled their own
+    window size** and were inheriting `window_placement-debug` from whichever
+    GUI script ran last, so their conditions depended on RUN ORDER —
+    `tab-strip.ps1` 3 red, `menu-bar.ps1` 2. Every condition `tab-strip.ps1`
+    sets up is a ratio OF THE TAB RUN, and it was not controlling the input the
+    ratio is taken of. **T267.** Two more probes would have been GREEN AND
+    EMPTY: `menu-bar.ps1` was clicking the caption's close button and asserting
+    that nothing happened, which a posted CLIENT click can never make happen.
+
+    Follow-ups: **T265** (a pinned window title has nowhere to paint on a merged
+    row), **T266** (the top resize edge now sits ON the tabs — measure WT before
+    changing it), **T267** (above).
 
     **~~T256~~ (done, 2026-07-31)** unblocked it and closed T254. The caption
     band moved the strip off client `y = 0`, and both scripts that measured it
