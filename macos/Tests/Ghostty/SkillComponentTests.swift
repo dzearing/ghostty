@@ -10,6 +10,26 @@ struct SkillComponentTests {
         return url
     }
 
+    @Test func rollsBackOnPartialFailure() throws {
+        let home = try tempHome()
+        // Force the process-feedback write to fail by placing a directory where its SKILL.md should go.
+        let pfPath = home.appendingPathComponent(".copilot/skills/process-feedback/SKILL.md")
+        try FileManager.default.createDirectory(at: pfPath, withIntermediateDirectories: true)
+        let c = SkillComponent(agent: .copilot, homeDirectoryURL: home, fileManager: .default)
+        #expect(throws: (any Error).self) { try c.install() }
+        // The first (ghoztty) skill must have been rolled back — no partial install left behind.
+        let ghz = home.appendingPathComponent(".copilot/skills/ghoztty/SKILL.md")
+        #expect(!FileManager.default.fileExists(atPath: ghz.path))
+    }
+
+    @Test func mixedStateReportsOutdated() throws {
+        let home = try tempHome()
+        let c = SkillComponent(agent: .copilot, homeDirectoryURL: home, fileManager: .default)
+        try c.install()
+        try FileManager.default.removeItem(at: home.appendingPathComponent(".copilot/skills/ghoztty/SKILL.md"))
+        #expect(c.state() == .outdated)
+    }
+
     @Test func installsBothSkillsIdempotentlyAndDetectsDrift() throws {
         let home = try tempHome()
         let c = SkillComponent(agent: .copilot, homeDirectoryURL: home, fileManager: .default)
