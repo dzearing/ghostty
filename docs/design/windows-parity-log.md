@@ -6177,9 +6177,10 @@ bash hop. The acceptance script now parses the file and rejects non-ASCII.
 
 Validation: the on-box dry-run publish end to end (exit 0, both artifacts at
 1.28.0 with version+arch names, stopped before `gh release create`);
-`test\win32\release-artifacts.ps1` ALL PASS (28); and the CI job's riskiest
-step - the Linux cross-build with the workflow's exact flags - proven in a
-debian container with the CI zig. What is NOT proven is GitHub running the job:
+`test\win32\release-artifacts.ps1` ALL PASS (28); and the CI job's whole build
+step - `build-release-artifacts.sh` with no `--skip-build`, the exact command
+the workflow runs - exit 0 in a debian container with the CI zig, producing
+both artifacts. What is NOT proven is GitHub running the job:
 `workflow_dispatch` needs the file on `main`, and the only other trigger is a
 real tag. **T348** carries that first run (and one unexplained
 compiler-terminated-mid-link under load, which is the shape of a CI flake).
