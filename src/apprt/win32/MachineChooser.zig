@@ -56,6 +56,8 @@ const type_ramp = @import("type_ramp.zig");
 const system_colors = @import("system_colors.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
+const chooser_sessions = @import("chooser_sessions.zig");
+const SessionRoster = @import("SessionRoster.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
 const relay_signin = @import("../../remote/relay_signin.zig");
 const w32 = @import("win32.zig");
@@ -116,6 +118,12 @@ const ROW_BG: chooser_rows.Rgb = WASH;
 fn rgb(c: chooser_rows.Rgb) u32 {
     return w32.RGB(c.r, c.g, c.b);
 }
+
+/// Hands out `MachineChooser.id`. A roster reply is matched on that id, never
+/// on a pointer: the chooser it was asked for may already be freed by the time
+/// the worker's `PostMessage` is dispatched, and a pointer comparison there
+/// would be a use-after-free with a plausible-looking result.
+var next_chooser_id: u64 = 1;
 
 var class_registered: bool = false;
 var bg_brush: ?w32.HBRUSH = null;
@@ -196,6 +204,13 @@ devices: []const relay_directory.Device = &.{},
 /// Current filtered rows (display order) mapped 1:1 to the listbox items.
 rows: [MAX_DEVICES + 1]Row = undefined,
 row_count: usize = 0,
+
+/// This chooser's identity for the whole app run — see `next_chooser_id`.
+id: u64,
+
+/// The selected machine's live sessions (T318). Only the Local row has one
+/// today; a remote machine's roster comes over its own transport in T319.
+roster: SessionRoster,
 
 /// Dialog layout in physical pixels from the owner DPI scale. Pure — the math
 /// and its tests live in `chooser_layout.zig`.
@@ -284,7 +299,14 @@ pub fn open(window: *Window) void {
         .account_btn = undefined,
         .account_link = undefined,
         .arena = std.heap.ArenaAllocator.init(alloc),
+        .id = next_chooser_id,
+        .roster = .init(alloc),
     };
+    next_chooser_id +%= 1;
+    // The saved layout's titles are one rung of the session label ladder, and
+    // the file does not change while a dialog is open — read it once here
+    // rather than on every repaint.
+    self.roster.loadManifest();
 
     // Resolve the relay base + bearer token and fetch the device list once.
     // Any failure degrades to a Local-only list plus a footer hint.
@@ -708,6 +730,11 @@ pub fn open(window: *Window) void {
     self.refilter("");
 
     window.machine_chooser = self;
+
+    // Prime the local roster the moment the dialog opens (Mac's `primeLocal`),
+    // so the count is in the detail subtitle before the user has looked at it.
+    // Off-thread, so this costs the dialog nothing.
+    self.roster.fetch(window.app, self.id, null);
 
     _ = w32.EnableWindow(owner, 0);
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
@@ -1277,11 +1304,80 @@ fn paintDetail(self: *MachineChooser, hdc: w32.HDC, l: Layout) void {
     // The detail subtitle is the ramp's CAPTION role, like the row subline it
     // echoes — it was drawing at body size, which made it compete with the
     // machine name instead of supporting it.
+    //
+    // Once the roster has loaded it LEADS with the session count, the way Mac's
+    // `detailSubtitle` does (`MachineChooserView.swift:520-540`).
+    var sub_buf2: [128]u8 = undefined;
+    const subtitle = self.detailSubtitle(&sub_buf2, row, detail.subtitle);
     var sub_rect = rect(l.detail_subtitle);
     const old_sub = if (self.subtitle_font) |f| w32.SelectObject(hdc, f) else null;
     _ = w32.SetTextColor(hdc, rgb(chooser_rows.secondaryOn(DIALOG_BG)));
-    drawTextUtf8(hdc, detail.subtitle, &sub_rect);
+    drawTextUtf8(hdc, subtitle, &sub_rect);
     if (old_sub) |o| _ = w32.SelectObject(hdc, o);
+
+    self.paintSessions(hdc, l, row);
+}
+
+/// The detail subtitle, with the session count prepended once the roster has
+/// loaded for a row that HAS one. A machine whose roster is still loading (or
+/// which has none) keeps its plain subtitle rather than showing a placeholder
+/// count — a number that appears and then changes is worse than one that
+/// appears late.
+fn detailSubtitle(
+    self: *const MachineChooser,
+    buf: []u8,
+    row: Row,
+    base: []const u8,
+) []const u8 {
+    if (row != .local) return base;
+    if (self.roster.state != .loaded) return base;
+
+    var rows: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const visible = self.roster.visible(self.window.app, &rows);
+    var count_buf: [32]u8 = undefined;
+    const count = chooser_sessions.countLabel(&count_buf, visible.len);
+    if (base.len == 0) return std.fmt.bufPrint(buf, "{s}", .{count}) catch base;
+    return std.fmt.bufPrint(buf, "{s} - {s}", .{ count, base }) catch base;
+}
+
+/// Paint the roster region for the selected row. Only the Local row has a
+/// roster today; a remote machine's comes over its own transport in T319, and
+/// until then its pane keeps the region empty rather than showing the local
+/// machine's sessions under a remote heading.
+fn paintSessions(self: *MachineChooser, hdc: w32.HDC, l: Layout, row: Row) void {
+    if (row != .local) return;
+    var rows: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const visible = self.roster.visible(self.window.app, &rows);
+    self.roster.paint(.{
+        .hdc = hdc,
+        .region = l.sessions,
+        .scale = self.window.scale,
+        .bg = DIALOG_BG,
+        .label_font = self.strong_font,
+        .caption_font = self.subtitle_font,
+    }, visible);
+}
+
+/// GUI thread: a roster fetch landed. Finds the chooser it was asked for by id
+/// — never by pointer — and hands it over; a chooser that closed in the
+/// meantime means the result is freed here instead.
+pub fn onSessions(app: *App, res: *SessionRoster.Result) void {
+    defer res.destroy();
+    for (app.windows.items) |win| {
+        const chooser = win.machine_chooser orelse continue;
+        if (chooser.id != res.chooser_id) continue;
+        if (chooser.roster.adopt(res)) chooser.refreshSessions();
+        return;
+    }
+    log.debug("chooser roster: reply landed after its chooser closed", .{});
+}
+
+/// Repaint the detail pane after the roster changed. The subtitle's count lives
+/// there too, so this is one invalidate and not two.
+fn refreshSessions(self: *MachineChooser) void {
+    const l = layout(self.window.scale, self.hint_lines);
+    var r = rect(l.detail);
+    _ = w32.InvalidateRect(self.hwnd, &r, 1);
 }
 
 /// The highlighted row, or null when the list is empty.
@@ -2049,6 +2145,20 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
+        // The roster's cards are painted on the dialog itself, not in a child
+        // control, so their pointer handling lives here.
+        w32.WM_MOUSEMOVE => {
+            self.onSessionHover(loWordSigned(lparam), hiWordSigned(lparam));
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_LBUTTONDOWN => {
+            if (self.onSessionClick(loWordSigned(lparam), hiWordSigned(lparam))) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_MOUSEWHEEL => {
+            if (self.onSessionWheel(@as(i16, @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)))))) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_CLOSE => {
             self.cancel();
             return 0;
@@ -2098,6 +2208,117 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+// ---------------------------------------------------------------------
+// Session roster interaction (T318)
+// ---------------------------------------------------------------------
+
+/// The roster's region and its currently visible rows, or null when the
+/// selected row has no roster. Every pointer handler starts here so hit
+/// testing, hovering and scrolling can never disagree about what is on screen.
+fn sessionView(
+    self: *MachineChooser,
+    rows: []SessionRoster.VisibleRow,
+) ?struct { region: chooser_layout.Rect, rows: []const SessionRoster.VisibleRow } {
+    const row = self.selectedRow() orelse return null;
+    if (row != .local) return null;
+    const l = layout(self.window.scale, self.hint_lines);
+    return .{ .region = l.sessions, .rows = self.roster.visible(self.window.app, rows) };
+}
+
+fn onSessionHover(self: *MachineChooser, x: i32, y: i32) void {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse {
+        self.setKillHover(-1);
+        return;
+    };
+    const hit = self.roster.killAt(view.rows, view.region, self.window.scale, x, y);
+    self.setKillHover(if (hit) |i| @intCast(i) else -1);
+}
+
+fn setKillHover(self: *MachineChooser, index: i32) void {
+    if (self.roster.hover_kill == index) return;
+    self.roster.hover_kill = index;
+    self.refreshSessions();
+}
+
+/// A click in the roster. Returns true when it was consumed.
+fn onSessionClick(self: *MachineChooser, x: i32, y: i32) bool {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse return false;
+    const idx = self.roster.killAt(view.rows, view.region, self.window.scale, x, y) orelse
+        return false;
+    self.confirmKill(view.rows[idx]);
+    return true;
+}
+
+fn onSessionWheel(self: *MachineChooser, wheel_delta: i16) bool {
+    var buf: [SessionRoster.max_rows]SessionRoster.VisibleRow = undefined;
+    const view = self.sessionView(&buf) orelse return false;
+    // Three card-heights per notch, the way a list scrolls three lines.
+    const m = chooser_sessions.metrics(self.window.scale);
+    const step = (m.title_h + m.pad_y * 2) * 3;
+    const delta: i32 = if (wheel_delta > 0) -step else step;
+    if (self.roster.scrollBy(delta, view.rows, view.region, self.window.scale)) {
+        self.refreshSessions();
+    }
+    return true;
+}
+
+/// Confirm, then END a session — the session-scoped equivalent of closing its
+/// pane, so it is destructive and Enter must not approve it.
+///
+/// The row is copied out of the roster first: the confirmation runs a nested
+/// message pump, and a reply landing under it replaces the `OwnedSessions` the
+/// row's strings borrow.
+fn confirmKill(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
+    var id_buf: [128]u8 = undefined;
+    const id_src = row.session.id;
+    if (id_src.len == 0 or id_src.len > id_buf.len) return;
+    const id = id_buf[0..id_src.len];
+    @memcpy(id, id_src);
+
+    var label_buf: [32]u8 = undefined;
+    const name = chooser_sessions.label(
+        &label_buf,
+        row.session,
+        row.live_title,
+        row.persisted_title,
+    );
+    var title_utf8: [256]u8 = undefined;
+    const title_text = std.fmt.bufPrint(
+        &title_utf8,
+        "End session \"{s}\"?",
+        .{name},
+    ) catch "End this session?";
+    var title_buf: [256]u16 = undefined;
+    const title = utf16z(&title_buf, title_text) orelse return;
+
+    const window = self.window;
+    const answer = ConfirmDialog.show(window.app, self.hwnd, window.scale, null, .{
+        .title = title.ptr,
+        .text = std.unicode.utf8ToUtf16LeStringLiteral(
+            "This ends the session - the same as closing its pane. " ++
+                "Any unsaved work in it is lost.",
+        ),
+        .icon = .warning,
+        .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("End Session"),
+        // Destructive: Enter must not approve it.
+        .default_cancel = true,
+    });
+    // The nested pump may have closed this chooser out from under us.
+    if (window.machine_chooser != self) return;
+    if (answer != .ok) return;
+
+    // Hide the row NOW: the close has an undo window during which the agent
+    // still lists the session, and a row that lingers there degrades to a
+    // "pid" label as its pane goes away — which reads as a failed Kill.
+    log.info("chooser roster: ending session id={s}", .{id});
+    self.roster.markKilled(id);
+    self.roster.hover_kill = -1;
+    self.refreshSessions();
+    self.roster.fetch(window.app, self.id, id);
 }
 
 /// Read the current filter edit text into `buf` (truncated to fit).
@@ -2329,6 +2550,9 @@ pub fn cancel(self: *MachineChooser) void {
 /// Free state that was allocated before the HWND existed (early-return paths
 /// in `open`). Does NOT touch `machine_chooser` or the owner (never set yet).
 fn destroyState(self: *MachineChooser) void {
+    // An in-flight roster fetch outlives this — it holds no pointer here, only
+    // the id, so its reply finds no chooser and frees itself.
+    self.roster.deinit();
     if (self.parsed) |*p| p.deinit();
     self.arena.deinit();
     self.window.app.core_app.alloc.destroy(self);

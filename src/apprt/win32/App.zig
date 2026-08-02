@@ -20,6 +20,7 @@ const PathInstaller = @import("PathInstaller.zig");
 const IpcRegistry = @import("IpcRegistry.zig");
 const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
+const SessionRoster = @import("SessionRoster.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
 const RenameDialog = @import("RenameDialog.zig");
@@ -4635,6 +4636,18 @@ fn msgWndProc(
         if (wparam != 0) {
             const res: *ActivityMonitor.DialResult = @ptrFromInt(wparam);
             ActivityMonitor.onDialed(res);
+        }
+        return 0;
+    }
+
+    if (msg == SessionRoster.WM_APP_CHOOSER_SESSIONS) {
+        // wparam = heap *Result owned by the handler. Same reason it lands here
+        // rather than on the chooser's own window as the two above: a chooser
+        // that closed first would have this message DISCARDED with its queue,
+        // leaking the roster it carries (T318).
+        if (wparam != 0) {
+            const res: *SessionRoster.Result = @ptrFromInt(wparam);
+            MachineChooser.onSessions(app, res);
         }
         return 0;
     }

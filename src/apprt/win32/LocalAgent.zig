@@ -448,6 +448,21 @@ pub fn sharedConnectionIfWarm(self: *LocalAgent) ?*connection.Connection {
     return null;
 }
 
+/// Dial the agent that is ALREADY running — never spawning one, and touching
+/// none of a manager's shared state. Returns a PROBE connection the caller owns
+/// and must `deinit`; null when no healthy agent answered.
+///
+/// A free function on purpose: it reads the info file and dials, nothing else,
+/// so it is safe from a WORKER THREAD. That is what the machine chooser's
+/// session roster needs (T318) — browsing a roster must never start a daemon,
+/// and it must never block the GUI thread on a dial. Mirrors Mac's
+/// `LocalAgentManager.dialExisting` (`LocalAgentManager.swift:348-358`).
+pub fn dialProbe(alloc: Allocator) ?tcp_dial.Dialed {
+    if (comptime builtin.os.tag != .windows) return null;
+    var probe: LocalAgent = .init(alloc);
+    return probe.dialExisting();
+}
+
 /// Terminate the running local agent and drop our connection to it, so the next
 /// resolve spawns the binary now on disk (T147). DESTRUCTIVE: the agent owns
 /// every persistent PTY, so its children die with it — the caller MUST have

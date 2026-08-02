@@ -5696,3 +5696,40 @@ Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
 green on re-run), `zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0 (after
 killing the repo's own running `ghoztty-agent.exe`, which held the install
 target). P1-P3 ALL PASS.
+
+## 2026-08-01 - T318 (T146 split): the chooser gets its session roster, and every pane on screen was badged as someone else's
+
+The Ctrl+Shift+N chooser had no roster at all - `MachineChooser.zig`'s only four
+matches for `session` were a relay error string. It now lists the local agent's
+live sessions in the detail pane, with the label ladder, activity/status badges,
+cwd + command sublines and Kill. Three pieces: `chooser_sessions.zig` (pure -
+ladder, filter, badges, card geometry, scroll clamp, tone->pixel colors; 16 unit
+tests), `SessionRoster.zig` (the RPC off-thread, the state, the painting, the
+hit testing - kept out of the 106 KB `MachineChooser.zig`), and
+`chooser_layout.sessions` for the region. `LocalAgent.dialProbe` is the "dial the
+agent that is already running, never spawn one" path a browse must use.
+
+Not an expander: Mac's roster is `detailSessions(target)` for the SELECTED
+machine, so selecting the Local row IS the expand. `isConnectable` is
+`alive or relaunchable` - a deliberate divergence from Mac, whose C API drops the
+field (T322) and therefore hides the resumable tombstones the filter was written
+to keep.
+
+The finding is the `open` badge. A pane's live session id is
+`core_surface.remoteSessionId()`; `Surface.remote_session_id` is set ONLY when a
+pane attaches to a restored session, so a freshly OPENed persistent pane has
+none - and the first build badged every pane on the user's own screen `attached`
+("someone else holds it") rather than `open` ("you do"). Every test passed
+through it; a screenshot did not. The acceptance now scans for the green badge
+with the no-agent run as its negative control. Three follow-ups: **T325** (the
+shared contrast search returns 8-bit colors a hair under the float floor it just
+cleared - measured 2.9905, and three test sites now carry a tolerance for it),
+**T326** (the agent terminates the child before replying to CLOSE_SESSION, so a
+Kill that worked reports `error.Timeout`), **T327** (`Send-TestMouse` takes
+screen coordinates while the comment beside it documents client ones - it cost a
+debugging cycle against a working feature).
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
+`test-agent` exit 0, `zig build -Dapp-runtime=win32 -Doptimize=Debug` exit 0
+(after killing the repo's own running `ghoztty-agent.exe`, which held the install
+target). P1-P3 ALL PASS. New: `test/win32/chooser-sessions.ps1` ALL PASS (16).

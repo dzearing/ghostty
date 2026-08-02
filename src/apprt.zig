@@ -136,6 +136,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/chooser_layout.zig");
 
+    // Pure win32 machine-chooser session roster — the label ladder, the
+    // connectable filter, badges and the card geometry (T318), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/chooser_sessions.zig");
+
     // Pure win32 Activity Monitor panel layout (T284), same no-OS-imports
     // deal.
     _ = @import("apprt/win32/activity_layout.zig");

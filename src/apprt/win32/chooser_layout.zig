@@ -75,6 +75,14 @@ pub const Layout = struct {
     action_row: Rect,
     /// Gap between two action buttons (Mac's `HStack(spacing: 8)`, 456).
     action_gap: i32,
+    /// Everything below the action row: the selected machine's session roster
+    /// (T318), Mac's `detailSessions` scroll region
+    /// (`MachineChooserView.swift:544-570`). It takes ALL the remaining height
+    /// of the detail pane, because a roster is a list of unknown length and the
+    /// pane is a fixed 840x540 — what does not fit scrolls, rather than the
+    /// region growing.
+    sessions: Rect,
+
     /// A labeled button is its measured caption plus `action_btn_pad` on each
     /// side, never narrower than this. These are the SURFACE's button-sizing
     /// rule, not the action row's private numbers — the account row's bordered
@@ -300,6 +308,15 @@ pub fn layout(scale: f32, hint_lines: i32) Layout {
             .top = action_top,
             .right = detail.right - margin,
             .bottom = action_top + btn_h,
+        },
+        // `lg` under the action row (§3.2's mapping of Mac's 14), then the
+        // pane's own bottom margin — the same 16 the header pays, so the
+        // roster sits in a symmetric well rather than against an edge.
+        .sessions = .{
+            .left = detail.left + margin,
+            .top = action_top + btn_h + px(12, scale),
+            .right = detail.right - margin,
+            .bottom = detail.bottom - margin,
         },
         // `md` (8) between two commands, Mac's `HStack(spacing: 8)`; `lg` (12)
         // of padding each side of a caption, and a 96 DIP floor that matches the
@@ -720,6 +737,37 @@ test "layout: detail header runs glyph -> title -> subtitle -> primary action" {
         try testing.expect(r.right <= l.detail.right);
         try testing.expect(r.bottom <= l.detail.bottom);
     }
+}
+
+test "layout: the session roster takes the detail pane below the action row (T318)" {
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const l = layout(scale, 1);
+        // Below the actions, clear of them, and inside the pane on every side.
+        try testing.expect(l.sessions.top > l.action_row.bottom);
+        try testing.expect(l.sessions.left >= l.detail.left);
+        try testing.expect(l.sessions.right <= l.detail.right);
+        try testing.expect(l.sessions.bottom <= l.detail.bottom);
+        // The header and the roster share one margin, so the pane reads as a
+        // well rather than as two differently-inset blocks.
+        try testing.expectEqual(l.detail_glyph.left, l.sessions.left);
+        try testing.expectEqual(l.action_row.right, l.sessions.right);
+        try testing.expectEqual(
+            l.detail_glyph.top - l.detail.top,
+            l.detail.bottom - l.sessions.bottom,
+        );
+        // It is the tallest thing in the pane: a roster is a list of unknown
+        // length, so it gets whatever is left rather than a fixed slot.
+        try testing.expect(l.sessions.height() > l.action_row.height() * 3);
+    }
+}
+
+test "layout: extra hint lines never move the detail pane's roster" {
+    // The status strip lives in the MASTER column; growing it must come out of
+    // the list, not out of the roster next door.
+    const one = layout(1.25, 1);
+    const four = layout(1.25, 4);
+    try testing.expectEqual(one.sessions.top, four.sessions.top);
+    try testing.expectEqual(one.sessions.bottom, four.sessions.bottom);
 }
 
 // --- action row (T177) ------------------------------------------------
