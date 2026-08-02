@@ -6035,3 +6035,46 @@ Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0, the full
 Debug GUI link exit 0, `test-agent` exit 0. P1-P3 ALL PASS.
 `layout-blobs.ps1` ALL PASS (37, incl. the new section F). `chooser-restore-all.ps1`
 ALL PASS (36).
+
+## 2026-08-02 - T344: the loop's selector was pointing at another machine's queue
+
+Current priorities went empty this turn - every named chain in it is done - so
+`next` became the selector for real, and its answer was **T30: "Mac-side: IPC
+dial must not modal-block the app/IPC server"**, whose Validation opens with
+*"Mac regression build"*. This box cannot build the Swift app. `next` is a pure
+function of the task files, so that is not a bad turn, it is a permanent one:
+every future turn gets the same answer, and behind T30 sit six more (T87, T134,
+T186, T246, T247, T340).
+
+The tracker has named the split since T87 - task titles say "Mac seat", and
+T132/T150/T240 leave "note for the Mac seat" paragraphs - but only in prose,
+where no tool can act on it. `seat:` makes it data: `win` (the default when the
+field is absent, so all 344 existing files are untouched), `mac`, or `any`.
+`next` and `list` filter on it, `validate` rejects anything else, and `new
+-Seat` writes it.
+
+The half worth writing down is that **filtering must not look like deleting.**
+`next` prints every todo it passed over for the other seat, with its seat -
+`Skipped 7 todo(s) for another seat (this seat=win): T30(mac), T87(mac), ...` -
+and `next -Seat mac` hands the Mac seat T30 as its own head. The first draft
+accumulated that list as it walked, the way the existing unmet-deps report does,
+so what it printed depended on where this seat's next task happened to sit in
+file order: with a `win` task at the head it reported nothing at all. A report
+whose contents depend on the answer it accompanies is not a report. It scans the
+whole list now. `list` keeps showing every seat by default, because it is the
+human's view of the tracker and hiding rows there would be the same lie in the
+other direction.
+
+`parity-tasks.ps1` also gained `-TaskDir`, without which nothing could exercise
+it except by writing into the real tracker.
+
+Positive control is the evidence: making the seat predicate return true
+unconditionally - the pre-T344 behavior - turns 15 assertions red, including
+"next no longer returns the Mac-side T30" against the real tracker.
+
+`next` now answers **T37**, a doc task this box can do.
+
+Lanes: `test -Dapp-runtime=none` exit 0, `-Dapp-runtime=win32` exit 0,
+`test-agent` exit 0. P1-P3 ALL PASS. New:
+`test/win32/parity-tasks-seat.ps1` ALL PASS (41), twice.
+`parity-tasks.ps1 validate` ALL PASS (374 tasks).

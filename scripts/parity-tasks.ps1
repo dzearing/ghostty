@@ -5,15 +5,22 @@
 
 .DESCRIPTION
   Replaces the single-file state table. Each task is <id>.md with YAML
-  frontmatter (id, title, phase, deps, status, commits) plus a Summary and
-  optional Details body. One file per task means two agents can add and edit
-  tasks concurrently without touching the same file.
+  frontmatter (id, title, phase, deps, status, commits, seat) plus a Summary
+  and optional Details body. One file per task means two agents can add and
+  edit tasks concurrently without touching the same file.
+
+  SEATS (T344). A task's `seat:` says which box can actually do it: `win` (the
+  Windows box, and the default when the field is absent), `mac` (needs a macOS
+  build/run), or `any`. `next` and `list` filter on it so the Windows loop is
+  never handed a task whose validation starts "Mac regression build" - which is
+  a permanent stall, since `next` is a pure function of the files.
 
   ASCII-only by design (PS 5.1 on this box mangles non-ASCII on rewrite).
 
 .EXAMPLE
   scripts\parity-tasks.ps1 list -Status todo
   scripts\parity-tasks.ps1 next
+  scripts\parity-tasks.ps1 next -Seat mac
   scripts\parity-tasks.ps1 show T144
   scripts\parity-tasks.ps1 new -Title "Fix the thing" -Phase K -Deps T73,T94
 #>
@@ -31,17 +38,33 @@ param(
     [string[]]$Deps,
     [string]$Title,
     [string]$Summary,
-    [string]$Commit
+    [string]$Commit,
+
+    # Which box can do the work: win (default) | mac | any. `list`/`next` treat
+    # it as a filter, `new` writes it into the created file.
+    [ValidateSet('win', 'mac', 'any', 'all')]
+    [string]$Seat,
+
+    # Escape hatch so the acceptance script can drive a fixture directory
+    # instead of the real tracker (same idea as GHOSTTY_HOST_DEFAULTS).
+    [string]$TaskDir
 )
 
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$TaskDir = Join-Path $RepoRoot 'docs\design\windows-parity-tasks'
+if (-not $TaskDir) {
+    $TaskDir = Join-Path $RepoRoot 'docs\design\windows-parity-tasks'
+}
 
 if (-not (Test-Path $TaskDir)) {
     throw "Task directory not found: $TaskDir"
 }
+
+# The seat a file with no `seat:` field belongs to. Absent means win, so the
+# field is optional forever and every pre-T344 task file keeps working.
+$DefaultSeat = 'win'
+$ValidSeats = @('win', 'mac', 'any')
 
 # ---------------------------------------------------------------- parsing ---
 
@@ -70,6 +93,9 @@ function ConvertFrom-Frontmatter {
         try { return [string]($raw | ConvertFrom-Json) } catch { return $raw.Trim('"') }
     }
 
+    $seat = & $unquote (& $get 'seat')
+    if (-not $seat) { $seat = $DefaultSeat }
+
     [PSCustomObject]@{
         Id      = & $get 'id'
         Title   = & $unquote (& $get 'title')
@@ -77,8 +103,17 @@ function ConvertFrom-Frontmatter {
         Deps    = & $parseList (& $get 'deps')
         Status  = & $unquote (& $get 'status')
         Commits = & $parseList (& $get 'commits')
+        Seat    = $seat
         Path    = $Path
     }
+}
+
+# A seat can work its own tasks plus the ones marked `any`. `all` is the
+# no-filter escape hatch for a human reading the whole tracker.
+function Test-SeatMatch {
+    param([string]$TaskSeat, [string]$Wanted)
+    if ($Wanted -eq 'all') { return $true }
+    return ($TaskSeat -eq $Wanted -or $TaskSeat -eq 'any')
 }
 
 function Get-AllTasks {
@@ -120,12 +155,17 @@ switch ($Command) {
 
     'list' {
         $tasks = Get-AllTasks
+        # `list` shows everything unless asked otherwise: it is the human's
+        # view of the tracker, where hiding rows by default would be a lie.
+        $wantSeat = if ($Seat) { $Seat } else { 'all' }
         if ($Status) { $tasks = $tasks | Where-Object { $_.Status -like "$Status*" } }
         if ($Phase) { $tasks = $tasks | Where-Object { $_.Phase -eq $Phase } }
+        $tasks = @($tasks | Where-Object { Test-SeatMatch $_.Seat $wantSeat })
         $tasks | Select-Object `
             Id,
         Status,
         Phase,
+        Seat,
         @{ N = 'Deps'; E = { ($_.Deps -join ',') } },
         @{ N = 'Title'; E = { if ($_.Title.Length -gt 70) { $_.Title.Substring(0, 67) + '...' } else { $_.Title } } } |
         Format-Table -AutoSize
@@ -138,9 +178,25 @@ switch ($Command) {
         $byId = @{}
         foreach ($t in $tasks) { $byId[$t.Id] = $t }
 
+        # The selector runs on ONE box, so it defaults to that box's seat.
+        $wantSeat = if ($Seat) { $Seat } else { $DefaultSeat }
+
+        # Scan the WHOLE list for the other seat's todos, not just the ones
+        # ahead of the pick: the point of the line below is to show that the
+        # other seat has a queue, and that answer must not depend on where in
+        # the file order this seat's next task happens to sit.
+        $otherSeat = @()
+        foreach ($t in $tasks) {
+            if ($t.Status -notmatch '^todo') { continue }
+            if (-not (Test-SeatMatch $t.Seat $wantSeat)) {
+                $otherSeat += ("{0}({1})" -f $t.Id, $t.Seat)
+            }
+        }
+
         $blocked = @()
         foreach ($t in $tasks) {
             if ($t.Status -notmatch '^todo') { continue }
+            if (-not (Test-SeatMatch $t.Seat $wantSeat)) { continue }
             $unmet = @()
             foreach ($d in $t.Deps) {
                 if (-not $byId.ContainsKey($d)) { continue }   # unknown dep: ignore, don't block
@@ -148,18 +204,24 @@ switch ($Command) {
             }
             if ($unmet.Count -eq 0) {
                 Write-Host ("NEXT: {0} - {1}" -f $t.Id, $t.Title)
-                Write-Host ("      phase={0} deps={1}" -f $t.Phase, ($t.Deps -join ','))
+                Write-Host ("      phase={0} deps={1} seat={2}" -f $t.Phase, ($t.Deps -join ','), $t.Seat)
                 Write-Host ("      file: docs/design/windows-parity-tasks/{0}.md" -f $t.Id)
                 if ($blocked.Count -gt 0) {
                     Write-Host ""
                     Write-Host ("Skipped {0} earlier todo(s) with unmet deps: {1}" -f $blocked.Count, ($blocked -join ', '))
                 }
+                # Loud, never silent: a task filtered out by seat is somebody
+                # else's queue, not a task that vanished.
+                if ($otherSeat.Count -gt 0) {
+                    Write-Host ("Skipped {0} todo(s) for another seat (this seat={1}): {2}" -f $otherSeat.Count, $wantSeat, ($otherSeat -join ', '))
+                }
                 exit 0
             }
             $blocked += ("{0}(needs {1})" -f $t.Id, ($unmet -join ','))
         }
-        Write-Host "No ready task: every todo has unmet deps, or nothing is todo."
+        Write-Host ("No ready task for seat={0}: every todo has unmet deps, is another seat's, or nothing is todo." -f $wantSeat)
         if ($blocked.Count -gt 0) { Write-Host ("Blocked: {0}" -f ($blocked -join ', ')) }
+        if ($otherSeat.Count -gt 0) { Write-Host ("Other seat: {0}" -f ($otherSeat -join ', ')) }
         exit 1
     }
 
@@ -204,6 +266,9 @@ switch ($Command) {
         $phaseJson = 'null'
         if ($Phase) { $phaseJson = ConvertTo-Json $Phase -Compress }
 
+        # `all` is a filter, not a seat a task can hold.
+        $seatValue = if ($Seat -and $Seat -ne 'all') { $Seat } else { $DefaultSeat }
+
         # Allocate the next free id by CREATING the file atomically. A racing
         # agent that picked the same number loses the CreateNew and we retry,
         # so two sessions can never mint the same id.
@@ -233,6 +298,7 @@ switch ($Command) {
                     "deps: $depsJson"
                     'status: "todo"'
                     'commits: []'
+                    ("seat: " + (ConvertTo-Json $seatValue -Compress))
                     '---'
                     ''
                     "# $tid - $Title"
@@ -283,6 +349,11 @@ switch ($Command) {
             }
             if ($t.Status -notmatch '^(todo|in-progress|done|blocked|skipped)') {
                 Write-Host ("ODD STATUS: {0} = '{1}'" -f $t.Id, $t.Status); $problems++
+            }
+            # A typo'd seat would hide the task from every seat's `next`, which
+            # is exactly the silent stall this field exists to end.
+            if ($ValidSeats -notcontains $t.Seat) {
+                Write-Host ("ODD SEAT: {0} = '{1}' (want one of: {2})" -f $t.Id, $t.Seat, ($ValidSeats -join ', ')); $problems++
             }
         }
 

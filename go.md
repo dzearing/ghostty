@@ -37,7 +37,11 @@ Concretely, in order, with no stops in between:
 
 1. **Pick up a task** — first Current-priorities item, else
    `powershell -NoProfile -File scripts\parity-tasks.ps1 next`. Never ask
-   which one.
+   which one. `next` answers for **this box's seat** (T344): tasks marked
+   `seat: mac` — a Swift fix, a macOS regression run — are the Mac seat's and
+   are listed as skipped rather than handed to you. Do not take one; if you
+   find a task you cannot validate here, mark it `seat: mac` and re-run
+   `next`.
 2. **Build it.**
 3. **Test it** — the task's own Validation, plus the standing floor (both
    `zig build test` lanes, `zig build test-agent`, P1–P3).

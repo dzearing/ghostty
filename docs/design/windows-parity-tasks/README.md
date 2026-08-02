@@ -35,6 +35,7 @@ phase: "K"
 deps: ["T89h"]
 status: "todo"
 commits: []
+seat: "win"
 ---
 
 # T144 — New windows (ctrl+n) open in C:\Windows\System32
@@ -56,6 +57,31 @@ Spec, design notes, on-box evidence. Grows as the task is worked.
 | `deps` | Ids that must be `done`/`skipped` first. `[]` if none. |
 | `status` | `todo` / `in-progress` / `done` / `blocked(<what>)` / `skipped(<why>)` |
 | `commits` | Commit hashes that delivered it. |
+| `seat` | Which box can do the work: `win` (default when absent) / `mac` / `any`. |
+
+## Seats (T344, 2026-08-02)
+
+Some tasks can only be done on the other machine — a Swift fix that needs a
+macOS regression build, a Mac-side verification of a shared-Zig change. The
+tracker has named them in prose since T87 (*"Mac seat: …"*), but the tooling
+did not know, so `next` kept handing this box **T30** — a task whose Validation
+begins *"Mac regression build"*. `next` is a pure function of the files, so
+that is not a one-turn annoyance: **every** turn gets the same answer.
+
+`seat:` makes it data. The default is `win`, which is why the field is
+optional and every pre-T344 file still means what it always did.
+
+```powershell
+scripts\parity-tasks.ps1 next                 # this box: win + any
+scripts\parity-tasks.ps1 next -Seat mac       # the Mac seat's own queue
+scripts\parity-tasks.ps1 list -Seat mac       # what is waiting over there
+scripts\parity-tasks.ps1 new -Title "…" -Seat mac
+```
+
+Filtering is never silent: `next` prints every todo it passed over for the
+other seat, with its seat, so the queue that is not yours stays visible. A
+seat value outside the set fails `validate` — a typo would hide the task from
+*both* seats, which is the stall this field exists to end.
 
 Suffixed ids are real and load-bearing: `T89a` (a split of T89) and `T89f2`
 (a split of a split). Any `T<digits>[letter][digits]` is valid.
