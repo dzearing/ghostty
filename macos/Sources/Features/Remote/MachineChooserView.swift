@@ -203,7 +203,7 @@ struct MachineChooserView: View {
     /// loaded (hidden while loading/failed or when zero).
     @ViewBuilder
     private func countBadge(for target: WindowTarget) -> some View {
-        if let key = browseKey(for: target), let n = browser.count(for: key), n > 0 {
+        if let key = browseKey(for: target), let n = actionableCount(for: key), n > 0 {
             Text("\(n)")
                 .font(.caption2)
                 .monospacedDigit()
@@ -568,7 +568,7 @@ struct MachineChooserView: View {
     @ViewBuilder
     private func detailSubtitle(_ target: WindowTarget) -> some View {
         HStack(spacing: 8) {
-            if let key = browseKey(for: target), let n = browser.count(for: key) {
+            if let key = browseKey(for: target), let n = actionableCount(for: key) {
                 Text("\(n) session\(n == 1 ? "" : "s")")
             }
             switch target {
@@ -603,7 +603,7 @@ struct MachineChooserView: View {
                         // unreconnectable `exited` dead-end). Protects against an
                         // OLDER agent that doesn't reap, and the brief window a
                         // still-bound tombstone exists. Alive + relaunchable stay.
-                        let sessions = allSessions.filter { $0.isConnectable }
+                        let sessions = actionable(allSessions)
                         if sessions.isEmpty {
                             sessionsPlaceholder(icon: "moon.zzz", text: "No active sessions")
                         } else {
@@ -927,6 +927,37 @@ struct MachineChooserView: View {
     private struct LiveSessionInfo {
         var openIDs: Set<String> = []
         var titles: [String: String] = [:]
+    }
+
+    /// The sessions the user can actually act on — what the list renders, and
+    /// what every count must agree with.
+    ///
+    /// Beyond the dead-tombstone backstop (`isConnectable`), this drops any
+    /// session the agent reports as ATTACHED that we have no open pane for.
+    /// In practice that is a pane just closed: its session stays alive for the
+    /// undo window (5s) and is still bound to us, so it rendered as a "Resume"
+    /// row for a window the user deliberately closed — which reads as a leak and
+    /// invites reviving it. It also covers a session attached to some OTHER
+    /// viewer, which this one equally cannot resume.
+    ///
+    /// Keyed on our own open panes rather than a "closing" marker, so it holds by
+    /// construction: if it is not on screen here and something else holds it, we
+    /// cannot offer it. Genuinely detached sessions — the real Resume case — are
+    /// untouched.
+    private func actionable(_ sessions: [BrowsedSession]) -> [BrowsedSession] {
+        let live = liveSessionInfo
+        return sessions.filter { session in
+            guard session.isConnectable else { return false }
+            if session.attached && !live.openIDs.contains(session.id) { return false }
+            return true
+        }
+    }
+
+    /// The count shown on a row badge / in the detail header. Derived from the
+    /// SAME filter as the list, so the number can never disagree with the rows.
+    private func actionableCount(for key: String) -> Int? {
+        guard let all = browser.loadedSessions(for: key) else { return nil }
+        return actionable(all).count
     }
 
     private var liveSessionInfo: LiveSessionInfo {

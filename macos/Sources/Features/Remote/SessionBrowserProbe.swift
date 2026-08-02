@@ -194,6 +194,14 @@ final class SessionBrowserProbe: ObservableObject {
         return nil
     }
 
+    /// The loaded roster for `key`, or nil if it hasn't loaded. Lets the view
+    /// apply its own visibility filter and derive a count from the SAME list it
+    /// renders, instead of a raw total that disagrees with the rows.
+    func loadedSessions(for key: String) -> [BrowsedSession]? {
+        if case .loaded(let sessions) = states[key] { return sessions }
+        return nil
+    }
+
     // MARK: Local agent
 
     /// Fetch the local agent's roster WITHOUT expanding, so "this Mac" can show
